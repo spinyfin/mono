@@ -139,9 +139,31 @@ pub async fn restore_preserved(
         positioned.to_owned()
     };
     let base = target.trim();
+    let pointer = revision(&preserved_name(&record.execution_id));
+    let variants = log(jj, &record.repo_path, &pointer, "commit_id ++ \"\\n\"").await?;
     let Some(tip) = select_tip(jj, record, base, recorded).await? else {
         return Ok(None);
     };
+    let discarded: Vec<_> = variants
+        .lines()
+        .filter(|candidate| *candidate != tip)
+        .map(str::to_owned)
+        .collect();
+    if !discarded.is_empty() {
+        jj.run(
+            &record.repo_path,
+            &[
+                "--ignore-working-copy",
+                "bookmark",
+                "set",
+                &preserved_name(&record.execution_id),
+                "-r",
+                &tip,
+                "--allow-backwards",
+            ],
+        )
+        .await?;
+    }
     let sources = format!("({}) ~ ::{base}", unpublished(&tip));
     let commits = log(
         jj,
@@ -219,6 +241,7 @@ pub async fn restore_preserved(
             .base_sha(base)
             .inherited_base(base)
             .conflicts(conflicts)
+            .discarded_tips(discarded.join("\n"))
             .build(),
     ))
 }

@@ -23,6 +23,10 @@ fn names(repo: &JjRepo) -> String {
     JjRepo::run(&repo.repo, &["bookmark", "list", "-T", "name ++ \"\\n\""])
 }
 
+async fn preserve_tip(jj: &LocalJj, record: &ExecutionBookmark, workspace: &Path) -> Result<Option<PreservedTip>> {
+    preserve(jj, record, workspace, None, None).await
+}
+
 #[tokio::test]
 async fn conflicted_variants_prefer_pr_ancestry_then_jj_evolution() {
     for on_pr in [0, 1, 2] {
@@ -32,7 +36,7 @@ async fn conflicted_variants_prefer_pr_ancestry_then_jj_evolution() {
         std::fs::write(repo.worker.join("common"), "common unpublished parent").unwrap();
         JjRepo::run(&repo.worker, &["new", "-m", "Diverging child"]);
         std::fs::write(repo.worker.join("work"), "preserved work").unwrap();
-        let saved = preserve(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+        let saved = preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
         let op = JjRepo::run(&repo.repo, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
         for title in ["Earlier variant", "Middle variant", "Later variant"] {
             JjRepo::run(&repo.repo, &["--at-op", &op, "describe", &saved.commit_id, "-m", title]);
@@ -85,7 +89,7 @@ async fn unpushed_tip_creates_exactly_one_bookmark_and_release_retry_reuses_it()
     let record = create(&LocalJj, &repo.worker, "exec_preserve", "local").await.unwrap();
     let before = names(&repo);
     std::fs::write(repo.worker.join("work"), "uncommitted edits").unwrap();
-    let tip = preserve(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    let tip = preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
     assert_eq!(tip.count, 1);
     assert_eq!(names(&repo).lines().count(), before.lines().count() + 1);
     assert!(names(&repo).contains("preserved/exec_preserve"));
@@ -93,7 +97,7 @@ async fn unpushed_tip_creates_exactly_one_bookmark_and_release_retry_reuses_it()
         JjRepo::run(&repo.worker, &["log", "-r", "@", "--no-graph", "-T", "change_id"]),
         tip.change_id
     );
-    assert_eq!(preserve(&LocalJj, &record, &repo.worker).await.unwrap(), Some(tip));
+    assert_eq!(preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap(), Some(tip));
     assert_eq!(names(&repo).lines().count(), before.lines().count() + 1);
 }
 
@@ -103,10 +107,10 @@ async fn later_unpublished_work_moves_the_preserved_bookmark() {
     let repo = fixture(dir.path());
     let record = create(&LocalJj, &repo.worker, "exec_move", "local").await.unwrap();
     std::fs::write(repo.worker.join("first"), "first unpublished").unwrap();
-    let first = preserve(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    let first = preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
     JjRepo::run(&repo.worker, &["new", "-m", "Later unpublished work"]);
     std::fs::write(repo.worker.join("second"), "second unpublished").unwrap();
-    let second = preserve(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    let second = preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
     assert_ne!(second.commit_id, first.commit_id);
     assert_eq!(
         JjRepo::run(
@@ -135,10 +139,10 @@ async fn recycled_workspace_cannot_replace_unadopted_preserved_work() {
     let repo = fixture(dir.path());
     let record = create(&LocalJj, &repo.worker, "exec_recycled", "local").await.unwrap();
     std::fs::write(repo.worker.join("first"), "original unpublished").unwrap();
-    let saved = preserve(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    let saved = preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
     JjRepo::run(&repo.replacement, &["new", "main"]);
     std::fs::write(repo.replacement.join("other"), "another occupant").unwrap();
-    let err = preserve(&LocalJj, &record, &repo.replacement).await.unwrap_err();
+    let err = preserve_tip(&LocalJj, &record, &repo.replacement).await.unwrap_err();
     assert!(is_pointer_integrity_error(&err));
     assert_eq!(
         JjRepo::run(
@@ -167,7 +171,7 @@ async fn published_work_and_empty_trailing_commit_create_no_bookmark() {
     JjRepo::run(&repo.repo, &["git", "fetch"]);
     JjRepo::run(&repo.worker, &["new", "-m", "Empty trailing commit"]);
     let before = names(&repo);
-    assert_eq!(preserve(&LocalJj, &record, &repo.worker).await.unwrap(), None);
+    assert_eq!(preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap(), None);
     assert_eq!(names(&repo), before);
 }
 
@@ -183,7 +187,7 @@ async fn missing_and_forgotten_workspace_uses_last_journaled_working_copy() {
     for i in 0..270 {
         JjRepo::run(&repo.repo, &["describe", "-m", &format!("Unrelated operation {i}")]);
     }
-    let saved = preserve(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    let saved = preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
     assert_eq!(saved.commit_id, tip);
     assert_eq!(saved.count, 1);
 }
@@ -195,7 +199,7 @@ async fn production_positioning_commits_are_not_restage_ancestors() {
         let repo = fixture(dir.path());
         let record = create(&LocalJj, &repo.worker, "exec_position", "local").await.unwrap();
         std::fs::write(repo.worker.join("work"), "unpublished").unwrap();
-        let saved = preserve(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+        let saved = preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
         let mut args = vec!["new", "main"];
         if let Some(description) = description {
             args.extend(["-m", description]);
@@ -260,7 +264,7 @@ async fn restoration_follows_rewrites_and_keeps_change_ids_on_new_base() {
     let repo = fixture(dir.path());
     let record = create(&LocalJj, &repo.worker, "exec_restore", "local").await.unwrap();
     std::fs::write(repo.worker.join("work"), "preserved edits").unwrap();
-    let saved = preserve(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    let saved = preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
     JjRepo::run(&repo.worker, &["describe", "-m", "Rewritten description"]);
     JjRepo::run(&repo.replacement, &["new", "main", "-m", "New upstream"]);
     std::fs::write(repo.replacement.join("upstream"), "upstream edits").unwrap();
@@ -313,7 +317,7 @@ async fn restoration_keeps_content_conflicts_for_worker_resolution() {
     let repo = fixture(dir.path());
     let record = create(&LocalJj, &repo.worker, "exec_conflicts", "local").await.unwrap();
     std::fs::write(repo.worker.join("base.txt"), "worker edits\n").unwrap();
-    let saved = preserve(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    let saved = preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
     JjRepo::run(&repo.replacement, &["new", "main", "-m", "Upstream edits"]);
     std::fs::write(repo.replacement.join("base.txt"), "upstream edits\n").unwrap();
     let report = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
@@ -332,7 +336,7 @@ async fn missing_bookmark_falls_back_to_the_recorded_commit() {
     let repo = fixture(dir.path());
     let record = create(&LocalJj, &repo.worker, "exec_hidden", "local").await.unwrap();
     std::fs::write(repo.worker.join("hidden"), "recorded unpublished").unwrap();
-    let saved = preserve(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    let saved = preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
     JjRepo::run(
         &repo.repo,
         &["bookmark", "delete", &preserved_name(&record.execution_id)],
@@ -355,7 +359,7 @@ async fn missing_bookmark_and_missing_commit_are_an_integrity_failure() {
     let repo = fixture(dir.path());
     let record = create(&LocalJj, &repo.worker, "exec_gone", "local").await.unwrap();
     std::fs::write(repo.worker.join("gone"), "unpublished").unwrap();
-    preserve(&LocalJj, &record, &repo.worker).await.unwrap();
+    preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap();
     JjRepo::run(
         &repo.repo,
         &["bookmark", "delete", &preserved_name(&record.execution_id)],
@@ -378,7 +382,7 @@ async fn conflicted_preservation_requires_current_work_to_be_retained() {
     let repo = fixture(dir.path());
     let record = create(&LocalJj, &repo.worker, "exec_variant", "local").await.unwrap();
     std::fs::write(repo.worker.join("work"), "saved work").unwrap();
-    let saved = preserve(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    let saved = preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
     let op = JjRepo::run(&repo.repo, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
     for title in ["First variant", "Second variant"] {
         JjRepo::run(&repo.repo, &["--at-op", &op, "describe", &saved.commit_id, "-m", title]);
@@ -390,10 +394,10 @@ async fn conflicted_preservation_requires_current_work_to_be_retained() {
     );
     assert_eq!(variants.lines().count(), 2);
     JjRepo::run(&repo.replacement, &["edit", variants.lines().next().unwrap()]);
-    assert!(preserve(&LocalJj, &record, &repo.replacement).await.is_ok());
+    assert!(preserve_tip(&LocalJj, &record, &repo.replacement).await.is_ok());
     JjRepo::run(&repo.replacement, &["new", "-m", "Additional work"]);
     std::fs::write(repo.replacement.join("extra"), "not yet retained").unwrap();
-    let error = preserve(&LocalJj, &record, &repo.replacement).await.unwrap_err();
+    let error = preserve_tip(&LocalJj, &record, &repo.replacement).await.unwrap_err();
     assert!(is_pointer_integrity_error(&error));
     assert_eq!(
         JjRepo::run(
@@ -402,4 +406,179 @@ async fn conflicted_preservation_requires_current_work_to_be_retained() {
         ),
         variants
     );
+}
+
+#[tokio::test]
+async fn reused_workspace_name_preserves_the_current_incarnation() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_reuse", "local").await.unwrap();
+    std::fs::write(repo.worker.join("stale"), "previous occupant").unwrap();
+    let stale = JjRepo::run(&repo.worker, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+    std::fs::remove_dir_all(&repo.worker).unwrap();
+    JjRepo::run(&repo.repo, &["workspace", "forget", "worker"]);
+    JjRepo::run(
+        &repo.repo,
+        &[
+            "workspace",
+            "add",
+            repo.worker.to_str().unwrap(),
+            "--name",
+            "worker",
+            "-r",
+            "main",
+        ],
+    );
+    std::fs::write(repo.worker.join("fresh"), "new incarnation").unwrap();
+    let fresh = JjRepo::run(&repo.worker, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+    assert_ne!(fresh, stale);
+    std::fs::remove_dir_all(&repo.worker).unwrap();
+    let saved = preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    assert_eq!(saved.commit_id, fresh);
+}
+
+#[tokio::test]
+async fn forget_lookup_matches_the_workspace_name_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let extra = dir.path().join("worker-extra");
+    JjRepo::run(
+        &repo.repo,
+        &[
+            "workspace",
+            "add",
+            extra.to_str().unwrap(),
+            "--name",
+            "worker-extra",
+            "-r",
+            "main",
+        ],
+    );
+    std::fs::write(extra.join("stale"), "other workspace").unwrap();
+    let stale = JjRepo::run(&extra, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+    std::fs::remove_dir_all(&extra).unwrap();
+    JjRepo::run(&repo.repo, &["workspace", "forget", "worker-extra"]);
+    let record = create(&LocalJj, &repo.worker, "exec_exact", "local").await.unwrap();
+    std::fs::write(repo.worker.join("current"), "this workspace").unwrap();
+    let current = JjRepo::run(&repo.worker, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+    assert_ne!(current, stale);
+    std::fs::remove_dir_all(&repo.worker).unwrap();
+    JjRepo::run(&repo.repo, &["workspace", "forget", "worker"]);
+    let saved = preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    assert_eq!(saved.commit_id, current);
+}
+
+#[tokio::test]
+async fn restoring_a_conflicted_bookmark_resolves_it_so_later_work_is_preserved() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_resolve", "local").await.unwrap();
+    std::fs::write(repo.worker.join("work"), "saved work").unwrap();
+    let saved = preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    let op = JjRepo::run(&repo.repo, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
+    for title in ["First variant", "Second variant"] {
+        JjRepo::run(&repo.repo, &["--at-op", &op, "describe", &saved.commit_id, "-m", title]);
+    }
+    let name = preserved_name(&record.execution_id);
+    assert_eq!(
+        JjRepo::run(
+            &repo.repo,
+            &["log", "--no-graph", "-r", &name, "-T", "commit_id ++ \"\\n\""]
+        )
+        .lines()
+        .count(),
+        2
+    );
+    JjRepo::run(&repo.replacement, &["new", "main"]);
+    let report = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !report.discarded_tips.trim().is_empty(),
+        "unselected variants must be named: {}",
+        report.discarded_tips
+    );
+    assert_eq!(
+        JjRepo::run(
+            &repo.repo,
+            &["log", "--no-graph", "-r", &name, "-T", "commit_id ++ \"\\n\""]
+        )
+        .lines()
+        .count(),
+        1
+    );
+    JjRepo::run(&repo.replacement, &["new", "-m", "Additional work"]);
+    std::fs::write(repo.replacement.join("extra"), "later unpublished").unwrap();
+    let updated = preserve_tip(&LocalJj, &record, &repo.replacement)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        JjRepo::run(&repo.repo, &["log", "--no-graph", "-r", &name, "-T", "commit_id"]),
+        updated.commit_id
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.replacement.join("extra")).unwrap(),
+        "later unpublished"
+    );
+}
+
+#[tokio::test]
+async fn missing_bookmark_keeps_recorded_unpublished_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_recorded", "local").await.unwrap();
+    std::fs::write(repo.worker.join("kept"), "recorded unpublished").unwrap();
+    let saved = preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    JjRepo::run(
+        &repo.repo,
+        &["bookmark", "delete", &preserved_name(&record.execution_id)],
+    );
+    JjRepo::run(&repo.replacement, &["new", "main"]);
+    let kept = preserve(&LocalJj, &record, &repo.replacement, Some(&saved), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.commit_id, saved.commit_id);
+    assert_eq!(
+        JjRepo::run(
+            &repo.repo,
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                &preserved_name(&record.execution_id),
+                "-T",
+                "commit_id"
+            ]
+        ),
+        saved.commit_id
+    );
+}
+
+#[tokio::test]
+async fn missing_bookmark_recorded_inspect_failure_is_not_empty_work() {
+    let record = ExecutionBookmark {
+        execution_id: "exec_inspect".into(),
+        repo_path: "store".into(),
+        host_id: "remote".into(),
+        base_commit: None,
+    };
+    let saved = PreservedTip {
+        change_id: "change".into(),
+        commit_id: "commit".into(),
+        count: 1,
+    };
+    let err = preserve(
+        &FailedRecordedLookup,
+        &record,
+        Path::new("workspace"),
+        Some(&saved),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("SSH transport unavailable"));
+    assert!(!is_pointer_integrity_error(&err));
 }

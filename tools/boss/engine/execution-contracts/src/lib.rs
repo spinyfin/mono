@@ -1469,8 +1469,10 @@ pub trait HostAdapter: Send + Sync {
         &self,
         record: &ExecutionBookmark,
         workspace: &Path,
+        recorded: Option<&PreservedTip>,
+        since_unix: Option<i64>,
     ) -> anyhow::Result<Option<boss_engine_recovery::execution_bookmark::PreservedTip>> {
-        let _ = (record, workspace);
+        let _ = (record, workspace, recorded, since_unix);
         bail!("workspace recovery confirmation is not supported by this host adapter")
     }
 

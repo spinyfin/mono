@@ -27,7 +27,7 @@ async fn dispatch_prefers_preserved_work_over_retired_legacy_pointers() {
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
     std::fs::write(repo.worker.join("fix"), "unpushed fix").unwrap();
-    let tip = recovery::preserve(&LocalJj, &record, &repo.worker)
+    let tip = recovery::preserve(&LocalJj, &record, &repo.worker, None, None)
         .await
         .unwrap()
         .unwrap();
@@ -89,7 +89,7 @@ async fn undecidable_preserved_bookmark_starts_fresh_and_raises_one_attention() 
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
     std::fs::write(repo.worker.join("fix"), "unpushed fix").unwrap();
-    let tip = recovery::preserve(&LocalJj, &record, &repo.worker)
+    let tip = recovery::preserve(&LocalJj, &record, &repo.worker, None, None)
         .await
         .unwrap()
         .unwrap();
@@ -223,7 +223,7 @@ async fn self_retry_restages_preserved_work_when_legacy_pointers_are_retired() {
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
     std::fs::write(repo.worker.join("retry-work"), "self-retry unpublished").unwrap();
-    let tip = recovery::preserve(&LocalJj, &record, &repo.worker)
+    let tip = recovery::preserve(&LocalJj, &record, &repo.worker, None, None)
         .await
         .unwrap()
         .unwrap();
@@ -286,7 +286,7 @@ async fn pre_start_teardown_then_retry_preserves_later_unpublished_edits() {
         .unwrap();
     db.record_execution_bookmark(&prior_record).unwrap();
     std::fs::write(repo.worker.join("inherited"), "inherited unpublished").unwrap();
-    let inherited = recovery::preserve(&LocalJj, &prior_record, &repo.worker)
+    let inherited = recovery::preserve(&LocalJj, &prior_record, &repo.worker, None, None)
         .await
         .unwrap()
         .unwrap();
@@ -486,7 +486,7 @@ async fn missing_preserved_bookmark_with_unresolvable_commit_raises_attention() 
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
     std::fs::write(repo.worker.join("fix"), "unpushed fix").unwrap();
-    let mut tip = recovery::preserve(&LocalJj, &record, &repo.worker)
+    let mut tip = recovery::preserve(&LocalJj, &record, &repo.worker, None, None)
         .await
         .unwrap()
         .unwrap();

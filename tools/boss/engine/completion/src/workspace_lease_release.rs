@@ -109,9 +109,11 @@ impl BookmarkGate for DbBookmarkGate<'_> {
                 .workspace_path
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("workspace path unavailable for preservation"))?;
+            let recorded = self.db.preserved_tip(&execution.id)?;
+            let since_unix = execution.started_epoch().or_else(|| execution.created_epoch());
             let tip = if let Some(adapter) = self.adapter {
                 adapter
-                    .confirm_workspace_recovery(&record, Path::new(workspace))
+                    .confirm_workspace_recovery(&record, Path::new(workspace), recorded.as_ref(), since_unix)
                     .await?
             } else {
                 anyhow::ensure!(record.host_id == "local", "preservation requires the owning host");
@@ -119,6 +121,8 @@ impl BookmarkGate for DbBookmarkGate<'_> {
                     &boss_engine_recovery::execution_bookmark::LocalJj,
                     &record,
                     Path::new(workspace),
+                    recorded.as_ref(),
+                    since_unix,
                 )
                 .await?
             };

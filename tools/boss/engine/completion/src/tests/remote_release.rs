@@ -22,7 +22,7 @@ crate::stub_host_adapter! { RemoteReleaseAdapter {
     async fn probe_workspace_occupancy(&self, _: &std::path::Path) -> Result<crate::workspace_lease_release::Occupancy> {
         Ok(self.occupancy)
     }
-    async fn confirm_workspace_recovery(&self, record: &boss_engine_recovery::execution_bookmark::ExecutionBookmark, workspace: &std::path::Path) -> anyhow::Result<Option<boss_engine_recovery::execution_bookmark::PreservedTip>> {
+    async fn confirm_workspace_recovery(&self, record: &boss_engine_recovery::execution_bookmark::ExecutionBookmark, workspace: &std::path::Path, _recorded: Option<&boss_engine_recovery::execution_bookmark::PreservedTip>, _since_unix: Option<i64>) -> anyhow::Result<Option<boss_engine_recovery::execution_bookmark::PreservedTip>> {
         crate::test_support::confirm_remote_test_recovery(record, workspace, "remote").map(|()| None)
     }
 } }
