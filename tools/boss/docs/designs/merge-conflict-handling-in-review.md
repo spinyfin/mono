@@ -2390,8 +2390,8 @@ Both answers close the `architectural_mismatch` exit for the attempt (`conflict_
 
 #### Dispatch
 
-Answering is an explicit human decision, so the work an answer creates is launched like `bossctl agents launch` (`ExecutionCoordinator::launch_answered_work`): through the global dispatch pause and focus mode. PR-writer sequencing still applies. An execution gated behind another writer on the PR waits as `waiting_dependency` and is promoted when the gate clears, and the launch respects the dispatch claim and per-repo lease bound. If a launch is refused, the ready execution stays queued for the ordinary scheduler.
+Answering is an explicit human decision, so the work an answer creates is launched like `bossctl agents launch` (`ExecutionCoordinator::launch_answered_work`). The answer transaction sets `work_executions.operator_forced_admission` on the new execution. The drain honours that flag under an operator-origin pause (including all-spawns) and outside focus mode. A breaker-origin pause holds the row as `dispatch_paused` and keeps the flag until resume. PR-writer sequencing still applies. An execution gated behind another writer on the PR waits as `waiting_dependency` and is promoted when the gate clears, and the launch respects the dispatch claim and per-repo lease bound. If a launch is refused, the persisted flag stays, and the drain admits the ready execution as operator-forced once it can run.
 
 #### Shared question mechanism
 
-Answering a task that is still gated by prerequisites used to be refused by the explicit-start check, rolling the whole answer back and leaving the question open. `restart_after_answer` now returns a gated task to `todo` with a waiting execution instead, for every question type.
+Answering a task that is still gated by prerequisites used to be refused by the explicit-start check, rolling the whole answer back and leaving the question open. `restart_after_answer` now parks a gated task as `blocked` / `dependency` with a waiting execution, for every question type, so the dependency cascade promotes it when the gate clears.

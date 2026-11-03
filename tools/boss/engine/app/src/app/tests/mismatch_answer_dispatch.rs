@@ -448,15 +448,6 @@ fn complete_writer(parked: &Parked, writer_id: &str, waiting_id: &str) {
         .work_db
         .try_unblock_dependency_if_resolved(waiting_id)
         .unwrap();
-    let product_id = parked
-        .state
-        .work_db
-        .get_work_item(waiting_id)
-        .unwrap()
-        .product_id()
-        .to_owned();
-    parked.state.work_db.reconcile_product_executions(&product_id).unwrap();
-    parked.state.work_db.promote_todo_autostart_stuck_executions().unwrap();
 }
 
 #[tokio::test]

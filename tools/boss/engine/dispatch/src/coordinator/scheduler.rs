@@ -451,22 +451,17 @@ impl ExecutionCoordinator {
     ///
     /// Answering is an explicit human decision, so the work it creates must not
     /// be re-queued behind the global dispatch pause or the focus set. The
-    /// latest non-terminal execution is marked operator-forced first, so a
-    /// writer wait, pool cap, preflight, or drain race keeps the admission
-    /// until the work is admitted or cancelled. A `ready` execution is handed
-    /// to [`Self::force_dispatch`] as [`DispatchAdmission::OperatorForced`].
+    /// answer transaction already marked the latest non-terminal execution
+    /// operator-forced, so a writer wait, pool cap, preflight, or drain race
+    /// keeps the admission until the work is admitted or cancelled. This path
+    /// does not re-mark: a post-commit re-mark can flag an execution the drain
+    /// has already admitted. A `ready` execution is handed to
+    /// [`Self::force_dispatch`] as [`DispatchAdmission::OperatorForced`].
     /// An execution gated behind another writer stays `waiting_dependency` for
     /// the dependency cascade, which then drains it as operator-forced. The
     /// dispatch claim and per-repo lease bound are respected. Returns the
     /// worker id, or `None` when there is no ready execution to launch.
     pub async fn launch_answered_work(self: &Arc<Self>, work_item_id: &str) -> Result<Option<String>> {
-        if let Err(err) = self.work_db.mark_operator_forced_admission(work_item_id) {
-            tracing::warn!(
-                work_item_id,
-                error = %format!("{err:#}"),
-                "failed to persist operator-forced admission for answered work",
-            );
-        }
         let ready = self
             .work_db
             .list_executions(Some(work_item_id))?
@@ -1341,9 +1336,9 @@ impl ExecutionCoordinator {
             // overridable.
             let is_operator_forced = operator_forced_ids.contains(&execution.id);
             let forced_admissible = Self::forced_admissible(is_operator_forced, pause.as_ref());
-            // Everyone else keeps the previous rules: all-spawns holds the
-            // whole queue; a new-work pause holds non-review non-critical
-            // rows unless a pause-bypass marker is consumed.
+            // Rows without admissible operator-forced admission: an all-spawns
+            // pause holds every row; a new-work pause holds non-review,
+            // non-critical rows unless a pause-bypass marker is consumed.
             if paused && !forced_admissible {
                 if !reviews_exempt_from_pause {
                     changed_waits.extend(self.record_dispatch_wait_reason(&execution, "dispatch_paused", None));

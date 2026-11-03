@@ -1782,7 +1782,9 @@ pub enum FrontendRequest {
     /// reason. The CLI surface is `boss engine conflicts mark-failed
     /// <attempt-id> --reason <r>` — workers call it when they hit one
     /// of the stop conditions (semantic obsolescence, product decision
-    /// required, architectural mismatch) and decide not to push. See
+    /// required, architectural mismatch) and decide not to push. `reason`
+    /// must be one of [`crate::CONFLICT_MARK_FAILED_REASONS`]; any other
+    /// string is rejected. See
     /// `tools/boss/docs/designs/merge-conflict-handling-in-review.md`
     /// Q4 / Q11.
     MarkConflictResolutionFailed {
