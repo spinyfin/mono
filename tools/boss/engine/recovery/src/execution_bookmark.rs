@@ -15,6 +15,13 @@ use serde::{Deserialize, Serialize};
 /// Editable setup state, without authored content, a message, or merge topology.
 const EMPTY_SETUP_CHANGES: &str = r#"(empty() & description(exact:"")) ~ (merges() | root())"#;
 
+mod preserved;
+#[cfg(test)]
+mod preserved_tests;
+pub use preserved::{PreservedTip, preserve, preserved_name};
+mod preserved_restore;
+pub use preserved_restore::restore_preserved;
+
 mod baseline;
 pub use baseline::checkpoint_baseline;
 
@@ -250,6 +257,14 @@ impl ExecutionBookmark {
 /// The transport is supplied by the host adapter; no engine types belong here.
 #[async_trait]
 pub trait Jj: Send + Sync {
+    async fn workspace_exists(&self, workspace: &Path) -> Result<bool> {
+        match std::fs::symlink_metadata(workspace) {
+            Ok(_) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     async fn run(&self, repo: &Path, args: &[&str]) -> Result<String>;
     async fn shared_repo(&self, workspace: &Path) -> Result<PathBuf>;
 }
@@ -643,6 +658,8 @@ pub async fn create_from(
             inherited_base
                 .map(str::to_owned)
                 .unwrap_or_else(|| revision(&prior.base()))
+        } else if let Some(base) = inherited_base {
+            base.to_owned()
         } else {
             baseline::durable_baseline(jj, workspace).await?
         };
@@ -878,49 +895,6 @@ pub async fn unpublished_diff(jj: &dyn Jj, record: &ExecutionBookmark) -> Result
     } else {
         patch
     })
-}
-
-/// Confirm the shared-store pointers alone: a usable baseline and an existing
-/// recovery head. Used when the workspace directory itself no longer exists,
-/// so there is no working copy whose commit could need covering.
-pub async fn confirm_pointers(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<()> {
-    resolve_pointers(jj, record).await?;
-    resolve_optional(jj, &record.repo_path, &record.head())
-        .await?
-        .ok_or_else(|| pointer_integrity_error("recovery head is missing"))?;
-    Ok(())
-}
-
-/// Verify that the recovery head preserves the current workspace commit,
-/// after snapshotting pending file edits on the owning host. When the
-/// workspace has moved forward from the head (for example a trailing
-/// `jj new`), the head is advanced to the workspace commit first, so an
-/// ordinary teardown does not depend on the worker having re-set it. A head
-/// that is not an ancestor of the workspace commit is never moved.
-pub async fn confirm_workspace(jj: &dyn Jj, record: &ExecutionBookmark, workspace: &Path) -> Result<()> {
-    anyhow::ensure!(
-        jj.shared_repo(workspace).await? == record.repo_path,
-        "workspace recovery store changed"
-    );
-    let current = jj
-        .run(workspace, &["log", "--no-graph", "-r", "@", "-T", "commit_id"])
-        .await?;
-    let current = current.trim();
-    // Resume also needs a usable baseline, not merely a retained head.
-    resolve_pointers(jj, record).await?;
-    let head = resolve_optional(jj, &record.repo_path, &record.head())
-        .await?
-        .ok_or_else(|| pointer_integrity_error("recovery head is missing"))?;
-    if descends(jj, &record.repo_path, current, &head).await? {
-        return Ok(());
-    }
-    anyhow::ensure!(
-        descends(jj, &record.repo_path, &head, current).await?,
-        "recovery head does not preserve the workspace commit"
-    );
-    jj.run(&record.repo_path, &["bookmark", "set", &record.head(), "-r", current])
-        .await
-        .map(|_| ())
 }
 
 #[cfg(test)]

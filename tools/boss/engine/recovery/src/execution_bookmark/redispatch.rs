@@ -21,6 +21,10 @@ pub struct RestoreReport {
     /// and why.
     #[serde(default)]
     pub base_fallback: Option<String>,
+    /// Commit ids of conflicted preserved variants that were not selected.
+    #[serde(default)]
+    #[builder(default)]
+    pub discarded_tips: String,
 }
 
 impl RestoreReport {
@@ -46,8 +50,16 @@ impl RestoreReport {
                 "{base}The PR head-branch bookmark still points at the original head: publishing requires moving that bookmark to the completed history with `jj bookmark set --allow-backwards` and rewriting the existing PR through `cube pr update`.\n\n"
             )
         };
+        let discarded = if self.discarded_tips.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nConflicted preserved variants not selected:\n```text\n{}```\n",
+                self.discarded_tips
+            )
+        };
         format!(
-            "## EXECUTION BOOKMARK RECOVERY\n\nRestored pointer: `{}`. After fetching the upstream, the engine staged copies of this history onto base SHA `{}`.\n\nOriginal commits (before rebasing):\n```text\n{}```\n\n{conflict_task}\n\n{pr_rewrite}Stay at `@` and inspect the inherited history. The old workspace was not used: re-run the required build and tests in your own leased workspace before publishing; earlier validation does not satisfy this run's gate.\n\n",
+            "## EXECUTION BOOKMARK RECOVERY\n\nRestored pointer: `{}`. After fetching the upstream, the engine restaged this history onto base SHA `{}`.\n\nOriginal commits (before rebasing):\n```text\n{}```\n{discarded}\n{conflict_task}\n\n{pr_rewrite}Stay at `@` and inspect the inherited history. The old workspace was not used: re-run the required build and tests in your own leased workspace before publishing; earlier validation does not satisfy this run's gate.\n\n",
             self.pointer, self.base_sha, self.commits
         )
     }

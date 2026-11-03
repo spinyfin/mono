@@ -298,6 +298,11 @@ pub(super) fn all() -> Vec<Migration> {
             legacy_version: None,
             apply: execution_recovery_rearm::migrate_fresh_start,
         },
+        Migration {
+            id: "20261103_0501_preserved_execution_tip".into(),
+            legacy_version: None,
+            apply: preserved_work::migrate,
+        },
     ]);
     migrations
 }

@@ -787,6 +787,7 @@ mod floor_tests {
                 .unwrap();
             pr_flow::migrate_operator_question_stuck_classification(&expected).unwrap();
             stuck_report::migrate_wait_history(&expected).unwrap();
+            preserved_work::migrate(&expected).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {

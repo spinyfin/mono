@@ -1079,7 +1079,8 @@ async fn revision_start_retry_keeps_its_own_pointers_on_the_staged_history() {
         ));
         h.next = db.get_execution(&h.next.id).unwrap();
         h.dispatch().await.unwrap();
-        assert_eq!(h.cube.goto_calls.lock().await.len(), 1);
+        // The failed attempt positioned once; the retry restages the recorded preserved tip.
+        assert_eq!(h.cube.goto_calls.lock().await.len(), 2);
         assert_eq!(diff(&LocalJj, &record).await.unwrap(), patch);
         for pointer in [record.base(), record.head(), record.publication()] {
             assert!(
@@ -1102,9 +1103,8 @@ async fn revision_start_retry_keeps_its_own_pointers_on_the_staged_history() {
             &["bookmark", "set", &record.head(), &record.publication(), "-r", "@"],
         );
         assert_eq!(diff(&LocalJj, &record).await.unwrap(), patch);
-        if fresh {
-            assert!(db.execution_restore_report(&h.next.id).unwrap().is_none());
-        }
+        // The retry restaged the recorded preserved tip, so it records a restore report.
+        assert!(db.execution_restore_report(&h.next.id).unwrap().is_some());
     }
 }
 

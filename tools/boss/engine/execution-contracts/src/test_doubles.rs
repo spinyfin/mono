@@ -508,6 +508,10 @@ macro_rules! stub_host_adapter {
         $crate::stub_host_adapter!(@munch $ty [$($acc)*] @done $($rest)*);
     };
 
+    (@munch $ty:ty [$($acc:tt)*] @done async fn restore_preserved_work $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn restore_preserved_work $a -> $r $b] @done $($rest)*);
+    };
+
     (@munch $ty:ty [$($acc:tt)*] @done async fn confirm_workspace_recovery $a:tt -> $r:ty $b:block) => {
         $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn confirm_workspace_recovery $a -> $r $b] @done);
     };

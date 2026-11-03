@@ -1832,11 +1832,12 @@ impl ExecutionCoordinator {
 
         let bookmark_result = async {
             if self.work_db.execution_bookmark_optional(&execution.id)?.is_none() {
-                let predecessor = recovered
-                    .as_ref()
-                    .filter(|recovered| recovered.has_work)
-                    .map(|recovered| self.work_db.execution_bookmark(&recovered.predecessor))
-                    .transpose()?;
+                let predecessor = match recovered.as_ref().filter(|recovered| recovered.has_work) {
+                    Some(recovered) if self.work_db.preserved_tip(&recovered.predecessor)?.is_none() => {
+                        Some(self.work_db.execution_bookmark(&recovered.predecessor)?)
+                    }
+                    _ => None,
+                };
                 let report = self.work_db.execution_restore_report(&execution.id)?;
                 let (record, retained) = self
                     .create_or_start_fresh(

@@ -822,6 +822,7 @@ mod dispatch_admission;
 mod execution;
 mod fresh_start;
 mod lease_limiter;
+mod preserved_work;
 mod run;
 mod scheduler;
 
