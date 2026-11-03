@@ -114,20 +114,15 @@ pub async fn restore_rebased(
         .await?;
         let baseline = one_commit(jj, workspace, "@-").await?;
         let unpublished = format!("({}..{head}) ~ (::{pr} | ::{base_sha})", revision(&record.base()));
-        jj.run(workspace, &["duplicate", &unpublished, "--insert-before", "@"])
-            .await?;
+        stage_unpublished(jj, workspace, &unpublished).await?;
         Some(baseline)
     } else {
         jj.run(workspace, &["new", &base_sha, "-m", "Resume recovered execution work"])
             .await?;
-        jj.run(
+        stage_unpublished(
+            jj,
             workspace,
-            &[
-                "duplicate",
-                &format!("{}..{head} ~ ::{base_sha}", revision(&record.base())),
-                "--insert-before",
-                "@",
-            ],
+            &format!("{}..{head} ~ ::{base_sha}", revision(&record.base())),
         )
         .await?;
         Some(base_sha.clone())
@@ -162,6 +157,19 @@ pub async fn restore_rebased(
         .maybe_inherited_base(inherited_base)
         .pr_bound(pr_bookmark.is_some())
         .build())
+}
+
+async fn stage_unpublished(jj: &dyn Jj, workspace: &Path, sources: &str) -> Result<()> {
+    // `workspace goto` leaves an empty, undescribed editable child. Recovery
+    // pointers retain it even if that run never edits anything. Copying it
+    // before the successor's working change would turn setup state into a
+    // permanent ancestor that jj refuses to push. Exclude it when constructing
+    // the new history; never abandon or rewrite the original recovery refs.
+    // Keep authored empty commits, unfinished content and merge topology.
+    let sources = format!("({sources}) ~ ({EMPTY_SETUP_CHANGES})");
+    jj.run(workspace, &["duplicate", &sources, "--insert-before", "@"])
+        .await?;
+    Ok(())
 }
 
 async fn one_commit(jj: &dyn Jj, workspace: &Path, revset: &str) -> Result<String> {

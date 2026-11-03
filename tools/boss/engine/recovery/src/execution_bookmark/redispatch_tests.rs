@@ -1,6 +1,8 @@
 use super::*;
 use boss_engine_test_git::jj::JjRepo;
 
+mod history;
+
 fn publish_main(repo: &JjRepo) -> String {
     JjRepo::run(&repo.repo, &["bookmark", "set", "main", "-r", "@"]);
     JjRepo::run(&repo.repo, &["git", "export"]);
