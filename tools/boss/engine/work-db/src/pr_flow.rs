@@ -2429,6 +2429,7 @@ impl WorkDb {
         let mut pending = PendingEvents::new();
         let mut minted_execution = false;
         let mut prerequisite_work_item_id = None;
+        let mut force_resume_execution_id = None;
         match (answer, &question.question.answer_type) {
             (OperatorAnswer::YesNo { value: true }, OperatorAnswerType::CreatePrerequisiteTask { name, brief, .. }) => {
                 let linked = super::prerequisite_question::approve_in_tx(
@@ -2445,13 +2446,15 @@ impl WorkDb {
             (OperatorAnswer::YesNo { value: true }, OperatorAnswerType::YesNo) => {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
                 let block = authorization_block(&question.question, &timestamp);
-                restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
+                force_resume_execution_id =
+                    restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
                 minted_execution = true;
             }
             (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. }) => {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
                 let block = choice_block(&question.question, &value, &timestamp);
-                restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
+                force_resume_execution_id =
+                    restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
                 minted_execution = true;
             }
             (
@@ -2483,6 +2486,7 @@ impl WorkDb {
             item: task_to_item(updated),
             minted_execution,
             prerequisite_work_item_id,
+            force_resume_execution_id,
         })
     }
 }
@@ -2497,6 +2501,10 @@ pub struct OperatorAnswerOutcome {
     /// The prerequisite task a Yes created or linked, so the RPC layer can
     /// invalidate it alongside the answered task.
     pub prerequisite_work_item_id: Option<String>,
+    /// The minted resume execution, when the run that asked the question was
+    /// admitted by an operator force launch. The RPC layer may bypass an
+    /// operator-originated dispatch pause for this resume.
+    pub force_resume_execution_id: Option<String>,
 }
 
 impl OperatorAnswerOutcome {
@@ -2505,12 +2513,16 @@ impl OperatorAnswerOutcome {
             item,
             minted_execution: false,
             prerequisite_work_item_id: None,
+            force_resume_execution_id: None,
         }
     }
 }
 
 /// Move the answered task back to Todo with `block` appended to its brief and
 /// mint the ready execution that carries the answer to the next worker.
+/// Returns that execution's id when the asking run was admitted by an
+/// operator force launch (see `work_executions.force_launched`), so the
+/// caller can bypass an operator-originated pause for the resume.
 fn restart_after_answer(
     pending: &mut PendingEvents,
     tx: &rusqlite::Transaction<'_>,
@@ -2518,7 +2530,7 @@ fn restart_after_answer(
     question: &OperatorQuestionView,
     block: &str,
     now: &str,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let description = format!("{}{block}", task.description);
     super::description_guard::validate_description_update(&task.description, &description, false)?;
     crate::task_status_audit::execute(
@@ -2530,7 +2542,8 @@ fn restart_after_answer(
         params![task.id, description, now],
     )?;
     let asking = query_execution(tx, &question.execution_id).require("execution", &question.execution_id)?;
-    request_execution_in_tx_with_live_check(
+    let asked_under_force_launch = super::dispatch::execution_force_launched_in(tx, &asking.id)?;
+    let resume = request_execution_in_tx_with_live_check(
         pending,
         tx,
         RequestExecutionInput::builder()
@@ -2543,7 +2556,7 @@ fn restart_after_answer(
         // no live-worker oracle is supplied.
         |_| true,
     )?;
-    Ok(())
+    Ok((asked_under_force_launch && resume.status == ExecutionStatus::Ready).then_some(resume.id))
 }
 
 /// No on a plain yes-no or ordinary prerequisite question: record the

@@ -14,6 +14,16 @@ pub(super) fn all() -> Vec<Migration> {
         .collect();
     migrations.extend([
         Migration {
+            id: "20261102_1200_execution_force_launched".into(),
+            legacy_version: None,
+            apply: |conn| {
+                if !table_has_column(conn, "work_executions", "force_launched")? {
+                    conn.execute_batch("ALTER TABLE work_executions ADD COLUMN force_launched INTEGER NOT NULL DEFAULT 0")?;
+                }
+                Ok(())
+            },
+        },
+        Migration {
             id: "20261029_1430_critical_requests".into(),
             legacy_version: None,
             apply: critical_requests::migrate,
@@ -295,4 +305,48 @@ pub(super) fn all() -> Vec<Migration> {
         },
     ]);
     migrations
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn force_launch_migration_preserves_existing_admissions() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE work_executions (id TEXT PRIMARY KEY); INSERT INTO work_executions VALUES ('existing')",
+        )
+        .unwrap();
+        let migration = super::all()
+            .into_iter()
+            .find(|migration| migration.id == "20261102_1200_execution_force_launched")
+            .unwrap();
+        assert_eq!(migration.legacy_version, None);
+        (migration.apply)(&conn).unwrap();
+        let flag = || {
+            conn.query_row(
+                "SELECT force_launched FROM work_executions WHERE id = 'existing'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(flag(), 0, "existing admissions must remain ordinary");
+        conn.execute(
+            "UPDATE work_executions SET force_launched = 1 WHERE id = 'existing'",
+            [],
+        )
+        .unwrap();
+        (migration.apply)(&conn).unwrap();
+        assert_eq!(flag(), 1, "a restored stamp must survive migration replay");
+        conn.execute("INSERT INTO work_executions (id) VALUES ('new')", [])
+            .unwrap();
+        let new_flag: i64 = conn
+            .query_row(
+                "SELECT force_launched FROM work_executions WHERE id = 'new'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_flag, 0, "new admissions default to ordinary dispatch");
+    }
 }

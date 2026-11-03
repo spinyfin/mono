@@ -787,6 +787,9 @@ mod floor_tests {
                 .unwrap();
             pr_flow::migrate_operator_question_stuck_classification(&expected).unwrap();
             stuck_report::migrate_wait_history(&expected).unwrap();
+            expected
+                .execute_batch("ALTER TABLE work_executions ADD COLUMN force_launched INTEGER NOT NULL DEFAULT 0")
+                .unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {
