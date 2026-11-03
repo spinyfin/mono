@@ -65,7 +65,9 @@ State is in memory and starts empty on engine restart; a combination that is sti
 
 ## Preserved-work attention
 
-`preserved_work_not_restaged` is `ProducerReconciles`. Dispatch files it when a recorded preserved tip cannot be restaged into a new lease, including when restore selects one conflicted variant and archives the unpublished others under `preserved-archive/<execution>/<commit>`. A later successful restage of that execution's preserved work that leaves no unpublished unselected variants resolves it; starting fresh is not evidence the work was recovered.
+`preserved_work_not_restaged` is `ProducerReconciles`. Dispatch files it when a recorded preserved tip cannot be restaged into a new lease. A later successful restage of the selected tip resolves it; starting fresh is not evidence the work was recovered.
+
+`preserved_work_archived` is `HumanDecision`. Dispatch files it when restore restages the selected tip and archives unpublished unselected variants under `preserved-archive/<execution>/<commit>`. A later restage of that selected tip does not recover the archived work.
 
 `preserved_work_needs_inspection` is `HumanDecision`. Teardown files it when the workspace tip and the existing preserved bookmark cannot be combined. The lease is still released and nothing is deleted; the item names both tips. A later restage of the old tip does not recover the new workspace tip named in the item.
 

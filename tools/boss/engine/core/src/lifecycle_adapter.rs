@@ -175,6 +175,7 @@ impl LifecycleServices for CoreLifecycleServices {
             &self.work_db,
             execution,
             pane,
+            Some(adapter),
             adapter.force_release_lease(lease_id, Some(reason)),
         )
         .await

@@ -529,3 +529,113 @@ async fn missing_preserved_bookmark_with_unresolvable_commit_raises_attention() 
         1
     );
 }
+
+#[tokio::test]
+async fn second_restore_keeps_archived_variant_attention() {
+    let dir = tempdir().unwrap();
+    let repo = JjRepo::new(dir.path());
+    let (db, prior, next) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
+    export_origin(&repo);
+    let record = recovery::create(&LocalJj, &repo.worker, &prior.id, "local")
+        .await
+        .unwrap();
+    db.record_execution_bookmark(&record).unwrap();
+    std::fs::write(repo.worker.join("fix"), "unpublished fix").unwrap();
+    let tip = recovery::preserve(&LocalJj, &record, &repo.worker, None, None)
+        .await
+        .unwrap()
+        .tip
+        .unwrap();
+    db.record_preserved_tip(&prior.id, &tip).unwrap();
+    let op = JjRepo::run(&repo.repo, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
+    for title in ["First variant", "Second variant"] {
+        JjRepo::run(&repo.repo, &["--at-op", &op, "describe", &tip.commit_id, "-m", title]);
+    }
+    let (coordinator, _) = coordinator_for(db.clone());
+    let lease = CubeWorkspaceLease {
+        workspace_id: "replacement".into(),
+        workspace_path: repo.replacement.clone(),
+        lease_id: "next".into(),
+        dirty_verified: None,
+    };
+    assert!(
+        coordinator
+            .recover_execution_bookmark_for_test(&next, &lease, &coordinator.host_adapter(), "mono", Some(99), Some(99))
+            .await
+            .unwrap()
+            .unwrap()
+            .has_work
+    );
+    let first = db
+        .list_attention_items(&prior.id)
+        .unwrap()
+        .into_iter()
+        .find(|item| {
+            item.kind == boss_engine_storage_values::attention_kinds::PRESERVED_WORK_ARCHIVED_ATTENTION_KIND
+                && item.status == "open"
+        })
+        .expect("archived variants must raise attention");
+    assert_eq!(first.title, "Preserved variants were archived");
+    assert!(
+        first.body_markdown.contains("preserved-archive/"),
+        "{}",
+        first.body_markdown
+    );
+    let later = dir.path().join("later");
+    JjRepo::run(
+        &repo.repo,
+        &[
+            "workspace",
+            "add",
+            later.to_str().unwrap(),
+            "--name",
+            "later",
+            "-r",
+            "main",
+        ],
+    );
+    let later_lease = CubeWorkspaceLease {
+        workspace_id: "later".into(),
+        workspace_path: later,
+        lease_id: "later".into(),
+        dirty_verified: None,
+    };
+    assert!(
+        coordinator
+            .recover_execution_bookmark_for_test(
+                &next,
+                &later_lease,
+                &coordinator.host_adapter(),
+                "mono",
+                Some(99),
+                Some(99)
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .has_work
+    );
+    let items: Vec<_> = db
+        .list_attention_items(&prior.id)
+        .unwrap()
+        .into_iter()
+        .filter(|item| {
+            item.kind == boss_engine_storage_values::attention_kinds::PRESERVED_WORK_ARCHIVED_ATTENTION_KIND
+                && item.status == "open"
+        })
+        .collect();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].title, "Preserved variants were archived");
+    assert!(
+        items[0].body_markdown.contains("preserved-archive/"),
+        "{}",
+        items[0].body_markdown
+    );
+    assert!(
+        db.list_attention_items(&prior.id).unwrap().iter().all(|item| {
+            item.kind != boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NOT_RESTAGED_ATTENTION_KIND
+                || item.status != "open"
+        }),
+        "a successful restage of the selected tip must not leave unrestaged attention open"
+    );
+}

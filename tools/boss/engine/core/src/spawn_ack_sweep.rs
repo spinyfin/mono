@@ -979,6 +979,7 @@ pub(crate) async fn reap_never_started_spawn(
             ctx.work_db,
             execution,
             crate::workspace_lease_release::PaneStatus::Gone,
+            None,
             ctx.cube_client.force_release_lease(
                 execution.cube_lease_id.as_deref().expect("lease checked"),
                 Some(orphan_reason.as_str()),
@@ -1983,6 +1984,55 @@ mod tests {
         assert_eq!(
             reaps[0].details["threshold_secs"],
             serde_json::json!(DRIVER_START_GRACE_SECS),
+        );
+    }
+
+    #[tokio::test]
+    async fn driver_start_timeout_releases_a_never_positioned_lease() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+        let execution_id = create_spawned_execution(&db, &work_item_id, 92697);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET started_at = NULL WHERE id = ?1",
+                [&execution_id],
+            )
+            .unwrap();
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_live_shell(&live_states, 1, &execution_id, &work_item_id, 92697, false);
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+        let cube = RecordingCube::default();
+        let (outcome, _) = run_pass(&db, &live_states, &coordinator, &cube).await;
+        assert_eq!(outcome.driver_start_reaped, 1);
+        assert_eq!(cube.released_lease_ids(), vec!["lease-1".to_owned()]);
+        assert!(db.get_execution(&execution_id).unwrap().cube_lease_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn driver_start_timeout_holds_a_started_lease_without_a_preservation_source() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+        let execution_id = create_spawned_execution(&db, &work_item_id, 92697);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_live_shell(&live_states, 1, &execution_id, &work_item_id, 92697, false);
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+        let cube = RecordingCube::default();
+        let (outcome, _) = run_pass(&db, &live_states, &coordinator, &cube).await;
+        assert_eq!(outcome.driver_start_reaped, 1);
+        assert!(
+            cube.released_lease_ids().is_empty(),
+            "a started run without a preservation source must keep the lease"
+        );
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().cube_lease_id.as_deref(),
+            Some("lease-1")
         );
     }
 

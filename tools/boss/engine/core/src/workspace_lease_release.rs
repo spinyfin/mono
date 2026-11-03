@@ -36,14 +36,14 @@ impl WorkspaceOccupancy for HostOccupancy {
 
 /// Inferred-death helper used by pane/pid/lost-workspace reconcilers.
 /// Occupancy is scanned on the host; a live pane still mapped in
-/// `live_states` is treated as present. Remote rows use
-/// [`OwningHostOccupancy`] with [`Occupancy::Empty`]: the caller has already
-/// proven the worker is gone, and an engine-host process scan cannot observe
-/// that workspace.
+/// `live_states` is treated as present. Remote rows go through
+/// [`release_remote_lease`] when `adapter` is the owning host; without an
+/// adapter the lease stays held.
 pub async fn release_lease_after_inferred_death(
     work_db: &WorkDb,
     execution: &WorkExecution,
     pane: PaneStatus,
+    adapter: Option<&dyn boss_execution_contracts::HostAdapter>,
     do_release: impl Future<Output = Result<()>>,
 ) -> LeaseReleaseOutcome {
     let Some(lease_id) = execution.cube_lease_id.as_deref() else {
@@ -51,9 +51,17 @@ pub async fn release_lease_after_inferred_death(
     };
     let local = matches!(work_db.execution_host_id(&execution.id), Ok(None))
         || matches!(work_db.execution_host_id(&execution.id), Ok(Some(host)) if host == "local");
+    if !local {
+        return match adapter {
+            Some(host) => release_remote_lease(work_db, host, &execution.id, pane, |_| do_release).await,
+            None => LeaseReleaseOutcome::Kept {
+                reason: KeepReason::OccupancyUnconfirmed,
+            },
+        };
+    }
     let snapshot = ProcessSnapshot::capture_async().await;
-    let owning = OwningHostOccupancy(Occupancy::Empty);
-    let occupancy: &dyn WorkspaceOccupancy = if local { &snapshot } else { &owning };
+    let db_gate = DbBookmarkGate { db: work_db, adapter };
+    let bookmark = sweep_bookmark_gate(work_db, execution, &db_gate);
     apply_release(
         work_db,
         execution,
@@ -61,11 +69,8 @@ pub async fn release_lease_after_inferred_death(
         ReleaseEvidence {
             cause: TerminalCause::Inferred,
             pane,
-            occupancy,
-            bookmark: &DbBookmarkGate {
-                db: work_db,
-                adapter: None,
-            },
+            occupancy: &snapshot,
+            bookmark,
         },
         do_release,
     )
@@ -301,7 +306,7 @@ fn release_previously_failed_in_cube(db: &WorkDb, execution_id: &str) -> bool {
 /// A row that never started a run holds only what cube placed in the
 /// workspace, so an absent bookmark is not a gap; every other row must
 /// confirm its recovery pointers.
-fn sweep_bookmark_gate<'a>(
+pub(crate) fn sweep_bookmark_gate<'a>(
     db: &WorkDb,
     execution: &WorkExecution,
     confirming: &'a DbBookmarkGate<'a>,

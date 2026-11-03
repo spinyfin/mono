@@ -1,28 +1,23 @@
 //! Restage preserved changes without manufacturing new change identities.
-use super::preserved::{change_revset, log, log_change, operations, unpublished};
+use super::preserved::{
+    RecordedPresence, log, operations, resolve_recorded_presence, unpublished, unpublished_archive_refs,
+};
 use super::*;
 
 async fn recorded_candidates(jj: &dyn Jj, record: &ExecutionBookmark, recorded: &PreservedTip) -> Result<Vec<String>> {
-    let visible = log_change(jj, &record.repo_path, &change_revset(&recorded.change_id)).await?;
-    let visible: Vec<_> = visible.lines().filter(|id| !id.is_empty()).map(str::to_owned).collect();
-    if !visible.is_empty() {
-        return Ok(visible);
+    match resolve_recorded_presence(jj, &record.repo_path, recorded).await? {
+        RecordedPresence::Visible(visible) => {
+            Ok(visible.lines().filter(|id| !id.is_empty()).map(str::to_owned).collect())
+        }
+        // Abandoned or squashed: the recorded commit still exists but has no
+        // visible successor. Do not restage it.
+        RecordedPresence::Hidden => Ok(Vec::new()),
+        RecordedPresence::Absent => Err(pointer_integrity_error(format!(
+            "{} is missing and recorded commit {} is not visible",
+            preserved_name(&record.execution_id),
+            recorded.commit_id
+        ))),
     }
-    let present = log(
-        jj,
-        &record.repo_path,
-        &format!("present({}) & ~root()", recorded.commit_id),
-        "commit_id ++ \"\\n\"",
-    )
-    .await?;
-    if present.lines().any(|id| id == recorded.commit_id) {
-        return Ok(vec![recorded.commit_id.clone()]);
-    }
-    Err(pointer_integrity_error(format!(
-        "{} is missing and recorded commit {} is not visible",
-        preserved_name(&record.execution_id),
-        recorded.commit_id
-    )))
 }
 
 /// Prefer a variant in the PR history, then the newest visible variant in
@@ -282,6 +277,12 @@ pub async fn restore_preserved(
             ],
         )
         .await?;
+    let mut archives = unpublished_archive_refs(jj, record).await?;
+    for entry in &unrestaged {
+        if !archives.iter().any(|existing| existing == entry) {
+            archives.push(entry.clone());
+        }
+    }
     Ok(Some(
         RestoreReport::builder()
             .pointer(preserved_name(&record.execution_id))
@@ -290,7 +291,7 @@ pub async fn restore_preserved(
             .inherited_base(base)
             .conflicts(conflicts)
             .discarded_tips(discarded.join("\n"))
-            .unrestaged_unpublished(unrestaged.join("\n"))
+            .unrestaged_unpublished(archives.join("\n"))
             .build(),
     ))
 }

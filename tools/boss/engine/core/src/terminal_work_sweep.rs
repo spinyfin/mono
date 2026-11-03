@@ -666,6 +666,7 @@ async fn reap_confirmed_candidates(
                     work_db,
                     &execution,
                     crate::workspace_lease_release::PaneStatus::Gone,
+                    None,
                     cube_client.force_release_lease(
                         lease_id,
                         Some("terminal-work sweep: bound work item row no longer exists"),
@@ -1311,6 +1312,8 @@ mod tests {
             .unwrap();
         let work_item_id = revision.id;
         let execution_id = create_execution(&db, &work_item_id);
+        db.force_started_at_for_test(&execution_id, boss_engine_utils::epoch_time::now_epoch_secs())
+            .unwrap();
 
         let live_states = Arc::new(LiveWorkerStateRegistry::new());
         register_live_worker(&live_states, 25, &execution_id, &work_item_id);

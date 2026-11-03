@@ -18,7 +18,10 @@ const EMPTY_SETUP_CHANGES: &str = r#"(empty() & description(exact:"")) ~ (merges
 mod preserved;
 #[cfg(test)]
 mod preserved_tests;
-pub use preserved::{PreserveInspect, PreserveOutcome, PreservedTip, preserve, preserved_archive_name, preserved_name};
+pub use preserved::{
+    PreserveInspect, PreserveOutcome, PreservedTip, preserve, preserved_archive_name, preserved_archive_prefix,
+    preserved_name,
+};
 mod preserved_restore;
 pub use preserved_restore::restore_preserved;
 

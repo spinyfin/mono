@@ -2,7 +2,9 @@ use super::blocked_workspace::Recovered;
 use super::fresh_start::{FreshStart, position_fresh_workspace};
 use super::*;
 use boss_engine_recovery::execution_bookmark::{is_pointer_integrity_error, pointer_integrity_error, preserved_name};
-use boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NOT_RESTAGED_ATTENTION_KIND;
+use boss_engine_storage_values::attention_kinds::{
+    PRESERVED_WORK_ARCHIVED_ATTENTION_KIND, PRESERVED_WORK_NOT_RESTAGED_ATTENTION_KIND,
+};
 
 impl ExecutionCoordinator {
     pub(super) async fn recover_preserved_work(
@@ -42,16 +44,12 @@ impl ExecutionCoordinator {
             Ok(Some(report)) => {
                 let has_work = !report.commits.trim().is_empty();
                 self.work_db.record_execution_restore_report(&execution.id, &report)?;
-                if !report.unrestaged_unpublished.trim().is_empty() {
-                    let name = preserved_name(&prior.id);
-                    let err = pointer_integrity_error(format!(
-                        "unselected preserved variants still have unpublished work: {}",
-                        report.unrestaged_unpublished
-                    ));
-                    if let Err(note_error) = self.preserved_work_attention(prior, &name, &err) {
-                        tracing::error!(?note_error, "could not raise preserved-work attention");
-                    }
-                } else if let Err(err) = self
+                if !report.unrestaged_unpublished.trim().is_empty()
+                    && let Err(note_error) = self.archived_variant_attention(prior, &report.unrestaged_unpublished)
+                {
+                    tracing::error!(?note_error, "could not raise archived-variant attention");
+                }
+                if let Err(err) = self
                     .work_db
                     .resolve_attention_kind_for_execution(&prior.id, PRESERVED_WORK_NOT_RESTAGED_ATTENTION_KIND)
                 {
@@ -67,7 +65,7 @@ impl ExecutionCoordinator {
                 let name = preserved_name(&prior.id);
                 let err = pointer_integrity_error(format!("{name} is missing and the recorded commit is not visible"));
                 tracing::warn!(execution_id = %execution.id, bookmark = name, error = %err, "preserved work not restaged; starting fresh");
-                if let Err(note_error) = self.preserved_work_attention(prior, &name, &err) {
+                if let Err(note_error) = self.unrestaged_attention(prior, &name, &err) {
                     tracing::error!(?note_error, "could not raise preserved-work attention");
                 }
                 self.work_db.delete_execution_restore_report(&execution.id)?;
@@ -77,7 +75,7 @@ impl ExecutionCoordinator {
             Err(err) if is_pointer_integrity_error(&err) => {
                 let name = preserved_name(&prior.id);
                 tracing::warn!(execution_id = %execution.id, bookmark = name, error = %err, "preserved work not restaged; starting fresh");
-                if let Err(note_error) = self.preserved_work_attention(prior, &name, &err) {
+                if let Err(note_error) = self.unrestaged_attention(prior, &name, &err) {
                     tracing::error!(?note_error, "could not raise preserved-work attention");
                 }
                 self.work_db.delete_execution_restore_report(&execution.id)?;
@@ -87,23 +85,50 @@ impl ExecutionCoordinator {
             Err(err) => Err(err),
         }
     }
-    fn preserved_work_attention(&self, prior: &WorkExecution, name: &str, err: &anyhow::Error) -> Result<()> {
-        if self
+    fn archived_variant_attention(&self, prior: &WorkExecution, archives: &str) -> Result<()> {
+        let kind = PRESERVED_WORK_ARCHIVED_ATTENTION_KIND;
+        let title = "Preserved variants were archived";
+        let lines: Vec<String> = archives
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| format!("- `{line}`"))
+            .collect();
+        let open = self
             .work_db
-            .reraise_open_execution_attention(&prior.id, PRESERVED_WORK_NOT_RESTAGED_ATTENTION_KIND)?
-            .is_some()
-        {
-            return Ok(());
-        }
-        self.work_db.create_attention_item(boss_protocol::CreateAttentionItemInput {
-            execution_id: Some(prior.id.clone()),
-            work_item_id: None,
-            kind: PRESERVED_WORK_NOT_RESTAGED_ATTENTION_KIND.into(),
-            status: None,
-            title: "Preserved work could not be restaged".into(),
-            body_markdown: format!("`{name}` remains available for inspection. {err:#}. The next worker starts from the current PR head or trunk."),
-            resolved_at: None,
-        })?;
+            .list_attention_items(&prior.id)?
+            .into_iter()
+            .find(|item| item.kind == kind && item.status == "open");
+        let body = match open {
+            Some(existing) => {
+                let mut body = existing.body_markdown;
+                for line in lines {
+                    if !body.contains(&line) {
+                        body.push('\n');
+                        body.push_str(&line);
+                    }
+                }
+                body
+            }
+            None => {
+                let listed = lines.join("\n");
+                format!(
+                    "The selected preserved tip was restaged. \
+                     Unpublished unselected variants remain under archive names:\n{listed}\n\
+                     Those archive bookmarks stay named for inspection. \
+                     A later restage of the selected tip does not recover them."
+                )
+            }
+        };
+        self.work_db.upsert_execution_attention(&prior.id, kind, title, &body)?;
+        Ok(())
+    }
+    fn unrestaged_attention(&self, prior: &WorkExecution, name: &str, err: &anyhow::Error) -> Result<()> {
+        self.work_db.upsert_execution_attention(
+            &prior.id,
+            PRESERVED_WORK_NOT_RESTAGED_ATTENTION_KIND,
+            "Preserved work could not be restaged",
+            &format!("`{name}` remains available for inspection. {err:#}. The next worker starts from the current PR head or trunk."),
+        )?;
         Ok(())
     }
 }

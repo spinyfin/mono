@@ -35,6 +35,41 @@ pub fn preserved_archive_name(execution_id: &str, commit: &str) -> String {
     format!("preserved-archive/{execution_id}/{commit}")
 }
 
+pub fn preserved_archive_prefix(execution_id: &str) -> String {
+    format!("preserved-archive/{execution_id}/")
+}
+
+/// Archive bookmarks for `execution_id` that still hold unpublished work.
+pub(super) async fn unpublished_archive_refs(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<Vec<String>> {
+    let prefix = preserved_archive_prefix(&record.execution_id);
+    let listed = jj
+        .run(
+            &record.repo_path,
+            &[
+                "--ignore-working-copy",
+                "bookmark",
+                "list",
+                "-T",
+                "name ++ \" \" ++ normal_target.commit_id() ++ \"\\n\"",
+            ],
+        )
+        .await?;
+    let mut refs = Vec::new();
+    for line in listed.lines() {
+        let Some((name, commit)) = line.split_once(' ') else {
+            continue;
+        };
+        if !name.starts_with(&prefix) || commit.is_empty() {
+            continue;
+        }
+        let work = log(jj, &record.repo_path, &unpublished(commit), "change_id ++ \"\\n\"").await?;
+        if !work.trim().is_empty() {
+            refs.push(format!("{commit} ({name})"));
+        }
+    }
+    Ok(refs)
+}
+
 pub(super) async fn log(jj: &dyn Jj, repo: &Path, rev: &str, template: &str) -> Result<String> {
     jj.run(
         repo,
@@ -285,6 +320,37 @@ enum RecordedExisting {
     Absent,
 }
 
+/// Visible commits of a recorded change, a hidden recorded commit, or neither.
+/// Teardown and restore must classify a recorded tip the same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RecordedPresence {
+    Visible(String),
+    Hidden,
+    Absent,
+}
+
+pub(super) async fn resolve_recorded_presence(
+    jj: &dyn Jj,
+    repo: &Path,
+    recorded: &PreservedTip,
+) -> Result<RecordedPresence> {
+    let visible = visible_commits(jj, repo, &recorded.change_id).await?;
+    if !visible.trim().is_empty() {
+        return Ok(RecordedPresence::Visible(visible));
+    }
+    let present = log(
+        jj,
+        repo,
+        &format!("present({}) & ~root()", recorded.commit_id),
+        "commit_id ++ \"\\n\"",
+    )
+    .await?;
+    if present.lines().any(|id| id == recorded.commit_id) {
+        return Ok(RecordedPresence::Hidden);
+    }
+    Ok(RecordedPresence::Absent)
+}
+
 /// Identify recorded work by change id. A commit already in remote history
 /// or the current workspace is adopted; a hidden commit is never bookmarked.
 async fn resolve_recorded(
@@ -307,21 +373,11 @@ async fn resolve_recorded(
     if !adopted.trim().is_empty() {
         return Ok(RecordedExisting::Adopted);
     }
-    let visible = visible_commits(jj, repo, &recorded.change_id).await?;
-    if !visible.trim().is_empty() {
-        return Ok(RecordedExisting::Visible(visible));
-    }
-    let present = log(
-        jj,
-        repo,
-        &format!("present({}) & ~root()", recorded.commit_id),
-        "commit_id ++ \"\\n\"",
-    )
-    .await?;
-    if present.lines().any(|id| id == recorded.commit_id) {
-        return Ok(RecordedExisting::Hidden);
-    }
-    Ok(RecordedExisting::Absent)
+    Ok(match resolve_recorded_presence(jj, repo, recorded).await? {
+        RecordedPresence::Visible(visible) => RecordedExisting::Visible(visible),
+        RecordedPresence::Hidden => RecordedExisting::Hidden,
+        RecordedPresence::Absent => RecordedExisting::Absent,
+    })
 }
 
 /// Update retained work only when the workspace has adopted its unpublished
@@ -356,21 +412,13 @@ pub async fn preserve(
     existing_ids.dedup();
     let mut existing = existing_ids.join("\n");
     let mut hidden_recorded = None;
+    let mut absent_recorded = None;
     if bookmark_missing && let Some(recorded) = recorded {
         match resolve_recorded(jj, &record.repo_path, recorded, workspace_commit.as_deref()).await? {
             RecordedExisting::Adopted => {}
             RecordedExisting::Visible(visible) => existing = visible,
             RecordedExisting::Hidden => hidden_recorded = Some(recorded.clone()),
-            RecordedExisting::Absent => {
-                return Ok(inspect(
-                    Some(recorded),
-                    None,
-                    format!(
-                        "{name} is missing and recorded commit {} is not visible; leave the recorded tip intact",
-                        recorded.commit_id
-                    ),
-                ));
-            }
+            RecordedExisting::Absent => absent_recorded = Some(recorded.clone()),
         }
     }
     let Some(tip) = workspace_commit else {
@@ -445,18 +493,60 @@ pub async fn preserve(
     }
     if let Some(hidden) = hidden_recorded {
         if count > 0 {
-            return Ok(inspect(
-                Some(&hidden),
-                Some(workspace_tip_ids),
-                format!(
-                    "{name} is missing and recorded commit {} is hidden; leave it and the new workspace tip intact",
-                    hidden.commit_id
-                ),
-            ));
+            point_bookmark(jj, &record.repo_path, &name, tip, true).await?;
+            return Ok(PreserveOutcome {
+                tip: Some(PreservedTip {
+                    change_id: workspace_ids.trim().to_owned(),
+                    commit_id: tip.to_owned(),
+                    count,
+                }),
+                inspect: Some(PreserveInspect {
+                    existing_commit_id: Some(hidden.commit_id.clone()),
+                    workspace_change_id: Some(workspace_ids.trim().to_owned()),
+                    workspace_commit_id: Some(tip.to_owned()),
+                    workspace_count: Some(count),
+                    reason: format!(
+                        "{name} is missing and recorded commit {} is hidden; leave it and bookmark the new workspace tip",
+                        hidden.commit_id
+                    ),
+                }),
+            });
+        }
+        // Abandoned or squashed: the change has no visible successor. Clear
+        // the row so restore cannot restage the hidden commit.
+        return Ok(PreserveOutcome::default());
+    }
+    if let Some(recorded) = absent_recorded {
+        let reason = format!(
+            "{name} is missing and recorded commit {} is not visible",
+            recorded.commit_id
+        );
+        if count > 0 {
+            point_bookmark(jj, &record.repo_path, &name, tip, true).await?;
+            return Ok(PreserveOutcome {
+                tip: Some(PreservedTip {
+                    change_id: workspace_ids.trim().to_owned(),
+                    commit_id: tip.to_owned(),
+                    count,
+                }),
+                inspect: Some(PreserveInspect {
+                    existing_commit_id: Some(recorded.commit_id),
+                    workspace_change_id: Some(workspace_ids.trim().to_owned()),
+                    workspace_commit_id: Some(tip.to_owned()),
+                    workspace_count: Some(count),
+                    reason,
+                }),
+            });
         }
         return Ok(PreserveOutcome {
-            tip: Some(hidden),
-            inspect: None,
+            tip: None,
+            inspect: Some(PreserveInspect {
+                existing_commit_id: Some(recorded.commit_id),
+                workspace_change_id: Some(workspace_ids.trim().to_owned()),
+                workspace_commit_id: Some(tip.to_owned()),
+                workspace_count: Some(count),
+                reason,
+            }),
         });
     }
     if count == 0 {

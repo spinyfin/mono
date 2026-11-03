@@ -138,4 +138,40 @@ impl WorkDb {
         let conn = self.connect()?;
         reraise_open_execution_attention(&conn, execution_id, kind)
     }
+
+    /// Create the open execution-scoped `kind` item, or refresh the title and
+    /// body of the existing one. Teardown inspect verdicts and archived-variant
+    /// restage notes accumulate distinct tips on a single HumanDecision item.
+    pub fn upsert_execution_attention(
+        &self,
+        execution_id: &str,
+        kind: &str,
+        title: &str,
+        body_markdown: &str,
+    ) -> Result<String> {
+        warn_if_lifecycle_undeclared(kind);
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        ensure_execution_exists(&tx, execution_id)?;
+        let id = if let Some(id) = reraise_open_execution_attention(&tx, execution_id, kind)? {
+            tx.execute(
+                "UPDATE work_attention_items SET title = ?2, body_markdown = ?3 WHERE id = ?1",
+                params![id, title, body_markdown],
+            )?;
+            id
+        } else {
+            let id = next_id("attn");
+            let now = now_string();
+            tx.execute(
+                "INSERT INTO work_attention_items (
+                    id, execution_id, work_item_id, kind, status, title, body_markdown, created_at,
+                    resolved_at, last_raised_at
+                 ) VALUES (?1, ?2, NULL, ?3, 'open', ?4, ?5, ?6, NULL, ?6)",
+                params![id, execution_id, kind, title, body_markdown, now],
+            )?;
+            id
+        };
+        tx.commit()?;
+        Ok(id)
+    }
 }

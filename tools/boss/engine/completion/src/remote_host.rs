@@ -82,14 +82,16 @@ impl ExecutionCubes for HostRoutedCubes {
                 return Ok(ResolvedExecutionCube {
                     cube: Arc::clone(&self.local),
                     host_id: "local".to_owned(),
+                    host_adapter: None,
                 });
             }
             Some(host_id) => host_id.to_owned(),
         };
         let adapter = resolve_host_adapter(&self.work_db, self.provider.as_ref(), &host_id).await?;
         Ok(ResolvedExecutionCube {
-            cube: Arc::new(HostAdapterCubeClient::new(adapter)),
+            cube: Arc::new(HostAdapterCubeClient::new(Arc::clone(&adapter))),
             host_id,
+            host_adapter: Some(adapter),
         })
     }
 }

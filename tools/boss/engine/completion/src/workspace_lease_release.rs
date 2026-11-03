@@ -119,10 +119,7 @@ impl BookmarkGate for DbBookmarkGate<'_> {
                     .confirm_workspace_recovery(&record, Path::new(workspace), recorded.as_ref(), since_unix)
                     .await?
             } else if record.host_id != "local" {
-                // Engine-side sweeps cannot run jj on a remote host. Keep the
-                // recorded tip and release; the remote bookmark stays in that
-                // store. Holding the lease here would strand it until TTL.
-                return Ok(());
+                anyhow::bail!("owning host adapter is unavailable for remote preservation");
             } else {
                 boss_engine_recovery::execution_bookmark::preserve(
                     &boss_engine_recovery::execution_bookmark::LocalJj,
@@ -138,13 +135,7 @@ impl BookmarkGate for DbBookmarkGate<'_> {
                 None => self.db.clear_preserved_tip(&execution.id)?,
             }
             if let Some(inspect) = outcome.inspect {
-                raise_attention(
-                    self.db,
-                    execution,
-                    boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND,
-                    "Preserved work needs inspection",
-                    &inspect_body(&inspect),
-                );
+                raise_inspect_attention(self.db, execution, inspect);
             }
             Ok(())
         }
@@ -457,22 +448,72 @@ pub async fn release_lease_after_proven_never_started(
     .await
 }
 
-fn inspect_body(inspect: &boss_engine_recovery::execution_bookmark::PreserveInspect) -> String {
-    let existing = inspect.existing_commit_id.as_deref().unwrap_or("none");
-    let workspace = match (
+fn inspect_workspace_line(inspect: &boss_engine_recovery::execution_bookmark::PreserveInspect) -> Option<String> {
+    match (
         inspect.workspace_change_id.as_deref(),
         inspect.workspace_commit_id.as_deref(),
         inspect.workspace_count,
     ) {
-        (Some(change), Some(commit), Some(count)) => {
-            format!("change {change}, commit {commit}, {count} unpublished commits")
-        }
-        _ => "unavailable".to_owned(),
-    };
-    format!(
-        "{}. Existing preserved commit: `{existing}`. New workspace tip: {workspace}. Nothing was deleted.",
+        (Some(change), Some(commit), Some(count)) => Some(format!(
+            "- workspace tip: change `{change}`, commit `{commit}`, {count} unpublished commits"
+        )),
+        _ => None,
+    }
+}
+
+fn inspect_body(inspect: &boss_engine_recovery::execution_bookmark::PreserveInspect) -> String {
+    let existing = inspect.existing_commit_id.as_deref().unwrap_or("none");
+    let mut body = format!(
+        "{}. Existing preserved commit: `{existing}`. Nothing was deleted.",
         inspect.reason
-    )
+    );
+    if let Some(line) = inspect_workspace_line(inspect) {
+        body.push('\n');
+        body.push_str(&line);
+    } else {
+        body.push_str(" New workspace tip: unavailable.");
+    }
+    body
+}
+
+fn raise_inspect_attention(
+    db: &WorkDb,
+    execution: &WorkExecution,
+    inspect: boss_engine_recovery::execution_bookmark::PreserveInspect,
+) {
+    let kind = boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND;
+    let title = "Preserved work needs inspection";
+    let open = db.list_attention_items(&execution.id).ok().and_then(|items| {
+        items
+            .into_iter()
+            .find(|item| item.kind == kind && item.status == "open")
+    });
+    let Some(existing) = open else {
+        raise_attention(db, execution, kind, title, &inspect_body(&inspect));
+        return;
+    };
+    let mut body = existing.body_markdown;
+    if let Some(commit) = inspect.existing_commit_id.as_deref()
+        && !body.contains(&format!("`{commit}`"))
+    {
+        body.push_str(&format!("\n- existing preserved commit: `{commit}`"));
+    }
+    if let Some(line) = inspect_workspace_line(&inspect)
+        && inspect
+            .workspace_commit_id
+            .as_deref()
+            .is_none_or(|commit| !body.contains(&format!("commit `{commit}`")))
+    {
+        body.push('\n');
+        body.push_str(&line);
+    }
+    if let Err(err) = db.upsert_execution_attention(&execution.id, kind, title, &body) {
+        tracing::error!(
+            execution_id = %execution.id,
+            error = %format!("{err:#}"),
+            "could not update preserved-work inspection attention",
+        );
+    }
 }
 
 pub fn raise_unreleased_attention(db: &WorkDb, execution: &WorkExecution, title: &str, body: &str) {

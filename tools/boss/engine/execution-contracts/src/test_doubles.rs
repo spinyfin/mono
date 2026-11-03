@@ -706,6 +706,7 @@ impl<T: CubeClient + 'static> ExecutionCubes for Arc<T> {
         Ok(ResolvedExecutionCube {
             cube: Arc::clone(self) as Arc<dyn CubeClient>,
             host_id: "local".to_owned(),
+            host_adapter: None,
         })
     }
 }

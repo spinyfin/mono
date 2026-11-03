@@ -509,6 +509,7 @@ pub async fn reconcile_if_pane_dead(
                     work_db,
                     execution,
                     crate::workspace_lease_release::PaneStatus::Gone,
+                    None,
                     cube.force_release_lease(lease_id, Some("pane-death reconcile: worker pane gone")),
                 )
                 .await;

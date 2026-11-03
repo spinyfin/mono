@@ -184,12 +184,17 @@ pub const EXECUTION_BOOKMARK_PRUNE_UNPROVEN_ATTENTION_KIND: &str = "execution_bo
 
 pub const EXECUTION_BOOKMARK_RECOVERY_FAILED_ATTENTION_KIND: &str = "execution_bookmark_recovery_failed";
 
-/// Filed when a recorded preserved tip cannot be restaged into a new lease,
-/// including when restore selects one conflicted variant and archives the
-/// others. Dispatch resolves it on a later successful restage that does not
-/// leave unpublished unselected variants. Teardown inspect verdicts use
-/// [`PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND`].
+/// Filed when a recorded preserved tip cannot be restaged into a new lease.
+/// Dispatch resolves it on a later successful restage of the selected tip.
+/// Starting fresh is not evidence the work was recovered. Archived unselected
+/// variants use [`PRESERVED_WORK_ARCHIVED_ATTENTION_KIND`]. Teardown inspect
+/// verdicts use [`PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND`].
 pub const PRESERVED_WORK_NOT_RESTAGED_ATTENTION_KIND: &str = "preserved_work_not_restaged";
+
+/// Filed when restore restages the selected preserved tip and archives
+/// unpublished unselected variants under `preserved-archive/` names. A later
+/// restage of the selected tip does not lower this signal.
+pub const PRESERVED_WORK_ARCHIVED_ATTENTION_KIND: &str = "preserved_work_archived";
 
 /// Filed at teardown when unpublished work in the workspace and the existing
 /// preserved bookmark (or recorded tip) cannot be combined. The lease is

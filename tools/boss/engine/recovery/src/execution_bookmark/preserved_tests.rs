@@ -653,3 +653,92 @@ async fn self_retry_amend_and_push_clears_preservation_without_resurrecting_hidd
     );
     assert!(!visible.lines().any(|id| id == saved.commit_id));
 }
+
+#[tokio::test]
+async fn missing_bookmark_and_absent_recorded_preserves_fresh_unpublished_tip() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_absent", "local").await.unwrap();
+    let recorded = PreservedTip {
+        change_id: "kqkqkqkqkqkqkqkqkqkqkqkqkqkqkqkq".into(),
+        commit_id: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into(),
+        count: 1,
+    };
+    std::fs::write(repo.worker.join("fresh"), "new unpublished").unwrap();
+    let outcome = preserve(&LocalJj, &record, &repo.worker, Some(&recorded), None)
+        .await
+        .unwrap();
+    let tip = outcome.tip.expect("fresh unpublished work must be recorded");
+    assert_eq!(tip.count, 1);
+    assert!(names(&repo).contains("preserved/exec_absent"));
+    let inspect = outcome.inspect.expect("absent recorded tip must raise inspect");
+    assert_eq!(inspect.existing_commit_id.as_deref(), Some(recorded.commit_id.as_str()));
+    assert_eq!(inspect.workspace_commit_id.as_deref(), Some(tip.commit_id.as_str()));
+    assert_eq!(inspect.workspace_count, Some(1));
+}
+
+#[tokio::test]
+async fn abandoned_restaged_tip_is_consumed_and_not_restaged() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_abandon", "local").await.unwrap();
+    std::fs::write(repo.worker.join("work"), "unpublished").unwrap();
+    let saved = preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    JjRepo::run(&repo.replacement, &["new", "main", "-m", "Current PR head"]);
+    restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+        .await
+        .unwrap()
+        .unwrap();
+    JjRepo::run(&repo.replacement, &["abandon", "@"]);
+    let outcome = preserve(&LocalJj, &record, &repo.replacement, Some(&saved), None)
+        .await
+        .unwrap();
+    assert!(outcome.tip.is_none(), "abandoned work must clear the recorded tip");
+    assert!(outcome.inspect.is_none());
+    assert!(
+        restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!repo.replacement.join("work").exists());
+}
+
+#[tokio::test]
+async fn hidden_recorded_tip_does_not_replace_fresh_unpublished_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_hidden_fresh", "local")
+        .await
+        .unwrap();
+    std::fs::write(repo.worker.join("work"), "unpublished").unwrap();
+    let saved = preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    JjRepo::run(&repo.replacement, &["new", "main", "-m", "Current PR head"]);
+    restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+        .await
+        .unwrap()
+        .unwrap();
+    JjRepo::run(&repo.replacement, &["abandon", "@"]);
+    JjRepo::run(&repo.replacement, &["new", "-m", "Fresh unpublished tip"]);
+    std::fs::write(repo.replacement.join("fresh"), "new unpublished").unwrap();
+    let outcome = preserve(&LocalJj, &record, &repo.replacement, Some(&saved), None)
+        .await
+        .unwrap();
+    let tip = outcome.tip.expect("fresh unpublished work must be recorded");
+    assert_ne!(tip.commit_id, saved.commit_id);
+    assert!(names(&repo).contains("preserved/exec_hidden_fresh"));
+    let inspect = outcome.inspect.expect("hidden recorded tip must raise inspect");
+    assert_eq!(inspect.existing_commit_id.as_deref(), Some(saved.commit_id.as_str()));
+    assert_eq!(inspect.workspace_commit_id.as_deref(), Some(tip.commit_id.as_str()));
+    assert!(
+        restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(!repo.replacement.join("work").exists());
+    assert_eq!(
+        std::fs::read_to_string(repo.replacement.join("fresh")).unwrap(),
+        "new unpublished"
+    );
+}
