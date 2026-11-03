@@ -517,10 +517,11 @@ pub(super) fn load_dispatch_pause_scope(
     work_db: &WorkDb,
     origin: boss_execution_contracts::DispatchPauseOrigin,
 ) -> boss_protocol::DispatchPauseScope {
-    match work_db.get_metadata(METADATA_KEY_DISPATCH_PAUSE_SCOPE).ok().flatten() {
-        Some(raw) => boss_protocol::DispatchPauseScope::from_persisted(&raw),
-        None => origin.default_scope(),
-    }
+    let raw_scope = work_db.get_metadata(METADATA_KEY_DISPATCH_PAUSE_SCOPE).ok().flatten();
+    boss_engine_storage_values::dispatch_pause::resolve_persisted_pause_scope(
+        raw_scope.as_deref(),
+        Some(origin.as_metadata_str()),
+    )
 }
 
 /// Re-apply a persisted dispatch pause to `coordinator` at boot. No-op when

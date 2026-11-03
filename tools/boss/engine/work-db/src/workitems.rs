@@ -116,6 +116,47 @@ pub fn insert_attention_item_row(conn: &Connection, input: &CreateAttentionItemI
     query_attention_item(conn, &id)?.with_context(|| format!("missing attention item after insert: {id}"))
 }
 
+/// Transaction-scoped body of [`WorkDb::upsert_refreshing_work_item_attention`]:
+/// create the open `kind` item for `work_item_id` or re-raise and refresh the
+/// existing one's title and body.
+pub(crate) fn upsert_refreshing_work_item_attention_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    work_item_id: &str,
+    kind: &str,
+    title: &str,
+    body_markdown: &str,
+) -> Result<()> {
+    warn_if_lifecycle_undeclared(kind);
+    let _ = product_id_for_work_item(tx, work_item_id)?;
+    if reraise_open_work_item_attention(tx, work_item_id, kind)?.is_none() {
+        let id = next_id("attn");
+        let now = now_string();
+        tx.execute(
+            "INSERT INTO work_attention_items (
+                id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at,
+                last_raised_at
+             ) VALUES (?1, NULL, ?2, ?3, 'open', ?4, ?5, ?6, NULL, ?6)",
+            params![id, work_item_id, kind, title, body_markdown, now],
+        )?;
+    } else {
+        // Refresh the existing open item's title/body rather than
+        // leaving it frozen at whatever it said the first time it
+        // tripped — a caller like the churn guard re-files on every
+        // sweep pass with an updated failure count / execution list,
+        // and a stale snapshot misleads the operator into thinking
+        // nothing has changed since the first trip.
+        tx.execute(
+            "UPDATE work_attention_items
+                SET title = ?3, body_markdown = ?4
+              WHERE work_item_id = ?1
+                AND kind = ?2
+                AND status = 'open'",
+            params![work_item_id, kind, title, body_markdown],
+        )?;
+    }
+    Ok(())
+}
+
 #[work_db_boundary::instrument]
 impl WorkDb {
     pub fn create_attention_item(&self, input: CreateAttentionItemInput) -> Result<WorkAttentionItem> {
@@ -232,36 +273,9 @@ impl WorkDb {
         title: &str,
         body_markdown: &str,
     ) -> Result<()> {
-        warn_if_lifecycle_undeclared(kind);
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let _ = product_id_for_work_item(&tx, work_item_id)?;
-        if reraise_open_work_item_attention(&tx, work_item_id, kind)?.is_none() {
-            let id = next_id("attn");
-            let now = now_string();
-            tx.execute(
-                "INSERT INTO work_attention_items (
-                    id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at,
-                    last_raised_at
-                 ) VALUES (?1, NULL, ?2, ?3, 'open', ?4, ?5, ?6, NULL, ?6)",
-                params![id, work_item_id, kind, title, body_markdown, now],
-            )?;
-        } else {
-            // Refresh the existing open item's title/body rather than
-            // leaving it frozen at whatever it said the first time it
-            // tripped — a caller like the churn guard re-files on every
-            // sweep pass with an updated failure count / execution list,
-            // and a stale snapshot misleads the operator into thinking
-            // nothing has changed since the first trip.
-            tx.execute(
-                "UPDATE work_attention_items
-                    SET title = ?3, body_markdown = ?4
-                  WHERE work_item_id = ?1
-                    AND kind = ?2
-                    AND status = 'open'",
-                params![work_item_id, kind, title, body_markdown],
-            )?;
-        }
+        upsert_refreshing_work_item_attention_in_tx(&tx, work_item_id, kind, title, body_markdown)?;
         tx.commit()?;
         Ok(())
     }

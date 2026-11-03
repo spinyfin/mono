@@ -363,3 +363,136 @@ async fn weaker_pause_requests_preserve_existing_full_holds() {
         }
     }
 }
+
+// ── review-pool reservations released by the handlers ─────────────────────
+
+fn never_started_pre_merge_batch(state: &ServerState, project_id: &str, product_id: &str, name: &str) -> String {
+    use boss_protocol::{ReviewBatchPhase, ReviewClassification, ReviewLanguageBucket, ReviewProfile};
+    let task = state
+        .work_db
+        .create_task(
+            boss_protocol::CreateTaskInput::builder()
+                .product_id(product_id)
+                .project_id(project_id)
+                .name(name)
+                .autostart(false)
+                .build(),
+        )
+        .unwrap();
+    let input = boss_work_db::ReviewBatchCreateInput::builder()
+        .cycle_root_id(task.id.clone())
+        .base_sha("base-sha")
+        .classification(
+            ReviewClassification::builder()
+                .changed_files(vec!["src/lib.rs".to_owned()])
+                .complexity_flags(vec![])
+                .has_production_code(true)
+                .metadata_missing(vec![])
+                .production_languages(vec![ReviewLanguageBucket::Rust])
+                .profile(ReviewProfile::Light)
+                .subsystem_buckets(vec!["src".to_owned()])
+                .build(),
+        )
+        .phase(ReviewBatchPhase::PreMerge)
+        .pr_number(42)
+        .pr_url(format!("https://github.com/example/repo/pull/{}", task.id))
+        .target_sha("head-sha")
+        .build();
+    match state
+        .work_db
+        .create_pre_merge_review_batch(input, "https://github.com/example/repo")
+        .unwrap()
+    {
+        boss_work_db::ReviewBatchDispatch::Created { batch, .. } => batch.id,
+        other => panic!("expected a new batch, got {other:?}"),
+    }
+}
+
+fn test_project(state: &ServerState, product_id: &str, name: &str) -> boss_protocol::Project {
+    state
+        .work_db
+        .create_project(boss_protocol::CreateProjectInput {
+            product_id: product_id.to_owned(),
+            name: name.to_owned(),
+            description: None,
+            goal: None,
+            autostart: false,
+            no_design_task: true,
+            design_reasoning_effort_xhigh: false,
+        })
+        .unwrap()
+}
+
+/// Narrowing focus through `UpdateDispatchFocus` releases the never-started
+/// out-of-scope reservation and keeps the in-scope one.
+#[tokio::test]
+async fn update_dispatch_focus_releases_never_started_out_of_scope_reservations() {
+    let (state, _dir) = test_server_state();
+    let product = boss_engine_runtime::test_support::create_test_product(&state.work_db);
+    let keep = test_project(&state, &product.id, "Keep");
+    let drop = test_project(&state, &product.id, "Drop");
+    let kept_batch = never_started_pre_merge_batch(&state, &keep.id, &product.id, "In scope");
+    let dropped_batch = never_started_pre_merge_batch(&state, &drop.id, &product.id, "Out of scope");
+
+    let sink = make_session_sink();
+    crate::app::dispatch_focus::handle_update_dispatch_focus(
+        dispatch(&state, &sink),
+        FrontendRequest::UpdateDispatchFocus {
+            action: boss_protocol::DispatchFocusAction::Set,
+            targets: vec![keep.id.clone()],
+        },
+    )
+    .await;
+    sole_response(&sink).await;
+
+    assert!(state.work_db.review_batch(&dropped_batch).unwrap().is_none());
+    assert!(state.work_db.review_batch(&kept_batch).unwrap().is_some());
+}
+
+/// An all-spawns `SetDispatchPaused` releases never-started reservations, but
+/// a default (`new_work`) operator pause leaves them alone.
+#[tokio::test]
+async fn all_spawns_set_dispatch_paused_releases_never_started_reservations() {
+    let (state, _dir) = test_server_state();
+    let product = boss_engine_runtime::test_support::create_test_product(&state.work_db);
+    let project = test_project(&state, &product.id, "Reviewed");
+    let batch = never_started_pre_merge_batch(&state, &project.id, &product.id, "Pending review");
+
+    pause_with_scope(&state, Some(DispatchPauseScope::NewWork)).await;
+    assert!(state.work_db.review_batch(&batch).unwrap().is_some());
+
+    pause_with_scope(&state, Some(DispatchPauseScope::AllSpawns)).await;
+    assert!(state.work_db.review_batch(&batch).unwrap().is_none());
+}
+
+/// Cold start with a persisted pause: an operator all-spawns pause releases
+/// never-started reservations; a scope-less operator pause (reviews exempt,
+/// as the coordinator restores it) and a breaker pause leave them in place.
+#[tokio::test]
+async fn restoring_a_persisted_pause_releases_reservations_only_for_operator_all_spawns() {
+    for (origin, scope, released) in [
+        ("operator", Some("all_spawns"), true),
+        ("operator", None, false),
+        ("breaker", Some("all_spawns"), false),
+        ("breaker", None, false),
+    ] {
+        let (state, _dir) = test_server_state();
+        let product = boss_engine_runtime::test_support::create_test_product(&state.work_db);
+        let project = test_project(&state, &product.id, "Reviewed");
+        let batch = never_started_pre_merge_batch(&state, &project.id, &product.id, "Pending review");
+        let db = &state.work_db;
+        db.set_metadata(METADATA_KEY_DISPATCH_PAUSED, "1").unwrap();
+        db.set_metadata(METADATA_KEY_DISPATCH_PAUSE_ORIGIN, origin).unwrap();
+        if let Some(scope) = scope {
+            db.set_metadata(METADATA_KEY_DISPATCH_PAUSE_SCOPE, scope).unwrap();
+        }
+
+        assert!(restore_persisted_dispatch_pause(db, &state.execution_coordinator));
+
+        assert_eq!(
+            db.review_batch(&batch).unwrap().is_none(),
+            released,
+            "origin={origin} scope={scope:?}"
+        );
+    }
+}

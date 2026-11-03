@@ -171,11 +171,6 @@ fn narrowing_focus_releases_never_started_out_of_scope_and_keeps_a_started_batch
         db.get_execution(&started_execs[0].id).unwrap().status,
         ExecutionStatus::Ready
     );
-    assert!(
-        !db.can_admit_review_batch(ReviewBatchPhase::PreMerge).unwrap()
-            || db.review_pool_reserved_units().unwrap().0 == PRE_MERGE_BATCH_RESERVATION_UNITS,
-        "the started out-of-focus batch must still occupy its reservation"
-    );
     assert_eq!(
         db.review_pool_reserved_units().unwrap().0,
         PRE_MERGE_BATCH_RESERVATION_UNITS
@@ -216,6 +211,7 @@ fn all_spawns_pause_defers_pre_merge_admission_and_new_work_does_not() {
     let root = create_test_chore_manual(&db, product.id.clone(), "review target");
 
     db.set_metadata("dispatch_paused", "1").unwrap();
+    db.set_metadata("dispatch_paused_origin", "operator").unwrap();
     db.set_metadata("dispatch_paused_scope", "new_work").unwrap();
     created_batch(create_batch(&db, &root.id, "head-new-work"));
 
@@ -242,6 +238,7 @@ fn all_spawns_pause_releases_never_started_pre_merge_reservations() {
     let (batch, executions) = created_batch(create_batch(&db, &root.id, "head-sha"));
 
     db.set_metadata("dispatch_paused", "1").unwrap();
+    db.set_metadata("dispatch_paused_origin", "operator").unwrap();
     db.set_metadata("dispatch_paused_scope", "new_work").unwrap();
     assert!(
         db.release_unstartable_pre_merge_review_reservations()
@@ -261,4 +258,109 @@ fn all_spawns_pause_releases_never_started_pre_merge_reservations() {
         db.get_execution(&executions[0].id).unwrap().status,
         ExecutionStatus::Abandoned
     );
+}
+
+/// A pause persisted before the scope key existed restores as its origin's
+/// default scope, matching the coordinator: an operator pause exempts
+/// reviews, so it neither defers admission nor releases reservations.
+#[test]
+fn operator_pause_without_scope_does_not_hold_reviews() {
+    let db = WorkDb::open(temp_db_path("pause-missing-scope-operator")).unwrap();
+    let product = create_test_product(&db);
+    let root = create_test_chore_manual(&db, product.id.clone(), "review target");
+    let (batch, _) = created_batch(create_batch(&db, &root.id, "head-a"));
+
+    db.set_metadata("dispatch_paused", "1").unwrap();
+    db.set_metadata("dispatch_paused_origin", "operator").unwrap();
+    assert!(
+        db.release_unstartable_pre_merge_review_reservations()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(db.review_batch(&batch.id).unwrap().is_some());
+    let other = create_test_chore_manual(&db, product.id, "another target");
+    created_batch(create_batch(&db, &other.id, "head-b"));
+}
+
+/// The breaker's automatic all_spawns pause is transient: it neither defers
+/// admission nor releases reservations, with or without a persisted scope.
+#[test]
+fn breaker_pause_does_not_hold_or_release_reviews() {
+    let db = WorkDb::open(temp_db_path("pause-breaker-no-hold")).unwrap();
+    let product = create_test_product(&db);
+    let root = create_test_chore_manual(&db, product.id.clone(), "review target");
+    let (batch, _) = created_batch(create_batch(&db, &root.id, "head-a"));
+
+    db.set_metadata("dispatch_paused", "1").unwrap();
+    db.set_metadata("dispatch_paused_origin", "breaker").unwrap();
+    for scope in [Some("all_spawns"), None] {
+        if let Some(scope) = scope {
+            db.set_metadata("dispatch_paused_scope", scope).unwrap();
+        }
+        assert!(
+            db.release_unstartable_pre_merge_review_reservations()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(db.review_batch(&batch.id).unwrap().is_some());
+        assert_eq!(db.pre_merge_review_hold_reason(&root.id).unwrap(), None);
+    }
+}
+
+/// An operator-requested (explicit) batch is not released by an all-spawns
+/// pause: deleting it would re-admit it later as a non-explicit batch.
+#[test]
+fn all_spawns_pause_keeps_explicit_never_started_batches() {
+    let db = WorkDb::open(temp_db_path("pause-keeps-explicit")).unwrap();
+    let product = create_test_product(&db);
+    let root = create_test_chore_manual(&db, product.id, "review target");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'in_review', pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![root.id, "https://github.com/example/repo/pull/1"],
+        )
+        .unwrap();
+    let mut input = batch_input(root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge);
+    input.pr_url = "https://github.com/example/repo/pull/1".to_owned();
+    let (batch, _) = created_batch(db.request_pre_merge_review_batch_for_pool(input, 16).unwrap());
+
+    db.set_metadata("dispatch_paused", "1").unwrap();
+    db.set_metadata("dispatch_paused_origin", "operator").unwrap();
+    db.set_metadata("dispatch_paused_scope", "all_spawns").unwrap();
+    assert!(
+        db.release_unstartable_pre_merge_review_reservations()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(db.review_batch(&batch.id).unwrap().is_some());
+}
+
+/// Releasing for a focus hold refreshes the text of an attention item an
+/// earlier pool-full deferral already opened.
+#[test]
+fn release_refreshes_an_existing_admission_deferred_item() {
+    let db = WorkDb::open(temp_db_path("focus-release-refreshes-attention")).unwrap();
+    let product = create_test_product(&db);
+    let focused = project(&db, &product.id, "Focused");
+    let other = project(&db, &product.id, "Other");
+    let root = project_task(&db, &product.id, &other.id, "Out of focus");
+    created_batch(create_batch(&db, &root.id, "head-sha"));
+    db.upsert_external_tracker_attention(
+        &root.id,
+        PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
+        "stale",
+        "stale body",
+    )
+    .unwrap();
+
+    focus_on_project(&db, &focused.id);
+    db.release_unstartable_pre_merge_review_reservations().unwrap();
+
+    let items = db
+        .list_open_attention_items_of_kind(PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND)
+        .unwrap();
+    assert_eq!(items.len(), 1);
+    assert_ne!(items[0].title, "stale");
+    assert!(items[0].body_markdown.contains("focus"));
 }

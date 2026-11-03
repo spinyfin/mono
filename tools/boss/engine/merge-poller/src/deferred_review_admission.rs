@@ -50,6 +50,28 @@ pub(crate) async fn sweep_deferred_review_admission_with(
             outcome.review_admission_still_deferred += 1;
             continue;
         }
+        // A root that focus mode or an all-spawns pause holds can only
+        // defer again, so skip the PR-metadata fetch the enqueuer performs
+        // and keep the marker visible. The hold is a local DB read.
+        match work_db.pre_merge_review_hold_reason(&candidate.cycle_root_id) {
+            Ok(Some(reason)) => {
+                tracing::debug!(
+                    task_id = %candidate.task_id,
+                    pr_url = %candidate.pr_url,
+                    reason,
+                    "merge poller: deferred review admission still held; skipping PR fetch"
+                );
+                file_admission_deferred_attention(work_db, &candidate.task_id, &candidate.pr_url);
+                outcome.review_admission_still_deferred += 1;
+                continue;
+            }
+            Ok(None) => {}
+            Err(err) => tracing::warn!(
+                task_id = %candidate.task_id,
+                ?err,
+                "merge poller: failed to evaluate review-admission hold; attempting admission"
+            ),
+        }
         match enqueuer
             .enqueue(
                 work_db,

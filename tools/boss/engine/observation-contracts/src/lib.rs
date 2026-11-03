@@ -768,22 +768,12 @@ impl PrPollStateWriter for NoopPrPollStateWriter {
     }
 }
 
-/// File the review-admission-deferred attention item used when the
-/// review pool has no free reservation for another pre-merge batch.
+/// File the review-admission-deferred attention item used when a pre-merge
+/// review cannot occupy a review-pool reservation right now: the pool has no
+/// free reservation, or dispatch focus / an all-spawns pause is holding the
+/// PR. Delegates to the work-db filer so the text lives in one place.
 pub fn file_admission_deferred_attention(work_db: &WorkDb, work_item_id: &str, pr_url: &str) {
-    let title = "Automated reviewer: waiting for a review-pool slot";
-    let body = format!(
-        "Pre-merge review for {pr_url} was deferred because it cannot occupy a review-pool \
-         reservation right now: the pool is full, or dispatch focus / an all-spawns pause is \
-         holding this PR. The review starts once a reservation is free and this PR is \
-         allowed to dispatch. Dismiss this item once that pass starts."
-    );
-    if let Err(err) = work_db.upsert_external_tracker_attention(
-        work_item_id,
-        boss_work_db::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
-        title,
-        &body,
-    ) {
+    if let Err(err) = work_db.file_admission_deferred_attention(work_item_id, pr_url) {
         tracing::warn!(
             work_item_id,
             ?err,

@@ -791,29 +791,32 @@ pub(super) const NO_BATCH_MEMBER_STARTED: &str = "NOT EXISTS (SELECT 1 FROM pr_r
                  JOIN work_executions we ON we.id = m.execution_id
                  WHERE m.batch_id = b.id AND we.started_at IS NOT NULL)";
 
-/// Metadata keys persisted by `handle_set_dispatch_paused`. Kept as literals
-/// so this crate does not depend on `boss_execution_contracts`; they must
-/// match `METADATA_KEY_DISPATCH_PAUSED` and `METADATA_KEY_DISPATCH_PAUSE_SCOPE`.
-const METADATA_KEY_DISPATCH_PAUSED: &str = "dispatch_paused";
-const METADATA_KEY_DISPATCH_PAUSE_SCOPE: &str = "dispatch_paused_scope";
-
 fn metadata_value_on(conn: &Connection, key: &str) -> Result<Option<String>> {
     conn.query_row("SELECT value FROM metadata WHERE key = ?1", [key], |row| row.get(0))
         .optional()
         .map_err(Into::into)
 }
 
-/// True when persisted dispatch pause is on and its scope holds PR reviews
-/// (`all_spawns`). The default `new_work` pause exempts reviews, so it does
-/// not invert review-pool reservations.
+/// True when an operator pause that holds PR reviews (`all_spawns`) is
+/// persisted. The default `new_work` pause exempts reviews, so it does not
+/// invert review-pool reservations; an absent scope resolves from the
+/// persisted origin exactly as the coordinator's restore does. Breaker
+/// pauses are transient and self-healing, so they neither defer admission
+/// nor release existing reservations: this keeps the hold and the release
+/// from depending on which handler happened to run.
 fn reviews_held_by_persisted_pause_on(conn: &Connection) -> Result<bool> {
-    match metadata_value_on(conn, METADATA_KEY_DISPATCH_PAUSED)? {
-        Some(value) if value == "1" => {
-            let scope = metadata_value_on(conn, METADATA_KEY_DISPATCH_PAUSE_SCOPE)?;
-            Ok(boss_protocol::DispatchPauseScope::from_persisted(scope.as_deref().unwrap_or_default()).holds_reviews())
-        }
-        _ => Ok(false),
-    }
+    use boss_engine_storage_values::dispatch_pause::{
+        METADATA_KEY_DISPATCH_PAUSE_ORIGIN, METADATA_KEY_DISPATCH_PAUSE_SCOPE, METADATA_KEY_DISPATCH_PAUSED,
+        operator_pause_holds_reviews,
+    };
+    let paused = metadata_value_on(conn, METADATA_KEY_DISPATCH_PAUSED)?;
+    let origin = metadata_value_on(conn, METADATA_KEY_DISPATCH_PAUSE_ORIGIN)?;
+    let scope = metadata_value_on(conn, METADATA_KEY_DISPATCH_PAUSE_SCOPE)?;
+    Ok(operator_pause_holds_reviews(
+        paused.as_deref(),
+        origin.as_deref(),
+        scope.as_deref(),
+    ))
 }
 
 /// Why a pre-merge batch for `cycle_root_id` must not occupy a reservation
@@ -831,32 +834,31 @@ fn pre_merge_dispatch_hold_on(conn: &Connection, cycle_root_id: &str) -> Result<
     Ok(None)
 }
 
+/// Title and body of the review-admission-deferred attention item. The one
+/// copy of this text: every filer goes through
+/// [`file_admission_deferred_attention_in_tx`] or
+/// [`WorkDb::file_admission_deferred_attention`].
+fn admission_deferred_attention_text(pr_url: &str) -> (&'static str, String) {
+    (
+        "Automated reviewer: waiting for a review-pool slot",
+        format!(
+            "Pre-merge review for {pr_url} was deferred because it cannot occupy a review-pool \
+             reservation right now: the pool is full, or dispatch focus / an all-spawns pause is \
+             holding this PR. The review starts once a reservation is free and this PR is \
+             allowed to dispatch. Dismiss this item once that pass starts."
+        ),
+    )
+}
+
 fn file_admission_deferred_attention_in_tx(tx: &Transaction<'_>, work_item_id: &str, pr_url: &str) -> Result<()> {
-    super::attention_filing::warn_if_lifecycle_undeclared(PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND);
-    if super::attention_filing::reraise_open_work_item_attention(
+    let (title, body) = admission_deferred_attention_text(pr_url);
+    super::workitems::upsert_refreshing_work_item_attention_in_tx(
         tx,
         work_item_id,
         PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
-    )?
-    .is_some()
-    {
-        return Ok(());
-    }
-    super::workitems::insert_attention_item_row(
-        tx,
-        &CreateAttentionItemInput::builder()
-            .work_item_id(work_item_id)
-            .kind(PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND)
-            .title("Automated reviewer: waiting for a review-pool slot")
-            .body_markdown(format!(
-                "Pre-merge review for {pr_url} was deferred because it cannot occupy a review-pool \
-                 reservation right now: the pool is full, or dispatch focus / an all-spawns pause is \
-                 holding this PR. The review starts once a reservation is free and this PR is \
-                 allowed to dispatch. Dismiss this item once that pass starts."
-            ))
-            .build(),
-    )?;
-    Ok(())
+        title,
+        &body,
+    )
 }
 
 /// Drop never-started pre-merge batches whose members cannot dispatch under
@@ -881,6 +883,7 @@ fn release_unstartable_pre_merge_review_reservations_in_tx(
              FROM pr_review_batches b
              WHERE b.phase = 'pre_merge'
                AND b.status NOT IN ('completed', 'failed')
+               AND b.explicit = 0
                AND {NO_BATCH_MEMBER_STARTED}
              ORDER BY b.created_at ASC, b.id ASC"
         ))?;
@@ -1437,6 +1440,29 @@ impl WorkDb {
         let released = release_unstartable_pre_merge_review_reservations_in_tx(&tx, &mut pending)?;
         commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(released)
+    }
+
+    /// Why a pre-merge batch for `cycle_root_id` cannot occupy a reservation
+    /// right now (`"dispatch_paused"` or `"focus_mode"`), or `None` when
+    /// admission may proceed to the capacity check. Lets the deferred-admission
+    /// sweep skip held roots without fetching PR metadata for a create that
+    /// can only defer.
+    pub fn pre_merge_review_hold_reason(&self, cycle_root_id: &str) -> Result<Option<&'static str>> {
+        let conn = self.connect()?;
+        pre_merge_dispatch_hold_on(&conn, cycle_root_id)
+    }
+
+    /// File (or re-raise and refresh) the review-admission-deferred attention
+    /// item for `work_item_id`. The single filer behind the pool-full,
+    /// focus-hold and all-spawns-hold paths.
+    pub fn file_admission_deferred_attention(&self, work_item_id: &str, pr_url: &str) -> Result<()> {
+        let (title, body) = admission_deferred_attention_text(pr_url);
+        self.upsert_refreshing_work_item_attention(
+            work_item_id,
+            PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
+            title,
+            &body,
+        )
     }
 
     /// Currently reserved review-pool units `(pre_merge, post_merge)` for

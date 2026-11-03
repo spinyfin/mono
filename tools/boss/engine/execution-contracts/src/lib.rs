@@ -1187,7 +1187,7 @@ impl DispatchPauseOrigin {
     /// [`METADATA_KEY_DISPATCH_PAUSE_ORIGIN`].
     pub fn as_metadata_str(self) -> &'static str {
         match self {
-            DispatchPauseOrigin::Operator => "operator",
+            DispatchPauseOrigin::Operator => boss_engine_storage_values::dispatch_pause::PERSISTED_ORIGIN_OPERATOR,
             DispatchPauseOrigin::Breaker => "breaker",
         }
     }
@@ -1196,10 +1196,7 @@ impl DispatchPauseOrigin {
     /// behaviour — an operator pause exempts reviews, a breaker pause holds
     /// everything.
     pub fn default_scope(self) -> DispatchPauseScope {
-        match self {
-            DispatchPauseOrigin::Operator => DispatchPauseScope::NewWork,
-            DispatchPauseOrigin::Breaker => DispatchPauseScope::AllSpawns,
-        }
+        boss_engine_storage_values::dispatch_pause::default_scope_for_persisted_origin(Some(self.as_metadata_str()))
     }
 
     /// Parse the persisted metadata value. Anything unrecognized (including
@@ -1208,9 +1205,10 @@ impl DispatchPauseOrigin {
     /// since restoring an unknown pause as review-exempt could resume
     /// burning spawn attempts against a still-broken spawn path.
     pub fn from_metadata_str(value: Option<&str>) -> Self {
-        match value {
-            Some("operator") => DispatchPauseOrigin::Operator,
-            _ => DispatchPauseOrigin::Breaker,
+        if boss_engine_storage_values::dispatch_pause::persisted_origin_is_operator(value) {
+            DispatchPauseOrigin::Operator
+        } else {
+            DispatchPauseOrigin::Breaker
         }
     }
 }
@@ -1850,7 +1848,7 @@ pub enum SendToAppError {
 /// restart. `pub` so the spawn-capability circuit breaker
 /// (`boss_engine::spawn_health`) can persist the auto-pause it applies through the
 /// same key the human toggle (`handle_set_dispatch_paused`) uses.
-pub const METADATA_KEY_DISPATCH_PAUSED: &str = "dispatch_paused";
+pub use boss_engine_storage_values::dispatch_pause::METADATA_KEY_DISPATCH_PAUSED;
 /// Metadata key storing the epoch-seconds timestamp at which dispatch was last
 /// paused. Zero (or absent) means not paused.
 pub const METADATA_KEY_DISPATCH_PAUSED_SINCE: &str = "dispatch_paused_since_epoch_s";
@@ -1860,7 +1858,7 @@ pub const METADATA_KEY_DISPATCH_PAUSED_SINCE: &str = "dispatch_paused_since_epoc
 /// absent (a pause persisted before this key existed) defaults to the
 /// non-exempt `breaker` origin — see
 /// [`DispatchPauseOrigin::from_metadata_str`].
-pub const METADATA_KEY_DISPATCH_PAUSE_ORIGIN: &str = "dispatch_paused_origin";
+pub use boss_engine_storage_values::dispatch_pause::METADATA_KEY_DISPATCH_PAUSE_ORIGIN;
 /// Metadata key storing the scope of the current pause — one of
 /// [`boss_protocol::DispatchPauseScope::as_str`]'s values — so a restart
 /// restores what the pause *held*, not just who paused. Absent (a
@@ -1868,7 +1866,7 @@ pub const METADATA_KEY_DISPATCH_PAUSE_ORIGIN: &str = "dispatch_paused_origin";
 /// scope; an unrecognised value restores as the stricter `all_spawns` — see
 /// `load_dispatch_pause_scope`. `pub` for the same reason as the
 /// origin key: the spawn-capability breaker persists its pause through it.
-pub const METADATA_KEY_DISPATCH_PAUSE_SCOPE: &str = "dispatch_paused_scope";
+pub use boss_engine_storage_values::dispatch_pause::METADATA_KEY_DISPATCH_PAUSE_SCOPE;
 /// Metadata key storing why dispatch is currently paused. Absent (or
 /// empty) while running; always set alongside [`METADATA_KEY_DISPATCH_PAUSED`]
 /// `"1"` and cleared alongside it going back to `"0"` — see

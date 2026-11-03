@@ -200,3 +200,57 @@ async fn sweep_admits_the_new_head_after_a_stale_head_verdict() {
     let again = sweep(&db, &publisher, "head-b").await;
     assert_eq!(again.review_admission_recovered, 0);
 }
+
+/// Enqueuer that fails the test if the sweep reaches it.
+struct PanicEnqueuer;
+
+#[async_trait]
+impl ReviewBatchEnqueuer for PanicEnqueuer {
+    async fn enqueue(&self, _: &WorkDb, _: &str, _: &str, _: &str, _: usize) -> Result<ReviewBatchDispatch> {
+        panic!("a held candidate must not be enqueued (it would fetch PR metadata for nothing)");
+    }
+}
+
+/// A candidate outside the dispatch focus set is counted as still deferred
+/// and never reaches the enqueuer, so a held root costs no PR fetch.
+#[tokio::test]
+async fn sweep_skips_enqueue_for_roots_held_by_focus() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let root_id = in_review_root(&db);
+    let (batch, _) = settled_batch(&db, &root_id, "head-a");
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE pr_review_batch_members SET status = 'failed' WHERE batch_id = ?1",
+            rusqlite::params![batch.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE pr_review_batches SET status = 'failed' WHERE id = ?1",
+            rusqlite::params![batch.id],
+        )
+        .unwrap();
+    }
+    let mut focus = boss_protocol::DispatchFocus::default();
+    focus.insert(
+        boss_protocol::DispatchFocusTargetKind::Project,
+        "proj_elsewhere".to_owned(),
+    );
+    db.save_dispatch_focus(&focus).unwrap();
+    let publisher = RecordingPublisher::default();
+    let mut outcome = SweepOutcome::default();
+
+    super::super::deferred_review_admission::sweep_deferred_review_admission_with(
+        &db,
+        &publisher,
+        &PanicEnqueuer,
+        None,
+        16,
+        &mut outcome,
+    )
+    .await;
+
+    assert_eq!(outcome.review_admission_recovered, 0);
+    assert_eq!(outcome.review_admission_still_deferred, 1);
+}
