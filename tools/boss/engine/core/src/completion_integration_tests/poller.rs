@@ -87,7 +87,7 @@ async fn merge_poller_recovers_missed_pr_open_for_waiting_human_execution() {
         publisher.as_ref(),
         None,
         Some(handler.as_ref()),
-        None,
+        Some(&crate::merge_poller_adapters::CoreSweepHost::with_remediation(None)),
     )
     .await;
 
@@ -226,8 +226,15 @@ async fn merge_poller_recheck_binds_three_stuck_workers_when_detector_recovers()
     }
     let probe = NoOpProbe;
 
-    let outcome =
-        crate::merge_poller::run_one_pass(db.as_ref(), &probe, publisher.as_ref(), None, Some(&handler), None).await;
+    let outcome = crate::merge_poller::run_one_pass(
+        db.as_ref(),
+        &probe,
+        publisher.as_ref(),
+        None,
+        Some(&handler),
+        Some(&crate::merge_poller_adapters::CoreSweepHost::with_remediation(None)),
+    )
+    .await;
 
     // Pass 1 — pre-fix behaviour: the recheck reaches all three
     // candidates but the detector still returns Stale on each. The
@@ -296,8 +303,15 @@ async fn merge_poller_recheck_binds_three_stuck_workers_when_detector_recovers()
         (chore_id, execution_id, url)
     })
     .collect();
-    let outcome2 =
-        crate::merge_poller::run_one_pass(db.as_ref(), &probe, publisher.as_ref(), None, Some(&handler), None).await;
+    let outcome2 = crate::merge_poller::run_one_pass(
+        db.as_ref(),
+        &probe,
+        publisher.as_ref(),
+        None,
+        Some(&handler),
+        Some(&crate::merge_poller_adapters::CoreSweepHost::with_remediation(None)),
+    )
+    .await;
     assert_eq!(
         outcome2.pr_recheck_recovered, 3,
         "all three stuck workers must transition on the recovery pass, got {outcome2:?}",
@@ -375,7 +389,7 @@ async fn background_children_horizon_is_rechecked_without_another_stop() {
         publisher.as_ref(),
         None,
         Some(&handler),
-        None,
+        Some(&crate::merge_poller_adapters::CoreSweepHost::with_remediation(None)),
     )
     .await;
 
@@ -411,7 +425,15 @@ async fn run_one_pass_uses_injected_enqueuer_for_pending_review() {
             .with_review_batch_enqueuer(enqueuer.clone()),
     );
     let publisher = RecordingPublisher::default();
-    let outcome = crate::merge_poller::run_one_pass(&db, &NoopMergeProbe, &publisher, None, Some(&handler), None).await;
+    let outcome = crate::merge_poller::run_one_pass(
+        &db,
+        &NoopMergeProbe,
+        &publisher,
+        None,
+        Some(&handler),
+        Some(&crate::merge_poller_adapters::CoreSweepHost::with_remediation(None)),
+    )
+    .await;
     assert_eq!(
         enqueuer.calls.lock().await.as_slice(),
         &[(chore.id, product.repo_remote_url.unwrap(), PR.into(), 3)]
@@ -556,7 +578,11 @@ async fn rearm_restores_the_parent_signal_not_the_revisions() {
     crate::merge_poller::maybe_clear_blocked(
         &db,
         &boss_execution_contracts::NoopExecutionPublisher,
-        (None, None),
+        crate::merge_poller::SweepHandlers {
+            cube_client: None,
+            completion_handler: None,
+            host: Some(&crate::merge_poller_adapters::CoreSweepHost::with_remediation(None)),
+        },
         &candidate,
         &probe,
         (&boss_observation_contracts::OpenPrCiStatus::Clean, true),

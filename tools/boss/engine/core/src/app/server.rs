@@ -1712,11 +1712,19 @@ async fn serve_scoped(
         server_state.work_db.clone(),
         merge_probe,
         server_state.publisher.clone(),
-        (
-            server_state.cube_client.clone(),
-            server_state.completion_handler.clone(),
+        crate::merge_poller::LoopServices {
+            cube_client: server_state.cube_client.clone(),
+            completion_handler: server_state.completion_handler.clone(),
             trunk_queue_api,
-        ),
+            // Conflict remediation, design-doc pointer maintenance and project
+            // population are carried out by the services that own them; the
+            // poller reaches them through this host.
+            host: Arc::new(crate::merge_poller_adapters::CoreSweepHost::new(
+                server_state.work_db.clone(),
+                server_state.publisher.clone(),
+                server_state.cube_client.clone(),
+            )),
+        },
         Duration::from_secs(60),
         server_state.metrics.clone(),
         (server_state.pr_reconciler_kick.clone(), pr_reconcile_requests),

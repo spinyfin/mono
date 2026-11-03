@@ -13,9 +13,11 @@ rust_library(
     visibility = [
         "//tools/boss/engine/completion:__pkg__",
         "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/merge-poller:__pkg__",
     ],
     deps = [
         "//tools/boss/engine/work-db",
+        "//tools/boss/engine/worker-bin",
         "//tools/boss/github",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
@@ -35,9 +37,11 @@ rust_library(
     visibility = [
         "//tools/boss/engine/completion:__pkg__",
         "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/merge-poller:__pkg__",
     ],
     deps = [
         "//tools/boss/engine/work-db:work_db_test_support",
+        "//tools/boss/engine/worker-bin",
         "//tools/boss/github",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),

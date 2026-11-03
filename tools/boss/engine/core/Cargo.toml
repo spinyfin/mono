@@ -50,6 +50,7 @@ boss-engine-completion = { path = "../completion" }
 boss-engine-dispatch = { path = "../dispatch" }
 boss-engine-driver = { path = "../driver" }
 boss-engine-live-worker-state = { path = "../live-worker-state" }
+boss-engine-merge-poller = { path = "../merge-poller" }
 boss-engine-driver-quota = { path = "../driver-quota" }
 boss-engine-attachments = { path = "../attachments" }
 boss-engine-grok-home-retention = { path = "../grok-home-retention" }
@@ -102,6 +103,7 @@ unicode-segmentation = { workspace = true }
 [dev-dependencies]
 boss-engine-completion = { path = "../completion", features = ["test-support"] }
 boss-engine-live-worker-state = { path = "../live-worker-state", features = ["test-support"] }
+boss-engine-merge-poller = { path = "../merge-poller", features = ["test-support"] }
 boss-execution-runner = { path = "../execution-runner", features = ["test-support"] }
 boss-execution-contracts = { path = "../execution-contracts", features = ["test-support"] }
 boss-work-db = { path = "../work-db", features = ["test-support"] }

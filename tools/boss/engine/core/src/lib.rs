@@ -26,16 +26,12 @@ pub mod automation_triage;
 pub mod awaiting_input_status;
 pub mod background_children;
 pub mod background_work;
-pub mod blocking_signal;
 pub mod board_invalidation_metrics;
 #[cfg(test)]
 mod board_invalidation_replay;
 pub use boss_execution_runner::boss_construct_scan;
 pub mod build_info;
 pub use boss_ci_log_reader as ci_log_reader;
-pub mod ci_watch;
-mod queue_ci_contract;
-mod remediation_push;
 pub use boss_claude_client as claude_client;
 pub mod cli;
 pub use boss_comment_anchor as comments_anchor;
@@ -43,12 +39,22 @@ pub use boss_engine_comment_classifier as comment_classifier;
 mod completion_adapters;
 #[cfg(test)]
 mod completion_integration_tests;
+mod merge_poller_adapters;
+#[cfg(test)]
+mod merge_poller_integration_tests;
 pub use boss_engine_completion as completion;
+// The merge-polling service and the CI / merge-queue collaborators only its loop
+// drives live in their own crate; each is re-exported under its historical path.
 pub use boss_engine_completion::{
     answer_agent_observability, build_wait, build_wait_tracker, codex_unobserved_command, conflict_stop_gate,
     driver_teardown, driver_transcript, hold_registry, merge_parent_deletion, nudge_breaker, postmortem_followups,
     pr_url_capture, proposal_channel_error, reconcile_audit, review_guide_capture, run_done_backstop,
     teardown_registry, wait_registry, worker_escalation,
+};
+pub use boss_engine_merge_poller as merge_poller;
+pub(crate) use boss_engine_merge_poller::remediation_push;
+pub use boss_engine_merge_poller::{
+    blocking_signal, ci_watch, merge_queue_renumber, trunk_merge, trunk_queue_adopt, trunk_queue_poller,
 };
 pub mod config;
 #[cfg(test)]
@@ -129,8 +135,6 @@ pub use boss_engine_live_worker_state::semantic_progress;
 pub mod lost_workspace_sweep;
 pub mod materializer;
 pub mod merge_mechanism;
-pub mod merge_poller;
-pub mod merge_queue_renumber;
 pub mod merge_when_ready;
 mod run_cost;
 // The metrics framework lives in its own crate; alias it under the
@@ -216,9 +220,6 @@ mod tmux_health;
 pub mod tmux_preflight;
 pub mod transcript_liveness;
 pub mod transient_recovery;
-pub mod trunk_merge;
-pub mod trunk_queue_adopt;
-pub mod trunk_queue_poller;
 pub use boss_engine_utility_model as utility_model;
 pub use boss_work_db as work;
 pub use work::work_dependencies;

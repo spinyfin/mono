@@ -36,6 +36,7 @@ members = [
   "tools/boss/engine/dispatch-reader",
   "tools/boss/engine/event-bus",
   "tools/boss/engine/live-worker-state",
+  "tools/boss/engine/merge-poller",
   "tools/boss/engine/single-flight",
   "tools/boss/engine/spoke-journal",
   "tools/boss/engine/spoke-outbound",

@@ -13,6 +13,7 @@ rust_library(
         "//tools/boss/engine/completion:__pkg__",
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/dispatch:__pkg__",
+        "//tools/boss/engine/merge-poller:__pkg__",
         "//tools/boss/engine/timer-wheel:__pkg__",
         "//tools/boss/engine/work-db:__pkg__",
     ],

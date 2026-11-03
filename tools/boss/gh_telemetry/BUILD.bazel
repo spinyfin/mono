@@ -14,6 +14,7 @@ rust_library(
         "//tools/boss/engine/completion:__pkg__",
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/execution-runner:__pkg__",
+        "//tools/boss/engine/merge-poller:__pkg__",
         "//tools/boss/engine/pr-review-sources:__pkg__",
         "//tools/boss/engine/work-db:__pkg__",
         "//tools/boss/github:__pkg__",

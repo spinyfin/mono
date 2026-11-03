@@ -15,6 +15,7 @@ rust_library(
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/driver:__pkg__",
         "//tools/boss/engine/execution-runner:__pkg__",
+        "//tools/boss/engine/observation-contracts:__pkg__",
     ],
     deps = all_crate_deps(normal = True),
 )

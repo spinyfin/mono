@@ -17,6 +17,7 @@ rust_library(
         "//tools/boss/engine/dispatch:__pkg__",
         "//tools/boss/engine/execution-runner:__pkg__",
         "//tools/boss/engine/live-worker-state:__pkg__",
+        "//tools/boss/engine/merge-poller:__pkg__",
     ],
     deps = [
         "//tools/boss/engine/dispatch-events",
@@ -45,6 +46,7 @@ rust_library(
         "//tools/boss/engine/dispatch:__pkg__",
         "//tools/boss/engine/execution-runner:__pkg__",
         "//tools/boss/engine/live-worker-state:__pkg__",
+        "//tools/boss/engine/merge-poller:__pkg__",
     ],
     deps = [
         "//tools/boss/engine/dispatch-events",
