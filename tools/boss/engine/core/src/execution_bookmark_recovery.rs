@@ -8,6 +8,7 @@ use boss_engine_recovery::recovery_backup::{backup_execution_patch, default_reco
 
 use crate::work::{CreateAttentionItemInput, WorkDb, WorkExecution};
 
+#[cfg(test)]
 pub(crate) use boss_engine_storage_values::attention_kinds::EXECUTION_BOOKMARK_CREATE_FAILED_ATTENTION_KIND as CREATE_FAILED;
 pub(crate) use boss_engine_storage_values::attention_kinds::EXECUTION_BOOKMARK_RECOVERY_FAILED_ATTENTION_KIND as RECOVERY_FAILED;
 #[cfg(test)]

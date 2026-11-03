@@ -583,6 +583,7 @@ fn enabled_source_capture_handler(
         Arc::new(RecordingPublisher::default()),
         Arc::new(NoopPaneReleaser),
         Arc::new(NoopProbeQueuer),
+        crate::completion_adapters::completion_collaborators(),
     )
     .with_feature_flags(flags)
     .with_source_packet_collector(collector)
@@ -731,6 +732,7 @@ async fn disabled_source_capture_flag_does_not_allocate_poller_sequences() {
         Arc::new(RecordingPublisher::default()),
         Arc::new(NoopPaneReleaser),
         Arc::new(NoopProbeQueuer),
+        crate::completion_adapters::completion_collaborators(),
     );
     let probe = StubProbe::new();
     probe.set_with_base_head(pr, PrLifecycleState::Open(OpenPrStatus::clean()), "base-1", "head-1");

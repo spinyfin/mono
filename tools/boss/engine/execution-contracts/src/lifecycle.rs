@@ -2,8 +2,10 @@
 //! Production implementations live in engine core.
 
 use crate::{
-    ExecutionPublisher, HostAdapter, HostAdapterProvider, LeaseReleaseOutcome, PaneStatus, PreStartStage, TerminalCause,
+    CubeClient, ExecutionPublisher, HostAdapter, HostAdapterProvider, LeaseReleaseOutcome, PaneStatus, PreStartStage,
+    TerminalCause,
 };
+use anyhow::Result;
 use async_trait::async_trait;
 use boss_dispatch_events::DispatchEventSink;
 use boss_engine_metrics_registry::Registry;
@@ -317,4 +319,65 @@ pub trait LifecycleServices: Send + Sync {
         base_sha: &str,
         pr_number: u64,
     ) -> Vec<String>;
+}
+
+/// Cube that owns an execution's lease, plus the host that cube lives on.
+///
+/// Returned by [`ExecutionCubes::cube_for_execution`] so callers that care
+/// about *which* host was resolved (e.g. emitting a remote-only ok event)
+/// do not have to re-derive it by sniffing display labels from
+/// [`CubeClient::command_repr`].
+#[derive(Clone)]
+pub struct ResolvedExecutionCube {
+    pub cube: Arc<dyn CubeClient>,
+    /// Host the execution's latest run was dispatched to. `"local"` when the
+    /// engine's own cube issued (or will issue) the lease — including
+    /// executions with no run row yet.
+    pub host_id: String,
+}
+
+impl ResolvedExecutionCube {
+    /// True when the lease lives on the engine's own cube.
+    pub fn is_local(&self) -> bool {
+        self.host_id == "local"
+    }
+}
+
+/// Resolves the cube endpoint that actually owns an execution's lease.
+///
+/// A lease is tracked only by the cube on the host its workspace lives on,
+/// so every heartbeat (and every auto-reap force-release) must go through
+/// this seam. `local` resolves to the engine's own client; any other host
+/// resolves through the same adapter provider the dispatch loop leased
+/// with. Resolution failure is deliberately an `Err`, never a silent skip:
+/// a heartbeat this sweep cannot route is a heartbeat that did not happen,
+/// and the caller must count it as a failure and emit the error event so it
+/// stays visible. See `heartbeat_one` in the cube lease heartbeat.
+#[async_trait]
+pub trait ExecutionCubes: Send + Sync {
+    /// The cube that owns `execution_id`'s lease, and the host that cube
+    /// lives on.
+    async fn cube_for_execution(&self, execution_id: &str) -> Result<ResolvedExecutionCube>;
+}
+
+/// Result of atomically checking and fencing a never-started run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NeverStartedReap {
+    /// The run is now fenced against later driver signals.
+    Committed,
+    /// A driver signal won the race; the run must not be reaped.
+    DriverSignalled,
+    /// The slot no longer belongs to this run.
+    SlotGone,
+    /// The run was already fenced against later driver signals.
+    AlreadyCommitted,
+}
+
+/// Driver observations and atomic reap fencing, supplied by the engine's live-state owner.
+pub trait DriverSignals: Send + Sync {
+    fn has_driver_signal_for_run(&self, run_id: &str) -> bool;
+    fn first_hook_event_for_run(&self, run_id: &str) -> Option<String>;
+    /// Atomically commit the reap fence unless a driver signal already won.
+    /// A successful commit prevents later driver signals from reviving the run.
+    fn commit_never_started_reap(&self, slot_id: u8, run_id: &str) -> NeverStartedReap;
 }

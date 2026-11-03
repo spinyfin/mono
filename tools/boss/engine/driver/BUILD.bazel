@@ -24,10 +24,12 @@ rust_library(
         "BOSS_ENGINE_BAZEL_RUN_COMMAND": ENGINE_BINARY_BAZEL_RUN_COMMAND,
     },
     visibility = [
+        "//tools/boss/engine/completion:__pkg__",
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/effort:__pkg__",
         "//tools/boss/engine/execution-runner:__pkg__",
         "//tools/boss/engine/host-execution:__pkg__",
+        "//tools/boss/engine/live-worker-state:__pkg__",
         "//tools/boss/engine/stdout-progress:__pkg__",
         "//tools/boss/engine/work-db:__pkg__",
     ],

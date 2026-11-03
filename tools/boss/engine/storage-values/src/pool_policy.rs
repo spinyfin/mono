@@ -142,3 +142,21 @@ pub fn kind_always_dispatches_on_pool_driver(kind: &ExecutionKind) -> bool {
 pub fn pool_driver_slug_for_execution_kind(kind: &ExecutionKind) -> Option<&'static str> {
     kind_always_dispatches_on_pool_driver(kind).then_some(REVIEWER_POOL_DRIVER)
 }
+
+/// Default value for the engine's `max_review_cycles` setting. Matches the
+/// "~3 cycles at worst" mental model from the review-cycle-cap design, §7.
+pub const DEFAULT_MAX_REVIEW_CYCLES: usize = 3;
+
+/// Default threshold for the no-op / trivial-diff skip gate (review-cycle-cap
+/// design, §8).
+/// Zero means "skip only when the effective diff is literally empty (0 changed
+/// lines)"; operators can raise this to also skip small cosmetic-only pushes.
+pub const DEFAULT_MIN_REVIEW_CHANGED_LINES: u64 = 0;
+
+/// No hook event for this long while a worker is `working` with no tool
+/// in flight ⇒ presumed wedged. 30 minutes is deliberately generous: a
+/// healthy worker emits a `PreToolUse`/`PostToolUse`/`UserPromptSubmit`
+/// hook far more often than this, so the threshold sits well clear of
+/// normal think/stream gaps while still bounding the indefinite hang the
+/// incident exhibited (~35 min and counting before manual recovery).
+pub const DEFAULT_STALE_THRESHOLD_SECS: i64 = 1_800;

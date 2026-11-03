@@ -188,7 +188,7 @@ its live `BOSS_SPAWN_TOKEN` exactly matches the durable run identity.
 
 `LiveWorkerState.activity` is reduced from the hook stream by
 `LiveWorkerStateRegistry::apply_sequenced_event`
-(`engine/core/src/live_worker_state.rs`), and the reducer is simple:
+(`engine/live-worker-state/src/lib.rs`), and the reducer is simple:
 `UserPromptSubmit` / `PreToolUse` / `PostToolUse` → `Working` (with the
 tool on `PreToolUse`), `Stop` → `Idle` (or `WaitingForInput` when a
 `Notification` preceded it), `SessionEnd` → `Terminated`. There is no

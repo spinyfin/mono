@@ -1,0 +1,2734 @@
+//! In-memory store of per-slot [`LiveWorkerState`] values.
+//!
+//! The events socket consumer feeds this; bossctl reads from it via
+//! the frontend RPC; the topic broker re-publishes the full snapshot
+//! whenever any slot changes so UI subscribers can push to the kanban
+//! Doing icon and the pane titlebar pill in near-real-time. Hook events
+//! are applied in the worker's emission order, never in the order their
+//! per-connection ingress tasks happen to finish — see
+//! [`LiveWorkerStateRegistry::apply_sequenced_event`].
+//!
+//! Keyed by slot id (the interactive pool spans 1..=16 across two pages,
+//! with automation/review above it), not run id — run records finalise
+//! quickly after spawn (they model the spawn act, not the worker's
+//! life). Two consecutive runs in the same slot reuse the slot key.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use boss_protocol::{
+    ExecutionKind, LiveWorkerMetadata, LiveWorkerState, SessionStartSource, WorkItemBinding, WorkerActivity,
+    WorkerEvent,
+};
+
+use crate::semantic_progress::{
+    SemanticProgressCheckpoint, SemanticToolCondition, SemanticTurnCondition, next_tool_condition, next_turn_condition,
+};
+use boss_engine_driver::ProgressFidelity;
+
+mod never_started_reap;
+pub mod semantic_progress;
+pub use never_started_reap::NeverStartedReapCommit;
+
+/// Attributed worker-pool label for a live run (`"main"`, `"automation"`,
+/// or `"review"`). Matches
+/// [`crate::coordinator::ExecutionCoordinator::attributed_pool_label`]:
+/// PR reviews and review guides always report `"review"`, automation triage and other
+/// automation-sourced work report `"automation"`, everything else
+/// reports `"main"`. Independent of which physical slot the run
+/// occupies (automation can spill into a main-pool Lower Decks slot).
+///
+/// Used at spawn registration to stamp [`LiveWorkerState::pool`] so
+/// `bossctl agents list` can render pool without joining the execution
+/// table or re-deriving attribution.
+pub fn attributed_pool_label(kind: ExecutionKind, has_source_automation: bool) -> &'static str {
+    match kind {
+        ExecutionKind::PrReview | ExecutionKind::PrReviewGuide => "review",
+        ExecutionKind::AutomationTriage => "automation",
+        _ if has_source_automation => "automation",
+        _ => "main",
+    }
+}
+
+/// Pool + execution-kind stamps carried into
+/// [`LiveWorkerStateRegistry::register_spawn_with_capabilities`] so production
+/// dispatch can populate [`LiveWorkerState::pool`] / [`LiveWorkerState::kind`]
+/// without growing the register-spawn arity further. Both fields are `None`
+/// for tests and any spawn path that does not know them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LiveSpawnRouting {
+    /// Attributed pool (`"main"` / `"automation"` / `"review"`).
+    pub pool: Option<String>,
+    /// Execution kind snake_case string (see [`ExecutionKind::as_str`]).
+    pub kind: Option<String>,
+    /// `Some(true)` for a local worker hosted in a tmux session, stamped
+    /// at spawn (or read from the durable run row on re-adoption).
+    /// `Some(false)` marks a local run whose durable tmux stamp is missing —
+    /// an invariant failure, never a supported hosting mode. `None` where
+    /// tmux hosting isn't meaningful — e.g. remote workers, which have no
+    /// local pane.
+    pub tmux_hosted: Option<bool>,
+    /// Badge type, project, host, and start-time stamps. Empty for tests and
+    /// spawn paths without a work item.
+    pub metadata: LiveWorkerMetadata,
+}
+
+impl LiveSpawnRouting {
+    /// All fields unset — the historical test/default shape.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Stamp pool + kind for a production dispatch that has no local tmux
+    /// worker — e.g. the remote-worker registration path, which has no
+    /// local pane at all. Use [`Self::new_with_hosting`] for a local spawn.
+    pub fn new(pool: impl Into<String>, kind: impl Into<String>) -> Self {
+        Self {
+            pool: Some(pool.into()),
+            kind: Some(kind.into()),
+            tmux_hosted: None,
+            metadata: LiveWorkerMetadata::default(),
+        }
+    }
+
+    /// Stamp pool, kind, and the tmux-hosting stamp for a local production
+    /// dispatch (`start_worker`, or re-adoption from the durable run row).
+    pub fn new_with_hosting(pool: Option<String>, kind: impl Into<String>, tmux_hosted: bool) -> Self {
+        Self {
+            pool,
+            kind: Some(kind.into()),
+            tmux_hosted: Some(tmux_hosted),
+            metadata: LiveWorkerMetadata::default(),
+        }
+    }
+
+    /// Attach the engine-resolved metadata (see `live_worker_metadata`).
+    pub fn with_metadata(mut self, metadata: LiveWorkerMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
+/// The model identifier the engine uses when no `SessionStart` hook
+/// has yet reported one — this is the model the launcher *asked* for,
+/// surfaced so the UI can render the real model name immediately
+/// instead of "Claude Unknown".
+pub const DEFAULT_LAUNCH_MODEL: &str = "opus";
+
+/// How long a slot must be stuck in `Spawning` with no hook events before
+/// [`LiveWorkerStateRegistry::mark_stalled_spawns`] will promote it —
+/// to `WaitingForInput` when the driver declared
+/// `Capability::AwaitingInputSignal`, or to `Idle` when it did not but
+/// `driver_signal_at` is already set. 30 seconds matches the dead-PID
+/// grace period and gives a fresh-but-slow worker enough runway while
+/// being well below the typical interactive-wait tolerance.
+///
+/// This threshold only ever promotes slots that already have a reported
+/// `shell_pid` (see the guard in `mark_stalled_spawns`) — a slot with no
+/// pid at all is a different failure class entirely, handled by
+/// `crate::spawn_ack_sweep` instead. See that module's doc comment for
+/// the 2026-07-03/04 false-live incident this split addresses.
+pub const STALLED_SPAWN_THRESHOLD_SECS: i64 = 30;
+
+/// How long a spawn may go without a **driver-originated** signal
+/// before [`LiveWorkerStateRegistry::unverified_driver_starts`] reports
+/// it as a never-started driver for
+/// [`crate::spawn_ack_sweep`] to reap.
+///
+/// ## Why this is a separate, longer window than the two above
+///
+/// [`STALLED_SPAWN_THRESHOLD_SECS`] answers "has this spawn been sitting
+/// in `Spawning` long enough to promote?". This one answers the strictly
+/// stronger question "did the *driver binary* come up?" — the question no
+/// check in Boss asked before, and the one the 2026-07-30 incident turned
+/// on: a pane hosting nothing but an idle login shell reported
+/// `shell_pid=92697` and satisfied every pane-level check forever.
+///
+/// 300s is deliberately far above any real driver startup. A healthy
+/// driver's first hook (`SessionStart`) fires within seconds of exec.
+/// The one historically legitimate multi-minute pre-hook wait — claude's
+/// first-run folder-trust dialog, which is the entire reason
+/// [`LiveWorkerStateRegistry::mark_stalled_spawns`] exists — is
+/// *pre-suppressed* at provision time by
+/// `boss_engine_driver::claude`'s `hasTrustDialogAccepted` seeding, so
+/// no driver should ever legitimately sit pre-hook for minutes. Five
+/// minutes leaves an order of magnitude of headroom over that reality
+/// while still bounding the hold: before this, the hold was unbounded.
+pub const DRIVER_START_GRACE_SECS: i64 = 300;
+
+/// How long after the most recent hook a slot may keep advertising
+/// `Spawning` before [`LiveWorkerStateRegistry::downgrade_stale_activity`]
+/// moves it to `Idle`.
+///
+/// Covers the shape `mark_stalled_spawns` deliberately ignores: a slot
+/// that *did* receive at least one hook (so `last_event_at` is set —
+/// typically `SessionStart(Resume)` on reattach, which stamps the
+/// timestamp without leaving `Spawning`) and then went quiet because
+/// `events.sock` degraded. Without this timer the slot sits at
+/// `activity=spawning` forever, which is a lie once an event has been
+/// observed. Same 30s window as the stalled-spawn threshold so the two
+/// honesty timers move in lockstep.
+pub const STALE_ACTIVITY_DOWNGRADE_SECS: i64 = 30;
+
+/// Thread-safe registry of LiveWorkerState entries, keyed by slot id.
+#[derive(Default)]
+pub struct LiveWorkerStateRegistry {
+    /// Every live slot's complete record. One map, not several parallel
+    /// ones keyed by the same `u8`: a slot's whole footprint is
+    /// established by a single `insert` and torn down by a single
+    /// `remove`, so no registration or release site has to remember a
+    /// per-field lifecycle, and there is no failure mode where one table
+    /// keeps a stale entry a sibling table already dropped.
+    inner: Mutex<HashMap<u8, SlotEntry>>,
+    /// Serialization locks that are independent of dispatch registry reads.
+    serial: SerialLocks,
+    /// Driver-hook evidence for runs whose pane is launching but whose slot
+    /// entry is not registered yet, keyed by run id. Armed by
+    /// [`Self::arm_pending_hooks`] before the CLI starts and drained into
+    /// the slot's [`SlotMeta`] atomically by registration, so a hook that
+    /// wins the race against registration is not lost. Always locked
+    /// *after* `inner` when both are held.
+    pending_hooks: Mutex<HashMap<String, PendingHooks>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub test_hooks: TestHooks,
+    persona_store: Option<std::sync::Arc<boss_work_db::WorkDb>>,
+}
+
+#[derive(Default)]
+struct SerialLocks {
+    /// Serializes lifecycle mutations.
+    lifecycle: Mutex<()>,
+    /// Serializes semantic-checkpoint capture-and-persist so an older
+    /// dispatch cannot overwrite a newer one. Never held together with
+    /// `inner` across a database call: `inner` is taken only briefly to
+    /// capture, and the lock order is `persist` -> database connection.
+    persist: Mutex<()>,
+}
+
+/// Test-only synchronization points for lifecycle/persona race tests.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Default)]
+pub struct TestHooks {
+    pub persona_boundary: Mutex<Option<Box<dyn Fn() + Send>>>,
+    pub lifecycle_waiter: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    /// Signalled once `with_semantic_progress` has taken the persistence lock
+    /// and captured its checkpoint, immediately before `consume` runs.
+    pub persist_boundary: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+}
+
+/// Hook evidence buffered for a run before its slot entry exists.
+#[derive(Default)]
+struct PendingHooks {
+    driver_signal_at: Option<i64>,
+    /// First driver hook event kind seen before the slot was registered.
+    /// Buffered here while the run is armed, then transferred into
+    /// `SlotMeta::first_hook_event` (and removed from this buffer) at
+    /// registration. First-write-wins; diagnostic-only.
+    first_hook_event: Option<String>,
+}
+
+/// One slot's full record: the wire-format state the app and `bossctl`
+/// render, plus the engine-side bookkeeping only the sweeps read.
+struct SlotEntry {
+    state: LiveWorkerState,
+    meta: SlotMeta,
+}
+
+/// Per-slot engine-side bookkeeping.
+///
+/// Deliberately kept out of [`LiveWorkerState`]: that struct is the wire
+/// format the app/bossctl consume, and none of these values has a UI
+/// consumer — only the sweeps'.
+///
+/// Builder-constructed per the repo's convention for structs past five
+/// fields. Only `spawned_at` and `awaiting_input_capable` are decided by
+/// the caller; the rest start at the one value a fresh entry can honestly
+/// hold (`bon` defaults `Option` fields to `None` on its own), so the
+/// construction site states exactly what it knows and nothing else.
+#[derive(Clone, Copy)]
+struct NotificationRepair {
+    notification_seq: u64,
+    stop_seq: u64,
+}
+
+#[derive(bon::Builder)]
+struct SlotMeta {
+    /// Confirmed process/session death fences buffered transcript events until
+    /// same-run re-adoption or a later `Alive` inspection restores the slot.
+    /// Ordinary buffered hooks never clear this flag.
+    #[builder(default)]
+    observed_dead: bool,
+    /// Set when the engine itself (not a driver `SessionEnd`) marked the slot
+    /// `Terminated` from liveness evidence. Only such terminations may be
+    /// revived by an `Alive` inspection; a hook-derived `Terminated` belongs
+    /// to the hook stream. Cleared when a hook restores activity or ends the session.
+    #[builder(default)]
+    inferred_terminated: bool,
+    /// Activity before the first engine termination, retained across repeated checks.
+    activity_before_termination: Option<WorkerActivity>,
+    /// Selects the next-response deadline independently of the nudge watermark.
+    #[builder(default = false)]
+    tool_completed_since_prompt: bool,
+    /// Set when a `Notification` hook arrives, cleared on the next `Stop`.
+    /// Lets us turn a `Stop` into `WaitingForInput` rather than `Idle`
+    /// when claude is paused on a permission prompt.
+    #[builder(default = false)]
+    notification_pending: bool,
+    /// Ingress sequence of the `Notification` behind `notification_pending`,
+    /// so a clearing hook that arrives late but was emitted after it can
+    /// still consume it.
+    notification_pending_seq: Option<u64>,
+    /// A late `Notification` that repaired the slot from `Idle` to
+    /// `WaitingForInput` on the strength of the `Stop` at `stop_seq`. A
+    /// clearing hook emitted between the two proves that `Stop` did not
+    /// consume the notification, and undoes the repair.
+    notification_repair: Option<NotificationRepair>,
+    /// Epoch-seconds timestamp recorded when `register_spawn` creates the
+    /// entry. Used by `mark_stalled_spawns` to detect workers that have
+    /// been stuck in `Spawning` without any hook event (the initial
+    /// directory-trust prompt fires before `SessionStart`, so the normal
+    /// `Notification`→`WaitingForInput` path is never triggered for it),
+    /// and by `unverified_driver_starts` to age a spawn against
+    /// [`DRIVER_START_GRACE_SECS`].
+    spawned_at: i64,
+    /// [`ProgressFidelity`] tier declared by the driver running this slot,
+    /// set by [`LiveWorkerStateRegistry::set_progress_fidelity`] after
+    /// spawn. Consulted by `crate::stale_worker_sweep` to decide whether —
+    /// and at what threshold — cadence-based staleness applies to this
+    /// slot. `None` (never declared) reads as [`ProgressFidelity::Rich`]
+    /// — today's only driver (Claude) and every existing call site that
+    /// never sets this explicitly, so the default preserves current
+    /// behaviour unchanged.
+    ///
+    /// In-memory only, and not persisted or rehydrated anywhere: if the
+    /// engine restarts while a worker is alive, the registry starts empty
+    /// and the slot re-defaults to `Rich` until the driver re-declares
+    /// (which today only happens at spawn, not on rehydrate). For a
+    /// `Coarse`- or `Minimal`-tier driver this silently re-enables
+    /// cadence-based staleness judgement for a slot the exemption was
+    /// meant to protect — a live worker mid-turn with no per-tool event
+    /// can then be swept as stale. No-op today (Claude is `Rich`), but a
+    /// real gap for the first non-`Rich` driver.
+    progress_fidelity: Option<ProgressFidelity>,
+    /// Does this run's driver declare `Capability::AwaitingInputSignal`?
+    /// Gates whether `apply_event` trusts a `WorkerEvent::Notification` as
+    /// a genuine "worker is blocked on human input" signal.
+    ///
+    /// Seeded `true` by `register_spawn` (Claude is the only driver in
+    /// production today, and it provides the capability), so the ~30
+    /// existing test call sites keep working unchanged. Production spawn
+    /// sites that resolve a real driver call
+    /// `register_spawn_with_capabilities` instead, passing the resolved
+    /// value directly so it can never be left at the default by a
+    /// forgotten follow-up call — see that method's doc for why the honest
+    /// default on absence is "never fake it", not a lower-fidelity guess.
+    awaiting_input_capable: bool,
+    /// Epoch-seconds timestamp of the first **driver-originated** signal
+    /// observed for the slot's current run — the moment Boss gained
+    /// positive evidence that the driver binary itself is running.
+    ///
+    /// ## Why this is not `LiveWorkerState::last_event_at`
+    ///
+    /// `last_event_at` is a *display* timestamp and is written by paths
+    /// that are not the driver: [`LiveWorkerStateRegistry::mark_stalled_spawns`]
+    /// synthesizes one when it promotes a slot out of `Spawning`, and
+    /// [`LiveWorkerStateRegistry::mark_errored`] stamps one on an
+    /// engine-side verdict. Treating it as proof of driver start would
+    /// let the engine's own guesses vouch for a driver that never ran.
+    /// This field is written by [`LiveWorkerStateRegistry::record_driver_signal`]
+    /// from two call sites in the hook ingress — a real worker hook, and
+    /// receipt of a `transcript_path` — and from the AgentJsonlFile ingress
+    /// (`WorkerEventSink::record_driver_attach`: discovery-time file
+    /// progress or attachment). There is also a non-hook-originated
+    /// writer: [`crate::spawn_ack_sweep::reap_never_started_spawn`]'s
+    /// liveness veto, which records a transcript found on disk as
+    /// [`DriverSignalKind::CorrelatedTranscript`] or
+    /// [`DriverSignalKind::CorrelatedTranscriptUnattachable`] before
+    /// refusing a vetoable reap. That write is still driver-originated in
+    /// the sense this field exists to protect — only the driver itself can
+    /// have produced the transcript the veto found — it just arrives via a
+    /// filesystem probe instead of the hook socket. It is additionally
+    /// restored (not fabricated) by
+    /// [`LiveWorkerStateRegistry::seed_semantic_progress`] from a durable
+    /// checkpoint on re-adoption, carrying forward proof this same field
+    /// already held before an engine restart. Every writer is either a
+    /// direct driver-originated signal or a restoration of one, so "has
+    /// this driver started?" still has a single, unforgeable answer.
+    ///
+    /// Note what is deliberately absent: `shell_pid`. A reported
+    /// tmux pane pid (`#{pane_pid}`) identifies the pane process, which
+    /// may still be the shell if the driver was never exec'd. It is zero
+    /// for remote workers or before registration. Every check that treated a positive
+    /// pid as evidence of a working worker is what the 2026-07-30
+    /// incident walked through untouched.
+    driver_signal_at: Option<i64>,
+    /// Event kind of the first driver hook received for this registration's
+    /// run. Diagnostic-only (it appears in spawn-confirmation failure logs):
+    /// first-write-wins, keyed by `run_id`, and reset whenever the slot is
+    /// re-registered. It is independent of `driver_signal_at` and plays no
+    /// part in reap fencing — never use it as proof the driver started.
+    first_hook_event: Option<String>,
+    /// Whether this registration is a newly spawned pane or an adopted
+    /// existing worker. [`DriverStartExpectation::Readopted`] still subjects
+    /// the slot to the driver-start timeout
+    /// ([`LiveWorkerStateRegistry::unverified_driver_starts`]); it changes
+    /// the pid-less tmux-invariant diagnostic and starts a fresh grace
+    /// window from this registration. See [`DriverStartExpectation`].
+    #[builder(default = DriverStartExpectation::EngineSpawned)]
+    driver_start_expectation: DriverStartExpectation,
+    /// Last **driver-originated** progress time, stamped only by
+    /// [`LiveWorkerStateRegistry::apply_event`] (and restored from the
+    /// durable checkpoint on tmux re-adoption). Never written by
+    /// [`Self::mark_stalled_spawns`] or [`Self::mark_errored`].
+    semantic_progress_at: Option<String>,
+    /// Tri-state tool condition established by driver events. Defaults to
+    /// [`SemanticToolCondition::Unknown`]; unknown is never coerced to idle.
+    #[builder(default = SemanticToolCondition::Unknown)]
+    semantic_tool_condition: SemanticToolCondition,
+    /// Tri-state turn condition established by driver events — the durable
+    /// shadow of `activity`'s turn gate (`Working` until a `Stop`). Defaults
+    /// to [`SemanticTurnCondition::Unknown`]; unknown is never coerced to
+    /// ended. Restored by [`LiveWorkerStateRegistry::seed_semantic_progress`]
+    /// and the reason a re-adopted mid-turn worker seeds as `Working` even
+    /// though its tool condition reads idle.
+    #[builder(default = SemanticTurnCondition::Unknown)]
+    semantic_turn_condition: SemanticTurnCondition,
+    /// Consecutive [`crate::transcript_liveness::TranscriptLiveness::Undeterminable`]
+    /// reap outcomes recorded for this slot's current run by
+    /// [`crate::spawn_ack_sweep::reap_never_started_spawn`]. Reset only by a
+    /// fresh registration (a new spawn or readoption creates a new
+    /// [`SlotEntry`] from scratch) — there is deliberately no "clear on a
+    /// confirmed Absent/Present" path, since either of those returns before
+    /// this counter is ever consulted.
+    #[builder(default)]
+    undeterminable_liveness_passes: u32,
+    /// Accept-order sequence of the newest hook event applied to this slot
+    /// through [`LiveWorkerStateRegistry::apply_sequenced_event`]. `None`
+    /// until the first sequenced event lands, and for slots fed only by
+    /// unsequenced ingress (the Codex stdout reader, engine-synthesized
+    /// events). A sequenced event numbered below this value was emitted by
+    /// the worker *before* the state the slot already shows, so applying it
+    /// would rewind the slot — it is refused instead; see that method.
+    last_applied_ingress_seq: Option<u64>,
+    /// The turn boundary (`Stop`) the worker is currently parked behind and
+    /// has not yet resumed from. Set by a `Stop`, taken by the next
+    /// main-session `UserPromptSubmit`/`PreToolUse`/`PostToolUse` — see
+    /// [`TurnBoundary`]. Deliberately not derived from the slot's activity:
+    /// a permission-prompt `Notification` also leaves `Working`, but it is
+    /// not a turn boundary and the tool that follows it is not a resume.
+    open_turn_boundary: Option<TurnBoundary>,
+    /// Sequence of the newest main-session `UserPromptSubmit`/`PreToolUse`/
+    /// `PostToolUse` applied. A `Stop` numbered below it was followed by a
+    /// resumed turn even though the `Stop` itself arrives late.
+    last_main_activity_seq: Option<u64>,
+    /// Sequence of the newest `Stop` applied (it consumed any pending
+    /// `Notification`).
+    last_stop_seq: Option<u64>,
+    /// Ordered clearing events retained for this slot lifetime so a late
+    /// notification is attributed to its first consumer, not the newest one.
+    #[builder(default)]
+    pending_clear_seqs: std::collections::BTreeSet<u64>,
+    /// Whether [`crate::spawn_ack_sweep::raise_liveness_undeterminable_attention`]
+    /// has already fired for this slot's current run. Guards against raising
+    /// the same attention item again on every subsequent pass once the
+    /// threshold has been crossed.
+    #[builder(default = false)]
+    undeterminable_attention_raised: bool,
+    /// Set atomically with [`LiveWorkerStateRegistry::confirm_never_started_reap`]
+    /// when a never-started reap commits. [`LiveWorkerStateRegistry::record_driver_signal`]
+    /// refuses to accept new evidence once this is set, so a hook that loses
+    /// the mutex to the reap is not recorded as proof that would contradict
+    /// an orphan already in flight.
+    #[builder(default = false)]
+    reap_committed: bool,
+}
+
+/// Whether the engine created this slot's current registration.
+///
+/// Driver-start verification asks whether the current registration ever
+/// produced a driver signal. A re-adoption registers a worker that was
+/// already running before this engine process began tracking it, so
+/// `spawned_at` is the moment the engine noticed, not the moment anything
+/// exec'd — a fresh grace window, not an exemption from the timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverStartExpectation {
+    /// The engine launched a driver for this registration and is owed
+    /// proof it came up. The normal spawn path.
+    EngineSpawned,
+    /// The registration re-adopted an already-running worker. The
+    /// driver-start timeout still applies after a fresh grace window from
+    /// this registration; a shell-only re-adoption with no driver signal
+    /// must time out. What this mark changes is the pid-less tmux-invariant
+    /// diagnostic (a missing pane pid is legal for a worker this engine
+    /// process did not launch) and that grace window's start. Driver-start
+    /// verification still requires a driver-originated signal; a live login
+    /// shell alone is not proof that the driver ever ran.
+    Readopted,
+}
+
+/// What Boss knows about a re-adopted worker at the moment it re-registers
+/// the slot. Passed to [`LiveWorkerStateRegistry::register_readoption`].
+///
+/// The two triggers differ in kind, and collapsing them would either
+/// discard real proof or manufacture it:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadoptionEvidence {
+    /// A worker hook arrived for a run the engine had already
+    /// terminalized. That is driver-originated proof of exactly the sort
+    /// [`LiveWorkerStateRegistry::record_driver_signal`] exists to record,
+    /// so re-adoption records it rather than throwing it away.
+    DriverHook,
+    /// Only a recorded shell pid was observed alive (`crate::durable_liveness`
+    /// probing the tmux `#{pane_pid}` the engine recorded at session creation). That is evidence
+    /// about the *shell*, never about the driver — the exact conflation
+    /// `driver_signal_at` exists to prevent — so nothing is recorded as
+    /// driver proof.
+    LiveShellPid,
+}
+
+/// Which driver-originated signal proved the driver is running. Recorded
+/// for the log line and the reap's dispatch event; both variants are
+/// equally authoritative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverSignalKind {
+    /// A worker hook event arrived over the events socket.
+    HookEvent,
+    /// A `transcript_path` was resolved for the run. Proof the driver
+    /// created its transcript, even if the hook's slot fan-out was
+    /// dropped (a hook can race `register_run_slot`).
+    TranscriptPath,
+    /// A transcript for the run was found on disk by the reaper's own
+    /// liveness probe ([`crate::transcript_liveness`]) — a rollout newer
+    /// than the pre-spawn baseline under the run's progress-ingress root
+    /// that discovery's own correlation rules would also attach, or the
+    /// recorded transcript path itself. Only the driver writes either, so
+    /// this is driver-start proof even when no ingress ever delivered an
+    /// event for the run (2026-09-13: four live Codex workers reaped
+    /// because discovery never attached rollouts that existed).
+    CorrelatedTranscript,
+    /// Same proof as [`Self::CorrelatedTranscript`] — a rollout the
+    /// liveness probe found on disk — but one discovery's own correlation
+    /// rules would NOT attach to the run (a `cwd` mismatch, an oversized
+    /// `session_meta`, etc.). Still driver-originated evidence the driver
+    /// ran, but distinguished from a clean attachment: an operator reading
+    /// this signal kind knows discovery has an unrelated bug worth fixing,
+    /// where `CorrelatedTranscript` implies discovery would have worked.
+    CorrelatedTranscriptUnattachable,
+}
+
+impl DriverSignalKind {
+    /// Stable, greppable label for logs and dispatch-event details.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DriverSignalKind::HookEvent => "hook_event",
+            DriverSignalKind::TranscriptPath => "transcript_path",
+            DriverSignalKind::CorrelatedTranscript => "correlated_transcript",
+            DriverSignalKind::CorrelatedTranscriptUnattachable => "correlated_transcript_unattachable",
+        }
+    }
+}
+
+/// A slot whose spawn has gone [`DRIVER_START_GRACE_SECS`] without any
+/// driver-originated signal — i.e. Boss has no evidence the driver
+/// binary ever executed. Returned by
+/// [`LiveWorkerStateRegistry::unverified_driver_starts`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnverifiedDriverStart {
+    pub slot_id: u8,
+    pub run_id: String,
+    /// The tmux `#{pane_pid}` the engine read at session creation, if any. Carried purely so the
+    /// reap can name it in the log and the attention item — it is
+    /// explicitly NOT part of the decision.
+    pub shell_pid: i32,
+    /// How long the slot has gone without a driver signal, in seconds.
+    pub silent_secs: i64,
+    /// Activity the slot is advertising. Recorded for diagnosis: the
+    /// 2026-07-30 grok occurrence sat at `Spawning`, while a
+    /// capability-declaring driver's identical failure would have been
+    /// promoted to `WaitingForInput` by `mark_stalled_spawns` first.
+    pub activity: WorkerActivity,
+}
+
+impl LiveWorkerStateRegistry {
+    pub fn tool_completed_since_prompt(&self, slot_id: u8) -> bool {
+        self.inner
+            .lock()
+            .expect("registry mutex poisoned")
+            .get(&slot_id)
+            .is_some_and(|entry| entry.meta.tool_completed_since_prompt)
+    }
+
+    /// Use durable persona leases for every production registration/release path.
+    pub fn with_work_db(work_db: std::sync::Arc<boss_work_db::WorkDb>) -> Self {
+        Self {
+            persona_store: Some(work_db),
+            ..Self::default()
+        }
+    }
+
+    pub fn release_persona_for_run(&self, run_id: &str) {
+        let _lifecycle = self.lock_lifecycle();
+        let registered = self
+            .inner
+            .lock()
+            .expect("registry mutex poisoned")
+            .values()
+            .any(|entry| entry.state.run_id == run_id);
+        if !registered {
+            self.release_persona_locked(run_id);
+        }
+    }
+
+    fn release_persona_locked(&self, run_id: &str) {
+        #[cfg(any(test, feature = "test-support"))]
+        self.notify_persona_boundary();
+        if let Some(db) = &self.persona_store
+            && let Err(error) = db.release_persona(run_id)
+        {
+            tracing::error!(run_id, %error, "could not release durable persona lease");
+        }
+    }
+    fn lock_lifecycle(&self) -> std::sync::MutexGuard<'_, ()> {
+        #[cfg(any(test, feature = "test-support"))]
+        if matches!(
+            self.serial.lifecycle.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ) && let Some(waiter) = self.test_hooks.lifecycle_waiter.lock().unwrap().take()
+        {
+            let _ = waiter.send(());
+        }
+        self.serial.lifecycle.lock().expect("lifecycle mutex poisoned")
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn notify_persona_boundary(&self) {
+        let hook = self.test_hooks.persona_boundary.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stamp the initial state for a freshly-allocated slot. Activity
+    /// is `Spawning` until the first hook arrives. Any prior entry
+    /// for this slot is replaced — the previous worker has been
+    /// released, so its terminal state isn't useful.
+    ///
+    /// `binding` is the work-item linkage for the run. Production
+    /// dispatch always passes `Some`; in-process tests and any
+    /// future direct-launch path that bypasses the work tables may
+    /// pass `None`.
+    ///
+    /// Seeds `awaiting_input_capable` `true` (Claude's historical
+    /// behaviour) — the ~30 existing test call sites in this crate rely on
+    /// that default. Production spawn paths that resolve an actual driver
+    /// must call [`Self::register_spawn_with_capabilities`] instead, so the
+    /// capability travels with registration rather than depending on a
+    /// second call that a future call site could forget.
+    #[track_caller]
+    pub fn register_spawn(
+        &self,
+        slot_id: u8,
+        run_id: impl Into<String>,
+        model: impl Into<String>,
+        shell_pid: i32,
+        binding: Option<WorkItemBinding>,
+    ) {
+        self.register_spawn_with_capabilities(
+            slot_id,
+            run_id,
+            model,
+            shell_pid,
+            binding,
+            true,
+            LiveSpawnRouting::none(),
+        );
+    }
+
+    /// Same as [`Self::register_spawn`], but takes `awaiting_input_capable`
+    /// directly instead of seeding `true` and relying on a follow-up
+    /// [`Self::set_awaiting_input_capable`] call. Production spawn sites
+    /// that resolve a real driver should call this: it closes the
+    /// fail-open gap where a spawn site that registers a slot but forgets
+    /// the setter would silently default to "trust `Notification`", and it
+    /// removes the window between the two calls where a concurrently
+    /// delivered hook event would be evaluated against that stale default.
+    ///
+    /// `routing` carries the attributed worker pool (`"main"` /
+    /// `"automation"` / `"review"`) and the execution kind
+    /// (`"task_implementation"`, …). Production dispatch always passes
+    /// both so `bossctl agents list` can render them without joining the
+    /// execution table; tests may leave them `None` via
+    /// [`LiveSpawnRouting::none`].
+    ///
+    /// Arity is one over clippy's default: the six spawn-identity args
+    /// (slot/run/model/pid/binding/capability) predate this method's
+    /// routing stamp, and collapsing them further would obscure the
+    /// call site. Routing is already a struct to absorb pool + kind.
+    ///
+    /// Registration is traced, mirroring [`Self::release_slot`]'s removal
+    /// trace. This registry is the *only* thing `bossctl agents list`
+    /// renders, so "was this run ever listed, and for how long?" is a
+    /// question operators ask of the engine trace after the fact. Removal
+    /// was already greppable; registration was not, so the trace could
+    /// show a slot being cleared with no record that it was ever occupied
+    /// — and a run that never appeared in `agents list` was
+    /// indistinguishable from one that appeared and was cleared
+    /// milliseconds later. `#[track_caller]` names the spawn path
+    /// (production dispatch vs. the remote-worker lazy registration)
+    /// without threading a reason through every call site. The line is
+    /// emitted *after* the insert, as `release_slot` emits its own after
+    /// the removal, so the timestamps of the two halves are comparable.
+    ///
+    /// Displacing an existing entry additionally logs a `warn`: that is
+    /// the prior run's last moment of visibility, and it happens with no
+    /// `release_slot` to pair against.
+    #[allow(clippy::too_many_arguments)]
+    #[track_caller]
+    pub fn register_spawn_with_capabilities(
+        &self,
+        slot_id: u8,
+        run_id: impl Into<String>,
+        model: impl Into<String>,
+        shell_pid: i32,
+        binding: Option<WorkItemBinding>,
+        awaiting_input_capable: bool,
+        routing: LiveSpawnRouting,
+    ) {
+        let _lifecycle = self.lock_lifecycle();
+        self.register_spawn_locked(
+            slot_id,
+            run_id,
+            model,
+            shell_pid,
+            binding,
+            awaiting_input_capable,
+            routing,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[track_caller]
+    fn register_spawn_locked(
+        &self,
+        slot_id: u8,
+        run_id: impl Into<String>,
+        model: impl Into<String>,
+        shell_pid: i32,
+        binding: Option<WorkItemBinding>,
+        awaiting_input_capable: bool,
+        routing: LiveSpawnRouting,
+    ) {
+        let caller = std::panic::Location::caller();
+        let mut state = LiveWorkerState::new_spawning_with_routing_and_hosting(
+            slot_id,
+            run_id,
+            model,
+            shell_pid,
+            binding,
+            routing.pool,
+            routing.kind,
+            routing.tmux_hosted,
+        );
+        state.apply_metadata(routing.metadata);
+        // Persona DB work stays outside the registry lock: dispatch holds the
+        // DB connection while calling `is_run_live`, so the reverse order
+        // could deadlock.
+        #[cfg(any(test, feature = "test-support"))]
+        self.notify_persona_boundary();
+        if let Some(db) = &self.persona_store {
+            match db.lease_persona_for_execution(&state.run_id) {
+                Ok(name) => state.name = name,
+                Err(error) => {
+                    tracing::warn!(run_id = %state.run_id, %error, "could not load persona; using execution identity")
+                }
+            }
+        }
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        // Copy what the trace line needs before `state` is moved into the
+        // map. The line itself is emitted *after* the mutation, mirroring
+        // `release_slot` — the two halves are meant to be diffed by
+        // timestamp for a run id, so each must be stamped at the point its
+        // own mutation actually lands, not before.
+        let run_id = state.run_id.clone();
+        let model = state.model.clone();
+        let pool = state.pool.clone();
+        let kind = state.kind.clone();
+        let work_item_id = state.work_item_id.clone();
+
+        // The whole entry — wire state and engine bookkeeping alike — is
+        // replaced in one `insert`. A recycled slot therefore cannot
+        // inherit *any* of the previous occupant's metadata. That is
+        // hygiene for `progress_fidelity` (a fresh occupant defaults to
+        // `Rich` until the spawn flow declares a tier) and load-bearing
+        // for `driver_signal_at`: a slot whose prior run had a healthy
+        // driver must never vouch for a new run whose driver never
+        // exec'd, which is precisely the "one process stands in for
+        // another" confusion that signal exists to remove.
+        let mut meta = SlotMeta::builder()
+            .spawned_at(boss_engine_utils::epoch_time::now_epoch_secs())
+            .awaiting_input_capable(awaiting_input_capable)
+            .build();
+        // Hand over hooks that arrived between CLI launch and now, under the
+        // same `inner` lock as the insert so a concurrent hook either lands
+        // in the pending buffer before this drain or sees the new entry.
+        let pending = self
+            .pending_hooks
+            .lock()
+            .expect("pending hooks mutex poisoned")
+            .remove(&run_id);
+        if let Some(pending) = pending {
+            if pending.driver_signal_at.is_some() {
+                tracing::info!(
+                    slot_id,
+                    run_id = %run_id,
+                    "driver-start verified: hook received before live-state registration",
+                );
+            }
+            meta.driver_signal_at = pending.driver_signal_at;
+            meta.first_hook_event = pending.first_hook_event;
+        }
+        let displaced = guard
+            .insert(slot_id, SlotEntry { state, meta })
+            .map(|prior| prior.state);
+        drop(guard);
+
+        tracing::info!(
+            slot_id,
+            run_id = %run_id,
+            model = %model,
+            shell_pid,
+            pool = pool.as_deref().unwrap_or("-"),
+            kind = kind.as_deref().unwrap_or("-"),
+            work_item_id = work_item_id.as_deref().unwrap_or("-"),
+            awaiting_input_capable,
+            replaced_run_id = displaced.as_ref().map(|prior| prior.run_id.as_str()).unwrap_or("-"),
+            registered_by = %caller,
+            "live-state registry: slot entry registered; run is now visible to `bossctl agents list`",
+        );
+
+        // A slot re-registered without an intervening `release_slot` is an
+        // engine bookkeeping desync (and what `EngineToAppError::SlotBusy`
+        // reports when the app's viewer disagrees). The prior
+        // run silently disappears from `agents list` here, so without this
+        // line the trace would carry two `registered` events and one
+        // `cleared` for the same slot, and diffing the pair for the
+        // displaced run id would give the wrong answer.
+        if let Some(prior) = displaced {
+            // The displaced run's lease would otherwise stay active forever
+            // (a same-run re-registration keeps its lease).
+            if prior.run_id != run_id {
+                self.release_persona_locked(&prior.run_id);
+            }
+            tracing::warn!(
+                slot_id,
+                run_id = %prior.run_id,
+                activity = prior.activity.as_str(),
+                shell_pid = prior.shell_pid,
+                replaced_by_run_id = %run_id,
+                registered_by = %caller,
+                "live-state registry: registration displaced a live entry without a release_slot; \
+                 the prior run's visibility in `bossctl agents list` ends here",
+            );
+        }
+    }
+
+    /// Register a slot for a worker that was **already running** before
+    /// the engine re-established tracking for it.
+    ///
+    /// Same registration as [`Self::register_spawn_with_capabilities`],
+    /// plus the three things re-adoption must not get wrong:
+    ///
+    /// 1. The entry is marked [`DriverStartExpectation::Readopted`], so
+    ///    the pid-less tmux-invariant diagnostic does not treat a missing
+    ///    pane pid as illegal, and `spawned_at` starts a fresh driver-start
+    ///    grace window. The driver-start timeout still applies: a
+    ///    shell-only re-adoption must time out unless a real driver signal
+    ///    was observed.
+    /// 2. When the re-adoption was triggered by a worker hook
+    ///    ([`ReadoptionEvidence::DriverHook`]) the driver signal is
+    ///    recorded, because that hook *is* driver-originated proof and
+    ///    discarding real evidence is never the safe default. A pid-only
+    ///    trigger ([`ReadoptionEvidence::LiveShellPid`]) records nothing:
+    ///    a live shell says nothing about the driver.
+    /// 3. Re-adopting the slot's current run is a reconciliation observation,
+    ///    not registration: it retains every [`LiveWorkerState`] field and
+    ///    `spawned_at`, while (re)asserting the readopted driver-start
+    ///    expectation. Full registration below applies only when the slot's
+    ///    occupant genuinely changes. A positive observed shell pid repairs a
+    ///    provisional or stale stored pid; a zero observation never clobbers a
+    ///    known pid.
+    ///
+    /// Exists as its own method rather than a flag on the spawn
+    /// registration so the marking cannot be forgotten by a caller that
+    /// registers and then returns — the failure direction of forgetting it
+    /// is a live worker being killed.
+    #[allow(clippy::too_many_arguments)]
+    #[track_caller]
+    pub fn register_readoption(
+        &self,
+        slot_id: u8,
+        run_id: impl Into<String>,
+        model: impl Into<String>,
+        shell_pid: i32,
+        binding: Option<WorkItemBinding>,
+        awaiting_input_capable: bool,
+        routing: LiveSpawnRouting,
+        evidence: ReadoptionEvidence,
+    ) {
+        let _lifecycle = self.lock_lifecycle();
+        let run_id = run_id.into();
+        // A prior DB failure may have left a placeholder name: look the persona
+        // up outside the registry lock, then revalidate before patching.
+        let needs_name_repair = self.persona_store.is_some()
+            && self
+                .inner
+                .lock()
+                .expect("registry mutex poisoned")
+                .get(&slot_id)
+                .is_some_and(|entry| {
+                    entry.state.run_id == run_id && entry.state.name == boss_protocol::placeholder_worker_name(&run_id)
+                });
+        let repaired_name = match (needs_name_repair, &self.persona_store) {
+            (true, Some(db)) => match db.lease_persona_for_execution(&run_id) {
+                Ok(name) => Some(name),
+                Err(error) => {
+                    tracing::warn!(slot_id, run_id = %run_id, %error, "re-adoption could not repair placeholder persona name");
+                    None
+                }
+            },
+            _ => None,
+        };
+        let (retained_existing_state, repaired_shell_pid) = {
+            let mut guard = self.inner.lock().expect("registry mutex poisoned");
+            match guard.get_mut(&slot_id) {
+                Some(entry) if entry.state.run_id == run_id => {
+                    if let Some(name) = repaired_name
+                        && entry.state.name == boss_protocol::placeholder_worker_name(&run_id)
+                    {
+                        entry.state.name = name;
+                    }
+                    // The worker already owns this slot. Re-adoption is a
+                    // reconciliation observation, not a new spawn, so retain
+                    // every live-state field (including an operator hold) rather
+                    // than replacing it with the freshly-spawned fiction.
+                    entry.meta.driver_start_expectation = DriverStartExpectation::Readopted;
+                    // Backfill (never overwrite) metadata the retained state
+                    // lacks, so a worker first registered without it still
+                    // gains type/project/host/start once a path can supply it.
+                    let state = &mut entry.state;
+                    let supplied = routing.metadata.clone();
+                    state.agent_type = state.agent_type.take().or(supplied.agent_type);
+                    state.project_id = state.project_id.take().or(supplied.project_id);
+                    state.project_name = state.project_name.take().or(supplied.project_name);
+                    state.host_id = state.host_id.take().or(supplied.host_id);
+                    state.started_at = state.started_at.take().or(supplied.started_at);
+                    state.product_id = state.product_id.take().or(supplied.product_id);
+                    state.work_item_short_id = state.work_item_short_id.take().or(supplied.work_item_short_id);
+                    state.pr_url = state.pr_url.take().or(supplied.pr_url);
+                    let repaired_shell_pid = (shell_pid > 0 && shell_pid != entry.state.shell_pid).then(|| {
+                        let previous_shell_pid = entry.state.shell_pid;
+                        entry.state.shell_pid = shell_pid;
+                        previous_shell_pid
+                    });
+                    // Same-run re-adoption is proof the worker survived an inferred
+                    // or confirmed death. Clear the fence and restore activity from
+                    // the in-memory semantic checkpoint; ordinary hooks cannot.
+                    if entry.meta.observed_dead || entry.meta.inferred_terminated {
+                        revive_slot_entry(entry);
+                    }
+                    (true, repaired_shell_pid)
+                }
+                _ => (false, None),
+            }
+        };
+        if retained_existing_state {
+            if evidence == ReadoptionEvidence::DriverHook {
+                self.record_driver_signal(&run_id, DriverSignalKind::HookEvent);
+            }
+            if let Some(previous_shell_pid) = repaired_shell_pid {
+                tracing::info!(
+                    slot_id,
+                    run_id = %run_id,
+                    previous_shell_pid,
+                    shell_pid,
+                    "live-state registry: re-adoption repaired the retained shell pid",
+                );
+            }
+            tracing::info!(
+                slot_id,
+                run_id = %run_id,
+                evidence = ?evidence,
+                "live-state registry: re-adoption found the same run already tracked; retained its live state",
+            );
+            return;
+        }
+        self.register_spawn_locked(
+            slot_id,
+            run_id.clone(),
+            model,
+            shell_pid,
+            binding,
+            awaiting_input_capable,
+            routing,
+        );
+        {
+            let mut guard = self.inner.lock().expect("registry mutex poisoned");
+            if let Some(entry) = guard.get_mut(&slot_id) {
+                entry.meta.driver_start_expectation = DriverStartExpectation::Readopted;
+            }
+        }
+        if evidence == ReadoptionEvidence::DriverHook {
+            self.record_driver_signal(&run_id, DriverSignalKind::HookEvent);
+        }
+        tracing::info!(
+            slot_id,
+            run_id = %run_id,
+            evidence = ?evidence,
+            "live-state registry: slot re-adopted for an already-running worker; \
+             driver-start verification still applies and starts a fresh grace window",
+        );
+    }
+
+    /// Restore a durable semantic-progress checkpoint onto a freshly
+    /// re-adopted slot.
+    ///
+    /// No-ops when the slot already has a display `last_event_at`: that means
+    /// this process has observed the worker (or retained its live state), so
+    /// the in-memory fields are newer than the checkpoint. Never writes
+    /// `last_event_at` — that field is also stamped by engine inference, and
+    /// seeding it would let `downgrade_stale_activity` coerce unknown
+    /// (`Spawning`) to idle once the restored stamp ages. The checkpoint is
+    /// itself durable proof of a driver-originated event, so it also restores
+    /// `driver_signal_at` — carrying the driver-start proof across an engine
+    /// restart without treating shell liveness as proof.
+    pub fn seed_semantic_progress(&self, slot_id: u8, checkpoint: &SemanticProgressCheckpoint) {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let Some(entry) = guard.get_mut(&slot_id) else {
+            return;
+        };
+        if entry.meta.driver_signal_at.is_none() {
+            // `progress_at` is written only at worker-event ingress. Prefer
+            // its original timestamp, but retain the proof even if a legacy
+            // row carries an unparsable timestamp.
+            entry.meta.driver_signal_at = Some(
+                boss_engine_utils::iso8601::parse_iso8601_to_epoch(&checkpoint.progress_at)
+                    .unwrap_or_else(boss_engine_utils::epoch_time::now_epoch_secs),
+            );
+        }
+        if entry.state.last_event_at.is_some() {
+            return;
+        }
+        entry.meta.semantic_progress_at = Some(checkpoint.progress_at.clone());
+        entry.meta.semantic_tool_condition = checkpoint.tool_condition;
+        entry.meta.semantic_turn_condition = checkpoint.turn_condition;
+        // The turn condition, not the tool condition, decides busy vs idle:
+        // the tool condition is `Idle` while thinking between completed tools.
+        // Codex background commands are `InFlight` during blocking polls and
+        // `Yielded` after a poll returns control to the model. The
+        // turn condition is persisted from the reducer's own turn gate, so
+        // `InTurn` holds from the first turn activity until a `Stop`.
+        match activity_from_semantic(checkpoint.turn_condition, checkpoint.tool_condition) {
+            Some(activity) => entry.state.activity = activity,
+            None => {
+                // No turn evidence. A balanced last tool boundary does not
+                // say the turn ended (the worker may be thinking or waiting
+                // on a background command), so no turn boundary is inferred
+                // from it: the slot stays unknown (`Spawning`) until the
+                // next driver event establishes the turn state. Rows
+                // written before the turn column existed are in this state
+                // once, at upgrade. Unknown must never be coerced to idle.
+            }
+        }
+    }
+
+    /// The durable semantic-progress checkpoint currently held for `slot_id`,
+    /// or `None` if no driver-originated event has been recorded (and none
+    /// was restored on re-adoption).
+    pub fn semantic_progress_for_slot(&self, slot_id: u8) -> Option<SemanticProgressCheckpoint> {
+        self.capture_semantic_progress(slot_id, None)
+    }
+
+    /// Clone the slot's checkpoint under one brief registry lock. With
+    /// `expect_run_id`, a slot that now belongs to a different run (released
+    /// and re-leased since the caller applied its event) yields `None`
+    /// rather than the new occupant's state.
+    fn capture_semantic_progress(
+        &self,
+        slot_id: u8,
+        expect_run_id: Option<&str>,
+    ) -> Option<SemanticProgressCheckpoint> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard.get(&slot_id).and_then(|entry| {
+            if expect_run_id.is_some_and(|run_id| entry.state.run_id != run_id) {
+                return None;
+            }
+            Some(SemanticProgressCheckpoint {
+                progress_at: entry.meta.semantic_progress_at.clone()?,
+                tool_condition: entry.meta.semantic_tool_condition,
+                turn_condition: entry.meta.semantic_turn_condition,
+            })
+        })
+    }
+
+    /// Capture the latest checkpoint and run `consume` (which persists it)
+    /// under a dedicated persistence lock, so writes are ordered by capture
+    /// and an older dispatch always writes the latest state. The registry
+    /// mutex is released before `consume` runs: `consume` may take the
+    /// database connection, whose holders (dispatch's live-run check) in
+    /// turn take the registry mutex. Do not re-enter this method from
+    /// `consume`.
+    ///
+    /// The checkpoint is captured only while `slot_id` still belongs to
+    /// `run_id`; otherwise `consume` sees `None` so one run's state is never
+    /// written to another run's row.
+    pub fn with_semantic_progress<R>(
+        &self,
+        slot_id: u8,
+        run_id: &str,
+        consume: impl FnOnce(Option<SemanticProgressCheckpoint>) -> R,
+    ) -> R {
+        let _persist = self.serial.persist.lock().unwrap_or_else(|e| e.into_inner());
+        let checkpoint = self.capture_semantic_progress(slot_id, Some(run_id));
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(boundary) = self.test_hooks.persist_boundary.lock().unwrap().take() {
+            let _ = boundary.send(());
+        }
+        consume(checkpoint)
+    }
+
+    /// Declare the [`ProgressFidelity`] tier for `slot_id`'s driver. The
+    /// spawn flow calls this right after `register_spawn` with the
+    /// resolved driver's `progress_fidelity()`. Slots this is never called
+    /// for (e.g. most tests) default to [`ProgressFidelity::Rich`] via
+    /// [`Self::progress_fidelity_for_slot`].
+    ///
+    /// A no-op for a slot with no live entry, mirroring the other per-slot
+    /// setters: the tier belongs to the occupant, so there is nothing to
+    /// declare it against.
+    pub fn set_progress_fidelity(&self, slot_id: u8, fidelity: ProgressFidelity) {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        if let Some(entry) = guard.get_mut(&slot_id) {
+            entry.meta.progress_fidelity = Some(fidelity);
+        }
+    }
+
+    /// The declared [`ProgressFidelity`] tier for `slot_id`, or
+    /// [`ProgressFidelity::Rich`] if never declared. Read by
+    /// `crate::stale_worker_sweep`.
+    pub fn progress_fidelity_for_slot(&self, slot_id: u8) -> ProgressFidelity {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard
+            .get(&slot_id)
+            .and_then(|entry| entry.meta.progress_fidelity)
+            .unwrap_or(ProgressFidelity::Rich)
+    }
+
+    /// Record whether the driver spawned into `slot_id` declares
+    /// `Capability::AwaitingInputSignal`. `register_spawn` seeds every
+    /// slot `true` (Claude's historical behaviour); a caller that resolves
+    /// a driver without the capability calls this with `false` so
+    /// `apply_event` stops trusting a `WorkerEvent::Notification` for this
+    /// slot as an "awaiting human input" signal.
+    ///
+    /// Deliberately does not attempt to re-derive `WaitingForInput` from a
+    /// lower-fidelity channel when set to `false` — per the agent-driver
+    /// design's absence policy for this capability (Degrade, not
+    /// Synthesize), a driver that can't know this state must not have
+    /// Boss guess it. `apply_event` honours that by leaving activity
+    /// untouched on a `Notification` it doesn't trust, so the worker
+    /// reads as `Working`/`Idle` rather than a fabricated
+    /// `WaitingForInput`.
+    ///
+    /// A no-op (silently ignored, no entry created) if the slot has no
+    /// live entry — mirrors the benign-drop behaviour of the other
+    /// per-slot setters when a hook or wiring call races spawn/release.
+    /// Whether `slot_id`'s driver can signal "awaiting input", the flag that
+    /// gates the `WaitingForInput` promotion in `derive_activity` and
+    /// `mark_stalled_spawns`.
+    ///
+    /// Defaults to `true` for a slot with no recorded answer, matching the
+    /// gates themselves — an unregistered slot must not silently lose the
+    /// promotion. Read side of [`Self::set_awaiting_input_capable`] and of the
+    /// `awaiting_input_capable` argument to
+    /// [`Self::register_spawn_with_capabilities`], so a registration site's
+    /// derivation is assertable rather than only observable through the
+    /// activity it later produces.
+    pub fn awaiting_input_capable(&self, slot_id: u8) -> bool {
+        self.inner
+            .lock()
+            .expect("registry mutex poisoned")
+            .get(&slot_id)
+            .map(|entry| entry.meta.awaiting_input_capable)
+            .unwrap_or(true)
+    }
+
+    pub fn set_awaiting_input_capable(&self, slot_id: u8, capable: bool) {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        if let Some(entry) = guard.get_mut(&slot_id) {
+            entry.meta.awaiting_input_capable = capable;
+        }
+    }
+
+    /// Drop the entry for `slot_id`. Called when the engine releases
+    /// a pane (slot is recycled).
+    ///
+    /// Removal is traced. Dropping an entry is not merely bookkeeping: a
+    /// slot with no live-tracked run becomes a husk candidate, and
+    /// `husk_pane_sweep` kills that pane's process one pass later. There
+    /// was previously no trace event on removal, so when live workers were
+    /// killed the clearing call site was invisible in the logs and the
+    /// mechanism could not be identified from a production incident.
+    /// `#[track_caller]` records which caller cleared it without requiring
+    /// every call site to thread a reason through.
+    #[track_caller]
+    pub fn release_slot(&self, slot_id: u8) {
+        let _lifecycle = self.lock_lifecycle();
+        let caller = std::panic::Location::caller();
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        // One `remove` drops the slot's entire footprint — wire state and
+        // every piece of engine bookkeeping — so no field can outlive the
+        // occupant it describes.
+        let removed = guard.remove(&slot_id).map(|entry| entry.state);
+        drop(guard);
+        if let Some(state) = &removed {
+            self.release_persona_locked(&state.run_id);
+        }
+
+        match removed {
+            Some(state) => tracing::info!(
+                slot_id,
+                run_id = %state.run_id,
+                activity = state.activity.as_str(),
+                last_event_at = ?state.last_event_at,
+                current_tool = ?state.current_tool,
+                shell_pid = state.shell_pid,
+                cleared_by = %caller,
+                "live-state registry: slot entry cleared; slot is now a husk candidate",
+            ),
+            None => tracing::debug!(
+                slot_id,
+                cleared_by = %caller,
+                "live-state registry: release_slot on a slot with no entry (no-op)",
+            ),
+        }
+    }
+
+    /// Drop the live-state entry belonging to `run_id`, whichever slot it
+    /// currently occupies. Returns the slot id that was released, or
+    /// `None` if no live entry matches `run_id` (already released, or
+    /// never registered — a benign no-op).
+    ///
+    /// For callers that only know the run id, not the slot — e.g.
+    /// `TransientRecoveryReaper::reap_worker` after `release_worker_pane`
+    /// found no run→slot mapping (its `NoLiveWorker` and untracked-viewer
+    /// arms skip [`Self::release_slot`]). Left alone, that shape strands both the
+    /// pool claim and this live-state entry: an entry still backing the
+    /// claim is exactly what `pool_claim_sweep` skips by design, so
+    /// nothing else ever reconciles it. Dropping the entry here clears
+    /// that gate.
+    #[track_caller]
+    pub fn release_slot_for_run(&self, run_id: &str) -> Option<u8> {
+        let _lifecycle = self.lock_lifecycle();
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let slot_id = guard.values().find(|entry| entry.state.run_id == run_id)?.state.slot_id;
+        guard.remove(&slot_id);
+        drop(guard);
+        self.release_persona_locked(run_id);
+        tracing::info!(slot_id, run_id, cleared_by = %std::panic::Location::caller(), "live-state registry: matching run entry cleared");
+        Some(slot_id)
+    }
+
+    /// Snapshot of every entry. Used by the frontend RPC handler and
+    /// by the topic publisher.
+    pub fn snapshot(&self) -> Vec<LiveWorkerState> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        let mut out: Vec<LiveWorkerState> = guard.values().map(|entry| entry.state.clone()).collect();
+        out.sort_by_key(|s| s.slot_id);
+        out
+    }
+
+    /// Test-only pid seeder. Production stamps `shell_pid` at registration
+    /// via [`Self::register_spawn_with_capabilities`]; this remains for
+    /// tests that seed or mutate a pid without the full spawn flow.
+    /// Returns the slot id if the entry was found and updated, or `None`
+    /// if no live slot matches.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn update_shell_pid(&self, run_id: &str, shell_pid: i32) -> Option<u8> {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        for entry in guard.values_mut() {
+            if entry.state.run_id == run_id {
+                let slot_id = entry.state.slot_id;
+                entry.state.shell_pid = shell_pid;
+                return Some(slot_id);
+            }
+        }
+        None
+    }
+
+    /// Record that a **driver-originated** signal arrived for `run_id` —
+    /// positive proof the driver binary is running.
+    ///
+    /// This is the writer of `driver_signal_at` for a live-observed
+    /// signal — [`LiveWorkerStateRegistry::seed_semantic_progress`] is the
+    /// only other writer, and it only restores a value this method (or a
+    /// prior engine process's call to it) already established, so this
+    /// remains the sole source of a *new* "has this driver started?"
+    /// answer. It is deliberately keyed by `run_id` rather than slot: the hook ingress
+    /// resolves `transcript_path` *before* it looks up the slot mapping
+    /// (`worker_events.rs`), and that lookup can legitimately miss for a
+    /// hook racing `register_run_slot`. Keying on the run means the
+    /// proof lands whenever the live-state registry knows the run, not
+    /// only when the slot fan-out survives.
+    ///
+    /// Idempotent and monotonic: the FIRST signal wins and later ones do
+    /// not move the timestamp. The question this answers is "did the
+    /// driver ever start?", not "when was it last alive" — that is
+    /// `last_event_at`'s job, and conflating the two is what let a
+    /// synthesized timestamp masquerade as driver evidence.
+    ///
+    /// Returns the slot id when a live entry matched, `None` otherwise
+    /// (a hook for a released or unknown run — a benign no-op).
+    pub fn record_driver_signal(&self, run_id: &str, kind: DriverSignalKind) -> Option<u8> {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let Some(entry) = guard.values_mut().find(|entry| entry.state.run_id == run_id) else {
+            // No entry yet: buffer the proof if registration is pending for
+            // this run (see `arm_pending_hooks`), else a benign no-op.
+            // `guard` stays held so registration cannot interleave.
+            if let Some(pending) = self
+                .pending_hooks
+                .lock()
+                .expect("pending hooks mutex poisoned")
+                .get_mut(run_id)
+            {
+                pending
+                    .driver_signal_at
+                    .get_or_insert_with(boss_engine_utils::epoch_time::now_epoch_secs);
+            }
+            return None;
+        };
+        let slot_id = entry.state.slot_id;
+        if entry.meta.reap_committed {
+            // The never-started reap already committed under this same
+            // mutex; accepting the signal now would record proof for a
+            // worker the sweep is about to orphan.
+            return None;
+        }
+        if entry.meta.driver_signal_at.is_some() {
+            // Already proven; keep the first timestamp.
+            return Some(slot_id);
+        }
+        entry.meta.driver_signal_at = Some(boss_engine_utils::epoch_time::now_epoch_secs());
+        drop(guard);
+        tracing::info!(
+            slot_id,
+            run_id,
+            signal = kind.as_str(),
+            "driver-start verified: first driver-originated signal received for this run",
+        );
+        Some(slot_id)
+    }
+
+    /// Arm hook buffering for `run_id` before its CLI is launched, discarding
+    /// any evidence buffered for an earlier attempt of the same run so a
+    /// retry cannot inherit it. Hooks that arrive before the slot is
+    /// registered are held and moved into the slot by registration; see
+    /// [`Self::disarm_pending_hooks`] for the failure path.
+    pub fn arm_pending_hooks(&self, run_id: &str) {
+        self.pending_hooks
+            .lock()
+            .expect("pending hooks mutex poisoned")
+            .insert(run_id.to_owned(), PendingHooks::default());
+    }
+
+    /// Drop buffered pre-registration evidence for `run_id` (the launch
+    /// failed before registration, so nothing will ever drain it).
+    pub fn disarm_pending_hooks(&self, run_id: &str) {
+        self.pending_hooks
+            .lock()
+            .expect("pending hooks mutex poisoned")
+            .remove(run_id);
+    }
+
+    /// Record the event kind of the first driver hook seen for `run_id`.
+    ///
+    /// Diagnostic-only and first-write-wins; the value is reset when the slot
+    /// is re-registered and is independent of `driver_signal_at` and reap
+    /// fencing. Buffers into the pending slot when registration has not
+    /// happened yet (see [`Self::arm_pending_hooks`]).
+    pub fn record_hook_event_kind(&self, run_id: &str, kind: &str) {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        if let Some(entry) = guard.values_mut().find(|entry| entry.state.run_id == run_id) {
+            if entry.meta.first_hook_event.is_none() {
+                entry.meta.first_hook_event = Some(kind.to_owned());
+                tracing::info!(run_id, first_hook_event = kind, "first driver hook received");
+            }
+        } else if let Some(pending) = self
+            .pending_hooks
+            .lock()
+            .expect("pending hooks mutex poisoned")
+            .get_mut(run_id)
+        {
+            pending.first_hook_event.get_or_insert_with(|| kind.to_owned());
+        }
+    }
+
+    /// The first hook event kind recorded for `run_id`'s live slot, if any.
+    /// Diagnostic-only: see [`Self::record_hook_event_kind`].
+    pub fn first_hook_event_for_run(&self, run_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("registry mutex poisoned")
+            .values()
+            .find(|entry| entry.state.run_id == run_id)
+            .and_then(|entry| entry.meta.first_hook_event.clone())
+    }
+
+    /// Whether a driver-originated signal has been recorded for `slot_id`.
+    pub fn driver_signal_at(&self, slot_id: u8) -> Option<i64> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard.get(&slot_id).and_then(|entry| entry.meta.driver_signal_at)
+    }
+
+    /// Whether any live slot for `run_id` has recorded a driver-originated
+    /// signal. Spawn-time confirmation keys on the run rather than the slot
+    /// so a hook that won the race against slot fan-out still counts.
+    pub fn has_driver_signal_for_run(&self, run_id: &str) -> bool {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard
+            .values()
+            .any(|entry| entry.state.run_id == run_id && entry.meta.driver_signal_at.is_some())
+    }
+
+    /// Record one `LivenessUndeterminable` reap outcome for `run_id`'s live
+    /// slot, so [`crate::spawn_ack_sweep::reap_never_started_spawn`] can
+    /// escalate a permanently-unreadable liveness answer instead of holding
+    /// it forever behind a log line.
+    ///
+    /// Returns `Some(true)` the first time the consecutive count reaches
+    /// `threshold` — the caller should raise exactly one attention item —
+    /// `Some(false)` on every other call (including after the item has
+    /// already been raised, so it is never raised twice for the same
+    /// registration), and `None` when no live slot matches `run_id` (already
+    /// released — a benign no-op).
+    pub fn record_liveness_undeterminable(&self, run_id: &str, threshold: u32) -> Option<bool> {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let entry = guard.values_mut().find(|entry| entry.state.run_id == run_id)?;
+        entry.meta.undeterminable_liveness_passes = entry.meta.undeterminable_liveness_passes.saturating_add(1);
+        let should_raise =
+            entry.meta.undeterminable_liveness_passes == threshold && !entry.meta.undeterminable_attention_raised;
+        if should_raise {
+            entry.meta.undeterminable_attention_raised = true;
+        }
+        Some(should_raise)
+    }
+
+    /// Whether `slot_id`'s current registration is owed driver-start proof
+    /// for a pane this engine spawned (`EngineSpawned`) or was re-adopted
+    /// (`Readopted`) — see [`DriverStartExpectation`]. Driver-start
+    /// verification itself applies to both cases; this only distinguishes
+    /// which timeout question is in play. `None` for a slot with no live
+    /// entry.
+    pub fn driver_start_expectation(&self, slot_id: u8) -> Option<DriverStartExpectation> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard.get(&slot_id).map(|entry| entry.meta.driver_start_expectation)
+    }
+
+    /// Every live slot that has gone `threshold_secs` past its spawn
+    /// **without any driver-originated signal** — Boss has no evidence
+    /// the driver binary ever executed.
+    ///
+    /// ## What this deliberately does NOT look at
+    ///
+    /// - **`shell_pid`.** A positive pid is the login shell hosting the
+    ///   pane, not the driver. `crate::spawn_ack_sweep`'s old
+    ///   `shell_pid > 0` skip and `mark_stalled_spawns`'s inverse
+    ///   `shell_pid <= 0` skip between them left a slot with a live
+    ///   shell and no driver owned by neither.
+    /// - **`activity`.** Restricting to `Spawning` would re-open the
+    ///   same hole from the other side: `mark_stalled_spawns` promotes a
+    ///   capability-declaring driver's identical failure to
+    ///   `WaitingForInput`, which would then escape this check.
+    /// - **`awaiting_input_capable`.** The capability gates whether Boss
+    ///   may *interpret* a `Notification` as "awaiting a human". It has
+    ///   nothing to say about whether a process exists, so it must not
+    ///   gate driver-start verification — that exemption is exactly why
+    ///   grok's occurrence went undetected.
+    /// - **`last_event_at`.** Written by `mark_stalled_spawns` and
+    ///   `mark_errored` from engine-side inference. Only
+    ///   `driver_signal_at` is unforgeable.
+    ///
+    /// The result is that this check fires for every driver, with any
+    /// capability set, in any activity, with or without a reported pid.
+    ///
+    /// ## Re-adoption preserves proof, not an exemption
+    ///
+    /// A re-adopted slot remains subject to this check. Its registration
+    /// timestamp starts a fresh grace window, during which durable semantic
+    /// progress is restored if the driver had signalled before an engine
+    /// restart. That checkpoint restores `driver_signal_at`, so a genuine
+    /// long-running worker remains protected. A re-adoption supported only
+    /// by a live login shell has no such proof and must time out: shell
+    /// liveness says nothing about whether the driver ever executed.
+    ///
+    /// A slot whose `spawned_at` is in the future is skipped as too
+    /// recent, the same as any other in-window spawn.
+    pub fn unverified_driver_starts(&self, now_epoch_secs: i64, threshold_secs: i64) -> Vec<UnverifiedDriverStart> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        let cutoff = now_epoch_secs.saturating_sub(threshold_secs);
+        let mut out = Vec::new();
+        for (slot_id, entry) in guard.iter() {
+            if entry.meta.driver_signal_at.is_some() {
+                continue;
+            }
+            if entry.meta.spawned_at > cutoff {
+                continue;
+            }
+            out.push(UnverifiedDriverStart {
+                slot_id: *slot_id,
+                run_id: entry.state.run_id.clone(),
+                shell_pid: entry.state.shell_pid,
+                silent_secs: now_epoch_secs.saturating_sub(entry.meta.spawned_at),
+                activity: entry.state.activity,
+            });
+        }
+        out.sort_by_key(|c| c.slot_id);
+        out
+    }
+
+    /// Stamp (or clear) the bound work item's PR URL on the live slot
+    /// for `run_id`. Called when a `cube pr create` / `gh pr create`
+    /// URL is verified against this execution's branch, so the Agents
+    /// pane header can show the PR while the worker is still running.
+    /// Returns `true` iff the stored value changed.
+    pub fn set_pr_url_for_run(&self, run_id: &str, pr_url: Option<String>) -> bool {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        for entry in guard.values_mut() {
+            if entry.state.run_id == run_id {
+                if entry.state.pr_url == pr_url {
+                    return false;
+                }
+                entry.state.pr_url = pr_url;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Set the `held` flag for the slot that owns `run_id`. Walks the
+    /// registry for a matching `run_id` and writes the flag in place.
+    /// Returns the slot id if the entry was found and updated, or `None`
+    /// if no live slot matches. Called by the `HoldRun`/`ReleaseHoldRun`
+    /// RPC handlers so `bossctl agents list`/`status` reflect an operator
+    /// hold immediately, without waiting for the next hook event.
+    pub fn set_held(&self, run_id: &str, held: bool) -> Option<u8> {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        for entry in guard.values_mut() {
+            if entry.state.run_id == run_id {
+                let slot_id = entry.state.slot_id;
+                entry.state.held = held;
+                return Some(slot_id);
+            }
+        }
+        None
+    }
+
+    /// Record the outcome of the engine's latest attempt to attach
+    /// `run_id`'s viewer to the app: `Some(reason)` after a failed
+    /// attempt, `None` once an attach succeeds. Keyed by run id because
+    /// every attach site (spawn, registration re-attach, the app's own
+    /// `RequestWorkerPaneAttach`) addresses the worker by run, not slot.
+    /// Returns `true` iff the stored value changed, so callers broadcast
+    /// only on a real transition. A run the registry does not know is a
+    /// no-op: there is no live worker whose card could show the reason.
+    pub fn set_viewer_attach_error(&self, run_id: &str, error: Option<String>) -> bool {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        for entry in guard.values_mut() {
+            if entry.state.run_id == run_id {
+                if entry.state.viewer_attach_error == error {
+                    return false;
+                }
+                entry.state.viewer_attach_error = error;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Keep a retained worker addressable without claiming a released roster name.
+    pub fn forget_persona_name(&self, run_id: &str) {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        for entry in guard.values_mut().filter(|entry| entry.state.run_id == run_id) {
+            entry.state.name = boss_protocol::placeholder_worker_name(run_id);
+        }
+    }
+
+    /// Look up the state for one slot.
+    pub fn get(&self, slot_id: u8) -> Option<LiveWorkerState> {
+        self.inner
+            .lock()
+            .expect("registry mutex poisoned")
+            .get(&slot_id)
+            .map(|entry| entry.state.clone())
+    }
+
+    /// Return the `run_id` of the non-terminal slot currently working on
+    /// `work_item_id`, or `None` if no such slot exists. Used by the
+    /// chore-update notification path to locate the worker that needs to
+    /// hear about an in-flight spec change.
+    pub fn run_id_for_work_item(&self, work_item_id: &str) -> Option<String> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard
+            .values()
+            .map(|entry| &entry.state)
+            .find(|state| !state.activity.is_terminal() && state.work_item_id.as_deref() == Some(work_item_id))
+            .map(|state| state.run_id.clone())
+    }
+
+    /// Return the current `shell_pid` for the non-terminal slot running
+    /// `run_id`, or `None` if no such slot exists or its pid is unset
+    /// (`0`, the not-yet-plumbed-back sentinel — see
+    /// [`boss_protocol::LiveWorkerState::shell_pid`]). Used by
+    /// [`crate::background_children::RegistryBackgroundActivityProbe`] to
+    /// resolve a Stop-boundary execution id to the pid its process-tree
+    /// scan should walk.
+    pub fn shell_pid_for_run(&self, run_id: &str) -> Option<i32> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard
+            .values()
+            .map(|entry| &entry.state)
+            .find(|state| !state.activity.is_terminal() && state.run_id == run_id)
+            .map(|state| state.shell_pid)
+            .filter(|pid| *pid > 0)
+    }
+
+    /// Return the most recent hook-activity stamp for `run_id`. Callers use
+    /// this as an opaque watermark: equality means no hook arrived since the
+    /// snapshot, while a change proves the worker resumed after its Stop.
+    ///
+    /// Deliberately reads `last_tool_ended_at` alone, never `last_event_at`.
+    /// `last_tool_ended_at` is written from exactly one place —
+    /// [`Self::apply_event`]'s `PostToolUse` arm — so it can only advance on
+    /// a real hook from the worker. `last_event_at` is also stamped by
+    /// engine-side inference ([`Self::mark_stalled_spawns`],
+    /// [`Self::mark_errored`]) that runs with no worker activity at all;
+    /// treating it as proof of resumption would let the engine's own
+    /// bookkeeping (e.g. an events-socket decode failure) retire a
+    /// suppressed nudge for a worker that never actually resumed — the
+    /// exact fail-closed failure mode
+    /// [`crate::completion::WorkerCompletionHandler::recheck_background_nudge`]
+    /// must avoid. `None` here means "no hook-only evidence available yet",
+    /// not "nothing changed" — callers must treat it as inconclusive rather
+    /// than as license to retire tracking.
+    pub fn activity_watermark_for_run(&self, run_id: &str) -> Option<String> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard
+            .values()
+            .find(|entry| !entry.state.activity.is_terminal() && entry.state.run_id == run_id)
+            .and_then(|entry| entry.state.last_tool_ended_at.clone())
+    }
+
+    /// True iff a live state entry exists for `run_id` whose activity
+    /// indicates the worker is still attached to the slot. Used by
+    /// `RequestExecution` to detect "the latest execution is
+    /// non-terminal on paper but the worker is gone" — that's the
+    /// stale-`waiting_human` shape that would otherwise make a
+    /// kanban-driven re-dispatch a silent no-op.
+    ///
+    /// `Terminated` and `Errored` count as **not** live: the slot is
+    /// no longer holding the run open. Everything else
+    /// (`Spawning`/`Working`/`WaitingForInput`/`Idle`) does.
+    pub fn is_run_live(&self, run_id: &str) -> bool {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard
+            .values()
+            .any(|entry| entry.state.run_id == run_id && !entry.state.activity.is_terminal())
+    }
+
+    /// Return the current [`WorkerActivity`] for the non-terminal slot
+    /// running `run_id`, or `None` if no such slot exists. Used by the
+    /// merge-poller staged-URL recheck path to decide whether a live
+    /// worker is mid-turn (`Working`) — finalizing while mid-turn reaps
+    /// the worker before its remaining prompt steps run. If duplicate live
+    /// slots exist for a run, prefers `Working` conservatively.
+    pub fn activity_for_run(&self, run_id: &str) -> Option<WorkerActivity> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        let mut first = None;
+        for state in guard.values().map(|entry| &entry.state) {
+            if state.activity.is_terminal() || state.run_id != run_id {
+                continue;
+            }
+            if state.activity == WorkerActivity::Working {
+                return Some(WorkerActivity::Working);
+            }
+            first.get_or_insert(state.activity);
+        }
+        first
+    }
+
+    /// Return `last_event_at` for the non-terminal slot running `run_id`.
+    /// Prefer a `Working` slot when duplicates exist so the mid-turn PR
+    /// completion horizon is measured against the activity that is actually
+    /// blocking terminalization.
+    pub fn last_event_at_for_run(&self, run_id: &str) -> Option<String> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        let mut first = None;
+        for state in guard.values().map(|entry| &entry.state) {
+            if state.activity.is_terminal() || state.run_id != run_id {
+                continue;
+            }
+            if state.activity == WorkerActivity::Working {
+                return state.last_event_at.clone();
+            }
+            if first.is_none() {
+                first = state.last_event_at.clone();
+            }
+        }
+        first
+    }
+
+    /// Return `current_tool` (a tool in flight — an unbalanced `PreToolUse`)
+    /// for the non-terminal slot running `run_id`. Mirrors
+    /// [`Self::last_event_at_for_run`]'s duplicate-slot preference so the two
+    /// stay consistent when read together for liveness corroboration — see
+    /// [`crate::durable_liveness::corroborating_liveness`].
+    pub fn current_tool_for_run(&self, run_id: &str) -> Option<String> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        let mut first = None;
+        for state in guard.values().map(|entry| &entry.state) {
+            if state.activity.is_terminal() || state.run_id != run_id {
+                continue;
+            }
+            if state.activity == WorkerActivity::Working {
+                return state.current_tool.clone();
+            }
+            if first.is_none() {
+                first = state.current_tool.clone();
+            }
+        }
+        first
+    }
+
+    /// Apply a hook event to the state for `slot_id`. Returns `true`
+    /// if the entry actually changed, so callers can suppress no-op
+    /// topic pushes. Returns `false` if no entry exists for the slot
+    /// (event arrived before spawn registered or after release) — the
+    /// caller should treat that as a benign drop.
+    ///
+    /// `SessionStart` carries an optional `model` from the hook payload;
+    /// when present it is treated as authoritative and overwrites the
+    /// launch default stamped at spawn. When absent (Codex stdout
+    /// `thread.started`, older fixtures), the launch default is retained.
+    ///
+    /// Unsequenced form of [`Self::apply_sequenced_event`]: the event is
+    /// always applied, in arrival order. Callers whose ingress is already
+    /// sequential (the Codex stdout reader, engine-synthesized events,
+    /// tests) use this.
+    pub fn apply_event(&self, slot_id: u8, event: &WorkerEvent) -> bool {
+        matches!(
+            self.apply_sequenced_event(slot_id, None, event),
+            ApplyEventOutcome::Applied { changed: true }
+        )
+    }
+
+    /// [`Self::apply_event`], applied in the worker's emission order.
+    ///
+    /// `ingress_seq` is the accept-order sequence the events-socket accept
+    /// loop stamped on the hook's connection
+    /// ([`crate::events_socket::HookConnection::ingress_seq`]). Each
+    /// connection is dispatched on its own task, so two hooks the worker
+    /// emitted in order can reach this method in either order — and the
+    /// race is not symmetric: a turn boundary persists the transcript path
+    /// and captures run cost before it gets here, while a `PreToolUse`
+    /// arrives almost directly. When Claude Code wakes a stopped session on
+    /// its own (a background command finished) the resumed turn opens with
+    /// tool hooks, no `UserPromptSubmit`; if the preceding `Stop` is still
+    /// on its way, it lands *after* the `PreToolUse` and rewinds the slot to
+    /// `Idle` with no tool, for as long as the next hook takes to arrive —
+    /// potentially the whole of a long tool call. See worker-liveness-contract.md
+    /// for what this explains and leaves unproven about the 2026-10-15 incident.
+    ///
+    /// So the slot remembers the newest sequence it applied, and an event
+    /// numbered below it is refused as [`ApplyEventOutcome::Stale`]: it
+    /// describes a state the worker has already moved past. Liveness
+    /// bookkeeping for a stale event is unaffected — the ingress recorded
+    /// the driver signal before calling here — and `None` always applies.
+    pub fn apply_sequenced_event(
+        &self,
+        slot_id: u8,
+        ingress_seq: Option<u64>,
+        event: &WorkerEvent,
+    ) -> ApplyEventOutcome {
+        self.apply_hook_event(
+            slot_id,
+            HookOrigin {
+                ingress_seq,
+                from_subagent: false,
+            },
+            event,
+        )
+        .outcome
+    }
+
+    /// Ingress sequence of the newest hook applied to `slot_id`, if any.
+    pub fn last_applied_ingress_seq(&self, slot_id: u8) -> Option<u64> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard.get(&slot_id)?.meta.last_applied_ingress_seq
+    }
+
+    /// Ingress sequence of the newest `Stop` applied to `slot_id`, if any.
+    pub fn last_stop_ingress_seq(&self, slot_id: u8) -> Option<u64> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard.get(&slot_id)?.meta.last_stop_seq
+    }
+
+    /// [`Self::apply_sequenced_event`] with the hook's full provenance, and
+    /// the turn-resume evidence the reduction produced.
+    ///
+    /// A *late* event is not simply discarded, because hook events are
+    /// incremental transitions rather than snapshots and two of them leave
+    /// state behind that later events read:
+    ///
+    /// - a `Notification` overtaken by the `Stop` that followed it still
+    ///   turns that `Stop` into `WaitingForInput` in emission order, so the
+    ///   late `Notification` repairs the slot (or sets the pending flag the
+    ///   events after it did not clear);
+    /// - a `Stop` overtaken by the resumed turn's tool hook still opened a
+    ///   turn boundary, which is reported through
+    ///   [`HookApplied::resumed_after`] so the caller can end the wait the
+    ///   worker declared before it.
+    ///
+    /// Every other late event describes a state the worker has already left
+    /// and is refused.
+    pub fn apply_hook_event(&self, slot_id: u8, origin: HookOrigin, event: &WorkerEvent) -> HookApplied {
+        let ingress_seq = origin.ingress_seq;
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let now = current_iso8601();
+        // The wire state and the per-slot bookkeeping this arm reads and
+        // writes now live in one entry, so a single lookup reaches both;
+        // `SlotEntry`'s fields split-borrow without a second map access.
+        let Some(SlotEntry { state, meta }) = guard.get_mut(&slot_id) else {
+            return HookApplied {
+                outcome: ApplyEventOutcome::NoSlot,
+                resumed_after: None,
+                repaired: false,
+            };
+        };
+        if meta.observed_dead {
+            return HookApplied {
+                outcome: ApplyEventOutcome::ObservedDead,
+                resumed_after: None,
+                repaired: false,
+            };
+        }
+        if let Some(ingress_seq) = ingress_seq {
+            if matches!(
+                event,
+                WorkerEvent::Stop { .. } | WorkerEvent::PreToolUse { .. } | WorkerEvent::SessionEnd { .. }
+            ) {
+                meta.pending_clear_seqs.insert(ingress_seq);
+            }
+            if let Some(last_applied_seq) = meta.last_applied_ingress_seq
+                && last_applied_seq > ingress_seq
+            {
+                tracing::info!(
+                    slot_id,
+                    run_id = %state.run_id,
+                    event = worker_event_name(event),
+                    ingress_seq,
+                    last_applied_seq,
+                    activity = state.activity.as_str(),
+                    current_tool = state.current_tool.as_deref().unwrap_or("-"),
+                    "live-state registry: a hook event arrived behind a newer one; \
+                     the slot already reflects what the worker did after it",
+                );
+                let (resumed_after, repaired) = reconcile_late_event(state, meta, ingress_seq, event, origin);
+                return HookApplied {
+                    outcome: ApplyEventOutcome::Stale { last_applied_seq },
+                    resumed_after,
+                    repaired,
+                };
+            }
+            meta.last_applied_ingress_seq = Some(ingress_seq);
+        }
+        let resumed_after = record_turn_progress(meta, ingress_seq, event, origin);
+        let before = state.clone();
+
+        state.last_event_at = Some(now.clone());
+        // Driver-originated only: this method is the hook/JSONL ingress.
+        // Engine-synthesized display stamps (`mark_stalled_spawns`,
+        // `mark_errored`) never reach here, so they cannot advance the
+        // semantic checkpoint.
+        if !matches!(event, WorkerEvent::Notification { .. }) {
+            meta.semantic_progress_at = Some(now);
+        }
+        meta.semantic_tool_condition = next_tool_condition(event, meta.semantic_tool_condition);
+        // A subagent's tool hooks say nothing about the main session's turn:
+        // they can land after the main session's `Stop`, and counting them
+        // would reopen a turn that has genuinely ended.
+        let subagent_tool_event =
+            origin.from_subagent && matches!(event, WorkerEvent::PreToolUse { .. } | WorkerEvent::PostToolUse { .. });
+        if !subagent_tool_event {
+            meta.semantic_turn_condition = next_turn_condition(event, meta.semantic_turn_condition);
+        }
+        // Any hook event is proof the worker's session is responsive
+        // again — clear a stale recovery banner regardless of which
+        // event arrived, so real progress after a nudge is never
+        // shadowed by "recovering from API error …".
+        state.recovery_status = None;
+
+        match event {
+            WorkerEvent::SessionStart { source, model, .. } => {
+                // Authoritative model from the hook when present. Launch
+                // defaults (`opus`, resolved effort slug, …) are a
+                // provisional stamp so the UI never shows "Claude Unknown"
+                // before the first hook; once SessionStart reports the
+                // real id we prefer it. Empty/None leaves the launch value.
+                if let Some(model) = model {
+                    state.model = model.clone();
+                }
+                // SessionStart with source=resume keeps the existing
+                // activity when the slot has already left Spawning
+                // (worker is resuming mid-life, not spawning fresh). For
+                // Startup — and for any SessionStart that arrives while
+                // still Spawning — leave Spawning for Idle: the session
+                // is alive. SessionStart alone does not start a turn;
+                // Working arrives on UserPromptSubmit / PreToolUse.
+                if state.activity == WorkerActivity::Spawning
+                    && matches!(
+                        source,
+                        SessionStartSource::Startup
+                            | SessionStartSource::Clear
+                            | SessionStartSource::Compact
+                            | SessionStartSource::Other
+                    )
+                {
+                    state.activity = WorkerActivity::Idle;
+                }
+                // Resume deliberately leaves Spawning alone so reattach /
+                // spawn-ack proof-of-life can stamp last_event_at without
+                // claiming the worker is past spawn. The stale-activity
+                // timer ([`Self::downgrade_stale_activity`]) then moves
+                // Spawning → Idle once last_event_at ages out, instead of
+                // silently advertising "spawning" after events.sock
+                // degrades and no further hooks arrive.
+            }
+            WorkerEvent::UserPromptSubmit { .. } => {
+                meta.tool_completed_since_prompt = false;
+                state.activity = WorkerActivity::Working;
+                state.current_tool = None;
+            }
+            WorkerEvent::PreToolUse { tool_name, .. } => {
+                state.activity = WorkerActivity::Working;
+                state.current_tool = Some(tool_name.clone());
+                meta.notification_pending = false;
+                meta.notification_pending_seq = None;
+            }
+            WorkerEvent::PostToolUse { .. } => {
+                state.current_tool = None;
+                state.last_tool_ended_at = state.last_event_at.clone();
+                if !origin.from_subagent {
+                    meta.tool_completed_since_prompt = true;
+                }
+                // Don't flip to Idle here — Stop is the authoritative
+                // turn boundary. Worker may chain multiple tools.
+                state.activity = WorkerActivity::Working;
+            }
+            WorkerEvent::ToolPoll { .. } | WorkerEvent::ModelProgress { .. } => {}
+            WorkerEvent::Notification { .. } => {
+                // Only trust this as an "awaiting human input" signal when
+                // the run's driver declared `Capability::AwaitingInputSignal`
+                // (see `set_awaiting_input_capable`). Absent that — a
+                // driver that doesn't back the signal, or emitted one it
+                // shouldn't have — leave activity untouched rather than
+                // guess: this is one of two places the "don't fake
+                // WaitingForInput" contract is enforced, the other being
+                // `mark_stalled_spawns`'s own `awaiting_input_capable` check.
+                if meta.awaiting_input_capable {
+                    state.activity = WorkerActivity::WaitingForInput;
+                    state.current_tool = None;
+                    meta.notification_pending = true;
+                    meta.notification_pending_seq = ingress_seq;
+                }
+            }
+            WorkerEvent::Stop { .. } => {
+                meta.notification_pending_seq = None;
+                let was_pending = std::mem::take(&mut meta.notification_pending);
+                state.current_tool = None;
+                state.activity = if was_pending {
+                    WorkerActivity::WaitingForInput
+                } else {
+                    WorkerActivity::Idle
+                };
+            }
+            WorkerEvent::SessionEnd { .. } => {
+                state.activity = WorkerActivity::Terminated;
+                // Deliberately does NOT clear `current_tool`. On the normal
+                // path `Stop` has already cleared it, so preserving it here
+                // is a no-op. On the ABNORMAL path — a `SessionEnd` that
+                // arrives while a `PreToolUse` is still unbalanced — the
+                // unbalanced tool is the single most valuable piece of
+                // evidence the engine holds: the worker was mid-tool when
+                // the session claimed to end, so the claim is contradicted
+                // by the worker's own hook stream and the process is very
+                // likely still running. `husk_pane_sweep` reads exactly
+                // this field (via
+                // [`crate::husk_pane_sweep::live_process_evidence`]) before
+                // it kills a pane's process, and clearing it here erased
+                // the contradiction at precisely the moment it mattered.
+                //
+                // 2026-07-26: six live workers received a synchronized
+                // `SessionEnd { reason: "other" }` burst inside 250ms while
+                // their `claude` processes kept running (three were inside a
+                // multi-minute foreground `bazel` build, so no further hook
+                // was ever going to arrive). This arm flipped all six to
+                // `Terminated` and wiped their in-flight tool; 107 seconds
+                // later the husk sweep retired five of them, killing live
+                // work. Keeping `current_tool` is what lets the corroboration
+                // guard see through a `SessionEnd` the process did not honor.
+                meta.notification_pending = false;
+                meta.notification_pending_seq = None;
+            }
+        }
+
+        if state.activity != WorkerActivity::Terminated || matches!(event, WorkerEvent::SessionEnd { .. }) {
+            meta.inferred_terminated = false;
+            meta.activity_before_termination = None;
+        }
+
+        // These timestamps are stamped on hook ingress, including events
+        // that leave the observable worker state unchanged. Compare a copy
+        // with their prior values restored so only another field makes the
+        // broadcast-dedup gate report a change.
+        let mut comparable_after = state.clone();
+        comparable_after.last_event_at = before.last_event_at.clone();
+        comparable_after.last_tool_ended_at = before.last_tool_ended_at.clone();
+        HookApplied {
+            outcome: ApplyEventOutcome::Applied {
+                changed: before != comparable_after,
+            },
+            resumed_after,
+            repaired: false,
+        }
+    }
+
+    /// Record confirmed death without inventing a driver event or refreshing its summary.
+    ///
+    /// Sets the `observed_dead` fence so buffered hooks cannot restore the
+    /// slot; only [`Self::register_readoption`] (same-run) or
+    /// [`Self::revive_from_liveness_inference`] clears it.
+    pub fn mark_terminated(&self, run_id: &str) -> bool {
+        self.terminate_run(run_id, true)
+    }
+
+    /// Show the slot as exited without fencing hooks or stopping later revival.
+    ///
+    /// Used for inferred tmux death that still has a live PID: the pane must
+    /// not display as working, but a subsequent `Alive` inspection or a
+    /// driver hook must still be able to recover the slot.
+    pub fn mark_terminated_display(&self, run_id: &str) -> bool {
+        self.terminate_run(run_id, false)
+    }
+
+    fn terminate_run(&self, run_id: &str, fence: bool) -> bool {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let Some(entry) = guard.values_mut().find(|entry| entry.state.run_id == run_id) else {
+            return false;
+        };
+        let fenced = fence && !entry.meta.observed_dead;
+        if fence {
+            entry.meta.observed_dead = true;
+        }
+        if entry.state.activity != WorkerActivity::Terminated {
+            entry.meta.inferred_terminated = true;
+            entry.meta.activity_before_termination = Some(entry.state.activity);
+        }
+        let state = &mut entry.state;
+        let changed = state.activity != WorkerActivity::Terminated;
+        state.activity = WorkerActivity::Terminated;
+        state.current_tool = None;
+        state.recovery_status = None;
+        fenced || changed
+    }
+
+    /// Whether confirmed death has fenced this run's hook stream.
+    pub fn is_observed_dead(&self, run_id: &str) -> bool {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard
+            .values()
+            .any(|entry| entry.state.run_id == run_id && entry.meta.observed_dead)
+    }
+
+    /// Clear the death fence and restore activity from driver/checkpoint
+    /// evidence. Ordinary buffered hooks cannot do this.
+    ///
+    /// Returns `true` when the slot changed (fence cleared and/or activity
+    /// restored), so callers can broadcast.
+    pub fn revive_from_liveness_inference(&self, run_id: &str) -> bool {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let Some(entry) = guard.values_mut().find(|entry| entry.state.run_id == run_id) else {
+            return false;
+        };
+        if !entry.meta.observed_dead && !entry.meta.inferred_terminated {
+            return false;
+        }
+        revive_slot_entry(entry)
+    }
+
+    /// Replace the live-status string for `slot_id` and stamp
+    /// `live_status_at` with the current ISO-8601 timestamp. Returns
+    /// `true` iff the entry actually changed — callers gate the
+    /// `broadcast_live_worker_states` push on this exactly like
+    /// [`Self::apply_event`] does.
+    ///
+    /// Pass `Some(text)` to set the field and `None` to clear it
+    /// (used when a worker has been idle long enough that the prior
+    /// summary would be misleading). Clearing also wipes
+    /// `live_status_at` so the staleness UI never has a dangling
+    /// timestamp.
+    ///
+    /// Returns `false` if no entry exists for the slot (event
+    /// arrived before spawn registered, or after release) — the
+    /// caller treats that as a benign drop, mirroring `apply_event`.
+    ///
+    /// Reject writes after termination, including an in-flight model response.
+    /// The trigger fan-in owns the remaining cadence policy.
+    pub fn set_live_status(&self, slot_id: u8, status: Option<String>) -> bool {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let Some(state) = guard.get_mut(&slot_id).map(|entry| &mut entry.state) else {
+            return false;
+        };
+        if state.activity == WorkerActivity::Terminated {
+            return false;
+        }
+        match (&status, &state.live_status) {
+            (None, None) => {
+                // Already cleared; nothing to broadcast.
+                false
+            }
+            (None, Some(_)) => {
+                // Clearing wipes both halves of the pair so the
+                // staleness UI never has a dangling timestamp.
+                state.live_status = None;
+                state.live_status_at = None;
+                true
+            }
+            (Some(_), _) => {
+                // Always advance the timestamp on a successful set —
+                // the staleness UI keys off it and the broadcast cost
+                // (8 slots × < 1 KiB at < 1 Hz aggregate) is the
+                // budget the design's Q6 already accepted. The
+                // text-equality short-circuit was tempting but would
+                // freeze `last_status_at` until the model picked a
+                // different phrasing, which is exactly the
+                // "no summarizer activity for >5min" stale signal
+                // we'd then misfire on.
+                state.live_status = status;
+                state.live_status_at = Some(current_iso8601());
+                true
+            }
+        }
+    }
+
+    /// Replace the `recovery_status` banner for `slot_id` — set by
+    /// [`crate::transient_recovery`] while a slot is being auto-recovered
+    /// from a transient Claude API error. Returns `true` iff the entry
+    /// actually changed.
+    ///
+    /// Deliberately independent of [`Self::set_live_status`]: that
+    /// field's owner (the live-status summarizer loop) clears it after
+    /// ~30s of continuous `Idle`, which is shorter than the
+    /// transient-recovery grace period — coupling the two would have
+    /// the recovery banner wiped before a human ever saw it. This field
+    /// is instead cleared by [`Self::apply_event`] the moment any hook
+    /// event arrives (proof the worker resumed) or by [`Self::release_slot`]
+    /// when the slot is torn down.
+    pub fn set_recovery_status(&self, slot_id: u8, status: Option<String>) -> bool {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let Some(state) = guard.get_mut(&slot_id).map(|entry| &mut entry.state) else {
+            return false;
+        };
+        if state.recovery_status == status {
+            return false;
+        }
+        state.recovery_status = status;
+        true
+    }
+
+    /// Mark a slot as errored. Used when the events socket fails to
+    /// decode a payload or repeatedly drops connections. Returns
+    /// `true` if the entry actually changed.
+    pub fn mark_errored(&self, slot_id: u8) -> bool {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let Some(state) = guard.get_mut(&slot_id).map(|entry| &mut entry.state) else {
+            return false;
+        };
+        if state.activity == WorkerActivity::Errored {
+            return false;
+        }
+        state.activity = WorkerActivity::Errored;
+        state.current_tool = None;
+        state.last_event_at = Some(current_iso8601());
+        true
+    }
+
+    /// Detect worker slots stuck in `Spawning` with no hook events for
+    /// longer than `threshold_secs` seconds and transition them off
+    /// `Spawning`, onto whichever activity the driver's own liveness
+    /// evidence actually supports.
+    ///
+    /// The initial directory-trust prompt that Claude Code shows at
+    /// session startup (for models that use `--permission-mode auto`)
+    /// fires *before* `SessionStart`, so no hook event ever arrives and
+    /// the normal `Notification`→`WaitingForInput` path is never
+    /// triggered. An unattended headless worker can never answer the
+    /// prompt, so the run stalls indefinitely with no UI signal. This
+    /// method is the detection path: if `last_event_at` is `None` (no
+    /// hook at all) and the slot has been in `Spawning` for more than
+    /// `threshold_secs` seconds, the activity is promoted so the existing
+    /// kanban dot fires instead of sitting on the `Spawning`/unknown icon.
+    ///
+    /// **Requires `shell_pid > 0`.** A slot that never reported a shell
+    /// pid at all has produced no evidence that any process — let alone
+    /// one blocked on an interactive prompt — ever started. Promoting
+    /// such a slot to `WaitingForInput` is exactly the 2026-07-03/04
+    /// false-live incident: the slot sat at `activity=waiting_for_input,
+    /// shell_pid=0` forever, presenting as "the worker needs a human"
+    /// when there was nothing an operator could attach to and answer.
+    /// A pid-less spawn stall is a different failure class, left in
+    /// `Spawning` here and handled instead by
+    /// `crate::spawn_ack_sweep::run_one_pass`, which terminal-fails and
+    /// redispatches it after a longer grace window.
+    ///
+    /// **Two liveness bases, branched on `awaiting_input_capable`.** A
+    /// driver's capability declaration decides which claim Boss is allowed
+    /// to make, not whether it may claim anything at all:
+    ///
+    /// - A driver that declares `Capability::AwaitingInputSignal` (Claude)
+    ///   gets the directory-trust-prompt promotion above: silence alone
+    ///   (`last_event_at == None`) is read as "blocked on the initial
+    ///   prompt" and promoted to `WaitingForInput`.
+    /// - A driver that omits it (Codex, Grok) never gets that promotion —
+    ///   guessing "awaits a human" from silence is exactly the kind of
+    ///   "no events for N seconds ⇒ assume blocked" leap `apply_event`
+    ///   refuses to make for an untrusted `Notification` from the same
+    ///   driver class. But the omission is a claim about the *stream*, not
+    ///   about whether Boss has any evidence at all — `meta.driver_signal_at`
+    ///   is a *different*, capability-independent fact: a driver-originated
+    ///   signal (a hook event, or a resolved `transcript_path`) has been
+    ///   observed for this run. For a file-ingress driver like Codex that
+    ///   fires as soon as discovery sees the rollout grow — even while the
+    ///   first `session_meta` line is still incomplete — and again when
+    ///   `AgentJsonlProgressManager` attaches. Proof the process is alive
+    ///   and has begun writing its transcript, well before the reader has
+    ///   parsed (let alone dispatched) a single complete record. Wait a
+    ///   full turn's `thinking` before the first parseable line and this
+    ///   sweep is the only thing that would otherwise notice the worker is
+    ///   stuck showing `Spawning`/unknown. When that proof exists, the
+    ///   honest claim is
+    ///   `Idle` — alive, no specific claim about what it is doing — never
+    ///   `WaitingForInput`, which this driver class gave no basis for. When
+    ///   even that proof is absent, this sweep still leaves the slot in
+    ///   `Spawning` rather than guess; `dead_pid_sweep`'s process-liveness
+    ///   backstop and driver-start verification (below) are the honest
+    ///   fallback for that case.
+    ///
+    /// ## Reconciliation with driver-start verification
+    ///
+    /// Both promotion decisions above are *presentation* decisions — "what
+    /// may Boss claim this worker is doing?" — and neither decides whether
+    /// the slot keeps its resources. Before driver-start verification
+    /// existed, the capability skip did exactly that by omission: it left
+    /// grok's never-started spawn parked at `Spawning` forever, and the
+    /// promotion in the capability-declaring case moved the slot out of
+    /// `Spawning` where `spawn_ack_sweep`'s activity filter could no longer
+    /// see it. Neither escape survives now:
+    ///
+    /// - [`Self::unverified_driver_starts`] reads only `driver_signal_at`
+    ///   and `spawned_at`, so it is blind to activity, capability and pid
+    ///   and covers every branch above identically.
+    /// - The `last_event_at` this method synthesizes below is explicitly
+    ///   NOT a driver signal. It moves the display timestamp only;
+    ///   `driver_signal_at` is untouched (and, in the `Idle` branch, was
+    ///   already set by the real driver-originated signal that justified
+    ///   the promotion — this method never writes it), so a promotion here
+    ///   can never vouch for a driver that never ran.
+    ///
+    /// Returns the slot IDs that were changed so callers can broadcast
+    /// the updated snapshot. Normal-running workers (whose `SessionStart`
+    /// hook fires within seconds of spawn) always have `last_event_at`
+    /// set before the threshold elapses; this method ignores them.
+    pub fn mark_stalled_spawns(&self, now_epoch_secs: i64, threshold_secs: i64) -> Vec<u8> {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let cutoff = now_epoch_secs.saturating_sub(threshold_secs);
+        let mut changed = Vec::new();
+        for (slot_id, SlotEntry { state, meta }) in guard.iter_mut() {
+            if state.activity != WorkerActivity::Spawning {
+                continue;
+            }
+            if state.shell_pid <= 0 {
+                // No process has reported in at all — `spawn_ack_sweep`
+                // owns this slot, not the directory-trust-prompt path.
+                continue;
+            }
+            if state.last_event_at.is_some() {
+                // SessionStart (or any other hook) already fired — the
+                // worker is past the startup phase; not our concern.
+                continue;
+            }
+            if meta.spawned_at > cutoff {
+                // Spawned too recently; give the worker more time.
+                continue;
+            }
+            if meta.semantic_progress_at.is_some() {
+                // A checkpoint-seeded driver is past startup; an unknown
+                // restored turn is not a directory-trust prompt.
+                continue;
+            }
+            let promoted = if meta.awaiting_input_capable {
+                WorkerActivity::WaitingForInput
+            } else if meta.driver_signal_at.is_some() {
+                // No capability-backed basis to claim "awaits a human", but
+                // real driver-originated evidence (a hook, or — for Codex —
+                // rollout file growth during discovery, or attach) says the
+                // process is alive. See the branch above for why `Idle`,
+                // not `WaitingForInput`, is the only honest claim here.
+                WorkerActivity::Idle
+            } else {
+                // Neither a capability-backed guess nor driver-originated
+                // evidence exists yet. Leave it in `Spawning` rather than
+                // guess, mirroring the zero-pid case above; `dead_pid_sweep`'s
+                // backstop and driver-start verification's reap are the
+                // honest fallback for this case (see the design doc's
+                // "ProgressObservation minimum-fidelity tier" decision).
+                continue;
+            };
+            state.activity = promoted;
+            // Display timestamp only — this is the engine narrating its
+            // own inference, not the driver reporting in. `driver_signal_at`
+            // is deliberately NOT written here: if it were, this promotion
+            // would silently satisfy driver-start verification and re-open
+            // the hole. See `unverified_driver_starts`.
+            state.last_event_at = Some(iso8601_utc(now_epoch_secs));
+            changed.push(*slot_id);
+        }
+        changed
+    }
+
+    /// Downgrade `Spawning` slots whose `last_event_at` is older than
+    /// `threshold_secs` to `Idle`.
+    ///
+    /// Complements [`Self::mark_stalled_spawns`]: that method only
+    /// considers slots that have *never* received a hook
+    /// (`last_event_at == None`) and promotes them to
+    /// `WaitingForInput` under the directory-trust-prompt hypothesis.
+    /// This method owns the complementary lie — a slot that *did*
+    /// receive a hook (so `last_event_at` is set) but is still
+    /// advertising `Spawning`. That shape arises when:
+    ///
+    /// - `SessionStart(Resume)` stamps `last_event_at` without leaving
+    ///   `Spawning` (deliberate: reattach/spawn-ack need a proof-of-life
+    ///   signal that does not claim the worker is past spawn), then
+    /// - `events.sock` degrades and no further hooks arrive.
+    ///
+    /// After the threshold the honest claim is "we saw life, then
+    /// silence" — `Idle` — not "still spawning". Leaves
+    /// `last_event_at == None` alone (stalled-spawn / spawn-ack own
+    /// that), and never touches non-`Spawning` activities
+    /// (`Working` with a long think, `WaitingForInput` while a human
+    /// decides, …).
+    ///
+    /// Returns the slot IDs that changed so callers can broadcast.
+    pub fn downgrade_stale_activity(&self, now_epoch_secs: i64, threshold_secs: i64) -> Vec<u8> {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let cutoff = iso8601_utc(now_epoch_secs.saturating_sub(threshold_secs));
+        let mut changed = Vec::new();
+        for (slot_id, entry) in guard.iter_mut() {
+            let state = &mut entry.state;
+            if state.activity != WorkerActivity::Spawning {
+                continue;
+            }
+            let Some(last) = state.last_event_at.as_deref() else {
+                // No event yet — mark_stalled_spawns / spawn_ack_sweep.
+                continue;
+            };
+            // Fixed-width ISO-8601: lexicographic order == chronological.
+            if last >= cutoff.as_str() {
+                continue;
+            }
+            state.activity = WorkerActivity::Idle;
+            state.current_tool = None;
+            changed.push(*slot_id);
+        }
+        changed
+    }
+
+    /// Override the recorded spawn timestamp for `slot_id`. Only
+    /// available in tests — production code always uses the wall-clock
+    /// time stamped by `register_spawn`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_spawn_time_for_test(&self, slot_id: u8, epoch_secs: i64) {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        if let Some(entry) = guard.get_mut(&slot_id) {
+            entry.meta.spawned_at = epoch_secs;
+        }
+    }
+
+    /// Override `last_event_at` for `slot_id` to an arbitrary ISO-8601
+    /// string. Test seam for reproducing a *recycled-slot* live state —
+    /// a slot whose `run_id` was replaced for the current execution but
+    /// whose `last_event_at` still carries a prior run's timestamp. Only
+    /// available in tests; production stamps this wall-clock in
+    /// `apply_event`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_last_event_at_for_test(&self, slot_id: u8, last_event_at: impl Into<String>) {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        if let Some(entry) = guard.get_mut(&slot_id) {
+            entry.state.last_event_at = Some(last_event_at.into());
+        }
+    }
+
+    /// Override `last_tool_ended_at` for `slot_id`. Test seam for a
+    /// duplicate `PostToolUse` whose ingress timestamp must advance even
+    /// though no tool is active.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_last_tool_ended_at_for_test(&self, slot_id: u8, last_tool_ended_at: impl Into<String>) {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        if let Some(entry) = guard.get_mut(&slot_id) {
+            entry.state.last_tool_ended_at = Some(last_tool_ended_at.into());
+        }
+    }
+
+    /// Override `activity` for `slot_id`. Test seam for a `Working` slot
+    /// whose tool condition is still [`SemanticToolCondition::Unknown`]
+    /// (no Pre/PostToolUse has ever established idle/in-flight).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_activity_for_test(&self, slot_id: u8, activity: WorkerActivity) {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        if let Some(entry) = guard.get_mut(&slot_id) {
+            entry.state.activity = activity;
+        }
+    }
+
+    /// Override the checkpoint's `tool_condition` for `slot_id` directly,
+    /// bypassing [`Self::seed_semantic_progress`]'s no-op guard (which
+    /// refuses once `last_event_at` is set). Test seam for reproducing a
+    /// driver state reset — the tool condition reverting to
+    /// [`SemanticToolCondition::Unknown`] — landing between two
+    /// classifications of the same live slot within one sweep pass.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_semantic_tool_condition_for_test(&self, slot_id: u8, tool_condition: SemanticToolCondition) {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        if let Some(entry) = guard.get_mut(&slot_id) {
+            entry.meta.semantic_tool_condition = tool_condition;
+        }
+    }
+}
+
+impl boss_execution_contracts::LiveWorkerLiveness for LiveWorkerStateRegistry {
+    fn is_run_live(&self, run_id: &str) -> bool {
+        LiveWorkerStateRegistry::is_run_live(self, run_id)
+    }
+
+    fn snapshot(&self) -> Vec<LiveWorkerState> {
+        LiveWorkerStateRegistry::snapshot(self)
+    }
+
+    fn release_slot_for_run(&self, run_id: &str) -> Option<u8> {
+        LiveWorkerStateRegistry::release_slot_for_run(self, run_id)
+    }
+
+    fn release_persona_for_run(&self, run_id: &str) {
+        LiveWorkerStateRegistry::release_persona_for_run(self, run_id)
+    }
+
+    fn last_event_at_for_run(&self, run_id: &str) -> Option<String> {
+        LiveWorkerStateRegistry::last_event_at_for_run(self, run_id)
+    }
+
+    fn current_tool_for_run(&self, run_id: &str) -> Option<String> {
+        LiveWorkerStateRegistry::current_tool_for_run(self, run_id)
+    }
+}
+
+impl boss_execution_contracts::DriverSignals for LiveWorkerStateRegistry {
+    fn has_driver_signal_for_run(&self, run_id: &str) -> bool {
+        LiveWorkerStateRegistry::has_driver_signal_for_run(self, run_id)
+    }
+
+    fn first_hook_event_for_run(&self, run_id: &str) -> Option<String> {
+        LiveWorkerStateRegistry::first_hook_event_for_run(self, run_id)
+    }
+
+    fn commit_never_started_reap(&self, slot_id: u8, run_id: &str) -> boss_execution_contracts::NeverStartedReap {
+        use boss_execution_contracts::NeverStartedReap;
+        match self.confirm_never_started_reap(slot_id, run_id) {
+            NeverStartedReapCommit::Committed { .. } => NeverStartedReap::Committed,
+            NeverStartedReapCommit::DriverSignalled => NeverStartedReap::DriverSignalled,
+            NeverStartedReapCommit::SlotGone => NeverStartedReap::SlotGone,
+            NeverStartedReapCommit::AlreadyCommitted => NeverStartedReap::AlreadyCommitted,
+        }
+    }
+}
+
+/// What [`LiveWorkerStateRegistry::apply_sequenced_event`] did with an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyEventOutcome {
+    /// The event was applied. `changed` reports whether any observable
+    /// field moved, exactly as [`LiveWorkerStateRegistry::apply_event`]'s
+    /// boolean does, so callers can keep suppressing no-op broadcasts.
+    Applied { changed: bool },
+    /// No entry exists for the slot — the event arrived before spawn
+    /// registered it or after release. A benign drop, as before.
+    NoSlot,
+    /// Physical death was already confirmed; late transcript events are ignored.
+    ObservedDead,
+    /// The event's ingress sequence is older than the newest event already
+    /// applied to the slot: the worker emitted it *before* the state the
+    /// slot currently shows. Not applied.
+    Stale { last_applied_seq: u64 },
+}
+
+/// Where the hook came from, beyond the event itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HookOrigin {
+    /// Accept-order sequence; see [`LiveWorkerStateRegistry::apply_sequenced_event`].
+    pub ingress_seq: Option<u64>,
+    /// The hook fired inside a subagent the main session launched, not in
+    /// the main session itself. A subagent keeps working after the main
+    /// session's turn has ended, so its tool hooks are not evidence that the
+    /// main session started a new turn.
+    pub from_subagent: bool,
+}
+
+/// A turn boundary (`Stop`) the main session was parked behind. `seq` is
+/// the boundary's ingress sequence (`None` for unsequenced ingress).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnBoundary {
+    pub seq: Option<u64>,
+}
+
+/// Result of [`LiveWorkerStateRegistry::apply_hook_event`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HookApplied {
+    pub outcome: ApplyEventOutcome,
+    /// Set when this hook is proof the main session started a new turn
+    /// after `TurnBoundary` — either the first main-session activity
+    /// following a `Stop`, or the late `Stop` itself once main-session
+    /// activity numbered above it has already been applied. This is what
+    /// ends a wait declared before that boundary: it is keyed on turn
+    /// ordering, not on the activity the slot happened to show.
+    pub resumed_after: Option<TurnBoundary>,
+    /// A late event was refused as [`ApplyEventOutcome::Stale`] but still
+    /// repaired the slot's activity (a `Notification` overtaken by its
+    /// `Stop`), so the caller must treat the slot as changed.
+    pub repaired: bool,
+}
+
+/// Bookkeeping for the turn lifecycle, run for every event that is applied.
+/// Returns the boundary the main session just resumed from, if any.
+fn record_turn_progress(
+    meta: &mut SlotMeta,
+    seq: Option<u64>,
+    event: &WorkerEvent,
+    origin: HookOrigin,
+) -> Option<TurnBoundary> {
+    let keep_newest = |slot: &mut Option<u64>| {
+        if seq.is_some() {
+            *slot = seq;
+        }
+    };
+    match event {
+        WorkerEvent::Stop { .. } => {
+            keep_newest(&mut meta.last_stop_seq);
+            meta.open_turn_boundary = Some(TurnBoundary { seq });
+            None
+        }
+        WorkerEvent::ToolPoll { .. } | WorkerEvent::ModelProgress { .. } | WorkerEvent::SessionEnd { .. } => None,
+        WorkerEvent::UserPromptSubmit { .. } | WorkerEvent::PreToolUse { .. } | WorkerEvent::PostToolUse { .. } => {
+            if origin.from_subagent {
+                return None;
+            }
+            keep_newest(&mut meta.last_main_activity_seq);
+            meta.open_turn_boundary.take()
+        }
+        WorkerEvent::SessionStart { .. } | WorkerEvent::Notification { .. } => None,
+    }
+}
+
+/// What a late (stale) event still contributes. Returns the boundary it
+/// proves the main session resumed from, and whether it repaired the slot.
+fn reconcile_late_event(
+    state: &mut LiveWorkerState,
+    meta: &mut SlotMeta,
+    seq: u64,
+    event: &WorkerEvent,
+    origin: HookOrigin,
+) -> (Option<TurnBoundary>, bool) {
+    match event {
+        WorkerEvent::Stop { .. } => {
+            let repaired = consume_late_notification(state, meta, seq);
+            let boundary = TurnBoundary { seq: Some(seq) };
+            if meta.last_main_activity_seq.is_some_and(|main| main > seq) {
+                return (Some(boundary), repaired);
+            }
+            // Only subagent hooks have been applied since: the main session
+            // is still behind this boundary, and its next hook resumes it.
+            let newest = meta
+                .open_turn_boundary
+                .and_then(|open| open.seq)
+                .map_or(seq, |open| open.max(seq));
+            meta.open_turn_boundary = Some(TurnBoundary { seq: Some(newest) });
+            (None, repaired)
+        }
+        WorkerEvent::ToolPoll { .. } | WorkerEvent::ModelProgress { .. } => (None, false),
+        WorkerEvent::SessionEnd { .. } => (None, consume_late_notification(state, meta, seq)),
+        WorkerEvent::Notification { .. } if meta.awaiting_input_capable => {
+            match meta
+                .pending_clear_seqs
+                .range((std::ops::Bound::Excluded(seq), std::ops::Bound::Unbounded))
+                .next()
+                .copied()
+            {
+                // In emission order this `Notification` was consumed by the
+                // event at `clear`. If that was the newest `Stop` and nothing
+                // has applied since, the `Stop` produced `Idle` for want of
+                // this `Notification`: it should have been `WaitingForInput`.
+                Some(clear) if clear > seq => {
+                    let stop_is_newest =
+                        meta.last_stop_seq == Some(clear) && meta.last_applied_ingress_seq == Some(clear);
+                    if stop_is_newest && state.activity == WorkerActivity::Idle {
+                        state.activity = WorkerActivity::WaitingForInput;
+                        state.current_tool = None;
+                        meta.notification_repair = Some(NotificationRepair {
+                            notification_seq: seq,
+                            stop_seq: clear,
+                        });
+                        return (None, true);
+                    }
+                    (None, false)
+                }
+                // Nothing applied since has cleared it: it is still pending
+                // for the `Stop` that ends this turn.
+                _ => {
+                    meta.notification_pending = true;
+                    meta.notification_pending_seq = Some(seq);
+                    (None, false)
+                }
+            }
+        }
+        WorkerEvent::UserPromptSubmit { .. } | WorkerEvent::PreToolUse { .. } | WorkerEvent::PostToolUse { .. }
+            if !origin.from_subagent =>
+        {
+            let repaired =
+                matches!(event, WorkerEvent::PreToolUse { .. }) && consume_late_notification(state, meta, seq);
+            meta.last_main_activity_seq = Some(meta.last_main_activity_seq.map_or(seq, |last| last.max(seq)));
+            let resumed = meta
+                .open_turn_boundary
+                .filter(|boundary| boundary.seq.is_none_or(|stop| seq > stop));
+            if resumed.is_some() {
+                meta.open_turn_boundary = None;
+            }
+            (resumed, repaired)
+        }
+        _ => (None, false),
+    }
+}
+
+/// A clearing hook (`Stop`, `PreToolUse`, `SessionEnd`) that arrives late
+/// consumes every `Notification` emitted before it that is still waiting on
+/// a consumer, including one that was reduced earlier in its absence:
+///
+/// - a pending flag set by a notification numbered below `seq` is dropped;
+/// - a repair to `WaitingForInput` made on the strength of a later `Stop` is
+///   undone, provided that `Stop` is still the newest thing applied and the
+///   slot is still where the repair left it. Returns `true` in that case so
+///   the caller mirrors the durable status back.
+///
+/// A notification numbered above `seq` is untouched.
+fn consume_late_notification(state: &mut LiveWorkerState, meta: &mut SlotMeta, seq: u64) -> bool {
+    if meta.notification_pending && meta.notification_pending_seq.is_some_and(|pending| pending < seq) {
+        meta.notification_pending = false;
+        meta.notification_pending_seq = None;
+    }
+    let Some(repair) = meta.notification_repair else {
+        return false;
+    };
+    if repair.notification_seq >= seq || seq >= repair.stop_seq {
+        return false;
+    }
+    meta.notification_repair = None;
+    if state.activity == WorkerActivity::WaitingForInput && meta.last_applied_ingress_seq == Some(repair.stop_seq) {
+        state.activity = WorkerActivity::Idle;
+        return true;
+    }
+    false
+}
+
+/// Hook event name for log lines — the payload's `hook_event_name`, not
+/// the full event (a `PreToolUse` carries the whole tool input).
+fn worker_event_name(event: &WorkerEvent) -> &'static str {
+    match event {
+        WorkerEvent::SessionStart { .. } => "SessionStart",
+        WorkerEvent::UserPromptSubmit { .. } => "UserPromptSubmit",
+        WorkerEvent::PreToolUse { .. } => "PreToolUse",
+        WorkerEvent::PostToolUse { .. } => "PostToolUse",
+        WorkerEvent::Stop { .. } => "Stop",
+        WorkerEvent::Notification { .. } => "Notification",
+        WorkerEvent::ToolPoll { .. } => "ToolPoll",
+        WorkerEvent::ModelProgress { .. } => "ModelProgress",
+        WorkerEvent::SessionEnd { .. } => "SessionEnd",
+    }
+}
+
+fn current_iso8601() -> String {
+    let secs = boss_engine_utils::epoch_time::now_epoch_secs();
+    boss_engine_utils::iso8601::format_epoch_iso8601(secs)
+}
+
+/// Format `epoch_secs` as the same fixed-width ISO-8601 UTC string
+/// (`YYYY-MM-DDTHH:MM:SSZ`) the registry stamps into `last_event_at`.
+/// Because the format is fixed-width, lexicographic string ordering
+/// matches chronological ordering — the stale-worker sweep builds a
+/// cutoff timestamp with this and compares `last_event_at < cutoff`
+/// directly, with no date parsing.
+pub fn iso8601_utc(epoch_secs: i64) -> String {
+    boss_engine_utils::iso8601::format_epoch_iso8601(epoch_secs)
+}
+
+/// Map a durable semantic checkpoint onto display activity.
+///
+/// `None` means there is no turn evidence: callers must preserve known
+/// activity rather than infer an idle or working turn.
+fn activity_from_semantic(turn: SemanticTurnCondition, tool: SemanticToolCondition) -> Option<WorkerActivity> {
+    match (turn, tool) {
+        (SemanticTurnCondition::InTurn, _) | (SemanticTurnCondition::Unknown, SemanticToolCondition::InFlight) => {
+            Some(WorkerActivity::Working)
+        }
+        (SemanticTurnCondition::Ended, _) => Some(WorkerActivity::Idle),
+        (SemanticTurnCondition::Unknown, _) => None,
+    }
+}
+
+/// Clear the death fence and restore the activity recorded before termination.
+/// Without a saved activity, use semantic evidence; absent either, retain the
+/// displayed activity rather than inventing a working turn.
+fn revive_slot_entry(entry: &mut SlotEntry) -> bool {
+    let was_fenced = entry.meta.observed_dead;
+    entry.meta.observed_dead = false;
+    entry.meta.inferred_terminated = false;
+    let previous = entry.state.activity;
+    entry.state.activity = entry
+        .meta
+        .activity_before_termination
+        .take()
+        .or_else(|| activity_from_semantic(entry.meta.semantic_turn_condition, entry.meta.semantic_tool_condition))
+        .unwrap_or(previous);
+    was_fenced || previous != entry.state.activity
+}
+
+#[cfg(test)]
+mod tests;

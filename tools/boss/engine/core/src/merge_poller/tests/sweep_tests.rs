@@ -1290,6 +1290,7 @@ async fn merged_pr_redispatches_live_review_revision_as_followup_and_records_can
         publisher.clone(),
         Arc::new(NoopPaneReleaser),
         Arc::new(NoopProbeQueuer),
+        crate::completion_adapters::completion_collaborators(),
     )
     .with_dispatch_events(events.clone());
     let probe = StubProbe::new();
@@ -2440,6 +2441,7 @@ async fn run_one_pass_recovers_late_pr_for_abandoned_execution() {
         publisher.clone(),
         Arc::new(NoopPaneReleaser),
         Arc::new(NoopProbeQueuer),
+        crate::completion_adapters::completion_collaborators(),
     );
 
     let outcome = run_one_pass(
@@ -2528,6 +2530,7 @@ async fn ci_resolved_stops_live_worker_and_keeps_task_in_review() {
         publisher.clone(),
         Arc::new(NoopPaneReleaser),
         Arc::new(NoopProbeQueuer),
+        crate::completion_adapters::completion_collaborators(),
     );
 
     let outcome = run_one_pass(

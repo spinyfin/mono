@@ -140,25 +140,7 @@ pub(crate) fn work_item_pr_url(work_item: &WorkItem) -> Option<&str> {
     }
 }
 
-/// The PR this task is bound to, if any.
-///
-/// Returns the structured `task.pr_url` column as set by
-/// `reconciler_attach_pr_url` and the `pr_url_capture` pipeline.
-/// Returns `None` when that field is empty or null.
-///
-/// **No description scanning.** An earlier version fell back to
-/// pattern-matching a PR URL out of `task.description` (mono#742).
-/// That fallback was removed because it fires on any description that
-/// *mentions* a PR in passing (e.g. an issue-imported chore whose body
-/// cites a repro session's PR as an example — see execution
-/// exec_18b341df81251750_4). A misfire sends the worker to a foreign
-/// repo's PR, which is strictly worse than a duplicate-PR restart.
-/// The reconciler path (`reconciler_attach_pr_url`) is responsible for
-/// populating `task.pr_url` before dispatch; if it has not done so yet
-/// the dispatcher should treat the task as PR-less and start fresh.
-pub fn task_bound_pr_url(task: &crate::work::Task) -> Option<&str> {
-    task.pr_url.as_deref().filter(|u| !u.is_empty())
-}
+pub use boss_engine_storage_values::branch_identity::task_bound_pr_url;
 
 /// Find a single canonical GitHub PR URL inside arbitrary text.
 ///

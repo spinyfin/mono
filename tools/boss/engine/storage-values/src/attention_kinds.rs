@@ -431,3 +431,8 @@ pub const LEGACY_PANE_DEATH_RECONCILE_ATTENTION_KIND: &str = "pane_death_reconci
 /// the review-cycle chain root, so a later successful fetch for any revision
 /// or the post-merge root review resolves it.
 pub const REVIEW_DESIGN_DOC_UNRESOLVED_ATTENTION_KIND: &str = "review_design_doc_unresolved";
+
+/// `work_attention_items.kind` filed when a row's binding could not be
+/// repaired automatically (no PR on its branch, a foreign PR, or repeated
+/// GitHub failures).
+pub const ATTENTION_KIND_PR_BINDING_REPAIR: &str = "pr_binding_repair";

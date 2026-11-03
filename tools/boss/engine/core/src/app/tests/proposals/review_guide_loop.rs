@@ -139,6 +139,7 @@ async fn revision_delivery_automatically_regenerates_guide_and_preserves_feedbac
     state.feature_flags.set("review_guide_generation", true).unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let handler = crate::completion::integration_handler(db.clone(), pr_url)
+        .with_collaborators(crate::completion_adapters::completion_collaborators())
         .with_feature_flags(state.feature_flags.clone())
         .with_source_packet_collector(counting_source_collector(
             calls.clone(),

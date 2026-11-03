@@ -1,0 +1,80 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+# The in-memory per-slot worker registry and the semantic-progress checkpoints
+# it folds hook events into. Shared by completion, the sweeps and the event
+# socket, so it sits below all of them.
+LIVE_WORKER_STATE_DEPS = [
+    "//tools/boss/engine/driver",
+    "//tools/boss/engine/execution-contracts",
+    "//tools/boss/engine/storage-values",
+    "//tools/boss/engine/utils",
+    "//tools/boss/engine/work-db",
+    "//tools/boss/protocol",
+]
+
+rust_library(
+    name = "live-worker-state",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "boss_engine_live_worker_state",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = [
+        "//tools/boss/engine/completion:__pkg__",
+        "//tools/boss/engine/core:__pkg__",
+    ],
+    deps = LIVE_WORKER_STATE_DEPS + all_crate_deps(normal = True),
+)
+
+# The fixture variant: exposes the registry's test hooks and is built against
+# the fixture variants of the contract and storage crates, so the engine's test
+# build and the completion fixtures see one set of types.
+rust_library(
+    name = "live_worker_state_test_support",
+    testonly = True,
+    srcs = glob(["src/**/*.rs"]),
+    aliases = {
+        "//tools/boss/engine/execution-contracts:execution_contracts_test_support": "boss_execution_contracts",
+        "//tools/boss/engine/work-db:work_db_test_support": "boss_work_db",
+    },
+    crate_features = ["test-support"],
+    crate_name = "boss_engine_live_worker_state_test_support",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = [
+        "//tools/boss/engine/completion:__pkg__",
+        "//tools/boss/engine/core:__pkg__",
+    ],
+    deps = [d for d in LIVE_WORKER_STATE_DEPS if d not in [
+        "//tools/boss/engine/execution-contracts",
+        "//tools/boss/engine/work-db",
+    ]] + [
+        "//tools/boss/engine/execution-contracts:execution_contracts_test_support",
+        "//tools/boss/engine/work-db:work_db_test_support",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "live-worker-state_test",
+    size = "small",
+    aliases = {
+        "//tools/boss/engine/work-db": "boss_work_db_production",
+        "//tools/boss/engine/work-db:work_db_test_support": "boss_work_db",
+    },
+    crate = ":live-worker-state",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//tools/boss/engine/work-db:work_db_test_support",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

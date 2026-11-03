@@ -524,60 +524,7 @@ async fn release_terminal_remote_resources(
     .await;
 }
 
-/// Release a remote worker's lease through the claimed release policy, for
-/// every path that releases on the strength of a recorded pid or a finished
-/// turn rather than a confirmed stop. The remote worker cannot be stopped by
-/// this engine, so the owning host's recovery bookmark and workspace
-/// occupancy (both probed through `host`) must confirm; an inconclusive
-/// probe keeps the lease. `release` performs the cube call for the lease id
-/// it is handed. Returns what actually happened.
-pub(crate) async fn release_remote_lease<Fut: std::future::Future<Output = anyhow::Result<()>>>(
-    work_db: &WorkDb,
-    host: &dyn HostAdapter,
-    execution_id: &str,
-    pane: crate::workspace_lease_release::PaneStatus,
-    release: impl FnOnce(String) -> Fut,
-) -> crate::workspace_lease_release::LeaseReleaseOutcome {
-    use crate::workspace_lease_release::{LeaseReleaseOutcome, Occupancy};
-    // Re-read: the row may have settled or lost its lease since the caller looked.
-    let Ok(execution) = work_db.get_execution(execution_id) else {
-        return LeaseReleaseOutcome::NoLease;
-    };
-    let Some(lease_id) = execution.cube_lease_id.clone() else {
-        return LeaseReleaseOutcome::NoLease;
-    };
-    let occupancy = match execution.workspace_path.as_deref() {
-        Some(path) => host
-            .probe_workspace_occupancy(std::path::Path::new(path))
-            .await
-            .unwrap_or_else(|err| {
-                tracing::debug!(
-                    execution_id,
-                    host_id = host.host_id(),
-                    error = %format!("{err:#}"),
-                    "remote lease release: workspace occupancy probe failed; keeping the lease",
-                );
-                Occupancy::Unknown
-            }),
-        None => Occupancy::Unknown,
-    };
-    crate::workspace_lease_release::apply_release(
-        work_db,
-        &execution,
-        &lease_id,
-        crate::workspace_lease_release::ReleaseEvidence {
-            cause: crate::workspace_lease_release::TerminalCause::Inferred,
-            pane,
-            occupancy: &crate::workspace_lease_release::OwningHostOccupancy(occupancy),
-            bookmark: &crate::workspace_lease_release::DbBookmarkGate {
-                db: work_db,
-                adapter: Some(host),
-            },
-        },
-        release(lease_id.clone()),
-    )
-    .await
-}
+pub(crate) use boss_engine_completion::workspace_lease_release::release_remote_lease;
 
 /// [`release_remote_lease`] for a dead worker, releasing through the same
 /// host's adapter.

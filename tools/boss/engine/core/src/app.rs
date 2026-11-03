@@ -1617,6 +1617,7 @@ impl ServerState {
             publisher.clone(),
             pane_releaser.clone(),
             probe_queuer.clone(),
+            crate::completion_adapters::completion_collaborators(),
         )
         .with_dispatch_events(dispatch_events.clone())
         .with_staged_pr_urls(staged_pr_urls.clone())

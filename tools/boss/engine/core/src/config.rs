@@ -35,15 +35,9 @@ pub const FRONTEND_SOCKET_ENV: &str = "BOSS_SOCKET_PATH";
 /// Environment override for the engine pid-file path.
 pub const PID_PATH_ENV: &str = "BOSS_ENGINE_PID_PATH";
 
-/// Default value for [`WorkConfig::max_review_cycles`]. Matches the
-/// "~3 cycles at worst" mental model from the review-cycle-cap design, §7.
-pub const DEFAULT_MAX_REVIEW_CYCLES: usize = 3;
-
-/// Default threshold for the no-op / trivial-diff skip gate (review-cycle-cap
-/// design, §8).
-/// Zero means "skip only when the effective diff is literally empty (0 changed
-/// lines)"; operators can raise this to also skip small cosmetic-only pushes.
-pub const DEFAULT_MIN_REVIEW_CHANGED_LINES: u64 = 0;
+/// Default value for [`WorkConfig::max_review_cycles`] and the review-cycle
+/// threshold; shared with the completion service, so defined below both.
+pub use boss_engine_storage_values::pool_policy::{DEFAULT_MAX_REVIEW_CYCLES, DEFAULT_MIN_REVIEW_CHANGED_LINES};
 
 /// Default line threshold for embedding `gh pr diff` output directly in the
 /// reviewer's initial prompt. PRs whose diff is at or below this many lines

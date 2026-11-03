@@ -1,0 +1,2554 @@
+//! Worker completion detection.
+//!
+//! `PaneSpawnRunner` returns `WorkerPaneAlive` immediately after spawning
+//! the worker pane, so the run row is recorded as `completed` before
+//! the worker has actually done any work. The execution sits live in
+//! `running` with the cube lease retained, and the linked task/chore
+//! stays in `active` (kanban "Doing"). Without something else driving
+//! the lifecycle, completed work just sits in Doing forever — that is
+//! the bug this module exists to close.
+//!
+//! ## Detection
+//!
+//! The primary signal is the in-memory PR-URL staging cache populated
+//! by the `PostToolUse` hook for `gh pr create` / `gh pr view` /
+//! `gh pr edit`: when the worker's hook stream carries a PR URL we
+//! finalize the work item against it without touching git or
+//! GitHub at all.
+//!
+//! The cold-path fallback (incident 001, AI #6) handles the case where
+//! staging is empty (engine restart, hook miss, etc.) by querying
+//! `gh pr list --head <branch>` for the PR whose head matches the
+//! engine-supplied per-execution branch name. The branch name is
+//! derived deterministically from `execution_id` (see
+//! [`expected_branch_name`]) and is injected into the worker prompt,
+//! so workers push to the name the engine gave them — sibling workers
+//! in other cube workspaces have different execution IDs and therefore
+//! cannot collide.
+//!
+//! The branch-keyed query replaces the previous SHA-keyed
+//! `jj_candidate_commit_shas` + `gh api commits/{sha}/pulls` recipe,
+//! which was structurally unsafe under cube's shared
+//! `.jj/repo/store/git`: bookmarks pushed by ANY concurrent worker
+//! were visible from EVERY workspace's `jj log`, so the detector
+//! routinely matched a sibling's bookmark and bound the wrong PR.
+//! See `tools/boss/docs/postmortems/incident-001-pr-fan-out.md` for
+//! the full incident write-up.
+//!
+//! Merges that happen *after* the worker exited are detected by a
+//! periodic poller wired in `app.rs`, which calls
+//! [`WorkDb::mark_chore_pr_merged`] for any chore in `in_review`
+//! whose `pr_url` is now in a merged GitHub state.
+
+#[cfg(any(test, feature = "test-support"))]
+use boss_protocol::BranchNaming;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow};
+use async_trait::async_trait;
+
+use boss_protocol::{
+    AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_PRODUCED_TASK, AUTOMATION_OUTCOME_SKIPPED, Attention,
+    AttentionGroup, CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_MERGE_CONFLICT_PREFIX, CREATED_VIA_PR_REVIEW_PREFIX,
+    CreateRevisionInput, ExecutionKind, ExecutionStatus, FrontendEvent, ProposalKind, ProposalState, ReasoningMode,
+    TaskKind,
+};
+
+use crate::automation_triage::TriageDecision;
+use crate::build_wait::detect_build_wait_signal;
+use crate::build_wait_tracker::{BuildWaitDecision, BuildWaitTracker, DEFAULT_BUILD_WAIT_HORIZON_SECS};
+use crate::conflict_stop_gate::ConflictClearance;
+use crate::dispatch_events::{
+    DispatchEvent, DispatchEventSink, NoopDispatchEventSink, Outcome as DispatchOutcome, Stage,
+};
+use crate::metrics::Registry;
+use crate::nudge_breaker::{DEFAULT_MAX_UNPRODUCTIVE_NUDGES, NudgeBreaker, NudgeDecision};
+#[cfg(any(test, feature = "test-support"))]
+use crate::work::FinishExecutionRunInput;
+#[cfg(test)]
+use crate::work::TaskStatus;
+use crate::work::{
+    CreateAttentionItemInput, PendingMergeCheck, WorkDb, WorkItem, WorkerFailureBasis, WorkerPrCompletionTarget,
+};
+use crate::worker_escalation::{WorkerSignal, WorkerSignalKind};
+use boss_engine_gh_invocation::{gh_compare_jq, run_gh};
+use boss_execution_contracts::{CubeClient, ExecutionPublisher, PreemptOutcome};
+use boss_gh_telemetry::{callers, scope as gh_scope};
+use boss_github::pr_url::pr_number_from_url;
+use boss_observation_contracts::{
+    MergeProbe, MergeQueueDequeueEvent, MergeQueueTimeline, NoopMergeProbe, NoopPrPollStateWriter, OpenPrCiStatus,
+    OpenPrMergeability, PrLifecycleProbe, PrLifecycleState, PrPollStateWriter, UnsupportedMergeQueueTimeline,
+};
+
+// Lower-crate vocabulary under short module aliases for handler sources.
+pub(crate) use boss_dispatch_events as dispatch_events;
+pub(crate) use boss_engine_driver as driver;
+pub(crate) use boss_engine_effort as effort;
+pub(crate) use boss_engine_live_worker_state as live_worker_state;
+pub(crate) use boss_engine_structured_output as structured_output;
+pub(crate) use boss_feature_flags as feature_flags;
+pub(crate) use boss_metrics as metrics;
+pub(crate) use boss_metrics::register_counter;
+pub(crate) use boss_pr_review as pr_review;
+pub(crate) use boss_transcript_markdown as transcript_markdown;
+pub(crate) use boss_work_db as work;
+pub(crate) use boss_work_db::deferred_scope;
+
+// Run-termination state and helpers the handler shares with the engine's
+// sweeps and RPC handlers. The engine re-exports each under its historical path.
+pub mod answer_agent_observability;
+pub mod automation_triage;
+pub mod background_children;
+pub mod build_wait;
+pub mod build_wait_tracker;
+pub mod codex_unobserved_command;
+pub mod collaborators;
+pub mod conflict_stop_gate;
+pub mod driver_teardown;
+pub mod driver_transcript;
+pub mod execution_publisher;
+pub mod hold_registry;
+pub mod merge_parent_deletion;
+pub mod nudge_breaker;
+pub mod postmortem_followups;
+pub mod pr_url_capture;
+pub mod proposal_channel_error;
+pub mod reconcile_audit;
+pub mod remote_host;
+pub mod review_guide_capture;
+pub mod run_done_backstop;
+pub mod teardown_registry;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+pub mod wait_registry;
+pub mod worker_escalation;
+pub mod workspace_lease_release;
+
+pub use collaborators::{CompletionCollaborators, ReviewGuideValidation};
+
+// The stub macros live with the contract traits they implement; re-exported so
+// `crate::stub_cube_client!` resolves in this crate's tests and fixtures.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use boss_execution_contracts::stub_cube_client;
+#[cfg(test)]
+pub(crate) use boss_execution_contracts::stub_host_adapter;
+
+// The inherent `impl WorkerCompletionHandler` is split across the submodules
+// below to keep each file under the 3000-line size limit. Each contributes
+// methods to the same type; the handler struct, shared types, traits, and free
+// helpers stay in this parent module and reach the submodules via `use super`.
+mod attention;
+mod conflict_delivery_gate;
+mod contribution_gate;
+mod execution_started;
+mod finalize_passes;
+mod handler_build;
+mod metadata_gate;
+mod no_op;
+mod nudge;
+mod pending_finalize;
+pub use pending_finalize::{PendingFinalizeSweepOutcome, RUN_DONE_FINALIZE_STUCK_ATTENTION_KIND, finalize_resolved};
+mod pr_binding_guard;
+mod pr_transition;
+mod queue_ci_audit;
+mod recheck;
+mod release;
+mod remediation;
+mod run_done_declaration;
+mod stop;
+mod teardown;
+mod worker_signals;
+
+// Re-export contribution-gate types into this parent so sibling completion
+// submodules (which `use super::*`) can name them — same pattern as the
+// free helpers defined directly in this file.
+pub use boss_observation_contracts::{
+    CompletionRequests, ReviewBatchEnqueuer, StopOutcome, file_admission_deferred_attention,
+};
+use conflict_delivery_gate::ConflictDeliveryDecision;
+use contribution_gate::{RevisionContributionReason, RevisionReviewGate};
+pub(crate) use pr_transition::GhReviewBatchEnqueuer;
+pub use pr_transition::review_batch_input_from_metadata;
+
+// Counter handles for the PR URL capture channels, in the order they are
+// consulted: the worker's structured-output artifact (the driver-agnostic file
+// contract), the PostToolUse staging cache, the driver's final-message
+// producer, and finally the cold-path `detect_pr` reconstruction. The
+// `primary_path` counter covers every URL that arrived via the staging cache,
+// whichever channel filled it.
+crate::register_counter!(
+    PR_URL_CAPTURE_PRIMARY_HIT,
+    "pr_url_capture.primary_path.hit",
+    "on_stop / recheck_for_pr found a staged PR URL and skipped the detector.",
+);
+crate::register_counter!(
+    PR_URL_CAPTURE_ARTIFACT_HIT,
+    "pr_url_capture.artifact.hit",
+    "the worker's structured-output PR-URL artifact supplied the URL (file contract, \
+     driver-agnostic).",
+);
+crate::register_counter!(
+    PR_URL_CAPTURE_DRIVER_FALLBACK_HIT,
+    "pr_url_capture.driver_fallback.hit",
+    "the driver's final-message producer supplied the PR URL (artifact and hook stream \
+     both empty).",
+);
+crate::register_counter!(
+    PR_URL_CAPTURE_RECONSTRUCTION_HIT,
+    "pr_url_capture.reconstruction_path.hit",
+    "detect_pr cold-path fallback was invoked (staging cache empty).",
+);
+crate::register_counter!(
+    PR_URL_CAPTURE_RECONSTRUCTION_FAILED,
+    "pr_url_capture.reconstruction_path.failed",
+    "detect_pr cold-path fallback returned Err (network / date-format class).",
+);
+crate::register_counter!(
+    PR_RECHECK_STAGED_BRANCH_MISMATCH,
+    "pr_url_capture.recheck_staged.branch_mismatch",
+    "staged URL's PR branch did not match execution's expected branch; URL was dropped.",
+);
+
+// The nudge/park ladder's only mover used to be a worker Stop. Every time the
+// recurring sweep has to advance a debounced ladder instead, it means the
+// worker went quiet at a boundary whose decision was withheld for pacing and
+// no further Stop was ever coming — i.e. the sweep broke a stall that would
+// otherwise have held a slot indefinitely. A nonzero, growing count is the
+// in-system signal for that class of stall; it should be rare.
+crate::register_counter!(
+    NUDGE_LADDER_SWEEP_ADVANCED,
+    "nudge_ladder.sweep_advanced",
+    "recurring sweep advanced a debounced nudge ladder no Stop boundary could have advanced.",
+);
+
+// Worker-proposal seam: fallback-hit counters for
+// `detect_and_file_worker_signals`'s legacy marker parsers, incremented only
+// when `worker_signal_proposals_seam` is on and no `worker_proposals` row
+// covered the signal — the exit criterion for eventually deleting each
+// parser (design §"Failure semantics: degrade loudly").
+//
+// Caveat: remote SSH-host workers always render the legacy marker-only
+// prompt text, because `SshHostAdapter` holds no `FeatureFlagsStore` and so
+// hardcodes the prompt-side seam flag to `false` regardless of the engine's
+// (local) read-path flag state (see `host_adapter.rs`'s `compose_worker_spawn`
+// call). Every remote worker's marker therefore counts here even when the
+// read path is proposals-first, indistinguishable from a local worker simply
+// ignoring the `boss propose` directive. Read this counter against local
+// executions only until the remote path also reads feature flags — a nonzero
+// count that includes remote executions does not mean the fallback is not
+// yet quiet.
+crate::register_counter!(
+    WORKER_SIGNAL_FALLBACK_HIT_EFFORT_ESCALATION,
+    "worker_proposals.fallback_hit.effort_escalation",
+    "detect_and_file_worker_signals fell back to the legacy [effort-escalation] marker parser \
+     because no worker_proposals row existed for the execution (worker_signal_proposals_seam on).",
+);
+crate::register_counter!(
+    WORKER_SIGNAL_FALLBACK_HIT_BLOCKED,
+    "worker_proposals.fallback_hit.blocked",
+    "detect_and_file_worker_signals fell back to the legacy [blocked] marker parser because no \
+     worker_proposals row existed for the execution (worker_signal_proposals_seam on).",
+);
+// Worker-proposal seam: fallback-hit counter for
+// `detect_and_record_deferred_scope`'s legacy [deferred-scope] marker parser
+// (design implementation task 9), incremented only when
+// `deferred_scope_proposals_seam` is on and no `worker_proposals` row
+// covered the marker — mirrors `WORKER_SIGNAL_FALLBACK_HIT_*` above. Same
+// remote-worker caveat applies (see the comment on those counters).
+crate::register_counter!(
+    DEFERRED_SCOPE_FALLBACK_HIT,
+    "worker_proposals.fallback_hit.deferred_scope",
+    "detect_and_record_deferred_scope fell back to the legacy [deferred-scope] marker parser \
+     because no worker_proposals row existed for the execution (deferred_scope_proposals_seam on).",
+);
+// Worker-proposal seam: fallback-hit counter for `reconcile_task_followups`'s
+// legacy structured-output-artifact / `FOLLOWUPS:` sentinel scrape and the
+// `attentions_followups_backstop` LLM pass (design implementation task 10),
+// incremented only when `followup_proposals_seam` is on and no
+// `worker_proposals` row of kind `followup_task` existed for the execution
+// — mirrors `WORKER_SIGNAL_FALLBACK_HIT_*`/`DEFERRED_SCOPE_FALLBACK_HIT`
+// above. Same remote-worker caveat applies (see the comment on those
+// counters).
+crate::register_counter!(
+    FOLLOWUP_FALLBACK_HIT,
+    "worker_proposals.fallback_hit.followup_task",
+    "reconcile_task_followups fell back to the legacy structured-output-artifact / FOLLOWUPS: \
+     sentinel scrape (or the attentions_followups_backstop LLM pass) because no worker_proposals \
+     row of kind followup_task existed for the execution (followup_proposals_seam on).",
+);
+// incident-004 AI-4: a first-class, in-system count of "finalize_pr_transition
+// tore down a producing execution whose live activity was still `working`
+// (mid-turn) rather than idle." Aggregate across every finalize source —
+// `pr_recheck_staged`, the `pr_recheck` detector branch, `stop_satisfied_clean`,
+// and any future source — because the postmortem measurement found the
+// missing guard was a property of the shared finalize/teardown funnel, not of
+// any one code block. See `WorkerCompletionHandler::record_mid_turn_reap` in
+// `completion/pr_transition.rs`, the single call site, and
+// tools/boss/docs/postmortems/incident-004-live-revision-workers-reaped-mid-turn.md.
+crate::register_counter!(
+    MID_TURN_REAP_TOTAL,
+    "completion.mid_turn_reap.total",
+    "finalize_pr_transition tore down a producing execution while its live activity was \
+     `working` (mid-turn) rather than idle, summed across every finalization source. \
+     Per-source breakdown: completion.mid_turn_reap.<source>.count.",
+);
+// Worker-proposal seam: fallback-hit counter for `finalize_automation_triage`'s
+// legacy `automation: task`/`automation: skip` marker parser, `recover_skip_reason`,
+// and the `find_most_recent_open_task_for_automation` open-task recovery
+// heuristic (design implementation task 11 — the worst-failing seam in the
+// design's inventory), incremented only when `automation_outcome_proposals_seam`
+// is on and no `worker_proposals` row of kind `automation_outcome` existed for
+// the execution — mirrors `WORKER_SIGNAL_FALLBACK_HIT_*`/`DEFERRED_SCOPE_FALLBACK_HIT`/
+// `FOLLOWUP_FALLBACK_HIT` above. Same remote-worker caveat applies (see the
+// comment on those counters).
+crate::register_counter!(
+    AUTOMATION_OUTCOME_FALLBACK_HIT,
+    "worker_proposals.fallback_hit.automation_outcome",
+    "finalize_automation_triage fell back to the legacy automation: task/skip marker parser, \
+     recover_skip_reason, and the find_most_recent_open_task_for_automation recovery heuristic \
+     because no worker_proposals row of kind automation_outcome existed for the execution \
+     (automation_outcome_proposals_seam on).",
+);
+
+// The run-done gate and its backstop. Together these are the soak
+// instrumentation for the declaration: `GATE_HELD` counts runs the health-alone
+// inference would have finalized and the declaration requirement did not,
+// `BACKSTOP_ASKED` counts how often that hold escalated as far as asking, and
+// `BACKSTOP_PARKED` counts the asks that went unanswered. A healthy soak has
+// `GATE_HELD` well above `BACKSTOP_ASKED` (workers declare, or finish, before
+// the horizon) and `BACKSTOP_PARKED` near zero.
+crate::register_counter!(
+    RUN_DONE_GATE_HELD,
+    "run_done.gate_held",
+    "The satisfied-deliverable gate's health-alone arm refused to finalize a run that had not \
+     declared itself done (run_done_proposals_seam on).",
+);
+crate::register_counter!(
+    RUN_DONE_FINALIZE_RETRY,
+    "run_done.finalize_retry",
+    "A declared-`run_done` finalize attempt ended without a terminal commit (a DB error or an \
+     inconclusive GitHub answer) and will be retried. A persistently climbing value means a \
+     finalize is stuck holding a worker slot and cube lease.",
+);
+crate::register_counter!(
+    RUN_DONE_BACKSTOP_ASKED,
+    "run_done.backstop_asked",
+    "The run-done backstop's silence horizon elapsed with no declaration and no sign of worker \
+     activity, so the worker was asked whether it is finished.",
+);
+crate::register_counter!(
+    RUN_DONE_BACKSTOP_PARKED,
+    "run_done.backstop_parked",
+    "The run-done backstop's ask went unanswered until the auto-nudge breaker tripped; the run was \
+     parked for a human and stamped `run_undeclared_at` — never recorded as a successful completion.",
+);
+
+pub use boss_engine_storage_values::attention_kinds::RUN_UNDECLARED_ATTENTION_KIND;
+
+pub use boss_engine_storage_values::attention_kinds::RUN_DONE_AUDIT_FLAGGED_ATTENTION_KIND;
+
+pub use boss_engine_storage_values::attention_kinds::RUN_DONE_BLOCKED_ATTENTION_KIND;
+
+/// Register all PR-URL-capture counter handles with `registry`. Called from
+/// `metrics_init::init_all` at engine startup so duplicate-name panics
+/// surface at boot rather than at the first counter increment.
+pub fn register_metrics(registry: &Registry) {
+    registry.register_counter(&RUN_DONE_GATE_HELD);
+    registry.register_counter(&RUN_DONE_FINALIZE_RETRY);
+    registry.register_counter(&RUN_DONE_BACKSTOP_ASKED);
+    registry.register_counter(&RUN_DONE_BACKSTOP_PARKED);
+    registry.register_counter(&PR_URL_CAPTURE_PRIMARY_HIT);
+    registry.register_counter(&PR_URL_CAPTURE_ARTIFACT_HIT);
+    registry.register_counter(&PR_URL_CAPTURE_DRIVER_FALLBACK_HIT);
+    registry.register_counter(&PR_URL_CAPTURE_RECONSTRUCTION_HIT);
+    registry.register_counter(&PR_URL_CAPTURE_RECONSTRUCTION_FAILED);
+    registry.register_counter(&PR_RECHECK_STAGED_BRANCH_MISMATCH);
+    registry.register_counter(&NUDGE_LADDER_SWEEP_ADVANCED);
+    registry.register_counter(&MID_TURN_REAP_TOTAL);
+    registry.register_counter(&WORKER_SIGNAL_FALLBACK_HIT_EFFORT_ESCALATION);
+    registry.register_counter(&WORKER_SIGNAL_FALLBACK_HIT_BLOCKED);
+    registry.register_counter(&DEFERRED_SCOPE_FALLBACK_HIT);
+    registry.register_counter(&FOLLOWUP_FALLBACK_HIT);
+    registry.register_counter(&AUTOMATION_OUTCOME_FALLBACK_HIT);
+}
+
+/// Catch-all `failure_reason` stamped on a `conflict_resolutions` row
+/// when the bound worker exits without pushing and without otherwise
+/// classifying the failure via `boss engine conflicts mark-failed`
+/// (design Q5 / Phase 4 #11). The activity-feed surface renders it
+/// loudly so the user knows the engine gave up rather than churning.
+pub const CONFLICT_NO_PUSH_REASON: &str = "no_push_no_stop_condition";
+
+/// Catch-all `failure_reason` stamped on a `ci_remediations` row when
+/// the bound worker exits without pushing and without otherwise
+/// classifying the outcome via `boss engine ci mark-failed`
+/// (design §Phase 10 #33). Mirrors [`CONFLICT_NO_PUSH_REASON`]; the
+/// name diverges to make audits unambiguous about which flow the
+/// catch-all fired in.
+pub const CI_NO_PUSH_REASON: &str = "no_push_no_classification";
+
+/// Re-exported from `boss_execution_contracts`.
+pub use boss_execution_contracts::{NoopWorkerPaneReleaser, PaneReleaseOutcome, WorkerPaneReleaser};
+
+/// What GitHub reports about a PR associated with the worker's
+/// local commits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrStatus {
+    /// No PR is associated with any of the worker's local commits.
+    None,
+    /// PR exists and at least one of the worker's local commit shas
+    /// matches the PR's head — nothing local is unpushed.
+    Fresh { url: String },
+    /// PR exists, but the worker's local commits are ahead of the
+    /// PR's pushed head sha. Treat as "no PR yet" for completion
+    /// purposes; the worker is probed to push.
+    Stale { url: String, reason: String },
+    /// PR exists and head_match, but `changed_files == 0` — the worker
+    /// pushed a commit with no file changes. Do not advance to
+    /// `in_review`; probe the worker to make real edits or close the PR.
+    EmptyDiff { url: String },
+    /// PR exists and is already merged. Move the work item straight
+    /// to `done`.
+    Merged { url: String },
+    /// PR exists but was closed without merging. The work item
+    /// should not advance — surface like "no PR" so the worker can
+    /// decide whether to reopen / open a new one.
+    Closed { url: String },
+}
+
+impl PrStatus {
+    /// PR url, regardless of state.
+    pub fn url(&self) -> Option<&str> {
+        match self {
+            PrStatus::None => None,
+            PrStatus::Fresh { url }
+            | PrStatus::Stale { url, .. }
+            | PrStatus::EmptyDiff { url }
+            | PrStatus::Merged { url }
+            | PrStatus::Closed { url } => Some(url),
+        }
+    }
+}
+
+pub use boss_engine_storage_values::branch_identity::{DEFAULT_WORKER_BRANCH_PREFIX, expected_branch_name};
+pub use boss_engine_storage_values::branch_identity::{
+    branch_work_item_suffix, branches_identify_same_work_item, head_identifies_any_branch,
+};
+
+/// Probes GitHub for the PR opened against an engine-supplied branch
+/// name and reports whether the PR is open / merged / closed / absent.
+///
+/// `repo_remote_url` is the product's `git@github.com:owner/repo.git`
+/// (or `https://...`) URL — the detector parses it into an
+/// `owner/repo` slug used to scope the `gh pr list` query.
+/// `expected_branch` is the engine-supplied head branch (see
+/// [`expected_branch_name`]).
+#[async_trait]
+pub trait PrDetector: Send + Sync {
+    /// Returns the PR status for `expected_branch` in `repo_remote_url`.
+    /// Implementations must treat "no PR with this head" as
+    /// `Ok(PrStatus::None)` to keep the caller's idle-vs-completed
+    /// logic clean. Errors are reserved for tool failures (`gh` auth
+    /// broken, network blips, etc.).
+    async fn detect_pr(&self, repo_remote_url: &str, expected_branch: &str) -> Result<PrStatus>;
+}
+
+/// Verifies whether a worker workspace carries a contribution beyond trunk.
+///
+/// A no-op marker is a statement about the workspace, not merely about the
+/// absence of a PR. The check is kept behind a trait so the Stop-boundary
+/// gate can fail closed on command errors while unit tests remain
+/// deterministic. The production implementation compares `main@origin` to
+/// `@`, so committed changes below an otherwise-empty working-copy commit
+/// are still a non-empty workspace contribution.
+#[async_trait]
+pub trait WorkspaceDiffVerifier: Send + Sync {
+    /// Returns `true` only when the workspace has no contribution beyond
+    /// `main@origin`.
+    /// Errors mean the workspace could not be verified and must refuse a
+    /// no-op completion.
+    async fn is_workspace_contribution_empty(&self, workspace_path: &Path) -> Result<bool>;
+}
+
+/// Production verifier for [`WorkspaceDiffVerifier`].
+#[derive(Debug, Default)]
+pub struct CommandWorkspaceDiffVerifier;
+
+/// Upper bound on verifying the contribution in a worker workspace.
+///
+/// `jj diff` snapshots the working copy and can wait for the shared repo
+/// lock. A no-op claim is refused when that evidence cannot be gathered;
+/// it must not stall the Stop handler indefinitely.
+const WORKSPACE_CONTRIBUTION_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[async_trait]
+impl WorkspaceDiffVerifier for CommandWorkspaceDiffVerifier {
+    async fn is_workspace_contribution_empty(&self, workspace_path: &Path) -> Result<bool> {
+        let command = "jj diff --from main@origin --to @ --summary";
+        let output = tokio::time::timeout(
+            WORKSPACE_CONTRIBUTION_CHECK_TIMEOUT,
+            tokio::process::Command::new("jj")
+                .args(["diff", "--from", "main@origin", "--to", "@", "--summary"])
+                .current_dir(workspace_path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "`{command}` timed out after {} seconds in {}",
+                WORKSPACE_CONTRIBUTION_CHECK_TIMEOUT.as_secs(),
+                workspace_path.display(),
+            )
+        })?
+        .with_context(|| format!("failed to run `{command}` in {}", workspace_path.display()))?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "`{command}` exited with {} in {}: {}",
+                output.status,
+                workspace_path.display(),
+                String::from_utf8_lossy(&output.stderr).trim(),
+            );
+        }
+        Ok(output.stdout.iter().all(u8::is_ascii_whitespace))
+    }
+}
+
+/// `PrDetector` that shells out to `gh pr list --head <branch>`. The
+/// branch name is engine-supplied and execution-unique
+/// (see [`expected_branch_name`]), so GitHub returns at most one PR
+/// per query — there is no cross-execution overlap to exploit.
+///
+/// Replaces the pre-incident-001 SHA-keyed recipe
+/// (`jj_candidate_commit_shas` + `gh api commits/{sha}/pulls`), which
+/// was structurally unsafe under cube's shared `.jj/repo/store/git`:
+/// any concurrent worker's bookmark passed the revset's
+/// `committer_date(after:…)` gate and the detector misattributed PRs.
+#[derive(Debug, Default)]
+pub struct CommandPrDetector;
+
+impl CommandPrDetector {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl PrDetector for CommandPrDetector {
+    async fn detect_pr(&self, repo_remote_url: &str, expected_branch: &str) -> Result<PrStatus> {
+        let repo_slug = parse_repo_slug(repo_remote_url)
+            .with_context(|| format!("failed to parse repo slug from `{repo_remote_url}`"))?;
+        let api_pr = match query_pr_for_branch(&repo_slug, expected_branch).await? {
+            Some(pr) => pr,
+            None => {
+                // Prefix-agnostic fallback (issue #1145): the worker may
+                // have honoured a product `worker_branch_prefix` and
+                // pushed its PR to `<prefix>/<suffix>` (e.g. `bduff/…`)
+                // rather than the engine-reconstructed `boss/<suffix>`.
+                // The exact `--head` query above misses that PR, so
+                // re-query by the work-item suffix (unique per execution
+                // within the repo) and accept any prefix.
+                let suffix = branch_work_item_suffix(expected_branch);
+                match query_pr_by_branch_suffix(&repo_slug, suffix).await? {
+                    Some(pr) => {
+                        tracing::info!(
+                            repo = %repo_slug,
+                            expected_branch = %expected_branch,
+                            pr_url = %pr.url,
+                            "pr_detect: no PR on the exact expected branch, but found one whose work-item suffix matches under a different prefix; associating (prefix-agnostic match)",
+                        );
+                        pr
+                    }
+                    None => {
+                        tracing::debug!(
+                            repo = %repo_slug,
+                            branch = %expected_branch,
+                            "pr_detect: no PR found for expected branch (exact or suffix match); returning None",
+                        );
+                        return Ok(PrStatus::None);
+                    }
+                }
+            }
+        };
+        let status = classify_pr(api_pr);
+        // EmptyDiff is tentative: GitHub computes diff stats
+        // asynchronously, so a freshly-pushed branch can report all
+        // three stat fields as 0 before the computation finishes. Run
+        // a secondary check against the full PR endpoint before
+        // surfacing EmptyDiff — a false positive here would loop the
+        // worker pane with bogus "your diff is empty" directives on
+        // every Stop event.
+        if let PrStatus::EmptyDiff { ref url } = status {
+            tracing::debug!(
+                pr_url = %url,
+                repo = %repo_slug,
+                "all diff stats zero on initial check; verifying via PR endpoint",
+            );
+            match verify_pr_diff_nonempty(&repo_slug, url).await {
+                Ok(true) => {
+                    tracing::debug!(
+                        pr_url = %url,
+                        "secondary check confirms non-empty diff; classifying as Fresh",
+                    );
+                    return Ok(PrStatus::Fresh { url: url.clone() });
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        pr_url = %url,
+                        ?err,
+                        "secondary diff-stat check failed; surfacing as detector failure",
+                    );
+                    return Err(err);
+                }
+            }
+        }
+        Ok(status)
+    }
+}
+
+/// Fetches the `headRefName` of a PR by number, used as the Layer-2
+/// defence-in-depth check before a staged PR URL drives the in_review
+/// transition. Decoupled from `PrDetector` so tests can stub the two
+/// concerns independently.
+#[async_trait]
+pub trait BranchVerifier: Send + Sync {
+    /// Returns the `headRefName` for PR `pr_number` in `repo_slug`, or
+    /// an error on network / API failure.
+    async fn fetch_pr_head_ref(&self, repo_slug: &str, pr_number: u64) -> Result<String>;
+
+    /// Returns the `headRefOid` (commit SHA of the PR's head ref) for
+    /// PR `pr_number` in `repo_slug`. Used by the Stop-boundary
+    /// SHA-delta gate to decide whether a resume run actually moved
+    /// the chore's bound PR before falling through to the
+    /// `PROBE_NO_PR` nudge.
+    async fn fetch_pr_head_oid(&self, repo_slug: &str, pr_number: u64) -> Result<String>;
+
+    /// Returns a fresh PR head OID for a teardown decision. This must bypass
+    /// the merge poller's persisted/batched observation so a stale snapshot
+    /// cannot falsely certify that a live worker made no contribution.
+    async fn fetch_pr_head_oid_fresh(&self, repo_slug: &str, pr_number: u64) -> Result<String>;
+
+    /// Returns the total number of changed lines (additions + deletions)
+    /// between `base` and `head` in `repo_slug`. Used by the no-op /
+    /// trivial-diff skip gate to detect pure rebases and
+    /// trivially-small pushes that don't warrant a fresh reviewer pass.
+    async fn fetch_diff_line_count(&self, repo_slug: &str, base: &str, head: &str) -> Result<u64>;
+
+    /// Returns the `baseRefName` (target-branch ref name) for PR
+    /// `pr_number` in `repo_slug`. Used by the conflict/CI-fix pure-rebase
+    /// skip gate to resolve the live base ref against which both the
+    /// pre- and post-resolution diff signatures are three-dot compared —
+    /// `ci_remediations` rows never stamp a base branch (a CI failure isn't
+    /// necessarily caused by a base move), so it's fetched fresh here
+    /// rather than read off the attempt row.
+    async fn fetch_pr_base_ref(&self, repo_slug: &str, pr_number: u64) -> Result<String>;
+
+    /// Returns a canonical, comparable signature of the file-level diff
+    /// between `base` and `head` in `repo_slug`: every changed file's name,
+    /// status, and unified patch text (with each hunk's `@@ -a,b +c,d @@`
+    /// line-position range normalized away — see
+    /// `normalize_patch_hunk_headers` — so a hunk that shifted position
+    /// because an unrelated upstream commit edited the same file above it
+    /// doesn't register as a content change), sorted by filename. Two
+    /// calls whose underlying content is identical return byte-identical
+    /// strings regardless of the commit SHAs involved — used by the
+    /// pure-rebase skip gate to tell "content unchanged, only the base
+    /// moved" from a resolution that introduced real content.
+    async fn fetch_diff_signature(&self, repo_slug: &str, base: &str, head: &str) -> Result<String>;
+
+    /// Returns `(title, body)` of PR `pr_number` in `repo_slug` in a single
+    /// `gh pr view` call. The body is used by the metadata-only CI-fix
+    /// finalize gate (issue #1252) to detect an operator-visible
+    /// PR-metadata delta: a CI-fix revision that repairs a PR-description
+    /// validator via `gh pr edit --body` makes no commit, so the head SHA
+    /// never moves — the body diff is the only evidence the worker
+    /// contributed. The title is snapshotted alongside it at execution
+    /// start so `boss pr body` can return both without a worker needing a
+    /// second `gh pr view` call. An empty body is a valid value (not an
+    /// error), unlike the head-ref fetches.
+    async fn fetch_pr_title_and_body(&self, repo_slug: &str, pr_number: u64) -> Result<(String, String)>;
+
+    /// True when `base` is an ancestor of (or identical to) `head`, from
+    /// GitHub's compare status (`ahead` / `identical`). Used by the queue-CI
+    /// evidence audit to confirm a verified tree really contained `main`.
+    /// Unsupported by default so verifiers that cannot answer skip the audit.
+    async fn fetch_is_ancestor(&self, _repo_slug: &str, _base: &str, _head: &str) -> Result<bool> {
+        Err(anyhow!("ancestry lookup unsupported by this verifier"))
+    }
+
+    async fn fetch_queue_dequeues(&self, _repo_slug: &str, _pr_number: u64) -> Result<Vec<MergeQueueDequeueEvent>> {
+        Err(anyhow!("queue timeline lookup unsupported by this verifier"))
+    }
+
+    /// The PR's state, head OID and live merge-queue entry (id, enqueuedAt)
+    /// in one read. Used by the queue-CI evidence audit to check a
+    /// worker-supplied `enqueuePullRequest` receipt against GitHub.
+    async fn fetch_pr_merge_queue_snapshot(
+        &self,
+        _repo_slug: &str,
+        _pr_number: u64,
+    ) -> Result<boss_github::gh_runner::PrMergeQueueSnapshot> {
+        Err(anyhow!("merge-queue entry lookup unsupported by this verifier"))
+    }
+}
+
+/// `BranchVerifier` that shells out to `gh pr view`.
+pub struct CommandBranchVerifier {
+    queue_timeline: Arc<dyn MergeQueueTimeline>,
+}
+
+impl Default for CommandBranchVerifier {
+    fn default() -> Self {
+        Self {
+            queue_timeline: Arc::new(UnsupportedMergeQueueTimeline),
+        }
+    }
+}
+
+impl CommandBranchVerifier {
+    /// Command verifier with no merge-queue timeline transport.
+    /// [`BranchVerifier::fetch_queue_dequeues`] returns the unsupported
+    /// error until [`Self::with_queue_timeline`] installs one. Callers that
+    /// only read PR head refs (the PR-binding repair sweep) can keep this
+    /// default.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Install the merge-queue timeline used by
+    /// [`BranchVerifier::fetch_queue_dequeues`].
+    pub fn with_queue_timeline(mut self, timeline: Arc<dyn MergeQueueTimeline>) -> Self {
+        self.queue_timeline = timeline;
+        self
+    }
+}
+
+#[async_trait]
+impl BranchVerifier for CommandBranchVerifier {
+    async fn fetch_pr_head_ref(&self, repo_slug: &str, pr_number: u64) -> Result<String> {
+        git_utils::gh_cli::fetch_pr_head_ref(repo_slug, pr_number).await
+    }
+
+    async fn fetch_pr_head_oid(&self, repo_slug: &str, pr_number: u64) -> Result<String> {
+        git_utils::gh_cli::fetch_pr_head_oid(repo_slug, pr_number).await
+    }
+
+    async fn fetch_pr_head_oid_fresh(&self, repo_slug: &str, pr_number: u64) -> Result<String> {
+        // Attribute the completion-path REST head read under COMPLETION so it
+        // shares the same GitHub-call accounting as the other completion
+        // helpers (and is not invisible to merge-poller budgets).
+        gh_scope(
+            callers::COMPLETION,
+            git_utils::gh_cli::fetch_pr_head_oid_fresh(repo_slug, pr_number),
+        )
+        .await
+    }
+
+    async fn fetch_diff_line_count(&self, repo_slug: &str, base: &str, head: &str) -> Result<u64> {
+        fetch_diff_line_count_cmd(repo_slug, base, head).await
+    }
+
+    async fn fetch_pr_base_ref(&self, repo_slug: &str, pr_number: u64) -> Result<String> {
+        git_utils::gh_cli::fetch_pr_base_ref(repo_slug, pr_number).await
+    }
+
+    async fn fetch_diff_signature(&self, repo_slug: &str, base: &str, head: &str) -> Result<String> {
+        fetch_diff_signature_cmd(repo_slug, base, head).await
+    }
+
+    async fn fetch_pr_title_and_body(&self, repo_slug: &str, pr_number: u64) -> Result<(String, String)> {
+        fetch_pr_title_and_body_cmd(repo_slug, pr_number).await
+    }
+
+    async fn fetch_is_ancestor(&self, repo_slug: &str, base: &str, head: &str) -> Result<bool> {
+        let status = gh_scope(callers::COMPLETION, gh_compare_jq(repo_slug, base, head, ".status")).await?;
+        Ok(matches!(status.as_str(), "ahead" | "identical"))
+    }
+
+    async fn fetch_queue_dequeues(&self, repo_slug: &str, pr_number: u64) -> Result<Vec<MergeQueueDequeueEvent>> {
+        let url = format!("https://github.com/{repo_slug}/pull/{pr_number}");
+        self.queue_timeline.fetch_dequeues(&url).await
+    }
+
+    async fn fetch_pr_merge_queue_snapshot(
+        &self,
+        repo_slug: &str,
+        pr_number: u64,
+    ) -> Result<boss_github::gh_runner::PrMergeQueueSnapshot> {
+        let (owner, name) = repo_slug
+            .split_once('/')
+            .with_context(|| format!("invalid repo slug `{repo_slug}`"))?;
+        gh_scope(
+            callers::COMPLETION,
+            boss_github::gh_runner::pr_merge_queue_snapshot(owner, name, pr_number),
+        )
+        .await
+    }
+}
+
+/// Shell out to `gh api repos/<repo_slug>/compare/<base>...<head>` and return
+/// the total number of changed lines (additions + deletions) across all files
+/// in the comparison. Returns `0` when the diff is empty (pure rebase with no
+/// file-content changes). Used by the no-op skip gate.
+async fn fetch_diff_line_count_cmd(repo_slug: &str, base: &str, head: &str) -> Result<u64> {
+    let trimmed = gh_scope(
+        callers::COMPLETION,
+        gh_compare_jq(
+            repo_slug,
+            base,
+            head,
+            "(.files // []) | map(.additions + .deletions) | add // 0",
+        ),
+    )
+    .await?;
+    let endpoint = format!("repos/{repo_slug}/compare/{base}...{head}");
+    let total: u64 = trimmed
+        .parse()
+        .with_context(|| format!("unexpected output from `gh api {endpoint}`: {trimmed:?}"))?;
+    Ok(total)
+}
+
+/// One entry from GitHub's compare `.files[]` array, carrying enough to
+/// build a content-comparable diff signature.
+#[derive(serde::Deserialize)]
+struct DiffSignatureFile {
+    filename: String,
+    status: String,
+    #[serde(default)]
+    patch: Option<String>,
+}
+
+/// Shell out to `gh api repos/<repo_slug>/compare/<base>...<head>` and
+/// return a canonical `(filename, status, patch)` signature of every
+/// changed file, sorted by filename and joined with control characters that
+/// cannot appear in a filename or unified-diff patch — so two signatures
+/// are byte-comparable regardless of the order GitHub returned files in.
+/// Used by the pure-rebase skip gate: identical signatures at two different
+/// `head` values (same `base`) mean the content introduced is identical,
+/// i.e. nothing changed but the base.
+async fn fetch_diff_signature_cmd(repo_slug: &str, base: &str, head: &str) -> Result<String> {
+    let trimmed = gh_scope(
+        callers::COMPLETION,
+        gh_compare_jq(repo_slug, base, head, "[.files[] | {filename, status, patch}]"),
+    )
+    .await?;
+    let endpoint = format!("repos/{repo_slug}/compare/{base}...{head}");
+    let mut files: Vec<DiffSignatureFile> = serde_json::from_str(&trimmed)
+        .with_context(|| format!("unexpected output from `gh api {endpoint}`: {trimmed:?}"))?;
+    files.sort_by(|a, b| a.filename.cmp(&b.filename));
+    Ok(files
+        .iter()
+        .map(|f| {
+            let patch = f.patch.as_deref().map(normalize_patch_hunk_headers).unwrap_or_default();
+            format!("{}\u{1f}{}\u{1f}{}", f.filename, f.status, patch)
+        })
+        .collect::<Vec<_>>()
+        .join("\u{1e}"))
+}
+
+/// Strip the numeric line-position range out of every unified-diff hunk
+/// header (`@@ -a,b +c,d @@ optional-context`) in `patch`, leaving the
+/// `@@ ... @@ optional-context` marker and every context/added/removed
+/// body line untouched. Two patches whose authored content is identical
+/// but whose hunks landed at different line numbers — because an upstream
+/// commit picked up by a rebase edited the same file above the hunk —
+/// produce identical normalized output; a real content change still
+/// changes the body lines and so still changes the output. Used by
+/// [`fetch_diff_signature_cmd`] so the pure-rebase skip gate's diff
+/// signature is comparable across a base movement that shifted line
+/// numbers without touching the PR's own content.
+fn normalize_patch_hunk_headers(patch: &str) -> String {
+    patch
+        .lines()
+        .map(|line| match line.strip_prefix("@@ ") {
+            Some(rest) => match rest.find(" @@") {
+                Some(end) => format!("@@ ...{}", &rest[end..]),
+                None => line.to_owned(),
+            },
+            None => line.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Shell out to `gh pr view <pr_number> -R <repo_slug> --json title,body`
+/// and return `(title, body)` from a single API round trip. An empty body
+/// is a valid result (returned as the empty string) — a PR can
+/// legitimately have no description, and the metadata-fix gate needs to
+/// distinguish "" (snapshotted empty) from a failed fetch.
+async fn fetch_pr_title_and_body_cmd(repo_slug: &str, pr_number: u64) -> Result<(String, String)> {
+    let pr_str = pr_number.to_string();
+    let display = format!("gh pr view {pr_number} -R {repo_slug} --json title,body");
+    let stdout = gh_scope(
+        callers::COMPLETION,
+        run_gh(
+            &[
+                "pr",
+                "view",
+                &pr_str,
+                "-R",
+                repo_slug,
+                "--json",
+                "title,body",
+                "--jq",
+                "[.title, .body]",
+            ],
+            &display,
+        ),
+    )
+    .await?;
+    let mut fields: Vec<String> =
+        serde_json::from_str(&stdout).with_context(|| format!("unexpected output from `{display}`: {stdout:?}"))?;
+    if fields.len() != 2 {
+        return Err(anyhow!("unexpected output from `{display}`: {stdout:?}"));
+    }
+    let body = fields.pop().expect("checked len == 2");
+    let title = fields.pop().expect("checked len == 2");
+    Ok((title, body))
+}
+
+/// Single PR row returned from `gh pr list --head <branch> --json …`.
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
+struct ApiPr {
+    url: String,
+    state: String,
+    merged_at: Option<String>,
+    /// Number of files changed in the PR.
+    /// May be 0 when GitHub hasn't finished computing diff stats yet (race
+    /// condition on a freshly-pushed branch); check `additions`/`deletions`
+    /// before treating zero as "genuinely empty".
+    changed_files: i64,
+    /// Lines added in the PR.  0 means absent or not-yet-computed.
+    additions: i64,
+    /// Lines deleted in the PR.  0 means absent or not-yet-computed.
+    deletions: i64,
+}
+
+/// Parse the first six tab-separated fields emitted by the shared
+/// `gh pr list … --json url,state,mergedAt,changedFiles,additions,deletions
+/// --jq … @tsv` query (in that exact order) into an [`ApiPr`].
+///
+/// Returns `None` when the URL field is empty — the `select(.)` /
+/// row-absent case — matching the original `url.is_empty()` guard at both
+/// call sites. `mergedAt` of empty or `"null"` (case-insensitively) maps to
+/// `None`; the three numeric fields fall back to `0` when missing or
+/// unparseable.
+///
+/// Any trailing fields beyond the first six (e.g. the `headRefName` column
+/// in the suffix-scan query) are ignored, so callers that need them must
+/// parse them separately from the same line.
+fn parse_api_pr_tsv(line: &str) -> Option<ApiPr> {
+    let mut parts = line.split('\t');
+    let url = parts.next().unwrap_or("").trim().to_owned();
+    let state = parts.next().unwrap_or("").trim().to_owned();
+    let merged_at_raw = parts.next().unwrap_or("").trim();
+    let changed_files_raw = parts.next().unwrap_or("0").trim();
+    let additions_raw = parts.next().unwrap_or("0").trim();
+    let deletions_raw = parts.next().unwrap_or("0").trim();
+    if url.is_empty() {
+        return None;
+    }
+    let merged_at = if merged_at_raw.is_empty() || merged_at_raw.eq_ignore_ascii_case("null") {
+        None
+    } else {
+        Some(merged_at_raw.to_owned())
+    };
+    Some(ApiPr {
+        url,
+        state,
+        merged_at,
+        changed_files: changed_files_raw.parse::<i64>().unwrap_or(0),
+        additions: additions_raw.parse::<i64>().unwrap_or(0),
+        deletions: deletions_raw.parse::<i64>().unwrap_or(0),
+    })
+}
+
+fn classify_pr(pr: ApiPr) -> PrStatus {
+    // Branch-keyed query already guarantees the PR was opened against
+    // this execution's engine-supplied head branch — no SHA matching
+    // needed. (Pre-incident-001 the detector ran a SHA-keyed query and
+    // had to gate on `head.sha` matching a local commit to reject the
+    // squash-merge-on-`main` misbind; branch-keyed detection makes that
+    // gate structurally unnecessary because a sibling worker's
+    // bookmark cannot share this execution's branch name.)
+    if pr.merged_at.is_some() {
+        return PrStatus::Merged { url: pr.url };
+    }
+    if pr.state.eq_ignore_ascii_case("closed") {
+        return PrStatus::Closed { url: pr.url };
+    }
+    // OPEN. A PR has real changes if ANY of the three diff-stat fields
+    // is positive.  `changed_files` alone is unreliable: GitHub computes
+    // it asynchronously and `gh pr list` can return 0 for a freshly-pushed
+    // branch before the computation finishes.  `additions` and `deletions`
+    // are populated by the same pipeline but are often available sooner.
+    // If ALL three are zero the PR is tentatively empty; `detect_pr` runs
+    // a secondary verification call against the full PR endpoint before
+    // surfacing `EmptyDiff` to callers.
+    let has_changes = pr.changed_files > 0 || pr.additions > 0 || pr.deletions > 0;
+    if has_changes {
+        PrStatus::Fresh { url: pr.url }
+    } else {
+        PrStatus::EmptyDiff { url: pr.url }
+    }
+}
+
+/// `gh pr list -R <slug> --head <branch> --state all` — return the
+/// single PR for `branch`, or `Ok(None)` if no PR exists with that
+/// head in `repo_slug`. `Err(_)` is reserved for tool / network failures.
+///
+/// `gh pr list --head` returns at most one open PR (GitHub enforces a
+/// unique open PR per head branch), and historical closed/merged PRs
+/// for the same head are extremely unlikely in practice because each
+/// execution gets a unique branch name. We pass `--limit 1` defensively
+/// — if multiple historical rows happen to exist, we want the most
+/// recent (which `gh pr list` returns first).
+async fn query_pr_for_branch(repo_slug: &str, branch: &str) -> Result<Option<ApiPr>> {
+    let stdout = gh_scope(
+        callers::COMPLETION,
+        run_gh(
+            &[
+                "pr",
+                "list",
+                "-R",
+                repo_slug,
+                "--head",
+                branch,
+                "--state",
+                "all",
+                "--limit",
+                "1",
+                "--json",
+                "url,state,mergedAt,changedFiles,additions,deletions",
+                "--jq",
+                r#".[0] | select(.) | [(.url // ""), (.state // ""), (.mergedAt // ""), ((.changedFiles // 0) | tostring), ((.additions // 0) | tostring), ((.deletions // 0) | tostring)] | @tsv"#,
+            ],
+            &format!("gh pr list -R {repo_slug} --head {branch}"),
+        ),
+    )
+    .await?;
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    Ok(parse_api_pr_tsv(trimmed))
+}
+
+/// Prefix-agnostic cold-path fallback (issue #1145): find a PR whose head
+/// branch *ends in* `suffix` — i.e. `<any-prefix>/<suffix>` — in
+/// `repo_slug`. Used when the exact `--head <boss/suffix>` query in
+/// [`query_pr_for_branch`] finds nothing because the worker honoured a
+/// product `worker_branch_prefix` and opened its PR under a different
+/// prefix.
+///
+/// `gh pr list --head` only matches a full branch name, so there is no
+/// server-side suffix filter; we list candidate PRs and filter in Rust by
+/// [`branch_work_item_suffix`]. The work-item suffix is unique per
+/// execution within a repo (the execution id or a hash of it), so at most
+/// one PR can match — this preserves the incident-001 cross-execution
+/// safety property (the query is still scoped to the product's repo and
+/// keyed on an execution-unique token, never a shared SHA).
+///
+/// We scan open PRs first (the freshly-opened PR we are racing to
+/// associate is open), bounded by `--limit`. If the page fills without a
+/// match we emit a `warn!` rather than silently giving up, so a truncated
+/// scan is visible.
+async fn query_pr_by_branch_suffix(repo_slug: &str, suffix: &str) -> Result<Option<ApiPr>> {
+    if suffix.is_empty() {
+        return Ok(None);
+    }
+    const SCAN_LIMIT: usize = 100;
+    let stdout = gh_scope(
+        callers::COMPLETION,
+        run_gh(
+            &[
+                "pr",
+                "list",
+                "-R",
+                repo_slug,
+                "--state",
+                "all",
+                "--limit",
+                "100",
+                "--json",
+                "url,state,mergedAt,changedFiles,additions,deletions,headRefName",
+                "--jq",
+                r#".[] | [(.url // ""), (.state // ""), (.mergedAt // ""), ((.changedFiles // 0) | tostring), ((.additions // 0) | tostring), ((.deletions // 0) | tostring), (.headRefName // "")] | @tsv"#,
+            ],
+            &format!("gh pr list -R {repo_slug} --state all (suffix scan)"),
+        ),
+    )
+    .await?;
+    let mut rows = 0usize;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        rows += 1;
+        // The shared 6-field parser ignores trailing columns, so pull the
+        // 7th `headRefName` field out separately for the suffix filter.
+        let head_ref = line.split('\t').nth(6).unwrap_or("").trim();
+        if head_ref.is_empty() {
+            continue;
+        }
+        if branch_work_item_suffix(head_ref) != suffix {
+            continue;
+        }
+        if let Some(pr) = parse_api_pr_tsv(line) {
+            return Ok(Some(pr));
+        }
+    }
+    if rows >= SCAN_LIMIT {
+        // Downgraded from `warn!` (2026-07-14 log-volume incident): in a
+        // busy repo with well over `SCAN_LIMIT` total PRs, hitting the row
+        // cap is the expected steady state every single time the worker
+        // genuinely has no PR yet — not evidence of a truncated search. This
+        // fired on essentially every PR-less Stop while a worker legitimately
+        // waited on a build, drowning out the rarer case worth a human's
+        // attention (a worker that already pushed under a non-`boss/` prefix
+        // whose PR is genuinely beyond the scanned page). `debug!` keeps the
+        // information available without the log-volume cost.
+        tracing::debug!(
+            repo = %repo_slug,
+            suffix,
+            scanned = rows,
+            "pr_detect: suffix scan hit the {SCAN_LIMIT}-PR limit without a match; a PR on a non-`boss/` prefix may exist beyond the scanned page",
+        );
+    }
+    Ok(None)
+}
+
+/// Secondary diff-stat verification via the full PR endpoint.
+///
+/// The `commits/{sha}/pulls` response can report `changed_files == 0`
+/// (and likewise `additions`/`deletions`) before GitHub finishes its
+/// async diff computation on a freshly pushed branch.  This function
+/// queries the authoritative per-PR endpoint and returns `true` when
+/// the PR has at least one added or deleted line, so callers can
+/// override an ambiguous `EmptyDiff` classification with `Fresh`.
+///
+/// An `Err` here means the secondary check itself failed (network blip,
+/// `gh` auth issue, etc.). Callers must propagate this as a detector
+/// failure rather than treating it as confirmation of an empty diff.
+async fn verify_pr_diff_nonempty(repo_slug: &str, pr_url: &str) -> Result<bool> {
+    let pr_number = pr_number_from_url(pr_url).ok_or_else(|| anyhow!("cannot parse PR number from URL: {pr_url}"))?;
+    let endpoint = format!("repos/{repo_slug}/pulls/{pr_number}");
+    let stdout = gh_scope(
+        callers::COMPLETION,
+        run_gh(
+            &[
+                "api",
+                &endpoint,
+                "-H",
+                "Accept: application/vnd.github+json",
+                "--jq",
+                "((.additions // 0) + (.deletions // 0))",
+            ],
+            &format!("gh api {endpoint}"),
+        ),
+    )
+    .await?;
+    let total: i64 = stdout
+        .trim()
+        .parse()
+        .with_context(|| format!("unexpected output from `gh api {endpoint}`: {:?}", stdout.trim()))?;
+    Ok(total > 0)
+}
+
+/// Pull `owner/repo` out of a remote URL. Handles both SSH
+/// (`git@github.com:owner/repo.git`) and HTTPS
+/// (`https://github.com/owner/repo[.git]`) shapes.
+pub fn parse_repo_slug(remote_url: &str) -> Result<String> {
+    git_utils::repo_slug::parse_github_slug_result(remote_url)
+}
+
+/// Queues an automatic probe for `run_id`. The shape mirrors
+/// `ServerState::queue_probe` but is exposed via a trait so the
+/// completion handler can be unit-tested without standing up the full
+/// app server. Implementations must be cheap and infallible — a probe
+/// that turns out to be undeliverable is settled at a terminal
+/// [`boss_protocol::ProbeDeliveryState`] by the injection path rather
+/// than dropped silently (see `dispatch_probe_on_stop` in `app.rs`).
+pub trait ProbeQueuer: Send + Sync {
+    /// Push `text` onto the FIFO of probes for `run_id`. The engine
+    /// types it into the pane via tmux `send-keys` as if the human had
+    /// typed it, at the earliest point the worker's pane will take a write.
+    ///
+    /// For a completion-driven probe that point is always the `Stop`
+    /// currently being handled: the completion handler runs inside the Stop
+    /// fan-out, before `dispatch_probe_on_stop`, so a nudge queued here is
+    /// delivered on the same boundary that produced it. That is a structural
+    /// property of this path, not a flag — a completion probe is never queued
+    /// mid-turn, so it never reaches a tool-boundary delivery.
+    ///
+    /// That "always delivered on the current boundary" guarantee holds ONLY
+    /// for a probe queued from inside a Stop fan-out. A probe queued from a
+    /// recurring sweep has no boundary to ride and needs
+    /// [`Self::deliver_queued_probes_now`].
+    fn queue_probe(&self, run_id: &str, text: &str);
+
+    /// Deliver whatever is queued for `run_id` **now**, without waiting for a
+    /// hook boundary.
+    ///
+    /// Probe delivery is otherwise driven entirely by worker hook events
+    /// (`dispatch_probe_on_stop` / `dispatch_probe_on_post_tool_use`) or by a
+    /// human's `ProbeRun` RPC. An idle worker emits neither, so a probe the
+    /// engine queues for one on a recurring sweep is written to the FIFO and
+    /// never leaves it — the engine "nudges" into a void, scores the silence
+    /// as an unproductive nudge, and the worker is never actually asked
+    /// anything. This is the seam that lets a sweep-driven nudge reach a
+    /// parked pane, so a re-driven ladder is honest: the worker really does
+    /// get the probe, and really does get the chance to answer with the
+    /// sanctioned terminal declaration.
+    ///
+    /// Fail-closed and best-effort, exactly like the hook-driven paths it
+    /// shares an implementation with: a pane whose `(activity, driver)`
+    /// posture admits no write leaves the probe queued for a later
+    /// opportunity rather than dropping it. Defaults to a no-op so
+    /// test/stub queuers are unaffected.
+    fn deliver_queued_probes_now(&self, _run_id: &str) {}
+
+    /// Drop every not-yet-delivered probe queued for `run_id`.
+    ///
+    /// Exists for the escalation/blocker suppression path: a probe
+    /// minted on an earlier Stop (e.g. a `PROBE_NO_PR` nudge whose pane
+    /// write failed and was requeued for retry — see
+    /// `dispatch_probe_on_stop`) can still be sitting in the queue when
+    /// a *later* Stop reveals the worker is blocked. `dispatch_probe_on_stop`
+    /// pops whatever is queued for a run on every `Stop` regardless of
+    /// that Stop's own completion outcome, so a stale probe like that
+    /// would otherwise fire even though this Stop just suppressed the
+    /// nudge — the worker sees "You stopped without producing a PR"
+    /// injected into its pane on the very turn it reported `[blocked]`.
+    /// Called whenever `on_stop_inner` finds an unresolved worker
+    /// signal, so no queued nudge survives into a Stop where nudging is
+    /// suppressed.
+    ///
+    /// `reason` is recorded against every discarded probe's status record.
+    /// It is not optional: discarding a probe the caller was told was
+    /// `queued` is only acceptable if that caller can subsequently find out
+    /// it happened and why. A discard that leaves the probe reading `queued`
+    /// is the silent-drop defect this parameter exists to prevent.
+    fn clear_pending_probes(&self, run_id: &str, reason: &str);
+}
+
+/// `ProbeQueuer` that drops everything — used when the test harness
+/// doesn't need to assert on probe wiring.
+#[derive(Debug, Default)]
+pub struct NoopProbeQueuer;
+
+impl ProbeQueuer for NoopProbeQueuer {
+    fn queue_probe(&self, _run_id: &str, _text: &str) {}
+    fn clear_pending_probes(&self, _run_id: &str, _reason: &str) {}
+}
+
+/// Maximum period a staged revision PR URL can defer recheck finalization
+/// while its worker is observed mid-turn. This shares the build-wait bound so
+/// a worker that never reaches Stop cannot keep an execution live forever.
+pub const DEFAULT_STAGED_PR_MID_TURN_DEFER_SECS: i64 = DEFAULT_BUILD_WAIT_HORIZON_SECS;
+
+/// Why a Stop-boundary nudge decision was recorded for later re-evaluation
+/// instead of being acted on when it was made. The two holds look identical
+/// in the registry but have opposite retirement conditions, and conflating
+/// them is what let a stalled execution lose the only record that could ever
+/// re-drive it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NudgeHold {
+    /// The nudge was suppressed because the worker still has live delegated
+    /// background children. The worker is *expected* to resume on its own —
+    /// so hook activity after the hold is positive proof the suppression did
+    /// its job, and the intent is retired.
+    BackgroundChildren,
+    /// The nudge decision was made and then debounced by
+    /// [`crate::nudge_breaker::MIN_RENUDGE_INTERVAL`]: an identical
+    /// fingerprint had just been nudged, so re-sending the same probe could
+    /// not carry new information *yet*.
+    ///
+    /// This hold must NEVER be retired on hook activity. A debounce is a
+    /// pacing decision about a decision already taken at a real turn
+    /// boundary, not a bet that the worker will resume — and the worker
+    /// cannot resume unaided, because the only thing that produces its next
+    /// Stop is a probe and the debounce is precisely the choice not to send
+    /// one. Retiring on a watermark change (the `BackgroundChildren` rule,
+    /// previously applied to every intent) drops the one record that keeps
+    /// the bounded nudge/park ladder advancing, leaving the execution live,
+    /// idle, and holding its slot with nothing scheduled to look at it again.
+    Debounced,
+    /// The nudge was suppressed because the worker declared an unexpired
+    /// `boss propose wait`. Like [`Self::Debounced`], this must not be
+    /// retired on hook activity: the worker is idle on a background job
+    /// that may emit no further Stop until we re-nudge after expiry. The
+    /// recurring recheck is what resumes the ladder once the wait ends.
+    WorkerWait,
+}
+
+// Six fields, so the project's builder convention applies. The three
+// construction sites here deliberately keep struct-literal syntax (two of
+// them re-record an existing intent with `..spread`, which a builder cannot
+// express); the derive is what keeps a future additive field from being a
+// breaking change for any site that does not need it.
+#[derive(Clone, bon::Builder)]
+#[builder(on(String, into))]
+struct BackgroundNudgeIntent {
+    probe_text: String,
+    fingerprint: String,
+    bound_pr_url: Option<String>,
+    proceed_outcome: StopOutcome,
+    activity_watermark: Option<String>,
+    /// Which suppression recorded this intent — see [`NudgeHold`]. Decides
+    /// how [`WorkerCompletionHandler::recheck_background_nudge`] is allowed
+    /// to retire it.
+    hold: NudgeHold,
+}
+
+#[derive(Default)]
+struct BackgroundNudgeRegistry {
+    inner: std::sync::Mutex<std::collections::HashMap<String, BackgroundNudgeIntent>>,
+}
+
+impl BackgroundNudgeRegistry {
+    fn record(&self, execution_id: &str, intent: BackgroundNudgeIntent) {
+        self.inner
+            .lock()
+            .expect("BackgroundNudgeRegistry mutex poisoned")
+            .insert(execution_id.to_owned(), intent);
+    }
+
+    fn get(&self, execution_id: &str) -> Option<BackgroundNudgeIntent> {
+        self.inner
+            .lock()
+            .expect("BackgroundNudgeRegistry mutex poisoned")
+            .get(execution_id)
+            .cloned()
+    }
+
+    fn execution_ids(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .expect("BackgroundNudgeRegistry mutex poisoned")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn forget(&self, execution_id: &str) {
+        self.inner
+            .lock()
+            .expect("BackgroundNudgeRegistry mutex poisoned")
+            .remove(execution_id);
+    }
+}
+
+pub struct BackgroundNudgeTracker {
+    horizon: Arc<BuildWaitTracker>,
+    intents: BackgroundNudgeRegistry,
+}
+
+impl BackgroundNudgeTracker {
+    fn new(horizon: Arc<BuildWaitTracker>) -> Self {
+        Self {
+            horizon,
+            intents: BackgroundNudgeRegistry::default(),
+        }
+    }
+
+    fn record(&self, execution_id: &str, now_epoch_secs: i64, horizon_secs: i64) -> BuildWaitDecision {
+        self.horizon.record(execution_id, now_epoch_secs, horizon_secs)
+    }
+
+    fn record_intent(&self, execution_id: &str, intent: BackgroundNudgeIntent) {
+        self.intents.record(execution_id, intent);
+    }
+
+    fn intent(&self, execution_id: &str) -> Option<BackgroundNudgeIntent> {
+        self.intents.get(execution_id)
+    }
+
+    fn execution_ids(&self) -> Vec<String> {
+        self.intents.execution_ids()
+    }
+
+    fn forget_intent(&self, execution_id: &str) {
+        self.intents.forget(execution_id);
+    }
+
+    /// Clear only the wait-duration horizon, leaving any recorded intent
+    /// alone. Used when the probe/horizon says suppression is no longer in
+    /// effect (no descendants, horizon elapsed, probe indeterminate) but the
+    /// nudge itself then gets debounced — the intent must survive that so
+    /// the recurring recheck sweep can still find and re-evaluate it later.
+    fn forget_horizon(&self, execution_id: &str) {
+        self.horizon.forget(execution_id);
+    }
+
+    fn forget(&self, execution_id: &str) {
+        self.horizon.forget(execution_id);
+        self.intents.forget(execution_id);
+    }
+}
+
+/// Orchestrates the on-Stop completion flow: detect PR, transition state in
+/// the work DB, release the cube lease, and publish the right invalidation
+/// events. Keeps the wiring side at the call site (`app.rs`) thin.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+pub struct WorkerCompletionHandler {
+    /// Per-execution serialization for Stop acceptance and refusal.
+    #[builder(default)]
+    stop_locks: std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    /// Validated `no-changes-needed` completions whose terminal write failed
+    /// at the Stop boundary, keyed by execution id. Kept until a retry
+    /// reaches a terminal state; see [`pending_finalize`].
+    #[builder(skip)]
+    pending_no_op_completions: std::sync::Mutex<std::collections::HashMap<String, PendingNoOpCompletion>>,
+    work_db: Arc<WorkDb>,
+    pr_detector: Arc<dyn PrDetector>,
+    /// Verifies the worker's recorded workspace is genuinely empty before a
+    /// primary implementation's `NO_CHANGES_NEEDED` claim can release it.
+    workspace_diff_verifier: Arc<dyn WorkspaceDiffVerifier>,
+    cube_client: Arc<dyn CubeClient>,
+    publisher: Arc<dyn ExecutionPublisher>,
+    pane_releaser: Arc<dyn WorkerPaneReleaser>,
+    probe_queuer: Arc<dyn ProbeQueuer>,
+    /// Structured dispatch timeline shared with the coordinator. The merge
+    /// poller uses it to record engine-driven cancellation after a parent PR
+    /// merges, closing the otherwise silent tail after `pane_spawned`.
+    dispatch_events: Arc<dyn DispatchEventSink>,
+    /// Primary-path PR URL staging. The events-socket dispatcher in
+    /// `app.rs` populates this from `PostToolUse` Bash hook events
+    /// whose `tool_response.stdout` carries a `gh pr create` (or
+    /// `gh pr view` / `gh pr edit`) URL. When `on_stop` /
+    /// `recheck_for_pr` fires, peek this cache first: if a URL is
+    /// staged we trust it verbatim (`PrStatus::Fresh`) and skip the
+    /// `jj log` + `gh api commits/{sha}/pulls` reconstruction
+    /// entirely. Reconstruction stays as the cold-path fallback for
+    /// engine-restart recovery (the cache lives in memory only).
+    ///
+    /// Defaults to an empty cache so test sites that don't exercise
+    /// the staging path get the same behaviour they always had —
+    /// nothing is staged → fall through to `pr_detector`.
+    staged_pr_urls: Arc<crate::pr_url_capture::StagedPrUrlCache>,
+    /// Live worker activity used to distinguish a mid-turn finalization from
+    /// one that occurs after the worker reached its Stop boundary.
+    live_worker_states: Option<Arc<crate::live_worker_state::LiveWorkerStateRegistry>>,
+    /// How long a staged revision PR URL may defer merge-poller finalization
+    /// while the worker is observed mid-turn. The bound is measured from
+    /// [`crate::pr_url_capture::StagedPrUrlEntry::staged_at`]; after it
+    /// expires, the staged path finalizes so a worker that never reaches Stop
+    /// cannot keep the execution live forever.
+    staged_pr_mid_turn_defer_secs: i64,
+    /// In-memory set recording `revision_implementation` executions that ran a
+    /// `jj git push` command since their last Stop boundary. Populated by the
+    /// `PostToolUse` hook dispatcher; consumed (and cleared) by
+    /// `on_stop_inner`'s SHA-delta `Contributed` gate to distinguish the
+    /// revision's own push from a concurrent parent-worker push.
+    staged_revision_pushes: Arc<crate::pr_url_capture::StagedRevisionPushCache>,
+    /// In-memory staging map for failed `boss propose` submissions.
+    /// Populated by the `PostToolUse` hook dispatcher in `app.rs`; consumed
+    /// by [`Self::detect_and_file_proposal_channel_error`] on `on_stop`,
+    /// which files an attention and increments
+    /// `worker_proposals.channel_error`. See [`crate::proposal_channel_error`].
+    staged_proposal_channel_errors: Arc<crate::proposal_channel_error::ProposalChannelErrorTracker>,
+    /// In-memory `execution_id → abandoned commands` staging map for Codex
+    /// `command_execution` items whose `item.started` was observed with no
+    /// matching `item.completed` before the turn boundary. Populated by the
+    /// worker-event dispatcher in `app/worker_events.rs`; consulted by
+    /// [`Self::detect_and_file_unobserved_command_signal`] (files an
+    /// attention item) and by `on_stop_inner`'s no-op gate,
+    /// which refuses the worker's no-op claim when this is non-empty for the
+    /// execution. See [`crate::codex_unobserved_command`].
+    staged_unobserved_commands: Arc<crate::codex_unobserved_command::UnobservedCommandTracker>,
+    /// Toggleable feature flags (incident 001 AI #5). Consulted by
+    /// `on_stop_inner` and `recheck_for_pr` to decide whether the
+    /// cold-path PR fallback is permitted to run. Defaults to a
+    /// store whose only state is the registry defaults — tests that
+    /// don't wire one in get the historical behaviour
+    /// (`detect_pr_cold_fallback` defaults ON).
+    feature_flags: Arc<crate::feature_flags::FeatureFlagsStore>,
+    /// Layer-2 defence-in-depth verifier. Before a staged PR URL drives
+    /// the in_review transition, the verifier fetches the PR's
+    /// `headRefName` and confirms it matches this execution's expected
+    /// branch (`boss/<execution_id>`). A mismatch means the URL was
+    /// staged from an unrelated Bash invocation — it is dropped and the
+    /// cold-path detector runs instead.
+    ///
+    /// Defaults to `CommandBranchVerifier` (shells out to `gh pr view`).
+    /// Tests that exercise the staged-URL path must wire in a stub via
+    /// [`Self::with_branch_verifier`] to avoid live network calls.
+    branch_verifier: Arc<dyn BranchVerifier>,
+    /// Merge-queue timeline applied to the default [`CommandBranchVerifier`].
+    /// Stored independently so [`Self::with_merge_queue_timeline`] cannot
+    /// replace a verifier installed via [`Self::with_branch_verifier`].
+    merge_queue_timeline: Option<Arc<dyn MergeQueueTimeline>>,
+    /// True after [`Self::with_branch_verifier`] replaces the default
+    /// command verifier. Timeline application then leaves the injected
+    /// verifier in place.
+    #[builder(default)]
+    branch_verifier_overridden: bool,
+    /// Engine-wide counter registry. Defaults to a fresh local registry
+    /// with the PR-capture counters pre-registered so tests that do not
+    /// call `with_metrics` still get valid increments. Production wires
+    /// in the shared engine registry via `with_metrics` after construction.
+    metrics: Arc<Registry>,
+    /// GitHub probe used for the on-transition CI-status pre-fetch.
+    /// When a task moves to Review the handler spawns a background task
+    /// that probes the new PR's CI state so the UI card has a real icon
+    /// from the first poll rather than waiting for the merge-poller sweep.
+    /// Defaults to [`NoopMergeProbe`]; production wires in the shared
+    /// [`CommandMergeProbe`] via [`Self::with_merge_probe`].
+    merge_probe: Arc<dyn MergeProbe>,
+    /// Writes PR poll state after the on-transition CI pre-fetch.
+    /// Defaults to [`NoopPrPollStateWriter`]; production wires
+    /// `MergePollerPrPollStateWriter` via [`Self::with_pr_poll_state_writer`].
+    pr_poll_state_writer: Arc<dyn PrPollStateWriter>,
+    /// Base backoff between the conflict stop gate's `mergeable=UNKNOWN`
+    /// re-probes (see [`crate::conflict_stop_gate`]). Defaults to
+    /// [`conflict_stop_gate::DEFAULT_UNKNOWN_RETRY_BACKOFF`]; tests set it
+    /// to zero via [`Self::with_conflict_unknown_backoff`] so the
+    /// indeterminate path doesn't sleep.
+    conflict_unknown_backoff: std::time::Duration,
+    /// Circuit breaker for the auto-nudge loop. Every nudge site routes
+    /// through [`Self::nudge_or_park`], which records the nudge against
+    /// this breaker; once `max_unproductive_nudges` consecutive nudges
+    /// fire with no state change the execution is parked instead of
+    /// nudged again (the Worf-incident fix). Shared via `Arc` so the
+    /// per-execution counters survive across the multiple `on_stop`
+    /// calls of a single worker session. Defaults to a fresh breaker.
+    nudge_breaker: Arc<NudgeBreaker>,
+    /// Cap on consecutive unproductive auto-nudges before the breaker
+    /// trips. Defaults to [`DEFAULT_MAX_UNPRODUCTIVE_NUDGES`]; tests
+    /// override it via [`Self::with_max_unproductive_nudges`].
+    max_unproductive_nudges: u32,
+    /// Time-bounded suppression tracker for the [`crate::build_wait`]
+    /// signal: a worker narrating that it is waiting on a backgrounded
+    /// build/test gate must not be nudged (each nudge just manufactures the
+    /// next Stop and burns the breaker cap above), but that trust is not
+    /// indefinite — see [`crate::build_wait_tracker`] for the incident this
+    /// exists to fix. Shared via `Arc` so per-execution state survives
+    /// across the multiple `on_stop` calls of a single worker session.
+    build_wait_tracker: Arc<BuildWaitTracker>,
+    /// How long a continuously-reported build-wait is trusted before
+    /// [`Self::nudge_or_park`] stops suppressing and falls back to the
+    /// normal nudge/park flow. Defaults to
+    /// [`DEFAULT_BUILD_WAIT_HORIZON_SECS`]; tests override it via
+    /// [`Self::with_build_wait_horizon_secs`].
+    build_wait_horizon_secs: i64,
+    /// Reports whether an execution's worker process tree still has live
+    /// descendants outside the driver runtime's foreground process group at
+    /// Stop boundary — e.g. a backgrounded
+    /// subagent spawned via the harness Agent tool that has not yet
+    /// reported back (observed live 2026-07-17). See
+    /// [`crate::background_children`] for the process-tree scan this
+    /// wraps in production. Defaults to
+    /// [`crate::background_children::NoopBackgroundActivityProbe`]; `app.rs`
+    /// wires in the real [`crate::background_children::RegistryBackgroundActivityProbe`]
+    /// via [`Self::with_background_activity_probe`].
+    background_activity_probe: Arc<dyn crate::background_children::BackgroundActivityProbe>,
+    /// Time horizon and exact nudge suppressed by a delegated-background
+    /// child sighting. It mirrors [`Self::build_wait_tracker`] with a
+    /// separate bounded state: the merge poller's recurring sweep replays the
+    /// intent when the child exits or the horizon elapses, unless hook
+    /// activity proves the worker resumed. This in-memory intent does not
+    /// survive an engine restart; DB-backed pending-PR recovery still covers
+    /// no-PR executions, while a future driver-owned delegation signal must
+    /// make bound-PR recovery durable too.
+    background_children_tracker: Arc<BackgroundNudgeTracker>,
+    /// How long a continuously-reported delegated-descendant sighting is
+    /// trusted before [`Self::nudge_or_park`] stops suppressing and falls
+    /// back to the normal nudge/park flow. Defaults to
+    /// [`crate::background_children::DEFAULT_BACKGROUND_CHILDREN_HORIZON_SECS`];
+    /// tests override it via [`Self::with_background_children_horizon_secs`].
+    background_children_horizon_secs: i64,
+    /// Silence tracker for the run-done backstop: how long an execution
+    /// that has not declared itself done
+    /// ([`boss_protocol::ProposalKind::RunDone`]) has been quiet at Stop
+    /// boundaries. Same bounded-suppression primitive as the two trackers
+    /// above and a separate instance for the same reason — it measures a
+    /// third, independent signal. See [`crate::run_done_backstop`] for why
+    /// the backstop is silence-and-liveness based rather than a slower copy
+    /// of the inference it replaces.
+    run_done_silence_tracker: Arc<BuildWaitTracker>,
+    /// Operator-placed holds that exempt a live run from the idle-park
+    /// (this handler's nudge/park flow) and auto-reap
+    /// (`stale_worker_sweep`) sweeps until released or the run
+    /// ends. See [`crate::hold_registry`] for the full rationale —
+    /// `bossctl agents hold`/`release-hold` is the operator-facing verb
+    /// pair. Shared via `Arc` so `app.rs`'s RPC handlers and both sweeps
+    /// see the same holds.
+    hold_registry: Arc<crate::hold_registry::HoldRegistry>,
+    /// Worker-declared waits (`boss propose wait`) that hold the produce-a-PR
+    /// nudge ladder until expiry. Shared with `app.rs`'s SubmitProposal
+    /// handler so a wait granted on the RPC is visible on the next Stop.
+    /// See [`crate::wait_registry`].
+    wait_registry: Arc<crate::wait_registry::WaitRegistry>,
+    /// In-flight completion-teardown marks. Every path that terminalizes
+    /// an execution marks it here BEFORE the terminalizing write and
+    /// clears the mark once [`Self::finish_worker_teardown`] has released
+    /// the pane, torn down driver state, and freed the cube lease.
+    /// `terminal_work_sweep` consults the same registry so it can
+    /// tell "this pane's own teardown owns it" apart from "this pane is a
+    /// strand" — see [`crate::teardown_registry`]. Shared via `Arc` so the
+    /// handler and the sweep see the same marks.
+    teardown_registry: Arc<crate::teardown_registry::TeardownRegistry>,
+    /// Maximum number of automated reviewer passes per PR.
+    /// When a producing task's `review_cycle` reaches this value the engine
+    /// skips the next reviewer pass and advances to human Review directly.
+    /// Defaults to `config::DEFAULT_MAX_REVIEW_CYCLES`; production
+    /// wires in the value from `WorkConfig` via
+    /// [`Self::with_max_review_cycles`].
+    max_review_cycles: usize,
+    /// Minimum changed-line count required to trigger a reviewer pass when
+    /// `last_reviewed_sha` is set. Pushes whose effective
+    /// diff (new head vs. last-reviewed head) totals fewer lines than this
+    /// threshold are skipped as trivial. Zero (the conservative default)
+    /// means skip only when the diff is literally empty (pure rebase with
+    /// no file-content changes). Production wires in the value from
+    /// `WorkConfig` via [`Self::with_min_review_changed_lines`].
+    min_review_changed_lines: u64,
+    /// Kill-switch for the revision-triggered-review experiment
+    /// (2026-07-01): when `true`, a `revision_implementation` execution that
+    /// pushes new commits to its parent PR re-triggers a `pr_review` pass,
+    /// same as the first push does — closing the gap where CI-fix,
+    /// conflict-resolution, and operator-filed revisions landed unreviewed.
+    /// Production wires in `WorkConfig.enable_revision_triggered_reviews`
+    /// (default `true`) via [`Self::with_enable_revision_triggered_reviews`].
+    /// Defaults to `false` here (not `true`, unlike the other review knobs
+    /// above) so the large body of revision-completion tests written before
+    /// this feature existed — which assert the legacy "revision advances
+    /// straight to in_review with no reviewer" behaviour — keep passing
+    /// without being individually updated; tests exercising the new
+    /// behaviour opt in explicitly.
+    enable_revision_triggered_reviews: bool,
+    /// PR state checker passed to `create_revision` in
+    /// `finalize_pr_review_pass`. Defaults to [`GhPrStateChecker`] (shells
+    /// out to `gh pr view`); tests inject `FakePrStateChecker::always(Open)`
+    /// via [`Self::with_pr_state_checker`] to avoid live network calls.
+    pr_state_checker: Arc<dyn crate::work::PrStateChecker>,
+    /// Engine-owned base directory for worker structured-output artifacts
+    /// (review findings / task followups). Mirrors the dir the spawn path
+    /// resolves via [`crate::structured_output::default_dir`]; both are the
+    /// same in production. Tests point it at a tempdir via
+    /// [`Self::with_structured_output_dir`] so they can seed/inspect the
+    /// artifact without touching the shared system temp dir.
+    structured_output_dir: std::path::PathBuf,
+    /// Resolves remote adapters for structured-output collection at the read
+    /// site. Kept optional for local-only tests and installations.
+    host_adapter_provider: Arc<std::sync::RwLock<Option<Arc<dyn boss_execution_contracts::HostAdapterProvider>>>>,
+    /// Owning-cube resolver shared with the lease heartbeat
+    /// (`cube_lease_heartbeat::HostRoutedCubes`); installed together
+    /// with the adapter provider. Until then a remote run fails to resolve
+    /// rather than falling back to the local cube.
+    execution_cubes: Arc<std::sync::RwLock<Option<Arc<dyn boss_execution_contracts::ExecutionCubes>>>>,
+    /// Clock the auto-nudge debounce guard reads from
+    /// ([`crate::nudge_breaker::MIN_RENUDGE_INTERVAL`]). Defaults to the
+    /// real wall clock (`Instant::now`) — correct for production, where
+    /// consecutive Stops for the same execution really are seconds to
+    /// minutes apart (a worker's own turn latency). Tests that
+    /// intentionally drive several `on_stop` calls back-to-back to
+    /// exercise the circuit breaker's *count* (rather than its timing)
+    /// wire in an auto-advancing fake clock via [`Self::with_now_fn`] so
+    /// each call lands past the debounce window without a real sleep;
+    /// dedicated debounce tests wire in a clock they control directly.
+    now_fn: Arc<dyn Fn() -> std::time::Instant + Send + Sync>,
+    /// How a producing execution's PR is turned into an immutable pre-merge
+    /// review batch. Defaults to [`GhReviewBatchEnqueuer`] (fetches SHAs via
+    /// `gh pr view`); tests inject a stub via
+    /// [`Self::with_review_batch_enqueuer`] so admission deferral can be
+    /// exercised without a live GitHub call.
+    review_batch_enqueuer: Arc<dyn ReviewBatchEnqueuer>,
+    /// Configured review-pool slot count used as weighted-admission
+    /// reservation capacity. Defaults to
+    /// [`boss_execution_contracts::DEFAULT_REVIEW_POOL_SIZE`]; production wires
+    /// `WorkConfig.review_pool_size` via [`Self::with_review_pool_size`].
+    review_pool_size: usize,
+    /// GitHub source-packet collector used by review-guide capture seams.
+    /// Production uses the GitHub-backed collector; tests inject a spy.
+    source_packet_collector: crate::review_guide_capture::SourcePacketCollector,
+    /// Engine-host services for design-doc scanning, attention extraction and
+    /// review-guide validation; see [`CompletionCollaborators`].
+    collaborators: CompletionCollaborators,
+}
+
+/// Outcome of [`WorkerCompletionHandler::try_retire_cleared_blocking_signal`].
+enum BlockingSignalOutcome {
+    /// The blocking signal was cleared and the attempt retired; the caller
+    /// must return this outcome directly.
+    Retired(StopOutcome),
+    /// Nothing was retired. Carries whatever probe context the method
+    /// already gathered along the way — `None` when it never got far
+    /// enough to probe (kind mismatch, no live attempt, probe failure, or
+    /// the PR is merged/closed), `Some` when it probed the PR and found an
+    /// active conflict attempt whose mergeability was not yet `Clean`.
+    /// Boxed: `ConflictSignalPrefetch` carries a full `PrLifecycleProbe`
+    /// and is much larger than the common `Retired`/`NotRetired(None)`
+    /// cases, so boxing avoids over-sizing every `BlockingSignalOutcome`
+    /// (clippy::large_enum_variant).
+    NotRetired(Option<Box<ConflictSignalPrefetch>>),
+}
+
+/// Probe context [`WorkerCompletionHandler::try_retire_cleared_blocking_signal`]
+/// already gathered, reused by [`WorkerCompletionHandler::conflict_revision_stop_refusal`]
+/// so it does not re-derive the parent attempt or re-probe a PR its caller
+/// just probed microseconds earlier.
+struct ConflictSignalPrefetch {
+    /// The PR probe result. Never `Clean` for the caller's `conflict_attempt`
+    /// — `try_retire_cleared_blocking_signal` already retires on `Clean`.
+    ///
+    /// This struct intentionally carries only the probe, not a
+    /// has-active-attempt boolean: `conflict_revision_stop_refusal` always
+    /// recomputes ownership itself via `has_active_conflict_attempt`, since
+    /// this call site's parent-attempt lookup has no crz_id to match
+    /// against and would silently bypass the ownership check if reused.
+    probe: PrLifecycleProbe,
+}
+
+/// What [`WorkerCompletionHandler::force_release`] actually did. Surfaced
+/// (rather than swallowed as `()`) so a caller tearing down a specific
+/// row — e.g. a deleted work item's live execution — can log one line
+/// that ties the row id to the concrete outcome instead of leaving a
+/// future zombie report to reconstruct it from execution-id-only lines
+/// scattered across this function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForceReleaseOutcome {
+    /// No live worker pane was mapped (mid-spawn or already released). The
+    /// cube lease is deliberately left held for the in-flight `run_execution`
+    /// to reap and release once its spawn settles.
+    HeldForInFlightSpawn,
+    /// A remote worker was not proven gone (alive, or its pid probe was
+    /// inconclusive or impossible). The cube lease, persona and live state
+    /// are deliberately left held; `remote_lease_reconcile` releases them
+    /// once a pid probe reports positive death.
+    HeldForRemoteWorker,
+    /// The pane was reaped but the execution held no lease columns —
+    /// already released by a prior call, or never leased.
+    NoLeaseHeld,
+    /// The pane was reaped and the cube lease released.
+    Released { lease_id: String },
+    /// The pane was reaped, but clearing the execution's workspace
+    /// columns in the DB failed before a cube release was attempted.
+    WorkspaceColumnClearFailed,
+    /// The pane was reaped and workspace columns cleared, but the cube
+    /// CLI call to release the lease failed.
+    LeaseReleaseFailed { lease_id: String },
+}
+
+impl ForceReleaseOutcome {
+    /// Short label for structured logging — stable across variant field
+    /// changes so log queries filtering on it don't need updating.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::HeldForInFlightSpawn => "held_for_in_flight_spawn",
+            Self::HeldForRemoteWorker => "held_for_remote_worker",
+            Self::NoLeaseHeld => "no_lease_held",
+            Self::Released { .. } => "released",
+            Self::WorkspaceColumnClearFailed => "workspace_column_clear_failed",
+            Self::LeaseReleaseFailed { .. } => "lease_release_failed",
+        }
+    }
+}
+
+#[async_trait]
+impl boss_execution_contracts::ExecutionStartedHook for WorkerCompletionHandler {
+    async fn on_execution_started(&self, execution_id: &str) {
+        // Inherent method already does the work; this just satisfies
+        // the trait the coordinator depends on.
+        WorkerCompletionHandler::on_execution_started(self, execution_id).await
+    }
+}
+
+#[async_trait]
+impl boss_execution_contracts::AutomationPreemptor for WorkerCompletionHandler {
+    /// Route dispatcher-initiated preemption through the exact teardown
+    /// `bossctl agents stop` and the stale-worker sweep use: pane
+    /// release + `reap_worker_process_tree` SIGTERM/SIGKILL ladder over
+    /// the worker's whole process group, pool-slot release, then cube
+    /// lease release.
+    ///
+    /// The `HeldForInFlightSpawn` → [`PreemptOutcome::MidSpawn`] mapping
+    /// is the load-bearing one: `force_release` refuses to release a
+    /// mid-spawn worker's lease (cube would re-lease a workspace
+    /// the in-flight spawn is about to occupy), so the dispatcher must
+    /// learn that nothing was torn down and abandon the preemption rather
+    /// than requeue work whose worker is still very much alive.
+    ///
+    /// `NoLeaseHeld` counts as released: the pane was found and reaped
+    /// (a `NoLiveWorker` pane short-circuits to `HeldForInFlightSpawn`
+    /// above it), so the slot is free and the victim holds no cube
+    /// resources to leak.
+    async fn preempt_worker(&self, execution_id: &str) -> PreemptOutcome {
+        match self.force_release(execution_id).await {
+            ForceReleaseOutcome::Released { .. } | ForceReleaseOutcome::NoLeaseHeld => PreemptOutcome::Released,
+            // A remote worker that is not proven gone is still running, so
+            // like a mid-spawn worker nothing was torn down: the caller must
+            // abandon the preemption rather than requeue its work.
+            ForceReleaseOutcome::HeldForInFlightSpawn | ForceReleaseOutcome::HeldForRemoteWorker => {
+                PreemptOutcome::MidSpawn
+            }
+            outcome @ (ForceReleaseOutcome::LeaseReleaseFailed { .. }
+            | ForceReleaseOutcome::WorkspaceColumnClearFailed) => {
+                tracing::warn!(
+                    execution_id,
+                    outcome = outcome.label(),
+                    "preemption teardown did not complete cleanly",
+                );
+                PreemptOutcome::Failed
+            }
+        }
+    }
+}
+
+/// Outcome of the resume-bounce SHA-delta gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShaDeltaGateOutcome {
+    /// The chore had a bound `pr_url`, snapshot+current SHA were
+    /// fetched, and the SHAs differ — this run moved the bound PR.
+    /// Caller should finalize via `finalize_pr_transition(InReview)`.
+    /// `head_now` is the fetched current head; callers that suppress
+    /// this outcome should persist it as the new baseline so subsequent
+    /// sweeps do not re-trigger on the same delta.
+    Contributed { pr_url: String, head_now: String },
+    /// The chore had a bound `pr_url`, snapshot+current SHA were
+    /// fetched, and the SHAs are equal — this run did not move the
+    /// bound PR. Caller nudges the worker to push to the *existing*
+    /// bound PR (never `gh pr create`), bounded by the circuit breaker,
+    /// without falling through to the cold-path branch detector.
+    /// `head_now` is the fetched current head (== baseline).
+    NoContribution { pr_url: String, head_now: String },
+    /// The gate could not evaluate (no bound PR, no snapshot, or a
+    /// fetch failure). Caller falls through to the existing
+    /// branch-keyed cold-path detector — preserves pre-change
+    /// behaviour for the new-PR flow.
+    Inapplicable,
+}
+
+/// What a Stop boundary knows about whether *this run* moved the bound
+/// PR, carried into [`WorkerCompletionHandler::try_finalize_satisfied_deliverable_on_stop`]
+/// so the finalize decision can depend on it.
+///
+/// This type exists because the satisfied-deliverable gate used to read
+/// the bound PR's live health as proof the run had delivered, while the
+/// SHA-delta gate that ran moments earlier already held the answer and
+/// spent it only on a nudge fingerprint. Threading the finding in makes
+/// it load-bearing on the finalize decision rather than merely on
+/// whether a reviewer pass runs.
+///
+/// There is deliberately no `Contributed` variant: a run the SHA-delta
+/// gate proved *did* move the head finalizes upstream via
+/// `finalize_pr_transition(.., "stop_sha_delta")` and never reaches this
+/// gate at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContributionEvidence {
+    /// [`ShaDeltaGateOutcome::NoContribution`]: the bound PR's head was
+    /// fetched and compared against this execution's `pr_head_before`
+    /// snapshot, and they are equal. This run did not move the PR —
+    /// positive proof of non-contribution, not an absence of evidence.
+    ///
+    /// Callers must only construct this when `pr_head_before` still holds
+    /// the head captured at dispatch time. If the parent-push suppression
+    /// path in `on_stop_inner` has ever rewritten it (see
+    /// `execution_pr_head_baseline_absorbed`), "unchanged" means "unchanged
+    /// since that absorbed baseline", which is a weaker claim — use
+    /// [`Self::Indeterminate`] instead.
+    ProvenAbsent,
+    /// [`ShaDeltaGateOutcome::Inapplicable`]: no baseline was ever
+    /// captured, or the head fetch failed. The run may or may not have
+    /// contributed; SHA comparison cannot say.
+    Indeterminate,
+}
+
+/// What [`WorkerCompletionHandler::evaluate_satisfied_deliverable_on_stop`]
+/// concluded, in the three-way form the two-way `Option` shape cannot
+/// express.
+///
+/// The distinction that matters is between the last two: both leave the run
+/// live, but for opposite reasons and with opposite correct responses.
+/// `NotSatisfied` means the deliverable genuinely is not ready (CI failing,
+/// conflict, closed PR) — nudging is the right answer, because there is
+/// work left to do. `AwaitingDeclaration` means the deliverable looks
+/// perfectly fine and the only missing thing is the worker saying so —
+/// nudging there would dog a worker that may be mid-investigation, which is
+/// the harm [`crate::run_done_backstop`] exists to avoid.
+#[derive(Debug)]
+pub(crate) enum SatisfiedDeliverableOutcome {
+    /// The gate finalized the run; the caller returns this outcome.
+    Finalized(StopOutcome),
+    /// The bound PR's health would have satisfied the gate, but the run has
+    /// not declared itself done and `run_done_proposals_seam` is on. The
+    /// caller hands this to the run-done backstop.
+    AwaitingDeclaration,
+    /// The bound PR is not in a satisfying state. The caller falls through
+    /// to its normal nudge/park path, exactly as before.
+    NotSatisfied,
+}
+
+/// Whether "the bound PR is open, mergeable and CI-clean" is on its own
+/// enough to call this run's deliverable satisfied at a Stop boundary
+/// where the head did not move.
+///
+/// **For every kind except `revision_implementation`: yes.** A primary
+/// implementation's deliverable *is* a healthy PR for its work item, and
+/// a PR bound to that item can only exist because some run of it pushed
+/// one. Reading the PR's health as "delivered" states something true.
+///
+/// **For a `revision_implementation`: only when the evidence does not
+/// contradict it.** A revision is dispatched *into* an open, mergeable,
+/// CI-clean parent PR — that is the definition of the state a reviewer
+/// pass hands it, and it holds at t=0 before the worker has read its
+/// prompt. The predicate is therefore trivially true from the instant
+/// the run starts and cannot distinguish "the revision landed its fix"
+/// from "the revision has not started". A revision's deliverable is a
+/// *change* to a PR that was already healthy, so when the SHA-delta gate
+/// has proven the head did not move
+/// ([`ContributionEvidence::ProvenAbsent`]) the PR's health is evidence
+/// of nothing and must not finalize the run as delivered. That is the
+/// defect this predicate closes: a revision on
+/// `spinyfin/mono#2589` was terminalized as delivered 78 s in, having
+/// produced no commit and no push, 1.7 s after the engine logged that it
+/// had contributed nothing.
+///
+/// [`ContributionEvidence::Indeterminate`] still qualifies: "we could not
+/// measure" is not the same claim as "we measured, and it did not move",
+/// and refusing it would re-open the stuck-revision dead end where a
+/// revision whose dispatch-time snapshot failed can never be finalized by
+/// any Stop, forever. The caller logs that finalize loudly — see
+/// `try_finalize_satisfied_deliverable_on_stop`.
+///
+/// Note this governs ONLY the health-alone arm. The gate's other
+/// satisfying states — the PR is merged, or GitHub has accepted it into
+/// the merge queue, or a merge-conflict revision's conflict has cleared —
+/// are unaffected, because each is either a genuine delta from the
+/// dispatch state or proof the deliverable has passed out of the
+/// worker's hands, where nudging it to push would be actively wrong.
+fn health_alone_satisfies_deliverable(kind: &ExecutionKind, contribution: ContributionEvidence) -> bool {
+    match kind {
+        ExecutionKind::RevisionImplementation => contribution != ContributionEvidence::ProvenAbsent,
+        _ => true,
+    }
+}
+
+pub use boss_engine_storage_values::attention_kinds::NUDGE_BREAKER_ATTENTION_KIND;
+
+pub use boss_engine_storage_values::attention_kinds::REVIEW_RESULT_GIVEUP_ATTENTION_KIND;
+
+pub use boss_engine_storage_values::attention_kinds::DRIVER_TERMINAL_ERROR_ATTENTION_KIND;
+
+pub use boss_engine_storage_values::attention_kinds::REVISION_NO_OP_ATTENTION_KIND;
+
+pub use boss_engine_storage_values::attention_kinds::MID_TURN_REAP_ATTENTION_KIND;
+
+pub use boss_engine_storage_values::attention_kinds::REMOTE_COLLECTION_FAILED_ATTENTION_KIND;
+
+/// Wait-declaration sentence shared verbatim by the produce-a-PR and
+/// push-to-existing-PR probes. A macro so [`PROBE_NO_PR`] can `concat!` the
+/// same literal instead of repeating it.
+macro_rules! worker_wait_nudge_directive {
+    () => {
+        " If you are legitimately waiting on a \
+long-running job (a background build, test gate, or similar), do not reply in prose — run \
+`$BOSS_BIN propose wait --reason \"<what you are waiting on>\" --duration <bound>` \
+(for example `--duration 30m`; the engine caps a single wait at 2h). Re-running renews \
+the wait. An unexpired wait holds the produce-a-PR nudge ladder; it does not stop other \
+safety checks."
+    };
+}
+
+/// Shared by the produce-a-PR and push-to-existing-PR probes: if the worker
+/// is legitimately waiting on a long-running job it must declare that with
+/// `boss propose wait` rather than answering in prose.
+pub const WORKER_WAIT_NUDGE_DIRECTIVE: &str = worker_wait_nudge_directive!();
+
+/// Probe text dispatched when a worker stops without producing any PR
+/// for its branch. Phrased so a worker that already finished the work
+/// will simply push and open one, but a worker that's blocked has an
+/// out to explain itself rather than churning.
+///
+/// The final sentence names the typed `boss propose done --outcome
+/// no-changes-needed` declaration rather than inviting free prose. Invariant:
+/// `worker_signalled_no_op` reads only that declaration, so a probe that
+/// merely invites prose cannot be acted on (the mono#2622 stall — see
+/// [`probe_push_to_existing_pr`]). Pinned by
+/// `probe_texts_name_the_no_op_declaration`.
+pub const PROBE_NO_PR: &str = concat!(
+    "You stopped without producing a PR for this work. \
+If the work is complete, open the PR with `cube pr create --branch <bookmark>` (pushes the \
+branch and opens the PR in one step, jj-aware, no GIT_DIR needed). If a PR already exists \
+for this branch, push any new commits with `cube pr update --branch <bookmark>` instead — \
+do not open a duplicate. If you're blocked, explain what you need. If instead you have \
+verified there is genuinely nothing left to change (`jj diff -r @` is empty because the work \
+is already done), do NOT answer in prose alone — prose is not a signal the engine can act on. \
+Declare it with `\"$BOSS_BIN\" propose done --outcome no-changes-needed --summary \"<what you \
+verified>\"`; that is the sanctioned way to close this run with no PR.",
+    worker_wait_nudge_directive!()
+);
+
+/// Extract the set of required-check names a `ci_remediations` attempt
+/// was opened to fix, parsed from its `failed_checks` JSON snapshot
+/// (each entry carries a `"name"` field; see `ci_watch::FailedCheckRecord`).
+/// An empty array, malformed JSON, or entries without a name yield an
+/// empty list — callers treat that as "no targeted-check information"
+/// and fall back to requiring whole-PR `Clean`.
+fn targeted_check_names(failed_checks_json: &str) -> Vec<String> {
+    serde_json::from_str::<serde_json::Value>(failed_checks_json)
+        .ok()
+        .and_then(|v| match v {
+            serde_json::Value::Array(arr) => Some(arr),
+            _ => None,
+        })
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| e.get("name").and_then(|n| n.as_str()))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether the CI blocking signal *this attempt was opened for* is now
+/// cleared on the bound PR.
+///
+/// The original heuristic keyed solely on whole-PR `Clean` (every
+/// required check terminal-green). That misses a legitimate completion:
+/// a remediation opened for one specific failing check (e.g. the "Pull
+/// Request Description" check, often fixed by a metadata-only
+/// `gh pr edit` with no commit) whose own check has gone green while
+/// *other, unrelated* required checks remain red or pending. Such an
+/// attempt has done its job and must be retired — not nudged forever to
+/// "push your commits".
+///
+/// Decision table:
+/// - `Clean`   → cleared (all required green; trivially clears any attempt).
+/// - `Failing` → cleared iff none of the attempt's targeted checks are
+///   among the currently-failing set. Remaining failures belong to other
+///   checks and will drive their own remediation once the parent snaps
+///   back to `in_review`.
+/// - `InFlight`→ never cleared: at least one required check is still
+///   non-terminal and we cannot tell from this aggregate whether the
+///   targeted check specifically has reached terminal-green yet. Stay
+///   conservative; the next sweep re-evaluates once checks terminalize.
+///
+/// When the attempt carries no parseable targeted-check names, only the
+/// `Clean` case clears it — preserving the pre-change behaviour.
+fn ci_attempt_signal_cleared(attempt_failed_checks: &str, ci: &OpenPrCiStatus) -> bool {
+    match ci {
+        OpenPrCiStatus::Clean => true,
+        OpenPrCiStatus::InFlight => false,
+        OpenPrCiStatus::Failing { failures } => {
+            let targeted = targeted_check_names(attempt_failed_checks);
+            if targeted.is_empty() {
+                return false;
+            }
+            let failing_names: std::collections::HashSet<&str> = failures.iter().map(|f| f.name.as_str()).collect();
+            !targeted.iter().any(|name| failing_names.contains(name.as_str()))
+        }
+    }
+}
+
+/// Whether an open PR's mergeability is good enough to call a worker's
+/// deliverable satisfied at a Stop boundary where the head never moved.
+///
+/// `Clean` always qualifies and `Conflict` never does. `Unknown` — GitHub
+/// still recomputing mergeability — is the interesting case: for an
+/// ordinary execution it is tolerated (CI cleanliness carries the
+/// decision there, and the merge poller re-blocks the PR later if the
+/// recompute settles on CONFLICTING). For a **merge-conflict revision**
+/// it must not qualify: clearing the conflict is that revision's entire
+/// deliverable, `merge_conflict_revision` already waives the CI half of
+/// the test, so accepting `Unknown` would finalize the run on no
+/// evidence at all — precisely the "took the worker's word" failure
+/// (spinyfin/mono#2070, 2026-07-23) this gate exists to prevent.
+fn mergeability_satisfies_deliverable(mergeability: OpenPrMergeability, merge_conflict_revision: bool) -> bool {
+    match mergeability {
+        OpenPrMergeability::Clean => true,
+        OpenPrMergeability::Conflict => false,
+        OpenPrMergeability::Unknown => !merge_conflict_revision,
+    }
+}
+
+/// Probe text dispatched when a PR is already bound to the worker's
+/// chore (a resume, or a `ci_remediation` exec whose sibling
+/// `chore_implementation` opened the PR). The worker must NEVER be told
+/// to `gh pr create` here — its job is to push fixes to the existing
+/// PR's branch. Phrased so a worker with nothing left to do can say so
+/// rather than churning; the circuit breaker bounds repeats.
+///
+/// **"Say so" must name the typed declaration.** Invariant:
+/// `worker_signalled_no_op` reads only the `boss propose done --outcome
+/// no-changes-needed` declaration, so a probe that only invites a prose
+/// answer ("explain your status") cannot be acted on — the honest answer is
+/// scored as "no progress" and the run idles in the nudge ladder holding its
+/// slot (the mono#2622 stall). Naming the declaration turns a correct
+/// "nothing to do" conclusion into a terminal on the worker's next turn.
+/// Pinned by `probe_texts_name_the_no_op_declaration`.
+pub fn probe_push_to_existing_pr(pr_url: &str) -> String {
+    format!(
+        "A PR already exists for this work: {pr_url}. Do NOT open a new PR. If you have local \
+commits, push them to the existing PR's branch with `cube pr update --branch <bookmark>`. If your \
+changes are already pushed, or you have verified this work needs no further code change, do NOT \
+answer in prose alone — prose is not a signal the engine can act on, and it will re-prompt you. \
+Declare it with `\"$BOSS_BIN\" propose done --outcome no-changes-needed --summary \"<what you \
+verified>\"`; that is the sanctioned way to close this run without another push.{WORKER_WAIT_NUDGE_DIRECTIVE}"
+    )
+}
+
+/// Probe queued when the no-op guard refuses a `no-changes-needed`
+/// declaration at the driver's Stop boundary. The declaration is consumed
+/// on refusal, so the worker must re-verify and declare again for the claim
+/// to count.
+pub const NO_OP_DECLARATION_REFUSED_PROBE: &str = "Your `no-changes-needed` declaration was refused: \
+the engine could not trust the verification behind it (a command ran without a confirmed \
+result, or an observed contribution contradicts the claim). The declaration has been discarded. \
+Re-run the verification and confirm the outcome. If the work is genuinely complete with nothing \
+to change, declare it again with `\"$BOSS_BIN\" propose done --outcome no-changes-needed --summary \
+\"<what you verified>\"`; otherwise finish the work and open or update the PR.";
+
+/// Probe text dispatched when a PR exists but the worker has local
+/// commits that haven't been pushed yet — the PR is stale.
+pub const PROBE_STALE_PR: &str = "A PR exists for this branch, but your local commits \
+are ahead of the PR's head. Push the new commits with `cube pr update --branch <bookmark>` \
+so the PR reflects your latest work, or explain why the local commits should not \
+be pushed.";
+
+/// Probe text dispatched when a PR exists and head_match is satisfied,
+/// but the PR contains no file changes (`changed_files == 0`). The
+/// worker likely pushed an empty commit without making any edits.
+pub const PROBE_EMPTY_PR: &str = "The PR you opened has an empty diff — no files were \
+changed. This usually means you committed and pushed without making any edits. \
+Run `jj diff -r @` to verify your working-copy changes. If the diff is empty, \
+you have not made any changes — do not keep this PR open. Either make the required \
+edits and push them, or close the PR and explain what went wrong.";
+
+/// Number of transcript-read attempts [`WorkerCompletionHandler::read_final_triage_message`]
+/// makes before concluding a triage transcript genuinely has no assistant
+/// text. Mirrors the linear-backoff shape of `ci_log_reader::run_capture`'s
+/// `ETXTBSY` retry, sized for a local disk flush rather than a subprocess
+/// spawn: attempts sleep `TRIAGE_TRANSCRIPT_READ_RETRY_BASE_MS * attempt`
+/// between reads, for a worst-case total wait of
+/// `TRIAGE_TRANSCRIPT_READ_RETRY_BASE_MS * (1+2+3+4) = 300ms` — comfortably
+/// wider than the single-digit-millisecond flush race seen in the field
+/// (assistant text written 33ms before the finaliser's read, which still
+/// lost the race with zero retries).
+pub const TRIAGE_TRANSCRIPT_READ_ATTEMPTS: u32 = 5;
+pub const TRIAGE_TRANSCRIPT_READ_RETRY_BASE_MS: u64 = 20;
+
+/// Outcome of reading a finished triage execution's final assistant message
+/// from its transcript (see [`WorkerCompletionHandler::read_final_triage_message`]).
+///
+/// Distinguishing these states is what makes a `failed_will_retry` triage run
+/// diagnosable from the run-history `detail`: "produced no transcript" (worker
+/// session never started), "transcript unreadable", and "no assistant prose"
+/// are very different failures from "the worker spoke but emitted no marker",
+/// yet all four previously collapsed to the bare string
+/// "triage ended without a decision marker".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TriageTranscript {
+    /// The final assistant text message — the one the marker parser scans.
+    FinalMessage(String),
+    /// No `transcript_path` was recorded for the execution. The worker session
+    /// likely never started (or its run row was never linked to a transcript).
+    NoPath,
+    /// A transcript path was recorded but the file could not be read (lookup
+    /// error or filesystem read error).
+    Unreadable,
+    /// The transcript parsed but contained no assistant text event across
+    /// every retried read (see [`TRIAGE_TRANSCRIPT_READ_ATTEMPTS`]) — the
+    /// worker emitted only tool calls / thinking, or crashed before any
+    /// prose. `event_count` is the non-assistant-text event count from the
+    /// last read, so the run-history detail can distinguish "transcript was
+    /// entirely empty" from "transcript recorded activity but no prose".
+    NoAssistantText { event_count: usize },
+}
+
+impl TriageTranscript {
+    /// The final assistant message text, or `None` for any state in which no
+    /// message could be read. Lets callers that only need the text (e.g. the
+    /// `pr_review` finaliser) ignore the failure-state distinction.
+    fn into_message(self) -> Option<String> {
+        match self {
+            TriageTranscript::FinalMessage(text) => Some(text),
+            TriageTranscript::NoPath | TriageTranscript::Unreadable | TriageTranscript::NoAssistantText { .. } => None,
+        }
+    }
+}
+
+/// Build the `failed_will_retry` detail for a triage run that yielded no
+/// usable decision, from the transcript readback state.
+///
+/// The `FinalMessage` arm keeps the stable "triage ended without a decision
+/// marker" prefix (so existing log greps / dashboards keep matching) and
+/// appends a bounded, single-line tail of what the agent actually said — the
+/// single most useful breadcrumb when debugging why a marker was missing.
+fn triage_no_decision_detail(transcript: &TriageTranscript) -> String {
+    match transcript {
+        TriageTranscript::FinalMessage(text) => format!(
+            "triage ended without a decision marker; final message tail: {}",
+            tail_snippet(text, 200)
+        ),
+        TriageTranscript::NoPath => "triage produced no transcript (no transcript path \
+             recorded; the worker session may have failed to start)"
+            .to_owned(),
+        TriageTranscript::Unreadable => "triage transcript could not be read from disk".to_owned(),
+        // Two genuinely different conditions, previously conflated into one
+        // string that asserted "worker emitted no prose" even when the
+        // transcript showed the worker was clearly active (a claim the
+        // event-count evidence didn't support). After
+        // `TRIAGE_TRANSCRIPT_READ_ATTEMPTS` retries drained the Stop-boundary
+        // flush race, `event_count == 0` means the transcript itself never
+        // materialised any content; `event_count > 0` means the worker acted
+        // (tool calls / thinking) but never produced assistant prose.
+        TriageTranscript::NoAssistantText { event_count: 0 } => "triage transcript contained no events at all \
+             (no assistant text, tool calls, or thinking recorded before stopping)"
+            .to_owned(),
+        TriageTranscript::NoAssistantText { event_count } => format!(
+            "triage transcript recorded {event_count} event(s) (tool calls / thinking) but no \
+             assistant text after waiting out the Stop-boundary transcript-flush window; worker \
+             emitted no prose before stopping"
+        ),
+    }
+}
+
+/// The trailing window (in characters) of the collapsed final message that the
+/// skip-recovery conclusion scan considers. Scoped to the *tail* so a
+/// mid-investigation "no warnings in module X" line early in the run cannot trip
+/// a skip; only the worker's closing words count.
+const SKIP_RECOVERY_TAIL_CHARS: usize = 400;
+
+/// Phrases whose presence in the final tail VETO skip-recovery — the worker was
+/// still mid-verification / deferring a decision, not concluding, so the run
+/// must stay `failed_will_retry`. These mirror the field-evidence tails ("I'll
+/// wait for checkleft to finish before deciding", "The authoritative checkleft
+/// run is in progress. Let me wait for it to complete", "Let me do one
+/// confirming check", "Let me broaden the check to the whole repo to be
+/// thorough"). Over-matching here is safe: it only keeps the conservative
+/// `failed_will_retry` default; it can never *cause* a false skip.
+const SKIP_RECOVERY_DEFERRAL_VETOES: &[&str] = &[
+    "wait",
+    "in progress",
+    "still running",
+    "is running",
+    "before deciding",
+    "to be thorough",
+    "one more",
+    "one confirming",
+    "let me ",
+    "i'll ",
+    "i will ",
+    "going to",
+    "let's ",
+];
+
+/// Phrases that affirmatively conclude there is no actionable work — a
+/// clean-repo / no-warnings verdict. At least one must appear in the final tail
+/// for skip-recovery to fire.
+const SKIP_RECOVERY_NO_WORK_SIGNALS: &[&str] = &[
+    "no warnings",
+    "no compiler warning",
+    "no compilation warning",
+    "no clippy",
+    "no lint",
+    "nothing to do",
+    "nothing actionable",
+    "no actionable",
+    "nothing to fix",
+    "no action needed",
+    "no action required",
+    "already clean",
+    "is clean",
+    "are clean",
+    "no issues found",
+    "no findings",
+    "no work to do",
+    "no changes needed",
+];
+
+/// Skip marker-recovery — the symmetric counterpart to the produced-task
+/// marker-recovery in [`WorkerCompletionHandler::finalize_automation_triage`].
+///
+/// When a triage run created **no** task and emitted **no** valid decision
+/// marker, but its final message plainly concluded there is nothing to do, this
+/// returns `Some(reason)` so the run is recorded `skipped` rather than looping
+/// `failed_will_retry` forever (each retry burning a full worker session while
+/// re-proving a repo that is already clean).
+///
+/// Deliberately conservative — a *false* skip merely defers to the automation's
+/// next scheduled fire (cheap), whereas a false `failed_will_retry` re-runs a
+/// whole session. It fires ONLY when:
+/// - the decision is [`TriageDecision::NoDecision`], and
+/// - a final assistant message exists (not a `NoPath`/`Unreadable`/no-prose
+///   state — there is nothing to conclude from), and
+/// - the *tail* of that message affirmatively concludes "no work" AND shows no
+///   mid-verification / deferred-intent language (the field-evidence failure
+///   shape, which must stay `failed_will_retry`).
+fn recover_skip_reason(decision: &TriageDecision, transcript: &TriageTranscript) -> Option<String> {
+    if !matches!(decision, TriageDecision::NoDecision) {
+        return None;
+    }
+    let TriageTranscript::FinalMessage(text) = transcript else {
+        return None;
+    };
+    if !tail_concludes_no_work(text) {
+        return None;
+    }
+    Some(tail_snippet(text, 200))
+}
+
+/// Scan the tail of a triage worker's final message for an affirmative
+/// "nothing to do" conclusion with no deferred-intent / mid-verification
+/// language. See [`recover_skip_reason`] for why this is intentionally strict.
+fn tail_concludes_no_work(text: &str) -> bool {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    let chars: Vec<char> = one_line.chars().collect();
+    let start = chars.len().saturating_sub(SKIP_RECOVERY_TAIL_CHARS);
+    let tail: String = chars[start..].iter().collect();
+    if SKIP_RECOVERY_DEFERRAL_VETOES.iter().any(|v| tail.contains(v)) {
+        return false;
+    }
+    SKIP_RECOVERY_NO_WORK_SIGNALS.iter().any(|s| tail.contains(s))
+}
+
+/// Collapse `text` to a single-line tail of at most `max_chars` characters for
+/// embedding in a run-history `detail`. Whitespace runs (including newlines)
+/// collapse to single spaces; when truncated, the result is prefixed with `…`
+/// so it reads as a tail rather than a head.
+fn tail_snippet(text: &str, max_chars: usize) -> String {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.is_empty() {
+        return "(empty)".to_owned();
+    }
+    let chars: Vec<char> = one_line.chars().collect();
+    if chars.len() <= max_chars {
+        one_line
+    } else {
+        let tail: String = chars[chars.len() - max_chars..].iter().collect();
+        format!("…{tail}")
+    }
+}
+
+/// Elapsed whole seconds since `timestamp`, a unix-seconds string as stored
+/// by `now_string()` (used for `WorkExecution::started_at`/`created_at`).
+/// Returns `None` if `timestamp` is unparseable. Used to log how long a
+/// `pr_review` pass took (2026-07-01 revision-review experiment) so the
+/// engine surfaces can track cost without a schema change.
+fn elapsed_secs_since(timestamp: &str) -> Option<i64> {
+    let then: i64 = timestamp.parse().ok()?;
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    Some((now - then).max(0))
+}
+
+fn work_item_id(item: &WorkItem) -> String {
+    match item {
+        WorkItem::Product(product) => product.id.clone(),
+        WorkItem::Project(project) => project.id.clone(),
+        WorkItem::Task(task) | WorkItem::Chore(task) => task.id.clone(),
+    }
+}
+
+/// Defined in the persistence layer; re-exported here under its original
+/// path — see [`crate::work::should_enqueue_reviewer_for_primary`].
+pub(crate) use crate::work::should_enqueue_reviewer_for_primary;
+
+/// Whether `execution` is a live worker that owns its own turn loop — i.e.
+/// the engine has dispatched it, its agent is driving, and a `Stop` from it
+/// is the worker's own turn boundary rather than an artefact of some other
+/// phase.
+///
+/// This is the gate on the *fallback* PR-detection paths ([`stop`]'s
+/// post-marker fallthrough and the merge poller's [`recheck`] sweep). Both
+/// are cold paths — a jj revset plus a GitHub walk — that must only run
+/// against a worker whose push, if any, has already happened.
+///
+/// - **Live** ([`ExecutionStatus::is_live`], i.e. `running` *or*
+///   `waiting_human`). A worker blocked on a human is still a worker that
+///   may have pushed a PR before it parked, so the wait must not exclude
+///   it; the pre-dispatch, `waiting_review`/`waiting_merge` and terminal
+///   statuses are all owned by other paths and stay excluded exactly as
+///   before.
+/// - **Not a reviewer.** A `pr_review` pane never opens a PR of its own —
+///   its lifecycle terminates through `finalize_pr_review_pass`. Running
+///   branch detection for one could only ever bind somebody else's PR.
+pub fn worker_owns_turn_loop(execution: &crate::work::WorkExecution) -> bool {
+    ExecutionStatus::is_live(&execution.status) && execution.kind != ExecutionKind::PrReview
+}
+
+/// The already-validated inputs of a `no-changes-needed` completion write
+/// that failed, retained so it can be retried without another worker event.
+#[derive(Debug, Clone)]
+struct PendingNoOpCompletion {
+    contribution: Option<ContributionEvidence>,
+    attention: Option<CreateAttentionItemInput>,
+}
+
+// The shared fixtures are public under `test-support` so the engine's
+// integration suite can drive the same handler harness; the test cases
+// themselves are compiled only under `cfg(test)`.
+#[cfg(any(test, feature = "test-support"))]
+pub mod tests;
+
+/// Deterministic-provider handler for cross-module integration tests, so the
+/// private `tests` module's harness need not be widened.
+#[cfg(any(test, feature = "test-support"))]
+pub fn integration_handler(db: Arc<crate::work::WorkDb>, pr_url: &str) -> WorkerCompletionHandler {
+    tests::integration_handler(db, pr_url)
+}
+
+#[cfg(test)]
+mod queue_timeline_contract_tests {
+    use super::*;
+
+    struct RecordingTimeline {
+        urls: std::sync::Mutex<Vec<String>>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl MergeQueueTimeline for RecordingTimeline {
+        async fn fetch_dequeues(&self, url: &str) -> Result<Vec<MergeQueueDequeueEvent>> {
+            self.urls.lock().unwrap().push(url.into());
+            if self.fail {
+                anyhow::bail!("queue timeline unavailable");
+            }
+            Ok(vec![MergeQueueDequeueEvent {
+                reason: "FAILED_CHECKS".into(),
+                created_at: Some("2026-10-01T00:00:00Z".into()),
+                pr_head_oid: Some("head".into()),
+                before_commit_oid: Some("queue".into()),
+                queue_base_oid: Some("base".into()),
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn command_verifier_delegates_queue_timeline_and_propagates_errors() {
+        for fail in [false, true] {
+            let timeline = Arc::new(RecordingTimeline {
+                urls: Default::default(),
+                fail,
+            });
+            let verifier = CommandBranchVerifier::new().with_queue_timeline(timeline.clone());
+            let result = verifier.fetch_queue_dequeues("example/repo", 42).await;
+            assert_eq!(
+                timeline.urls.lock().unwrap().as_slice(),
+                &["https://github.com/example/repo/pull/42"]
+            );
+            if fail {
+                assert_eq!(result.unwrap_err().to_string(), "queue timeline unavailable");
+            } else {
+                let events = result.unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].reason, "FAILED_CHECKS");
+                assert_eq!(events[0].pr_head_oid.as_deref(), Some("head"));
+                assert_eq!(events[0].before_commit_oid.as_deref(), Some("queue"));
+                assert_eq!(events[0].queue_base_oid.as_deref(), Some("base"));
+                assert_eq!(events[0].created_at.as_deref(), Some("2026-10-01T00:00:00Z"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn command_verifier_without_timeline_preserves_unsupported_error() {
+        let err = CommandBranchVerifier::new()
+            .fetch_queue_dequeues("example/repo", 42)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "queue timeline lookup unsupported by this verifier");
+    }
+
+    struct InjectedVerifier;
+
+    #[async_trait]
+    impl BranchVerifier for InjectedVerifier {
+        async fn fetch_pr_head_ref(&self, _: &str, _: u64) -> Result<String> {
+            Ok("injected".into())
+        }
+        async fn fetch_pr_head_oid(&self, _: &str, _: u64) -> Result<String> {
+            Ok("oid".into())
+        }
+        async fn fetch_pr_head_oid_fresh(&self, _: &str, _: u64) -> Result<String> {
+            Ok("oid".into())
+        }
+        async fn fetch_diff_line_count(&self, _: &str, _: &str, _: &str) -> Result<u64> {
+            Ok(0)
+        }
+        async fn fetch_pr_base_ref(&self, _: &str, _: u64) -> Result<String> {
+            Ok("main".into())
+        }
+        async fn fetch_diff_signature(&self, _: &str, _: &str, _: &str) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn fetch_pr_title_and_body(&self, _: &str, _: u64) -> Result<(String, String)> {
+            Ok((String::new(), String::new()))
+        }
+        async fn fetch_queue_dequeues(&self, _: &str, _: u64) -> Result<Vec<MergeQueueDequeueEvent>> {
+            anyhow::bail!("injected verifier has no timeline");
+        }
+    }
+
+    fn handler_for_timeline_tests() -> (tempfile::TempDir, WorkerCompletionHandler) {
+        let (dir, db) = crate::test_support::open_db_arc();
+        let handler = WorkerCompletionHandler::new(
+            db,
+            Arc::new(CommandPrDetector::new()),
+            Arc::new(crate::test_support::NoopCube),
+            Arc::new(crate::test_support::RecordingPublisher::default()),
+            Arc::new(NoopWorkerPaneReleaser),
+            Arc::new(NoopProbeQueuer),
+            CompletionCollaborators::noop(),
+        );
+        (dir, handler)
+    }
+
+    #[tokio::test]
+    async fn merge_queue_timeline_applies_to_default_command_verifier() {
+        let timeline = Arc::new(RecordingTimeline {
+            urls: Default::default(),
+            fail: false,
+        });
+        let (_dir, handler) = handler_for_timeline_tests();
+        let handler = handler.with_merge_queue_timeline(timeline.clone());
+        let events = handler
+            .branch_verifier
+            .fetch_queue_dequeues("example/repo", 7)
+            .await
+            .unwrap();
+        assert_eq!(events[0].reason, "FAILED_CHECKS");
+        assert_eq!(
+            timeline.urls.lock().unwrap().as_slice(),
+            &["https://github.com/example/repo/pull/7"]
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_queue_timeline_does_not_replace_injected_verifier() {
+        let timeline = Arc::new(RecordingTimeline {
+            urls: Default::default(),
+            fail: false,
+        });
+        let injected: Arc<dyn BranchVerifier> = Arc::new(InjectedVerifier);
+        for after_timeline in [false, true] {
+            let (_dir, handler) = handler_for_timeline_tests();
+            let handler = if after_timeline {
+                handler
+                    .with_merge_queue_timeline(timeline.clone())
+                    .with_branch_verifier(injected.clone())
+            } else {
+                handler
+                    .with_branch_verifier(injected.clone())
+                    .with_merge_queue_timeline(timeline.clone())
+            };
+            let err = handler
+                .branch_verifier
+                .fetch_queue_dequeues("example/repo", 7)
+                .await
+                .unwrap_err();
+            assert_eq!(err.to_string(), "injected verifier has no timeline");
+        }
+        assert!(timeline.urls.lock().unwrap().is_empty());
+    }
+}

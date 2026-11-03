@@ -165,25 +165,6 @@ impl RunnerHost for EngineRunnerHost {
     }
 }
 
-impl DriverSignals for crate::live_worker_state::LiveWorkerStateRegistry {
-    fn has_driver_signal_for_run(&self, run_id: &str) -> bool {
-        self.has_driver_signal_for_run(run_id)
-    }
-    fn first_hook_event_for_run(&self, run_id: &str) -> Option<String> {
-        self.first_hook_event_for_run(run_id)
-    }
-    fn commit_never_started_reap(&self, slot_id: u8, run_id: &str) -> boss_execution_runner::host::NeverStartedReap {
-        use crate::live_worker_state::NeverStartedReapCommit as RegistryOutcome;
-        use boss_execution_runner::host::NeverStartedReap;
-        match self.confirm_never_started_reap(slot_id, run_id) {
-            RegistryOutcome::Committed { .. } => NeverStartedReap::Committed,
-            RegistryOutcome::DriverSignalled => NeverStartedReap::DriverSignalled,
-            RegistryOutcome::SlotGone => NeverStartedReap::SlotGone,
-            RegistryOutcome::AlreadyCommitted => NeverStartedReap::AlreadyCommitted,
-        }
-    }
-}
-
 pub(crate) async fn compose_worker_spawn(
     db: &WorkDb,
     worker_id: &str,

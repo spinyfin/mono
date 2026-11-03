@@ -1,0 +1,143 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+# Deliberately no core, dispatch or merge-poller dependency: the review,
+# design-detection and live-worker behaviour completion needs from the engine
+# host reaches it through the observation- and execution-contract traits its
+# caller injects.
+COMPLETION_DEPS = [
+    "//lib/rust/git_utils",
+    "//tools/boss/backoff",
+    "//tools/boss/engine/dispatch-events",
+    "//tools/boss/engine/driver",
+    "//tools/boss/engine/effort",
+    "//tools/boss/engine/event-bus",
+    "//tools/boss/engine/execution-contracts",
+    "//tools/boss/engine/feature-flags",
+    "//tools/boss/engine/gh-invocation",
+    "//tools/boss/engine/host-execution",
+    "//tools/boss/engine/live-worker-state",
+    "//tools/boss/engine/metrics",
+    "//tools/boss/engine/observation-contracts",
+    "//tools/boss/engine/pr-review",
+    "//tools/boss/engine/pr-review-sources",
+    "//tools/boss/engine/recovery",
+    "//tools/boss/engine/review-guide",
+    "//tools/boss/engine/storage-values",
+    "//tools/boss/engine/structured-output",
+    "//tools/boss/engine/task-scope",
+    "//tools/boss/engine/transcript-markdown:transcript_markdown",
+    "//tools/boss/engine/utils",
+    "//tools/boss/engine/work-db",
+    "//tools/boss/engine/worker-bin",
+    "//tools/boss/gh_telemetry",
+    "//tools/boss/github",
+    "//tools/boss/protocol",
+]
+
+# Variants of the crates below that carry fixtures; the engine's test build and
+# this crate's own tests compile against them so their types unify.
+TEST_SUPPORT_ALIASES = {
+    "//tools/boss/engine/execution-contracts:execution_contracts_test_support": "boss_execution_contracts",
+    "//tools/boss/engine/live-worker-state:live_worker_state_test_support": "boss_engine_live_worker_state",
+    "//tools/boss/engine/observation-contracts:observation_contracts_test_support": "boss_observation_contracts",
+    "//tools/boss/engine/work-db:work_db_test_support": "boss_work_db",
+}
+
+TEST_SUPPORT_SWAPS = [
+    "//tools/boss/engine/execution-contracts",
+    "//tools/boss/engine/live-worker-state",
+    "//tools/boss/engine/observation-contracts",
+    "//tools/boss/engine/work-db",
+]
+
+TEST_SUPPORT_DEPS = [
+    "//tools/boss/engine/execution-contracts:execution_contracts_test_support",
+    "//tools/boss/engine/live-worker-state:live_worker_state_test_support",
+    "//tools/boss/engine/observation-contracts:observation_contracts_test_support",
+    "//tools/boss/engine/proposal-validation",
+    "//tools/boss/engine/test-git",
+    "//tools/boss/engine/work-db:work_db_test_support",
+]
+
+# Fixture-only crates the test-support library links as normal dependencies;
+# the crate's own test target already receives them as dev-dependencies.
+FIXTURE_LIBRARY_DEPS = [
+    "@mono_crates//:rusqlite",
+    "@mono_crates//:tempfile",
+]
+
+# Test cases live beside the code they exercise but must not invalidate the
+# service library: editing one recompiles only the crate's own test target.
+TEST_CASE_SOURCES = [
+    "src/review_guide_capture_tests.rs",
+    "src/tests/**",
+]
+
+# The fixture harness is compiled into the test-support library only.
+FIXTURE_SOURCES = [
+    "src/test_support.rs",
+    "src/tests.rs",
+]
+
+rust_library(
+    name = "completion",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = TEST_CASE_SOURCES + FIXTURE_SOURCES,
+    ),
+    crate_name = "boss_engine_completion",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//tools/boss/engine/core:__pkg__"],
+    deps = COMPLETION_DEPS + all_crate_deps(normal = True),
+)
+
+rust_library(
+    name = "completion_test_support",
+    testonly = True,
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = TEST_CASE_SOURCES,
+    ),
+    aliases = TEST_SUPPORT_ALIASES,
+    crate_features = ["test-support"],
+    crate_name = "boss_engine_completion_test_support",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//tools/boss/engine/core:__pkg__"],
+    deps = [d for d in COMPLETION_DEPS if d not in TEST_SUPPORT_SWAPS] + TEST_SUPPORT_DEPS + FIXTURE_LIBRARY_DEPS + all_crate_deps(normal = True),
+)
+
+# The crate's own tests compile every source, test cases included, as a unit of
+# their own rather than through `crate = ":completion"`, so that the library
+# targets above can leave the test cases out.
+rust_test(
+    name = "completion_test",
+    size = "small",
+    timeout = "moderate",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = TEST_SUPPORT_ALIASES,
+    crate_name = "boss_engine_completion",
+    crate_root = "src/lib.rs",
+    data = ["//tools/boss/engine/recovery:jj_test_binary"],
+    edition = "2024",
+    env = {
+        "BOSS_JJ_BIN": "$(rootpath //tools/boss/engine/recovery:jj_test_binary)",
+        "HOME": "/tmp",
+    },
+    experimental_enable_sharding = True,
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    shard_count = 4,
+    deps = [d for d in COMPLETION_DEPS if d not in TEST_SUPPORT_SWAPS] + TEST_SUPPORT_DEPS + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
