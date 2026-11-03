@@ -2,8 +2,8 @@ load("@mono_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//tools/test-sandbox:defs.bzl", "network_enabled_rust_test")
-load(":codex_cli_version.bzl", "CODEX_CLI_VERSION")
-load(":engine_binary.bzl", "ENGINE_BINARY_BAZEL_RUN_COMMAND", "ENGINE_BINARY_NAME", "ENGINE_BINARY_TARGET")
+load(":engine_binary.bzl", "ENGINE_BINARY_NAME")
+load(":runtime.bzl", "runtime_libraries")
 
 filegroup(
     name = "handoff_reset_prompt_source",
@@ -11,154 +11,23 @@ filegroup(
     visibility = ["//tools/boss/cli:__pkg__"],
 )
 
+runtime_libraries()
+
 rust_library(
     name = "engine_lib",
-    srcs = glob(
-        ["src/**/*.rs"],
-        # Keep the library in lockstep with the module tree: a hand-maintained
-        # explicit list silently drifts when a new `mod` file is added (it is
-        # then absent from rustc's inputs -> E0583). Every other boss crate globs.
-        exclude = [
-            # Crate root of the `engine` rust_binary below, not the library.
-            "src/main.rs",
-        ],
-    ),
-    compile_data = [
-        "remote/boss-remote-run.sh",
-        # Stamped build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).
-        # Referenced via include!(env!("BOSS_BUILD_INFO_RS")) in build_info_stamp module.
-        "//tools/boss/installer:build_info_rs",
-        # Read by boss_construct_scan.rs's self-test to assert the CHECKS.yaml
-        # boss-ism pattern stays byte-identical to BOSS_ID_RE.
-        "//:CHECKS.yaml",
-        # Reference-driver conformance goldens — include_str!'d from
-        # src/conformance/claude_goldens.rs.
-        "src/conformance/goldens/settings_standard.json.golden",
-        "src/conformance/goldens/claude_md_standard.md.golden",
-        # Planner parser regressions read these live docs directly so their
-        # expectations cannot drift from the source of truth.
-        "//tools/boss/docs:operator_forced_dispatch_design_doc",
-        "//tools/boss/docs:engine_app_rpc_design_doc",
-    ],
+    srcs = ["src/facade.rs"],
     crate_name = "boss_engine",
-    crate_root = "src/lib.rs",
+    crate_root = "src/facade.rs",
     edition = "2024",
-    proc_macro_deps = all_crate_deps(proc_macro = True),
-    rustc_env = {
-        # Absolute path to the generated build-info constants file.
-        # rules_rust prefixes $(execpath) values with ${pwd} and resolves
-        # them to absolute filesystem paths before invoking rustc.
-        "BOSS_BUILD_INFO_RS": "$(execpath //tools/boss/installer:build_info_rs)",
-        # Absolute path to the root CHECKS.yaml, read by
-        # boss_construct_scan.rs's self-test via include_str!(env!(...)). A
-        # plain relative include_str! can't cross this package boundary: the
-        # source file's compile-time path is rooted under bazel-out, not the
-        # real source tree, so `../../../CHECKS.yaml` doesn't resolve there.
-        "BOSS_CHECKS_YAML": "$(execpath //:CHECKS.yaml)",
-        # Absolute path to the real operator-forced-dispatch design doc, read
-        # by the planner breakdown-authority regression test via
-        # include_str!(env!(...)) — same cross-package-boundary reason as
-        # BOSS_CHECKS_YAML above. Keeps the test reading the source of truth
-        # instead of a testdata copy that can silently drift.
-        "BOSS_OPERATOR_FORCED_DISPATCH_DESIGN_DOC": "$(execpath //tools/boss/docs:operator_forced_dispatch_design_doc)",
-        # Absolute path to a live design doc with bold-bullet breakdown
-        # entries, read by the planner parser regression test.
-        "BOSS_ENGINE_APP_RPC_DESIGN_DOC": "$(execpath //tools/boss/docs:engine_app_rpc_design_doc)",
-        # Canonical `bazel run` command for the engine target, so worker-facing
-        # guidance (worker_setup.rs, agent_launch_guard.rs) can't drift from
-        # the real target label the way the pre-split `//tools/boss/engine:engine`
-        # string did.
-        "BOSS_ENGINE_BAZEL_RUN_COMMAND": ENGINE_BINARY_BAZEL_RUN_COMMAND,
-        "BOSS_ENGINE_BAZEL_TARGET": ENGINE_BINARY_TARGET,
-        # Same source of truth as the codex_test_* http_archive stanzas in
-        # MODULE.bazel and the driver's config-compatibility test, so
-        # PINNED_CODEX_CLI_VERSION can never drift from the release the
-        # driver's test binaries are fetched from.
-        "CODEX_CLI_VERSION": CODEX_CLI_VERSION,
-    },
     visibility = [
         "//tools/boss/bossctl:__pkg__",
         "//tools/boss/cli:__pkg__",
         "//tools/boss/client:__pkg__",
     ],
     deps = [
-        "//tools/boss/engine/execution-runner",
-        "//tools/boss/engine/host-execution",
-        "//tools/boss/engine/execution-contracts",
-        "//tools/boss/engine/observation-contracts",
-        "//lib/rust/git_utils",
-        "//tools/boss/backoff",
-        # NOT "//tools/boss/build-provenance": that crate's source embeds
-        # the commit sha and changes every commit. It is linked only by the
-        # two `engine` rust_binary targets below, which hand the values to
-        # `build_info::install_provenance` at startup. See
-        # `stamped_provenance_isolation_test` at the bottom of this file.
-        "//tools/boss/claude_client",
-        "//tools/boss/codex_auth",
-        "//tools/boss/command-runner",
-        "//tools/boss/comment_anchor",
-        "//tools/boss/engine/attachments",
-        "//tools/boss/engine/automation-dedup",
-        "//tools/boss/engine/automation-schedule",
-        "//tools/boss/engine/board-gesture",
-        "//tools/boss/engine/board-projection",
-        "//tools/boss/engine/ci-log-reader",
-        "//tools/boss/engine/codex-rollout-retention",
-        "//tools/boss/engine/comment-classifier",
-        "//tools/boss/engine/completion",
-        "//tools/boss/engine/conflict-diagnosis",
-        "//tools/boss/engine/day-rotated-log",
-        "//tools/boss/engine/design-doc-fetcher",
-        "//tools/boss/engine/design-docs",
-        "//tools/boss/engine/deterministic-resolvers",
-        "//tools/boss/engine/dispatch",
-        "//tools/boss/engine/dispatch-events",
-        "//tools/boss/engine/dispatch-reader",
-        "//tools/boss/engine/driver",
-        "//tools/boss/engine/driver-quota",
-        "//tools/boss/engine/editorial",
-        "//tools/boss/engine/effort",
-        "//tools/boss/engine/event-bus",
-        "//tools/boss/engine/feature-flags",
-        "//tools/boss/engine/gh-invocation",
-        "//tools/boss/engine/live-worker-state",
-        "//tools/boss/engine/grok-home-retention",
-        "//tools/boss/engine/live-status-redact",
-        "//tools/boss/engine/merge-poller",
-        "//tools/boss/engine/metrics",
-        "//tools/boss/engine/offsite-backup",
-        "//tools/boss/engine/planner-validation",
-        "//tools/boss/engine/pr-review",
-        "//tools/boss/engine/pr-review-sources",
-        "//tools/boss/engine/pr-template",
-        "//tools/boss/engine/proposal-validation",
-        "//tools/boss/engine/recovery",
-        "//tools/boss/engine/review-guide",
-        "//tools/boss/engine/single-flight",
-        "//tools/boss/engine/ssh-transport",
-        "//tools/boss/engine/stdout-progress",
-        "//tools/boss/engine/storage-values",
-        "//tools/boss/engine/structured-output",
-        "//tools/boss/engine/task-scope",
-        "//tools/boss/engine/timer-wheel",
-        "//tools/boss/engine/transcript-markdown:transcript_markdown",
-        "//tools/boss/engine/transcript-tail",
-        "//tools/boss/engine/transient-error",
-        "//tools/boss/engine/utility-model",
-        "//tools/boss/engine/utils",
-        "//tools/boss/engine/worker-bin",
-        "//tools/boss/engine/work-db",
-        "//tools/boss/engine/worker-policy",
-        "//tools/boss/gh_telemetry",
-        "//tools/boss/github",
-        "//tools/boss/github_tracker",
-        "//tools/boss/http_retry",
-        "//tools/boss/log-files",
-        "//tools/boss/protocol",
-        "//tools/boss/tmux",
-        "//tools/boss/trunk_auth",
-        "//tools/boss/trunk_client",
-    ] + all_crate_deps(normal = True),
+        ":runtime",
+        "//tools/boss/engine/app",
+    ],
 )
 
 rust_binary(
@@ -230,9 +99,9 @@ rust_binary(
 )
 
 # engine_lib_test is ONE rust_test with native Bazel sharding
-# (shard_count = 11), enabled by the rules_rust#3774 backport patch in
+# (shard_count = 7), enabled by the rules_rust#3774 backport patch in
 # //third_party/patches (see MODULE.bazel single_version_override). One
-# cfg(test) compile of the crate + 11 parallel shard executions, vs the
+# cfg(test) compile of the crate + 7 parallel shard executions, vs the
 # previous layout's 4 filter-partitioned rust_test targets = 4 full compiles.
 # See docs/investigations/rust-test-sharding-engine-lib-test.md for
 # the correctness gate and before/after measurements this adoption is based on.
@@ -248,13 +117,8 @@ rust_binary(
 #     Bazel sandbox (union of the previous per-shard envs; harmless for
 #     tests that don't read it).
 #
-# Single-test dev loop: `bazel test --test_arg=--exact --test_arg=name` does
-# NOT work here (sharding forces --exact name matching per-shard, so a lone
-# test name only reaches whichever shard it hashes into, and `bazel run` on a
-# sharded test is refused outright: "'run' only works with tests with one
-# shard"). Instead, disable sharding for the run and exec the binary directly:
-#   bazel run --test_sharding_strategy=disabled \
-#       //tools/boss/engine/core:engine_lib_test -- --exact path::to::test_name
+# Run an individual test through the hermetic wrapper with bazel test
+# --test_filter=path::to::test_name.
 
 rust_test(
     name = "engine_lib_test",
@@ -280,7 +144,7 @@ rust_test(
         "//tools/boss/engine/work-db:work-db": "boss_work_db_production",
         "//tools/boss/engine/work-db:work_db_test_support": "boss_work_db",
     },
-    crate = ":engine_lib",
+    crate = ":runtime",
     data = [
         # Config loading requires an engine-owned cube, just like the engine.
         "//tools/cube",
@@ -301,10 +165,11 @@ rust_test(
     },
     experimental_enable_sharding = True,
     proc_macro_deps = all_crate_deps(
+        package_name = "tools/boss/engine/core/runtime",
         proc_macro = True,
         proc_macro_dev = True,
     ),
-    shard_count = 11,
+    shard_count = 7,
     deps = [
         "//tools/boss/engine/completion:completion_test_support",
         "//tools/boss/engine/dispatch:dispatch_test_support",
@@ -318,6 +183,7 @@ rust_test(
         "//tools/boss/engine/test-git",
         "//tools/boss/engine/work-db:work_db_test_support",
     ] + all_crate_deps(
+        package_name = "tools/boss/engine/core/runtime",
         normal = True,
         normal_dev = True,
     ),
@@ -351,7 +217,7 @@ network_enabled_rust_test(
         "codex_guard_conformance_against_live_dispatched_models",
         "--nocapture",
     ],
-    crate = ":engine_lib",
+    crate = ":runtime",
     data = [
         "@codex_probe_runtime//codex:login-shell",
         "@codex_probe_runtime//codex:ca.pem",
@@ -375,6 +241,7 @@ network_enabled_rust_test(
         "HOME": "/tmp",
     },
     proc_macro_deps = all_crate_deps(
+        package_name = "tools/boss/engine/core/runtime",
         proc_macro = True,
         proc_macro_dev = True,
     ),
@@ -392,6 +259,7 @@ network_enabled_rust_test(
         "//tools/boss/engine/test-git",
         "//tools/boss/engine/work-db:work_db_test_support",
     ] + all_crate_deps(
+        package_name = "tools/boss/engine/core/runtime",
         normal = True,
         normal_dev = True,
     ),
@@ -900,7 +768,10 @@ sh_test(
     name = "no_gh_pr_merge_test",
     size = "small",
     srcs = ["tests/no_gh_pr_merge_test.sh"],
-    data = [":engine_srcs"],
+    data = [
+        ":engine_srcs",
+        "//tools/boss/engine/app:srcs",
+    ],
 )
 
 # Fails if app-hosted worker machinery (the removed engine↔app lifecycle and
@@ -916,6 +787,7 @@ sh_test(
         ":engine_srcs",
         "//tools/boss/app-macos:swift_sources",
         "//tools/boss/bossctl:srcs",
+        "//tools/boss/engine/app:srcs",
         "//tools/boss/engine/driver:srcs",
         "//tools/boss/engine/execution-runner:srcs",
         "//tools/boss/protocol:srcs",
@@ -929,7 +801,7 @@ sh_test(
 # leaf that only the two `engine` rust_binary targets above link. The moment
 # it is (transitively) a dependency of `engine_lib`, every commit — a
 # docs-only change included — recompiles `engine_lib`, every
-# `rust_test(crate = ":engine_lib")` binary, `boss` and `bossctl`, and
+# `rust_test(crate = ":runtime")` binary, `boss` and `bossctl`, and
 # re-executes their tests. See
 # docs/investigations/docs-only-pr-reexecutes-engine-tests-2026-10-21.md.
 #
@@ -940,8 +812,12 @@ sh_test(
 # closure plus test-only deps — anything `boss`/`bossctl` would inherit.
 genquery(
     name = "engine_lib_test_stamped_deps",
-    expression = 'filter("//tools/boss/(build-provenance:|installer:build_provenance_rs)", deps(//tools/boss/engine/core:engine_lib_test))',
-    scope = [":engine_lib_test"],
+    expression = 'filter("//tools/boss/(build-provenance:|installer:build_provenance_rs)", deps(set(//tools/boss/engine/core:engine_lib_test //tools/boss/engine/core:engine_lib //tools/boss/engine/app:app_test)))',
+    scope = [
+        ":engine_lib_test",
+        ":engine_lib",
+        "//tools/boss/engine/app:app_test",
+    ],
 )
 
 # Positive control: the same filter over the production binary must find the

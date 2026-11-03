@@ -11,11 +11,11 @@ pub(crate) fn server_observed(tmux: &Tmux) {
     let _ = SERVER_OBSERVATIONS.send(tmux.clone());
 }
 
-pub(crate) fn subscribe() -> broadcast::Receiver<Tmux> {
+pub fn subscribe() -> broadcast::Receiver<Tmux> {
     SERVER_OBSERVATIONS.subscribe()
 }
 
-pub(crate) fn version_warning(source: &str, output: &str) -> Option<EngineHealthIssue> {
+pub fn version_warning(source: &str, output: &str) -> Option<EngineHealthIssue> {
     let parsed = TmuxVersion::parse(output).ok();
     let development = output.trim().starts_with("tmux next-");
     let fixed = TmuxVersion { major: 3, minor: 8 };
@@ -48,7 +48,7 @@ pub(crate) fn version_warning(source: &str, output: &str) -> Option<EngineHealth
     })
 }
 
-pub(crate) async fn installed_warning(tmux: &Tmux) -> Option<EngineHealthIssue> {
+pub async fn installed_warning(tmux: &Tmux) -> Option<EngineHealthIssue> {
     let output = match tokio::time::timeout(std::time::Duration::from_secs(3), tmux.version_output()).await {
         Ok(Ok(output)) => output,
         Ok(Err(error)) => format!("version probe failed: {error}"),
@@ -57,7 +57,7 @@ pub(crate) async fn installed_warning(tmux: &Tmux) -> Option<EngineHealthIssue> 
     version_warning("Installed tmux", &output)
 }
 
-pub(crate) async fn server_warning(tmux: &Tmux) -> Option<EngineHealthIssue> {
+pub async fn server_warning(tmux: &Tmux) -> Option<EngineHealthIssue> {
     let output = match tokio::time::timeout(std::time::Duration::from_secs(3), tmux.server_version_output()).await {
         Ok(Ok(Some(output))) => output,
         Ok(Ok(None)) => return None,

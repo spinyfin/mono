@@ -61,7 +61,7 @@ crate::register_counter!(
 );
 
 /// Register this module's counter handles. Called from
-/// [`crate::metrics_init::init_all`] at engine startup.
+/// `boss_engine::metrics_init::init_all` at engine startup.
 pub fn init(registry: &Registry) {
     registry.register_counter(&SPECULATIVE_CONFLICT_PREDICTED);
     registry.register_counter(&SPECULATIVE_CONFLICT_CLEAN);

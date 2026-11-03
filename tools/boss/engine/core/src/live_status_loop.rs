@@ -801,7 +801,7 @@ impl LiveStatusManager {
     /// True iff the manager currently has a task for `slot_id`. Used
     /// by tests; the production dispatcher just calls [`Self::notify`]
     /// and lets a missing slot fall through.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn has_slot(&self, slot_id: u8) -> bool {
         self.slots
             .lock()

@@ -24,8 +24,8 @@ use crate::spawn_flow::TMUX_SESSION_SCHEMA;
 use crate::tmux_session_options::insert_color_environment;
 use crate::work::{CoordinatorTmuxRecord, WorkDb};
 
-pub(crate) mod inbox;
-pub(crate) mod reset_handoff;
+pub mod inbox;
+pub mod reset_handoff;
 
 pub const COORDINATOR_SESSION_NAME: &str = "boss-coordinator";
 const SPAWN_TOKEN_ENV: &str = "BOSS_SPAWN_TOKEN";
@@ -55,13 +55,13 @@ const PROMPT_NUDGE_HASH_KEY: &str = "coordinator.prompt_nudge_hash";
 /// [`coordinator_update_available`] for why the *comparison* is a separate,
 /// fully pure function.
 #[async_trait::async_trait]
-pub(crate) trait ClaudeVersionProbe: Send + Sync {
+pub trait ClaudeVersionProbe: Send + Sync {
     async fn probe(&self) -> Option<String>;
 }
 
 /// Production probe: shells out to `claude --version` with a bounded
 /// timeout. See [`probe_installed_claude_version`].
-pub(crate) struct RealClaudeVersionProbe;
+pub struct RealClaudeVersionProbe;
 
 #[async_trait::async_trait]
 impl ClaudeVersionProbe for RealClaudeVersionProbe {
@@ -79,7 +79,7 @@ impl ClaudeVersionProbe for RealClaudeVersionProbe {
 /// lifecycle function below take one borrowed context instead of
 /// threading the same five values through positionally at every call.
 #[derive(Clone, Copy, bon::Builder)]
-pub(crate) struct CoordinatorSpawn<'a> {
+pub struct CoordinatorSpawn<'a> {
     pub(crate) work_db: &'a WorkDb,
     pub(crate) tmux: &'a Tmux,
     pub(crate) create_tmux: &'a Tmux,
@@ -243,7 +243,7 @@ async fn recreate_and_record(
 /// resolve it once via [`coordinator_working_directory`]. `spawn.version_probe`
 /// is only ever consulted when this call actually creates a new session (see
 /// [`start_new`]).
-pub(crate) async fn ensure_for_attach(spawn: &CoordinatorSpawn<'_>) -> Result<CoordinatorTmuxRecord> {
+pub async fn ensure_for_attach(spawn: &CoordinatorSpawn<'_>) -> Result<CoordinatorTmuxRecord> {
     match spawn.work_db.coordinator_tmux_record()? {
         None => start_new(spawn, CoordinatorStartReason::FirstCreation)
             .await
@@ -259,7 +259,7 @@ pub(crate) async fn ensure_for_attach(spawn: &CoordinatorSpawn<'_>) -> Result<Co
 ///
 /// Returns the replacement record only when the viewer must reattach. A
 /// healthy session and a live model mismatch are deliberately left alone.
-pub(crate) async fn restart_if_dead(
+pub async fn restart_if_dead(
     spawn: &CoordinatorSpawn<'_>,
     supervisor_restart_churn_before: u32,
 ) -> Result<Option<CoordinatorTmuxRecord>> {
@@ -384,7 +384,7 @@ pub(crate) async fn restart_if_dead(
 /// unchecked that churns forever with no backoff and no operator signal, so
 /// `record_restart` gives that path its own escalating backoff and its own
 /// ceiling attention, reset only by a genuinely idle pass (`Ok(None)`).
-pub(crate) struct CoordinatorRestartFailures {
+pub struct CoordinatorRestartFailures {
     consecutive_failures: u32,
     ceiling_notified: bool,
     restart_churn: u32,
@@ -392,24 +392,30 @@ pub(crate) struct CoordinatorRestartFailures {
 }
 
 /// What the supervisor should do after recording a failed pass.
-pub(crate) struct RestartFailureDecision {
+pub struct RestartFailureDecision {
     pub delay: Duration,
     /// Raise the operator attention; true only the first time we reach the ceiling.
     pub notify: bool,
 }
 
 /// What the supervisor should do after recording a successful restart.
-pub(crate) struct RestartChurnDecision {
+pub struct RestartChurnDecision {
     pub delay: Duration,
     /// Raise the operator attention; true only the first time we reach the ceiling.
     pub notify: bool,
 }
 
-impl CoordinatorRestartFailures {
-    pub(crate) const LIMIT: u32 = 5;
-    pub(crate) const BACKOFF_CAP: Duration = Duration::from_secs(60);
+impl Default for CoordinatorRestartFailures {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-    pub(crate) fn new() -> Self {
+impl CoordinatorRestartFailures {
+    pub const LIMIT: u32 = 5;
+    pub const BACKOFF_CAP: Duration = Duration::from_secs(60);
+
+    pub fn new() -> Self {
         Self {
             consecutive_failures: 0,
             ceiling_notified: false,
@@ -418,17 +424,17 @@ impl CoordinatorRestartFailures {
         }
     }
 
-    pub(crate) fn consecutive_failures(&self) -> u32 {
+    pub fn consecutive_failures(&self) -> u32 {
         self.consecutive_failures
     }
 
-    pub(crate) fn restart_churn(&self) -> u32 {
+    pub fn restart_churn(&self) -> u32 {
         self.restart_churn
     }
 
     /// Record a genuinely healthy pass: no restart was needed. Resets both
     /// the failure counter and the restart-churn counter.
-    pub(crate) fn record_success(&mut self) {
+    pub fn record_success(&mut self) {
         self.consecutive_failures = 0;
         self.ceiling_notified = false;
         self.restart_churn = 0;
@@ -438,7 +444,7 @@ impl CoordinatorRestartFailures {
     /// Record a failed pass (`Err`, or session directory not ready). The
     /// retry cadence stays flat at `BACKOFF_CAP` once the ceiling is
     /// reached — the supervisor keeps retrying, it does not pause.
-    pub(crate) fn record_failure(&mut self) -> RestartFailureDecision {
+    pub fn record_failure(&mut self) -> RestartFailureDecision {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         if self.consecutive_failures < Self::LIMIT {
             return RestartFailureDecision {
@@ -459,7 +465,7 @@ impl CoordinatorRestartFailures {
     /// its own backoff (2s, 4s, 8s, 16s, 32s, capped at `BACKOFF_CAP`) so a
     /// crash-looping `claude` child cannot respawn every 2s forever, and
     /// raises its own ceiling attention once per streak.
-    pub(crate) fn record_restart(&mut self) -> RestartChurnDecision {
+    pub fn record_restart(&mut self) -> RestartChurnDecision {
         self.consecutive_failures = 0;
         self.ceiling_notified = false;
         self.restart_churn = self.restart_churn.saturating_add(1);
@@ -484,7 +490,7 @@ impl CoordinatorRestartFailures {
 /// created by a concurrent restart recovery. `reason` is recorded to the
 /// audit log so a manual reset is distinguishable there both from the
 /// automatic model-mismatch path and from a crash/session-loss restart.
-pub(crate) async fn recreate_after_confirmation(
+pub async fn recreate_after_confirmation(
     spawn: &CoordinatorSpawn<'_>,
     expected_spawn_token: &str,
     reason: CoordinatorRecreateReason,
@@ -741,7 +747,7 @@ async fn session_exists(tmux: &Tmux, name: &str) -> Result<bool> {
 /// `legacy_tmux` is `None` when the caller could not build a legacy handle
 /// (e.g. no resolved tmux executable yet) — in that case this always
 /// returns `socket_tmux`, matching the engine's pre-migration behavior.
-pub(crate) async fn resolve_active_handle<'a>(socket_tmux: &'a Tmux, legacy_tmux: Option<&'a Tmux>) -> &'a Tmux {
+pub async fn resolve_active_handle<'a>(socket_tmux: &'a Tmux, legacy_tmux: Option<&'a Tmux>) -> &'a Tmux {
     let Some(legacy) = legacy_tmux else {
         return socket_tmux;
     };
@@ -769,7 +775,7 @@ pub(crate) async fn resolve_active_handle<'a>(socket_tmux: &'a Tmux, legacy_tmux
 /// Read the detached coordinator pane's real pid for the engine's trust
 /// root. A Ghostty surface attached to tmux is only a client and must not be
 /// recorded here.
-pub(crate) async fn pane_pid(tmux: &Tmux, record: &CoordinatorTmuxRecord) -> Result<libc::pid_t> {
+pub async fn pane_pid(tmux: &Tmux, record: &CoordinatorTmuxRecord) -> Result<libc::pid_t> {
     let raw = tmux
         .display_message(&record.session_name, DisplayField::PanePid)
         .await?;
@@ -1282,7 +1288,7 @@ fn is_strictly_newer(installed: &str, running: &str) -> bool {
 /// date" state from this. Deliberately pure — `installed` is resolved by
 /// the caller (see `probe_installed_claude_version`/[`ClaudeVersionProbe`]),
 /// so this is directly testable without spawning a real process.
-pub(crate) fn coordinator_update_available(record: &CoordinatorTmuxRecord, installed: Option<&str>) -> Option<String> {
+pub fn coordinator_update_available(record: &CoordinatorTmuxRecord, installed: Option<&str>) -> Option<String> {
     let running = record.launched_claude_version.as_deref()?;
     let installed = installed?;
     is_strictly_newer(installed, running).then_some(installed.to_owned())
@@ -1291,7 +1297,7 @@ pub(crate) fn coordinator_update_available(record: &CoordinatorTmuxRecord, insta
 /// Resolve the production coordinator session directory under Application
 /// Support. Callers pass the result into lifecycle helpers so tests can
 /// inject a prepared temporary directory instead.
-pub(crate) fn coordinator_working_directory() -> Result<PathBuf> {
+pub fn coordinator_working_directory() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is required for the coordinator session"))?;
     Ok(PathBuf::from(home)
         .join("Library")

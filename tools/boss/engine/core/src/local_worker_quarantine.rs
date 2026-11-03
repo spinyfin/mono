@@ -30,13 +30,13 @@ pub(crate) use boss_engine_storage_values::attention_kinds::LOCAL_WORKER_STARTUP
 pub(crate) const PRE_BOOT_MARGIN_SECS: i64 = 3600;
 
 #[derive(Default)]
-pub(crate) struct StartupQuarantineReport {
+pub struct StartupQuarantineReport {
     pub protected_execution_ids: HashSet<String>,
     pub dead_execution_ids: HashSet<String>,
     pub scan_failed: bool,
 }
 
-pub(crate) fn quarantine_historical_local_workers(db: &WorkDb) -> Result<StartupQuarantineReport> {
+pub fn quarantine_historical_local_workers(db: &WorkDb) -> Result<StartupQuarantineReport> {
     let boot = kernel_boot_epoch_secs();
     if boot.is_none() {
         tracing::warn!("kernel boot time is unavailable; pre-boot historical runs cannot be proven dead this startup");

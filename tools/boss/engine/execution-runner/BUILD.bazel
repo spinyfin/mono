@@ -44,7 +44,10 @@ rust_library(
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     rustc_env = {"BOSS_CHECKS_YAML": "$(execpath //:CHECKS.yaml)"},
-    visibility = ["//tools/boss/engine/core:__pkg__"],
+    visibility = [
+        "//tools/boss/engine/app:__pkg__",
+        "//tools/boss/engine/core:__pkg__",
+    ],
     deps = RUNNER_DEPS + all_crate_deps(normal = True),
 )
 
@@ -64,7 +67,10 @@ rust_library(
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     rustc_env = {"BOSS_CHECKS_YAML": "$(execpath //:CHECKS.yaml)"},
-    visibility = ["//tools/boss/engine/core:__pkg__"],
+    visibility = [
+        "//tools/boss/engine/app:__pkg__",
+        "//tools/boss/engine/core:__pkg__",
+    ],
     deps = [d for d in RUNNER_DEPS if d not in [
         "//tools/boss/engine/pane-summary",
         "//tools/boss/engine/work-db",
@@ -106,5 +112,8 @@ rust_test(
 filegroup(
     name = "srcs",
     srcs = glob(["src/**/*.rs"]),
-    visibility = ["//tools/boss/engine/core:__pkg__"],
+    visibility = [
+        "//tools/boss/engine/app:__pkg__",
+        "//tools/boss/engine/core:__pkg__",
+    ],
 )

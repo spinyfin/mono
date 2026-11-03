@@ -36,8 +36,8 @@
 //! server is asked directly what exists, so no teardown RPC failure mode
 //! can hide a leaked session from it.
 //!
-//! [`crate::app::ServerState::list_hosted_pane_statuses`] and
-//! [`crate::app::ServerState::retire_pane`] remain as the manual,
+//! `boss_engine::app::ServerState::list_hosted_pane_statuses` and
+//! `boss_engine::app::ServerState::retire_pane` remain as the manual,
 //! operator-invoked path (using `DetachWorkerPane` for leftover viewers)
 //! via `bossctl agents list --all` /
 //! `bossctl agents retire-pane`. Occupancy for those verbs is resolved
@@ -72,7 +72,7 @@
 //! wrong, which is what happened on 2026-07-26: six live workers received a
 //! synchronized `SessionEnd { reason: "other" }` burst inside 250ms while
 //! their `claude` processes kept running. `apply_event` flipped each to
-//! `WorkerActivity::Terminated`, [`crate::app::ServerState::list_hosted_pane_statuses`]
+//! `WorkerActivity::Terminated`, `boss_engine::app::ServerState::list_hosted_pane_statuses`
 //! classified those terminal entries as husks, and so five slots looked
 //! like husks on two consecutive passes and were retired 107 seconds later —
 //! SIGTERMing five workers mid-work, three of them inside a foreground
@@ -157,7 +157,7 @@
 //! there (`request_resume_execution`, `mark_execution_orphaned`, the
 //! completion path). So [`death_evidence_from_db`] is a second opinion the
 //! husk classifier cannot supply — note that a pane whose live-state entry
-//! was *released* reaches [`crate::app::ServerState::list_hosted_pane_statuses`]'s
+//! was *released* reaches `boss_engine::app::ServerState::list_hosted_pane_statuses`'s
 //! "no entry at all" arm, where [`live_process_evidence`] is never consulted
 //! and there is no per-candidate corroboration to weigh at all.
 //!
@@ -371,7 +371,7 @@ pub(crate) fn death_evidence_from_db(work_db: &WorkDb, spawn_token: &str) -> Hus
 /// `PostToolUse`, so a pure recency window would age it out and kill it
 /// mid-build. This mirrors
 /// [`crate::dead_pid_sweep`]'s `corroborating_liveness` for the same reason.
-pub(crate) fn live_process_evidence(state: &LiveWorkerState, now_epoch_secs: i64) -> Option<String> {
+pub fn live_process_evidence(state: &LiveWorkerState, now_epoch_secs: i64) -> Option<String> {
     // Guard before probing: `kill(0, 0)` signals the caller's own process
     // group, and a negative pid signals an arbitrary one. A slot that never
     // reported a shell pid offers no corroboration either way.
@@ -425,7 +425,7 @@ pub(crate) fn live_process_evidence_with(
 
 /// Abstracts the app round-trips this sweep needs so it is unit-testable
 /// without a full `ServerState`/app session. Implemented by
-/// [`crate::app::ServerState`] in `app/server.rs`.
+/// `boss_engine::app::ServerState` in `app/server.rs`.
 #[async_trait::async_trait]
 pub trait HuskPaneSweepSource: Send + Sync {
     /// Enumerate the private tmux server and return sessions whose token has

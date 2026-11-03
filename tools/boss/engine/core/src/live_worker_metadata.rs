@@ -13,7 +13,7 @@ use crate::work::{WorkDb, WorkExecution};
 
 /// Keep the durable binding even for execution owners (such as review-guide
 /// comparisons and comments) that are not ordinary work-item variants.
-pub(crate) fn execution_binding(work_db: &WorkDb, execution: &WorkExecution) -> boss_protocol::WorkItemBinding {
+pub fn execution_binding(work_db: &WorkDb, execution: &WorkExecution) -> boss_protocol::WorkItemBinding {
     let work_item_name = work_db
         .get_work_item(&execution.work_item_id)
         .map(|item| crate::runner::work_item_name(&item).to_owned())
@@ -29,7 +29,7 @@ pub(crate) use boss_engine_completion::driver_transcript::guide_launch_config;
 
 /// Shared identity for both restart registration paths, with the execution
 /// stamp taking precedence over the pre-spawn guide configuration.
-pub(crate) fn adopted_identity(
+pub fn adopted_identity(
     work_db: &WorkDb,
     execution: &WorkExecution,
     driver: Option<&dyn crate::driver::AgentDriver>,
@@ -114,7 +114,7 @@ pub(crate) fn resolve(work_db: &WorkDb, execution: &WorkExecution, host_id: &str
 /// Like [`resolve`], but takes the caller's already-computed
 /// `has_source_automation` (the same flag fed to `attributed_pool_label`), so
 /// the badge type and the stamped pool derive from one lookup.
-pub(crate) fn resolve_with_automation(
+pub fn resolve_with_automation(
     work_db: &WorkDb,
     execution: &WorkExecution,
     host_id: &str,

@@ -53,12 +53,12 @@ use crate::work::CoordinatorTmuxRecord;
 /// facts, decisions, open threads, prohibitions — not a transcript
 /// replay; the cap is what keeps it that way when a session is tempted to
 /// dump everything it knows.
-pub(crate) const MAX_HANDOFF_BYTES: usize = 16 * 1024;
+pub const MAX_HANDOFF_BYTES: usize = 16 * 1024;
 
 /// Filename of the session-start brief, written under the coordinator
 /// session directory's `.claude/` (next to the app-managed
 /// `settings.local.json`) and handed to `claude` as its initial prompt.
-pub(crate) const START_BRIEF_FILENAME: &str = "handoff-brief.txt";
+pub const START_BRIEF_FILENAME: &str = "handoff-brief.txt";
 
 pub(crate) use boss_engine_storage_values::{CoordinatorHandoff, HandoffState};
 
@@ -148,7 +148,7 @@ impl From<&CoordinatorTmuxRecord> for PreviousSession {
 
 /// Normalize and bound a handoff body. Returns the trimmed body, or the
 /// operator-facing reason it was refused.
-pub(crate) fn validate_handoff_body(body: &str) -> std::result::Result<String, String> {
+pub fn validate_handoff_body(body: &str) -> std::result::Result<String, String> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return Err(
@@ -169,7 +169,7 @@ pub(crate) fn validate_handoff_body(body: &str) -> std::result::Result<String, S
 
 /// Wire view of a stored handoff, judged against the coordinator record
 /// that is live *now*.
-pub(crate) fn handoff_view(
+pub fn handoff_view(
     handoff: &CoordinatorHandoff,
     current_spawn_token: Option<&str>,
     now_epoch_secs: i64,

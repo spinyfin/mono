@@ -1,0 +1,1135 @@
+use super::super::worker_events::extract_last_assistant_text;
+use super::*;
+
+use boss_engine_runtime::test_support::*;
+
+#[test]
+fn queue_probe_mints_unique_probe_ids() {
+    let (server_state, _dir) = test_server_state();
+    let id_one = server_state.queue_probe("run-x".into(), "first".into(), false);
+    let id_two = server_state.queue_probe("run-x".into(), "second".into(), false);
+    assert_ne!(id_one, id_two, "probe ids must be unique per call");
+    assert!(id_one.starts_with("probe-"));
+    assert!(id_two.starts_with("probe-"));
+    let popped_one = server_state.pop_pending_probe("run-x").expect("first probe present");
+    let popped_two = server_state.pop_pending_probe("run-x").expect("second probe present");
+    assert_eq!(popped_one.probe_id, id_one);
+    assert_eq!(popped_one.text, "first");
+    assert_eq!(popped_two.probe_id, id_two);
+    assert_eq!(popped_two.text, "second");
+    assert!(
+        server_state.pop_pending_probe("run-x").is_none(),
+        "queue must be empty after both probes pop",
+    );
+}
+
+/// The primitive behind "one probe in flight per run": claiming a probe and
+/// claiming the run's single reply slot are one step, so a second delivery
+/// site cannot claim a probe while the first is still writing. Without this,
+/// the three concurrent delivery sites (the `ProbeRun` call, `PostToolUse`,
+/// `Stop`) could each observe an empty slot across the seconds-long pane write
+/// and the first probe's pending `ProbeReplied` would be lost.
+#[test]
+fn reserving_a_probe_claims_the_runs_only_delivery_slot() {
+    let (server_state, _dir) = test_server_state();
+    server_state.worker_registry.register_run_slot("run-y", 1);
+    let first = server_state.queue_probe("run-y".into(), "first".into(), false);
+    let second = server_state.queue_probe("run-y".into(), "second".into(), false);
+
+    let claimed = server_state
+        .try_reserve_probe_for_delivery("run-y", Some("/tmp/t.jsonl".to_owned()), 42)
+        .expect("the first claim must succeed");
+    assert_eq!(claimed.probe_id, first);
+    assert!(server_state.has_in_flight_probe("run-y"));
+
+    assert!(
+        server_state.try_reserve_probe_for_delivery("run-y", None, 0).is_none(),
+        "the queued second probe must not be claimable while the first holds the slot",
+    );
+    assert!(
+        server_state.has_pending_probe("run-y"),
+        "refusing the claim must leave the second probe queued, not drop it",
+    );
+
+    // A write that never happened gives the probe and the slot back.
+    server_state.release_probe_reservation("run-y", claimed);
+    assert!(!server_state.has_in_flight_probe("run-y"));
+    let reclaimed = server_state
+        .try_reserve_probe_for_delivery("run-y", None, 0)
+        .expect("the released probe must be claimable again");
+    assert_eq!(
+        reclaimed.probe_id, first,
+        "a released probe keeps its id and its place at the front of the queue",
+    );
+    assert_ne!(reclaimed.probe_id, second);
+}
+
+/// The Claude reader, driven through its own driver. Behaviour here is
+/// unchanged by the driver-aware rewrite: `ClaudeDriver`'s transcript
+/// normalization is the identity, so these entries reach the extractor
+/// byte-for-byte as they always did.
+fn claude_driver() -> std::sync::Arc<dyn boss_engine_driver::AgentDriver> {
+    boss_engine_driver::DriverRegistry::default().require("claude").unwrap()
+}
+
+fn codex_driver() -> std::sync::Arc<dyn boss_engine_driver::AgentDriver> {
+    boss_engine_driver::DriverRegistry::default().require("codex").unwrap()
+}
+
+#[test]
+fn extract_last_assistant_text_handles_modern_content_blocks() {
+    let chunk = r#"{"type":"user","message":{"content":[{"type":"text","text":"prompt"}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"alpha "},{"type":"text","text":"beta"}]}}
+{"type":"system","subtype":"ping"}
+"#;
+    let result = extract_last_assistant_text(Some(claude_driver().as_ref()), chunk);
+    assert_eq!(result.as_deref(), Some("alpha beta"));
+}
+
+#[test]
+fn extract_last_assistant_text_picks_most_recent_when_multiple() {
+    let chunk = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"old"}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"new"}]}}
+"#;
+    let result = extract_last_assistant_text(Some(claude_driver().as_ref()), chunk);
+    assert_eq!(
+        result.as_deref(),
+        Some("new"),
+        "two adjacent single-block messages must not be glued together the way two blocks \
+         inside one message are",
+    );
+}
+
+#[test]
+fn extract_last_assistant_text_returns_none_when_no_assistant_turn() {
+    let chunk = r#"{"type":"user","message":{"content":[{"type":"text","text":"hi"}]}}
+{"type":"system","subtype":"compact"}
+"#;
+    assert_eq!(extract_last_assistant_text(Some(claude_driver().as_ref()), chunk), None);
+}
+
+#[test]
+fn extract_last_assistant_text_skips_unparseable_lines() {
+    let chunk = "this is not json\n{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"survived\"}]}}\n";
+    assert_eq!(
+        extract_last_assistant_text(Some(claude_driver().as_ref()), chunk).as_deref(),
+        Some("survived"),
+    );
+}
+
+/// An unresolvable driver falls back to reading the entries as written —
+/// exactly the pre-normalization behaviour — rather than losing the read.
+#[test]
+fn extract_last_assistant_text_without_a_driver_reads_entries_as_written() {
+    let chunk = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"raw"}]}}
+"#;
+    assert_eq!(extract_last_assistant_text(None, chunk).as_deref(), Some("raw"));
+}
+
+/// The regression this rewrite exists for. A Codex worker's transcript is a
+/// rollout: `session_meta` / `event_msg` / `response_item`, with the reply
+/// prose on an `event_msg`/`agent_message` record and again on the
+/// `response_item` message. No record in it has `type == "assistant"`, so the
+/// old Claude-shaped scan returned `None` for every Codex probe — the reply
+/// was delivered, answered and read at the right boundary, and `ProbeReplied`
+/// still never fired.
+#[test]
+fn extract_last_assistant_text_reads_a_codex_rollout_reply() {
+    let chunk = concat!(
+        r#"{"type":"session_meta","payload":{"id":"thread-1"}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"agent_message","message":"still building, waiting"}}"#,
+        "\n",
+        r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"still building, waiting"}]}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+        "\n",
+    );
+    assert_eq!(
+        extract_last_assistant_text(Some(codex_driver().as_ref()), chunk).as_deref(),
+        Some("still building, waiting"),
+    );
+    assert_eq!(
+        extract_last_assistant_text(None, chunk),
+        None,
+        "without the driver's normalization the same rollout is unreadable — which is what \
+         the shipped reader used to do to every Codex probe",
+    );
+}
+
+/// A folded mid-turn prompt and its answer land in the *same* Codex turn, so
+/// the single boundary that turn produces is the one the reply must be read
+/// at. The buffered prompt is visible in the rollout as an
+/// `event_msg`/`user_message` record — the progress dialect drops it, the
+/// transcript dialect does not — and the extractor must return the prose that
+/// follows it, not the pre-injection prose.
+#[test]
+fn extract_last_assistant_text_returns_the_folded_prompts_answer() {
+    let chunk = concat!(
+        r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"agent_message","message":"working on the original ask"}}"#,
+        "\n",
+        r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"working on the original ask"}]}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"user_message","message":"[nudge] what is your status?"}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"agent_message","message":"status: pushed, waiting on CI"}}"#,
+        "\n",
+        r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"status: pushed, waiting on CI"}]}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+        "\n",
+    );
+    assert_eq!(
+        extract_last_assistant_text(Some(codex_driver().as_ref()), chunk).as_deref(),
+        Some("status: pushed, waiting on CI"),
+    );
+}
+
+#[tokio::test]
+async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
+    // End-to-end smoke for the ProbeReplied flow: call queue_probe,
+    // dispatch the probe via the events-socket Stop hook, append an
+    // assistant turn to the transcript, fire the follow-up Stop,
+    // and observe ProbeReplied land on the per-run probe topic.
+    // This locks in the wire shape a `bossctl probe --wait` (or
+    // any other observer) would consume.
+    use boss_protocol::RequestExecutionInput;
+    use boss_protocol::WorkerEvent;
+
+    let (server_state, _dir) = test_server_state();
+
+    // Seed: product → chore → execution → run with a real
+    // transcript path on disk. Without the run row the engine's
+    // dispatch can't resolve a transcript path and would skip
+    // emission — that's the production behaviour we want covered.
+    let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
+    let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
+    let execution = server_state
+        .work_db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    let transcript_dir = tempfile::tempdir().unwrap();
+    let transcript_path = transcript_dir.path().join("transcript.jsonl");
+    std::fs::write(
+        &transcript_path,
+        "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n",
+    )
+    .unwrap();
+    // Create the work_runs row so transcript_path_for_execution(execution.id)
+    // can resolve the path. The run.id is not used for hook correlation — in
+    // production BOSS_RUN_ID carries execution.id (exec_*), not run.id (run_*).
+    server_state
+        .work_db
+        .create_run(boss_protocol::CreateRunInput {
+            execution_id: execution.id.clone(),
+            agent_id: "agent-1".into(),
+            status: Some("active".into()),
+            transcript_path: Some(transcript_path.display().to_string()),
+            artifacts_path: None,
+            result_summary: None,
+            error_text: None,
+            started_at: None,
+            finished_at: None,
+        })
+        .unwrap();
+
+    // Map the execution (via its exec_* id) to slot 1 so dispatch_probe_on_stop
+    // has a pane to write into. In production BOSS_RUN_ID carries
+    // execution.id (exec_*), not run.id (run_*). Park activity at Idle so
+    // the Stop-path activity guard (fail closed) allows the write.
+    register_idle_worker(&server_state, &execution.id, 1);
+
+    // Subscribe a session to the per-run probe topic and pin the
+    // ServerState so probe pushes have somewhere to land.
+    let session_id = "session-probe-observer".to_owned();
+    let sink = make_session_sink();
+    server_state
+        .topic_broker
+        .register_session(&session_id, sink.clone())
+        .await;
+    server_state
+        .topic_broker
+        .subscribe(&session_id, &[probe_topic(&execution.id)])
+        .await;
+
+    let _tmux = install_live_tmux_delivery(&server_state, &execution.id, 1, "boss-probe");
+
+    // Queue a probe and pull the minted probe_id back out of the
+    // queue head so we can assert it threads through to ProbeReplied.
+    // In production BOSS_RUN_ID is execution.id (exec_*), so probe
+    // operations use execution.id, not run.id.
+    let probe_id = server_state.queue_probe(execution.id.clone(), "what now?".into(), false);
+
+    // Fire the first Stop boundary. This dispatches the probe into
+    // the worker's tmux pane and records the in-flight entry.
+    let first_stop = boss_engine_runtime::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
+            session_id: "claude-sess-1".into(),
+            stop_hook_active: false,
+            stop_reason: boss_protocol::StopReason::Completed,
+        },
+        Some(execution.id.clone()),
+        None,
+    );
+    dispatch_probe_reply_on_stop(&server_state, &first_stop).await;
+    dispatch_probe_on_stop(&server_state, &first_stop).await;
+
+    // Append an assistant turn — the worker has now "replied".
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&transcript_path).unwrap();
+        let line = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"the answer\"}]}}";
+        writeln!(file, "{line}").unwrap();
+    }
+
+    // Second Stop: the engine should see the in-flight probe,
+    // read the new transcript bytes, and publish ProbeReplied on
+    // the per-run probe topic.
+    let second_stop = boss_engine_runtime::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
+            session_id: "claude-sess-1".into(),
+            stop_hook_active: false,
+            stop_reason: boss_protocol::StopReason::Completed,
+        },
+        Some(execution.id.clone()),
+        None,
+    );
+    dispatch_probe_reply_on_stop(&server_state, &second_stop).await;
+
+    let envelope = sink.next().await.expect("ProbeReplied envelope should be published");
+    match envelope.payload {
+        FrontendEvent::ProbeReplied {
+            run_id: emitted_run,
+            probe_id: emitted_probe,
+            text,
+        } => {
+            assert_eq!(emitted_run, execution.id);
+            assert_eq!(emitted_probe, probe_id);
+            assert_eq!(text, "the answer");
+        }
+        other => panic!("expected ProbeReplied, got {other:?}"),
+    }
+
+    // Idempotency: a duplicate Stop with no in-flight entry must
+    // not re-emit the same probe id.
+    dispatch_probe_reply_on_stop(&server_state, &second_stop).await;
+    let drain = tokio::time::timeout(Duration::from_millis(50), sink.next()).await;
+    assert!(
+        drain.is_err(),
+        "duplicate Stop must not produce a second ProbeReplied for the same probe id",
+    );
+}
+
+/// Safety guard: a probe on PostToolUse must **not** write to the pane when
+/// the worker is mid-turn on a driver that rejects stdin (`grok`). Live tmux
+/// delivery is installed so the posture guard is what refuses the write, not
+/// a missing transport. Injecting into a non-consuming foreground process is
+/// a safety issue (ghostty-codex-pane-viability Q2 Layer D), not hygiene.
+///
+/// Note what this does *not* assert: that `Working` alone forbids the write.
+/// It does not — a mid-turn worker on a driver that buffers stdin is
+/// injectable, which is what makes mid-flight steering work at all. See
+/// `app::tests::probe_delivery` for both halves of that decision under a
+/// resolvable driver.
+///
+/// The probe is left queued for the next Stop boundary (no pop), and the
+/// deferral is treated as *expected* — no `ProbeDeliveryEscalated`
+/// (multi-tool turns must not spam once per tool).
+#[tokio::test]
+async fn dispatch_probe_defers_when_worker_not_accepting_input() {
+    use boss_protocol::WorkerEvent;
+
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 5, Some("grok"));
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 5, "boss-5");
+
+    let watch_session_id = "session-probe-watch-refuse".to_owned();
+    let watch_sink = make_session_sink();
+    server_state
+        .topic_broker
+        .register_session(&watch_session_id, watch_sink.clone())
+        .await;
+    server_state
+        .topic_broker
+        .subscribe(&watch_session_id, &[probe_topic(&run_id)])
+        .await;
+
+    let probe_id = server_state.queue_probe(run_id.clone(), "what now?".into(), true);
+
+    let post_tool_use = boss_engine_runtime::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::PostToolUse {
+            session_id: "claude-sess-1".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({}),
+            tool_response: serde_json::json!({}),
+        },
+        Some(run_id.clone()),
+        None,
+    );
+    dispatch_probe_on_post_tool_use(&server_state, &post_tool_use).await;
+
+    assert!(
+        !runner.wrote_text(),
+        "deferred probe must not write into the pane; calls={:?}",
+        runner.calls(),
+    );
+    // Probe remains queued (never popped) for Stop-boundary delivery.
+    let still = server_state
+        .pop_pending_probe(&run_id)
+        .expect("deferred probe must remain queued for Stop boundary");
+    assert_eq!(still.probe_id, probe_id);
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Queued),
+    );
+
+    // Expected Working deferral must not publish ProbeDeliveryEscalated.
+    let drain = tokio::time::timeout(Duration::from_millis(50), watch_sink.next()).await;
+    assert!(
+        drain.is_err(),
+        "Working-on-PostToolUse deferral must not escalate; got {:?}",
+        drain.map(|e| e.map(|env| format!("{:?}", env.payload))),
+    );
+}
+
+/// When the activity guard passes (worker Idle) but the CLI never
+/// confirms the write, the corrected probe-6 understanding still
+/// applies: do **not** auto-redeliver. Lifecycle is Unconfirmed and a
+/// ProbeDeliveryEscalated push is emitted. This is the post-guard
+/// observability path; mid-turn refusal is covered separately.
+#[tokio::test(start_paused = true)]
+async fn dispatch_probe_on_idle_records_unconfirmed_without_redelivery() {
+    use boss_protocol::WorkerEvent;
+
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_idle_worker_with_driver(&server_state, 6, None);
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 6, "boss-6");
+
+    let watch_session_id = "session-probe-watch-unconfirmed".to_owned();
+    let watch_sink = make_session_sink();
+    server_state
+        .topic_broker
+        .register_session(&watch_session_id, watch_sink.clone())
+        .await;
+    server_state
+        .topic_broker
+        .subscribe(&watch_session_id, &[probe_topic(&run_id)])
+        .await;
+
+    let probe_id = server_state.queue_probe(run_id.clone(), "what now?".into(), true);
+
+    let post_tool_use = boss_engine_runtime::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::PostToolUse {
+            session_id: "claude-sess-1".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({}),
+            tool_response: serde_json::json!({}),
+        },
+        Some(run_id.clone()),
+        None,
+    );
+    let dispatch = tokio::spawn({
+        let server_state = server_state.clone();
+        async move { dispatch_probe_on_post_tool_use(&server_state, &post_tool_use).await }
+    });
+
+    tokio::time::advance(Duration::from_secs(10)).await;
+    dispatch.await.expect("dispatch task");
+
+    assert!(
+        runner.wrote_text(),
+        "the pane write itself must have gone out; calls={:?}",
+        runner.calls(),
+    );
+    assert!(
+        server_state.take_in_flight_probe(&run_id).is_some(),
+        "unconfirmed delivery keeps the in-flight slot so a later reply is still captured",
+    );
+    assert!(
+        server_state.pop_pending_probe(&run_id).is_none(),
+        "delivered probe must not be auto-redelivered",
+    );
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Unconfirmed),
+        "unconfirmed delivery must be recorded, not left unknown",
+    );
+
+    let envelope = watch_sink
+        .next()
+        .await
+        .expect("unconfirmed delivery must publish ProbeDeliveryEscalated");
+    match envelope.payload {
+        FrontendEvent::ProbeDeliveryEscalated {
+            run_id: emitted_run,
+            probe_id: emitted_probe,
+            reason,
+        } => {
+            assert_eq!(emitted_run, run_id);
+            assert_eq!(emitted_probe, probe_id);
+            assert!(
+                reason.contains("unconfirmed"),
+                "escalation reason must name unconfirmed delivery, got {reason}"
+            );
+        }
+        other => panic!("expected ProbeDeliveryEscalated, got {other:?}"),
+    }
+}
+
+/// Regression: `dispatch_probe_now` must deliver a probe
+/// immediately to a worker whose activity is `Idle` — i.e. one that
+/// is between turns and has no Stop boundary coming. Before the fix,
+/// `bossctl probe` targeted at an idle worker would stall forever
+/// because `dispatch_probe_on_stop` only fires on Stop events and an
+/// idle worker never produces another Stop without receiving input
+/// first.
+#[tokio::test]
+async fn probe_queued_for_idle_worker_dispatches_immediately() {
+    use boss_protocol::{RequestExecutionInput, WorkerActivity, WorkerEvent};
+
+    let (server_state, _dir) = test_server_state();
+
+    // Minimal DB rows so transcript lookup has something to resolve.
+    let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
+    let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
+    let execution = server_state
+        .work_db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    let _run = server_state
+        .work_db
+        .create_run(boss_protocol::CreateRunInput {
+            execution_id: execution.id.clone(),
+            agent_id: "agent-1".into(),
+            status: Some("active".into()),
+            transcript_path: None,
+            artifacts_path: None,
+            result_summary: None,
+            error_text: None,
+            started_at: None,
+            finished_at: None,
+        })
+        .unwrap();
+
+    // Register slot and set activity to Idle (worker between turns).
+    server_state.worker_registry.register_run_slot(execution.id.clone(), 1);
+    server_state
+        .live_worker_states
+        .register_spawn(1, execution.id.clone(), "claude-opus-4-7", 0, None);
+    // Apply a Stop event to transition Spawning → Idle.
+    server_state.live_worker_states.apply_event(
+        1,
+        &WorkerEvent::Stop {
+            session_id: "sess-1".into(),
+            stop_hook_active: false,
+            stop_reason: boss_protocol::StopReason::Completed,
+        },
+    );
+    assert_eq!(
+        server_state.live_worker_states.get(1).unwrap().activity,
+        WorkerActivity::Idle,
+        "precondition: worker must be idle",
+    );
+
+    let runner = install_live_tmux_delivery(&server_state, &execution.id, 1, "boss-probe");
+    // Queue the probe and call dispatch_probe_now directly.
+    server_state.queue_probe(execution.id.clone(), "coordinator nudge".into(), false);
+    dispatch_probe_now(&server_state, &execution.id).await;
+
+    assert!(
+        runner.wrote_text(),
+        "idle immediate dispatch must write the probe into the pane; calls={:?}",
+        runner.calls(),
+    );
+
+    // Probe must have been consumed (popped from pending_probes and
+    // an in-flight entry recorded).
+    assert!(
+        server_state.pop_pending_probe(&execution.id).is_none(),
+        "probe must be consumed, not left in pending_probes",
+    );
+}
+
+/// Regression: `dispatch_probe_now` must also deliver a probe
+/// immediately to a worker whose activity is `WaitingForInput` — the
+/// state a session lands in when a `Stop` follows a `Notification`
+/// (e.g. a worker parked at its prompt after the coordinator or a
+/// permission dialog already resolved). Before the fix, a probe
+/// queued against such a session stalled forever: it has already
+/// produced its terminal `Stop` for this turn, so `dispatch_probe_on_stop`
+/// never fires again on its own, and `dispatch_probe_now` only
+/// recognized `WorkerActivity::Idle`. `send_input_to_worker` /
+/// `bossctl agents send` use the same activity guard (Idle /
+/// WaitingForInput accept typed input), so probe delivery matches.
+#[tokio::test]
+async fn probe_queued_for_waiting_for_input_worker_dispatches_immediately() {
+    use boss_protocol::{RequestExecutionInput, WorkerActivity, WorkerEvent};
+
+    let (server_state, _dir) = test_server_state();
+
+    let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
+    let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
+    let execution = server_state
+        .work_db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    let _run = server_state
+        .work_db
+        .create_run(boss_protocol::CreateRunInput {
+            execution_id: execution.id.clone(),
+            agent_id: "agent-1".into(),
+            status: Some("active".into()),
+            transcript_path: None,
+            artifacts_path: None,
+            result_summary: None,
+            error_text: None,
+            started_at: None,
+            finished_at: None,
+        })
+        .unwrap();
+
+    // Register slot and drive activity to WaitingForInput: a
+    // Notification (permission prompt) immediately followed by a Stop.
+    server_state.worker_registry.register_run_slot(execution.id.clone(), 1);
+    server_state
+        .live_worker_states
+        .register_spawn(1, execution.id.clone(), "claude-opus-4-7", 0, None);
+    server_state.live_worker_states.apply_event(
+        1,
+        &WorkerEvent::Notification {
+            session_id: "sess-1".into(),
+            message: "permission prompt".into(),
+        },
+    );
+    server_state.live_worker_states.apply_event(
+        1,
+        &WorkerEvent::Stop {
+            session_id: "sess-1".into(),
+            stop_hook_active: false,
+            stop_reason: boss_protocol::StopReason::Completed,
+        },
+    );
+    assert_eq!(
+        server_state.live_worker_states.get(1).unwrap().activity,
+        WorkerActivity::WaitingForInput,
+        "precondition: worker must be parked in WaitingForInput",
+    );
+
+    let runner = install_live_tmux_delivery(&server_state, &execution.id, 1, "boss-probe");
+
+    // Queue the probe and call dispatch_probe_now directly.
+    server_state.queue_probe(execution.id.clone(), "coordinator nudge".into(), false);
+    dispatch_probe_now(&server_state, &execution.id).await;
+
+    assert!(
+        runner.wrote_text(),
+        "WaitingForInput immediate dispatch must write the probe into the pane; calls={:?}",
+        runner.calls(),
+    );
+    assert!(
+        server_state.pop_pending_probe(&execution.id).is_none(),
+        "probe must be consumed, not left in pending_probes",
+    );
+}
+
+/// Regression: probes queued by the completion handler during a Stop
+/// event must be dispatched on the SAME Stop, not stalled until the
+/// next one. The event-loop order change (completion before probe
+/// dispatch) enables this: `dispatch_completion_on_stop` adds to
+/// `pending_probes`, then `dispatch_probe_on_stop` picks them up.
+#[tokio::test]
+async fn completion_probe_dispatched_on_same_stop_as_completion() {
+    use boss_protocol::RequestExecutionInput;
+    use boss_protocol::WorkerEvent;
+
+    let (server_state, _dir) = test_server_state();
+
+    let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
+    let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
+    let execution = server_state
+        .work_db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    let _run = server_state
+        .work_db
+        .create_run(boss_protocol::CreateRunInput {
+            execution_id: execution.id.clone(),
+            agent_id: "agent-1".into(),
+            status: Some("active".into()),
+            transcript_path: None,
+            artifacts_path: None,
+            result_summary: None,
+            error_text: None,
+            started_at: None,
+            finished_at: None,
+        })
+        .unwrap();
+
+    // The engine maps hooks and pane delivery by execution id, not the
+    // bookkeeping work-run id. Keep the fixture on that production path so
+    // the driver liveness check resolves the task's configured driver.
+    register_idle_worker(&server_state, &execution.id, 1);
+
+    // Queue a probe manually (simulating what the completion handler does)
+    // BEFORE dispatch_probe_on_stop fires, to verify the dispatch picks it up.
+    server_state.queue_probe(execution.id.clone(), "push your PR".into(), false);
+
+    let runner = install_live_tmux_delivery(&server_state, &execution.id, 1, "boss-probe");
+
+    // Fire the Stop event. With the new ordering, dispatch_probe_on_stop
+    // runs after dispatch_completion_on_stop and sees the queued probe.
+    let stop = boss_engine_runtime::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
+            session_id: "sess-1".into(),
+            stop_hook_active: false,
+            stop_reason: boss_protocol::StopReason::Completed,
+        },
+        Some(execution.id.clone()),
+        None,
+    );
+    dispatch_probe_on_stop(&server_state, &stop).await;
+
+    assert!(
+        runner.wrote_text(),
+        "same-Stop completion probe must write into the pane; calls={:?}",
+        runner.calls(),
+    );
+    assert!(
+        server_state.pop_pending_probe(&execution.id).is_none(),
+        "probe must be consumed by dispatch_probe_on_stop",
+    );
+}
+
+/// The Stop path records what it can actually vouch for. A parked worker
+/// takes the write as its next prompt, so `Consumed` is honest. A worker
+/// whose live activity is still `Working` on a buffering driver passes the
+/// posture guard, but the text only reaches the composer — nothing here
+/// observed a submission — so that must be recorded as `Buffered`, the same
+/// state the mid-turn path uses.
+#[tokio::test]
+async fn probe_on_stop_records_buffered_for_a_mid_turn_write() {
+    use boss_protocol::WorkerEvent;
+
+    let (server_state, _dir) = test_server_state();
+    // Default driver (`claude`) buffers mid-turn input; activity stays
+    // `Working`, which in production the fan-out would have cleared to
+    // `Idle` before this dispatcher runs.
+    let run_id = register_working_worker_with_driver(&server_state, 6, None);
+    let _tmux = install_live_tmux_delivery(&server_state, &run_id, 6, "boss-6");
+    let probe_id = server_state.queue_probe(run_id.clone(), "status?".into(), false);
+
+    let stop = boss_engine_runtime::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
+            session_id: "sess-1".into(),
+            stop_hook_active: false,
+            stop_reason: boss_protocol::StopReason::Completed,
+        },
+        Some(run_id.clone()),
+        None,
+    );
+    dispatch_probe_on_stop(&server_state, &stop).await;
+
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Buffered),
+        "a mid-turn write must not claim the worker consumed it",
+    );
+}
+
+/// The on-turn-boundary dispatchers follow the **driver's** answer, not the
+/// shape of the event.
+///
+/// A `WorkerEvent::Stop` resolved through a driver that declares no
+/// `Capability::TurnBoundary` is not a turn boundary, so probe dispatch must
+/// leave the queued probe alone. Before the boundary moved behind
+/// `AgentDriver::turn_boundary`, the dispatchers matched the `Stop` variant
+/// directly and this event would have fired them regardless of what the
+/// driver had to say.
+#[tokio::test]
+async fn probe_dispatch_ignores_a_stop_from_a_driver_with_no_turn_boundary() {
+    use boss_protocol::WorkerEvent;
+
+    let (server_state, _dir) = test_server_state();
+    let run_id = "run-boundaryless";
+    server_state.worker_registry.register_run_slot(run_id, 5);
+    let probe_id = server_state.queue_probe(run_id.to_owned(), "are you stuck?".into(), false);
+
+    let boundaryless = boss_engine_driver::test_support::StubDriver::new(
+        boss_engine_driver::test_support::stub_descriptor(),
+        boss_engine_driver::CapabilitySet::new([]),
+    );
+    let stop = boss_engine_runtime::events_socket::IncomingHookEvent::resolve(
+        &boundaryless,
+        WorkerEvent::Stop {
+            session_id: "sess-1".into(),
+            stop_hook_active: false,
+            stop_reason: boss_protocol::StopReason::Completed,
+        },
+        Some(run_id.to_owned()),
+        None,
+        None,
+    );
+    assert!(!stop.is_turn_boundary(), "precondition: the driver reports no boundary");
+
+    dispatch_probe_on_stop(&server_state, &stop).await;
+
+    let still_queued = server_state
+        .pop_pending_probe(run_id)
+        .expect("probe must survive an event the driver does not call a turn boundary");
+    assert_eq!(still_queued.probe_id, probe_id);
+}
+
+/// Multi-tool mid-turn on a driver that cannot take mid-turn input: each
+/// `PostToolUse` forces activity to `Working` before probe dispatch. The
+/// tool-boundary path must short-circuit without popping and must not
+/// publish `ProbeDeliveryEscalated` once per tool.
+#[tokio::test]
+async fn probe_multi_tool_post_tool_use_does_not_escalate_spam() {
+    use boss_protocol::WorkerEvent;
+
+    let (server_state, _dir) = test_server_state();
+    let run_id = "run-urgent-multi-tool";
+    register_working_worker(&server_state, run_id, 9);
+
+    let watch_session_id = "session-probe-watch-multi".to_owned();
+    let watch_sink = make_session_sink();
+    server_state
+        .topic_broker
+        .register_session(&watch_session_id, watch_sink.clone())
+        .await;
+    server_state
+        .topic_broker
+        .subscribe(&watch_session_id, &[probe_topic(run_id)])
+        .await;
+
+    let probe_id = server_state.queue_probe(run_id.to_owned(), "redirect now".into(), true);
+
+    for tool in ["Bash", "Edit", "Read"] {
+        let post_tool_use = boss_engine_runtime::events_socket::IncomingHookEvent::for_test(
+            WorkerEvent::PostToolUse {
+                session_id: "claude-sess-1".into(),
+                tool_name: tool.into(),
+                tool_input: serde_json::json!({}),
+                tool_response: serde_json::json!({}),
+            },
+            Some(run_id.to_owned()),
+            None,
+        );
+        // Production fan-out order: live-state apply first (forces Working),
+        // then tool-boundary probe dispatch.
+        dispatch_live_worker_state(&server_state, &post_tool_use).await;
+        dispatch_probe_on_post_tool_use(&server_state, &post_tool_use).await;
+    }
+
+    let still = server_state
+        .pop_pending_probe(run_id)
+        .expect("probe must remain queued across multi-tool deferrals");
+    assert_eq!(still.probe_id, probe_id);
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Queued),
+    );
+
+    let drain = tokio::time::timeout(Duration::from_millis(50), watch_sink.next()).await;
+    assert!(
+        drain.is_err(),
+        "multi-tool PostToolUse deferrals must not publish ProbeDeliveryEscalated; got {:?}",
+        drain.map(|e| e.map(|env| format!("{:?}", env.payload))),
+    );
+}
+
+/// Production-shaped ordering for a driver that does not accept mid-turn
+/// input: `dispatch_worker_event_fanout` applies PostToolUse → Working before
+/// probe dispatch, and the tool-boundary path refuses. The probe stays queued,
+/// then delivers on the subsequent Stop when activity becomes Idle — the
+/// preserved last-resort transport.
+#[tokio::test]
+async fn probe_defers_through_fanout_then_delivers_on_stop() {
+    use boss_protocol::WorkerEvent;
+
+    let (server_state, _dir) = test_server_state();
+    // Grok rejects mid-turn stdin, but the execution still has a concrete
+    // driver identity that the terminal Stop-boundary delivery can verify.
+    let run_id = register_working_worker_with_driver(&server_state, 3, Some("grok"));
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 3, "boss-3");
+
+    let probe_id = server_state.queue_probe(run_id.clone(), "please pivot".into(), true);
+
+    // Mid-turn tool boundary via full fan-out (production shape).
+    let post_tool_use = boss_engine_runtime::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::PostToolUse {
+            session_id: "claude-sess-1".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({}),
+            tool_response: serde_json::json!({}),
+        },
+        Some(run_id.clone()),
+        None,
+    );
+    dispatch_worker_event_fanout(&server_state, &post_tool_use).await;
+
+    assert!(
+        !runner.wrote_text(),
+        "fan-out PostToolUse while Working must not write into the pane; calls={:?}",
+        runner.calls(),
+    );
+    // Peek without consuming for the Stop step: re-queue after assert.
+    let still = server_state
+        .pop_pending_probe(&run_id)
+        .expect("probe must still be queued after mid-turn fan-out");
+    assert_eq!(still.probe_id, probe_id);
+    server_state.requeue_probe_front(run_id.clone(), still);
+
+    // Turn ends: Stop flips activity to Idle, then probe dispatches.
+
+    let stop = boss_engine_runtime::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
+            session_id: "claude-sess-1".into(),
+            stop_hook_active: false,
+            stop_reason: boss_protocol::StopReason::Completed,
+        },
+        Some(run_id.clone()),
+        None,
+    );
+    // Production order: live-state (Idle) then probe dispatch.
+    dispatch_live_worker_state(&server_state, &stop).await;
+    dispatch_probe_on_stop(&server_state, &stop).await;
+
+    assert!(
+        runner.wrote_text(),
+        "Stop after mid-turn deferral must write the probe into the pane; calls={:?}",
+        runner.calls(),
+    );
+    assert!(
+        server_state.pop_pending_probe(&run_id).is_none(),
+        "probe must be consumed on Stop after mid-turn deferral",
+    );
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Consumed),
+    );
+}
+
+/// Stop-path activity guard is fail-closed: missing live state must not
+/// write to the pane (ghostty-codex-pane-viability Q2 Layer D). The
+/// probe stays queued for a later attempt once live state is known.
+#[tokio::test]
+async fn dispatch_probe_on_stop_refuses_when_live_state_missing() {
+    use boss_protocol::WorkerEvent;
+
+    let (server_state, _dir) = test_server_state();
+    let run_id = execution_id_with_driver(&server_state, None);
+    server_state.worker_registry.register_run_slot(&run_id, 2);
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 2, "boss-2");
+
+    let probe_id = server_state.queue_probe(run_id.clone(), "hello?".into(), false);
+
+    let stop = boss_engine_runtime::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
+            session_id: "sess-1".into(),
+            stop_hook_active: false,
+            stop_reason: boss_protocol::StopReason::Completed,
+        },
+        Some(run_id.clone()),
+        None,
+    );
+    dispatch_probe_on_stop(&server_state, &stop).await;
+
+    assert!(
+        !runner.wrote_text(),
+        "missing live state must fail closed with no pane write; calls={:?}",
+        runner.calls(),
+    );
+    let still = server_state
+        .pop_pending_probe(&run_id)
+        .expect("probe must remain queued when Stop refuses");
+    assert_eq!(still.probe_id, probe_id);
+}
+
+/// A pane write that succeeds after the slot mapping has already been
+/// cleared must settle orphaned, not consumed. tmux delivery awaits
+/// `send_keys` and delivery confirmation, so teardown can still interleave:
+/// the runner hook drops the mapping while the text write is pending, and
+/// `record_pane_write_outcome` must recheck the slot after the write.
+#[tokio::test]
+async fn a_pane_write_raced_by_concurrent_teardown_settles_orphaned_not_consumed() {
+    use boss_protocol::WorkerEvent;
+
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_idle_worker_with_driver(&server_state, 9, None);
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 9, "boss-9");
+    let probe_id = server_state.queue_probe(run_id.clone(), "status?".into(), false);
+
+    let take_state = server_state.clone();
+    let take_run = run_id.clone();
+    runner.set_on_text_write(move || {
+        take_state.worker_registry.take_slot_for_run(&take_run);
+    });
+
+    let stop = boss_engine_runtime::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
+            session_id: "sess-1".into(),
+            stop_hook_active: false,
+            stop_reason: boss_protocol::StopReason::Completed,
+        },
+        Some(run_id.clone()),
+        None,
+    );
+    let outcome = dispatch_probe_on_stop(&server_state, &stop).await;
+
+    assert!(
+        runner.wrote_text(),
+        "the race is post-write: bytes must have reached tmux before the mapping vanished; calls={:?}",
+        runner.calls(),
+    );
+    assert_eq!(
+        outcome,
+        ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Orphaned),
+        "a write whose pane was released before the outcome was recorded must settle orphaned",
+    );
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Orphaned),
+    );
+    let attentions = server_state
+        .work_db
+        .list_attention_items(&run_id)
+        .expect("attention items readable");
+    assert!(
+        attentions
+            .iter()
+            .any(|item| item.kind == crate::app::probes::PROBE_UNDELIVERED_ATTENTION_KIND),
+        "an orphaned post-write probe must file PROBE_UNDELIVERED attention",
+    );
+}
+
+/// Pre-write fail-closed: if the run already has no slot mapping,
+/// `dispatch_probe_on_stop` must not write and must leave the probe queued.
+#[tokio::test]
+async fn dispatch_probe_on_stop_refuses_when_slot_mapping_is_already_gone() {
+    use boss_protocol::WorkerEvent;
+
+    let (server_state, _dir) = test_server_state();
+    let run_id = execution_id_with_driver(&server_state, None);
+    register_idle_worker(&server_state, &run_id, 9);
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 9, "boss-9");
+    let probe_id = server_state.queue_probe(run_id.clone(), "status?".into(), false);
+    server_state.worker_registry.take_slot_for_run(&run_id);
+
+    let stop = boss_engine_runtime::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
+            session_id: "sess-1".into(),
+            stop_hook_active: false,
+            stop_reason: boss_protocol::StopReason::Completed,
+        },
+        Some(run_id.to_owned()),
+        None,
+    );
+    let outcome = dispatch_probe_on_stop(&server_state, &stop).await;
+
+    assert!(
+        !runner.wrote_text(),
+        "a missing slot mapping must not write; calls={:?}",
+        runner.calls(),
+    );
+    assert_eq!(
+        outcome,
+        ProbeDispatchOutcome::NoSlotMapping,
+        "a local run whose pane mapping is already gone must fail closed",
+    );
+    let still = server_state
+        .pop_pending_probe(&run_id)
+        .expect("probe stays queued when there is no pane to write into");
+    assert_eq!(still.probe_id, probe_id);
+}
+
+// ── The effort-escalation acknowledgement asymmetry ─────────────────────────
+//
+// Issuing a probe is the documented ack gesture for a worker-declared
+// escalation/blocker, but *acceptance* of that probe is not the same as
+// *delivery* of it. Resolving the run's open worker-signal attention items
+// as soon as the probe is queued lifts the completion handler's suppressed
+// auto-nudge before the worker has necessarily seen anything — worse than
+// never resolving at all, because the suppression that was protecting the
+// worker from a premature "produce a PR" nudge is gone while the actual
+// acknowledgement text may still never arrive.
+
+fn open_worker_escalation_attention(server_state: &ServerState, run_id: &str) -> String {
+    server_state
+        .work_db
+        .create_attention_item(boss_work_db::CreateAttentionItemInput {
+            body_markdown: "worker declared an effort escalation".to_owned(),
+            kind: boss_engine_completion::worker_escalation::WORKER_ESCALATION_ATTENTION_KIND.to_owned(),
+            title: "effort escalation".to_owned(),
+            execution_id: Some(run_id.to_owned()),
+            resolved_at: None,
+            status: None,
+            work_item_id: None,
+        })
+        .expect("attention item must be creatable")
+        .id
+}
+
+fn attention_status(server_state: &ServerState, run_id: &str, attention_id: &str) -> String {
+    server_state
+        .work_db
+        .list_attention_items(run_id)
+        .expect("attention items must be listable")
+        .into_iter()
+        .find(|item| item.id == attention_id)
+        .expect("the attention item must still exist")
+        .status
+}
+
+/// A probe tagged for worker-signal resolution must not resolve the
+/// attention item merely for being queued — only once its own delivery
+/// state actually confirms the worker got it.
+#[test]
+fn a_marked_probe_does_not_resolve_worker_signal_attentions_until_delivered() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = execution_id_with_driver(&server_state, None);
+    let attention_id = open_worker_escalation_attention(&server_state, &run_id);
+
+    let probe_id = server_state.queue_probe(run_id.clone(), "[effort-escalation-ack] proceed".into(), false);
+    server_state.mark_probe_for_worker_signal_resolution(&probe_id, &run_id);
+
+    assert_eq!(
+        attention_status(&server_state, &run_id, &attention_id),
+        "open",
+        "queuing (accepting) the probe must not itself resolve the attention item",
+    );
+
+    server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Consumed);
+
+    assert_eq!(
+        attention_status(&server_state, &run_id, &attention_id),
+        "resolved",
+        "the attention item must resolve once the probe is actually confirmed delivered",
+    );
+}
+
+/// The converse: a marked probe that settles undeliverable must leave the
+/// attention item open — the acknowledgement never reached the worker, so
+/// the auto-nudge suppression it protects must not lift.
+#[test]
+fn a_marked_probe_that_never_delivers_leaves_worker_signal_attentions_open() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = execution_id_with_driver(&server_state, None);
+    let attention_id = open_worker_escalation_attention(&server_state, &run_id);
+
+    let probe_id = server_state.queue_probe(run_id.clone(), "[effort-escalation-ack] proceed".into(), false);
+    server_state.mark_probe_for_worker_signal_resolution(&probe_id, &run_id);
+
+    server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Abandoned);
+
+    assert_eq!(
+        attention_status(&server_state, &run_id, &attention_id),
+        "open",
+        "a probe that settles undeliverable must not resolve the attention item it was meant to \
+         acknowledge — the auto-nudge suppression must stay in effect",
+    );
+}

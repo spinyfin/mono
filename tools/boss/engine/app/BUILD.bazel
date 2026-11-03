@@ -1,0 +1,135 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("//tools/boss/engine/core:engine_binary.bzl", "ENGINE_BINARY_BAZEL_RUN_COMMAND")
+
+exports_files(["Cargo.toml"])
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//tools/boss/engine/core:__pkg__"],
+)
+
+APP_DEPS = [
+    "//tools/boss/command-runner",
+    "//tools/boss/engine/execution-runner",
+    "//tools/boss/engine/execution-contracts",
+    "//tools/boss/comment_anchor",
+    "//tools/boss/engine/attachments",
+    "//tools/boss/engine/board-gesture",
+    "//tools/boss/engine/comment-classifier",
+    "//tools/boss/engine/completion",
+    "//tools/boss/engine/design-docs",
+    "//tools/boss/engine/dispatch",
+    "//tools/boss/engine/dispatch-events",
+    "//tools/boss/engine/dispatch-reader",
+    "//tools/boss/engine/driver",
+    "//tools/boss/engine/driver-quota",
+    "//tools/boss/engine/editorial",
+    "//tools/boss/engine/effort",
+    "//tools/boss/engine/event-bus",
+    "//tools/boss/engine/feature-flags",
+    "//tools/boss/engine/gh-invocation",
+    "//tools/boss/engine/live-worker-state",
+    "//tools/boss/engine/merge-poller",
+    "//tools/boss/engine/metrics",
+    "//tools/boss/engine/offsite-backup",
+    "//tools/boss/engine/proposal-validation",
+    "//tools/boss/engine/recovery",
+    "//tools/boss/engine/review-guide",
+    "//tools/boss/engine/single-flight",
+    "//tools/boss/engine/ssh-transport",
+    "//tools/boss/engine/storage-values",
+    "//tools/boss/engine/task-scope",
+    "//tools/boss/engine/timer-wheel",
+    "//tools/boss/engine/transcript-markdown:transcript_markdown",
+    "//tools/boss/engine/transient-error",
+    "//tools/boss/engine/utility-model",
+    "//tools/boss/engine/utils",
+    "//tools/boss/engine/work-db",
+    "//tools/boss/engine/worker-policy",
+    "//tools/boss/gh_telemetry",
+    "//tools/boss/github",
+    "//tools/boss/http_retry",
+    "//tools/boss/log-files",
+    "//tools/boss/protocol",
+    "//tools/boss/tmux",
+    "//tools/boss/trunk_auth",
+    "//tools/boss/trunk_client",
+    "//tools/boss/engine/core:runtime",
+]
+
+rust_library(
+    name = "app",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "boss_engine_app",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    rustc_env = {"BOSS_ENGINE_BAZEL_RUN_COMMAND": ENGINE_BINARY_BAZEL_RUN_COMMAND},
+    visibility = ["//tools/boss/engine/core:__pkg__"],
+    deps = APP_DEPS + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "app_test",
+    size = "small",
+    timeout = "moderate",
+    # crate inheritance keeps the production dependency; compile this test
+    # against the fixture variant under its usual Rust name instead.
+    aliases = {
+        "//tools/boss/engine/core:runtime": "boss_engine_runtime_production",
+        "//tools/boss/engine/core:runtime_test_support": "boss_engine_runtime",
+        "//tools/boss/engine/completion": "boss_engine_completion_production",
+        "//tools/boss/engine/completion:completion_test_support": "boss_engine_completion",
+        "//tools/boss/engine/dispatch": "boss_engine_dispatch_production",
+        "//tools/boss/engine/dispatch:dispatch_test_support": "boss_engine_dispatch",
+        "//tools/boss/engine/execution-runner": "boss_execution_runner_production",
+        "//tools/boss/engine/execution-runner:runner_test_support": "boss_execution_runner",
+        "//tools/boss/engine/execution-contracts": "boss_execution_contracts_production",
+        "//tools/boss/engine/execution-contracts:execution_contracts_test_support": "boss_execution_contracts",
+        "//tools/boss/engine/live-worker-state": "boss_engine_live_worker_state_production",
+        "//tools/boss/engine/live-worker-state:live_worker_state_test_support": "boss_engine_live_worker_state",
+        "//tools/boss/engine/merge-poller": "boss_engine_merge_poller_production",
+        "//tools/boss/engine/merge-poller:merge_poller_test_support": "boss_engine_merge_poller",
+        "//tools/boss/engine/observation-contracts": "boss_observation_contracts_production",
+        "//tools/boss/engine/observation-contracts:observation_contracts_test_support": "boss_observation_contracts",
+        "//tools/boss/engine/work-db:work-db": "boss_work_db_production",
+        "//tools/boss/engine/work-db:work_db_test_support": "boss_work_db",
+    },
+    crate = ":app",
+    data = [
+        # Config loading requires an engine-owned cube, just like the engine.
+        "//tools/cube",
+        "@jj_test_tools//:jj",
+    ],
+    edition = "2024",
+    env = {
+        "BOSS_EVENT_BIN": "/opt/boss/bin/boss-event",
+        "BOSS_JJ_BIN": "$(rootpath @jj_test_tools//:jj)",
+        "HOME": "/tmp",
+    },
+    experimental_enable_sharding = True,
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    shard_count = 4,
+    visibility = ["//tools/boss/engine/core:__pkg__"],
+    deps = [
+        "//tools/boss/engine/completion:completion_test_support",
+        "//tools/boss/engine/core:runtime_test_support",
+        "//tools/boss/engine/dispatch:dispatch_test_support",
+        "//tools/boss/engine/execution-contracts:execution_contracts_test_support",
+        "//tools/boss/engine/execution-runner:runner_test_support",
+        "//tools/boss/engine/live-worker-state:live_worker_state_test_support",
+        "//tools/boss/engine/merge-poller:merge_poller_test_support",
+        "//tools/boss/engine/observation-contracts:observation_contracts_test_support",
+        "//tools/boss/engine/prose-vocabulary",
+        "//tools/boss/engine/task-scope",
+        "//tools/boss/engine/work-db:work_db_test_support",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

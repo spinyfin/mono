@@ -62,7 +62,7 @@ pub(crate) fn report_chain_block(db: &WorkDb, execution: &WorkExecution, reason:
     Ok(())
 }
 
-pub(crate) async fn backup_dead_execution(db: &WorkDb, execution: &WorkExecution) -> Option<PathBuf> {
+pub async fn backup_dead_execution(db: &WorkDb, execution: &WorkExecution) -> Option<PathBuf> {
     execution.started_at.as_ref()?;
     let result: Result<Option<PathBuf>> = async {
         let record = db.execution_bookmark(&execution.id)?;

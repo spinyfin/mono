@@ -6,7 +6,7 @@
 //! A [`boss_execution_contracts::WorkerPool`] slot is claimed at dispatch
 //! (`drain_ready_queue` / `force_dispatch` → `claim_worker`) and, for a
 //! pane-spawned run, its release is DEFERRED to
-//! [`crate::app::ServerState::release_worker_pane`], which frees the
+//! `boss_engine::app::ServerState::release_worker_pane`, which frees the
 //! slot after token-verified tmux teardown and viewer detach. Every
 //! other release path keys off a *live* worker:
 //!
@@ -18,7 +18,7 @@
 //!   [`LiveWorkerStateRegistry`] and derive the slot to release from a
 //!   *live-state entry*;
 //! * transient-recovery iterates the same registry but routes teardown
-//!   through [`crate::app::ServerState::release_worker_pane`], so the
+//!   through `boss_engine::app::ServerState::release_worker_pane`, so the
 //!   pool claim is handed back only when the app confirms the pane is
 //!   gone.
 //!

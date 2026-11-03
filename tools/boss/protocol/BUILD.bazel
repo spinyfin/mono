@@ -37,7 +37,10 @@ rust_test(
 filegroup(
     name = "srcs",
     srcs = glob(["src/**/*.rs"]),
-    visibility = ["//tools/boss/engine/core:__pkg__"],
+    visibility = [
+        "//tools/boss/engine/app:__pkg__",
+        "//tools/boss/engine/core:__pkg__",
+    ],
 )
 
 # Keeps the Rust roster and the crew portrait grid (and the

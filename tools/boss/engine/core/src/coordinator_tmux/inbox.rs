@@ -24,7 +24,7 @@ pub use turn::TurnObserver;
 mod tests;
 
 #[async_trait::async_trait]
-pub(crate) trait HandoffDelivery: Send + Sync {
+pub trait HandoffDelivery: Send + Sync {
     async fn deliver(&self, tmux: &Tmux, record: &CoordinatorTmuxRecord, prompt: &str) -> Result<()>;
 
     async fn deliver_locked<'a>(
@@ -114,7 +114,7 @@ pub fn relay_launch_command(input_dir: &Path, executable: &str, model: &str) -> 
     )
 }
 
-pub(crate) struct ClaudeInbox;
+pub struct ClaudeInbox;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]

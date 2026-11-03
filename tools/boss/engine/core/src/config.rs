@@ -135,7 +135,7 @@ pub struct WorkConfig {
     ///
     /// Resolved once (from `BOSS_EVENTS_SOCKET`, else the production default)
     /// and, for a test fixture, overwritten by the isolation guard in
-    /// [`crate::app::run`] before the config is frozen — exactly the way
+    /// `boss_engine::app::run` before the config is frozen — exactly the way
     /// `db_path` is handled. Everything downstream that needs to know where
     /// the engine is listening reads it from here rather than re-deriving it
     /// from the environment: a fixture that isolated its own socket but
@@ -150,7 +150,7 @@ pub struct WorkConfig {
     /// `pr status`, …) dial *this* engine.
     ///
     /// Resolved once (from `BOSS_SOCKET_PATH`, else the production default)
-    /// and overwritten in [`crate::app::run`] / [`crate::app::serve`] with
+    /// and overwritten in `boss_engine::app::run` / `boss_engine::app::serve` with
     /// the socket this process actually binds. Everything downstream that
     /// hands workers a control-socket path reads it from here rather than
     /// re-deriving it from `$HOME` or `$BOSS_SOCKET_PATH`: a Grok worker's
@@ -166,7 +166,7 @@ pub struct WorkConfig {
     /// from a pane still find the token after `BOSS_SOCKET_PATH` has
     /// switched CLI discovery into its sibling-derivation branch.
     ///
-    /// Stamped in [`crate::app::serve`] from the path `resolve_engine_paths`
+    /// Stamped in `boss_engine::app::serve` from the path `resolve_engine_paths`
     /// resolved (isolation-derived, else `$BOSS_ENGINE_CONTROL_TOKEN_PATH`,
     /// else the production default). Never re-derived from the socket stem:
     /// production writes `engine-control.token`, while sibling derivation

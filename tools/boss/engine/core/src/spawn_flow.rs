@@ -284,7 +284,7 @@ const WORKER_XAI_API_KEY_NO_INTERACTIVE_AUTH: &str = "xai-boss-worker-no-interac
 /// here is automatically enforced there with no second edit to keep in
 /// sync. That module rejects adopting a session whose schema is missing,
 /// unparseable, or newer than this value.
-pub(crate) const TMUX_SESSION_SCHEMA: &str = "1";
+pub const TMUX_SESSION_SCHEMA: &str = "1";
 /// Name of the environment variable [`TMUX_SESSION_SCHEMA`] is carried in.
 /// Adoption reads this name from a different process generation's live
 /// session, so it remains local to that compatibility boundary.
@@ -479,7 +479,7 @@ impl IngressReadoption {
 
 /// Public API for callers that want to wire pane-spawning into the
 /// coordinator (or a test). The trait is implemented by
-/// [`crate::app::ServerState`]; users should typically call through
+/// `boss_engine::app::ServerState`; users should typically call through
 /// `ServerState` directly, but the trait makes the dependency
 /// explicit and lets stub implementations stand in for unit tests.
 #[async_trait::async_trait]
@@ -585,7 +585,7 @@ pub trait WorkerSpawner: Send + Sync {
     /// kill the just-spawned worker before the coordinator releases the
     /// deferred lease. Default no-op for test spawners that don't host
     /// real panes; production `ServerState` delegates to
-    /// [`crate::app::ServerState::release_worker_pane`].
+    /// `boss_engine::app::ServerState::release_worker_pane`.
     async fn reap_worker_pane(&self, _run_id: &str) {}
 }
 
@@ -949,7 +949,7 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
 /// success, for [`boss_protocol::LiveWorkerState::viewer_attach_error`].
 /// The typed app error is spelled out (not `Debug`-formatted) because the
 /// text is rendered verbatim on the worker's pane card.
-pub(crate) fn viewer_attach_failure_reason(response: &EngineToAppResponse) -> String {
+pub fn viewer_attach_failure_reason(response: &EngineToAppResponse) -> String {
     match response {
         EngineToAppResponse::AttachWorkerPane { result: Err(err) } => format!("the app refused the viewer: {err}"),
         EngineToAppResponse::AttachWorkerPane { result: Ok(_) } => {

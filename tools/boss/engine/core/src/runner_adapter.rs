@@ -165,7 +165,7 @@ impl RunnerHost for EngineRunnerHost {
     }
 }
 
-pub(crate) async fn compose_worker_spawn(
+pub async fn compose_worker_spawn(
     db: &WorkDb,
     worker_id: &str,
     execution: &WorkExecution,

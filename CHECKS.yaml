@@ -8,6 +8,7 @@ checks:
     check: text/forbidden-pattern
     include:
       - "tools/boss/engine/core/src/**/*.rs"
+      - "tools/boss/engine/app/src/**/*.rs"
     policy:
       severity: error
     config:

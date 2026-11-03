@@ -8,7 +8,7 @@
 //! per-slot live state) or the [`boss_execution_contracts::WorkerPool`]'s claim
 //! table. Both are *derived* bookkeeping — the engine's belief about what is
 //! running — and both are cleared unconditionally at the end of
-//! [`crate::app::ServerState::release_worker_pane`], which runs on every
+//! `boss_engine::app::ServerState::release_worker_pane`, which runs on every
 //! terminal path "successfully or not".
 //!
 //! That is fine while the belief is right. It is catastrophic when the belief
@@ -68,7 +68,7 @@ use crate::work::WorkDb;
 /// How far back a recorded `work_runs.shell_pid` is trusted by the callers
 /// that act on it: the re-dispatch guard ([`crate::orphan_sweep`], via
 /// [`probe_work_item_worker`]) and the durable-pid reap in
-/// [`crate::app::ServerState::release_worker_pane`] (via
+/// `boss_engine::app::ServerState::release_worker_pane` (via
 /// [`probe_execution_worker_within`]).
 ///
 /// A pid is only meaningful until the OS recycles it, so a probe against an
@@ -324,7 +324,7 @@ pub fn probe_execution_worker(work_db: &WorkDb, execution_id: &str) -> WorkerPro
 /// **Use this, not [`probe_execution_worker`], for anything destructive.**
 /// A recorded pid is a durable *number*, not a durable *handle*: once the OS
 /// recycles it, the same integer names an unrelated process, and the reap in
-/// [`crate::app::ServerState::release_worker_pane`] signals a process
+/// `boss_engine::app::ServerState::release_worker_pane` signals a process
 /// **group**. The read-only callers (the husk classifier's
 /// `durable_live_process_evidence`, `bossctl`-facing state) keep the unbounded
 /// form on purpose: their failure direction is "decline to act", so a stale
@@ -388,7 +388,7 @@ pub fn probe_work_item_worker(
     Some((execution_id, probe_recorded_pid(Some(shell_pid))))
 }
 
-pub(crate) fn probe_recorded_pid(shell_pid: Option<i64>) -> WorkerProcess {
+pub fn probe_recorded_pid(shell_pid: Option<i64>) -> WorkerProcess {
     let Some(pid) = shell_pid.filter(|pid| *pid > 0) else {
         return WorkerProcess::Unknown;
     };

@@ -57,7 +57,21 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::app::process_is_alive;
+/// Uses `kill(pid, 0)` (signal 0 = probe, no signal delivered): returns `true`
+/// when the kernel confirms the process exists.  `EPERM` (process exists but
+/// we can't signal it) also counts as alive; only `ESRCH` (no such process)
+/// means dead.
+pub fn process_is_alive(pid: libc::pid_t) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid, 0) };
+    if result == 0 {
+        return true;
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    errno == libc::EPERM
+}
 
 /// File mode for the control-token file. The token is the auth
 /// credential for the shutdown RPC, so the file must not be readable

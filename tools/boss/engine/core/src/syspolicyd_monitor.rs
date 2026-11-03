@@ -26,7 +26,7 @@
 //! It samples `syspolicyd`'s CPU usage on a fixed cadence and, once the
 //! daemon has been saturated (≥ [`SATURATION_CPU_PCT`]) for
 //! [`SATURATION_SAMPLES_TO_ALERT`] consecutive samples, flips a shared
-//! [`SyspolicydHealth`] flag. [`crate::app::build_engine_health_report`]
+//! [`SyspolicydHealth`] flag. `boss_engine::app::build_engine_health_report`
 //! reads that flag and emits an `EngineHealthIssue` so the macOS app
 //! raises a banner naming the cause and the remedy.
 //!

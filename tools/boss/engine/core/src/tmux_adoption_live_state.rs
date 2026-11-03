@@ -81,11 +81,11 @@ pub(crate) async fn register_adopted_live_state<S>(
 mod tests {
     use super::*;
 
-    use crate::app::SendToAppError;
     use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::protocol::{EngineToAppRequest, EngineToAppResponse};
     use crate::test_support::{create_test_chore_manual, create_test_product, open_db};
     use crate::worker_registry::WorkerRegistry;
+    use boss_execution_contracts::SendToAppError;
     use boss_protocol::RequestExecutionInput;
     use tokio::time::Duration;
 

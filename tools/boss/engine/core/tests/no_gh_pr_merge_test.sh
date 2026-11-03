@@ -15,10 +15,10 @@
 # not behaviour.
 set -euo pipefail
 
-src_dir="$TEST_SRCDIR/mono/tools/boss/engine/core/src"
+engine_dir="$TEST_SRCDIR/${TEST_WORKSPACE:-_main}/tools/boss/engine"
 allowed_file="merge_when_ready.rs"
 
-matches="$(grep -rl '"pr", *"merge"' "$src_dir" --include="*.rs" || true)"
+matches="$(grep -rl '"pr", *"merge"' "$engine_dir/core/src" "$engine_dir/app/src" --include="*.rs" || true)"
 bad="$(echo "$matches" | grep -v "/${allowed_file}\$" || true)"
 
 if [ -n "$bad" ]; then

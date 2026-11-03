@@ -43,6 +43,8 @@ members = [
   "tools/boss/engine/spoke",
   "tools/boss/engine/host-execution",
   "tools/boss/engine/core",
+  "tools/boss/engine/core/runtime",
+  "tools/boss/engine/app",
   "tools/boss/engine/execution-runner",
   "tools/boss/engine/pane-summary",
   "tools/boss/engine/execution-contracts",
