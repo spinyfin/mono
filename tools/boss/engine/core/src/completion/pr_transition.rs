@@ -75,20 +75,6 @@ pub(crate) fn review_batch_input_from_metadata(
     Ok(input)
 }
 
-/// Production or test strategy for creating a pre-merge review batch from
-/// a producing execution's PR. Tests inject a stub that skips `gh`.
-#[async_trait]
-pub trait ReviewBatchEnqueuer: Send + Sync {
-    async fn enqueue(
-        &self,
-        work_db: &crate::work::WorkDb,
-        work_item_id: &str,
-        repo_remote_url: &str,
-        pr_url: &str,
-        review_pool_size: usize,
-    ) -> anyhow::Result<crate::work::ReviewBatchDispatch>;
-}
-
 /// Default enqueuer: fetch immutable SHAs from GitHub, then admit a batch.
 pub(crate) struct GhReviewBatchEnqueuer;
 
@@ -103,28 +89,6 @@ impl ReviewBatchEnqueuer for GhReviewBatchEnqueuer {
         review_pool_size: usize,
     ) -> anyhow::Result<crate::work::ReviewBatchDispatch> {
         enqueue_review_batch(work_db, work_item_id, repo_remote_url, pr_url, review_pool_size).await
-    }
-}
-
-pub(crate) fn file_admission_deferred_attention(work_db: &crate::work::WorkDb, work_item_id: &str, pr_url: &str) {
-    let title = "Automated reviewer: waiting for a review-pool slot";
-    let body = format!(
-        "Pre-merge review for {pr_url} was deferred because the review pool has no free \
-         reservation for another pre-merge batch. The review starts once a batch completes \
-         and the deferred-admission sweep retries. Dismiss this item once that \
-         pass starts."
-    );
-    if let Err(err) = work_db.upsert_external_tracker_attention(
-        work_item_id,
-        crate::work::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
-        title,
-        &body,
-    ) {
-        tracing::warn!(
-            work_item_id,
-            ?err,
-            "failed to file review-admission-deferred attention item"
-        );
     }
 }
 
@@ -1021,7 +985,7 @@ impl WorkerCompletionHandler {
             // and the merge-poller sweep picks it up on its next pass.
             let probe = self.merge_probe.clone();
             let work_db = self.work_db.clone();
-            let publisher = self.publisher.clone();
+            let writer = self.pr_poll_state_writer.clone();
             let candidate = PendingMergeCheck {
                 work_item_id: work_item_id.clone(),
                 product_id: product_id.clone(),
@@ -1030,15 +994,9 @@ impl WorkerCompletionHandler {
             boss_task_scope::spawn(async move {
                 match probe.probe(&candidate.pr_url).await {
                     Ok(lifecycle_probe) => {
-                        update_pr_poll_state(
-                            &work_db,
-                            publisher.as_ref(),
-                            &candidate,
-                            &lifecycle_probe,
-                            None,
-                            "completion",
-                        )
-                        .await;
+                        writer
+                            .update_pr_poll_state(&work_db, &candidate, &lifecycle_probe, "completion")
+                            .await;
                     }
                     Err(err) => {
                         tracing::debug!(

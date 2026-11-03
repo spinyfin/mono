@@ -94,9 +94,10 @@ async fn merge_poller_recheck_binds_three_stuck_workers_when_detector_recovers()
         }
     }
     let probe = NoOpProbe;
+    let requests: &dyn CompletionRequests = &handler;
 
     let outcome =
-        crate::merge_poller::run_one_pass(db.as_ref(), &probe, publisher.as_ref(), None, Some(&handler), None).await;
+        crate::merge_poller::run_one_pass(db.as_ref(), &probe, publisher.as_ref(), None, Some(requests), None).await;
 
     // Pass 1 — pre-fix behaviour: the recheck reaches all three
     // candidates but the detector still returns Stale on each. The
@@ -166,7 +167,7 @@ async fn merge_poller_recheck_binds_three_stuck_workers_when_detector_recovers()
     })
     .collect();
     let outcome2 =
-        crate::merge_poller::run_one_pass(db.as_ref(), &probe, publisher.as_ref(), None, Some(&handler), None).await;
+        crate::merge_poller::run_one_pass(db.as_ref(), &probe, publisher.as_ref(), None, Some(requests), None).await;
     assert_eq!(
         outcome2.pr_recheck_recovered, 3,
         "all three stuck workers must transition on the recovery pass, got {outcome2:?}",
@@ -2701,12 +2702,13 @@ async fn background_children_horizon_is_rechecked_without_another_stop() {
     // No second `on_stop` call: change only the horizon and drive the same
     // recurring pass production uses. The saved Stop intent must be replayed.
     let handler = handler.with_background_children_horizon_secs(0);
+    let requests: &dyn CompletionRequests = &handler;
     crate::merge_poller::run_one_pass(
         db.as_ref(),
         &NoopMergeProbe,
         publisher.as_ref(),
         None,
-        Some(&handler),
+        Some(requests),
         None,
     )
     .await;

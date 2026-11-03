@@ -49,10 +49,12 @@ use tokio::sync::Notify;
 use boss_event_bus::Event;
 pub use boss_github::{CiProvider, RequiredCheckFailure};
 use boss_github::{fetch_failing_checks_for_commit, parse_provider_job_id, provider_for_url};
+pub(crate) use boss_observation_contracts::{
+    CompletionRequests, PrPollStateWriter, ReviewBatchEnqueuer, StopOutcome, file_admission_deferred_attention,
+};
 
 use crate::blocking_signal::SignalKind;
 use crate::ci_watch;
-use crate::completion::{StopOutcome, WorkerCompletionHandler};
 use crate::conflict_remediation::{ConflictRemediationQueue, LadderRemediationJob};
 use crate::conflict_watch;
 use crate::design_detector;

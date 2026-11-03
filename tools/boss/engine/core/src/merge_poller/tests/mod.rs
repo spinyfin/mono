@@ -608,7 +608,7 @@ async fn open_probe_does_not_recollect_an_unchanged_complete_comparison() {
         probe.as_ref(),
         publisher.as_ref(),
         None,
-        Some(&handler),
+        Some(&handler as &dyn CompletionRequests),
         None,
     )
     .await;
@@ -620,7 +620,7 @@ async fn open_probe_does_not_recollect_an_unchanged_complete_comparison() {
         probe.as_ref(),
         publisher.as_ref(),
         None,
-        Some(&handler),
+        Some(&handler as &dyn CompletionRequests),
         None,
     )
     .await;
@@ -644,7 +644,7 @@ async fn open_probe_does_not_recollect_an_unchanged_complete_comparison() {
         probe.as_ref(),
         publisher.as_ref(),
         None,
-        Some(&second_handler),
+        Some(&second_handler as &dyn CompletionRequests),
         None,
     )
     .await;
@@ -671,7 +671,7 @@ async fn open_probe_does_not_recollect_an_unchanged_complete_comparison() {
         probe.as_ref(),
         publisher.as_ref(),
         None,
-        Some(&handler),
+        Some(&handler as &dyn CompletionRequests),
         None,
     )
     .await;
@@ -705,7 +705,7 @@ async fn open_probe_without_head_ref_oid_persists_nothing() {
         probe.as_ref(),
         publisher.as_ref(),
         None,
-        Some(&handler),
+        Some(&handler as &dyn CompletionRequests),
         None,
     )
     .await;
@@ -740,7 +740,7 @@ async fn disabled_source_capture_flag_does_not_allocate_poller_sequences() {
         probe.as_ref(),
         publisher.as_ref(),
         None,
-        Some(&handler),
+        Some(&handler as &dyn CompletionRequests),
         None,
     )
     .await;

@@ -580,7 +580,7 @@ pub fn spawn_loop(
     // the parameter count under clippy::too_many_arguments.
     handlers: (
         Arc<dyn CubeClient>,
-        Arc<WorkerCompletionHandler>,
+        Arc<dyn CompletionRequests>,
         Arc<dyn crate::trunk_queue_poller::TrunkQueueApi>,
     ),
     interval: Duration,

@@ -627,6 +627,7 @@ dependencies = [
  "boss-http-retry",
  "boss-log-files",
  "boss-metrics",
+ "boss-observation-contracts",
  "boss-pr-review",
  "boss-pr-template",
  "boss-prose-vocabulary",
@@ -1288,6 +1289,21 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "boss-observation-contracts"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bon",
+ "boss-github",
+ "boss-pr-review-sources",
+ "boss-protocol",
+ "boss-work-db",
  "tokio",
  "tracing",
 ]

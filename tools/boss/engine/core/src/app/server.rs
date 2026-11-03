@@ -1714,7 +1714,7 @@ async fn serve_scoped(
         server_state.publisher.clone(),
         (
             server_state.cube_client.clone(),
-            server_state.completion_handler.clone(),
+            server_state.completion_handler.clone() as Arc<dyn boss_observation_contracts::CompletionRequests>,
             trunk_queue_api,
         ),
         Duration::from_secs(60),

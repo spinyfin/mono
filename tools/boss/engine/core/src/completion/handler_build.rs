@@ -41,6 +41,7 @@ impl WorkerCompletionHandler {
             branch_verifier: Arc::new(CommandBranchVerifier::new()),
             metrics: local_metrics,
             merge_probe: Arc::new(NoopMergeProbe),
+            pr_poll_state_writer: Arc::new(NoopPrPollStateWriter),
             conflict_unknown_backoff: conflict_stop_gate::DEFAULT_UNKNOWN_RETRY_BACKOFF,
             nudge_breaker: Arc::new(NudgeBreaker::new()),
             max_unproductive_nudges: DEFAULT_MAX_UNPRODUCTIVE_NUDGES,
@@ -490,6 +491,20 @@ impl WorkerCompletionHandler {
         self
     }
 
+    /// Wire the merge poller's poll-state writer for the on-transition CI
+    /// pre-fetch. Production passes [`crate::merge_poller::MergePollerPrPollStateWriter`]
+    /// so completion does not import the poller's `update_pr_poll_state`.
+    pub fn with_pr_poll_state_writer(mut self, writer: Arc<dyn PrPollStateWriter>) -> Self {
+        self.pr_poll_state_writer = writer;
+        self
+    }
+
+    /// Review-batch enqueuer used by the merge poller's deferred-admission
+    /// sweep. Production is [`GhReviewBatchEnqueuer`].
+    pub fn review_batch_enqueuer(&self) -> &dyn ReviewBatchEnqueuer {
+        self.review_batch_enqueuer.as_ref()
+    }
+
     /// Shrink the conflict stop gate's `mergeable=UNKNOWN` re-probe
     /// backoff. Tests pass [`std::time::Duration::ZERO`] so exercising the
     /// indeterminate path costs no wall clock; production keeps the
@@ -508,5 +523,86 @@ impl WorkerCompletionHandler {
     pub(super) fn with_now_fn(mut self, now_fn: Arc<dyn Fn() -> std::time::Instant + Send + Sync>) -> Self {
         self.now_fn = now_fn;
         self
+    }
+}
+
+#[async_trait]
+impl CompletionRequests for WorkerCompletionHandler {
+    fn review_guide_source_capture_enabled(&self) -> bool {
+        WorkerCompletionHandler::review_guide_source_capture_enabled(self)
+    }
+
+    fn pending_background_nudge_execution_ids(&self) -> Vec<String> {
+        WorkerCompletionHandler::pending_background_nudge_execution_ids(self)
+    }
+
+    async fn recheck_background_nudge(&self, execution_id: &str) -> Option<StopOutcome> {
+        WorkerCompletionHandler::recheck_background_nudge(self, execution_id).await
+    }
+
+    fn review_batch_fanout_enabled(&self) -> bool {
+        WorkerCompletionHandler::review_batch_fanout_enabled(self)
+    }
+
+    fn review_pool_size(&self) -> usize {
+        WorkerCompletionHandler::review_pool_size(self)
+    }
+
+    async fn force_release(&self, execution_id: &str) {
+        let _ = WorkerCompletionHandler::force_release(self, execution_id).await;
+    }
+
+    async fn record_parent_pr_merge_cancellation(
+        &self,
+        execution: &boss_protocol::WorkExecution,
+        prior_status: ExecutionStatus,
+        chain_root_id: &str,
+    ) {
+        WorkerCompletionHandler::record_parent_pr_merge_cancellation(self, execution, prior_status, chain_root_id)
+            .await;
+    }
+
+    async fn force_stop_execution(&self, execution_id: &str) {
+        WorkerCompletionHandler::force_stop_execution(self, execution_id).await;
+    }
+
+    async fn recheck_for_pr(&self, execution_id: &str) -> StopOutcome {
+        WorkerCompletionHandler::recheck_for_pr(self, execution_id).await
+    }
+
+    async fn recheck_for_pr_late(&self, candidate: &crate::work::LatePrCandidate) -> StopOutcome {
+        WorkerCompletionHandler::recheck_for_pr_late(self, candidate).await
+    }
+
+    fn reconcile_review_guide_source_from_probe(
+        &self,
+        root_task_id: &str,
+        pr_url: &str,
+        observed: boss_pr_review_sources::PinnedComparison,
+        observation_sequence: i64,
+    ) {
+        WorkerCompletionHandler::reconcile_review_guide_source_from_probe(
+            self,
+            root_task_id,
+            pr_url,
+            observed,
+            observation_sequence,
+        );
+    }
+
+    fn speculative_conflict_prediction_enabled(&self) -> bool {
+        WorkerCompletionHandler::speculative_conflict_prediction_enabled(self)
+    }
+
+    fn stacked_pr_auto_structuring_enabled(&self) -> bool {
+        WorkerCompletionHandler::stacked_pr_auto_structuring_enabled(self)
+    }
+
+    fn mechanical_rebase_enabled(&self) -> bool {
+        WorkerCompletionHandler::mechanical_rebase_enabled(self)
+    }
+
+    fn review_batch_enqueuer(&self) -> &dyn ReviewBatchEnqueuer {
+        WorkerCompletionHandler::review_batch_enqueuer(self)
     }
 }
