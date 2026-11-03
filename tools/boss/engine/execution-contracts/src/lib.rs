@@ -40,7 +40,7 @@ use boss_engine_recovery::execution_bookmark::{self, ExecutionBookmark};
 use boss_engine_storage_values::Host;
 use boss_engine_storage_values::pool_policy::{AUTOMATION_WORKER_ID_PREFIX, REVIEW_WORKER_ID_PREFIX};
 use boss_engine_structured_output::StructuredOutputKind;
-use boss_host_execution::recovery_pr::fetch_recovery_pr_base;
+use boss_host_execution::recovery_pr::{ClosedRecoveryPr, fetch_recovery_pr_base};
 pub use boss_host_execution::types::{
     CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
 };
@@ -1530,12 +1530,36 @@ pub trait HostAdapter: Send + Sync {
         let _ = (record, pr_bookmark, trunk);
         bail!("execution bookmark reconciliation is not supported by this host adapter")
     }
-    /// Drop an execution's head bookmarks after a deliberate fresh start so
-    /// the same execution can create fresh pointers; returns what was
-    /// released so the caller can record the commits.
-    async fn release_execution_bookmark_heads(&self, record: &ExecutionBookmark) -> Result<Vec<(String, String)>> {
-        let _ = record;
+    /// Position a fresh child of the repository's configured trunk.
+    async fn start_fresh_workspace(&self, workspace: &Path) -> Result<()> {
+        let _ = workspace;
+        bail!("fresh workspace positioning is not supported by this host adapter")
+    }
+    /// Archive unpublished targets before optionally releasing names that the
+    /// current execution must reuse. Predecessor publication names stay tracked.
+    async fn release_execution_bookmark_heads(
+        &self,
+        record: &ExecutionBookmark,
+        release_names: bool,
+    ) -> Result<Vec<(String, String)>> {
+        let _ = (record, release_names);
         bail!("execution bookmark release is not supported by this host adapter")
+    }
+    /// Structured PR lookup before cube positioning: true when the PR is open,
+    /// false when it is closed or merged. An unresolvable base still counts as
+    /// open so positioning can fall back to the repository main branch.
+    async fn recovery_pr_is_open(&self, repo_id: &str, pr: u64) -> Result<bool> {
+        let repos = self.list_repos().await?;
+        let repo = repos
+            .iter()
+            .find(|repo| repo.repo_id == repo_id)
+            .ok_or_else(|| anyhow!("recovery repository {repo_id} is absent from cube repo list"))?;
+        match self.recovery_pr_base(&repo.origin, pr).await {
+            Ok(_) => Ok(true),
+            Err(err) if err.is::<ClosedRecoveryPr>() => Ok(false),
+            Err(err) if execution_bookmark::is_base_unresolvable_error(&err) => Ok(true),
+            Err(err) => Err(err),
+        }
     }
     /// Forget a finished execution's pointers once a voucher proves its
     /// preserved work is published; unproven work keeps its recovery head.

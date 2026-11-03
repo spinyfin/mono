@@ -148,3 +148,33 @@ fn completed_revision_is_not_redispatched_while_completion_is_being_consumed() {
         assert_eq!(executions_for(&db, &revision).len(), 2);
     }
 }
+
+#[test]
+fn archived_revision_records_an_informational_note_without_blocking_the_chain() {
+    let db = WorkDb::open(temp_db_path("revision-recovery-note")).unwrap();
+    let product = make_revision_product(&db, "archive");
+    let root = make_in_review_chore(&db, &product, "https://github.com/spinyfin/mono/pull/42");
+    let revision = insert_revision_row(&db, &product, &root);
+    db.reconcile_product_executions(&product).unwrap();
+    let execution = db.get_execution(&executions_for(&db, &revision)[0].0).unwrap();
+    db.record_recovery_fresh_start(
+        &execution,
+        "exec_next",
+        "preserved work is not contained",
+        &[("preserved/exec_prior/abc".into(), "abc".into())],
+    )
+    .unwrap();
+    assert!(
+        db.list_open_attention_items_of_kind(
+            boss_engine_storage_values::attention_kinds::REVISION_CHAIN_RECOVERY_BLOCKED_ATTENTION_KIND
+        )
+        .unwrap()
+        .is_empty()
+    );
+    let notes = db.list_attention_items_for_work_item(&execution.work_item_id).unwrap();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].status, "resolved");
+    assert!(notes[0].body_markdown.contains("preserved/exec_prior/abc"));
+    assert!(notes[0].body_markdown.contains("exec_next"));
+    assert_eq!(task_status(&db, &revision), "todo");
+}

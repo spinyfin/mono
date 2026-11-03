@@ -369,8 +369,7 @@ fn baseline_detail(record: &ExecutionBookmark, base: Option<&str>) -> String {
 }
 
 /// The pointers failed in a repairable way and nothing recorded carries the
-/// preserved work. Names each missing change and the exact command that would adopt the
-/// vouching commit if the content is confirmed present.
+/// preserved work. Names each missing change for the archive/fresh-start note.
 fn not_contained_error(
     record: &ExecutionBookmark,
     base: Option<&str>,
@@ -382,13 +381,10 @@ fn not_contained_error(
     pointer_integrity_error_of(
         PointerIntegrityKind::NotContained,
         format!(
-            "preserved work of execution {} is not contained in {vouching_name} ({vouching}): {}; {}. Original failure: {failure}. Nothing was moved. If the listed commits' content is confirmed to be in {vouching_name}, adopt it with `jj bookmark set {} {} {} -r {vouching} --allow-backwards` in the shared store and restart the item; otherwise recover the commits first.",
+            "preserved work of execution {} is not contained in {vouching_name} ({vouching}): {}; {}. Original failure: {failure}. Recovery could not be proved; dispatch will archive these pointers and start fresh.",
             record.execution_id,
             missing_detail(superseded),
             baseline_detail(record, base),
-            record.base(),
-            record.head(),
-            record.publication(),
         ),
     )
 }
@@ -558,9 +554,8 @@ pub async fn reconcile(
             &failure.to_string(),
         ));
     }
-    // Terminal: not reconcilable again, so a retry cannot loop on it. The
-    // engine decides between blocking and a deliberate fresh start from the
-    // kind of the original failure, which stays in the message.
+    // No safe recovery proof. Dispatch archives the source and starts fresh;
+    // this diagnostic is informational evidence for that fallback.
     Err(pointer_integrity_error_of(
         PointerIntegrityKind::NotContained,
         format!(
