@@ -4,12 +4,37 @@ use super::*;
 
 /// Prefer a variant in the PR history, then the newest visible variant in
 /// jj's evolution log and operation journal. Unrelated changes are undecidable.
-async fn select_tip(jj: &dyn Jj, record: &ExecutionBookmark, base: &str) -> Result<Option<String>> {
+async fn select_tip(
+    jj: &dyn Jj,
+    record: &ExecutionBookmark,
+    base: &str,
+    recorded: Option<&PreservedTip>,
+) -> Result<Option<String>> {
     let pointer = revision(&preserved_name(&record.execution_id));
     let output = log(jj, &record.repo_path, &pointer, "commit_id ++ \"\\n\"").await?;
     let candidates: Vec<_> = output.lines().collect();
     match candidates.as_slice() {
-        [] => return Ok(None),
+        [] => {
+            let Some(recorded) = recorded else {
+                return Ok(None);
+            };
+            let present = log(
+                jj,
+                &record.repo_path,
+                &format!("present({})", recorded.commit_id),
+                "commit_id ++ \"\\n\"",
+            )
+            .await
+            .unwrap_or_default();
+            if present.lines().any(|id| id == recorded.commit_id) {
+                return Ok(Some(recorded.commit_id.clone()));
+            }
+            return Err(pointer_integrity_error(format!(
+                "{} is missing and recorded commit {} is not visible",
+                preserved_name(&record.execution_id),
+                recorded.commit_id
+            )));
+        }
         [tip] => return Ok(Some((*tip).to_owned())),
         _ => {}
     }
@@ -95,6 +120,7 @@ pub async fn restore_preserved(
     jj: &dyn Jj,
     record: &ExecutionBookmark,
     workspace: &Path,
+    recorded: Option<&PreservedTip>,
 ) -> Result<Option<RestoreReport>> {
     if jj.shared_repo(workspace).await? != record.repo_path {
         return Err(pointer_integrity_error("preserved work belongs to another store"));
@@ -103,7 +129,7 @@ pub async fn restore_preserved(
         .run(workspace, &["log", "--no-graph", "-r", "@", "-T", "commit_id"])
         .await?;
     let base = base.trim();
-    let Some(tip) = select_tip(jj, record, base).await? else {
+    let Some(tip) = select_tip(jj, record, base, recorded).await? else {
         return Ok(None);
     };
     let sources = format!("({}) ~ ::{base}", unpublished(&tip));
@@ -116,11 +142,9 @@ pub async fn restore_preserved(
     .await?;
     if !commits.is_empty() {
         let change = log(jj, &record.repo_path, &tip, "change_id").await?;
-        jj.run(workspace, &["new", base, "-m", "Resume preserved execution work"])
-            .await?;
         // Include empty connectors in the roots; exclude published history.
         let roots = format!("roots(::{tip} ~ (::remote_bookmarks() | ::{base}))");
-        jj.run(workspace, &["rebase", "-s", &roots, "-d", "@"]).await?;
+        jj.run(workspace, &["rebase", "-s", &roots, "-d", base]).await?;
         let evolved = log(
             jj,
             &record.repo_path,

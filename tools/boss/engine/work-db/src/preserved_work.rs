@@ -58,13 +58,19 @@ impl WorkDb {
     pub fn record_preserved_tip(&self, execution_id: &str, tip: &PreservedTip) -> Result<()> {
         let changed = self.connect()?.execute(
             "UPDATE work_executions SET preserved_change_id = ?2, preserved_commit_id = ?3,
-                preserved_commit_count = ?4 WHERE id = ?1 AND preserved_commit_id IS NULL",
+                preserved_commit_count = ?4 WHERE id = ?1",
             params![execution_id, tip.change_id, tip.commit_id, tip.count],
         )?;
-        anyhow::ensure!(
-            changed == 1 || self.preserved_tip(execution_id)?.is_some(),
-            "execution missing for preserved work"
-        );
+        anyhow::ensure!(changed == 1, "execution missing for preserved work");
+        Ok(())
+    }
+
+    pub fn clear_preserved_tip(&self, execution_id: &str) -> Result<()> {
+        self.connect()?.execute(
+            "UPDATE work_executions SET preserved_change_id = NULL, preserved_commit_id = NULL,
+                preserved_commit_count = NULL WHERE id = ?1",
+            params![execution_id],
+        )?;
         Ok(())
     }
 

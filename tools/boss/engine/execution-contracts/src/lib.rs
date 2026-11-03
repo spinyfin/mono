@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use boss_engine_effort::SpawnConfig;
-use boss_engine_recovery::execution_bookmark::{self, ExecutionBookmark};
+use boss_engine_recovery::execution_bookmark::{self, ExecutionBookmark, PreservedTip};
 use boss_engine_storage_values::Host;
 use boss_engine_storage_values::pool_policy::{AUTOMATION_WORKER_ID_PREFIX, REVIEW_WORKER_ID_PREFIX};
 use boss_engine_structured_output::StructuredOutputKind;
@@ -1478,8 +1478,9 @@ pub trait HostAdapter: Send + Sync {
         &self,
         record: &ExecutionBookmark,
         workspace: &Path,
+        recorded: Option<&PreservedTip>,
     ) -> Result<Option<execution_bookmark::RestoreReport>> {
-        let _ = (record, workspace);
+        let _ = (record, workspace, recorded);
         bail!("preserved work restoration is not supported by this host adapter")
     }
 

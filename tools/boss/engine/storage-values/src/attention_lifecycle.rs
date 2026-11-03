@@ -184,6 +184,11 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         "Archiving writes this informational note already resolved. Durable archive references retain the preserved commits independently of later pruning.",
     ),
     entry(
+        PRESERVED_WORK_NOT_RESTAGED_ATTENTION_KIND,
+        ClearedBy::ProducerReconciles,
+        "Dispatch files this when a recorded preserved tip cannot be restaged. A later successful restage of that execution's preserved work resolves it; starting fresh is not evidence the work was recovered.",
+    ),
+    entry(
         LEASE_UNRELEASED_ATTENTION_KIND,
         ClearedBy::ProducerReconciles,
         "A release gate kept the lease. The release path resolves the item itself when a later gate \

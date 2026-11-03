@@ -76,6 +76,75 @@ async fn teardown_preserves_workspace_even_when_legacy_pointers_are_missing() {
 }
 
 #[tokio::test]
+async fn teardown_overwrites_a_stale_preserved_tip_with_later_unpublished_work() {
+    let (dir, db) = open_db();
+    let repo = boss_engine_test_git::jj::JjRepo::new(dir.path());
+    let execution = fixture(&db, &repo.worker).await;
+    std::fs::write(repo.worker.join("first.txt"), "first unpublished").unwrap();
+    let first = apply_release(
+        &db,
+        &execution,
+        "lease",
+        ReleaseEvidence {
+            cause: TerminalCause::ProvenNeverStarted,
+            pane: PaneStatus::Gone,
+            occupancy: &EmptyOccupancy,
+            bookmark: &DbBookmarkGate { db: &db, adapter: None },
+        },
+        async { Ok(()) },
+    )
+    .await;
+    assert_eq!(first, LeaseReleaseOutcome::Released);
+    let frozen = db.preserved_tip(&execution.id).unwrap().unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET cube_lease_id = 'lease', cube_workspace_id = 'workspace', workspace_path = ?2 WHERE id = ?1",
+            rusqlite::params![execution.id, repo.worker.to_str().unwrap()],
+        )
+        .unwrap();
+    let execution = db.get_execution(&execution.id).unwrap();
+    LocalJj
+        .run(&repo.worker, &["new", "-m", "Later unpublished work"])
+        .await
+        .unwrap();
+    std::fs::write(repo.worker.join("later.txt"), "later unpublished").unwrap();
+    let second = apply_release(
+        &db,
+        &execution,
+        "lease",
+        ReleaseEvidence {
+            cause: TerminalCause::ProvenCompleted,
+            pane: PaneStatus::Gone,
+            occupancy: &EmptyOccupancy,
+            bookmark: &DbBookmarkGate { db: &db, adapter: None },
+        },
+        async { Ok(()) },
+    )
+    .await;
+    assert_eq!(second, LeaseReleaseOutcome::Released);
+    let updated = db.preserved_tip(&execution.id).unwrap().unwrap();
+    assert_ne!(updated.commit_id, frozen.commit_id);
+    assert_eq!(
+        LocalJj
+            .run(
+                &repo.repo,
+                &[
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    &execution_bookmark::preserved_name(&execution.id),
+                    "-T",
+                    "commit_id",
+                ],
+            )
+            .await
+            .unwrap(),
+        updated.commit_id
+    );
+}
+
+#[tokio::test]
 async fn failed_legacy_backup_does_not_prevent_teardown_preservation() {
     let (dir, db) = open_db();
     let repo = boss_engine_test_git::jj::JjRepo::new(dir.path());

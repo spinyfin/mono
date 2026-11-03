@@ -101,10 +101,10 @@ impl BookmarkGate for DbBookmarkGate<'_> {
             return BookmarkStatus::NotRequired;
         }
         let result: Result<()> = async {
-            if self.db.preserved_tip(&execution.id)?.is_some() {
-                return Ok(());
-            }
-            let record = self.db.execution_bookmark(&execution.id)?;
+            let record = self
+                .db
+                .preservation_source(&execution.id)?
+                .ok_or_else(|| anyhow::anyhow!("workspace recovery store location is unavailable for preservation"))?;
             let workspace = execution
                 .workspace_path
                 .as_deref()
@@ -122,8 +122,9 @@ impl BookmarkGate for DbBookmarkGate<'_> {
                 )
                 .await?
             };
-            if let Some(tip) = tip {
-                self.db.record_preserved_tip(&execution.id, &tip)?;
+            match tip {
+                Some(tip) => self.db.record_preserved_tip(&execution.id, &tip)?,
+                None => self.db.clear_preserved_tip(&execution.id)?,
             }
             Ok(())
         }

@@ -184,6 +184,10 @@ pub const EXECUTION_BOOKMARK_PRUNE_UNPROVEN_ATTENTION_KIND: &str = "execution_bo
 
 pub const EXECUTION_BOOKMARK_RECOVERY_FAILED_ATTENTION_KIND: &str = "execution_bookmark_recovery_failed";
 
+/// Filed when a recorded preserved tip cannot be restaged into a new lease.
+/// Dispatch resolves it on a later successful restage of that same work.
+pub const PRESERVED_WORK_NOT_RESTAGED_ATTENTION_KIND: &str = "preserved_work_not_restaged";
+
 pub const REVISION_CHAIN_RECOVERY_BLOCKED_ATTENTION_KIND: &str = "revision_chain_recovery_blocked";
 
 pub const EXECUTION_BOOKMARK_CREATE_FAILED_ATTENTION_KIND: &str = "execution_bookmark_create_failed";

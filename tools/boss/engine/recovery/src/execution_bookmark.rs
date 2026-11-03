@@ -897,16 +897,5 @@ pub async fn unpublished_diff(jj: &dyn Jj, record: &ExecutionBookmark) -> Result
     })
 }
 
-/// Confirm the shared-store pointers alone: a usable baseline and an existing
-/// recovery head. Used when the workspace directory itself no longer exists,
-/// so there is no working copy whose commit could need covering.
-pub async fn confirm_pointers(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<()> {
-    resolve_pointers(jj, record).await?;
-    resolve_optional(jj, &record.repo_path, &record.head())
-        .await?
-        .ok_or_else(|| pointer_integrity_error("recovery head is missing"))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests;

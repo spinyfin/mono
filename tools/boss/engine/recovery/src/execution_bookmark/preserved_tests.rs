@@ -59,7 +59,7 @@ async fn conflicted_variants_prefer_pr_ancestry_then_jj_evolution() {
             }
         }
         JjRepo::run(&repo.replacement, &positioning);
-        let report = restore_preserved(&LocalJj, &record, &repo.replacement)
+        let report = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
             .await
             .unwrap()
             .unwrap();
@@ -95,6 +95,38 @@ async fn unpushed_tip_creates_exactly_one_bookmark_and_release_retry_reuses_it()
     );
     assert_eq!(preserve(&LocalJj, &record, &repo.worker).await.unwrap(), Some(tip));
     assert_eq!(names(&repo).lines().count(), before.lines().count() + 1);
+}
+
+#[tokio::test]
+async fn later_unpublished_work_moves_the_preserved_bookmark() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_move", "local").await.unwrap();
+    std::fs::write(repo.worker.join("first"), "first unpublished").unwrap();
+    let first = preserve(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    JjRepo::run(&repo.worker, &["new", "-m", "Later unpublished work"]);
+    std::fs::write(repo.worker.join("second"), "second unpublished").unwrap();
+    let second = preserve(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    assert_ne!(second.commit_id, first.commit_id);
+    assert_eq!(
+        JjRepo::run(
+            &repo.repo,
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                &revision(&preserved_name(&record.execution_id)),
+                "-T",
+                "commit_id",
+            ],
+        ),
+        second.commit_id
+    );
+    assert!(
+        std::fs::read_to_string(repo.worker.join("second"))
+            .unwrap()
+            .contains("second")
+    );
 }
 
 #[tokio::test]
@@ -137,12 +169,27 @@ async fn restoration_follows_rewrites_and_keeps_change_ids_on_new_base() {
     JjRepo::run(&repo.replacement, &["new", "main", "-m", "New upstream"]);
     std::fs::write(repo.replacement.join("upstream"), "upstream edits").unwrap();
     let base = JjRepo::run(&repo.replacement, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
-    let report = restore_preserved(&LocalJj, &record, &repo.replacement)
+    let report = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
         .await
         .unwrap()
         .unwrap();
     assert_eq!(report.base_sha, base);
     assert!(report.conflicts.is_empty());
+    let empty = JjRepo::run(
+        &repo.replacement,
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            &format!("({base}..@) & empty()"),
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
+    );
+    assert!(
+        empty.trim().is_empty(),
+        "restaging must not insert empty commits: {empty}"
+    );
     assert_eq!(
         std::fs::read_to_string(repo.replacement.join("work")).unwrap(),
         "preserved edits"
@@ -170,10 +217,10 @@ async fn restoration_keeps_content_conflicts_for_worker_resolution() {
     let repo = fixture(dir.path());
     let record = create(&LocalJj, &repo.worker, "exec_conflicts", "local").await.unwrap();
     std::fs::write(repo.worker.join("base.txt"), "worker edits\n").unwrap();
-    preserve(&LocalJj, &record, &repo.worker).await.unwrap();
+    let saved = preserve(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
     JjRepo::run(&repo.replacement, &["new", "main", "-m", "Upstream edits"]);
     std::fs::write(repo.replacement.join("base.txt"), "upstream edits\n").unwrap();
-    let report = restore_preserved(&LocalJj, &record, &repo.replacement)
+    let report = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
         .await
         .unwrap()
         .unwrap();
@@ -181,4 +228,50 @@ async fn restoration_keeps_content_conflicts_for_worker_resolution() {
     assert!(report.instructions().contains("FIRST TASK"));
     let file = std::fs::read_to_string(repo.replacement.join("base.txt")).unwrap();
     assert!(file.contains("worker edits") && file.contains("upstream edits"));
+}
+
+#[tokio::test]
+async fn missing_bookmark_falls_back_to_the_recorded_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_hidden", "local").await.unwrap();
+    std::fs::write(repo.worker.join("hidden"), "recorded unpublished").unwrap();
+    let saved = preserve(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    JjRepo::run(
+        &repo.repo,
+        &["bookmark", "delete", &preserved_name(&record.execution_id)],
+    );
+    JjRepo::run(&repo.replacement, &["new", "main", "-m", "Current PR head"]);
+    let report = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(report.commits.contains("recorded unpublished") || !report.commits.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(repo.replacement.join("hidden")).unwrap(),
+        "recorded unpublished"
+    );
+}
+
+#[tokio::test]
+async fn missing_bookmark_and_missing_commit_are_an_integrity_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_gone", "local").await.unwrap();
+    std::fs::write(repo.worker.join("gone"), "unpublished").unwrap();
+    preserve(&LocalJj, &record, &repo.worker).await.unwrap();
+    JjRepo::run(
+        &repo.repo,
+        &["bookmark", "delete", &preserved_name(&record.execution_id)],
+    );
+    let recorded = PreservedTip {
+        change_id: "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".into(),
+        // A well-formed id that is not the null revision and is not in this store.
+        commit_id: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into(),
+        count: 1,
+    };
+    let err = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&recorded))
+        .await
+        .unwrap_err();
+    assert!(is_pointer_integrity_error(&err), "{err:#}");
 }

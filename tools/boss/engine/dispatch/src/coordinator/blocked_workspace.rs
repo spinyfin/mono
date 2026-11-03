@@ -131,9 +131,10 @@ impl ExecutionCoordinator {
         } else {
             return Ok(None);
         };
-        // A pre-start retry already owns staged history and its legacy names;
-        // keep that positioning stable until the worker actually starts.
-        if prior.id != execution.id && self.work_db.preserved_tip(&prior.id)?.is_some() {
+        // Preserved work is the source of truth whenever a tip exists,
+        // including a retry of the same execution. Legacy pointers are
+        // only used when no preserved tip is recorded.
+        if self.work_db.preserved_tip(&prior.id)?.is_some() {
             return self
                 .recover_preserved_work(
                     execution,
