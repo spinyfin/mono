@@ -14,6 +14,9 @@ mod two_leaf;
 #[path = "review_start_failure_tests.rs"]
 mod start_failure;
 
+#[path = "review_batch_focus_admission_tests.rs"]
+mod focus_admission;
+
 fn classification() -> ReviewClassification {
     ReviewClassification::builder()
         .changed_files(vec!["tools/boss/engine/pr-review/src/parsing.rs".to_owned()])

@@ -18,6 +18,8 @@ Focus mode is on while the set is non-empty. The set is persisted in the engine 
 
 Focus never rewrites a work item: no autostart flip, no deferral, no status change. Out-of-scope rows keep their `ready` execution untouched and carry the `focus_mode` dispatch wait reason, exactly as rows carry `dispatch_paused` or `interactive_concurrency_cap`. Clearing focus, or adding a row's project or product, lets them dispatch on the next pass. Rows are held, never dropped.
 
+Pre-merge review **batches** are the one exception, because a batch holds a four-unit review-pool reservation from creation until it completes or fails. While focus is on, an out-of-scope root is not admitted (it goes through the same deferred-admission sweep as a full pool). Setting or narrowing focus releases never-started out-of-scope batches so in-scope reviews can use those reservations; a batch that already has a started member keeps its reservation. An all-spawns dispatch pause (reviews held) uses the same rule; the default `new_work` pause does not, because reviews stay exempt and can still start.
+
 ## What is in scope
 
 A work item is in scope when any of these holds (`tools/boss/engine/work-db/src/dispatch_focus.rs` is the single implementation):
@@ -39,7 +41,7 @@ A row that cannot be attributed to anything is out of scope: focus admits only w
 
 ## Precedence
 
-- The **global dispatch pause** overrides focus. The focus gate runs after the pause gate and only ever holds more, so focus never resumes anything while paused, and a paused row shows `dispatch_paused` rather than `focus_mode`. Under the default `new_work` pause, PR reviews stay exempt from the pause, so they follow focus instead.
+- The **global dispatch pause** overrides focus. The focus gate runs after the pause gate and only ever holds more, so focus never resumes anything while paused, and a paused row shows `dispatch_paused` rather than `focus_mode`. Under the default `new_work` pause, PR reviews stay exempt from the pause, so they follow focus instead. An `all_spawns` pause holds reviews too, so pre-merge admission defers those batches the same way focus does rather than letting them occupy reservations they cannot use.
 - The spawn-breaker's half-open recovery probe is an automatic path, so it respects focus: under a breaker pause it picks its canary only from ready rows inside the focus set, and admits nothing when every ready row is out of scope or scope cannot be resolved. Only an explicit `bossctl agents launch` bypasses focus.
 - `bossctl agents launch` (`force_dispatch`) bypasses focus, as it bypasses the pause. `bossctl work start --force` (the pause-only override) does **not**: the admission preview reports a `focus_mode` blocker and the request is refused with the same guidance.
 - The interactive concurrency cap applies as usual to in-scope rows.

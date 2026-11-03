@@ -773,10 +773,10 @@ impl PrPollStateWriter for NoopPrPollStateWriter {
 pub fn file_admission_deferred_attention(work_db: &WorkDb, work_item_id: &str, pr_url: &str) {
     let title = "Automated reviewer: waiting for a review-pool slot";
     let body = format!(
-        "Pre-merge review for {pr_url} was deferred because the review pool has no free \
-         reservation for another pre-merge batch. The review starts once a batch completes \
-         and the deferred-admission sweep retries. Dismiss this item once that \
-         pass starts."
+        "Pre-merge review for {pr_url} was deferred because it cannot occupy a review-pool \
+         reservation right now: the pool is full, or dispatch focus / an all-spawns pause is \
+         holding this PR. The review starts once a reservation is free and this PR is \
+         allowed to dispatch. Dismiss this item once that pass starts."
     );
     if let Err(err) = work_db.upsert_external_tracker_attention(
         work_item_id,

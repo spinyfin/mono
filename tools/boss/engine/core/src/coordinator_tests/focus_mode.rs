@@ -22,9 +22,10 @@ use super::helpers::*;
 
 use crate::dispatch_events::RecordingDispatchEventSink;
 use crate::spawn_health::{SpawnHealthTracker, maybe_admit_recovery_probe};
+use crate::work::{ReviewBatchCreateInput, ReviewBatchDispatch};
 use boss_protocol::{
     DISPATCH_WAIT_REASON_FOCUS_MODE, DispatchFocus, DispatchFocusTargetKind, DispatchPauseScope, ExecutionKind,
-    OperatorAnswer, PauseReason, Project,
+    OperatorAnswer, PauseReason, Project, ReviewBatchPhase, ReviewClassification, ReviewLanguageBucket, ReviewProfile,
 };
 
 struct Harness {
@@ -634,4 +635,91 @@ async fn the_breaker_recovery_probe_admits_nothing_when_every_ready_row_is_out_o
     }
     assert!(h.dispatched().await.is_empty());
     assert!(events.events().await.is_empty());
+}
+
+fn pre_merge_batch(db: &WorkDb, root_id: &str, target_sha: &str) -> (String, Vec<String>) {
+    let input = ReviewBatchCreateInput::builder()
+        .cycle_root_id(root_id)
+        .base_sha("base-sha")
+        .classification(
+            ReviewClassification::builder()
+                .changed_files(vec!["src/lib.rs".to_owned()])
+                .complexity_flags(vec![])
+                .has_production_code(true)
+                .metadata_missing(vec![])
+                .production_languages(vec![ReviewLanguageBucket::Rust])
+                .profile(ReviewProfile::Light)
+                .subsystem_buckets(vec!["src".to_owned()])
+                .build(),
+        )
+        .phase(ReviewBatchPhase::PreMerge)
+        .pr_number(42)
+        .pr_url("https://github.com/example/repo/pull/42")
+        .target_sha(target_sha)
+        .build();
+    match db
+        .create_pre_merge_review_batch(input, "https://github.com/example/repo")
+        .unwrap()
+    {
+        ReviewBatchDispatch::Created { batch, executions } => {
+            (batch.id, executions.into_iter().map(|e| e.id).collect())
+        }
+        other => panic!("expected a new batch, got {other:?}"),
+    }
+}
+
+/// Four never-started out-of-focus pre-merge batches fill the reservation
+/// pool; once focus is on, the in-focus batch is admitted and its members
+/// dispatch, while the out-of-focus members are abandoned.
+#[tokio::test]
+async fn in_focus_pre_merge_batch_is_admitted_and_dispatches_after_out_of_focus_reservations_fill_the_pool() {
+    let h = harness();
+    for driver in ["claude", "codex"] {
+        crate::test_support::insert_host_capability(&h.db, "local", &format!("driver={driver}"), "auto");
+    }
+    let focused = h.project("Focused");
+    let other = h.project("Other");
+    let mut out_of_focus_execs = Vec::new();
+    for i in 0..4 {
+        let (task_id, _) = h.ready_project_task(&other, &format!("Out {i}"));
+        h.db.connect()
+            .unwrap()
+            .execute("DELETE FROM work_executions WHERE work_item_id = ?1", [&task_id])
+            .unwrap();
+        let (_batch_id, execs) = pre_merge_batch(&h.db, &task_id, &format!("head-out-{i}"));
+        out_of_focus_execs.extend(execs);
+    }
+    assert!(
+        !h.db
+            .can_admit_review_batch(boss_protocol::ReviewBatchPhase::PreMerge)
+            .unwrap()
+    );
+
+    h.db.save_dispatch_focus(&{
+        let mut focus = DispatchFocus::default();
+        focus.insert(DispatchFocusTargetKind::Project, focused.id.clone());
+        focus
+    })
+    .unwrap();
+    h.focus_on(&[&focused]);
+
+    let (in_scope_task, _) = h.ready_project_task(&focused, "In focus PR");
+    h.db.connect()
+        .unwrap()
+        .execute("DELETE FROM work_executions WHERE work_item_id = ?1", [&in_scope_task])
+        .unwrap();
+    let (_batch_id, in_focus_execs) = pre_merge_batch(&h.db, &in_scope_task, "head-in");
+    assert_eq!(in_focus_execs.len(), 2);
+
+    h.drain_and_wait_for(&[&in_focus_execs[0], &in_focus_execs[1]]).await;
+
+    let dispatched = h.dispatched().await;
+    assert_eq!(
+        dispatched,
+        HashSet::from([in_focus_execs[0].clone(), in_focus_execs[1].clone()])
+    );
+    for id in &out_of_focus_execs {
+        assert_eq!(h.execution(id).status, ExecutionStatus::Abandoned);
+        assert!(!dispatched.contains(id), "out-of-focus member {id} must not dispatch");
+    }
 }

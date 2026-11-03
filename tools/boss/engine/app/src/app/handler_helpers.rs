@@ -557,6 +557,14 @@ pub(super) fn restore_persisted_dispatch_pause(
         "dispatch: restoring persisted pause state — dispatch remains \
          globally paused until `bossctl dispatch resume` is called",
     );
+    if scope.holds_reviews()
+        && let Err(err) = work_db.release_unstartable_pre_merge_review_reservations()
+    {
+        tracing::warn!(
+            ?err,
+            "dispatch: failed to release never-started pre-merge review reservations on pause restore"
+        );
+    }
     true
 }
 

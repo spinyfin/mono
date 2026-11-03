@@ -1,0 +1,264 @@
+//! Pre-merge review admission consults dispatch focus and all-spawns pause
+//! so out-of-scope never-started batches cannot starve in-scope reviews.
+
+use boss_protocol::{
+    CreateProjectInput, CreateTaskInput, DispatchFocus, DispatchFocusTargetKind, ExecutionStatus, ReviewBatchPhase,
+};
+
+use super::*;
+
+fn project(db: &WorkDb, product_id: &str, name: &str) -> Project {
+    db.create_project(CreateProjectInput {
+        product_id: product_id.to_owned(),
+        name: name.to_owned(),
+        description: None,
+        goal: None,
+        autostart: false,
+        no_design_task: true,
+        design_reasoning_effort_xhigh: false,
+    })
+    .unwrap()
+}
+
+fn project_task(db: &WorkDb, product_id: &str, project_id: &str, name: &str) -> Task {
+    let task = db
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product_id)
+                .project_id(project_id)
+                .name(name)
+                .autostart(false)
+                .build(),
+        )
+        .unwrap();
+    db.update_work_item(
+        &task.id,
+        WorkItemPatch {
+            pr_url: Some(format!(
+                "https://github.com/example/repo/pull/{}",
+                &task.id[task.id.len().saturating_sub(4)..]
+            )),
+            status: Some("active".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    task
+}
+
+fn focus_on_project(db: &WorkDb, project_id: &str) {
+    let mut focus = DispatchFocus::default();
+    focus.insert(DispatchFocusTargetKind::Project, project_id.to_owned());
+    db.save_dispatch_focus(&focus).unwrap();
+}
+
+fn create_batch(db: &WorkDb, cycle_root_id: &str, target_sha: &str) -> ReviewBatchDispatch {
+    db.create_pre_merge_review_batch(
+        batch_input(cycle_root_id.to_owned(), target_sha, ReviewBatchPhase::PreMerge),
+        "https://github.com/example/repo",
+    )
+    .unwrap()
+}
+
+fn created_batch(dispatch: ReviewBatchDispatch) -> (ReviewBatch, Vec<WorkExecution>) {
+    match dispatch {
+        ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+        other => panic!("expected Created, got {other:?}"),
+    }
+}
+
+/// While focus is on, an out-of-focus root is deferred and leaves no batch.
+#[test]
+fn focus_defers_an_out_of_scope_pre_merge_batch() {
+    let db = WorkDb::open(temp_db_path("focus-defer-out-of-scope")).unwrap();
+    let product = create_test_product(&db);
+    let focused = project(&db, &product.id, "Focused");
+    let other = project(&db, &product.id, "Other");
+    let out = project_task(&db, &product.id, &other.id, "Out of focus PR");
+    focus_on_project(&db, &focused.id);
+
+    match create_batch(&db, &out.id, "head-out") {
+        ReviewBatchDispatch::AdmissionDeferred => {}
+        other => panic!("expected AdmissionDeferred for an out-of-focus root, got {other:?}"),
+    }
+    assert!(
+        db.review_batch_for_target(&out.id, ReviewBatchPhase::PreMerge, "head-out")
+            .unwrap()
+            .is_none()
+    );
+    assert!(db.can_admit_review_batch(ReviewBatchPhase::PreMerge).unwrap());
+}
+
+/// Four never-started out-of-focus batches filling the pool are released
+/// when an in-focus PR is admitted, so the in-focus batch is created.
+#[test]
+fn in_focus_admission_releases_four_never_started_out_of_focus_reservations() {
+    let db = WorkDb::open(temp_db_path("focus-release-four-out-of-focus")).unwrap();
+    let product = create_test_product(&db);
+    let focused = project(&db, &product.id, "Focused");
+    let other = project(&db, &product.id, "Other");
+    let mut out_of_focus = Vec::new();
+    for i in 0..4 {
+        let task = project_task(&db, &product.id, &other.id, &format!("Out {i}"));
+        let (batch, executions) = created_batch(create_batch(&db, &task.id, &format!("head-out-{i}")));
+        out_of_focus.push((task, batch, executions));
+    }
+    assert!(
+        !db.can_admit_review_batch(ReviewBatchPhase::PreMerge).unwrap(),
+        "four out-of-focus batches must fill the 16-unit pool"
+    );
+
+    focus_on_project(&db, &focused.id);
+    let in_focus = project_task(&db, &product.id, &focused.id, "In focus PR");
+    let (admitted, executions) = created_batch(create_batch(&db, &in_focus.id, "head-in"));
+
+    assert_eq!(admitted.cycle_root_id, in_focus.id);
+    assert_eq!(admitted.generation, 1);
+    assert_eq!(executions.len(), 2);
+    for execution in &executions {
+        assert_eq!(execution.status, ExecutionStatus::Ready);
+        assert_eq!(execution.work_item_id, in_focus.id);
+    }
+    for (task, batch, members) in &out_of_focus {
+        assert!(
+            db.review_batch(&batch.id).unwrap().is_none(),
+            "never-started out-of-focus batch {} must be released",
+            batch.id
+        );
+        for execution in members {
+            assert_eq!(
+                db.get_execution(&execution.id).unwrap().status,
+                ExecutionStatus::Abandoned
+            );
+        }
+        let deferred = db.list_tasks_awaiting_pre_merge_review_admission().unwrap();
+        assert!(
+            deferred
+                .iter()
+                .any(|c| c.task_id == task.id || c.cycle_root_id == task.id),
+            "released root {} must return to deferred admission: {deferred:?}",
+            task.id
+        );
+    }
+}
+
+/// Narrowing focus releases never-started reservations that just fell out
+/// of the set, while a batch with a started member keeps its reservation.
+#[test]
+fn narrowing_focus_releases_never_started_out_of_scope_and_keeps_a_started_batch() {
+    let db = WorkDb::open(temp_db_path("focus-narrow-keeps-started")).unwrap();
+    let product = create_test_product(&db);
+    let keep = project(&db, &product.id, "Keep");
+    let drop = project(&db, &product.id, "Drop");
+    let started_root = project_task(&db, &product.id, &drop.id, "Started out of focus");
+    let never_root = project_task(&db, &product.id, &drop.id, "Never started out of focus");
+    let (started_batch, started_execs) = created_batch(create_batch(&db, &started_root.id, "head-started"));
+    let (never_batch, never_execs) = created_batch(create_batch(&db, &never_root.id, "head-never"));
+    db.force_started_at_for_test(&started_execs[0].id, 1_700_000_000)
+        .unwrap();
+
+    focus_on_project(&db, &keep.id);
+    let released = db.release_unstartable_pre_merge_review_reservations().unwrap();
+    assert_eq!(released, vec![never_batch.id.clone()]);
+    assert!(db.review_batch(&never_batch.id).unwrap().is_none());
+    assert_eq!(
+        db.get_execution(&never_execs[0].id).unwrap().status,
+        ExecutionStatus::Abandoned
+    );
+    let kept = db.review_batch(&started_batch.id).unwrap().unwrap();
+    assert_eq!(kept.status, ReviewBatchStatus::Collecting);
+    assert_eq!(
+        db.get_execution(&started_execs[0].id).unwrap().status,
+        ExecutionStatus::Ready
+    );
+    assert!(
+        !db.can_admit_review_batch(ReviewBatchPhase::PreMerge).unwrap()
+            || db.review_pool_reserved_units().unwrap().0 == PRE_MERGE_BATCH_RESERVATION_UNITS,
+        "the started out-of-focus batch must still occupy its reservation"
+    );
+    assert_eq!(
+        db.review_pool_reserved_units().unwrap().0,
+        PRE_MERGE_BATCH_RESERVATION_UNITS
+    );
+}
+
+/// Releasing a never-started batch does not consume an automatic remint
+/// generation: once the root is in focus, admission is generation 1.
+#[test]
+fn released_never_started_batch_readmits_at_generation_one() {
+    let db = WorkDb::open(temp_db_path("focus-release-preserves-generation")).unwrap();
+    let product = create_test_product(&db);
+    let focused = project(&db, &product.id, "Focused");
+    let other = project(&db, &product.id, "Other");
+    let root = project_task(&db, &product.id, &other.id, "Moves into focus");
+    let (first, _) = created_batch(create_batch(&db, &root.id, "head-sha"));
+    assert_eq!(first.generation, 1);
+
+    focus_on_project(&db, &focused.id);
+    assert!(matches!(
+        create_batch(&db, &root.id, "head-sha"),
+        ReviewBatchDispatch::AdmissionDeferred
+    ));
+    assert!(db.review_batch(&first.id).unwrap().is_none());
+
+    focus_on_project(&db, &other.id);
+    let (again, _) = created_batch(create_batch(&db, &root.id, "head-sha"));
+    assert_eq!(again.generation, 1);
+    assert_ne!(again.id, first.id);
+}
+
+/// An all-spawns pause holds reviews, so a new pre-merge batch is deferred.
+/// The default new_work pause does not.
+#[test]
+fn all_spawns_pause_defers_pre_merge_admission_and_new_work_does_not() {
+    let db = WorkDb::open(temp_db_path("pause-all-spawns-defers-review")).unwrap();
+    let product = create_test_product(&db);
+    let root = create_test_chore_manual(&db, product.id.clone(), "review target");
+
+    db.set_metadata("dispatch_paused", "1").unwrap();
+    db.set_metadata("dispatch_paused_scope", "new_work").unwrap();
+    created_batch(create_batch(&db, &root.id, "head-new-work"));
+
+    let other = create_test_chore_manual(&db, product.id, "another target");
+    db.set_metadata("dispatch_paused_scope", "all_spawns").unwrap();
+    match create_batch(&db, &other.id, "head-all-spawns") {
+        ReviewBatchDispatch::AdmissionDeferred => {}
+        other => panic!("expected AdmissionDeferred under all-spawns pause, got {other:?}"),
+    }
+    assert!(
+        db.review_batch_for_target(&other.id, ReviewBatchPhase::PreMerge, "head-all-spawns")
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// An all-spawns pause releases never-started pre-merge reservations so
+/// they cannot occupy the pool while reviews cannot start.
+#[test]
+fn all_spawns_pause_releases_never_started_pre_merge_reservations() {
+    let db = WorkDb::open(temp_db_path("pause-all-spawns-releases")).unwrap();
+    let product = create_test_product(&db);
+    let root = create_test_chore_manual(&db, product.id, "review target");
+    let (batch, executions) = created_batch(create_batch(&db, &root.id, "head-sha"));
+
+    db.set_metadata("dispatch_paused", "1").unwrap();
+    db.set_metadata("dispatch_paused_scope", "new_work").unwrap();
+    assert!(
+        db.release_unstartable_pre_merge_review_reservations()
+            .unwrap()
+            .is_empty(),
+        "new_work pause must leave never-started review reservations in place"
+    );
+    assert!(db.review_batch(&batch.id).unwrap().is_some());
+
+    db.set_metadata("dispatch_paused_scope", "all_spawns").unwrap();
+    assert_eq!(
+        db.release_unstartable_pre_merge_review_reservations().unwrap(),
+        vec![batch.id.clone()]
+    );
+    assert!(db.review_batch(&batch.id).unwrap().is_none());
+    assert_eq!(
+        db.get_execution(&executions[0].id).unwrap().status,
+        ExecutionStatus::Abandoned
+    );
+}

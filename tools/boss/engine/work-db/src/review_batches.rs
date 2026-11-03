@@ -74,13 +74,14 @@ pub enum ReviewBatchDispatch {
     LegacyExecution(WorkExecution),
     /// The review pool's weighted reservation accounting (see
     /// [`can_admit_review_batch_in_tx`]) has no room for a new batch of this
-    /// target's phase right now. No batch and no member executions were
-    /// created — the caller must not treat this as a failure to retry with
-    /// backoff; it is expected whenever the pool is at capacity. The
-    /// producing task is held in PendingReview, and the merge poller's
-    /// deferred-admission sweep (`list_tasks_awaiting_pre_merge_review_admission`)
-    /// retries `create_pre_merge_review_batch` once an existing batch
-    /// completes and releases its reservation.
+    /// target's phase right now, or dispatch focus / an all-spawns pause is
+    /// holding the root so a reservation would never be used. No batch and
+    /// no member executions were created — the caller must not treat this as
+    /// a failure to retry with backoff. The producing task is held in
+    /// PendingReview, and the merge poller's deferred-admission sweep
+    /// (`list_tasks_awaiting_pre_merge_review_admission`) retries
+    /// `create_pre_merge_review_batch` once a reservation is free and this
+    /// root is allowed to dispatch.
     AdmissionDeferred,
     /// The target sha already has a durable, informative `pr_review`
     /// verdict (from a batch leaf or a legacy single reviewer) recorded
@@ -790,6 +791,156 @@ pub(super) const NO_BATCH_MEMBER_STARTED: &str = "NOT EXISTS (SELECT 1 FROM pr_r
                  JOIN work_executions we ON we.id = m.execution_id
                  WHERE m.batch_id = b.id AND we.started_at IS NOT NULL)";
 
+/// Metadata keys persisted by `handle_set_dispatch_paused`. Kept as literals
+/// so this crate does not depend on `boss_execution_contracts`; they must
+/// match `METADATA_KEY_DISPATCH_PAUSED` and `METADATA_KEY_DISPATCH_PAUSE_SCOPE`.
+const METADATA_KEY_DISPATCH_PAUSED: &str = "dispatch_paused";
+const METADATA_KEY_DISPATCH_PAUSE_SCOPE: &str = "dispatch_paused_scope";
+
+fn metadata_value_on(conn: &Connection, key: &str) -> Result<Option<String>> {
+    conn.query_row("SELECT value FROM metadata WHERE key = ?1", [key], |row| row.get(0))
+        .optional()
+        .map_err(Into::into)
+}
+
+/// True when persisted dispatch pause is on and its scope holds PR reviews
+/// (`all_spawns`). The default `new_work` pause exempts reviews, so it does
+/// not invert review-pool reservations.
+fn reviews_held_by_persisted_pause_on(conn: &Connection) -> Result<bool> {
+    match metadata_value_on(conn, METADATA_KEY_DISPATCH_PAUSED)? {
+        Some(value) if value == "1" => {
+            let scope = metadata_value_on(conn, METADATA_KEY_DISPATCH_PAUSE_SCOPE)?;
+            Ok(boss_protocol::DispatchPauseScope::from_persisted(scope.as_deref().unwrap_or_default()).holds_reviews())
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Why a pre-merge batch for `cycle_root_id` must not occupy a reservation
+/// right now: an all-spawns pause holds reviews, or focus mode is on and
+/// the root is outside the set. `None` means admission may proceed to the
+/// pool-capacity check.
+fn pre_merge_dispatch_hold_on(conn: &Connection, cycle_root_id: &str) -> Result<Option<&'static str>> {
+    if reviews_held_by_persisted_pause_on(conn)? {
+        return Ok(Some("dispatch_paused"));
+    }
+    let focus = super::dispatch_focus::load_dispatch_focus_on(conn)?;
+    if focus.is_active() && !super::dispatch_focus::work_item_in_dispatch_focus_on(conn, cycle_root_id, &focus)? {
+        return Ok(Some("focus_mode"));
+    }
+    Ok(None)
+}
+
+fn file_admission_deferred_attention_in_tx(tx: &Transaction<'_>, work_item_id: &str, pr_url: &str) -> Result<()> {
+    super::attention_filing::warn_if_lifecycle_undeclared(PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND);
+    if super::attention_filing::reraise_open_work_item_attention(
+        tx,
+        work_item_id,
+        PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
+    )?
+    .is_some()
+    {
+        return Ok(());
+    }
+    super::workitems::insert_attention_item_row(
+        tx,
+        &CreateAttentionItemInput::builder()
+            .work_item_id(work_item_id)
+            .kind(PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND)
+            .title("Automated reviewer: waiting for a review-pool slot")
+            .body_markdown(format!(
+                "Pre-merge review for {pr_url} was deferred because it cannot occupy a review-pool \
+                 reservation right now: the pool is full, or dispatch focus / an all-spawns pause is \
+                 holding this PR. The review starts once a reservation is free and this PR is \
+                 allowed to dispatch. Dismiss this item once that pass starts."
+            ))
+            .build(),
+    )?;
+    Ok(())
+}
+
+/// Drop never-started pre-merge batches whose members cannot dispatch under
+/// the current focus set or an all-spawns pause, freeing their reservations.
+///
+/// Deleting (after abandoning member executions) rather than failing the
+/// batch preserves the automatic remint generation cap: a later admission
+/// of the same head is generation 1 again, matching "this batch was never
+/// admitted". A batch with any member `started_at` keeps its reservation.
+fn release_unstartable_pre_merge_review_reservations_in_tx(
+    tx: &Transaction<'_>,
+    pending: &mut PendingEvents,
+) -> Result<Vec<String>> {
+    let reviews_held = reviews_held_by_persisted_pause_on(tx)?;
+    let focus = super::dispatch_focus::load_dispatch_focus_on(tx)?;
+    if !reviews_held && !focus.is_active() {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<(String, String, String, Option<String>)> = {
+        let mut statement = tx.prepare(&format!(
+            "SELECT b.id, b.cycle_root_id, b.pr_url, b.producing_work_item_id
+             FROM pr_review_batches b
+             WHERE b.phase = 'pre_merge'
+               AND b.status NOT IN ('completed', 'failed')
+               AND {NO_BATCH_MEMBER_STARTED}
+             ORDER BY b.created_at ASC, b.id ASC"
+        ))?;
+        let mapped = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let now = now_string();
+    let mut released = Vec::new();
+    for (batch_id, cycle_root_id, pr_url, producing_work_item_id) in rows {
+        if !reviews_held && super::dispatch_focus::work_item_in_dispatch_focus_on(tx, &cycle_root_id, &focus)? {
+            continue;
+        }
+        let member_execution_ids: Vec<(String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT we.id, we.work_item_id
+                 FROM work_executions we
+                 JOIN pr_review_batch_members m ON m.execution_id = we.id
+                 WHERE m.batch_id = ?1
+                   AND we.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')",
+            )?;
+            stmt.query_map(params![batch_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        tx.execute(
+            "UPDATE work_executions
+             SET status = 'abandoned', finished_at = ?2
+             WHERE id IN (SELECT execution_id FROM pr_review_batch_members WHERE batch_id = ?1)
+               AND status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')",
+            params![batch_id, now],
+        )?;
+        for (execution_id, work_item_id) in &member_execution_ids {
+            stage_execution_terminal(pending, tx, execution_id, work_item_id)?;
+        }
+        tx.execute("DELETE FROM pr_review_batches WHERE id = ?1", params![batch_id])?;
+        file_admission_deferred_attention_in_tx(tx, &cycle_root_id, &pr_url)?;
+        if let Some(producing_id) = producing_work_item_id
+            && producing_id != cycle_root_id
+        {
+            file_admission_deferred_attention_in_tx(tx, &producing_id, &pr_url)?;
+        }
+        tracing::info!(
+            batch_id = %batch_id,
+            cycle_root_id = %cycle_root_id,
+            reviews_held,
+            "released never-started pre-merge review reservation held by focus or all-spawns pause"
+        );
+        released.push(batch_id);
+    }
+    Ok(released)
+}
+
 /// A failed leaf whose latest attempt never reached a review session: the
 /// member's execution has no `started_at`, so it died in pre-start dispatch
 /// (workspace lease, bookmark recovery, change create, spawn) and
@@ -1271,6 +1422,23 @@ impl WorkDb {
         can_admit_review_batch_in_tx(&tx, phase, reservation_capacity(review_pool_size))
     }
 
+    /// Release reservation-holding pre-merge batches whose members cannot
+    /// start under the current dispatch focus set or an all-spawns pause.
+    ///
+    /// A batch with any member that has `started_at` keeps its reservation.
+    /// Each released batch is deleted after its never-started member
+    /// executions are abandoned, and its cycle root is filed as
+    /// [`PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND`] so the deferred-admission
+    /// sweep retries once the hold lifts. Returns the released batch ids.
+    pub fn release_unstartable_pre_merge_review_reservations(&self) -> Result<Vec<String>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut pending = PendingEvents::new();
+        let released = release_unstartable_pre_merge_review_reservations_in_tx(&tx, &mut pending)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
+        Ok(released)
+    }
+
     /// Currently reserved review-pool units `(pre_merge, post_merge)` for
     /// live cycle roots. Used by the merge poller to sample the
     /// `review_pool.reserved_units` gauge.
@@ -1329,6 +1497,12 @@ impl WorkDb {
         if input.phase != ReviewBatchPhase::PreMerge {
             bail!("leaf reviewer dispatch only supports pre_merge batches");
         }
+        // Free reservations that cannot dispatch under the current focus or
+        // all-spawns pause *before* the capacity check, so an in-focus (or
+        // unpaused) candidate is not starved by never-started out-of-scope
+        // batches. Own transaction so abandoned member executions publish
+        // terminal events even when this call later defers.
+        self.release_unstartable_pre_merge_review_reservations()?;
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if explicit {
@@ -1435,6 +1609,16 @@ impl WorkDb {
         if already_reviewed {
             tx.commit()?;
             return Ok(ReviewBatchDispatch::AlreadyReviewed);
+        }
+        if let Some(hold) = pre_merge_dispatch_hold_on(&tx, &input.cycle_root_id)? {
+            if explicit {
+                bail!(
+                    "cannot start review batch: {hold} is holding this PR so a pre-merge \
+                     reservation would never be used"
+                );
+            }
+            tx.commit()?;
+            return Ok(ReviewBatchDispatch::AdmissionDeferred);
         }
         if !can_admit_review_batch_in_tx(&tx, ReviewBatchPhase::PreMerge, reservation_capacity(review_pool_size))? {
             if explicit {

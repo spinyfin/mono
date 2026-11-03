@@ -1,8 +1,9 @@
 //! `GetDispatchFocus` / `UpdateDispatchFocus`: the dispatch focus set behind
 //! `bossctl dispatch focus`. The set is persisted in the metadata KV (so it
 //! survives an engine restart) and mirrored into the coordinator, whose
-//! `drain_ready_queue` applies it as a pure admission gate. Nothing here
-//! touches a work item.
+//! `drain_ready_queue` applies it as a pure admission gate. Setting or
+//! narrowing the set also releases never-started out-of-focus pre-merge
+//! review-batch reservations so in-scope reviews are not starved.
 
 use boss_protocol::{DispatchFocus, DispatchFocusAction, DispatchFocusState};
 
@@ -49,6 +50,12 @@ pub(super) fn restore_persisted_dispatch_focus(server_state: &ServerState) {
                  to the focus set until `bossctl dispatch focus clear`",
             );
             server_state.execution_coordinator.restore_dispatch_focus(focus);
+            if let Err(err) = server_state.work_db.release_unstartable_pre_merge_review_reservations() {
+                tracing::warn!(
+                    ?err,
+                    "dispatch: failed to release never-started out-of-focus pre-merge review reservations on restore"
+                );
+            }
         }
         Ok(_) => {}
         Err(err) => {
@@ -159,6 +166,20 @@ pub(super) async fn handle_update_dispatch_focus(ctx: Dispatch, req: FrontendReq
         products = next.product_ids.len(),
         "dispatch: focus set updated",
     );
+    // Persist-then-apply has already made `next` the durable set, so
+    // unstartable out-of-focus pre-merge reservations can be released
+    // against it before the scheduler kick below.
+    match work_db.release_unstartable_pre_merge_review_reservations() {
+        Ok(released) if !released.is_empty() => tracing::info!(
+            released = released.len(),
+            "dispatch: released never-started out-of-focus pre-merge review reservations"
+        ),
+        Ok(_) => {}
+        Err(err) => tracing::warn!(
+            ?err,
+            "dispatch: failed to release never-started out-of-focus pre-merge review reservations"
+        ),
+    }
     coordinator.set_dispatch_focus(next);
     // The board's queue positions mirror the drain's gates, focus included.
     server_state.republish_queued_dispatch_if_changed().await;
