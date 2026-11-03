@@ -142,7 +142,10 @@ pub async fn preserve(jj: &dyn Jj, record: &ExecutionBookmark, workspace: &Path)
     for old in existing.lines() {
         let work = log(jj, &record.repo_path, &unpublished(old), "change_id ++ \"\\n\"").await?;
         let contained = work.lines().all(|change| ancestors.lines().any(|id| id == change));
-        contained_variant |= contained;
+        let old_ancestors = log(jj, &record.repo_path, &format!("::{old}"), "change_id ++ \"\\n\"").await?;
+        contained_variant |= commits
+            .lines()
+            .all(|change| old_ancestors.lines().any(|id| id == change));
         if !work.is_empty() {
             let change = log(jj, &record.repo_path, old, "change_id").await?;
             retained.get_or_insert(PreservedTip {

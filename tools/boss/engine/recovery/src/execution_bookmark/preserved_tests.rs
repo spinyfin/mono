@@ -371,3 +371,35 @@ async fn missing_bookmark_and_missing_commit_are_an_integrity_failure() {
         .unwrap_err();
     assert!(is_pointer_integrity_error(&err), "{err:#}");
 }
+
+#[tokio::test]
+async fn conflicted_preservation_requires_current_work_to_be_retained() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_variant", "local").await.unwrap();
+    std::fs::write(repo.worker.join("work"), "saved work").unwrap();
+    let saved = preserve(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    let op = JjRepo::run(&repo.repo, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
+    for title in ["First variant", "Second variant"] {
+        JjRepo::run(&repo.repo, &["--at-op", &op, "describe", &saved.commit_id, "-m", title]);
+    }
+    let name = preserved_name(&record.execution_id);
+    let variants = JjRepo::run(
+        &repo.repo,
+        &["log", "--no-graph", "-r", &name, "-T", "commit_id ++ \"\\n\""],
+    );
+    assert_eq!(variants.lines().count(), 2);
+    JjRepo::run(&repo.replacement, &["edit", variants.lines().next().unwrap()]);
+    assert!(preserve(&LocalJj, &record, &repo.replacement).await.is_ok());
+    JjRepo::run(&repo.replacement, &["new", "-m", "Additional work"]);
+    std::fs::write(repo.replacement.join("extra"), "not yet retained").unwrap();
+    let error = preserve(&LocalJj, &record, &repo.replacement).await.unwrap_err();
+    assert!(is_pointer_integrity_error(&error));
+    assert_eq!(
+        JjRepo::run(
+            &repo.repo,
+            &["log", "--no-graph", "-r", &name, "-T", "commit_id ++ \"\\n\""]
+        ),
+        variants
+    );
+}
