@@ -113,7 +113,6 @@ filegroup(
     name = "srcs",
     srcs = glob(["src/**/*.rs"]),
     visibility = [
-        "//tools/boss/engine/app:__pkg__",
         "//tools/boss/engine/core:__pkg__",
     ],
 )

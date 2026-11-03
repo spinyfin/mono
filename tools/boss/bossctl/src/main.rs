@@ -416,8 +416,8 @@ enum Command {
         #[arg(long)]
         until: Option<String>,
         /// Match the JSON `target` field (tracing module path). Exact match
-        /// or module-prefix (`boss_engine::app` matches
-        /// `boss_engine::app::server`). Does **not** search message bodies.
+        /// or module-prefix (`boss_engine_app::app` matches
+        /// `boss_engine_app::app::server`). Does **not** search message bodies.
         #[arg(long)]
         target: Option<String>,
         /// Match the JSON `level` field case-insensitively (`info`, `ERROR`).

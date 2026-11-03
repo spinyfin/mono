@@ -95,8 +95,8 @@ pub(super) async fn raise_project_scoped_engine_health_attention(
 
 /// Surface a latched coordinator restart ceiling in each active project's
 /// attention feed. The supervisor keeps retrying at the flat `BACKOFF_CAP`
-/// cadence after the ceiling; this makes that condition visible to the
-/// operator rather than only in tracing.
+/// cadence after the ceiling; this publishes the condition in each project's
+/// attention feed as well as tracing.
 pub(super) async fn raise_coordinator_restart_ceiling_attention(server_state: &Arc<ServerState>) {
     raise_project_scoped_engine_health_attention(
         server_state,

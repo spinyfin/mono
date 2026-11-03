@@ -85,6 +85,7 @@ mod coordinator_guidance;
 mod coordinator_handoff;
 mod cost;
 mod critical_requests;
+mod decision_notifications;
 mod decisions;
 mod dependencies;
 mod design_docs;
@@ -95,15 +96,9 @@ mod engine_meta;
 mod events_accept;
 mod executions;
 mod external_tracker;
-mod github_auth;
-mod queued_dispatch;
-mod tmux_health;
-// `pub(crate)` so the spawn-capability circuit breaker (`boss_engine_runtime::spawn_health`)
-// can persist its auto-pause through the same `METADATA_KEY_DISPATCH_PAUSED*`
-// keys the human dispatch toggle uses. Individual items stay `pub(crate)`/
-// `pub(super)`; only the module path is widened.
 mod frontend_event_kind;
 pub(crate) mod frontend_metrics;
+mod github_auth;
 pub(crate) mod handler_helpers;
 mod hosts;
 mod ideas;
@@ -116,24 +111,18 @@ mod metrics;
 mod pane_delivery;
 mod pane_ops;
 mod panes;
+mod panic_hook;
 mod pid_file;
 mod planner_ops;
 mod pr_status;
-mod project_postmortem_ops;
-// `pub(crate)` so `boss_engine_runtime::attention_lifecycle` can bind
-// `PROBE_UNDELIVERED_ATTENTION_KIND` rather than re-spelling the string.
-// Individual items stay `pub(super)`; only the module path is widened.
 mod probe_interrupt;
 pub(crate) mod probes;
 mod process_signals;
 mod products;
+mod project_postmortem_ops;
 mod projects;
 pub(crate) mod proposals;
-// `pub(crate)` so `boss_engine_runtime::attention_lifecycle` can name
-// `PROGRESS_INGRESS_UNRECOVERABLE_ATTENTION_KIND` in the lifecycle registry
-// (crate-internal only — nothing outside the engine sees this module).
-mod decision_notifications;
-mod panic_hook;
+mod queued_dispatch;
 pub(crate) mod readoption;
 mod review;
 mod review_guide;
@@ -145,6 +134,7 @@ mod shutdown;
 mod subscriptions;
 #[cfg(test)]
 mod tests;
+mod tmux_health;
 mod tmux_teardown;
 mod transcript_persist;
 mod trunk_auth;

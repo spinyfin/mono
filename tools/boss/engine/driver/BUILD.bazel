@@ -136,7 +136,6 @@ filegroup(
     }),
     # engine/core's conformance live pins run against the same pinned release.
     visibility = [
-        "//tools/boss/engine/app:__pkg__",
         "//tools/boss/engine/core:__pkg__",
     ],
 )
@@ -151,7 +150,6 @@ filegroup(
     }),
     # engine/core's conformance live pins run against the same pinned release.
     visibility = [
-        "//tools/boss/engine/app:__pkg__",
         "//tools/boss/engine/core:__pkg__",
     ],
 )
@@ -162,7 +160,6 @@ filegroup(
     name = "srcs",
     srcs = glob(["src/**/*.rs"]),
     visibility = [
-        "//tools/boss/engine/app:__pkg__",
         "//tools/boss/engine/core:__pkg__",
     ],
 )

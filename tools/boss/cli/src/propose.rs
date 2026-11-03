@@ -5,7 +5,7 @@
 //! [`FrontendRequest::SubmitProposal`] / [`FrontendRequest::ListProposals`]
 //! call and renders the typed reply. Payload validation (schema, rate
 //! caps, attribution) happens engine-side — see
-//! `boss_engine_proposal_validation` and `engine/core/src/app/proposals.rs`
+//! `boss_engine_proposal_validation` and `engine/app/src/app/proposals.rs`
 //! — so a malformed submission comes back as a
 //! [`FrontendEvent::ProposalRejected`] the worker can act on immediately,
 //! rather than a client-side guess at what the engine would have accepted.
@@ -1084,7 +1084,7 @@ fn flag_hint_for_field(kind: ProposalKind, field: &str) -> Option<&'static str> 
 /// `None` for `--list` rejections, which never carry field errors.
 ///
 /// `pub(crate)`: `boss context` reuses `ProposalRejected` for its own
-/// attribution failures (see `engine/core/src/app/context.rs`'s doc
+/// attribution failures (see `engine/app/src/app/context.rs`'s doc
 /// comment), so `context::run_context_command` renders them the same way
 /// with `kind = None`.
 pub(crate) fn render_proposal_rejection(kind: Option<ProposalKind>, error: ProposalSubmissionError) -> CliError {

@@ -137,9 +137,8 @@ pub mod merge_mechanism;
 pub mod merge_when_ready;
 pub mod run_cost;
 // The metrics framework lives in its own crate; alias it under the
-// module path the engine has always used it by. `metrics_init` holds
-// the engine-specific startup registration that can't move down
-// (it names every engine module that declares a handle).
+// module path the engine has always used it by. The engine-specific startup
+// registration lives in `boss_engine_app::metrics_init`.
 pub use boss_metrics as metrics;
 // Re-exported so the declaration macros keep resolving as
 // `crate::register_counter!` at every engine call site; the macros

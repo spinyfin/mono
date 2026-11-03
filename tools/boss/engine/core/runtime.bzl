@@ -55,7 +55,7 @@ def runtime_libraries():
             # explicit list silently drifts when a new `mod` file is added (it is
             # then absent from rustc's inputs -> E0583). Every other boss crate globs.
             exclude = [
-                # Crate root of the `engine` rust_binary below, not the library.
+                # Crate root of the `engine` rust_binary in `core/BUILD.bazel`, not the library.
                 "src/main.rs",
                 "src/facade.rs",
             ],
@@ -122,9 +122,9 @@ def runtime_libraries():
             "//lib/rust/git_utils",
             # NOT "//tools/boss/build-provenance": that crate's source embeds
             # the commit sha and changes every commit. It is linked only by the
-            # two `engine` rust_binary targets below, which hand the values to
+            # two `engine` rust_binary targets in `core/BUILD.bazel`, which hand the values to
             # `build_info::install_provenance` at startup. See
-            # `stamped_provenance_isolation_test` at the bottom of this file.
+            # `stamped_provenance_isolation_test` in `core/BUILD.bazel`.
             "//tools/boss/claude_client",
             "//tools/boss/codex_auth",
             "//tools/boss/command-runner",

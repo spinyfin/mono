@@ -2,8 +2,8 @@
 //! handlers — `boss handoff show` / `boss handoff write`.
 //!
 //! The coordinator session handoff is the short brief the outgoing
-//! coordinator session writes so the next one does not start with zero
-//! knowledge of what the operator said; see [`boss_engine_runtime::coordinator_handoff`]
+//! coordinator session writes so the next one starts with the prior
+//! instructions and decisions; see [`boss_engine_runtime::coordinator_handoff`]
 //! for the storage, state, and delivery design. These handlers are the
 //! write path (the coordinator itself, via the CLI) and the read-back path
 //! (`show`, e.g. after context compaction).

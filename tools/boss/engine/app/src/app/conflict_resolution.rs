@@ -298,7 +298,7 @@ pub(super) async fn handle_record_producer_side_conflict(ctx: Dispatch, req: Fro
         unreachable!()
     };
     {
-        // Worker-facing telemetry surface (Layer 0 / T1). Same
+        // Worker-facing telemetry surface. Same
         // `User`-tier reasoning as `mark_conflict_resolution_failed`:
         // the only state change is a fresh, self-contained
         // `conflict_resolutions` row — a worker forging bogus content

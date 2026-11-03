@@ -198,7 +198,7 @@ stopped session **on its own** when a background command finishes, and
 that resumed turn opens with tool hooks and no prompt.
 
 What can go wrong is ordering. The events-socket accept loop
-(`engine/core/src/app/events_accept.rs`) dispatches every connection on its
+(`engine/app/src/app/events_accept.rs`) dispatches every connection on its
 own task, so two hooks the worker emitted in order can reach the reducer in
 either order — and the race is not symmetric. A turn boundary persists the
 transcript path and folds the transcript into the run's cost snapshot (a
@@ -253,7 +253,7 @@ Three things close the ordering hole:
   tests) keep the always-apply `apply_event`.
 - **The live-state transition and its durable projection run before the
   slow half of ingress.** `dispatch_live_worker_state`
-  (`engine/core/src/app/worker_events.rs`) applies the event, broadcasts,
+  (`engine/app/src/app/worker_events.rs`) applies the event, broadcasts,
   and mirrors the awaiting-input state onto the execution row, and only then
   persists the transcript path and captures cost. The row write is decided
   from the pane's activity at write time, inside a gate that serializes the
