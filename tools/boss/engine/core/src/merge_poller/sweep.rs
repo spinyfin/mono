@@ -414,7 +414,7 @@ pub async fn run_one_pass_observed(
         + stranded_ci_attempts.len()
         + stranded_blocked.len()
         + late_pr_candidates.len();
-    if total == 0 {
+    if total == 0 && !super::deferred_review_admission::has_pending_review_admission(work_db, completion_handler) {
         // No candidates at all: an empty observation set, which retires every
         // remaining adaptive slot rather than leaving orphans behind.
         return (SweepOutcome::default(), Vec::new());
@@ -610,21 +610,17 @@ pub async fn run_one_pass_observed(
         .await;
     }
 
-    if skip_unbatched_review_holds {
-        let pool_size = completion_handler
-            .map(|handler| handler.review_pool_size())
-            .unwrap_or(boss_execution_contracts::DEFAULT_REVIEW_POOL_SIZE);
-        if let Some(handler) = completion_handler {
-            sweep_deferred_review_admission_with(
-                work_db,
-                publisher,
-                handler.review_batch_enqueuer(),
-                None,
-                pool_size,
-                &mut outcome,
-            )
-            .await;
-        }
+    if skip_unbatched_review_holds && let Some(handler) = completion_handler {
+        let pool_size = handler.review_pool_size();
+        sweep_deferred_review_admission_with(
+            work_db,
+            publisher,
+            handler.review_batch_enqueuer(),
+            None,
+            pool_size,
+            &mut outcome,
+        )
+        .await;
     }
     if let Err(err) = work_db.sweep_reported_live_review_batch_members() {
         tracing::warn!(?err, "merge poller: failed to sweep reported live batch members");
@@ -846,21 +842,17 @@ pub async fn reconcile_batch(
         }
         Err(err) => tracing::warn!(?err, "merge poller: failed to list stalled reviewer tasks"),
     }
-    if skip_unbatched_review_holds {
-        let pool_size = completion_handler
-            .map(|handler| handler.review_pool_size())
-            .unwrap_or(boss_execution_contracts::DEFAULT_REVIEW_POOL_SIZE);
-        if let Some(handler) = completion_handler {
-            sweep_deferred_review_admission_with(
-                work_db,
-                publisher,
-                handler.review_batch_enqueuer(),
-                Some(&wanted),
-                pool_size,
-                &mut outcome,
-            )
-            .await;
-        }
+    if skip_unbatched_review_holds && let Some(handler) = completion_handler {
+        let pool_size = handler.review_pool_size();
+        sweep_deferred_review_admission_with(
+            work_db,
+            publisher,
+            handler.review_batch_enqueuer(),
+            Some(&wanted),
+            pool_size,
+            &mut outcome,
+        )
+        .await;
     }
 
     // Observe every *requested* URL, not just the probed ones, so a URL that
@@ -1421,7 +1413,8 @@ pub(crate) async fn sweep_one(
                 handler.reconcile_review_guide_source_from_probe(
                     &candidate.work_item_id,
                     &candidate.pr_url,
-                    boss_pr_review_sources::PinnedComparison { base_sha, head_sha },
+                    &base_sha,
+                    &head_sha,
                     observation_sequence,
                 );
             }
@@ -2280,13 +2273,13 @@ impl PrPollStateWriter for MergePollerPrPollStateWriter {
 
 /// Persist CI + review + merge-queue poll state and emit a change event
 /// when any field flips value. Called from `sweep_one` for every open PR and
-/// from `completion.rs` after the on-transition initial CI fetch.
+/// through [`MergePollerPrPollStateWriter`] after completion's initial CI fetch.
 ///
 /// `known_active_queue_failure` lets the sweep reaper hand off its already-
 /// loaded merge-queue remediation (or `Some(None)` when it just retired one)
 /// so this function does not open a second sqlite connection for the same
 /// work item on the same pass. Pass `None` when the caller did not run the
-/// reaper — this function self-fetches in that case (e.g. `completion.rs`).
+/// reaper — this function self-fetches in that case (e.g. the completion adapter).
 pub(crate) async fn update_pr_poll_state(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,

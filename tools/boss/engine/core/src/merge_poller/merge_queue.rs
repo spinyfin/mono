@@ -1,26 +1,5 @@
 use super::*;
 
-/// One `RemovedFromMergeQueueEvent` entry from the PR's timeline.
-#[derive(Debug, Clone)]
-pub struct MergeQueueDequeueEvent {
-    pub reason: String,
-    /// Time GitHub recorded the dequeue event. An intent created after this
-    /// event must not be retired by historical timeline evidence.
-    pub created_at: Option<String>,
-    /// PR head that was in effect when this timeline event was emitted.
-    /// Derived from the preceding `PullRequestCommit` /
-    /// `HeadRefForcePushedEvent` in the same ordered timeline connection.
-    /// `None` means the bounded timeline window did not carry enough
-    /// evidence to attribute the queue failure to a PR head, so callers
-    /// must not mint a CI-failure revision from it.
-    pub pr_head_oid: Option<String>,
-    /// `beforeCommit.oid` — the synthetic merge SHA that failed CI.
-    /// `None` when GitHub omitted it (edge case for non-CI reasons).
-    pub before_commit_oid: Option<String>,
-    /// First parent of the failed queue construction, possibly including queued siblings.
-    pub queue_base_oid: Option<String>,
-}
-
 /// Timeline-events selection set for [`build_batch_query`]'s `fields`
 /// parameter, used by [`fetch_merge_queue_dequeue_events_batch`]. Requests
 /// the last 20 PR-head / dequeue timeline entries. Including PR commits and

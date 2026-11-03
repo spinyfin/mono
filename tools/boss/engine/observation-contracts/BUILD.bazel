@@ -14,7 +14,6 @@ rust_library(
         "//tools/boss/engine/core:__pkg__",
     ],
     deps = [
-        "//tools/boss/engine/pr-review-sources",
         "//tools/boss/engine/work-db",
         "//tools/boss/github",
         "//tools/boss/protocol",
@@ -37,7 +36,6 @@ rust_library(
         "//tools/boss/engine/core:__pkg__",
     ],
     deps = [
-        "//tools/boss/engine/pr-review-sources",
         "//tools/boss/engine/work-db:work_db_test_support",
         "//tools/boss/github",
         "//tools/boss/protocol",

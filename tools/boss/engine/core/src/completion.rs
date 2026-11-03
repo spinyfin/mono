@@ -78,8 +78,8 @@ use boss_execution_contracts::{CubeClient, ExecutionPublisher, PreemptOutcome};
 use boss_gh_telemetry::{callers, scope as gh_scope};
 use boss_github::pr_url::pr_number_from_url;
 use boss_observation_contracts::{
-    MergeProbe, NoopMergeProbe, NoopPrPollStateWriter, OpenPrCiStatus, OpenPrMergeability, PrLifecycleProbe,
-    PrLifecycleState, PrPollStateWriter,
+    MergeProbe, MergeQueueDequeueEvent, MergeQueueTimeline, NoopMergeProbe, NoopPrPollStateWriter, OpenPrCiStatus,
+    OpenPrMergeability, PrLifecycleProbe, PrLifecycleState, PrPollStateWriter, UnsupportedMergeQueueTimeline,
 };
 
 // The inherent `impl WorkerCompletionHandler` is split across the submodules
@@ -628,11 +628,7 @@ pub trait BranchVerifier: Send + Sync {
         Err(anyhow!("ancestry lookup unsupported by this verifier"))
     }
 
-    async fn fetch_queue_dequeues(
-        &self,
-        _repo_slug: &str,
-        _pr_number: u64,
-    ) -> Result<Vec<crate::merge_poller::MergeQueueDequeueEvent>> {
+    async fn fetch_queue_dequeues(&self, _repo_slug: &str, _pr_number: u64) -> Result<Vec<MergeQueueDequeueEvent>> {
         Err(anyhow!("queue timeline lookup unsupported by this verifier"))
     }
 
@@ -649,12 +645,26 @@ pub trait BranchVerifier: Send + Sync {
 }
 
 /// `BranchVerifier` that shells out to `gh pr view`.
-#[derive(Debug, Default)]
-pub struct CommandBranchVerifier;
+pub struct CommandBranchVerifier {
+    queue_timeline: Arc<dyn MergeQueueTimeline>,
+}
+
+impl Default for CommandBranchVerifier {
+    fn default() -> Self {
+        Self {
+            queue_timeline: Arc::new(UnsupportedMergeQueueTimeline),
+        }
+    }
+}
 
 impl CommandBranchVerifier {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    pub fn with_queue_timeline(mut self, timeline: Arc<dyn MergeQueueTimeline>) -> Self {
+        self.queue_timeline = timeline;
+        self
     }
 }
 
@@ -700,14 +710,9 @@ impl BranchVerifier for CommandBranchVerifier {
         Ok(matches!(status.as_str(), "ahead" | "identical"))
     }
 
-    async fn fetch_queue_dequeues(
-        &self,
-        repo_slug: &str,
-        pr_number: u64,
-    ) -> Result<Vec<crate::merge_poller::MergeQueueDequeueEvent>> {
+    async fn fetch_queue_dequeues(&self, repo_slug: &str, pr_number: u64) -> Result<Vec<MergeQueueDequeueEvent>> {
         let url = format!("https://github.com/{repo_slug}/pull/{pr_number}");
-        let mut events = crate::merge_poller::fetch_merge_queue_dequeue_events_batch(std::slice::from_ref(&url)).await;
-        events.remove(&url).context("queue timeline unavailable")
+        self.queue_timeline.fetch_dequeues(&url).await
     }
 
     async fn fetch_pr_merge_queue_snapshot(
@@ -2315,4 +2320,67 @@ mod tests;
 #[cfg(test)]
 pub(crate) fn integration_handler(db: Arc<crate::work::WorkDb>, pr_url: &str) -> WorkerCompletionHandler {
     tests::integration_handler(db, pr_url)
+}
+
+#[cfg(test)]
+mod queue_timeline_contract_tests {
+    use super::*;
+
+    struct RecordingTimeline {
+        urls: std::sync::Mutex<Vec<String>>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl MergeQueueTimeline for RecordingTimeline {
+        async fn fetch_dequeues(&self, url: &str) -> Result<Vec<MergeQueueDequeueEvent>> {
+            self.urls.lock().unwrap().push(url.into());
+            if self.fail {
+                anyhow::bail!("queue timeline unavailable");
+            }
+            Ok(vec![MergeQueueDequeueEvent {
+                reason: "FAILED_CHECKS".into(),
+                created_at: Some("2026-10-01T00:00:00Z".into()),
+                pr_head_oid: Some("head".into()),
+                before_commit_oid: Some("queue".into()),
+                queue_base_oid: Some("base".into()),
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn command_verifier_delegates_queue_timeline_and_propagates_errors() {
+        for fail in [false, true] {
+            let timeline = Arc::new(RecordingTimeline {
+                urls: Default::default(),
+                fail,
+            });
+            let verifier = CommandBranchVerifier::new().with_queue_timeline(timeline.clone());
+            let result = verifier.fetch_queue_dequeues("example/repo", 42).await;
+            assert_eq!(
+                timeline.urls.lock().unwrap().as_slice(),
+                &["https://github.com/example/repo/pull/42"]
+            );
+            if fail {
+                assert_eq!(result.unwrap_err().to_string(), "queue timeline unavailable");
+            } else {
+                let events = result.unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].reason, "FAILED_CHECKS");
+                assert_eq!(events[0].pr_head_oid.as_deref(), Some("head"));
+                assert_eq!(events[0].before_commit_oid.as_deref(), Some("queue"));
+                assert_eq!(events[0].queue_base_oid.as_deref(), Some("base"));
+                assert_eq!(events[0].created_at.as_deref(), Some("2026-10-01T00:00:00Z"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn command_verifier_without_timeline_preserves_unsupported_error() {
+        let err = CommandBranchVerifier::new()
+            .fetch_queue_dequeues("example/repo", 42)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "queue timeline lookup unsupported by this verifier");
+    }
 }

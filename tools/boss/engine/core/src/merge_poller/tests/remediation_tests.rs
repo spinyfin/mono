@@ -188,7 +188,7 @@ async fn blocked_remediation_does_not_delay_detection_of_an_unrelated_pr() {
             probe.as_ref(),
             publisher.as_ref(),
             Some(&NoopCubeClient as &dyn CubeClient),
-            Some(&handler as &dyn CompletionRequests),
+            Some(&handler),
             Some(&remediation.queue),
         ),
     )
@@ -267,7 +267,7 @@ async fn repeat_passes_do_not_stack_ladder_runs_on_the_same_pr() {
             probe.as_ref(),
             publisher.as_ref(),
             Some(&NoopCubeClient as &dyn CubeClient),
-            Some(&handler as &dyn CompletionRequests),
+            Some(&handler),
             Some(&remediation.queue),
         )
         .await;
@@ -342,7 +342,7 @@ async fn a_declined_enqueue_is_retried_by_a_later_pass_rather_than_stranding_the
             probe.as_ref(),
             publisher.as_ref(),
             Some(&NoopCubeClient as &dyn CubeClient),
-            Some(&handler as &dyn CompletionRequests),
+            Some(&handler),
             Some(&queue),
         )
         .await

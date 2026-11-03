@@ -41,7 +41,8 @@ use crate::live_status_loop::{
 };
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::merge_poller::{
-    CommandMergeProbe, MergePollerPrPollStateWriter, MergeProbe, spawn_loop as spawn_merge_poller,
+    CommandMergeProbe, MergePollerPrPollStateWriter, MergePollerQueueTimeline, MergeProbe,
+    spawn_loop as spawn_merge_poller,
 };
 use crate::merge_when_ready;
 use crate::protocol::{
@@ -1625,6 +1626,7 @@ impl ServerState {
         .with_staged_unobserved_commands(staged_unobserved_commands.clone())
         .with_feature_flags(feature_flags_for_handler)
         .with_merge_probe(ci_probe)
+        .with_merge_queue_timeline(Arc::new(MergePollerQueueTimeline))
         .with_pr_poll_state_writer(Arc::new(MergePollerPrPollStateWriter::new(publisher.clone())))
         .with_metrics(metrics_for_completion)
         .with_max_review_cycles(cfg.work.max_review_cycles)

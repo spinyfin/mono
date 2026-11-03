@@ -1300,7 +1300,7 @@ async fn merged_pr_redispatches_live_review_revision_as_followup_and_records_can
         probe.as_ref(),
         publisher.as_ref(),
         None,
-        Some(&handler as &dyn CompletionRequests),
+        Some(&handler),
         None,
     )
     .await;
@@ -2447,7 +2447,7 @@ async fn run_one_pass_recovers_late_pr_for_abandoned_execution() {
         probe.as_ref(),
         publisher.as_ref(),
         None,
-        Some(&handler as &dyn CompletionRequests),
+        Some(&handler),
         None,
     )
     .await;
@@ -2535,7 +2535,7 @@ async fn ci_resolved_stops_live_worker_and_keeps_task_in_review() {
         probe.as_ref(),
         publisher.as_ref(),
         None,
-        Some(&handler as &dyn CompletionRequests),
+        Some(&handler),
         None,
     )
     .await;

@@ -65,7 +65,7 @@ async fn merged_pr_redispatches_leaseless_review_revision_converted_in_place() {
     super::super::sweep::stop_active_revision_executions(
         &db,
         publisher.as_ref(),
-        Some(&handler as &dyn CompletionRequests),
+        Some(&handler),
         &parent_id,
         &mut outcome,
     )

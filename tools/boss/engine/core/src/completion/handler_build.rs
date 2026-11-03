@@ -491,9 +491,13 @@ impl WorkerCompletionHandler {
         self
     }
 
-    /// Wire the merge poller's poll-state writer for the on-transition CI
-    /// pre-fetch. Production passes [`crate::merge_poller::MergePollerPrPollStateWriter`]
-    /// so completion does not import the poller's `update_pr_poll_state`.
+    /// Configure the command verifier's merge-queue timeline transport.
+    pub fn with_merge_queue_timeline(mut self, timeline: Arc<dyn MergeQueueTimeline>) -> Self {
+        self.branch_verifier = Arc::new(CommandBranchVerifier::new().with_queue_timeline(timeline));
+        self
+    }
+
+    /// Configure the writer for completion's on-transition CI pre-fetch.
     pub fn with_pr_poll_state_writer(mut self, writer: Arc<dyn PrPollStateWriter>) -> Self {
         self.pr_poll_state_writer = writer;
         self
@@ -578,14 +582,18 @@ impl CompletionRequests for WorkerCompletionHandler {
         &self,
         root_task_id: &str,
         pr_url: &str,
-        observed: boss_pr_review_sources::PinnedComparison,
+        base_sha: &str,
+        head_sha: &str,
         observation_sequence: i64,
     ) {
         WorkerCompletionHandler::reconcile_review_guide_source_from_probe(
             self,
             root_task_id,
             pr_url,
-            observed,
+            boss_pr_review_sources::PinnedComparison {
+                base_sha: base_sha.into(),
+                head_sha: head_sha.into(),
+            },
             observation_sequence,
         );
     }

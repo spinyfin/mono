@@ -1301,7 +1301,6 @@ dependencies = [
  "async-trait",
  "bon",
  "boss-github",
- "boss-pr-review-sources",
  "boss-protocol",
  "boss-work-db",
  "tokio",

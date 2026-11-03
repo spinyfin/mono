@@ -2,6 +2,20 @@
 
 use super::*;
 
+/// Deferred admission can be the only work in an otherwise empty sweep.
+pub(super) fn has_pending_review_admission(work_db: &WorkDb, handler: Option<&dyn CompletionRequests>) -> bool {
+    if !handler.is_some_and(|handler| handler.review_batch_fanout_enabled()) {
+        return false;
+    }
+    match work_db.list_tasks_awaiting_pre_merge_review_admission() {
+        Ok(candidates) => !candidates.is_empty(),
+        Err(err) => {
+            tracing::warn!(?err, "merge poller: failed to list deferred review-admission tasks");
+            false
+        }
+    }
+}
+
 /// Retry pre-merge review admission for tasks held in PendingReview with no
 /// live batch. Distinguishes a new head (create a batch or stay deferred)
 /// from a completed batch on the current SHA (advance to human Review).

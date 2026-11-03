@@ -50,7 +50,8 @@ use boss_event_bus::Event;
 pub use boss_github::{CiProvider, RequiredCheckFailure};
 use boss_github::{fetch_failing_checks_for_commit, parse_provider_job_id, provider_for_url};
 pub(crate) use boss_observation_contracts::{
-    CompletionRequests, PrPollStateWriter, ReviewBatchEnqueuer, StopOutcome, file_admission_deferred_attention,
+    CompletionRequests, MergeQueueTimeline, PrPollStateWriter, ReviewBatchEnqueuer, StopOutcome,
+    file_admission_deferred_attention,
 };
 
 use crate::blocking_signal::SignalKind;
@@ -89,8 +90,9 @@ mod probe;
 mod schedule;
 mod sweep;
 
+pub use boss_observation_contracts::MergeQueueDequeueEvent;
 pub use classify::*;
-pub use merge_queue::*;
+pub(crate) use merge_queue::*;
 pub use metrics::*;
 #[cfg(test)]
 pub(crate) use post_merge_review::maybe_trigger_post_merge_review;
@@ -100,3 +102,14 @@ pub use sweep::*;
 
 #[cfg(test)]
 mod tests;
+
+/// GitHub timeline transport shared with completion at composition time.
+pub struct MergePollerQueueTimeline;
+
+#[async_trait]
+impl MergeQueueTimeline for MergePollerQueueTimeline {
+    async fn fetch_dequeues(&self, pr_url: &str) -> Result<Vec<MergeQueueDequeueEvent>> {
+        let mut events = fetch_merge_queue_dequeue_events_batch(&[pr_url.to_owned()]).await;
+        events.remove(pr_url).context("queue timeline unavailable")
+    }
+}
