@@ -356,6 +356,28 @@ fn assert_forced_admission(parked: &Parked, execution_id: &str, expected: bool) 
     );
 }
 
+/// After the writer reaches `in_review`, `try_unblock_dependency_if_resolved`
+/// promotes the waiting row to `ready`. ServerState's live scheduler can then
+/// claim it (operator-forced admission still holds through the pause) before
+/// the test reads the row, so `Claimed` / `Running` are the same unblocked
+/// outcome as `Ready`.
+fn assert_unblocked_for_dispatch(exec: &WorkExecution) {
+    assert_ne!(
+        exec.status,
+        ExecutionStatus::WaitingDependency,
+        "{} still waiting after the writer finished",
+        exec.id
+    );
+    assert!(
+        matches!(
+            exec.status,
+            ExecutionStatus::Ready | ExecutionStatus::Claimed | ExecutionStatus::Running
+        ),
+        "unexpected status after writer finished: {:?}",
+        exec.status
+    );
+}
+
 fn port_revision_id(parked: &Parked) -> String {
     parked
         .state
@@ -532,7 +554,7 @@ async fn force_answer_behind_a_writer_dispatches_once_the_writer_finishes() {
     assert_not_dispatched(&parked, &exec.id);
     complete_writer(&parked, &writer_id, &parked.revision_id);
     let exec = latest_execution(&parked.state, &parked.revision_id);
-    assert_eq!(exec.status, ExecutionStatus::Ready);
+    assert_unblocked_for_dispatch(&exec);
     timed_drain(&parked).await;
     wait_until_runner_saw(&parked, &exec.id).await;
     assert_forced_admission(&parked, &exec.id, false);
@@ -552,7 +574,7 @@ async fn rewrite_answer_behind_a_writer_dispatches_once_the_writer_finishes() {
     assert_not_dispatched(&parked, &exec.id);
     complete_writer(&parked, &writer_id, &port_id);
     let exec = latest_execution(&parked.state, &port_id);
-    assert_eq!(exec.status, ExecutionStatus::Ready);
+    assert_unblocked_for_dispatch(&exec);
     timed_drain(&parked).await;
     wait_until_runner_saw(&parked, &exec.id).await;
     assert_forced_admission(&parked, &exec.id, false);
