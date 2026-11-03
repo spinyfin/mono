@@ -14,8 +14,38 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Worker-facing `mark-failed` reason: the upstream change already did what
+/// this PR was trying to do.
+pub const CONFLICT_OBSOLESCENCE_SUSPECTED_REASON: &str = "obsolescence_suspected";
+/// Worker-facing `mark-failed` reason: the conflict needs a human choice
+/// between two valid resolutions.
+pub const CONFLICT_PRODUCT_DECISION_REQUIRED_REASON: &str = "product_decision_required";
 /// The `mark-failed` reason that raises the question.
 pub const CONFLICT_ARCHITECTURAL_MISMATCH_REASON: &str = "architectural_mismatch";
+
+/// The closed set of reasons a worker may pass to
+/// `boss engine conflicts mark-failed`. Engine-internal reasons (for example
+/// `no_push_no_stop_condition`) are not on this list: they go through
+/// `WorkDb::mark_conflict_resolution_failed` directly.
+pub const CONFLICT_MARK_FAILED_REASONS: [&str; 3] = [
+    CONFLICT_OBSOLESCENCE_SUSPECTED_REASON,
+    CONFLICT_PRODUCT_DECISION_REQUIRED_REASON,
+    CONFLICT_ARCHITECTURAL_MISMATCH_REASON,
+];
+
+/// Whether `reason` is one of [`CONFLICT_MARK_FAILED_REASONS`]. The error
+/// text is shown to the worker, so it names the allowed reasons and the
+/// same porting guidance as [`ArchitecturalMismatchEvidence::validate`].
+pub fn validate_conflict_mark_failed_reason(reason: &str) -> Result<(), String> {
+    if CONFLICT_MARK_FAILED_REASONS.contains(&reason) {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{reason}` is not an allowed mark-failed reason. Use `{CONFLICT_OBSOLESCENCE_SUSPECTED_REASON}`, \
+             `{CONFLICT_PRODUCT_DECISION_REQUIRED_REASON}`, or `{CONFLICT_ARCHITECTURAL_MISMATCH_REASON}`. {GUIDANCE}"
+        ))
+    }
+}
 
 /// Answer that rewrites the PR onto the new base as a port-sized revision.
 pub const CONFLICT_MISMATCH_CHOICE_REWRITE: &str = "Rewrite onto the new base";
@@ -265,5 +295,17 @@ mod tests {
             assert_eq!(MismatchBasis::parse(basis.as_str()), Some(basis));
         }
         assert_eq!(MismatchBasis::parse("files_moved"), None);
+    }
+
+    #[test]
+    fn non_canonical_mark_failed_reasons_are_rejected() {
+        for reason in ["gave_up", "too_many_conflicts", "architecture_mismatch", ""] {
+            let err = validate_conflict_mark_failed_reason(reason).unwrap_err();
+            assert!(err.contains("not an allowed mark-failed reason"), "{err}");
+            assert!(err.contains("normal conflict work"), "{err}");
+        }
+        for reason in CONFLICT_MARK_FAILED_REASONS {
+            validate_conflict_mark_failed_reason(reason).unwrap();
+        }
     }
 }

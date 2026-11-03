@@ -252,6 +252,10 @@ pub(super) async fn handle_mark_conflict_resolution_failed(ctx: Dispatch, req: F
         }
         return;
     }
+    if let Err(message) = boss_protocol::validate_conflict_mark_failed_reason(&reason) {
+        send_work_error(&sink, &request_id, &message);
+        return;
+    }
     {
         // Worker-facing stop-condition surface. `User` tier:
         // the worker pane invokes `boss engine conflicts
@@ -260,7 +264,10 @@ pub(super) async fn handle_mark_conflict_resolution_failed(ctx: Dispatch, req: F
         // change is on a `conflict_resolutions` row keyed by
         // an opaque id — a worker forging an attempt id has
         // no row to clobber, so authority gates aren't
-        // load-bearing here.
+        // load-bearing here. Non-canonical reasons are rejected
+        // above; engine-internal reasons such as
+        // `no_push_no_stop_condition` call
+        // `WorkDb::mark_conflict_resolution_failed` directly.
         match work_db.mark_conflict_resolution_failed(&attempt_id, &reason) {
             Ok(Some(attempt)) => {
                 tracing::warn!(

@@ -2586,9 +2586,10 @@ impl OperatorAnswerOutcome {
 /// A task still gated by prerequisites (a conflict revision queued behind
 /// another writer on the same PR is the common case) cannot be started
 /// explicitly: that request is refused, which would roll the whole answer back
-/// and leave the question open. Such a task is returned to Todo with a
-/// waiting execution instead, and the dependency cascade promotes it when the
-/// gate clears.
+/// and leave the question open. Such a task is parked as `blocked` /
+/// `dependency` with a waiting execution, matching revision insert and
+/// prerequisite approval, so the dependency cascade promotes it on the
+/// event path when the gate clears.
 pub(super) fn restart_after_answer(
     pending: &mut PendingEvents,
     tx: &rusqlite::Transaction<'_>,
@@ -2608,6 +2609,7 @@ pub(super) fn restart_after_answer(
         params![task.id, description, now],
     )?;
     if !deps::gating_prereqs_for(tx, &task.id)?.is_empty() {
+        maybe_engine_block_dependent(pending, tx, &task.id, now)?;
         let task = query_task(tx, &task.id).require("task", &task.id)?;
         if task.kind == TaskKind::Revision {
             reconcile_revision_execution(pending, tx, &mut ExecutionReconcileResult::default(), &task)?;

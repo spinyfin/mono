@@ -392,6 +392,12 @@ fn answering_a_gated_conflict_revision_parks_it_behind_its_gate_instead_of_faili
         )
         .expect("a gated item can still be answered");
     assert!(!outcome.minted_execution, "the gate decides when it starts");
+    assert_eq!(task_status(&f.db, &f.revision_id), "blocked");
+    assert_eq!(
+        blocked_fields(&f.db, &f.revision_id).0.as_deref(),
+        Some("dependency"),
+        "the cascade only promotes engine-owned dependency blocks"
+    );
     let executions = executions_for(&f.db, &f.revision_id);
     assert_eq!(executions.last().unwrap().1, "waiting_dependency", "{executions:?}");
     assert!(
@@ -405,6 +411,22 @@ fn answering_a_gated_conflict_revision_parks_it_behind_its_gate_instead_of_faili
             .unwrap()
             .unwrap()
             .mismatch_exit_barred
+    );
+
+    {
+        let conn = f.db.connect().unwrap();
+        conn.execute("UPDATE tasks SET status = 'in_review' WHERE id = ?1", [&writer])
+            .unwrap();
+    }
+    assert!(
+        f.db.try_unblock_dependency_if_resolved(&f.revision_id).unwrap(),
+        "maybe_engine_unblock_dependent promotes a blocked/dependency row on the event path"
+    );
+    assert_eq!(task_status(&f.db, &f.revision_id), "todo");
+    assert_eq!(
+        executions_for(&f.db, &f.revision_id).last().unwrap().1,
+        "ready",
+        "the cascade promotes the waiting execution when the writer reaches in_review"
     );
 }
 

@@ -1130,15 +1130,13 @@ pub(crate) struct EngineConflictsMarkFailedArgs {
     /// spawn prompt.
     pub(crate) attempt_id: String,
 
-    /// Failure reason. The design canonicalises three:
-    /// `obsolescence_suspected`, `product_decision_required`,
-    /// `architectural_mismatch`. Any string is accepted; the engine
-    /// stores it verbatim on the attempt row. `architectural_mismatch`
-    /// is only for a real behavioural conflict after a genuine attempt
-    /// to port the change onto main's new layout, and requires the
-    /// evidence flags below; it asks the repo owner instead of failing
-    /// the attempt.
-    #[arg(long)]
+    /// Failure reason. Closed set: `obsolescence_suspected`,
+    /// `product_decision_required`, `architectural_mismatch`.
+    /// `architectural_mismatch` is only for a real behavioural conflict
+    /// after a genuine attempt to port the change onto main's new
+    /// layout, and requires the evidence flags below; it asks the repo
+    /// owner instead of failing the attempt.
+    #[arg(long, value_parser = ["obsolescence_suspected", "product_decision_required", "architectural_mismatch"])]
     pub(crate) reason: String,
 
     /// Why main has no faithful place for the PR's behaviour:

@@ -71,6 +71,27 @@ async fn mark_conflict_resolution_failed_flips_attempt_status() -> Result<()> {
     let response = client
         .send_request(&FrontendRequest::MarkConflictResolutionFailed {
             attempt_id: attempt.id.clone(),
+            reason: "gave_up".to_owned(),
+            evidence: None,
+        })
+        .await?;
+    match response {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("not an allowed mark-failed reason"),
+                "expected canonical-reason rejection, got: {message}",
+            );
+            assert!(
+                message.contains("normal conflict work"),
+                "unhelpful rejection: {message}",
+            );
+        }
+        other => return Err(anyhow!("expected WorkError, got: {other:?}")),
+    }
+
+    let response = client
+        .send_request(&FrontendRequest::MarkConflictResolutionFailed {
+            attempt_id: attempt.id.clone(),
             reason: "product_decision_required".to_owned(),
             evidence: None,
         })
@@ -89,7 +110,7 @@ async fn mark_conflict_resolution_failed_flips_attempt_status() -> Result<()> {
     let response = client
         .send_request(&FrontendRequest::MarkConflictResolutionFailed {
             attempt_id: attempt.id.clone(),
-            reason: "ignored".to_owned(),
+            reason: "obsolescence_suspected".to_owned(),
             evidence: None,
         })
         .await?;
@@ -108,7 +129,7 @@ async fn mark_conflict_resolution_failed_flips_attempt_status() -> Result<()> {
     let response = client
         .send_request(&FrontendRequest::MarkConflictResolutionFailed {
             attempt_id: "crz_does_not_exist".to_owned(),
-            reason: "nope".to_owned(),
+            reason: "obsolescence_suspected".to_owned(),
             evidence: None,
         })
         .await?;
@@ -1151,7 +1172,7 @@ async fn engine_conflicts_retry_resets_terminal_rows() -> Result<()> {
     client
         .send_request(&FrontendRequest::MarkConflictResolutionFailed {
             attempt_id: b.id.clone(),
-            reason: "gave_up".to_owned(),
+            reason: "obsolescence_suspected".to_owned(),
             evidence: None,
         })
         .await?;

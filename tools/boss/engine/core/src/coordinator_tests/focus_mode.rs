@@ -745,6 +745,7 @@ async fn work_created_by_an_answer_launches_through_the_pause_and_outside_the_fo
     // Left to the scheduler, the row would just sit behind the pause.
     h.coordinator.drain_ready_queue_for_test().await;
     assert!(h.dispatched().await.is_empty());
+    h.db.mark_operator_forced_admission(&answered_task).unwrap();
 
     let worker = h
         .coordinator
@@ -775,6 +776,7 @@ async fn work_created_by_an_answer_still_waits_behind_a_live_writer() {
             [&task],
         )
         .unwrap();
+    h.db.mark_operator_forced_admission(&task).unwrap();
 
     assert_eq!(h.coordinator.launch_answered_work(&task).await.unwrap(), None);
     assert!(h.dispatched().await.is_empty());
@@ -817,6 +819,7 @@ async fn answered_work_dispatches_through_pause_and_focus_after_a_preflight_refu
     );
     h.coordinator
         .set_dispatch_preflight_block(Some("test: local dispatch unavailable".into()));
+    h.db.mark_operator_forced_admission(&answered_task).unwrap();
 
     let err = h
         .coordinator
