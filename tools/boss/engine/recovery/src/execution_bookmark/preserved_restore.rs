@@ -24,8 +24,7 @@ async fn select_tip(
                 &format!("present({})", recorded.commit_id),
                 "commit_id ++ \"\\n\"",
             )
-            .await
-            .unwrap_or_default();
+            .await?;
             if present.lines().any(|id| id == recorded.commit_id) {
                 return Ok(Some(recorded.commit_id.clone()));
             }
@@ -125,10 +124,21 @@ pub async fn restore_preserved(
     if jj.shared_repo(workspace).await? != record.repo_path {
         return Err(pointer_integrity_error("preserved work belongs to another store"));
     }
-    let base = jj
+    let positioned = jj
         .run(workspace, &["log", "--no-graph", "-r", "@", "-T", "commit_id"])
         .await?;
-    let base = base.trim();
+    let positioned = positioned.trim();
+    let empty = log(jj, &record.repo_path, &format!("{positioned} & empty()"), "commit_id").await?;
+    let parents = log(jj, &record.repo_path, &format!("{positioned}-"), "commit_id ++ \"\\n\"").await?;
+    // Only a single-parent empty commit is a disposable positioning child;
+    // an empty merge may itself be the intended destination.
+    let discard_positioning = !empty.is_empty() && parents.lines().count() == 1;
+    let target = if discard_positioning {
+        parents.trim().to_owned()
+    } else {
+        positioned.to_owned()
+    };
+    let base = target.trim();
     let Some(tip) = select_tip(jj, record, base, recorded).await? else {
         return Ok(None);
     };
@@ -176,6 +186,18 @@ pub async fn restore_preserved(
         let selected = selected
             .ok_or_else(|| pointer_integrity_error("rebased preserved change has no identifiable evolution"))?;
         jj.run(workspace, &["edit", selected]).await?;
+        if discard_positioning {
+            let remaining = log(
+                jj,
+                &record.repo_path,
+                &format!("present({positioned}) & empty()"),
+                "commit_id",
+            )
+            .await?;
+            if !remaining.is_empty() {
+                jj.run(workspace, &["abandon", positioned]).await?;
+            }
+        }
     }
     let conflicts = jj
         .run(

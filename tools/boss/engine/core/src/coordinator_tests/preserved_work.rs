@@ -2,6 +2,8 @@ use super::helpers::*;
 use boss_engine_recovery::execution_bookmark::{self as recovery, LocalJj};
 use boss_engine_test_git::jj::JjRepo;
 
+mod release_tests;
+
 #[tokio::test]
 async fn dispatch_prefers_preserved_work_over_retired_legacy_pointers() {
     let dir = tempdir().unwrap();

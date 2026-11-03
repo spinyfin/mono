@@ -74,7 +74,32 @@ async fn workspace_tip(jj: &dyn Jj, record: &ExecutionBookmark, workspace: &Path
         .and_then(|s| s.to_str())
         .context("workspace name unavailable")?;
     let rev = format!("present({}@)", serde_json::to_string(name)?);
-    for (_, _, operation) in operations(jj, &record.repo_path).await? {
+    // Locate the forget operation directly, even after a busy store has
+    // accumulated many unrelated operations. The cap is a safety backstop.
+    let forgotten = jj
+        .run(
+            &record.repo_path,
+            &[
+                "--ignore-working-copy",
+                "op",
+                "log",
+                "--no-graph",
+                "-n",
+                "100000",
+                "-T",
+                &format!(
+                    "if(description.contains(\"forget workspace\") && description.contains({}), id ++ \"\\n\")",
+                    serde_json::to_string(name)?
+                ),
+            ],
+        )
+        .await?;
+    let recent = operations(jj, &record.repo_path).await?;
+    let candidates = forgotten
+        .lines()
+        .map(|id| format!("{id}-"))
+        .chain(recent.into_iter().map(|(_, _, id)| id));
+    for operation in candidates {
         let tip = jj
             .run(
                 &record.repo_path,
@@ -96,26 +121,54 @@ async fn workspace_tip(jj: &dyn Jj, record: &ExecutionBookmark, workspace: &Path
             return Ok(tip);
         }
     }
-    anyhow::bail!("no journaled working copy for {name}; keep recovery references")
+    Err(pointer_integrity_error(format!(
+        "no journaled working copy for {name}; keep preserved/{} and recovery references",
+        record.execution_id
+    )))
 }
 
-/// Snapshot the current workspace tip on every teardown. Idempotent when the
-/// tip has not moved; otherwise the preserved bookmark and recorded row follow
-/// the later unpublished work, including a retry of the same execution.
+/// Update retained work only when the workspace has adopted its unpublished
+/// changes. A fresh workspace proves nothing about an earlier attempt.
 pub async fn preserve(jj: &dyn Jj, record: &ExecutionBookmark, workspace: &Path) -> Result<Option<PreservedTip>> {
     let name = preserved_name(&record.execution_id);
     let existing = log(jj, &record.repo_path, &revision(&name), "commit_id ++ \"\\n\"").await?;
-    if !existing.trim().is_empty() {
-        ensure!(
-            existing.lines().count() == 1,
-            "{name} has multiple preserved tips; leave them intact"
-        );
-    }
     let tip = workspace_tip(jj, record, workspace).await?;
     let tip = tip.trim();
-    let commits = log(jj, &record.repo_path, &unpublished(tip), "commit_id ++ \"\\n\"").await?;
+    let commits = log(jj, &record.repo_path, &unpublished(tip), "change_id ++ \"\\n\"").await?;
     let count = commits.lines().count() as u64;
+    let ancestors = log(jj, &record.repo_path, &format!("::{tip}"), "change_id ++ \"\\n\"").await?;
+    let mut retained = None;
+    let mut contained_variant = false;
+    for old in existing.lines() {
+        let work = log(jj, &record.repo_path, &unpublished(old), "change_id ++ \"\\n\"").await?;
+        let contained = work.lines().all(|change| ancestors.lines().any(|id| id == change));
+        contained_variant |= contained;
+        if !work.is_empty() {
+            let change = log(jj, &record.repo_path, old, "change_id").await?;
+            retained.get_or_insert(PreservedTip {
+                change_id: change.trim().into(),
+                commit_id: old.into(),
+                count: work.lines().count() as u64,
+            });
+            if !contained && count > 0 && existing.lines().count() == 1 {
+                return Err(pointer_integrity_error(format!(
+                    "{name} contains unpublished work absent from the current workspace; leave both intact"
+                )));
+            }
+        }
+    }
+    if existing.lines().count() > 1 {
+        if count == 0 || contained_variant {
+            return Ok(retained);
+        }
+        return Err(pointer_integrity_error(format!(
+            "{name} has multiple preserved tips unrelated to current work; leave all intact"
+        )));
+    }
     if count == 0 {
+        if retained.is_some() {
+            return Ok(retained);
+        }
         if !existing.trim().is_empty() {
             jj.run(
                 &record.repo_path,

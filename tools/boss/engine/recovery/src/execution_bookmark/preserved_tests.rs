@@ -130,6 +130,33 @@ async fn later_unpublished_work_moves_the_preserved_bookmark() {
 }
 
 #[tokio::test]
+async fn recycled_workspace_cannot_replace_unadopted_preserved_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_recycled", "local").await.unwrap();
+    std::fs::write(repo.worker.join("first"), "original unpublished").unwrap();
+    let saved = preserve(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    JjRepo::run(&repo.replacement, &["new", "main"]);
+    std::fs::write(repo.replacement.join("other"), "another occupant").unwrap();
+    let err = preserve(&LocalJj, &record, &repo.replacement).await.unwrap_err();
+    assert!(is_pointer_integrity_error(&err));
+    assert_eq!(
+        JjRepo::run(
+            &repo.repo,
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                &preserved_name(&record.execution_id),
+                "-T",
+                "commit_id"
+            ]
+        ),
+        saved.commit_id
+    );
+}
+
+#[tokio::test]
 async fn published_work_and_empty_trailing_commit_create_no_bookmark() {
     let dir = tempfile::tempdir().unwrap();
     let repo = fixture(dir.path());
@@ -153,9 +180,78 @@ async fn missing_and_forgotten_workspace_uses_last_journaled_working_copy() {
     let tip = JjRepo::run(&repo.worker, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
     std::fs::remove_dir_all(&repo.worker).unwrap();
     JjRepo::run(&repo.repo, &["workspace", "forget", "worker"]);
+    for i in 0..270 {
+        JjRepo::run(&repo.repo, &["describe", "-m", &format!("Unrelated operation {i}")]);
+    }
     let saved = preserve(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
     assert_eq!(saved.commit_id, tip);
     assert_eq!(saved.count, 1);
+}
+
+#[tokio::test]
+async fn production_positioning_commits_are_not_restage_ancestors() {
+    for description in [None, Some("Fresh execution")] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = fixture(dir.path());
+        let record = create(&LocalJj, &repo.worker, "exec_position", "local").await.unwrap();
+        std::fs::write(repo.worker.join("work"), "unpublished").unwrap();
+        let saved = preserve(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+        let mut args = vec!["new", "main"];
+        if let Some(description) = description {
+            args.extend(["-m", description]);
+        }
+        JjRepo::run(&repo.replacement, &args);
+        let report = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            report.base_sha,
+            JjRepo::run(&repo.repo, &["log", "--no-graph", "-r", "main", "-T", "commit_id"])
+        );
+        assert!(
+            JjRepo::run(
+                &repo.replacement,
+                &["log", "--no-graph", "-r", "(::@ ~ ::main) & empty()", "-T", "commit_id"]
+            )
+            .is_empty()
+        );
+    }
+}
+
+struct FailedRecordedLookup;
+
+#[async_trait]
+impl Jj for FailedRecordedLookup {
+    async fn shared_repo(&self, _: &Path) -> Result<PathBuf> {
+        Ok(PathBuf::from("store"))
+    }
+    async fn run(&self, _: &Path, args: &[&str]) -> Result<String> {
+        if args.iter().any(|arg| arg.starts_with("present(")) {
+            anyhow::bail!("SSH transport unavailable");
+        }
+        Ok(String::new())
+    }
+}
+
+#[tokio::test]
+async fn recorded_commit_transport_failure_is_not_an_integrity_verdict() {
+    let record = ExecutionBookmark {
+        execution_id: "exec_transport".into(),
+        repo_path: "store".into(),
+        host_id: "remote".into(),
+        base_commit: None,
+    };
+    let saved = PreservedTip {
+        change_id: "change".into(),
+        commit_id: "commit".into(),
+        count: 1,
+    };
+    let err = restore_preserved(&FailedRecordedLookup, &record, Path::new("workspace"), Some(&saved))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("SSH transport unavailable"));
+    assert!(!is_pointer_integrity_error(&err));
 }
 
 #[tokio::test]

@@ -131,7 +131,18 @@ impl BookmarkGate for DbBookmarkGate<'_> {
         .await;
         match result {
             Ok(()) => BookmarkStatus::Confirmed,
-            Err(err) => BookmarkStatus::Unconfirmed(format!("{err:#}")),
+            Err(err) => {
+                if boss_engine_recovery::execution_bookmark::is_pointer_integrity_error(&err) {
+                    raise_attention(
+                        self.db,
+                        execution,
+                        boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NOT_RESTAGED_ATTENTION_KIND,
+                        "Preserved work needs inspection",
+                        &format!("{err:#}"),
+                    );
+                }
+                BookmarkStatus::Unconfirmed(format!("{err:#}"))
+            }
         }
     }
 }
