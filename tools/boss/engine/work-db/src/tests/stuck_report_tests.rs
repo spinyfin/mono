@@ -75,6 +75,14 @@ fn project_prerequisite_is_progressing_until_terminal_or_missing() {
         relation: None,
     })
     .unwrap();
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(&task.id)
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::WaitingDependency)
+            .build(),
+    )
+    .unwrap();
     assert_eq!(row(&db, &task.id).bucket, StuckBucket::WaitingOnDependency);
     db.connect()
         .unwrap()
@@ -165,11 +173,12 @@ fn report_fixtures_cover_human_capacity_dependency_and_engine_stuck() {
     db.connect()
         .unwrap()
         .execute(
-            "UPDATE tasks SET pr_merge_state_status = 'BEHIND' WHERE id = ?1",
+            "UPDATE tasks SET pr_merge_state_status = 'BEHIND', review_required_state = 'approved',
+             ci_required_state = 'success' WHERE id = ?1",
             [&review.id],
         )
         .unwrap();
-    assert_eq!(row(&db, &review.id).bucket, StuckBucket::EngineStuck);
+    assert_eq!(row(&db, &review.id).bucket, StuckBucket::WaitingOnHuman);
     assert_eq!(row(&db, &review.id).classification, "S18_pr_behind");
     assert_eq!(
         db.stuck_report(0, now(), &observed_live_pid)
@@ -225,10 +234,7 @@ fn waiting_human_age_tracks_execution_transition_and_live_work_is_excluded() {
     let timestamp = now();
     db.connect()
         .unwrap()
-        .execute(
-            "UPDATE task_status_audit SET changed_at = ?1 WHERE property = 'execution_waiting_human'",
-            [timestamp - 100],
-        )
+        .execute("UPDATE execution_wait_history SET changed_at = ?1", [timestamp - 100])
         .unwrap();
     db.connect()
         .unwrap()
@@ -279,11 +285,8 @@ fn waiting_human_age_tracks_execution_transition_and_live_work_is_excluded() {
     assert_eq!(
         db.connect()
             .unwrap()
-            .query_row(
-                "SELECT COUNT(*) FROM task_status_audit WHERE property = 'execution_waiting_human'",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
+            .query_row("SELECT COUNT(*) FROM execution_wait_history", [], |r| r
+                .get::<_, i64>(0))
             .unwrap(),
         2
     );
@@ -296,10 +299,10 @@ fn waiting_human_migration_backfills_lower_bound_and_survives_reopen() {
     let (_, id, _) = make_waiting_human_chore(&db, "Historical wait");
     let conn = db.connect().unwrap();
     conn.execute_batch(
-        "DROP TRIGGER execution_waiting_human_insert;
-        DROP TRIGGER execution_waiting_human_update;
-        DELETE FROM task_status_audit WHERE property = 'execution_waiting_human';
-        DELETE FROM schema_migrations WHERE id = '20261029_1900_execution_waiting_human_history';",
+        "DROP TRIGGER execution_wait_history_insert;
+        DROP TRIGGER execution_wait_history_update;
+        DROP TABLE execution_wait_history;
+        DELETE FROM schema_migrations WHERE id IN ('20261029_1900_execution_waiting_human_history', '20261103_1800_execution_wait_history');",
     )
     .unwrap();
     drop(conn);
@@ -312,11 +315,8 @@ fn waiting_human_migration_backfills_lower_bound_and_survives_reopen() {
         assert_eq!(
             db.connect()
                 .unwrap()
-                .query_row(
-                    "SELECT COUNT(*) FROM task_status_audit WHERE property = 'execution_waiting_human'",
-                    [],
-                    |r| r.get::<_, i64>(0)
-                )
+                .query_row("SELECT COUNT(*) FROM execution_wait_history", [], |r| r
+                    .get::<_, i64>(0))
                 .unwrap(),
             1
         );
@@ -471,6 +471,14 @@ fn human_only_gates_do_not_count_as_progressing_prerequisites() {
             relation: None,
         })
         .unwrap();
+        db.create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&dependent.id)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::WaitingDependency)
+                .build(),
+        )
+        .unwrap();
         assert_eq!(
             row(&db, &dependent.id).bucket,
             if expected == StuckBucket::WaitingOnHuman {
@@ -524,7 +532,10 @@ fn classification_table_covers_failure_attention_and_global_hold_precedence() {
     let root = create_test_chore_manual(&db, &product.id, "Green parent");
     db.connect()
         .unwrap()
-        .execute("UPDATE tasks SET ci_required_state = 'pass' WHERE id = ?1", [&root.id])
+        .execute(
+            "UPDATE tasks SET ci_required_state = 'success' WHERE id = ?1",
+            [&root.id],
+        )
         .unwrap();
     for (dispatch, blocked, status, attention, ci, revision, wait, expected) in [
         (
@@ -673,7 +684,7 @@ fn ended_human_wait_does_not_replace_task_age_or_basis() {
         let conn = db.connect().unwrap();
         conn.execute("UPDATE tasks SET status = ?1 WHERE id = ?2", params![status, id])
             .unwrap();
-        conn.execute("UPDATE task_status_audit SET changed_at = ?1, basis = 'status_change', age_is_lower_bound = 0 WHERE work_item_id = ?2 AND property != 'execution_waiting_human'", params![timestamp - 500, id]).unwrap();
+        conn.execute("UPDATE task_status_audit SET changed_at = ?1, basis = 'status_change', age_is_lower_bound = 0 WHERE work_item_id = ?2", params![timestamp - 500, id]).unwrap();
         // Resuming and waiting again places the wait after the last task transition.
         conn.execute(
             "UPDATE work_executions SET status = 'running' WHERE id = ?1",
@@ -685,7 +696,11 @@ fn ended_human_wait_does_not_replace_task_age_or_basis() {
             [&execution],
         )
         .unwrap();
-        conn.execute("UPDATE task_status_audit SET changed_at = ?1, basis = ?2, age_is_lower_bound = ?3 WHERE work_item_id = ?4 AND property = 'execution_waiting_human'", params![timestamp - 100, if legacy { "unknown_legacy" } else { "execution_waiting_human" }, legacy, id]).unwrap();
+        conn.execute(
+            "UPDATE execution_wait_history SET changed_at = ?1, age_is_lower_bound = ?2 WHERE execution_id = ?3",
+            params![timestamp - 100, legacy, execution],
+        )
+        .unwrap();
         conn.execute(
             "UPDATE work_executions SET status = 'running' WHERE id = ?1",
             [&execution],
@@ -721,6 +736,7 @@ fn non_task_waits_never_enter_task_history() {
             design_reasoning_effort_xhigh: false,
         })
         .unwrap();
+    let mut execution_ids = Vec::new();
     for (id, kind) in [
         (&product.id, ExecutionKind::ProductDesign),
         (&project.id, ExecutionKind::ProjectDesign),
@@ -735,28 +751,35 @@ fn non_task_waits_never_enter_task_history() {
                     .build(),
             )
             .unwrap();
-        let conn = db.connect().unwrap();
-        conn.execute(
-            "UPDATE work_executions SET status = 'running' WHERE id = ?1",
-            [&execution.id],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE work_executions SET status = 'waiting_human' WHERE id = ?1",
-            [&execution.id],
-        )
-        .unwrap();
+        execution_ids.push(execution.id);
     }
     let conn = db.connect().unwrap();
-    crate::stuck_report::migrate_wait_history(&conn).unwrap();
-    let count: i64 = conn
+    for execution_id in &execution_ids {
+        let history: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM execution_wait_history WHERE execution_id = ?1",
+                [execution_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(history, 1, "{execution_id}");
+    }
+    let audit: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM task_status_audit WHERE property = 'execution_waiting_human'",
             [],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(count, 0);
+    assert_eq!(audit, 0);
+    drop(conn);
+    let report = db.stuck_report(0, now(), &observed_live_pid).unwrap();
+    for id in [&product.id, &project.id] {
+        assert!(
+            report.rows.iter().all(|row| row.work_item_id != *id),
+            "non-task {id} must not appear in the stuck report"
+        );
+    }
 }
 
 #[test]

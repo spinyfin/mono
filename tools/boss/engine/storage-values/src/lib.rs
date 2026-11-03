@@ -8,6 +8,7 @@ pub mod attention_lifecycle;
 pub mod branch_identity;
 pub mod ci_contract;
 pub mod dispatch_pause;
+pub mod dispatch_wait;
 pub mod merge_mechanism;
 pub mod merge_parent_signoff;
 pub mod pool_policy;

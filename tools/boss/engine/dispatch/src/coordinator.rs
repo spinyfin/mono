@@ -155,11 +155,11 @@ pub const MAX_CONCURRENT_INTERACTIVE_WORKERS: usize = 8;
 /// claimed and released as soon as the lease returns, success or failure.
 pub const MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO: usize = 2;
 
-/// User-visible wait reason for a ready row held because this origin
-/// already has [`MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO`] lease calls
-/// in flight. Distinct from the interactive-cap wording: these rows are
-/// not waiting for a worker slot.
-pub const WAITING_FOR_WORKSPACE_REASON: &str = "Waiting for a workspace";
+pub use boss_engine_storage_values::dispatch_wait::{
+    DISPATCH_WAIT_REASON_AUTOMATION_PAUSED, DISPATCH_WAIT_REASON_DISPATCH_PAUSED, DISPATCH_WAIT_REASON_FOCUS_MODE,
+    DISPATCH_WAIT_REASON_POOL_EXHAUSTED, WAITING_FOR_WORKSPACE_REASON, interactive_cap_wait_reason,
+    is_capacity_wait_reason,
+};
 
 use boss_engine_storage_values::pool_policy::{AUTOMATION_WORKER_ID_PREFIX, REVIEW_WORKER_ID_PREFIX};
 
@@ -225,16 +225,6 @@ const MAX_INFLIGHT_DISPATCHES: usize = MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POO
 /// human already has a concrete execution to look at.
 const PRE_START_RETRY_DELAYS: [Duration; 3] =
     [Duration::from_secs(5), Duration::from_secs(15), Duration::from_secs(45)];
-
-/// User-visible interactive-cap hold text. Lease-pending slots are
-/// never called "working".
-pub fn interactive_cap_wait_reason(working: usize, lease_pending: usize) -> String {
-    if lease_pending == 0 {
-        format!("Waiting for an available worker ({working} working)")
-    } else {
-        format!("Waiting for an available worker ({working} working, {lease_pending} waiting for a workspace)")
-    }
-}
 
 /// How often `run_execution`'s [`HeartbeatGuard`] re-stamps the cube
 /// lease expiry. Cube's `DEFAULT_LEASE_TTL_SECS` (and the engine's

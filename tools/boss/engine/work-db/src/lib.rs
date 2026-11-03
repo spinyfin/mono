@@ -797,7 +797,9 @@ mod schema_init;
 pub use schema_init::table_exists;
 #[cfg(test)]
 use schema_init::table_has_column;
+mod execution_wait_history;
 mod semantic_progress;
+mod stuck_activity;
 mod stuck_report;
 mod sweep_reads;
 mod task_status_audit;
