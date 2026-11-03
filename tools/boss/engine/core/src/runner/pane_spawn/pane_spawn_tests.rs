@@ -25,13 +25,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use crate::app::SendToAppError;
 use crate::driver::AgentDriver;
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::protocol::{AttachWorkerPaneResult, EngineToAppRequest, EngineToAppResponse, EnvVar};
 use crate::test_support::*;
 use crate::work::{CreateChoreInput, CreateProjectInput, CreateTaskInput, EffortLevel, Task, WorkExecution, WorkItem};
 use crate::worker_registry::WorkerRegistry;
+use boss_execution_contracts::SendToAppError;
 use boss_protocol::{ExecutionKind, ExecutionStatus, TaskKind, TaskStatus};
 use boss_tmux::{CommandOutput, CommandRunner, Tmux};
 use std::ffi::OsString;

@@ -283,12 +283,12 @@ pub fn init() {
 /// actually called [`init`]. Production code should not read this.
 static EAGER_INIT_CALLED: AtomicBool = AtomicBool::new(false);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn eager_init_called_for_test() -> bool {
     EAGER_INIT_CALLED.load(Ordering::SeqCst)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn reset_eager_init_for_test() {
     EAGER_INIT_CALLED.store(false, Ordering::SeqCst);
 }

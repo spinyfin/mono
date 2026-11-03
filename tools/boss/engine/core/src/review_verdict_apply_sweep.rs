@@ -19,7 +19,7 @@ use anyhow::Result;
 use boss_protocol::{ProposalState, WorkerProposal};
 
 /// Observe the comparison above storage, before applying its owned result.
-pub(crate) fn apply_review_verdict_proposal(
+pub fn apply_review_verdict_proposal(
     db: &WorkDb,
     proposal_id: &str,
     pr_checker: &dyn PrStateChecker,
@@ -66,7 +66,7 @@ pub(crate) fn apply_review_verdict_proposal(
     )
 }
 
-pub(crate) fn observe_merge_parent_deletions(input: &MergeParentComparison) -> Vec<String> {
+pub fn observe_merge_parent_deletions(input: &MergeParentComparison) -> Vec<String> {
     crate::merge_parent_deletion::compute_merged_parent_deletions_blocking(
         &input.repo_slug,
         &input.head_before,

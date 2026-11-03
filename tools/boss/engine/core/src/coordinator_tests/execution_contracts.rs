@@ -170,7 +170,9 @@ async fn host_provider_and_runner_preserve_typed_app_send_errors() {
             .unwrap_err();
         // The compatibility path and the lower contract are the same error type.
         assert_eq!(
-            err.downcast_ref::<crate::app::SendToAppError>().unwrap().to_string(),
+            err.downcast_ref::<boss_execution_contracts::SendToAppError>()
+                .unwrap()
+                .to_string(),
             expected
         );
         assert_eq!(err.to_string(), "worker request failed");

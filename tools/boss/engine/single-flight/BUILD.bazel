@@ -8,7 +8,10 @@ rust_library(
     crate_name = "boss_single_flight",
     crate_root = "src/lib.rs",
     edition = "2024",
-    visibility = ["//tools/boss/engine/core:__pkg__"],
+    visibility = [
+        "//tools/boss/engine/app:__pkg__",
+        "//tools/boss/engine/core:__pkg__",
+    ],
 )
 
 rust_test(

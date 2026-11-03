@@ -357,16 +357,16 @@ impl RunCostTail {
 
 /// Process-lifetime incremental tails keyed by execution id.
 #[derive(Default)]
-pub(crate) struct RunCostCapture {
+pub struct RunCostCapture {
     inner: StdMutex<HashMap<String, Arc<Mutex<RunCostTail>>>>,
 }
 
 impl RunCostCapture {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
-    pub(crate) async fn capture_and_persist(
+    pub async fn capture_and_persist(
         &self,
         work_db: &crate::work::WorkDb,
         execution_id: &str,
@@ -403,7 +403,7 @@ impl RunCostCapture {
             .map_err(|error| error.to_string())
     }
 
-    pub(crate) fn forget(&self, execution_id: &str) {
+    pub fn forget(&self, execution_id: &str) {
         self.inner
             .lock()
             .expect("run cost capture mutex poisoned")

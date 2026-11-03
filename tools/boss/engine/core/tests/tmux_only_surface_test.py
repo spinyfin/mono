@@ -41,6 +41,7 @@ def source_files(root):
     sources = {}
     for directory, extension in (
         ("engine/core/src", ".rs"),
+        ("engine/app/src", ".rs"),
         ("engine/execution-runner/src", ".rs"),
         ("protocol/src", ".rs"),
         ("engine/driver/src", ".rs"),
@@ -82,7 +83,7 @@ def violations(sources):
                     continue
             line = content.count("\n", 0, match.start()) + 1
             errors.append(f"{path}:{line}: removed identifier {identifier}")
-        if path.startswith(("engine/core/src/", "engine/execution-runner/src/")) and OPTIONAL_HOST.search(content):
+        if path.startswith(("engine/core/src/", "engine/app/src/", "engine/execution-runner/src/")) and OPTIONAL_HOST.search(content):
             errors.append(f"{path}: an optional TmuxWorkerHost permits a local spawn without identity")
 
     settings = sources["engine/core/src/settings.rs"]
@@ -102,7 +103,7 @@ def violations(sources):
     if not intent or not create or intent.start() >= create.start():
         errors.append("durable tmux intent must precede session creation")
 
-    if "NotTmuxHosted" in sources["engine/core/src/app/tmux_teardown.rs"]:
+    if "NotTmuxHosted" in sources["engine/app/src/app/tmux_teardown.rs"]:
         errors.append("local teardown must not return the remote-only NotTmuxHosted outcome")
     if "tmux_hosted" in sources["engine/core/src/worker_registry.rs"]:
         errors.append("WorkerRegistry must not retain a per-pane hosting-mode bit")
@@ -125,7 +126,7 @@ def verify_guard(sources):
         spawn_path,
         host_path,
         "engine/core/src/settings.rs",
-        "engine/core/src/app/tmux_teardown.rs",
+        "engine/app/src/app/tmux_teardown.rs",
         "engine/core/src/worker_registry.rs",
         "protocol/src/engine_app.rs",
     )}
@@ -134,7 +135,7 @@ def verify_guard(sources):
         (host_path, sources[host_path].replace("pub tmux_host: TmuxWorkerHost,", "pub tmux_host: Option<TmuxWorkerHost>,")),
         (spawn_path, spawn.replace(".record_tmux_spawn_intent(", ".skip_intent(")),
         (spawn_path, spawn.replace(".record_tmux_spawn_intent(", ".new_session(); store.record_tmux_spawn_intent(", 1)),
-        ("engine/core/src/app/tmux_teardown.rs", "NotTmuxHosted"),
+        ("engine/app/src/app/tmux_teardown.rs", "NotTmuxHosted"),
         ("engine/core/src/worker_registry.rs", "tmux_hosted: bool"),
         ("protocol/src/engine_app.rs", "pub enum EngineToAppRequest {\n    SpawnWorkerPane,\n}"),
     ]

@@ -779,7 +779,7 @@ pub(crate) async fn release_reaped_execution(
         .await;
 }
 
-pub(crate) enum PidStatus {
+pub enum PidStatus {
     Alive,
     Dead,
     PermissionDenied,
@@ -791,7 +791,7 @@ pub(crate) enum PidStatus {
 /// - Returns `Dead` when `ESRCH` (no such process).
 /// - Returns `PermissionDenied` when `EPERM` (process exists, not ours).
 /// - Returns `Unknown` on any other error; caller skips conservatively.
-pub(crate) fn probe_pid(pid: i32) -> PidStatus {
+pub fn probe_pid(pid: i32) -> PidStatus {
     // SAFETY: kill(pid, 0) sends no signal; it only checks whether
     // the process exists and we have permission to signal it. The
     // `pid` value comes from the OS-reported shell_pid at spawn time.

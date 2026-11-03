@@ -2090,7 +2090,9 @@ async fn answer_agent_start_records_queue_wait_metric_and_dispatch_event() {
     db.bind_answer_agent_run_execution(&run.id, &execution.id).unwrap();
 
     let metrics = Arc::new(crate::metrics::Registry::new());
-    crate::metrics_init::init_all(&metrics);
+    crate::answer_agent_observability::register_metrics(&metrics);
+    crate::coordinator::register_metrics(&metrics);
+    crate::dispatch_metrics::register_metrics(&metrics);
     let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
     let mut coordinator = ExecutionCoordinator::new(
         db.clone(),

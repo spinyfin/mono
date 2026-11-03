@@ -210,8 +210,8 @@ impl IncomingHookEvent {
     /// resolves via [`crate::driver::DriverRegistry`] — with no peer pid.
     /// Tests that need a *different* driver's boundary (or its absence)
     /// call `resolve` directly.
-    #[cfg(test)]
-    pub(crate) fn for_test(event: WorkerEvent, run_id: Option<String>, transcript_path: Option<String>) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(event: WorkerEvent, run_id: Option<String>, transcript_path: Option<String>) -> Self {
         let driver = crate::driver::DriverRegistry::default()
             .require(crate::effort::ENGINE_DEFAULT_DRIVER)
             .expect("engine default driver is always registered");
@@ -348,7 +348,7 @@ pub fn bind_events_socket(path: &Path) -> io::Result<UnixListener> {
 /// assume stale" so a transient permission hiccup doesn't newly block
 /// startup — the existing `remove_file` error handling right after this call
 /// still surfaces a real problem.
-pub(crate) fn path_has_a_live_listener(path: &Path) -> bool {
+pub fn path_has_a_live_listener(path: &Path) -> bool {
     match std::os::unix::net::UnixStream::connect(path) {
         Ok(_stream) => true,
         Err(_) => false,

@@ -28,7 +28,7 @@
 //!    survived the restart, so its slot claim, `WorkerRegistry` entries,
 //!    `LiveWorkerState` entry, and live-status summarizer task are rebuilt
 //!    from the DB row plus a fresh read of the session's pane pid — the same
-//!    things [`crate::app::readoption`] rebuilds for a *terminalized*
+//!    things `boss_engine::app::readoption` rebuilds for a *terminalized*
 //!    survivor, minus the DB status flip that path needs and this one
 //!    doesn't (the row was never wrong here).
 //!
@@ -109,7 +109,7 @@ use boss_execution_contracts::slot_id_from_worker_id;
 
 mod dead_pane;
 mod persist;
-pub(crate) use persist::persist_observed_pane_state;
+pub use persist::persist_observed_pane_state;
 use persist::{PaneObservation, PersistedPanePid, adoption_pid_snapshot, persist_observed_pane_pid};
 
 /// The tmux session environment variable carrying [`TMUX_SESSION_SCHEMA`].
@@ -338,7 +338,7 @@ pub async fn observe_tmux_identity(
 /// `#{window_activity}` and `#{pane_current_command}` for the sweep's
 /// staleness classification. A caller that only feeds
 /// `persist_observed_pane_state` (teardown's completion-path probe, and
-/// [`crate::app::pane_delivery`]'s own dead-pane check) should call this
+/// `boss_engine::app::pane_delivery`'s own dead-pane check) should call this
 /// instead, so it does not spawn and discard two extra tmux subprocesses in
 /// the narrow window between a verified token match and a reap's kill
 /// signal.
@@ -351,10 +351,7 @@ pub async fn observe_tmux_identity(
 /// `pane_delivery` must treat it as "cannot prove the pane is safe to write
 /// to" and refuse, while teardown's best-effort reap degrades it locally and
 /// proceeds regardless.
-pub(crate) async fn observe_pane_dead_state(
-    tmux: &Tmux,
-    session_name: &str,
-) -> anyhow::Result<TmuxIdentityObservation> {
+pub async fn observe_pane_dead_state(tmux: &Tmux, session_name: &str) -> anyhow::Result<TmuxIdentityObservation> {
     let pane_dead = tmux.display_message(session_name, DisplayField::PaneDead).await? == "1";
     let pane_dead_status = if pane_dead {
         let status = tmux.display_message(session_name, DisplayField::PaneDeadStatus).await?;
@@ -1610,7 +1607,6 @@ mod tests {
     use boss_tmux::{CommandOutput, CommandRunner};
     use tokio::time::Duration;
 
-    use crate::app::SendToAppError;
     use crate::coordinator::ExecutionCoordinator;
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::driver::AgentDriver;
@@ -1619,6 +1615,7 @@ mod tests {
     use crate::test_support::{NoopCube, NoopRunner, create_test_chore_manual, create_test_product_named, open_db_arc};
     use crate::worker_readoption::{LiveWorkerConvergence, NoopLiveWorkerConvergence};
     use crate::worker_registry::WorkerRegistry;
+    use boss_execution_contracts::SendToAppError;
     use boss_execution_contracts::WorkerPool;
 
     /// A fake `boss` tmux server: scripted answers for `list-sessions`,

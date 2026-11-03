@@ -12,6 +12,7 @@ rust_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     # Minimal visibility: only the engine provisions/reads the Trunk token.
     visibility = [
+        "//tools/boss/engine/app:__pkg__",
         "//tools/boss/engine/core:__pkg__",
     ],
     deps = [

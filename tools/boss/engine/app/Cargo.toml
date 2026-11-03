@@ -1,0 +1,80 @@
+[package]
+name = "boss-engine-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+boss-command-runner = { path = "../../command-runner" }
+boss-engine-runtime = { path = "../core/runtime" }
+boss-execution-runner = { path = "../execution-runner" }
+boss-execution-contracts = { path = "../execution-contracts" }
+boss-engine-storage-values = { path = "../storage-values" }
+boss-work-db = { path = "../work-db" }
+boss-task-scope = { path = "../task-scope" }
+anyhow = { workspace = true }
+boss-comment-anchor = { path = "../../comment_anchor" }
+boss-engine-comment-classifier = { path = "../comment-classifier" }
+boss-gh-telemetry = { path = "../../gh_telemetry" }
+boss-github = { path = "../../github" }
+boss-http-retry = { path = "../../http_retry" }
+boss-trunk-auth = { path = "../../trunk_auth" }
+boss-trunk-client = { path = "../../trunk_client" }
+boss-transcript-markdown = { path = "../transcript-markdown" }
+boss-tmux = { path = "../../tmux" }
+async-trait = { workspace = true }
+bon = { workspace = true }
+chrono = { workspace = true }
+boss-dispatch-events = { path = "../dispatch-events" }
+boss-dispatch-reader = { path = "../dispatch-reader" }
+boss-editorial = { path = "../editorial" }
+boss-engine-board-gesture = { path = "../board-gesture" }
+boss-engine-design-docs = { path = "../design-docs" }
+boss-engine-completion = { path = "../completion" }
+boss-engine-dispatch = { path = "../dispatch" }
+boss-engine-driver = { path = "../driver" }
+boss-engine-live-worker-state = { path = "../live-worker-state" }
+boss-engine-merge-poller = { path = "../merge-poller" }
+boss-engine-driver-quota = { path = "../driver-quota" }
+boss-engine-attachments = { path = "../attachments" }
+boss-engine-offsite-backup = { path = "../offsite-backup" }
+boss-engine-effort = { path = "../effort" }
+boss-feature-flags = { path = "../feature-flags" }
+boss-engine-gh-invocation = { path = "../gh-invocation" }
+boss-log-files = { path = "../../log-files" }
+boss-metrics = { path = "../metrics" }
+boss-review-guide = { path = "../review-guide" }
+boss-engine-proposal-validation = { path = "../proposal-validation" }
+boss-engine-recovery = { path = "../recovery" }
+boss-protocol = { path = "../../protocol" }
+boss-ssh-transport = { path = "../ssh-transport" }
+boss-timer-wheel = { path = "../timer-wheel" }
+boss-event-bus = { path = "../event-bus" }
+boss-single-flight = { path = "../single-flight" }
+boss-engine-transient-error = { path = "../transient-error" }
+boss-engine-utility-model = { path = "../utility-model" }
+boss-engine-utils = { path = "../utils" }
+boss-engine-worker-policy = { path = "../worker-policy" }
+fs4 = { workspace = true }
+libc = "0.2"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+rusqlite = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+rustls = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+boss-engine-runtime = { path = "../core/runtime", features = ["test-support"] }
+boss-engine-completion = { path = "../completion", features = ["test-support"] }
+boss-engine-live-worker-state = { path = "../live-worker-state", features = ["test-support"] }
+boss-engine-merge-poller = { path = "../merge-poller", features = ["test-support"] }
+boss-execution-runner = { path = "../execution-runner", features = ["test-support"] }
+boss-execution-contracts = { path = "../execution-contracts", features = ["test-support"] }
+boss-work-db = { path = "../work-db", features = ["test-support"] }
+boss-prose-vocabulary = { path = "../prose-vocabulary" }
+tempfile = { workspace = true }
+wiremock = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

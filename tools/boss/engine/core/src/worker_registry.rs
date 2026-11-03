@@ -219,7 +219,7 @@ impl WorkerRegistry {
     /// Build a registry with the supplied power-assertion controller. The
     /// engine supplies the production `caffeinate` controller; the default
     /// registry uses a no-op controller for hermetic tests.
-    pub(crate) fn with_sleep_assertion(sleep_assertion: Arc<crate::sleep_assertion::SleepAssertionController>) -> Self {
+    pub fn with_sleep_assertion(sleep_assertion: Arc<crate::sleep_assertion::SleepAssertionController>) -> Self {
         Self {
             inner: Arc::default(),
             sleep_assertion,
@@ -483,7 +483,7 @@ impl WorkerRegistry {
     }
 
     /// Resolve identity and confinement tier from the same verified entry.
-    pub(crate) fn lookup_classified_with_ancestor_walk(&self, pid: libc::pid_t) -> Option<(String, bool)> {
+    pub fn lookup_classified_with_ancestor_walk(&self, pid: libc::pid_t) -> Option<(String, bool)> {
         let resolution = self.resolve_ancestry(pid);
         resolution.matched.map(|(_, run)| (run, resolution.progression))
     }

@@ -73,7 +73,7 @@ crate::register_gauge!(
 );
 
 /// Register the static handles. Called from
-/// [`crate::metrics_init::init_all`] at engine startup.
+/// `boss_engine::metrics_init::init_all` at engine startup.
 pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&GITHUB_API_CALLS_TOTAL);
     registry.register_counter(&GITHUB_API_POINTS_TOTAL);

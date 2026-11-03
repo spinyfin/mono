@@ -207,7 +207,7 @@ pub fn make_dispatchable_coordinator(db: Arc<WorkDb>, pool_size: usize) -> Arc<E
 }
 
 /// Running guide in the crash window before the execution launch stamp.
-pub(crate) fn unstamped_codex_guide(db: &WorkDb) -> crate::work::WorkExecution {
+pub fn unstamped_codex_guide(db: &WorkDb) -> crate::work::WorkExecution {
     let root = create_active_chore(db, &create_product(db), "guide restart");
     let (series, comparison) = seed_review_guide_series(db, &root);
     let attempt = db
@@ -228,7 +228,7 @@ pub(crate) fn unstamped_codex_guide(db: &WorkDb) -> crate::work::WorkExecution {
     execution
 }
 
-pub(crate) fn apply_review_verdict(
+pub fn apply_review_verdict(
     db: &WorkDb,
     id: &str,
     checker: &dyn crate::work::PrStateChecker,
@@ -238,7 +238,7 @@ pub(crate) fn apply_review_verdict(
     })
 }
 
-pub(crate) fn apply_pending_review_verdicts(
+pub fn apply_pending_review_verdicts(
     db: &WorkDb,
     checker: &dyn crate::work::PrStateChecker,
 ) -> anyhow::Result<crate::work::ReviewVerdictApplyStats> {

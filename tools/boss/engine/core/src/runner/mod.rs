@@ -7,8 +7,8 @@ use crate::config::RuntimeConfig;
 #[cfg(test)]
 pub use boss_execution_contracts::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
 pub(crate) use boss_execution_runner::{
-    ComposedWorkerSpawn, WorkerSpawnOpts, designated_output_kind, install_boss_event_to_stable_bin, pane_spawn,
-    resolve_boss_event_binary, spawn_launch_limits, task_bound_pr_url, work_item_name, work_item_task_kind,
+    ComposedWorkerSpawn, WorkerSpawnOpts, designated_output_kind, pane_spawn, spawn_launch_limits, work_item_name,
+    work_item_task_kind,
 };
 use std::path::PathBuf;
 
@@ -49,10 +49,10 @@ pub fn bound_events_socket_path(cfg: &RuntimeConfig) -> PathBuf {
 /// Frontend (control) socket this engine bound — exported to workers as
 /// `BOSS_SOCKET_PATH`.
 ///
-/// Returns the stamp [`crate::app::serve`] wrote: the socket this engine
+/// Returns the stamp `boss_engine::app::serve` wrote: the socket this engine
 /// actually bound. [`crate::config::WorkConfig::load_from`] pre-seeds this
 /// field from `$BOSS_SOCKET_PATH` or the production HOME-derived default;
-/// `serve` (and [`crate::app::run`]) overwrite it with the bound path
+/// `serve` (and `boss_engine::app::run`) overwrite it with the bound path
 /// before any worker is spawned. This getter itself does not re-read the
 /// environment — `None` means the config was never stamped (in-process
 /// tests that build via `WorkConfig::builder()`), and
@@ -65,7 +65,7 @@ pub fn bound_frontend_socket_path(cfg: &RuntimeConfig) -> Option<PathBuf> {
 /// Control-token file this engine wrote — exported to workers as
 /// `BOSS_ENGINE_CONTROL_TOKEN_PATH`.
 ///
-/// Returns the stamp [`crate::app::serve`] wrote from
+/// Returns the stamp `boss_engine::app::serve` wrote from
 /// `resolve_engine_paths`'s `control_token`. Like
 /// [`bound_frontend_socket_path`], this getter does not re-derive a path
 /// from the socket stem or the environment: production writes
@@ -90,7 +90,7 @@ pub fn engine_events_socket_path() -> PathBuf {
     boss_log_files::default_events_socket_path().unwrap_or_default()
 }
 
-pub(crate) use super::runner_adapter::compose_worker_spawn;
+pub use super::runner_adapter::compose_worker_spawn;
 #[cfg(test)]
 #[path = "pane_spawn/pane_spawn_tests.rs"]
 mod pane_spawn_tests;

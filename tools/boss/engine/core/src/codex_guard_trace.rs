@@ -45,7 +45,7 @@ crate::register_counter!(
 );
 
 /// Register both guard-trace counters with `registry`. Called from
-/// [`crate::metrics_init::init_all`] at engine startup.
+/// `boss_engine::metrics_init::init_all` at engine startup.
 pub fn register_metrics(registry: &crate::metrics::Registry) {
     registry.register_counter(&CODEX_GUARD_TRACE_REPORTED);
     registry.register_counter(&CODEX_GUARDS_SILENT);

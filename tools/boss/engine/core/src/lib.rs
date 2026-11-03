@@ -11,7 +11,6 @@ pub mod agent_jsonl_discovery;
 pub mod agent_jsonl_progress;
 pub use boss_execution_runner::answer_agent;
 pub mod answer_agent_completion_sweep;
-pub mod app;
 pub mod attention_lifecycle;
 pub mod attention_reconcile_sweep;
 pub mod attentions_detector;
@@ -36,10 +35,10 @@ pub use boss_claude_client as claude_client;
 pub mod cli;
 pub use boss_comment_anchor as comments_anchor;
 pub use boss_engine_comment_classifier as comment_classifier;
-mod completion_adapters;
+pub mod completion_adapters;
 #[cfg(test)]
 mod completion_integration_tests;
-mod merge_poller_adapters;
+pub mod merge_poller_adapters;
 #[cfg(test)]
 mod merge_poller_integration_tests;
 pub use boss_engine_completion as completion;
@@ -63,9 +62,9 @@ pub use boss_conflict_diagnosis as conflict_diagnosis;
 pub mod conflict_ladder;
 pub mod conflict_remediation;
 pub mod conflict_watch;
-pub(crate) mod coordinator_guidance;
-pub(crate) mod coordinator_handoff;
-pub(crate) mod coordinator_tmux;
+pub mod coordinator_guidance;
+pub mod coordinator_handoff;
+pub mod coordinator_tmux;
 pub mod cost_pricing;
 pub mod cost_report;
 pub use boss_host_execution::cube as cube_commands;
@@ -111,7 +110,7 @@ pub mod execution_liveness;
 pub mod execution_retention_sweep;
 pub mod external_tracker;
 pub use boss_feature_flags as feature_flags;
-mod execution_bookmark_recovery;
+pub mod execution_bookmark_recovery;
 pub mod github_api_usage;
 pub mod host_adapter;
 pub mod host_capability_probe;
@@ -129,25 +128,23 @@ pub mod ladder_lease_registry;
 pub(crate) mod libproc;
 pub mod live_status;
 pub mod live_status_loop;
-pub(crate) mod live_worker_metadata;
+pub mod live_worker_metadata;
 pub use boss_engine_live_worker_state as live_worker_state;
 pub use boss_engine_live_worker_state::semantic_progress;
 pub mod lost_workspace_sweep;
 pub mod materializer;
 pub mod merge_mechanism;
 pub mod merge_when_ready;
-mod run_cost;
+pub mod run_cost;
 // The metrics framework lives in its own crate; alias it under the
-// module path the engine has always used it by. `metrics_init` holds
-// the engine-specific startup registration that can't move down
-// (it names every engine module that declares a handle).
+// module path the engine has always used it by. The engine-specific startup
+// registration lives in `boss_engine_app::metrics_init`.
 pub use boss_metrics as metrics;
 // Re-exported so the declaration macros keep resolving as
 // `crate::register_counter!` at every engine call site; the macros
 // are `#[macro_export]`ed from `boss_engine_metrics_registry` and
 // re-exported through `boss_metrics`.
 pub use boss_metrics::{register_counter, register_gauge};
-pub mod metrics_init;
 pub mod orphan_sweep;
 pub mod planner;
 pub mod pool_claim_sweep;
@@ -157,7 +154,7 @@ pub mod populator;
 pub use boss_pr_review as pr_review;
 pub use boss_pr_template as pr_template;
 pub mod board_notification_bridge;
-mod hung_worker;
+pub mod hung_worker;
 pub mod pr_review_recovery;
 pub mod pre_start_streak;
 pub mod project_postmortem_sweep;
@@ -173,7 +170,7 @@ pub mod remote_transcript;
 pub mod remote_wrapper;
 pub mod repo_slug;
 pub mod resolution_signal_capture;
-mod review_guide_validation;
+pub mod review_guide_validation;
 mod review_guide_workspace;
 pub mod review_verdict_apply_sweep;
 pub mod rotating_file;
@@ -189,7 +186,7 @@ pub mod spawn_health;
 pub mod speculative_conflict;
 pub mod ssh_spawn;
 pub use boss_ssh_transport as ssh_transport;
-mod local_worker_quarantine;
+pub mod local_worker_quarantine;
 pub mod stacked_pr_structuring;
 pub mod stale_worker_sweep;
 pub mod startup_pane_reconcile;
@@ -204,19 +201,21 @@ pub(crate) mod sweep_loop;
 pub mod sweep_metrics;
 pub mod syspolicyd_monitor;
 pub mod terminal_work_sweep;
-#[cfg(test)]
-pub(crate) mod test_support;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 // The stub macros live with the contract traits they implement; re-exported so
 // `crate::stub_cube_client!` keeps resolving in engine tests.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use boss_execution_contracts::stub_cube_client;
 #[cfg(test)]
-pub(crate) use boss_execution_contracts::{stub_cube_client, stub_host_adapter};
+pub(crate) use boss_execution_contracts::stub_host_adapter;
 pub mod tmux_adoption;
 pub(crate) mod tmux_adoption_live_state;
 pub(crate) mod tmux_session_options;
 pub use boss_transcript_tail as transcript_tail;
 pub mod trace_rotation;
 pub use boss_engine_transient_error as transient_error;
-mod tmux_health;
+pub mod tmux_health;
 pub mod tmux_preflight;
 pub mod transcript_liveness;
 pub mod transient_recovery;
@@ -228,10 +227,10 @@ pub mod worker_refresh_liveness;
 pub mod worker_registry;
 pub mod worker_sandbox_audit;
 pub mod worker_setup;
-mod worker_throttle;
+pub mod worker_throttle;
 pub mod workspace_lease_release;
 pub mod wrapper_distribution;
 
-mod lifecycle_adapter;
+pub mod lifecycle_adapter;
 pub use lifecycle_adapter::CoreCoordinatorConstructors;
 mod runner_adapter;

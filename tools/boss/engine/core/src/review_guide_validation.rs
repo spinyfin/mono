@@ -54,7 +54,7 @@ pub(crate) fn validate_at_workspace(
 /// large packet read and the `git` calls hold no lock; storage then refuses
 /// the submission, storing nothing, if the attempt is not running or the
 /// comparison changed while validation ran.
-pub(crate) fn submit_worker_proposal(
+pub fn submit_worker_proposal(
     db: &WorkDb,
     input: SubmitWorkerProposalInput<'_>,
 ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
@@ -74,7 +74,7 @@ pub(crate) fn submit_worker_proposal(
 
 /// What [`recover_orphaned_submissions`] did.
 #[derive(Debug, Default)]
-pub(crate) struct ReviewGuideSubmissionRecoveryReport {
+pub struct ReviewGuideSubmissionRecoveryReport {
     /// `(proposal_id, attempt_id, version_id)` for every guide published.
     pub published: Vec<(String, String, String)>,
     /// `(proposal_id, reason)` for every candidate left untouched.
@@ -82,7 +82,7 @@ pub(crate) struct ReviewGuideSubmissionRecoveryReport {
 }
 
 impl ReviewGuideSubmissionRecoveryReport {
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.published.is_empty() && self.skipped.is_empty()
     }
 }
@@ -95,7 +95,7 @@ impl ReviewGuideSubmissionRecoveryReport {
 /// same fences a live submission would face. A body that no longer validates
 /// is reported as skipped and nothing is written. Validation shells out to
 /// `git`, so call this off the async runtime.
-pub(crate) fn recover_orphaned_submissions(db: &WorkDb) -> Result<ReviewGuideSubmissionRecoveryReport> {
+pub fn recover_orphaned_submissions(db: &WorkDb) -> Result<ReviewGuideSubmissionRecoveryReport> {
     let mut report = ReviewGuideSubmissionRecoveryReport::default();
     for submission in db.list_orphaned_review_guide_submissions()? {
         let proposal_id = submission.proposal_id.clone();

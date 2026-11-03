@@ -5,7 +5,7 @@
 //!
 //! A worker's normal terminal act is opening its PR; the engine reaps it
 //! immediately afterward via the completion path's
-//! [`crate::app::ServerState::release_worker_pane`]. But that teardown can
+//! `boss_engine::app::ServerState::release_worker_pane`. But that teardown can
 //! fail to land: the laptop is closed, an API call wedges, the run hangs
 //! mid-turn. The worker then sits alive — typically in `waiting_for_input`
 //! — holding its slot indefinitely, long after its task went `done` and
@@ -147,7 +147,7 @@ use boss_execution_contracts::CubeClient;
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Tears down a live worker pane bound to a run id. Implemented by
-/// [`crate::app::ServerState`] (delegating to `release_worker_pane`);
+/// `boss_engine::app::ServerState` (delegating to `release_worker_pane`);
 /// stubbed in tests and in contexts without an app session.
 #[async_trait::async_trait]
 pub trait WorkerReaper: Send + Sync {

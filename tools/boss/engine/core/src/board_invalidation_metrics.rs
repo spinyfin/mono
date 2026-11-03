@@ -61,13 +61,13 @@ pub fn record_runtime_patch(registry: &Registry, cards: usize) {
 }
 
 /// Pushes recorded for `(source, class)`, or zero.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn pushes(registry: &Registry, source: &str, class: InvalidationClass) -> u64 {
     registry.counter_value(&push_counter(source, class)).unwrap_or(0)
 }
 
 /// Pushes recorded for `class` across every source, or zero.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn pushes_of_class(registry: &Registry, class: InvalidationClass) -> u64 {
     [SOURCE_MUTATION, SOURCE_BATCH_MUTATION, SOURCE_EXECUTION]
         .into_iter()
@@ -75,12 +75,12 @@ pub fn pushes_of_class(registry: &Registry, class: InvalidationClass) -> u64 {
         .sum()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn full_assemblies(registry: &Registry) -> u64 {
     registry.counter_value(FULL_ASSEMBLIES).unwrap_or(0)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn runtime_patches(registry: &Registry) -> u64 {
     registry.counter_value(RUNTIME_PATCHES).unwrap_or(0)
 }

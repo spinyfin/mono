@@ -52,7 +52,7 @@ const DUPLEX_BYTES: usize = 64 * 1024;
 /// Where a run's file ingress had got to, durably.
 ///
 /// Written by the ingress itself and read back by
-/// [`crate::app::ServerState::readopt_live_worker`]. It exists because the
+/// `boss_engine::app::ServerState::readopt_live_worker`. It exists because the
 /// two answers available without it are both wrong for a session that
 /// outlives an engine restart: re-tailing from byte 0 republishes every
 /// record of every prior turn — a second `SessionStart`, a second `Stop` per

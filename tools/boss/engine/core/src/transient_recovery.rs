@@ -61,7 +61,7 @@
 //!      outright instead of silently landing on a different, clean
 //!      workspace, which would strand the uncommitted work. The stalled
 //!      worker's pane is torn down through
-//!      [`crate::app::ServerState::release_worker_pane`]; the pool claim
+//!      `boss_engine::app::ServerState::release_worker_pane`; the pool claim
 //!      is handed back only when that teardown is confirmed.
 //!   5. **Escalate** (permanent / unrecognised / retry cap reached):
 //!      raise a `WorkAttentionItem` and stop. The orphan-active sweep
@@ -170,7 +170,7 @@ pub trait WorkerNudger: Send + Sync {
 /// Tears down a recovered worker's tmux pane and hands the pool slot back
 /// only when that teardown is confirmed.
 ///
-/// Production wires this to [`crate::app::ServerState::release_worker_pane`],
+/// Production wires this to `boss_engine::app::ServerState::release_worker_pane`,
 /// the same confirmed-teardown path completion / stale-worker / spawn-ack
 /// already use. Callers must **not** also
 /// [`ExecutionCoordinator::release_worker_and_kick`]: that is how this
@@ -779,7 +779,7 @@ fn should_inspect(activity: WorkerActivity) -> bool {
 
 /// Tear the recovered worker's pane down through
 /// [`TransientRecoveryReaper`]. Production routes this to
-/// [`crate::app::ServerState::release_worker_pane`], which drops the
+/// `boss_engine::app::ServerState::release_worker_pane`, which drops the
 /// live-state entry and hands the pool claim back **only** when the app
 /// confirms the pane is gone.
 ///

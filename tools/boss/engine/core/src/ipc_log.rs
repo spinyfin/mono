@@ -25,9 +25,9 @@
 //!
 //! # Correlation
 //!
-//! `request_id` is minted by [`crate::app::AppSessionHandle::allocate_request_id`]
+//! `request_id` is minted by `boss_engine::app::AppSessionHandle::allocate_request_id`
 //! as `<session_id>-eng-req-<n>`, where `session_id` is itself
-//! `session-<boot_id>-<n>` (see [`crate::app::ServerState::allocate_session_id`]),
+//! `session-<boot_id>-<n>` (see `boss_engine::app::ServerState::allocate_session_id`),
 //! and echoed back verbatim by the app, so it is the join key with
 //! `ipc-*.jsonl`: `(request_id, direction, kind)` identifies one exchange
 //! leg on either side. The `<boot_id>` component (a millisecond epoch

@@ -1118,7 +1118,7 @@ pub enum FrontendRequest {
     /// Replies with [`FrontendEvent::WorkerContextResult`], or
     /// [`FrontendEvent::ProposalRejected`] when attribution fails — reused
     /// from the proposal API, which faces the identical attribution
-    /// failure modes (see `engine/core/src/app/context.rs`).
+    /// failure modes (see `engine/app/src/app/context.rs`).
     GetWorkerContext {
         run_id: String,
     },

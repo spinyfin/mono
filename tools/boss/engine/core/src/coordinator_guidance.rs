@@ -45,13 +45,13 @@ pub(crate) const SESSION_START_FETCH_BUDGET: Duration = Duration::from_secs(3);
 
 /// Per-product bound for an on-demand `boss guidance show`. More generous
 /// than the launch budget: a CLI caller is waiting for exactly this.
-pub(crate) const ON_DEMAND_FETCH_BUDGET: Duration = Duration::from_secs(45);
+pub const ON_DEMAND_FETCH_BUDGET: Duration = Duration::from_secs(45);
 
 /// Products whose guidance the coordinator is bound by: every product
 /// that is not archived. Products without a repo are included — their
 /// `NoRepoConfigured` state is reported rather than them being omitted,
 /// so the coordinator can see the list is complete.
-pub(crate) fn guidance_products(work_db: &WorkDb) -> anyhow::Result<Vec<Product>> {
+pub fn guidance_products(work_db: &WorkDb) -> anyhow::Result<Vec<Product>> {
     Ok(work_db
         .list_products()?
         .into_iter()
@@ -61,7 +61,7 @@ pub(crate) fn guidance_products(work_db: &WorkDb) -> anyhow::Result<Vec<Product>
 
 /// Read every product's guidance concurrently, each bounded by `budget`.
 /// Always returns one view per input product, in input order.
-pub(crate) async fn load_product_guidance(
+pub async fn load_product_guidance(
     design_docs: &Arc<DesignDocsService>,
     work_db: &WorkDb,
     products: &[Product],

@@ -146,8 +146,8 @@ fn epoch_now() -> i64 {
     boss_engine_utils::epoch_time::now_epoch_secs()
 }
 
-// Phase-4 counter handles for DispatcherStats. Registered via
-// `register_metrics` which is called from `crate::metrics_init::init_all` at
+// Counter handles for DispatcherStats. Registered via
+// `register_metrics` which is called from `boss_engine_app::metrics_init::init_all` at
 // engine startup.
 crate::register_counter!(
     DISPATCHER_HOOK_EVENTS_TOTAL,
@@ -202,7 +202,7 @@ crate::register_counter!(
 );
 
 /// Register every DispatcherStats counter handle with `registry`.
-/// Called once from `crate::metrics_init::init_all` at engine startup so duplicate-name
+/// Called once from `boss_engine_app::metrics_init::init_all` at engine startup so duplicate-name
 /// panics surface at boot rather than on the first increment.
 pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&DISPATCHER_HOOK_EVENTS_TOTAL);
@@ -801,7 +801,7 @@ impl LiveStatusManager {
     /// True iff the manager currently has a task for `slot_id`. Used
     /// by tests; the production dispatcher just calls [`Self::notify`]
     /// and lets a missing slot fall through.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn has_slot(&self, slot_id: u8) -> bool {
         self.slots
             .lock()
@@ -2090,7 +2090,7 @@ mod tests {
         mgr.stop_slot(5);
     }
 
-    /// Phase-4 acceptance test: an increment via the legacy `inc_*`
+    /// Acceptance test: an increment via the legacy `inc_*`
     /// wrapper and a direct increment via the framework handle both
     /// show up in `snapshot()` and in `registry.counter_value()`.
     #[test]

@@ -1,11 +1,11 @@
 //! Fresh handoff gate for UI-confirmed coordinator replacement.
 use super::*;
 
-pub(crate) const HANDOFF_TIMEOUT: Duration = Duration::from_secs(30);
+pub const HANDOFF_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Leads the error returned when the request could not be delivered. The app
 /// matches this text to keep the reset UI alive and offer a forced reset.
-pub(crate) const DELIVERY_FAILED_PREFIX: &str = "coordinator did not receive the handoff request";
+pub const DELIVERY_FAILED_PREFIX: &str = "coordinator did not receive the handoff request";
 
 /// The `[Boss reset request]` marker lets the coordinator recognise this as
 /// engine-originated despite Claude attributing it to another session.
@@ -23,7 +23,7 @@ pub(crate) fn handoff_request_prompt(now_epoch_secs: i64, authorization: &str) -
 
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
-pub(crate) struct HandoffRequest<'a> {
+pub struct HandoffRequest<'a> {
     work_db: &'a WorkDb,
     tmux: &'a Tmux,
     lifecycle_lock: &'a tokio::sync::Mutex<()>,
@@ -38,7 +38,7 @@ pub(crate) struct HandoffRequest<'a> {
 /// cannot replace the session between the token check and the prompt, then
 /// releases it for the (long) wait. Recreation must recheck the token under
 /// the lock after this returns. Errors leave the session untouched.
-pub(crate) async fn request_and_wait(request: HandoffRequest<'_>) -> Result<bool> {
+pub async fn request_and_wait(request: HandoffRequest<'_>) -> Result<bool> {
     let HandoffRequest {
         work_db,
         tmux,

@@ -25,7 +25,7 @@ pub(crate) static DEAD_PANE_TERMINAL: SweepTicker = SweepTicker::new(
 );
 
 /// Register every handle this module declares. Called from
-/// [`crate::metrics_init::init_all`] at engine startup.
+/// `boss_engine::metrics_init::init_all` at engine startup.
 pub fn register_metrics(registry: &Registry) {
     for ticker in [
         &DEAD_PANE_TERMINAL,

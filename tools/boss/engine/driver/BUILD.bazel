@@ -24,6 +24,7 @@ rust_library(
         "BOSS_ENGINE_BAZEL_RUN_COMMAND": ENGINE_BINARY_BAZEL_RUN_COMMAND,
     },
     visibility = [
+        "//tools/boss/engine/app:__pkg__",
         "//tools/boss/engine/completion:__pkg__",
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/effort:__pkg__",
@@ -134,7 +135,9 @@ filegroup(
         ":aarch64_linux": ["@codex_test_aarch64_linux//:codex"],
     }),
     # engine/core's conformance live pins run against the same pinned release.
-    visibility = ["//tools/boss/engine/core:__pkg__"],
+    visibility = [
+        "//tools/boss/engine/core:__pkg__",
+    ],
 )
 
 filegroup(
@@ -146,7 +149,9 @@ filegroup(
         ":aarch64_linux": ["@codex_test_aarch64_linux//:code_mode_host"],
     }),
     # engine/core's conformance live pins run against the same pinned release.
-    visibility = ["//tools/boss/engine/core:__pkg__"],
+    visibility = [
+        "//tools/boss/engine/core:__pkg__",
+    ],
 )
 
 # Production sources scanned by `//tools/boss/engine/core:tmux_only_surface_test`,
@@ -154,5 +159,7 @@ filegroup(
 filegroup(
     name = "srcs",
     srcs = glob(["src/**/*.rs"]),
-    visibility = ["//tools/boss/engine/core:__pkg__"],
+    visibility = [
+        "//tools/boss/engine/core:__pkg__",
+    ],
 )
