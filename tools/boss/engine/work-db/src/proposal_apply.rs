@@ -1026,8 +1026,10 @@ fn apply_run_done(
         // A conflict worker that stopped on `architectural_mismatch` declares
         // itself blocked without a question of its own: the engine asks the
         // repo owner on its behalf, with the evidence the worker recorded.
-        // Always open: the revision may already be blocked on this decision.
-        super::conflict_mismatch::insert_open_question(tx, execution_id, proposal_id, &question)?;
+        // Shared parkability: a task already blocked awaiting this answer
+        // can still park; any other status, a deleted task, or a changed
+        // blocked reason withdraws the row as `task_not_parkable`.
+        super::pr_flow::insert_question_with_liveness(tx, execution_id, proposal_id, &question, None)?;
         super::conflict_mismatch::link_question(tx, execution_id, proposal_id, &attempt_id)?;
     }
 

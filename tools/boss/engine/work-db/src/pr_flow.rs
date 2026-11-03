@@ -2256,7 +2256,16 @@ pub(super) fn insert_question_with_liveness(
     let Some(task) = query_task(conn, &execution.work_item_id)? else {
         return Ok(());
     };
-    let parkable = task.deleted_at.is_none() && matches!(task.status, TaskStatus::Active | TaskStatus::Todo);
+    // Open only when the item can actually park on the question. Active and
+    // Todo can. A task already blocked awaiting this same operator answer
+    // can too: the engine may re-raise after a withdrawal while the task is
+    // still waiting on the human. Any other blocked reason, an archived or
+    // deleted item, or a work item that is not a task, is withdrawn as
+    // `task_not_parkable`.
+    let parkable = task.deleted_at.is_none()
+        && (matches!(task.status, TaskStatus::Active | TaskStatus::Todo)
+            || (task.status == TaskStatus::Blocked
+                && task.blocked_reason.as_deref() == Some("awaiting_operator_answer")));
     let stuck_classification = if task.blocked_reason.is_some() || task.dispatch_failed_reason.is_some() {
         let durable = super::stuck_report::classification(conn, &task, None)?;
         if let Some(worker) = worker

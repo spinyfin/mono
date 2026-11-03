@@ -276,31 +276,6 @@ pub(super) fn execution_has_open_mismatch_question(conn: &Connection, execution_
     )?)
 }
 
-/// Insert the engine-generated mismatch question as `open`. The revision may
-/// already be blocked awaiting this decision; that is still a parkable ask.
-pub(super) fn insert_open_question(
-    tx: &Transaction<'_>,
-    execution_id: &str,
-    proposal_id: &str,
-    question: &OperatorQuestion,
-) -> Result<()> {
-    let execution = query_execution(tx, execution_id).require("execution", execution_id)?;
-    tx.execute(
-        "INSERT INTO operator_questions
-         (id, work_item_id, execution_id, proposal_id, question_json, status, created_at, stuck_classification)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, 'S8_operator_question')",
-        params![
-            next_id("oq"),
-            execution.work_item_id,
-            execution_id,
-            proposal_id,
-            serde_json::to_string(question)?,
-            now_string(),
-        ],
-    )?;
-    Ok(())
-}
-
 /// Tie the question inserted for `proposal_id` to its attempt.
 pub(super) fn link_question(
     tx: &Transaction<'_>,

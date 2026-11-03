@@ -4,20 +4,22 @@
 
 use super::*;
 use crate::app::work_items::handle_operator_question;
+use async_trait::async_trait;
 use boss_engine_dispatch::coordinator::DispatchPauseOrigin;
 use boss_engine_runtime::test_support::{create_test_chore_manual, create_test_product, insert_host_capability};
 use boss_execution_contracts::{
-    CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
+    CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus, ExecutionRunner,
+    RunOutcome, RunWaitState,
 };
 use boss_protocol::{
     ArchitecturalMismatchEvidence, CONFLICT_MISMATCH_CHOICE_FORCE_MERGE, CONFLICT_MISMATCH_CHOICE_REWRITE,
-    CREATED_VIA_MERGE_CONFLICT_PREFIX, CreateProjectInput, CreateRevisionInput, CreateTaskInput, DispatchFocus,
-    DispatchFocusTargetKind, DispatchPauseScope, EffortLevel, ExecutionStatus, FrontendRequest, MismatchBasis,
-    OperatorAnswer, PauseReason, ProposalKind, RunDoneOutcome, RunDoneProposalPayload, WorkExecution, WorkItemPatch,
+    CREATED_VIA_MERGE_CONFLICT_PREFIX, CREATED_VIA_PR_REVIEW_PREFIX, CreateProjectInput, CreateRevisionInput,
+    DispatchFocus, DispatchFocusTargetKind, DispatchPauseScope, EffortLevel, ExecutionStatus, FrontendRequest,
+    MismatchBasis, OperatorAnswer, PauseReason, ProposalKind, RunDoneOutcome, RunDoneProposalPayload, TaskStatus,
+    WorkExecution, WorkItem, WorkItemPatch,
 };
-use boss_work_db::{
-    ConflictResolutionInsertInput, FakePrStateChecker, PrOpenState, SubmitWorkerProposalInput,
-};
+use boss_work_db::{ConflictResolutionInsertInput, FakePrStateChecker, PrOpenState, SubmitWorkerProposalInput};
+use std::sync::Mutex;
 
 const PR_URL: &str = "https://github.com/spinyfin/mono/pull/3405";
 
@@ -94,9 +96,41 @@ boss_execution_contracts::stub_cube_client! { AnswerDispatchCube {
     }
 }}
 
+struct RecordingRunner {
+    calls: Mutex<Vec<String>>,
+}
+
+impl RecordingRunner {
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl ExecutionRunner for RecordingRunner {
+    async fn run_execution(
+        &self,
+        _worker_id: &str,
+        execution: &WorkExecution,
+        _work_item: &boss_protocol::WorkItem,
+        _workspace_path: &std::path::Path,
+        _cube_change_id: Option<&str>,
+    ) -> anyhow::Result<RunOutcome> {
+        self.calls.lock().unwrap().push(execution.id.clone());
+        Ok(RunOutcome {
+            wait_state: RunWaitState::WorkerPaneAlive,
+            result_summary: Some(format!("test run finished for {}", execution.id)),
+            attention: None,
+            slot_id: None,
+            spawn_config: None,
+        })
+    }
+}
+
 struct Parked {
     _dir: tempfile::TempDir,
     state: Arc<ServerState>,
+    runner: Arc<RecordingRunner>,
     revision_id: String,
     focused_project_id: String,
 }
@@ -114,9 +148,12 @@ fn evidence() -> ArchitecturalMismatchEvidence {
 }
 
 fn parked_mismatch() -> Parked {
+    let runner = Arc::new(RecordingRunner {
+        calls: Mutex::new(Vec::new()),
+    });
     let (state, dir) = test_server_state_with_overrides(ServerStateOverrides {
         cube_client: Some(Arc::new(AnswerDispatchCube)),
-        execution_runner: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsRunner)),
+        execution_runner: Some(runner.clone()),
         pr_state_checker: Some(Arc::new(FakePrStateChecker::always(PrOpenState::Open))),
         ..Default::default()
     });
@@ -205,6 +242,7 @@ fn parked_mismatch() -> Parked {
     Parked {
         _dir: dir,
         state,
+        runner,
         revision_id: revision.id,
         focused_project_id: focused.id,
     }
@@ -217,9 +255,37 @@ fn hold_pause_and_focus(parked: &Parked) {
     parked.state.execution_coordinator.pause_dispatch_scoped(
         1_786_385_816,
         DispatchPauseOrigin::Operator,
-        DispatchPauseScope::NewWork,
+        DispatchPauseScope::AllSpawns,
         PauseReason::new("test: operator pause").unwrap(),
     );
+}
+
+async fn timed_answer(parked: &Parked, choice: &str) -> FrontendEvent {
+    let snapshot = format!(
+        "revision={} status={:?} gating={:?} runner={:?}",
+        parked.revision_id,
+        latest_execution(&parked.state, &parked.revision_id).status,
+        parked.state.work_db.gating_prereqs_for(&parked.revision_id).unwrap(),
+        parked.runner.calls(),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(8), answer(parked, choice))
+        .await
+        .unwrap_or_else(|_| panic!("answer hung; {snapshot}"))
+}
+
+async fn timed_drain(parked: &Parked) {
+    let snapshot = format!(
+        "revision={} status={:?} runner={:?}",
+        parked.revision_id,
+        latest_execution(&parked.state, &parked.revision_id).status,
+        parked.runner.calls(),
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        parked.state.execution_coordinator.drain_ready_queue_for_test(),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("drain hung; {snapshot}"));
 }
 
 async fn answer(parked: &Parked, choice: &str) -> FrontendEvent {
@@ -257,15 +323,140 @@ fn latest_execution(state: &ServerState, work_item_id: &str) -> WorkExecution {
         .expect("execution")
 }
 
-async fn wait_until_not_ready(state: &ServerState, execution_id: &str) {
+async fn wait_until_runner_saw(parked: &Parked, execution_id: &str) {
     for _ in 0..300 {
-        let status = state.work_db.get_execution(execution_id).unwrap().status;
-        if status != ExecutionStatus::Ready {
+        if parked.runner.calls().iter().any(|id| id == execution_id) {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    panic!("execution {execution_id} stayed ready");
+    panic!(
+        "runner never saw {execution_id}; calls={:?} status={:?}",
+        parked.runner.calls(),
+        parked.state.work_db.get_execution(execution_id).unwrap().status
+    );
+}
+
+fn assert_not_dispatched(parked: &Parked, execution_id: &str) {
+    assert!(
+        !parked.runner.calls().iter().any(|id| id == execution_id),
+        "runner saw {execution_id} before clearance: {:?}",
+        parked.runner.calls()
+    );
+}
+
+fn assert_forced_admission(parked: &Parked, execution_id: &str, expected: bool) {
+    assert_eq!(
+        parked
+            .state
+            .work_db
+            .execution_has_operator_forced_admission(execution_id)
+            .unwrap(),
+        expected
+    );
+}
+
+fn port_revision_id(parked: &Parked) -> String {
+    parked
+        .state
+        .work_db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT revision_task_id FROM conflict_resolutions
+             WHERE revision_task_id IS NOT NULL AND revision_task_id != ?1",
+            [&parked.revision_id],
+            |row| row.get(0),
+        )
+        .expect("port revision")
+}
+
+/// A live same-PR writer the answered work must wait for.
+///
+/// Inserted with SQL so minting it does not publish work-item events that
+/// would kick ServerState's live scheduler while this test is still
+/// arranging the fixture.
+fn attach_running_writer(parked: &Parked) -> String {
+    let writer_id = format!("{}_writer", parked.revision_id);
+    let exec_id = format!("{}_exec", writer_id);
+    let parent_id = match parked.state.work_db.get_work_item(&parked.revision_id).unwrap() {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task
+            .parent_task_id
+            .expect("conflict revision is parented on the PR chore"),
+        other => panic!("conflict revision must be a task, got {other:?}"),
+    };
+    let conn = parked.state.work_db.connect().unwrap();
+    conn.execute(
+        "INSERT INTO tasks (
+             id, product_id, kind, name, description, status, created_via,
+             created_at, updated_at, parent_task_id
+         )
+         SELECT ?1, product_id, 'revision', 'Address review findings', '',
+                'active', ?3, '1700000000', '1700000000', ?2
+         FROM tasks WHERE id = ?2",
+        rusqlite::params![
+            writer_id,
+            parent_id,
+            format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_writer")
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO work_executions (
+             id, work_item_id, kind, status, repo_remote_url, created_at
+         ) VALUES (?1, ?2, 'revision_implementation', 'running',
+                   'https://github.com/spinyfin/mono.git', '1700000000')",
+        rusqlite::params![exec_id, writer_id],
+    )
+    .unwrap();
+    boss_work_db::work_dependencies::insert_edge(
+        &conn,
+        &parked.revision_id,
+        &writer_id,
+        boss_work_db::work_dependencies::RELATION_BLOCKS,
+        "1",
+    )
+    .unwrap();
+    writer_id
+}
+
+fn complete_writer(parked: &Parked, writer_id: &str, waiting_id: &str) {
+    let writer_exec = latest_execution(&parked.state, writer_id);
+    parked
+        .state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            [&writer_exec.id],
+        )
+        .unwrap();
+    parked
+        .state
+        .work_db
+        .update_work_item(
+            writer_id,
+            WorkItemPatch {
+                status: Some(TaskStatus::InReview.as_str().to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+    let _ = parked
+        .state
+        .work_db
+        .try_unblock_dependency_if_resolved(waiting_id)
+        .unwrap();
+    let product_id = parked
+        .state
+        .work_db
+        .get_work_item(waiting_id)
+        .unwrap()
+        .product_id()
+        .to_owned();
+    parked.state.work_db.reconcile_product_executions(&product_id).unwrap();
+    parked.state.work_db.promote_todo_autostart_stuck_executions().unwrap();
 }
 
 #[tokio::test]
@@ -279,12 +470,8 @@ async fn force_answer_dispatches_through_the_pause_and_outside_the_focus_set() {
         "{response:?}"
     );
     let exec = latest_execution(&parked.state, &parked.revision_id);
-    wait_until_not_ready(&parked.state, &exec.id).await;
-    assert_ne!(exec.status, ExecutionStatus::WaitingDependency);
-    assert_ne!(
-        parked.state.work_db.get_execution(&exec.id).unwrap().status,
-        ExecutionStatus::Ready
-    );
+    wait_until_runner_saw(&parked, &exec.id).await;
+    assert_forced_admission(&parked, &exec.id, false);
 }
 
 #[tokio::test]
@@ -296,25 +483,11 @@ async fn rewrite_answer_dispatches_the_port_through_the_pause_and_outside_the_fo
         matches!(response, FrontendEvent::WorkItemUpdated { .. }),
         "{response:?}"
     );
-    let port_id: String = parked
-        .state
-        .work_db
-        .connect()
-        .unwrap()
-        .query_row(
-            "SELECT revision_task_id FROM conflict_resolutions
-             WHERE revision_task_id IS NOT NULL AND revision_task_id != ?1",
-            [&parked.revision_id],
-            |row| row.get(0),
-        )
-        .expect("port revision");
+    let port_id = port_revision_id(&parked);
     assert_ne!(port_id, parked.revision_id);
     let exec = latest_execution(&parked.state, &port_id);
-    wait_until_not_ready(&parked.state, &exec.id).await;
-    assert_ne!(
-        parked.state.work_db.get_execution(&exec.id).unwrap().status,
-        ExecutionStatus::Ready
-    );
+    wait_until_runner_saw(&parked, &exec.id).await;
+    assert_forced_admission(&parked, &exec.id, false);
 }
 
 #[tokio::test]
@@ -328,73 +501,68 @@ async fn force_answer_keeps_admission_through_a_preflight_refusal_then_drains() 
     let _ = answer(&parked, CONFLICT_MISMATCH_CHOICE_FORCE_MERGE).await;
     let exec = latest_execution(&parked.state, &parked.revision_id);
     assert_eq!(exec.status, ExecutionStatus::Ready);
-    assert!(
-        parked
-            .state
-            .work_db
-            .execution_has_operator_forced_admission(&exec.id)
-            .unwrap()
-    );
+    assert_forced_admission(&parked, &exec.id, true);
+    assert_not_dispatched(&parked, &exec.id);
     parked.state.execution_coordinator.set_dispatch_preflight_block(None);
     parked.state.execution_coordinator.drain_ready_queue_for_test().await;
-    wait_until_not_ready(&parked.state, &exec.id).await;
+    wait_until_runner_saw(&parked, &exec.id).await;
+    assert_forced_admission(&parked, &exec.id, false);
 }
 
 #[tokio::test]
-async fn force_answer_behind_a_writer_dispatches_once_the_row_is_ready() {
+async fn rewrite_answer_keeps_admission_through_a_preflight_refusal_then_drains() {
     let parked = parked_mismatch();
-    let product_id = parked
-        .state
-        .work_db
-        .get_work_item(&parked.revision_id)
-        .unwrap()
-        .product_id()
-        .to_owned();
-    let writer = parked
-        .state
-        .work_db
-        .create_task(
-            CreateTaskInput::builder()
-                .product_id(product_id)
-                .project_id(parked.focused_project_id.clone())
-                .name("Live writer")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    hold_pause_and_focus(&parked);
     parked
         .state
-        .work_db
-        .connect()
-        .unwrap()
-        .execute("UPDATE tasks SET status = 'active' WHERE id = ?1", [&writer.id])
-        .unwrap();
-    boss_work_db::work_dependencies::insert_edge(
-        &parked.state.work_db.connect().unwrap(),
-        &parked.revision_id,
-        &writer.id,
-        boss_work_db::work_dependencies::RELATION_BLOCKS,
-        "1",
-    )
-    .unwrap();
+        .execution_coordinator
+        .set_dispatch_preflight_block(Some("test: local dispatch unavailable".into()));
+    let _ = answer(&parked, CONFLICT_MISMATCH_CHOICE_REWRITE).await;
+    let exec = latest_execution(&parked.state, &port_revision_id(&parked));
+    assert_eq!(exec.status, ExecutionStatus::Ready);
+    assert_forced_admission(&parked, &exec.id, true);
+    assert_not_dispatched(&parked, &exec.id);
+    parked.state.execution_coordinator.set_dispatch_preflight_block(None);
+    parked.state.execution_coordinator.drain_ready_queue_for_test().await;
+    wait_until_runner_saw(&parked, &exec.id).await;
+    assert_forced_admission(&parked, &exec.id, false);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn force_answer_behind_a_writer_dispatches_once_the_writer_finishes() {
+    let parked = parked_mismatch();
     hold_pause_and_focus(&parked);
-    let _ = answer(&parked, CONFLICT_MISMATCH_CHOICE_FORCE_MERGE).await;
+    let writer_id = attach_running_writer(&parked);
+    let _ = timed_answer(&parked, CONFLICT_MISMATCH_CHOICE_FORCE_MERGE).await;
     let exec = latest_execution(&parked.state, &parked.revision_id);
     assert_eq!(exec.status, ExecutionStatus::WaitingDependency);
-    assert!(
-        parked
-            .state
-            .work_db
-            .execution_has_operator_forced_admission(&exec.id)
-            .unwrap()
-    );
-    parked
-        .state
-        .work_db
-        .connect()
-        .unwrap()
-        .execute("UPDATE work_executions SET status = 'ready' WHERE id = ?1", [&exec.id])
-        .unwrap();
-    parked.state.execution_coordinator.drain_ready_queue_for_test().await;
-    wait_until_not_ready(&parked.state, &exec.id).await;
+    assert_forced_admission(&parked, &exec.id, true);
+    timed_drain(&parked).await;
+    assert_not_dispatched(&parked, &exec.id);
+    complete_writer(&parked, &writer_id, &parked.revision_id);
+    let exec = latest_execution(&parked.state, &parked.revision_id);
+    assert_eq!(exec.status, ExecutionStatus::Ready);
+    timed_drain(&parked).await;
+    wait_until_runner_saw(&parked, &exec.id).await;
+    assert_forced_admission(&parked, &exec.id, false);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rewrite_answer_behind_a_writer_dispatches_once_the_writer_finishes() {
+    let parked = parked_mismatch();
+    hold_pause_and_focus(&parked);
+    let writer_id = attach_running_writer(&parked);
+    let _ = timed_answer(&parked, CONFLICT_MISMATCH_CHOICE_REWRITE).await;
+    let port_id = port_revision_id(&parked);
+    let exec = latest_execution(&parked.state, &port_id);
+    assert_eq!(exec.status, ExecutionStatus::WaitingDependency);
+    assert_forced_admission(&parked, &exec.id, true);
+    timed_drain(&parked).await;
+    assert_not_dispatched(&parked, &exec.id);
+    complete_writer(&parked, &writer_id, &port_id);
+    let exec = latest_execution(&parked.state, &port_id);
+    assert_eq!(exec.status, ExecutionStatus::Ready);
+    timed_drain(&parked).await;
+    wait_until_runner_saw(&parked, &exec.id).await;
+    assert_forced_admission(&parked, &exec.id, false);
 }

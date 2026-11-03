@@ -5,7 +5,7 @@ use super::*;
 use boss_protocol::{
     ArchitecturalMismatchEvidence, CONFLICT_MISMATCH_CHOICE_FORCE_MERGE, CONFLICT_MISMATCH_CHOICE_REWRITE,
     MismatchBasis, OperatorAnswer, OperatorAnswerType, OperatorQuestionStatus, ProposalKind, RunDoneOutcome,
-    RunDoneProposalPayload,
+    RunDoneProposalPayload, TaskStatus, WorkItemPatch,
 };
 
 const PR_URL: &str = "https://github.com/spinyfin/mono/pull/3405";
@@ -278,7 +278,7 @@ fn a_mismatch_raises_a_question_and_leaves_no_dead_end() {
 }
 
 #[test]
-fn a_second_distinct_blocked_declaration_re_raises_the_withdrawn_question() {
+fn a_second_distinct_blocked_declaration_keeps_the_open_question() {
     let f = fixture();
     raise_question(&f);
     assert_eq!(open_linked_question_count(&f), 1);
@@ -522,6 +522,132 @@ fn admission_copy_probes_only_forced_executions() {
             .any(|line| line.contains("work_executions_operator_forced_idx")),
         "{plan:?}"
     );
+}
+
+fn declare_outcome_keyed(f: &Fixture, outcome: RunDoneOutcome, key: &str) {
+    let payload = serde_json::to_string(&RunDoneProposalPayload {
+        outcome,
+        summary: "later declaration".into(),
+        question: None,
+        queue_ci_evidence: None,
+    })
+    .unwrap();
+    f.db.submit_worker_proposal(crate::SubmitWorkerProposalInput {
+        execution_id: &f.execution_id,
+        work_item_id: &f.revision_id,
+        kind: ProposalKind::RunDone,
+        payload_json: &payload,
+        idempotency_key: key,
+    })
+    .unwrap()
+    .unwrap();
+}
+
+fn assert_one_open_linked_question_still_answers(f: &Fixture) {
+    assert_eq!(open_questions(f).len(), 1, "{:?}", open_questions(f));
+    assert_eq!(open_linked_question_count(f), 1);
+    let OperatorAnswerType::MultipleChoice { choices } = &open_questions(f)[0].question.answer_type else {
+        panic!("expected a multiple-choice question");
+    };
+    assert_eq!(
+        choices,
+        &[
+            CONFLICT_MISMATCH_CHOICE_REWRITE.to_owned(),
+            CONFLICT_MISMATCH_CHOICE_FORCE_MERGE.to_owned()
+        ]
+    );
+}
+
+#[test]
+fn a_withdrawn_mismatch_question_is_re_raised_by_a_later_blocked_declaration() {
+    let f = fixture();
+    raise_question(&f);
+    assert_eq!(open_linked_question_count(&f), 1);
+
+    declare_outcome_keyed(&f, RunDoneOutcome::Delivered, "declare-delivered");
+    assert_eq!(
+        open_questions(&f).len(),
+        0,
+        "a non-blocked declaration withdraws the question"
+    );
+    assert!(
+        mismatch_evidence_present(&f),
+        "evidence stays until the question is answered"
+    );
+
+    declare_blocked_keyed(&f, "declare-blocked-again");
+    assert_one_open_linked_question_still_answers(&f);
+    assert!(f.db.is_conflict_revision_running_or_queued(&f.revision_id).unwrap());
+
+    let outcome =
+        f.db.answer_operator_question_with(
+            &f.revision_id,
+            OperatorAnswer::MultipleChoice {
+                value: CONFLICT_MISMATCH_CHOICE_FORCE_MERGE.into(),
+            },
+            &open_pr(),
+        )
+        .unwrap();
+    assert_eq!(outcome.dispatch_work_item_id.as_deref(), Some(f.revision_id.as_str()));
+    assert_eq!(open_questions(&f).len(), 0);
+}
+
+#[test]
+fn a_late_blocked_declaration_does_not_reopen_a_question_after_the_human_changes_the_blocked_reason() {
+    let f = fixture();
+    raise_question(&f);
+    f.db.update_work_item(
+        &f.revision_id,
+        WorkItemPatch {
+            blocked_reason: Some("worker_failed".into()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        open_questions(&f).len(),
+        0,
+        "changing the blocked reason withdraws the question"
+    );
+
+    declare_blocked_keyed(&f, "declare-blocked-again");
+    assert_eq!(
+        open_questions(&f).len(),
+        0,
+        "a task that is no longer awaiting an operator answer is not parkable"
+    );
+    assert!(!f.db.is_conflict_revision_running_or_queued(&f.revision_id).unwrap());
+}
+
+#[test]
+fn a_late_blocked_declaration_does_not_reopen_a_question_after_the_task_is_archived() {
+    let f = fixture();
+    raise_question(&f);
+    f.db.update_work_item(
+        &f.revision_id,
+        WorkItemPatch {
+            status: Some(TaskStatus::Archived.as_str().to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(open_questions(&f).len(), 0);
+
+    declare_blocked_keyed(&f, "declare-blocked-again");
+    assert_eq!(open_questions(&f).len(), 0);
+    assert!(!f.db.is_conflict_revision_running_or_queued(&f.revision_id).unwrap());
+}
+
+#[test]
+fn a_late_blocked_declaration_does_not_reopen_a_question_after_the_task_is_deleted() {
+    let f = fixture();
+    raise_question(&f);
+    f.db.delete_work_item(&f.revision_id).unwrap();
+    assert_eq!(open_questions(&f).len(), 0);
+
+    declare_blocked_keyed(&f, "declare-blocked-again");
+    assert_eq!(open_questions(&f).len(), 0);
+    assert!(!f.db.is_conflict_revision_running_or_queued(&f.revision_id).unwrap());
 }
 
 #[test]

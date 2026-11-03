@@ -858,3 +858,33 @@ async fn operator_forced_work_drains_through_an_all_spawns_pause() {
         Some("dispatch_paused")
     );
 }
+
+/// A breaker-origin pause is never overridable: a flagged ready row stays
+/// held with its admission intact, then dispatches after resume.
+#[tokio::test]
+async fn operator_forced_work_is_held_under_a_breaker_pause_and_dispatches_after_resume() {
+    let h = harness();
+    let project = h.project("Any");
+    let (answered_task, answered_exec) = h.ready_project_task(&project, "Answered");
+    h.db.mark_operator_forced_admission(&answered_task).unwrap();
+    h.coordinator.pause_dispatch_scoped(
+        1_786_385_816,
+        DispatchPauseOrigin::Breaker,
+        DispatchPauseScope::AllSpawns,
+        PauseReason::new("test: spawn path broken").unwrap(),
+    );
+
+    h.coordinator.drain_ready_queue_for_test().await;
+    assert!(h.dispatched().await.is_empty());
+    assert_eq!(h.execution(&answered_exec).status, ExecutionStatus::Ready);
+    assert_eq!(
+        h.execution(&answered_exec).dispatch_wait_reason.as_deref(),
+        Some("dispatch_paused")
+    );
+    assert!(h.db.execution_has_operator_forced_admission(&answered_exec).unwrap());
+
+    h.coordinator.resume_dispatch();
+    h.drain_and_wait_for(&[&answered_exec]).await;
+    assert_eq!(h.dispatched().await, HashSet::from([answered_exec.clone()]));
+    assert!(!h.db.execution_has_operator_forced_admission(&answered_exec).unwrap());
+}
