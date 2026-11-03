@@ -833,23 +833,27 @@ fn remove_workspace_from_disk(
 }
 
 /// A disk-pressure reading taken on the lease path, and what reclamation did
-/// about it. Returned only when the volume was actually below its floor —
-/// this is the record of an intervention, not a routine measurement.
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+/// about it. Returned only when the volume was actually below a floor — this
+/// is the record of an intervention, not a routine measurement.
+#[derive(Debug, Clone, Copy, serde::Serialize, bon::Builder)]
 pub(super) struct DiskPressureRelief {
     pub(super) before: DiskSpace,
     pub(super) after: DiskSpace,
+    /// The cleanup low-water mark ([`config::PoolConfig::free_space_floor_bytes`]).
     pub(super) floor_bytes: u64,
+    /// The mint-refusal floor ([`config::PoolConfig::mint_floor_bytes`]).
+    pub(super) mint_floor_bytes: u64,
     pub(super) report: ReclaimReport,
-    /// Whether the volume cleared its floor once reclamation was done. `false`
-    /// does not fail the lease: reusing an existing workspace costs no disk
-    /// and is still allowed. It only means a *mint* in this same call will be
-    /// refused by [`assert_mint_headroom`].
+    /// Whether the volume cleared the *mint* floor once reclamation was done.
+    /// `false` does not fail the lease: reusing an existing workspace costs no
+    /// disk and is still allowed. It only means a *mint* in this same call
+    /// will be refused by [`assert_mint_headroom`].
     pub(super) recovered: bool,
 }
 
-/// If the pool's volume is below its free-space floor, compact everything free
-/// in `repo` and re-measure.
+/// If the pool's volume is below its cleanup low-water mark — or below the
+/// mint floor, so a mint this call may need is given the chance to reclaim
+/// first — compact everything free in `repo` and re-measure.
 ///
 /// This is the "free space is a first-class input" path, and it is
 /// reclaim-then-proceed by design: the lease is not refused for being on a
@@ -878,7 +882,8 @@ pub(super) fn relieve_disk_pressure(
     let pool = config::load_config().unwrap_or_default().pool;
     let before = DiskSpace::probe(workspace_root).ok()?;
     let floor_bytes = pool.free_space_floor_bytes(before.total_bytes);
-    if !before.is_below(floor_bytes) {
+    let mint_floor_bytes = pool.mint_floor_bytes();
+    if !before.is_below(floor_bytes) && !before.is_below(mint_floor_bytes) {
         return None;
     }
 
@@ -891,7 +896,7 @@ pub(super) fn relieve_disk_pressure(
     );
     let report = compact_free_workspaces(runner, store, database_path, Some(repo), now_epoch_s, true, deadline);
     let after = DiskSpace::probe(workspace_root).unwrap_or(before);
-    let recovered = !after.is_below(floor_bytes);
+    let recovered = !after.is_below(mint_floor_bytes);
 
     audit!(
         database_path,
@@ -899,6 +904,7 @@ pub(super) fn relieve_disk_pressure(
         repo = repo,
         workspace_root = workspace_root.display().to_string(),
         floor_bytes = floor_bytes,
+        mint_floor_bytes = mint_floor_bytes,
         total_bytes = before.total_bytes,
         available_before_bytes = before.available_bytes,
         available_after_bytes = after.available_bytes,
@@ -910,23 +916,31 @@ pub(super) fn relieve_disk_pressure(
     );
     if !recovered {
         eprintln!(
-            "cube: disk pressure: still {} free after compacting {} workspace(s) (floor {}); \
-             leasing an existing workspace remains available, growing the pool does not",
+            "cube: disk pressure: still {} free after compacting {} workspace(s) (provisioning \
+             floor {}); leasing an existing workspace remains available, growing the pool does not",
             human_bytes(after.available_bytes),
             report.workspaces_compacted,
-            human_bytes(floor_bytes),
+            human_bytes(mint_floor_bytes),
         );
     }
-    Some(DiskPressureRelief {
-        before,
-        after,
-        floor_bytes,
-        report,
-        recovered,
-    })
+    Some(
+        DiskPressureRelief::builder()
+            .before(before)
+            .after(after)
+            .floor_bytes(floor_bytes)
+            .mint_floor_bytes(mint_floor_bytes)
+            .report(report)
+            .recovered(recovered)
+            .build(),
+    )
 }
 
-/// Refuse to mint a workspace onto a volume below its free-space floor.
+/// Refuse to mint a workspace onto a volume with less free space than a new
+/// workspace needs ([`config::PoolConfig::mint_floor_bytes`]).
+///
+/// This floor is deliberately not the cleanup low-water mark: that one is
+/// tuned for when to start reclaiming and may be set high (a percentage of a
+/// large disk) without that ever meaning a workspace cannot fit.
 ///
 /// Called from the one place that grows the pool, so every mint path — the
 /// ordinary one and the dirty-reclaim retry — is covered by construction.
@@ -944,7 +958,7 @@ pub(super) fn assert_mint_headroom(repo: &str, workspace_root: &Path) -> Result<
         );
         return Ok(());
     };
-    let floor_bytes = pool.free_space_floor_bytes(space.total_bytes);
+    let floor_bytes = pool.mint_floor_bytes();
     if !space.is_below(floor_bytes) {
         return Ok(());
     }

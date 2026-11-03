@@ -173,12 +173,16 @@ Behavior:
   unpushed work (`cube workspace force-release --reason crash`) is a separate
   GC/recovery concern, decoupled from the lease path.
 - Treat free disk as an input. If the volume holding the pool is below its
-  free-space floor, the lease first compacts build-artifact trees out of that
-  repo's free workspaces and re-measures, then carries on. Reusing an existing
-  workspace is never refused for this. Only _growing_ the pool is, and only
-  when compaction could not recover the shortfall — a fact about the host, not
-  about the pool, reported as its own exit code (8) with the volume, the floor
-  and the shortfall in the message. See [Disk Reclamation](#disk-reclamation).
+  cleanup low-water mark (or below the mint floor), the lease first compacts
+  build-artifact trees out of that repo's free workspaces and re-measures, then
+  carries on. Reusing an existing workspace is never refused for this. Only
+  _growing_ the pool is, and only when free space is still below the **mint
+  floor** — the space one new workspace needs, `mint-min-free-bytes` — after
+  compaction. The mint floor is separate from the cleanup low-water mark and
+  does not scale with the disk, so starting cleanup earlier never makes leases
+  fail sooner. A refusal is a fact about the host, not about the pool,
+  reported as its own exit code (8) with the volume, the floor and the
+  shortfall in the message. See [Disk Reclamation](#disk-reclamation).
 - Self-heal degraded pool entries on lease. A free workspace whose directory
   has neither `.jj/` nor `.git/` (a "broken-empty" husk, e.g. from a clone
   interrupted before this guarantee landed) holds no recoverable work, so cube
@@ -692,8 +696,9 @@ max-free-workspaces = 20
 build-artifact-dirs = ["target", ".build"]
 compact-idle-hours = 6
 min-free-bytes = 21474836480   # 20 GiB
-min-free-percent = 2           # floor = max(bytes, percent-of-total)
-cleanup-headroom-bytes = 17179869184   # 16 GiB: how far above the floor cleanup stops
+min-free-percent = 2           # cleanup trigger = max(bytes, percent-of-total)
+cleanup-headroom-bytes = 17179869184   # 16 GiB: how far above the trigger cleanup stops
+mint-min-free-bytes = 62277025792   # 58 GiB: refuse a new workspace below this (default: 2 × 24 GiB workspace + 10 GiB OS reserve)
 
 [pool.repos.flunge]
 max-free-workspaces = 6

@@ -114,7 +114,8 @@ pub enum CubeError {
     #[error("salvage of workspace `{workspace_id}` is incomplete: {reason}")]
     SalvageIncomplete { workspace_id: String, reason: String },
     /// Growing the pool would have been written onto a volume that is already
-    /// below cube's free-space floor, and reclamation could not clear it.
+    /// below the free space a new workspace needs (the mint floor), and
+    /// reclamation could not clear it.
     ///
     /// This is NOT a pool-size cap. cube has no limit on how many workspaces a
     /// repo may have and a lease that can reuse an existing free workspace
@@ -124,9 +125,9 @@ pub enum CubeError {
     /// the volume rather than at the pool.
     #[error(
         "refusing to provision a new workspace for `{repo}`: only {available} is free on the volume \
-         holding `{workspace_root}`, below cube's floor of {floor} (short by {shortfall}). \
+         holding `{workspace_root}`, below the {floor} a new workspace needs (short by {shortfall}). \
          Reclamation already ran and could not recover enough. Free space on that volume, or lower \
-         `[pool] min-free-bytes` / `min-free-percent` in cube.toml. Leasing an existing free \
+         `[pool] mint-min-free-bytes` in cube.toml. Leasing an existing free \
          workspace for this repo is unaffected — this blocks only growing the pool."
     )]
     InsufficientDiskSpace {
