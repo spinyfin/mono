@@ -224,6 +224,14 @@ const POST_MERGE_BATCH_RESERVATION_UNITS: i64 = 1;
 /// already terminal (`done`/`archived`) do not hold a reservation: nothing
 /// can settle them through the quorum path, so counting them would
 /// permanently deny pre-merge review to every other product.
+///
+/// Known gap: post-merge batches effectively never count here. The merge
+/// poller creates a post-merge batch in the same pass that marks its root
+/// `done`, so the done/archived root filter excludes them. Consequences:
+/// post-merge reviewers occupy physical review slots without a reservation,
+/// and the post-merge half of the `review_pool.reserved_units` gauge reads 0.
+/// A fix would exempt `phase = 'post_merge'` from the root-status filter,
+/// mirroring the post-merge carve-out in `reap_inert_review_batches`.
 fn reserved_batch_count_in_tx(tx: &Transaction<'_>, phase: ReviewBatchPhase) -> Result<i64> {
     let count: i64 = tx.query_row(
         "SELECT COUNT(*)
@@ -819,6 +827,19 @@ fn reviews_held_by_persisted_pause_on(conn: &Connection) -> Result<bool> {
     ))
 }
 
+/// The persisted focus, treating an unreadable value as focus off. This
+/// matches the coordinator's restore: holding every review because the
+/// persisted value cannot be parsed would be the worse failure.
+fn load_focus_or_off(conn: &Connection) -> boss_protocol::DispatchFocus {
+    super::dispatch_focus::load_dispatch_focus_on(conn).unwrap_or_else(|err| {
+        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+        WARN_ONCE.call_once(|| {
+            tracing::warn!(?err, "persisted dispatch focus is unreadable; treating focus as off");
+        });
+        boss_protocol::DispatchFocus::default()
+    })
+}
+
 /// Why a pre-merge batch for `cycle_root_id` must not occupy a reservation
 /// right now: an all-spawns pause holds reviews, or focus mode is on and
 /// the root is outside the set. `None` means admission may proceed to the
@@ -827,7 +848,7 @@ fn pre_merge_dispatch_hold_on(conn: &Connection, cycle_root_id: &str) -> Result<
     if reviews_held_by_persisted_pause_on(conn)? {
         return Ok(Some("dispatch_paused"));
     }
-    let focus = super::dispatch_focus::load_dispatch_focus_on(conn)?;
+    let focus = load_focus_or_off(conn);
     if focus.is_active() && !super::dispatch_focus::work_item_in_dispatch_focus_on(conn, cycle_root_id, &focus)? {
         return Ok(Some("focus_mode"));
     }
@@ -871,13 +892,16 @@ fn file_admission_deferred_attention_in_tx(tx: &Transaction<'_>, work_item_id: &
 /// Deleting (after abandoning member executions) rather than failing the
 /// batch preserves the automatic remint generation cap: a later admission
 /// of the same head is generation 1 again, matching "this batch was never
-/// admitted". A batch with any member `started_at` keeps its reservation.
+/// admitted". A batch with any member `started_at` keeps its reservation, as
+/// does one with a member past `ready` (for example `claimed`, mid cube
+/// setup): abandoning it would fail the in-flight spawn and free a
+/// reservation while a physical slot is still held.
 fn release_unstartable_pre_merge_review_reservations_in_tx(
     tx: &Transaction<'_>,
     pending: &mut PendingEvents,
 ) -> Result<Vec<String>> {
     let reviews_held = reviews_held_by_persisted_pause_on(tx)?;
-    let focus = super::dispatch_focus::load_dispatch_focus_on(tx)?;
+    let focus = load_focus_or_off(tx);
     if !reviews_held && !focus.is_active() {
         return Ok(Vec::new());
     }
@@ -889,6 +913,12 @@ fn release_unstartable_pre_merge_review_reservations_in_tx(
                AND b.status NOT IN ('completed', 'failed')
                AND b.explicit = 0
                AND {NO_BATCH_MEMBER_STARTED}
+               AND NOT EXISTS (SELECT 1 FROM pr_review_batch_members m
+                               JOIN work_executions we ON we.id = m.execution_id
+                               WHERE m.batch_id = b.id
+                                 AND we.status NOT IN ('queued', 'ready', 'waiting_dependency',
+                                                       'completed', 'abandoned', 'failed',
+                                                       'cancelled', 'orphaned'))
              ORDER BY b.created_at ASC, b.id ASC"
         ))?;
         let mapped = statement.query_map([], |row| {
@@ -913,7 +943,7 @@ fn release_unstartable_pre_merge_review_reservations_in_tx(
                  FROM work_executions we
                  JOIN pr_review_batch_members m ON m.execution_id = we.id
                  WHERE m.batch_id = ?1
-                   AND we.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')",
+                   AND we.status IN ('queued', 'ready', 'waiting_dependency')",
             )?;
             stmt.query_map(params![batch_id], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -924,7 +954,7 @@ fn release_unstartable_pre_merge_review_reservations_in_tx(
             "UPDATE work_executions
              SET status = 'abandoned', finished_at = ?2
              WHERE id IN (SELECT execution_id FROM pr_review_batch_members WHERE batch_id = ?1)
-               AND status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')",
+               AND status IN ('queued', 'ready', 'waiting_dependency')",
             params![batch_id, now],
         )?;
         for (execution_id, work_item_id) in &member_execution_ids {
@@ -1446,16 +1476,6 @@ impl WorkDb {
         Ok(released)
     }
 
-    /// Why a pre-merge batch for `cycle_root_id` cannot occupy a reservation
-    /// right now (`"dispatch_paused"` or `"focus_mode"`), or `None` when
-    /// admission may proceed to the capacity check. Lets the deferred-admission
-    /// sweep skip held roots without fetching PR metadata for a create that
-    /// can only defer.
-    pub fn pre_merge_review_hold_reason(&self, cycle_root_id: &str) -> Result<Option<&'static str>> {
-        let conn = self.connect()?;
-        pre_merge_dispatch_hold_on(&conn, cycle_root_id)
-    }
-
     /// Skip remote metadata only when a held root has no review history that
     /// could settle it. Any batch, verdict or legacy reviewer requires the
     /// normal immutable-head checks, even while spawning is held.
@@ -1670,13 +1690,10 @@ impl WorkDb {
             tx.commit()?;
             return Ok(ReviewBatchDispatch::AlreadyReviewed);
         }
-        if let Some(hold) = pre_merge_dispatch_hold_on(&tx, &input.cycle_root_id)? {
-            if explicit {
-                bail!(
-                    "cannot start review batch: {hold} is holding this PR so a pre-merge \
-                     reservation would never be used"
-                );
-            }
+        // Explicit starts are requested by name, never released by the hold, and
+        // their members can still be run with `bossctl agents launch`, so the
+        // hold only defers automatic admission.
+        if !explicit && pre_merge_dispatch_hold_on(&tx, &input.cycle_root_id)?.is_some() {
             tx.commit()?;
             return Ok(ReviewBatchDispatch::AdmissionDeferred);
         }
