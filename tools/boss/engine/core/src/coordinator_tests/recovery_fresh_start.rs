@@ -104,6 +104,11 @@ async fn fresh_start_on_host(kind: ExecutionKind, resume: bool, pr: bool, disabl
             .unwrap();
         db.bind_pr_review_guide_attempt_execution(&attempt.id, &next.id)
             .unwrap();
+        // The guide must use its capture even after the PR advances.
+        JjRepo::run(&repo.repo, &["new", "@", "-m", "PR advances after capture"]);
+        std::fs::write(repo.repo.join("shared.txt"), "newer published work\n").unwrap();
+        JjRepo::run(&repo.repo, &["bookmark", "set", "pr/99", "-r", "@"]);
+        assert_ne!(commit(&repo.repo, "pr/99"), current);
     }
     let next = db.get_execution(&next.id).unwrap();
     let source_pointers = recovery::snapshot_pointers(&LocalJj, &record).await.unwrap();
@@ -151,13 +156,26 @@ async fn fresh_start_on_host(kind: ExecutionKind, resume: bool, pr: bool, disabl
     let expected = if pr { current } else { commit(&repo.repo, "main") };
     assert_eq!(fresh.base_commit.as_deref(), Some(expected.as_str()));
     assert!(recovery::diff(&LocalJj, &fresh).await.unwrap().is_empty());
+    // Scheduler passes must not refire the running attempt or lease again.
+    for _ in 0..3 {
+        coordinator.drain_ready_queue_for_test().await;
+        assert!(
+            !db.list_ready_executions()
+                .unwrap()
+                .iter()
+                .any(|ready| ready.id == next.id)
+        );
+    }
+    assert_eq!(db.get_execution(&next.id).unwrap().status, ExecutionStatus::Running);
+    assert_eq!(db.get_execution(&next.id).unwrap().pre_start_failure_count, 0);
+    assert_eq!(cube.lease_calls.lock().await.len(), 1);
     let archive = format!("preserved/{source}/{preserved}");
     if kind.is_read_only_review() {
         assert_eq!(
             recovery::snapshot_pointers(&LocalJj, &record).await.unwrap(),
             source_pointers
         );
-        assert!(db.execution_bookmark_optional(&source).unwrap().is_some());
+        assert_eq!(db.execution_bookmark(&source).unwrap(), record);
         assert!(db.execution_bookmark_retired_reason(&source).unwrap().is_none());
         assert!(
             db.list_attention_items_for_work_item(&db.owning_work_item_id(&next.work_item_id))
@@ -165,11 +183,11 @@ async fn fresh_start_on_host(kind: ExecutionKind, resume: bool, pr: bool, disabl
                 .is_empty()
         );
         assert!(JjRepo::run(&repo.repo, &["bookmark", "list", &format!("glob:preserved/{source}/*")]).is_empty());
-        for _ in 0..3 {
-            coordinator.drain_ready_queue_for_test().await;
-        }
-        assert_eq!(db.get_execution(&next.id).unwrap().status, ExecutionStatus::Running);
-        assert_eq!(cube.lease_calls.lock().await.len(), 1);
+        assert!(
+            db.list_open_attention_items_of_kind(crate::execution_bookmark_recovery::CHAIN_BLOCKED)
+                .unwrap()
+                .is_empty()
+        );
         return;
     }
     assert_eq!(commit(&repo.repo, &archive), preserved);
@@ -220,26 +238,6 @@ async fn fresh_start_on_host(kind: ExecutionKind, resume: bool, pr: bool, disabl
         preserved,
         "later prune must retain archives"
     );
-    {
-        // Scheduler passes see the running review, rather than refiring the
-        // failed pre-start attempt and accumulating recovery cards.
-        for _ in 0..3 {
-            coordinator.drain_ready_queue_for_test().await;
-            assert!(
-                !db.list_ready_executions()
-                    .unwrap()
-                    .iter()
-                    .any(|ready| ready.id == next.id)
-            );
-        }
-        assert_eq!(db.get_execution(&next.id).unwrap().status, ExecutionStatus::Running);
-        assert_eq!(db.get_execution(&next.id).unwrap().pre_start_failure_count, 0);
-        assert_eq!(
-            cube.lease_calls.lock().await.len(),
-            1,
-            "scheduler must not refire the running execution"
-        );
-    }
     for name in [fresh.head(), fresh.publication()] {
         JjRepo::run(
             &repo.repo,
