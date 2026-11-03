@@ -957,3 +957,5 @@ pub use review_verdicts::{
 };
 pub use revision_helpers::normalize_priority;
 pub use trunk_merge_intents::{ActiveTrunkMergeIntent, TrunkMergeIntent, TrunkMergeIntentInsertInput};
+
+mod preserved_work;

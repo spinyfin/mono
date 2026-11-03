@@ -1465,9 +1465,22 @@ pub trait HostAdapter: Send + Sync {
         bail!("execution bookmarks are not supported by this host adapter")
     }
 
-    async fn confirm_workspace_recovery(&self, record: &ExecutionBookmark, workspace: &Path) -> Result<()> {
+    async fn confirm_workspace_recovery(
+        &self,
+        record: &ExecutionBookmark,
+        workspace: &Path,
+    ) -> anyhow::Result<Option<boss_engine_recovery::execution_bookmark::PreservedTip>> {
         let _ = (record, workspace);
         bail!("workspace recovery confirmation is not supported by this host adapter")
+    }
+
+    async fn restore_preserved_work(
+        &self,
+        record: &ExecutionBookmark,
+        workspace: &Path,
+    ) -> Result<Option<execution_bookmark::RestoreReport>> {
+        let _ = (record, workspace);
+        bail!("preserved work restoration is not supported by this host adapter")
     }
 
     async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {

@@ -621,11 +621,11 @@ mod tests {
         let (_d, db) = open_db();
         let product = create_product(&db);
         let automation = create_automation(&db, &product);
-        let exec = parked_triage_execution(&db, &automation, "/nonexistent/old-root/mono-agent-030", "local");
-        seed_dispatch_run(&db, &automation, &exec.id, 1_700_000_000);
-        // The recovery pointers live in the shared store, which outlives the workspace.
         let store = TempDir::new().unwrap();
         let repo = boss_engine_test_git::jj::JjRepo::new(store.path());
+        let exec = parked_triage_execution(&db, &automation, repo.worker.to_str().unwrap(), "local");
+        seed_dispatch_run(&db, &automation, &exec.id, 1_700_000_000);
+        // The journaled working copy lives in the shared store after the directory is lost.
         let record = boss_engine_recovery::execution_bookmark::create(
             &boss_engine_recovery::execution_bookmark::LocalJj,
             &repo.worker,
@@ -635,12 +635,16 @@ mod tests {
         .await
         .unwrap();
         db.record_execution_bookmark(&record).unwrap();
+        std::fs::write(repo.worker.join("work.txt"), "journaled worker edits").unwrap();
+        boss_engine_test_git::jj::JjRepo::run(&repo.worker, &["status"]);
+        std::fs::remove_dir_all(&repo.worker).unwrap();
         let cube = RecordingCube(Default::default());
 
         assert!(reconcile_if_execution_dead(&db, &NoopDispatchEventSink, &exec, Some(&cube)).await);
 
         assert_eq!(*cube.0.lock().unwrap(), vec!["lease-1".to_owned()]);
         assert_eq!(db.get_execution(&exec.id).unwrap().cube_lease_id, None);
+        assert!(db.preserved_tip(&exec.id).unwrap().is_some());
         assert!(
             db.list_attention_items(&exec.id)
                 .unwrap()

@@ -122,13 +122,29 @@ impl ExecutionCoordinator {
         if execution.kind.is_read_only_review() {
             return Ok(None);
         }
-        let prior = if self.work_db.execution_bookmark_optional(&execution.id)?.is_some() {
+        let prior = if self.work_db.preserved_tip(&execution.id)?.is_some()
+            || self.work_db.execution_bookmark_optional(&execution.id)?.is_some()
+        {
             execution.clone()
         } else if let Some(prior) = self.work_db.recovery_predecessor(execution)? {
             prior
         } else {
             return Ok(None);
         };
+        // A pre-start retry already owns staged history and its legacy names;
+        // keep that positioning stable until the worker actually starts.
+        if prior.id != execution.id && self.work_db.preserved_tip(&prior.id)?.is_some() {
+            return self
+                .recover_preserved_work(
+                    execution,
+                    &prior,
+                    lease,
+                    adapter,
+                    repo_id,
+                    (pr_for_goto, pr_for_reconcile),
+                )
+                .await;
+        }
         let Some(record) = self.work_db.execution_bookmark_optional(&prior.id)? else {
             self.warn_missing_execution_bookmark(execution, Some(&prior.id)).await;
             self.work_db.delete_execution_restore_report(&execution.id)?;

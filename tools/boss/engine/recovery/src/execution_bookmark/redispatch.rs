@@ -47,7 +47,7 @@ impl RestoreReport {
             )
         };
         format!(
-            "## EXECUTION BOOKMARK RECOVERY\n\nRestored pointer: `{}`. After fetching the upstream, the engine staged copies of this history onto base SHA `{}`.\n\nOriginal commits (before rebasing):\n```text\n{}```\n\n{conflict_task}\n\n{pr_rewrite}Stay at `@` and inspect the inherited history. The old workspace was not used: re-run the required build and tests in your own leased workspace before publishing; earlier validation does not satisfy this run's gate.\n\n",
+            "## EXECUTION BOOKMARK RECOVERY\n\nRestored pointer: `{}`. After fetching the upstream, the engine restaged this history onto base SHA `{}`.\n\nOriginal commits (before rebasing):\n```text\n{}```\n\n{conflict_task}\n\n{pr_rewrite}Stay at `@` and inspect the inherited history. The old workspace was not used: re-run the required build and tests in your own leased workspace before publishing; earlier validation does not satisfy this run's gate.\n\n",
             self.pointer, self.base_sha, self.commits
         )
     }

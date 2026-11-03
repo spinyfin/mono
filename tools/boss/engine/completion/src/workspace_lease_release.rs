@@ -6,7 +6,7 @@
 //! terminal path releases the lease as soon as those gates pass, so a
 //! finished run does not hold a 10–20 GiB workspace until TTL.
 //!
-//! Resume reads preserved work from `boss-recovery/<execution>` bookmarks
+//! Resume prefers `preserved/<execution>` bookmarks over legacy recovery names
 //! in the shared jj store, never from the originating working copy.
 //!
 //! This is the release policy shared by completion's teardown and the engine's
@@ -55,7 +55,7 @@ impl WorkspaceOccupancy for OwningHostOccupancy {
     }
 }
 
-/// Recovery-bookmark confirmation on the execution's owning host.
+/// Teardown preservation on the execution's owning host.
 #[async_trait::async_trait]
 pub trait BookmarkGate: Send + Sync {
     async fn status(&self, execution: &WorkExecution) -> BookmarkStatus;
@@ -86,7 +86,7 @@ pub fn decide(
     }
 }
 
-/// Confirm preserved work through jj on the owning host. A missing record
+/// Preserve unpublished work through jj on the owning host. A missing record
 /// is never evidence of an empty workspace.
 pub struct DbBookmarkGate<'a> {
     pub db: &'a WorkDb,
@@ -96,43 +96,36 @@ pub struct DbBookmarkGate<'a> {
 #[async_trait::async_trait]
 impl BookmarkGate for DbBookmarkGate<'_> {
     async fn status(&self, execution: &WorkExecution) -> BookmarkStatus {
+        // Read-only reviews never preserve or inherit implementation work.
+        if execution.kind.is_read_only_review() {
+            return BookmarkStatus::NotRequired;
+        }
         let result: Result<()> = async {
-            anyhow::ensure!(
-                !has_open_bookmark_failure(self.db, &execution.id),
-                "recovery creation or backup failed"
-            );
+            if self.db.preserved_tip(&execution.id)?.is_some() {
+                return Ok(());
+            }
             let record = self.db.execution_bookmark(&execution.id)?;
             let workspace = execution
                 .workspace_path
                 .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("workspace path unavailable for recovery confirmation"))?;
-            // A lost workspace has no working copy to cover: only the
-            // shared-store pointers can be confirmed.
-            if self.adapter.is_none() && workspace_provably_absent(Path::new(workspace)) {
-                anyhow::ensure!(
-                    record.host_id == "local",
-                    "recovery confirmation requires the owning host"
-                );
-                return boss_engine_recovery::execution_bookmark::confirm_pointers(
-                    &boss_engine_recovery::execution_bookmark::LocalJj,
-                    &record,
-                )
-                .await;
-            }
-            if let Some(adapter) = self.adapter {
-                adapter.confirm_workspace_recovery(&record, Path::new(workspace)).await
+                .ok_or_else(|| anyhow::anyhow!("workspace path unavailable for preservation"))?;
+            let tip = if let Some(adapter) = self.adapter {
+                adapter
+                    .confirm_workspace_recovery(&record, Path::new(workspace))
+                    .await?
             } else {
-                anyhow::ensure!(
-                    record.host_id == "local",
-                    "recovery confirmation requires the owning host"
-                );
-                boss_engine_recovery::execution_bookmark::confirm_workspace(
+                anyhow::ensure!(record.host_id == "local", "preservation requires the owning host");
+                boss_engine_recovery::execution_bookmark::preserve(
                     &boss_engine_recovery::execution_bookmark::LocalJj,
                     &record,
                     Path::new(workspace),
                 )
-                .await
+                .await?
+            };
+            if let Some(tip) = tip {
+                self.db.record_preserved_tip(&execution.id, &tip)?;
             }
+            Ok(())
         }
         .await;
         match result {
@@ -223,7 +216,7 @@ pub async fn apply_release(
         _ => Occupancy::Empty,
     };
     // Pane and occupancy verdicts come first. Confirming the bookmark
-    // snapshots the working copy and may advance the recovery head in the
+    // snapshots the working copy and may create a preserved bookmark in the
     // shared store, which must not race a worker that may still be running
     // jj in this workspace.
     let bookmark_status = if matches!(

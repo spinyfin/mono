@@ -95,6 +95,23 @@ fi
 
 #[async_trait]
 impl Jj for SshHostAdapter {
+    async fn workspace_exists(&self, workspace: &Path) -> Result<bool> {
+        let output = self
+            .transport
+            .run(&["test", "-d", workspace.to_str().context("workspace path is not UTF-8")?])
+            .await?;
+        if output.success() {
+            Ok(true)
+        } else {
+            anyhow::ensure!(
+                output.status == 1 && output.stderr.trim().is_empty(),
+                "remote workspace probe failed: {}",
+                output.stderr
+            );
+            Ok(false)
+        }
+    }
+
     async fn run(&self, repo: &Path, args: &[&str]) -> Result<String> {
         let path = repo.to_str().context("shared repo path is not UTF-8")?;
         let mut command = vec!["jj", "--no-pager", "-R", path];
@@ -216,9 +233,25 @@ impl HostAdapter for LocalHostAdapter {
             .await
     }
 
-    async fn confirm_workspace_recovery(&self, record: &ExecutionBookmark, workspace: &Path) -> Result<()> {
+    async fn confirm_workspace_recovery(
+        &self,
+        record: &ExecutionBookmark,
+        workspace: &Path,
+    ) -> anyhow::Result<Option<boss_engine_recovery::execution_bookmark::PreservedTip>> {
         anyhow::ensure!(record.host_id == self.host_id(), "recovery host mismatch");
-        execution_bookmark::confirm_workspace(&LocalJj, record, workspace).await
+        execution_bookmark::preserve(&LocalJj, record, workspace).await
+    }
+    async fn restore_preserved_work(
+        &self,
+        record: &ExecutionBookmark,
+        workspace: &Path,
+    ) -> Result<Option<execution_bookmark::RestoreReport>> {
+        if record.host_id != self.host_id() {
+            return Err(execution_bookmark::pointer_integrity_error(
+                "preserved work belongs to another host",
+            ));
+        }
+        execution_bookmark::restore_preserved(&LocalJj, record, workspace).await
     }
 
     async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {
@@ -819,9 +852,25 @@ impl HostAdapter for SshHostAdapter {
         .await
     }
 
-    async fn confirm_workspace_recovery(&self, record: &ExecutionBookmark, workspace: &Path) -> Result<()> {
+    async fn confirm_workspace_recovery(
+        &self,
+        record: &ExecutionBookmark,
+        workspace: &Path,
+    ) -> anyhow::Result<Option<boss_engine_recovery::execution_bookmark::PreservedTip>> {
         anyhow::ensure!(record.host_id == self.host_id(), "recovery host mismatch");
-        execution_bookmark::confirm_workspace(self, record, workspace).await
+        execution_bookmark::preserve(self, record, workspace).await
+    }
+    async fn restore_preserved_work(
+        &self,
+        record: &ExecutionBookmark,
+        workspace: &Path,
+    ) -> Result<Option<execution_bookmark::RestoreReport>> {
+        if record.host_id != self.host_id() {
+            return Err(execution_bookmark::pointer_integrity_error(
+                "preserved work belongs to another host",
+            ));
+        }
+        execution_bookmark::restore_preserved(self, record, workspace).await
     }
 
     async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {

@@ -31,45 +31,16 @@ async fn fixture(db: &WorkDb, workspace: &Path) -> WorkExecution {
 }
 
 #[tokio::test]
-async fn real_gate_confirms_snapshot_and_rejects_missing_or_stale_head() {
+async fn teardown_preserves_workspace_even_when_legacy_pointers_are_missing() {
     let (dir, db) = open_db();
     let repo = boss_engine_test_git::jj::JjRepo::new(dir.path());
     let execution = fixture(&db, &repo.worker).await;
-    let gate = DbBookmarkGate { db: &db, adapter: None };
-    std::fs::write(repo.worker.join("work.txt"), "preserve this work").unwrap();
-    assert_eq!(gate.status(&execution).await, BookmarkStatus::Confirmed);
-    // A trailing `jj new` leaves the head behind @; the gate advances it.
-    LocalJj
-        .run(&repo.worker, &["new", "-m", "Trailing change"])
-        .await
-        .unwrap();
-    std::fs::write(repo.worker.join("more.txt"), "moved past the head").unwrap();
-    assert_eq!(gate.status(&execution).await, BookmarkStatus::Confirmed);
     let record = db.execution_bookmark(&execution.id).unwrap();
-    let at = |rev: &str| {
-        let worker = repo.worker.clone();
-        let rev = rev.to_owned();
-        async move {
-            LocalJj
-                .run(&worker, &["log", "--no-graph", "-r", &rev, "-T", "commit_id"])
-                .await
-                .unwrap()
-        }
-    };
-    assert_eq!(at(&record.head()).await, at("@").await);
-    // A workspace commit on a different line than the head is never covered.
-    LocalJj
-        .run(&repo.worker, &["new", &record.base(), "-m", "Unbookmarked work"])
-        .await
-        .unwrap();
-    std::fs::write(repo.worker.join("other.txt"), "unpreserved").unwrap();
-    assert!(matches!(gate.status(&execution).await, BookmarkStatus::Unconfirmed(_)));
-    LocalJj.run(&repo.worker, &["new", &record.head()]).await.unwrap();
-    assert_eq!(gate.status(&execution).await, BookmarkStatus::Confirmed);
     LocalJj
         .run(&repo.worker, &["bookmark", "delete", &record.head()])
         .await
         .unwrap();
+    std::fs::write(repo.worker.join("work.txt"), "preserve this work").unwrap();
     let outcome = apply_release(
         &db,
         &execution,
@@ -78,47 +49,117 @@ async fn real_gate_confirms_snapshot_and_rejects_missing_or_stale_head() {
             cause: TerminalCause::ProvenCompleted,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &gate,
+            bookmark: &DbBookmarkGate { db: &db, adapter: None },
         },
-        async { panic!("missing recovery pointer must hold the lease") },
+        async { Ok(()) },
     )
     .await;
-    assert_eq!(
-        outcome,
-        LeaseReleaseOutcome::Kept {
-            reason: KeepReason::BookmarkUnconfirmed
-        }
-    );
-    assert_eq!(
-        db.get_execution(&execution.id).unwrap().cube_lease_id.as_deref(),
-        Some("lease")
-    );
-    assert!(
-        db.list_attention_items(&execution.id)
-            .unwrap()
-            .iter()
-            .any(|item| item.kind == LEASE_UNRELEASED_ATTENTION_KIND)
-    );
+    assert_eq!(outcome, LeaseReleaseOutcome::Released);
+    let tip = db.preserved_tip(&execution.id).unwrap().unwrap();
+    let actual = LocalJj
+        .run(
+            &repo.repo,
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                &execution_bookmark::preserved_name(&execution.id),
+                "-T",
+                "commit_id",
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(actual, tip.commit_id);
+    assert!(tip.count > 0);
+    assert!(db.get_execution(&execution.id).unwrap().cube_lease_id.is_none());
 }
 
 #[tokio::test]
-async fn failed_backup_prevents_release_even_with_a_valid_pointer() {
+async fn failed_legacy_backup_does_not_prevent_teardown_preservation() {
     let (dir, db) = open_db();
     let repo = boss_engine_test_git::jj::JjRepo::new(dir.path());
     let execution = fixture(&db, &repo.worker).await;
-    let record = db.execution_bookmark(&execution.id).unwrap();
-    let failure = LocalJj
-        .run(
-            &repo.worker,
-            &["bookmark", "set", &record.head(), "-r", "nonexistent_revision"],
-        )
-        .await
-        .unwrap_err();
-    crate::execution_bookmark_recovery::report_failure(&db, &execution, &format!("{failure:#}"));
-    assert!(matches!(
+    crate::execution_bookmark_recovery::report_failure(&db, &execution, "legacy backup failed");
+    std::fs::write(repo.worker.join("work.txt"), "preserve independently of backup").unwrap();
+    assert_eq!(
         DbBookmarkGate { db: &db, adapter: None }.status(&execution).await,
-        BookmarkStatus::Unconfirmed(_)
-    ));
+        BookmarkStatus::Confirmed
+    );
+    assert!(db.preserved_tip(&execution.id).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn reaped_worker_preserves_exactly_one_bookmark_only_for_unpushed_work() {
+    use boss_engine_test_git::jj::JjRepo;
+    for published in [false, true] {
+        let (dir, db) = open_db();
+        let repo = JjRepo::new(dir.path());
+        JjRepo::run(&repo.repo, &["bookmark", "set", "main", "-r", "@"]);
+        JjRepo::run(&repo.repo, &["git", "export"]);
+        JjRepo::run(
+            &repo.repo,
+            &[
+                "git",
+                "remote",
+                "add",
+                "origin",
+                repo.repo.join(".jj/repo/store/git").to_str().unwrap(),
+            ],
+        );
+        JjRepo::run(&repo.repo, &["git", "fetch"]);
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, product.id, "reaped worker");
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id)
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        db.start_execution_run(
+            &execution.id,
+            "worker",
+            "mono",
+            "lease",
+            "worker",
+            repo.worker.to_str().unwrap(),
+        )
+        .unwrap();
+        let record = execution_bookmark::create(&LocalJj, &repo.worker, &execution.id, "local")
+            .await
+            .unwrap();
+        db.record_execution_bookmark(&record).unwrap();
+        std::fs::write(repo.worker.join("work.txt"), "worker edits").unwrap();
+        if published {
+            JjRepo::run(&repo.worker, &["bookmark", "set", "published", "-r", "@"]);
+            JjRepo::run(&repo.worker, &["git", "export"]);
+            JjRepo::run(&repo.repo, &["git", "fetch"]);
+            JjRepo::run(&repo.worker, &["new", "-m", "Trailing empty change"]);
+        }
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(
+            db.set_run_shell_pid_for_execution(&execution.id, i64::from(pid))
+                .unwrap()
+        );
+        db.mark_execution_orphaned(&execution.id, "reaped worker").unwrap();
+        let before = JjRepo::run(&repo.repo, &["bookmark", "list", "-T", "name ++ \"\\n\""]);
+        let outcome = run_one_pass_with_occupancy(&db, &OkCube, &LiveWorkerStateRegistry::new(), || async {
+            EmptyOccupancy
+        })
+        .await;
+        assert_eq!(outcome.released, 1);
+        let after = JjRepo::run(&repo.repo, &["bookmark", "list", "-T", "name ++ \"\\n\""]);
+        assert_eq!(after.lines().count(), before.lines().count() + usize::from(!published));
+        assert_eq!(db.preserved_tip(&execution.id).unwrap().is_some(), !published);
+        if !published {
+            assert!(after.contains(&execution_bookmark::preserved_name(&execution.id)));
+        }
+    }
 }
 
 #[tokio::test]
