@@ -168,7 +168,7 @@ async fn host_provider_and_runner_preserve_typed_app_send_errors() {
             .spawn_worker("worker-1", &execution, &item, Path::new("/unused"), None)
             .await
             .unwrap_err();
-        // The compatibility path and the lower contract are the same error type.
+        // The runner's typed send error survives the host-adapter and provider layers.
         assert_eq!(
             err.downcast_ref::<boss_execution_contracts::SendToAppError>()
                 .unwrap()

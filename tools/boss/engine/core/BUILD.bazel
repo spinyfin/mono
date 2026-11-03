@@ -3,7 +3,7 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//tools/test-sandbox:defs.bzl", "network_enabled_rust_test")
 load(":engine_binary.bzl", "ENGINE_BINARY_NAME")
-load(":runtime.bzl", "runtime_libraries")
+load(":runtime.bzl", "TEST_ALIASES", "TEST_DEPS", "runtime_libraries")
 
 filegroup(
     name = "handoff_reset_prompt_source",
@@ -126,24 +126,7 @@ rust_test(
     timeout = "moderate",
     # crate inheritance keeps the production dependency; compile this test
     # against the fixture variant under its usual Rust name instead.
-    aliases = {
-        "//tools/boss/engine/completion": "boss_engine_completion_production",
-        "//tools/boss/engine/completion:completion_test_support": "boss_engine_completion",
-        "//tools/boss/engine/dispatch": "boss_engine_dispatch_production",
-        "//tools/boss/engine/dispatch:dispatch_test_support": "boss_engine_dispatch",
-        "//tools/boss/engine/execution-runner": "boss_execution_runner_production",
-        "//tools/boss/engine/execution-runner:runner_test_support": "boss_execution_runner",
-        "//tools/boss/engine/execution-contracts": "boss_execution_contracts_production",
-        "//tools/boss/engine/execution-contracts:execution_contracts_test_support": "boss_execution_contracts",
-        "//tools/boss/engine/live-worker-state": "boss_engine_live_worker_state_production",
-        "//tools/boss/engine/live-worker-state:live_worker_state_test_support": "boss_engine_live_worker_state",
-        "//tools/boss/engine/merge-poller": "boss_engine_merge_poller_production",
-        "//tools/boss/engine/merge-poller:merge_poller_test_support": "boss_engine_merge_poller",
-        "//tools/boss/engine/observation-contracts": "boss_observation_contracts_production",
-        "//tools/boss/engine/observation-contracts:observation_contracts_test_support": "boss_observation_contracts",
-        "//tools/boss/engine/work-db:work-db": "boss_work_db_production",
-        "//tools/boss/engine/work-db:work_db_test_support": "boss_work_db",
-    },
+    aliases = TEST_ALIASES,
     crate = ":runtime",
     data = [
         # Config loading requires an engine-owned cube, just like the engine.
@@ -170,18 +153,10 @@ rust_test(
         proc_macro_dev = True,
     ),
     shard_count = 7,
-    deps = [
-        "//tools/boss/engine/completion:completion_test_support",
-        "//tools/boss/engine/dispatch:dispatch_test_support",
-        "//tools/boss/engine/execution-contracts:execution_contracts_test_support",
-        "//tools/boss/engine/execution-runner:runner_test_support",
-        "//tools/boss/engine/live-worker-state:live_worker_state_test_support",
-        "//tools/boss/engine/merge-poller:merge_poller_test_support",
-        "//tools/boss/engine/observation-contracts:observation_contracts_test_support",
+    deps = TEST_DEPS + [
         "//tools/boss/engine/prose-vocabulary",
         "//tools/boss/engine/task-scope",
         "//tools/boss/engine/test-git",
-        "//tools/boss/engine/work-db:work_db_test_support",
     ] + all_crate_deps(
         package_name = "tools/boss/engine/core/runtime",
         normal = True,
@@ -195,24 +170,7 @@ network_enabled_rust_test(
     timeout = "moderate",
     # crate inheritance keeps the production dependency; compile this test
     # against the fixture variant under its usual Rust name instead.
-    aliases = {
-        "//tools/boss/engine/completion": "boss_engine_completion_production",
-        "//tools/boss/engine/completion:completion_test_support": "boss_engine_completion",
-        "//tools/boss/engine/dispatch": "boss_engine_dispatch_production",
-        "//tools/boss/engine/dispatch:dispatch_test_support": "boss_engine_dispatch",
-        "//tools/boss/engine/execution-runner": "boss_execution_runner_production",
-        "//tools/boss/engine/execution-runner:runner_test_support": "boss_execution_runner",
-        "//tools/boss/engine/execution-contracts": "boss_execution_contracts_production",
-        "//tools/boss/engine/execution-contracts:execution_contracts_test_support": "boss_execution_contracts",
-        "//tools/boss/engine/live-worker-state": "boss_engine_live_worker_state_production",
-        "//tools/boss/engine/live-worker-state:live_worker_state_test_support": "boss_engine_live_worker_state",
-        "//tools/boss/engine/merge-poller": "boss_engine_merge_poller_production",
-        "//tools/boss/engine/merge-poller:merge_poller_test_support": "boss_engine_merge_poller",
-        "//tools/boss/engine/observation-contracts": "boss_observation_contracts_production",
-        "//tools/boss/engine/observation-contracts:observation_contracts_test_support": "boss_observation_contracts",
-        "//tools/boss/engine/work-db:work-db": "boss_work_db_production",
-        "//tools/boss/engine/work-db:work_db_test_support": "boss_work_db",
-    },
+    aliases = TEST_ALIASES,
     args = [
         "codex_guard_conformance_against_live_dispatched_models",
         "--nocapture",
@@ -246,18 +204,10 @@ network_enabled_rust_test(
         proc_macro_dev = True,
     ),
     tags = ["manual"],
-    deps = [
-        "//tools/boss/engine/completion:completion_test_support",
-        "//tools/boss/engine/dispatch:dispatch_test_support",
-        "//tools/boss/engine/execution-contracts:execution_contracts_test_support",
-        "//tools/boss/engine/execution-runner:runner_test_support",
-        "//tools/boss/engine/live-worker-state:live_worker_state_test_support",
-        "//tools/boss/engine/merge-poller:merge_poller_test_support",
-        "//tools/boss/engine/observation-contracts:observation_contracts_test_support",
+    deps = TEST_DEPS + [
         "//tools/boss/engine/prose-vocabulary",
         "//tools/boss/engine/task-scope",
         "//tools/boss/engine/test-git",
-        "//tools/boss/engine/work-db:work_db_test_support",
     ] + all_crate_deps(
         package_name = "tools/boss/engine/core/runtime",
         normal = True,
@@ -808,8 +758,8 @@ sh_test(
 # `genquery` evaluates against the real dependency graph at build time
 # (hermetic, cached, no `bazel query` subprocess), so the test fails on the
 # PR that reintroduces the edge rather than showing up later as CI slowness.
-# `engine_lib_test` is the query root because its closure is `engine_lib`'s
-# closure plus test-only deps — anything `boss`/`bossctl` would inherit.
+# Roots are `engine_lib` (what `boss`/`bossctl` link) plus the runtime and
+# app test binaries, whose closures add the fixture variants.
 genquery(
     name = "engine_lib_test_stamped_deps",
     expression = 'filter("//tools/boss/(build-provenance:|installer:build_provenance_rs)", deps(set(//tools/boss/engine/core:engine_lib_test //tools/boss/engine/core:engine_lib //tools/boss/engine/app:app_test)))',

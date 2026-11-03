@@ -140,8 +140,6 @@ async fn run_server(cli: Cli, cfg: Arc<RuntimeConfig>, isolation: IsolationPaths
     .await
 }
 
-/// Return `true` if the process at `pid` is still alive on this machine.
-///
 pub use boss_engine_runtime::engine_control::process_is_alive;
 
 // Lets `Arc<ServerState>` be coerced to `Arc<dyn WorkerReaper>` for the

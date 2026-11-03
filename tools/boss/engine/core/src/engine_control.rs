@@ -57,8 +57,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+/// Return `true` if the process at `pid` is still alive on this machine.
+///
 /// Uses `kill(pid, 0)` (signal 0 = probe, no signal delivered): returns `true`
-/// when the kernel confirms the process exists.  `EPERM` (process exists but
+/// when the kernel confirms the process exists. `EPERM` (process exists but
 /// we can't signal it) also counts as alive; only `ESRCH` (no such process)
 /// means dead.
 pub fn process_is_alive(pid: libc::pid_t) -> bool {

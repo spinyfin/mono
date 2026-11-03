@@ -334,7 +334,7 @@ pub fn bind_events_socket(path: &Path) -> io::Result<UnixListener> {
 /// Is a live process currently listening at `path`?
 ///
 /// This is the last-line defence beneath the isolation guard's path
-/// resolution (see `crate::app::isolation`): whatever route led here — a
+/// resolution (see `boss_engine::app::isolation`): whatever route led here — a
 /// correctly-derived fixture path, a resolution hole in the guard, or a bug
 /// that bypasses it entirely — a socket file with nothing behind it is safe
 /// to unlink and rebind, and one with a live process behind it never is. That
