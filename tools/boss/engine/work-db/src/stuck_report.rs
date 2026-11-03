@@ -27,7 +27,7 @@ impl WorkDb {
         let (mut report, probes) = {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
-            build(&tx, minimum_age_secs, now)?
+            build(&tx, minimum_age_secs, now.saturating_sub(minimum_age_secs), now)?
         };
         apply_probes(&mut report, probes, pid_is_alive);
         Ok(report)
@@ -53,7 +53,13 @@ pub(super) fn apply_probes(
 /// once the connection lock is released.
 pub(super) type PendingProbe = (String, Option<i64>);
 
-pub(super) fn build(conn: &Connection, minimum_age_secs: i64, now: i64) -> Result<(StuckReport, Vec<PendingProbe>)> {
+/// `question_since` is the start of the window for the questions-filed counts.
+pub(super) fn build(
+    conn: &Connection,
+    minimum_age_secs: i64,
+    question_since: i64,
+    now: i64,
+) -> Result<(StuckReport, Vec<PendingProbe>)> {
     let mut probes: Vec<PendingProbe> = Vec::new();
     let mut stmt = conn.prepare(
         "SELECT id FROM tasks t WHERE deleted_at IS NULL AND status NOT IN ('done','archived')
@@ -184,7 +190,7 @@ pub(super) fn build(conn: &Connection, minimum_age_secs: i64, now: i64) -> Resul
     let questions: u64 = conn.query_row(
         "SELECT COUNT(*) FROM operator_questions
          WHERE CAST(created_at AS INTEGER) >= ?1 AND CAST(created_at AS INTEGER) <= ?2",
-        params![now.saturating_sub(minimum_age_secs), now],
+        params![question_since, now],
         |r| r.get(0),
     )?;
     let report = StuckReport::builder()
@@ -192,7 +198,7 @@ pub(super) fn build(conn: &Connection, minimum_age_secs: i64, now: i64) -> Resul
         .minimum_age_secs(minimum_age_secs)
         .rows(rows)
         .questions_filed(questions)
-        .questions_filed_by_stuck_kind(questions_by_kind(conn, now.saturating_sub(minimum_age_secs), now)?)
+        .questions_filed_by_stuck_kind(questions_by_kind(conn, question_since, now)?)
         .unconverted_declared_blockers(unconverted)
         .build();
     Ok((report, probes))

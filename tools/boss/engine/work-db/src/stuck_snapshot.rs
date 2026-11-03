@@ -1,6 +1,6 @@
 //! One persisted stuck report per UTC day, so gauge trends survive restarts.
 use super::*;
-use crate::stuck_report::{apply_probes, build, questions_by_kind};
+use crate::stuck_report::{apply_probes, build};
 use boss_protocol::StuckReport;
 
 pub(super) const MIGRATION_ID: &str = "20261103_1200_task_stuck_daily_snapshots";
@@ -26,35 +26,47 @@ impl WorkDb {
     /// caller returns the row that was stored first.
     pub fn stuck_daily_snapshot(&self, now: i64, pid_is_alive: &dyn Fn(Option<i64>) -> bool) -> Result<StuckReport> {
         let day = now.div_euclid(86400);
-        let (built, probes) = {
-            let mut conn = self.connect()?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
-            if let Some(report) = stored(&tx, day)? {
-                return Ok(report);
-            }
-            let (mut report, probes) = build(&tx, 0, now)?;
-            // The ledger-wide window above is empty at age zero; a daily
-            // sample counts the questions filed over the preceding day.
-            report.questions_filed = tx.query_row(
-                "SELECT COUNT(*) FROM operator_questions WHERE CAST(created_at AS INTEGER) BETWEEN ?1 AND ?2",
-                params![now - 86400, now],
-                |r| r.get(0),
-            )?;
-            report.questions_filed_by_stuck_kind = questions_by_kind(&tx, now - 86400, now)?;
-            (report, probes)
+        // The read phase runs on an independent connection, so the shared
+        // writer connection is untouched while the report is assembled.
+        let (mut report, probes) = match self.stuck_snapshot_read_phase(day, now)? {
+            SnapshotRead::Stored(report) => return Ok(report),
+            SnapshotRead::Built(report, probes) => (report, probes),
         };
-        // The connection guard is released before the host probe runs: the
-        // connection mutex is not reentrant.
-        let mut report = built;
         apply_probes(&mut report, probes, pid_is_alive);
         let mut conn = self.connect()?;
-        conn.execute(
-            "INSERT OR IGNORE INTO task_stuck_daily_snapshots(day, report_json) VALUES (?1, ?2)",
+        // Immediate, so concurrent samplers serialize here and the first
+        // decodable row wins; an undecodable row is replaced.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Ok(Some(winner)) = stored(&tx, day) {
+            return Ok(winner);
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO task_stuck_daily_snapshots(day, report_json) VALUES (?1, ?2)",
             params![day, serde_json::to_string(&report)?],
         )?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        stored(&tx, day)?.ok_or_else(|| anyhow::anyhow!("stuck snapshot for day {day} missing after insert"))
+        tx.commit()?;
+        Ok(report)
     }
+
+    /// Look up or build the day's report on a reader connection. Never takes
+    /// the shared connection mutex (in-memory test databases excepted, where
+    /// `reader()` is a clone).
+    pub(super) fn stuck_snapshot_read_phase(&self, day: i64, now: i64) -> Result<SnapshotRead> {
+        let reader = self.reader()?;
+        let mut conn = reader.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        // An undecodable stored row counts as a miss; the store step replaces it.
+        if let Ok(Some(report)) = stored(&tx, day) {
+            return Ok(SnapshotRead::Stored(report));
+        }
+        let (report, probes) = build(&tx, 0, now - 86400, now)?;
+        Ok(SnapshotRead::Built(report, probes))
+    }
+}
+
+pub(super) enum SnapshotRead {
+    Stored(StuckReport),
+    Built(StuckReport, Vec<crate::stuck_report::PendingProbe>),
 }
 
 fn stored(conn: &Connection, day: i64) -> Result<Option<StuckReport>> {
