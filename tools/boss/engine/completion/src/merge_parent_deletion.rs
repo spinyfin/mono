@@ -1,4 +1,4 @@
-//! Deterministic both-parents deletion tripwire (incident-002 remediation P2).
+//! Deterministic both-parents deletion tripwire.
 //!
 //! Incident 002 (`tools/boss/docs/postmortems/incident-002-merge-conflict-\
 //! deletion-blessed-by-review.md`): a merge-conflict / forward-port resolution
@@ -7,7 +7,7 @@
 //! "supersedes", and the automated reviewer — anchored on the worker's *stated
 //! purpose* — blessed the removal.
 //!
-//! The structural fix (postmortem §5 P2, the highest-leverage item) is a check
+//! The structural safeguard is a check
 //! that never asks "did the worker mean to?" and only asks "did a merged parent
 //! lose functionality?". For a PR that resolves a merge / forward-port, diff the
 //! resolution against **both merge parents** — the PR's prior head AND the moved

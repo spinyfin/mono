@@ -689,6 +689,9 @@ impl ExecutionPublisher for RecordingPublisher {
     }
 }
 
+/// Test-only routing for shared cube clients, including heartbeat fixtures.
+/// The implementation lives with the trait because downstream crates cannot
+/// implement this external trait for the external Arc type (the orphan rule).
 /// Route every execution to the one cube — the single-cube shape tests model,
 /// which is exactly right for a local-only engine. Multi-host routing needs
 /// its own fixture, because a stub that answers for every execution cannot

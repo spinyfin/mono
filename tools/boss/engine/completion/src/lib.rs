@@ -82,8 +82,7 @@ use boss_observation_contracts::{
     OpenPrMergeability, PrLifecycleProbe, PrLifecycleState, PrPollStateWriter, UnsupportedMergeQueueTimeline,
 };
 
-// Lower-crate vocabulary, reachable under the module paths these sources have
-// always used.
+// Lower-crate vocabulary under short module aliases for handler sources.
 pub(crate) use boss_dispatch_events as dispatch_events;
 pub(crate) use boss_engine_driver as driver;
 pub(crate) use boss_engine_effort as effort;
@@ -153,7 +152,7 @@ mod pending_finalize;
 pub use pending_finalize::{PendingFinalizeSweepOutcome, RUN_DONE_FINALIZE_STUCK_ATTENTION_KIND, finalize_resolved};
 mod pr_binding_guard;
 mod pr_transition;
-pub mod queue_ci_audit;
+mod queue_ci_audit;
 mod recheck;
 mod release;
 mod remediation;
@@ -170,7 +169,8 @@ pub use boss_observation_contracts::{
 };
 use conflict_delivery_gate::ConflictDeliveryDecision;
 use contribution_gate::{RevisionContributionReason, RevisionReviewGate};
-pub use pr_transition::{GhReviewBatchEnqueuer, review_batch_input_from_metadata};
+pub(crate) use pr_transition::GhReviewBatchEnqueuer;
+pub use pr_transition::review_batch_input_from_metadata;
 
 // Counter handles for the PR URL capture channels, in the order they are
 // consulted: the worker's structured-output artifact (the driver-agnostic file

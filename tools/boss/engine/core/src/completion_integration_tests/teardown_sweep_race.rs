@@ -300,7 +300,7 @@ async fn sweep_does_not_reap_a_worker_whose_pane_teardown_is_in_flight() {
         let execution_id = execution_id.clone();
         async move {
             handler
-                .finalize_pr_transition(
+                .finalize_pr_transition_for_test(
                     &execution_id,
                     "https://github.com/spinyfin/mono/pull/9100".to_owned(),
                     WorkerPrCompletionTarget::Done,
@@ -405,7 +405,7 @@ async fn sweep_does_not_reap_a_worker_behind_a_slow_cube_release() {
         let execution_id = execution_id.clone();
         async move {
             handler
-                .finalize_pr_transition(
+                .finalize_pr_transition_for_test(
                     &execution_id,
                     "https://github.com/spinyfin/mono/pull/9101".to_owned(),
                     WorkerPrCompletionTarget::Done,
@@ -487,7 +487,7 @@ async fn pr_completion_teardown_runs_pane_then_driver_then_cube() {
 
     crate::driver_teardown::test_hooks::reset();
     handler
-        .finalize_pr_transition(
+        .finalize_pr_transition_for_test(
             &execution_id,
             "https://github.com/spinyfin/mono/pull/9102".to_owned(),
             WorkerPrCompletionTarget::Done,

@@ -159,11 +159,7 @@ impl Contradiction {
 /// signal belongs to the PR-owning parent (`attempt.work_item_id`), not to the
 /// CI-fix revision that made the declaration, and a newer attempt means the
 /// failure was already picked up again.
-pub fn rearm_parent_failure_signal(
-    work_db: &crate::work::WorkDb,
-    execution_id: &str,
-    input: &QueueCiAuditInput,
-) -> bool {
+fn rearm_parent_failure_signal(work_db: &crate::work::WorkDb, execution_id: &str, input: &QueueCiAuditInput) -> bool {
     let attempt = &input.attempt;
     match work_db.has_newer_ci_remediation(&attempt.work_item_id, &attempt.id, &attempt.created_at) {
         Ok(false) => {}
@@ -199,7 +195,7 @@ pub fn rearm_parent_failure_signal(
     }
 }
 
-pub async fn rearm_and_notify(
+async fn rearm_and_notify(
     work_db: &crate::work::WorkDb,
     publisher: &dyn ExecutionPublisher,
     execution_id: &str,
@@ -297,6 +293,24 @@ pub(super) async fn audit_queue_ci_delivery(
 /// Fixtures shared with the engine's integration suite under `test-support`.
 #[cfg(any(test, feature = "test-support"))]
 pub mod fixtures {
+    use super::ExecutionPublisher;
+
+    pub fn rearm_parent_failure_signal(
+        work_db: &crate::work::WorkDb,
+        execution_id: &str,
+        input: &QueueCiAuditInput,
+    ) -> bool {
+        super::rearm_parent_failure_signal(work_db, execution_id, input)
+    }
+
+    pub async fn rearm_and_notify(
+        work_db: &crate::work::WorkDb,
+        publisher: &dyn ExecutionPublisher,
+        execution_id: &str,
+        input: &QueueCiAuditInput,
+    ) -> bool {
+        super::rearm_and_notify(work_db, publisher, execution_id, input).await
+    }
     use boss_protocol::{QueueCiEvidence, QueueCiRun};
 
     use super::QueueCiAuditInput;

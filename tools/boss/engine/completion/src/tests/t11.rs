@@ -464,7 +464,7 @@ async fn automation_outcome_proposals_first_uses_produced_task_proposal_ignoring
 #[tokio::test]
 async fn automation_outcome_proposals_first_resolves_the_friendly_task_id_the_prompt_actually_teaches() {
     // The rewritten preamble/CLAUDE.md teach `boss propose automation-outcome
-    // --produced-task T42` — the friendly `T<short_id>` form printed by
+    // --produced-task <friendly-task-id>` — the friendly `T<short_id>` form printed by
     // `boss task create --automation` — never the internal primary id used
     // in the fixture above. The applier must resolve that friendly id
     // before its provenance check, exactly as `get_work_item_resolving_short_id`

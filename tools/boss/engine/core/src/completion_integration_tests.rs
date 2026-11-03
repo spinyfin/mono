@@ -3,10 +3,8 @@
 //! sweep, conflict watch, review-guide validation and review-verdict
 //! application.
 //!
-//! They live here, not in the completion crate, because that crate cannot
-//! depend on the services that drive it. They run against the handler
-//! harness the completion crate shares under its `test-support` feature, so a
-//! scenario means exactly what it did when it sat beside the handler.
+//! These tests use the completion crate's test-support harness and inject
+//! the engine's concrete collaborators.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -22,8 +20,7 @@ use boss_execution_contracts::ExecutionPublisher;
 use boss_host_execution::types::{CubeRepoSummary, CubeWorkspaceStatus};
 use boss_metrics::Registry;
 use boss_observation_contracts::{
-    MergeProbe, NoopMergeProbe, OpenPrMergeability, PrLifecycleProbe, PrLifecycleState, PrPollStateWriter,
-    ReviewBatchEnqueuer,
+    MergeProbe, NoopMergeProbe, OpenPrMergeability, PrPollStateWriter, ReviewBatchEnqueuer,
 };
 use boss_protocol::{BranchNaming, ExecutionKind, ExecutionStatus, ProposalKind, ReviewLanguageBucket, ReviewProfile};
 use tempfile::{TempDir, tempdir};

@@ -76,7 +76,7 @@ pub fn review_batch_input_from_metadata(
 }
 
 /// Default enqueuer: fetch immutable SHAs from GitHub, then admit a batch.
-pub struct GhReviewBatchEnqueuer;
+pub(crate) struct GhReviewBatchEnqueuer;
 
 #[async_trait]
 impl ReviewBatchEnqueuer for GhReviewBatchEnqueuer {
@@ -96,7 +96,7 @@ impl WorkerCompletionHandler {
     /// Stop hook path, `"pr_recheck"` for the merge-poller's
     /// fallback sweep — so operators can see which path closed a
     /// given chore.
-    pub async fn finalize_pr_transition(
+    pub(super) async fn finalize_pr_transition(
         &self,
         execution_id: &str,
         pr_url: String,
@@ -1272,21 +1272,10 @@ mod already_reviewed_at_head_tests {
 
 #[cfg(test)]
 mod observation_seam_tests {
+    use super::fixtures::{PR, lifecycle_probe};
     use super::*;
     use crate::test_support::*;
-    use boss_observation_contracts::PrReviewState;
     use tokio::sync::{Mutex, Notify};
-
-    const PR: &str = "https://github.com/spinyfin/mono/pull/42";
-
-    fn lifecycle_probe() -> PrLifecycleProbe {
-        PrLifecycleProbe::builder()
-            .url(PR)
-            .state(PrLifecycleState::Open(boss_observation_contracts::OpenPrStatus::clean()))
-            .labels(Vec::new())
-            .review(PrReviewState::Required)
-            .build()
-    }
 
     struct PrefetchProbe {
         fail: bool,
@@ -1390,5 +1379,22 @@ mod observation_seam_tests {
     #[tokio::test]
     async fn completion_prefetch_does_not_write_after_probe_failure() {
         check_completion_prefetch(true).await;
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod fixtures {
+    use super::*;
+    use boss_observation_contracts::PrReviewState;
+
+    pub const PR: &str = "https://github.com/spinyfin/mono/pull/42";
+
+    pub fn lifecycle_probe() -> PrLifecycleProbe {
+        PrLifecycleProbe::builder()
+            .url(PR)
+            .state(PrLifecycleState::Open(boss_observation_contracts::OpenPrStatus::clean()))
+            .labels(Vec::new())
+            .review(PrReviewState::Required)
+            .build()
     }
 }

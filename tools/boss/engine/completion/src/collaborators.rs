@@ -1,7 +1,7 @@
 //! Engine-host services the completion handler calls but does not own.
 //!
 //! Completion decides *when* a finished run's PR needs design-doc scanning,
-//! attention extraction, review-guide validation or live-worker bookkeeping;
+//! attention extraction or review-guide validation;
 //! the engine host owns *how*. Each seam is a narrow trait implemented by the
 //! engine's composition layer and injected when the handler is built, so this
 //! crate never imports the host.

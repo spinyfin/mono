@@ -1,17 +1,8 @@
 use super::*;
-use boss_engine_completion::queue_ci_audit::fixtures::{HEAD, input};
-use boss_engine_completion::queue_ci_audit::{rearm_and_notify, rearm_parent_failure_signal};
-
-const PR: &str = "https://github.com/spinyfin/mono/pull/42";
-
-fn lifecycle_probe() -> PrLifecycleProbe {
-    PrLifecycleProbe::builder()
-        .url(PR)
-        .state(PrLifecycleState::Open(boss_observation_contracts::OpenPrStatus::clean()))
-        .labels(Vec::new())
-        .review(boss_observation_contracts::PrReviewState::Required)
-        .build()
-}
+use boss_engine_completion::test_support::pr_transition::{PR, lifecycle_probe};
+use boss_engine_completion::test_support::queue_ci_audit::{
+    HEAD, input, rearm_and_notify, rearm_parent_failure_signal,
+};
 
 #[derive(Default)]
 struct DeferredEnqueuer {

@@ -8,6 +8,9 @@ workspace = "../../../.."
 # Exposes the fixtures and internals the engine's integration suite drives.
 # Always on under `cfg(test)`; never enabled in production builds.
 test-support = [
+  "boss-execution-contracts/test-support",
+  "boss-work-db/test-support",
+  "boss-engine-live-worker-state/test-support",
   "dep:boss-engine-proposal-validation",
   "dep:boss-engine-test-git",
   "dep:rusqlite",
@@ -58,6 +61,7 @@ tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+boss-engine-live-worker-state = { path = "../live-worker-state", features = ["test-support"] }
 boss-engine-proposal-validation = { path = "../proposal-validation" }
 boss-engine-test-git = { path = "../test-git" }
 boss-execution-contracts = { path = "../execution-contracts", features = ["test-support"] }

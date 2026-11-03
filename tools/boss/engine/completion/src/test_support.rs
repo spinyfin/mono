@@ -236,3 +236,19 @@ pub async fn wait_for_source_capture(db: &WorkDb, root: &str) {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
+
+// Test-only entry points keep completion internals out of the production API.
+pub use crate::pr_transition::fixtures as pr_transition;
+pub use crate::queue_ci_audit::fixtures as queue_ci_audit;
+
+impl crate::WorkerCompletionHandler {
+    pub async fn finalize_pr_transition_for_test(
+        &self,
+        execution_id: &str,
+        pr_url: String,
+        target: crate::work::WorkerPrCompletionTarget,
+        source: &'static str,
+    ) -> crate::StopOutcome {
+        self.finalize_pr_transition(execution_id, pr_url, target, source).await
+    }
+}
