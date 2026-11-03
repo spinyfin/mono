@@ -832,10 +832,10 @@ fn reviews_held_by_persisted_pause_on(conn: &Connection) -> Result<bool> {
 /// persisted value cannot be parsed would be the worse failure.
 fn load_focus_or_off(conn: &Connection) -> boss_protocol::DispatchFocus {
     super::dispatch_focus::load_dispatch_focus_on(conn).unwrap_or_else(|err| {
-        tracing::warn!(
-            ?err,
-            "persisted dispatch focus is unreadable; treating focus as off for review admission"
-        );
+        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+        WARN_ONCE.call_once(|| {
+            tracing::warn!(?err, "persisted dispatch focus is unreadable; treating focus as off");
+        });
         boss_protocol::DispatchFocus::default()
     })
 }
@@ -943,7 +943,7 @@ fn release_unstartable_pre_merge_review_reservations_in_tx(
                  FROM work_executions we
                  JOIN pr_review_batch_members m ON m.execution_id = we.id
                  WHERE m.batch_id = ?1
-                   AND we.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')",
+                   AND we.status IN ('queued', 'ready', 'waiting_dependency')",
             )?;
             stmt.query_map(params![batch_id], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -954,7 +954,7 @@ fn release_unstartable_pre_merge_review_reservations_in_tx(
             "UPDATE work_executions
              SET status = 'abandoned', finished_at = ?2
              WHERE id IN (SELECT execution_id FROM pr_review_batch_members WHERE batch_id = ?1)
-               AND status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')",
+               AND status IN ('queued', 'ready', 'waiting_dependency')",
             params![batch_id, now],
         )?;
         for (execution_id, work_item_id) in &member_execution_ids {
@@ -1690,7 +1690,7 @@ impl WorkDb {
             tx.commit()?;
             return Ok(ReviewBatchDispatch::AlreadyReviewed);
         }
-        // Explicit starts are operator-chosen, never released by the hold, and
+        // Explicit starts are requested by name, never released by the hold, and
         // their members can still be run with `bossctl agents launch`, so the
         // hold only defers automatic admission.
         if !explicit && pre_merge_dispatch_hold_on(&tx, &input.cycle_root_id)?.is_some() {

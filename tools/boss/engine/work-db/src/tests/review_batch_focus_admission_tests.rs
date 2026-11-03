@@ -481,28 +481,42 @@ fn unreadable_persisted_focus_does_not_block_admission() {
     created_batch(create_batch(&db, &root.id, "head-garbage"));
 }
 
-/// An explicit review start is operator-chosen and is admitted even when
-/// focus would hold the PR for automatic admission.
+/// An explicit review start is admitted and retained when focus or an
+/// all-spawns pause holds automatic admission.
 #[test]
-fn explicit_start_is_admitted_under_focus() {
-    let db = WorkDb::open(temp_db_path("focus-explicit-admitted")).unwrap();
-    let product = create_test_product(&db);
-    let focused = project(&db, &product.id, "Focused");
-    let other = project(&db, &product.id, "Other");
-    let out = project_task(&db, &product.id, &other.id, "Out of focus PR");
-    db.connect()
-        .unwrap()
-        .execute(
-            "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
-            rusqlite::params![out.id],
-        )
-        .unwrap();
-    focus_on_project(&db, &focused.id);
-    let mut input = batch_input(out.id.clone(), "head-explicit", ReviewBatchPhase::PreMerge);
-    input.pr_url = format!(
-        "https://github.com/example/repo/pull/{}",
-        &out.id[out.id.len().saturating_sub(4)..]
-    );
-    let (batch, _) = created_batch(db.request_pre_merge_review_batch_for_pool(input, 16).unwrap());
-    assert!(batch.explicit);
+fn explicit_start_is_admitted_and_retained_under_holds() {
+    for hold in ["focus", "all_spawns"] {
+        let db = WorkDb::open(temp_db_path("focus-explicit-admitted")).unwrap();
+        let product = create_test_product(&db);
+        let focused = project(&db, &product.id, "Focused");
+        let other = project(&db, &product.id, "Other");
+        let out = project_task(&db, &product.id, &other.id, "Out of focus PR");
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+                rusqlite::params![out.id],
+            )
+            .unwrap();
+        if hold == "focus" {
+            focus_on_project(&db, &focused.id);
+        } else {
+            db.set_metadata("dispatch_paused", "1").unwrap();
+            db.set_metadata("dispatch_paused_origin", "operator").unwrap();
+            db.set_metadata("dispatch_paused_scope", "all_spawns").unwrap();
+        }
+        let mut input = batch_input(out.id.clone(), "head-explicit", ReviewBatchPhase::PreMerge);
+        input.pr_url = format!(
+            "https://github.com/example/repo/pull/{}",
+            &out.id[out.id.len().saturating_sub(4)..]
+        );
+        let (batch, _) = created_batch(db.request_pre_merge_review_batch_for_pool(input, 16).unwrap());
+        assert!(batch.explicit);
+        assert!(
+            db.release_unstartable_pre_merge_review_reservations()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(db.review_batch(&batch.id).unwrap().is_some());
+    }
 }
