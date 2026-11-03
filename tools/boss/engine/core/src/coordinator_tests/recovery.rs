@@ -77,12 +77,12 @@ async fn merge_cancel_workspace_preference_is_ignored_without_dirty_reuse() {
     };
 
     let lease = coordinator
-        .lease_workspace_with_fallback(
+        .lease_workspace_with_fallback_for_test(
             &execution,
             "worker-followup",
             &repo,
             "continue-review",
-            &coordinator.host_adapter,
+            &coordinator.host_adapter(),
         )
         .await
         .expect("a merge-cancel preference is soft when its workspace is unavailable");
@@ -129,12 +129,12 @@ async fn revision_resume_uses_fresh_scratch_without_workspace_pinning() {
     };
 
     let result = coordinator
-        .lease_workspace_with_fallback(
+        .lease_workspace_with_fallback_for_test(
             &execution,
             "worker-resume",
             &repo,
             "resume-revision",
-            &coordinator.host_adapter,
+            &coordinator.host_adapter(),
         )
         .await;
 
@@ -179,10 +179,10 @@ async fn recovery_uses_bookmark_without_replaying_a_legacy_patch() {
     std::fs::write(&patch, "obsolete patch, must never replay").unwrap();
     let coordinator = recovery_coordinator(db);
     let restored = coordinator
-        .recover_execution_bookmark(
+        .recover_execution_bookmark_for_test(
             &resume,
             &lease_for(&repo.replacement, Some(true)),
-            &coordinator.host_adapter,
+            &coordinator.host_adapter(),
             "mono",
             None,
             None,
@@ -194,7 +194,7 @@ async fn recovery_uses_bookmark_without_replaying_a_legacy_patch() {
         Some((dead_id.clone(), true))
     );
     let report = coordinator
-        .work_db
+        .work_db()
         .execution_restore_report(&resume.id)
         .unwrap()
         .unwrap();
@@ -211,14 +211,14 @@ async fn recovery_uses_bookmark_without_replaying_a_legacy_patch() {
     // A pre-start failure after restoring can later be pruned. Its report
     // must follow the execution instead of preventing retention cleanup.
     coordinator
-        .work_db
+        .work_db()
         .connect()
         .unwrap()
         .execute("DELETE FROM work_executions WHERE id = ?1", [&resume.id])
         .unwrap();
     assert!(
         coordinator
-            .work_db
+            .work_db()
             .execution_restore_report(&resume.id)
             .unwrap()
             .is_none()
@@ -239,10 +239,10 @@ async fn recovery_uses_shared_store_when_cube_recovered_nothing() {
     std::fs::write(repo.worker.join("foreign.txt"), "foreign work").unwrap();
     let coordinator = recovery_coordinator(db);
     let restored = coordinator
-        .recover_execution_bookmark(
+        .recover_execution_bookmark_for_test(
             &resume,
             &lease_for(&repo.replacement, Some(false)),
-            &coordinator.host_adapter,
+            &coordinator.host_adapter(),
             "mono",
             None,
             None,
@@ -254,7 +254,7 @@ async fn recovery_uses_shared_store_when_cube_recovered_nothing() {
         Some((dead_id.clone(), true))
     );
     let report = coordinator
-        .work_db
+        .work_db()
         .execution_restore_report(&resume.id)
         .unwrap()
         .unwrap();
@@ -296,10 +296,10 @@ async fn missing_baseline_is_rebuilt_from_the_record_or_retired_loudly_without_a
         std::fs::write(&patch, "legacy evidence").unwrap();
         let coordinator = recovery_coordinator(db.clone());
         let restored = coordinator
-            .recover_execution_bookmark(
+            .recover_execution_bookmark_for_test(
                 &resume,
                 &lease_for(&repo.replacement, None),
-                &coordinator.host_adapter,
+                &coordinator.host_adapter(),
                 "mono",
                 None,
                 None,
@@ -389,10 +389,10 @@ async fn bookkeeping_only_work_is_not_reported_as_a_recovery() {
     JjRepo::run(&repo.worker, &["status"]);
     let coordinator = recovery_coordinator(db);
     let restored = coordinator
-        .recover_execution_bookmark(
+        .recover_execution_bookmark_for_test(
             &resume,
             &lease_for(&repo.replacement, None),
-            &coordinator.host_adapter,
+            &coordinator.host_adapter(),
             "mono",
             None,
             None,
@@ -416,10 +416,10 @@ async fn recovery_is_a_no_op_for_a_non_resume_dispatch() {
         .unwrap();
     let coordinator = recovery_coordinator(db);
     let restored = coordinator
-        .recover_execution_bookmark(
+        .recover_execution_bookmark_for_test(
             &fresh,
             &lease_for(dir.path(), None),
-            &coordinator.host_adapter,
+            &coordinator.host_adapter(),
             "mono",
             None,
             None,
@@ -490,7 +490,7 @@ async fn resume_does_not_reclaim_stale_lease_for_recovery() {
     };
 
     let result = coordinator
-        .lease_workspace_with_fallback(&resume, "worker-resume", &repo, "task", &coordinator.host_adapter)
+        .lease_workspace_with_fallback_for_test(&resume, "worker-resume", &repo, "task", &coordinator.host_adapter())
         .await;
     assert!(result.is_ok(), "resume lease should succeed after reclaim");
 
@@ -546,7 +546,7 @@ async fn hard_prefer_resume_does_not_reclaim_unowned_lease() {
     };
 
     let _ = coordinator
-        .lease_workspace_with_fallback(&resume, "worker-resume", &repo, "task", &coordinator.host_adapter)
+        .lease_workspace_with_fallback_for_test(&resume, "worker-resume", &repo, "task", &coordinator.host_adapter())
         .await;
 
     let releases = cube.force_release_calls.lock().await;

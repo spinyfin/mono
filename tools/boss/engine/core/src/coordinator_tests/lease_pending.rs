@@ -83,7 +83,7 @@ async fn lease_pending_does_not_block_admission_when_working_below_cap() {
         admission.blockers
     );
 
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
 
     let occupancy = coordinator.worker_pool().occupancy().await;
@@ -128,7 +128,7 @@ async fn per_repo_lease_attempt_bound_holds_ready_rows() {
         .with_dispatch_events(recording.clone()),
     );
 
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     wait_until_in_flight_leases(&cube, MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO).await;
 
     assert!(
@@ -199,7 +199,7 @@ async fn lease_timeout_backs_off_and_releases_the_slot() {
         .with_cube_lease_timeout(Duration::from_millis(80)),
     );
 
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Ready).await;
 
     let after = db.get_execution(&execution_id).unwrap();
@@ -224,7 +224,7 @@ async fn lease_timeout_backs_off_and_releases_the_slot() {
     );
     assert_eq!(cube.lease_calls.lock().await.len(), 1);
 
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     sleep(Duration::from_millis(50)).await;
     assert_eq!(
         cube.lease_calls.lock().await.len(),
@@ -275,7 +275,7 @@ async fn cap_hold_text_names_working_and_lease_pending() {
             .expect("idle slot for a lease-pending claim");
     }
 
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
 
     let held = db.get_execution(&execution.id).unwrap();
     assert_eq!(held.status, ExecutionStatus::Ready);
@@ -324,12 +324,12 @@ async fn cap_hold_text_names_working_and_lease_pending() {
     let held_permits: Vec<_> = (0..MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO)
         .map(|i| {
             coordinator
-                .repo_lease_limiter
+                .repo_lease_limiter()
                 .try_begin(&execution.repo_remote_url, &format!("other-exec-{i}"))
                 .expect("permit below the bound")
         })
         .collect();
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     let held = db.get_execution(&execution.id).unwrap();
     assert_eq!(held.dispatch_wait_reason.as_deref(), Some(expected.as_str()));
     drop(held_permits);
@@ -385,7 +385,7 @@ async fn released_lease_permit_redrains_held_rows_without_an_external_kick() {
         .with_max_concurrent_leases_per_repo(1),
     );
 
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     wait_until_in_flight_leases(&cube, 1).await;
     let held = execution_ids
         .iter()
@@ -429,12 +429,12 @@ async fn lease_permit_is_not_held_through_the_spawn_pipeline() {
         )
         .with_max_concurrent_leases_per_repo(1),
     );
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     wait_for_execution_status(db.as_ref(), &execution_ids[0], ExecutionStatus::Running).await;
     let execution = db.get_execution(&execution_ids[0]).unwrap();
     assert!(
         coordinator
-            .repo_lease_limiter
+            .repo_lease_limiter()
             .try_begin(&execution.repo_remote_url, "another-exec")
             .is_some(),
         "the permit must be free once the lease has returned"
@@ -477,7 +477,7 @@ async fn cap_overshoot_is_bounded_by_the_per_repo_lease_bound() {
         .await
         .expect("idle slot");
 
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     wait_until_in_flight_leases(&cube, MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO).await;
     gate.add_permits(MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO);
     for id in &execution_ids[..MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO] {
@@ -533,7 +533,7 @@ async fn cap_one_with_two_pending_successful_leases_stays_within_the_bound() {
     );
     coordinator.set_max_concurrent_interactive_workers(1).unwrap();
 
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     wait_until_in_flight_leases(&cube, MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO).await;
     gate.add_permits(MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO);
     for id in &execution_ids[..MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO] {
@@ -575,7 +575,7 @@ async fn force_dispatch_respects_the_per_repo_lease_bound() {
         )
         .with_max_concurrent_leases_per_repo(1),
     );
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     wait_until_in_flight_leases(&cube, 1).await;
 
     let held_id = execution_ids
@@ -616,7 +616,7 @@ async fn adapter_reported_lease_timeout_backs_off_without_a_second_attempt() {
         )
         .with_pre_start_retry_delays(vec![Duration::from_secs(5)]),
     );
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     wait_for_execution_status(db.as_ref(), &execution_ids[0], ExecutionStatus::Ready).await;
     for _ in 0..100 {
         if db.get_execution(&execution_ids[0]).unwrap().pre_start_failure_count == 1 {
@@ -683,14 +683,14 @@ async fn repeated_lease_timeouts_back_off_for_longer_each_time() {
         }
     };
 
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     wait_for_failures(1).await;
     let first_not_before = not_before(id);
     assert!(first_not_before <= epoch() + 2, "first backoff is the short delay");
     assert_eq!(coordinator.worker_pool().occupancy().await.lease_pending, 0);
     assert_eq!(
         coordinator
-            .repo_lease_limiter
+            .repo_lease_limiter()
             .in_flight(&db.get_execution(id).unwrap().repo_remote_url),
         0,
         "a backing-off row holds no permit"
@@ -700,7 +700,7 @@ async fn repeated_lease_timeouts_back_off_for_longer_each_time() {
         sleep(Duration::from_millis(100)).await;
     }
     let before_second = epoch();
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     wait_for_failures(2).await;
     assert!(
         not_before(id) >= before_second + 5,

@@ -1,5 +1,6 @@
-//! Tests for [`super`]'s execution-coordinator dispatch pipeline, grouped by
-//! the concern each module exercises. Shared fixtures live in [`helpers`].
+//! Integration tests for the dispatch coordinator (`boss_engine_dispatch`)
+//! driven against the engine's real lifecycle services, grouped by the concern
+//! each module exercises. Shared fixtures live in [`helpers`].
 
 mod answer_agent_positioning;
 mod automation;
@@ -27,4 +28,3 @@ mod review_pause;
 mod revision_gating;
 mod spawn_failures;
 mod stacked_restore_retry;
-mod unit;

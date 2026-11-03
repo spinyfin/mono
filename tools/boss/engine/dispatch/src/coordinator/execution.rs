@@ -260,7 +260,7 @@ impl ExecutionCoordinator {
     /// Pick the host this execution should run on. Durable pins bypass
     /// capability matching; a one-dispatch requested host remains subject to it,
     /// then ranks the survivors by branch affinity / free slots — see
-    /// [`crate::host_scheduling::select_host`].
+    /// `boss_engine::host_scheduling::select_host`.
     ///
     /// The local host is never slot-gated here: the worker pool already
     /// bounded local concurrency before dispatch reached this point, and
@@ -420,7 +420,7 @@ impl ExecutionCoordinator {
     /// Resolve the driver used by both host placement and spawn-failure alerts.
     pub(crate) fn resolve_spawn_driver(&self, execution: &WorkExecution, worker_id: &str) -> Result<Option<String>> {
         if execution.kind == ExecutionKind::PrReviewGuide {
-            return Ok(Some(crate::runner::REVIEW_GUIDE_DRIVER.to_owned()));
+            return Ok(Some(boss_execution_contracts::REVIEW_GUIDE_DRIVER.to_owned()));
         }
         if execution.kind == ExecutionKind::PrReview
             && let Some(member) = self.work_db.review_batch_member_for_execution(&execution.id)?
@@ -445,7 +445,7 @@ impl ExecutionCoordinator {
     /// forgot to check one, which is precisely how the 2026-08-10 incident
     /// happened. Any future caller must name a [`DispatchAdmission`], and
     /// the compiler will not let it avoid the question.
-    pub(super) async fn schedule_execution(
+    pub(crate) async fn schedule_execution(
         self: &Arc<Self>,
         execution: &WorkExecution,
         worker_id: &str,
@@ -2090,7 +2090,7 @@ impl ExecutionCoordinator {
         }
     }
 
-    pub(super) async fn lease_workspace_with_fallback(
+    pub(crate) async fn lease_workspace_with_fallback(
         &self,
         execution: &WorkExecution,
         worker_id: &str,
@@ -2455,7 +2455,7 @@ impl ExecutionCoordinator {
     ///
     /// Do NOT call this for post-`run_started` failures — those require
     /// `finish_execution_run`.
-    pub(super) async fn record_start_failure(
+    pub(crate) async fn record_start_failure(
         &self,
         coordinator: Arc<ExecutionCoordinator>,
         execution: &WorkExecution,

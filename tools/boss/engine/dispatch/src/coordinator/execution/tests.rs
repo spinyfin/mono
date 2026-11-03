@@ -1,5 +1,5 @@
 use super::pr_number_for_workspace_goto;
-use crate::test_support::{create_active_chore, create_product, open_db, seed_review_guide_series};
+use crate::work::test_support::{create_active_chore, create_product, open_db, seed_review_guide_series};
 use crate::work::{CreateCommentInput, WorkItemPatch};
 use boss_protocol::{CommentAnchor, ExecutionKind, ExecutionStatus, WorkExecution, WorkItem};
 

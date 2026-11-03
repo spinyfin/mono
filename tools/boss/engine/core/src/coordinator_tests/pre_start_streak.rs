@@ -367,19 +367,27 @@ fn spawn_driver_resolution_covers_guides_pools_and_ordinary_workers() {
     let coordinator = coordinator_failing_first(&db, 0);
     let guide = create_guide_execution(&db, &product, 11);
     assert_eq!(
-        coordinator.resolve_spawn_driver(&guide, "review-1").unwrap().as_deref(),
+        coordinator
+            .resolve_spawn_driver_for_test(&guide, "review-1")
+            .unwrap()
+            .as_deref(),
         Some("codex")
     );
     let chore = create_test_chore(&db, product, "ordinary worker");
     db.reconcile_product_executions(&chore.product_id).unwrap();
     let ordinary = db.list_executions(Some(&chore.id)).unwrap().remove(0);
     assert_eq!(
-        coordinator.resolve_spawn_driver(&ordinary, "worker-1").unwrap(),
+        coordinator
+            .resolve_spawn_driver_for_test(&ordinary, "worker-1")
+            .unwrap(),
         db.get_execution_driver_slug(&ordinary.id).unwrap()
     );
     for worker in ["review-1", "auto-worker-1"] {
         assert_eq!(
-            coordinator.resolve_spawn_driver(&ordinary, worker).unwrap().as_deref(),
+            coordinator
+                .resolve_spawn_driver_for_test(&ordinary, worker)
+                .unwrap()
+                .as_deref(),
             Some(
                 crate::coordinator::pool_dispatch_policy_for_worker_id(worker)
                     .unwrap()
@@ -428,7 +436,9 @@ fn batch_requested_driver_takes_precedence_over_pool_driver() {
     for execution in executions {
         let member = db.review_batch_member_for_execution(&execution.id).unwrap().unwrap();
         assert_eq!(
-            coordinator.resolve_spawn_driver(&execution, "review-1").unwrap(),
+            coordinator
+                .resolve_spawn_driver_for_test(&execution, "review-1")
+                .unwrap(),
             Some(member.requested_driver)
         );
     }

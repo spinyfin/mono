@@ -7,9 +7,8 @@ use crate::config::RuntimeConfig;
 #[cfg(test)]
 pub use boss_execution_contracts::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
 pub(crate) use boss_execution_runner::{
-    ComposedWorkerSpawn, REVIEW_GUIDE_DRIVER, WorkerSpawnOpts, designated_output_kind,
-    install_boss_event_to_stable_bin, pane_spawn, resolve_boss_event_binary, spawn_launch_limits, task_bound_pr_url,
-    work_item_name, work_item_task_kind,
+    ComposedWorkerSpawn, WorkerSpawnOpts, designated_output_kind, install_boss_event_to_stable_bin, pane_spawn,
+    resolve_boss_event_binary, spawn_launch_limits, task_bound_pr_url, work_item_name, work_item_task_kind,
 };
 use std::path::PathBuf;
 

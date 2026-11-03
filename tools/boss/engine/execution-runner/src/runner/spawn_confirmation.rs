@@ -29,35 +29,9 @@ use std::time::Duration;
 
 use boss_protocol::PaneMonitorSpec;
 
-/// Typed spawn-confirmation failure so the coordinator can classify the
-/// attention body without matching error-message substrings.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum SpawnConfirmationError {
-    #[error(
-        "refusing to complete {driver_name} spawn for {run_id}: driver composer never became ready within {timeout_secs}s \
-         (no driver signal or pane marker after prompt delivery); recording a failed spawn"
-    )]
-    ComposerNotReady {
-        driver_name: String,
-        run_id: String,
-        timeout_secs: u64,
-    },
-    #[error(
-        "refusing to complete {driver_name} spawn for {run_id}: no driver hook or session event arrived within \
-         {timeout_secs}s after prompt delivery; recording a failed spawn"
-    )]
-    TurnDidNotStart {
-        driver_name: String,
-        run_id: String,
-        timeout_secs: u64,
-    },
-}
-
-/// Walk an anyhow chain for a [`SpawnConfirmationError`].
-pub fn spawn_confirmation_error(err: &anyhow::Error) -> Option<&SpawnConfirmationError> {
-    err.chain()
-        .find_map(|cause| cause.downcast_ref::<SpawnConfirmationError>())
-}
+pub use boss_execution_contracts::{
+    SpawnConfirmationError, composer_not_ready_error, spawn_confirmation_error, turn_did_not_start_error,
+};
 
 use crate::driver::{AgentDriver, ProgressIngress, ProgressObservationConfig};
 use crate::host::DriverSignals;
@@ -148,22 +122,6 @@ where
         let remaining = deadline - now;
         tokio::time::sleep(poll.min(remaining)).await;
     }
-}
-
-pub fn composer_not_ready_error(driver_name: &str, run_id: &str, timeout: Duration) -> anyhow::Error {
-    anyhow::Error::from(SpawnConfirmationError::ComposerNotReady {
-        driver_name: driver_name.to_owned(),
-        run_id: run_id.to_owned(),
-        timeout_secs: timeout.as_secs(),
-    })
-}
-
-pub fn turn_did_not_start_error(driver_name: &str, run_id: &str, timeout: Duration) -> anyhow::Error {
-    anyhow::Error::from(SpawnConfirmationError::TurnDidNotStart {
-        driver_name: driver_name.to_owned(),
-        run_id: run_id.to_owned(),
-        timeout_secs: timeout.as_secs(),
-    })
 }
 
 /// Run the two spawn-time waits against injected predicates so production

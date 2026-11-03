@@ -24,7 +24,7 @@ async fn queue_wait_changes_and_claims_refresh_the_board_without_repeated_hold_n
         publisher.clone(),
     ));
     let worker = coordinator.worker_pool().claim_worker("exec_busy", None).await.unwrap();
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     let runtime = db.get_task_runtime(&chore.id).unwrap();
     assert_eq!(runtime.execution_status, Some(ExecutionStatus::Ready));
     assert_eq!(runtime.dispatch_wait_reason.as_deref(), Some("pool_exhausted"));
@@ -37,7 +37,7 @@ async fn queue_wait_changes_and_claims_refresh_the_board_without_repeated_hold_n
         vec!["dispatch_wait_changed".to_owned()],
         "a wait-reason change touches one card's runtime, never the board's shape"
     );
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     assert_eq!(
         publisher.events.lock().await.len(),
         1,
@@ -45,7 +45,7 @@ async fn queue_wait_changes_and_claims_refresh_the_board_without_repeated_hold_n
     );
 
     coordinator.worker_pool().release_worker(&worker, None).await;
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     assert!(
         publisher
             .events
@@ -238,7 +238,7 @@ async fn recover_failed_dispatch_records_pre_start_failure_and_unclaims() {
         .with_pre_start_retry_delays(vec![Duration::from_secs(30)]),
     );
     coordinator
-        .recover_failed_dispatch(&execution, "worker-1", &anyhow!("cube setup exploded"))
+        .recover_failed_dispatch_for_test(&execution, "worker-1", &anyhow!("cube setup exploded"))
         .await;
 
     let after = db.get_execution(&execution_id).unwrap();

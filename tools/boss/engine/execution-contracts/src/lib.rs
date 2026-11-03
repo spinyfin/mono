@@ -7,8 +7,12 @@ pub use lease_release::{
 };
 mod host_selection;
 pub use host_selection::{
-    ChoreRequirements, DRIVERS_PROBED_CAPABILITY, Eligibility, HostSlot, IneligibilityReason, driver_capability,
-    select_host,
+    ChoreRequirements, DRIVERS_PROBED_CAPABILITY, Eligibility, HostSlot, IneligibilityReason, REVIEW_GUIDE_DRIVER,
+    driver_capability, select_host,
+};
+mod spawn_confirmation;
+pub use spawn_confirmation::{
+    SpawnConfirmationError, composer_not_ready_error, spawn_confirmation_error, turn_did_not_start_error,
 };
 mod worker_kind;
 pub use worker_kind::{WorkerKind, worker_kind_for_execution};
@@ -1768,6 +1772,27 @@ pub trait HostAdapterProvider: Send + Sync {
     /// a pre-start failure in the dispatch loop, leaving the execution
     /// recoverable on a later kick.
     async fn adapter_for(&self, host: &Host) -> Result<Arc<dyn HostAdapter>>;
+}
+
+/// The default provider: hands back the one local adapter for every host.
+/// Used by tests and local-only deployments — when no remote hosts are
+/// registered the scheduler only ever picks `local`, so the host argument
+/// is irrelevant. Production swaps in the SSH-aware provider.
+pub struct LocalHostAdapterProvider {
+    local: Arc<dyn HostAdapter>,
+}
+
+impl LocalHostAdapterProvider {
+    pub fn new(local: Arc<dyn HostAdapter>) -> Self {
+        Self { local }
+    }
+}
+
+#[async_trait]
+impl HostAdapterProvider for LocalHostAdapterProvider {
+    async fn adapter_for(&self, _host: &Host) -> Result<Arc<dyn HostAdapter>> {
+        Ok(Arc::clone(&self.local))
+    }
 }
 
 /// Whether any process has its cwd inside the workspace.

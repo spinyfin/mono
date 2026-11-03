@@ -2446,7 +2446,7 @@ async fn requested_host_became_ineligible_fails_review_guide_card() {
         )
         .with_pre_start_retry_delays(vec![]),
     );
-    coordinator.mark_requested_host(&fixture.execution_id, "local".to_owned());
+    coordinator.mark_requested_host_for_test(&fixture.execution_id, "local".to_owned());
     db.set_host_enabled("local", false).unwrap();
     coordinator.kick();
     wait_for_execution_status(db.as_ref(), &fixture.execution_id, ExecutionStatus::Cancelled).await;

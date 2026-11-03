@@ -25,7 +25,7 @@ Every consumer, by pointer (paths are repo-relative):
 **`boss-recovery/<exec>`**
 
 - Written by: `create_from` on `@` (`execution_bookmark.rs:581`); the worker advances it, as the dispatch prompt instructs (`tools/boss/engine/core/src/runner/prompt.rs:1578`, `:1761`).
-- Read by: `resolve_heads` (`execution_bookmark.rs:441`), `restore` (`:745`), `restore_for_retry` (`:751`), `release_heads` (`:684`), `diff` (`:700`); the coordinator's blocked-workspace recovery (`tools/boss/engine/core/src/coordinator/blocked_workspace.rs:45`, diff at `:83`); the abandoned-bookmark sweep (`tools/boss/engine/core/src/abandoned_execution_bookmarks.rs:17`); prune (`prune.rs:188`).
+- Read by: `resolve_heads` (`execution_bookmark.rs:441`), `restore` (`:745`), `restore_for_retry` (`:751`), `release_heads` (`:684`), `diff` (`:700`); the coordinator's blocked-workspace recovery (`tools/boss/engine/dispatch/src/coordinator/blocked_workspace.rs:46`, diff at `:84`); the abandoned-bookmark sweep (`tools/boss/engine/core/src/abandoned_execution_bookmarks.rs:17`); prune (`prune.rs:188`).
 - What is actually needed: the tip of the worker's **local** work, including work that was never pushed. This is the one pointer nothing else can reconstruct. Needed until the work is proven published, then never.
 
 **`boss/<exec>`**

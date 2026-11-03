@@ -38,7 +38,7 @@ async fn pr_review_execution_routes_to_review_pool() {
     // pool_for_execution must hand back the review pool — claiming from
     // it yields a `review-` worker id.
     let wid = coord
-        .pool_for_execution(&review_exec)
+        .pool_for_execution_for_test(&review_exec)
         .claim_worker("exec-review", None)
         .await
         .unwrap();
@@ -58,7 +58,7 @@ async fn pr_review_execution_routes_to_review_pool() {
         .build();
     assert!(!coord.execution_targets_review_pool(&chore_exec));
     let wid2 = coord
-        .pool_for_execution(&chore_exec)
+        .pool_for_execution_for_test(&chore_exec)
         .claim_worker("exec-chore", None)
         .await
         .unwrap();
@@ -225,13 +225,13 @@ async fn pr_review_with_pr_url_positions_via_goto_not_create_change() {
     let coordinator = Arc::new(coord);
 
     let worker_id = coordinator
-        .pool_for_execution(&execution)
+        .pool_for_execution_for_test(&execution)
         .claim_worker(&execution.id, None)
         .await
         .expect("review pool slot available");
 
     let result = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(result.is_ok(), "schedule_execution must succeed: {result:?}");
 
@@ -286,13 +286,13 @@ async fn pr_review_lease_failure_records_start_failure() {
     let coordinator = Arc::new(coord.with_pre_start_retry_delays(Vec::new()));
 
     let worker_id = coordinator
-        .pool_for_execution(&execution)
+        .pool_for_execution_for_test(&execution)
         .claim_worker(&execution.id, None)
         .await
         .expect("review pool slot available");
 
     let result = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(result.is_err(), "schedule_execution must fail when the lease fails");
 
@@ -342,13 +342,13 @@ async fn pr_review_goto_failure_records_positioning_failed() {
     let coordinator = Arc::new(coord.with_pre_start_retry_delays(Vec::new()));
 
     let worker_id = coordinator
-        .pool_for_execution(&execution)
+        .pool_for_execution_for_test(&execution)
         .claim_worker(&execution.id, None)
         .await
         .expect("review pool slot available");
 
     let result = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(result.is_err(), "schedule_execution must fail when goto fails");
 
@@ -403,13 +403,13 @@ async fn pr_review_without_pr_url_uses_create_change_path() {
     let coordinator = Arc::new(coord);
 
     let worker_id = coordinator
-        .pool_for_execution(&execution)
+        .pool_for_execution_for_test(&execution)
         .claim_worker(&execution.id, None)
         .await
         .expect("review pool slot available");
 
     let result = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(
         result.is_ok(),
@@ -881,7 +881,7 @@ async fn review_guide_refuses_an_explicit_remote_host_before_leasing() {
     .with_dispatch_events(recording.clone());
     coord.set_review_pool(WorkerPool::new_review(1));
     coord
-        .requested_host_ids
+        .requested_host_ids()
         .lock()
         .unwrap()
         .insert(execution.id.clone(), "remote".to_owned());

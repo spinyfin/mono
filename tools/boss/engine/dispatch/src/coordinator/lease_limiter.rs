@@ -74,7 +74,7 @@ impl Inner {
 
 /// Counts in-flight lease attempts per repo origin URL.
 #[derive(Clone)]
-pub(super) struct RepoLeaseLimiter {
+pub struct RepoLeaseLimiter {
     inner: Arc<Inner>,
 }
 
@@ -84,7 +84,7 @@ pub(super) struct RepoLeaseLimiter {
 /// on every other path (early return, failure, panic). When the release
 /// freed a permit that a row was denied, the scheduler is kicked so that
 /// row is drained again.
-pub(super) struct LeaseAttemptGuard {
+pub struct LeaseAttemptGuard {
     inner: Arc<Inner>,
     execution_id: String,
     token: u64,
@@ -104,7 +104,7 @@ impl RepoLeaseLimiter {
     /// Try to start one more in-flight attempt for `repo` on behalf of
     /// `execution_id`. `None` means the bound is already sat; the caller
     /// must not claim a worker slot.
-    pub(super) fn try_begin(&self, repo: &str, execution_id: &str) -> Option<LeaseAttemptGuard> {
+    pub fn try_begin(&self, repo: &str, execution_id: &str) -> Option<LeaseAttemptGuard> {
         let mut state = self.inner.state.lock().expect("repo lease limiter lock poisoned");
         if state.held.contains_key(execution_id) {
             return None;
@@ -142,8 +142,9 @@ impl RepoLeaseLimiter {
         self.inner.release(execution_id, None)
     }
 
-    #[cfg(test)]
-    pub(super) fn in_flight(&self, repo: &str) -> usize {
+    /// Attempts currently in flight for `repo`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn in_flight(&self, repo: &str) -> usize {
         self.inner
             .state
             .lock()
@@ -154,8 +155,9 @@ impl RepoLeaseLimiter {
             .unwrap_or(0)
     }
 
-    #[cfg(test)]
-    pub(super) fn denied(&self, repo: &str) -> bool {
+    /// Whether a row was denied a permit for `repo` while the bound was sat.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn denied(&self, repo: &str) -> bool {
         self.inner
             .state
             .lock()

@@ -1727,26 +1727,10 @@ pub use boss_execution_contracts::HostAdapterProvider;
 #[cfg(not(test))]
 use boss_execution_contracts::HostAdapterProvider;
 
-/// The default provider: hands back the one local adapter for every host.
-/// Used by tests and local-only deployments — when no remote hosts are
-/// registered the scheduler only ever picks `local`, so the host argument
-/// is irrelevant. Production swaps in [`SshHostAdapterProvider`].
-pub struct LocalHostAdapterProvider {
-    local: Arc<dyn HostAdapter>,
-}
-
-impl LocalHostAdapterProvider {
-    pub fn new(local: Arc<dyn HostAdapter>) -> Self {
-        Self { local }
-    }
-}
-
-#[async_trait]
-impl HostAdapterProvider for LocalHostAdapterProvider {
-    async fn adapter_for(&self, _host: &Host) -> Result<Arc<dyn HostAdapter>> {
-        Ok(Arc::clone(&self.local))
-    }
-}
+/// The default provider (every host resolves to the one local adapter) lives
+/// beside the trait it implements so the dispatch coordinator can default to it
+/// without depending on this module. Production swaps in [`SshHostAdapterProvider`].
+pub use boss_execution_contracts::LocalHostAdapterProvider;
 
 /// Production provider: returns the local adapter for `host_id = "local"`
 /// and builds (and caches) an [`SshHostAdapter`] for every other host.

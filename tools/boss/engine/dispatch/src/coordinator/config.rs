@@ -95,7 +95,7 @@ impl ExecutionCoordinator {
 
     /// Seed the bounded `merge_order` dispatch-stagger window (seconds).
     /// `app.rs` calls this with the (already-clamped)
-    /// [`crate::config::WorkConfig::merge_order_stagger_secs`]; `0` disables
+    /// `boss_engine::config::WorkConfig::merge_order_stagger_secs`; `0` disables
     /// the stagger. Tests set it directly to exercise the deferral.
     pub fn set_merge_order_stagger_secs(&mut self, secs: u64) {
         self.merge_order_stagger_secs = secs;
@@ -107,8 +107,143 @@ impl ExecutionCoordinator {
         self.automation_pool = pool;
     }
 
+    /// Test-only views of coordinator internals the integration suite drives
+    /// directly. Gated so production code cannot reach the scheduler latches
+    /// or the other state they guard.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn work_db(&self) -> &Arc<WorkDb> {
+        &self.work_db
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn inflight_dispatches(&self) -> &InflightDispatches {
+        &self.inflight_dispatches
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn scheduling_active(&self) -> &AtomicBool {
+        &self.scheduling_active
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn scheduling_pending(&self) -> &AtomicBool {
+        &self.scheduling_pending
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn requested_host_ids(&self) -> &std::sync::Mutex<HashMap<String, String>> {
+        &self.requested_host_ids
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn repo_lease_limiter(&self) -> &lease_limiter::RepoLeaseLimiter {
+        &self.repo_lease_limiter
+    }
+
+    // Test-only entry points onto crate-internal coordinator operations.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn drain_ready_queue_for_test(self: &Arc<Self>) -> DrainOutcome {
+        self.drain_ready_queue().await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pool_for_execution_for_test<'a>(&'a self, execution: &WorkExecution) -> &'a WorkerPool {
+        self.pool_for_execution(execution)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn schedule_execution_for_test(
+        self: &Arc<Self>,
+        execution: &WorkExecution,
+        worker_id: &str,
+        admission: DispatchAdmission,
+    ) -> Result<()> {
+        self.schedule_execution(execution, worker_id, admission).await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn recover_failed_dispatch_for_test(
+        self: &Arc<Self>,
+        execution: &WorkExecution,
+        worker_id: &str,
+        err: &anyhow::Error,
+    ) {
+        self.recover_failed_dispatch(execution, worker_id, err).await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn resolve_spawn_driver_for_test(&self, execution: &WorkExecution, worker_id: &str) -> Result<Option<String>> {
+        self.resolve_spawn_driver(execution, worker_id)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn validate_requested_host_for_test(&self, work_item_id: &str, host_id: &str) -> Result<()> {
+        self.validate_requested_host(work_item_id, host_id)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn mark_requested_host_for_test(&self, execution_id: &str, host_id: String) {
+        self.mark_requested_host(execution_id, host_id)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn note_dispatch_ready_for_test(self: &Arc<Self>) {
+        self.note_dispatch_ready()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn stranded_ready_executions_for_test(&self, ready: &[WorkExecution], min_age_ms: u64) -> Vec<(String, u64)> {
+        self.stranded_ready_executions(ready, min_age_ms)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn raise_ready_answer_agent_alarms_for_test(&self, ready: &[WorkExecution], threshold: Duration) {
+        self.raise_ready_answer_agent_alarms(ready, threshold)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn record_start_failure_for_test(
+        &self,
+        coordinator: Arc<ExecutionCoordinator>,
+        execution: &WorkExecution,
+        worker_id: &str,
+        cube_repo_id: Option<&str>,
+        attention: (&str, &str),
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        self.record_start_failure(coordinator, execution, worker_id, cube_repo_id, attention, error)
+            .await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn lease_workspace_with_fallback_for_test(
+        &self,
+        execution: &WorkExecution,
+        worker_id: &str,
+        repo: &CubeRepoHandle,
+        task: &str,
+        adapter: &Arc<dyn HostAdapter>,
+    ) -> Result<CubeWorkspaceLease> {
+        self.lease_workspace_with_fallback(execution, worker_id, repo, task, adapter)
+            .await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn recover_execution_bookmark_for_test(
+        &self,
+        execution: &WorkExecution,
+        lease: &CubeWorkspaceLease,
+        adapter: &Arc<dyn HostAdapter>,
+        repo_id: &str,
+        pr_for_goto: Option<u64>,
+        pr_for_reconcile: Option<u64>,
+    ) -> Result<Option<blocked_workspace::Recovered>> {
+        self.recover_execution_bookmark(execution, lease, adapter, repo_id, pr_for_goto, pr_for_reconcile)
+            .await
+    }
+
     /// The local-host adapter. `app.rs` reads this to seed the production
-    /// [`crate::host_adapter::SshHostAdapterProvider`] (which returns it
+    /// `boss_engine::host_adapter::SshHostAdapterProvider` (which returns it
     /// verbatim for `host_id = "local"`).
     pub fn host_adapter(&self) -> Arc<dyn HostAdapter> {
         Arc::clone(&self.host_adapter)
@@ -158,7 +293,7 @@ impl ExecutionCoordinator {
     ///
     /// Exposed so lease bookkeeping that runs OUTSIDE the dispatch loop can
     /// reach the same per-host cube the dispatch loop leased with — notably
-    /// [`crate::cube_lease_heartbeat::HostRoutedCubes`], which must beat a
+    /// `boss_engine::cube_lease_heartbeat::HostRoutedCubes`, which must beat a
     /// remote lease against the remote cube that issued it rather than the
     /// engine's own. Read only after `app.rs` has installed the SSH-capable
     /// provider; a caller that reads it earlier gets the local-only default,
@@ -197,7 +332,7 @@ impl ExecutionCoordinator {
     /// Re-establish reverse events forwards for every detached remote run
     /// after an engine restart. Thin binding of the coordinator's
     /// `work_db` + host-adapter provider to
-    /// [`crate::remote_reattach::reattach_remote_runs`]; `app.rs` calls
+    /// `boss_engine::remote_reattach::reattach_remote_runs`; `app.rs` calls
     /// this once at startup so a remote worker that outlived the previous
     /// engine has its hook stream (and eventual completion) routed back.
     pub async fn reattach_remote_runs(&self, engine_events_socket: &str) -> boss_execution_contracts::ReattachSummary {
@@ -215,7 +350,7 @@ impl ExecutionCoordinator {
     /// scheduler if anything was reaped (a cleared remote zombie unblocks
     /// the redundant-spawn guard for its work item). Thin binding of the
     /// coordinator's `work_db` + host-adapter provider + dispatch-event
-    /// sink to [`crate::remote_lease_reconcile::reconcile_remote_leases`];
+    /// sink to `boss_engine::remote_lease_reconcile::reconcile_remote_leases`;
     /// the periodic sweep in `app.rs` drives it.
     pub async fn reconcile_remote_leases_once(
         self: &Arc<Self>,
@@ -352,7 +487,7 @@ impl ExecutionCoordinator {
     /// there must be exactly one `EventBus` per engine process so every
     /// producer and subscriber — this coordinator's `kick()`/
     /// `spawn_dispatch_ready_subscriber`, and any future producer wired
-    /// through `crate::event_publish::commit_and_publish` — reaches the same
+    /// through `boss_engine::event_publish::commit_and_publish` — reaches the same
     /// fan-out. `app.rs` calls this once at construction with the single
     /// `Arc<EventBus>` it also hands to `ServerState`. Left unset, the
     /// coordinator keeps its private `EventBus::new()` default, which is
@@ -364,7 +499,7 @@ impl ExecutionCoordinator {
 
     /// The coordinator's `EventBus`, per the design doc's "one engine
     /// process, one bus" invariant. A future producer living outside the
-    /// coordinator (e.g. a `crate::event_publish::commit_and_publish` call
+    /// coordinator (e.g. a `boss_engine::event_publish::commit_and_publish` call
     /// site in another module) reaches the same bus `kick()` and
     /// `spawn_dispatch_ready_subscriber` use through
     /// `server_state.execution_coordinator.event_bus()`, rather than
@@ -372,7 +507,7 @@ impl ExecutionCoordinator {
     /// also uses this to log the subscriber count once the dispatch-ready
     /// subscriber has attached, as a boot-time sanity check that the
     /// injected bus in [`Self::set_event_bus`] is actually the one wired up.
-    pub(crate) fn event_bus(&self) -> &Arc<EventBus> {
+    pub fn event_bus(&self) -> &Arc<EventBus> {
         &self.event_bus
     }
 
@@ -388,10 +523,10 @@ impl ExecutionCoordinator {
     /// The live per-slot worker registry, when [`Self::set_live_worker_states`]
     /// has wired one up. `None` in tests that don't install it — callers must
     /// treat that as "no corroborating signal available", never as "worker is
-    /// dead": [`crate::durable_liveness::corroborate_against_live_registry`]
-    /// and its callers ([`crate::dead_pane_sweep`], [`crate::orphan_sweep`]'s
+    /// dead": `boss_engine::durable_liveness::corroborate_against_live_registry`
+    /// and its callers (`boss_engine::dead_pane_sweep`, `boss_engine::orphan_sweep`'s
     /// redispatch guard) already fail open (trust the raw pid probe) on `None`.
-    pub(crate) fn live_worker_states(&self) -> Option<&dyn LiveWorkerLiveness> {
+    pub fn live_worker_states(&self) -> Option<&dyn LiveWorkerLiveness> {
         self.live_worker_states.as_deref()
     }
 
@@ -654,7 +789,7 @@ impl ExecutionCoordinator {
     ///   The review exclusion is the fix for the incident's actual damage:
     ///   the canary's death records another terminal execution against its
     ///   work item, and for a `pr_review` that feeds
-    ///   [`crate::pr_review_recovery`]'s churn guard, which parks the item
+    ///   `boss_engine::pr_review_recovery`'s churn guard, which parks the item
     ///   and leaves an open PR permanently unreviewed. It is also what makes
     ///   `reviews: held` true — a breaker pause that spent reviews as
     ///   canaries was not holding them.
@@ -883,7 +1018,7 @@ impl ExecutionCoordinator {
     /// The per-(driver, worker kind) pre-start failure streak tracker. The
     /// engine health report reads its active alerts, and
     /// `ServerState::spawn_spawn_streak_health_broadcaster` subscribes to
-    /// its changes. See [`crate::pre_start_streak`].
+    /// its changes. See `boss_engine::pre_start_streak`.
     pub fn pre_start_streaks(&self) -> &Arc<PreStartStreakTracker> {
         &self.pre_start_streaks
     }
@@ -952,7 +1087,7 @@ impl ExecutionCoordinator {
     /// automation pool. Regular task executions route to the automation pool
     /// when the owning task has `source_automation_id IS NOT NULL` (it was
     /// produced by an automation). All other executions go to the main pool.
-    pub(super) fn pool_for_execution<'a>(&'a self, execution: &WorkExecution) -> &'a WorkerPool {
+    pub(crate) fn pool_for_execution<'a>(&'a self, execution: &WorkExecution) -> &'a WorkerPool {
         match self.dispatch_pool_for(execution) {
             boss_protocol::DispatchPool::Review => &self.review_pool,
             boss_protocol::DispatchPool::Automation => &self.automation_pool,
@@ -967,7 +1102,7 @@ impl ExecutionCoordinator {
     /// pool and pause rules as reviews rather than the automation pool.
     ///
     /// `pub` rather than `pub(super)` because [`Self::dispatch_hold_for`] and
-    /// [`crate::spawn_health::maybe_admit_recovery_probe`] must agree exactly
+    /// `boss_engine::spawn_health::maybe_admit_recovery_probe` must agree exactly
     /// on what counts as a review: the gate refuses a review canary, and the
     /// probe skips review rows so it never wastes its turn being refused.
     /// Two independent notions of "is this a review" is precisely the drift

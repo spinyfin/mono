@@ -660,7 +660,7 @@ async fn interactive_concurrency_cap_holds_ready_rows() {
             .expect("idle slot below the cap");
     }
 
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
 
     // Never dispatched: no run, no cube activity, still `ready`.
     assert!(db.active_run_ids_for_execution(&execution.id).unwrap().is_empty());
@@ -706,7 +706,7 @@ async fn interactive_concurrency_cap_holds_ready_rows() {
 
     // One worker frees → the next drain dispatches the held row.
     coordinator.worker_pool().release_worker("worker-1", None).await;
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
     assert!(
         !db.active_run_ids_for_execution(&execution.id).unwrap().is_empty(),
@@ -822,7 +822,7 @@ async fn raising_interactive_concurrency_cap_live_unblocks_held_rows() {
             .expect("idle slot below the cap");
     }
 
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     assert!(
         db.active_run_ids_for_execution(&execution.id).unwrap().is_empty(),
         "row must be held at the cap before it is raised",
@@ -835,7 +835,7 @@ async fn raising_interactive_concurrency_cap_live_unblocks_held_rows() {
         .set_max_concurrent_interactive_workers(MAX_CONCURRENT_INTERACTIVE_WORKERS + 1)
         .expect("in-range raise applies verbatim");
     assert_eq!(outcome.applied, MAX_CONCURRENT_INTERACTIVE_WORKERS + 1);
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
 
     wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
     assert!(
@@ -879,7 +879,7 @@ async fn pin_to_disabled_host_yields_no_eligible_host() {
         .await
         .expect("worker available");
     let result = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(result.is_err(), "no eligible host must fail the dispatch");
 
@@ -924,7 +924,7 @@ async fn host_selection_fails_closed_when_enabled_local_has_no_driver_capability
         .await
         .expect("worker available");
     let err = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await
         .unwrap_err();
     assert!(
@@ -973,7 +973,7 @@ async fn no_eligible_host_emits_terminal_host_selected_error_event() {
         .await
         .expect("worker available");
     let result = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(result.is_err(), "no eligible host must fail the dispatch");
 
@@ -1526,7 +1526,7 @@ async fn critical_item_dispatches_past_a_full_interactive_cap() {
             .expect("idle slot below the cap");
     }
 
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
 
     wait_for_execution_status(db.as_ref(), &urgent_execution.id, ExecutionStatus::Running).await;
     assert!(
@@ -1608,7 +1608,7 @@ async fn critical_item_is_picked_before_older_high_priority_items() {
         ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
             .with_pre_start_retry_delays(Vec::new()),
     );
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
 
     let newer_execution = db.list_executions(Some(&newer.id)).unwrap().pop().unwrap();
     wait_for_execution_status(db.as_ref(), &newer_execution.id, ExecutionStatus::Running).await;
@@ -1653,7 +1653,7 @@ async fn critical_item_dispatches_while_dispatch_is_paused_and_non_critical_stay
         PauseReason::new("test: operator pause").unwrap(),
     );
 
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
 
     wait_for_execution_status(db.as_ref(), &urgent_execution.id, ExecutionStatus::Running).await;
     let held = db.get_execution(&ordinary_execution.id).unwrap();
@@ -1708,7 +1708,7 @@ async fn critical_item_is_still_held_by_a_breaker_pause() {
         PauseReason::new("test: breaker pause").unwrap(),
     );
 
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
 
     assert_eq!(
         runner.calls.lock().await.len(),

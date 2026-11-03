@@ -156,7 +156,7 @@ impl Harness {
     /// row's absence can only be asserted once the rows that should dispatch
     /// have.
     async fn drain_and_wait_for(&self, dispatched: &[&str]) {
-        self.coordinator.drain_ready_queue().await;
+        self.coordinator.drain_ready_queue_for_test().await;
         self.wait_for_runner(dispatched).await;
     }
 
@@ -314,7 +314,7 @@ async fn the_global_pause_overrides_focus() {
         PauseReason::new("test: operator pause").unwrap(),
     );
 
-    h.coordinator.drain_ready_queue().await;
+    h.coordinator.drain_ready_queue_for_test().await;
 
     assert!(
         h.dispatched().await.is_empty(),
@@ -351,7 +351,7 @@ async fn an_all_spawns_pause_holds_in_scope_reviews_too() {
         PauseReason::new("test: spawn path suspect").unwrap(),
     );
 
-    h.coordinator.drain_ready_queue().await;
+    h.coordinator.drain_ready_queue_for_test().await;
 
     assert!(h.dispatched().await.is_empty());
     assert_eq!(
@@ -402,7 +402,7 @@ async fn the_concurrency_cap_still_applies_to_in_scope_rows() {
     // The cap counts live workers, so the next in-scope row waits on it.
     let (_, second) = h.ready_project_task(&focused, "Second in scope");
     let (_, outside) = h.ready_project_task(&other, "Out of scope");
-    h.coordinator.drain_ready_queue().await;
+    h.coordinator.drain_ready_queue_for_test().await;
 
     assert_eq!(h.dispatched().await, HashSet::from([first]));
     let capped = h.execution(&second);
