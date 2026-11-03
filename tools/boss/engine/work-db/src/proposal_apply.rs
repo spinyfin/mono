@@ -1014,6 +1014,14 @@ fn apply_run_done(
     super::queue_ci_evidence::record_delivery(tx, execution_id, &payload)?;
     if let Some(question) = &payload.question {
         super::pr_flow::insert_question_with_liveness(tx, execution_id, proposal_id, question, question_worker)?;
+    } else if payload.outcome == boss_protocol::RunDoneOutcome::Blocked
+        && let Some((attempt_id, question)) = super::conflict_mismatch::take_pending_question(tx, execution_id)?
+    {
+        // A conflict worker that stopped on `architectural_mismatch` declares
+        // itself blocked without a question of its own: the engine asks the
+        // repo owner on its behalf, with the evidence the worker recorded.
+        super::pr_flow::insert_question_with_liveness(tx, execution_id, proposal_id, &question, question_worker)?;
+        super::conflict_mismatch::link_question(tx, execution_id, proposal_id, &attempt_id)?;
     }
 
     Ok(ApplyDecision::Applied(ApplyOutcome {

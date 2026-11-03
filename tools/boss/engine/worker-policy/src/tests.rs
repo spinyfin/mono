@@ -101,6 +101,7 @@ fn conflict_worker_telemetry_verbs_stay_allowed() {
     assert_allowed(FrontendRequest::MarkConflictResolutionFailed {
         attempt_id: "cr_1".into(),
         reason: "unresolvable".into(),
+        evidence: None,
     });
 }
 

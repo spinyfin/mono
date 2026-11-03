@@ -89,6 +89,7 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
             // task; the board must refresh that card too.
             let mut changed = vec![work_item_id(&item)];
             changed.extend(outcome.prerequisite_work_item_id);
+            changed.extend(outcome.touched_work_item_ids);
             let revision = publish_work_invalidation(
                 &server_state,
                 &session_id,
@@ -99,6 +100,28 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
                 changed,
             )
             .await;
+            if let Some(dispatch_id) = outcome.dispatch_work_item_id {
+                // The answer is committed. Launching is best-effort: when it
+                // cannot launch now (a writer is live on the PR, the pool is
+                // at its hard cap) the ready execution stays queued and the
+                // ordinary scheduler picks it up.
+                match server_state
+                    .execution_coordinator
+                    .launch_answered_work(&dispatch_id)
+                    .await
+                {
+                    Ok(worker) => tracing::info!(
+                        work_item_id = %dispatch_id,
+                        launched = worker.is_some(),
+                        "operator answer: launched the work it created",
+                    ),
+                    Err(err) => tracing::warn!(
+                        work_item_id = %dispatch_id,
+                        error = %format!("{err:#}"),
+                        "operator answer: could not launch the work it created; it stays queued",
+                    ),
+                }
+            }
             send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
         }
         Err(err) => match err.downcast_ref::<boss_protocol::OperatorQuestionError>() {

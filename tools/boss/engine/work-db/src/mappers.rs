@@ -719,6 +719,7 @@ pub(crate) fn map_conflict_resolution(row: &Row<'_>) -> rusqlite::Result<Conflic
         conflict_class: row.get(21)?,
         resolved_by_rung: row.get(22)?,
         mechanical_rung_in_flight: row.get(23)?,
+        mismatch_exit_barred: row.get::<_, i64>(24)? != 0,
     })
 }
 
@@ -731,7 +732,8 @@ pub const CONFLICT_RESOLUTION_COLUMNS: &str =
                 base_sha_at_trigger, head_sha_before, head_sha_after, status, failure_reason,
                 cube_lease_id, cube_workspace_id, worker_id, conflict_diagnosis,
                 created_at, started_at, finished_at, revision_task_id,
-                event_source, conflict_class, resolved_by_rung, mechanical_rung_in_flight";
+                event_source, conflict_class, resolved_by_rung, mechanical_rung_in_flight,
+                mismatch_exit_barred";
 
 pub(crate) fn query_conflict_resolution(conn: &Connection, id: &str) -> Result<Option<ConflictResolution>> {
     let mut stmt = conn.prepare(&format!(

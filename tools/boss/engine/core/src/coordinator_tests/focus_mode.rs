@@ -723,3 +723,55 @@ async fn in_focus_pre_merge_batch_is_admitted_and_dispatches_after_out_of_focus_
         assert!(!dispatched.contains(id), "out-of-focus member {id} must not dispatch");
     }
 }
+
+/// An answer that creates work launches it like `bossctl agents launch`: the
+/// global pause and the focus set hold an ordinary resume, but not the work an
+/// explicit human decision just created.
+#[tokio::test]
+async fn work_created_by_an_answer_launches_through_the_pause_and_outside_the_focus_set() {
+    let h = harness();
+    let focused = h.project("Focused");
+    let other = h.project("Other");
+    let _ = h.ready_project_task(&focused, "In scope");
+    let (answered_task, answered_exec) = h.ready_project_task(&other, "Answered, outside focus");
+    h.focus_on(&[&focused]);
+    h.coordinator.pause_dispatch_scoped(
+        1_786_385_816,
+        DispatchPauseOrigin::Operator,
+        DispatchPauseScope::NewWork,
+        PauseReason::new("test: operator pause").unwrap(),
+    );
+
+    // Left to the scheduler, the row would just sit behind the pause.
+    h.coordinator.drain_ready_queue_for_test().await;
+    assert!(h.dispatched().await.is_empty());
+
+    let worker = h
+        .coordinator
+        .launch_answered_work(&answered_task)
+        .await
+        .expect("launching the answered work succeeds");
+    assert!(worker.is_some());
+    h.wait_for_runner(&[&answered_exec]).await;
+    assert_eq!(h.dispatched().await, HashSet::from([answered_exec]));
+}
+
+/// Writer sequencing still applies: an execution gated behind another writer
+/// on the PR is not `ready`, so there is nothing to launch until the gate
+/// clears.
+#[tokio::test]
+async fn work_created_by_an_answer_still_waits_behind_a_live_writer() {
+    let h = harness();
+    let project = h.project("Gated");
+    let (task, _) = h.ready_project_task(&project, "Gated answer");
+    h.db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'waiting_dependency' WHERE work_item_id = ?1",
+            [&task],
+        )
+        .unwrap();
+
+    assert_eq!(h.coordinator.launch_answered_work(&task).await.unwrap(), None);
+    assert!(h.dispatched().await.is_empty());
+}

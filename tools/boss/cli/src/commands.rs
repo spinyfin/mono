@@ -1749,21 +1749,6 @@ pub(crate) struct EngineConflictsAbandonArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-pub(crate) struct EngineConflictsMarkFailedArgs {
-    /// Attempt id from the `conflict_resolutions` table (e.g.
-    /// `crz_…`). The current attempt id is part of the worker's
-    /// spawn prompt.
-    pub(crate) attempt_id: String,
-
-    /// Free-form failure reason. The design canonicalises three:
-    /// `obsolescence_suspected`, `product_decision_required`,
-    /// `architectural_mismatch`. Any string is accepted; the engine
-    /// stores it verbatim on the attempt row.
-    #[arg(long)]
-    pub(crate) reason: String,
-}
-
-#[derive(Debug, Clone, Args)]
 pub(crate) struct EngineConflictsRecordProducerArgs {
     /// Your own execution id (given to you at spawn time as
     /// `execution id` in the task briefing). The engine resolves

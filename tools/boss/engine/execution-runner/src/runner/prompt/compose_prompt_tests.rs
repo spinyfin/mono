@@ -698,7 +698,7 @@ fn resume_directive_present_when_structured_pr_url_is_set() {
     );
 }
 
-fn revision_execution(pr_url: &str) -> WorkExecution {
+pub(super) fn revision_execution(pr_url: &str) -> WorkExecution {
     WorkExecution::builder()
         .id("exec_rev_01")
         .work_item_id("task-1")
@@ -1003,7 +1003,7 @@ fn bazel_gate_recognizes_workspace_marker_files() {
 
 // Helpers shared by revision fragment tests.
 
-fn revision_task_with_created_via(pr_url: Option<&str>, created_via: &str) -> WorkItem {
+pub(super) fn revision_task_with_created_via(pr_url: Option<&str>, created_via: &str) -> WorkItem {
     let mut task = crate::work::Task::builder()
         .id("task-rev-1")
         .product_id("prod-1")
@@ -1020,7 +1020,7 @@ fn revision_task_with_created_via(pr_url: Option<&str>, created_via: &str) -> Wo
     WorkItem::Task(task)
 }
 
-fn sample_conflict_attempt() -> crate::work::ConflictResolution {
+pub(super) fn sample_conflict_attempt() -> crate::work::ConflictResolution {
     use crate::conflict_diagnosis::{ConflictDiagnosis, ConflictedFile};
     let diag = ConflictDiagnosis {
         schema_version: 1,
@@ -1058,6 +1058,7 @@ fn sample_conflict_attempt() -> crate::work::ConflictResolution {
         conflict_class: None,
         resolved_by_rung: None,
         mechanical_rung_in_flight: None,
+        mismatch_exit_barred: false,
     }
 }
 

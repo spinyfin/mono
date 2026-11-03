@@ -135,6 +135,19 @@ impl WorkDb {
         if started {
             return Ok(true);
         }
+        // A revision parked on the architectural-mismatch question is waiting
+        // for the repo owner, not dead: it stays the attempt's fix vehicle so
+        // the poller neither supersedes it nor mints a competitor.
+        if status == "blocked"
+            && conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM operator_questions
+                 WHERE work_item_id = ?1 AND status = 'open' AND conflict_resolution_id IS NOT NULL)",
+                params![revision_task_id],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            return Ok(true);
+        }
         if !matches!(status.as_str(), "todo" | "active") {
             return Ok(false);
         }

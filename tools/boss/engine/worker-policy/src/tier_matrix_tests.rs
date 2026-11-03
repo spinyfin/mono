@@ -107,6 +107,7 @@ fn sanctioned_write_fixtures() -> Vec<FrontendRequest> {
         FrontendRequest::MarkConflictResolutionFailed {
             attempt_id: "cr_1".into(),
             reason: "x".into(),
+            evidence: None,
         },
         FrontendRequest::RecordProducerSideConflict {
             execution_id: "e".into(),

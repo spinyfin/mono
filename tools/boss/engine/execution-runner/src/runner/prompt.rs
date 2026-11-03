@@ -2093,6 +2093,81 @@ If already queued, read its existing entry ID with `gh api graphql -f query='que
     out
 }
 
+/// The "porting is normal conflict work" guidance and the stop conditions for a
+/// conflict-resolution revision.
+///
+/// The bar for stopping on `architectural_mismatch` is very high, so the
+/// refactor cases that used to look like grounds to stop (files moved or
+/// deleted, modules or crates split or renamed, helpers behind a new crate
+/// boundary, migrations that must move, every commit conflicting) are named
+/// here as ordinary work. Once the repo owner has answered the
+/// architectural-mismatch question for this attempt, that exit is not offered
+/// at all and the engine refuses it.
+fn conflict_porting_and_stop_conditions(attempt: &ConflictResolution) -> String {
+    let mut out = String::new();
+    out.push_str("\n### Porting is part of conflict resolution\n\n");
+    out.push_str(
+        "`main` may have been refactored under this PR. All of the following are **normal conflict \
+         work, never grounds to stop**:\n\n\
+         - files moved or deleted on `main`;\n\
+         - modules or crates split or renamed;\n\
+         - helpers that became private or moved behind a new crate boundary;\n\
+         - migrations that must move to another crate's sequence;\n\
+         - every commit of the PR conflicting.\n\n\
+         Study `main`'s new layout first: find where the code this PR changes lives now (read the \
+         log of `main` since the base, search for the moved symbols, and read the PRs that moved \
+         them), then port the change's **intent** onto that layout, commit by commit, putting code \
+         where it now lives. Preserve the PR's behaviour and every earlier review fix. A resolution \
+         that only makes the textual conflict disappear is not enough.\n\n\
+         **Effort is not a reason to stop.** If the port is bigger than this attempt's sizing, keep \
+         going and emit the effort-escalation marker described above. Never exit because the work \
+         is large.\n\n",
+    );
+    out.push_str("### Stop conditions\n\n");
+    out.push_str(
+        "If either of the following applies, comment on the PR explaining the situation,\n\
+         do NOT push, and run `\"$BOSS_BIN\" engine conflicts mark-failed <attempt-id> --reason <r>`\n\
+         with the appropriate reason — the engine will mark the attempt `failed`:\n\n\
+            1. **Semantic obsolescence** — the upstream change accomplished what this PR\n   \
+            was trying to do. Reason: `obsolescence_suspected`.\n\
+            2. **Product decision required** — the conflict needs a human choice between\n   \
+            two valid resolutions. Reason: `product_decision_required`.\n\n",
+    );
+    if attempt.mismatch_exit_barred {
+        out.push_str(
+            "`architectural_mismatch` is **not** an allowed exit for this attempt: the repo owner has \
+             already decided how to proceed, and the engine refuses that reason. Resolve the conflicts \
+             against the refactored code and push.\n\n",
+        );
+    } else {
+        out.push_str(
+            "3. **Architectural mismatch** — a *behavioural* conflict that remains after a genuine \
+             attempt to port the change onto `main`'s new layout. The reference case: this PR adds a \
+             feature to a subsystem that `main` deleted completely, so the feature has nowhere to \
+             live. Comparable: `main` redesigned the concept the PR changes so there is no faithful \
+             place for its behaviour, or `main`'s new behaviour directly contradicts the PR's intent \
+             and needs a product decision. A subsystem that was moved, split or renamed — rather than \
+             deleted — never meets this bar. \"Too many conflicts\", \"files moved\" and \"large \
+             rewrite\" are rejected. You must have studied `main`'s new layout and attempted the port \
+             first, and the command requires the evidence:\n\n\
+             ```\n\
+             \"$BOSS_BIN\" engine conflicts mark-failed <attempt-id> --reason architectural_mismatch \\\n  \
+             --basis <subsystem_deleted|concept_redesigned|behaviour_contradiction> \\\n  \
+             --conflicting-commits \"<the commits that conflict>\" \\\n  \
+             --main-changes \"<files or symbols that moved or were deleted on main, and the PRs that did it>\" \\\n  \
+             --attempted-port \"<what you tried when porting>\" \\\n  \
+             --contradiction \"<the specific behavioural contradiction, in one sentence>\" \\\n  \
+             --recommendation \"<one line: rewrite onto the new base, or force a merge>\"\n\
+             ```\n\n\
+             This does not fail the attempt. Do not push, then declare \
+             `propose done --outcome blocked`: the engine asks the repo owner to choose between \
+             rewriting onto the new base and forcing a merge.\n\n",
+        );
+    }
+    out.push_str("Do NOT close the PR yourself. Closing is the human's call.\n\n");
+    out
+}
+
 /// Signal-specific fragment appended to `compose_revision_directive` when the
 /// revision was created with `created_via = "merge-conflict:<crz_id>"`.
 ///
@@ -2249,19 +2324,7 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution, bazel_work
             );
         }
     }
-    out.push_str("\n### Stop conditions\n\n");
-    out.push_str(
-        "If any of the following applies, comment on the PR explaining the situation,\n\
-         do NOT push, and run `\"$BOSS_BIN\" engine conflicts mark-failed <attempt-id> --reason <r>`\n\
-         with the appropriate reason — the engine will mark the attempt `failed`:\n\n\
-            1. **Semantic obsolescence** — the upstream change accomplished what this PR\n   \
-            was trying to do. Reason: `obsolescence_suspected`.\n\
-            2. **Product decision required** — the conflict needs a human choice between\n   \
-            two valid resolutions. Reason: `product_decision_required`.\n\
-            3. **Architectural mismatch** — the upstream removed an abstraction this PR\n   \
-            was extending. Reason: `architectural_mismatch`.\n\n\
-         Do NOT close the PR yourself. Closing is the human's call.\n\n",
-    );
+    out.push_str(&conflict_porting_and_stop_conditions(attempt));
     out.push('\n');
     out.push_str("### Post-resolution PR comment\n\n");
     out.push_str(
@@ -2903,3 +2966,7 @@ fn render_diagnosis_markdown(diagnosis: &ConflictDiagnosis) -> String {
 #[cfg(test)]
 #[path = "prompt/compose_prompt_tests.rs"]
 mod compose_prompt_tests;
+
+#[cfg(test)]
+#[path = "prompt/conflict_prompt_tests.rs"]
+mod conflict_prompt_tests;

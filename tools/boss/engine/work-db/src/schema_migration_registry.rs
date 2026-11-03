@@ -294,6 +294,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: driver_allocation::sol_selection::migrate_default_full_share,
         },
         Migration {
+            id: conflict_mismatch::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: conflict_mismatch::migrate,
+        },
+        Migration {
             id: "20261102_2105_recovery_fresh_start".into(),
             legacy_version: None,
             apply: execution_recovery_rearm::migrate_fresh_start,

@@ -445,6 +445,34 @@ impl ExecutionCoordinator {
         Ok(worker_id)
     }
 
+    /// Launch the ready execution an operator's answer just created for
+    /// `work_item_id`, the way `bossctl agents launch` would.
+    ///
+    /// Answering is an explicit human decision, so the work it creates must not
+    /// be re-queued behind the global dispatch pause or the focus set. This
+    /// hands the execution to [`Self::force_dispatch`] as
+    /// [`DispatchAdmission::OperatorForced`], which bypasses both. Everything
+    /// else still applies: an execution gated behind another writer on the same
+    /// PR is not `ready` (it waits as `waiting_dependency`) and is left for the
+    /// dependency cascade, and the dispatch claim and per-repo lease bound are
+    /// respected. Returns the worker id, or `None` when there is no ready
+    /// execution to launch.
+    pub async fn launch_answered_work(self: &Arc<Self>, work_item_id: &str) -> Result<Option<String>> {
+        let ready = self
+            .work_db
+            .list_executions(Some(work_item_id))?
+            .into_iter()
+            .filter(|execution| execution.work_item_id == work_item_id && execution.status == ExecutionStatus::Ready)
+            .max_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
+        match ready {
+            Some(execution) => self
+                .force_dispatch(&execution.id, DispatchAdmission::OperatorForced)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
     async fn run_scheduler(self: Arc<Self>) {
         // Lossless-wakeup loop. The `scheduling_pending` flag is reset
         // at the top of each iteration so we have a clean "have we
