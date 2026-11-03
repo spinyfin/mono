@@ -790,6 +790,7 @@ mod floor_tests {
             super::super::conflict_mismatch::migrate(&expected).unwrap();
             preserved_work::migrate(&expected).unwrap();
             execution_wait_history::migrate(&expected).unwrap();
+            stuck_snapshot::migrate(&expected).unwrap();
             super::super::conflict_mismatch::migrate_operator_forced_admission(&expected).unwrap();
             let before = capture(&expected);
             drop(conn);

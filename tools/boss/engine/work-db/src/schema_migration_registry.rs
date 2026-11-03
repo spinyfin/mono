@@ -314,6 +314,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: execution_wait_history::migrate,
         },
         Migration {
+            id: stuck_snapshot::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: stuck_snapshot::migrate,
+        },
+        Migration {
             id: conflict_mismatch::OPERATOR_FORCED_ADMISSION_MIGRATION_ID.into(),
             legacy_version: None,
             apply: conflict_mismatch::migrate_operator_forced_admission,

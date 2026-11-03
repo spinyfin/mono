@@ -29,22 +29,31 @@ impl WorkDb {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
             build(&tx, minimum_age_secs, now)?
         };
-        for (work_item_id, pid) in probes {
-            if pid_is_alive(pid)
-                && let Some(row) = report.rows.iter_mut().find(|r| r.work_item_id == work_item_id)
-            {
-                row.classification = "S15_orphan_live_pid".into();
-            }
-        }
+        apply_probes(&mut report, probes, pid_is_alive);
         Ok(report)
+    }
+}
+
+/// Reclassify Active items whose recorded worker pid the host reports alive.
+pub(super) fn apply_probes(
+    report: &mut StuckReport,
+    probes: Vec<PendingProbe>,
+    pid_is_alive: &dyn Fn(Option<i64>) -> bool,
+) {
+    for (work_item_id, pid) in probes {
+        if pid_is_alive(pid)
+            && let Some(row) = report.rows.iter_mut().find(|r| r.work_item_id == work_item_id)
+        {
+            row.classification = "S15_orphan_live_pid".into();
+        }
     }
 }
 
 /// An Active item's recorded worker pid still to be checked against the host
 /// once the connection lock is released.
-type PendingProbe = (String, Option<i64>);
+pub(super) type PendingProbe = (String, Option<i64>);
 
-fn build(conn: &Connection, minimum_age_secs: i64, now: i64) -> Result<(StuckReport, Vec<PendingProbe>)> {
+pub(super) fn build(conn: &Connection, minimum_age_secs: i64, now: i64) -> Result<(StuckReport, Vec<PendingProbe>)> {
     let mut probes: Vec<PendingProbe> = Vec::new();
     let mut stmt = conn.prepare(
         "SELECT id FROM tasks t WHERE deleted_at IS NULL AND status NOT IN ('done','archived')
@@ -437,7 +446,7 @@ pub(super) fn classification(conn: &Connection, task: &Task, wait: Option<&str>)
     })
 }
 
-fn questions_by_kind(conn: &Connection, since: i64, now: i64) -> Result<BTreeMap<String, u64>> {
+pub(super) fn questions_by_kind(conn: &Connection, since: i64, now: i64) -> Result<BTreeMap<String, u64>> {
     let mut statement = conn.prepare(
         "SELECT stuck_classification, COUNT(*) FROM operator_questions
          WHERE CAST(created_at AS INTEGER) BETWEEN ?1 AND ?2 GROUP BY stuck_classification",

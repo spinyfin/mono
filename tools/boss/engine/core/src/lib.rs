@@ -197,6 +197,7 @@ pub use boss_engine_structured_output as structured_output;
 #[cfg(test)]
 mod storage_orchestration_tests;
 pub use boss_execution_runner::supersession_scan;
+pub mod stuck_metrics;
 pub(crate) mod sweep_loop;
 pub mod sweep_metrics;
 pub mod syspolicyd_monitor;

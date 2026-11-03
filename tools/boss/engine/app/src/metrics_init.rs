@@ -80,6 +80,8 @@ pub fn init_all(registry: &Registry) {
     // Background pass durations and item counts, plus loop-owned cadence
     // for the singleton envelope and terminal-work sweeps.
     boss_engine_runtime::sweep_metrics::register_metrics(registry);
+    // Daily stuck-work gauges, set from the persisted per-UTC-day report.
+    boss_engine_runtime::stuck_metrics::register_metrics(registry);
 }
 
 #[cfg(test)]
@@ -267,6 +269,11 @@ mod tests {
                 "merge_poller.adaptive_tracked",
                 "review_pool.deferred_pre_merge",
                 "review_pool.reserved_units",
+                "task_stuck.engine_stuck",
+                "task_stuck.engine_stuck_max_age_seconds",
+                "task_stuck.waiting_on_capacity",
+                "task_stuck.waiting_on_dependency",
+                "task_stuck.waiting_on_human",
                 "terminal_work_sweep.items_per_pass",
                 "terminal_work_sweep.pass_duration_ms",
                 "terminal_work_sweep.tick_interval_ms",

@@ -801,6 +801,7 @@ mod execution_wait_history;
 mod semantic_progress;
 mod stuck_activity;
 mod stuck_report;
+mod stuck_snapshot;
 mod sweep_reads;
 mod task_status_audit;
 mod task_status_backfill;
