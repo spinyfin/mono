@@ -81,10 +81,7 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// sweep files an attention item and stops retrying until restart.
 pub const MAX_ATTEMPTS_PER_TASK: u32 = 3;
 
-/// `work_attention_items.kind` filed when a row's binding could not be
-/// repaired automatically (no PR on its branch, a foreign PR, or repeated
-/// GitHub failures).
-pub const ATTENTION_KIND_PR_BINDING_REPAIR: &str = "pr_binding_repair";
+pub use boss_engine_storage_values::attention_kinds::ATTENTION_KIND_PR_BINDING_REPAIR;
 
 /// Scans without mutating so a failed GitHub read preserves the repair signal.
 /// A successful scan may contain no unambiguous doc path.

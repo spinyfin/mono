@@ -11,9 +11,11 @@ rust_library(
     edition = "2024",
     proc_macro_deps = ["//tools/boss/engine/work-db-boundary:work_db_boundary"] + all_crate_deps(proc_macro = True),
     visibility = [
+        "//tools/boss/engine/completion:__pkg__",
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/dispatch:__pkg__",
         "//tools/boss/engine/execution-runner:__pkg__",
+        "//tools/boss/engine/live-worker-state:__pkg__",
         "//tools/boss/engine/observation-contracts:__pkg__",
         "//tools/boss/engine/pane-summary:__pkg__",
     ],
@@ -54,9 +56,11 @@ rust_library(
     edition = "2024",
     proc_macro_deps = ["//tools/boss/engine/work-db-boundary:work_db_boundary"] + all_crate_deps(proc_macro = True),
     visibility = [
+        "//tools/boss/engine/completion:__pkg__",
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/dispatch:__pkg__",
         "//tools/boss/engine/execution-runner:__pkg__",
+        "//tools/boss/engine/live-worker-state:__pkg__",
         "//tools/boss/engine/observation-contracts:__pkg__",
         "//tools/boss/engine/pane-summary:__pkg__",
     ],

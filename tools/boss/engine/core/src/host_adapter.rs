@@ -1628,97 +1628,7 @@ pub(crate) fn validate_remote_output_path(
     Ok(path)
 }
 
-// ── HostAdapterCubeClient ─────────────────────────────────────────────────────
-
-/// Presents a [`HostAdapter`]'s cube half as a [`CubeClient`].
-///
-/// [`HostAdapter`] already declares every method [`CubeClient`] requires —
-/// the trait was carved so that "which cube owns this workspace" is a
-/// property of the host, not a global. But the engine's lease bookkeeping
-/// predates host routing and is written against `&dyn CubeClient`
-/// throughout ([`crate::cube_lease_heartbeat`],
-/// [`crate::run_reconcile::confirm_execution_dead`]). This newtype is the
-/// adapter between the two, so a caller that has resolved the *owning*
-/// host can hand its cube to that existing code unchanged instead of
-/// silently falling back to the engine's own local cube.
-///
-/// Every method is a straight delegation — there is no `unimplemented!()`
-/// arm and no behaviour of its own, which is what makes the substitution
-/// safe: code that receives one of these cannot tell it apart from the
-/// local `CommandCubeClient` except by which machine answers.
-pub struct HostAdapterCubeClient {
-    adapter: Arc<dyn HostAdapter>,
-}
-
-impl HostAdapterCubeClient {
-    pub fn new(adapter: Arc<dyn HostAdapter>) -> Self {
-        Self { adapter }
-    }
-}
-
-#[async_trait]
-impl CubeClient for HostAdapterCubeClient {
-    async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle> {
-        self.adapter.ensure_repo(origin).await
-    }
-
-    async fn lease_workspace(
-        &self,
-        repo_id: &str,
-        task: &str,
-        prefer_workspace_id: Option<&str>,
-        allow_dirty: bool,
-        exclude_workspace_ids: &[&str],
-    ) -> Result<CubeWorkspaceLease> {
-        self.adapter
-            .lease_workspace(repo_id, task, prefer_workspace_id, allow_dirty, exclude_workspace_ids)
-            .await
-    }
-
-    async fn create_change(&self, workspace_path: &Path, title: &str) -> Result<CubeChangeHandle> {
-        self.adapter.create_change(workspace_path, title).await
-    }
-
-    async fn goto_workspace(&self, workspace_path: &Path, pr: u64) -> Result<()> {
-        self.adapter.goto_workspace(workspace_path, pr).await
-    }
-
-    async fn goto_workspace_revision(&self, workspace_path: &Path, sha: &str) -> Result<()> {
-        self.adapter.goto_workspace_revision(workspace_path, sha).await
-    }
-
-    async fn release_workspace(&self, lease_id: &str) -> Result<()> {
-        self.adapter.release_workspace(lease_id).await
-    }
-
-    async fn release_workspace_with_reset(&self, lease_id: &str) -> Result<()> {
-        self.adapter.release_workspace_with_reset(lease_id).await
-    }
-
-    async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus> {
-        self.adapter.workspace_status(workspace_path).await
-    }
-
-    async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()> {
-        self.adapter.heartbeat_lease(lease_id, ttl_seconds).await
-    }
-
-    async fn force_release_lease(&self, lease_id: &str, reason: Option<&str>) -> Result<()> {
-        self.adapter.force_release_lease(lease_id, reason).await
-    }
-
-    async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
-        self.adapter.list_workspaces().await
-    }
-
-    async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
-        self.adapter.list_repos().await
-    }
-
-    fn command_repr(&self, args: &[&str]) -> Option<(String, String)> {
-        self.adapter.command_repr(args)
-    }
-}
+pub use boss_engine_completion::remote_host::HostAdapterCubeClient;
 
 // ── HostAdapterProvider ─────────────────────────────────────────────────────────
 
@@ -1894,23 +1804,7 @@ fn reject_unobservable_remote_driver(
     )
 }
 
-/// Resolve a durable host identity once, validating the provider's routing.
-pub(crate) async fn resolve_host_adapter(
-    work_db: &WorkDb,
-    provider: &dyn HostAdapterProvider,
-    host_id: &str,
-) -> Result<Arc<dyn HostAdapter>> {
-    let host = work_db
-        .get_host(host_id)?
-        .with_context(|| format!("host '{host_id}' is no longer in the host registry"))?;
-    let adapter = provider.adapter_for(&host).await?;
-    anyhow::ensure!(
-        adapter.host_id() == host_id,
-        "host adapter for '{host_id}' reports host '{}'",
-        adapter.host_id()
-    );
-    Ok(adapter)
-}
+pub(crate) use boss_engine_completion::remote_host::resolve_host_adapter;
 
 /// Render generated rules and ship them to the remote agent-rules destination.
 pub(crate) async fn stage_remote_agent_rules(

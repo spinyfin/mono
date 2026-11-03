@@ -42,3 +42,31 @@ pub use store::{MetricsCounterRow, MetricsGaugeRow, MetricsStore};
 
 pub mod population_progress;
 pub mod population_timing;
+
+/// Lowercase and replace any character outside the registry's
+/// allowed charset (`a-z 0-9 . _`) with `_`, so an arbitrary
+/// `product_id` or `conflict_class` can't produce an invalid dynamic
+/// metric name or let two distinct products collide on one counter.
+///
+/// Shared by every per-product dynamic-counter call site (the merge poller,
+/// speculative conflict prediction, stacked-PR structuring, answer-agent
+/// observability) so they sanitize identically.
+pub fn sanitize_metric_name_component(raw: &str) -> String {
+    let sanitized: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_uppercase() {
+                c.to_ascii_lowercase()
+            } else if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "_".to_owned()
+    } else {
+        sanitized
+    }
+}

@@ -58,6 +58,7 @@ async fn merged_pr_redispatches_leaseless_review_revision_converted_in_place() {
         publisher.clone(),
         Arc::new(NoopPaneReleaser),
         Arc::new(NoopProbeQueuer),
+        crate::completion_adapters::completion_collaborators(),
     );
     let mut outcome = SweepOutcome::default();
     // Exercise the post-transaction merge step directly: no periodic

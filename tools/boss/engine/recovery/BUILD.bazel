@@ -11,6 +11,7 @@ rust_library(
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
+        "//tools/boss/engine/completion:__pkg__",
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/dispatch:__pkg__",
         "//tools/boss/engine/execution-contracts:__pkg__",
@@ -56,5 +57,8 @@ filegroup(
     name = "jj_test_binary",
     testonly = True,
     srcs = ["@jj_test_tools//:jj"],
-    visibility = ["//tools/boss/engine/host-execution:__pkg__"],
+    visibility = [
+        "//tools/boss/engine/completion:__pkg__",
+        "//tools/boss/engine/host-execution:__pkg__",
+    ],
 )

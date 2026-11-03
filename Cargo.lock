@@ -594,6 +594,7 @@ dependencies = [
  "boss-engine-board-gesture",
  "boss-engine-codex-rollout-retention",
  "boss-engine-comment-classifier",
+ "boss-engine-completion",
  "boss-engine-day-rotated-log",
  "boss-engine-design-docs",
  "boss-engine-dispatch",
@@ -603,6 +604,7 @@ dependencies = [
  "boss-engine-gh-invocation",
  "boss-engine-grok-home-retention",
  "boss-engine-live-status-redact",
+ "boss-engine-live-worker-state",
  "boss-engine-offsite-backup",
  "boss-engine-planner-validation",
  "boss-engine-proposal-validation",
@@ -744,6 +746,54 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "boss-engine-completion"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bon",
+ "boss-backoff",
+ "boss-dispatch-events",
+ "boss-engine-driver",
+ "boss-engine-effort",
+ "boss-engine-gh-invocation",
+ "boss-engine-live-worker-state",
+ "boss-engine-proposal-validation",
+ "boss-engine-recovery",
+ "boss-engine-storage-values",
+ "boss-engine-structured-output",
+ "boss-engine-test-git",
+ "boss-engine-utils",
+ "boss-engine-worker-bin",
+ "boss-event-bus",
+ "boss-execution-contracts",
+ "boss-feature-flags",
+ "boss-gh-telemetry",
+ "boss-github",
+ "boss-host-execution",
+ "boss-metrics",
+ "boss-observation-contracts",
+ "boss-pr-review",
+ "boss-pr-review-sources",
+ "boss-protocol",
+ "boss-review-guide",
+ "boss-task-scope",
+ "boss-transcript-markdown",
+ "boss-work-db",
+ "chrono",
+ "git-utils",
+ "libc",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
 ]
 
 [[package]]
@@ -899,6 +949,21 @@ dependencies = [
  "boss-engine-utils",
  "regex",
  "serde_json",
+]
+
+[[package]]
+name = "boss-engine-live-worker-state"
+version = "0.1.0"
+dependencies = [
+ "bon",
+ "boss-engine-driver",
+ "boss-engine-storage-values",
+ "boss-engine-utils",
+ "boss-execution-contracts",
+ "boss-protocol",
+ "boss-work-db",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

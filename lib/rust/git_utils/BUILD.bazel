@@ -17,6 +17,7 @@ rust_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/cli:__pkg__",
+        "//tools/boss/engine/completion:__pkg__",
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/design-doc-fetcher:__pkg__",
         "//tools/boss/engine/design-docs:__pkg__",

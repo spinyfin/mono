@@ -11,6 +11,7 @@ rust_library(
     edition = "2024",
     visibility = [
         "//tools/boss/engine/attachments:__pkg__",
+        "//tools/boss/engine/completion:__pkg__",
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/day-rotated-log:__pkg__",
         "//tools/boss/engine/dispatch:__pkg__",

@@ -38,33 +38,7 @@ pub fn record_conflict_class_counter(registry: &Registry, product_id: &str, conf
     registry.counter_inc_by_dynamic(&name, "Conflict events classified into this class for this product.", 1);
 }
 
-/// Lowercase and replace any character outside the registry's
-/// allowed charset (`a-z 0-9 . _`) with `_`, so an arbitrary
-/// `product_id` or `conflict_class` can't produce an invalid dynamic
-/// metric name or let two distinct products collide on one counter.
-///
-/// `pub(crate)` so other per-product dynamic-counter call sites (e.g.
-/// [`crate::speculative_conflict`]) reuse the same sanitization instead of
-/// duplicating it.
-pub(crate) fn sanitize_metric_name_component(raw: &str) -> String {
-    let sanitized: String = raw
-        .chars()
-        .map(|c| {
-            if c.is_ascii_uppercase() {
-                c.to_ascii_lowercase()
-            } else if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitized.is_empty() {
-        "_".to_owned()
-    } else {
-        sanitized
-    }
-}
+pub(crate) use boss_metrics::sanitize_metric_name_component;
 crate::register_counter!(
     PR_RECHECK_RECOVERED,
     "merge_poller.pr_recheck_recovered",

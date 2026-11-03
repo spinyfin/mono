@@ -499,12 +499,9 @@ pub fn resolve_stale_worker_attention_for_work_item(work_db: &WorkDb, work_item_
 }
 
 /// No hook event for this long while a worker is `working` with no tool
-/// in flight ⇒ presumed wedged. 30 minutes is deliberately generous: a
-/// healthy worker emits a `PreToolUse`/`PostToolUse`/`UserPromptSubmit`
-/// hook far more often than this, so the threshold sits well clear of
-/// normal think/stream gaps while still bounding the indefinite hang the
-/// incident exhibited (~35 min and counting before manual recovery).
-pub const DEFAULT_STALE_THRESHOLD_SECS: i64 = 1_800;
+/// in flight ⇒ presumed wedged. Shared with the completion service's
+/// run-done backstop, so defined below both.
+pub use boss_engine_storage_values::pool_policy::DEFAULT_STALE_THRESHOLD_SECS;
 
 /// Grace period after `started_at` (epoch seconds) during which we skip
 /// staleness probing, mirroring [`crate::dead_pid_sweep::DEAD_PID_GRACE_SECS`].

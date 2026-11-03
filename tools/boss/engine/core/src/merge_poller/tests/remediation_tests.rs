@@ -142,6 +142,7 @@ fn handler_with_ladder_enabled(
         publisher,
         Arc::new(NoopPaneReleaser),
         Arc::new(NoopProbeQueuer),
+        crate::completion_adapters::completion_collaborators(),
     )
     .with_feature_flags(flags)
 }

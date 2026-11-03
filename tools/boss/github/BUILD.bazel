@@ -20,6 +20,7 @@ rust_library(
     },
     visibility = [
         "//tools/boss:__subpackages__",
+        "//tools/boss/engine/completion:__pkg__",
     ],
     deps = [
         "//lib/rust/git_utils",

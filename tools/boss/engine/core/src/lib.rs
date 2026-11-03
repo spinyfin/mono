@@ -11,7 +11,6 @@ pub mod agent_jsonl_discovery;
 pub mod agent_jsonl_progress;
 pub use boss_execution_runner::answer_agent;
 pub mod answer_agent_completion_sweep;
-pub mod answer_agent_observability;
 pub mod app;
 pub mod attention_lifecycle;
 pub mod attention_reconcile_sweep;
@@ -33,8 +32,6 @@ pub mod board_invalidation_metrics;
 mod board_invalidation_replay;
 pub use boss_execution_runner::boss_construct_scan;
 pub mod build_info;
-pub mod build_wait;
-pub mod build_wait_tracker;
 pub use boss_ci_log_reader as ci_log_reader;
 pub mod ci_watch;
 mod queue_ci_contract;
@@ -43,14 +40,22 @@ pub use boss_claude_client as claude_client;
 pub mod cli;
 pub use boss_comment_anchor as comments_anchor;
 pub use boss_engine_comment_classifier as comment_classifier;
-pub mod completion;
+mod completion_adapters;
+#[cfg(test)]
+mod completion_integration_tests;
+pub use boss_engine_completion as completion;
+pub use boss_engine_completion::{
+    answer_agent_observability, build_wait, build_wait_tracker, codex_unobserved_command, conflict_stop_gate,
+    driver_teardown, driver_transcript, hold_registry, merge_parent_deletion, nudge_breaker, postmortem_followups,
+    pr_url_capture, proposal_channel_error, reconcile_audit, review_guide_capture, run_done_backstop,
+    teardown_registry, wait_registry, worker_escalation,
+};
 pub mod config;
 #[cfg(test)]
 mod conformance;
 pub use boss_conflict_diagnosis as conflict_diagnosis;
 pub mod conflict_ladder;
 pub mod conflict_remediation;
-pub mod conflict_stop_gate;
 pub mod conflict_watch;
 pub(crate) mod coordinator_guidance;
 pub(crate) mod coordinator_handoff;
@@ -77,12 +82,9 @@ pub mod attachment_retention_sweep;
 pub mod attachment_server;
 pub mod codex_guard_trace;
 pub mod codex_home_retention_sweep;
-pub mod codex_unobserved_command;
 #[cfg(test)]
 mod coordinator_tests;
 pub mod dispatch_failure_recovery_sweep;
-pub mod driver_teardown;
-pub mod driver_transcript;
 pub mod durable_liveness;
 pub mod grok_home_retention_sweep;
 pub mod grok_quota_refresh;
@@ -105,7 +107,6 @@ pub mod external_tracker;
 pub use boss_feature_flags as feature_flags;
 mod execution_bookmark_recovery;
 pub mod github_api_usage;
-pub mod hold_registry;
 pub mod host_adapter;
 pub mod host_capability_probe;
 pub mod host_provisioning;
@@ -123,16 +124,15 @@ pub(crate) mod libproc;
 pub mod live_status;
 pub mod live_status_loop;
 pub(crate) mod live_worker_metadata;
-pub mod live_worker_state;
+pub use boss_engine_live_worker_state as live_worker_state;
+pub use boss_engine_live_worker_state::semantic_progress;
 pub mod lost_workspace_sweep;
 pub mod materializer;
 pub mod merge_mechanism;
-pub mod merge_parent_deletion;
 pub mod merge_poller;
 pub mod merge_queue_renumber;
 pub mod merge_when_ready;
 mod run_cost;
-pub mod wait_registry;
 // The metrics framework lives in its own crate; alias it under the
 // module path the engine has always used it by. `metrics_init` holds
 // the engine-specific startup registration that can't move down
@@ -144,29 +144,24 @@ pub use boss_metrics as metrics;
 // re-exported through `boss_metrics`.
 pub use boss_metrics::{register_counter, register_gauge};
 pub mod metrics_init;
-pub mod nudge_breaker;
 pub mod orphan_sweep;
 pub mod planner;
 pub mod pool_claim_sweep;
 pub use boss_metrics::population_progress;
 pub use boss_metrics::population_timing;
 pub mod populator;
-pub mod postmortem_followups;
 pub use boss_pr_review as pr_review;
 pub use boss_pr_template as pr_template;
 pub mod board_notification_bridge;
 mod hung_worker;
 pub mod pr_review_recovery;
-pub mod pr_url_capture;
 pub mod pre_start_streak;
 pub mod project_postmortem_sweep;
 pub use boss_execution_runner::prompt_fragments;
-pub mod proposal_channel_error;
 pub mod proposal_expiry_sweep;
 #[cfg(test)]
 pub(crate) use boss_prose_vocabulary as prose_vocabulary;
 pub mod protocol;
-pub(crate) mod reconcile_audit;
 pub mod remote_input_lifecycle;
 pub mod remote_lease_reconcile;
 pub mod remote_reattach;
@@ -174,17 +169,14 @@ pub mod remote_transcript;
 pub mod remote_wrapper;
 pub mod repo_slug;
 pub mod resolution_signal_capture;
-pub mod review_guide_capture;
 mod review_guide_validation;
 mod review_guide_workspace;
 pub mod review_verdict_apply_sweep;
 pub mod rotating_file;
-pub mod run_done_backstop;
 pub mod run_done_finalize_sweep;
 pub mod run_reconcile;
 pub mod runner;
 pub mod runtime_shutdown;
-pub mod semantic_progress;
 pub mod settings;
 pub mod sleep_assertion;
 pub mod spawn_ack_sweep;
@@ -207,10 +199,13 @@ pub use boss_execution_runner::supersession_scan;
 pub(crate) mod sweep_loop;
 pub mod sweep_metrics;
 pub mod syspolicyd_monitor;
-pub mod teardown_registry;
 pub mod terminal_work_sweep;
 #[cfg(test)]
 pub(crate) mod test_support;
+// The stub macros live with the contract traits they implement; re-exported so
+// `crate::stub_cube_client!` keeps resolving in engine tests.
+#[cfg(test)]
+pub(crate) use boss_execution_contracts::{stub_cube_client, stub_host_adapter};
 pub mod tmux_adoption;
 pub(crate) mod tmux_adoption_live_state;
 pub(crate) mod tmux_session_options;
@@ -227,7 +222,6 @@ pub mod trunk_queue_poller;
 pub use boss_engine_utility_model as utility_model;
 pub use boss_work_db as work;
 pub use work::work_dependencies;
-pub mod worker_escalation;
 pub mod worker_readoption;
 pub mod worker_refresh_liveness;
 pub mod worker_registry;

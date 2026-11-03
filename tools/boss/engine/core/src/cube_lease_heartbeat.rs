@@ -194,110 +194,22 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+#[cfg(test)]
 use async_trait::async_trait;
 use boss_protocol::{ExecutionKind, WorkExecution};
 
 use crate::coordinator::ExecutionCoordinator;
 use crate::dead_pid_sweep::{PidStatus, probe_pid};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
-use crate::host_adapter::HostAdapterCubeClient;
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::run_reconcile::{self, RunReconcileReport, RunReconcileVerdict};
 use crate::work::WorkDb;
+#[cfg(test)]
 use boss_execution_contracts::CubeClient;
-use boss_execution_contracts::HostAdapterProvider;
 
-/// Cube that owns an execution's lease, plus the host that cube lives on.
-///
-/// Returned by [`ExecutionCubes::cube_for_execution`] so callers that care
-/// about *which* host was resolved (e.g. emitting a remote-only ok event)
-/// do not have to re-derive it by sniffing display labels from
-/// [`CubeClient::command_repr`].
-#[derive(Clone)]
-pub struct ResolvedExecutionCube {
-    pub cube: Arc<dyn CubeClient>,
-    /// Host the execution's latest run was dispatched to. `"local"` when the
-    /// engine's own cube issued (or will issue) the lease — including
-    /// executions with no run row yet.
-    pub host_id: String,
-}
+pub use boss_execution_contracts::{ExecutionCubes, ResolvedExecutionCube};
 
-impl ResolvedExecutionCube {
-    /// True when the lease lives on the engine's own cube.
-    pub fn is_local(&self) -> bool {
-        self.host_id == "local"
-    }
-}
-
-/// Resolves the cube endpoint that actually owns an execution's lease.
-///
-/// A lease is tracked only by the cube on the host its workspace lives on,
-/// so every heartbeat (and every auto-reap force-release) must go through
-/// this seam. `local` resolves to the engine's own client; any other host
-/// resolves through the same adapter provider the dispatch loop leased
-/// with. Resolution failure is deliberately an `Err`, never a silent skip:
-/// a heartbeat this sweep cannot route is a heartbeat that did not happen,
-/// and the caller must count it as a failure and emit the error event so it
-/// stays visible. See [`heartbeat_one`].
-#[async_trait]
-pub trait ExecutionCubes: Send + Sync {
-    /// The cube that owns `execution_id`'s lease, and the host that cube
-    /// lives on.
-    async fn cube_for_execution(&self, execution_id: &str) -> Result<ResolvedExecutionCube>;
-}
-
-/// Production [`ExecutionCubes`]: routes by the host the execution's
-/// current run was dispatched to.
-///
-/// `local` (and an execution with no run row yet) resolves to the engine's
-/// own cube client unchanged, so the local-only path is byte-for-byte what
-/// it was. Every other host resolves through the same
-/// [`HostAdapterProvider`] the dispatch loop leases and releases with, so
-/// the heartbeat rides the identical `ssh <host> cube …` `ControlMaster`
-/// that issued the lease in the first place.
-pub struct HostRoutedCubes {
-    work_db: Arc<WorkDb>,
-    provider: Arc<dyn HostAdapterProvider>,
-    local: Arc<dyn CubeClient>,
-}
-
-impl HostRoutedCubes {
-    pub fn new(work_db: Arc<WorkDb>, provider: Arc<dyn HostAdapterProvider>, local: Arc<dyn CubeClient>) -> Self {
-        Self {
-            work_db,
-            provider,
-            local,
-        }
-    }
-}
-
-#[async_trait]
-impl ExecutionCubes for HostRoutedCubes {
-    async fn cube_for_execution(&self, execution_id: &str) -> Result<ResolvedExecutionCube> {
-        let host_id = self
-            .work_db
-            .latest_run_host_for_execution(execution_id)
-            .with_context(|| format!("resolving the dispatch host for execution {execution_id}"))?;
-        let host_id = match host_id.as_deref() {
-            // No run row yet, or a local run: the engine's own cube issued
-            // (or will issue) this lease.
-            None | Some("local") => {
-                return Ok(ResolvedExecutionCube {
-                    cube: Arc::clone(&self.local),
-                    host_id: "local".to_owned(),
-                });
-            }
-            Some(host_id) => host_id.to_owned(),
-        };
-        let adapter =
-            crate::host_adapter::resolve_host_adapter(&self.work_db, self.provider.as_ref(), &host_id).await?;
-        Ok(ResolvedExecutionCube {
-            cube: Arc::new(HostAdapterCubeClient::new(adapter)),
-            host_id,
-        })
-    }
-}
+pub use boss_engine_completion::remote_host::HostRoutedCubes;
 
 /// Consecutive cube-lease-heartbeat failures for one execution before the
 /// engine treats the lease as definitively gone and auto-reaps the
@@ -1582,21 +1494,6 @@ mod tests {
         }
     } }
 
-    /// Route every execution to the one stub cube — the single-cube shape
-    /// these tests model, which is exactly right for a local-only engine.
-    /// Multi-host routing has its own fixtures further down
-    /// (`RoutingCubes`), because a stub that answers for every execution
-    /// cannot tell a correctly-routed call from a misrouted one.
-    #[async_trait]
-    impl ExecutionCubes for Arc<RecordingCube> {
-        async fn cube_for_execution(&self, _execution_id: &str) -> Result<ResolvedExecutionCube> {
-            Ok(ResolvedExecutionCube {
-                cube: Arc::clone(self) as Arc<dyn CubeClient>,
-                host_id: "local".to_owned(),
-            })
-        }
-    }
-
     // ─── helpers ─────────────────────────────────────────────────────────────
 
     /// Build a `cube workspace list` row. Mirrors `run_reconcile`'s test
@@ -2536,16 +2433,6 @@ mod tests {
             Ok(vec![])
         }
     } }
-
-    #[async_trait]
-    impl ExecutionCubes for Arc<SlowCube> {
-        async fn cube_for_execution(&self, _execution_id: &str) -> Result<ResolvedExecutionCube> {
-            Ok(ResolvedExecutionCube {
-                cube: Arc::clone(self) as Arc<dyn CubeClient>,
-                host_id: "local".to_owned(),
-            })
-        }
-    }
 
     /// A hung heartbeat for one slot must NOT block heartbeating of the
     /// remaining slots. The timed-out slot increments `failed`; the other

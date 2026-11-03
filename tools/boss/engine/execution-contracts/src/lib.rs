@@ -21,9 +21,12 @@ pub use pre_start_streak::{
     FailureEffect, PRE_START_FAILURE_STREAK_THRESHOLD, PreStartStreakTracker, StreakKey, UNRESOLVED_DRIVER_LABEL,
 };
 mod lifecycle;
+#[cfg(feature = "test-support")]
+pub mod test_doubles;
 pub use lifecycle::{
-    LifecycleServices, LiveWorkerLiveness, NoopWorkerPaneReleaser, PaneReleaseOutcome, PidStatus, ReattachSummary,
-    RemoteLeaseReconcileOutcome, TeardownReason, WorkerPaneReleaser,
+    DriverSignals, ExecutionCubes, LifecycleServices, LiveWorkerLiveness, NeverStartedReap, NoopWorkerPaneReleaser,
+    PaneReleaseOutcome, PidStatus, ReattachSummary, RemoteLeaseReconcileOutcome, ResolvedExecutionCube, TeardownReason,
+    WorkerPaneReleaser,
 };
 
 use std::path::Path;

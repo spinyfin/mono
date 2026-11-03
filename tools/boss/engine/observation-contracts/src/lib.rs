@@ -1,11 +1,12 @@
 //! Shared observation contracts for completion and merge polling.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use boss_github::RequiredCheckFailure;
-use boss_protocol::{ExecutionStatus, WorkExecution};
+use boss_protocol::{Attention, AttentionGroup, ExecutionStatus, WorkExecution};
 use boss_work_db::{LatePrCandidate, PendingMergeCheck, ReviewBatchDispatch, WorkDb};
 
 /// One slice of GitHub-reported PR lifecycle state, captured by a
@@ -868,6 +869,145 @@ impl<T: CompletionRequests + ?Sized> CompletionRequests for std::sync::Arc<T> {
 
     fn review_batch_enqueuer(&self) -> &dyn ReviewBatchEnqueuer {
         T::review_batch_enqueuer(self.as_ref())
+    }
+}
+
+/// Design-doc and task-doc pointer callbacks fired when a completing (or
+/// already-merged) PR belongs to a design or doc-producing task.
+///
+/// Completion and merge polling both call these; the implementation owns
+/// the PR scan and the pointer writes, so neither service imports it.
+#[async_trait]
+pub trait DesignDetection: Send + Sync {
+    async fn on_task_doc_pr_detected(&self, work_db: &WorkDb, task_id: &str, product_id: &str, pr_url: &str);
+
+    async fn on_task_doc_pr_merged(
+        &self,
+        work_db: &WorkDb,
+        task_id: &str,
+        product_id: &str,
+        pr_url: &str,
+        base_ref_name: Option<&str>,
+    );
+
+    async fn on_design_pr_detected(
+        &self,
+        work_db: &WorkDb,
+        task_id: &str,
+        product_id: &str,
+        project_id: &str,
+        pr_url: &str,
+    );
+
+    async fn on_design_pr_merged(
+        &self,
+        work_db: &WorkDb,
+        task_id: &str,
+        product_id: &str,
+        project_id: &str,
+        pr_url: &str,
+        base_ref_name: Option<&str>,
+    );
+}
+
+/// An attention group and the members it just created, when a reconcile
+/// pass produced any.
+pub type AttentionsCreated = Option<(AttentionGroup, Vec<Attention>)>;
+
+/// Design-question and follow-up attention extraction that runs when a
+/// worker's PR completes. Each `reconcile_*` is the primary channel and each
+/// `extract_*_backstop` the supervisor-extraction fallback the caller gates
+/// behind a feature flag.
+#[async_trait]
+pub trait AttentionsDetection: Send + Sync {
+    async fn reconcile_design_doc_questions(
+        &self,
+        work_db: &WorkDb,
+        task_id: &str,
+        project_id: &str,
+        pr_url: &str,
+        merged: bool,
+    ) -> AttentionsCreated;
+
+    async fn extract_doc_questions_backstop(
+        &self,
+        work_db: &WorkDb,
+        task_id: &str,
+        project_id: &str,
+        pr_url: &str,
+        merged: bool,
+    ) -> AttentionsCreated;
+
+    async fn reconcile_task_followups(
+        &self,
+        work_db: &WorkDb,
+        work_item_id: &str,
+        execution_id: &str,
+        structured_output_dir: Option<&Path>,
+        transcript_path: Option<&str>,
+    ) -> AttentionsCreated;
+
+    async fn extract_followups_backstop(
+        &self,
+        work_db: &WorkDb,
+        work_item_id: &str,
+        execution_id: &str,
+        transcript_path: Option<&str>,
+    ) -> AttentionsCreated;
+}
+
+/// Detection that does nothing. For tests that never reach the detectors.
+#[derive(Debug, Default)]
+pub struct NoopDocDetection;
+
+#[async_trait]
+impl DesignDetection for NoopDocDetection {
+    async fn on_task_doc_pr_detected(&self, _: &WorkDb, _: &str, _: &str, _: &str) {}
+
+    async fn on_task_doc_pr_merged(&self, _: &WorkDb, _: &str, _: &str, _: &str, _: Option<&str>) {}
+
+    async fn on_design_pr_detected(&self, _: &WorkDb, _: &str, _: &str, _: &str, _: &str) {}
+
+    async fn on_design_pr_merged(&self, _: &WorkDb, _: &str, _: &str, _: &str, _: &str, _: Option<&str>) {}
+}
+
+#[async_trait]
+impl AttentionsDetection for NoopDocDetection {
+    async fn reconcile_design_doc_questions(
+        &self,
+        _: &WorkDb,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: bool,
+    ) -> AttentionsCreated {
+        None
+    }
+
+    async fn extract_doc_questions_backstop(
+        &self,
+        _: &WorkDb,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: bool,
+    ) -> AttentionsCreated {
+        None
+    }
+
+    async fn reconcile_task_followups(
+        &self,
+        _: &WorkDb,
+        _: &str,
+        _: &str,
+        _: Option<&Path>,
+        _: Option<&str>,
+    ) -> AttentionsCreated {
+        None
+    }
+
+    async fn extract_followups_backstop(&self, _: &WorkDb, _: &str, _: &str, _: Option<&str>) -> AttentionsCreated {
+        None
     }
 }
 

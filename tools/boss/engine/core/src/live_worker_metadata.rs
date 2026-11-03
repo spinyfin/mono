@@ -25,21 +25,7 @@ pub(crate) fn execution_binding(work_db: &WorkDb, execution: &WorkExecution) -> 
     }
 }
 
-/// Guide launch configuration is persisted before the pane starts, unlike
-/// the execution launch stamp, which is written after spawn returns.
-pub(crate) fn guide_launch_config(work_db: &WorkDb, execution: &WorkExecution) -> Option<(String, String)> {
-    if execution.kind != ExecutionKind::PrReviewGuide {
-        return None;
-    }
-    match work_db.pr_review_guide_attempt_for_execution(&execution.id) {
-        Ok(Some(attempt)) => Some((attempt.driver?, attempt.model?)),
-        Ok(None) => None,
-        Err(error) => {
-            tracing::warn!(execution_id = %execution.id, %error, "could not read guide launch configuration");
-            None
-        }
-    }
-}
+pub(crate) use boss_engine_completion::driver_transcript::guide_launch_config;
 
 /// Shared identity for both restart registration paths, with the execution
 /// stamp taking precedence over the pre-spawn guide configuration.

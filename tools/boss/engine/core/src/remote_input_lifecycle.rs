@@ -41,20 +41,7 @@ fn driver_config_dirs() -> Vec<&'static str> {
     dirs
 }
 
-/// Remove every staged input attempt recorded for `execution_id`, clearing
-/// each marker once its attempt directory is gone. The directory is named by
-/// the attempt id in the marker, not by the execution id.
-pub(crate) async fn cleanup_execution_inputs(
-    work_db: &WorkDb,
-    adapter: &dyn boss_execution_contracts::HostAdapter,
-    execution_id: &str,
-) -> Result<()> {
-    for item in work_db.pending_remote_input_cleanups_for_execution(execution_id)? {
-        adapter.cleanup_initial_input(&item.workspace, &item.run_id).await?;
-        work_db.clear_remote_input_cleanup(&item)?;
-    }
-    Ok(())
-}
+pub(crate) use boss_engine_completion::remote_host::cleanup_execution_inputs;
 
 /// Remove the exact per-run input directory under every driver config dir.
 pub(crate) async fn remove_run_input(exec: &dyn SshExec, workspace: &str, run_id: &str) -> Result<()> {
