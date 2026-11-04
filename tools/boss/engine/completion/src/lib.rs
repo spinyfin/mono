@@ -1763,7 +1763,7 @@ impl boss_execution_contracts::ExecutionStartedHook for WorkerCompletionHandler 
         WorkerCompletionHandler::on_execution_started(self, execution_id).await
     }
 
-    async fn snapshot_pr_head_before(&self, execution_id: &str) {
+    async fn snapshot_pr_head_before(&self, execution_id: &str) -> Result<()> {
         WorkerCompletionHandler::snapshot_pr_head_before(self, execution_id).await
     }
 }

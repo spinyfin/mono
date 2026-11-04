@@ -6,66 +6,29 @@
 use super::*;
 
 impl WorkerCompletionHandler {
-    /// Hook invoked once when an execution transitions to `running`
-    /// (from the coordinator's `start_execution_run` path). If the
-    /// bound chore already has a PR URL (i.e. this is a resume /
-    /// bounce-back of an already-bound chore), capture the PR's
-    /// current head SHA into `work_executions.pr_head_before` so the
-    /// Stop-boundary SHA-delta gate can verify the run's contribution.
-    ///
-    /// Best-effort: every step is fallible (work item lookup, repo
-    /// slug parsing, PR number parsing, GitHub fetch) and on failure
-    /// we log at WARN and leave `pr_head_before` unset. The gate
-    /// treats a missing snapshot as "inapplicable" and falls through
-    /// to the existing branch-keyed detector path — never noisier
-    /// than the pre-change behaviour.
+    /// Capture metadata after start; the pre-pointer hook requires a durable head.
     pub async fn on_execution_started(&self, execution_id: &str) {
-        self.snapshot_bound_pr(execution_id, true).await;
+        if let Err(err) = self.snapshot_bound_pr(execution_id, true).await {
+            tracing::warn!(execution_id, ?err, "execution_started snapshot failed");
+        }
     }
 
-    /// Only the head-SHA half of [`Self::on_execution_started`], run before
-    /// dispatch creates the recovery pointer so the pointer's floor is the
-    /// bound PR's head rather than an ancestry guess.
-    pub async fn snapshot_pr_head_before(&self, execution_id: &str) {
-        self.snapshot_bound_pr(execution_id, false).await;
+    /// Fail before pointer creation when the bound PR head cannot be recorded.
+    pub async fn snapshot_pr_head_before(&self, execution_id: &str) -> Result<()> {
+        self.snapshot_bound_pr(execution_id, false).await
     }
 
-    async fn snapshot_bound_pr(&self, execution_id: &str, include_metadata: bool) {
-        let execution = match self.work_db.get_execution(execution_id) {
-            Ok(execution) => execution,
-            Err(err) => {
-                tracing::debug!(
-                    execution_id,
-                    ?err,
-                    "execution_started hook: unknown execution — skipping pr_head_before snapshot"
-                );
-                return;
-            }
-        };
-        // `AutomationTriage`'s `work_item_id` is an automation id,
-        // `AnswerAgent`'s is a comment id, and `PrReviewGuide`'s is a
-        // comparison id — none is a product/project/task, so `get_work_item`
-        // can never resolve them, and none of these kinds ever has a bound
-        // PR to snapshot a head SHA for. Skip before paying for (and warning
-        // on) a lookup that structurally cannot succeed.
+    async fn snapshot_bound_pr(&self, execution_id: &str, include_metadata: bool) -> Result<()> {
+        let execution = self.work_db.get_execution(execution_id)?;
         if matches!(
             execution.kind,
             ExecutionKind::AutomationTriage | ExecutionKind::AnswerAgent | ExecutionKind::PrReviewGuide
         ) {
-            tracing::debug!(
-                execution_id,
-                kind = %execution.kind.as_str(),
-                "execution_started hook: kind never has a bound PR — skipping pr_head_before snapshot"
-            );
-            return;
+            tracing::debug!(execution_id, kind = %execution.kind.as_str(), "execution_started hook: kind never has a bound PR — skipping pr_head_before snapshot");
+            return Ok(());
         }
-        let bound_pr_url = match self.work_db.get_work_item(&execution.work_item_id) {
-            Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => {
-                // For revision_implementation executions the task's own
-                // pr_url is always NULL (design: revision tasks don't own
-                // a PR).  Fall back to execution.pr_url (stamped at
-                // dispatch), then to a chain-root lookup for executions
-                // where execution.pr_url was not reliably set.
+        let bound_pr_url = match self.work_db.get_work_item(&execution.work_item_id)? {
+            WorkItem::Task(task) | WorkItem::Chore(task) => {
                 boss_engine_storage_values::branch_identity::task_bound_pr_url(&task)
                     .map(str::to_owned)
                     .or_else(|| {
@@ -80,78 +43,21 @@ impl WorkerCompletionHandler {
                         }
                     })
             }
-            Ok(_) => None,
-            Err(err) => {
-                tracing::warn!(
-                    execution_id,
-                    work_item_id = %execution.work_item_id,
-                    ?err,
-                    "execution_started hook: work item lookup failed; skipping pr_head_before snapshot"
-                );
-                return;
-            }
+            _ => None,
         };
-        let bound_pr_url = match bound_pr_url {
-            Some(url) => url,
-            None => {
-                tracing::debug!(
-                    execution_id,
-                    "execution_started hook: chore has no bound pr_url — new-PR flow, no snapshot needed"
-                );
-                return;
-            }
+        let Some(bound_pr_url) = bound_pr_url else {
+            return Ok(());
         };
-        let repo_slug = match parse_repo_slug(&execution.repo_remote_url) {
-            Ok(slug) => slug,
-            Err(err) => {
-                tracing::warn!(
-                    execution_id,
-                    repo_remote_url = %execution.repo_remote_url,
-                    ?err,
-                    "execution_started hook: cannot parse repo slug; skipping pr_head_before snapshot"
-                );
-                return;
-            }
-        };
-        let pr_number = match pr_number_from_url(&bound_pr_url) {
-            Some(n) => n,
-            None => {
-                tracing::warn!(
-                    execution_id,
-                    bound_pr_url = %bound_pr_url,
-                    "execution_started hook: cannot parse PR number from bound URL; skipping pr_head_before snapshot"
-                );
-                return;
-            }
-        };
-        let head_oid = match self.branch_verifier.fetch_pr_head_oid(&repo_slug, pr_number).await {
-            Ok(oid) => oid,
-            Err(err) => {
-                tracing::warn!(
-                    execution_id,
-                    bound_pr_url = %bound_pr_url,
-                    ?err,
-                    "execution_started hook: fetch headRefOid failed; skipping pr_head_before snapshot"
-                );
-                return;
-            }
-        };
-        if let Err(err) = self.work_db.set_execution_pr_head_before(execution_id, &head_oid) {
-            tracing::warn!(
-                execution_id,
-                ?err,
-                "execution_started hook: failed to persist pr_head_before"
-            );
-            return;
+        let repo_slug = parse_repo_slug(&execution.repo_remote_url)?;
+        let pr_number =
+            pr_number_from_url(&bound_pr_url).ok_or_else(|| anyhow::anyhow!("invalid bound PR URL: {bound_pr_url}"))?;
+        // Preserve the pre-pointer baseline when the running hook collects metadata.
+        if execution.pr_head_before.is_none() {
+            let head_oid = self.branch_verifier.fetch_pr_head_oid(&repo_slug, pr_number).await?;
+            self.work_db.set_execution_pr_head_before(execution_id, &head_oid)?;
         }
-        tracing::info!(
-            execution_id,
-            bound_pr_url = %bound_pr_url,
-            head_oid = %head_oid,
-            "execution_started hook: snapshotted pr_head_before for SHA-delta gate"
-        );
         if !include_metadata {
-            return;
+            return Ok(());
         }
 
         // Also snapshot the PR title and body as the baseline for the
@@ -208,6 +114,7 @@ impl WorkerCompletionHandler {
                 );
             }
         }
+        Ok(())
     }
 
     /// Result of [`Self::try_retire_cleared_blocking_signal`]. `NotRetired`

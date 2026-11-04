@@ -1,4 +1,5 @@
 use super::helpers::*;
+use crate::work::{FakePrStateChecker, PrOpenState};
 use boss_engine_recovery::execution_bookmark::{LocalJj, create};
 use boss_engine_test_git::jj::JjRepo;
 
@@ -46,47 +47,132 @@ async fn bookmark_creation_failure_is_recorded_before_a_worker_can_start() {
     );
 }
 
-/// Stands in for the real execution-started hook: it snapshots the bound PR
-/// head onto the execution row, which is all the recovery pointer needs.
-struct SnapshotPrHead {
-    db: Arc<WorkDb>,
-    head: String,
-}
-
-#[async_trait]
-impl boss_execution_contracts::ExecutionStartedHook for SnapshotPrHead {
-    async fn on_execution_started(&self, _: &str) {}
-
-    async fn snapshot_pr_head_before(&self, id: &str) {
-        self.db.set_execution_pr_head_before(id, &self.head).unwrap();
+#[tokio::test]
+async fn dispatch_snapshots_the_pr_head_before_the_recovery_pointer_is_created() {
+    for revision in [false, true] {
+        bound_pr_snapshot_dispatch(revision, false).await;
     }
 }
 
 #[tokio::test]
-async fn dispatch_snapshots_the_pr_head_before_the_recovery_pointer_is_created() {
+async fn failed_pr_head_snapshot_retries_without_creating_an_ancestry_floor() {
+    bound_pr_snapshot_dispatch(true, true).await;
+}
+
+async fn bound_pr_snapshot_dispatch(revision: bool, fail_first: bool) {
     let dir = tempdir().unwrap();
-    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let path = dir.path().join("boss.db");
+    let db = Arc::new(WorkDb::open(path.clone()).unwrap());
     seed_local_claude_driver(&db);
-    let product = create_test_product(&db);
-    let chore = create_test_chore(&db, product.id.clone(), "Bound PR floor");
-    db.reconcile_product_executions(&product.id).unwrap();
-    let id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
-    assert_eq!(db.get_execution(&id).unwrap().pr_head_before, None);
-    let head = "c".repeat(40);
-    let cube = Arc::new(FakeCubeClient::default());
-    let runner = Arc::new(FakeExecutionRunner::default());
-    let mut coordinator = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner);
-    coordinator.set_execution_started_hook(Arc::new(SnapshotPrHead {
-        db: db.clone(),
-        head: head.clone(),
-    }));
+    let (_, chore_id) = make_pr_review_fixture(&db, Some("https://github.com/foo/bar/pull/99"));
+    let (item, kind) = if revision {
+        let task = db
+            .create_revision(
+                crate::work::CreateRevisionInput::builder()
+                    .parent_task_id(chore_id)
+                    .description("Review revision")
+                    .autostart(false)
+                    .created_via("test")
+                    .build(),
+                &FakePrStateChecker::always(PrOpenState::Open),
+            )
+            .unwrap();
+        assert!(task.pr_url.is_none());
+        (task.id, ExecutionKind::RevisionImplementation)
+    } else {
+        (chore_id, ExecutionKind::ChoreImplementation)
+    };
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute("UPDATE tasks SET autostart = 1 WHERE id = ?1", [&item])
+        .unwrap();
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(item)
+                .kind(kind)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let id = execution.id;
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET repo_remote_url = 'https://github.com/foo/bar.git' WHERE id = ?1",
+            [&id],
+        )
+        .unwrap();
+    assert!(db.get_execution(&id).unwrap().pr_head_before.is_none());
+    assert!(db.get_execution(&id).unwrap().pr_url.is_none());
+    let repo = JjRepo::new(dir.path());
+    JjRepo::run(
+        &repo.worker,
+        &["config", "set", "--repo", "revset-aliases.'trunk()'", "root()"],
+    );
+    // The PR head is an empty, undescribed commit; ancestry discovery skips it.
+    let head = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    JjRepo::run(&repo.worker, &["bookmark", "set", "pr/99", "-r", "@"]);
+    JjRepo::run(&repo.worker, &["new", "pr/99", "-m", "PR checkout"]);
+    let ancestry = create(&LocalJj, &repo.worker, "exec_ancestry_probe", "local")
+        .await
+        .unwrap();
+    assert_ne!(ancestry.base_commit.as_deref(), Some(head.as_str()));
+    let cube = Arc::new(
+        FakeCubeClient {
+            workspace_root: Some(dir.path().to_path_buf()),
+            real_bookmarks: true,
+            position_real_workspace: true,
+            ..Default::default()
+        }
+        .with_next_workspace_id("worker"),
+    );
+    let verifier = crate::completion::tests::StubBranchVerifier::ok("pr/99");
+    verifier
+        .set_head_oid(if fail_first {
+            Err("transient PR head fetch failure".into())
+        } else {
+            Ok(head.clone())
+        })
+        .await;
+    let handler = crate::completion::integration_handler(db.clone(), "https://github.com/foo/bar/pull/99")
+        .with_branch_verifier(verifier.clone());
+    let runner = Arc::new(FakeExecutionRunner {
+        pending: true,
+        ..Default::default()
+    });
+    let sink = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let mut coordinator = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+        .with_pre_start_retry_delays(vec![Duration::from_secs(1)])
+        .with_dispatch_events(sink.clone());
+    coordinator.set_execution_started_hook(Arc::new(handler));
     let coordinator = Arc::new(coordinator);
     coordinator.kick();
+    if fail_first {
+        let events = wait_for_stage(&sink, &id, "pre_start_failure").await;
+        let failure = events.iter().find(|e| e.stage == "pre_start_failure").unwrap();
+        assert_eq!(failure.details["will_retry"], true);
+        assert!(
+            failure
+                .error_message
+                .as_deref()
+                .unwrap()
+                .contains("transient PR head fetch failure")
+        );
+        assert!(db.execution_bookmark_optional(&id).unwrap().is_none());
+        assert!(db.get_execution(&id).unwrap().pr_head_before.is_none());
+        assert!(cube.bookmark_calls.lock().await.is_empty());
+        assert!(runner.calls.lock().await.is_empty());
+        verifier.set_head_oid(Ok(head.clone())).await;
+    }
     wait_for_execution_status(&db, &id, ExecutionStatus::Running).await;
     assert_eq!(
-        cube.bookmark_inherited_bases.lock().await.as_slice(),
-        [Some(head)],
-        "the pointer floor must be the PR head snapshotted at dispatch, not an ancestry guess"
+        db.get_execution(&id).unwrap().pr_head_before.as_deref(),
+        Some(head.as_str())
+    );
+    assert_eq!(
+        db.execution_bookmark(&id).unwrap().base_commit.as_deref(),
+        Some(head.as_str())
     );
 }
 
