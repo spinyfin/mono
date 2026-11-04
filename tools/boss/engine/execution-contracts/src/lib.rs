@@ -1536,17 +1536,6 @@ pub trait HostAdapter: Send + Sync {
         let _ = (record, workspace, repo_id, pr);
         bail!("recovery PR preparation is not supported by this host adapter")
     }
-    /// Repair stranded, diverged or baseline-less pointers from an
-    /// engine-recorded anchor. Returns None when the pointers are intact.
-    async fn reconcile_execution_bookmark(
-        &self,
-        record: &ExecutionBookmark,
-        pr_bookmark: Option<&str>,
-        trunk: &str,
-    ) -> Result<Option<execution_bookmark::Reconciliation>> {
-        let _ = (record, pr_bookmark, trunk);
-        bail!("execution bookmark reconciliation is not supported by this host adapter")
-    }
     /// Position a fresh child of the repository's configured trunk.
     async fn start_fresh_workspace(&self, workspace: &Path) -> Result<()> {
         let _ = workspace;

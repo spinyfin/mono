@@ -1,3 +1,4 @@
+use super::reconcile_tests::one;
 use super::*;
 use boss_engine_test_git::jj::JjRepo;
 
@@ -213,7 +214,10 @@ async fn rewritten_pr_head_does_not_replay_stale_published_commits() {
     JjRepo::run(&repo.worker, &["describe", "-m", "Old published PR"]);
     JjRepo::run(&repo.worker, &["bookmark", "set", "pr/78", "-r", "@"]);
     JjRepo::run(&repo.worker, &["new", "-m", "Unpushed revision"]);
-    let prior = create(&LocalJj, &repo.worker, "exec_rewritten", "local").await.unwrap();
+    let old_pr = one(&repo.worker, "pr/78");
+    let prior = create_from(&LocalJj, &repo.worker, "exec_rewritten", "local", None, Some(&old_pr))
+        .await
+        .unwrap();
     // The publication pointer may still be at the old PR baseline while
     // recovery has advanced to unpublished work.
     JjRepo::run(
@@ -297,6 +301,10 @@ async fn chore_stages_copies_on_configured_branch_and_remote() {
     origin(&repo);
     JjRepo::run(&repo.repo, &["git", "remote", "rename", "origin", "upstream"]);
     JjRepo::run(&repo.repo, &["bookmark", "rename", "main", "trunk"]);
+    JjRepo::run(
+        &repo.repo,
+        &["config", "set", "--repo", "revset-aliases.\"trunk()\"", "trunk"],
+    );
     JjRepo::run(&repo.repo, &["git", "export"]);
     let prior = create(&LocalJj, &repo.worker, "exec_chore_copy", "local")
         .await
@@ -360,5 +368,96 @@ async fn stacked_revision_keeps_parent_commits_on_their_original_history() {
     );
     for file in ["parent", "child", "fix"] {
         assert!(repo.replacement.join(file).exists());
+    }
+}
+
+#[tokio::test]
+async fn unpushed_local_rebase_of_the_pr_line_does_not_replay_pr_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = JjRepo::new(dir.path());
+    origin(&repo);
+    std::fs::write(repo.worker.join("pr-one"), "first").unwrap();
+    JjRepo::run(&repo.worker, &["describe", "-m", "PR commit one"]);
+    JjRepo::run(&repo.worker, &["new", "-m", "PR commit two"]);
+    std::fs::write(repo.worker.join("pr-two"), "second").unwrap();
+    JjRepo::run(&repo.worker, &["bookmark", "set", "pr/79", "-r", "@"]);
+    let pr_head = one(&repo.worker, "pr/79");
+    JjRepo::run(&repo.worker, &["new", "-m", "Unpushed revision"]);
+    let prior = create_from(
+        &LocalJj,
+        &repo.worker,
+        "exec_local_rebase",
+        "local",
+        None,
+        Some(&pr_head),
+    )
+    .await
+    .unwrap();
+    assert_eq!(prior.base_commit.as_deref(), Some(pr_head.as_str()));
+    std::fs::write(repo.worker.join("local-fix"), "preserved").unwrap();
+    JjRepo::run(&repo.worker, &["status"]);
+    // The PR branch is published, which keeps the original head visible.
+    let remote_dir = tempfile::tempdir().unwrap();
+    let remote = JjRepo::new(remote_dir.path());
+    JjRepo::run(
+        &repo.repo,
+        &[
+            "git",
+            "remote",
+            "add",
+            "published",
+            remote.repo.join(".jj/repo/store/git").to_str().unwrap(),
+        ],
+    );
+    JjRepo::run(
+        &repo.repo,
+        &[
+            "git",
+            "push",
+            "--remote",
+            "published",
+            "--bookmark",
+            "pr/79",
+            "--allow-new",
+        ],
+    );
+    // Main advances, and the worker rebases the whole PR line onto it without
+    // pushing, so the recovery pointer follows the rewritten commits.
+    JjRepo::run(&repo.repo, &["new", "main", "-m", "Main advances"]);
+    std::fs::write(repo.repo.join("toolchain"), "updated").unwrap();
+    publish_main(&repo);
+    JjRepo::run(&repo.worker, &["rebase", "-b", "@", "-d", "main"]);
+    assert_ne!(one(&repo.worker, &prior.head()), pr_head);
+    // Cube's bound-PR checkout leaves `pr/79` at the published head.
+    JjRepo::run(
+        &repo.repo,
+        &["bookmark", "set", "pr/79", "-r", "pr/79@published", "--allow-backwards"],
+    );
+    assert_eq!(one(&repo.repo, "pr/79"), pr_head);
+    // The patch holds the PR line and the work above it, never upstream changes.
+    let patch = diff(&LocalJj, &prior).await.unwrap();
+    assert!(patch.contains("local-fix") && patch.contains("pr-two"), "{patch}");
+    assert!(!patch.contains("toolchain"), "{patch}");
+
+    let report = restore_rebased(&LocalJj, &prior, &repo.replacement, Some("pr/79"), "main", "origin")
+        .await
+        .unwrap();
+    assert!(report.conflicts.is_empty(), "{}", report.conflicts);
+    for file in ["pr-one", "pr-two", "local-fix", "toolchain"] {
+        assert!(repo.replacement.join(file).exists(), "{file}");
+    }
+    let titles = JjRepo::run(
+        &repo.replacement,
+        &[
+            "log",
+            "-r",
+            "main..@",
+            "--no-graph",
+            "-T",
+            "description.first_line() ++ \"\\n\"",
+        ],
+    );
+    for title in ["PR commit one", "PR commit two"] {
+        assert_eq!(titles.lines().filter(|line| *line == title).count(), 1, "{titles}");
     }
 }

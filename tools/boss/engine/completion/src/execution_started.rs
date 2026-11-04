@@ -13,20 +13,24 @@ impl WorkerCompletionHandler {
         }
     }
 
-    /// Fail before pointer creation when the bound PR head cannot be recorded.
+    /// Record the bound PR's current head before the recovery pointer is created.
+    ///
+    /// Only the head lookup itself can fail the caller, because a transient
+    /// GitHub failure is worth retrying. A bound PR that cannot be located
+    /// locally (unparseable URL or remote, missing work item) fails every
+    /// attempt identically, so it is logged and the pointer falls back to its
+    /// trunk floor instead of failing the start.
+    ///
+    /// The snapshot always belongs to the attempt that creates the pointer: a
+    /// head recorded by an earlier attempt that failed before the pointer
+    /// existed is overwritten, so the recovery floor and the SHA-delta
+    /// baseline never credit movement between attempts to this run.
     pub async fn snapshot_pr_head_before(&self, execution_id: &str) -> Result<()> {
         self.snapshot_bound_pr(execution_id, false).await
     }
 
-    async fn snapshot_bound_pr(&self, execution_id: &str, include_metadata: bool) -> Result<()> {
-        let execution = self.work_db.get_execution(execution_id)?;
-        if matches!(
-            execution.kind,
-            ExecutionKind::AutomationTriage | ExecutionKind::AnswerAgent | ExecutionKind::PrReviewGuide
-        ) {
-            tracing::debug!(execution_id, kind = %execution.kind.as_str(), "execution_started hook: kind never has a bound PR — skipping pr_head_before snapshot");
-            return Ok(());
-        }
+    /// The bound PR for an execution: its repo slug, number and URL.
+    async fn locate_bound_pr(&self, execution: &boss_protocol::WorkExecution) -> Result<Option<(String, u64, String)>> {
         let bound_pr_url = match self.work_db.get_work_item(&execution.work_item_id)? {
             WorkItem::Task(task) | WorkItem::Chore(task) => {
                 boss_engine_storage_values::branch_identity::task_bound_pr_url(&task)
@@ -46,13 +50,41 @@ impl WorkerCompletionHandler {
             _ => None,
         };
         let Some(bound_pr_url) = bound_pr_url else {
-            return Ok(());
+            return Ok(None);
         };
         let repo_slug = parse_repo_slug(&execution.repo_remote_url)?;
         let pr_number =
             pr_number_from_url(&bound_pr_url).ok_or_else(|| anyhow::anyhow!("invalid bound PR URL: {bound_pr_url}"))?;
-        // Preserve the pre-pointer baseline when the running hook collects metadata.
-        if execution.pr_head_before.is_none() {
+        Ok(Some((repo_slug, pr_number, bound_pr_url)))
+    }
+
+    async fn snapshot_bound_pr(&self, execution_id: &str, include_metadata: bool) -> Result<()> {
+        let execution = self.work_db.get_execution(execution_id)?;
+        if matches!(
+            execution.kind,
+            ExecutionKind::AutomationTriage | ExecutionKind::AnswerAgent | ExecutionKind::PrReviewGuide
+        ) {
+            tracing::debug!(execution_id, kind = %execution.kind.as_str(), "execution_started hook: kind never has a bound PR — skipping pr_head_before snapshot");
+            return Ok(());
+        }
+        let located = match self.locate_bound_pr(&execution).await {
+            Ok(located) => located,
+            Err(err) if !include_metadata => {
+                tracing::warn!(
+                    execution_id,
+                    ?err,
+                    "pre-pointer snapshot: bound PR cannot be located; recording no pr_head_before"
+                );
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
+        let Some((repo_slug, pr_number, bound_pr_url)) = located else {
+            return Ok(());
+        };
+        // The pre-pointer call owns the snapshot for the attempt that creates
+        // the pointer; the running hook preserves it.
+        if !include_metadata || execution.pr_head_before.is_none() {
             let head_oid = self.branch_verifier.fetch_pr_head_oid(&repo_slug, pr_number).await?;
             self.work_db.set_execution_pr_head_before(execution_id, &head_oid)?;
         }

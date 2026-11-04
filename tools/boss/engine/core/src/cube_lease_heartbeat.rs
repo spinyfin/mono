@@ -389,6 +389,9 @@ struct HeartbeatCtx<'a> {
     cubes: &'a dyn ExecutionCubes,
     dispatch_events: &'a dyn DispatchEventSink,
     breaker: &'a HeartbeatFailureBreaker,
+    /// Occupancy probe for the lease release after a reap; `None` scans the
+    /// host's process table.
+    occupancy: Option<&'a dyn crate::workspace_lease_release::WorkspaceOccupancy>,
 }
 
 /// The identifiers naming one heartbeat target, bundled for the same
@@ -589,6 +592,7 @@ pub async fn run_one_pass(
         dispatch_events,
         breaker,
         HEARTBEAT_CUBE_TIMEOUT,
+        None,
     )
     .await
 }
@@ -602,12 +606,14 @@ async fn run_one_pass_impl(
     dispatch_events: &dyn DispatchEventSink,
     breaker: &HeartbeatFailureBreaker,
     heartbeat_timeout: Duration,
+    occupancy: Option<&dyn crate::workspace_lease_release::WorkspaceOccupancy>,
 ) -> HeartbeatSweepOutcome {
     let ctx = HeartbeatCtx {
         work_db,
         cubes,
         dispatch_events,
         breaker,
+        occupancy,
     };
     let mut outcome = HeartbeatSweepOutcome::default();
     let mut registered_run_ids: HashSet<String> = HashSet::new();
@@ -1309,11 +1315,12 @@ async fn reap_and_release_lease(
     // logged rather than propagated.
     match ctx.cubes.cube_for_execution(&execution.id).await {
         Ok(resolved) => {
-            crate::workspace_lease_release::release_lease_after_inferred_death(
+            crate::workspace_lease_release::release_lease_after_inferred_death_with(
                 ctx.work_db,
                 execution,
                 crate::workspace_lease_release::PaneStatus::Gone,
                 resolved.host_adapter.as_deref(),
+                ctx.occupancy,
                 resolved.cube.force_release_lease(lease_id, Some(reason)),
             )
             .await;

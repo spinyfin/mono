@@ -143,17 +143,6 @@ impl HostAdapter for FlakyRestoreAdapter {
         self.inner.discard_orphaned_execution_baseline(record).await
     }
 
-    async fn reconcile_execution_bookmark(
-        &self,
-        record: &ExecutionBookmark,
-        pr_bookmark: Option<&str>,
-        trunk: &str,
-    ) -> Result<Option<boss_engine_recovery::execution_bookmark::Reconciliation>> {
-        self.inner
-            .reconcile_execution_bookmark(record, pr_bookmark, trunk)
-            .await
-    }
-
     async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus> {
         self.inner.workspace_status(workspace_path).await
     }

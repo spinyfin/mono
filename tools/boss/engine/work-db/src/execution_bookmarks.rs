@@ -243,17 +243,6 @@ impl WorkDb {
         Ok(())
     }
 
-    /// Persist the note dispatch wrote when it re-anchored this execution's
-    /// recovery source, for the worker prompt.
-    pub fn record_bookmark_reconciliation_note(&self, execution_id: &str, note: &str) -> Result<()> {
-        let changed = self.connect()?.execute(
-            "UPDATE execution_bookmarks SET reconciliation_note = ?2 WHERE execution_id = ?1",
-            params![execution_id, note],
-        )?;
-        anyhow::ensure!(changed == 1, "reconciliation execution bookmark record missing");
-        Ok(())
-    }
-
     pub fn bookmark_reconciliation_note(&self, execution_id: &str) -> Result<Option<String>> {
         Ok(self
             .connect()?

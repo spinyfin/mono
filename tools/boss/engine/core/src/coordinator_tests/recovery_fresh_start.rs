@@ -139,6 +139,10 @@ async fn fresh_start_on_host(kind: ExecutionKind, resume: bool, pr: bool, disabl
         JjRepo::run(&repo.repo, &["bookmark", "set", "pr/99", "-r", "@"]);
         assert_ne!(commit(&repo.repo, "pr/99"), current);
     }
+    if pr {
+        // Dispatch snapshots the bound PR's head before creating the pointer.
+        db.set_execution_pr_head_before(&next.id, &current).unwrap();
+    }
     let next = db.get_execution(&next.id).unwrap();
     let source_pointers = JjRepo::run(&repo.repo, &["bookmark", "list", &format!("glob:*{source}*")]);
     let cube = Arc::new(FakeCubeClient {

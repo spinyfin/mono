@@ -1,8 +1,8 @@
 use super::fresh_start::{FreshStart, position_fresh_workspace};
 use super::*;
 use boss_engine_recovery::execution_bookmark::{
-    ExecutionBookmark, Reconciliation, is_base_unresolvable_error, is_missing_pointer_error,
-    is_pointer_integrity_error, pointer_integrity_error,
+    ExecutionBookmark, is_base_unresolvable_error, is_missing_pointer_error, is_pointer_integrity_error,
+    pointer_integrity_error,
 };
 
 /// What dispatch recovered into the new lease.
@@ -10,8 +10,6 @@ use boss_engine_recovery::execution_bookmark::{
 pub struct Recovered {
     pub predecessor: String,
     pub has_work: bool,
-    /// Set when the predecessor's pointers had to be re-anchored first.
-    pub reconciliation: Option<Reconciliation>,
 }
 
 impl ExecutionCoordinator {
@@ -343,7 +341,6 @@ impl ExecutionCoordinator {
         Ok(Some(Recovered {
             predecessor: prior.id.clone(),
             has_work,
-            reconciliation: None,
         }))
     }
 

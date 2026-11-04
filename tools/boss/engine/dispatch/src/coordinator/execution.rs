@@ -1832,9 +1832,21 @@ impl ExecutionCoordinator {
 
         let bookmark_result = async {
             if self.work_db.execution_bookmark_optional(&execution.id)?.is_none() {
-                self.execution_started_hook
-                    .snapshot_pr_head_before(&execution.id)
-                    .await?;
+                // A GitHub failure is retried like any pre-start failure, but a
+                // recovery floor never stops work from starting for good: once
+                // the retry budget is spent, the pointer falls back to trunk.
+                if let Err(err) = self.execution_started_hook.snapshot_pr_head_before(&execution.id).await {
+                    let spent = usize::try_from(execution.pre_start_failure_count.max(0))
+                        .is_ok_and(|failures| failures >= self.pre_start_retry_delays.len());
+                    if !spent {
+                        return Err(err);
+                    }
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        ?err,
+                        "pr_head_before snapshot failed on the final attempt; creating the pointer without it"
+                    );
+                }
                 let execution_for_pointer = self.work_db.get_execution(&execution.id)?;
                 let predecessor = match recovered.as_ref().filter(|recovered| recovered.has_work) {
                     Some(recovered) if self.work_db.preserved_tip(&recovered.predecessor)?.is_none() => {
@@ -1866,15 +1878,12 @@ impl ExecutionCoordinator {
                 }
                 self.work_db.record_execution_bookmark(&record)?;
             }
-            if let Some(recovered) = &recovered {
-                if recovered.predecessor != execution.id {
-                    self.work_db
-                        .record_bookmark_recovery(&execution.id, &recovered.predecessor, recovered.has_work)?;
-                }
-                if let Some(reconciliation) = &recovered.reconciliation {
-                    self.work_db
-                        .record_bookmark_reconciliation_note(&execution.id, &reconciliation.note())?;
-                }
+            if let Some(recovered) = recovered
+                .as_ref()
+                .filter(|recovered| recovered.predecessor != execution.id)
+            {
+                self.work_db
+                    .record_bookmark_recovery(&execution.id, &recovered.predecessor, recovered.has_work)?;
             }
             Ok::<_, anyhow::Error>(())
         }

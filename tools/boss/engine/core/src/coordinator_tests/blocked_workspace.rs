@@ -769,7 +769,7 @@ impl boss_engine_recovery::execution_bookmark::Jj for InterruptedTransplant {
     async fn run(&self, repo: &Path, args: &[&str]) -> Result<String> {
         use boss_engine_recovery::execution_bookmark::LocalJj;
         let result = LocalJj.run(repo, args).await?;
-        if args.first() == Some(&"duplicate") && args[1].contains("boss-recovery/") {
+        if args.first() == Some(&"duplicate") && !args[1].contains("..") {
             return Err(anyhow!("injected lost reply after transplant"));
         }
         Ok(result)

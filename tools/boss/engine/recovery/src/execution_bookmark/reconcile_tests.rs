@@ -80,14 +80,17 @@ pub(super) struct Scene {
 pub(super) async fn revision_on_pr_head(execution_id: &str) -> Scene {
     let dir = tempfile::tempdir().unwrap();
     let repo = JjRepo::new(dir.path());
-    JjRepo::run(&repo.repo, &["bookmark", "set", "main", "-r", "@"]);
     JjRepo::run(&repo.repo, &["new", "main", "-m", "Published PR commit"]);
     std::fs::write(repo.repo.join("pr.txt"), "published\n").unwrap();
     JjRepo::run(&repo.repo, &["bookmark", "set", "pr/7", "boss/root", "-r", "@"]);
     // cube workspace goto --pr 7, then cube change create.
     JjRepo::run(&repo.worker, &["new", "pr/7"]);
     JjRepo::run(&repo.worker, &["new", "-m", "Revision work"]);
-    let record = create(&LocalJj, &repo.worker, execution_id, "local").await.unwrap();
+    // Dispatch records the bound PR's head as the floor.
+    let pr_head = one(&repo.repo, "pr/7");
+    let record = create_from(&LocalJj, &repo.worker, execution_id, "local", None, Some(&pr_head))
+        .await
+        .unwrap();
     std::fs::write(repo.worker.join("revision.txt"), "revision work\n").unwrap();
     JjRepo::run(&repo.worker, &["status"]);
     JjRepo::run(&repo.repo, &["new", "main", "-m", "Main advances"]);

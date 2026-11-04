@@ -319,19 +319,6 @@ impl HostAdapter for LocalHostAdapter {
         pr_anchor::ensure(&LocalJj, self, record, pr).await?;
         Ok(true)
     }
-    async fn reconcile_execution_bookmark(
-        &self,
-        record: &ExecutionBookmark,
-        pr_bookmark: Option<&str>,
-        trunk: &str,
-    ) -> Result<Option<execution_bookmark::Reconciliation>> {
-        anyhow::ensure!(
-            record.host_id == "local",
-            "recovery bookmark belongs to host {}",
-            record.host_id
-        );
-        execution_bookmark::reconcile(&LocalJj, record, pr_bookmark, trunk).await
-    }
     async fn start_fresh_workspace(&self, workspace: &Path) -> Result<()> {
         execution_bookmark::Jj::run(&LocalJj, workspace, &["new", "trunk()", "-m", "Fresh execution"]).await?;
         Ok(())
@@ -936,18 +923,6 @@ impl HostAdapter for SshHostAdapter {
         result?;
         pr_anchor::ensure(self, self, record, pr).await?;
         Ok(true)
-    }
-    async fn reconcile_execution_bookmark(
-        &self,
-        record: &ExecutionBookmark,
-        pr_bookmark: Option<&str>,
-        trunk: &str,
-    ) -> Result<Option<execution_bookmark::Reconciliation>> {
-        anyhow::ensure!(
-            record.host_id == self.host_id(),
-            "recovery store belongs to another host"
-        );
-        execution_bookmark::reconcile(self, record, pr_bookmark, trunk).await
     }
     async fn start_fresh_workspace(&self, workspace: &Path) -> Result<()> {
         execution_bookmark::Jj::run(self, workspace, &["new", "trunk()", "-m", "Fresh execution"]).await?;

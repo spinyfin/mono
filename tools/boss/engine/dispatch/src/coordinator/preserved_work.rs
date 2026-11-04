@@ -58,7 +58,6 @@ impl ExecutionCoordinator {
                 Ok(Some(Recovered {
                     predecessor: prior.id.clone(),
                     has_work,
-                    reconciliation: None,
                 }))
             }
             Ok(None) => {
