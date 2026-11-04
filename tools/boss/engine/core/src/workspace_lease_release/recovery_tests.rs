@@ -158,6 +158,165 @@ async fn failed_legacy_backup_does_not_prevent_teardown_preservation() {
     assert!(db.preserved_tip(&execution.id).unwrap().is_some());
 }
 
+struct UnavailableRegistry;
+crate::stub_cube_client! { UnavailableRegistry {
+    async fn list_workspaces(&self) -> Result<Vec<boss_execution_contracts::CubeWorkspaceStatus>> {
+        anyhow::bail!("cube registry unavailable")
+    }
+} }
+
+#[tokio::test]
+async fn inferred_registry_failure_keeps_lease_but_proven_stop_preserves_live_work() {
+    let (dir, db) = open_db();
+    let repo = boss_engine_test_git::jj::JjRepo::new(dir.path());
+    let execution = fixture(&db, &repo.worker).await;
+    std::fs::write(repo.worker.join("work"), "latest unsnapshotted edits").unwrap();
+    let gate = DbBookmarkGate::new(&db, None).with_cube(&UnavailableRegistry);
+    let outcome = apply_release(
+        &db,
+        &execution,
+        "lease",
+        ReleaseEvidence {
+            cause: TerminalCause::Inferred,
+            pane: PaneStatus::Gone,
+            occupancy: &EmptyOccupancy,
+            bookmark: &gate,
+        },
+        async { panic!("unconfirmed ownership must not release") },
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        LeaseReleaseOutcome::Kept {
+            reason: KeepReason::BookmarkUnconfirmed
+        }
+    );
+    assert!(db.preserved_tip(&execution.id).unwrap().is_none());
+    assert_eq!(
+        gate.status_for_cause(&execution, TerminalCause::ProvenStopped).await,
+        BookmarkStatus::Confirmed
+    );
+    assert!(db.preserved_tip(&execution.id).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn unresolved_first_teardown_raises_inspection_without_prior_record() {
+    for boundary in [None, Some(1)] {
+        let (dir, db) = open_db();
+        let repo = boss_engine_test_git::jj::JjRepo::new(dir.path());
+        let execution = fixture(&db, &repo.worker).await;
+        if let Some(boundary) = boundary {
+            db.confirm_workspace_lease(&execution.id, "lease", boundary).unwrap();
+        }
+        assert!(db.preserved_tip(&execution.id).unwrap().is_none());
+        let gate = DbBookmarkGate::new(&db, None).with_cube(&OkCube);
+        assert_eq!(
+            gate.status_for_cause(&execution, TerminalCause::Inferred).await,
+            BookmarkStatus::Confirmed
+        );
+        let items = db.list_attention_items(&execution.id).unwrap();
+        assert!(items.iter().any(|item| item.kind == "preserved_work_needs_inspection"));
+    }
+}
+
+struct HandoffRegistry(Vec<boss_execution_contracts::CubeWorkspaceStatus>);
+crate::stub_cube_client! { HandoffRegistry {
+    async fn release_workspace(&self, _: &str) -> Result<()> { Ok(()) }
+    async fn force_release_lease(&self, _: &str, _: Option<&str>) -> Result<()> { Ok(()) }
+    async fn list_workspaces(&self) -> Result<Vec<boss_execution_contracts::CubeWorkspaceStatus>> { Ok(self.0.clone()) }
+} }
+
+#[tokio::test]
+async fn leftover_sweep_uses_original_heartbeat_after_intervening_holders() {
+    use boss_engine_test_git::jj::JjRepo;
+    for state in ["free", "unlisted", "leased"] {
+        let (dir, db) = open_db();
+        let repo = JjRepo::new(dir.path());
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, product.id, "intervening holders");
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id)
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        db.start_execution_run(
+            &execution.id,
+            "worker",
+            "mono",
+            "lease",
+            "worker",
+            repo.worker.to_str().unwrap(),
+        )
+        .unwrap();
+        let record = execution_bookmark::create(&LocalJj, &repo.worker, &execution.id, "local")
+            .await
+            .unwrap();
+        db.record_execution_bookmark(&record).unwrap();
+        std::fs::write(repo.worker.join("ours"), "original worker").unwrap();
+        let ours = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+        db.confirm_workspace_lease(
+            &execution.id,
+            "lease",
+            boss_engine_utils::epoch_time::now_epoch_ms() as i64,
+        )
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        JjRepo::run(&repo.worker, &["new", "root()", "-m", "Intervening holder"]);
+        std::fs::write(repo.worker.join("theirs"), "released holder").unwrap();
+        let intervening = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+        if state == "leased" {
+            JjRepo::run(&repo.worker, &["new", "root()", "-m", "Third holder"]);
+            std::fs::write(repo.worker.join("third"), "current holder").unwrap();
+        }
+        let current = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+        let registry = HandoffRegistry(if state == "unlisted" {
+            vec![]
+        } else {
+            vec![
+                boss_execution_contracts::CubeWorkspaceStatus::builder()
+                    .workspace_id("worker")
+                    .workspace_path(repo.worker.clone())
+                    .state(state)
+                    .maybe_lease_id((state == "leased").then(|| "third-lease".to_owned()))
+                    .build(),
+            ]
+        });
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        db.set_run_shell_pid_for_execution(&execution.id, i64::from(pid))
+            .unwrap();
+        db.mark_execution_orphaned(&execution.id, "original worker exited")
+            .unwrap();
+        let outcome = run_one_pass_with_occupancy(&db, &registry, &LiveWorkerStateRegistry::new(), || async {
+            EmptyOccupancy
+        })
+        .await;
+        assert_eq!(outcome.released, 1, "{state}: {outcome:?}");
+        assert_eq!(db.preserved_tip(&execution.id).unwrap().unwrap().commit_id, ours);
+        let name = execution_bookmark::preserved_name(&execution.id);
+        assert_eq!(
+            JjRepo::run(&repo.repo, &["log", "--no-graph", "-r", &name, "-T", "commit_id"]),
+            ours
+        );
+        assert_eq!(
+            JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]),
+            current
+        );
+        assert_eq!(
+            JjRepo::run(
+                &repo.repo,
+                &["log", "--no-graph", "-r", &intervening, "-T", "commit_id"]
+            ),
+            intervening
+        );
+    }
+}
+
 #[tokio::test]
 async fn reaped_worker_preserves_exactly_one_bookmark_only_for_unpushed_work() {
     use boss_engine_test_git::jj::JjRepo;
@@ -201,11 +360,13 @@ async fn reaped_worker_preserves_exactly_one_bookmark_only_for_unpushed_work() {
             .await
             .unwrap();
         db.record_execution_bookmark(&record).unwrap();
+        db.confirm_workspace_lease(
+            &execution.id,
+            "lease",
+            boss_engine_utils::epoch_time::now_epoch_ms() as i64,
+        )
+        .unwrap();
         std::fs::write(repo.worker.join("work.txt"), "worker edits").unwrap();
-        // Snapshot into an unpublished commit. The leftover-lease sweep asks
-        // cube before reading live `@`; an unlisted workspace uses the
-        // registered working copy without snapshotting.
-        JjRepo::run(&repo.worker, &["describe", "-m", "Unpublished worker edits"]);
         if published {
             JjRepo::run(&repo.worker, &["bookmark", "set", "published", "-r", "@"]);
             JjRepo::run(&repo.worker, &["git", "export"]);

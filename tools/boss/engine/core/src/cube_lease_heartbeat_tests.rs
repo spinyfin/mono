@@ -549,6 +549,14 @@ async fn live_lease_is_heartbeated() {
     let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
 
     assert_eq!(outcome.heartbeated, 1, "live lease must be heartbeated");
+    let boundary = db
+        .workspace_lease_boundary(&execution_id)
+        .unwrap()
+        .expect("successful heartbeat is durable");
+    assert!(boundary > 0);
+    db.confirm_workspace_lease(&execution_id, "previous-lease", boundary + 1000)
+        .unwrap();
+    assert_eq!(db.workspace_lease_boundary(&execution_id).unwrap(), Some(boundary));
     assert_eq!(outcome.failed, 0);
     assert_eq!(cube.calls(), vec![("lease-live".to_owned(), Some(LEASE_TTL_SECS))]);
     assert!(sink.events().await.is_empty(), "no event on the success path");
@@ -1552,11 +1560,13 @@ async fn reap_dead_lease_with_workspace(pushed: bool) {
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
+    db.confirm_workspace_lease(
+        &execution_id,
+        lease_id,
+        boss_engine_utils::epoch_time::now_epoch_ms() as i64,
+    )
+    .unwrap();
     std::fs::write(repo.worker.join("work.txt"), "worker edits").unwrap();
-    // Snapshot into an unpublished commit. Inferred-death preservation reads
-    // the registered working copy without snapshotting live `@` when cube does
-    // not list this workspace as still leased here.
-    JjRepo::run(&repo.worker, &["describe", "-m", "Unpublished worker edits"]);
     if pushed {
         JjRepo::run(&repo.worker, &["bookmark", "set", "published", "-r", "@"]);
         JjRepo::run(&repo.worker, &["git", "export"]);
@@ -1629,6 +1639,12 @@ async fn remote_reap_with_adapter_preserves_unpushed_work() {
     db.record_execution_bookmark(&record).unwrap();
     std::fs::write(repo.worker.join("work.txt"), "remote unpublished").unwrap();
     JjRepo::run(&repo.worker, &["describe", "-m", "Remote unpublished work"]);
+    db.confirm_workspace_lease(
+        &execution_id,
+        "lease-remote-unpushed",
+        boss_engine_utils::epoch_time::now_epoch_ms() as i64,
+    )
+    .unwrap();
 
     let live_states = LiveWorkerStateRegistry::new();
     register_slot(&live_states, 1, &execution_id, std::process::id() as i32);
@@ -1670,6 +1686,12 @@ async fn remote_reap_with_adapter_preserves_unpushed_work() {
 /// snapshot that stack as `preserved/<reaped exec>` or rewrite it.
 #[tokio::test]
 async fn heartbeat_reap_does_not_preserve_another_holders_unpublished_stack() {
+    for holder in ["successor", "free", "third"] {
+        reap_after_handoff(holder).await;
+    }
+}
+
+async fn reap_after_handoff(holder: &str) {
     let dir = tempfile::tempdir().unwrap();
     let repo = JjRepo::new(dir.path());
     export_origin(&repo);
@@ -1690,8 +1712,18 @@ async fn heartbeat_reap_does_not_preserve_another_holders_unpublished_stack() {
     db.record_execution_bookmark(&record).unwrap();
     std::fs::write(repo.worker.join("ours.txt"), "reaped worker edits").unwrap();
     let ours = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    let boundary = boss_engine_utils::epoch_time::now_epoch_ms() as i64;
+    db.confirm_workspace_lease(&execution_id, "lease-reaped", boundary)
+        .unwrap();
+    let successor_started = boss_engine_utils::epoch_time::now_epoch_secs();
+    tokio::time::sleep(Duration::from_millis(20)).await;
     JjRepo::run(&repo.worker, &["new", "main", "-m", "Unrelated holder stack"]);
     std::fs::write(repo.worker.join("theirs.txt"), "other holder's unpublished").unwrap();
+    let intervening = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    if holder == "third" {
+        JjRepo::run(&repo.worker, &["new", "main", "-m", "Third holder"]);
+        std::fs::write(repo.worker.join("theirs.txt"), "other holder's unpublished").unwrap();
+    }
     let theirs = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
     assert_ne!(ours.trim(), theirs.trim());
 
@@ -1700,7 +1732,15 @@ async fn heartbeat_reap_does_not_preserve_another_holders_unpublished_stack() {
     let cube = Arc::new(RecordingCube::default());
     cube.fail.store(true, Ordering::SeqCst);
     let mut successor = workspace("mono-agent-001", "leased", Some("lease-successor"));
-    successor.leased_at_epoch_s = Some(boss_engine_utils::epoch_time::now_epoch_secs());
+    successor.leased_at_epoch_s = Some(successor_started);
+    if holder == "free" {
+        successor.state = "free".into();
+        successor.lease_id = None;
+        successor.leased_at_epoch_s = None;
+    } else if holder == "third" {
+        successor.lease_id = Some("lease-third".into());
+        successor.leased_at_epoch_s = Some(boss_engine_utils::epoch_time::now_epoch_secs());
+    }
     cube.set_workspaces(vec![successor]);
     let sink = RecordingDispatchEventSink::new();
     let breaker = HeartbeatFailureBreaker::default();
@@ -1722,6 +1762,7 @@ async fn heartbeat_reap_does_not_preserve_another_holders_unpublished_stack() {
         "other holder's unpublished"
     );
     let names = preserved_names(&repo, &execution_id);
+    assert_eq!(names, vec![recovery::preserved_name(&execution_id)]);
     for name in &names {
         let preserved = JjRepo::run(&repo.repo, &["log", "--no-graph", "-r", name, "-T", "commit_id"]);
         assert_ne!(
@@ -1735,9 +1776,17 @@ async fn heartbeat_reap_does_not_preserve_another_holders_unpublished_stack() {
             "{name} must record the reaped worker tip, not live @"
         );
     }
-    let recorded = db.preserved_tip(&execution_id).unwrap();
-    if let Some(tip) = recorded {
-        assert_ne!(tip.commit_id, theirs.trim());
-        assert_eq!(tip.commit_id, ours.trim());
-    }
+    assert_eq!(
+        JjRepo::run(
+            &repo.repo,
+            &["log", "--no-graph", "-r", &intervening, "-T", "commit_id"]
+        ),
+        intervening
+    );
+    let tip = db
+        .preserved_tip(&execution_id)
+        .unwrap()
+        .expect("our work must be recorded");
+    assert_ne!(tip.commit_id, theirs.trim());
+    assert_eq!(tip.commit_id, ours.trim());
 }

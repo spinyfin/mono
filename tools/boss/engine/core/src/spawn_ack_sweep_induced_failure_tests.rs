@@ -314,7 +314,18 @@ async fn assert_incident_detected_and_released(fixture: &IncidentFixture) {
     );
 
     let attentions = db.list_attention_items(execution_id).unwrap();
-    assert_eq!(attentions.len(), 1, "an attention item must be raised");
+    assert_eq!(attentions.len(), 2, "an attention item must be raised");
+    assert!(
+        attentions
+            .iter()
+            .any(|item| item.kind == "preserved_work_needs_inspection")
+    );
+    let attentions: Vec<_> = attentions
+        .iter()
+        .filter(|item| item.kind == DRIVER_START_ATTENTION_KIND)
+        .collect();
+    assert_eq!(attentions.len(), 1);
+
     assert_eq!(attentions[0].kind, DRIVER_START_ATTENTION_KIND);
     assert!(
         attentions[0].body_markdown.contains(&shell_pid.to_string()),

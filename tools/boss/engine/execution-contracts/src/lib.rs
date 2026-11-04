@@ -1497,10 +1497,8 @@ pub trait HostAdapter: Send + Sync {
     }
 
     /// Confirm preservation using an explicit workspace-tip source. Inferred-death
-    /// teardown passes [`WorkspaceTipSource::Historical`] or
-    /// [`WorkspaceTipSource::Registered`] so live `@` is not snapshotted in a
-    /// workspace cube has already reassigned or reset. The default forwards to
-    /// [`Self::confirm_workspace_recovery`], which snapshots live `@`.
+    /// teardown passes an ownership boundary through to the owning host.
+    /// Adapters must honor that boundary rather than snapshot another holder.
     async fn confirm_workspace_recovery_from(
         &self,
         record: &ExecutionBookmark,

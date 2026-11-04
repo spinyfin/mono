@@ -937,9 +937,17 @@ async fn heartbeat_one(
     // effort display only — the local-vs-remote decision below uses the
     // host id from resolution, not this label.
     let cube_invocation = cube.command_repr(&["workspace", "heartbeat", lease_id]);
+    let confirmed_at = boss_engine_utils::epoch_time::now_epoch_ms() as i64;
     let result = tokio::time::timeout(timeout, cube.heartbeat_lease(lease_id, Some(LEASE_TTL_SECS))).await;
     match result {
         Ok(Ok(())) => {
+            if let Err(err) = ctx
+                .work_db
+                .confirm_workspace_lease(execution_id, lease_id, confirmed_at)
+            {
+                tracing::error!(execution_id, error = %err, "failed to record confirmed workspace lease boundary");
+                return false;
+            }
             *succeeded += 1;
             tracing::debug!(
                 execution_id,

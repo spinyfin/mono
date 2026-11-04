@@ -83,11 +83,13 @@ pub async fn release_lease_after_inferred_death_with(
             &snapshot
         }
     };
-    let db_gate = match cube {
-        Some(cube) => DbBookmarkGate::new(work_db, adapter).with_cube(cube),
-        None => DbBookmarkGate::new(work_db, adapter),
+    let plain_gate = DbBookmarkGate::new(work_db, adapter);
+    let cube_gate = cube.map(|cube| DbBookmarkGate::new(work_db, adapter).with_cube(cube));
+    let db_gate: &dyn BookmarkGate = match cube_gate.as_ref() {
+        Some(gate) => gate,
+        None => &plain_gate,
     };
-    let bookmark = sweep_bookmark_gate(work_db, execution, &db_gate);
+    let bookmark = sweep_bookmark_gate(work_db, execution, db_gate);
     apply_release(
         work_db,
         execution,
@@ -335,7 +337,7 @@ fn release_previously_failed_in_cube(db: &WorkDb, execution_id: &str) -> bool {
 pub(crate) fn sweep_bookmark_gate<'a>(
     db: &WorkDb,
     execution: &WorkExecution,
-    confirming: &'a DbBookmarkGate<'a>,
+    confirming: &'a dyn BookmarkGate,
 ) -> &'a dyn BookmarkGate {
     if execution.started_at.is_none() && never_positioned(db, &execution.id, PreStartStage::BeforeRecoveryBookmark) {
         &NeverPositioned

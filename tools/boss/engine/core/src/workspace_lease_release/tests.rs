@@ -406,7 +406,7 @@ async fn db_bookmark_gate_rejects_a_record_without_a_pointer() {
     })
     .unwrap();
     assert!(matches!(
-        DbBookmarkGate::new(&db, None).status(&execution).await,
+        DbBookmarkGate { db: &db, adapter: None }.status(&execution).await,
         BookmarkStatus::Unconfirmed(_)
     ));
 }
@@ -416,7 +416,7 @@ async fn db_bookmark_gate_rejects_a_failed_or_missing_write() {
     let (_dir, db) = open_db();
     let execution = seed_terminal(&db, ExecutionStatus::Failed, "lease-none");
     assert!(matches!(
-        DbBookmarkGate::new(&db, None).status(&execution).await,
+        DbBookmarkGate { db: &db, adapter: None }.status(&execution).await,
         BookmarkStatus::Unconfirmed(_)
     ));
 }

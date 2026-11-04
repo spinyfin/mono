@@ -23,6 +23,69 @@ fn names(repo: &JjRepo) -> String {
     JjRepo::run(&repo.repo, &["bookmark", "list", "-T", "name ++ \"\\n\""])
 }
 
+#[tokio::test]
+async fn historical_and_registered_reads_never_resurrect_hidden_work() {
+    for action in ["commit", "squash", "abandon"] {
+        for historical in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = fixture(dir.path());
+            let record = create(&LocalJj, &repo.worker, "exec_hidden_history", "local")
+                .await
+                .unwrap();
+            if action == "squash" {
+                std::fs::write(repo.worker.join("parent"), "parent work").unwrap();
+                JjRepo::run(&repo.worker, &["new", "-m", "Child work"]);
+            }
+            std::fs::write(repo.worker.join("work"), "work to rewrite or abandon").unwrap();
+            let hidden = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+            let boundary = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            match action {
+                "commit" => {
+                    JjRepo::run(&repo.worker, &["commit", "-m", "Published work"]);
+                }
+                "squash" => {
+                    JjRepo::run(&repo.worker, &["squash", "-m", "Published combined work"]);
+                }
+                _ => {
+                    JjRepo::run(&repo.worker, &["abandon", "@"]);
+                }
+            }
+            if action != "abandon" {
+                JjRepo::run(&repo.worker, &["bookmark", "set", "published", "-r", "@-"]);
+                JjRepo::run(&repo.worker, &["git", "export"]);
+                JjRepo::run(&repo.repo, &["git", "fetch"]);
+            }
+            let source = if historical {
+                WorkspaceTipSource::LeaseBoundary {
+                    unix_millis: boundary,
+                    snapshot_if_unchanged: false,
+                }
+            } else {
+                WorkspaceTipSource::Registered
+            };
+            assert!(
+                !super::preserved::commit_is_visible(&LocalJj, &repo.repo, hidden.trim())
+                    .await
+                    .unwrap()
+            );
+            let outcome = preserve_from(&LocalJj, &record, &repo.worker, None, None, source)
+                .await
+                .unwrap();
+            assert!(outcome.tip.is_none(), "{action}, historical={historical}: {outcome:?}");
+            assert!(!names(&repo).contains("preserved/exec_hidden_history"));
+            assert!(
+                !super::preserved::commit_is_visible(&LocalJj, &repo.repo, hidden.trim())
+                    .await
+                    .unwrap()
+            );
+        }
+    }
+}
+
 async fn preserve_tip(jj: &LocalJj, record: &ExecutionBookmark, workspace: &Path) -> Result<Option<PreservedTip>> {
     Ok(preserve(jj, record, workspace, None, None).await?.tip)
 }
@@ -755,6 +818,11 @@ async fn historical_tip_does_not_snapshot_a_reassigned_workspace() {
         .unwrap();
     std::fs::write(repo.worker.join("ours.txt"), "reaped worker edits").unwrap();
     let ours = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    let boundary = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     JjRepo::run(&repo.worker, &["new", "main", "-m", "Unrelated holder stack"]);
     std::fs::write(repo.worker.join("theirs.txt"), "other holder's unpublished").unwrap();
     let theirs = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
@@ -765,8 +833,9 @@ async fn historical_tip_does_not_snapshot_a_reassigned_workspace() {
         &repo.worker,
         None,
         None,
-        WorkspaceTipSource::Historical {
-            at_or_before_unix: None,
+        WorkspaceTipSource::LeaseBoundary {
+            unix_millis: boundary,
+            snapshot_if_unchanged: false,
         },
     )
     .await

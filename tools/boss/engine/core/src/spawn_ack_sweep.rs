@@ -1969,7 +1969,22 @@ mod tests {
         );
 
         let attentions = db.list_attention_items(&execution_id).unwrap();
-        assert_eq!(attentions.len(), 1, "the reap must raise exactly one attention item");
+        assert_eq!(
+            attentions.len(),
+            2,
+            "the reap and unresolved preservation each raise attention"
+        );
+        assert!(
+            attentions
+                .iter()
+                .any(|item| item.kind == "preserved_work_needs_inspection")
+        );
+        let attentions: Vec<_> = attentions
+            .iter()
+            .filter(|item| item.kind == DRIVER_START_ATTENTION_KIND)
+            .collect();
+        assert_eq!(attentions.len(), 1);
+
         assert_eq!(attentions[0].kind, DRIVER_START_ATTENTION_KIND);
         assert!(
             attentions[0].body_markdown.contains("92697"),

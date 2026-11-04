@@ -1289,6 +1289,7 @@ impl WorkDb {
              SET status = 'running',
                  cube_repo_id = ?2,
                  cube_lease_id = ?3,
+                 lease_confirmed_at_millis = ?8,
                  cube_workspace_id = ?4,
                  workspace_path = ?5,
                  host_id = ?7,
@@ -1304,7 +1305,8 @@ impl WorkDb {
                 cube_workspace_id,
                 workspace_path,
                 now,
-                host_id
+                host_id,
+                (boss_engine_utils::epoch_time::now_epoch_ms() as i64)
             ],
         )?;
         if updated == 0 {

@@ -2,6 +2,33 @@ use crate::schema_init::table_has_column;
 use crate::*;
 use boss_engine_recovery::execution_bookmark::PreservedTip;
 
+pub(crate) fn migrate_lease_boundary(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "work_executions", "lease_confirmed_at_millis")? {
+        conn.execute_batch("ALTER TABLE work_executions ADD COLUMN lease_confirmed_at_millis INTEGER")?;
+    }
+    Ok(())
+}
+
+#[test]
+fn lease_boundary_upgrade_does_not_invent_ownership_for_existing_rows() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE work_executions (id TEXT PRIMARY KEY, cube_lease_id TEXT);
+        INSERT INTO work_executions VALUES ('old', 'old-lease');",
+    )
+    .unwrap();
+    migrate_lease_boundary(&conn).unwrap();
+    migrate_lease_boundary(&conn).unwrap();
+    let boundary: Option<i64> = conn
+        .query_row(
+            "SELECT lease_confirmed_at_millis FROM work_executions WHERE id = 'old'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(boundary, None);
+}
+
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     for (column, ty) in [
         ("preserved_change_id", "TEXT"),
@@ -33,6 +60,26 @@ fn upgrade_retains_old_rows_without_inventing_preserved_work() {
 
 #[work_db_boundary::instrument]
 impl WorkDb {
+    /// Record only a successful heartbeat of the lease still attached to this row.
+    /// The timestamp is captured before contacting cube, so a delayed response
+    /// cannot extend ownership past a subsequent handoff.
+    pub fn confirm_workspace_lease(&self, execution_id: &str, lease_id: &str, unix_millis: i64) -> Result<()> {
+        self.connect()?.execute(
+            "UPDATE work_executions SET lease_confirmed_at_millis = max(COALESCE(lease_confirmed_at_millis, 0), ?3)
+             WHERE id = ?1 AND cube_lease_id = ?2",
+            params![execution_id, lease_id, unix_millis],
+        )?;
+        Ok(())
+    }
+
+    pub fn workspace_lease_boundary(&self, execution_id: &str) -> Result<Option<i64>> {
+        Ok(self.connect()?.query_row(
+            "SELECT lease_confirmed_at_millis FROM work_executions WHERE id = ?1",
+            [execution_id],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Store location remains useful after the legacy pointer row is retired.
     pub fn preservation_source(
         &self,
