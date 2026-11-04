@@ -7,6 +7,29 @@ fn commit(repo: &std::path::Path, rev: &str) -> String {
     JjRepo::run(repo, &["log", "--no-graph", "-r", rev, "-T", "commit_id"])
 }
 
+/// Two concurrent operations move the recovery head to different commits,
+/// leaving the bookmark conflicted: a genuine integrity failure (unlike a
+/// rewritten or missing baseline, which is not one). The publication head
+/// keeps the unpublished work, so archives still name it.
+fn conflict_recovery_head(repo: &std::path::Path, record: &recovery::ExecutionBookmark) {
+    let operation = JjRepo::run(repo, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
+    for target in [commit(repo, "main"), commit(repo, "root()")] {
+        JjRepo::run(
+            repo,
+            &[
+                "--at-op",
+                operation.trim(),
+                "bookmark",
+                "set",
+                &record.head(),
+                "-r",
+                &target,
+                "--allow-backwards",
+            ],
+        );
+    }
+}
+
 /// Both preserved work and the new PR edit the same file differently. The
 /// baseline points at the new PR while the old heads retain the unpushed edit.
 async fn fresh_start(kind: ExecutionKind, resume: bool, pr: bool) {
@@ -56,24 +79,30 @@ async fn fresh_start_on_host(kind: ExecutionKind, resume: bool, pr: bool, disabl
     JjRepo::run(&repo.repo, &["bookmark", "set", "pr/99", "-r", "@"]);
     let current = commit(&repo.repo, "@");
     if !disabled_source {
-        JjRepo::run(
-            &repo.repo,
-            &["bookmark", "set", &record.base(), "-r", "@", "--allow-backwards"],
-        );
+        // Two concurrent operations move the recovery head to different
+        // commits, leaving the bookmark conflicted: a genuine integrity failure
+        // (unlike a rewritten or missing baseline, which is not one).
+        let operation = JjRepo::run(&repo.repo, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
+        for target in [commit(&repo.repo, "main"), current.clone()] {
+            JjRepo::run(
+                &repo.repo,
+                &[
+                    "--at-op",
+                    operation.trim(),
+                    "bookmark",
+                    "set",
+                    &record.head(),
+                    "-r",
+                    &target,
+                    "--allow-backwards",
+                ],
+            );
+        }
         let failure = recovery::diff(&LocalJj, &record).await.unwrap_err();
         assert_eq!(
             recovery::pointer_integrity_kind(&failure),
-            Some(recovery::PointerIntegrityKind::NotDescended)
+            Some(recovery::PointerIntegrityKind::Other)
         );
-        if pr {
-            let failure = recovery::reconcile(&LocalJj, &record, Some("pr/99"), "main")
-                .await
-                .unwrap_err();
-            assert_eq!(
-                recovery::pointer_integrity_kind(&failure),
-                Some(recovery::PointerIntegrityKind::NotContained)
-            );
-        }
     }
     if kind == ExecutionKind::PrReviewGuide {
         let packet = crate::test_support::review_guide_source_packet(&commit(&repo.repo, "main"), &current);
@@ -111,7 +140,7 @@ async fn fresh_start_on_host(kind: ExecutionKind, resume: bool, pr: bool, disabl
         assert_ne!(commit(&repo.repo, "pr/99"), current);
     }
     let next = db.get_execution(&next.id).unwrap();
-    let source_pointers = recovery::snapshot_pointers(&LocalJj, &record).await.unwrap();
+    let source_pointers = JjRepo::run(&repo.repo, &["bookmark", "list", &format!("glob:*{source}*")]);
     let cube = Arc::new(FakeCubeClient {
         workspace_root: Some(dir.path().to_path_buf()),
         next_workspace_id: Mutex::new(Some("replacement".into())),
@@ -172,7 +201,7 @@ async fn fresh_start_on_host(kind: ExecutionKind, resume: bool, pr: bool, disabl
     let archive = format!("preserved-archive/{source}/{preserved}");
     if kind.is_read_only_review() {
         assert_eq!(
-            recovery::snapshot_pointers(&LocalJj, &record).await.unwrap(),
+            JjRepo::run(&repo.repo, &["bookmark", "list", &format!("glob:*{source}*")]),
             source_pointers
         );
         assert_eq!(db.execution_bookmark(&source).unwrap(), record);
@@ -592,12 +621,7 @@ async fn startup_pane_resume_archives_damaged_pointers_and_spawns() {
     std::fs::write(repo.worker.join("work.txt"), "keep unpublished work").unwrap();
     JjRepo::run(&repo.worker, &["status"]);
     let old = commit(&repo.repo, &record.head());
-    JjRepo::run(&repo.repo, &["new", "main", "-m", "Unrelated baseline"]);
-    std::fs::write(repo.repo.join("other.txt"), "other work").unwrap();
-    JjRepo::run(
-        &repo.repo,
-        &["bookmark", "set", &record.base(), "-r", "@", "--allow-backwards"],
-    );
+    conflict_recovery_head(&repo.repo, &record);
     let (next, _) = db
         .start_execution_run(
             &next.id,
@@ -689,17 +713,16 @@ async fn initialization_fallback(inherited: bool) {
     let source_id = if inherited { &source.id } else { &next.id };
     let repo = JjRepo::new(dir.path());
     super::recovery::configure_recovery_origin(&repo.repo);
-    let mut prior = recovery::create(&LocalJj, &repo.worker, source_id, "local")
+    let prior = recovery::create(&LocalJj, &repo.worker, source_id, "local")
         .await
         .unwrap();
     std::fs::write(repo.worker.join("lost.txt"), "keep this work").unwrap();
     JjRepo::run(&repo.worker, &["status"]);
     let old = commit(&repo.repo, &prior.head());
     if inherited {
-        // The source baseline disappeared between recovery and adoption.
-        prior.base_commit = None;
-        JjRepo::run(&repo.repo, &["bookmark", "forget", &prior.base()]);
+        // The source head became ambiguous between recovery and adoption.
         db.record_execution_bookmark(&prior).unwrap();
+        conflict_recovery_head(&repo.repo, &prior);
     }
     // Recovery has already staged unpublished history in the destination.
     JjRepo::run(&repo.replacement, &["new", &old, "-m", "Restaged work"]);

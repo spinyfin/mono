@@ -493,11 +493,10 @@ async fn blocked_revision_dispatch_restores_bookmark_with_or_without_original_wo
 }
 
 /// Dispatch against a predecessor whose baseline bookmark is gone and whose
-/// record predates the baseline commit (MissingBaseline). With the PR head carrying
-/// the work, dispatch resumes from it; otherwise it retires the record,
-/// files attention, and starts fresh instead of wedging on every attempt.
+/// record predates the baseline commit. Neither is an integrity failure: the
+/// floor is trunk and the unpublished revision work is restaged.
 #[tokio::test]
-async fn blocked_revision_dispatch_resumes_from_pr_head_or_retires_an_unvouched_pointer() {
+async fn blocked_revision_dispatch_restages_a_record_without_a_baseline() {
     for pr_carries_work in [true, false] {
         let dir = tempdir().unwrap();
         let path = dir.path().join("boss.db");
@@ -577,79 +576,24 @@ async fn blocked_revision_dispatch_resumes_from_pr_head_or_retires_an_unvouched_
             !cube.goto_calls.lock().await.is_empty(),
             "the bound PR is resolved before reconciling"
         );
-        let heads_exist = JjRepo::run(
-            &repo.repo,
-            &[
-                "--ignore-working-copy",
-                "bookmark",
-                "list",
-                "-T",
-                "name ++ \"\\n\"",
-                &record.head(),
-                &record.base(),
-                &record.publication(),
-            ],
-        );
         let retired_attention: Vec<_> = db
             .list_attention_items_for_work_item(&prior.work_item_id)
             .unwrap()
             .into_iter()
             .filter(|item| item.kind == crate::execution_bookmark_recovery::RECOVERY_RETIRED)
             .collect();
-        if pr_carries_work {
-            assert_eq!(
-                db.bookmark_recovery(&next.id).unwrap(),
-                Some((prior.id.clone(), false)),
-                "the work is in the PR"
-            );
-            let note = db
-                .bookmark_reconciliation_note(&next.id)
-                .unwrap()
-                .expect("reconciliation note stored");
-            assert!(note.contains("resumed from the PR head `pr/99`"), "{note}");
-            assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
-            assert!(retired_attention.is_empty());
-            let base = JjRepo::run(
-                &repo.repo,
-                &[
-                    "--ignore-working-copy",
-                    "log",
-                    "--no-graph",
-                    "-r",
-                    &format!("bookmarks(exact:\"{}\")", record.base()),
-                    "-T",
-                    "commit_id",
-                ],
-            );
-            assert_eq!(base, work, "the baseline was rebuilt at the PR head");
-        } else {
-            assert_eq!(
-                db.bookmark_recovery(&next.id).unwrap(),
-                None,
-                "a fresh start recovers nothing"
-            );
-            assert!(db.bookmark_reconciliation_note(&next.id).unwrap().is_none());
-            assert!(
-                db.execution_bookmark_optional(&prior.id).unwrap().is_none(),
-                "the record is no longer a recovery source"
-            );
-            let reason = db
-                .execution_bookmark_retired_reason(&prior.id)
-                .unwrap()
-                .expect("retired");
-            assert!(
-                reason.contains("found 0") && reason.contains("Revision work"),
-                "{reason}"
-            );
-            assert_eq!(retired_attention.len(), 1, "{retired_attention:?}");
-            assert!(retired_attention[0].body_markdown.contains(&next.id));
-            assert!(
-                !heads_exist.lines().any(|l| l == record.head() || l == record.base()),
-                "retired predecessor releases its private pointer names"
-            );
-            assert!(heads_exist.lines().any(|l| l == record.publication()));
-            assert!(db.execution_restore_report(&next.id).unwrap().is_none());
-        }
+        // No baseline bookmark and no baseline commit is not an integrity
+        // failure: the floor falls back to trunk and the unpublished revision
+        // work is restaged, whether or not the PR bookmark happens to carry it.
+        assert_eq!(
+            db.bookmark_recovery(&next.id).unwrap(),
+            Some((prior.id.clone(), true)),
+            "pr_carries_work={pr_carries_work}"
+        );
+        assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
+        assert!(retired_attention.is_empty(), "{retired_attention:?}");
+        let report = db.execution_restore_report(&next.id).unwrap().expect("restore report");
+        assert!(report.commits.contains("Revision work"), "{}", report.commits);
         assert!(
             db.execution_bookmark_optional(&next.id).unwrap().is_some(),
             "the new run has its own pointers"
@@ -825,7 +769,7 @@ impl boss_engine_recovery::execution_bookmark::Jj for InterruptedTransplant {
     async fn run(&self, repo: &Path, args: &[&str]) -> Result<String> {
         use boss_engine_recovery::execution_bookmark::LocalJj;
         let result = LocalJj.run(repo, args).await?;
-        if args.first() == Some(&"duplicate") && args[1].contains("boss-base/") {
+        if args.first() == Some(&"duplicate") && args[1].contains("boss-recovery/") {
             return Err(anyhow!("injected lost reply after transplant"));
         }
         Ok(result)
@@ -848,6 +792,10 @@ async fn rewritten_pr_dispatch_preserves_successor_work_through_second_recovery(
     JjRepo::run(&h.repo.repo, &["new", "main", "-m", "Old published PR"]);
     std::fs::write(h.repo.repo.join("stale-pr"), "old published").unwrap();
     JjRepo::run(&h.repo.repo, &["bookmark", "set", "pr/99", &record.base(), "-r", "@"]);
+    // Dispatch recorded this PR head as the execution's baseline commit.
+    let old_pr = JjRepo::run(&h.repo.repo, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    db.update_execution_bookmark_base(&prior.id, &old_pr).unwrap();
+    let record = db.execution_bookmark(&prior.id).unwrap();
     JjRepo::run(&h.repo.worker, &["rebase", "-r", "@", "-d", "pr/99"]);
     JjRepo::run(&h.repo.repo, &["new", "main", "-m", "Rewritten PR"]);
     std::fs::write(h.repo.repo.join("rewritten-pr"), "force pushed").unwrap();
@@ -1267,6 +1215,7 @@ async fn kept_pre_start_lease_does_not_block_redispatch() {
         repo_path: PathBuf::from("/tmp/boss-no-such-repo"),
         host_id: "local".to_owned(),
         base_commit: None,
+        pr_head_before: None,
     })
     .unwrap();
     let cube = Arc::new(FakeCubeClient::default());

@@ -402,6 +402,7 @@ async fn db_bookmark_gate_rejects_a_record_without_a_pointer() {
         repo_path: PathBuf::from("/tmp/repo"),
         host_id: "local".to_owned(),
         base_commit: None,
+        pr_head_before: None,
     })
     .unwrap();
     assert!(matches!(

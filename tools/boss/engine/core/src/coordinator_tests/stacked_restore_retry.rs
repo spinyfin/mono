@@ -15,10 +15,6 @@ struct FlakyRestoreAdapter {
 
 #[async_trait]
 impl HostAdapter for FlakyRestoreAdapter {
-    async fn checkpoint_execution_baseline(&self, record: &ExecutionBookmark) -> Result<String> {
-        self.inner.checkpoint_execution_baseline(record).await
-    }
-
     async fn prepare_recovery_pr(
         &self,
         record: &ExecutionBookmark,
@@ -289,10 +285,7 @@ async fn every_integrity_verdict_archives_and_allows_fresh_dispatch() {
     use boss_engine_test_git::jj::JjRepo;
     for kind in [
         PointerIntegrityKind::Other,
-        PointerIntegrityKind::NotDescended,
-        PointerIntegrityKind::Diverged,
         PointerIntegrityKind::NotContained,
-        PointerIntegrityKind::MissingBaseline,
         PointerIntegrityKind::PrHeadUnavailable,
     ] {
         let h = chain_harness(true, true, false).await;

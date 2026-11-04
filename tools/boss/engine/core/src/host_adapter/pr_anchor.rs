@@ -47,26 +47,6 @@ impl PrAliasRepair for SshHostAdapter {
     }
 }
 
-pub(super) async fn reconcile(
-    jj: &dyn Jj,
-    repair: &dyn PrAliasRepair,
-    record: &ExecutionBookmark,
-    pr_bookmark: Option<&str>,
-    trunk: &str,
-) -> Result<Option<execution_bookmark::Reconciliation>> {
-    use execution_bookmark::{PointerIntegrityKind, pointer_integrity_kind};
-    let initial = execution_bookmark::reconcile(jj, record, pr_bookmark, trunk).await;
-    if !initial
-        .as_ref()
-        .is_err_and(|err| pointer_integrity_kind(err) == Some(PointerIntegrityKind::PrHeadUnavailable))
-    {
-        return initial;
-    }
-    let pr = bound_pr(pr_bookmark)?;
-    repair_with(jj, repair, record, pr, REPAIR_TIMEOUT).await?;
-    after_repair(execution_bookmark::reconcile(jj, record, pr_bookmark, trunk).await, pr)
-}
-
 pub(super) async fn ensure(jj: &dyn Jj, repair: &dyn PrAliasRepair, record: &ExecutionBookmark, pr: u64) -> Result<()> {
     match execution_bookmark::resolve_bookmark_commit(jj, record, &format!("pr/{pr}")).await {
         Ok(Some(_)) => Ok(()),

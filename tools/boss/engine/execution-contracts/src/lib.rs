@@ -237,6 +237,14 @@ impl ExecutionPublisher for NoopExecutionPublisher {
 #[async_trait]
 pub trait ExecutionStartedHook: Send + Sync {
     async fn on_execution_started(&self, execution_id: &str);
+
+    /// Record only the bound PR's head SHA into `pr_head_before`, ahead of
+    /// the recovery pointer being created (dispatch moves the execution to
+    /// `running`, and so calls `on_execution_started`, after that point).
+    /// Failures prevent pointer creation and remain retryable.
+    async fn snapshot_pr_head_before(&self, _execution_id: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// No-op hook used as the default. Production swaps it out via
@@ -1515,11 +1523,6 @@ pub trait HostAdapter: Send + Sync {
     ) -> Result<execution_bookmark::RestoreReport> {
         let _ = (record, workspace, pr_bookmark, base_branch);
         bail!("rebased execution recovery is not supported by this host adapter")
-    }
-    /// Validate and heal the baseline, returning its current durable identity.
-    async fn checkpoint_execution_baseline(&self, record: &ExecutionBookmark) -> Result<String> {
-        let _ = record;
-        bail!("baseline checkpoint is not supported by this host adapter")
     }
     /// Resolve an open PR while preserving the pre-checkout recovery pointers.
     /// Returns false for a closed or merged PR, which cannot anchor recovery.

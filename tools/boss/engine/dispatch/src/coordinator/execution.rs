@@ -1832,6 +1832,10 @@ impl ExecutionCoordinator {
 
         let bookmark_result = async {
             if self.work_db.execution_bookmark_optional(&execution.id)?.is_none() {
+                self.execution_started_hook
+                    .snapshot_pr_head_before(&execution.id)
+                    .await?;
+                let execution_for_pointer = self.work_db.get_execution(&execution.id)?;
                 let predecessor = match recovered.as_ref().filter(|recovered| recovered.has_work) {
                     Some(recovered) if self.work_db.preserved_tip(&recovered.predecessor)?.is_none() => {
                         Some(self.work_db.execution_bookmark(&recovered.predecessor)?)
@@ -1841,7 +1845,7 @@ impl ExecutionCoordinator {
                 let report = self.work_db.execution_restore_report(&execution.id)?;
                 let (record, retained) = self
                     .create_or_start_fresh(
-                        execution,
+                        &execution_for_pointer,
                         &lease,
                         &adapter,
                         (

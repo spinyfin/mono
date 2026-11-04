@@ -2,7 +2,7 @@ use super::fresh_start::{FreshStart, position_fresh_workspace};
 use super::*;
 use boss_engine_recovery::execution_bookmark::{
     ExecutionBookmark, Reconciliation, is_base_unresolvable_error, is_missing_pointer_error,
-    is_pointer_integrity_error, is_reconcilable_pointer_error, pointer_integrity_error, pointer_integrity_kind,
+    is_pointer_integrity_error, pointer_integrity_error,
 };
 
 /// What dispatch recovered into the new lease.
@@ -26,6 +26,15 @@ impl ExecutionCoordinator {
         positioning: FreshStart<'_>,
     ) -> Result<(ExecutionBookmark, bool)> {
         let (predecessor, inherited_base) = inheritance;
+        // A restore report's copied PR baseline wins. On a fresh start, the
+        // bound-PR snapshot on the execution row is the floor; never walk the
+        // positioned workspace. A predecessor without a report inherits its
+        // own resolved floor inside pointer creation.
+        let inherited_base = if predecessor.is_some() {
+            inherited_base
+        } else {
+            inherited_base.or(execution.pr_head_before.as_deref())
+        };
         let result = adapter
             .create_execution_bookmark(&lease.workspace_path, &execution.id, predecessor, inherited_base)
             .await;
@@ -85,7 +94,12 @@ impl ExecutionCoordinator {
         position_fresh_workspace(adapter.as_ref(), &lease.workspace_path, &positioning).await?;
         adapter.create_change(&lease.workspace_path, positioning.title).await?;
         let record = adapter
-            .create_execution_bookmark(&lease.workspace_path, &execution.id, None, None)
+            .create_execution_bookmark(
+                &lease.workspace_path,
+                &execution.id,
+                None,
+                execution.pr_head_before.as_deref(),
+            )
             .await?;
         Ok((record, false))
     }
@@ -215,45 +229,30 @@ impl ExecutionCoordinator {
                 | ExecutionKind::TaskImplementation
                 | ExecutionKind::RevisionImplementation
         );
-        // Inspect (and if needed repair) the pointers before anything reads
-        // them: both restore paths below assume a single line from the
-        // baseline to the head.
-        let (patch, reconciliation) = match adapter.execution_bookmark_diff(record).await {
-            Ok(patch) => {
-                let base = adapter.checkpoint_execution_baseline(record).await?;
-                self.work_db.update_execution_bookmark_base(&prior.id, &base)?;
-                (patch, None)
-            }
+        // Inspect the pointers before anything reads them. The diff floor is
+        // the baseline commit recorded on the row, so a baseline bookmark that
+        // was rewritten, abandoned or deleted needs no repair here.
+        let patch = match adapter.execution_bookmark_diff(record).await {
+            Ok(patch) => patch,
             Err(err) if is_missing_pointer_error(&err) => {
                 self.degrade_missing_pointers(execution, Some(&prior.id), record, &err)
                     .await;
                 return Err(err);
             }
-            Err(err) if is_reconcilable_pointer_error(&err) => {
-                self.reconcile_for_recovery(execution, prior, record, lease, adapter, repo_id, pr_for_reconcile, err)
-                    .await?
-            }
             Err(err) => return Err(err),
         };
-        let reconciled_pr = reconciliation.as_ref().and_then(|r| match &r.anchor {
-            boss_engine_recovery::execution_bookmark::Anchor::PrHead { .. } => pr_for_reconcile,
-            _ => None,
-        });
         let has_work = if prior.id != execution.id && is_implementation {
             let has_work = !patch.trim().is_empty();
             if execution.kind == ExecutionKind::RevisionImplementation && pr_for_goto.is_none() && !has_work {
                 return Ok(None);
             }
-            // A retry after reconciliation may already have intact pointers.
-            // Keep using the recorded open PR even when this attempt did not
-            // itself move the baseline, or an empty recovered range would
-            // discard the PR implementation during restaging.
-            let positioning_pr = match reconciled_pr.or(pr_for_goto).or(pr_for_reconcile) {
+            // Keep using the recorded open PR even when the recovered range is
+            // empty, or restaging would discard the PR implementation.
+            let positioning_pr = match pr_for_goto.or(pr_for_reconcile) {
                 Some(pr)
-                    if reconciled_pr.is_some()
-                        || adapter
-                            .prepare_recovery_pr(record, &lease.workspace_path, repo_id, pr)
-                            .await? =>
+                    if adapter
+                        .prepare_recovery_pr(record, &lease.workspace_path, repo_id, pr)
+                        .await? =>
                 {
                     Some(pr)
                 }
@@ -338,83 +337,14 @@ impl ExecutionCoordinator {
                         "predecessor": prior.id,
                         "bookmark": record.head(),
                         "has_work": has_work,
-                        "reconciled": reconciliation.as_ref().map(|r| r.anchor.commit().to_owned()),
                     })),
             )
             .await;
         Ok(Some(Recovered {
             predecessor: prior.id.clone(),
             has_work,
-            reconciliation,
+            reconciliation: None,
         }))
-    }
-
-    /// Try the existing reconciliation proofs before archiving and starting fresh.
-    #[allow(clippy::too_many_arguments)]
-    async fn reconcile_for_recovery(
-        &self,
-        execution: &WorkExecution,
-        prior: &WorkExecution,
-        record: &ExecutionBookmark,
-        lease: &CubeWorkspaceLease,
-        adapter: &Arc<dyn HostAdapter>,
-        repo_id: &str,
-        pr_for_reconcile: Option<u64>,
-        failure: anyhow::Error,
-    ) -> Result<(String, Option<Reconciliation>)> {
-        let kind = pointer_integrity_kind(&failure);
-        tracing::warn!(
-            execution_id = %execution.id,
-            predecessor = %prior.id,
-            ?kind,
-            error = %failure,
-            "recovery pointers are damaged; reconciling against engine-recorded pointers"
-        );
-        let pr_bookmark = match pr_for_reconcile {
-            Some(pr) => adapter
-                .prepare_recovery_pr(record, &lease.workspace_path, repo_id, pr)
-                .await?
-                .then(|| format!("pr/{pr}")),
-            None => None,
-        };
-        let repos = adapter.list_repos().await?;
-        let trunk = repos
-            .iter()
-            .find(|repo| repo.repo_id == repo_id)
-            .map(|repo| repo.main_branch.clone())
-            .ok_or_else(|| anyhow!("recovery repository {repo_id} is absent from cube repo list"))?;
-        match adapter
-            .reconcile_execution_bookmark(record, pr_bookmark.as_deref(), &trunk)
-            .await
-        {
-            Ok(reconciliation) => {
-                let base = adapter.checkpoint_execution_baseline(record).await?;
-                self.work_db.update_execution_bookmark_base(&prior.id, &base)?;
-                if let Some(reconciliation) = &reconciliation {
-                    tracing::info!(
-                        execution_id = %execution.id,
-                        predecessor = %prior.id,
-                        anchor = ?reconciliation.anchor,
-                        "recovery pointers reconciled"
-                    );
-                    self.dispatch_events
-                        .emit(
-                            DispatchEvent::new(Stage::WorkspaceRecovery, DispatchOutcome::Ok, &execution.id)
-                                .with_work_item(&execution.work_item_id)
-                                .with_details(serde_json::json!({
-                                    "source": "pointer_reconciliation",
-                                    "predecessor": prior.id,
-                                    "anchor": reconciliation.anchor,
-                                    "failure": reconciliation.failure,
-                                })),
-                        )
-                        .await;
-                }
-                let patch = adapter.execution_bookmark_diff(record).await?;
-                Ok((patch, reconciliation))
-            }
-            Err(err) => Err(err),
-        }
     }
 
     /// Archive first, then retire the recovery source so subsequent attempts

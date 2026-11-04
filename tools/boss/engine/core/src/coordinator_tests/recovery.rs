@@ -272,7 +272,7 @@ async fn recovery_uses_shared_store_when_cube_recovered_nothing() {
 }
 
 #[tokio::test]
-async fn missing_baseline_is_rebuilt_from_the_record_or_retired_loudly_without_a_pr() {
+async fn missing_baseline_bookmark_is_not_an_integrity_failure() {
     use boss_engine_test_git::jj::JjRepo;
     for recorded_commit in [true, false] {
         let dir = tempdir().unwrap();
@@ -307,72 +307,26 @@ async fn missing_baseline_is_rebuilt_from_the_record_or_retired_loudly_without_a
             .await
             .unwrap();
         assert!(patch.exists(), "legacy evidence is never consumed");
-        let base_exists = JjRepo::run(
-            &repo.repo,
-            &[
-                "--ignore-working-copy",
-                "bookmark",
-                "list",
-                "-T",
-                "name ++ \"\\n\"",
-                &format!("boss-base/{dead_id}"),
-            ],
-        )
-        .lines()
-        .any(|l| l == format!("boss-base/{dead_id}"));
         let retired: Vec<_> = db
             .list_attention_items_for_work_item(&resume.work_item_id)
             .unwrap()
             .into_iter()
             .filter(|item| item.kind == crate::execution_bookmark_recovery::RECOVERY_RETIRED)
             .collect();
-        if recorded_commit {
-            // The record's own commit vouches for the heads: the bookmark is
-            // rebuilt from it and the work recovered as if nothing happened.
-            assert_eq!(
-                restored.map(|r| (r.predecessor, r.has_work)),
-                Some((dead_id.clone(), true))
-            );
-            assert!(base_exists, "baseline bookmark rebuilt from the recorded commit");
-            assert_eq!(
-                std::fs::read_to_string(repo.replacement.join("hello.txt")).unwrap(),
-                "recovered work\n"
-            );
-            assert!(retired.is_empty());
-            assert!(db.execution_bookmark_optional(&dead_id).unwrap().is_some());
-        } else {
-            // Nothing recorded vouches and the item has no PR: a deliberate,
-            // loud fresh start instead of blocking on the same dead pointer.
-            assert!(restored.is_none(), "{restored:?}");
-            assert!(!base_exists);
-            assert!(!repo.replacement.join("hello.txt").exists());
-            assert_eq!(retired.len(), 1, "{retired:?}");
-            assert!(
-                retired[0].body_markdown.contains("found 0"),
-                "{}",
-                retired[0].body_markdown
-            );
-            assert!(db.execution_bookmark_optional(&dead_id).unwrap().is_none());
-            let reason = db.execution_bookmark_retired_reason(&dead_id).unwrap().unwrap();
-            assert!(reason.contains("no recorded PR"), "{reason}");
-            // Durable archives replace the predecessor's disposable pointers.
-            let head = format!("glob:preserved-archive/{dead_id}/*");
-            assert!(
-                JjRepo::run(
-                    &repo.repo,
-                    &[
-                        "--ignore-working-copy",
-                        "bookmark",
-                        "list",
-                        "-T",
-                        "name ++ \"\\n\"",
-                        &head
-                    ]
-                )
-                .lines()
-                .any(|l| l.starts_with(&format!("preserved-archive/{dead_id}/")))
-            );
-        }
+        // A lost baseline bookmark, with or without a recorded baseline commit
+        // (trunk is the floor without one), is not an integrity failure: the
+        // work is recovered, nothing is rebuilt and nothing is retired.
+        assert_eq!(
+            restored.map(|r| (r.predecessor, r.has_work)),
+            Some((dead_id.clone(), true)),
+            "recorded_commit={recorded_commit}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.replacement.join("hello.txt")).unwrap(),
+            "recovered work\n"
+        );
+        assert!(retired.is_empty());
+        assert!(db.execution_bookmark_optional(&dead_id).unwrap().is_some());
     }
 }
 

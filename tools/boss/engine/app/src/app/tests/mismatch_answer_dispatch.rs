@@ -154,6 +154,7 @@ fn parked_mismatch() -> Parked {
     let (state, dir) = test_server_state_with_overrides(ServerStateOverrides {
         cube_client: Some(Arc::new(AnswerDispatchCube)),
         execution_runner: Some(runner.clone()),
+        branch_verifier: Some(Arc::new(SettableHeadRefVerifier::default())),
         pr_state_checker: Some(Arc::new(FakePrStateChecker::always(PrOpenState::Open))),
         ..Default::default()
     });

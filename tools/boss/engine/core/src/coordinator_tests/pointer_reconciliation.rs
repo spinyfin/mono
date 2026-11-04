@@ -49,18 +49,16 @@ async fn task_and_chore_recovery_keeps_verified_pr_files_and_persists_baseline()
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(
-            recovered.reconciliation.unwrap().anchor,
-            recovery::Anchor::PrHead { .. }
-        ));
+        assert!(recovered.reconciliation.is_none());
         assert_eq!(
             std::fs::read_to_string(repo.replacement.join("pr-only.txt")).unwrap(),
             "published implementation"
         );
         let reloaded = db.execution_bookmark(&prior.id).unwrap();
-        assert!(reloaded.base_commit.is_some());
-        // Retry after pointers were reconciled but before the new run starts.
-        // No reconciliation is needed now; the recorded PR still owns positioning.
+        // A record with no usable baseline commit is recovered against trunk:
+        // nothing is repaired and the row is left as recorded.
+        assert!(reloaded.base_commit.is_none());
+        // Retry before the new run starts; the recorded PR still owns positioning.
         coordinator
             .recover_execution_bookmark_for_test(&next, &lease, &coordinator.host_adapter(), "mono", None, Some(99))
             .await
@@ -70,8 +68,7 @@ async fn task_and_chore_recovery_keeps_verified_pr_files_and_persists_baseline()
             std::fs::read_to_string(repo.replacement.join("pr-only.txt")).unwrap(),
             "published implementation"
         );
-        JjRepo::run(&repo.repo, &["bookmark", "delete", &record.base()]);
-        assert!(recovery::diff(&LocalJj, &reloaded).await.unwrap().is_empty());
+        recovery::diff(&LocalJj, &reloaded).await.unwrap();
         assert!(
             db.record_execution_bookmark(&reloaded).is_err(),
             "live duplicates must fail"
@@ -86,6 +83,7 @@ async fn checkout_of_predecessor_publication_cannot_hide_unpublished_work() {
     let dir = tempdir().unwrap();
     let (db, prior, next) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
     let repo = JjRepo::new(dir.path());
+    super::recovery::configure_recovery_origin(&repo.repo);
     let record = recovery::create(&LocalJj, &repo.worker, &prior.id, "local")
         .await
         .unwrap();
@@ -113,32 +111,29 @@ async fn checkout_of_predecessor_publication_cannot_hide_unpublished_work() {
         workspace_id: "replacement".into(),
         workspace_path: repo.replacement.clone(),
     };
-    assert!(
-        coordinator
-            .recover_execution_bookmark_for_test(&next, &lease, &coordinator.host_adapter(), "mono", Some(99), Some(99))
-            .await
-            .unwrap()
-            .is_none()
+    // The publication head carries work the recovery head lacks. Neither head
+    // is dropped: both are restaged into the new workspace.
+    let recovered = coordinator
+        .recover_execution_bookmark_for_test(&next, &lease, &coordinator.host_adapter(), "mono", Some(99), Some(99))
+        .await
+        .unwrap();
+    assert!(recovered.is_some_and(|r| r.has_work));
+    assert_eq!(
+        std::fs::read_to_string(repo.replacement.join("unpublished.txt")).unwrap(),
+        "unique work"
     );
     for (name, commit) in before {
         if let Some(commit) = commit {
             if name == record.base() {
-                assert_eq!(record.base_commit.as_deref(), Some(commit.as_str()));
                 continue;
             }
-            let archive = format!("preserved-archive/{}/{commit}", prior.id);
             assert_eq!(
-                JjRepo::run(&repo.repo, &["log", "--no-graph", "-r", &archive, "-T", "commit_id"]),
-                commit
+                JjRepo::run(&repo.repo, &["log", "--no-graph", "-r", &commit, "-T", "commit_id"]),
+                commit,
+                "{name} stays reachable"
             );
         }
     }
-    let notes = coordinator
-        .work_db()
-        .list_attention_items_for_work_item(&prior.work_item_id)
-        .unwrap();
-    assert_eq!(notes[0].status, "resolved");
-    assert!(notes[0].body_markdown.contains("not contained"));
 }
 
 /// A read-only review inherits nothing from the reviewer before it: the same
@@ -313,10 +308,11 @@ async fn closed_pr_does_not_prevent_retiring_a_missing_baseline() {
 }
 
 #[tokio::test]
-async fn abandoned_recorded_baseline_is_retired_and_a_fresh_dispatch_proceeds() {
+async fn abandoned_recorded_baseline_does_not_retire_the_record() {
     let dir = tempdir().unwrap();
     let (db, prior, next) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
     let repo = JjRepo::new(dir.path());
+    super::recovery::configure_recovery_origin(&repo.repo);
     let mut record = recovery::create(&LocalJj, &repo.worker, &prior.id, "local")
         .await
         .unwrap();
@@ -345,26 +341,15 @@ async fn abandoned_recorded_baseline_is_retired_and_a_fresh_dispatch_proceeds() 
         workspace_id: "replacement".into(),
         workspace_path: repo.replacement.clone(),
     };
-    assert!(
-        coordinator
-            .recover_execution_bookmark_for_test(&next, &lease, &coordinator.host_adapter(), "mono", None, None)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_none());
-    // The retired record no longer blocks: a later dispatch starts fresh.
-    assert!(
-        coordinator
-            .recover_execution_bookmark_for_test(&next, &lease, &coordinator.host_adapter(), "mono", None, None)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    coordinator
+        .recover_execution_bookmark_for_test(&next, &lease, &coordinator.host_adapter(), "mono", None, None)
+        .await
+        .unwrap();
+    assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
 }
 
 #[tokio::test]
-async fn rewrite_checkpoint_survives_baseline_loss_and_record_reload() {
+async fn rewritten_baseline_and_lost_bookmark_need_no_checkpoint() {
     let dir = tempdir().unwrap();
     let (db, prior, _) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
     let repo = JjRepo::new(dir.path());
@@ -382,13 +367,20 @@ async fn rewrite_checkpoint_survives_baseline_loss_and_record_reload() {
     std::fs::write(repo.repo.join("upstream.txt"), "upstream").unwrap();
     JjRepo::run(&repo.repo, &["bookmark", "set", "new-upstream", "-r", "@"]);
     JjRepo::run(&repo.worker, &["rebase", "-b", &record.head(), "-d", "new-upstream"]);
-    db.checkpoint_rewritten_baselines(&prior.work_item_id).await.unwrap();
     let reloaded = db.execution_bookmark(&prior.id).unwrap();
-    assert_ne!(reloaded.base_commit, record.base_commit);
+    assert_eq!(
+        reloaded.base_commit, record.base_commit,
+        "no checkpoint rewrites the row"
+    );
     JjRepo::run(&repo.repo, &["bookmark", "delete", &record.base()]);
     let patch = recovery::diff(&LocalJj, &reloaded).await.unwrap();
     assert!(patch.contains("revision.txt"));
-    assert!(!patch.contains("pr.txt"));
+    assert!(
+        !recovery::unpublished_diff(&LocalJj, &reloaded)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// Cube's shared-store mutations exercised through both production rebase paths.
@@ -479,11 +471,6 @@ async fn damaged_historical_checkpoint_cannot_skip_retirement_or_deletion_signof
         JjRepo::run(
             &repo.repo,
             &["bookmark", "set", &record.publication(), "-r", "@", "--allow-backwards"],
-        );
-        let error = recovery::checkpoint_baseline(&LocalJj, &record).await.unwrap_err();
-        assert_eq!(
-            recovery::pointer_integrity_kind(&error),
-            Some(recovery::PointerIntegrityKind::Diverged)
         );
         let before = recovery::snapshot_pointers(&LocalJj, &record).await.unwrap();
         let publisher = RecordingPublisher::default();
@@ -906,6 +893,7 @@ mod rebase_adoption {
                 repo_path: fx.dir.path().join("missing-store"),
                 host_id: "local".into(),
                 base_commit: None,
+                pr_head_before: None,
             })
             .unwrap();
     }
@@ -1033,10 +1021,8 @@ mod rebase_adoption {
         );
         std::fs::write(fx.repo.worker.join("after.txt"), "after the rebase").unwrap();
         JjRepo::run(&fx.repo.worker, &["status"]);
-        recovery::checkpoint_baseline(&LocalJj, live).await.unwrap();
         let patch = recovery::diff(&LocalJj, live).await.unwrap();
         assert!(patch.contains("revision.txt") && patch.contains("after.txt"), "{patch}");
-        assert!(!patch.contains("upstream.txt"), "{patch}");
     }
 
     #[tokio::test]

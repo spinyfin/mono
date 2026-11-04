@@ -511,7 +511,7 @@ pub(crate) async fn run_rung1_in_lease_with(
 
     if rebase.clean {
         // A clean push is the whole operation: adopt the pushed PR head.
-        finish_rebase_pointers(work_db, &saved, attempt, candidate, rebase.pushed).await;
+        finish_rebase_pointers(work_db, &saved, attempt, rebase.pushed).await;
         if rebase.pushed {
             // Vet rung 1's pushed resolution against the
             // both-parents deletion tripwire before auto-retiring.
@@ -615,13 +615,13 @@ pub(crate) async fn run_rung1_in_lease_with(
         // one.
         // Only a retired or signoff-held resolution was pushed.
         let pushed = matches!(rung0_outcome, LadderOutcome::Retired | LadderOutcome::HaltedForSignoff);
-        finish_rebase_pointers(work_db, &saved, attempt, candidate, pushed).await;
+        finish_rebase_pointers(work_db, &saved, attempt, pushed).await;
         match rung0_outcome {
             LadderOutcome::FellThrough { reason, .. } => reason,
             other => return other,
         }
     } else {
-        finish_rebase_pointers(work_db, &saved, attempt, candidate, false).await;
+        finish_rebase_pointers(work_db, &saved, attempt, false).await;
         // Rung 0 is compile-time gated off (see `RUNG0_APPLY_LIVE`). Emit one
         // line so the engine trace records *why* the deterministic resolvers
         // show zero activity — a config fact, not a dispatch/logging bug
@@ -749,17 +749,12 @@ async fn finish_rebase_pointers(
         boss_engine_recovery::execution_bookmark::PointerSnapshot,
     )],
     attempt: &ConflictResolution,
-    candidate: &PendingMergeCheck,
     pushed: bool,
 ) {
     let branch = pushed.then_some(attempt.head_branch.as_str());
-    if work_db
+    work_db
         .finish_rebase_pointers(saved, branch, &attempt.base_branch)
-        .await
-        && let Err(err) = work_db.checkpoint_rewritten_baselines(&candidate.work_item_id).await
-    {
-        tracing::warn!(?err, "rebase baseline checkpoint unavailable");
-    }
+        .await;
 }
 
 /// Rung 0: feed rung-1's residual conflicted files to the deterministic-

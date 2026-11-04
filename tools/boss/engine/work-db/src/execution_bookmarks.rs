@@ -157,22 +157,6 @@ impl WorkDb {
         true
     }
 
-    /// Checkpoint intact records independently without changing ladder outcomes.
-    pub async fn checkpoint_rewritten_baselines(&self, chain_root_id: &str) -> Result<()> {
-        use boss_engine_recovery::execution_bookmark::checkpoint_baseline;
-        for record in self.chain_bookmark_records(chain_root_id) {
-            let result: Result<()> = async {
-                let base = checkpoint_baseline(&LocalJj, &record).await?;
-                self.update_execution_bookmark_base(&record.execution_id, &base)
-            }
-            .await;
-            if let Err(err) = result {
-                tracing::warn!(execution_id = %record.execution_id, ?err, "rebase baseline checkpoint failed; keeping recorded baseline");
-            }
-        }
-        Ok(())
-    }
-
     pub fn record_execution_restore_report(
         &self,
         execution_id: &str,
@@ -344,8 +328,10 @@ impl WorkDb {
         Ok(self
             .connect()?
             .query_row(
-                "SELECT execution_id, repo_path, host_id, base_commit FROM execution_bookmarks
-                 WHERE execution_id = ?1 AND retired_at IS NULL",
+                "SELECT eb.execution_id, eb.repo_path, eb.host_id, eb.base_commit, we.pr_head_before
+                 FROM execution_bookmarks eb
+                 LEFT JOIN work_executions we ON we.id = eb.execution_id
+                 WHERE eb.execution_id = ?1 AND eb.retired_at IS NULL",
                 [execution_id],
                 |row| {
                     Ok(ExecutionBookmark {
@@ -353,6 +339,7 @@ impl WorkDb {
                         repo_path: std::path::PathBuf::from(row.get::<_, String>(1)?),
                         host_id: row.get(2)?,
                         base_commit: row.get(3)?,
+                        pr_head_before: row.get(4)?,
                     })
                 },
             )
@@ -604,5 +591,37 @@ impl WorkDb {
             resolved_at: Some(now_string()),
         })?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod pr_head_before_loader_tests {
+    use super::*;
+    use crate::test_support::{create_ready_chore_execution, create_test_chore_manual, create_test_product};
+    use boss_engine_recovery::execution_bookmark::ExecutionBookmark;
+    use std::path::PathBuf;
+
+    #[test]
+    fn loader_attaches_pr_head_before_from_the_execution_row() {
+        let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+        let product = create_test_product(&db);
+        let chore = create_test_chore_manual(&db, product.id, "bound PR");
+        let execution = create_ready_chore_execution(&db, chore.id);
+        db.set_execution_pr_head_before(&execution.id, "abc123def456abc123def456abc123def456abc1")
+            .unwrap();
+        db.record_execution_bookmark(&ExecutionBookmark {
+            execution_id: execution.id.clone(),
+            repo_path: PathBuf::from("/tmp/shared"),
+            host_id: "local".into(),
+            base_commit: None,
+            pr_head_before: None,
+        })
+        .unwrap();
+        let record = db.execution_bookmark(&execution.id).unwrap();
+        assert_eq!(record.base_commit, None);
+        assert_eq!(
+            record.pr_head_before.as_deref(),
+            Some("abc123def456abc123def456abc123def456abc1")
+        );
     }
 }

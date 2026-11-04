@@ -124,56 +124,38 @@ async fn scene(dir: &Path, conflicted: bool, restore: bool) -> (Store, Execution
     )
 }
 
-async fn repaired(conflicted: bool, restore: bool) {
+async fn repaired(conflicted: bool) {
     let dir = tempfile::tempdir().unwrap();
-    let (store, record, head) = scene(dir.path(), conflicted, restore).await;
+    let (store, record, head) = scene(dir.path(), conflicted, true).await;
     let cube = FakeCube::new(&store, &head);
-    if restore {
-        let preserved = one(&store.repo.repo, &record.head());
-        let report = restore_rebased(
-            &store,
-            &cube,
-            &record,
-            &store.repo.replacement,
-            Some("pr/7"),
-            "main",
-            "origin",
-        )
-        .await
-        .unwrap();
-        assert!(report.pr_bound);
-        assert!(JjRepo::run(&store.repo.replacement, &["file", "show", "root:work.txt"]).contains("preserved work"));
-        assert_eq!(one(&store.repo.repo, &record.head()), preserved);
-        assert_eq!(one(&store.repo.repo, &record.publication()), preserved);
-    } else {
-        let result = reconcile(&store, &cube, &record, Some("pr/7"), "main")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(result.anchor.commit(), head);
-    }
+    let preserved = one(&store.repo.repo, &record.head());
+    let report = restore_rebased(
+        &store,
+        &cube,
+        &record,
+        &store.repo.replacement,
+        Some("pr/7"),
+        "main",
+        "origin",
+    )
+    .await
+    .unwrap();
+    assert!(report.pr_bound);
+    assert!(JjRepo::run(&store.repo.replacement, &["file", "show", "root:work.txt"]).contains("preserved work"));
+    assert_eq!(one(&store.repo.repo, &record.head()), preserved);
+    assert_eq!(one(&store.repo.repo, &record.publication()), preserved);
     assert_eq!(one(&store.repo.repo, "pr/7"), head);
     assert!(execution_bookmark::diff(&store, &record).await.unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn reconcile_repairs_missing_alias_through_fake_gh() {
-    repaired(false, false).await;
-}
-
-#[tokio::test]
-async fn reconcile_repairs_conflicted_alias_through_fake_gh() {
-    repaired(true, false).await;
-}
-
-#[tokio::test]
 async fn restore_repairs_alias_deleted_by_fetch() {
-    repaired(false, true).await;
+    repaired(false).await;
 }
 
 #[tokio::test]
 async fn restore_repairs_alias_conflicted_by_fetch() {
-    repaired(true, true).await;
+    repaired(true).await;
 }
 
 /// Stands in for `cube workspace repair-pr-bookmark`: fetches the head branch
@@ -228,12 +210,11 @@ impl PrAliasRepair for FailingCube {
 async fn lookup_failures_remain_retryable_but_cube_refusals_block() {
     let dir = tempfile::tempdir().unwrap();
     let (store, record, _) = scene(dir.path(), false, false).await;
-    let transient = reconcile(
+    let transient = ensure(
         &store,
         &FailingCube("Cube command failed: HTTP 503 network unavailable"),
         &record,
-        Some("pr/7"),
-        "main",
+        7,
     )
     .await
     .unwrap_err();
@@ -249,9 +230,7 @@ async fn lookup_failures_remain_retryable_but_cube_refusals_block() {
         // transports surface it.
         r#"Cube command failed: {"error":"cannot repair `pr/7`: PR 7 returned no head.sha: \"abc123\" is not a full 40-character commit id"}"#,
     ] {
-        let blocked = reconcile(&store, &FailingCube(refusal), &record, Some("pr/7"), "main")
-            .await
-            .unwrap_err();
+        let blocked = ensure(&store, &FailingCube(refusal), &record, 7).await.unwrap_err();
         assert!(execution_bookmark::is_pointer_integrity_error(&blocked), "{blocked:#}");
     }
 }
@@ -311,9 +290,17 @@ async fn lost_again_after_repair_is_loud_and_not_a_legacy_blocker() {
         let (store, record, sha) = scene(dir.path(), conflicted, false).await;
         store.damage_after_repair.store(true, Ordering::SeqCst);
         let lookup = FakeCube::new(&store, &sha);
-        let err = reconcile(&store, &lookup, &record, Some("pr/7"), "main")
-            .await
-            .unwrap_err();
+        let err = restore_rebased(
+            &store,
+            &lookup,
+            &record,
+            &store.repo.replacement,
+            Some("pr/7"),
+            "main",
+            "origin",
+        )
+        .await
+        .unwrap_err();
         assert!(execution_bookmark::is_pointer_integrity_error(&err));
         assert!(err.to_string().contains("removed or conflicted again"));
         assert!(!execution_bookmark::is_legacy_pr_anchor_blocker(&err.to_string()));

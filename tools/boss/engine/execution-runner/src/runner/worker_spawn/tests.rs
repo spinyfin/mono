@@ -1707,6 +1707,7 @@ mod compose_worker_spawn_tests {
             repo_path: workspace.path().to_path_buf(),
             host_id: "local".into(),
             base_commit: None,
+            pr_head_before: None,
         })
         .unwrap();
         db.record_bookmark_recovery(&execution.id, "exec_prior", false).unwrap();

@@ -1,29 +1,13 @@
-//! Repair an execution's pointers from something the engine recorded itself.
+//! Containment proofs for preserved work, and the pointer move that follows an
+//! engine rebase.
 //!
-//! Three failures are repairable, and each comes from one bookmark being
-//! moved, or deleted, without the others:
-//!
-//! - **Stranded baseline** (`NotDescended`): the change under `boss-base/…`
-//!   was rewritten in a different operation from the one that re-parented
-//!   the head (concurrent workspaces on one store merge their operations and
-//!   leave the change divergent), or an `undo`/`restore` resurrected an old
-//!   variant. The head's lineage carries the new variant; the bookmark stays
-//!   on the old one.
-//! - **Diverged heads** (`Diverged`): the worker advanced `boss/…` to push
-//!   while `boss-recovery/…` stayed behind, or cube's bound-PR checkout
-//!   re-pointed the PR branch at the remote head after a local amend.
-//! - **Missing baseline** (`MissingBaseline`): the baseline was created on
-//!   an empty positioning commit that the worker later abandoned, which
-//!   deletes the bookmarks on it, or cube forgot a conflicted bookmark.
-//!
-//! The repair never guesses. It resumes only from a pointer the engine can
-//! vouch for, in this order: the PR head cube wrote for the item's recorded
-//! PR, when every preserved change is already in it; the baseline commit the
-//! record itself carries, when the heads still descend from it; or, with no
-//! PR, the head that already carries the other head's changes. Preserved work
-//! that none of these carries is a hard failure naming each missing change,
-//! and nothing moves. Superseded commits stay in the store; only the
-//! references move.
+//! Lineage between an execution's pointers and its baseline is not checked:
+//! jj rewrites commits and merges concurrent operations as a matter of course,
+//! so a pointer that no longer descends from the recorded baseline is normal
+//! history, not damage, and nothing here repairs it. What remains is the
+//! content-equivalence proof ([`containment`]) used to decide that a vouching
+//! commit already carries preserved work, and [`adopt_pushed_head`], which
+//! moves pointers onto a PR head that carries all of it.
 use super::*;
 
 /// One rewritten change: the preserved commit and the vouching history's
@@ -75,19 +59,12 @@ pub enum Anchor {
     /// The PR head cube wrote for the item's recorded PR; all three
     /// references now point at it.
     PrHead { bookmark: String, commit: String },
-    /// The baseline commit in the record; only `boss-base/…` was recreated.
-    RecordedBaseline { commit: String },
-    /// The other head of the same execution, which already carried this
-    /// one's changes; the superseded head now points at it too.
-    ContainingHead { bookmark: String, commit: String },
 }
 
 impl Anchor {
     pub fn commit(&self) -> &str {
         match self {
-            Anchor::PrHead { commit, .. }
-            | Anchor::RecordedBaseline { commit }
-            | Anchor::ContainingHead { commit, .. } => commit,
+            Anchor::PrHead { commit, .. } => commit,
         }
     }
 }
@@ -110,22 +87,16 @@ impl Reconciliation {
     /// Worker-facing explanation, appended to the recovery instructions.
     pub fn note(&self) -> String {
         let resumed = match &self.anchor {
-            Anchor::PrHead { bookmark, commit } => format!(
-                "The engine resumed from the PR head `{bookmark}` (`{commit}`) and moved the baseline and both pointers there."
-            ),
-            Anchor::RecordedBaseline { commit } => format!(
-                "The engine recreated the baseline bookmark at the commit validated by its recorded provenance (`{commit}`); the heads were not moved."
-            ),
-            Anchor::ContainingHead { bookmark, commit } => format!(
-                "The engine resumed from `{bookmark}` (`{commit}`), which already carried the other pointer's changes, and moved that pointer there."
-            ),
+            Anchor::PrHead { bookmark, commit } => {
+                format!("The engine resumed from the PR head `{bookmark}` (`{commit}`) and moved both pointers there.")
+            }
         };
         let baseline = match &self.baseline {
             Some(commit) => format!(" (`{commit}`)"),
             None => String::new(),
         };
         let mut text = format!(
-            "## EXECUTION POINTER RECONCILIATION\n\nThe preserved pointers for execution `{}` no longer formed a single line from their engine-created baseline{baseline}: {}. {resumed}\n\n",
+            "## EXECUTION POINTER RECONCILIATION\n\nThe preserved pointers for execution `{}` were moved onto a published head{baseline}: {}. {resumed}\n\n",
             self.execution_id, self.failure
         );
         for pointer in &self.superseded {
@@ -358,21 +329,10 @@ fn missing_detail(superseded: &[SupersededPointer]) -> String {
     detail.join("; ")
 }
 
-fn baseline_detail(record: &ExecutionBookmark, base: Option<&str>) -> String {
-    match base {
-        Some(base) => format!("baseline {} is at {base}", record.base()),
-        None => format!(
-            "baseline {} is gone and the record carries no usable commit",
-            record.base()
-        ),
-    }
-}
-
-/// The pointers failed in a repairable way and nothing recorded carries the
-/// preserved work. Names each missing change for the archive/fresh-start note.
+/// Preserved work that nothing recorded carries. Names each missing change for
+/// the archive/fresh-start note.
 fn not_contained_error(
     record: &ExecutionBookmark,
-    base: Option<&str>,
     vouching_name: &str,
     vouching: &str,
     superseded: &[SupersededPointer],
@@ -381,10 +341,9 @@ fn not_contained_error(
     pointer_integrity_error_of(
         PointerIntegrityKind::NotContained,
         format!(
-            "preserved work of execution {} is not contained in {vouching_name} ({vouching}): {}; {}. Original failure: {failure}. Recovery could not be proved; dispatch will archive these pointers and start fresh.",
+            "preserved work of execution {} is not contained in {vouching_name} ({vouching}): {}. Original failure: {failure}. Recovery could not be proved; dispatch will archive these pointers and start fresh.",
             record.execution_id,
             missing_detail(superseded),
-            baseline_detail(record, base),
         ),
     )
 }
@@ -409,173 +368,26 @@ async fn set_bookmarks(jj: &dyn Jj, record: &ExecutionBookmark, bookmarks: &[Str
     Ok(())
 }
 
-/// The integrity state of a record's pointers, classified for repair.
-enum Damage {
-    Intact,
-    /// The bookmark is absent or stale but the recorded baseline's evolution
-    /// still vouches for every head: only the baseline bookmark needs repair.
-    BaselineBookmarkOnly {
-        base: String,
-    },
-    Repairable {
-        failure: anyhow::Error,
-        base: Option<String>,
-    },
-}
-
-async fn classify(jj: &dyn Jj, record: &ExecutionBookmark, heads: &Heads) -> Result<Damage> {
-    let (base, base_bookmarked) = match resolve_base(jj, record, heads).await {
-        Ok(base) => base,
-        Err(err) if pointer_integrity_kind(&err) == Some(PointerIntegrityKind::MissingBaseline) => {
-            return Ok(Damage::Repairable {
-                failure: err,
-                base: None,
-            });
-        }
-        Err(err) => return Err(err),
-    };
-    let pointers = Pointers {
-        base: base.clone(),
-        base_bookmarked,
-        heads: heads.clone(),
-    };
-    match head_bookmark_of(jj, record, &pointers).await {
-        Ok(_) if base_bookmarked => Ok(Damage::Intact),
-        Ok(_) => Ok(Damage::BaselineBookmarkOnly { base }),
-        Err(err) if is_reconcilable_pointer_error(&err) => Ok(Damage::Repairable {
-            failure: err,
-            base: Some(base),
-        }),
-        Err(err) => Err(err),
-    }
-}
-
-/// Repair stranded, diverged or baseline-less pointers from an
-/// engine-recorded anchor.
-///
-/// `pr_bookmark` is the `pr/<n>` bookmark cube's bound-PR checkout wrote for
-/// the item's recorded PR, when the item has one; it is never inferred from
-/// a branch name. `trunk` is the repository's main branch, used only to
-/// exclude upstream commits from the preserved-work range.
-///
-/// `Ok(None)` when the pointers are intact: nothing is touched. `Ok(Some)`
-/// when a recorded anchor vouched for every head and the references were
-/// moved to it. Any other integrity failure, a PR bookmark that does not
-/// resolve, or preserved work nothing recorded carries is an error, and in
-/// the last case it names each missing change and moves nothing.
+/// Retained for the host protocol: with lineage no longer an invariant there
+/// is nothing to repair, so this only confirms that at least one execution head
+/// still exists. `pr_bookmark` and `trunk` are accepted for wire compatibility.
 pub async fn reconcile(
     jj: &dyn Jj,
     record: &ExecutionBookmark,
-    pr_bookmark: Option<&str>,
-    trunk: &str,
+    _pr_bookmark: Option<&str>,
+    _trunk: &str,
 ) -> Result<Option<Reconciliation>> {
-    let heads = resolve_heads(jj, record).await?;
-    let (failure, base) = match classify(jj, record, &heads).await? {
-        Damage::Intact => return Ok(None),
-        Damage::BaselineBookmarkOnly { base } => {
-            set_bookmarks(jj, record, &[record.base()], &base).await?;
-            return Ok(Some(Reconciliation {
-                execution_id: record.execution_id.clone(),
-                anchor: Anchor::RecordedBaseline { commit: base },
-                baseline: None,
-                superseded: Vec::new(),
-                failure: format!(
-                    "recovery bookmark {} was absent or did not reference the validated baseline",
-                    record.base()
-                ),
-            }));
-        }
-        Damage::Repairable { failure, base } => (failure, base),
-    };
-    let named = heads.named(record);
-    if let Some(pr_bookmark) = pr_bookmark {
-        let pr_head = resolve_pr_head(jj, record, pr_bookmark).await?;
-        let superseded = superseded_pointers(jj, record, &named, base.as_deref(), &pr_head, trunk).await?;
-        if superseded.iter().any(|pointer| !pointer.containment.is_contained()) {
-            return Err(not_contained_error(
-                record,
-                base.as_deref(),
-                &format!("PR head {pr_bookmark}"),
-                &pr_head,
-                &superseded,
-                &failure.to_string(),
-            ));
-        }
-        let mut bookmarks = vec![record.base()];
-        bookmarks.extend(named.iter().map(|(bookmark, _)| bookmark.clone()));
-        set_bookmarks(jj, record, &bookmarks, &pr_head).await?;
-        return Ok(Some(Reconciliation {
-            execution_id: record.execution_id.clone(),
-            anchor: Anchor::PrHead {
-                bookmark: pr_bookmark.to_owned(),
-                commit: pr_head,
-            },
-            baseline: base,
-            superseded,
-            failure: failure.to_string(),
-        }));
-    }
-    // No PR to vouch. Two heads of one execution may still vouch for each
-    // other: when one already carries every change of the other, resuming
-    // from it drops nothing.
-    if let (Some(base), Some(PointerIntegrityKind::Diverged)) = (&base, pointer_integrity_kind(&failure)) {
-        for (candidate, other) in [(&named[0], &named[1]), (&named[1], &named[0])] {
-            let superseded =
-                superseded_pointers(jj, record, std::slice::from_ref(other), Some(base), &candidate.1, trunk).await?;
-            if superseded.iter().all(|pointer| pointer.containment.is_contained()) {
-                set_bookmarks(jj, record, std::slice::from_ref(&other.0), &candidate.1).await?;
-                return Ok(Some(Reconciliation {
-                    execution_id: record.execution_id.clone(),
-                    anchor: Anchor::ContainingHead {
-                        bookmark: candidate.0.clone(),
-                        commit: candidate.1.clone(),
-                    },
-                    baseline: Some(base.clone()),
-                    superseded,
-                    failure: failure.to_string(),
-                }));
-            }
-        }
-        let superseded = superseded_pointers(
-            jj,
-            record,
-            std::slice::from_ref(&named[0]),
-            Some(base),
-            &named[1].1,
-            trunk,
-        )
-        .await?;
-        return Err(not_contained_error(
-            record,
-            Some(base),
-            &named[1].0,
-            &named[1].1,
-            &superseded,
-            &failure.to_string(),
-        ));
-    }
-    // No safe recovery proof. Dispatch archives the source and starts fresh;
-    // this diagnostic is informational evidence for that fallback.
-    Err(pointer_integrity_error_of(
-        PointerIntegrityKind::NotContained,
-        format!(
-            "{failure}; the item has no recorded PR, so no engine-recorded pointer can vouch for the preserved work ({}). Nothing was moved.",
-            named
-                .iter()
-                .map(|(bookmark, commit)| format!("{bookmark} is at {commit}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    ))
+    resolve_heads(jj, record).await?;
+    Ok(None)
 }
 
-/// Move an execution's whole pointer set onto a commit that was just pushed
-/// as the PR head, after an engine rebase rewrote the lineage the pointers
-/// sit on. Adopts only when that commit already carries every preserved
-/// change of both heads (ancestry, or a content-equivalent rewrite), so a
-/// later recovery stages nothing the PR already has and no pointer ends up
-/// on a different lineage from the others. Otherwise nothing moves and the
-/// uncontained changes are named in the error.
+/// Move an execution's pointers onto a commit that was just pushed as the PR
+/// head, after an engine rebase rewrote the lineage the pointers sit on.
+/// Adopts only when that commit already carries every preserved change of both
+/// heads (ancestry, or a content-equivalent rewrite), so a later recovery
+/// stages nothing the PR already has and no pointer ends up on a different
+/// lineage from the others. Otherwise nothing moves and the uncontained
+/// changes are named in the error.
 pub async fn adopt_pushed_head(
     jj: &dyn Jj,
     record: &ExecutionBookmark,
@@ -583,19 +395,20 @@ pub async fn adopt_pushed_head(
     trunk: &str,
 ) -> Result<Anchor> {
     let heads = resolve_heads(jj, record).await?;
-    let (base, _) = resolve_base(jj, record, &heads).await?;
+    let base = resolve_base(jj, record).await?;
     let named = heads.named(record);
     let superseded = superseded_pointers(jj, record, &named, Some(&base), pushed_head, trunk).await?;
     if superseded.iter().any(|pointer| !pointer.containment.is_contained()) {
         return Err(not_contained_error(
             record,
-            Some(&base),
             "the pushed PR head",
             pushed_head,
             &superseded,
             "an engine rebase rewrote the PR branch",
         ));
     }
+    // The baseline bookmark moves with the pointers so cube and humans see one
+    // line; recovery itself reads the baseline commit recorded on the row.
     let mut bookmarks = vec![record.base()];
     bookmarks.extend(named.iter().map(|(bookmark, _)| bookmark.clone()));
     set_bookmarks(jj, record, &bookmarks, pushed_head).await?;

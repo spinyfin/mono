@@ -161,6 +161,7 @@ fn read_only_reviews_never_inherit_a_recovery_predecessor() {
             repo_path: "/tmp/shared".into(),
             host_id: "local".into(),
             base_commit: None,
+            pr_head_before: None,
         })
         .unwrap();
         db.record_worker_failure(&prior.id, "died before start").unwrap();

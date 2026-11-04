@@ -59,7 +59,7 @@ pub async fn release_lease_after_inferred_death(
             },
         };
     }
-    let snapshot = ProcessSnapshot::capture_async().await;
+    let snapshot = occupancy_snapshot().await;
     let db_gate = DbBookmarkGate { db: work_db, adapter };
     let bookmark = sweep_bookmark_gate(work_db, execution, &db_gate);
     apply_release(
@@ -75,6 +75,26 @@ pub async fn release_lease_after_inferred_death(
         do_release,
     )
     .await
+}
+
+/// Production walks every process cwd. Tests inject a complete empty
+/// snapshot: Bazel's linux-sandbox `/proc` walk is often incomplete, and
+/// an `Unknown` occupancy verdict would hold every inferred-death lease
+/// even when the fixture has already proven the worker gone. Occupancy
+/// itself is covered by the leftover-lease sweep tests that call
+/// [`ProcessSnapshot::capture`] and [`HostOccupancy`] directly.
+async fn occupancy_snapshot() -> ProcessSnapshot {
+    #[cfg(test)]
+    {
+        ProcessSnapshot {
+            cwds: Vec::new(),
+            complete: true,
+        }
+    }
+    #[cfg(not(test))]
+    {
+        ProcessSnapshot::capture_async().await
+    }
 }
 
 fn occupancy_of(workspace_path: &Path) -> Occupancy {
@@ -108,6 +128,7 @@ impl ProcessSnapshot {
     /// [`Self::capture`] for async callers: every enumeration runs on a
     /// blocking thread and the retry delay yields instead of parking a
     /// runtime worker.
+    #[cfg_attr(test, allow(dead_code))]
     async fn capture_async() -> Self {
         let mut snapshot = Self::capture_once_blocking().await;
         for _ in 1..CAPTURE_ATTEMPTS {

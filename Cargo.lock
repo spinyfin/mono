@@ -1045,7 +1045,6 @@ dependencies = [
  "bon",
  "boss-engine-test-git",
  "boss-log-files",
- "git-utils",
  "serde",
  "serde_json",
  "tempfile",

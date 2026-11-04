@@ -20,9 +20,9 @@
 //! execution recorded after its push, the pushed branch's remote-tracking
 //! bookmark, or the trunk's. Nothing is ever inferred from a name.
 //!
-//! A head is forgotten only once some voucher carries it; the baseline is
-//! always forgotten, because the record's `base_commit` and jj's evolution log
-//! let it be rebuilt ([`resolve_base`]). The recovery and publication heads
+//! A head is forgotten only once some voucher carries it; the baseline
+//! bookmark is always forgotten, because recovery reads the record's
+//! `base_commit`, never the bookmark ([`resolve_base`]). The recovery and publication heads
 //! can legitimately diverge, so each is judged on its own: a head no voucher
 //! carries stays, whichever head that is, and when no voucher resolved at all
 //! both stay. Because only proven heads are ever forgotten, a later call with
@@ -194,11 +194,7 @@ pub async fn prune(jj: &dyn Jj, record: &ExecutionBookmark, vouchers: &[Voucher]
         }
         Err(err) => return Err(err),
     };
-    let base = match resolve_base(jj, record, &heads).await {
-        Ok((base, _)) => Some(base),
-        Err(err) if pointer_integrity_kind(&err) == Some(PointerIntegrityKind::MissingBaseline) => None,
-        Err(err) => return Err(err),
-    };
+    let base = resolve_base(jj, record).await?;
     let named = heads.named(record);
     let mut tried = Vec::new();
     // The cheapest proof needs no voucher at all: when every non-empty
@@ -244,7 +240,7 @@ pub async fn prune(jj: &dyn Jj, record: &ExecutionBookmark, vouchers: &[Voucher]
         };
         let mut containments = Vec::with_capacity(named.len());
         for (_, head) in &named {
-            containments.push(containment(jj, repo, base.as_deref(), head, &commit, trunk).await?);
+            containments.push(containment(jj, repo, Some(&base), head, &commit, trunk).await?);
         }
         let attempt = Attempt {
             label: voucher.label.clone(),

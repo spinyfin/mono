@@ -251,6 +251,7 @@ async fn recorded_commit_transport_failure_is_not_an_integrity_verdict() {
         repo_path: "store".into(),
         host_id: "remote".into(),
         base_commit: None,
+        pr_head_before: None,
     };
     let saved = PreservedTip {
         change_id: "change".into(),
@@ -584,6 +585,7 @@ async fn missing_bookmark_recorded_inspect_failure_is_not_empty_work() {
         repo_path: "store".into(),
         host_id: "remote".into(),
         base_commit: None,
+        pr_head_before: None,
     };
     let saved = PreservedTip {
         change_id: "change".into(),

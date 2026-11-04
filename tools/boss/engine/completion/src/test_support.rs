@@ -151,6 +151,7 @@ pub fn preserve_test_workspace(db: &WorkDb, execution_id: &str) {
         },
         host_id: "local".to_owned(),
         base_commit: None,
+        pr_head_before: None,
     };
     JjRepo::run(workspace, &["bookmark", "set", &record.base(), "-r", "@-"]);
     JjRepo::run(
@@ -169,6 +170,7 @@ pub fn record_remote_test_recovery(db: &WorkDb, execution_id: &str, host: &str) 
         repo_path: std::path::PathBuf::from(execution.workspace_path.unwrap()),
         host_id: host.to_owned(),
         base_commit: None,
+        pr_head_before: None,
     })
     .unwrap();
 }
