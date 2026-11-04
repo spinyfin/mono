@@ -1,0 +1,9 @@
+[package]
+name = "boss-engine-recovery-fixtures"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+anyhow = { workspace = true }
+boss-engine-recovery = { path = "../recovery" }

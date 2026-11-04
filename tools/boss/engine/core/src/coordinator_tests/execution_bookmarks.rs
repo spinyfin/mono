@@ -1,6 +1,7 @@
 use super::helpers::*;
 use crate::work::{FakePrStateChecker, PrOpenState};
-use boss_engine_recovery::execution_bookmark::{LocalJj, create};
+use boss_engine_recovery::execution_bookmark::LocalJj;
+use boss_engine_recovery_fixtures::create;
 use boss_engine_test_git::jj::JjRepo;
 
 #[tokio::test]
@@ -93,6 +94,36 @@ async fn fresh_dispatch_preserves_and_reports_work_without_legacy_bookmark_failu
                     .contains("unpublished")
                 );
             }
+            // A successor publishes the preserved work while the teardown count
+            // stays frozen on the row; the next scan must resolve, not re-raise.
+            let preserved = preserved_name(&execution.id);
+            // jj refuses to push undescribed commits; describing keeps change ids.
+            JjRepo::run(
+                &repo.repo,
+                &[
+                    "describe",
+                    "-m",
+                    "published work",
+                    &format!("trunk()..bookmarks(exact:\"{preserved}\")"),
+                ],
+            );
+            JjRepo::run(&repo.repo, &["bookmark", "create", "published", "-r", &preserved]);
+            JjRepo::run(
+                &repo.repo,
+                &["git", "push", "--remote", "origin", "-b", "published", "--allow-new"],
+            );
+            assert!(db.preserved_tip(&execution.id).unwrap().unwrap().count > 0);
+            crate::abandoned_execution_bookmarks::run_one_pass(&db, &coordinator)
+                .await
+                .unwrap();
+            let notes = db.list_attention_items(&execution.id).unwrap();
+            assert!(
+                notes.iter().all(
+                    |note| note.kind != crate::abandoned_execution_bookmarks::RECOVERABLE_WORK
+                        || note.status == "resolved"
+                ),
+                "{notes:?}"
+            );
         }
     }
 }
@@ -630,7 +661,8 @@ mod prune_sweep {
     use super::super::helpers::*;
     use crate::execution_bookmark_prune::{BATCH_SIZE, GH_LOOKUPS_PER_PASS, UNPROVEN, run_one_pass};
     use crate::work::{PrOpenState, PrStateChecker, prune_outcome};
-    use boss_engine_recovery::execution_bookmark::{ExecutionBookmark, LocalJj, create};
+    use boss_engine_recovery::execution_bookmark::{ExecutionBookmark, LocalJj};
+    use boss_engine_recovery_fixtures::create;
     use boss_engine_test_git::jj::JjRepo;
     use std::sync::atomic::AtomicUsize;
 

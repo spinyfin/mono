@@ -20,5 +20,6 @@ serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "time"] }
 
 [dev-dependencies]
+boss-engine-recovery-fixtures = { path = "../recovery-fixtures" }
 boss-engine-test-git = { path = "../test-git" }
 tempfile = { workspace = true }

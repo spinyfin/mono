@@ -15,9 +15,11 @@ pub(crate) async fn run_one_pass(db: &WorkDb, coordinator: &ExecutionCoordinator
         let inspection = async {
             let record = db.execution_bookmark(&execution.id)?;
             let (pointer, has_work) = if let Some(tip) = db.preserved_tip(&execution.id)? {
+                // The teardown count is a snapshot; a successor may have
+                // restored and published the work since.
                 (
                     boss_engine_recovery::execution_bookmark::preserved_name(&execution.id),
-                    tip.count > 0,
+                    tip.count > 0 && coordinator.preserved_work_unpublished(&record, &tip).await?,
                 )
             } else {
                 let patch = coordinator.inspect_execution_bookmark(&record).await?;

@@ -373,6 +373,15 @@ impl ExecutionCoordinator {
         }
         .await;
         let heads = archive?;
+        if heads.is_empty() && is_missing_pointer_error(reason) && !is_pointer_integrity_error(reason) {
+            // Nothing was archived and nothing was damaged: the execution never
+            // preserved work. Drop the row so dispatch records a fresh baseline,
+            // without a recovery-problem note or a skipped-recovery event.
+            tracing::debug!(execution_id = %execution.id, predecessor = %prior.id, "no recovery source to retire beyond the row");
+            self.work_db
+                .retire_execution_bookmark(&prior.id, "no preserved work; nothing to recover")?;
+            return Ok(());
+        }
         let reason = format!("pointer integrity: {reason:#}");
         tracing::info!(
             execution_id = %execution.id,
@@ -403,23 +412,6 @@ impl ExecutionCoordinator {
         Ok(())
     }
 
-    /// Shared handling for a recorded recovery pointer whose bookmarks are both
-    /// gone: name them in the log, emit the skipped-recovery event, and let the
-    /// caller continue without recovery. Integrity and transport errors never
-    /// come through here.
-    pub(super) async fn degrade_missing_pointers(
-        &self,
-        execution: &WorkExecution,
-        predecessor: Option<&str>,
-        record: &boss_engine_recovery::execution_bookmark::ExecutionBookmark,
-        err: &anyhow::Error,
-    ) {
-        tracing::warn!(execution_id = %execution.id, predecessor,
-            recovery_pointer = %record.head(), publication_pointer = %record.publication(),
-            error = %err, "recovery pointers are missing; continuing without recovery");
-        self.warn_missing_execution_bookmark(execution, predecessor).await;
-    }
-
     /// Loud, non-fatal: a missing pointer is visible in dispatch events and
     /// logs, but does not fail dispatch or resume. The abandoned-bookmark
     /// sweep is the place that still reports it as attention.
@@ -440,6 +432,23 @@ impl ExecutionCoordinator {
                     })),
             )
             .await;
+    }
+
+    /// Whether `recorded` still holds unpublished work on the record's host.
+    pub async fn preserved_work_unpublished(
+        &self,
+        record: &boss_engine_recovery::execution_bookmark::ExecutionBookmark,
+        recorded: &boss_engine_recovery::execution_bookmark::PreservedTip,
+    ) -> Result<bool> {
+        let host = self
+            .work_db
+            .get_host(&record.host_id)?
+            .ok_or_else(|| anyhow!("recovery host {} is unavailable", record.host_id))?;
+        self.host_adapter_provider
+            .adapter_for(&host)
+            .await?
+            .preserved_work_unpublished(record, recorded)
+            .await
     }
 
     pub async fn inspect_execution_bookmark(

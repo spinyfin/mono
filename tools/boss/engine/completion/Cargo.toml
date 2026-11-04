@@ -12,6 +12,7 @@ test-support = [
   "boss-work-db/test-support",
   "boss-engine-live-worker-state/test-support",
   "dep:boss-engine-proposal-validation",
+  "dep:boss-engine-recovery-fixtures",
   "dep:boss-engine-test-git",
   "dep:rusqlite",
   "dep:tempfile",
@@ -30,6 +31,7 @@ boss-engine-proposal-validation = { path = "../proposal-validation", optional = 
 boss-engine-recovery = { path = "../recovery" }
 boss-engine-storage-values = { path = "../storage-values" }
 boss-engine-structured-output = { path = "../structured-output" }
+boss-engine-recovery-fixtures = { path = "../recovery-fixtures", optional = true }
 boss-engine-test-git = { path = "../test-git", optional = true }
 boss-engine-utils = { path = "../utils" }
 boss-engine-worker-bin = { path = "../worker-bin" }
@@ -63,6 +65,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 boss-engine-live-worker-state = { path = "../live-worker-state", features = ["test-support"] }
 boss-engine-proposal-validation = { path = "../proposal-validation" }
+boss-engine-recovery-fixtures = { path = "../recovery-fixtures" }
 boss-engine-test-git = { path = "../test-git" }
 boss-execution-contracts = { path = "../execution-contracts", features = ["test-support"] }
 boss-work-db = { path = "../work-db", features = ["test-support"] }

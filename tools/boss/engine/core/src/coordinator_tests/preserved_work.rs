@@ -22,7 +22,7 @@ async fn dispatch_prefers_preserved_work_over_retired_legacy_pointers() {
         ],
     );
     JjRepo::run(&repo.repo, &["git", "fetch"]);
-    let record = recovery::create(&LocalJj, &repo.worker, &prior.id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -85,7 +85,7 @@ async fn undecidable_preserved_bookmark_starts_fresh_and_raises_one_attention() 
     let repo = JjRepo::new(dir.path());
     let (db, prior, mut next) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
     JjRepo::run(&repo.repo, &["bookmark", "set", "main", "pr/99", "-r", "@"]);
-    let record = recovery::create(&LocalJj, &repo.worker, &prior.id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -220,7 +220,7 @@ async fn self_retry_restages_preserved_work_when_legacy_pointers_are_retired() {
     let repo = JjRepo::new(dir.path());
     let (db, execution, _) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
     export_origin(&repo);
-    let record = recovery::create(&LocalJj, &repo.worker, &execution.id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &execution.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -284,7 +284,7 @@ async fn pre_start_teardown_then_retry_preserves_later_unpublished_edits() {
     let db_path = dir.path().join("boss.db");
     let (db, prior, execution) = super::blocked_workspace::blocked_pair(&db_path);
     export_origin(&repo);
-    let prior_record = recovery::create(&LocalJj, &repo.worker, &prior.id, "local")
+    let prior_record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&prior_record).unwrap();
@@ -325,7 +325,7 @@ async fn pre_start_teardown_then_retry_preserves_later_unpublished_edits() {
         )
         .unwrap();
     let execution = db.get_execution(&execution.id).unwrap();
-    let record = recovery::create(&LocalJj, &repo.replacement, &execution.id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.replacement, &execution.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -485,7 +485,7 @@ async fn missing_preserved_bookmark_with_unresolvable_commit_raises_attention() 
     let repo = JjRepo::new(dir.path());
     let (db, prior, next) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
     export_origin(&repo);
-    let record = recovery::create(&LocalJj, &repo.worker, &prior.id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -536,7 +536,7 @@ async fn second_restore_keeps_archived_variant_attention() {
     let repo = JjRepo::new(dir.path());
     let (db, prior, next) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
     export_origin(&repo);
-    let record = recovery::create(&LocalJj, &repo.worker, &prior.id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();

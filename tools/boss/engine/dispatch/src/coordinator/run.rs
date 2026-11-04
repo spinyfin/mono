@@ -1141,7 +1141,8 @@ impl ExecutionCoordinator {
             match self.inspect_execution_bookmark(&record).await {
                 Ok(patch) => Ok(Some(patch)),
                 Err(err) if boss_engine_recovery::execution_bookmark::is_missing_pointer_error(&err) => {
-                    self.degrade_missing_pointers(execution, None, &record, &err).await;
+                    // No head is the normal state of a run that preserved nothing.
+                    tracing::debug!(execution_id = %execution.id, "no legacy execution head to inspect");
                     Ok(None)
                 }
                 Err(err) => Err(err),

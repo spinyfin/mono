@@ -557,9 +557,15 @@ impl WorkDb {
             archives,
             (
                 "Recovery source retired; starting fresh",
-                &format!(
-                    "Execution `{next_id}` starts fresh from an open PR, trunk, or the captured immutable review target. No action is required."
-                ),
+                &if archives.is_empty() {
+                    format!(
+                        "Execution `{next_id}` starts fresh from an open PR, trunk, or the captured immutable review target. No action is required."
+                    )
+                } else {
+                    format!(
+                        "Execution `{next_id}` starts fresh from an open PR, trunk, or the captured immutable review target. Any unpublished work from the retired source remains at the archive bookmarks listed above; inspect them if that work is still wanted."
+                    )
+                },
             ),
         )
     }

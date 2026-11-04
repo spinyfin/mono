@@ -18,7 +18,7 @@ async fn task_and_chore_recovery_keeps_verified_pr_files_without_persisting_a_ba
         next.kind = kind;
         let repo = JjRepo::new(dir.path());
         super::recovery::configure_recovery_origin(&repo.repo);
-        let mut record = recovery::create(&LocalJj, &repo.worker, &prior.id, "local")
+        let mut record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "local")
             .await
             .unwrap();
         record.base_commit = None;
@@ -84,7 +84,7 @@ async fn checkout_of_predecessor_publication_cannot_hide_unpublished_work() {
     let (db, prior, next) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
     let repo = JjRepo::new(dir.path());
     super::recovery::configure_recovery_origin(&repo.repo);
-    let record = recovery::create(&LocalJj, &repo.worker, &prior.id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -157,7 +157,7 @@ async fn read_only_review_ignores_a_damaged_predecessor_record() {
         .unwrap();
     next.kind = ExecutionKind::PrReview;
     let repo = JjRepo::new(dir.path());
-    let record = recovery::create(&LocalJj, &repo.worker, &prior.id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -273,7 +273,7 @@ async fn closed_pr_with_a_missing_baseline_recovers_against_trunk_without_retiri
     let dir = tempdir().unwrap();
     let (db, prior, next) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
     let repo = JjRepo::new(dir.path());
-    let mut record = recovery::create(&LocalJj, &repo.worker, &prior.id, "local")
+    let mut record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "local")
         .await
         .unwrap();
     record.base_commit = None;
@@ -314,7 +314,7 @@ async fn abandoned_recorded_baseline_does_not_retire_the_record() {
     let (db, prior, next) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
     let repo = JjRepo::new(dir.path());
     super::recovery::configure_recovery_origin(&repo.repo);
-    let mut record = recovery::create(&LocalJj, &repo.worker, &prior.id, "local")
+    let mut record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "local")
         .await
         .unwrap();
     // The record names cube's empty positioning commit as its baseline, which
@@ -358,7 +358,7 @@ async fn rewritten_baseline_and_lost_bookmark_need_no_checkpoint() {
     JjRepo::run(&repo.worker, &["new", "main", "-m", "PR implementation"]);
     std::fs::write(repo.worker.join("pr.txt"), "implementation").unwrap();
     JjRepo::run(&repo.worker, &["new", "-m", "Revision"]);
-    let record = recovery::create(&LocalJj, &repo.worker, &prior.id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -461,7 +461,7 @@ async fn damaged_historical_checkpoint_cannot_skip_retirement_or_deletion_signof
             )
             .unwrap();
         let repo = JjRepo::new(dir.path());
-        let record = recovery::create(&LocalJj, &repo.worker, &execution.id, "local")
+        let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &execution.id, "local")
             .await
             .unwrap();
         db.record_execution_bookmark(&record).unwrap();
@@ -535,7 +535,7 @@ async fn speculative_rewrite_restores_original_baseline_before_next_goto() {
     JjRepo::run(&repo.worker, &["new", "main", "-m", "Published implementation"]);
     std::fs::write(repo.worker.join("pr.txt"), "implementation").unwrap();
     JjRepo::run(&repo.worker, &["new", "-m", "Revision"]);
-    let record = recovery::create(&LocalJj, &repo.worker, &prior.id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -623,7 +623,7 @@ mod rebase_adoption {
         JjRepo::run(&repo.worker, &["new", "main", "-m", "PR work"]);
         std::fs::write(repo.worker.join("pr.txt"), "implementation").unwrap();
         JjRepo::run(&repo.worker, &["new", "-m", "Revision"]);
-        let root = recovery::create(&LocalJj, &repo.worker, &execution.id, "local")
+        let root = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &execution.id, "local")
             .await
             .unwrap();
         db.record_execution_bookmark(&root).unwrap();
@@ -681,7 +681,7 @@ mod rebase_adoption {
                     .build(),
             )
             .unwrap();
-        let record = recovery::create(&LocalJj, &fx.repo.worker, &execution.id, "local")
+        let record = boss_engine_recovery_fixtures::create(&LocalJj, &fx.repo.worker, &execution.id, "local")
             .await
             .unwrap();
         fx.db.record_execution_bookmark(&record).unwrap();
@@ -982,7 +982,7 @@ mod rebase_adoption {
                     .build(),
             )
             .unwrap();
-        let record = recovery::create(&LocalJj, &fx.repo.worker, &execution.id, "local")
+        let record = boss_engine_recovery_fixtures::create(&LocalJj, &fx.repo.worker, &execution.id, "local")
             .await
             .unwrap();
         fx.db.record_execution_bookmark(&record).unwrap();

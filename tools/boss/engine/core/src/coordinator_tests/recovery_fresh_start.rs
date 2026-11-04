@@ -73,7 +73,7 @@ async fn fresh_start_on_host(kind: ExecutionKind, resume: bool, pr: bool, disabl
     let source = if resume { next.id.clone() } else { prior.id.clone() };
     let repo = JjRepo::new(dir.path());
     super::recovery::configure_recovery_origin(&repo.repo);
-    let record = recovery::create(&LocalJj, &repo.worker, &source, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &source, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -409,7 +409,7 @@ async fn source_host_dispatch(full: bool) {
     let next = db.get_execution(&next.id).unwrap();
     let repo = JjRepo::new(dir.path());
     super::recovery::configure_recovery_origin(&repo.repo);
-    let record = recovery::create(&LocalJj, &repo.worker, &prior.id, "source")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "source")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -487,7 +487,7 @@ async fn free_recovery_source_host_is_preferred_over_another_eligible_host() {
     let next = db.get_execution(&next.id).unwrap();
     let repo = JjRepo::new(dir.path());
     super::recovery::configure_recovery_origin(&repo.repo);
-    let record = recovery::create(&LocalJj, &repo.worker, &prior.id, "source")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "source")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -595,7 +595,7 @@ async fn stale_current_names_retry_adoption_without_retiring_valid_predecessor()
     let (db, prior, next) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
     let repo = JjRepo::new(dir.path());
     super::recovery::configure_recovery_origin(&repo.repo);
-    let source = recovery::create(&LocalJj, &repo.worker, &prior.id, "local")
+    let source = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&source).unwrap();
@@ -603,7 +603,7 @@ async fn stale_current_names_retry_adoption_without_retiring_valid_predecessor()
     JjRepo::run(&repo.worker, &["status"]);
     let head = commit(&repo.repo, &source.head());
     JjRepo::run(&repo.replacement, &["new", &head, "-m", "Recovered"]);
-    let stale = recovery::create(&LocalJj, &repo.replacement, &next.id, "local")
+    let stale = boss_engine_recovery_fixtures::create(&LocalJj, &repo.replacement, &next.id, "local")
         .await
         .unwrap();
     std::fs::write(repo.replacement.join("stale.txt"), "distinct stale work").unwrap();
@@ -744,7 +744,7 @@ async fn startup_pane_resume_archives_damaged_pointers_and_spawns() {
     seed_local_claude_driver(&db);
     let repo = JjRepo::new(dir.path());
     super::recovery::configure_recovery_origin(&repo.repo);
-    let record = recovery::create(&LocalJj, &repo.worker, &next.id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &next.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -856,7 +856,7 @@ async fn initialization_fallback(inherited: bool) {
     let source_id = if inherited { &source.id } else { &next.id };
     let repo = JjRepo::new(dir.path());
     super::recovery::configure_recovery_origin(&repo.repo);
-    let prior = recovery::create(&LocalJj, &repo.worker, source_id, "local")
+    let prior = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, source_id, "local")
         .await
         .unwrap();
     std::fs::write(repo.worker.join("lost.txt"), "keep this work").unwrap();

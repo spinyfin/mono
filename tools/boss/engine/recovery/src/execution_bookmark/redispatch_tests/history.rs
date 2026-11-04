@@ -81,7 +81,8 @@ async fn redispatch_does_not_promote_positioning_changes_into_pushed_history() {
             )
             .await
             .unwrap();
-            // A second redispatch with no edits must not reintroduce the setup entry.
+            // A second redispatch must not promote positioning or setup changes
+            // into the history that gets pushed.
             let second = restore_rebased(&LocalJj, &next, &repo.replacement, pr, "main", "origin").await;
             if has_fixes {
                 second.unwrap();

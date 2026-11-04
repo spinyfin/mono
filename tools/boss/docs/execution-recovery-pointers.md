@@ -1,11 +1,15 @@
 # Execution recovery pointers
 
-Dispatch records a starting commit on the execution row. It does not create `boss-base/<execution id>` or `boss/<execution id>` at dispatch. A transitional `boss-recovery/<execution id>` exists only when the positioned lease already carries unpublished commits. The worker creates `boss/<execution id>` immediately before `cube pr create`. Teardown preservation (`preserved/<execution id>`) is the source for later edits; the worker does not advance recovery bookmarks.
+Dispatch creates no bookmarks. It records the baseline commit on the `execution_bookmarks` row, and the rest of the lifecycle is:
+
+- The worker creates the publication branch `boss/<execution id>` (`jj bookmark set boss/<execution id> -r @`) immediately before `cube pr create`. The worker does not advance any recovery bookmark.
+- At teardown, when the workspace holds unpublished work, the engine writes one `preserved/<execution id>` bookmark at its tip and records that tip on the execution row. Nothing is written when there is nothing to preserve. The preserved tip is the source for later edits.
+- A transitional `boss-recovery/<execution id>` head exists only when a positioned lease already carries unpublished commits (work restored from a preserved tip). A `boss-base/<execution id>` bookmark exists only for legacy executions that were in flight before this layout; recovery never reads it.
 
 Legacy names still found in the store:
 
-- `boss-base/<execution id>`: leftover baseline bookmark from earlier engines. Recovery never reads it; the floor is the row's `base_commit`.
-- `boss-recovery/<execution id>`: transitional recovery head created only for unpublished work already on the lease at dispatch.
+- `boss-base/<execution id>`: leftover baseline bookmark from earlier engines. The floor is the row's `base_commit`.
+- `boss-recovery/<execution id>`: recovery head, transitional as described above.
 - `boss/<execution id>`: the publication head the worker creates before opening a PR, then pushes.
 
 The `execution_bookmarks` row for the execution records the shared store path, the host, and the baseline commit id (`base_commit`) recorded at dispatch from `work_executions.pr_head_before` (bound PR) or the commit the workspace was positioned on (normally trunk, or an open task PR's head when recovery positioned there), captured as the working copy's parent right after positioning, or returned by the engine's own fresh positioning, and carried to pointer creation so a trunk that advances in between cannot move the floor. `trunk()` resolved at pointer creation is only the last resort when no positioned commit could be captured; the positioned commit is captured after every positioning (a fresh change's parent, or the PR head / target commit a goto landed on), even when the pre-pointer snapshot recorded no `pr_head_before`; a failed capture is retried as a pre-start failure rather than recording that later floor. Recovery reads that commit id as the floor of the execution's work; it never reads the `boss-base/` bookmark. A baseline commit that was rewritten or abandoned still exists in the store and still works as a floor; a row with no usable `base_commit` uses the bound PR's `pr_head_before`, then trunk.

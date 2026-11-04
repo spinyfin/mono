@@ -243,7 +243,8 @@ async fn record_then_delete_heads(
     dir: &std::path::Path,
     execution_id: &str,
 ) -> boss_engine_test_git::jj::JjRepo {
-    use boss_engine_recovery::execution_bookmark::{LocalJj, create};
+    use boss_engine_recovery::execution_bookmark::LocalJj;
+    use boss_engine_recovery_fixtures::create;
     use boss_engine_test_git::jj::JjRepo;
     let repo = JjRepo::new(dir);
     let record = create(&LocalJj, &repo.worker, execution_id, "local").await.unwrap();
@@ -328,6 +329,55 @@ async fn self_retry_with_deleted_own_heads_drops_the_stale_row_and_continues() {
         )
         .is_empty()
     );
+}
+
+/// A row recorded by dispatch for a run that preserved nothing has a baseline
+/// commit and no head. Redispatching it is ordinary, not a recovery failure.
+#[tokio::test]
+async fn redispatch_of_a_fresh_empty_execution_raises_no_recovery_note() {
+    use boss_engine_recovery::execution_bookmark::{LocalJj, create_from};
+    use boss_engine_test_git::jj::JjRepo;
+    for self_retry in [true, false] {
+        let dir = tempdir().unwrap();
+        let (db, prior, next) = blocked_pair(&dir.path().join("boss.db"));
+        let repo = JjRepo::new(dir.path());
+        super::recovery::configure_recovery_origin(&repo.repo);
+        JjRepo::run(&repo.repo, &["git", "fetch", "--remote", "origin", "--branch", "main"]);
+        let source = if self_retry { &next } else { &prior };
+        let record = create_from(&LocalJj, &repo.worker, &source.id, "local", None, None)
+            .await
+            .unwrap();
+        db.record_execution_bookmark(&record).unwrap();
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            Arc::new(FakeCubeClient {
+                real_bookmarks: true,
+                ..FakeCubeClient::default()
+            }),
+            Arc::new(FakeExecutionRunner::default()),
+        ));
+        let lease = CubeWorkspaceLease {
+            lease_id: "lease-new".into(),
+            workspace_id: "workspace-old".into(),
+            workspace_path: repo.worker.clone(),
+            dirty_verified: None,
+        };
+        let recovered = coordinator
+            .recover_execution_bookmark_for_test(&next, &lease, &coordinator.host_adapter(), "mono", None, None)
+            .await
+            .unwrap();
+        assert!(recovered.is_none(), "self_retry {self_retry}: {recovered:?}");
+        for work_item in [&prior.work_item_id, &next.work_item_id] {
+            assert!(
+                db.list_attention_items_for_work_item(work_item)
+                    .unwrap()
+                    .iter()
+                    .all(|item| item.kind != crate::execution_bookmark_recovery::RECOVERY_RETIRED),
+                "self_retry {self_retry}: a fresh empty run must not write a recovery note"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -520,7 +570,8 @@ async fn blocked_revision_dispatch_restores_bookmark_with_or_without_original_wo
             )
             .unwrap();
         let next = db.get_execution(&next.id).unwrap();
-        use boss_engine_recovery::execution_bookmark::{LocalJj, create};
+        use boss_engine_recovery::execution_bookmark::LocalJj;
+        use boss_engine_recovery_fixtures::create;
         use boss_engine_test_git::jj::JjRepo;
         let repo = JjRepo::new(dir.path());
         super::recovery::configure_recovery_origin(&repo.repo);
@@ -605,7 +656,8 @@ async fn blocked_revision_dispatch_restages_a_record_without_a_baseline() {
             )
             .unwrap();
         let next = db.get_execution(&next.id).unwrap();
-        use boss_engine_recovery::execution_bookmark::{LocalJj, create};
+        use boss_engine_recovery::execution_bookmark::LocalJj;
+        use boss_engine_recovery_fixtures::create;
         use boss_engine_test_git::jj::JjRepo;
         let repo = JjRepo::new(dir.path());
         super::recovery::configure_recovery_origin(&repo.repo);
@@ -708,7 +760,8 @@ pub(super) struct ChainHarness {
 /// execution created through `request_resume_execution` (which never stamps
 /// `pr_url`). `chain_root_pr` / `origin` toggle the failure shapes.
 pub(super) async fn chain_harness(chain_root_pr: bool, origin: bool, conflict: bool) -> ChainHarness {
-    use boss_engine_recovery::execution_bookmark::{LocalJj, create};
+    use boss_engine_recovery::execution_bookmark::LocalJj;
+    use boss_engine_recovery_fixtures::create;
     use boss_engine_test_git::jj::JjRepo;
     let dir = tempdir().unwrap();
     let path = dir.path().join("boss.db");
@@ -1328,7 +1381,8 @@ async fn revision_recovery_selects_the_repo_by_id_not_by_stored_url() {
 
 #[tokio::test]
 async fn pr_review_self_retry_with_a_record_still_positions_via_goto() {
-    use boss_engine_recovery::execution_bookmark::{LocalJj, create};
+    use boss_engine_recovery::execution_bookmark::LocalJj;
+    use boss_engine_recovery_fixtures::create;
     let mut h = chain_harness(true, true, false).await;
     let db = h.coordinator.work_db().clone();
     rusqlite::Connection::open(h._dir.path().join("boss.db"))

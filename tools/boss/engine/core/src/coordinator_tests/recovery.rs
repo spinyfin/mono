@@ -147,7 +147,8 @@ async fn revision_resume_uses_fresh_scratch_without_workspace_pinning() {
 }
 
 async fn record_recovery_work(db: &WorkDb, id: &str, workspace: &std::path::Path) {
-    use boss_engine_recovery::execution_bookmark::{LocalJj, create};
+    use boss_engine_recovery::execution_bookmark::LocalJj;
+    use boss_engine_recovery_fixtures::create;
     let shared = boss_engine_recovery::execution_bookmark::Jj::shared_repo(&LocalJj, workspace)
         .await
         .unwrap();
@@ -872,7 +873,8 @@ async fn resume_pane_spawn_reenters_the_runner_for_a_running_leased_execution() 
 
 #[tokio::test]
 async fn resume_pane_spawn_continues_when_the_recorded_heads_are_missing() {
-    use boss_engine_recovery::execution_bookmark::{LocalJj, create};
+    use boss_engine_recovery::execution_bookmark::LocalJj;
+    use boss_engine_recovery_fixtures::create;
     use boss_engine_test_git::jj::JjRepo;
     let (_dir, db) = open_db_arc();
     seed_local_claude_driver(&db);

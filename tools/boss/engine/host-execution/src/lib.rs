@@ -2360,7 +2360,7 @@ mod tests {
         use boss_engine_recovery::execution_bookmark::{self as recovery, Jj, LocalJj};
         let root = tempfile::tempdir().unwrap();
         let repo = boss_engine_test_git::jj::JjRepo::new(root.path());
-        let record = recovery::create(&LocalJj, &repo.worker, "exec_test", "host")
+        let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, "exec_test", "host")
             .await
             .unwrap();
         std::fs::write(repo.worker.join("work.txt"), "preserved work").unwrap();
@@ -2567,7 +2567,7 @@ mod tests {
         };
         std::fs::write(repo.worker.join("work.txt"), "worker edit").unwrap();
         LocalJj.run(&repo.worker, &["status"]).await.unwrap();
-        // The worker creates the publication branch immediately before opening a PR.
+        // Dispatch creates no publication branch; create it as a worker does before publishing.
         LocalJj
             .run(&repo.worker, &["bookmark", "set", "boss/exec_test", "-r", "@"])
             .await
@@ -2676,7 +2676,7 @@ mod recovery_tests {
         for interrupt in [false, true] {
             let root = tempfile::tempdir().unwrap();
             let repo = boss_engine_test_git::jj::JjRepo::new(root.path());
-            let record = recovery::create(&LocalJj, &repo.worker, "exec_test", "host")
+            let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, "exec_test", "host")
                 .await
                 .unwrap();
             let saved = recovery::snapshot_pointers(&LocalJj, &record).await.unwrap();

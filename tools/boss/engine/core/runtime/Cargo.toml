@@ -109,6 +109,7 @@ boss-execution-runner = { path = "../../execution-runner", features = ["test-sup
 boss-execution-contracts = { path = "../../execution-contracts", features = ["test-support"] }
 boss-work-db = { path = "../../work-db", features = ["test-support"] }
 boss-prose-vocabulary = { path = "../../prose-vocabulary" }
+boss-engine-recovery-fixtures = { path = "../../recovery-fixtures" }
 boss-engine-test-git = { path = "../../test-git" }
 tempfile = { workspace = true }
 wiremock = { workspace = true }

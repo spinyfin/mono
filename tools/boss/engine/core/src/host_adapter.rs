@@ -252,7 +252,9 @@ impl HostAdapter for LocalHostAdapter {
         since_unix: Option<i64>,
         tip_source: WorkspaceTipSource,
     ) -> anyhow::Result<execution_bookmark::PreserveOutcome> {
-        anyhow::ensure!(record.host_id == self.host_id(), "recovery host mismatch");
+        if record.host_id != self.host_id() {
+            return Err(execution_bookmark::pointer_integrity_error("recovery host mismatch"));
+        }
         execution_bookmark::preserve_from(&LocalJj, record, workspace, recorded, since_unix, tip_source).await
     }
     async fn restore_preserved_work(
@@ -269,12 +271,26 @@ impl HostAdapter for LocalHostAdapter {
         execution_bookmark::restore_preserved(&LocalJj, record, workspace, recorded).await
     }
 
+    async fn preserved_work_unpublished(
+        &self,
+        record: &ExecutionBookmark,
+        recorded: &execution_bookmark::PreservedTip,
+    ) -> Result<bool> {
+        if record.host_id != self.host_id() {
+            return Err(execution_bookmark::pointer_integrity_error(
+                "preserved work belongs to another host",
+            ));
+        }
+        execution_bookmark::preserved_work_unpublished(&LocalJj, record, recorded).await
+    }
+
     async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {
-        anyhow::ensure!(
-            record.host_id == "local",
-            "recovery bookmark belongs to host {}",
-            record.host_id
-        );
+        if record.host_id != "local" {
+            return Err(execution_bookmark::pointer_integrity_error(format!(
+                "recovery bookmark belongs to host {}",
+                record.host_id
+            )));
+        }
         execution_bookmark::unpublished_diff(&LocalJj, record).await
     }
 
@@ -284,19 +300,21 @@ impl HostAdapter for LocalHostAdapter {
         workspace: &Path,
         self_retry: bool,
     ) -> Result<bool> {
-        anyhow::ensure!(
-            record.host_id == "local",
-            "recovery bookmark belongs to host {}",
-            record.host_id
-        );
+        if record.host_id != "local" {
+            return Err(execution_bookmark::pointer_integrity_error(format!(
+                "recovery bookmark belongs to host {}",
+                record.host_id
+            )));
+        }
         execution_bookmark::restore_for_retry(&LocalJj, record, workspace, self_retry).await
     }
     async fn discard_orphaned_execution_baseline(&self, record: &ExecutionBookmark) -> Result<()> {
-        anyhow::ensure!(
-            record.host_id == "local",
-            "recovery bookmark belongs to host {}",
-            record.host_id
-        );
+        if record.host_id != "local" {
+            return Err(execution_bookmark::pointer_integrity_error(format!(
+                "recovery bookmark belongs to host {}",
+                record.host_id
+            )));
+        }
         execution_bookmark::discard_orphaned_baseline(&LocalJj, record).await
     }
     async fn restore_rebased_execution_bookmark(
@@ -306,10 +324,11 @@ impl HostAdapter for LocalHostAdapter {
         pr_bookmark: Option<&str>,
         base_branch: &str,
     ) -> Result<execution_bookmark::RestoreReport> {
-        anyhow::ensure!(
-            record.host_id == self.host_id(),
-            "recovery store belongs to another host"
-        );
+        if record.host_id != self.host_id() {
+            return Err(execution_bookmark::pointer_integrity_error(
+                "recovery store belongs to another host",
+            ));
+        }
         let remote = boss_host_execution::workspace::recovery_remote(&LocalJj, workspace).await?;
         pr_anchor::restore_rebased(&LocalJj, self, record, workspace, pr_bookmark, base_branch, &remote).await
     }
@@ -320,10 +339,11 @@ impl HostAdapter for LocalHostAdapter {
         repo_id: &str,
         pr: u64,
     ) -> Result<bool> {
-        anyhow::ensure!(
-            record.host_id == self.host_id(),
-            "recovery store belongs to another host"
-        );
+        if record.host_id != self.host_id() {
+            return Err(execution_bookmark::pointer_integrity_error(
+                "recovery store belongs to another host",
+            ));
+        }
         if !recovery_pr_is_open(self, repo_id, pr).await? {
             return Ok(false);
         }
@@ -344,11 +364,12 @@ impl HostAdapter for LocalHostAdapter {
         record: &ExecutionBookmark,
         release_names: bool,
     ) -> Result<Vec<(String, String)>> {
-        anyhow::ensure!(
-            record.host_id == "local",
-            "recovery bookmark belongs to host {}",
-            record.host_id
-        );
+        if record.host_id != "local" {
+            return Err(execution_bookmark::pointer_integrity_error(format!(
+                "recovery bookmark belongs to host {}",
+                record.host_id
+            )));
+        }
         execution_bookmark::release_heads(&LocalJj, record, release_names).await
     }
     async fn prune_execution_bookmark(
@@ -357,11 +378,12 @@ impl HostAdapter for LocalHostAdapter {
         vouchers: &[execution_bookmark::Voucher],
         trunk: &str,
     ) -> Result<execution_bookmark::PruneOutcome> {
-        anyhow::ensure!(
-            record.host_id == "local",
-            "recovery bookmark belongs to host {}",
-            record.host_id
-        );
+        if record.host_id != "local" {
+            return Err(execution_bookmark::pointer_integrity_error(format!(
+                "recovery bookmark belongs to host {}",
+                record.host_id
+            )));
+        }
         execution_bookmark::prune(&LocalJj, record, vouchers, trunk).await
     }
 
@@ -870,7 +892,9 @@ impl HostAdapter for SshHostAdapter {
         since_unix: Option<i64>,
         tip_source: WorkspaceTipSource,
     ) -> anyhow::Result<execution_bookmark::PreserveOutcome> {
-        anyhow::ensure!(record.host_id == self.host_id(), "recovery host mismatch");
+        if record.host_id != self.host_id() {
+            return Err(execution_bookmark::pointer_integrity_error("recovery host mismatch"));
+        }
         execution_bookmark::preserve_from(self, record, workspace, recorded, since_unix, tip_source).await
     }
     async fn restore_preserved_work(
@@ -887,12 +911,26 @@ impl HostAdapter for SshHostAdapter {
         execution_bookmark::restore_preserved(self, record, workspace, recorded).await
     }
 
+    async fn preserved_work_unpublished(
+        &self,
+        record: &ExecutionBookmark,
+        recorded: &execution_bookmark::PreservedTip,
+    ) -> Result<bool> {
+        if record.host_id != self.host_id() {
+            return Err(execution_bookmark::pointer_integrity_error(
+                "preserved work belongs to another host",
+            ));
+        }
+        execution_bookmark::preserved_work_unpublished(self, record, recorded).await
+    }
+
     async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {
-        anyhow::ensure!(
-            record.host_id == self.host_id(),
-            "recovery bookmark belongs to host {}",
-            record.host_id
-        );
+        if record.host_id != self.host_id() {
+            return Err(execution_bookmark::pointer_integrity_error(format!(
+                "recovery bookmark belongs to host {}",
+                record.host_id
+            )));
+        }
         execution_bookmark::unpublished_diff(self, record).await
     }
 
@@ -902,19 +940,21 @@ impl HostAdapter for SshHostAdapter {
         workspace: &Path,
         self_retry: bool,
     ) -> Result<bool> {
-        anyhow::ensure!(
-            record.host_id == self.host_id(),
-            "recovery bookmark belongs to host {}",
-            record.host_id
-        );
+        if record.host_id != self.host_id() {
+            return Err(execution_bookmark::pointer_integrity_error(format!(
+                "recovery bookmark belongs to host {}",
+                record.host_id
+            )));
+        }
         execution_bookmark::restore_for_retry(self, record, workspace, self_retry).await
     }
     async fn discard_orphaned_execution_baseline(&self, record: &ExecutionBookmark) -> Result<()> {
-        anyhow::ensure!(
-            record.host_id == self.host_id(),
-            "recovery bookmark belongs to host {}",
-            record.host_id
-        );
+        if record.host_id != self.host_id() {
+            return Err(execution_bookmark::pointer_integrity_error(format!(
+                "recovery bookmark belongs to host {}",
+                record.host_id
+            )));
+        }
         execution_bookmark::discard_orphaned_baseline(self, record).await
     }
     async fn restore_rebased_execution_bookmark(
@@ -924,10 +964,11 @@ impl HostAdapter for SshHostAdapter {
         pr_bookmark: Option<&str>,
         base_branch: &str,
     ) -> Result<execution_bookmark::RestoreReport> {
-        anyhow::ensure!(
-            record.host_id == self.host_id(),
-            "recovery store belongs to another host"
-        );
+        if record.host_id != self.host_id() {
+            return Err(execution_bookmark::pointer_integrity_error(
+                "recovery store belongs to another host",
+            ));
+        }
         let remote = boss_host_execution::workspace::recovery_remote(self, workspace).await?;
         pr_anchor::restore_rebased(self, self, record, workspace, pr_bookmark, base_branch, &remote).await
     }
@@ -938,10 +979,11 @@ impl HostAdapter for SshHostAdapter {
         repo_id: &str,
         pr: u64,
     ) -> Result<bool> {
-        anyhow::ensure!(
-            record.host_id == self.host_id(),
-            "recovery store belongs to another host"
-        );
+        if record.host_id != self.host_id() {
+            return Err(execution_bookmark::pointer_integrity_error(
+                "recovery store belongs to another host",
+            ));
+        }
         if !recovery_pr_is_open(self, repo_id, pr).await? {
             return Ok(false);
         }
@@ -965,10 +1007,11 @@ impl HostAdapter for SshHostAdapter {
         record: &ExecutionBookmark,
         release_names: bool,
     ) -> Result<Vec<(String, String)>> {
-        anyhow::ensure!(
-            record.host_id == self.host_id(),
-            "recovery store belongs to another host"
-        );
+        if record.host_id != self.host_id() {
+            return Err(execution_bookmark::pointer_integrity_error(
+                "recovery store belongs to another host",
+            ));
+        }
         execution_bookmark::release_heads(self, record, release_names).await
     }
 

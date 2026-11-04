@@ -23,7 +23,7 @@ mod preserved;
 mod preserved_tests;
 pub use preserved::{
     BoundaryOwnership, PreserveInspect, PreserveOutcome, PreservedTip, WorkspaceTipSource, preserve, preserve_from,
-    preserved_archive_name, preserved_archive_prefix, preserved_name,
+    preserved_archive_name, preserved_archive_prefix, preserved_name, preserved_work_unpublished,
 };
 mod preserved_restore;
 pub use preserved_restore::restore_preserved;
@@ -516,12 +516,14 @@ pub(crate) async fn resume_heads_of(jj: &dyn Jj, record: &ExecutionBookmark) -> 
     resume_heads(jj, record, &pointers).await
 }
 
-/// Compatibility fixtures that still need the pre-migration three-bookmark layout.
-pub mod test_support;
-
-/// Compatibility alias for [`test_support::create_legacy_three_bookmark_fixture`].
-/// Dispatch uses [`create_from`], which never creates baseline or publication names.
-pub use test_support::{create_legacy_three_bookmark_fixture as create, create_legacy_three_bookmark_fixture_from};
+/// Compatibility fixtures for the pre-migration three-bookmark layout, used only by this
+/// crate's own tests. Other crates use `boss_engine_recovery_fixtures`.
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+pub(crate) use test_support::{
+    create_legacy_three_bookmark_fixture as create, create_legacy_three_bookmark_fixture_from,
+};
 
 /// Pointer initialization failed after identifying the shared store. Dispatch
 /// archives these pointers before creating fresh ones.
