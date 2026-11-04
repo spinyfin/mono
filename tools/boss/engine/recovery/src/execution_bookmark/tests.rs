@@ -48,6 +48,97 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn fresh_dispatch_records_the_floor_without_a_store_operation_and_teardown_preserves_edits() {
+    let f = Fixture::new().await;
+    let trunk = one_commit(&LocalJj, &f.repo, "@").await.unwrap();
+    LocalJj
+        .run(
+            &f.repo,
+            &["config", "set", "--repo", "revset-aliases.\"trunk()\"", &trunk],
+        )
+        .await
+        .unwrap();
+    let operation = || async {
+        LocalJj
+            .run(&f.repo, &["op", "log", "--no-graph", "-n", "1", "-T", "id"])
+            .await
+            .unwrap()
+    };
+    let before = operation().await;
+    let record = create_from(&LocalJj, &f.worker, "exec_fresh", "local", None, None)
+        .await
+        .unwrap();
+    assert_eq!(operation().await, before, "empty dispatch must not mutate the store");
+    assert_eq!(
+        record.base_commit,
+        Some(one_commit(&LocalJj, &f.worker, "trunk()").await.unwrap())
+    );
+    assert!(LocalJj.run(&f.repo, &["bookmark", "list"]).await.unwrap().is_empty());
+
+    // The worker need not advance any recovery bookmark, even across new changes.
+    std::fs::write(f.worker.join("first.txt"), "first edit").unwrap();
+    LocalJj.run(&f.worker, &["new", "-m", "Follow-up"]).await.unwrap();
+    std::fs::write(f.worker.join("second.txt"), "second edit").unwrap();
+    let saved = preserve(&LocalJj, &record, &f.worker, None, None).await.unwrap();
+    assert!(saved.tip.is_some());
+    assert!(saved.inspect.is_none());
+    let names = LocalJj
+        .run(&f.repo, &["bookmark", "list", "-T", "name ++ \"\\n\""])
+        .await
+        .unwrap();
+    assert_eq!(names.trim(), preserved_name(&record.execution_id));
+    for file in ["first.txt", "second.txt"] {
+        let content = LocalJj
+            .run(
+                &f.repo,
+                &[
+                    "file",
+                    "show",
+                    "-r",
+                    &preserved_name(&record.execution_id),
+                    &format!("root:{file}"),
+                ],
+            )
+            .await
+            .unwrap();
+        assert!(content.contains("edit"));
+    }
+}
+
+#[tokio::test]
+async fn restored_dispatch_creates_only_one_recovery_head_and_uses_the_recorded_floor() {
+    let f = Fixture::new().await;
+    let prior = f.record("exec_prior").await;
+    f.edit(&prior).await;
+    restore(&LocalJj, &prior, &f.replacement).await.unwrap();
+    let before = LocalJj
+        .run(&f.repo, &["op", "log", "--no-graph", "-n", "1", "-T", "id"])
+        .await
+        .unwrap();
+    let next = create_from(&LocalJj, &f.replacement, "exec_next", "local", Some(&prior), None)
+        .await
+        .unwrap();
+    let parent = LocalJj
+        .run(
+            &f.repo,
+            &["op", "log", "--no-graph", "--at-op", "@-", "-n", "1", "-T", "id"],
+        )
+        .await
+        .unwrap();
+    assert_eq!(parent, before, "restored dispatch must perform one store operation");
+    assert_eq!(next.base_commit, prior.base_commit);
+    let names = LocalJj
+        .run(
+            &f.repo,
+            &["bookmark", "list", "glob:*exec_next", "-T", "name ++ \"\\n\""],
+        )
+        .await
+        .unwrap();
+    assert_eq!(names.trim(), next.head());
+    assert!(unpublished_diff(&LocalJj, &next).await.unwrap().contains("second.txt"));
+}
+
+#[tokio::test]
 async fn terminated_run_survives_released_removed_reused_and_foreign_leased_workspace() {
     for state in ["released", "removed", "reused", "leased_elsewhere"] {
         let f = Fixture::new().await;
@@ -523,6 +614,7 @@ async fn conflicted_pointer_bookmark_is_a_pointer_integrity_error() {
 async fn existing_initialization_names_are_an_integrity_failure() {
     let f = Fixture::new().await;
     let record = f.record("exec_existing").await;
+    f.edit(&record).await;
     let error = create(&LocalJj, &f.worker, &record.execution_id, "local")
         .await
         .unwrap_err();
@@ -546,9 +638,16 @@ impl Jj for UnavailableInitialization {
 #[tokio::test]
 async fn initialization_transport_error_remains_retryable() {
     let f = Fixture::new().await;
-    let error = create(&UnavailableInitialization, &f.worker, "exec_transport", "local")
-        .await
-        .unwrap_err();
+    let error = create_from(
+        &UnavailableInitialization,
+        &f.worker,
+        "exec_transport",
+        "local",
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
     assert!(error.downcast_ref::<CreationFailure>().is_some());
     assert!(!is_pointer_integrity_error(&error));
     assert!(format!("{error:#}").contains("SSH unavailable"));

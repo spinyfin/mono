@@ -2567,6 +2567,11 @@ mod tests {
         };
         std::fs::write(repo.worker.join("work.txt"), "worker edit").unwrap();
         LocalJj.run(&repo.worker, &["status"]).await.unwrap();
+        // The publication branch is now created by the worker, not dispatch.
+        LocalJj
+            .run(&repo.worker, &["bookmark", "set", "boss/exec_test", "-r", "@"])
+            .await
+            .unwrap();
         for anchor in [String::new(), "0123456789abcdef0123456789abcdef01234567".to_owned()] {
             let mut bookmark = created.bookmark.clone().unwrap();
             bookmark.anchor_commit = anchor;

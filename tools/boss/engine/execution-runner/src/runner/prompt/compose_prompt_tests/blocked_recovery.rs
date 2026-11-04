@@ -62,7 +62,8 @@ fn revision_recovery_never_offers_checkout_that_discards_inherited_work() {
     assert!(prompt.contains("Stay at `@`"));
     assert!(!prompt.contains("The engine pre-positioned this workspace via"));
     assert!(!prompt.contains("**Fallback**"));
-    assert!(prompt.contains("keep it advanced locally"));
+    assert!(!prompt.contains("keep it advanced locally"));
+    assert!(prompt.contains("preserves unpublished workspace edits at teardown"));
     assert!(prompt.contains("pr update --branch"));
     assert!(prompt.contains("--json headRefName --jq .headRefName"));
     assert!(!prompt.contains("jj log -r 'parents(@)'"));

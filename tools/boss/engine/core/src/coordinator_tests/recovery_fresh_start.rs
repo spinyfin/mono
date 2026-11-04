@@ -84,6 +84,9 @@ async fn fresh_start_on_host(kind: ExecutionKind, resume: bool, pr: bool, disabl
     std::fs::write(repo.repo.join("shared.txt"), "current published work\n").unwrap();
     JjRepo::run(&repo.repo, &["bookmark", "set", "pr/99", "-r", "@"]);
     let current = commit(&repo.repo, "@");
+    if pr {
+        db.set_execution_pr_head_before(&next.id, &current).unwrap();
+    }
     if !disabled_source {
         // Two concurrent operations move the recovery head to different
         // commits, leaving the bookmark conflicted: a genuine integrity failure
@@ -200,7 +203,20 @@ async fn fresh_start_on_host(kind: ExecutionKind, resume: bool, pr: bool, disabl
     if !pr {
         assert_ne!(commit(&repo.repo, "main"), expected);
     }
-    assert!(recovery::diff(&LocalJj, &fresh).await.unwrap().is_empty());
+    assert!(
+        JjRepo::run(
+            &repo.repo,
+            &["bookmark", "list", &fresh.base(), &fresh.head(), &fresh.publication()]
+        )
+        .is_empty()
+    );
+    assert!(
+        JjRepo::run(
+            &repo.replacement,
+            &["diff", "--git", "--from", fresh.base_commit.as_deref().unwrap()]
+        )
+        .is_empty()
+    );
     // Scheduler passes must not refire the running attempt or lease again.
     for _ in 0..3 {
         coordinator.drain_ready_queue_for_test().await;
@@ -357,7 +373,7 @@ async fn unreachable_source_transport_retries_without_retiring_source() {
 }
 
 #[tokio::test]
-async fn full_remote_source_waits_without_retiring_recoverable_work() {
+async fn full_remote_source_does_not_pin_dispatch_to_its_occupied_slot() {
     source_host_dispatch(true).await;
 }
 
@@ -421,25 +437,22 @@ async fn source_host_dispatch(full: bool) {
     let result = coordinator
         .schedule_execution_for_test(&next, &worker, DispatchAdmission::Queued)
         .await;
-    if full {
-        let err = result.unwrap_err();
-        assert!(format!("{err:#}").contains("no free slot"), "{err:#}");
-        assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
-        assert!(db.execution_bookmark_retired_reason(&prior.id).unwrap().is_none());
-        assert!(cube.lease_calls.lock().await.is_empty());
-    } else {
-        let error = result.unwrap_err();
-        assert!(
-            format!("{error:#}").contains("source transport unavailable"),
-            "{error:#}"
-        );
-        let next = db.get_execution(&next.id).unwrap();
-        assert!(next.started_at.is_none());
-        assert_eq!(next.pre_start_failure_count, 1);
-        assert!(next.dispatch_not_before.is_some());
-        assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
-        assert!(db.execution_bookmark_retired_reason(&prior.id).unwrap().is_none());
-    }
+    let error = result.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("source transport unavailable"),
+        "{error:#}"
+    );
+    assert_eq!(
+        cube.lease_calls.lock().await.len(),
+        1,
+        "dispatch chose an available host"
+    );
+    let next = db.get_execution(&next.id).unwrap();
+    assert!(next.started_at.is_none());
+    assert_eq!(next.pre_start_failure_count, 1);
+    assert!(next.dispatch_not_before.is_some());
+    assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
+    assert!(db.execution_bookmark_retired_reason(&prior.id).unwrap().is_none());
     for name in [record.head(), record.publication()] {
         assert_eq!(commit(&repo.repo, &name), old);
     }
@@ -686,7 +699,20 @@ async fn startup_pane_resume_archives_damaged_pointers_and_spawns() {
     assert_eq!(commit(&repo.repo, &format!("preserved-archive/{}/{old}", next.id)), old);
     let fresh = db.execution_bookmark(&next.id).unwrap();
     assert_eq!(fresh.base_commit, Some(commit(&repo.repo, "main")));
-    assert!(recovery::diff(&LocalJj, &fresh).await.unwrap().is_empty());
+    assert!(
+        JjRepo::run(
+            &repo.repo,
+            &["bookmark", "list", &fresh.base(), &fresh.head(), &fresh.publication()]
+        )
+        .is_empty()
+    );
+    assert!(
+        JjRepo::run(
+            &repo.replacement,
+            &["diff", "--git", "--from", fresh.base_commit.as_deref().unwrap()]
+        )
+        .is_empty()
+    );
     assert!(!repo.worker.join("work.txt").exists());
     for _ in 0..100 {
         if !runner.calls.lock().await.is_empty() {
@@ -703,7 +729,7 @@ async fn partial_pointer_initialization_archives_before_recreating_the_names() {
 }
 
 #[tokio::test]
-async fn inherited_baseline_adoption_failure_archives_and_starts_fresh() {
+async fn staged_work_survives_a_later_conflict_in_the_predecessor_bookmark() {
     initialization_fallback(true).await;
 }
 
@@ -794,8 +820,25 @@ async fn initialization_fallback(inherited: bool) {
             )
             .await
             .unwrap();
-        assert!(!retained);
-        fresh
+        assert!(retained);
+        assert_eq!(fresh.base_commit, prior.base_commit);
+        assert!(repo.replacement.join("lost.txt").exists());
+        assert!(
+            recovery::diff(&LocalJj, &fresh)
+                .await
+                .unwrap()
+                .contains("keep this work")
+        );
+        assert!(
+            db.list_attention_items_for_work_item(&next.work_item_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            recovery::diff(&LocalJj, &prior).await.is_err(),
+            "the conflicted predecessor was left intact"
+        );
+        return;
     };
     assert_eq!(fresh.base_commit.unwrap(), commit(&repo.repo, "main"));
     assert!(!repo.replacement.join("lost.txt").exists());

@@ -1,8 +1,8 @@
 //! Engine-created recovery references in the shared jj repository.
 //!
-//! The worker advances the execution bookmark before editing a new change;
-//! jj itself follows rewrites of the bookmarked change. Recovery never reads
-//! the originating working copy. The baseline is the commit id recorded on the
+//! Teardown preserves unpublished workspace edits; workers maintain only their
+//! publication branch. Legacy recovery references remain readable during the
+//! transition. The baseline is the commit id recorded on the
 //! execution row at dispatch (`pr_head_before` for a bound PR, the trunk commit
 //! for a fresh item), so rewriting or abandoning any bookmark never invalidates
 //! it; published upstream history is excluded when checking for abandoned work.
@@ -515,10 +515,27 @@ pub(crate) async fn resume_heads_of(jj: &dyn Jj, record: &ExecutionBookmark) -> 
     resume_heads(jj, record, &pointers).await
 }
 
-/// Called after positioning, before a worker can run. Existing refs are errors:
-/// retry callers must use their persisted record, never overwrite provenance.
+/// Construct a legacy three-bookmark record for recovery compatibility fixtures.
+/// Dispatch uses `create_from`, which never creates baseline or publication names.
 pub async fn create(jj: &dyn Jj, workspace: &Path, execution_id: &str, host_id: &str) -> Result<ExecutionBookmark> {
-    create_from(jj, workspace, execution_id, host_id, None, None).await
+    let record = create_from(jj, workspace, execution_id, host_id, None, None).await?;
+    jj.run(
+        workspace,
+        &[
+            "bookmark",
+            "set",
+            &record.base(),
+            "-r",
+            record.base_commit.as_deref().unwrap(),
+        ],
+    )
+    .await?;
+    jj.run(
+        workspace,
+        &["bookmark", "set", &record.head(), &record.publication(), "-r", "@"],
+    )
+    .await?;
+    Ok(record)
 }
 
 /// Pointer initialization failed after identifying the shared store. Dispatch
@@ -568,13 +585,12 @@ pub async fn create_from(
                 "execution recovery pointer names already exist",
             ));
         }
-        if let Some(prior) = predecessor {
-            if prior.repo_path != record.repo_path || prior.host_id != record.host_id {
-                return Err(pointer_integrity_error(
-                    "inherited baseline belongs to another recovery store",
-                ));
-            }
-            diff(jj, prior).await?;
+        if let Some(prior) = predecessor
+            && (prior.repo_path != record.repo_path || prior.host_id != record.host_id)
+        {
+            return Err(pointer_integrity_error(
+                "inherited baseline belongs to another recovery store",
+            ));
         }
         // A restore-report, positioned-commit, or `pr_head_before` hash is
         // the floor only when it still exists. A missing hash is not copied:
@@ -588,17 +604,27 @@ pub async fn create_from(
         } else {
             one_commit(jj, workspace, "trunk()").await?
         };
-        jj.run(workspace, &["bookmark", "create", &record.base(), "-r", &baseline])
+        record.base_commit = Some(baseline.clone());
+        // Fresh dispatch records only its starting commit. Retain the legacy
+        // recovery head only when the positioned lease carries unpublished work;
+        // teardown preserves subsequent edits from the workspace itself.
+        let unpublished = jj
+            .run(
+                workspace,
+                &[
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    &format!("({baseline}..@) ~ (::remote_bookmarks() | empty())"),
+                    "-T",
+                    "commit_id",
+                ],
+            )
             .await?;
-        jj.run(
-            workspace,
-            &["bookmark", "create", &record.head(), &record.publication(), "-r", "@"],
-        )
-        .await?;
-        // The bookmark is the convenience; the commit is the baseline's identity.
-        record.base_commit = Some(one_commit(jj, workspace, &baseline).await?);
-        // Validate through the shared store, not the workspace we just positioned.
-        diff(jj, &record).await?;
+        if !unpublished.trim().is_empty() {
+            jj.run(workspace, &["bookmark", "create", &record.head(), "-r", "@"])
+                .await?;
+        }
         Ok(record.clone())
     }
     .await;

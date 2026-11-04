@@ -77,6 +77,12 @@ pub async fn backup_dead_execution(db: &WorkDb, execution: &WorkExecution) -> Op
     .await;
     match result {
         Ok(path) => path,
+        Err(err) if boss_engine_recovery::execution_bookmark::is_missing_pointer_error(&err) => {
+            // Fresh executions have no legacy head. Lease teardown preserves
+            // the workspace directly, including edits after the last jj new.
+            tracing::debug!(execution_id = %execution.id, "no legacy bookmark to export; teardown preserves workspace work");
+            None
+        }
         Err(err) => {
             report_failure(db, execution, &format!("{err:#}"));
             None

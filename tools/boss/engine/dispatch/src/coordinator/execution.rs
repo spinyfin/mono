@@ -390,40 +390,6 @@ impl ExecutionCoordinator {
         // there. `schedule_execution` clears it explicitly on success or
         // on a terminal cancel — never here.
         let requested = self.requested_host_for(&execution.id);
-        let recovery_record = match self.work_db.execution_bookmark_optional(&execution.id)? {
-            Some(record) => Some(record),
-            None => match self.work_db.recovery_predecessor(execution)? {
-                Some(prior) => self.work_db.execution_bookmark_optional(&prior.id)?,
-                None => None,
-            },
-        };
-        if let Some(record) = recovery_record
-            && pinned.is_none()
-            && requested.is_none()
-            && execution.kind != ExecutionKind::PrReviewGuide
-        {
-            // Prefer the source host when unconstrained. A requested host or
-            // local-only guide archives the source through its owning adapter
-            // and starts fresh instead of failing host selection.
-            match self.pick_host(
-                work_item,
-                None,
-                Some(record.host_id.clone()),
-                self.resolve_spawn_driver(execution, worker_id)?,
-            ) {
-                Ok(host) => return Ok(host),
-                Err(err) => {
-                    let Some(failure) = err.downcast_ref::<HostSelectionFailure>() else {
-                        return Err(err);
-                    };
-                    if failure.report.iter().any(|entry| {
-                        entry.host_id == record.host_id && entry.reasons == [IneligibilityReason::NoFreeSlots]
-                    }) {
-                        return Err(err);
-                    }
-                }
-            }
-        }
         if execution.kind == ExecutionKind::PrReviewGuide {
             for host in [pinned.as_deref(), requested.as_deref()].into_iter().flatten() {
                 anyhow::ensure!(

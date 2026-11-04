@@ -14,16 +14,24 @@ pub(crate) async fn run_one_pass(db: &WorkDb, coordinator: &ExecutionCoordinator
     for execution in executions {
         let inspection = async {
             let record = db.execution_bookmark(&execution.id)?;
-            let patch = coordinator.inspect_execution_bookmark(&record).await?;
+            let (pointer, has_work) = if let Some(tip) = db.preserved_tip(&execution.id)? {
+                (
+                    boss_engine_recovery::execution_bookmark::preserved_name(&execution.id),
+                    tip.count > 0,
+                )
+            } else {
+                let patch = coordinator.inspect_execution_bookmark(&record).await?;
+                (record.head(), !patch.trim().is_empty())
+            };
             db.resolve_attention_kind_for_execution(
                 &execution.id,
                 crate::execution_bookmark_recovery::RECOVERY_FAILED,
             )?;
-            Ok::<_, anyhow::Error>((record, patch))
+            Ok::<_, anyhow::Error>((record, pointer, has_work))
         }
         .await;
         match inspection {
-            Ok((record, patch)) if !patch.trim().is_empty() => {
+            Ok((record, pointer, true)) => {
                 if db
                     .reraise_open_execution_attention(&execution.id, RECOVERABLE_WORK)?
                     .is_some()
@@ -36,13 +44,18 @@ pub(crate) async fn run_one_pass(db: &WorkDb, coordinator: &ExecutionCoordinator
                     kind: RECOVERABLE_WORK.to_owned(),
                     status: None,
                     title: "Unpublished execution work is recoverable".to_owned(),
-                    body_markdown: format!("Execution `{}` left unpublished work at engine-created bookmark `{}` in the shared jj store on host `{}`. Recovery can resume this work in a fresh lease; the originating workspace is not needed. The engine has not pushed this unvalidated work.", execution.id, record.head(), record.host_id),
+                    body_markdown: format!("Execution `{}` has recorded unpublished work at bookmark `{}` in the shared jj store on host `{}`. Recovery can resume this work in a fresh lease; the originating workspace is not needed. The engine has not pushed this unvalidated work.", execution.id, pointer, record.host_id),
                     resolved_at: None,
                 })?;
                 reported += 1;
             }
             Ok(_) => {
                 db.resolve_attention_kind_for_execution(&execution.id, RECOVERABLE_WORK)?;
+            }
+            Err(err) if boss_engine_recovery::execution_bookmark::is_missing_pointer_error(&err) => {
+                // Absence is normal for new executions. Teardown owns workspace
+                // preservation and reports any failure through its own attention.
+                tracing::debug!(execution_id = %execution.id, "no legacy execution bookmark to inspect");
             }
             Err(err) => {
                 crate::execution_bookmark_recovery::report_failure(db, &execution, &format!("{err:#}"));

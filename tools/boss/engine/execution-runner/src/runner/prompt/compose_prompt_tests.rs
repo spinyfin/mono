@@ -963,7 +963,7 @@ fn revision_prompt_omits_expected_branch_line() {
     // The revision directive remains the only — and now uncontradicted —
     // word on branching.
     assert!(
-        prompt.contains("The engine owns your `boss-recovery/exec_*` recovery bookmark; keep it advanced locally"),
+        prompt.contains("A revision never opens a new PR."),
         "revision directive must still forbid creating a boss/exec_* bookmark:\n{prompt}",
     );
 }
@@ -1145,7 +1145,7 @@ fn revision_directive_with_conflict_provenance_injects_conflict_fragment() {
     );
     // Must still contain the base revision directive spine.
     assert!(
-        prompt.contains("The engine owns your `boss-recovery/exec_*` recovery bookmark; keep it advanced locally"),
+        prompt.contains("A revision never opens a new PR."),
         "base revision directive must still be present:\n{prompt}",
     );
     // incident-002: the preservation rule must be present so a
@@ -1583,7 +1583,7 @@ fn revision_directive_with_ci_fix_provenance_injects_ci_fragment() {
     );
     // Must still contain the base revision directive spine.
     assert!(
-        prompt.contains("The engine owns your `boss-recovery/exec_*` recovery bookmark; keep it advanced locally"),
+        prompt.contains("A revision never opens a new PR."),
         "base revision directive must still be present:\n{prompt}",
     );
 }
@@ -1820,7 +1820,7 @@ fn revision_directive_without_provenance_has_no_fragment() {
         "no CI fragment for operator revision:\n{prompt}",
     );
     assert!(
-        prompt.contains("The engine owns your `boss-recovery/exec_*` recovery bookmark; keep it advanced locally"),
+        prompt.contains("A revision never opens a new PR."),
         "base revision directive must still be present:\n{prompt}",
     );
 }

@@ -248,16 +248,41 @@ async fn self_retry_with_deleted_own_heads_drops_the_stale_row_and_continues() {
         db.execution_bookmark_optional(&next.id).unwrap().is_none(),
         "a stale row would make dispatch skip creating fresh pointers"
     );
-    // Dispatch now creates fresh pointers for the same execution id; the
-    // surviving baseline must not make that fail.
+    // Dispatch records a fresh baseline for the same execution id; a
+    // surviving legacy name must not make that fail.
     let fresh = coordinator
         .host_adapter()
         .create_execution_bookmark(&repo.worker, &next.id, None, None)
         .await
         .expect("fresh creation must succeed after the orphaned baseline is discarded");
-    boss_engine_recovery::execution_bookmark::diff(&boss_engine_recovery::execution_bookmark::LocalJj, &fresh)
-        .await
-        .expect("fresh bookmarks must validate");
+    assert_eq!(
+        fresh.base_commit.as_deref(),
+        Some(
+            boss_engine_test_git::jj::JjRepo::run(
+                &repo.repo,
+                &["log", "--no-graph", "-r", "trunk()", "-T", "commit_id"]
+            )
+            .as_str()
+        )
+    );
+    assert!(
+        boss_engine_test_git::jj::JjRepo::run(
+            &repo.repo,
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                &format!(
+                    "bookmarks(exact:{}) | bookmarks(exact:{})",
+                    fresh.base(),
+                    fresh.publication()
+                ),
+                "-T",
+                "commit_id"
+            ]
+        )
+        .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -325,9 +350,34 @@ async fn self_retry_with_deleted_own_heads_and_stale_report_still_positions_on_t
         "the stale report must be cleared"
     );
     let fresh = db.execution_bookmark(&next.id).unwrap();
-    boss_engine_recovery::execution_bookmark::diff(&boss_engine_recovery::execution_bookmark::LocalJj, &fresh)
-        .await
-        .expect("fresh bookmarks must validate");
+    assert_eq!(
+        fresh.base_commit.as_deref(),
+        Some(
+            boss_engine_test_git::jj::JjRepo::run(
+                &repo.repo,
+                &["log", "--no-graph", "-r", "trunk()", "-T", "commit_id"]
+            )
+            .as_str()
+        )
+    );
+    assert!(
+        boss_engine_test_git::jj::JjRepo::run(
+            &repo.repo,
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                &format!(
+                    "bookmarks(exact:{}) | bookmarks(exact:{})",
+                    fresh.base(),
+                    fresh.publication()
+                ),
+                "-T",
+                "commit_id"
+            ]
+        )
+        .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -978,12 +1028,15 @@ async fn orphaned_predecessor_with_no_head_bookmarks_dispatches_cleanly() {
     assert!(db.execution_restore_report(&h.next.id).unwrap().is_none());
     assert!(!h.repo.replacement.join("revision.txt").exists());
     let successor = db.execution_bookmark(&h.next.id).unwrap();
+    assert!(successor.base_commit.is_some());
     assert!(
-        boss_engine_recovery::execution_bookmark::diff(&boss_engine_recovery::execution_bookmark::LocalJj, &successor)
-            .await
-            .unwrap()
-            .is_empty()
+        JjRepo::run(
+            &h.repo.repo,
+            &["bookmark", "list", &successor.base(), &successor.publication()]
+        )
+        .is_empty()
     );
+    assert!(JjRepo::run(&h.repo.replacement, &["diff", "--git", "--from", "pr/99"]).is_empty());
     assert_eq!(h.cube.goto_calls.lock().await.len(), 1);
 }
 
@@ -994,8 +1047,28 @@ async fn revision_start_retry_keeps_its_own_pointers_on_the_staged_history() {
     for fresh in [false, true] {
         let mut h = chain_harness(true, true, false).await;
         let db = h.coordinator.work_db().clone();
+        h.cube = Arc::new(FakeCubeClient {
+            workspace_root: Some(h._dir.path().to_path_buf()),
+            next_workspace_id: Mutex::new(Some("replacement".into())),
+            position_real_workspace: true,
+            real_bookmarks: true,
+            ..FakeCubeClient::default()
+        });
+        h.coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            h.cube.clone(),
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..FakeExecutionRunner::default()
+            }),
+        ));
         let conn = rusqlite::Connection::open(h._dir.path().join("boss.db")).unwrap();
         if fresh {
+            JjRepo::run(
+                &h.repo.repo,
+                &["git", "fetch", "--remote", "origin", "--branch", "main"],
+            );
             conn.execute("DELETE FROM execution_bookmarks WHERE execution_id != ?1", [&h.next.id])
                 .unwrap();
         }
@@ -1008,9 +1081,19 @@ async fn revision_start_retry_keeps_its_own_pointers_on_the_staged_history() {
                 .contains("injected run start failure")
         );
         let record = db.execution_bookmark(&h.next.id).unwrap();
-        let patch = diff(&LocalJj, &record).await.unwrap();
+        let patch = if fresh {
+            assert!(db.preserved_tip(&h.next.id).unwrap().is_none());
+            let patch = JjRepo::run(
+                &h.repo.replacement,
+                &["diff", "--git", "--from", record.base_commit.as_deref().unwrap()],
+            );
+            assert!(patch.is_empty());
+            patch
+        } else {
+            diff(&LocalJj, &record).await.unwrap()
+        };
         conn.execute_batch("DROP TRIGGER fail_run_start; UPDATE work_executions SET status = 'ready', dispatch_not_before = NULL WHERE started_at IS NULL;").unwrap();
-        // A later retry sees a changed main and PR head, but must not restage its own refs.
+        // A retry preserves staged work, or follows the current PR when there was none.
         JjRepo::run(&h.repo.repo, &["new", "main", "-m", "Main advanced before retry"]);
         std::fs::write(h.repo.repo.join("later"), "later main").unwrap();
         JjRepo::run(&h.repo.repo, &["bookmark", "set", "main", "pr/99", "-r", "@"]);
@@ -1027,10 +1110,31 @@ async fn revision_start_retry_keeps_its_own_pointers_on_the_staged_history() {
         ));
         h.next = db.get_execution(&h.next.id).unwrap();
         h.dispatch().await.unwrap();
-        // The failed attempt positioned once; the retry restages the recorded preserved tip.
+        // Both attempts position the lease; only unpublished work is restaged.
         assert_eq!(h.cube.goto_calls.lock().await.len(), 2);
-        assert_eq!(diff(&LocalJj, &record).await.unwrap(), patch);
-        for pointer in [record.base(), record.head(), record.publication()] {
+        if fresh {
+            assert!(h.repo.replacement.join("later").exists());
+            assert!(db.execution_restore_report(&h.next.id).unwrap().is_none());
+            assert!(db.preserved_tip(&h.next.id).unwrap().is_none());
+            continue;
+        }
+        let restored_patch = || {
+            JjRepo::run(
+                &h.repo.replacement,
+                &["diff", "--git", "--from", "pr/99", "--to", &record.head()],
+            )
+        };
+        assert_eq!(restored_patch(), patch);
+        assert!(h.repo.replacement.join("later").exists());
+        assert!(
+            JjRepo::run(
+                &h.repo.repo,
+                &["bookmark", "list", &record.base(), &record.publication()]
+            )
+            .is_empty()
+        );
+        {
+            let pointer = record.head();
             assert!(
                 !JjRepo::run(
                     &h.repo.replacement,
@@ -1050,7 +1154,7 @@ async fn revision_start_retry_keeps_its_own_pointers_on_the_staged_history() {
             &h.repo.replacement,
             &["bookmark", "set", &record.head(), &record.publication(), "-r", "@"],
         );
-        assert_eq!(diff(&LocalJj, &record).await.unwrap(), patch);
+        assert_eq!(restored_patch(), patch);
         // The retry restaged the recorded preserved tip, so it records a restore report.
         assert!(db.execution_restore_report(&h.next.id).unwrap().is_some());
     }
