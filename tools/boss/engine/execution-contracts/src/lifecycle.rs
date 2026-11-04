@@ -334,6 +334,10 @@ pub struct ResolvedExecutionCube {
     /// engine's own cube issued (or will issue) the lease — including
     /// executions with no run row yet.
     pub host_id: String,
+    /// Owning-host adapter for a remote cube, when routing could resolve one.
+    /// Inferred-death release uses this to preserve unpublished work and probe
+    /// occupancy; `None` keeps a remote lease.
+    pub host_adapter: Option<Arc<dyn HostAdapter>>,
 }
 
 impl ResolvedExecutionCube {

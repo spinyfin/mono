@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use boss_engine_effort::SpawnConfig;
-use boss_engine_recovery::execution_bookmark::{self, ExecutionBookmark, PreservedTip};
+use boss_engine_recovery::execution_bookmark::{self, ExecutionBookmark, PreserveOutcome, PreservedTip};
 use boss_engine_storage_values::Host;
 use boss_engine_storage_values::pool_policy::{AUTOMATION_WORKER_ID_PREFIX, REVIEW_WORKER_ID_PREFIX};
 use boss_engine_structured_output::StructuredOutputKind;
@@ -1471,7 +1471,7 @@ pub trait HostAdapter: Send + Sync {
         workspace: &Path,
         recorded: Option<&PreservedTip>,
         since_unix: Option<i64>,
-    ) -> anyhow::Result<Option<boss_engine_recovery::execution_bookmark::PreservedTip>> {
+    ) -> anyhow::Result<PreserveOutcome> {
         let _ = (record, workspace, recorded, since_unix);
         bail!("workspace recovery confirmation is not supported by this host adapter")
     }

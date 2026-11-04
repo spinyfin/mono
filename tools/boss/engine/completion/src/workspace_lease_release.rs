@@ -101,6 +101,9 @@ impl BookmarkGate for DbBookmarkGate<'_> {
             return BookmarkStatus::NotRequired;
         }
         let result: Result<()> = async {
+            // An open legacy creation/backup failure must not skip preserve().
+            // The row's source is what teardown needs; the failure item is
+            // about a previous attempt's bookmark write, not this run's work.
             let record = self
                 .db
                 .preservation_source(&execution.id)?
@@ -111,12 +114,13 @@ impl BookmarkGate for DbBookmarkGate<'_> {
                 .ok_or_else(|| anyhow::anyhow!("workspace path unavailable for preservation"))?;
             let recorded = self.db.preserved_tip(&execution.id)?;
             let since_unix = execution.started_epoch().or_else(|| execution.created_epoch());
-            let tip = if let Some(adapter) = self.adapter {
+            let outcome = if let Some(adapter) = self.adapter {
                 adapter
                     .confirm_workspace_recovery(&record, Path::new(workspace), recorded.as_ref(), since_unix)
                     .await?
+            } else if record.host_id != "local" {
+                anyhow::bail!("owning host adapter is unavailable for remote preservation");
             } else {
-                anyhow::ensure!(record.host_id == "local", "preservation requires the owning host");
                 boss_engine_recovery::execution_bookmark::preserve(
                     &boss_engine_recovery::execution_bookmark::LocalJj,
                     &record,
@@ -126,27 +130,19 @@ impl BookmarkGate for DbBookmarkGate<'_> {
                 )
                 .await?
             };
-            match tip {
-                Some(tip) => self.db.record_preserved_tip(&execution.id, &tip)?,
+            match &outcome.tip {
+                Some(tip) => self.db.record_preserved_tip(&execution.id, tip)?,
                 None => self.db.clear_preserved_tip(&execution.id)?,
+            }
+            if let Some(inspect) = outcome.inspect {
+                raise_inspect_attention(self.db, execution, inspect);
             }
             Ok(())
         }
         .await;
         match result {
             Ok(()) => BookmarkStatus::Confirmed,
-            Err(err) => {
-                if boss_engine_recovery::execution_bookmark::is_pointer_integrity_error(&err) {
-                    raise_attention(
-                        self.db,
-                        execution,
-                        boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NOT_RESTAGED_ATTENTION_KIND,
-                        "Preserved work needs inspection",
-                        &format!("{err:#}"),
-                    );
-                }
-                BookmarkStatus::Unconfirmed(format!("{err:#}"))
-            }
+            Err(err) => BookmarkStatus::Unconfirmed(format!("{err:#}")),
         }
     }
 }
@@ -450,6 +446,74 @@ pub async fn release_lease_after_proven_never_started(
         adapter.release_workspace(lease_id),
     )
     .await
+}
+
+fn inspect_workspace_line(inspect: &boss_engine_recovery::execution_bookmark::PreserveInspect) -> Option<String> {
+    match (
+        inspect.workspace_change_id.as_deref(),
+        inspect.workspace_commit_id.as_deref(),
+        inspect.workspace_count,
+    ) {
+        (Some(change), Some(commit), Some(count)) => Some(format!(
+            "- workspace tip: change `{change}`, commit `{commit}`, {count} unpublished commits"
+        )),
+        _ => None,
+    }
+}
+
+fn inspect_body(inspect: &boss_engine_recovery::execution_bookmark::PreserveInspect) -> String {
+    let existing = inspect.existing_commit_id.as_deref().unwrap_or("none");
+    let mut body = format!(
+        "{}. Existing preserved commit: `{existing}`. Nothing was deleted.",
+        inspect.reason
+    );
+    if let Some(line) = inspect_workspace_line(inspect) {
+        body.push('\n');
+        body.push_str(&line);
+    } else {
+        body.push_str(" New workspace tip: unavailable.");
+    }
+    body
+}
+
+fn raise_inspect_attention(
+    db: &WorkDb,
+    execution: &WorkExecution,
+    inspect: boss_engine_recovery::execution_bookmark::PreserveInspect,
+) {
+    let kind = boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND;
+    let title = "Preserved work needs inspection";
+    let open = db.list_attention_items(&execution.id).ok().and_then(|items| {
+        items
+            .into_iter()
+            .find(|item| item.kind == kind && item.status == "open")
+    });
+    let Some(existing) = open else {
+        raise_attention(db, execution, kind, title, &inspect_body(&inspect));
+        return;
+    };
+    let mut body = existing.body_markdown;
+    if let Some(commit) = inspect.existing_commit_id.as_deref()
+        && !body.contains(&format!("`{commit}`"))
+    {
+        body.push_str(&format!("\n- existing preserved commit: `{commit}`"));
+    }
+    if let Some(line) = inspect_workspace_line(&inspect)
+        && inspect
+            .workspace_commit_id
+            .as_deref()
+            .is_none_or(|commit| !body.contains(&format!("commit `{commit}`")))
+    {
+        body.push('\n');
+        body.push_str(&line);
+    }
+    if let Err(err) = db.upsert_execution_attention(&execution.id, kind, title, &body) {
+        tracing::error!(
+            execution_id = %execution.id,
+            error = %format!("{err:#}"),
+            "could not update preserved-work inspection attention",
+        );
+    }
 }
 
 pub fn raise_unreleased_attention(db: &WorkDb, execution: &WorkExecution, title: &str, body: &str) {

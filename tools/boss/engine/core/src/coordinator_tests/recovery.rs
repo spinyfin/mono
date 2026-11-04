@@ -356,7 +356,7 @@ async fn missing_baseline_is_rebuilt_from_the_record_or_retired_loudly_without_a
             let reason = db.execution_bookmark_retired_reason(&dead_id).unwrap().unwrap();
             assert!(reason.contains("no recorded PR"), "{reason}");
             // Durable archives replace the predecessor's disposable pointers.
-            let head = format!("glob:preserved/{dead_id}/*");
+            let head = format!("glob:preserved-archive/{dead_id}/*");
             assert!(
                 JjRepo::run(
                     &repo.repo,
@@ -370,7 +370,7 @@ async fn missing_baseline_is_rebuilt_from_the_record_or_retired_loudly_without_a
                     ]
                 )
                 .lines()
-                .any(|l| l.starts_with(&format!("preserved/{dead_id}/")))
+                .any(|l| l.starts_with(&format!("preserved-archive/{dead_id}/")))
             );
         }
     }

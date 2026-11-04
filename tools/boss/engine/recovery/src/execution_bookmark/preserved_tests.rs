@@ -24,7 +24,7 @@ fn names(repo: &JjRepo) -> String {
 }
 
 async fn preserve_tip(jj: &LocalJj, record: &ExecutionBookmark, workspace: &Path) -> Result<Option<PreservedTip>> {
-    preserve(jj, record, workspace, None, None).await
+    Ok(preserve(jj, record, workspace, None, None).await?.tip)
 }
 
 #[tokio::test]
@@ -142,8 +142,14 @@ async fn recycled_workspace_cannot_replace_unadopted_preserved_work() {
     let saved = preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
     JjRepo::run(&repo.replacement, &["new", "main"]);
     std::fs::write(repo.replacement.join("other"), "another occupant").unwrap();
-    let err = preserve_tip(&LocalJj, &record, &repo.replacement).await.unwrap_err();
-    assert!(is_pointer_integrity_error(&err));
+    let outcome = preserve(&LocalJj, &record, &repo.replacement, None, None)
+        .await
+        .unwrap();
+    assert!(outcome.inspect.is_some(), "teardown must inspect, not refuse");
+    assert_eq!(
+        outcome.tip.as_ref().map(|tip| tip.commit_id.as_str()),
+        Some(saved.commit_id.as_str())
+    );
     assert_eq!(
         JjRepo::run(
             &repo.repo,
@@ -365,7 +371,8 @@ async fn missing_bookmark_and_missing_commit_are_an_integrity_failure() {
         &["bookmark", "delete", &preserved_name(&record.execution_id)],
     );
     let recorded = PreservedTip {
-        change_id: "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".into(),
+        // Not jj's root change id (32 `z`s), which `present()` would resolve.
+        change_id: "kqkqkqkqkqkqkqkqkqkqkqkqkqkqkqkq".into(),
         // A well-formed id that is not the null revision and is not in this store.
         commit_id: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into(),
         count: 1,
@@ -397,8 +404,10 @@ async fn conflicted_preservation_requires_current_work_to_be_retained() {
     assert!(preserve_tip(&LocalJj, &record, &repo.replacement).await.is_ok());
     JjRepo::run(&repo.replacement, &["new", "-m", "Additional work"]);
     std::fs::write(repo.replacement.join("extra"), "not yet retained").unwrap();
-    let error = preserve_tip(&LocalJj, &record, &repo.replacement).await.unwrap_err();
-    assert!(is_pointer_integrity_error(&error));
+    let outcome = preserve(&LocalJj, &record, &repo.replacement, None, None)
+        .await
+        .unwrap();
+    assert!(outcome.inspect.is_some(), "teardown must inspect, not refuse");
     assert_eq!(
         JjRepo::run(
             &repo.repo,
@@ -499,6 +508,16 @@ async fn restoring_a_conflicted_bookmark_resolves_it_so_later_work_is_preserved(
         "unselected variants must be named: {}",
         report.discarded_tips
     );
+    assert!(
+        !report.unrestaged_unpublished.trim().is_empty(),
+        "unselected unpublished variants must keep a named archive: {}",
+        report.unrestaged_unpublished
+    );
+    assert!(
+        report.unrestaged_unpublished.contains("preserved-archive/"),
+        "{}",
+        report.unrestaged_unpublished
+    );
     assert_eq!(
         JjRepo::run(
             &repo.repo,
@@ -539,6 +558,7 @@ async fn missing_bookmark_keeps_recorded_unpublished_work() {
     let kept = preserve(&LocalJj, &record, &repo.replacement, Some(&saved), None)
         .await
         .unwrap()
+        .tip
         .unwrap();
     assert_eq!(kept.commit_id, saved.commit_id);
     assert_eq!(
@@ -581,4 +601,144 @@ async fn missing_bookmark_recorded_inspect_failure_is_not_empty_work() {
     .unwrap_err();
     assert!(err.to_string().contains("SSH transport unavailable"));
     assert!(!is_pointer_integrity_error(&err));
+}
+
+#[tokio::test]
+async fn self_retry_amend_and_push_clears_preservation_without_resurrecting_hidden_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_retry", "local").await.unwrap();
+    std::fs::write(repo.worker.join("work"), "unpublished").unwrap();
+    let saved = preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    JjRepo::run(&repo.replacement, &["new", "main", "-m", "Current PR head"]);
+    restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+        .await
+        .unwrap()
+        .unwrap();
+    std::fs::write(repo.replacement.join("work"), "amended and published").unwrap();
+    JjRepo::run(&repo.replacement, &["status"]);
+    let change = JjRepo::run(&repo.replacement, &["log", "-r", "@", "--no-graph", "-T", "change_id"]);
+    assert_eq!(change, saved.change_id);
+    let rewritten = JjRepo::run(&repo.replacement, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+    assert_ne!(rewritten, saved.commit_id);
+    JjRepo::run(&repo.replacement, &["bookmark", "set", "published", "-r", "@"]);
+    JjRepo::run(&repo.replacement, &["git", "export"]);
+    JjRepo::run(&repo.repo, &["git", "fetch"]);
+    JjRepo::run(&repo.replacement, &["new", "-m", "Empty trailing commit"]);
+    let outcome = preserve(&LocalJj, &record, &repo.replacement, Some(&saved), None)
+        .await
+        .unwrap();
+    assert!(outcome.tip.is_none(), "published rewritten work must clear the row");
+    assert!(outcome.inspect.is_none());
+    let listed = names(&repo);
+    assert!(
+        !listed.lines().any(|name| name == "preserved/exec_retry"),
+        "local preserved bookmark must be deleted: {listed}"
+    );
+    let visible = JjRepo::run(
+        &repo.repo,
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            &format!("present({})", saved.change_id),
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
+    );
+    assert_eq!(
+        visible.lines().count(),
+        1,
+        "the change must not be divergent: {visible}"
+    );
+    assert!(!visible.lines().any(|id| id == saved.commit_id));
+}
+
+#[tokio::test]
+async fn missing_bookmark_and_absent_recorded_preserves_fresh_unpublished_tip() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_absent", "local").await.unwrap();
+    let recorded = PreservedTip {
+        change_id: "kqkqkqkqkqkqkqkqkqkqkqkqkqkqkqkq".into(),
+        commit_id: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into(),
+        count: 1,
+    };
+    std::fs::write(repo.worker.join("fresh"), "new unpublished").unwrap();
+    let outcome = preserve(&LocalJj, &record, &repo.worker, Some(&recorded), None)
+        .await
+        .unwrap();
+    let tip = outcome.tip.expect("fresh unpublished work must be recorded");
+    assert_eq!(tip.count, 1);
+    assert!(names(&repo).contains("preserved/exec_absent"));
+    let inspect = outcome.inspect.expect("absent recorded tip must raise inspect");
+    assert_eq!(inspect.existing_commit_id.as_deref(), Some(recorded.commit_id.as_str()));
+    assert_eq!(inspect.workspace_commit_id.as_deref(), Some(tip.commit_id.as_str()));
+    assert_eq!(inspect.workspace_count, Some(1));
+}
+
+#[tokio::test]
+async fn abandoned_restaged_tip_is_consumed_and_not_restaged() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_abandon", "local").await.unwrap();
+    std::fs::write(repo.worker.join("work"), "unpublished").unwrap();
+    let saved = preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    JjRepo::run(&repo.replacement, &["new", "main", "-m", "Current PR head"]);
+    restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+        .await
+        .unwrap()
+        .unwrap();
+    JjRepo::run(&repo.replacement, &["abandon", "@"]);
+    let outcome = preserve(&LocalJj, &record, &repo.replacement, Some(&saved), None)
+        .await
+        .unwrap();
+    assert!(outcome.tip.is_none(), "abandoned work must clear the recorded tip");
+    assert!(outcome.inspect.is_none());
+    assert!(
+        restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!repo.replacement.join("work").exists());
+}
+
+#[tokio::test]
+async fn hidden_recorded_tip_does_not_replace_fresh_unpublished_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_hidden_fresh", "local")
+        .await
+        .unwrap();
+    std::fs::write(repo.worker.join("work"), "unpublished").unwrap();
+    let saved = preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    JjRepo::run(&repo.replacement, &["new", "main", "-m", "Current PR head"]);
+    restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+        .await
+        .unwrap()
+        .unwrap();
+    JjRepo::run(&repo.replacement, &["abandon", "@"]);
+    JjRepo::run(&repo.replacement, &["new", "-m", "Fresh unpublished tip"]);
+    std::fs::write(repo.replacement.join("fresh"), "new unpublished").unwrap();
+    let outcome = preserve(&LocalJj, &record, &repo.replacement, Some(&saved), None)
+        .await
+        .unwrap();
+    let tip = outcome.tip.expect("fresh unpublished work must be recorded");
+    assert_ne!(tip.commit_id, saved.commit_id);
+    assert!(names(&repo).contains("preserved/exec_hidden_fresh"));
+    let inspect = outcome.inspect.expect("hidden recorded tip must raise inspect");
+    assert_eq!(inspect.existing_commit_id.as_deref(), Some(saved.commit_id.as_str()));
+    assert_eq!(inspect.workspace_commit_id.as_deref(), Some(tip.commit_id.as_str()));
+    assert!(
+        restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(!repo.replacement.join("work").exists());
+    assert_eq!(
+        std::fs::read_to_string(repo.replacement.join("fresh")).unwrap(),
+        "new unpublished"
+    );
 }

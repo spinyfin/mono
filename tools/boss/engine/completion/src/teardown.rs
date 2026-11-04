@@ -79,6 +79,7 @@ impl WorkerCompletionHandler {
                 Ok(boss_execution_contracts::ResolvedExecutionCube {
                     cube: Arc::clone(&self.cube_client),
                     host_id: "local".to_owned(),
+                    host_adapter: None,
                 })
             }
         }

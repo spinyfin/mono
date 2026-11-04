@@ -126,7 +126,7 @@ async fn checkout_of_predecessor_publication_cannot_hide_unpublished_work() {
                 assert_eq!(record.base_commit.as_deref(), Some(commit.as_str()));
                 continue;
             }
-            let archive = format!("preserved/{}/{commit}", prior.id);
+            let archive = format!("preserved-archive/{}/{commit}", prior.id);
             assert_eq!(
                 JjRepo::run(&repo.repo, &["log", "--no-graph", "-r", &archive, "-T", "commit_id"]),
                 commit

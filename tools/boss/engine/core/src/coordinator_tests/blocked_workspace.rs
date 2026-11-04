@@ -364,7 +364,7 @@ async fn read_only_review_leaves_deleted_predecessor_heads_uninspected() {
     assert!(
         boss_engine_test_git::jj::JjRepo::run(
             &repo.repo,
-            &["bookmark", "list", &format!("glob:preserved/{}/*", prior.id)]
+            &["bookmark", "list", &format!("glob:preserved-archive/{}/*", prior.id)]
         )
         .is_empty()
     );
@@ -936,7 +936,7 @@ async fn revision_without_any_bound_pr_archives_and_starts_fresh() {
     assert!(
         !boss_engine_test_git::jj::JjRepo::run(
             &h.repo.repo,
-            &["bookmark", "list", &format!("glob:preserved/{}/*", prior.id)]
+            &["bookmark", "list", &format!("glob:preserved-archive/{}/*", prior.id)]
         )
         .is_empty()
     );
@@ -1003,7 +1003,7 @@ async fn ssh_fetch_failure_retries_without_archiving() {
     assert!(
         JjRepo::run(
             &h.repo.repo,
-            &["bookmark", "list", &format!("glob:preserved/{}/*", prior.id)]
+            &["bookmark", "list", &format!("glob:preserved-archive/{}/*", prior.id)]
         )
         .is_empty()
     );

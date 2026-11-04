@@ -1,6 +1,24 @@
 //! Restage preserved changes without manufacturing new change identities.
-use super::preserved::{log, operations, unpublished};
+use super::preserved::{
+    RecordedPresence, log, operations, resolve_recorded_presence, unpublished, unpublished_archive_refs,
+};
 use super::*;
+
+async fn recorded_candidates(jj: &dyn Jj, record: &ExecutionBookmark, recorded: &PreservedTip) -> Result<Vec<String>> {
+    match resolve_recorded_presence(jj, &record.repo_path, recorded).await? {
+        RecordedPresence::Visible(visible) => {
+            Ok(visible.lines().filter(|id| !id.is_empty()).map(str::to_owned).collect())
+        }
+        // Abandoned or squashed: the recorded commit still exists but has no
+        // visible successor. Do not restage it.
+        RecordedPresence::Hidden => Ok(Vec::new()),
+        RecordedPresence::Absent => Err(pointer_integrity_error(format!(
+            "{} is missing and recorded commit {} is not visible",
+            preserved_name(&record.execution_id),
+            recorded.commit_id
+        ))),
+    }
+}
 
 /// Prefer a variant in the PR history, then the newest visible variant in
 /// jj's evolution log and operation journal. Unrelated changes are undecidable.
@@ -9,45 +27,40 @@ async fn select_tip(
     record: &ExecutionBookmark,
     base: &str,
     recorded: Option<&PreservedTip>,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, Vec<String>)>> {
     let pointer = revision(&preserved_name(&record.execution_id));
     let output = log(jj, &record.repo_path, &pointer, "commit_id ++ \"\\n\"").await?;
-    let candidates: Vec<_> = output.lines().collect();
+    let candidates: Vec<String> = if output.trim().is_empty() {
+        let Some(recorded) = recorded else {
+            return Ok(None);
+        };
+        recorded_candidates(jj, record, recorded).await?
+    } else {
+        output.lines().filter(|id| !id.is_empty()).map(str::to_owned).collect()
+    };
     match candidates.as_slice() {
-        [] => {
-            let Some(recorded) = recorded else {
-                return Ok(None);
-            };
-            let present = log(
-                jj,
-                &record.repo_path,
-                &format!("present({})", recorded.commit_id),
-                "commit_id ++ \"\\n\"",
-            )
-            .await?;
-            if present.lines().any(|id| id == recorded.commit_id) {
-                return Ok(Some(recorded.commit_id.clone()));
-            }
-            return Err(pointer_integrity_error(format!(
-                "{} is missing and recorded commit {} is not visible",
-                preserved_name(&record.execution_id),
-                recorded.commit_id
-            )));
-        }
-        [tip] => return Ok(Some((*tip).to_owned())),
+        [] => return Ok(None),
+        [tip] => return Ok(Some((tip.clone(), candidates))),
         _ => {}
     }
+    let candidate_rev = candidates.join("|");
     let ancestors = log(
         jj,
         &record.repo_path,
-        &format!("{pointer} & ::{base}"),
+        &format!("({candidate_rev}) & ::{base}"),
         "commit_id ++ \"\\n\"",
     )
     .await?;
     if let Some(tip) = ancestors.lines().next() {
-        return Ok(Some(tip.to_owned()));
+        return Ok(Some((tip.to_owned(), candidates)));
     }
-    let changes = log(jj, &record.repo_path, &pointer, "change_id ++ \"\\n\"").await?;
+    let changes = log(
+        jj,
+        &record.repo_path,
+        &format!("({candidate_rev})"),
+        "change_id ++ \"\\n\"",
+    )
+    .await?;
     let changes: std::collections::HashSet<_> = changes.lines().collect();
     if changes.len() == 1 {
         // evolog takes one commit, even for divergent changes. Prefer a
@@ -68,7 +81,7 @@ async fn select_tip(
                 )
                 .await?;
             if candidates.iter().all(|other| evolution.lines().any(|id| id == *other)) {
-                return Ok(Some((*candidate).to_owned()));
+                return Ok(Some((candidate.clone(), candidates.clone())));
             }
         }
         // Concurrent evolution has multiple roots. The operation journal
@@ -77,7 +90,7 @@ async fn select_tip(
         let mut latest: Option<((i64, u32), String)> = None;
         for (seconds, nanos, operation) in operations(jj, &record.repo_path).await? {
             if latest.as_ref().is_some_and(|(time, _)| *time > (seconds, nanos)) {
-                return Ok(latest.map(|(_, tip)| tip));
+                return Ok(latest.map(|(_, selected)| (selected, candidates.clone())));
             }
             let visible = jj
                 .run(
@@ -97,13 +110,16 @@ async fn select_tip(
                 .await?;
             let visible: Vec<_> = visible.lines().collect();
             if let [tip] = visible.as_slice()
-                && candidates.contains(tip)
+                && candidates.iter().any(|candidate| candidate == tip)
             {
                 if latest.as_ref().is_some_and(|(_, selected)| selected != tip) {
                     break;
                 }
                 latest = Some(((seconds, nanos), (*tip).to_owned()));
             }
+        }
+        if let Some((_, tip)) = latest {
+            return Ok(Some((tip, candidates)));
         }
     }
     Err(pointer_integrity_error(format!(
@@ -113,8 +129,9 @@ async fn select_tip(
 }
 
 /// The destination is the PR head or trunk already positioned by cube.
-/// The preserved bookmark follows jj's rewrite naturally; no explicit pointer
-/// movement, baseline proof, reconciliation or duplication is involved.
+/// When more than one preserved variant exists, this step points
+/// `preserved/<exec>` at the selected commit (`jj bookmark set --allow-backwards`)
+/// and archives unselected unpublished variants so they remain named.
 pub async fn restore_preserved(
     jj: &dyn Jj,
     record: &ExecutionBookmark,
@@ -139,16 +156,42 @@ pub async fn restore_preserved(
         positioned.to_owned()
     };
     let base = target.trim();
-    let pointer = revision(&preserved_name(&record.execution_id));
-    let variants = log(jj, &record.repo_path, &pointer, "commit_id ++ \"\\n\"").await?;
-    let Some(tip) = select_tip(jj, record, base, recorded).await? else {
+    let Some((tip, candidates)) = select_tip(jj, record, base, recorded).await? else {
         return Ok(None);
     };
-    let discarded: Vec<_> = variants
-        .lines()
-        .filter(|candidate| *candidate != tip)
-        .map(str::to_owned)
+    let discarded: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| *candidate != &tip)
+        .cloned()
         .collect();
+    let mut unrestaged = Vec::new();
+    for candidate in &discarded {
+        let unique = log(
+            jj,
+            &record.repo_path,
+            &format!("{} ~ ::{tip}", unpublished(candidate)),
+            "commit_id ++ \"\\n\"",
+        )
+        .await?;
+        if unique.trim().is_empty() {
+            continue;
+        }
+        let archive = preserved_archive_name(&record.execution_id, candidate);
+        jj.run(
+            &record.repo_path,
+            &[
+                "--ignore-working-copy",
+                "bookmark",
+                "set",
+                &archive,
+                "-r",
+                candidate,
+                "--allow-backwards",
+            ],
+        )
+        .await?;
+        unrestaged.push(format!("{candidate} ({archive})"));
+    }
     if !discarded.is_empty() {
         jj.run(
             &record.repo_path,
@@ -234,6 +277,12 @@ pub async fn restore_preserved(
             ],
         )
         .await?;
+    let mut archives = unpublished_archive_refs(jj, record).await?;
+    for entry in &unrestaged {
+        if !archives.iter().any(|existing| existing == entry) {
+            archives.push(entry.clone());
+        }
+    }
     Ok(Some(
         RestoreReport::builder()
             .pointer(preserved_name(&record.execution_id))
@@ -242,6 +291,7 @@ pub async fn restore_preserved(
             .inherited_base(base)
             .conflicts(conflicts)
             .discarded_tips(discarded.join("\n"))
+            .unrestaged_unpublished(archives.join("\n"))
             .build(),
     ))
 }

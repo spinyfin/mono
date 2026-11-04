@@ -477,6 +477,7 @@ async fn maybe_force_release_reconciled_lease(
         work_db,
         execution,
         crate::workspace_lease_release::PaneStatus::Gone,
+        None,
         cube.force_release_lease(lease_id, Some("execution-liveness reconcile: worker pane gone")),
     )
     .await;
