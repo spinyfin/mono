@@ -46,6 +46,10 @@ enum BossRevealCapture {
 
     static func start(updateModel: UpdateModel) {
         guard let state, let path = BossCaptureArgs.shared.captureTo else { return }
+        if state == "switcher-hidden" || state == "switcher-visible" {
+            BossWorkSwitcherCapture.start(path: path, hidden: state == "switcher-hidden", updateModel: updateModel)
+            return
+        }
         if state == "revision-ai-review" || state == "revision-folded" {
             BossRevisionReviewCapture.start(path: path, folded: state == "revision-folded")
             return

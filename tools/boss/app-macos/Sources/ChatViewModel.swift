@@ -281,6 +281,7 @@ final class ChatViewModel: ObservableObject {
             // fallback — so reporting here is what keeps the engine's copy
             // from drifting, rather than having each call site remember.
             if oldValue != selectedWorkProductID {
+                if !isRestoringWorkSelection, let id = selectedWorkProductID { selectionHistory.useProduct(id) }
                 reportSelectedProductToEngine()
             }
         }
@@ -318,7 +319,12 @@ final class ChatViewModel: ObservableObject {
         body()
     }
     @Published var selectedProjectFilterIDs: Set<String> = [] {
-        didSet { notePublishedWorkInputChanged() }
+        didSet {
+            if !isRestoringWorkSelection, let productID = selectedWorkProductID {
+                selectionHistory.useProjects(selectedProjectFilterIDs.subtracting(oldValue), productID: productID)
+            }
+            notePublishedWorkInputChanged()
+        }
     }
     /// When true, the board shows all project-less work items (chores,
     /// investigation tasks, etc.) and their revisions. Mutually exclusive
@@ -854,7 +860,12 @@ final class ChatViewModel: ObservableObject {
     static let connectionLostBannerDelay: TimeInterval = 2.0 // grace period before a disconnect may raise the banner
     var connectionGeneration = 0 // bumped on connect/disconnect; supersedes a stale banner-reveal
     var subscribedWorkTopics: Set<String> = []
-    let defaults = BossDefaults.store
+    lazy var selectionHistory = WorkSelectionHistory(defaults: defaults)
+    var isRestoringWorkSelection = true
+    @Published var isWorkSidebarHidden = false {
+        didSet { defaults.set(isWorkSidebarHidden, forKey: "boss.work.sidebarHidden") }
+    }
+    let defaults: UserDefaults
 
     /// Notification manager for Review-lane transitions. Fires a system
     /// banner when a task reaches `in_review` while the app is backgrounded.
@@ -883,7 +894,8 @@ final class ChatViewModel: ObservableObject {
     let bossPanelCollapsedDefaultsKey = "boss.work.bossPanelCollapsed"
     let bossPanelWidthDefaultsKey = "boss.work.bossPanelWidth"
 
-    init(paths: BossEnginePaths) {
+    init(paths: BossEnginePaths, defaults: UserDefaults = BossDefaults.store) {
+        self.defaults = defaults
         self.paths = paths
         self.socketPath = paths.socketPath
         self.processController = EngineProcessController(paths: paths)
@@ -907,16 +919,18 @@ final class ChatViewModel: ObservableObject {
     /// `BossEnginePaths.forTest(...)` so the test-context refusal in
     /// `BossEnginePaths.production*()` still applies to anything that
     /// reaches for the canonical paths.
-    convenience init(socketPath: String) {
+    convenience init(socketPath: String, defaults: UserDefaults = BossDefaults.store) {
         let paths = BossEnginePaths.forTest(
             socketPath: socketPath,
             pidPath: "\(socketPath).pid",
             controlTokenPath: "\(socketPath).token"
         )
-        self.init(paths: paths)
+        self.init(paths: paths, defaults: defaults)
     }
 
     private func commonInit() {
+        defer { isRestoringWorkSelection = false }
+        isWorkSidebarHidden = defaults.bool(forKey: "boss.work.sidebarHidden")
         bindBoardReadObserver()
         commentBridge.onSubmissionRejected = { [weak self] action in
             self?.showActionNotSaved(requestKind: action)

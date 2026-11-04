@@ -140,6 +140,7 @@ extension ChatViewModel {
         case .workRuntimePatch(let productId, let cards, let absent, let isComplete, let requestID, let revision):
             handleWorkRuntimePatch(productID: productId, cards: cards, absent: absent, isComplete: isComplete, requestID: requestID, revision: revision)
         case .productsList(let products):
+            selectionHistory.pruneProducts(validIDs: Set(products.filter { $0.status != "archived" }.map(\.id)))
             self.products = products.sorted(by: { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending })
             let activeIDs = Set(activeProducts.map(\.id))
             if let selectedWorkProductID,
@@ -161,6 +162,7 @@ extension ChatViewModel {
             }
             refreshWorkSubscriptions()
         case .projectsList(let productId, let projects):
+            selectionHistory.pruneProjects(productID: productId, validIDs: Set(projects.filter { $0.status != "archived" }.map(\.id)))
             projectsByProductID[productId] = projects.sorted(by: projectSort)
         case .workTree(let product, let projects, let tasks, let chores, let taskRuntimes, let dependencies, let ideas, let attentionItems, let attentionGroups, let attentionMembers, let plannerRuns, let requestID, let revision):
             guard acceptWorkTree(productID: product.id, requestID: requestID, revision: revision) else { return }
