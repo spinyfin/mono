@@ -1589,6 +1589,20 @@ impl WorkDb {
         Ok(seen.unwrap_or(0) != 0)
     }
 
+    /// Forget the recorded `pr_head_before`, so a stale snapshot from an
+    /// earlier attempt cannot become the floor of a later one.
+    pub fn clear_execution_pr_head_before(&self, execution_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let affected = conn.execute(
+            "UPDATE work_executions SET pr_head_before = NULL WHERE id = ?1",
+            params![execution_id],
+        )?;
+        if affected == 0 {
+            bail!("unknown execution: {execution_id}");
+        }
+        Ok(())
+    }
+
     pub fn set_execution_pr_head_before(&self, execution_id: &str, sha: &str) -> Result<()> {
         if sha.is_empty() {
             bail!("set_execution_pr_head_before: sha must be non-empty");

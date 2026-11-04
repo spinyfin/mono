@@ -8,7 +8,7 @@
 
 use std::process::Stdio;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use tokio::process::Command;
 
 /// Spawn a `gh` subprocess with the standard stdio / kill-on-drop
@@ -25,14 +25,82 @@ async fn run_gh(args: &[&str], display: &str) -> Result<String> {
         .kill_on_drop(true)
         .output()
         .await
-        .with_context(|| format!("failed to spawn `{display}`"))?;
+        .map_err(|err| GhError::new(GhErrorKind::Deterministic, format!("failed to spawn `{display}`: {err}")))?;
     if !output.status.success() {
-        return Err(anyhow!(
-            "`{display}` failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        return Err(GhError::new(classify_stderr(stderr), format!("`{display}` failed: {stderr}")).into());
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Whether repeating a failed `gh` call can succeed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GhErrorKind {
+    /// Connectivity, timeout, server-side or rate-limit failure: a later
+    /// attempt can succeed.
+    Transient,
+    /// A missing PR/repository, rejected credentials, an unusable `gh`
+    /// binary or a malformed answer: every attempt fails the same way.
+    Deterministic,
+}
+
+/// A failed `gh` invocation, carrying whether retrying it is worthwhile.
+/// Downcast from the returned [`anyhow::Error`] with [`is_deterministic`].
+#[derive(Debug)]
+pub struct GhError {
+    kind: GhErrorKind,
+    message: String,
+}
+
+impl GhError {
+    pub fn new(kind: GhErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub fn kind(&self) -> GhErrorKind {
+        self.kind
+    }
+}
+
+impl std::fmt::Display for GhError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for GhError {}
+
+/// True when `error` is a [`GhError`] that retrying cannot fix.
+pub fn is_deterministic(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<GhError>()
+        .is_some_and(|err| err.kind == GhErrorKind::Deterministic)
+}
+
+/// Classify `gh` stderr. Anything not recognised as deterministic is
+/// transient, so an unfamiliar failure keeps the retry behaviour.
+fn classify_stderr(stderr: &str) -> GhErrorKind {
+    const DETERMINISTIC: [&str; 7] = [
+        "Could not resolve to a PullRequest",
+        "Could not resolve to a Repository",
+        "HTTP 404",
+        "HTTP 401",
+        "gh auth login",
+        "authentication token",
+        "not logged in",
+    ];
+    if stderr.contains("rate limit") {
+        return GhErrorKind::Transient;
+    }
+    if DETERMINISTIC.iter().any(|needle| stderr.contains(needle)) {
+        GhErrorKind::Deterministic
+    } else {
+        GhErrorKind::Transient
+    }
 }
 
 /// Fetch the head commit SHA (`headRefOid`) for a PR by shelling out to
@@ -192,7 +260,11 @@ fn parse_open_pr_base(output: &str) -> Result<Option<String>> {
 /// returned a null or the JQ filter found nothing).
 pub(crate) fn parse_head_sha_output(sha: String, pr_number: u64, repo_slug: &str) -> Result<String> {
     if sha.is_empty() {
-        return Err(anyhow!("empty headRefOid for PR {pr_number} in {repo_slug}"));
+        return Err(GhError::new(
+            GhErrorKind::Deterministic,
+            format!("empty headRefOid for PR {pr_number} in {repo_slug}"),
+        )
+        .into());
     }
     Ok(sha)
 }
@@ -210,6 +282,36 @@ mod tests {
         for invalid in ["OPEN", "OPEN\nnull", "unknown\nmain"] {
             assert!(parse_open_pr_base(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn stderr_classification_separates_missing_pr_and_auth_from_transport() {
+        for stderr in [
+            "GraphQL: Could not resolve to a PullRequest with the number of 9. (repository.pullRequest)",
+            "HTTP 404: Not Found (https://api.github.com/repos/o/r/pulls/9)",
+            "HTTP 401: Bad credentials",
+            "To get started with GitHub CLI, please run:  gh auth login",
+        ] {
+            assert_eq!(classify_stderr(stderr), GhErrorKind::Deterministic, "{stderr}");
+        }
+        for stderr in [
+            "error connecting to api.github.com",
+            "HTTP 502: Bad Gateway",
+            "HTTP 403: API rate limit exceeded for user",
+            "i/o timeout",
+        ] {
+            assert_eq!(classify_stderr(stderr), GhErrorKind::Transient, "{stderr}");
+        }
+    }
+
+    #[test]
+    fn is_deterministic_reads_the_typed_kind_through_context() {
+        let deterministic: anyhow::Error = GhError::new(GhErrorKind::Deterministic, "missing").into();
+        assert!(is_deterministic(&deterministic));
+        assert!(is_deterministic(&deterministic.context("while snapshotting")));
+        let transient: anyhow::Error = GhError::new(GhErrorKind::Transient, "offline").into();
+        assert!(!is_deterministic(&transient));
+        assert!(!is_deterministic(&anyhow!("untyped")));
     }
 
     #[test]

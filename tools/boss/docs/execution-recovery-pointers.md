@@ -6,7 +6,7 @@ The engine keeps three bookmarks per execution in the shared jj store of the rep
 - `boss-recovery/<execution id>`: the recovery head the worker advances as it works.
 - `boss/<execution id>`: the publication head, the branch a worker pushes.
 
-The `execution_bookmarks` row for the execution records the shared store path, the host, and the baseline commit id (`base_commit`) recorded at dispatch from `work_executions.pr_head_before` (bound PR) or the trunk commit resolved at positioning (fresh item). Recovery reads that commit id as the floor of the execution's work; it never reads the `boss-base/` bookmark. A baseline commit that was rewritten or abandoned still exists in the store and still works as a floor; a row with no usable `base_commit` uses the bound PR's `pr_head_before`, then trunk.
+The `execution_bookmarks` row for the execution records the shared store path, the host, and the baseline commit id (`base_commit`) recorded at dispatch from `work_executions.pr_head_before` (bound PR) or the trunk commit resolved when the pointer is created (fresh item; when the engine itself positions a fresh workspace on trunk as a recovery fallback, the commit it positioned on). Recovery reads that commit id as the floor of the execution's work; it never reads the `boss-base/` bookmark. A baseline commit that was rewritten or abandoned still exists in the store and still works as a floor; a row with no usable `base_commit` uses the bound PR's `pr_head_before`, then trunk.
 
 Recovery is an optimisation. If pointer integrity checks cannot establish safe recovery, the engine archives the preserved commits and starts fresh. Transport failures retry through the ordinary positioning-failure path without retiring the recovery source. Redoing work is preferable to leaving an item unable to progress.
 
@@ -20,19 +20,19 @@ Every consumer, by pointer (paths are repo-relative):
 
 **`boss-base/<exec>`**
 
-- Written by: `create_from` (`tools/boss/engine/recovery/src/execution_bookmark.rs:581`); moved by reconciliation and mechanical-rebase checkpoints through `set_bookmarks` (`tools/boss/engine/recovery/src/execution_bookmark/reconcile.rs:398`, called at `:479`, `:507`, `:603`) and by `restore_pointers` (`tools/boss/engine/recovery/src/execution_bookmark/snapshot.rs:21`).
-- Read by: `resolve_base` (`execution_bookmark.rs:475`; callers `execution_bookmark.rs:496`, `reconcile.rs:430`, `prune.rs:197`), which is the floor of `diff` (`execution_bookmark.rs:700`) and `unpublished_diff` (`execution_bookmark.rs:781`) and of the lineage check; the redispatch unpublished revsets (`tools/boss/engine/recovery/src/execution_bookmark/redispatch.rs:116`, `:127`); the rearm migration's error parsing (`tools/boss/engine/work-db/src/execution_recovery_rearm.rs:25`); pointer snapshots (`snapshot.rs:8`); prune (`prune.rs:186`).
+- Written by: `create_from` at dispatch, `adopt_pushed_head`, and `restore_pointers` (snapshot restore, `snapshot.rs`). Nothing checkpoints or heals it any more.
+- Read by: `resolve_base` (callers in `execution_bookmark.rs`, `reconcile.rs` and `prune.rs`), which is the floor of `diff` and `unpublished_diff`; the redispatch unpublished revsets (`tools/boss/engine/recovery/src/execution_bookmark/redispatch.rs:116`, `:127`); the rearm migration's error parsing (`tools/boss/engine/work-db/src/execution_recovery_rearm.rs:25`); pointer snapshots (`snapshot.rs:8`); prune (`prune.rs:186`).
 - What is actually needed: a baseline **commit id**, which the row records. `resolve_base` returns it (falling back to `pr_head_before`, then `trunk()`, when the row has none), and nothing repairs, heals or re-checkpoints it: `heal_baseline`, `checkpoint_baseline` and `evolved_baseline` are gone, and the ancestry walk that `durable_baseline` performed is gone with them: `create_from` takes its floor from the restore report, the predecessor's floor, or `trunk()`, and never infers one from the positioned workspace. The bookmark is still created at dispatch and moved by `adopt_pushed_head`, but only for humans and the dispatch writers that a later change removes.
 
 **`boss-recovery/<exec>`**
 
-- Written by: `create_from` on `@` (`execution_bookmark.rs:581`); the worker advances it, as the dispatch prompt instructs (`tools/boss/engine/core/src/runner/prompt.rs:1578`, `:1761`).
+- Written by: `create_from` on `@`; the worker advances it, as the dispatch prompt instructs (`tools/boss/engine/core/src/runner/prompt.rs:1578`, `:1761`).
 - Read by: `resolve_heads` (`execution_bookmark.rs:441`), `restore` (`:745`), `restore_for_retry` (`:751`), `release_heads` (`:684`), `diff` (`:700`); the coordinator's blocked-workspace recovery (`tools/boss/engine/dispatch/src/coordinator/blocked_workspace.rs:46`, diff at `:84`); the abandoned-bookmark sweep (`tools/boss/engine/core/src/abandoned_execution_bookmarks.rs:17`); prune (`prune.rs:188`).
 - What is actually needed: the tip of the worker's **local** work, including work that was never pushed. This is the one pointer nothing else can reconstruct. Needed until the work is proven published, then never.
 
 **`boss/<exec>`**
 
-- Written by: `create_from` on `@` (`execution_bookmark.rs:581`); the worker advances it and pushes it (`tools/boss/engine/core/src/runner/prompt.rs:465`, `cube pr create --branch boss/<exec>`); cube may move it to the remote head on a bound-PR checkout.
+- Written by: `create_from` on `@`; the worker advances it and pushes it (`tools/boss/engine/core/src/runner/prompt.rs:465`, `cube pr create --branch boss/<exec>`); cube may move it to the remote head on a bound-PR checkout.
 - Read by: `resolve_heads` (`execution_bookmark.rs:441`, the second head); PR binding by head ref (`tools/boss/engine/core/src/pr_binding_repair_sweep.rs:285`, `:288`; `tools/boss/engine/core/src/design_detector.rs:40`); the worker branch prefix (`tools/boss/engine/completion/src/lib.rs:541`, `:550`); cube's bookmark sweep, which forgets it once it is reachable from `main` (`tools/cube/src/app/gc.rs:112`, `:157`); its remote-tracking twin `boss/<exec>@origin` is a publication voucher for prune (`prune.rs:58`, `tools/boss/engine/core/src/execution_bookmark_prune.rs:121`).
 - What is actually needed: a **git branch name** to push, which jj can only push from a local bookmark, plus "what was pushed last". The branch must exist while the worker may push again; afterwards GitHub (`headRefName`), the merge poller's `tasks.pr_head_sha`, and the executions' `pr_head_before`/`pr_head_after` columns all record the pushed head without the bookmark.
 

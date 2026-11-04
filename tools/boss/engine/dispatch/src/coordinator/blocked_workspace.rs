@@ -89,14 +89,14 @@ impl ExecutionCoordinator {
             tracing::error!(?note_error, "could not record pointer initialization archive note");
         }
         self.work_db.delete_execution_restore_report(&execution.id)?;
-        position_fresh_workspace(adapter.as_ref(), &lease.workspace_path, &positioning).await?;
+        let positioned = position_fresh_workspace(adapter.as_ref(), &lease.workspace_path, &positioning).await?;
         adapter.create_change(&lease.workspace_path, positioning.title).await?;
         let record = adapter
             .create_execution_bookmark(
                 &lease.workspace_path,
                 &execution.id,
                 None,
-                execution.pr_head_before.as_deref(),
+                positioned.as_deref().or(execution.pr_head_before.as_deref()),
             )
             .await?;
         Ok((record, false))

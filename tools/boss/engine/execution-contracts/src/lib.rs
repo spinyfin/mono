@@ -1536,8 +1536,10 @@ pub trait HostAdapter: Send + Sync {
         let _ = (record, workspace, repo_id, pr);
         bail!("recovery PR preparation is not supported by this host adapter")
     }
-    /// Position a fresh child of the repository's configured trunk.
-    async fn start_fresh_workspace(&self, workspace: &Path) -> Result<()> {
+    /// Position a fresh child of the repository's configured trunk, resolved
+    /// once, and return the commit it was positioned on so the recovery
+    /// pointer's floor is that commit rather than a later re-resolution.
+    async fn start_fresh_workspace(&self, workspace: &Path) -> Result<String> {
         let _ = workspace;
         bail!("fresh workspace positioning is not supported by this host adapter")
     }

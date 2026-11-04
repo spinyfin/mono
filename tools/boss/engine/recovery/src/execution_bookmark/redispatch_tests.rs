@@ -461,3 +461,67 @@ async fn unpushed_local_rebase_of_the_pr_line_does_not_replay_pr_commits() {
         assert_eq!(titles.lines().filter(|line| *line == title).count(), 1, "{titles}");
     }
 }
+
+#[tokio::test]
+async fn unpushed_amendment_to_a_published_pr_commit_is_retained_exactly_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = JjRepo::new(dir.path());
+    origin(&repo);
+    std::fs::write(repo.worker.join("pr-one"), "first").unwrap();
+    JjRepo::run(&repo.worker, &["describe", "-m", "PR commit one"]);
+    JjRepo::run(&repo.worker, &["bookmark", "set", "pr/80", "-r", "@"]);
+    let pr_head = one(&repo.worker, "pr/80");
+    JjRepo::run(&repo.worker, &["new", "-m", "Unpushed revision"]);
+    let prior = create_from(
+        &LocalJj,
+        &repo.worker,
+        "exec_amended_pr_commit",
+        "amend",
+        None,
+        Some(&pr_head),
+    )
+    .await
+    .unwrap();
+    // Publish the PR commit so its original head stays visible.
+    let remote_dir = tempfile::tempdir().unwrap();
+    let remote = JjRepo::new(remote_dir.path());
+    JjRepo::run(
+        &repo.repo,
+        &[
+            "git",
+            "remote",
+            "add",
+            "published",
+            remote.repo.join(".jj/repo/store/git").to_str().unwrap(),
+        ],
+    );
+    JjRepo::run(
+        &repo.repo,
+        &["git", "push", "--remote", "published", "--bookmark", "pr/80", "--allow-new"],
+    );
+    // The worker squashes a unique fix into the published commit without
+    // pushing: same change id, different content.
+    std::fs::write(repo.worker.join("amended-fix"), "only in the amendment").unwrap();
+    JjRepo::run(&repo.worker, &["squash", "--use-destination-message"]);
+    assert_ne!(one(&repo.worker, "pr/80"), pr_head);
+    JjRepo::run(
+        &repo.repo,
+        &["bookmark", "set", "pr/80", "-r", "pr/80@published", "--allow-backwards"],
+    );
+    assert_eq!(one(&repo.repo, "pr/80"), pr_head);
+
+    let report = restore_rebased(&LocalJj, &prior, &repo.replacement, Some("pr/80"), "main", "origin")
+        .await
+        .unwrap();
+    assert!(report.conflicts.is_empty(), "{}", report.conflicts);
+    assert_eq!(
+        std::fs::read_to_string(repo.replacement.join("amended-fix")).unwrap(),
+        "only in the amendment"
+    );
+    assert!(repo.replacement.join("pr-one").exists());
+    let patch = JjRepo::run(&repo.replacement, &["diff", "--from", "main", "--to", "@", "--git"]);
+    // The published content is carried once by the copy of the PR line; the
+    // amended variant adds only what the published commit did not have.
+    assert_eq!(patch.matches("+only in the amendment").count(), 1, "{patch}");
+    assert_eq!(patch.matches("+first").count(), 1, "{patch}");
+}

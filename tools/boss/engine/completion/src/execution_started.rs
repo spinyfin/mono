@@ -21,10 +21,17 @@ impl WorkerCompletionHandler {
     /// attempt identically, so it is logged and the pointer falls back to its
     /// trunk floor instead of failing the start.
     ///
+    /// A deterministic head-lookup failure (the PR is gone, credentials are
+    /// rejected) would fail every retry the same way, so it too is logged and
+    /// the pointer falls back to its trunk floor immediately; only transport
+    /// failures are returned for retry.
+    ///
     /// The snapshot always belongs to the attempt that creates the pointer: a
     /// head recorded by an earlier attempt that failed before the pointer
-    /// existed is overwritten, so the recovery floor and the SHA-delta
-    /// baseline never credit movement between attempts to this run.
+    /// existed is cleared first, then replaced only when this attempt's own
+    /// lookup succeeds. A skipped or failed lookup leaves no head, so the
+    /// recovery floor and the SHA-delta baseline never credit movement
+    /// between attempts to this run.
     pub async fn snapshot_pr_head_before(&self, execution_id: &str) -> Result<()> {
         self.snapshot_bound_pr(execution_id, false).await
     }
@@ -67,6 +74,9 @@ impl WorkerCompletionHandler {
             tracing::debug!(execution_id, kind = %execution.kind.as_str(), "execution_started hook: kind never has a bound PR — skipping pr_head_before snapshot");
             return Ok(());
         }
+        if !include_metadata && execution.pr_head_before.is_some() {
+            self.work_db.clear_execution_pr_head_before(execution_id)?;
+        }
         let located = match self.locate_bound_pr(&execution).await {
             Ok(located) => located,
             Err(err) if !include_metadata => {
@@ -85,8 +95,18 @@ impl WorkerCompletionHandler {
         // The pre-pointer call owns the snapshot for the attempt that creates
         // the pointer; the running hook preserves it.
         if !include_metadata || execution.pr_head_before.is_none() {
-            let head_oid = self.branch_verifier.fetch_pr_head_oid(&repo_slug, pr_number).await?;
-            self.work_db.set_execution_pr_head_before(execution_id, &head_oid)?;
+            match self.branch_verifier.fetch_pr_head_oid(&repo_slug, pr_number).await {
+                Ok(head_oid) => self.work_db.set_execution_pr_head_before(execution_id, &head_oid)?,
+                Err(err) if !include_metadata && git_utils::gh_cli::is_deterministic(&err) => {
+                    tracing::warn!(
+                        execution_id,
+                        ?err,
+                        "pre-pointer snapshot: head lookup cannot succeed on retry; recording no pr_head_before"
+                    );
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            }
         }
         if !include_metadata {
             return Ok(());

@@ -112,7 +112,7 @@ impl HostAdapter for FlakyRestoreAdapter {
         self.inner.goto_workspace_revision(workspace_path, sha).await
     }
 
-    async fn start_fresh_workspace(&self, workspace: &Path) -> Result<()> {
+    async fn start_fresh_workspace(&self, workspace: &Path) -> Result<String> {
         self.inner.start_fresh_workspace(workspace).await
     }
 

@@ -319,9 +319,10 @@ impl HostAdapter for LocalHostAdapter {
         pr_anchor::ensure(&LocalJj, self, record, pr).await?;
         Ok(true)
     }
-    async fn start_fresh_workspace(&self, workspace: &Path) -> Result<()> {
-        execution_bookmark::Jj::run(&LocalJj, workspace, &["new", "trunk()", "-m", "Fresh execution"]).await?;
-        Ok(())
+    async fn start_fresh_workspace(&self, workspace: &Path) -> Result<String> {
+        let trunk = execution_bookmark::one_commit(&LocalJj, workspace, "trunk()").await?;
+        execution_bookmark::Jj::run(&LocalJj, workspace, &["new", &trunk, "-m", "Fresh execution"]).await?;
+        Ok(trunk)
     }
     async fn release_execution_bookmark_heads(
         &self,
@@ -924,9 +925,10 @@ impl HostAdapter for SshHostAdapter {
         pr_anchor::ensure(self, self, record, pr).await?;
         Ok(true)
     }
-    async fn start_fresh_workspace(&self, workspace: &Path) -> Result<()> {
-        execution_bookmark::Jj::run(self, workspace, &["new", "trunk()", "-m", "Fresh execution"]).await?;
-        Ok(())
+    async fn start_fresh_workspace(&self, workspace: &Path) -> Result<String> {
+        let trunk = execution_bookmark::one_commit(self, workspace, "trunk()").await?;
+        execution_bookmark::Jj::run(self, workspace, &["new", &trunk, "-m", "Fresh execution"]).await?;
+        Ok(trunk)
     }
     async fn release_execution_bookmark_heads(
         &self,
@@ -2287,6 +2289,24 @@ mod tests {
             Arc::new(crate::test_support::NoopRunner),
         );
         assert_eq!(adapter.command_repr(&["anything"]), None);
+    }
+
+    #[tokio::test]
+    async fn fresh_workspace_reports_the_trunk_commit_it_is_positioned_on() {
+        use boss_engine_test_git::jj::JjRepo;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = JjRepo::new(dir.path());
+        JjRepo::run(&repo.worker, &["bookmark", "set", "main", "-r", "@"]);
+        JjRepo::run(&repo.worker, &["config", "set", "--repo", "revset-aliases.'trunk()'", "main"]);
+        let adapter = LocalHostAdapter::new(
+            Arc::new(ReprCube { repr_some: false }),
+            Arc::new(crate::test_support::NoopRunner),
+        );
+        let positioned = adapter.start_fresh_workspace(&repo.worker).await.unwrap();
+        let trunk = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "main", "-T", "commit_id"]);
+        let parent = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@-", "-T", "commit_id"]);
+        assert_eq!(positioned, trunk);
+        assert_eq!(parent, trunk, "the fresh change sits directly on the reported commit");
     }
 
     #[test]

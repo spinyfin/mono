@@ -616,7 +616,7 @@ async fn predecessor_floor(jj: &dyn Jj, prior: &ExecutionBookmark) -> Result<Str
 }
 
 /// Resolve a revset to exactly one commit id.
-async fn one_commit(jj: &dyn Jj, repo: &Path, revset: &str) -> Result<String> {
+pub async fn one_commit(jj: &dyn Jj, repo: &Path, revset: &str) -> Result<String> {
     let output = jj
         .run(repo, &["log", "--no-graph", "-r", revset, "-T", "commit_id ++ \"\\n\""])
         .await?;

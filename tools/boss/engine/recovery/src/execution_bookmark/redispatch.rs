@@ -134,20 +134,31 @@ pub async fn restore_rebased(
         // A floor rewritten by a local rebase that was never pushed leaves
         // rewritten variants of the PR's own commits above the recorded
         // floor. The copy of `base_sha..pr` above already carries those
-        // changes, so only work whose change id is not already in the PR is
-        // staged on top of it.
-        let pr_changes: std::collections::HashSet<String> = change_commits(jj, workspace, &format!("{base_sha}..{pr}"))
-            .await?
-            .into_iter()
-            .map(|(change, _)| change)
-            .collect();
+        // changes, so a variant is dropped only when it has the PR commit's
+        // change id AND an empty interdiff against it. A variant that was
+        // amended, squashed into or conflict-resolved in place without being
+        // pushed shares the change id but holds extra content: it is staged.
+        let pr_changes: std::collections::HashMap<String, String> =
+            change_commits(jj, workspace, &format!("{base_sha}..{pr}"))
+                .await?
+                .into_iter()
+                .collect();
         let unpublished = format!("{} ~ (::{pr} | ::{base_sha})", above_floor(&floor, &head));
-        let own_work: Vec<String> = change_commits(jj, workspace, &unpublished)
-            .await?
-            .into_iter()
-            .filter(|(change, _)| !pr_changes.contains(change))
-            .map(|(_, commit)| commit)
-            .collect();
+        let mut own_work: Vec<String> = Vec::new();
+        for (change, commit) in change_commits(jj, workspace, &unpublished).await? {
+            if let Some(published) = pr_changes.get(&change) {
+                let interdiff = jj
+                    .run(
+                        workspace,
+                        &["interdiff", "--from", &commit, "--to", published, "--git"],
+                    )
+                    .await?;
+                if crate::recovery_apply::filter_bookkeeping(&interdiff).text.trim().is_empty() {
+                    continue;
+                }
+            }
+            own_work.push(commit);
+        }
         if !own_work.is_empty() {
             stage_unpublished(jj, workspace, &own_work.join(" | ")).await?;
         }

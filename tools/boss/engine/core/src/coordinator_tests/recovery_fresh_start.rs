@@ -803,7 +803,7 @@ impl crate::host_adapter::HostAdapter for ScratchDestination {
     fn host_id(&self) -> &str {
         "destination"
     }
-    async fn start_fresh_workspace(&self, workspace: &Path) -> Result<()> {
+    async fn start_fresh_workspace(&self, workspace: &Path) -> Result<String> {
         self.inner.start_fresh_workspace(workspace).await
     }
     async fn release_execution_bookmark_heads(

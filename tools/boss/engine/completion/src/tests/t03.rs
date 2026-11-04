@@ -2741,3 +2741,61 @@ async fn pre_pointer_snapshot_reports_a_head_lookup_failure_for_retry() {
     assert!(format!("{err:#}").contains("github unavailable"), "{err:#}");
     assert_eq!(db.get_execution(&execution_id).unwrap().pr_head_before, None);
 }
+
+#[tokio::test]
+async fn a_failed_lookup_after_an_earlier_snapshot_leaves_no_stale_head() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    db.update_work_item(
+        &chore_id,
+        crate::work::WorkItemPatch {
+            pr_url: Some("https://github.com/spinyfin/mono/pull/609".into()),
+            ..crate::work::WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    let verifier = StubBranchVerifier::ok("boss/exec_old");
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let handler = handler.with_branch_verifier(verifier.clone());
+
+    verifier.set_head_oid(Ok("first_attempt_head".into())).await;
+    handler.snapshot_pr_head_before(&execution_id).await.unwrap();
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().pr_head_before.as_deref(),
+        Some("first_attempt_head")
+    );
+
+    verifier.set_head_oid(Err("connection reset".into())).await;
+    assert!(handler.snapshot_pr_head_before(&execution_id).await.is_err());
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().pr_head_before,
+        None,
+        "a lookup that fails on the retry must not leave the earlier attempt's head as the floor"
+    );
+}
+
+#[tokio::test]
+async fn a_deterministic_head_lookup_failure_proceeds_without_a_snapshot_while_a_transport_failure_retries() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    db.update_work_item(
+        &chore_id,
+        crate::work::WorkItemPatch {
+            pr_url: Some("https://github.com/spinyfin/mono/pull/610".into()),
+            ..crate::work::WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    let verifier = StubBranchVerifier::ok("boss/exec_old");
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let handler = handler.with_branch_verifier(verifier.clone());
+
+    verifier.set_head_oid(Err("error connecting to api.github.com".into())).await;
+    assert!(handler.snapshot_pr_head_before(&execution_id).await.is_err());
+
+    verifier
+        .set_head_oid_deterministic_failure("Could not resolve to a PullRequest with the number of 610")
+        .await;
+    handler.snapshot_pr_head_before(&execution_id).await.unwrap();
+    assert_eq!(db.get_execution(&execution_id).unwrap().pr_head_before, None);
+}
