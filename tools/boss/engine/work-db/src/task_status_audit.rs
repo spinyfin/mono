@@ -73,17 +73,13 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     )?;
     super::task_status_backfill::backfill(conn)?;
     for property in ["status", "blocked_reason", "dispatch_failed_reason", "autostart"] {
-        install_property_triggers(conn, property, true)?;
+        install_property_triggers(conn, property)?;
     }
     Ok(())
 }
 
 /// Install the triggers that record every change to `tasks.<property>`.
-///
-/// `record_unset_inserts` is `false` for a property that is NULL on nearly
-/// every row (`parked_at`): a task insert then records the property only when
-/// it arrives set, instead of writing a NULL history row per task.
-pub(super) fn install_property_triggers(conn: &Connection, property: &str, record_unset_inserts: bool) -> Result<()> {
+pub(super) fn install_property_triggers(conn: &Connection, property: &str) -> Result<()> {
     // Repeated failure observations carry new provenance even when the
     // displayed reason is unchanged. Ordinary unchanged updates do not
     // restart the age clock.
@@ -103,11 +99,6 @@ pub(super) fn install_property_triggers(conn: &Connection, property: &str, recor
     } else {
         String::new()
     };
-    let insert_when = if record_unset_inserts {
-        String::new()
-    } else {
-        format!("WHEN NEW.{property} IS NOT NULL")
-    };
     conn.execute_batch(&format!(
         "CREATE TRIGGER IF NOT EXISTS task_status_audit_update_{property}
          AFTER UPDATE OF {property} ON tasks
@@ -121,7 +112,7 @@ pub(super) fn install_property_triggers(conn: &Connection, property: &str, recor
                 COALESCE((SELECT basis FROM task_status_audit_context), 'unattributed_write'));
          END;
          CREATE TRIGGER IF NOT EXISTS task_status_audit_insert_{property}
-         AFTER INSERT ON tasks {insert_when} BEGIN
+         AFTER INSERT ON tasks BEGIN
             INSERT INTO task_status_audit
                 (work_item_id, property, old_value, new_value, actor, changed_at, basis)
             VALUES (NEW.id, '{property}', NULL, NEW.{property},

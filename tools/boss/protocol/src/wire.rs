@@ -181,7 +181,6 @@ pub enum CoordinatorRecreateReason {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(clippy::large_enum_variant)] // internally-tagged RPC; boxing a payload is a follow-up
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FrontendRequest {
     /// Engine-side abandon for a non-terminal `ci_remediations`
@@ -508,8 +507,10 @@ pub enum FrontendRequest {
     /// source fields in the input. Replies with
     /// [`FrontendEvent::AttentionCreated`].
     CreateAttention {
+        /// Boxed so `FrontendRequest` stays within clippy's
+        /// `large_enum_variant` budget; serde output is identical.
         #[serde(flatten)]
-        input: CreateAttentionInput,
+        input: Box<CreateAttentionInput>,
     },
 
     CreateAttentionItem {
@@ -2940,7 +2941,9 @@ pub enum FrontendRequest {
 
     UpdateWorkItem {
         id: String,
-        patch: WorkItemPatch,
+        /// Boxed so `FrontendRequest` stays within clippy's
+        /// `large_enum_variant` budget; serde output is identical.
+        patch: Box<WorkItemPatch>,
     },
 
     /// Snapshot every engine worker pool's (main, automation, review)

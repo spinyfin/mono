@@ -752,7 +752,7 @@ pub(crate) async fn update_work_item(
         client,
         FrontendRequest::UpdateWorkItem {
             id: id.to_owned(),
-            patch,
+            patch: Box::new(patch),
         },
         "work item update",
         FrontendEvent::WorkItemUpdated { item } => item,

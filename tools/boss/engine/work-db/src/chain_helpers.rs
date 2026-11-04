@@ -709,6 +709,9 @@ pub(crate) fn cascade_project_id_to_revisions(
             params![rev_id, project_id, now],
         )?;
     }
+    // Membership triggers may have stamped `parked_at` on the cascaded
+    // revisions; flush so the ledger matches the row in this transaction.
+    crate::parking::flush_parked_at_ledger(conn)?;
     Ok(())
 }
 

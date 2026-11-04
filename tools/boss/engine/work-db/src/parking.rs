@@ -20,24 +20,28 @@
 //!   task created in or moved into a parked project is stamped by a trigger,
 //!   but the predicate does not depend on that;
 //! - it is a revision and its chain root (or that root's project) is parked.
-//!   A revision follows its parent PR, so it is never parked on its own and
-//!   needs no stamp of its own for a directly parked parent.
+//!   A revision follows its parent PR, so it is never parked on its own; it
+//!   is born parked with a copy of the chain root's stamp (`parked_via =
+//!   'direct'` or `'project:<id>'`), and parent un-park clears those
+//!   inherited stamps. The SQL predicate still treats a revision of a
+//!   parked root as parked, as a backstop.
 //!
 //! ## What park and un-park do
 //!
-//! - **Park a task**: stamp it, and cancel its never-started executions
-//!   (`ready | queued | waiting_dependency`, reason `parked`). A live
-//!   execution (`claimed | running | waiting_human`) is never killed: parking
-//!   is an attention decision, not a cancellation, and the in-flight run
-//!   finishes normally.
+//! - **Park a task**: stamp it, stamp every open revision whose chain root
+//!   is this task, and cancel never-started executions (`ready | queued |
+//!   waiting_dependency`, reason `parked`) on the task and those revisions.
+//!   A live execution (`claimed | running | waiting_human`) is never killed:
+//!   parking is an attention decision, not a cancellation, and the in-flight
+//!   run finishes normally.
 //! - **Park a project**: stamp the project, then every open, non-deleted task
 //!   in it (hidden revision rows and `deferred` rows included) with
 //!   `project:<id>`, in one transaction. A task the owner parked directly
 //!   keeps its own stamp.
-//! - **Un-park a task**: clear the stamp. A task that is parked only because
-//!   its project is parked cannot be un-parked on its own — un-park the
-//!   project — which would otherwise leave a row that looks un-parked but is
-//!   still skipped.
+//! - **Un-park a task**: clear the stamp and the inherited stamps on its
+//!   open revisions. A task whose project is still parked cannot be
+//!   un-parked on its own — un-park the project — which would otherwise
+//!   leave a row that looks un-parked but is still skipped.
 //! - **Un-park a project**: clear the project and only the rows whose stamp
 //!   names it. A task parked directly before or during the project's park
 //!   stays parked.
@@ -59,7 +63,10 @@
 //! `parked_at`). A trigger on `tasks.parked_at` writes a parking-owned sink
 //! that does not name the ledger tables, so `ALTER TABLE` rewrite still
 //! works after an upgrade test has dropped those tables; the write helper
-//! copies the sink into the ledger inside the same savepoint. The `basis`
+//! copies the sink into the ledger inside the same savepoint. Writes that
+//! fire the membership triggers without going through that helper leave
+//! rows in the sink until the next helper call (or an explicit flush at
+//! the write site). The `basis`
 //! names the producer: [`BASIS_PARKED`], [`BASIS_UNPARKED`],
 //! [`BASIS_PROJECT_PARK_CASCADE`], [`BASIS_PROJECT_UNPARK_CASCADE`]; a task
 //! born parked or moved into a parked project carries the basis of the write
@@ -116,6 +123,23 @@ BEGIN
         parked_via = 'project:' || NEW.project_id
     WHERE id = NEW.id AND parked_at IS NULL AND NEW.project_id IS NOT NULL
       AND EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id AND parked_at IS NOT NULL);
+END;
+CREATE TRIGGER IF NOT EXISTS tasks_born_parked_with_parked_parent
+AFTER INSERT ON tasks
+WHEN NEW.kind = 'revision' AND NEW.parked_at IS NULL AND NEW.parent_task_id IS NOT NULL
+ AND EXISTS (
+    SELECT 1 FROM tasks parent
+    WHERE parent.id = NEW.parent_task_id
+      AND parent.parked_at IS NOT NULL
+      AND parent.status NOT IN ('done', 'archived')
+ )
+BEGIN
+    UPDATE tasks SET
+        parked_at = (SELECT parked_at FROM tasks WHERE id = NEW.parent_task_id),
+        parked_by = (SELECT parked_by FROM tasks WHERE id = NEW.parent_task_id),
+        parked_reason = (SELECT parked_reason FROM tasks WHERE id = NEW.parent_task_id),
+        parked_via = (SELECT parked_via FROM tasks WHERE id = NEW.parent_task_id)
+    WHERE id = NEW.id;
 END;";
 
 /// Trigger SQL names only parking-owned tables, never `task_status_audit*`.
@@ -135,8 +159,6 @@ CREATE TABLE IF NOT EXISTS parking_audit_sink (
     changed_at TEXT NOT NULL,
     basis TEXT NOT NULL
 );
-DROP TRIGGER IF EXISTS task_status_audit_update_parked_at;
-DROP TRIGGER IF EXISTS task_status_audit_insert_parked_at;
 CREATE TRIGGER IF NOT EXISTS parking_audit_parked_at
 AFTER UPDATE OF parked_at ON tasks
 WHEN OLD.parked_at IS NOT NEW.parked_at
@@ -163,18 +185,31 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Copy parked_at sink rows into the ledger. No-op when either table is gone
-/// (upgrade tests drop the ledger, then `ALTER TABLE` other columns).
+/// Copy parked_at sink rows into the ledger. No-op when the sink is empty
+/// or the ledger table is gone (upgrade tests drop the ledger, then
+/// `ALTER TABLE` other columns). Membership triggers that fire from a
+/// plain `conn.execute` (revision `project_id` cascade, a raw INSERT)
+/// leave rows in the sink until this runs; call it at those write sites
+/// so list/show and the stuck report see the ledger in the same
+/// transaction rather than after an unrelated later write.
 pub(super) fn flush_parked_at_ledger(conn: &Connection) -> rusqlite::Result<()> {
-    let ready: i64 = conn.query_row(
+    let pending: i64 = conn.query_row(
         "SELECT CASE WHEN
-            EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_status_audit')
-            AND EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'parking_audit_sink')
-            THEN 1 ELSE 0 END",
+            EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'parking_audit_sink')
+            THEN (SELECT EXISTS (SELECT 1 FROM parking_audit_sink LIMIT 1))
+            ELSE 0 END",
         [],
         |row| row.get(0),
     )?;
-    if ready == 0 {
+    if pending == 0 {
+        return Ok(());
+    }
+    let has_ledger: i64 = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_status_audit')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_ledger == 0 {
         return Ok(());
     }
     conn.execute_batch(
@@ -332,6 +367,15 @@ pub fn parked_holder(conn: &Connection, work_item_id: &str) -> Result<Option<Par
             && let Some(holder) = open_parked_project(conn, project_id)?
         {
             return Ok(Some(holder));
+        }
+        // A revision inherits its parent's stamp and cannot be un-parked on
+        // its own: the chain root is the holder even when the revision row
+        // carries a copy of the stamp.
+        if row.is_revision
+            && let Some(root_id) = row.parent_task_id.as_deref()
+            && let Some(root) = task_park_row(conn, root_id)?
+        {
+            return Ok(Some(root.into_holder(root_id)));
         }
         return Ok(Some(row.into_holder(work_item_id)));
     }
@@ -533,16 +577,17 @@ fn set_task_parked(
                     params![id, PARKED_VIA_DIRECT, actor, reason, now],
                 )?;
             }
+            inherit_park_stamp_onto_open_revisions(tx, pending, id, actor, now, BASIS_PARKED)?;
             return Ok(());
         }
         stamp_task(tx, id, actor, reason, PARKED_VIA_DIRECT, now, BASIS_PARKED)?;
-        cancel_pending_executions(tx, pending, id)?;
+        inherit_park_stamp_onto_open_revisions(tx, pending, id, actor, now, BASIS_PARKED)?;
         return Ok(());
     }
     if task.parked_at.is_none() {
         return Ok(());
     }
-    if let Some(project_id) = task.parked_via.as_deref().and_then(|via| via.strip_prefix("project:"))
+    if let Some(project_id) = task.project_id.as_deref()
         && open_parked_project(tx, project_id)?.is_some()
     {
         bail!(
@@ -557,6 +602,15 @@ fn set_task_parked(
         "UPDATE tasks SET parked_at = NULL, parked_by = NULL, parked_reason = NULL, parked_via = NULL, updated_at = ?2
          WHERE id = ?1",
         params![id, now],
+    )?;
+    crate::task_status_audit::execute(
+        tx,
+        BASIS_UNPARKED,
+        actor,
+        "UPDATE tasks SET parked_at = NULL, parked_by = NULL, parked_reason = NULL, parked_via = NULL, updated_at = ?2
+         WHERE parent_task_id = ?1 AND kind = 'revision' AND parked_via = ?3
+           AND deleted_at IS NULL AND status NOT IN ('done', 'archived')",
+        params![id, now, PARKED_VIA_DIRECT],
     )?;
     Ok(())
 }
@@ -579,6 +633,58 @@ fn stamp_task(
         params![id, now, actor, reason, via],
     )?;
     Ok(())
+}
+
+/// Copy the chain root's park stamp onto its open revisions and cancel
+/// their never-started executions. A revision follows its parent PR, so
+/// parking the parent parks the chain; claimed/running/waiting_human rows
+/// stay alive.
+fn inherit_park_stamp_onto_open_revisions(
+    tx: &Connection,
+    pending: &mut PendingEvents,
+    parent_id: &str,
+    actor: &str,
+    now: &str,
+    basis: &str,
+) -> Result<()> {
+    crate::task_status_audit::execute(
+        tx,
+        basis,
+        actor,
+        "UPDATE tasks SET
+            parked_at = (SELECT parked_at FROM tasks WHERE id = ?1),
+            parked_by = (SELECT parked_by FROM tasks WHERE id = ?1),
+            parked_reason = (SELECT parked_reason FROM tasks WHERE id = ?1),
+            parked_via = (SELECT parked_via FROM tasks WHERE id = ?1),
+            updated_at = ?2
+         WHERE parent_task_id = ?1 AND kind = 'revision'
+           AND deleted_at IS NULL AND status NOT IN ('done', 'archived')
+           AND (
+                parked_at IS NULL
+                OR parked_via IS NOT (SELECT parked_via FROM tasks WHERE id = ?1)
+                OR parked_at IS NOT (SELECT parked_at FROM tasks WHERE id = ?1)
+                OR parked_by IS NOT (SELECT parked_by FROM tasks WHERE id = ?1)
+                OR parked_reason IS NOT (SELECT parked_reason FROM tasks WHERE id = ?1)
+           )",
+        params![parent_id, now],
+    )?;
+    cancel_pending_executions(tx, pending, parent_id)?;
+    for revision_id in open_revision_ids(tx, parent_id)? {
+        cancel_pending_executions(tx, pending, &revision_id)?;
+    }
+    Ok(())
+}
+
+fn open_revision_ids(tx: &Connection, parent_id: &str) -> Result<Vec<String>> {
+    Ok(tx
+        .prepare(
+            "SELECT id FROM tasks
+             WHERE parent_task_id = ?1 AND kind = 'revision'
+               AND deleted_at IS NULL AND status NOT IN ('done', 'archived')
+             ORDER BY created_at, id",
+        )?
+        .query_map([parent_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 fn set_project_parked(
@@ -733,14 +839,16 @@ mod tests {
     fn revision_of(db: &WorkDb, parent: &str, name: &str) -> String {
         let parent = get_task(db, parent);
         let id = format!("task_rev_{name}");
-        db.connect()
-            .unwrap()
-            .execute(
-                "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, created_at, updated_at, parent_task_id)
-                 VALUES (?1, ?2, ?3, 'revision', ?4, '', 'todo', '1', '1', ?5)",
-                params![id, parent.product_id, parent.project_id, name, parent.id],
-            )
-            .unwrap();
+        let conn = db.connect().unwrap();
+        crate::task_status_audit::execute(
+            &conn,
+            "insert_revision_in_tx",
+            LAST_STATUS_ACTOR_HUMAN,
+            "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, created_at, updated_at, parent_task_id)
+             VALUES (?1, ?2, ?3, 'revision', ?4, '', 'todo', '1', '1', ?5)",
+            params![id, parent.product_id, parent.project_id, name, parent.id],
+        )
+        .unwrap();
         id
     }
 
@@ -1084,21 +1192,86 @@ mod tests {
     }
 
     #[test]
-    fn a_revision_is_parked_with_its_parent_without_a_stamp_of_its_own() {
+    fn a_revision_is_born_parked_from_a_directly_parked_parent() {
         let (_dir, db, product) = fixture();
         let parent = create_test_chore_manual(&db, &product, "Parent PR");
-        let revision = revision_of(&db, &parent.id, "follows");
-        assert!(db.upkeep_eligible(&revision).unwrap());
         park(&db, &parent.id);
-        assert!(db.is_parked(&revision).unwrap());
-        assert_eq!(get_task(&db, &revision).parked_at, None);
+        let parent_row = get_task(&db, &parent.id);
+        let revision = revision_of(&db, &parent.id, "follows");
+        let row = get_task(&db, &revision);
+        assert!(row.is_parked(), "section 1.2: born parked with the parent's stamp");
+        assert_eq!(row.parked_at, parent_row.parked_at);
+        assert_eq!(row.parked_by, parent_row.parked_by);
+        assert_eq!(row.parked_reason, parent_row.parked_reason);
+        assert_eq!(row.parked_via.as_deref(), Some(PARKED_VIA_DIRECT));
+        let rows = ledger(&db, &revision);
+        assert_eq!(
+            rows.len(),
+            1,
+            "a born-parked revision writes a parked_at ledger row: {rows:?}"
+        );
+        assert!(row.parked_at.is_some());
         let holder = parked_holder(&db.connect().unwrap(), &revision).unwrap().unwrap();
         assert_eq!(
             (holder.holder_id.as_str(), holder.holder_is_project),
             (parent.id.as_str(), false)
         );
         unpark(&db, &parent.id).unwrap();
+        let after = get_task(&db, &revision);
+        assert!(!after.is_parked());
+        assert_eq!(after.parked_at, None);
         assert!(db.upkeep_eligible(&revision).unwrap());
+        assert_eq!(ledger(&db, &revision).last().unwrap().3, BASIS_UNPARKED);
+    }
+
+    #[test]
+    fn parking_a_parent_stamps_existing_revisions_and_cancels_only_their_pending_executions() {
+        let (_dir, db, product) = fixture();
+        let parent = create_test_chore_manual(&db, &product, "Parent PR");
+        let pending_rev = revision_of(&db, &parent.id, "pending");
+        let live_rev = revision_of(&db, &parent.id, "live");
+        let pending_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(pending_rev.clone())
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        let live_exec = create_spawned_execution(&db, &live_rev, 4243);
+        park(&db, &parent.id);
+        let pending_row = get_task(&db, &pending_rev);
+        let live_row = get_task(&db, &live_rev);
+        assert!(pending_row.is_parked() && live_row.is_parked());
+        assert_eq!(pending_row.parked_via.as_deref(), Some(PARKED_VIA_DIRECT));
+        assert_eq!(live_row.parked_via.as_deref(), Some(PARKED_VIA_DIRECT));
+        assert_eq!(execution_status(&db, &pending_exec.id), "cancelled");
+        assert_eq!(
+            execution_status(&db, &live_exec),
+            "running",
+            "a live revision worker is never killed"
+        );
+    }
+
+    #[test]
+    fn unparking_a_direct_child_of_a_parked_project_is_refused_and_keeps_the_stamp() {
+        let (_dir, db, product) = fixture();
+        let p = project(&db, &product, "Still parked");
+        let child = project_task(&db, &product, &p, "direct-child");
+        park(&db, &p);
+        db.park_work_item_as_actor(&child, true, Some("mine"), LAST_STATUS_ACTOR_HUMAN)
+            .unwrap();
+        assert_eq!(get_task(&db, &child).parked_via.as_deref(), Some(PARKED_VIA_DIRECT));
+        let error = unpark(&db, &child).unwrap_err();
+        assert!(
+            format!("{error:#}").contains(&format!("boss project unpark {p}")),
+            "{error:#}"
+        );
+        let row = get_task(&db, &child);
+        assert!(row.is_parked(), "is_parked and the stamp must agree");
+        assert_eq!(row.parked_via.as_deref(), Some(PARKED_VIA_DIRECT));
+        assert_eq!(row.parked_reason.as_deref(), Some("mine"));
     }
 
     #[test]

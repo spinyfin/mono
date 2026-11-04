@@ -49,7 +49,7 @@ pub(super) fn resolve_write_actor(
 /// descends from neither the coordinator nor the app, so it would resolve to
 /// `'human'`), and `WorkDb` then judges the resolved actor string, which
 /// admits only `human` and `boss`.
-fn refuse_agent_parking(server_state: &ServerState, peer_pid: Option<libc::pid_t>) -> anyhow::Result<()> {
+pub(super) fn refuse_agent_parking(server_state: &ServerState, peer_pid: Option<libc::pid_t>) -> anyhow::Result<()> {
     let peer_class = server_state.classify_peer(peer_pid);
     if peer_class.is_progression() {
         return Err(boss_work_db::parking::parking_refusal("progression"));
@@ -548,7 +548,7 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
     };
     tracing::Span::current().record("item_id", &id);
     tracing::debug!(target: "work_write_timing", boundary = "handler_entry");
-    apply_work_item_patch(ctx, id, patch, None).await;
+    apply_work_item_patch(ctx, id, *patch, None).await;
 }
 
 /// Park or un-park a task, chore or project. A parking-only `UpdateWorkItem`
@@ -776,6 +776,11 @@ pub(super) async fn apply_work_item_patch(
         } else {
             None
         };
+        // A parking-only patch does not change lifecycle status. The
+        // in_review / terminal teardown helpers look at the resulting
+        // status, not at whether this patch moved it, so they would
+        // otherwise force-release a live execution on an in_review park.
+        let parking_only = patch.is_parking_only();
         // Bug #679: when the patch is a kanban drag-to-Doing
         // (a task/chore transitioning from non-active to
         // `active`) and dispatch would deterministically fail
@@ -887,7 +892,10 @@ pub(super) async fn apply_work_item_patch(
                 // Idempotent — duplicate or no-op cases
                 // (already released, never spawned, not a
                 // task/chore) collapse inside force_release.
-                if let Some(execution_id) = terminal_chore_execution(&work_db, &item) {
+                // Parking-only patches skip this: they do not
+                // change status, and a live execution is left
+                // to finish.
+                if !parking_only && let Some(execution_id) = terminal_chore_execution(&work_db, &item) {
                     let handler = server_state.completion_handler.clone();
                     boss_task_scope::spawn(async move {
                         handler.force_release(&execution_id).await;
@@ -902,7 +910,7 @@ pub(super) async fn apply_work_item_patch(
                 // the human-drag path and any ghost panes left
                 // behind by a failed or partial auto-release.
                 // Idempotent for the same reasons as above.
-                if let Some(execution_id) = in_review_chore_execution(&work_db, &item) {
+                if !parking_only && let Some(execution_id) = in_review_chore_execution(&work_db, &item) {
                     let handler = server_state.completion_handler.clone();
                     boss_task_scope::spawn(async move {
                         handler.force_release(&execution_id).await;
@@ -916,7 +924,9 @@ pub(super) async fn apply_work_item_patch(
                 // status is already `todo` from the patch above;
                 // autostart was cleared to 0 when the task first
                 // entered Doing, so it will not be re-dispatched.
-                if let Some(execution_id) = active_to_todo_execution(&work_db, &previous_task_status, &item) {
+                if !parking_only
+                    && let Some(execution_id) = active_to_todo_execution(&work_db, &previous_task_status, &item)
+                {
                     let handler = server_state.completion_handler.clone();
                     let id_for_cancel = id.clone();
                     boss_task_scope::spawn(async move {

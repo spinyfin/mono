@@ -401,7 +401,7 @@ pub(crate) async fn run_project_command(command: ProjectCommand, ctx: &RunContex
                 })
                 .await?
             };
-            let projects = apply_project_list_filters_with(
+            let projects = apply_project_list_filters(
                 projects,
                 ProjectListCriteria::builder()
                     .statuses(&args.status)

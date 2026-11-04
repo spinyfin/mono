@@ -198,30 +198,7 @@ pub(crate) struct ProjectListCriteria<'a> {
     pub(crate) parked: ParkedListFilter,
 }
 
-#[cfg(test)]
 pub(crate) fn apply_project_list_filters(
-    items: Vec<Project>,
-    statuses: &[ProjectStatusArg],
-    match_term: Option<&str>,
-    ids: &[String],
-    limit: Option<usize>,
-    repo: Option<&RepoSelector>,
-    product_repo: Option<&str>,
-) -> Vec<Project> {
-    apply_project_list_filters_with(
-        items,
-        ProjectListCriteria::builder()
-            .statuses(statuses)
-            .maybe_match_term(match_term)
-            .ids(ids)
-            .maybe_limit(limit)
-            .build(),
-        repo,
-        product_repo,
-    )
-}
-
-pub(crate) fn apply_project_list_filters_with(
     items: Vec<Project>,
     criteria: ProjectListCriteria<'_>,
     repo: Option<&RepoSelector>,
@@ -1571,6 +1548,23 @@ mod parked_list_tests {
     }
 
     #[test]
+    fn parked_revision_rows_use_their_own_stamp_in_the_list_filter() {
+        let mut revision = task("task_rev", true);
+        revision.kind = TaskKind::Revision;
+        revision.parked_via = Some("direct".to_owned());
+        let rows = vec![revision, task("task_live", false)];
+        let visible = apply_task_list_filters(rows.clone(), TaskListCriteria::builder().build(), None, None);
+        assert_eq!(ids(&visible), ["task_live"]);
+        let visible = apply_task_list_filters(
+            rows,
+            TaskListCriteria::builder().parked(ParkedListFilter::Only).build(),
+            None,
+            None,
+        );
+        assert_eq!(ids(&visible), ["task_rev"]);
+    }
+
+    #[test]
     fn done_row_with_park_stamp_is_not_parked_for_the_list_filter() {
         let mut done = task("task_done", true);
         done.status = TaskStatus::Done;
@@ -1683,10 +1677,10 @@ mod parked_list_tests {
     #[test]
     fn parked_projects_hidden_by_default_shown_on_request() {
         let rows = vec![project("proj_parked", true), project("proj_live", false)];
-        let visible = apply_project_list_filters(rows.clone(), &[], None, &[], None, None, None);
+        let visible = apply_project_list_filters(rows.clone(), ProjectListCriteria::builder().build(), None, None);
         assert_eq!(visible.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["proj_live"]);
 
-        let visible = apply_project_list_filters_with(
+        let visible = apply_project_list_filters(
             rows.clone(),
             ProjectListCriteria::builder().parked(ParkedListFilter::Include).build(),
             None,
@@ -1694,7 +1688,7 @@ mod parked_list_tests {
         );
         assert_eq!(visible.len(), 2);
 
-        let visible = apply_project_list_filters_with(
+        let visible = apply_project_list_filters(
             rows,
             ProjectListCriteria::builder().parked(ParkedListFilter::Only).build(),
             None,
@@ -1704,5 +1698,593 @@ mod parked_list_tests {
             visible.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
             ["proj_parked"]
         );
+    }
+}
+
+#[cfg(test)]
+mod list_filter_tests {
+    use super::*;
+    use crate::{Cli, Commands, ProjectStatusArg, TaskCommand, TaskPriority, TaskStatusArg};
+    use boss_protocol::{Project, ProjectStatus, Task, TaskKind, TaskStatus};
+    use clap::Parser;
+
+    fn dummy_task(id: &str, kind: TaskKind) -> Task {
+        Task::builder()
+            .id(id)
+            .product_id("prod_1")
+            .kind(kind)
+            .name("n")
+            .description("")
+            .status(TaskStatus::Todo)
+            .created_at("")
+            .updated_at("")
+            .build()
+    }
+
+    #[test]
+    fn archived_tasks_hidden_from_list_by_default_but_shown_on_request() {
+        let archived = Task::builder()
+            .id("task_archived")
+            .product_id("prod_1")
+            .kind(TaskKind::Chore)
+            .name("n")
+            .description("")
+            .status(TaskStatus::Archived)
+            .created_at("")
+            .updated_at("")
+            .build();
+        let live = Task::builder()
+            .id("task_live")
+            .product_id("prod_1")
+            .kind(TaskKind::Chore)
+            .name("n")
+            .description("")
+            .status(TaskStatus::Todo)
+            .created_at("")
+            .updated_at("")
+            .build();
+
+        // Default view: archived is hidden, live rows still show.
+        let visible = apply_task_list_filters(
+            vec![archived.clone(), live.clone()],
+            TaskListCriteria::builder()
+                .statuses(&[])
+                .priorities(&[])
+                .ids(&[])
+                .include_archived(false)
+                .build(),
+            None,
+            None,
+        );
+        assert_eq!(visible.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["task_live"]);
+
+        // `--include-archived` surfaces it alongside everything else.
+        let visible = apply_task_list_filters(
+            vec![archived.clone(), live.clone()],
+            TaskListCriteria::builder()
+                .statuses(&[])
+                .priorities(&[])
+                .ids(&[])
+                .include_archived(true)
+                .build(),
+            None,
+            None,
+        );
+        assert_eq!(visible.len(), 2);
+
+        // An explicit `--status archived` filter also surfaces it, without
+        // needing `--include-archived` too.
+        let visible = apply_task_list_filters(
+            vec![archived, live],
+            TaskListCriteria::builder()
+                .statuses(&[TaskStatusArg::Archived])
+                .priorities(&[])
+                .ids(&[])
+                .include_archived(false)
+                .build(),
+            None,
+            None,
+        );
+        assert_eq!(
+            visible.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            ["task_archived"]
+        );
+    }
+
+    /// Filter-test row: `dummy_task` with the fields the list filters
+    /// actually read dialled in. Everything else keeps the
+    /// `dummy_task` defaults.
+    fn filterable_task(id: &str, name: &str, description: &str, status: TaskStatus, priority: &str) -> Task {
+        let mut task = dummy_task(id, TaskKind::Task);
+        task.name = name.to_owned();
+        task.description = description.to_owned();
+        task.status = status;
+        task.priority = priority.to_owned();
+        task
+    }
+
+    /// Filter-test row for projects, mirroring [`filterable_task`].
+    fn filterable_project(id: &str, name: &str, description: &str, status: ProjectStatus) -> Project {
+        Project::builder()
+            .id(id)
+            .product_id("prod_1")
+            .name(name)
+            .slug(name.to_lowercase())
+            .description(description)
+            .goal("")
+            .status(status)
+            .created_at("")
+            .updated_at("")
+            .build()
+    }
+
+    /// The filters promise a *set* of surviving rows, not an ordering —
+    /// sort so no test accidentally pins iteration order.
+    fn surviving_task_ids(tasks: &[Task]) -> Vec<&str> {
+        let mut ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn surviving_project_ids(projects: &[Project]) -> Vec<&str> {
+        let mut ids: Vec<&str> = projects.iter().map(|p| p.id.as_str()).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// `TaskListCriteria` with every dimension off — the "no flags
+    /// passed" baseline each test narrows one field at a time.
+    fn unfiltered_task_criteria<'a>() -> TaskListCriteria<'a> {
+        TaskListCriteria::builder()
+            .statuses(&[])
+            .priorities(&[])
+            .ids(&[])
+            .include_archived(false)
+            .build()
+    }
+
+    /// `--parent` keeps only rows whose `parent_task_id` matches. Omitting
+    /// it leaves every row. A missing projection would make this filter
+    /// always empty — the false-negative the list surface used to produce.
+    #[test]
+    fn task_list_filters_by_parent_task_id() {
+        let mut child = filterable_task("task_child", "child", "", TaskStatus::Todo, "medium");
+        child.parent_task_id = Some("task_parent".to_owned());
+        let other = filterable_task("task_other", "other", "", TaskStatus::Todo, "medium");
+        let orphan = filterable_task("task_orphan", "orphan", "", TaskStatus::Todo, "medium");
+        let rows = vec![child, other, orphan];
+
+        let visible = apply_task_list_filters(
+            rows.clone(),
+            TaskListCriteria::builder().parent_task_id("task_parent").build(),
+            None,
+            None,
+        );
+        assert_eq!(surviving_task_ids(&visible), ["task_child"]);
+
+        // No --parent: nothing is filtered out on that axis.
+        let visible = apply_task_list_filters(rows, unfiltered_task_criteria(), None, None);
+        assert_eq!(visible.len(), 3);
+    }
+
+    #[test]
+    fn task_list_parses_parent_flag() {
+        let cli = Cli::parse_from(["boss", "task", "list", "--parent", "task_18c731dad84bb5f8_30a"]);
+        match cli.command {
+            Commands::Task {
+                command: TaskCommand::List(args),
+            } => assert_eq!(args.parent.as_deref(), Some("task_18c731dad84bb5f8_30a")),
+            _ => panic!("expected task list command"),
+        }
+    }
+
+    /// `--priority` is an OR over the listed values; omitting it keeps
+    /// every priority.
+    #[test]
+    fn task_list_filters_by_priority() {
+        let rows = || {
+            vec![
+                filterable_task("task_low", "n", "", TaskStatus::Todo, "low"),
+                filterable_task("task_medium", "n", "", TaskStatus::Todo, "medium"),
+                filterable_task("task_high", "n", "", TaskStatus::Todo, "high"),
+            ]
+        };
+
+        let visible = apply_task_list_filters(
+            rows(),
+            TaskListCriteria::builder().priorities(&[TaskPriority::High]).build(),
+            None,
+            None,
+        );
+        assert_eq!(surviving_task_ids(&visible), ["task_high"]);
+
+        // Several values OR together.
+        let visible = apply_task_list_filters(
+            rows(),
+            TaskListCriteria::builder()
+                .priorities(&[TaskPriority::Low, TaskPriority::High])
+                .build(),
+            None,
+            None,
+        );
+        assert_eq!(surviving_task_ids(&visible), ["task_high", "task_low"]);
+
+        // No `--priority` at all: nothing is filtered out on that axis.
+        let visible = apply_task_list_filters(rows(), unfiltered_task_criteria(), None, None);
+        assert_eq!(visible.len(), 3);
+    }
+
+    /// `--match` is a case-insensitive substring test against the name
+    /// *or* the description — a hit in either field keeps the row.
+    #[test]
+    fn task_list_match_term_hits_name_or_description_case_insensitively() {
+        let rows = || {
+            vec![
+                filterable_task("task_name_hit", "Fix Nimbus deploy", "", TaskStatus::Todo, "medium"),
+                filterable_task(
+                    "task_desc_hit",
+                    "unrelated",
+                    "rollout to NIMBUS",
+                    TaskStatus::Todo,
+                    "medium",
+                ),
+                filterable_task("task_miss", "unrelated", "nothing to see", TaskStatus::Todo, "medium"),
+            ]
+        };
+
+        // Lowercase term matches the mixed-case name and the uppercase
+        // description alike.
+        let visible = apply_task_list_filters(
+            rows(),
+            TaskListCriteria::builder().match_term("nimbus").build(),
+            None,
+            None,
+        );
+        assert_eq!(surviving_task_ids(&visible), ["task_desc_hit", "task_name_hit"]);
+
+        // ...and an uppercase term is folded the same way.
+        let visible = apply_task_list_filters(
+            rows(),
+            TaskListCriteria::builder().match_term("NiMbUs").build(),
+            None,
+            None,
+        );
+        assert_eq!(surviving_task_ids(&visible), ["task_desc_hit", "task_name_hit"]);
+
+        // A term nothing carries filters everything out.
+        let visible = apply_task_list_filters(
+            rows(),
+            TaskListCriteria::builder().match_term("zeppelin").build(),
+            None,
+            None,
+        );
+        assert!(visible.is_empty());
+    }
+
+    /// An explicit id set restricts the listing to those rows; ids that
+    /// match nothing are simply absent rather than an error.
+    #[test]
+    fn task_list_restricts_to_requested_ids() {
+        let rows = || {
+            vec![
+                filterable_task("task_1", "n", "", TaskStatus::Todo, "medium"),
+                filterable_task("task_2", "n", "", TaskStatus::Todo, "medium"),
+                filterable_task("task_3", "n", "", TaskStatus::Todo, "medium"),
+            ]
+        };
+
+        let ids = vec!["task_1".to_owned(), "task_3".to_owned()];
+        let visible = apply_task_list_filters(rows(), TaskListCriteria::builder().ids(&ids).build(), None, None);
+        assert_eq!(surviving_task_ids(&visible), ["task_1", "task_3"]);
+
+        // An id set naming rows that aren't present yields nothing.
+        let ids = vec!["task_absent".to_owned()];
+        let visible = apply_task_list_filters(rows(), TaskListCriteria::builder().ids(&ids).build(), None, None);
+        assert!(visible.is_empty());
+    }
+
+    /// `--limit` caps how many rows come back, and it applies to what
+    /// *survived* the other filters — not to the raw input — so a
+    /// limited listing is never padded with rows the filters rejected.
+    #[test]
+    fn task_list_limit_caps_the_filtered_rows() {
+        let rows = vec![
+            filterable_task("task_done_1", "n", "", TaskStatus::Done, "medium"),
+            filterable_task("task_todo_1", "n", "", TaskStatus::Todo, "medium"),
+            filterable_task("task_todo_2", "n", "", TaskStatus::Todo, "medium"),
+            filterable_task("task_todo_3", "n", "", TaskStatus::Todo, "medium"),
+        ];
+
+        // Limit alone: fewer rows than the input, all still real rows.
+        let visible = apply_task_list_filters(rows.clone(), TaskListCriteria::builder().limit(2).build(), None, None);
+        assert_eq!(visible.len(), 2);
+
+        // Limit with a status filter: the two rows returned are both
+        // `todo` — the leading `done` row does not consume a slot.
+        let visible = apply_task_list_filters(
+            rows.clone(),
+            TaskListCriteria::builder()
+                .statuses(&[TaskStatusArg::Backlog])
+                .limit(2)
+                .build(),
+            None,
+            None,
+        );
+        assert_eq!(visible.len(), 2);
+        assert!(visible.iter().all(|t| t.status == TaskStatus::Todo));
+
+        // A limit above the match count is not padding — you get what matched.
+        let visible = apply_task_list_filters(
+            rows,
+            TaskListCriteria::builder()
+                .statuses(&[TaskStatusArg::Done])
+                .limit(10)
+                .build(),
+            None,
+            None,
+        );
+        assert_eq!(surviving_task_ids(&visible), ["task_done_1"]);
+    }
+
+    /// `--repo` matches a task's *resolved* repo: its own override
+    /// wins, otherwise the parent product's default. A task with
+    /// neither never matches (the selector is a positive filter).
+    #[test]
+    fn task_list_repo_selector_matches_override_and_inherited() {
+        let mut overridden = filterable_task("task_override", "n", "", TaskStatus::Todo, "medium");
+        overridden.repo_remote_url = Some("git@github.com:myorg/nimbus.git".to_owned());
+        let inherited = filterable_task("task_inherited", "n", "", TaskStatus::Todo, "medium");
+
+        let selector = RepoSelector::parse("nimbus").unwrap();
+
+        // Product default is `mono`: only the overriding task resolves
+        // to nimbus.
+        let visible = apply_task_list_filters(
+            vec![overridden.clone(), inherited.clone()],
+            unfiltered_task_criteria(),
+            Some(&selector),
+            Some("git@github.com:spinyfin/mono.git"),
+        );
+        assert_eq!(surviving_task_ids(&visible), ["task_override"]);
+
+        // Product default is nimbus: the non-overriding task inherits
+        // it and matches too (design R10 / Q3).
+        let visible = apply_task_list_filters(
+            vec![overridden.clone(), inherited.clone()],
+            unfiltered_task_criteria(),
+            Some(&selector),
+            Some("git@github.com:myorg/nimbus.git"),
+        );
+        assert_eq!(surviving_task_ids(&visible), ["task_inherited", "task_override"]);
+
+        // No product repo to fall back on: the task that resolves to
+        // nothing is filtered out rather than matching by default.
+        let visible = apply_task_list_filters(
+            vec![overridden, inherited],
+            unfiltered_task_criteria(),
+            Some(&selector),
+            None,
+        );
+        assert_eq!(surviving_task_ids(&visible), ["task_override"]);
+    }
+
+    /// The filter dimensions compose as AND: a row must clear every
+    /// one that was supplied, not merely any of them.
+    #[test]
+    fn task_list_filters_compose_as_and() {
+        let rows = vec![
+            filterable_task("task_both", "Nimbus rollout", "", TaskStatus::Done, "high"),
+            filterable_task("task_term_only", "Nimbus planning", "", TaskStatus::Todo, "high"),
+            filterable_task("task_status_only", "unrelated", "", TaskStatus::Done, "high"),
+        ];
+
+        // Match term AND status: only the row satisfying both survives.
+        let visible = apply_task_list_filters(
+            rows.clone(),
+            TaskListCriteria::builder()
+                .statuses(&[TaskStatusArg::Done])
+                .match_term("nimbus")
+                .build(),
+            None,
+            None,
+        );
+        assert_eq!(surviving_task_ids(&visible), ["task_both"]);
+
+        // Adding a third dimension the row fails (priority) empties the
+        // result even though the other two still match.
+        let visible = apply_task_list_filters(
+            rows,
+            TaskListCriteria::builder()
+                .statuses(&[TaskStatusArg::Done])
+                .priorities(&[TaskPriority::Low])
+                .match_term("nimbus")
+                .build(),
+            None,
+            None,
+        );
+        assert!(visible.is_empty());
+    }
+
+    /// `--status` on `project list` is an OR over the listed values;
+    /// unlike tasks, projects have no hidden-by-default status, so an
+    /// empty filter returns archived rows too.
+    #[test]
+    fn project_list_filters_by_status() {
+        let rows = || {
+            vec![
+                filterable_project("proj_planned", "n", "", ProjectStatus::Planned),
+                filterable_project("proj_active", "n", "", ProjectStatus::Active),
+                filterable_project("proj_archived", "n", "", ProjectStatus::Archived),
+            ]
+        };
+
+        let visible = apply_project_list_filters(
+            rows(),
+            ProjectListCriteria::builder()
+                .statuses(&[ProjectStatusArg::Active])
+                .build(),
+            None,
+            None,
+        );
+        assert_eq!(surviving_project_ids(&visible), ["proj_active"]);
+
+        let visible = apply_project_list_filters(
+            rows(),
+            ProjectListCriteria::builder()
+                .statuses(&[ProjectStatusArg::Planned, ProjectStatusArg::Archived])
+                .build(),
+            None,
+            None,
+        );
+        assert_eq!(surviving_project_ids(&visible), ["proj_archived", "proj_planned"]);
+
+        // No status filter: everything, archived included.
+        let visible = apply_project_list_filters(rows(), ProjectListCriteria::builder().build(), None, None);
+        assert_eq!(visible.len(), 3);
+    }
+
+    /// An explicit id set restricts the project listing to those rows.
+    #[test]
+    fn project_list_restricts_to_requested_ids() {
+        let rows = vec![
+            filterable_project("proj_1", "n", "", ProjectStatus::Active),
+            filterable_project("proj_2", "n", "", ProjectStatus::Active),
+        ];
+
+        let ids = vec!["proj_2".to_owned()];
+        let visible = apply_project_list_filters(
+            rows.clone(),
+            ProjectListCriteria::builder().ids(&ids).build(),
+            None,
+            None,
+        );
+        assert_eq!(surviving_project_ids(&visible), ["proj_2"]);
+
+        let ids = vec!["proj_absent".to_owned()];
+        let visible = apply_project_list_filters(rows, ProjectListCriteria::builder().ids(&ids).build(), None, None);
+        assert!(visible.is_empty());
+    }
+
+    /// `--match` on projects behaves like the task one: case-insensitive
+    /// substring against the name *or* the description.
+    #[test]
+    fn project_list_match_term_hits_name_or_description_case_insensitively() {
+        let rows = || {
+            vec![
+                filterable_project("proj_name_hit", "Nimbus Migration", "", ProjectStatus::Active),
+                filterable_project("proj_desc_hit", "unrelated", "depends on NIMBUS", ProjectStatus::Active),
+                filterable_project("proj_miss", "unrelated", "nothing to see", ProjectStatus::Active),
+            ]
+        };
+
+        let visible = apply_project_list_filters(
+            rows(),
+            ProjectListCriteria::builder().match_term("nimbus").build(),
+            None,
+            None,
+        );
+        assert_eq!(surviving_project_ids(&visible), ["proj_desc_hit", "proj_name_hit"]);
+
+        let visible = apply_project_list_filters(
+            rows(),
+            ProjectListCriteria::builder().match_term("NiMbUs").build(),
+            None,
+            None,
+        );
+        assert_eq!(surviving_project_ids(&visible), ["proj_desc_hit", "proj_name_hit"]);
+
+        let visible = apply_project_list_filters(
+            rows(),
+            ProjectListCriteria::builder().match_term("zeppelin").build(),
+            None,
+            None,
+        );
+        assert!(visible.is_empty());
+    }
+
+    /// `--limit` caps the surviving project rows, and applies after the
+    /// other filters rather than to the raw input.
+    #[test]
+    fn project_list_limit_caps_the_filtered_rows() {
+        let rows = vec![
+            filterable_project("proj_done", "n", "", ProjectStatus::Done),
+            filterable_project("proj_active_1", "n", "", ProjectStatus::Active),
+            filterable_project("proj_active_2", "n", "", ProjectStatus::Active),
+            filterable_project("proj_active_3", "n", "", ProjectStatus::Active),
+        ];
+
+        let visible = apply_project_list_filters(
+            rows.clone(),
+            ProjectListCriteria::builder().limit(2).build(),
+            None,
+            None,
+        );
+        assert_eq!(visible.len(), 2);
+
+        // The leading `done` row does not consume one of the two slots.
+        let visible = apply_project_list_filters(
+            rows.clone(),
+            ProjectListCriteria::builder()
+                .statuses(&[ProjectStatusArg::Active])
+                .limit(2)
+                .build(),
+            None,
+            None,
+        );
+        assert_eq!(visible.len(), 2);
+        assert!(visible.iter().all(|p| p.status == ProjectStatus::Active));
+
+        // A limit above the match count returns just what matched.
+        let visible = apply_project_list_filters(
+            rows,
+            ProjectListCriteria::builder()
+                .statuses(&[ProjectStatusArg::Done])
+                .limit(10)
+                .build(),
+            None,
+            None,
+        );
+        assert_eq!(surviving_project_ids(&visible), ["proj_done"]);
+    }
+
+    /// Projects carry no repo of their own — they resolve through the
+    /// parent product — so `--repo` is all-or-nothing for a product's
+    /// projects: it either keeps every one or none.
+    #[test]
+    fn project_list_repo_selector_gates_on_the_parent_product() {
+        let rows = || {
+            vec![
+                filterable_project("proj_1", "n", "", ProjectStatus::Active),
+                filterable_project("proj_2", "n", "", ProjectStatus::Active),
+            ]
+        };
+        let selector = RepoSelector::parse("nimbus").unwrap();
+
+        // Product resolves to nimbus: every project under it is kept.
+        let visible = apply_project_list_filters(
+            rows(),
+            ProjectListCriteria::builder().build(),
+            Some(&selector),
+            Some("git@github.com:myorg/nimbus.git"),
+        );
+        assert_eq!(surviving_project_ids(&visible), ["proj_1", "proj_2"]);
+
+        // Product resolves elsewhere: none of them are.
+        let visible = apply_project_list_filters(
+            rows(),
+            ProjectListCriteria::builder().build(),
+            Some(&selector),
+            Some("git@github.com:spinyfin/mono.git"),
+        );
+        assert!(visible.is_empty());
+
+        // Product has no repo at all: `--repo` is a positive filter, so
+        // nothing matches.
+        let visible = apply_project_list_filters(rows(), ProjectListCriteria::builder().build(), Some(&selector), None);
+        assert!(visible.is_empty());
+
+        // Without a selector the product's repo is irrelevant.
+        let visible = apply_project_list_filters(rows(), ProjectListCriteria::builder().build(), None, None);
+        assert_eq!(visible.len(), 2);
     }
 }

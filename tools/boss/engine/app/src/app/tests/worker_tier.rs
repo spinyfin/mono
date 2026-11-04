@@ -98,7 +98,7 @@ fn enforcing_state(run_id: &str) -> (Arc<ServerState>, tempfile::TempDir) {
 fn denied_request() -> FrontendRequest {
     FrontendRequest::UpdateWorkItem {
         id: "task_1".to_owned(),
-        patch: boss_protocol::WorkItemPatch::default(),
+        patch: Box::new(boss_protocol::WorkItemPatch::default()),
     }
 }
 
@@ -734,4 +734,178 @@ async fn critical_update_handler_refuses_worker_and_accepts_human_peer() {
     };
     assert_eq!(updated.priority, "critical");
     assert_eq!(updated.critical_set_by.as_deref(), Some("human"));
+}
+
+fn park_payload(request_id: &str, id: &str, parked: bool) -> String {
+    serde_json::json!({
+        "request_id": request_id,
+        "payload": { "type": "park_work_item", "id": id, "parked": parked, "reason": "not now" }
+    })
+    .to_string()
+}
+
+fn parking_update_payload(request_id: &str, id: &str, parked: bool) -> String {
+    serde_json::json!({
+        "request_id": request_id,
+        "payload": { "type": "update_work_item", "id": id, "patch": { "parked": parked } }
+    })
+    .to_string()
+}
+
+fn assert_caller_tier_refusal(parsed: &serde_json::Value, tier: &str) {
+    assert_eq!(parsed["payload"]["type"], "work_error", "{parsed}");
+    let message = parsed.to_string();
+    assert!(message.contains("parking is the owner's decision"), "{message}");
+    assert!(message.contains(&format!("`{tier}`")), "{message}");
+}
+
+#[tokio::test]
+async fn worker_and_progression_peers_are_refused_park_even_with_the_tier_gate_off() {
+    let (state, _dir) = test_server_state();
+    state.feature_flags.set("worker_rpc_tier", false).unwrap();
+    let product = boss_engine_runtime::test_support::create_test_product(&state.work_db);
+    let chore = boss_engine_runtime::test_support::create_test_chore_manual(&state.work_db, product.id, "Park me");
+    let id = chore.id.clone();
+
+    state.worker_registry.register(self_pid(), "exec_worker".to_owned());
+    // The handler-side classify_peer gate is what stops a worker when the
+    // optional verb table is off; resolve_status_actor would map this pid
+    // to `human` and WorkDb would otherwise accept the write.
+    assert!(work_items::refuse_agent_parking(&state, Some(self_pid())).is_err());
+    for (request_id, payload) in [
+        ("park-worker", park_payload("park-worker", &id, true)),
+        ("update-worker", parking_update_payload("update-worker", &id, true)),
+        ("unpark-worker", park_payload("unpark-worker", &id, false)),
+    ] {
+        let refused = round_trip(state.clone(), Some(self_pid()), &payload).await;
+        assert_eq!(refused["request_id"], request_id);
+        assert_caller_tier_refusal(&refused, "worker");
+        assert!(
+            !state.work_db.is_parked(&id).unwrap(),
+            "a refused park must write nothing"
+        );
+    }
+    state.worker_registry.unregister(self_pid());
+
+    let execution = state
+        .work_db
+        .create_execution(
+            boss_protocol::CreateExecutionInput::builder()
+                .work_item_id(&id)
+                .kind(boss_protocol::ExecutionKind::TaskImplementation)
+                .status(boss_protocol::ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let parent = boss_engine_runtime::worker_registry::parent_pid(self_pid())
+        .unwrap()
+        .unwrap();
+    state
+        .worker_registry
+        .register_progression(parent, &execution.id, &state.work_db)
+        .unwrap();
+    // Progression always hits the verb table first, so ParkWorkItem never
+    // reaches the handler. The handler gate still names this peer, matching
+    // the worker path, and the RPC still writes nothing.
+    let handler_err = work_items::refuse_agent_parking(&state, Some(self_pid())).unwrap_err();
+    assert!(
+        handler_err.to_string().contains("parking is the owner's decision"),
+        "{handler_err}"
+    );
+    assert!(handler_err.to_string().contains("`progression`"), "{handler_err}");
+    for payload in [
+        park_payload("park-prog", &id, true),
+        parking_update_payload("update-prog", &id, true),
+        park_payload("unpark-prog", &id, false),
+    ] {
+        let refused = round_trip(state.clone(), Some(self_pid()), &payload).await;
+        assert_eq!(refused["payload"]["type"], "worker_tier_denied", "{refused}");
+        assert_eq!(refused["payload"]["denial"]["reason"], "progression_scope");
+        assert!(
+            !state.work_db.is_parked(&id).unwrap(),
+            "a refused park must write nothing"
+        );
+    }
+    state.worker_registry.unregister(parent);
+}
+
+#[tokio::test]
+async fn human_and_coordinator_peers_can_park_and_unpark() {
+    let (state, _dir) = test_server_state();
+    let product = boss_engine_runtime::test_support::create_test_product(&state.work_db);
+    let human_chore =
+        boss_engine_runtime::test_support::create_test_chore_manual(&state.work_db, product.id.clone(), "Human park");
+    let boss_chore =
+        boss_engine_runtime::test_support::create_test_chore_manual(&state.work_db, product.id, "Boss park");
+
+    let parked = round_trip(
+        state.clone(),
+        Some(self_pid()),
+        &park_payload("human-park", &human_chore.id, true),
+    )
+    .await;
+    assert_eq!(parked["payload"]["type"], "work_item_updated", "{parked}");
+    assert!(state.work_db.is_parked(&human_chore.id).unwrap());
+    let unparked = round_trip(
+        state.clone(),
+        Some(self_pid()),
+        &parking_update_payload("human-unpark", &human_chore.id, false),
+    )
+    .await;
+    assert_eq!(unparked["payload"]["type"], "work_item_updated", "{unparked}");
+    assert!(!state.work_db.is_parked(&human_chore.id).unwrap());
+
+    state.set_boss_pid(self_pid());
+    let parked = round_trip(
+        state.clone(),
+        Some(self_pid()),
+        &park_payload("boss-park", &boss_chore.id, true),
+    )
+    .await;
+    assert_eq!(parked["payload"]["type"], "work_item_updated", "{parked}");
+    assert!(state.work_db.is_parked(&boss_chore.id).unwrap());
+    let unparked = round_trip(
+        state.clone(),
+        Some(self_pid()),
+        &park_payload("boss-unpark", &boss_chore.id, false),
+    )
+    .await;
+    assert_eq!(unparked["payload"]["type"], "work_item_updated", "{unparked}");
+    assert!(!state.work_db.is_parked(&boss_chore.id).unwrap());
+}
+
+#[tokio::test]
+async fn parking_an_in_review_item_does_not_force_release_a_live_execution() {
+    let (state, _dir) = test_server_state();
+    let product = boss_engine_runtime::test_support::create_test_product(&state.work_db);
+    let chore = boss_engine_runtime::test_support::create_test_chore_manual(&state.work_db, product.id, "In review");
+    state
+        .work_db
+        .update_work_item(
+            &chore.id,
+            boss_protocol::WorkItemPatch::builder().status("in_review").build(),
+        )
+        .unwrap();
+    let execution_id = boss_engine_runtime::test_support::create_spawned_execution(&state.work_db, &chore.id, 4242);
+    let before = state.work_db.get_execution(&execution_id).unwrap();
+    assert_eq!(before.status, boss_protocol::ExecutionStatus::Running);
+    let lease_before = before.cube_lease_id.clone();
+    assert!(
+        lease_before.is_some(),
+        "fixture must hold a lease or this test proves nothing"
+    );
+
+    for (request_id, parked) in [("park-live", true), ("unpark-live", false)] {
+        let parsed = round_trip(
+            state.clone(),
+            Some(self_pid()),
+            &park_payload(request_id, &chore.id, parked),
+        )
+        .await;
+        assert_eq!(parsed["payload"]["type"], "work_item_updated", "{parsed}");
+        tokio::task::yield_now().await;
+        let after = state.work_db.get_execution(&execution_id).unwrap();
+        assert_eq!(after.status, boss_protocol::ExecutionStatus::Running);
+        assert_eq!(after.cube_lease_id, lease_before);
+    }
 }

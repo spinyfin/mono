@@ -747,7 +747,7 @@ async fn update_work_item(client: &mut BossClient, id: &str, patch: WorkItemPatc
     match client
         .send_request(&FrontendRequest::UpdateWorkItem {
             id: id.to_owned(),
-            patch,
+            patch: Box::new(patch),
         })
         .await?
     {

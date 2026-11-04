@@ -170,7 +170,7 @@ async fn measure(child_count: usize, boundaries: &archive_timing_support::Bounda
     let reply = client
         .send_request(&FrontendRequest::UpdateWorkItem {
             id: seeded.project.id.clone(),
-            patch: WorkItemPatch::builder().status("archived").build(),
+            patch: Box::new(WorkItemPatch::builder().status("archived").build()),
         })
         .await?;
     let received = Instant::now();
