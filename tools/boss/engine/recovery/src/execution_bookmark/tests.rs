@@ -120,11 +120,65 @@ async fn consecutive_recoveries_keep_work_when_the_predecessor_has_no_recorded_b
     f.edit(&prior).await;
     let mut legacy = prior.clone();
     legacy.base_commit = None;
+    legacy.pr_head_before = Some(floor.clone());
     assert!(restore(&LocalJj, &legacy, &f.replacement).await.unwrap());
     let next = create_from(
         &LocalJj,
         &f.replacement,
         "exec_legacy_null_next",
+        "local",
+        Some(&legacy),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(next.base_commit.as_deref(), Some(floor.as_str()));
+    let patch = unpublished_diff(&LocalJj, &next).await.unwrap();
+    assert!(patch.contains("work.txt") && patch.contains("second.txt"), "{patch}");
+}
+
+#[tokio::test]
+async fn a_conflicted_legacy_boss_base_is_ignored_when_inheriting_a_predecessor_floor() {
+    let f = Fixture::new().await;
+    let prior = f.record("exec_conflicted_boss_base").await;
+    let floor = prior.base_commit.clone().unwrap();
+    f.edit(&prior).await;
+    let mut legacy = prior.clone();
+    legacy.base_commit = None;
+    legacy.pr_head_before = Some(floor.clone());
+    // Make the predecessor's boss-base/ bookmark conflicted: two concurrent
+    // operations set it to different commits.
+    let op = LocalJj
+        .run(&f.repo, &["op", "log", "-n", "1", "--no-graph", "-T", "id"])
+        .await
+        .unwrap();
+    let head = LocalJj
+        .run(&f.worker, &["log", "--no-graph", "-r", "@-", "-T", "commit_id"])
+        .await
+        .unwrap();
+    for target in [head.trim(), "root()"] {
+        LocalJj
+            .run(
+                &f.repo,
+                &[
+                    "--at-op",
+                    op.trim(),
+                    "bookmark",
+                    "set",
+                    &prior.base(),
+                    "-r",
+                    target,
+                    "--allow-backwards",
+                ],
+            )
+            .await
+            .unwrap();
+    }
+    assert!(restore(&LocalJj, &legacy, &f.replacement).await.unwrap());
+    let next = create_from(
+        &LocalJj,
+        &f.replacement,
+        "exec_conflicted_boss_base_next",
         "local",
         Some(&legacy),
         None,

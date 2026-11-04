@@ -605,15 +605,12 @@ pub async fn create_from(
 }
 
 /// Effective floor of a predecessor whose restore report did not supply one:
-/// its recorded `base_commit` when that hash is still in the store, else its
-/// `boss-base/` bookmark if that still exists, else `pr_head_before`, else
-/// trunk. Never inferred from the successor workspace (which has already been
+/// its recorded `base_commit` when that hash is still in the store, else
+/// `pr_head_before`, else trunk (the same order as `resolve_base`). The legacy
+/// `boss-base/` bookmark is never read. Never inferred from the successor workspace (which has already been
 /// restored onto the predecessor heads) and never an unchecked raw hash.
 async fn predecessor_floor(jj: &dyn Jj, prior: &ExecutionBookmark) -> Result<String> {
     if let Some(commit) = usable_commit(jj, &prior.repo_path, prior.base_commit.as_deref()).await? {
-        return Ok(commit);
-    }
-    if let Some(commit) = resolve_optional(jj, &prior.repo_path, &prior.base()).await? {
         return Ok(commit);
     }
     if let Some(commit) = usable_commit(jj, &prior.repo_path, prior.pr_head_before.as_deref()).await? {

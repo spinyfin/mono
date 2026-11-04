@@ -286,6 +286,8 @@ message Bookmark {
   string recovery = 4;
   string base = 5;
   string anchor_commit = 6;
+  // Bound-PR head snapshot; the floor when anchor_commit is empty or unusable.
+  string pr_head_before = 7;
 }
 message WorkspaceResult {
   string repo_id = 1;

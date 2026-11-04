@@ -237,6 +237,12 @@ impl ExecutionPublisher for NoopExecutionPublisher {
 #[async_trait]
 pub trait ExecutionStartedHook: Send + Sync {
     async fn on_execution_started(&self, execution_id: &str);
+
+    /// Record only the bound PR's head SHA into `pr_head_before`, ahead of
+    /// the recovery pointer being created (dispatch moves the execution to
+    /// `running`, and so calls `on_execution_started`, after that point).
+    /// Best-effort; the default does nothing.
+    async fn snapshot_pr_head_before(&self, _execution_id: &str) {}
 }
 
 /// No-op hook used as the default. Production swaps it out via

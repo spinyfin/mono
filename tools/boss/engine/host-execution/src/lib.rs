@@ -1280,6 +1280,9 @@ mod validation {
         if !value.anchor_commit.is_empty() {
             commit(&value.anchor_commit)?;
         }
+        if !value.pr_head_before.is_empty() {
+            commit(&value.pr_head_before)?;
+        }
         Ok(())
     }
 
@@ -1946,7 +1949,7 @@ pub mod workspace {
                 repo_path: LocalJj.shared_repo(path).await?,
                 host_id: self.host_id.clone(),
                 base_commit: bookmark.and_then(|b| optional(&b.anchor_commit)).map(str::to_owned),
-                pr_head_before: None,
+                pr_head_before: bookmark.and_then(|b| optional(&b.pr_head_before)).map(str::to_owned),
             })
         }
     }
@@ -1959,6 +1962,7 @@ pub mod workspace {
             recovery: record.head(),
             base: record.base(),
             anchor_commit: record.base_commit.clone().unwrap_or_default(),
+            pr_head_before: record.pr_head_before.clone().unwrap_or_default(),
         }
     }
 
@@ -2233,6 +2237,7 @@ mod tests {
             recovery: "boss-recovery/exec_test".into(),
             base: "boss-base/exec_test".into(),
             anchor_commit: "a".repeat(40),
+            pr_head_before: String::new(),
         };
         for number in 1..=20 {
             let kind = Kind::try_from(number).unwrap();
@@ -2521,6 +2526,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_diff_uses_pr_head_before_when_the_anchor_is_absent() {
+        use boss_engine_recovery::execution_bookmark::{Jj, LocalJj};
+        let root = tempfile::tempdir().unwrap();
+        let repo = boss_engine_test_git::jj::JjRepo::new(root.path());
+        // A bound PR's published commit that is not on trunk.
+        LocalJj
+            .run(&repo.worker, &["new", "trunk()", "-m", "PR baseline"])
+            .await
+            .unwrap();
+        std::fs::write(repo.worker.join("pr.txt"), "published by the PR").unwrap();
+        LocalJj.run(&repo.worker, &["status"]).await.unwrap();
+        let pr_head = LocalJj
+            .run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"])
+            .await
+            .unwrap();
+        LocalJj
+            .run(&repo.worker, &["new", "-m", "Worker change"])
+            .await
+            .unwrap();
+        let cube = Cube::new(root.path());
+        *cube.owner.lock().unwrap() = Some(workspace::lease_owner(&run()));
+        let executor = workspace::Executor {
+            cube,
+            host_id: "host".into(),
+        };
+        let mut create = op(Kind::CreateBookmark);
+        create.inherited_base = pr_head.trim().to_owned();
+        let result = executor.execute(&command(create), false, 1).await;
+        assert_eq!(result.code, v1::ResultCode::Ok as i32, "{}", result.reason);
+        let Some(command_result::Value::Workspace(created)) = result.value else {
+            panic!("missing bookmark result")
+        };
+        std::fs::write(repo.worker.join("work.txt"), "worker edit").unwrap();
+        LocalJj.run(&repo.worker, &["status"]).await.unwrap();
+        for anchor in [String::new(), "0123456789abcdef0123456789abcdef01234567".to_owned()] {
+            let mut bookmark = created.bookmark.clone().unwrap();
+            bookmark.anchor_commit = anchor;
+            bookmark.pr_head_before = pr_head.trim().to_owned();
+            let request = v1::WorkspaceOp {
+                kind: Kind::DiffBookmark.into(),
+                repo_id: "repo".into(),
+                bookmark: Some(bookmark),
+                ..Default::default()
+            };
+            let result = executor.execute(&command(request), false, 1).await;
+            assert_eq!(result.code, v1::ResultCode::Ok as i32, "{}", result.reason);
+            let Some(command_result::Value::Workspace(diff)) = result.value else {
+                panic!("missing diff result")
+            };
+            let diff: String = serde_json::from_slice(&diff.cube_result_json).unwrap();
+            assert!(diff.contains("work.txt"), "{diff}");
+            assert!(!diff.contains("pr.txt"), "PR baseline leaked into the diff: {diff}");
+        }
+    }
+
+    #[tokio::test]
     async fn failed_read_is_rejected() {
         struct FailedRead;
         #[async_trait]
@@ -2626,6 +2687,7 @@ mod recovery_tests {
                     recovery: record.head(),
                     base: record.base(),
                     anchor_commit: record.base_commit.clone().unwrap(),
+                    pr_head_before: String::new(),
                 }),
                 ..op(Kind::PrepareRecoveryPr)
             });

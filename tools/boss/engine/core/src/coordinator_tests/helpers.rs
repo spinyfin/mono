@@ -130,6 +130,8 @@ pub(super) struct FakeCubeClient {
     /// Exercise actual checkout positioning as well as recovery in scratch jj repos.
     pub(super) position_real_workspace: bool,
     pub(super) bookmark_calls: Mutex<Vec<String>>,
+    /// The `inherited_base` each bookmark creation was handed, in call order.
+    pub(super) bookmark_inherited_bases: Mutex<Vec<Option<String>>>,
     pub(super) fail_goto: bool,
     /// Fail the first N `goto_workspace` calls, then succeed.
     pub(super) fail_first_n_goto: usize,
@@ -481,6 +483,7 @@ crate::stub_cube_client! { FakeCubeClient {
             calls.push(execution_id.to_owned());
             calls.len() - 1
         };
+        self.bookmark_inherited_bases.lock().await.push(inherited_base.map(str::to_owned));
         if self.fail_bookmark_create || call_index < self.fail_first_n_bookmark_creates { return Err(anyhow!("jj bookmark create failed")); }
         if self.real_bookmarks {
             return boss_engine_recovery::execution_bookmark::create_from(

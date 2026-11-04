@@ -1762,6 +1762,10 @@ impl boss_execution_contracts::ExecutionStartedHook for WorkerCompletionHandler 
         // the trait the coordinator depends on.
         WorkerCompletionHandler::on_execution_started(self, execution_id).await
     }
+
+    async fn snapshot_pr_head_before(&self, execution_id: &str) {
+        WorkerCompletionHandler::snapshot_pr_head_before(self, execution_id).await
+    }
 }
 
 #[async_trait]

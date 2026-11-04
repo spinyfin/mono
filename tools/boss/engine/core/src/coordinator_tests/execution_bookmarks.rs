@@ -46,6 +46,50 @@ async fn bookmark_creation_failure_is_recorded_before_a_worker_can_start() {
     );
 }
 
+/// Stands in for the real execution-started hook: it snapshots the bound PR
+/// head onto the execution row, which is all the recovery pointer needs.
+struct SnapshotPrHead {
+    db: Arc<WorkDb>,
+    head: String,
+}
+
+#[async_trait]
+impl boss_execution_contracts::ExecutionStartedHook for SnapshotPrHead {
+    async fn on_execution_started(&self, _: &str) {}
+
+    async fn snapshot_pr_head_before(&self, id: &str) {
+        self.db.set_execution_pr_head_before(id, &self.head).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn dispatch_snapshots_the_pr_head_before_the_recovery_pointer_is_created() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Bound PR floor");
+    db.reconcile_product_executions(&product.id).unwrap();
+    let id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+    assert_eq!(db.get_execution(&id).unwrap().pr_head_before, None);
+    let head = "c".repeat(40);
+    let cube = Arc::new(FakeCubeClient::default());
+    let runner = Arc::new(FakeExecutionRunner::default());
+    let mut coordinator = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner);
+    coordinator.set_execution_started_hook(Arc::new(SnapshotPrHead {
+        db: db.clone(),
+        head: head.clone(),
+    }));
+    let coordinator = Arc::new(coordinator);
+    coordinator.kick();
+    wait_for_execution_status(&db, &id, ExecutionStatus::Running).await;
+    assert_eq!(
+        cube.bookmark_inherited_bases.lock().await.as_slice(),
+        [Some(head)],
+        "the pointer floor must be the PR head snapshotted at dispatch, not an ancestry guess"
+    );
+}
+
 async fn wait_for_stage(
     sink: &crate::dispatch_events::RecordingDispatchEventSink,
     execution_id: &str,

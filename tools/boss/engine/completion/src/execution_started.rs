@@ -20,6 +20,17 @@ impl WorkerCompletionHandler {
     /// to the existing branch-keyed detector path — never noisier
     /// than the pre-change behaviour.
     pub async fn on_execution_started(&self, execution_id: &str) {
+        self.snapshot_bound_pr(execution_id, true).await;
+    }
+
+    /// Only the head-SHA half of [`Self::on_execution_started`], run before
+    /// dispatch creates the recovery pointer so the pointer's floor is the
+    /// bound PR's head rather than an ancestry guess.
+    pub async fn snapshot_pr_head_before(&self, execution_id: &str) {
+        self.snapshot_bound_pr(execution_id, false).await;
+    }
+
+    async fn snapshot_bound_pr(&self, execution_id: &str, include_metadata: bool) {
         let execution = match self.work_db.get_execution(execution_id) {
             Ok(execution) => execution,
             Err(err) => {
@@ -139,6 +150,9 @@ impl WorkerCompletionHandler {
             head_oid = %head_oid,
             "execution_started hook: snapshotted pr_head_before for SHA-delta gate"
         );
+        if !include_metadata {
+            return;
+        }
 
         // Also snapshot the PR title and body as the baseline for the
         // metadata-only CI-fix finalize gate (issue #1252) and for `boss pr
