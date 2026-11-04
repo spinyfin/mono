@@ -53,22 +53,12 @@ struct WorkSwitcherMenu: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            heading("Recent products")
-            ForEach(model.recentWorkProducts) { product in
-                row(product.name, choice: .product(product.id), selected: model.selectedWorkProductID == product.id)
-            }
-            if model.recentWorkProducts.isEmpty {
-                Text("No active products").foregroundStyle(.secondary).padding(8)
-            }
-            if model.selectedProduct != nil {
-                Divider().padding(.vertical, 5)
-                heading("Recent projects")
-                row("All projects", choice: .allProjects, selected: !model.hasProjectFilters)
-                ForEach(model.recentWorkProjects) { project in
-                    row(project.name, choice: .project(project.id), selected: model.selectedProjectFilterIDs.contains(project.id))
+        ScrollViewReader { proxy in
+            ScrollView { content }
+                .frame(maxHeight: Self.maxMenuHeight)
+                .onChange(of: highlighted) { _, choice in
+                    if let choice { proxy.scrollTo(choice) }
                 }
-            }
         }
         .padding(8)
         .frame(width: 300)
@@ -86,6 +76,29 @@ struct WorkSwitcherMenu: View {
         }.frame(width: 0, height: 0))
         .onChange(of: choices) { _, updated in
             if let highlighted, !updated.contains(highlighted) { self.highlighted = updated.first }
+        }
+    }
+
+    /// Caps the menu so many selected projects scroll instead of overflowing the display.
+    static let maxMenuHeight: CGFloat = 420
+
+    private var content: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            heading("Recent products")
+            ForEach(model.recentWorkProducts) { product in
+                row(product.name, choice: .product(product.id), selected: model.selectedWorkProductID == product.id)
+            }
+            if model.recentWorkProducts.isEmpty {
+                Text("No active products").foregroundStyle(.secondary).padding(8)
+            }
+            if model.selectedProduct != nil {
+                Divider().padding(.vertical, 5)
+                heading("Recent projects")
+                row("All projects", choice: .allProjects, selected: !model.hasProjectFilters)
+                ForEach(model.recentWorkProjects) { project in
+                    row(project.name, choice: .project(project.id), selected: model.selectedProjectFilterIDs.contains(project.id))
+                }
+            }
         }
     }
 
@@ -107,6 +120,7 @@ struct WorkSwitcherMenu: View {
                         in: RoundedRectangle(cornerRadius: 5))
         }
         .buttonStyle(.plain)
+        .id(choice)
         .accessibilityAddTraits(selected ? .isSelected : [])
         .onHover { if $0 { highlighted = choice } }
     }
@@ -145,6 +159,19 @@ private struct WorkSwitcherKeyboard: NSViewRepresentable {
 
         override func keyDown(with event: NSEvent) {
             if !handle(event.keyCode) { super.keyDown(with: event) }
+        }
+    }
+}
+
+extension ToolbarContent {
+    /// On Liquid Glass toolbars adjacent items share one capsule; keep the
+    /// switcher in its own so it does not merge with the Mode picker.
+    @ToolbarContentBuilder
+    func separatedFromNeighborGlass() -> some ToolbarContent {
+        if #available(macOS 26.0, *) {
+            self.sharedBackgroundVisibility(.hidden)
+        } else {
+            self
         }
     }
 }

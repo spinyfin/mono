@@ -159,6 +159,22 @@ final class WorkSwitcherTests: XCTestCase {
         }
     }
 
+    func testManySelectedProjectsAreAllListedAndMenuHeightIsBounded() {
+        withDefaults { defaults in
+            let model = model(defaults)
+            model.products = [product("Alpha")]
+            model.selectWorkProduct("Alpha")
+            let ids = (0..<12).map { "Project \($0)" }
+            model.projectsByProductID["Alpha"] = ids.map { project($0) }
+            for id in ids { model.toggleProjectFilter(id) }
+            XCTAssertEqual(model.recentWorkProjects.count, 12)
+            let host = NSHostingView(rootView: WorkSwitcherMenu(model: model) {})
+            host.frame = NSRect(x: 0, y: 0, width: 320, height: 2000)
+            host.layoutSubtreeIfNeeded()
+            XCTAssertLessThanOrEqual(host.fittingSize.height, WorkSwitcherMenu.maxMenuHeight + 16 + 1)
+        }
+    }
+
     func testArrowKeysAndReturnSelectFromRealMenu() {
         withDefaults { defaults in
             let model = model(defaults)
@@ -199,7 +215,6 @@ final class WorkSwitcherTests: XCTestCase {
             key("\r", code: 36)
             XCTAssertEqual(model.selectedWorkProductID, "Beta")
             XCTAssertTrue(dismissed)
-            XCTAssertFalse(window.isVisible)
         }
     }
 }

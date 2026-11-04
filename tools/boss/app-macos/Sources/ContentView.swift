@@ -252,6 +252,7 @@ struct ContentView: View {
         .toolbar {
             if WorkSwitcherToolbar.isVisible(model: model) {
                 ToolbarItem(placement: .navigation) { WorkSwitcherToolbar(model: model) }
+                    .separatedFromNeighborGlass()
             }
             ToolbarItem(placement: .navigation) {
                 NativeSegmentedPicker(
