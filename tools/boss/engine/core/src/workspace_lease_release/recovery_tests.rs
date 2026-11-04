@@ -49,7 +49,7 @@ async fn teardown_preserves_workspace_even_when_legacy_pointers_are_missing() {
             cause: TerminalCause::ProvenCompleted,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &DbBookmarkGate { db: &db, adapter: None },
+            bookmark: &DbBookmarkGate::new(&db, None),
         },
         async { Ok(()) },
     )
@@ -89,7 +89,7 @@ async fn teardown_overwrites_a_stale_preserved_tip_with_later_unpublished_work()
             cause: TerminalCause::ProvenNeverStarted,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &DbBookmarkGate { db: &db, adapter: None },
+            bookmark: &DbBookmarkGate::new(&db, None),
         },
         async { Ok(()) },
     )
@@ -117,7 +117,7 @@ async fn teardown_overwrites_a_stale_preserved_tip_with_later_unpublished_work()
             cause: TerminalCause::ProvenCompleted,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &DbBookmarkGate { db: &db, adapter: None },
+            bookmark: &DbBookmarkGate::new(&db, None),
         },
         async { Ok(()) },
     )
@@ -152,7 +152,7 @@ async fn failed_legacy_backup_does_not_prevent_teardown_preservation() {
     crate::execution_bookmark_recovery::report_failure(&db, &execution, "legacy backup failed");
     std::fs::write(repo.worker.join("work.txt"), "preserve independently of backup").unwrap();
     assert_eq!(
-        DbBookmarkGate { db: &db, adapter: None }.status(&execution).await,
+        DbBookmarkGate::new(&db, None).status(&execution).await,
         BookmarkStatus::Confirmed
     );
     assert!(db.preserved_tip(&execution.id).unwrap().is_some());
@@ -202,6 +202,10 @@ async fn reaped_worker_preserves_exactly_one_bookmark_only_for_unpushed_work() {
             .unwrap();
         db.record_execution_bookmark(&record).unwrap();
         std::fs::write(repo.worker.join("work.txt"), "worker edits").unwrap();
+        // Snapshot into an unpublished commit. The leftover-lease sweep asks
+        // cube before reading live `@`; an unlisted workspace uses the
+        // registered working copy without snapshotting.
+        JjRepo::run(&repo.worker, &["describe", "-m", "Unpublished worker edits"]);
         if published {
             JjRepo::run(&repo.worker, &["bookmark", "set", "published", "-r", "@"]);
             JjRepo::run(&repo.worker, &["git", "export"]);
@@ -454,7 +458,7 @@ async fn sweep_retries_a_pidless_row_only_after_a_gated_cube_failure() {
             cause: TerminalCause::ProvenStopped,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &DbBookmarkGate { db: &db, adapter: None },
+            bookmark: &DbBookmarkGate::new(&db, None),
         },
         async { anyhow::bail!("cube temporarily unavailable") },
     )
@@ -586,7 +590,7 @@ async fn occupied_workspace_does_not_advance_the_recovery_head() {
                 cwds: vec![(std::process::id() + 1, repo.worker.canonicalize().unwrap())],
                 complete: true,
             },
-            bookmark: &DbBookmarkGate { db: &db, adapter: None },
+            bookmark: &DbBookmarkGate::new(&db, None),
         },
         async { panic!("an occupied workspace is not released") },
     )
@@ -643,7 +647,7 @@ async fn successful_release_resolves_both_lease_attention_kinds() {
             cause: TerminalCause::ProvenCompleted,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &DbBookmarkGate { db: &db, adapter: None },
+            bookmark: &DbBookmarkGate::new(&db, None),
         },
         async { Ok(()) },
     )

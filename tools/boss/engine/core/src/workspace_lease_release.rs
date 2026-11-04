@@ -44,9 +44,10 @@ pub async fn release_lease_after_inferred_death(
     execution: &WorkExecution,
     pane: PaneStatus,
     adapter: Option<&dyn boss_execution_contracts::HostAdapter>,
+    cube: Option<&dyn CubeClient>,
     do_release: impl Future<Output = Result<()>>,
 ) -> LeaseReleaseOutcome {
-    release_lease_after_inferred_death_with(work_db, execution, pane, adapter, None, do_release).await
+    release_lease_after_inferred_death_with(work_db, execution, pane, adapter, None, cube, do_release).await
 }
 
 /// [`release_lease_after_inferred_death`] with an explicit occupancy probe.
@@ -58,6 +59,7 @@ pub async fn release_lease_after_inferred_death_with(
     pane: PaneStatus,
     adapter: Option<&dyn boss_execution_contracts::HostAdapter>,
     occupancy: Option<&dyn WorkspaceOccupancy>,
+    cube: Option<&dyn CubeClient>,
     do_release: impl Future<Output = Result<()>>,
 ) -> LeaseReleaseOutcome {
     let Some(lease_id) = execution.cube_lease_id.as_deref() else {
@@ -81,7 +83,10 @@ pub async fn release_lease_after_inferred_death_with(
             &snapshot
         }
     };
-    let db_gate = DbBookmarkGate { db: work_db, adapter };
+    let db_gate = match cube {
+        Some(cube) => DbBookmarkGate::new(work_db, adapter).with_cube(cube),
+        None => DbBookmarkGate::new(work_db, adapter),
+    };
     let bookmark = sweep_bookmark_gate(work_db, execution, &db_gate);
     apply_release(
         work_db,
@@ -421,10 +426,7 @@ async fn run_one_pass_with_occupancy<O: WorkspaceOccupancy, Fut: Future<Output =
             occupancy = Some(capture.take().expect("one scan per pass")().await);
         }
         let occupancy = occupancy.as_ref().expect("scanned above");
-        let db_gate = DbBookmarkGate {
-            db: work_db,
-            adapter: None,
-        };
+        let db_gate = DbBookmarkGate::new(work_db, None).with_cube(cube_client);
         let result = apply_release(
             work_db,
             &execution,

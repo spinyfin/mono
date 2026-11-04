@@ -1,7 +1,5 @@
 //! Restage preserved changes without manufacturing new change identities.
-use super::preserved::{
-    RecordedPresence, log, operations, resolve_recorded_presence, unpublished, unpublished_archive_refs,
-};
+use super::preserved::{RecordedPresence, log, operations, resolve_recorded_presence, unpublished};
 use super::*;
 
 async fn recorded_candidates(jj: &dyn Jj, record: &ExecutionBookmark, recorded: &PreservedTip) -> Result<Vec<String>> {
@@ -277,12 +275,6 @@ pub async fn restore_preserved(
             ],
         )
         .await?;
-    let mut archives = unpublished_archive_refs(jj, record).await?;
-    for entry in &unrestaged {
-        if !archives.iter().any(|existing| existing == entry) {
-            archives.push(entry.clone());
-        }
-    }
     Ok(Some(
         RestoreReport::builder()
             .pointer(preserved_name(&record.execution_id))
@@ -291,7 +283,7 @@ pub async fn restore_preserved(
             .inherited_base(base)
             .conflicts(conflicts)
             .discarded_tips(discarded.join("\n"))
-            .unrestaged_unpublished(archives.join("\n"))
+            .unrestaged_unpublished(unrestaged.join("\n"))
             .build(),
     ))
 }

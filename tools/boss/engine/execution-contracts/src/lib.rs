@@ -36,7 +36,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use boss_engine_effort::SpawnConfig;
-use boss_engine_recovery::execution_bookmark::{self, ExecutionBookmark, PreserveOutcome, PreservedTip};
+use boss_engine_recovery::execution_bookmark::{
+    self, ExecutionBookmark, PreserveOutcome, PreservedTip, WorkspaceTipSource,
+};
 use boss_engine_storage_values::Host;
 use boss_engine_storage_values::pool_policy::{AUTOMATION_WORKER_ID_PREFIX, REVIEW_WORKER_ID_PREFIX};
 use boss_engine_structured_output::StructuredOutputKind;
@@ -1492,6 +1494,24 @@ pub trait HostAdapter: Send + Sync {
     ) -> anyhow::Result<PreserveOutcome> {
         let _ = (record, workspace, recorded, since_unix);
         bail!("workspace recovery confirmation is not supported by this host adapter")
+    }
+
+    /// Confirm preservation using an explicit workspace-tip source. Inferred-death
+    /// teardown passes [`WorkspaceTipSource::Historical`] or
+    /// [`WorkspaceTipSource::Registered`] so live `@` is not snapshotted in a
+    /// workspace cube has already reassigned or reset. The default forwards to
+    /// [`Self::confirm_workspace_recovery`], which snapshots live `@`.
+    async fn confirm_workspace_recovery_from(
+        &self,
+        record: &ExecutionBookmark,
+        workspace: &Path,
+        recorded: Option<&PreservedTip>,
+        since_unix: Option<i64>,
+        tip_source: WorkspaceTipSource,
+    ) -> anyhow::Result<PreserveOutcome> {
+        let _ = tip_source;
+        self.confirm_workspace_recovery(record, workspace, recorded, since_unix)
+            .await
     }
 
     async fn restore_preserved_work(

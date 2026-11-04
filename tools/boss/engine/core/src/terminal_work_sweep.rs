@@ -667,6 +667,7 @@ async fn reap_confirmed_candidates(
                     &execution,
                     crate::workspace_lease_release::PaneStatus::Gone,
                     None,
+                    Some(cube_client),
                     cube_client.force_release_lease(
                         lease_id,
                         Some("terminal-work sweep: bound work item row no longer exists"),

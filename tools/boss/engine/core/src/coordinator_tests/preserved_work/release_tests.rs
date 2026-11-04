@@ -99,7 +99,7 @@ async fn failed_self_retry_then_pre_start_release_retains_recorded_work() {
                 },
                 pane: PaneStatus::Gone,
                 occupancy: &EmptyOccupancy,
-                bookmark: &DbBookmarkGate { db: &db, adapter: None },
+                bookmark: &DbBookmarkGate::new(&db, None),
             },
             async { Ok(()) },
         )
@@ -185,7 +185,7 @@ async fn conflicted_preserved_bookmark_releases_clean_workspace_without_moving_v
             cause: TerminalCause::ProvenCompleted,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &DbBookmarkGate { db: &db, adapter: None },
+            bookmark: &DbBookmarkGate::new(&db, None),
         },
         async { Ok(()) },
     )
@@ -253,7 +253,7 @@ async fn missing_bookmark_failed_restore_then_release_keeps_recorded_tip() {
             cause: TerminalCause::ProvenNeverStarted,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &DbBookmarkGate { db: &db, adapter: None },
+            bookmark: &DbBookmarkGate::new(&db, None),
         },
         async { Ok(()) },
     )
@@ -360,7 +360,7 @@ async fn conflicted_preserved_bookmark_is_resolved_so_later_work_can_be_preserve
             cause: TerminalCause::ProvenCompleted,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &DbBookmarkGate { db: &db, adapter: None },
+            bookmark: &DbBookmarkGate::new(&db, None),
         },
         async { Ok(()) },
     )
@@ -420,7 +420,7 @@ async fn inspect_verdict_releases_the_lease_and_raises_inspection_attention() {
             cause: TerminalCause::ProvenCompleted,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &DbBookmarkGate { db: &db, adapter: None },
+            bookmark: &DbBookmarkGate::new(&db, None),
         },
         async { Ok(()) },
     )
@@ -483,7 +483,7 @@ async fn second_inspect_teardown_appends_the_new_workspace_tip() {
                 cause: TerminalCause::ProvenCompleted,
                 pane: PaneStatus::Gone,
                 occupancy: &EmptyOccupancy,
-                bookmark: &DbBookmarkGate { db: &db, adapter: None },
+                bookmark: &DbBookmarkGate::new(&db, None),
             },
             async { Ok(()) },
         )
@@ -523,7 +523,7 @@ async fn second_inspect_teardown_appends_the_new_workspace_tip() {
                 cause: TerminalCause::ProvenCompleted,
                 pane: PaneStatus::Gone,
                 occupancy: &EmptyOccupancy,
-                bookmark: &DbBookmarkGate { db: &db, adapter: None },
+                bookmark: &DbBookmarkGate::new(&db, None),
             },
             async { Ok(()) },
         )
@@ -610,7 +610,7 @@ async fn abandoning_a_restaged_tip_clears_the_row_and_is_not_restaged() {
                 cause: TerminalCause::ProvenCompleted,
                 pane: PaneStatus::Gone,
                 occupancy: &EmptyOccupancy,
-                bookmark: &DbBookmarkGate { db: &db, adapter: None },
+                bookmark: &DbBookmarkGate::new(&db, None),
             },
             async { Ok(()) },
         )
@@ -701,7 +701,7 @@ async fn absent_recorded_tip_bookmarks_fresh_unpublished_work_and_releases() {
                 cause: TerminalCause::ProvenCompleted,
                 pane: PaneStatus::Gone,
                 occupancy: &EmptyOccupancy,
-                bookmark: &DbBookmarkGate { db: &db, adapter: None },
+                bookmark: &DbBookmarkGate::new(&db, None),
             },
             async { Ok(()) },
         )
@@ -759,7 +759,7 @@ async fn db_bookmark_gate_holds_without_a_preservation_source() {
         resolved_at: None,
     })
     .unwrap();
-    let status = DbBookmarkGate { db: &db, adapter: None }.status(&execution).await;
+    let status = DbBookmarkGate::new(&db, None).status(&execution).await;
     assert!(
         matches!(status, BookmarkStatus::Unconfirmed(ref msg) if msg.contains("store location is unavailable")),
         "{status:?}"
@@ -778,7 +778,7 @@ async fn db_bookmark_gate_holds_a_remote_row_without_an_adapter() {
         pr_head_before: None,
     })
     .unwrap();
-    let status = DbBookmarkGate { db: &db, adapter: None }.status(&execution).await;
+    let status = DbBookmarkGate::new(&db, None).status(&execution).await;
     assert!(
         matches!(status, BookmarkStatus::Unconfirmed(ref msg) if msg.contains("owning host adapter is unavailable")),
         "{status:?}"

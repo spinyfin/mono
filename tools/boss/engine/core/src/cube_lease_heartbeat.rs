@@ -1321,6 +1321,7 @@ async fn reap_and_release_lease(
                 crate::workspace_lease_release::PaneStatus::Gone,
                 resolved.host_adapter.as_deref(),
                 ctx.occupancy,
+                Some(resolved.cube.as_ref()),
                 resolved.cube.force_release_lease(lease_id, Some(reason)),
             )
             .await;

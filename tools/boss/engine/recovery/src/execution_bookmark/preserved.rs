@@ -39,35 +39,19 @@ pub fn preserved_archive_prefix(execution_id: &str) -> String {
     format!("preserved-archive/{execution_id}/")
 }
 
-/// Archive bookmarks for `execution_id` that still hold unpublished work.
-pub(super) async fn unpublished_archive_refs(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<Vec<String>> {
-    let prefix = preserved_archive_prefix(&record.execution_id);
-    let listed = jj
-        .run(
-            &record.repo_path,
-            &[
-                "--ignore-working-copy",
-                "bookmark",
-                "list",
-                "-T",
-                "name ++ \" \" ++ normal_target.commit_id() ++ \"\\n\"",
-            ],
-        )
-        .await?;
-    let mut refs = Vec::new();
-    for line in listed.lines() {
-        let Some((name, commit)) = line.split_once(' ') else {
-            continue;
-        };
-        if !name.starts_with(&prefix) || commit.is_empty() {
-            continue;
-        }
-        let work = log(jj, &record.repo_path, &unpublished(commit), "change_id ++ \"\\n\"").await?;
-        if !work.trim().is_empty() {
-            refs.push(format!("{commit} ({name})"));
-        }
-    }
-    Ok(refs)
+/// How teardown may read the workspace tip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceTipSource {
+    /// The workspace still belongs to this execution. Snapshot live `@`.
+    Live,
+    /// Cube lists the workspace free, or does not list it. Use the registered
+    /// working copy without snapshotting `@`. If that tip has no unpublished
+    /// work (cube reset it), walk the operation log for the previous tip.
+    Registered,
+    /// Cube lists another lease, or the list failed. Do not use the current
+    /// working copy. Resolve `workspace@` from the operation log, preferring
+    /// operations at or before `at_or_before_unix` (the successor lease start).
+    Historical { at_or_before_unix: Option<i64> },
 }
 
 pub(super) async fn log(jj: &dyn Jj, repo: &Path, rev: &str, template: &str) -> Result<String> {
@@ -130,20 +114,25 @@ async fn working_copy_at(jj: &dyn Jj, repo: &Path, operation: Option<&str>, rev:
     jj.run(repo, &args).await
 }
 
-/// Snapshot once after the writer stops. A lost directory first reads the
-/// still-registered working copy at the current operation. Forget history is
-/// consulted only when that name is absent, and only the newest forget whose
-/// timestamp is at or after this execution's lease or start is used. Cube
-/// names jj workspaces after their final directories, including during
-/// staged provisioning, and can reuse a name after a forget. Missing history
-/// is `Ok(None)` so teardown can keep the existing bookmark and release.
+/// Snapshot once after the writer stops. A live workspace that still belongs
+/// to this execution is read at `@`. A workspace cube lists as free, or does
+/// not list, is read from the registered working copy without snapshotting
+/// `@`. A workspace cube has already reassigned, or a failed cube list, skips
+/// that current working copy so teardown cannot record another holder's stack.
+/// Forget history is consulted only when that name is absent, and only the
+/// newest forget whose timestamp is at or after this execution's lease or
+/// start is used. Cube names jj workspaces after their final directories,
+/// including during staged provisioning, and can reuse a name after a forget.
+/// Missing history is `Ok(None)` so teardown can keep the existing bookmark
+/// and release.
 async fn workspace_tip(
     jj: &dyn Jj,
     record: &ExecutionBookmark,
     workspace: &Path,
     since_unix: Option<i64>,
+    tip_source: WorkspaceTipSource,
 ) -> Result<Option<String>> {
-    if jj.workspace_exists(workspace).await? {
+    if matches!(tip_source, WorkspaceTipSource::Live) && jj.workspace_exists(workspace).await? {
         ensure!(
             jj.shared_repo(workspace).await? == record.repo_path,
             "workspace recovery store changed"
@@ -153,18 +142,72 @@ async fn workspace_tip(
                 .await?,
         ));
     }
+    historical_workspace_tip(jj, record, workspace, since_unix, tip_source).await
+}
+
+async fn historical_workspace_tip(
+    jj: &dyn Jj,
+    record: &ExecutionBookmark,
+    workspace: &Path,
+    since_unix: Option<i64>,
+    tip_source: WorkspaceTipSource,
+) -> Result<Option<String>> {
     let name = workspace
         .file_name()
         .and_then(|s| s.to_str())
         .context("workspace name unavailable")?;
     let rev = format!("present({}@)", serde_json::to_string(name)?);
-    match working_copy_at(jj, &record.repo_path, None, &rev).await {
-        Ok(current) if !current.trim().is_empty() => return Ok(Some(current)),
-        Ok(_) => {}
+    let skip_current = matches!(tip_source, WorkspaceTipSource::Historical { .. });
+    let at_or_before = match tip_source {
+        WorkspaceTipSource::Historical { at_or_before_unix } => at_or_before_unix,
+        WorkspaceTipSource::Live | WorkspaceTipSource::Registered => None,
+    };
+    let live = match working_copy_at(jj, &record.repo_path, None, &rev).await {
+        Ok(current) if !current.trim().is_empty() => Some(current.trim().to_owned()),
+        Ok(_) => None,
         // A forgotten name is not a revision at the current operation; look
         // up the forget instead of treating the missing selector as fatal.
-        Err(err) if is_missing_revision_error(&err) => {}
+        Err(err) if is_missing_revision_error(&err) => None,
         Err(err) => return Err(err),
+    };
+    let live_unpublished = match live.as_deref() {
+        Some(current) => unpublished_count(jj, &record.repo_path, current).await? > 0,
+        None => false,
+    };
+    if !skip_current
+        && live_unpublished
+        && let Some(current) = live.as_ref()
+    {
+        return Ok(Some(current.clone()));
+    }
+    let skip_matching = skip_current || live.as_ref().is_some();
+    let live_change = match live.as_deref() {
+        Some(current) if skip_matching => log(jj, &record.repo_path, current, "change_id")
+            .await
+            .ok()
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty()),
+        _ => None,
+    };
+    for (seconds, _, id) in operations(jj, &record.repo_path).await? {
+        if at_or_before.is_some_and(|before| seconds > before) {
+            continue;
+        }
+        let tip = match working_copy_at(jj, &record.repo_path, Some(&id), &rev).await {
+            Ok(tip) => tip,
+            Err(err) if is_missing_revision_error(&err) => continue,
+            Err(err) => return Err(err),
+        };
+        let tip = tip.trim();
+        if tip.is_empty() {
+            continue;
+        }
+        if skip_matching
+            && is_current_holder_tip(jj, &record.repo_path, tip, live.as_deref(), live_change.as_deref()).await?
+        {
+            continue;
+        }
+        return Ok(Some(tip.to_owned()));
     }
     let forget = format!("forget workspace {name}");
     let forgotten = jj
@@ -191,20 +234,47 @@ async fn workspace_tip(
         if since_unix.is_some_and(|since| seconds < since) {
             continue;
         }
+        if at_or_before.is_some_and(|before| seconds > before) {
+            continue;
+        }
         let parent = format!("{id}-");
         let tip = working_copy_at(jj, &record.repo_path, Some(&parent), &rev).await?;
-        if !tip.trim().is_empty() {
-            return Ok(Some(tip));
+        let tip = tip.trim();
+        if tip.is_empty() {
+            break;
         }
-        break;
-    }
-    for (_, _, id) in operations(jj, &record.repo_path).await? {
-        let tip = working_copy_at(jj, &record.repo_path, Some(&id), &rev).await?;
-        if !tip.trim().is_empty() {
-            return Ok(Some(tip));
+        if skip_matching
+            && is_current_holder_tip(jj, &record.repo_path, tip, live.as_deref(), live_change.as_deref()).await?
+        {
+            break;
         }
+        return Ok(Some(tip.to_owned()));
     }
     Ok(None)
+}
+
+async fn unpublished_count(jj: &dyn Jj, repo: &Path, tip: &str) -> Result<u64> {
+    let commits = log(jj, repo, &unpublished(tip), "change_id ++ \"\\n\"").await?;
+    Ok(commits.lines().filter(|line| !line.is_empty()).count() as u64)
+}
+
+/// The currently registered working copy, or a rewrite of the same change
+/// (for example `jj new` then a snapshot of that empty commit).
+async fn is_current_holder_tip(
+    jj: &dyn Jj,
+    repo: &Path,
+    tip: &str,
+    live: Option<&str>,
+    live_change: Option<&str>,
+) -> Result<bool> {
+    if live == Some(tip) {
+        return Ok(true);
+    }
+    let Some(live_change) = live_change else {
+        return Ok(false);
+    };
+    let tip_change = log(jj, repo, tip, "change_id").await?;
+    Ok(tip_change.trim() == live_change)
 }
 
 async fn forget_preserved(jj: &dyn Jj, repo: &Path, name: &str) -> Result<()> {
@@ -392,10 +462,25 @@ pub async fn preserve(
     recorded: Option<&PreservedTip>,
     since_unix: Option<i64>,
 ) -> Result<PreserveOutcome> {
+    preserve_from(jj, record, workspace, recorded, since_unix, WorkspaceTipSource::Live).await
+}
+
+/// [`preserve`] with an explicit workspace-tip source. Inferred-death
+/// teardown passes [`WorkspaceTipSource::Historical`] when cube has already
+/// reassigned the workspace, and [`WorkspaceTipSource::Registered`] when
+/// cube lists it free or does not list it, so live `@` is not snapshotted.
+pub async fn preserve_from(
+    jj: &dyn Jj,
+    record: &ExecutionBookmark,
+    workspace: &Path,
+    recorded: Option<&PreservedTip>,
+    since_unix: Option<i64>,
+    tip_source: WorkspaceTipSource,
+) -> Result<PreserveOutcome> {
     let name = preserved_name(&record.execution_id);
     let bookmark_commits = log(jj, &record.repo_path, &revision(&name), "commit_id ++ \"\\n\"").await?;
     let bookmark_missing = bookmark_commits.trim().is_empty();
-    let workspace_commit = workspace_tip(jj, record, workspace, since_unix)
+    let workspace_commit = workspace_tip(jj, record, workspace, since_unix, tip_source)
         .await?
         .and_then(|commit| {
             let tip = commit.trim();
@@ -494,22 +579,19 @@ pub async fn preserve(
     if let Some(hidden) = hidden_recorded {
         if count > 0 {
             point_bookmark(jj, &record.repo_path, &name, tip, true).await?;
+            tracing::info!(
+                execution_id = %record.execution_id,
+                hidden_commit_id = %hidden.commit_id,
+                new_commit_id = %tip,
+                "recorded preserved commit is hidden; bookmarking the new workspace tip"
+            );
             return Ok(PreserveOutcome {
                 tip: Some(PreservedTip {
                     change_id: workspace_ids.trim().to_owned(),
                     commit_id: tip.to_owned(),
                     count,
                 }),
-                inspect: Some(PreserveInspect {
-                    existing_commit_id: Some(hidden.commit_id.clone()),
-                    workspace_change_id: Some(workspace_ids.trim().to_owned()),
-                    workspace_commit_id: Some(tip.to_owned()),
-                    workspace_count: Some(count),
-                    reason: format!(
-                        "{name} is missing and recorded commit {} is hidden; leave it and bookmark the new workspace tip",
-                        hidden.commit_id
-                    ),
-                }),
+                inspect: None,
             });
         }
         // Abandoned or squashed: the change has no visible successor. Clear

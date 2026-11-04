@@ -25,6 +25,9 @@ pub use boss_engine_storage_values::attention_kinds::LEASE_UNRELEASED_ATTENTION_
 
 pub use boss_engine_storage_values::attention_kinds::LEASE_RELEASE_FAILED_ATTENTION_KIND;
 
+use boss_engine_recovery::execution_bookmark::WorkspaceTipSource;
+use boss_execution_contracts::{CubeClient, CubeWorkspaceStatus, HostAdapter};
+
 pub use boss_execution_contracts::{
     BookmarkStatus, KeepReason, LeaseReleaseDecision, LeaseReleaseOutcome, Occupancy, PaneStatus, PreStartStage,
     TerminalCause,
@@ -90,7 +93,94 @@ pub fn decide(
 /// is never evidence of an empty workspace.
 pub struct DbBookmarkGate<'a> {
     pub db: &'a WorkDb,
-    pub adapter: Option<&'a dyn boss_execution_contracts::HostAdapter>,
+    pub adapter: Option<&'a dyn HostAdapter>,
+    cube: Option<&'a dyn CubeClient>,
+}
+
+impl<'a> DbBookmarkGate<'a> {
+    pub fn new(db: &'a WorkDb, adapter: Option<&'a dyn HostAdapter>) -> Self {
+        Self {
+            db,
+            adapter,
+            cube: None,
+        }
+    }
+
+    pub fn with_cube(mut self, cube: &'a dyn CubeClient) -> Self {
+        self.cube = Some(cube);
+        self
+    }
+}
+
+/// Live `@` is snapshotted only when cube still lists this workspace as leased
+/// under `execution.cube_lease_id`. Another lease walks the operation log
+/// instead of reading the successor's working copy. A free or unlisted
+/// workspace uses the registered working copy without snapshotting `@`. A
+/// failed list also skips the live snapshot.
+async fn workspace_tip_source(
+    execution: &WorkExecution,
+    cube: Option<&dyn CubeClient>,
+    adapter: Option<&dyn HostAdapter>,
+) -> WorkspaceTipSource {
+    let listed = match cube {
+        Some(cube) => cube.list_workspaces().await,
+        None => match adapter {
+            Some(adapter) => adapter.list_workspaces().await,
+            None => return WorkspaceTipSource::Live,
+        },
+    };
+    let workspaces = match listed {
+        Ok(list) => list,
+        Err(err) => {
+            tracing::warn!(
+                execution_id = %execution.id,
+                error = %format!("{err:#}"),
+                "could not list cube workspaces to confirm live working-copy ownership; not snapshotting live @"
+            );
+            return WorkspaceTipSource::Historical {
+                at_or_before_unix: None,
+            };
+        }
+    };
+    tip_source_from_workspaces(execution, &workspaces)
+}
+
+fn tip_source_from_workspaces(execution: &WorkExecution, workspaces: &[CubeWorkspaceStatus]) -> WorkspaceTipSource {
+    let Some(workspace_id) = execution.cube_workspace_id.as_deref() else {
+        return WorkspaceTipSource::Historical {
+            at_or_before_unix: None,
+        };
+    };
+    let Some(lease_id) = execution.cube_lease_id.as_deref() else {
+        return WorkspaceTipSource::Historical {
+            at_or_before_unix: None,
+        };
+    };
+    match workspaces.iter().find(|ws| ws.workspace_id == workspace_id) {
+        Some(ws) if ws.state == "leased" && ws.lease_id.as_deref() == Some(lease_id) => WorkspaceTipSource::Live,
+        Some(ws) if ws.lease_id.as_deref().is_some_and(|id| id != lease_id) => {
+            tracing::info!(
+                execution_id = %execution.id,
+                cube_workspace_id = workspace_id,
+                recorded_lease_id = lease_id,
+                cube_lease_id_now = ws.lease_id.as_deref().unwrap_or("<none>"),
+                "cube lists this workspace under a different lease; resolving the tip from the operation log"
+            );
+            WorkspaceTipSource::Historical {
+                at_or_before_unix: ws.leased_at_epoch_s,
+            }
+        }
+        Some(ws) => {
+            tracing::info!(
+                execution_id = %execution.id,
+                cube_workspace_id = workspace_id,
+                cube_state = %ws.state,
+                "cube lists this workspace free; using the registered working copy without snapshotting live @"
+            );
+            WorkspaceTipSource::Registered
+        }
+        None => WorkspaceTipSource::Registered,
+    }
 }
 
 #[async_trait::async_trait]
@@ -114,19 +204,27 @@ impl BookmarkGate for DbBookmarkGate<'_> {
                 .ok_or_else(|| anyhow::anyhow!("workspace path unavailable for preservation"))?;
             let recorded = self.db.preserved_tip(&execution.id)?;
             let since_unix = execution.started_epoch().or_else(|| execution.created_epoch());
+            let tip_source = workspace_tip_source(execution, self.cube, self.adapter).await;
             let outcome = if let Some(adapter) = self.adapter {
                 adapter
-                    .confirm_workspace_recovery(&record, Path::new(workspace), recorded.as_ref(), since_unix)
+                    .confirm_workspace_recovery_from(
+                        &record,
+                        Path::new(workspace),
+                        recorded.as_ref(),
+                        since_unix,
+                        tip_source,
+                    )
                     .await?
             } else if record.host_id != "local" {
                 anyhow::bail!("owning host adapter is unavailable for remote preservation");
             } else {
-                boss_engine_recovery::execution_bookmark::preserve(
+                boss_engine_recovery::execution_bookmark::preserve_from(
                     &boss_engine_recovery::execution_bookmark::LocalJj,
                     &record,
                     Path::new(workspace),
                     recorded.as_ref(),
                     since_unix,
+                    tip_source,
                 )
                 .await?
             };
@@ -424,10 +522,7 @@ pub async fn release_lease_after_proven_never_started(
             },
         };
     }
-    let db_gate = DbBookmarkGate {
-        db: work_db,
-        adapter: Some(adapter),
-    };
+    let db_gate = DbBookmarkGate::new(work_db, Some(adapter));
     let bookmark: &dyn BookmarkGate = if never_positioned(work_db, &execution.id, stage) {
         &NeverPositioned
     } else {
@@ -610,10 +705,7 @@ pub async fn release_remote_lease<Fut: std::future::Future<Output = anyhow::Resu
             cause: TerminalCause::Inferred,
             pane,
             occupancy: &OwningHostOccupancy(occupancy),
-            bookmark: &DbBookmarkGate {
-                db: work_db,
-                adapter: Some(host),
-            },
+            bookmark: &DbBookmarkGate::new(work_db, Some(host)),
         },
         release(lease_id.clone()),
     )

@@ -1495,14 +1495,15 @@ crate::stub_host_adapter! { PreserveRemoteAdapter {
     async fn probe_workspace_occupancy(&self, _: &std::path::Path) -> Result<crate::workspace_lease_release::Occupancy> {
         Ok(crate::workspace_lease_release::Occupancy::Empty)
     }
-    async fn confirm_workspace_recovery(
+    async fn confirm_workspace_recovery_from(
         &self,
         record: &recovery::ExecutionBookmark,
         workspace: &std::path::Path,
         recorded: Option<&recovery::PreservedTip>,
         since_unix: Option<i64>,
+        tip_source: recovery::WorkspaceTipSource,
     ) -> anyhow::Result<recovery::PreserveOutcome> {
-        recovery::preserve(&LocalJj, record, workspace, recorded, since_unix).await
+        recovery::preserve_from(&LocalJj, record, workspace, recorded, since_unix, tip_source).await
     }
 } }
 
@@ -1552,6 +1553,10 @@ async fn reap_dead_lease_with_workspace(pushed: bool) {
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
     std::fs::write(repo.worker.join("work.txt"), "worker edits").unwrap();
+    // Snapshot into an unpublished commit. Inferred-death preservation reads
+    // the registered working copy without snapshotting live `@` when cube does
+    // not list this workspace as still leased here.
+    JjRepo::run(&repo.worker, &["describe", "-m", "Unpublished worker edits"]);
     if pushed {
         JjRepo::run(&repo.worker, &["bookmark", "set", "published", "-r", "@"]);
         JjRepo::run(&repo.worker, &["git", "export"]);
@@ -1623,6 +1628,7 @@ async fn remote_reap_with_adapter_preserves_unpushed_work() {
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
     std::fs::write(repo.worker.join("work.txt"), "remote unpublished").unwrap();
+    JjRepo::run(&repo.worker, &["describe", "-m", "Remote unpublished work"]);
 
     let live_states = LiveWorkerStateRegistry::new();
     register_slot(&live_states, 1, &execution_id, std::process::id() as i32);
@@ -1657,4 +1663,81 @@ async fn remote_reap_with_adapter_preserves_unpushed_work() {
         "unpushed remote work must yield exactly one preserved bookmark: {names:?}"
     );
     assert!(db.preserved_tip(&execution_id).unwrap().is_some());
+}
+
+/// Cube has already reassigned the workspace to another lease, and that
+/// holder has unpublished work at live `@`. Heartbeat auto-reap must not
+/// snapshot that stack as `preserved/<reaped exec>` or rewrite it.
+#[tokio::test]
+async fn heartbeat_reap_does_not_preserve_another_holders_unpublished_stack() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = JjRepo::new(dir.path());
+    export_origin(&repo);
+    let (_db_dir, db) = open_db_arc();
+    let product_id = create_product(&db);
+    let work_item_id = create_chore(&db, &product_id);
+    let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-reaped");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET workspace_path = ?2 WHERE id = ?1",
+            rusqlite::params![execution_id, repo.worker.to_str().unwrap()],
+        )
+        .unwrap();
+    let record = recovery::create(&LocalJj, &repo.worker, &execution_id, "local")
+        .await
+        .unwrap();
+    db.record_execution_bookmark(&record).unwrap();
+    std::fs::write(repo.worker.join("ours.txt"), "reaped worker edits").unwrap();
+    let ours = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    JjRepo::run(&repo.worker, &["new", "main", "-m", "Unrelated holder stack"]);
+    std::fs::write(repo.worker.join("theirs.txt"), "other holder's unpublished").unwrap();
+    let theirs = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    assert_ne!(ours.trim(), theirs.trim());
+
+    let live_states = LiveWorkerStateRegistry::new();
+    register_slot(&live_states, 1, &execution_id, std::process::id() as i32);
+    let cube = Arc::new(RecordingCube::default());
+    cube.fail.store(true, Ordering::SeqCst);
+    let mut successor = workspace("mono-agent-001", "leased", Some("lease-successor"));
+    successor.leased_at_epoch_s = Some(boss_engine_utils::epoch_time::now_epoch_secs());
+    cube.set_workspaces(vec![successor]);
+    let sink = RecordingDispatchEventSink::new();
+    let breaker = HeartbeatFailureBreaker::default();
+    for _ in 0..AUTO_REAP_AFTER_CONSECUTIVE_FAILURES - 1 {
+        let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+        assert_eq!(outcome.auto_reaped, 0);
+    }
+    let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+    assert_eq!(outcome.auto_reaped, 1);
+    assert_eq!(cube.force_release_calls(), vec!["lease-reaped".to_owned()]);
+
+    assert_eq!(
+        JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]).trim(),
+        theirs.trim(),
+        "the other holder's stack must not be rewritten"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.worker.join("theirs.txt")).unwrap(),
+        "other holder's unpublished"
+    );
+    let names = preserved_names(&repo, &execution_id);
+    for name in &names {
+        let preserved = JjRepo::run(&repo.repo, &["log", "--no-graph", "-r", name, "-T", "commit_id"]);
+        assert_ne!(
+            preserved.trim(),
+            theirs.trim(),
+            "{name} must not point at the other holder's unpublished stack"
+        );
+        assert_eq!(
+            preserved.trim(),
+            ours.trim(),
+            "{name} must record the reaped worker tip, not live @"
+        );
+    }
+    let recorded = db.preserved_tip(&execution_id).unwrap();
+    if let Some(tip) = recorded {
+        assert_ne!(tip.commit_id, theirs.trim());
+        assert_eq!(tip.commit_id, ours.trim());
+    }
 }

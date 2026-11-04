@@ -337,7 +337,7 @@ async fn pre_start_teardown_then_retry_preserves_later_unpublished_edits() {
             cause: TerminalCause::ProvenNeverStarted,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &DbBookmarkGate { db: &db, adapter: None },
+            bookmark: &DbBookmarkGate::new(&db, None),
         },
         async { Ok(()) },
     )
@@ -398,7 +398,7 @@ async fn pre_start_teardown_then_retry_preserves_later_unpublished_edits() {
             cause: TerminalCause::ProvenCompleted,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &DbBookmarkGate { db: &db, adapter: None },
+            bookmark: &DbBookmarkGate::new(&db, None),
         },
         async { Ok(()) },
     )

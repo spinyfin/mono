@@ -729,9 +729,10 @@ async fn hidden_recorded_tip_does_not_replace_fresh_unpublished_work() {
     let tip = outcome.tip.expect("fresh unpublished work must be recorded");
     assert_ne!(tip.commit_id, saved.commit_id);
     assert!(names(&repo).contains("preserved/exec_hidden_fresh"));
-    let inspect = outcome.inspect.expect("hidden recorded tip must raise inspect");
-    assert_eq!(inspect.existing_commit_id.as_deref(), Some(saved.commit_id.as_str()));
-    assert_eq!(inspect.workspace_commit_id.as_deref(), Some(tip.commit_id.as_str()));
+    assert!(
+        outcome.inspect.is_none(),
+        "abandoning restaged work and starting a new unpublished tip is routine; no inspect verdict"
+    );
     assert!(
         restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
             .await
@@ -742,5 +743,75 @@ async fn hidden_recorded_tip_does_not_replace_fresh_unpublished_work() {
     assert_eq!(
         std::fs::read_to_string(repo.replacement.join("fresh")).unwrap(),
         "new unpublished"
+    );
+}
+
+#[tokio::test]
+async fn historical_tip_does_not_snapshot_a_reassigned_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_reassigned", "local")
+        .await
+        .unwrap();
+    std::fs::write(repo.worker.join("ours.txt"), "reaped worker edits").unwrap();
+    let ours = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    JjRepo::run(&repo.worker, &["new", "main", "-m", "Unrelated holder stack"]);
+    std::fs::write(repo.worker.join("theirs.txt"), "other holder's unpublished").unwrap();
+    let theirs = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    assert_ne!(ours.trim(), theirs.trim());
+    let outcome = preserve_from(
+        &LocalJj,
+        &record,
+        &repo.worker,
+        None,
+        None,
+        WorkspaceTipSource::Historical {
+            at_or_before_unix: None,
+        },
+    )
+    .await
+    .unwrap();
+    let tip = outcome
+        .tip
+        .expect("historical lookup must recover the reaped worker tip");
+    assert_eq!(tip.commit_id, ours.trim());
+    assert_ne!(tip.commit_id, theirs.trim());
+    assert_eq!(
+        JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]).trim(),
+        theirs.trim(),
+        "the other holder's stack must not be rewritten"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.worker.join("theirs.txt")).unwrap(),
+        "other holder's unpublished"
+    );
+}
+
+#[tokio::test]
+async fn restore_reports_only_archives_it_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_legacy_archive", "local")
+        .await
+        .unwrap();
+    std::fs::write(repo.worker.join("work"), "preserved work").unwrap();
+    let saved = preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    JjRepo::run(&repo.worker, &["new", "main", "-m", "Legacy integrity archive"]);
+    std::fs::write(repo.worker.join("legacy.txt"), "pointer-integrity archive").unwrap();
+    let legacy = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    let archive = preserved_archive_name(&record.execution_id, legacy.trim());
+    JjRepo::run(
+        &repo.repo,
+        &["bookmark", "set", &archive, "-r", legacy.trim(), "--allow-backwards"],
+    );
+    JjRepo::run(&repo.replacement, &["new", "main", "-m", "Current PR head"]);
+    let report = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !report.unrestaged_unpublished.contains(&archive),
+        "legacy integrity archives must not be reported as unrestaged variants: {}",
+        report.unrestaged_unpublished
     );
 }
