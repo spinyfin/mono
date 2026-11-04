@@ -571,6 +571,7 @@ pub(crate) async fn run_list_revisions(
             .ids(&resolved_ids)
             .maybe_limit(args.limit)
             .include_archived(args.include_archived)
+            .parked(args.parked.filter())
             .build(),
         None,
         product.repo_remote_url.as_deref(),
@@ -754,6 +755,25 @@ pub(crate) async fn update_work_item(
             patch,
         },
         "work item update",
+        FrontendEvent::WorkItemUpdated { item } => item,
+    )
+}
+
+pub(crate) async fn park_work_item(
+    client: &mut BossClient,
+    id: &str,
+    parked: bool,
+    reason: Option<String>,
+) -> Result<WorkItem, CliError> {
+    let label = if parked { "work item park" } else { "work item unpark" };
+    rpc_call!(
+        client,
+        FrontendRequest::ParkWorkItem {
+            id: id.to_owned(),
+            parked,
+            reason,
+        },
+        label,
         FrontendEvent::WorkItemUpdated { item } => item,
     )
 }

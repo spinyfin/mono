@@ -1821,24 +1821,18 @@ fn lint_product() -> Product {
 }
 
 fn lint_project(slug: &str, path: Option<&str>) -> Project {
-    Project {
-        id: format!("proj_{slug}"),
-        product_id: "prod_1".to_owned(),
-        name: slug.to_owned(),
-        slug: slug.to_owned(),
-        description: String::new(),
-        goal: String::new(),
-        status: ProjectStatus::Planned,
-        priority: "medium".to_owned(),
-        created_at: String::new(),
-        updated_at: String::new(),
-        last_status_actor: "human".to_owned(),
-        status_basis: None,
-        design_doc_repo_remote_url: None,
-        design_doc_branch: None,
-        design_doc_path: path.map(str::to_owned),
-        short_id: None,
-    }
+    Project::builder()
+        .id(format!("proj_{slug}"))
+        .product_id("prod_1")
+        .name(slug)
+        .slug(slug)
+        .description("")
+        .goal("")
+        .status(ProjectStatus::Planned)
+        .created_at("")
+        .updated_at("")
+        .maybe_design_doc_path(path.map(str::to_owned))
+        .build()
 }
 
 /// A resolved pointer with a leased workspace whose file exists

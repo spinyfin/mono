@@ -89,7 +89,7 @@ pub fn query_product(conn: &Connection, id: &str) -> Result<Option<Product>> {
 pub fn query_project(conn: &Connection, id: &str) -> Result<Option<Project>> {
     conn.query_row(
         "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor,
-                design_doc_repo_remote_url, design_doc_branch, design_doc_path, short_id, status_basis
+                design_doc_repo_remote_url, design_doc_branch, design_doc_path, short_id, status_basis, parked_at, parked_by, parked_reason, parked_via
          FROM projects
          WHERE id = ?1",
         [id],
@@ -101,7 +101,7 @@ pub fn query_project(conn: &Connection, id: &str) -> Result<Option<Project>> {
 
 pub fn query_task(conn: &Connection, id: &str) -> Result<Option<Task>> {
     conn.query_row(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, parent_task_id, origin_task_short_id, origin_pr_number, completed_at, archived_by, archived_at, archived_reason, dispatch_failed_reason, dispatch_failed_error, dispatch_failed_at, blocked_detail, deferred, tags, human_driven, completion_summary, effort_matched_rule, effort_reasons, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, source_automation_id, design_reasoning_effort_xhigh, critical_set_by, critical_set_at, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, parent_task_id, origin_task_short_id, origin_pr_number, completed_at, archived_by, archived_at, archived_reason, dispatch_failed_reason, dispatch_failed_error, dispatch_failed_at, blocked_detail, deferred, tags, human_driven, completion_summary, effort_matched_rule, effort_reasons, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, source_automation_id, design_reasoning_effort_xhigh, critical_set_by, critical_set_at, parked_at, parked_by, parked_reason, parked_via, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
          FROM tasks
          WHERE id = ?1",
         [id],
@@ -156,7 +156,7 @@ pub(crate) fn query_attention_item(conn: &Connection, id: &str) -> Result<Option
 pub(crate) fn list_projects_for_product(conn: &Connection, product_id: &str) -> Result<Vec<Project>> {
     let mut stmt = conn.prepare(
         "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor,
-                design_doc_repo_remote_url, design_doc_branch, design_doc_path, short_id, status_basis
+                design_doc_repo_remote_url, design_doc_branch, design_doc_path, short_id, status_basis, parked_at, parked_by, parked_reason, parked_via
          FROM projects
          WHERE product_id = ?1
          ORDER BY created_at ASC, name COLLATE NOCASE ASC",
@@ -167,7 +167,7 @@ pub(crate) fn list_projects_for_product(conn: &Connection, product_id: &str) -> 
 
 pub(crate) fn list_tasks_for_product(conn: &Connection, product_id: &str) -> Result<Vec<Task>> {
     let mut stmt = conn.prepare(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, parked_at, parked_by, parked_reason, parked_via, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
          FROM tasks
          WHERE product_id = ?1 AND deleted_at IS NULL
          ORDER BY project_id ASC, ordinal ASC, created_at ASC, id ASC",

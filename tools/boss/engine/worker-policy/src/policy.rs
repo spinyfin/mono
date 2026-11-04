@@ -441,6 +441,7 @@ fn worker_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::DismissAttention { .. }
         | FrontendRequest::LinkWorkItemExternalRef { .. }
         | FrontendRequest::MoveWorkItemOnBoard { .. }
+        | FrontendRequest::ParkWorkItem { .. }
         | FrontendRequest::RemoveDependency { .. }
         | FrontendRequest::ReorderProjectTasks { .. }
         | FrontendRequest::RestoreWorkItem { .. }

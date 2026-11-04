@@ -308,6 +308,7 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::OpenDocument { .. }
         | FrontendRequest::OpenLiveWorkspaceTerminal { .. }
         | FrontendRequest::OpenReviewTerminal { .. }
+        | FrontendRequest::ParkWorkItem { .. }
         | FrontendRequest::PlanProject { .. }
         | FrontendRequest::ProbeRun { .. }
         | FrontendRequest::ReapRun { .. }

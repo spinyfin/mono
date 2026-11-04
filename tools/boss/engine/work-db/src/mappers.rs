@@ -72,8 +72,25 @@ pub fn map_product(row: &Row<'_>) -> rusqlite::Result<Product> {
     })
 }
 
+/// The four parking columns (`parked_at`, `parked_by`, `parked_reason`,
+/// `parked_via`), as `[at, by, reason, via]`. They are optional trailing
+/// columns: a SELECT that carries them lists the four contiguously starting at
+/// `parked_at`, wherever that falls, and one that does not reports "not
+/// parked". Every SELECT feeding a surface that shows or filters on parking
+/// (single-item show, the list verbs, the work tree) includes them.
+fn parked_columns(row: &Row<'_>) -> rusqlite::Result<[Option<String>; 4]> {
+    let Ok(first) = row.as_ref().column_index("parked_at") else {
+        return Ok([None, None, None, None]);
+    };
+    let get = |offset: usize| {
+        Ok::<_, rusqlite::Error>(row.get::<_, Option<String>>(first + offset)?.filter(|s| !s.is_empty()))
+    };
+    Ok([get(0)?, get(1)?, get(2)?, get(3)?])
+}
+
 pub(crate) fn map_project(row: &Row<'_>) -> rusqlite::Result<Project> {
     let status_raw: String = row.get(6)?;
+    let [parked_at, parked_by, parked_reason, parked_via] = parked_columns(row)?;
     Ok(Project {
         id: row.get(0)?,
         product_id: row.get(1)?,
@@ -91,6 +108,10 @@ pub(crate) fn map_project(row: &Row<'_>) -> rusqlite::Result<Project> {
         design_doc_path: row.get(13)?,
         short_id: row.get(14)?,
         status_basis: row.get(15)?,
+        parked_at,
+        parked_by,
+        parked_reason,
+        parked_via,
     })
 }
 
@@ -214,6 +235,7 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         && (matches!(status, TaskStatus::InReview | TaskStatus::Done)
             || (status == TaskStatus::Blocked
                 && boss_engine_board_gesture::is_review_phase_blocked_reason(blocked_reason.as_deref())));
+    let [parked_at, parked_by, parked_reason, parked_via] = parked_columns(row)?;
     Ok(Task {
         id: row.get(0)?,
         operator_question: {
@@ -260,6 +282,11 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         // wide SELECT only (`map_task_with_parent_provenance_and_archived_reason`).
         critical_set_by: None,
         critical_set_at: None,
+        // Parking: optional trailing columns, read by name (see `parked_columns`).
+        parked_at,
+        parked_by,
+        parked_reason,
+        parked_via,
         repo_remote_url: row.get(18)?,
         effort_level,
         // Effort provenance is not part of the base 33-column SELECT;

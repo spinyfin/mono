@@ -9,7 +9,7 @@ use boss_engine_storage_values::dispatch_wait::{
     DISPATCH_WAIT_REASON_AUTOMATION_PAUSED, DISPATCH_WAIT_REASON_DISPATCH_PAUSED, DISPATCH_WAIT_REASON_FOCUS_MODE,
 };
 use boss_protocol::{StuckBucket, StuckReport, StuckRow};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[work_db_boundary::instrument]
 impl WorkDb {
@@ -80,6 +80,11 @@ pub(super) fn build(
         if waiting_human.is_none() && super::stuck_activity::related_work_is_live(conn, &task)? {
             continue;
         }
+        // Parked by the owner (the item itself, its project, or its revision chain
+        // root): an explicit decision, so it is neither stuck nor counted as an
+        // unconverted blocker, and it ages from the owner's stamp rather than
+        // from whatever ledger event came last.
+        let parked_holder = super::parking::parked_holder(conn, &id)?;
         let failure_basis = latest_basis(conn, &id, "blocked_reason")?;
         let basis: String = conn
             .query_row(
@@ -125,8 +130,11 @@ pub(super) fn build(
         let declared = task.dispatch_failed_reason.as_deref() == Some("deliberate_park")
             || (task.blocked_reason.as_deref() == Some("worker_failed")
                 && matches!(failure_basis.as_deref(), Some("declared_blocked" | "nudge_breaker")));
+        if let Some(parked_at) = parked_holder.as_ref().and_then(|holder| holder.parked_at) {
+            (changed_at, legacy) = (parked_at, false);
+        }
         let human = human_hold(conn, &task, failure_basis.as_deref(), now)?;
-        if declared && !human {
+        if declared && !human && parked_holder.is_none() {
             unconverted += 1;
         }
         let age = now.saturating_sub(changed_at).max(0);
@@ -139,8 +147,16 @@ pub(super) fn build(
         let classification = classification(conn, &task, wait.as_deref())?;
         let dependency =
             task.blocked_reason.as_deref() == Some("dependency") && progressing_prerequisite(conn, &id, now)?;
-        let bucket = if human || matches!(classification.as_str(), "S18_pr_behind" | "awaiting_merge") {
+        let bucket = if parked_holder.is_some() {
+            StuckBucket::Parked
+        } else if human || matches!(classification.as_str(), "S18_pr_behind" | "awaiting_merge") {
             StuckBucket::WaitingOnHuman
+        } else if task.blocked_reason.as_deref() == Some("dependency")
+            && has_parked_prerequisite(conn, &id, &mut BTreeSet::new())?
+        {
+            // Waiting on a prerequisite the owner parked: the decision about the
+            // prerequisite is also the decision about this item.
+            StuckBucket::ParkedUpstream
         } else if capacity {
             StuckBucket::WaitingOnCapacity
         } else if dependency {
@@ -159,7 +175,7 @@ pub(super) fn build(
         // A live recorded pid outranks every durable reason except S19, so
         // only a non-S19 Active item is probed (the pid-age filter matches
         // the orphan sweep's trust window).
-        if task.status == TaskStatus::Active && classification != "S19_waiting_human" {
+        if task.status == TaskStatus::Active && classification != "S19_waiting_human" && parked_holder.is_none() {
             let pid = super::run_rows::latest_local_worker_process_for_work_item(
                 conn,
                 &task.id,
@@ -310,6 +326,21 @@ fn human_hold(conn: &Connection, task: &Task, failure_basis: Option<&str>, now: 
             && !queued_wait
             && task.dispatch_failed_reason.is_none()
             && task.blocked_reason.is_none()))
+}
+
+/// `true` when a gating prerequisite of `id`, or transitively of one of those,
+/// is parked. The walk is over unsatisfied `blocks` edges only, so it stops at
+/// finished work; `seen` bounds it against a dependency cycle.
+fn has_parked_prerequisite(conn: &Connection, id: &str, seen: &mut BTreeSet<String>) -> Result<bool> {
+    for prerequisite in deps::gating_prereqs_for(conn, id)? {
+        if !seen.insert(prerequisite.clone()) {
+            continue;
+        }
+        if super::parking::is_parked(conn, &prerequisite)? || has_parked_prerequisite(conn, &prerequisite, seen)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn progressing_prerequisite(conn: &Connection, id: &str, now: i64) -> Result<bool> {

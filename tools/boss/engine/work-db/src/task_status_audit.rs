@@ -20,8 +20,26 @@ pub fn execute<P: rusqlite::Params>(
             "INSERT INTO task_status_audit_context (basis, actor) VALUES (?1, ?2)",
             params![basis, actor],
         )?;
+        // Parking's parked_at trigger reads this table (never the ledger
+        // tables) so ALTER TABLE rewrite still works after an upgrade test
+        // has dropped the ledger. Missing is the pre-parking schema.
+        let parking_ctx: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'parking_audit_context'",
+            [],
+            |row| row.get(0),
+        )?;
+        if parking_ctx > 0 {
+            conn.execute(
+                "INSERT OR REPLACE INTO parking_audit_context (singleton, basis, actor) VALUES (1, ?1, ?2)",
+                params![basis, actor],
+            )?;
+        }
         let count = conn.execute(sql, params)?;
+        super::parking::flush_parked_at_ledger(conn)?;
         conn.execute("DELETE FROM task_status_audit_context", [])?;
+        if parking_ctx > 0 {
+            conn.execute("DELETE FROM parking_audit_context", [])?;
+        }
         Ok(count)
     })();
     if result.is_err() {
@@ -55,47 +73,62 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     )?;
     super::task_status_backfill::backfill(conn)?;
     for property in ["status", "blocked_reason", "dispatch_failed_reason", "autostart"] {
-        // Repeated failure observations carry new provenance even when the
-        // displayed reason is unchanged. Ordinary unchanged updates do not
-        // restart the age clock.
-        let repeated = if property == "blocked_reason" {
-            let bases = super::pr_flow::WorkerFailureBasis::ALL
-                .iter()
-                .map(|basis| format!("'{}'", basis.as_str()))
-                .collect::<Vec<_>>()
-                .join(",");
-            format!(
-                "OR (NEW.blocked_reason = 'worker_failed' AND EXISTS (
-                SELECT 1 FROM task_status_audit_context WHERE basis IN ({bases})))"
-            )
-        } else if property == "dispatch_failed_reason" {
-            "OR (NEW.dispatch_failed_reason IS NOT NULL AND NEW.dispatch_failed_at IS NOT OLD.dispatch_failed_at)"
-                .to_owned()
-        } else {
-            String::new()
-        };
-        conn.execute_batch(&format!(
-            "CREATE TRIGGER IF NOT EXISTS task_status_audit_update_{property}
-             AFTER UPDATE OF {property} ON tasks
-             WHEN OLD.{property} IS NOT NEW.{property} {repeated}
-             BEGIN
-                INSERT INTO task_status_audit
-                    (work_item_id, property, old_value, new_value, actor, changed_at, basis)
-                VALUES (NEW.id, '{property}', OLD.{property}, NEW.{property},
-                    COALESCE((SELECT actor FROM task_status_audit_context), NEW.last_status_actor),
-                    strftime('%s','now'),
-                    COALESCE((SELECT basis FROM task_status_audit_context), 'unattributed_write'));
-             END;
-             CREATE TRIGGER IF NOT EXISTS task_status_audit_insert_{property}
-             AFTER INSERT ON tasks BEGIN
-                INSERT INTO task_status_audit
-                    (work_item_id, property, old_value, new_value, actor, changed_at, basis)
-                VALUES (NEW.id, '{property}', NULL, NEW.{property},
-                    COALESCE((SELECT actor FROM task_status_audit_context), NEW.last_status_actor),
-                    strftime('%s','now'),
-                    COALESCE((SELECT basis FROM task_status_audit_context), 'unattributed_write'));
-             END;"
-        ))?;
+        install_property_triggers(conn, property, true)?;
     }
+    Ok(())
+}
+
+/// Install the triggers that record every change to `tasks.<property>`.
+///
+/// `record_unset_inserts` is `false` for a property that is NULL on nearly
+/// every row (`parked_at`): a task insert then records the property only when
+/// it arrives set, instead of writing a NULL history row per task.
+pub(super) fn install_property_triggers(conn: &Connection, property: &str, record_unset_inserts: bool) -> Result<()> {
+    // Repeated failure observations carry new provenance even when the
+    // displayed reason is unchanged. Ordinary unchanged updates do not
+    // restart the age clock.
+    let repeated = if property == "blocked_reason" {
+        let bases = super::pr_flow::WorkerFailureBasis::ALL
+            .iter()
+            .map(|basis| format!("'{}'", basis.as_str()))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "OR (NEW.blocked_reason = 'worker_failed' AND EXISTS (
+                SELECT 1 FROM task_status_audit_context WHERE basis IN ({bases})))"
+        )
+    } else if property == "dispatch_failed_reason" {
+        "OR (NEW.dispatch_failed_reason IS NOT NULL AND NEW.dispatch_failed_at IS NOT OLD.dispatch_failed_at)"
+            .to_owned()
+    } else {
+        String::new()
+    };
+    let insert_when = if record_unset_inserts {
+        String::new()
+    } else {
+        format!("WHEN NEW.{property} IS NOT NULL")
+    };
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER IF NOT EXISTS task_status_audit_update_{property}
+         AFTER UPDATE OF {property} ON tasks
+         WHEN OLD.{property} IS NOT NEW.{property} {repeated}
+         BEGIN
+            INSERT INTO task_status_audit
+                (work_item_id, property, old_value, new_value, actor, changed_at, basis)
+            VALUES (NEW.id, '{property}', OLD.{property}, NEW.{property},
+                COALESCE((SELECT actor FROM task_status_audit_context), NEW.last_status_actor),
+                strftime('%s','now'),
+                COALESCE((SELECT basis FROM task_status_audit_context), 'unattributed_write'));
+         END;
+         CREATE TRIGGER IF NOT EXISTS task_status_audit_insert_{property}
+         AFTER INSERT ON tasks {insert_when} BEGIN
+            INSERT INTO task_status_audit
+                (work_item_id, property, old_value, new_value, actor, changed_at, basis)
+            VALUES (NEW.id, '{property}', NULL, NEW.{property},
+                COALESCE((SELECT actor FROM task_status_audit_context), NEW.last_status_actor),
+                strftime('%s','now'),
+                COALESCE((SELECT basis FROM task_status_audit_context), 'unattributed_write'));
+         END;"
+    ))?;
     Ok(())
 }

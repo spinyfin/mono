@@ -266,6 +266,21 @@ pub struct WorkItemPatch {
     pub pr_url: Option<String>,
     pub priority: Option<String>,
 
+    /// Park (`Some(true)`) or un-park (`Some(false)`) a task, chore or
+    /// project. `None` → leave unchanged. Only the human and boss caller
+    /// tiers may set it; the engine refuses every other tier at the write
+    /// boundary, the way it refuses a raise to `critical`. A parking patch
+    /// carries only `parked` / `parked_reason`: park and un-park are their
+    /// own request ([`crate::FrontendRequest::ParkWorkItem`] builds exactly
+    /// this patch), so they never ride along with an unrelated edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked: Option<bool>,
+
+    /// Optional free-text reason recorded with a park. Ignored unless
+    /// `parked` is `Some(true)`; an empty string records no reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_reason: Option<String>,
+
     /// Move a leaf work item's project membership. `None` → leave
     /// unchanged. `Some("")` → move to the no-project state: a
     /// `project_task` becomes a `chore` and its `ordinal` is cleared.
@@ -315,6 +330,25 @@ pub struct WorkItemPatch {
     /// task/chore updates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remove_tags: Option<Vec<String>>,
+}
+
+impl WorkItemPatch {
+    /// `true` when this patch asks to park or un-park and changes nothing
+    /// else. Compared against the serialized default patch rather than a
+    /// field list, so a field added to the patch later is covered without
+    /// anyone remembering to extend this check.
+    pub fn is_parking_only(&self) -> bool {
+        if self.parked.is_none() && self.parked_reason.is_none() {
+            return false;
+        }
+        let mut rest = self.clone();
+        rest.parked = None;
+        rest.parked_reason = None;
+        matches!(
+            (serde_json::to_value(&rest), serde_json::to_value(WorkItemPatch::default())),
+            (Ok(rest), Ok(empty)) if rest == empty
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]

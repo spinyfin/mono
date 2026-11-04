@@ -42,6 +42,24 @@ pub(super) fn resolve_write_actor(
     Ok(resolve_status_actor(server_state, peer_pid))
 }
 
+/// Refuse a park or un-park from a socket peer the worker registry classifies
+/// as an agent. Parking is the owner's decision, so the same two-step gate as
+/// a raise to `critical` applies: this handler-side check sees the worker /
+/// progression classification (`resolve_status_actor` cannot — a worker pane
+/// descends from neither the coordinator nor the app, so it would resolve to
+/// `'human'`), and `WorkDb` then judges the resolved actor string, which
+/// admits only `human` and `boss`.
+fn refuse_agent_parking(server_state: &ServerState, peer_pid: Option<libc::pid_t>) -> anyhow::Result<()> {
+    let peer_class = server_state.classify_peer(peer_pid);
+    if peer_class.is_progression() {
+        return Err(boss_work_db::parking::parking_refusal("progression"));
+    }
+    if peer_class.is_worker() {
+        return Err(boss_work_db::parking::parking_refusal("worker"));
+    }
+    Ok(())
+}
+
 pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
@@ -533,6 +551,21 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
     apply_work_item_patch(ctx, id, patch, None).await;
 }
 
+/// Park or un-park a task, chore or project. A parking-only `UpdateWorkItem`
+/// through the same path, so both requests share one tier rule.
+#[tracing::instrument(name = "park_work_item", level = "debug", skip_all, fields(request_id = %ctx.request_id, item_id = tracing::field::Empty))]
+pub(super) async fn handle_park_work_item(ctx: Dispatch, req: FrontendRequest) {
+    let FrontendRequest::ParkWorkItem { id, parked, reason } = req else {
+        unreachable!()
+    };
+    tracing::Span::current().record("item_id", &id);
+    let patch = WorkItemPatch::builder()
+        .parked(parked)
+        .maybe_parked_reason(reason)
+        .build();
+    apply_work_item_patch(ctx, id, patch, None).await;
+}
+
 /// Confirmed pause-only override state carried from a `MoveWorkItemOnBoard`
 /// app-drag into [`apply_work_item_patch`]'s dispatch step. `None` from
 /// every other caller — an explicit `UpdateWorkItem`, and the drop's own
@@ -711,6 +744,12 @@ pub(super) async fn apply_work_item_patch(
         peer_pid,
         ..
     } = ctx;
+    if (patch.parked.is_some() || patch.parked_reason.is_some())
+        && let Err(err) = refuse_agent_parking(&server_state, peer_pid)
+    {
+        send_work_error(&sink, &request_id, &err);
+        return;
+    }
     let id = match server_state.resolve_work_item_id(&id).await {
         Ok(id) => id,
         Err(err) => {

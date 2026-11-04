@@ -875,6 +875,11 @@ impl WorkDb {
     /// where the caller tier has already been resolved to `"human"` or
     /// `"boss"`.
     pub fn update_work_item_as_actor(&self, id: &str, patch: WorkItemPatch, actor: &str) -> Result<WorkItem> {
+        // Park and un-park are the owner's decision with their own cascade, so
+        // they never ride along with an unrelated edit: see `parking`.
+        if patch.parked.is_some() || patch.parked_reason.is_some() {
+            return self.apply_parking_patch(id, &patch, actor);
+        }
         match classify_id(id)? {
             ItemKind::Product => self.update_product(id, patch, actor),
             ItemKind::Project => self.update_project(id, patch, actor),
@@ -1178,7 +1183,7 @@ impl WorkDb {
         let projects = {
             let mut stmt = conn.prepare(
                 "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor,
-                        design_doc_repo_remote_url, design_doc_branch, design_doc_path, short_id, status_basis
+                        design_doc_repo_remote_url, design_doc_branch, design_doc_path, short_id, status_basis, parked_at, parked_by, parked_reason, parked_via
                  FROM projects
                  WHERE product_id = ?1
                  ORDER BY created_at ASC, name COLLATE NOCASE ASC",
@@ -1638,7 +1643,7 @@ impl WorkDb {
         if let Some(project) = conn
             .query_row(
                 "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor,
-                        design_doc_repo_remote_url, design_doc_branch, design_doc_path, short_id, status_basis
+                        design_doc_repo_remote_url, design_doc_branch, design_doc_path, short_id, status_basis, parked_at, parked_by, parked_reason, parked_via
                  FROM projects
                  WHERE product_id = ?1 AND short_id = ?2",
                 params![product_id, short_id],
@@ -1739,7 +1744,7 @@ impl WorkDb {
         let mut tasks = if let Some(project_id) = project_id {
             ensure_project_belongs_to_product(&conn, project_id, product_id)?;
             let mut stmt = conn.prepare(&format!(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, parent_task_id, tags, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, parent_task_id, tags, parked_at, parked_by, parked_reason, parked_via, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
                  FROM tasks
                  WHERE product_id = ?1 AND project_id = ?2 AND kind IN ({kind_clause}){deleted_clause}
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1748,7 +1753,7 @@ impl WorkDb {
             collect_rows(rows)?
         } else {
             let mut stmt = conn.prepare(&format!(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, parent_task_id, tags, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, parent_task_id, tags, parked_at, parked_by, parked_reason, parked_via, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
                  FROM tasks
                  WHERE product_id = ?1 AND kind IN ({kind_clause}){deleted_clause}
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1867,7 +1872,7 @@ impl WorkDb {
             ""
         };
         let mut stmt = conn.prepare(&format!(
-            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, parent_task_id, origin_task_short_id, origin_pr_number, completed_at, tags, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, parent_task_id, origin_task_short_id, origin_pr_number, completed_at, tags, parked_at, parked_by, parked_reason, parked_via, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
              FROM tasks
              WHERE product_id = ?1 AND kind = 'revision'{deleted_clause}{parent_clause}
              ORDER BY created_at ASC",
@@ -1904,7 +1909,7 @@ impl WorkDb {
         // See `list_tasks` for the include-deleted contract.
         let deleted_clause = if include_deleted { "" } else { " AND deleted_at IS NULL" };
         let mut stmt = conn.prepare(&format!(
-            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, parent_task_id, origin_task_short_id, origin_pr_number, completed_at, tags, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, parent_task_id, origin_task_short_id, origin_pr_number, completed_at, tags, parked_at, parked_by, parked_reason, parked_via, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
              FROM tasks
              WHERE product_id = ?1 AND (kind = 'chore' OR (kind = 'followup' AND project_id IS NULL)){deleted_clause}
              ORDER BY created_at ASC",

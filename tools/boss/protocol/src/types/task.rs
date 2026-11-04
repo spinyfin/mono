@@ -743,6 +743,32 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub critical_set_at: Option<String>,
 
+    /// When the owner parked this row (epoch seconds, decimal string).
+    /// `None` → not parked. Parking is orthogonal to [`Self::status`]: a
+    /// parked row keeps its lifecycle position, leaves the default board,
+    /// and is skipped by automatic dispatch and upkeep until un-parked.
+    /// `parked_at IS NOT NULL` is the single load-bearing fact; the three
+    /// fields below are provenance. A row can also be *effectively* parked
+    /// without carrying this stamp (its project is parked, or its revision
+    /// chain root is) — the engine's `is_parked` predicate is the authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_at: Option<String>,
+
+    /// Status actor that parked the row (`human` or `boss`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_by: Option<String>,
+
+    /// Optional free text from the owner explaining the park.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_reason: Option<String>,
+
+    /// How the stamp got here: [`PARKED_VIA_DIRECT`] (the row itself was
+    /// parked) or `project:<project_id>` (its project's park cascaded onto
+    /// it; see [`parked_via_project`]). Un-parking a project clears only the
+    /// rows whose stamp names that project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_via: Option<String>,
+
     pub status: TaskStatus,
     pub updated_at: String,
 
@@ -1286,6 +1312,24 @@ impl Task {
     pub fn short_label(&self) -> String {
         short_id_label(self.short_id).unwrap_or_else(|| "a task".to_owned())
     }
+
+    /// `true` when the row itself carries a park stamp and is still open.
+    /// Terminal rows (`done` / `archived`) are never reported as parked: a
+    /// parked PR that merges keeps its stamp as history, but the card is
+    /// finished work and must not hide behind the parked filter. This reads
+    /// only the row's own stamp — a row parked through its project or its
+    /// revision chain root is judged by the engine's `is_parked` predicate.
+    pub fn is_parked(&self) -> bool {
+        self.parked_at.is_some() && !self.status.is_terminal()
+    }
+}
+
+/// `parked_via` for a row the owner parked directly.
+pub const PARKED_VIA_DIRECT: &str = "direct";
+
+/// `parked_via` for a row stamped by its project's park cascade.
+pub fn parked_via_project(project_id: &str) -> String {
+    format!("project:{project_id}")
 }
 
 /// Live runtime status for a single task/chore — the current execution

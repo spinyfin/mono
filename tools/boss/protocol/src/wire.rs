@@ -181,6 +181,7 @@ pub enum CoordinatorRecreateReason {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)] // internally-tagged RPC; boxing a payload is a follow-up
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FrontendRequest {
     /// Engine-side abandon for a non-terminal `ci_remediations`
@@ -1939,6 +1940,13 @@ pub enum FrontendRequest {
         work_item_id: String,
     },
 
+    ParkWorkItem {
+        id: String,
+        parked: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
     /// Operator entry point for the auto-populate Planner/Materializer
     /// (design P783 §2 "Reusability" #2 — "plan this project now" /
     /// replan). Builds the same `PlannerInput` the design-PR-merge
@@ -2975,19 +2983,14 @@ mod topic_event_payload;
 pub use topic_event_payload::TopicEventPayload;
 
 #[cfg(test)]
-mod editorial_controls_tests;
-
+mod coordinator_reset_tests;
 #[cfg(test)]
-mod frontend_event_wire_tests;
-
+mod editorial_controls_tests;
 #[cfg(test)]
 mod feature_flags_wire_tests;
-
 #[cfg(test)]
-mod topic_and_envelope_tests;
-
+mod frontend_event_wire_tests;
 #[cfg(test)]
 mod sorted_request_variants_test;
-
 #[cfg(test)]
-mod coordinator_reset_tests;
+mod topic_and_envelope_tests;

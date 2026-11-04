@@ -55,6 +55,44 @@ pub(crate) fn resolved_repo_for_task<'a>(task: &'a Task, product_repo: Option<&'
     task.repo_remote_url.as_deref().or(product_repo)
 }
 
+/// Shared `--parked` / `--include-parked` flags. Parked rows are hidden by
+/// default, matching the board. `--include-parked` adds them back; `--parked`
+/// shows only parked rows.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ParkedListArgs {
+    /// Show only parked rows.
+    #[arg(long = "parked", conflicts_with = "include_parked")]
+    pub(crate) parked: bool,
+
+    /// Include parked rows in the listing. Parked rows are hidden by default.
+    #[arg(long = "include-parked")]
+    pub(crate) include_parked: bool,
+}
+
+impl ParkedListArgs {
+    pub(crate) fn filter(&self) -> ParkedListFilter {
+        if self.parked {
+            ParkedListFilter::Only
+        } else if self.include_parked {
+            ParkedListFilter::Include
+        } else {
+            ParkedListFilter::Exclude
+        }
+    }
+}
+
+/// How a listing treats parked rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ParkedListFilter {
+    /// Default: hide parked rows.
+    #[default]
+    Exclude,
+    /// `--include-parked`: parked rows sit alongside live ones.
+    Include,
+    /// `--parked`: only parked rows.
+    Only,
+}
+
 /// Criteria for `apply_task_list_filters`, bundled to keep the function's
 /// argument count under clippy's `too_many_arguments` threshold.
 ///
@@ -76,6 +114,10 @@ pub(crate) struct TaskListCriteria<'a> {
     /// show-everything default other statuses get.
     #[builder(default)]
     pub(crate) include_archived: bool,
+    /// Parked rows are hidden by default. `--include-parked` adds them
+    /// back; `--parked` shows only parked rows.
+    #[builder(default)]
+    pub(crate) parked: ParkedListFilter,
     /// When set, keep only rows whose `parent_task_id` equals this primary
     /// id. Requires the list surface to project `parent_task_id` (see
     /// `WorkDb::list_tasks`); without that projection every row would
@@ -105,6 +147,9 @@ pub(crate) fn apply_task_list_filters(
         .into_iter()
         .filter(|task| {
             if !show_archived && task.status.as_str() == "archived" {
+                return false;
+            }
+            if !parked_list_keeps(criteria.parked, task.is_parked()) {
                 return false;
             }
             if !allowed_statuses.is_empty() && !allowed_statuses.contains(&task.status.as_str()) {
@@ -139,6 +184,21 @@ pub(crate) fn apply_task_list_filters(
         .collect()
 }
 
+/// Criteria for `apply_project_list_filters`, bundled so the function stays
+/// under clippy's `too_many_arguments` threshold. Mirrors [`TaskListCriteria`].
+#[derive(bon::Builder)]
+pub(crate) struct ProjectListCriteria<'a> {
+    #[builder(default)]
+    pub(crate) statuses: &'a [ProjectStatusArg],
+    pub(crate) match_term: Option<&'a str>,
+    #[builder(default)]
+    pub(crate) ids: &'a [String],
+    pub(crate) limit: Option<usize>,
+    #[builder(default)]
+    pub(crate) parked: ParkedListFilter,
+}
+
+#[cfg(test)]
 pub(crate) fn apply_project_list_filters(
     items: Vec<Project>,
     statuses: &[ProjectStatusArg],
@@ -148,12 +208,34 @@ pub(crate) fn apply_project_list_filters(
     repo: Option<&RepoSelector>,
     product_repo: Option<&str>,
 ) -> Vec<Project> {
-    let allowed_statuses: Vec<&str> = statuses.iter().map(|s| s.as_str()).collect();
-    let id_set: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
-    let lc_term = match_term.map(str::to_lowercase);
+    apply_project_list_filters_with(
+        items,
+        ProjectListCriteria::builder()
+            .statuses(statuses)
+            .maybe_match_term(match_term)
+            .ids(ids)
+            .maybe_limit(limit)
+            .build(),
+        repo,
+        product_repo,
+    )
+}
+
+pub(crate) fn apply_project_list_filters_with(
+    items: Vec<Project>,
+    criteria: ProjectListCriteria<'_>,
+    repo: Option<&RepoSelector>,
+    product_repo: Option<&str>,
+) -> Vec<Project> {
+    let allowed_statuses: Vec<&str> = criteria.statuses.iter().map(|s| s.as_str()).collect();
+    let id_set: std::collections::HashSet<&str> = criteria.ids.iter().map(String::as_str).collect();
+    let lc_term = criteria.match_term.map(str::to_lowercase);
     items
         .into_iter()
         .filter(|project| {
+            if !parked_list_keeps(criteria.parked, project.is_parked()) {
+                return false;
+            }
             if !allowed_statuses.is_empty() && !allowed_statuses.contains(&project.status.as_str()) {
                 return false;
             }
@@ -177,8 +259,16 @@ pub(crate) fn apply_project_list_filters(
             }
             true
         })
-        .take(limit.unwrap_or(usize::MAX))
+        .take(criteria.limit.unwrap_or(usize::MAX))
         .collect()
+}
+
+fn parked_list_keeps(filter: ParkedListFilter, is_parked: bool) -> bool {
+    match filter {
+        ParkedListFilter::Exclude => !is_parked,
+        ParkedListFilter::Include => true,
+        ParkedListFilter::Only => is_parked,
+    }
 }
 
 pub(crate) fn print_entity<T, F>(ctx: &RunContext, json_value: &T, human: F) -> Result<(), CliError>
@@ -231,6 +321,10 @@ pub(crate) fn print_projects_table(projects: &[Project], with_primary_id: bool) 
         header.push("ID");
     }
     header.extend_from_slice(&["SLUG", "NAME", "STATUS", "PRIORITY", "GOAL"]);
+    let show_parked = projects.iter().any(|p| p.is_parked());
+    if show_parked {
+        header.push("PARKED");
+    }
     let mut table = new_dynamic_table(header);
     for project in projects {
         let mut row: Vec<String> = Vec::new();
@@ -246,6 +340,13 @@ pub(crate) fn print_projects_table(projects: &[Project], with_primary_id: bool) 
         row.push(project.status.to_string());
         row.push(project.priority.clone());
         row.push(project.goal.clone());
+        if show_parked {
+            row.push(if project.is_parked() {
+                "yes".to_owned()
+            } else {
+                String::new()
+            });
+        }
         table.add_row(row);
     }
     print_table(table);
@@ -318,6 +419,10 @@ pub(crate) fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
     if show_deleted {
         header.push("DELETED");
     }
+    let show_parked = tasks.iter().any(|t| t.is_parked());
+    if show_parked {
+        header.push("PARKED");
+    }
     let mut table = new_dynamic_table(header);
     for task in tasks {
         let ordinal = task.ordinal.map(|value| value.to_string()).unwrap_or_default();
@@ -358,6 +463,13 @@ pub(crate) fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
         }
         if show_deleted {
             row.push(task.deleted_at.clone().unwrap_or_default());
+        }
+        if show_parked {
+            row.push(if task.is_parked() {
+                "yes".to_owned()
+            } else {
+                String::new()
+            });
         }
         table.add_row(row);
     }
@@ -512,6 +624,13 @@ pub(crate) fn print_project_details(
     if !project.goal.is_empty() {
         println!("Goal: {}", project.goal);
     }
+    print_park_fields(
+        project.is_parked(),
+        project.parked_at.as_deref(),
+        project.parked_by.as_deref(),
+        project.parked_reason.as_deref(),
+        project.parked_via.as_deref(),
+    );
     if !project.description.is_empty() {
         println!("Description: {}", project.description);
     }
@@ -974,6 +1093,31 @@ pub(crate) fn decide_open_design_action(
     }
 }
 
+fn print_park_fields(
+    is_parked: bool,
+    parked_at: Option<&str>,
+    parked_by: Option<&str>,
+    parked_reason: Option<&str>,
+    parked_via: Option<&str>,
+) {
+    if !is_parked && parked_at.is_none() {
+        return;
+    }
+    println!("Parked: {}", if is_parked { "yes" } else { "no (stamp retained)" });
+    if let Some(at) = parked_at {
+        println!("Parked at: {}", format_stored_epoch(at));
+    }
+    if let Some(by) = parked_by {
+        println!("Parked by: {by}");
+    }
+    if let Some(via) = parked_via {
+        println!("Parked via: {via}");
+    }
+    if let Some(reason) = parked_reason.filter(|reason| !reason.is_empty()) {
+        println!("Parked reason: {reason}");
+    }
+}
+
 pub(crate) fn print_task_details(title: &str, task: &Task, parent_product: Option<&Product>, with_primary_id: bool) {
     println!("{title}");
     if let Some(n) = task.short_id {
@@ -995,6 +1139,13 @@ pub(crate) fn print_task_details(title: &str, task: &Task, parent_product: Optio
     if task.deferred {
         println!("Deferred: yes (future scope — awaiting approval to dispatch)");
     }
+    print_park_fields(
+        task.is_parked(),
+        task.parked_at.as_deref(),
+        task.parked_by.as_deref(),
+        task.parked_reason.as_deref(),
+        task.parked_via.as_deref(),
+    );
     if task.human_driven {
         println!("Human-driven: yes (no agent worker; close with `boss task complete --summary \"…\"`)");
     }
@@ -1349,4 +1500,209 @@ pub(crate) async fn run_release_command(flags: &GlobalFlags) -> Result<(), CliEr
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod parked_list_tests {
+    use super::*;
+    use boss_protocol::{Project, ProjectStatus, Task, TaskKind, TaskStatus};
+    use clap::Parser;
+
+    fn task(id: &str, parked: bool) -> Task {
+        let mut task = Task::builder()
+            .id(id)
+            .product_id("prod_1")
+            .kind(TaskKind::Task)
+            .name(id)
+            .description("")
+            .status(TaskStatus::Todo)
+            .created_at("")
+            .updated_at("")
+            .build();
+        if parked {
+            task.parked_at = Some("1".to_owned());
+        }
+        task
+    }
+
+    fn project(id: &str, parked: bool) -> Project {
+        let mut project = Project::builder()
+            .id(id)
+            .product_id("prod_1")
+            .name(id)
+            .slug(id)
+            .description("")
+            .goal("")
+            .status(ProjectStatus::Active)
+            .created_at("")
+            .updated_at("")
+            .build();
+        if parked {
+            project.parked_at = Some("1".to_owned());
+        }
+        project
+    }
+
+    fn ids(tasks: &[Task]) -> Vec<&str> {
+        tasks.iter().map(|t| t.id.as_str()).collect()
+    }
+
+    #[test]
+    fn parked_tasks_hidden_by_default_shown_on_request() {
+        let rows = vec![task("task_parked", true), task("task_live", false)];
+        let visible = apply_task_list_filters(rows.clone(), TaskListCriteria::builder().build(), None, None);
+        assert_eq!(ids(&visible), ["task_live"]);
+
+        let visible = apply_task_list_filters(
+            rows.clone(),
+            TaskListCriteria::builder().parked(ParkedListFilter::Include).build(),
+            None,
+            None,
+        );
+        assert_eq!(ids(&visible), ["task_parked", "task_live"]);
+
+        let visible = apply_task_list_filters(
+            rows,
+            TaskListCriteria::builder().parked(ParkedListFilter::Only).build(),
+            None,
+            None,
+        );
+        assert_eq!(ids(&visible), ["task_parked"]);
+    }
+
+    #[test]
+    fn done_row_with_park_stamp_is_not_parked_for_the_list_filter() {
+        let mut done = task("task_done", true);
+        done.status = TaskStatus::Done;
+        let visible = apply_task_list_filters(vec![done], TaskListCriteria::builder().build(), None, None);
+        assert_eq!(ids(&visible), ["task_done"]);
+    }
+
+    #[test]
+    fn parses_task_park_command() {
+        let cli = Cli::parse_from(["boss", "task", "park", "T1", "--reason", "later"]);
+        match cli.command {
+            Commands::Task {
+                command: TaskCommand::Park(args),
+            } => {
+                assert_eq!(args.id, "T1");
+                assert_eq!(args.reason.as_deref(), Some("later"));
+            }
+            _ => panic!("expected task park command"),
+        }
+    }
+
+    #[test]
+    fn parses_task_unpark_command() {
+        let cli = Cli::parse_from(["boss", "task", "unpark", "T1"]);
+        match cli.command {
+            Commands::Task {
+                command: TaskCommand::Unpark(args),
+            } => assert_eq!(args.id, "T1"),
+            _ => panic!("expected task unpark command"),
+        }
+    }
+
+    #[test]
+    fn parses_chore_and_project_park_commands() {
+        let cli = Cli::parse_from(["boss", "chore", "park", "T9"]);
+        match cli.command {
+            Commands::Chore {
+                command: ChoreCommand::Park(args),
+            } => assert_eq!(args.id, "T9"),
+            _ => panic!("expected chore park command"),
+        }
+        let cli = Cli::parse_from([
+            "boss",
+            "project",
+            "park",
+            "P1",
+            "--product",
+            "boss",
+            "--reason",
+            "focus",
+        ]);
+        match cli.command {
+            Commands::Project {
+                command: ProjectCommand::Park(args),
+            } => {
+                assert_eq!(args.selector, "P1");
+                assert_eq!(args.product.as_deref(), Some("boss"));
+                assert_eq!(args.reason.as_deref(), Some("focus"));
+            }
+            _ => panic!("expected project park command"),
+        }
+        let cli = Cli::parse_from(["boss", "project", "unpark", "P1", "--product", "boss"]);
+        match cli.command {
+            Commands::Project {
+                command: ProjectCommand::Unpark(args),
+            } => {
+                assert_eq!(args.selector, "P1");
+                assert_eq!(args.product.as_deref(), Some("boss"));
+            }
+            _ => panic!("expected project unpark command"),
+        }
+    }
+
+    #[test]
+    fn parses_listing_parked_flags() {
+        let only = Cli::parse_from(["boss", "task", "list", "--parked"]);
+        match only.command {
+            Commands::Task {
+                command: TaskCommand::List(args),
+            } => assert_eq!(args.parked.filter(), ParkedListFilter::Only),
+            _ => panic!("expected task list command"),
+        }
+        let include = Cli::parse_from(["boss", "task", "list", "--include-parked"]);
+        match include.command {
+            Commands::Task {
+                command: TaskCommand::List(args),
+            } => assert_eq!(args.parked.filter(), ParkedListFilter::Include),
+            _ => panic!("expected task list command"),
+        }
+        for argv in [
+            ["boss", "chore", "list", "--include-parked"],
+            ["boss", "project", "list", "--include-parked"],
+            ["boss", "task", "list-revisions", "--include-parked"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_ok(), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_parked_combined_with_include_parked() {
+        let err = Cli::try_parse_from(["boss", "task", "list", "--parked", "--include-parked"])
+            .expect_err("--parked and --include-parked must conflict");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("--parked") || rendered.contains("--include-parked"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn parked_projects_hidden_by_default_shown_on_request() {
+        let rows = vec![project("proj_parked", true), project("proj_live", false)];
+        let visible = apply_project_list_filters(rows.clone(), &[], None, &[], None, None, None);
+        assert_eq!(visible.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["proj_live"]);
+
+        let visible = apply_project_list_filters_with(
+            rows.clone(),
+            ProjectListCriteria::builder().parked(ParkedListFilter::Include).build(),
+            None,
+            None,
+        );
+        assert_eq!(visible.len(), 2);
+
+        let visible = apply_project_list_filters_with(
+            rows,
+            ProjectListCriteria::builder().parked(ParkedListFilter::Only).build(),
+            None,
+            None,
+        );
+        assert_eq!(
+            visible.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            ["proj_parked"]
+        );
+    }
 }

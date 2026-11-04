@@ -199,6 +199,7 @@ pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
         | R::OpenDocument { .. }
         | R::OpenLiveWorkspaceTerminal { .. }
         | R::OpenReviewTerminal { .. }
+        | R::ParkWorkItem { .. }
         | R::PlanProject { .. }
         | R::ProbeRun { .. }
         | R::ReapRun { .. }

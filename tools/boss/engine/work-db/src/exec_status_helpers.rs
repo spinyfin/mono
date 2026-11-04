@@ -253,6 +253,15 @@ pub fn task_accepts_execution(task: &Task) -> bool {
     if task.deleted_at.is_some() {
         return false;
     }
+    // Parked: the owner's explicit "not now". No automatic path mints an
+    // execution for a parked row — only un-parking brings it back (see
+    // `parking`). This reads the row's own stamp; a row parked through its
+    // project or its revision chain root is held by the mint-point check in
+    // `reconcile_work_item_execution` / `reconcile_revision_execution`, which
+    // runs the full database predicate.
+    if task.is_parked() {
+        return false;
+    }
     // Non-dispatchable states. `in_review` is explicitly blocked here
     // because moving a task directly to `in_review` (e.g. via
     // `boss task update --status in-review` on a task that never went
@@ -688,6 +697,20 @@ mod tests {
         assert!(!task_accepts_execution(&task(TaskStatus::Todo, false, None)));
         // Once active, autostart no longer gates (it is cleared at start).
         assert!(task_accepts_execution(&task(TaskStatus::Active, false, None)));
+    }
+
+    #[test]
+    fn task_accepts_execution_rejects_parked_rows_in_every_open_status() {
+        for status in [TaskStatus::Todo, TaskStatus::Active, TaskStatus::Blocked] {
+            let mut parked = task(status.clone(), true, None);
+            parked.parked_at = Some("1700000000".to_owned());
+            assert!(
+                !task_accepts_execution(&parked),
+                "a parked {status} row must not accept"
+            );
+            parked.parked_at = None;
+            assert!(task_accepts_execution(&parked), "un-parking restores {status}");
+        }
     }
 
     #[test]
