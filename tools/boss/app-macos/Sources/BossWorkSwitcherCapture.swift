@@ -52,7 +52,7 @@ enum BossWorkSwitcherCapture {
             .overlay(alignment: .topLeading) {
                 if hidden && !CommandLine.arguments.contains("--capture-switcher-closed") {
                     WorkSwitcherMenu(model: model, dismiss: {})
-                        .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
                         .overlay(RoundedRectangle(cornerRadius: 10).stroke(.gray.opacity(0.3)))
                         .shadow(radius: 8, y: 2)
                         .padding(.leading, 90)
