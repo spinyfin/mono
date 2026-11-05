@@ -2790,7 +2790,9 @@ async fn a_deterministic_head_lookup_failure_proceeds_without_a_snapshot_while_a
     let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
     let handler = handler.with_branch_verifier(verifier.clone());
 
-    verifier.set_head_oid(Err("error connecting to api.github.com".into())).await;
+    verifier
+        .set_head_oid(Err("error connecting to api.github.com".into()))
+        .await;
     assert!(handler.snapshot_pr_head_before(&execution_id).await.is_err());
 
     verifier

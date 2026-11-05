@@ -2297,7 +2297,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = JjRepo::new(dir.path());
         JjRepo::run(&repo.worker, &["bookmark", "set", "main", "-r", "@"]);
-        JjRepo::run(&repo.worker, &["config", "set", "--repo", "revset-aliases.'trunk()'", "main"]);
+        JjRepo::run(
+            &repo.worker,
+            &["config", "set", "--repo", "revset-aliases.'trunk()'", "main"],
+        );
         let adapter = LocalHostAdapter::new(
             Arc::new(ReprCube { repr_some: false }),
             Arc::new(crate::test_support::NoopRunner),

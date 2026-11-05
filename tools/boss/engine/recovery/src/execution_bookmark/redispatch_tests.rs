@@ -497,7 +497,15 @@ async fn unpushed_amendment_to_a_published_pr_commit_is_retained_exactly_once() 
     );
     JjRepo::run(
         &repo.repo,
-        &["git", "push", "--remote", "published", "--bookmark", "pr/80", "--allow-new"],
+        &[
+            "git",
+            "push",
+            "--remote",
+            "published",
+            "--bookmark",
+            "pr/80",
+            "--allow-new",
+        ],
     );
     // The worker squashes a unique fix into the published commit without
     // pushing: same change id, different content.

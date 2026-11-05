@@ -572,6 +572,8 @@ async fn shallow_history_below_trunk_does_not_affect_baseline_creation() {
     let advanced = one_commit(&LocalJj, &repo.worker, "trunk()").await.unwrap();
     assert_ne!(advanced, base);
     assert_eq!(record.base_commit.as_deref(), Some(base.as_str()));
-    let next = create(&LocalJj, &repo.worker, "exec_shallow_next", "local").await.unwrap();
+    let next = create(&LocalJj, &repo.worker, "exec_shallow_next", "local")
+        .await
+        .unwrap();
     assert_eq!(next.base_commit.as_deref(), Some(advanced.as_str()));
 }

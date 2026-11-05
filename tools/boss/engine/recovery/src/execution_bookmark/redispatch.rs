@@ -148,12 +148,13 @@ pub async fn restore_rebased(
         for (change, commit) in change_commits(jj, workspace, &unpublished).await? {
             if let Some(published) = pr_changes.get(&change) {
                 let interdiff = jj
-                    .run(
-                        workspace,
-                        &["interdiff", "--from", &commit, "--to", published, "--git"],
-                    )
+                    .run(workspace, &["interdiff", "--from", &commit, "--to", published, "--git"])
                     .await?;
-                if crate::recovery_apply::filter_bookkeeping(&interdiff).text.trim().is_empty() {
+                if crate::recovery_apply::filter_bookkeeping(&interdiff)
+                    .text
+                    .trim()
+                    .is_empty()
+                {
                     continue;
                 }
             }

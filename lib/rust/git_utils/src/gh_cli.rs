@@ -25,7 +25,12 @@ async fn run_gh(args: &[&str], display: &str) -> Result<String> {
         .kill_on_drop(true)
         .output()
         .await
-        .map_err(|err| GhError::new(GhErrorKind::Deterministic, format!("failed to spawn `{display}`: {err}")))?;
+        .map_err(|err| {
+            GhError::new(
+                GhErrorKind::Deterministic,
+                format!("failed to spawn `{display}`: {err}"),
+            )
+        })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr = stderr.trim();

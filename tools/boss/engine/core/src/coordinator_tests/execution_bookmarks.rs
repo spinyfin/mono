@@ -126,7 +126,13 @@ async fn bound_pr_fixture(revision: bool) -> BoundPrFixture {
         .await
         .unwrap();
     assert_ne!(ancestry.base_commit.as_deref(), Some(head.as_str()));
-    BoundPrFixture { dir, db, id, repo, head }
+    BoundPrFixture {
+        dir,
+        db,
+        id,
+        repo,
+        head,
+    }
 }
 
 async fn bound_pr_snapshot_dispatch(revision: bool, fail_first: bool) {
@@ -1108,7 +1114,10 @@ fn advance_bound_pr(fx: &BoundPrFixture) -> String {
     JjRepo::run(&fx.repo.worker, &["new", "pr/99", "-m", "PR head moved"]);
     std::fs::write(fx.repo.worker.join("moved"), "pushed by someone else").unwrap();
     JjRepo::run(&fx.repo.worker, &["bookmark", "set", "pr/99", "-r", "@"]);
-    let moved = JjRepo::run(&fx.repo.worker, &["log", "--no-graph", "-r", "pr/99", "-T", "commit_id"]);
+    let moved = JjRepo::run(
+        &fx.repo.worker,
+        &["log", "--no-graph", "-r", "pr/99", "-T", "commit_id"],
+    );
     JjRepo::run(&fx.repo.worker, &["new", "pr/99", "-m", "PR checkout"]);
     moved
 }
@@ -1126,7 +1135,13 @@ async fn retry_after_a_post_snapshot_failure_uses_the_head_at_the_retry() {
     let events = wait_for_stage(&sink, &fx.id, "pre_start_failure").await;
     let failure = events.iter().find(|e| e.stage == "pre_start_failure").unwrap();
     assert_eq!(failure.details["will_retry"], true);
-    assert!(failure.error_message.as_deref().unwrap().contains("jj bookmark create failed"));
+    assert!(
+        failure
+            .error_message
+            .as_deref()
+            .unwrap()
+            .contains("jj bookmark create failed")
+    );
     assert_eq!(
         fx.db.get_execution(&fx.id).unwrap().pr_head_before.as_deref(),
         Some(fx.head.as_str()),
