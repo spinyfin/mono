@@ -1560,13 +1560,14 @@ async fn reap_dead_lease_with_workspace(pushed: bool) {
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
+    std::fs::write(repo.worker.join("work.txt"), "worker edits").unwrap();
+    JjRepo::run(&repo.worker, &["status"]);
     db.confirm_workspace_lease(
         &execution_id,
         lease_id,
         boss_engine_utils::epoch_time::now_epoch_ms() as i64,
     )
     .unwrap();
-    std::fs::write(repo.worker.join("work.txt"), "worker edits").unwrap();
     if pushed {
         JjRepo::run(&repo.worker, &["bookmark", "set", "published", "-r", "@"]);
         JjRepo::run(&repo.worker, &["git", "export"]);

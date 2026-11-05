@@ -100,8 +100,9 @@ pub struct DbBookmarkGate<'a> {
     pub adapter: Option<&'a dyn HostAdapter>,
 }
 
-/// Optional cube evidence leaves the basic owning-host gate usable by proven
-/// release callers without changing its construction API.
+/// A [`DbBookmarkGate`] that asks the owning cube's registry whether this
+/// execution still holds its workspace before inferred-death teardown reads
+/// the working copy; proven releases skip the registry check.
 pub struct CubeBookmarkGate<'a> {
     gate: DbBookmarkGate<'a>,
     cube: &'a dyn CubeClient,
@@ -176,15 +177,8 @@ async fn workspace_tip_source(
     );
     Ok((
         match boundary {
-            Some(unix_millis) => WorkspaceTipSource::LeaseBoundary {
-                unix_millis,
-                snapshot_if_unchanged: !workspaces.iter().any(|ws| {
-                    execution.cube_workspace_id.as_deref() == Some(ws.workspace_id.as_str()) && ws.state == "leased"
-                }),
-            },
-            None => WorkspaceTipSource::Historical {
-                at_or_before_unix: None,
-            },
+            Some(unix_millis) => WorkspaceTipSource::LeaseBoundary { unix_millis },
+            None => WorkspaceTipSource::UnknownBoundary,
         },
         ownership,
     ))
