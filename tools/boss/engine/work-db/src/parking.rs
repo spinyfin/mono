@@ -66,7 +66,10 @@
 //! copies the sink into the ledger inside the same savepoint. Writes that
 //! fire the membership triggers without going through that helper leave
 //! rows in the sink until the next helper call (or an explicit flush at
-//! the write site). The `basis`
+//! the write site). Table-existence is probed by touching the relation and
+//! treating "no such table" as empty: upgrade tests drop the ledger (and
+//! sometimes the sink) in-process before `ALTER TABLE`, so a cached
+//! sqlite_master answer would go stale. The `basis`
 //! names the producer: [`BASIS_PARKED`], [`BASIS_UNPARKED`],
 //! [`BASIS_PROJECT_PARK_CASCADE`], [`BASIS_PROJECT_UNPARK_CASCADE`]; a task
 //! born parked or moved into a parked project carries the basis of the write
@@ -185,6 +188,16 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// True when `err` is SQLite's "no such table: {table}". Upgrade tests drop
+/// parking and ledger tables in-process before `ALTER TABLE` rewrite, so
+/// callers probe by using the relation rather than caching `sqlite_master`.
+pub(super) fn sqlite_missing_table(err: &rusqlite::Error, table: &str) -> bool {
+    match err {
+        rusqlite::Error::SqliteFailure(_, Some(msg)) => msg.contains("no such table") && msg.contains(table),
+        _ => false,
+    }
+}
+
 /// Copy parked_at sink rows into the ledger. No-op when the sink is empty
 /// or the ledger table is gone (upgrade tests drop the ledger, then
 /// `ALTER TABLE` other columns). Membership triggers that fire from a
@@ -193,31 +206,25 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
 /// so list/show and the stuck report see the ledger in the same
 /// transaction rather than after an unrelated later write.
 pub(super) fn flush_parked_at_ledger(conn: &Connection) -> rusqlite::Result<()> {
-    let pending: i64 = conn.query_row(
-        "SELECT CASE WHEN
-            EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'parking_audit_sink')
-            THEN (SELECT EXISTS (SELECT 1 FROM parking_audit_sink LIMIT 1))
-            ELSE 0 END",
-        [],
-        |row| row.get(0),
-    )?;
+    let pending: i64 = match conn.query_row("SELECT EXISTS (SELECT 1 FROM parking_audit_sink LIMIT 1)", [], |row| {
+        row.get(0)
+    }) {
+        Ok(value) => value,
+        Err(err) if sqlite_missing_table(&err, "parking_audit_sink") => return Ok(()),
+        Err(err) => return Err(err),
+    };
     if pending == 0 {
         return Ok(());
     }
-    let has_ledger: i64 = conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_status_audit')",
-        [],
-        |row| row.get(0),
-    )?;
-    if has_ledger == 0 {
-        return Ok(());
-    }
-    conn.execute_batch(
+    match conn.execute_batch(
         "INSERT INTO task_status_audit (work_item_id, property, old_value, new_value, actor, changed_at, basis)
          SELECT work_item_id, 'parked_at', old_value, new_value, actor, changed_at, basis FROM parking_audit_sink;
          DELETE FROM parking_audit_sink;",
-    )?;
-    Ok(())
+    ) {
+        Ok(()) => Ok(()),
+        Err(err) if sqlite_missing_table(&err, "task_status_audit") => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 /// A refused parking operation. Typed so callers can tell the owner what to do
@@ -1404,6 +1411,23 @@ mod tests {
             1,
             "un-parking restores ordinary dispatch"
         );
+    }
+
+    #[test]
+    fn flush_parked_at_ledger_is_a_noop_when_upgrade_tests_have_dropped_the_sink() {
+        let (_dir, db, _product) = fixture();
+        let conn = db.connect().unwrap();
+        conn.execute_batch("DROP TABLE parking_audit_sink; DROP TABLE parking_audit_context;")
+            .unwrap();
+        flush_parked_at_ledger(&conn).unwrap();
+        crate::task_status_audit::execute(
+            &conn,
+            "unattributed_write",
+            LAST_STATUS_ACTOR_HUMAN,
+            "UPDATE tasks SET updated_at = updated_at WHERE 0",
+            [],
+        )
+        .unwrap();
     }
 
     #[test]

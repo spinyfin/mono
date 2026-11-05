@@ -827,7 +827,7 @@ pub(crate) async fn create_attention_rpc(
 ) -> Result<(Attention, AttentionGroup), CliError> {
     rpc_call!(
         client,
-        FrontendRequest::CreateAttention { input },
+        FrontendRequest::CreateAttention { input: Box::new(input) },
         "attention create",
         FrontendEvent::AttentionCreated { attention, group } => (attention, group),
     )

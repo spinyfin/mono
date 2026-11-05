@@ -22,22 +22,21 @@ pub fn execute<P: rusqlite::Params>(
         )?;
         // Parking's parked_at trigger reads this table (never the ledger
         // tables) so ALTER TABLE rewrite still works after an upgrade test
-        // has dropped the ledger. Missing is the pre-parking schema.
-        let parking_ctx: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'parking_audit_context'",
-            [],
-            |row| row.get(0),
-        )?;
-        if parking_ctx > 0 {
-            conn.execute(
-                "INSERT OR REPLACE INTO parking_audit_context (singleton, basis, actor) VALUES (1, ?1, ?2)",
-                params![basis, actor],
-            )?;
-        }
+        // has dropped the ledger. Missing is the pre-parking schema: try
+        // the write and treat "no such table" as absent rather than
+        // looking up sqlite_master on every task-status write.
+        let parking_ctx = match conn.execute(
+            "INSERT OR REPLACE INTO parking_audit_context (singleton, basis, actor) VALUES (1, ?1, ?2)",
+            params![basis, actor],
+        ) {
+            Ok(_) => true,
+            Err(err) if super::parking::sqlite_missing_table(&err, "parking_audit_context") => false,
+            Err(err) => return Err(err),
+        };
         let count = conn.execute(sql, params)?;
         super::parking::flush_parked_at_ledger(conn)?;
         conn.execute("DELETE FROM task_status_audit_context", [])?;
-        if parking_ctx > 0 {
+        if parking_ctx {
             conn.execute("DELETE FROM parking_audit_context", [])?;
         }
         Ok(count)

@@ -1077,22 +1077,41 @@ fn print_park_fields(
     parked_reason: Option<&str>,
     parked_via: Option<&str>,
 ) {
-    if !is_parked && parked_at.is_none() {
-        return;
+    for line in park_detail_lines(is_parked, parked_at, parked_by, parked_reason, parked_via) {
+        println!("{line}");
     }
-    println!("Parked: {}", if is_parked { "yes" } else { "no (stamp retained)" });
+}
+
+/// Lines `boss task show` prints for a parked row. Empty when the row has
+/// no stamp: a revision born parked from its parent carries its own stamp,
+/// so this is the same projection the list filter uses.
+fn park_detail_lines(
+    is_parked: bool,
+    parked_at: Option<&str>,
+    parked_by: Option<&str>,
+    parked_reason: Option<&str>,
+    parked_via: Option<&str>,
+) -> Vec<String> {
+    if !is_parked && parked_at.is_none() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "Parked: {}",
+        if is_parked { "yes" } else { "no (stamp retained)" }
+    )];
     if let Some(at) = parked_at {
-        println!("Parked at: {}", format_stored_epoch(at));
+        lines.push(format!("Parked at: {}", format_stored_epoch(at)));
     }
     if let Some(by) = parked_by {
-        println!("Parked by: {by}");
+        lines.push(format!("Parked by: {by}"));
     }
     if let Some(via) = parked_via {
-        println!("Parked via: {via}");
+        lines.push(format!("Parked via: {via}"));
     }
     if let Some(reason) = parked_reason.filter(|reason| !reason.is_empty()) {
-        println!("Parked reason: {reason}");
+        lines.push(format!("Parked reason: {reason}"));
     }
+    lines
 }
 
 pub(crate) fn print_task_details(title: &str, task: &Task, parent_product: Option<&Product>, with_primary_id: bool) {
@@ -1565,6 +1584,28 @@ mod parked_list_tests {
     }
 
     #[test]
+    fn parked_revision_show_prints_the_inherited_stamp() {
+        let mut revision = task("task_rev", true);
+        revision.kind = TaskKind::Revision;
+        revision.parked_via = Some("direct".to_owned());
+        revision.parked_by = Some("human".to_owned());
+        revision.parked_reason = Some("not now".to_owned());
+        let lines = park_detail_lines(
+            revision.is_parked(),
+            revision.parked_at.as_deref(),
+            revision.parked_by.as_deref(),
+            revision.parked_reason.as_deref(),
+            revision.parked_via.as_deref(),
+        );
+        assert!(lines.iter().any(|line| line == "Parked: yes"), "{lines:?}");
+        assert!(lines.iter().any(|line| line == "Parked via: direct"), "{lines:?}");
+        assert!(lines.iter().any(|line| line == "Parked by: human"), "{lines:?}");
+        assert!(lines.iter().any(|line| line == "Parked reason: not now"), "{lines:?}");
+        let live = task("task_live", false);
+        assert!(park_detail_lines(live.is_parked(), live.parked_at.as_deref(), None, None, None).is_empty());
+    }
+
+    #[test]
     fn done_row_with_park_stamp_is_not_parked_for_the_list_filter() {
         let mut done = task("task_done", true);
         done.status = TaskStatus::Done;
@@ -1698,5 +1739,196 @@ mod parked_list_tests {
             visible.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
             ["proj_parked"]
         );
+    }
+}
+
+#[cfg(test)]
+mod project_list_filter_tests {
+    use super::*;
+    use crate::ProjectStatusArg;
+    use boss_protocol::{Project, ProjectStatus};
+
+    fn filterable_project(id: &str, name: &str, description: &str, status: ProjectStatus) -> Project {
+        Project::builder()
+            .id(id)
+            .product_id("prod_1")
+            .name(name)
+            .slug(name.to_lowercase())
+            .description(description)
+            .goal("")
+            .status(status)
+            .created_at("")
+            .updated_at("")
+            .build()
+    }
+
+    fn surviving_project_ids(projects: &[Project]) -> Vec<&str> {
+        let mut ids: Vec<&str> = projects.iter().map(|p| p.id.as_str()).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn project_list_filters_by_status() {
+        let rows = || {
+            vec![
+                filterable_project("proj_planned", "n", "", ProjectStatus::Planned),
+                filterable_project("proj_active", "n", "", ProjectStatus::Active),
+                filterable_project("proj_archived", "n", "", ProjectStatus::Archived),
+            ]
+        };
+
+        let visible = apply_project_list_filters(
+            rows(),
+            ProjectListCriteria::builder()
+                .statuses(&[ProjectStatusArg::Active])
+                .build(),
+            None,
+            None,
+        );
+        assert_eq!(surviving_project_ids(&visible), ["proj_active"]);
+
+        let visible = apply_project_list_filters(
+            rows(),
+            ProjectListCriteria::builder()
+                .statuses(&[ProjectStatusArg::Planned, ProjectStatusArg::Archived])
+                .build(),
+            None,
+            None,
+        );
+        assert_eq!(surviving_project_ids(&visible), ["proj_archived", "proj_planned"]);
+
+        let visible = apply_project_list_filters(rows(), ProjectListCriteria::builder().build(), None, None);
+        assert_eq!(visible.len(), 3);
+    }
+
+    #[test]
+    fn project_list_restricts_to_requested_ids() {
+        let rows = vec![
+            filterable_project("proj_1", "n", "", ProjectStatus::Active),
+            filterable_project("proj_2", "n", "", ProjectStatus::Active),
+        ];
+
+        let ids = vec!["proj_2".to_owned()];
+        let visible = apply_project_list_filters(
+            rows.clone(),
+            ProjectListCriteria::builder().ids(&ids).build(),
+            None,
+            None,
+        );
+        assert_eq!(surviving_project_ids(&visible), ["proj_2"]);
+
+        let ids = vec!["proj_absent".to_owned()];
+        let visible = apply_project_list_filters(rows, ProjectListCriteria::builder().ids(&ids).build(), None, None);
+        assert!(visible.is_empty());
+    }
+
+    #[test]
+    fn project_list_match_term_hits_name_or_description_case_insensitively() {
+        let rows = || {
+            vec![
+                filterable_project("proj_name_hit", "Nimbus Migration", "", ProjectStatus::Active),
+                filterable_project("proj_desc_hit", "unrelated", "depends on NIMBUS", ProjectStatus::Active),
+                filterable_project("proj_miss", "unrelated", "nothing to see", ProjectStatus::Active),
+            ]
+        };
+
+        let visible = apply_project_list_filters(
+            rows(),
+            ProjectListCriteria::builder().match_term("nimbus").build(),
+            None,
+            None,
+        );
+        assert_eq!(surviving_project_ids(&visible), ["proj_desc_hit", "proj_name_hit"]);
+
+        let visible = apply_project_list_filters(
+            rows(),
+            ProjectListCriteria::builder().match_term("NiMbUs").build(),
+            None,
+            None,
+        );
+        assert_eq!(surviving_project_ids(&visible), ["proj_desc_hit", "proj_name_hit"]);
+
+        let visible = apply_project_list_filters(
+            rows(),
+            ProjectListCriteria::builder().match_term("zeppelin").build(),
+            None,
+            None,
+        );
+        assert!(visible.is_empty());
+    }
+
+    #[test]
+    fn project_list_limit_caps_the_filtered_rows() {
+        let rows = vec![
+            filterable_project("proj_done", "n", "", ProjectStatus::Done),
+            filterable_project("proj_active_1", "n", "", ProjectStatus::Active),
+            filterable_project("proj_active_2", "n", "", ProjectStatus::Active),
+            filterable_project("proj_active_3", "n", "", ProjectStatus::Active),
+        ];
+
+        let visible = apply_project_list_filters(
+            rows.clone(),
+            ProjectListCriteria::builder().limit(2).build(),
+            None,
+            None,
+        );
+        assert_eq!(visible.len(), 2);
+
+        let visible = apply_project_list_filters(
+            rows.clone(),
+            ProjectListCriteria::builder()
+                .statuses(&[ProjectStatusArg::Active])
+                .limit(2)
+                .build(),
+            None,
+            None,
+        );
+        assert_eq!(visible.len(), 2);
+        assert!(visible.iter().all(|p| p.status == ProjectStatus::Active));
+
+        let visible = apply_project_list_filters(
+            rows,
+            ProjectListCriteria::builder()
+                .statuses(&[ProjectStatusArg::Done])
+                .limit(10)
+                .build(),
+            None,
+            None,
+        );
+        assert_eq!(surviving_project_ids(&visible), ["proj_done"]);
+    }
+
+    #[test]
+    fn project_list_repo_selector_gates_on_the_parent_product() {
+        let rows = || {
+            vec![
+                filterable_project("proj_1", "n", "", ProjectStatus::Active),
+                filterable_project("proj_2", "n", "", ProjectStatus::Active),
+            ]
+        };
+        let selector = RepoSelector::parse("nimbus").unwrap();
+
+        let visible = apply_project_list_filters(
+            rows(),
+            ProjectListCriteria::builder().build(),
+            Some(&selector),
+            Some("git@github.com:myorg/nimbus.git"),
+        );
+        assert_eq!(surviving_project_ids(&visible), ["proj_1", "proj_2"]);
+
+        let visible = apply_project_list_filters(
+            rows(),
+            ProjectListCriteria::builder().build(),
+            Some(&selector),
+            Some("git@github.com:spinyfin/mono.git"),
+        );
+        assert!(visible.is_empty());
+
+        let visible = apply_project_list_filters(rows(), ProjectListCriteria::builder().build(), Some(&selector), None);
+        assert!(visible.is_empty());
+
+        let visible = apply_project_list_filters(rows(), ProjectListCriteria::builder().build(), None, None);
+        assert_eq!(visible.len(), 2);
     }
 }

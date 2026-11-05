@@ -1317,8 +1317,10 @@ impl Task {
     /// Terminal rows (`done` / `archived`) are never reported as parked: a
     /// parked PR that merges keeps its stamp as history, but the card is
     /// finished work and must not hide behind the parked filter. This reads
-    /// only the row's own stamp — a row parked through its project or its
-    /// revision chain root is judged by the engine's `is_parked` predicate.
+    /// only the row's own stamp. A revision of a parked parent is born with
+    /// a copy of that stamp, so list and show agree with dispatch. The
+    /// engine's SQL predicate remains the backstop for a row whose project
+    /// is parked and whose stamp has not yet been written.
     pub fn is_parked(&self) -> bool {
         self.parked_at.is_some() && !self.status.is_terminal()
     }
