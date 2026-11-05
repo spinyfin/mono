@@ -753,6 +753,7 @@ steps:
             last_holder: None,
             last_task: None,
             last_activity_at_epoch_s: None,
+            lease_generation: 0,
         }
     }
 

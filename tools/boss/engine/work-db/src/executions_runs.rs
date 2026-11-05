@@ -1290,6 +1290,7 @@ impl WorkDb {
                  cube_repo_id = ?2,
                  cube_lease_id = ?3,
                  lease_confirmed_at_millis = ?8,
+                 cube_lease_generation = NULL,
                  cube_workspace_id = ?4,
                  workspace_path = ?5,
                  host_id = ?7,

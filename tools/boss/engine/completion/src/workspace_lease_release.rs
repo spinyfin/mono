@@ -25,7 +25,7 @@ pub use boss_engine_storage_values::attention_kinds::LEASE_UNRELEASED_ATTENTION_
 
 pub use boss_engine_storage_values::attention_kinds::LEASE_RELEASE_FAILED_ATTENTION_KIND;
 
-use boss_engine_recovery::execution_bookmark::WorkspaceTipSource;
+use boss_engine_recovery::execution_bookmark::{BoundaryOwnership, WorkspaceTipSource};
 use boss_execution_contracts::{CubeClient, HostAdapter};
 
 pub use boss_execution_contracts::{
@@ -141,10 +141,15 @@ impl BookmarkGate for CubeBookmarkGate<'_> {
 }
 
 /// Inferred death requires an owning-host registry check. Failure keeps the
-/// lease for retry; uncertain ownership resolves only at this lease's boundary.
+/// lease for retry. The workspace is read live only with positive ownership
+/// evidence: it still holds this execution's lease, or it is free again and
+/// cube's claim counter equals the one recorded for this lease, so no other
+/// lease was ever claimed on it. Anything else resolves only at this lease's
+/// boundary and never adopts later changes.
 async fn workspace_tip_source(
     execution: &WorkExecution,
     boundary: Option<i64>,
+    lease_generation: Option<i64>,
     cube: Option<&dyn CubeClient>,
     adapter: Option<&dyn HostAdapter>,
 ) -> Result<(WorkspaceTipSource, String)> {
@@ -165,19 +170,38 @@ async fn workspace_tip_source(
     if owned {
         return Ok((WorkspaceTipSource::Live, String::new()));
     }
+    let registered = execution
+        .cube_workspace_id
+        .as_deref()
+        .and_then(|id| workspaces.iter().find(|ws| ws.workspace_id == id));
+    // A workspace cube no longer lists cannot be held by anyone either.
+    let free = registered.is_none_or(|ws| ws.state == "free");
+    let sole_holder = registered.is_some_and(|ws| ws.state == "free")
+        && matches!((lease_generation, registered.and_then(|ws| ws.lease_generation)), (Some(held), Some(now)) if held == now);
+    if sole_holder {
+        return Ok((WorkspaceTipSource::Live, String::new()));
+    }
     let ownership = format!(
-        "workspace {:?}, original lease {:?}, current registry leases: {:?}",
+        "workspace {:?}, original lease {:?}, recorded lease generation {:?}, current registry leases: {:?}",
         execution.cube_workspace_id,
         execution.cube_lease_id,
+        lease_generation,
         workspaces
             .iter()
             .filter(|ws| execution.cube_workspace_id.as_deref() == Some(ws.workspace_id.as_str()))
-            .map(|ws| (&ws.state, &ws.lease_id))
+            .map(|ws| (&ws.state, &ws.lease_id, ws.lease_generation))
             .collect::<Vec<_>>()
     );
     Ok((
         match boundary {
-            Some(unix_millis) => WorkspaceTipSource::LeaseBoundary { unix_millis },
+            Some(unix_millis) => WorkspaceTipSource::LeaseBoundary {
+                unix_millis,
+                ownership: if free {
+                    BoundaryOwnership::FreeUnproven
+                } else {
+                    BoundaryOwnership::Reassigned
+                },
+            },
             None => WorkspaceTipSource::UnknownBoundary,
         },
         ownership,
@@ -213,6 +237,7 @@ impl DbBookmarkGate<'_> {
                 workspace_tip_source(
                     execution,
                     self.db.workspace_lease_boundary(&execution.id)?,
+                    self.db.workspace_lease_generation(&execution.id)?,
                     cube,
                     self.adapter,
                 )

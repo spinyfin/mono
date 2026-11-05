@@ -793,6 +793,7 @@ mod floor_tests {
             stuck_snapshot::migrate(&expected).unwrap();
             super::super::conflict_mismatch::migrate_operator_forced_admission(&expected).unwrap();
             preserved_work::migrate_lease_boundary(&expected).unwrap();
+            preserved_work::migrate_lease_generation(&expected).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {

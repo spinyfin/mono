@@ -240,7 +240,8 @@ impl Store {
                 unhealthy_since_epoch_s,
                 last_holder,
                 last_task,
-                last_activity_at_epoch_s
+                last_activity_at_epoch_s,
+                lease_generation
             FROM workspaces
             WHERE 1=1
             "#,
@@ -315,7 +316,8 @@ impl Store {
                     unhealthy_since_epoch_s,
                     last_holder,
                     last_task,
-                    last_activity_at_epoch_s
+                    last_activity_at_epoch_s,
+                    lease_generation
                 FROM workspaces
                 WHERE repo = ?1
                 ORDER BY workspace_id
@@ -476,7 +478,8 @@ impl Store {
                     last_release_reason = NULL,
                     health_status = NULL,
                     unhealthy_since_epoch_s = NULL,
-                    last_activity_at_epoch_s = ?5
+                    last_activity_at_epoch_s = ?5,
+                    lease_generation = lease_generation + 1
                 WHERE repo = ?7 AND workspace_id = ?8 AND state = ?9 AND cleanup_status IS NULL
                 "#,
                 params![
@@ -512,7 +515,8 @@ impl Store {
                     unhealthy_since_epoch_s,
                     last_holder,
                     last_task,
-                    last_activity_at_epoch_s
+                    last_activity_at_epoch_s,
+                    lease_generation
                 FROM workspaces
                 WHERE repo = ?1 AND workspace_id = ?2
                 "#,
@@ -731,7 +735,8 @@ impl Store {
                     last_release_reason = NULL,
                     health_status = NULL,
                     unhealthy_since_epoch_s = NULL,
-                    last_activity_at_epoch_s = ?5
+                    last_activity_at_epoch_s = ?5,
+                    lease_generation = lease_generation + 1
                 WHERE repo = ?7 AND workspace_id = ?8 AND state = ?9 AND cleanup_status IS NULL
                 "#,
                 params![
@@ -772,7 +777,8 @@ impl Store {
                     unhealthy_since_epoch_s,
                     last_holder,
                     last_task,
-                    last_activity_at_epoch_s
+                    last_activity_at_epoch_s,
+                    lease_generation
                 FROM workspaces
                 WHERE repo = ?1 AND workspace_id = ?2
                 "#,
@@ -804,7 +810,8 @@ impl Store {
                     unhealthy_since_epoch_s,
                     last_holder,
                     last_task,
-                    last_activity_at_epoch_s
+                    last_activity_at_epoch_s,
+                    lease_generation
                 FROM workspaces
                 WHERE workspace_path = ?1
                 "#,
@@ -835,7 +842,8 @@ impl Store {
                     unhealthy_since_epoch_s,
                     last_holder,
                     last_task,
-                    last_activity_at_epoch_s
+                    last_activity_at_epoch_s,
+                    lease_generation
                 FROM workspaces
                 WHERE lease_id = ?1
                 "#,
@@ -1004,7 +1012,8 @@ impl Store {
                     unhealthy_since_epoch_s,
                     last_holder,
                     last_task,
-                    last_activity_at_epoch_s
+                    last_activity_at_epoch_s,
+                    lease_generation
                 FROM workspaces
                 WHERE repo = ?1 AND workspace_id = ?2
                 "#,
@@ -1514,6 +1523,7 @@ impl Store {
                     cleanup_status TEXT,
                     cleanup_started_at_epoch_s INTEGER,
                     last_cleaned_at_epoch_s INTEGER,
+                    lease_generation INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY(repo, workspace_id),
                     FOREIGN KEY(repo) REFERENCES repos(repo) ON DELETE CASCADE
                 );
@@ -1597,6 +1607,11 @@ impl Store {
         try_add_column(
             &self.connection,
             "ALTER TABLE workspaces ADD COLUMN last_cleaned_at_epoch_s INTEGER",
+        )?;
+        // Monotonic count of claims on this workspace; see `WorkspaceRecord::lease_generation`.
+        try_add_column(
+            &self.connection,
+            "ALTER TABLE workspaces ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0",
         )?;
 
         // Created after the ALTERs above so it also lands on a database whose
@@ -1749,6 +1764,7 @@ fn row_to_workspace_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspac
         last_holder: row.get(13)?,
         last_task: row.get(14)?,
         last_activity_at_epoch_s: row.get(15)?,
+        lease_generation: row.get(16)?,
     })
 }
 
@@ -1835,6 +1851,17 @@ mod tests {
         // And it is durable, not just present on the returned struct.
         let reread = store.list_workspaces("mono").expect("list").pop().expect("row");
         assert_eq!(reread.last_activity_at_epoch_s, Some(activity));
+
+        // Every claim bumps the generation; release and re-listing keep it.
+        assert_eq!(discovered.lease_generation, 0);
+        assert_eq!(claimed.lease_generation, 1);
+        assert_eq!(released.lease_generation, 1, "release must not reset the generation");
+        assert_eq!(reread.lease_generation, 1);
+        let reclaimed = store
+            .claim_workspace("mono", "boss", "task", "lease-2", 1_700_000_100, None, None)
+            .expect("claim")
+            .expect("claimed");
+        assert_eq!(reclaimed.lease_generation, 2);
     }
 
     /// TTL expiry frees a workspace without anyone calling `release`, so it has

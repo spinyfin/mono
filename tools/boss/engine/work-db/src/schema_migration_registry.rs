@@ -19,6 +19,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: preserved_work::migrate_lease_boundary,
         },
         Migration {
+            id: "20261105_1200_workspace_lease_generation".into(),
+            legacy_version: None,
+            apply: preserved_work::migrate_lease_generation,
+        },
+        Migration {
             id: "20261029_1430_critical_requests".into(),
             legacy_version: None,
             apply: critical_requests::migrate,

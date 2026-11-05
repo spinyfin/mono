@@ -1560,14 +1560,16 @@ async fn reap_dead_lease_with_workspace(pushed: bool) {
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
+    // Edits stay unsnapshotted: no jj command runs before the worker dies.
     std::fs::write(repo.worker.join("work.txt"), "worker edits").unwrap();
-    JjRepo::run(&repo.worker, &["status"]);
     db.confirm_workspace_lease(
         &execution_id,
         lease_id,
         boss_engine_utils::epoch_time::now_epoch_ms() as i64,
     )
     .unwrap();
+    db.record_workspace_lease_generation(&execution_id, lease_id, 1)
+        .unwrap();
     if pushed {
         JjRepo::run(&repo.worker, &["bookmark", "set", "published", "-r", "@"]);
         JjRepo::run(&repo.worker, &["git", "export"]);
@@ -1584,6 +1586,10 @@ async fn reap_dead_lease_with_workspace(pushed: bool) {
 
     let live_states = LiveWorkerStateRegistry::new();
     let cube = Arc::new(RecordingCube::default());
+    // Free again with the claim counter unchanged: no other lease was claimed.
+    let mut free = workspace("mono-agent-001", "free", None);
+    free.lease_generation = Some(1);
+    cube.set_workspaces(vec![free]);
     let sink = RecordingDispatchEventSink::new();
     let breaker = HeartbeatFailureBreaker::default();
     let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
@@ -1790,4 +1796,170 @@ async fn reap_after_handoff(holder: &str) {
         .expect("our work must be recorded");
     assert_ne!(tip.commit_id, theirs.trim());
     assert_eq!(tip.commit_id, ours.trim());
+    // A free workspace holding unpublished post-boundary work is reported; one
+    // leased under another id is that holder's stack and must raise nothing.
+    let inspections = db
+        .list_attention_items(&execution_id)
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.kind == "preserved_work_needs_inspection")
+        .count();
+    assert_eq!(inspections, usize::from(holder == "free"), "{holder}");
+}
+
+/// An `--allow-dirty` successor claimed the workspace (claim counter bumped),
+/// edited the change it inherited, ran jj or not, and force-released it. The
+/// reaped execution must not bookmark those edits.
+#[tokio::test]
+async fn heartbeat_reap_never_adopts_an_allow_dirty_successors_edits() {
+    for successor_ran_jj in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = JjRepo::new(dir.path());
+        export_origin(&repo);
+        let (_db_dir, db) = open_db_arc();
+        let product_id = create_product(&db);
+        let work_item_id = create_chore(&db, &product_id);
+        let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-reaped");
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET workspace_path = ?2 WHERE id = ?1",
+                rusqlite::params![execution_id, repo.worker.to_str().unwrap()],
+            )
+            .unwrap();
+        let record = recovery::create(&LocalJj, &repo.worker, &execution_id, "local")
+            .await
+            .unwrap();
+        db.record_execution_bookmark(&record).unwrap();
+        std::fs::write(repo.worker.join("ours.txt"), "reaped worker edits").unwrap();
+        JjRepo::run(&repo.worker, &["status"]);
+        db.confirm_workspace_lease(
+            &execution_id,
+            "lease-reaped",
+            boss_engine_utils::epoch_time::now_epoch_ms() as i64,
+        )
+        .unwrap();
+        db.record_workspace_lease_generation(&execution_id, "lease-reaped", 1)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        std::fs::write(repo.worker.join("theirs.txt"), "allow-dirty successor").unwrap();
+        if successor_ran_jj {
+            JjRepo::run(&repo.worker, &["status"]);
+        }
+
+        let live_states = LiveWorkerStateRegistry::new();
+        register_slot(&live_states, 1, &execution_id, std::process::id() as i32);
+        let cube = Arc::new(RecordingCube::default());
+        cube.fail.store(true, Ordering::SeqCst);
+        let mut free = workspace("mono-agent-001", "free", None);
+        free.lease_generation = Some(2);
+        cube.set_workspaces(vec![free]);
+        let sink = RecordingDispatchEventSink::new();
+        let breaker = HeartbeatFailureBreaker::default();
+        for _ in 0..AUTO_REAP_AFTER_CONSECUTIVE_FAILURES - 1 {
+            run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+        }
+        let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+        assert_eq!(outcome.auto_reaped, 1);
+        assert!(
+            preserved_names(&repo, &execution_id).is_empty(),
+            "ran_jj={successor_ran_jj}: the successor's edits were bookmarked"
+        );
+        assert!(db.preserved_tip(&execution_id).unwrap().is_none());
+        assert!(
+            db.list_attention_items(&execution_id)
+                .unwrap()
+                .iter()
+                .any(|item| item.kind == "preserved_work_needs_inspection")
+        );
+    }
+}
+
+/// A free workspace with no ownership evidence: edits made after the last
+/// confirmed boundary and never snapshotted are reported, not dropped.
+#[tokio::test]
+async fn heartbeat_reap_reports_unsnapshotted_work_without_ownership_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = JjRepo::new(dir.path());
+    export_origin(&repo);
+    let (_db_dir, db) = open_db_arc();
+    let product_id = create_product(&db);
+    let work_item_id = create_chore(&db, &product_id);
+    let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-reaped");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET workspace_path = ?2 WHERE id = ?1",
+            rusqlite::params![execution_id, repo.worker.to_str().unwrap()],
+        )
+        .unwrap();
+    let record = recovery::create(&LocalJj, &repo.worker, &execution_id, "local")
+        .await
+        .unwrap();
+    db.record_execution_bookmark(&record).unwrap();
+    std::fs::write(repo.worker.join("ours.txt"), "reaped worker edits").unwrap();
+    JjRepo::run(&repo.worker, &["status"]);
+    db.confirm_workspace_lease(
+        &execution_id,
+        "lease-reaped",
+        boss_engine_utils::epoch_time::now_epoch_ms() as i64,
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    JjRepo::run(&repo.worker, &["new", "-m", "Next change"]);
+    std::fs::write(repo.worker.join("next.txt"), "never snapshotted").unwrap();
+
+    let live_states = LiveWorkerStateRegistry::new();
+    register_slot(&live_states, 1, &execution_id, std::process::id() as i32);
+    let cube = Arc::new(RecordingCube::default());
+    cube.fail.store(true, Ordering::SeqCst);
+    cube.set_workspaces(vec![workspace("mono-agent-001", "free", None)]);
+    let sink = RecordingDispatchEventSink::new();
+    let breaker = HeartbeatFailureBreaker::default();
+    for _ in 0..AUTO_REAP_AFTER_CONSECUTIVE_FAILURES - 1 {
+        run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+    }
+    let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+    assert_eq!(outcome.auto_reaped, 1);
+    assert!(
+        db.list_attention_items(&execution_id)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == "preserved_work_needs_inspection"),
+        "post-boundary work was dropped silently"
+    );
+}
+
+/// The first successful beat records cube's claim counter for this lease; a
+/// later beat or a registry that no longer lists the lease changes nothing.
+#[tokio::test]
+async fn heartbeat_records_the_lease_generation_once() {
+    let (_dir, db) = open_db_arc();
+    let product_id = create_product(&db);
+    let work_item_id = create_chore(&db, &product_id);
+    let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-gen");
+    let live_states = LiveWorkerStateRegistry::new();
+    register_slot(&live_states, 1, &execution_id, std::process::id() as i32);
+    let cube = Arc::new(RecordingCube::default());
+    let sink = RecordingDispatchEventSink::new();
+    let breaker = HeartbeatFailureBreaker::default();
+
+    // Not yet listed as leased: nothing to record.
+    run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+    assert_eq!(db.workspace_lease_generation(&execution_id).unwrap(), None);
+
+    let mut leased = workspace("mono-agent-001", "leased", Some("lease-gen"));
+    leased.lease_generation = Some(7);
+    cube.set_workspaces(vec![leased.clone()]);
+    run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+    assert_eq!(db.workspace_lease_generation(&execution_id).unwrap(), Some(7));
+
+    leased.lease_generation = Some(9);
+    cube.set_workspaces(vec![leased]);
+    run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+    assert_eq!(
+        db.workspace_lease_generation(&execution_id).unwrap(),
+        Some(7),
+        "the generation of this lease is fixed once recorded"
+    );
 }

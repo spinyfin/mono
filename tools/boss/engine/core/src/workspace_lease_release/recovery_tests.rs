@@ -219,6 +219,22 @@ async fn unresolved_first_teardown_raises_inspection_without_prior_record() {
     }
 }
 
+/// The registry row cube would report for the test workspace.
+fn registry_row(
+    workspace: &Path,
+    state: &str,
+    lease_id: Option<&str>,
+    generation: Option<i64>,
+) -> boss_execution_contracts::CubeWorkspaceStatus {
+    boss_execution_contracts::CubeWorkspaceStatus::builder()
+        .workspace_id("worker")
+        .workspace_path(workspace.to_path_buf())
+        .state(state)
+        .maybe_lease_id(lease_id.map(str::to_owned))
+        .maybe_lease_generation(generation)
+        .build()
+}
+
 struct HandoffRegistry(Vec<boss_execution_contracts::CubeWorkspaceStatus>);
 crate::stub_cube_client! { HandoffRegistry {
     async fn release_workspace(&self, _: &str) -> Result<()> { Ok(()) }
@@ -264,6 +280,7 @@ async fn leftover_sweep_uses_original_heartbeat_after_intervening_holders() {
             boss_engine_utils::epoch_time::now_epoch_ms() as i64,
         )
         .unwrap();
+        db.record_workspace_lease_generation(&execution.id, "lease", 1).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         JjRepo::run(&repo.worker, &["new", "root()", "-m", "Intervening holder"]);
         std::fs::write(repo.worker.join("theirs"), "released holder").unwrap();
@@ -276,14 +293,13 @@ async fn leftover_sweep_uses_original_heartbeat_after_intervening_holders() {
         let registry = HandoffRegistry(if state == "unlisted" {
             vec![]
         } else {
-            vec![
-                boss_execution_contracts::CubeWorkspaceStatus::builder()
-                    .workspace_id("worker")
-                    .workspace_path(repo.worker.clone())
-                    .state(state)
-                    .maybe_lease_id((state == "leased").then(|| "third-lease".to_owned()))
-                    .build(),
-            ]
+            // Other leases were claimed after this execution's (generation 1).
+            vec![registry_row(
+                &repo.worker,
+                state,
+                (state == "leased").then_some("third-lease"),
+                Some(if state == "leased" { 3 } else { 2 }),
+            )]
         });
         let mut child = std::process::Command::new("true").spawn().unwrap();
         let pid = child.id();
@@ -298,6 +314,14 @@ async fn leftover_sweep_uses_original_heartbeat_after_intervening_holders() {
         .await;
         assert_eq!(outcome.released, 1, "{state}: {outcome:?}");
         assert_eq!(db.preserved_tip(&execution.id).unwrap().unwrap().commit_id, ours);
+        // Another holder's stack is reported only when no one else holds the
+        // workspace now; while it is leased under another id it is theirs.
+        assert_eq!(
+            open_kinds(&db, &execution.id).contains(&"preserved_work_needs_inspection".to_owned()),
+            state != "leased",
+            "{state}: {:?}",
+            open_kinds(&db, &execution.id)
+        );
         let name = execution_bookmark::preserved_name(&execution.id);
         assert_eq!(
             JjRepo::run(&repo.repo, &["log", "--no-graph", "-r", &name, "-T", "commit_id"]),
@@ -360,14 +384,15 @@ async fn reaped_worker_preserves_exactly_one_bookmark_only_for_unpushed_work() {
             .await
             .unwrap();
         db.record_execution_bookmark(&record).unwrap();
+        // Edits are left unsnapshotted: no jj command runs before the worker dies.
         std::fs::write(repo.worker.join("work.txt"), "worker edits").unwrap();
-        JjRepo::run(&repo.worker, &["status"]);
         db.confirm_workspace_lease(
             &execution.id,
             "lease",
             boss_engine_utils::epoch_time::now_epoch_ms() as i64,
         )
         .unwrap();
+        db.record_workspace_lease_generation(&execution.id, "lease", 1).unwrap();
         if published {
             JjRepo::run(&repo.worker, &["bookmark", "set", "published", "-r", "@"]);
             JjRepo::run(&repo.worker, &["git", "export"]);
@@ -383,7 +408,9 @@ async fn reaped_worker_preserves_exactly_one_bookmark_only_for_unpushed_work() {
         );
         db.mark_execution_orphaned(&execution.id, "reaped worker").unwrap();
         let before = JjRepo::run(&repo.repo, &["bookmark", "list", "-T", "name ++ \"\\n\""]);
-        let outcome = run_one_pass_with_occupancy(&db, &OkCube, &LiveWorkerStateRegistry::new(), || async {
+        // Free again with the claim counter unchanged: no one else held it.
+        let registry = HandoffRegistry(vec![registry_row(&repo.worker, "free", None, Some(1))]);
+        let outcome = run_one_pass_with_occupancy(&db, &registry, &LiveWorkerStateRegistry::new(), || async {
             EmptyOccupancy
         })
         .await;
@@ -816,4 +843,135 @@ async fn successful_release_resolves_both_lease_attention_kinds() {
     .await;
     assert_eq!(outcome, LeaseReleaseOutcome::Released);
     assert!(open_kinds(&db, &execution.id).is_empty());
+}
+
+/// Start an execution on a fresh worker workspace whose process has died.
+async fn orphaned_worker(db: &WorkDb, repo: &boss_engine_test_git::jj::JjRepo) -> WorkExecution {
+    let product = create_test_product(db);
+    let chore = create_test_chore(db, product.id, "orphaned worker");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.start_execution_run(
+        &execution.id,
+        "worker",
+        "mono",
+        "lease",
+        "worker",
+        repo.worker.to_str().unwrap(),
+    )
+    .unwrap();
+    let record = execution_bookmark::create(&LocalJj, &repo.worker, &execution.id, "local")
+        .await
+        .unwrap();
+    db.record_execution_bookmark(&record).unwrap();
+    execution
+}
+
+fn kill_worker(db: &WorkDb, execution: &WorkExecution) {
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    db.set_run_shell_pid_for_execution(&execution.id, i64::from(pid))
+        .unwrap();
+    db.mark_execution_orphaned(&execution.id, "worker exited").unwrap();
+}
+
+/// Files in the tree `preserved/<exec>` points at, or empty when it is unset.
+fn preserved_files(repo: &boss_engine_test_git::jj::JjRepo, execution: &WorkExecution) -> String {
+    let name = execution_bookmark::preserved_name(&execution.id);
+    let listed = boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["bookmark", "list", "-T", "name ++ \"\\n\""]);
+    if listed.lines().any(|line| line == name) {
+        boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["file", "list", "-r", &name])
+    } else {
+        String::new()
+    }
+}
+
+/// A successor leased the workspace dirty (claim counter bumped), edited the
+/// inherited change, and force-released it. Whether or not it ran a jj command,
+/// its edits must never become `preserved/<exec>`.
+#[tokio::test]
+async fn leftover_sweep_never_adopts_an_allow_dirty_successors_edits() {
+    use boss_engine_test_git::jj::JjRepo;
+    for successor_ran_jj in [true, false] {
+        let (dir, db) = open_db();
+        let repo = JjRepo::new(dir.path());
+        let execution = orphaned_worker(&db, &repo).await;
+        std::fs::write(repo.worker.join("ours"), "original worker").unwrap();
+        JjRepo::run(&repo.worker, &["status"]);
+        db.confirm_workspace_lease(
+            &execution.id,
+            "lease",
+            boss_engine_utils::epoch_time::now_epoch_ms() as i64,
+        )
+        .unwrap();
+        db.record_workspace_lease_generation(&execution.id, "lease", 1).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        std::fs::write(repo.worker.join("theirs"), "allow-dirty successor").unwrap();
+        if successor_ran_jj {
+            JjRepo::run(&repo.worker, &["status"]);
+        }
+        kill_worker(&db, &execution);
+        let registry = HandoffRegistry(vec![registry_row(&repo.worker, "free", None, Some(2))]);
+        let outcome = run_one_pass_with_occupancy(&db, &registry, &LiveWorkerStateRegistry::new(), || async {
+            EmptyOccupancy
+        })
+        .await;
+        assert_eq!(outcome.released, 1, "{outcome:?}");
+        let preserved = preserved_files(&repo, &execution);
+        assert!(
+            !preserved.contains("theirs"),
+            "ran_jj={successor_ran_jj}: the successor's edits were bookmarked: {preserved}"
+        );
+        if let Some(tip) = db.preserved_tip(&execution.id).unwrap() {
+            let files = JjRepo::run(&repo.repo, &["file", "list", "-r", &tip.commit_id]);
+            assert!(!files.contains("theirs"), "ran_jj={successor_ran_jj}: {files}");
+        }
+        assert!(open_kinds(&db, &execution.id).contains(&"preserved_work_needs_inspection".to_owned()));
+    }
+}
+
+/// A free workspace with no ownership evidence: the dead worker's unsnapshotted
+/// edits after its last confirmed boundary are reported, not dropped.
+#[tokio::test]
+async fn leftover_sweep_reports_unsnapshotted_work_in_a_free_workspace_without_ownership_evidence() {
+    use boss_engine_test_git::jj::JjRepo;
+    for action in ["edit", "new"] {
+        let (dir, db) = open_db();
+        let repo = JjRepo::new(dir.path());
+        let execution = orphaned_worker(&db, &repo).await;
+        std::fs::write(repo.worker.join("ours"), "original worker").unwrap();
+        JjRepo::run(&repo.worker, &["status"]);
+        db.confirm_workspace_lease(
+            &execution.id,
+            "lease",
+            boss_engine_utils::epoch_time::now_epoch_ms() as i64,
+        )
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        if action == "new" {
+            JjRepo::run(&repo.worker, &["new", "-m", "Next change"]);
+            std::fs::write(repo.worker.join("next"), "unsnapshotted").unwrap();
+        } else {
+            std::fs::write(repo.worker.join("ours"), "edited after the boundary").unwrap();
+        }
+        kill_worker(&db, &execution);
+        let registry = HandoffRegistry(vec![registry_row(&repo.worker, "free", None, None)]);
+        let outcome = run_one_pass_with_occupancy(&db, &registry, &LiveWorkerStateRegistry::new(), || async {
+            EmptyOccupancy
+        })
+        .await;
+        assert_eq!(outcome.released, 1, "{action}: {outcome:?}");
+        assert!(
+            open_kinds(&db, &execution.id).contains(&"preserved_work_needs_inspection".to_owned()),
+            "{action}: post-boundary work was dropped silently"
+        );
+    }
 }

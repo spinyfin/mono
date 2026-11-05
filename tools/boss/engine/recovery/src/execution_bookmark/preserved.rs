@@ -44,15 +44,34 @@ pub fn preserved_archive_prefix(execution_id: &str) -> String {
 pub enum WorkspaceTipSource {
     /// The workspace still belongs to this execution. Snapshot live `@`.
     Live,
-    /// The workspace no longer provably belongs to this execution. Resolve the
-    /// registered tip as of this execution's last confirmed lease time. The
-    /// live working copy is never snapshotted, because nothing proves that a
-    /// later holder did not write to it; newer registered work that the
-    /// boundary tip does not contain is reported for inspection instead.
-    LeaseBoundary { unix_millis: i64 },
+    /// The workspace no longer holds this execution's lease and nothing proves
+    /// it never had another holder. Resolve the registered tip as of this
+    /// execution's last confirmed lease time. Work the boundary tip does not
+    /// contain is never bookmarked: a later holder may have written it, so it
+    /// is reported for inspection (see [`BoundaryOwnership`]).
+    LeaseBoundary {
+        unix_millis: i64,
+        ownership: BoundaryOwnership,
+    },
     /// No lease boundary was recorded, so no historical tip can be chosen.
     /// Teardown raises inspection rather than guessing.
     UnknownBoundary,
+}
+
+/// What the owning cube's registry says about a workspace this execution no
+/// longer provably holds. A workspace whose lease generation is unchanged
+/// since this execution's lease and that is free again has no other holder,
+/// so it is resolved as [`WorkspaceTipSource::Live`] and never reaches this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundaryOwnership {
+    /// The workspace is free, but a later lease cannot be ruled out. The
+    /// working copy is snapshotted only to find work made after the boundary,
+    /// which is reported for inspection and never bookmarked.
+    FreeUnproven,
+    /// The workspace is leased under another id (or gone from the registry).
+    /// Its working copy and registered tip belong to someone else: no
+    /// snapshot, and nothing about it is reported against this execution.
+    Reassigned,
 }
 
 pub(super) async fn log(jj: &dyn Jj, repo: &Path, rev: &str, template: &str) -> Result<String> {
@@ -110,13 +129,26 @@ async fn working_copy_at(jj: &dyn Jj, repo: &Path, operation: Option<&str>, rev:
     jj.run(repo, &args).await
 }
 
-/// A resolved workspace tip plus registered work it does not contain.
+/// A resolved workspace tip plus unpublished work it does not contain.
 #[derive(Default)]
 struct WorkspaceTip {
     commit: Option<String>,
-    /// Live registered tip and its unpublished change count when it holds work
-    /// absent from `commit`, whose ownership cannot be established.
-    unclaimed: Option<(String, u64)>,
+    /// Unpublished work that is not in `commit` and whose owner cannot be
+    /// established. Reported for inspection, never bookmarked.
+    unclaimed: Vec<Unclaimed>,
+}
+
+struct Unclaimed {
+    commit: String,
+    count: u64,
+    note: String,
+}
+
+/// The boundary commit's visible unpublished rewrite, found when ownership of
+/// the workspace is not proven.
+struct HistoricalTip {
+    commit: Option<String>,
+    rewritten_to: Option<String>,
 }
 
 /// Snapshot after the writer stops only with current ownership evidence.
@@ -138,8 +170,26 @@ async fn workspace_tip(
                 jj.run(workspace, &["log", "--no-graph", "-r", "@", "-T", "commit_id"])
                     .await?,
             ),
-            unclaimed: None,
+            unclaimed: Vec::new(),
         });
+    }
+    if matches!(
+        tip_source,
+        WorkspaceTipSource::LeaseBoundary {
+            ownership: BoundaryOwnership::FreeUnproven,
+            ..
+        }
+    ) && jj.workspace_exists(workspace).await?
+    {
+        ensure!(
+            jj.shared_repo(workspace).await? == record.repo_path,
+            "workspace recovery store changed"
+        );
+        // Nobody holds the workspace, so writing its pending edits into the
+        // journal is harmless. The result is only compared with the boundary
+        // tip; it is never adopted.
+        jj.run(workspace, &["log", "--no-graph", "-r", "@", "-T", "commit_id"])
+            .await?;
     }
     historical_workspace_tip(jj, record, workspace, since_unix, tip_source).await
 }
@@ -151,11 +201,13 @@ async fn historical_workspace_tip(
     since_unix: Option<i64>,
     tip_source: WorkspaceTipSource,
 ) -> Result<WorkspaceTip> {
-    let boundary = match tip_source {
-        WorkspaceTipSource::LeaseBoundary { unix_millis } => Some(unix_millis),
-        WorkspaceTipSource::Live => None,
+    let (boundary, ownership) = match tip_source {
+        WorkspaceTipSource::LeaseBoundary { unix_millis, ownership } => (Some(unix_millis), Some(ownership)),
+        WorkspaceTipSource::Live => (None, None),
         WorkspaceTipSource::UnknownBoundary => return Ok(WorkspaceTip::default()),
     };
+    // Only a provably sole holder may have its commit rewrites followed.
+    let follow_rewrites = ownership.is_none();
     let name = workspace
         .file_name()
         .and_then(|s| s.to_str())
@@ -178,13 +230,34 @@ async fn historical_workspace_tip(
         if tip.is_empty() {
             continue;
         }
-        let commit = visible_historical_tip(jj, &record.repo_path, &tip).await?;
-        let unclaimed = if boundary.is_some() {
-            unclaimed_registered_work(jj, &record.repo_path, &rev, commit.as_deref()).await?
-        } else {
-            None
-        };
-        return Ok(WorkspaceTip { commit, unclaimed });
+        let resolved = visible_historical_tip(jj, &record.repo_path, &tip, follow_rewrites).await?;
+        // The live registered tip leads: it is what a human inspects first.
+        let mut unclaimed = Vec::new();
+        if ownership == Some(BoundaryOwnership::FreeUnproven)
+            && let Some(extra) =
+                unclaimed_registered_work(jj, &record.repo_path, &rev, resolved.commit.as_deref()).await?
+        {
+            unclaimed.push(extra);
+        }
+        if let Some(rewrite) = resolved.rewritten_to
+            && !unclaimed.iter().any(|seen| seen.commit == rewrite)
+        {
+            let work = log(jj, &record.repo_path, &unpublished(&rewrite), "change_id ++ \"\n\"").await?;
+            let count = work.lines().count() as u64;
+            if count > 0 {
+                unclaimed.push(Unclaimed {
+                    note: format!(
+                        "the lease boundary tip was rewritten to {rewrite} ({count} unpublished change(s)) afterwards; leaving it unbookmarked because the rewrite may belong to a later holder"
+                    ),
+                    commit: rewrite,
+                    count,
+                });
+            }
+        }
+        return Ok(WorkspaceTip {
+            commit: resolved.commit,
+            unclaimed,
+        });
     }
     // A forgotten workspace's journaled tip is read from its pre-forget view.
     let forget = format!("forget workspace {name}");
@@ -215,8 +288,10 @@ async fn historical_workspace_tip(
         let tip = working_copy_at(jj, &record.repo_path, Some(&format!("{id}-")), &rev).await?;
         if !tip.trim().is_empty() {
             return Ok(WorkspaceTip {
-                commit: visible_historical_tip(jj, &record.repo_path, tip.trim()).await?,
-                unclaimed: None,
+                commit: visible_historical_tip(jj, &record.repo_path, tip.trim(), follow_rewrites)
+                    .await?
+                    .commit,
+                unclaimed: Vec::new(),
             });
         }
     }
@@ -231,7 +306,7 @@ async fn unclaimed_registered_work(
     repo: &Path,
     rev: &str,
     resolved: Option<&str>,
-) -> Result<Option<(String, u64)>> {
+) -> Result<Option<Unclaimed>> {
     let live = match working_copy_at(jj, repo, None, rev).await {
         Ok(live) => live.trim().to_owned(),
         Err(err) if is_missing_revision_error(&err) => return Ok(None),
@@ -249,24 +324,50 @@ async fn unclaimed_registered_work(
     )
     .await?;
     let count = extra.lines().count() as u64;
-    Ok((count > 0).then_some((live, count)))
+    Ok((count > 0).then(|| Unclaimed {
+        note: format!(
+            "registered workspace tip {live} holds {count} unpublished change(s) absent from the work resolved at the lease boundary; leaving them unbookmarked because their owner cannot be established"
+        ),
+        commit: live,
+        count,
+    }))
 }
 
-/// Never bookmark a hidden pre-rewrite or deliberately abandoned commit. An
-/// unpublished amendment of a pushed change wins over the pushed commit.
-async fn visible_historical_tip(jj: &dyn Jj, repo: &Path, tip: &str) -> Result<Option<String>> {
+/// Never bookmark a hidden pre-rewrite or deliberately abandoned commit. With
+/// `follow_rewrites`, an unpublished amendment of a pushed change wins over the
+/// pushed commit. Without it the change id proves nothing: a later holder that
+/// inherited the commit and ran any jj command rewrote it under the same change
+/// id. Such a rewrite is never followed; it is returned as `rewritten_to` for
+/// inspection, and the boundary commit is used only while it is still visible
+/// as it was.
+async fn visible_historical_tip(jj: &dyn Jj, repo: &Path, tip: &str, follow_rewrites: bool) -> Result<HistoricalTip> {
+    let found = |commit: Option<String>| HistoricalTip {
+        commit,
+        rewritten_to: None,
+    };
     let change = log(jj, repo, tip, "change_id").await?;
+    let mut rewritten_to = None;
     let unpublished_visible = log_change(
         jj,
         repo,
         &format!("{} & ~::remote_bookmarks()", change_revset(change.trim())),
     )
     .await?;
-    match unpublished_visible.lines().count() {
-        1 => return Ok(unpublished_visible.lines().next().map(str::to_owned)),
-        0 => {}
-        _ => return Ok(None),
+    if follow_rewrites {
+        match unpublished_visible.lines().count() {
+            1 => return Ok(found(unpublished_visible.lines().next().map(str::to_owned))),
+            0 => {}
+            _ => return Ok(found(None)),
+        }
+    } else if commit_is_visible(jj, repo, tip).await? {
+        return Ok(found(Some(tip.to_owned())));
+    } else {
+        rewritten_to = unpublished_visible.lines().next().map(str::to_owned);
     }
+    let mut resolved = HistoricalTip {
+        commit: None,
+        rewritten_to,
+    };
     let published = log_change(
         jj,
         repo,
@@ -274,17 +375,19 @@ async fn visible_historical_tip(jj: &dyn Jj, repo: &Path, tip: &str) -> Result<O
     )
     .await?;
     if let Some(published) = published.lines().next() {
-        return Ok(Some(published.to_owned()));
+        resolved.commit = Some(published.to_owned());
+        return Ok(resolved);
     }
     // Abandonment can leave earlier visible unpublished ancestors.
     let ancestors = log(
         jj,
         repo,
         &format!("heads(::{tip} & (::visible_heads() | ::remote_bookmarks()))"),
-        "commit_id ++ \"\\n\"",
+        "commit_id ++ \"\n\"",
     )
     .await?;
-    Ok((ancestors.lines().count() == 1).then(|| ancestors.trim().to_owned()))
+    resolved.commit = (ancestors.lines().count() == 1).then(|| ancestors.trim().to_owned());
+    Ok(resolved)
 }
 
 async fn forget_preserved(jj: &dyn Jj, repo: &Path, name: &str) -> Result<()> {
@@ -487,18 +590,26 @@ pub async fn preserve_from(
     let resolved = workspace_tip(jj, record, workspace, since_unix, tip_source).await?;
     let unclaimed = resolved.unclaimed;
     let mut outcome = preserve_resolved(jj, record, workspace, recorded, tip_source, resolved.commit).await?;
-    if let Some((live, count)) = unclaimed {
-        let note = format!(
-            "registered workspace tip {live} holds {count} unpublished change(s) absent from the work resolved at the lease boundary; leaving them unbookmarked because their owner cannot be established"
-        );
+    if let Some(first) = unclaimed.first() {
+        let note = unclaimed
+            .iter()
+            .map(|work| work.note.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
         match outcome.inspect.as_mut() {
-            Some(inspect) => inspect.reason.push_str(&format!("; {note}")),
+            Some(inspect) => {
+                inspect.reason.push_str(&format!("; {note}"));
+                if inspect.workspace_commit_id.is_none() {
+                    inspect.workspace_commit_id = Some(first.commit.clone());
+                    inspect.workspace_count = Some(first.count);
+                }
+            }
             None => {
                 outcome.inspect = Some(PreserveInspect {
                     existing_commit_id: outcome.tip.as_ref().map(|tip| tip.commit_id.clone()),
                     workspace_change_id: None,
-                    workspace_commit_id: Some(live),
-                    workspace_count: Some(count),
+                    workspace_commit_id: Some(first.commit.clone()),
+                    workspace_count: Some(first.count),
                     reason: note,
                 });
             }

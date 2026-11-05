@@ -881,6 +881,41 @@ async fn run_one_pass_impl(
     outcome
 }
 
+/// Once per lease, records cube's claim counter for the workspace this
+/// execution holds. Teardown compares it with the registry later to prove no
+/// other lease was claimed on the workspace. Best effort: without it,
+/// teardown simply cannot prove sole ownership and stays conservative.
+async fn record_lease_generation(
+    work_db: &WorkDb,
+    cube: &dyn boss_execution_contracts::CubeClient,
+    execution_id: &str,
+    lease_id: &str,
+) {
+    match work_db.workspace_lease_generation(execution_id) {
+        Ok(None) => {}
+        Ok(Some(_)) => return,
+        Err(err) => {
+            tracing::debug!(execution_id, error = %err, "could not read recorded lease generation");
+            return;
+        }
+    }
+    let generation = match cube.list_workspaces().await {
+        Ok(workspaces) => workspaces
+            .into_iter()
+            .find(|ws| ws.state == "leased" && ws.lease_id.as_deref() == Some(lease_id))
+            .and_then(|ws| ws.lease_generation),
+        Err(err) => {
+            tracing::debug!(execution_id, error = %format!("{err:#}"), "could not list workspaces to record lease generation");
+            return;
+        }
+    };
+    if let Some(generation) = generation
+        && let Err(err) = work_db.record_workspace_lease_generation(execution_id, lease_id, generation)
+    {
+        tracing::debug!(execution_id, error = %err, "could not record lease generation");
+    }
+}
+
 /// Execute one `cube workspace heartbeat` call with a timeout. Increments
 /// either `*succeeded` or `*failed`, emits a dispatch error event on
 /// failure or timeout, and returns whether the heartbeat succeeded so the
@@ -948,6 +983,7 @@ async fn heartbeat_one(
                 tracing::error!(execution_id, error = %err, "failed to record confirmed workspace lease boundary");
                 return false;
             }
+            record_lease_generation(ctx.work_db, cube, execution_id, lease_id).await;
             *succeeded += 1;
             tracing::debug!(
                 execution_id,

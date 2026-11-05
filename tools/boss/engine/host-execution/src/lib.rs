@@ -1183,6 +1183,10 @@ pub mod types {
         #[serde(default)]
         pub last_task: Option<String>,
         pub leased_at_epoch_s: Option<i64>,
+        /// Cube's monotonic claim counter for this workspace. Absent from older
+        /// cube builds.
+        #[serde(default)]
+        pub lease_generation: Option<i64>,
         pub lease_expires_at_epoch_s: Option<i64>,
     }
 
