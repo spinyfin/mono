@@ -319,6 +319,9 @@ impl HostAdapter for LocalHostAdapter {
         pr_anchor::ensure(&LocalJj, self, record, pr).await?;
         Ok(true)
     }
+    async fn positioned_parent(&self, workspace: &Path) -> Result<String> {
+        execution_bookmark::one_commit(&LocalJj, workspace, "@-").await
+    }
     async fn start_fresh_workspace(&self, workspace: &Path) -> Result<String> {
         let trunk = execution_bookmark::one_commit(&LocalJj, workspace, "trunk()").await?;
         execution_bookmark::Jj::run(&LocalJj, workspace, &["new", &trunk, "-m", "Fresh execution"]).await?;
@@ -924,6 +927,9 @@ impl HostAdapter for SshHostAdapter {
         result?;
         pr_anchor::ensure(self, self, record, pr).await?;
         Ok(true)
+    }
+    async fn positioned_parent(&self, workspace: &Path) -> Result<String> {
+        execution_bookmark::one_commit(self, workspace, "@-").await
     }
     async fn start_fresh_workspace(&self, workspace: &Path) -> Result<String> {
         let trunk = execution_bookmark::one_commit(self, workspace, "trunk()").await?;

@@ -142,6 +142,10 @@ async fn rewritten_baseline_keeps_working_without_ancestry_repair() {
     JjRepo::run(repo, &["bookmark", "delete", &s.record.base()]);
     let patch = diff(&LocalJj, &s.record).await.unwrap();
     assert!(patch.contains("revision.txt"), "{patch}");
+    assert!(
+        !patch.contains("toolchain.txt"),
+        "upstream changes must not leak into the patch: {patch}"
+    );
     assert!(!unpublished_diff(&LocalJj, &s.record).await.unwrap().is_empty());
     assert!(
         restore_for_retry(&LocalJj, &s.record, &s.repo.replacement, true)

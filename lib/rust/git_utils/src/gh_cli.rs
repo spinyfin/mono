@@ -27,7 +27,7 @@ async fn run_gh(args: &[&str], display: &str) -> Result<String> {
         .await
         .map_err(|err| {
             GhError::new(
-                GhErrorKind::Deterministic,
+                classify_spawn_error(&err),
                 format!("failed to spawn `{display}`: {err}"),
             )
         })?;
@@ -86,26 +86,84 @@ pub fn is_deterministic(error: &anyhow::Error) -> bool {
         .is_some_and(|err| err.kind == GhErrorKind::Deterministic)
 }
 
-/// Classify `gh` stderr. Anything not recognised as deterministic is
-/// transient, so an unfamiliar failure keeps the retry behaviour.
+/// Retry policy for `gh` stderr: a missing resource or an authorization
+/// failure repeats identically, so it is deterministic. A rate limit, and
+/// anything unfamiliar, keeps the retry behaviour.
 fn classify_stderr(stderr: &str) -> GhErrorKind {
-    const DETERMINISTIC: [&str; 7] = [
-        "Could not resolve to a PullRequest",
-        "Could not resolve to a Repository",
-        "HTTP 404",
-        "HTTP 401",
+    match classify_failure(stderr) {
+        GhFailure::NotAuthorized | GhFailure::NotFound => GhErrorKind::Deterministic,
+        GhFailure::RateLimited | GhFailure::Other => GhErrorKind::Transient,
+    }
+}
+
+/// A spawn failure is deterministic only when `gh` is missing or not
+/// executable. Resource exhaustion (`EAGAIN`, `EMFILE`, `ETXTBSY`) clears up.
+fn classify_spawn_error(err: &std::io::Error) -> GhErrorKind {
+    match err.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => GhErrorKind::Deterministic,
+        _ => GhErrorKind::Transient,
+    }
+}
+
+// ── Failure classification shared with `boss-github` ─────────────────────────
+//
+// HTTP status, authorization, missing-resource and rate-limit recognition lives
+// here once; callers map it onto their own retry policy.
+
+/// What a failed `gh` invocation says about its cause, independent of any
+/// caller's retry policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GhFailure {
+    /// Primary or secondary rate limit (including the HTTP 403 it can arrive
+    /// as). Waiting is the remedy.
+    RateLimited,
+    /// Rejected or missing credentials, or an authorization refusal
+    /// (HTTP 401 / 403 that is not a rate limit).
+    NotAuthorized,
+    /// The PR, repository or other resource does not exist (HTTP 404).
+    NotFound,
+    /// Anything else: connectivity, timeouts, server errors, unfamiliar text.
+    Other,
+}
+
+/// Scan `gh`'s stderr for an HTTP status code pattern like "(HTTP 404)" or "HTTP 404".
+pub fn parse_http_status(stderr: &str) -> Option<u16> {
+    let lower = stderr.to_lowercase();
+    let pos = lower.find("http ")?;
+    // `to_lowercase` can change byte lengths for non-ASCII text, so index the
+    // lowered string itself; status digits are ASCII either way.
+    let digits: String = lower[pos + 5..].chars().take_while(char::is_ascii_digit).collect();
+    digits.parse::<u16>().ok()
+}
+
+/// Classify `gh` stderr. Matching is case-insensitive. A rate limit is checked
+/// first because it is delivered as an HTTP 403 and must not read as an
+/// authorization failure.
+pub fn classify_failure(stderr: &str) -> GhFailure {
+    let lower = stderr.to_lowercase();
+    if lower.contains("rate limit") || lower.contains("secondary rate") || lower.contains("http 429") {
+        return GhFailure::RateLimited;
+    }
+    const NOT_AUTHORIZED: [&str; 6] = [
+        "http 401",
+        "http 403",
+        "bad credentials",
         "gh auth login",
         "authentication token",
         "not logged in",
     ];
-    if stderr.contains("rate limit") {
-        return GhErrorKind::Transient;
+    if NOT_AUTHORIZED.iter().any(|needle| lower.contains(needle)) {
+        return GhFailure::NotAuthorized;
     }
-    if DETERMINISTIC.iter().any(|needle| stderr.contains(needle)) {
-        GhErrorKind::Deterministic
-    } else {
-        GhErrorKind::Transient
+    const NOT_FOUND: [&str; 3] = [
+        "could not resolve to a pullrequest",
+        "could not resolve to a repository",
+        "not found",
+    ];
+    if parse_http_status(stderr) == Some(404) || NOT_FOUND.iter().any(|needle| lower.contains(needle)) {
+        return GhFailure::NotFound;
     }
+    GhFailure::Other
 }
 
 /// Fetch the head commit SHA (`headRefOid`) for a PR by shelling out to
@@ -295,6 +353,7 @@ mod tests {
             "GraphQL: Could not resolve to a PullRequest with the number of 9. (repository.pullRequest)",
             "HTTP 404: Not Found (https://api.github.com/repos/o/r/pulls/9)",
             "HTTP 401: Bad credentials",
+            "Resource not accessible by integration (HTTP 403)",
             "To get started with GitHub CLI, please run:  gh auth login",
         ] {
             assert_eq!(classify_stderr(stderr), GhErrorKind::Deterministic, "{stderr}");
@@ -306,6 +365,17 @@ mod tests {
             "i/o timeout",
         ] {
             assert_eq!(classify_stderr(stderr), GhErrorKind::Transient, "{stderr}");
+        }
+    }
+
+    #[test]
+    fn spawn_failures_are_deterministic_only_when_gh_is_unusable() {
+        use std::io::{Error, ErrorKind};
+        for kind in [ErrorKind::NotFound, ErrorKind::PermissionDenied] {
+            assert_eq!(classify_spawn_error(&Error::from(kind)), GhErrorKind::Deterministic);
+        }
+        for kind in [ErrorKind::WouldBlock, ErrorKind::ResourceBusy, ErrorKind::Interrupted] {
+            assert_eq!(classify_spawn_error(&Error::from(kind)), GhErrorKind::Transient);
         }
     }
 
@@ -342,5 +412,58 @@ mod tests {
         let full_sha = "a".repeat(40);
         let result = parse_head_sha_output(full_sha.clone(), 1, "org/repo").unwrap();
         assert_eq!(result, full_sha);
+    }
+
+    #[test]
+    fn rate_limit_wins_over_the_403_it_arrives_as() {
+        for stderr in [
+            "gh: API rate limit exceeded (HTTP 403)",
+            "You have exceeded a secondary rate limit (HTTP 403)",
+            "HTTP 429: Too Many Requests",
+        ] {
+            assert_eq!(classify_failure(stderr), GhFailure::RateLimited, "{stderr}");
+        }
+    }
+
+    #[test]
+    fn non_rate_limit_403_and_credentials_are_not_authorized() {
+        for stderr in [
+            "Resource not accessible by integration (HTTP 403)",
+            "HTTP 401: Bad credentials",
+            "To get started with GitHub CLI, please run:  gh auth login",
+            "The authentication token is invalid",
+        ] {
+            assert_eq!(classify_failure(stderr), GhFailure::NotAuthorized, "{stderr}");
+        }
+    }
+
+    #[test]
+    fn missing_resources_are_not_found_case_insensitively() {
+        for stderr in [
+            "GraphQL: Could not resolve to a PullRequest with the number of 9.",
+            "gh: Not Found (HTTP 404)",
+            "http 404: not found",
+        ] {
+            assert_eq!(classify_failure(stderr), GhFailure::NotFound, "{stderr}");
+        }
+    }
+
+    #[test]
+    fn connectivity_and_server_errors_are_other() {
+        for stderr in [
+            "error connecting to api.github.com",
+            "HTTP 502: Bad Gateway",
+            "i/o timeout",
+            "",
+        ] {
+            assert_eq!(classify_failure(stderr), GhFailure::Other, "{stderr}");
+        }
+    }
+
+    #[test]
+    fn http_status_is_parsed_from_embedded_text() {
+        assert_eq!(parse_http_status("gh: Not Found (HTTP 404)"), Some(404));
+        assert_eq!(parse_http_status("gh: API rate limit exceeded (HTTP 429)"), Some(429));
+        assert_eq!(parse_http_status("no status here"), None);
     }
 }

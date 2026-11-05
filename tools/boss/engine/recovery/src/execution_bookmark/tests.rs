@@ -388,6 +388,17 @@ async fn only_missing_heads_fail_without_lineage_or_baseline_bookmark_checks() {
         "{patch}"
     );
 
+    // A restore carries both lines' files into the successor workspace.
+    assert!(restore(&LocalJj, &record, &f.replacement).await.unwrap());
+    assert_eq!(
+        std::fs::read_to_string(f.replacement.join("recovery-line.txt")).unwrap(),
+        "recovery line\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.replacement.join("publication-line.txt")).unwrap(),
+        "publication line\n"
+    );
+
     // The baseline bookmark is never read.
     LocalJj
         .run(&f.repo, &["bookmark", "delete", &record.base()])

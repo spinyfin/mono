@@ -1543,6 +1543,14 @@ pub trait HostAdapter: Send + Sync {
         let _ = workspace;
         bail!("fresh workspace positioning is not supported by this host adapter")
     }
+    /// The commit the workspace's working copy sits on (its parent). After
+    /// cube's lease positioning this is the commit the workspace was
+    /// positioned on, which becomes a fresh pointer's floor even if trunk
+    /// advances before the pointer is created.
+    async fn positioned_parent(&self, workspace: &Path) -> Result<String> {
+        let _ = workspace;
+        bail!("workspace parent resolution is not supported by this host adapter")
+    }
     /// Archive unpublished targets before optionally releasing names that the
     /// current execution must reuse. Predecessor publication names stay tracked.
     async fn release_execution_bookmark_heads(

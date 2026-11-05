@@ -1830,6 +1830,18 @@ impl ExecutionCoordinator {
             }
         };
 
+        // The commit cube positioned this workspace on is the pointer floor for
+        // a fresh start. Capture it now so a trunk that advances before the
+        // pointer exists cannot move the floor onto unrelated upstream work.
+        let positioned_base = if change.is_some() {
+            adapter
+                .positioned_parent(&lease.workspace_path)
+                .await
+                .inspect_err(|err| tracing::warn!(?err, "could not capture the positioned commit"))
+                .ok()
+        } else {
+            None
+        };
         let bookmark_result = async {
             if self.work_db.execution_bookmark_optional(&execution.id)?.is_none() {
                 // A GitHub failure is retried like any pre-start failure, but a
@@ -1862,7 +1874,14 @@ impl ExecutionCoordinator {
                         &adapter,
                         (
                             predecessor.as_ref(),
-                            report.as_ref().and_then(|r| r.inherited_base.as_deref()),
+                            // Fresh with no PR head and no restore report: the floor
+                            // is the commit cube positioned the workspace on.
+                            report
+                                .as_ref()
+                                .and_then(|r| r.inherited_base.as_deref())
+                                .or(positioned_base.as_deref().filter(|_| {
+                                    predecessor.is_none() && execution_for_pointer.pr_head_before.is_none()
+                                })),
                         ),
                         super::fresh_start::FreshStart {
                             repo_id: &repo.repo_id,

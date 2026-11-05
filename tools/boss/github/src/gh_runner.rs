@@ -312,15 +312,7 @@ pub struct CommandGhRunner;
 /// `trees` reuse it for their 404 branches rather than re-deriving the
 /// pattern with ad-hoc `contains("404")` / `contains("http 404")` checks.
 pub(crate) fn parse_http_status_from_stderr(stderr: &str) -> Option<u16> {
-    let lower = stderr.to_lowercase();
-    if let Some(pos) = lower.find("http ") {
-        let after = &stderr[pos + 5..];
-        let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if let Ok(code) = digits.parse::<u16>() {
-            return Some(code);
-        }
-    }
-    None
+    git_utils::gh_cli::parse_http_status(stderr)
 }
 
 /// Map a non-success `gh` exit into a status-carrying [`GhRunnerError`],

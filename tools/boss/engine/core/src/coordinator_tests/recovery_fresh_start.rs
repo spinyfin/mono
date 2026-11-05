@@ -897,3 +897,58 @@ impl crate::host_adapter::HostAdapter for ScratchDestination {
             .await
     }
 }
+
+#[tokio::test]
+async fn fresh_pointer_floor_is_the_positioned_commit_when_trunk_advances_afterwards() {
+    let dir = tempdir().unwrap();
+    let (db, _source, next) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
+    let repo = JjRepo::new(dir.path());
+    super::recovery::configure_recovery_origin(&repo.repo);
+    let cube = Arc::new(FakeCubeClient {
+        real_bookmarks: true,
+        position_real_workspace: true,
+        ..Default::default()
+    });
+    let coordinator = ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        cube,
+        Arc::new(FakeExecutionRunner::default()),
+    );
+    let adapter = coordinator.host_adapter();
+    let lease = CubeWorkspaceLease {
+        lease_id: "lease".into(),
+        workspace_id: "replacement".into(),
+        workspace_path: repo.replacement.clone(),
+        dirty_verified: None,
+    };
+    // Position the workspace on trunk, then capture what it sits on as dispatch does.
+    let trunk_then = adapter.start_fresh_workspace(&repo.replacement).await.unwrap();
+    adapter.create_change(&repo.replacement, "Fresh work").await.unwrap();
+    let positioned = adapter.positioned_parent(&repo.replacement).await.unwrap();
+    assert_eq!(positioned, trunk_then);
+    // Trunk advances with unrelated upstream work before the pointer exists.
+    JjRepo::run(&repo.repo, &["new", "main", "-m", "Upstream advance"]);
+    std::fs::write(repo.repo.join("upstream.txt"), "someone else's work").unwrap();
+    JjRepo::run(&repo.repo, &["bookmark", "set", "main", "-r", "@"]);
+    let trunk_now = commit(&repo.repo, "main");
+    assert_ne!(trunk_now, trunk_then);
+    let (record, retained) = coordinator
+        .create_or_start_fresh_for_test(
+            &next,
+            &lease,
+            &adapter,
+            (None, Some(&positioned)),
+            FreshStart {
+                repo_id: "mono",
+                immutable_target: None,
+                bound_pr: None,
+                task_pr: None,
+                title: "Fresh work",
+            },
+        )
+        .await
+        .unwrap();
+    assert!(retained);
+    assert_eq!(record.base_commit.as_deref(), Some(trunk_then.as_str()));
+}
