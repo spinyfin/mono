@@ -507,10 +507,8 @@ pub enum FrontendRequest {
     /// source fields in the input. Replies with
     /// [`FrontendEvent::AttentionCreated`].
     CreateAttention {
-        /// Boxed so `FrontendRequest` stays within clippy's
-        /// `large_enum_variant` budget; serde output is identical.
         #[serde(flatten)]
-        input: Box<CreateAttentionInput>,
+        input: CreateAttentionInput,
     },
 
     CreateAttentionItem {
