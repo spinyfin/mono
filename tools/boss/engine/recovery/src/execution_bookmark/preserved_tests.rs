@@ -26,7 +26,7 @@ fn names(repo: &JjRepo) -> String {
 #[tokio::test]
 async fn historical_and_registered_reads_never_resurrect_hidden_work() {
     for action in ["commit", "squash", "abandon"] {
-        for historical in [false, true] {
+        for mode in ["registered", "historical", "lease boundary"] {
             let dir = tempfile::tempdir().unwrap();
             let repo = fixture(dir.path());
             let record = create(&LocalJj, &repo.worker, "exec_hidden_history", "local")
@@ -38,6 +38,9 @@ async fn historical_and_registered_reads_never_resurrect_hidden_work() {
             }
             std::fs::write(repo.worker.join("work"), "work to rewrite or abandon").unwrap();
             let hidden = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+            if mode == "historical" {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
             let boundary = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -59,13 +62,15 @@ async fn historical_and_registered_reads_never_resurrect_hidden_work() {
                 JjRepo::run(&repo.worker, &["git", "export"]);
                 JjRepo::run(&repo.repo, &["git", "fetch"]);
             }
-            let source = if historical {
-                WorkspaceTipSource::LeaseBoundary {
+            let source = match mode {
+                "registered" => WorkspaceTipSource::Registered,
+                "historical" => WorkspaceTipSource::Historical {
+                    at_or_before_unix: Some(boundary / 1000),
+                },
+                _ => WorkspaceTipSource::LeaseBoundary {
                     unix_millis: boundary,
-                    snapshot_if_unchanged: false,
-                }
-            } else {
-                WorkspaceTipSource::Registered
+                    snapshot_if_unchanged: true,
+                },
             };
             assert!(
                 !super::preserved::commit_is_visible(&LocalJj, &repo.repo, hidden.trim())
@@ -75,7 +80,8 @@ async fn historical_and_registered_reads_never_resurrect_hidden_work() {
             let outcome = preserve_from(&LocalJj, &record, &repo.worker, None, None, source)
                 .await
                 .unwrap();
-            assert!(outcome.tip.is_none(), "{action}, historical={historical}: {outcome:?}");
+            assert!(outcome.tip.is_none(), "{action}, mode={mode}: {outcome:?}");
+            assert!(outcome.inspect.is_none(), "{action}, mode={mode}: {outcome:?}");
             assert!(!names(&repo).contains("preserved/exec_hidden_history"));
             assert!(
                 !super::preserved::commit_is_visible(&LocalJj, &repo.repo, hidden.trim())
