@@ -130,7 +130,7 @@ async fn bound_pr_fixture(revision: bool) -> BoundPrFixture {
 }
 
 async fn bound_pr_snapshot_dispatch(revision: bool, fail_first: bool) {
-    let BoundPrFixture { dir, db, id, repo, head } = bound_pr_fixture(revision).await;
+    let BoundPrFixture { dir, db, id, head, .. } = bound_pr_fixture(revision).await;
     let cube = Arc::new(
         FakeCubeClient {
             workspace_root: Some(dir.path().to_path_buf()),
@@ -1073,7 +1073,7 @@ mod prune_sweep {
 fn bound_pr_coordinator(
     fx: &BoundPrFixture,
     cube: Arc<FakeCubeClient>,
-    verifier: &crate::completion::StubBranchVerifier,
+    verifier: &Arc<crate::completion::tests::StubBranchVerifier>,
     retry_delays: Vec<Duration>,
     sink: Arc<crate::dispatch_events::RecordingDispatchEventSink>,
 ) -> (Arc<ExecutionCoordinator>, Arc<FakeExecutionRunner>) {
