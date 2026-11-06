@@ -625,16 +625,46 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                 outcome(command, ResultCode::OutcomeUncertain, "stop interrupted", Some(pane))
             });
         }
+        // A Terminal record already classified the outcome. Kill any retained
+        // remain-on-exit session without demoting the phase or replacing the
+        // stored evidence; otherwise a later Adopt would report Missing.
+        if record.phase == Phase::Terminal {
+            return Ok(
+                match self
+                    .tmux
+                    .kill_session_verified(&record.session, &record.spawn_token)
+                    .await
+                {
+                    Ok(KillSessionOutcome::Killed | KillSessionOutcome::Absent) => outcome(
+                        command,
+                        ResultCode::Ok,
+                        String::new(),
+                        Some(self.observe(&record).await),
+                    ),
+                    Err(KillSessionError::TokenMismatch { actual, .. }) => outcome(
+                        command,
+                        ResultCode::Rejected,
+                        format!("refusing stop: live token {actual} is not this execution"),
+                        Some(self.observe(&record).await),
+                    ),
+                    Err(error) => outcome(
+                        command,
+                        ResultCode::OutcomeUncertain,
+                        error.to_string(),
+                        Some(self.observe(&record).await),
+                    ),
+                },
+            );
+        }
         record.phase = Phase::Stopping;
         self.persist(&record)?;
+        let mut observed = self.observe(&record).await;
         if stop.grace_ms > 0 {
             let budget = Duration::from_millis(u64::from(stop.grace_ms.min(30_000)));
             let deadline = Instant::now() + budget;
-            while Instant::now() < deadline {
-                if pane_life(&self.observe(&record).await) != PaneLife::Alive {
-                    break;
-                }
+            while pane_life(&observed) == PaneLife::Alive && Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(100)).await;
+                observed = self.observe(&record).await;
             }
         }
         match self
@@ -643,15 +673,18 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             .await
         {
             Ok(KillSessionOutcome::Killed | KillSessionOutcome::Absent) => {
-                // Record Missing from the kill outcome. Observe after reclaim
-                // answers from this evidence rather than from a gone session.
-                let pane = PaneState {
-                    session: record.session.clone(),
-                    pane_id: record.pane_id.clone().unwrap_or_default(),
-                    pid: record.pid.unwrap_or(0),
-                    boot_id: record.boot_id.clone(),
-                    life: PaneLife::Missing.into(),
-                    ..Default::default()
+                // Keep a pre-kill Exited/BriefNotDelivered observation. Killing
+                // a still-alive pane records Missing from the kill outcome.
+                let pane = match pane_life(&observed) {
+                    PaneLife::Exited | PaneLife::BriefNotDelivered => observed,
+                    _ => PaneState {
+                        session: record.session.clone(),
+                        pane_id: record.pane_id.clone().unwrap_or_default(),
+                        pid: record.pid.unwrap_or(0),
+                        boot_id: record.boot_id.clone(),
+                        life: PaneLife::Missing.into(),
+                        ..Default::default()
+                    },
                 };
                 self.record_terminal(&mut record, &pane)?;
                 Ok(outcome(
@@ -1774,6 +1807,100 @@ mod tests {
         let record = stored(&supervisor.store);
         assert_eq!(record.phase, Phase::Terminal);
         assert!(record.reclaimed);
+    }
+
+    #[tokio::test]
+    async fn stop_on_terminal_exited_keeps_evidence_and_adopt_reports_exited() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeTmux::default());
+        live(&fake);
+        let supervisor = supervisor(root.path(), fake.clone()).await;
+        seed(&supervisor.store, Phase::Terminal);
+        update(&supervisor.store, |r| {
+            r.terminal = Some(TerminalEvidence {
+                life: PaneLife::Exited.into(),
+                exit_code: Some(64),
+            });
+            r.reclaimed = true;
+        });
+        let result = supervisor.execute(&stop_command(), false, 1).await;
+        assert_eq!(result.code, ResultCode::Ok as i32, "{}", result.reason);
+        assert_eq!(pane_life(&pane_of(&result)), PaneLife::Exited);
+        let record = stored(&supervisor.store);
+        assert_eq!(record.phase, Phase::Terminal);
+        assert_eq!(
+            record.terminal,
+            Some(TerminalEvidence {
+                life: PaneLife::Exited.into(),
+                exit_code: Some(64)
+            })
+        );
+        assert!(!fake.killed.lock().unwrap().is_empty());
+        heartbeat_leases(&supervisor.cube, &supervisor.store).await;
+        assert!(supervisor.cube.heartbeats.lock().unwrap().is_empty());
+        let adopted = supervisor.execute(&adopt_command(), false, 1).await;
+        assert_eq!(adopted.code, ResultCode::Ok as i32);
+        assert_eq!(pane_life(&pane_of(&adopted)), PaneLife::Exited);
+        assert_eq!(stored(&supervisor.store).phase, Phase::Terminal);
+    }
+
+    #[tokio::test]
+    async fn stop_on_alive_exited_pane_records_exited_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeTmux::default());
+        live(&fake);
+        fake.pane_dead
+            .lock()
+            .unwrap()
+            .insert(session_name("token"), ("1".into(), Some(0)));
+        let supervisor = supervisor(root.path(), fake).await;
+        seed(&supervisor.store, Phase::Alive);
+        let home = run_home("stop-already-exited");
+        update(&supervisor.store, |r| r.home = Some(home.clone()));
+        let result = supervisor.execute(&stop_command(), false, 1).await;
+        assert_eq!(result.code, ResultCode::Ok as i32, "{}", result.reason);
+        assert_eq!(pane_life(&pane_of(&result)), PaneLife::Exited);
+        let record = stored(&supervisor.store);
+        assert_eq!(record.phase, Phase::Terminal);
+        assert!(record.reclaimed);
+        assert_eq!(
+            record.terminal,
+            Some(TerminalEvidence {
+                life: PaneLife::Exited.into(),
+                exit_code: Some(0)
+            })
+        );
+        assert!(!home.exists());
+        let adopted = supervisor.execute(&adopt_command(), false, 1).await;
+        assert_eq!(pane_life(&pane_of(&adopted)), PaneLife::Exited);
+    }
+
+    #[tokio::test]
+    async fn stop_on_alive_brief_not_delivered_pane_keeps_that_life() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeTmux::default());
+        live(&fake);
+        fake.pane_dead
+            .lock()
+            .unwrap()
+            .insert(session_name("token"), ("1".into(), Some(64)));
+        let supervisor = supervisor(root.path(), fake).await;
+        seed(&supervisor.store, Phase::Alive);
+        let home = run_home("stop-brief-not-delivered");
+        update(&supervisor.store, |r| r.home = Some(home.clone()));
+        let result = supervisor.execute(&stop_command(), false, 1).await;
+        assert_eq!(result.code, ResultCode::Ok as i32, "{}", result.reason);
+        assert_eq!(pane_life(&pane_of(&result)), PaneLife::BriefNotDelivered);
+        let record = stored(&supervisor.store);
+        assert_eq!(
+            record.terminal,
+            Some(TerminalEvidence {
+                life: PaneLife::BriefNotDelivered.into(),
+                exit_code: Some(64)
+            })
+        );
+        let adopted = supervisor.execute(&adopt_command(), false, 1).await;
+        assert_eq!(pane_life(&pane_of(&adopted)), PaneLife::BriefNotDelivered);
     }
 
     #[tokio::test]

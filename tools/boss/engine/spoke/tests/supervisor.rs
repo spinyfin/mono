@@ -454,9 +454,17 @@ async fn real_spawn_reaches_alive_without_waiting_out_the_brief_budget_and_deliv
     }
     // Wait for Deliver's trailing Return after "second" before taking the
     // Interrupt snapshot; otherwise the Return can land in the tail and
-    // fail a strict `\x1b` equality.
+    // fail a strict `\x1b` equality. Multi-line Deliver uses paste-buffer -p,
+    // so the fixture may see `second\x1b[201~\r` rather than contiguous
+    // `second\r`.
     let received = wait_for_file(&out, |bytes| {
-        bytes.windows(4).any(|w| w == b"ping") && bytes.windows(7).any(|w| w == b"second\r")
+        if !bytes.windows(4).any(|w| w == b"ping") {
+            return false;
+        }
+        let Some(pos) = bytes.windows(6).position(|w| w == b"second") else {
+            return false;
+        };
+        bytes[pos + 6..].contains(&b'\r')
     })
     .await;
 
