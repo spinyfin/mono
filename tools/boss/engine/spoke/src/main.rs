@@ -59,6 +59,7 @@ mod commands {
     ) -> Result<()> {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_sweep: Option<std::time::Instant> = None;
         loop {
             interval.tick().await;
             let pending = journal
@@ -66,6 +67,18 @@ mod commands {
                 .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
                 .begin_pending()?;
             let Some((command, interrupted)) = pending else {
+                // Idle: look for workers that finished since the last look. This
+                // runs on the command loop, so it never races a command, and it
+                // works from the durable records, so it also settles workers
+                // that exited while this daemon was down.
+                if let Some(supervisor) = &supervisor
+                    && last_sweep.is_none_or(|at| at.elapsed() >= worker::EXIT_SWEEP_INTERVAL)
+                {
+                    last_sweep = Some(std::time::Instant::now());
+                    for (run, error) in supervisor.sweep().await {
+                        tracing::warn!(run, error, "worker exit sweep failed");
+                    }
+                }
                 continue;
             };
             let observed = stamp()?;
@@ -222,10 +235,23 @@ struct Args {
     tmux_bin: Option<PathBuf>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt().with_writer(std::io::stderr).init();
     let args = Args::parse();
+    let homes_root = boss_host_execution::homes::pin(&args.state_dir.join("homes"))?;
+    // SAFETY: the process is still single-threaded here; the async runtime and
+    // every worker thread are built only after this, so nothing reads the
+    // environment concurrently. Driver provisioning reads this variable.
+    unsafe {
+        std::env::set_var(boss_host_execution::homes::ROOT_ENV, &homes_root);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(serve(args, homes_root))
+}
+
+async fn serve(args: Args, homes_root: PathBuf) -> Result<()> {
     let journal = Arc::new(Mutex::new(Journal::open(
         &args.state_dir,
         &args.host_id,
@@ -242,11 +268,6 @@ async fn main() -> Result<()> {
         .tls_config(tls)?;
     let boot = host::boot_id()?;
     let stamp = || host::stamp(&boot);
-    let homes_root = boss_host_execution::homes::pin(&args.state_dir.join("homes"))?;
-    // SAFETY: set once at process start, before any worker provision reads it.
-    unsafe {
-        std::env::set_var(boss_host_execution::homes::ROOT_ENV, &homes_root);
-    }
     let cube = boss_host_execution::cube::LocalCube {
         command: args.cube_bin,
         args: Vec::new(),

@@ -37,9 +37,20 @@ pub fn is_brief_not_delivered_status(exit_code: Option<i32>, last_output: Option
     })
 }
 
-/// Marker file, exit 64, or relay diagnostic: the brief was not delivered.
+/// The markers are authoritative: a delivered marker means the brief reached
+/// the driver whatever its exit code, and an undelivered marker means it did
+/// not. Exit 64 and relay diagnostics are consulted only when neither marker
+/// can be read.
 pub fn is_brief_not_delivered(exit_code: Option<i32>, home: Option<&Path>, last_output: Option<&str>) -> bool {
-    home.is_some_and(undelivered_marker_present) || is_brief_not_delivered_status(exit_code, last_output)
+    if let Some(home) = home {
+        if delivered_marker_present(home) {
+            return false;
+        }
+        if undelivered_marker_present(home) {
+            return true;
+        }
+    }
+    is_brief_not_delivered_status(exit_code, last_output)
 }
 
 /// The retained per-run home a driver's runtime state owns: a Codex
@@ -539,6 +550,53 @@ assert_processes_exited(lifetime_reader)
             started.elapsed() < std::time::Duration::from_secs(20),
             "relay waited for the stray descendant"
         );
+    }
+
+    #[test]
+    fn delivered_marker_is_written_while_the_driver_is_still_running() {
+        let temp = tempfile::tempdir().unwrap();
+        provision(temp.path(), temp.path(), "private sentinel", &crate::ClaudeDriver).unwrap();
+        let driver = temp.path().join("driver.py");
+        fs::write(
+            &driver,
+            "import os, time, tty\n\
+             tty.setraw(0)\n\
+             os.write(1, b'\\x1b[?2004hClaude Code')\n\
+             data = b''\n\
+             while not data.endswith(b'\\r'):\n\
+             \x20   data += os.read(0, 4096)\n\
+             time.sleep(30)\n",
+        )
+        .unwrap();
+        let mut child = std::process::Command::new("python3")
+            .arg(temp.path().join("initial-prompt.py"))
+            .args(["python3"])
+            .arg(&driver)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !delivered_marker_present(temp.path()) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let still_running = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(delivered_marker_present(temp.path()), "no delivered marker");
+        assert!(still_running, "driver exited before the marker was observed");
+    }
+
+    #[test]
+    fn delivered_marker_outranks_exit_64() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join(DELIVERED_MARKER), "").unwrap();
+        assert!(!is_brief_not_delivered(Some(64), Some(temp.path()), None));
+        let other = tempfile::tempdir().unwrap();
+        assert!(is_brief_not_delivered(Some(64), Some(other.path()), None));
+        fs::write(other.path().join(UNDELIVERED_MARKER), "").unwrap();
+        assert!(is_brief_not_delivered(Some(1), Some(other.path()), None));
     }
 
     #[test]

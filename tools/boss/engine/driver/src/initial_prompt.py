@@ -301,8 +301,11 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30):
             if master in writable:
                 count = os.write(master, pending[:4096])
                 pending = pending[count:]
-                if not pending and submitting:
+                if not pending and submitting and not delivered:
                     delivered = True
+                    # Durable proof the moment the submit bytes are fully
+                    # written, not when the (long-lived) driver exits.
+                    write_marker(DELIVERED_MARKER)
                 elif not pending and paste_started and not delivered and submit_at is None:
                     # Let the TUI consume the paste event before Return; this
                     # is the same separation used by terminal paste delivery.
@@ -384,9 +387,7 @@ def main():
 
 if __name__ == "__main__":
     try:
-        code = main()
-        write_marker(DELIVERED_MARKER)
-        sys.exit(code)
+        sys.exit(main())
     except Exception as error:
         print(f"boss initial brief delivery failed: {error}", file=sys.stderr)
         write_marker(UNDELIVERED_MARKER)

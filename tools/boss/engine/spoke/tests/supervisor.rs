@@ -125,21 +125,18 @@ async fn live_tmux(root: &Path) -> (Tmux, TmuxServerGuard) {
 }
 
 fn seed(store: &MemoryStore, token: &str, phase: Phase) {
-    let record = ExecutionRecord {
-        execution_id: format!("exec-{token}"),
-        run_id: format!("run-{token}"),
-        spawn_token: token.into(),
-        assignment_generation: 1,
-        lease_id: "lease".into(),
-        workspace_id: "worker".into(),
-        session: session_name(token),
-        phase,
-        boot_id: "boot".into(),
-        pane_id: None,
-        pid: None,
-        runtime_state: None,
-        home: None,
-    };
+    let record = ExecutionRecord::builder()
+        .execution_id(format!("exec-{token}"))
+        .run_id(format!("run-{token}"))
+        .spawn_token(token)
+        .assignment_generation(1)
+        .lease_id("lease")
+        .workspace_id("worker")
+        .session(session_name(token))
+        .phase(phase)
+        .boot_id("boot")
+        .driver_id("claude")
+        .build();
     store
         .save(
             &record.run_id,
@@ -314,8 +311,251 @@ async fn stop_is_token_verified_and_leaves_siblings() {
     assert!(!names.contains(&session_name("drop")), "{names:?}");
 }
 
+/// Executable fixture standing in for the `claude` CLI. The pane's `PATH` comes
+/// from the hermetic test environment and ignores the session environment, so
+/// the fixture lives in the private home's `.nix-profile/bin`, which that
+/// `PATH` starts with. `FIXTURE_MODE=exit` makes it quit without reading the
+/// brief; otherwise it satisfies the relay's readiness markers and appends
+/// every byte it then receives to `$FIXTURE_OUT`.
+const FIXTURE_CLAUDE: &str = r#"#!/bin/sh
+[ "$FIXTURE_MODE" = exit ] && exit 0
+exec python3 -c '
+import os, tty
+tty.setraw(0)
+os.write(1, b"\x1b[?2004hClaude Code")
+while True:
+    data = os.read(0, 4096)
+    if not data:
+        break
+    with open(os.environ["FIXTURE_OUT"], "ab") as out:
+        out.write(data)
+'
+"#;
+
+fn install_fixture_claude() {
+    use std::os::unix::fs::PermissionsExt;
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let bin = PathBuf::from(std::env::var("HOME").expect("test HOME")).join(".nix-profile/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let tmp = bin.join(".claude.tmp");
+        std::fs::write(&tmp, FIXTURE_CLAUDE).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&tmp, bin.join("claude")).unwrap();
+    });
+}
+
+fn real_spawn(token: &str, mode: &str, out: &Path) -> v1::Command {
+    install_fixture_claude();
+    let mut command = spawn_command(token, "spawn-real");
+    if let Some(command::Body::Spawn(spawn)) = &mut command.body {
+        spawn.env = vec![
+            v1::Env {
+                name: "FIXTURE_MODE".into(),
+                value: mode.into(),
+            },
+            v1::Env {
+                name: "FIXTURE_OUT".into(),
+                value: out.display().to_string(),
+            },
+        ];
+    }
+    command
+}
+
+fn run_of(token: &str) -> v1::Run {
+    v1::Run {
+        execution_id: format!("exec-{token}"),
+        run_id: format!("run-{token}"),
+        spawn_token: token.into(),
+        assignment_generation: 1,
+    }
+}
+
+fn command_of(token: &str, id: &str, body: command::Body) -> v1::Command {
+    v1::Command {
+        sequence: 1,
+        command_id: id.into(),
+        run: Some(run_of(token)),
+        not_after_unix_ms: i64::MAX,
+        body: Some(body),
+    }
+}
+
+fn pane_of(result: &v1::CommandResult) -> v1::PaneState {
+    let Some(command_result::Value::Pane(pane)) = &result.value else {
+        panic!("missing pane in {result:?}");
+    };
+    pane.clone()
+}
+
+async fn wait_for_file(path: &Path, wanted: impl Fn(&[u8]) -> bool) -> Vec<u8> {
+    for _ in 0..200 {
+        let bytes = std::fs::read(path).unwrap_or_default();
+        if wanted(&bytes) {
+            return bytes;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "condition never met; file holds {:?}",
+        std::fs::read(path).unwrap_or_default()
+    );
+}
+
 #[tokio::test]
-async fn daemon_restart_adopts_the_live_session() {
+async fn real_spawn_reaches_alive_without_waiting_out_the_brief_budget_and_delivers_input() {
+    let root = tempfile::tempdir().unwrap();
+    let (tmux, _guard) = live_tmux(root.path()).await;
+    let out = root.path().join("received.bin");
+    let mut supervisor = supervisor(root.path(), tmux.clone());
+    supervisor.brief_budget = Duration::from_secs(30);
+    let started = std::time::Instant::now();
+    let result = supervisor
+        .execute(&real_spawn("real-alive", "echo", &out), false, 1)
+        .await;
+    assert_eq!(result.code, ResultCode::Ok as i32, "{}", result.reason);
+    assert!(
+        started.elapsed() < Duration::from_secs(25),
+        "spawn waited out the delivery budget: {:?}",
+        started.elapsed()
+    );
+    let pane = pane_of(&result);
+    assert_eq!(
+        pane.life,
+        v1::PaneLife::Alive as i32,
+        "pane output: {}",
+        tmux.capture_pane(&session_name("real-alive")).await.unwrap_or_default()
+    );
+    assert_eq!(pane.session, session_name("real-alive"));
+    assert_eq!(
+        tmux.show_environment(&session_name("real-alive"), TMUX_SPAWN_TOKEN_ENV)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("real-alive")
+    );
+    // The brief itself reached the driver through the relay.
+    let received = wait_for_file(&out, |bytes| bytes.windows(12).any(|w| w == b"do the thing")).await;
+    let mark = received.len();
+
+    // Single-line and multi-line input go to the exact session.
+    for (id, text) in [("d-one", "ping"), ("d-two", "first\nsecond")] {
+        let deliver = command_of(
+            "real-alive",
+            id,
+            command::Body::Deliver(v1::Deliver {
+                kind: v1::DeliveryKind::Nudge as i32,
+                input_utf8: text.as_bytes().to_vec(),
+            }),
+        );
+        let delivered = supervisor.execute(&deliver, false, 1).await;
+        assert_eq!(delivered.code, ResultCode::Ok as i32, "{}", delivered.reason);
+    }
+    let received = wait_for_file(&out, |bytes| {
+        bytes.windows(6).any(|w| w == b"second") && bytes.windows(4).any(|w| w == b"ping")
+    })
+    .await;
+
+    // Interrupt is the driver's Escape, with no Return after it.
+    let mark = mark.max(received.len());
+    let interrupt = command_of(
+        "real-alive",
+        "i-one",
+        command::Body::Deliver(v1::Deliver {
+            kind: v1::DeliveryKind::Interrupt as i32,
+            input_utf8: Vec::new(),
+        }),
+    );
+    let interrupted = supervisor.execute(&interrupt, false, 1).await;
+    assert_eq!(interrupted.code, ResultCode::Ok as i32, "{}", interrupted.reason);
+    let after = wait_for_file(&out, |bytes| bytes.len() > mark).await;
+    assert_eq!(&after[mark..], b"\x1b", "interrupt must be one Escape and no Return");
+
+    // Stop removes the run's input home and the settings file with it.
+    let home = {
+        let record = supervisor.store.load("run-real-alive", "real-alive").unwrap().unwrap();
+        serde_json::from_slice::<ExecutionRecord>(&record).unwrap().home
+    }
+    .expect("run input home recorded");
+    assert!(home.exists());
+    let stopped = supervisor
+        .execute(
+            &command_of("real-alive", "stop-real", command::Body::Stop(v1::Stop { grace_ms: 0 })),
+            false,
+            1,
+        )
+        .await;
+    assert_eq!(stopped.code, ResultCode::Ok as i32, "{}", stopped.reason);
+    assert!(!home.exists(), "input home survived Stop");
+}
+
+#[tokio::test]
+async fn real_spawn_whose_relay_exits_64_is_brief_not_delivered() {
+    let root = tempfile::tempdir().unwrap();
+    let (tmux, _guard) = live_tmux(root.path()).await;
+    let out = root.path().join("received.bin");
+    let mut supervisor = supervisor(root.path(), tmux);
+    supervisor.brief_budget = Duration::from_secs(30);
+    let result = supervisor
+        .execute(&real_spawn("real-undelivered", "exit", &out), false, 1)
+        .await;
+    assert_eq!(result.code, ResultCode::Ok as i32, "{}", result.reason);
+    let pane = pane_of(&result);
+    assert_eq!(pane.life, v1::PaneLife::BriefNotDelivered as i32, "{pane:?}");
+    assert_eq!(pane.exit_code, Some(64));
+    let record: ExecutionRecord = serde_json::from_slice(
+        &supervisor
+            .store
+            .load("run-real-undelivered", "real-undelivered")
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record.phase, Phase::Terminal);
+    assert!(record.reclaimed);
+}
+
+#[tokio::test]
+async fn a_worker_that_exits_after_spawn_returned_is_settled_by_the_sweep() {
+    let root = tempfile::tempdir().unwrap();
+    let (tmux, _guard) = live_tmux(root.path()).await;
+    create_session(&tmux, "later", "sleep 1").await;
+    let supervisor = supervisor(root.path(), tmux);
+    seed(&supervisor.store, "later", Phase::Alive);
+    assert!(supervisor.sweep().await.is_empty());
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        supervisor.sweep().await;
+        let record: ExecutionRecord =
+            serde_json::from_slice(&supervisor.store.load("run-later", "later").unwrap().unwrap()).unwrap();
+        if record.phase == Phase::Terminal {
+            assert!(record.terminal.is_some());
+            return;
+        }
+    }
+    panic!("the finished worker was never settled");
+}
+
+/// Drives one command over the hub connection and returns its result.
+async fn run_over_hub(connection: &mut hub::Connection, command: v1::Command) -> v1::CommandResult {
+    use boss_protocol_spoke::v1::{hub_frame, record, spoke_frame};
+    let id = command.command_id.clone();
+    connection.send(hub_frame::Body::Command(command)).await;
+    loop {
+        if let spoke_frame::Body::Record(record) = connection.next().await {
+            connection.receipt(record.sequence).await;
+            if let Some(record::Body::Result(result)) = record.body
+                && result.command_id == id
+            {
+                return result;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn daemon_restart_adopts_the_same_live_session_without_a_second_launch() {
     use std::os::unix::fs::PermissionsExt;
     let tmux_bin = declared_tmux_binary().expect("host tmux");
     let mut hub = hub::Fixture::new().await;
@@ -331,21 +571,96 @@ async fn daemon_restart_adopts_the_live_session() {
     )
     .unwrap();
     std::fs::set_permissions(&cube, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let daemon = hub.start_with_tmux(&cube, &tmux_bin);
-    let connection = hub.connection().await;
-    connection.welcome(0).await;
-    drop(daemon);
-    drop(connection);
-    let _restarted = hub.start_with_tmux(&cube, &tmux_bin);
-    let connection = hub.connection().await;
-    assert!(
-        connection
-            .hello
-            .features
-            .iter()
-            .any(|feature| feature.name == "execution"),
-        "{:?}",
-        connection.hello.features
+
+    struct LogOnPanic(PathBuf);
+    impl Drop for LogOnPanic {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                eprintln!("DAEMON LOG: {:?}", std::fs::read_to_string(&self.0));
+            }
+        }
+    }
+    let _log = LogOnPanic(hub.dir.path().join("daemon.log"));
+    // A live token session on the daemon's tmux server, and the durable
+    // journal record a previous daemon wrote for it.
+    let state = hub.root();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let tmux = Tmux::from_path_with_socket(&tmux_bin, state.join("tmux.sock")).unwrap();
+    let _guard = TmuxServerGuard::new(tmux_bin.clone(), state.join("tmux.sock"));
+    tmux.start_private_server().await.expect("start tmux server");
+    create_session(&tmux, "survivor", "sleep 3600").await;
+    let pane_id = tmux
+        .display_message(&session_name("survivor"), DisplayField::PaneId)
+        .await
+        .unwrap();
+    let pane_pid = tmux
+        .display_message(&session_name("survivor"), DisplayField::PanePid)
+        .await
+        .unwrap();
+    let record = ExecutionRecord::builder()
+        .execution_id("exec-survivor")
+        .run_id("run-survivor")
+        .spawn_token("survivor")
+        .assignment_generation(1)
+        .lease_id("lease")
+        .workspace_id("worker")
+        .session(session_name("survivor"))
+        .phase(Phase::Alive)
+        .boot_id("old-boot")
+        .pane_id(pane_id.clone())
+        .driver_id("claude")
+        .build();
+    {
+        let mut journal =
+            boss_spoke_journal::Journal::open(&state, "host", boss_spoke_journal::Limits::default()).unwrap();
+        journal
+            .save_execution("run-survivor", "survivor", &serde_json::to_vec(&record).unwrap())
+            .unwrap();
+    }
+
+    for (sequence, (generation, command_id)) in [("first", "adopt-first"), ("restarted", "adopt-restarted")]
+        .into_iter()
+        .enumerate()
+    {
+        let daemon = hub.start_with_tmux(&cube, &tmux_bin);
+        let mut connection = hub.connection().await;
+        connection.welcome(0).await;
+        let mut adopt = command_of("survivor", command_id, command::Body::Adopt(v1::Empty {}));
+        adopt.sequence = sequence as u64 + 1;
+        let result = run_over_hub(&mut connection, adopt).await;
+        assert_eq!(result.code, ResultCode::Ok as i32, "{generation}: {}", result.reason);
+        let pane = pane_of(&result);
+        assert_eq!(pane.life, v1::PaneLife::Alive as i32, "{generation}: {pane:?}");
+        assert_eq!(pane.pane_id, pane_id, "{generation}");
+        assert_eq!(pane.session, session_name("survivor"), "{generation}");
+        assert!(
+            connection
+                .hello
+                .features
+                .iter()
+                .any(|feature| feature.name == "execution"),
+            "{:?}",
+            connection.hello.features
+        );
+        drop(connection);
+        drop(daemon);
+    }
+
+    // Same session, same token, same pane process: nothing was launched again.
+    let sessions = tmux.list_sessions().await.unwrap();
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    assert_eq!(
+        tmux.show_environment(&session_name("survivor"), TMUX_SPAWN_TOKEN_ENV)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("survivor")
     );
-    connection.welcome(0).await;
+    assert_eq!(
+        tmux.display_message(&session_name("survivor"), DisplayField::PanePid)
+            .await
+            .unwrap(),
+        pane_pid
+    );
 }

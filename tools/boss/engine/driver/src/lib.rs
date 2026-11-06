@@ -1811,6 +1811,16 @@ pub enum EnvDirective {
     Unset(String),
 }
 
+/// Render one [`EnvDirective`] as a shell statement to prepend to a worker
+/// pane's spawn command. Generic over every driver: the caller turns `Set` /
+/// `Unset` into shell syntax but never knows which variables a driver names.
+pub fn render_env_directive(directive: &EnvDirective) -> String {
+    match directive {
+        EnvDirective::Set(key, value) => format!("export {key}={}; ", boss_ssh_transport::shell_quote(value)),
+        EnvDirective::Unset(key) => format!("unset {key}; "),
+    }
+}
+
 /// What [`AgentDriver::spawn_invocation`] produces for [`Capability::Spawn`]:
 /// the environment adjustments and command line the spawn flow applies to
 /// the worker pane, verbatim and in order. A driver owns both its command

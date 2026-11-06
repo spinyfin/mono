@@ -181,19 +181,8 @@ mod sol_spawn {
 }
 use crate::{ExecutionRunner, RunOutcome, RunWaitState};
 
-/// Render one driver-supplied [`crate::driver::EnvDirective`] as a shell
-/// statement to prepend to the worker pane's spawn command. Generic over
-/// every driver: the engine knows how to turn a `Set`/`Unset` directive into
-/// shell syntax, but never which vars a given driver names (that knowledge
-/// stays in the driver's [`crate::driver::SpawnPlan`]).
-pub fn render_env_directive(directive: &crate::driver::EnvDirective) -> String {
-    match directive {
-        crate::driver::EnvDirective::Set(key, value) => {
-            format!("export {key}={}; ", crate::ssh_transport::shell_quote(value))
-        }
-        crate::driver::EnvDirective::Unset(key) => format!("unset {key}; "),
-    }
-}
+// The directive-to-shell rendering lives beside `EnvDirective` in the driver crate.
+pub use boss_engine_driver::render_env_directive;
 
 pub(crate) fn assemble_worker_command(
     priority: &str,

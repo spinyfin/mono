@@ -231,7 +231,6 @@ impl Fixture {
     pub fn start_with_cube(&self, cube: &Path) -> Daemon {
         Daemon::start(self.dir.path(), &self.endpoint, cube, None)
     }
-    #[allow(dead_code)]
     pub fn start_with_tmux(&self, cube: &Path, tmux: &Path) -> Daemon {
         Daemon::start(self.dir.path(), &self.endpoint, cube, Some(tmux))
     }
