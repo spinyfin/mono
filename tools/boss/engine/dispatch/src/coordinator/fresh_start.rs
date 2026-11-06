@@ -27,9 +27,10 @@ async fn fresh_start_target<'a>(adapter: &dyn HostAdapter, start: &FreshStart<'a
     None
 }
 
-/// Position the fresh workspace; returns the trunk commit it was positioned on
-/// when it started from trunk, which is then the pointer's floor.
-pub(super) async fn position_fresh_workspace(
+/// Position the workspace without reading back where it landed; returns the
+/// trunk commit only when it started fresh from trunk. For callers that
+/// restore preserved work next and take no floor from the positioning.
+pub(super) async fn position_workspace(
     adapter: &dyn HostAdapter,
     workspace: &Path,
     start: &FreshStart<'_>,
@@ -38,5 +39,19 @@ pub(super) async fn position_fresh_workspace(
         Some(GotoTarget::Revision(sha)) => adapter.goto_workspace_revision(workspace, sha).await.map(|()| None),
         Some(GotoTarget::Pr(pr)) => adapter.goto_workspace(workspace, pr).await.map(|()| None),
         None => adapter.start_fresh_workspace(workspace).await.map(Some),
+    }
+}
+
+/// Position the fresh workspace; returns the commit it was positioned on,
+/// which is then the pointer's floor: the trunk commit for a fresh start, or
+/// the PR head / target commit a goto landed on.
+pub(super) async fn position_fresh_workspace(
+    adapter: &dyn HostAdapter,
+    workspace: &Path,
+    start: &FreshStart<'_>,
+) -> Result<Option<String>> {
+    match position_workspace(adapter, workspace, start).await? {
+        Some(commit) => Ok(Some(commit)),
+        None => adapter.positioned_parent(workspace).await.map(Some),
     }
 }

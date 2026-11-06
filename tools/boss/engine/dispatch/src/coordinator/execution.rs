@@ -1830,13 +1830,15 @@ impl ExecutionCoordinator {
             }
         };
 
-        // The commit cube positioned this workspace on is the pointer floor for
-        // a fresh start. Capture it now so a trunk that advances before the
+        // The commit cube positioned this workspace on (a fresh change's
+        // parent, or the PR head / target commit a goto landed on) is the
+        // pointer floor for a fresh start; only a recovered workspace, which
+        // was not positioned at all, has none. Capture it now so a trunk that advances before the
         // pointer exists cannot move the floor onto unrelated upstream work.
         // A failed capture is a pre-start positioning failure: retry rather
         // than creating a pointer whose floor is a later re-resolution of
         // trunk().
-        let positioned_base = if change.is_some() {
+        let positioned_base = if !recovered_blocked {
             match adapter.positioned_parent(&lease.workspace_path).await {
                 Ok(commit) => Some(commit),
                 Err(err) => {

@@ -1186,8 +1186,11 @@ async fn spent_retry_budget_creates_the_pointer_without_a_head_but_earlier_attem
     wait_for_execution_status(&fx.db, &fx.id, ExecutionStatus::Running).await;
     assert_eq!(fx.db.get_execution(&fx.id).unwrap().pr_head_before, None);
     let record = fx.db.execution_bookmark(&fx.id).unwrap();
-    assert!(record.base_commit.is_some(), "the pointer falls back to a trunk floor");
-    assert_ne!(record.base_commit.as_deref(), Some(fx.head.as_str()));
+    assert_eq!(
+        record.base_commit.as_deref(),
+        Some(fx.head.as_str()),
+        "without a snapshot the floor is the PR head the workspace was positioned on, not trunk"
+    );
 }
 
 #[tokio::test]

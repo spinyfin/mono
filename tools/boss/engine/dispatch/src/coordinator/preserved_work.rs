@@ -1,5 +1,5 @@
 use super::blocked_workspace::Recovered;
-use super::fresh_start::{FreshStart, position_fresh_workspace};
+use super::fresh_start::{FreshStart, position_workspace};
 use super::*;
 use boss_engine_recovery::execution_bookmark::{is_pointer_integrity_error, pointer_integrity_error, preserved_name};
 use boss_engine_storage_values::attention_kinds::{
@@ -28,7 +28,7 @@ impl ExecutionCoordinator {
             task_pr: None,
             title: "",
         };
-        position_fresh_workspace(adapter.as_ref(), &lease.workspace_path, &positioning).await?;
+        position_workspace(adapter.as_ref(), &lease.workspace_path, &positioning).await?;
         let restored = async {
             let record = self
                 .work_db
@@ -68,7 +68,7 @@ impl ExecutionCoordinator {
                     tracing::error!(?note_error, "could not raise preserved-work attention");
                 }
                 self.work_db.delete_execution_restore_report(&execution.id)?;
-                position_fresh_workspace(adapter.as_ref(), &lease.workspace_path, &positioning).await?;
+                position_workspace(adapter.as_ref(), &lease.workspace_path, &positioning).await?;
                 Ok(None)
             }
             Err(err) if is_pointer_integrity_error(&err) => {
@@ -78,7 +78,7 @@ impl ExecutionCoordinator {
                     tracing::error!(?note_error, "could not raise preserved-work attention");
                 }
                 self.work_db.delete_execution_restore_report(&execution.id)?;
-                position_fresh_workspace(adapter.as_ref(), &lease.workspace_path, &positioning).await?;
+                position_workspace(adapter.as_ref(), &lease.workspace_path, &positioning).await?;
                 Ok(None)
             }
             Err(err) => Err(err),
