@@ -46,9 +46,11 @@
 //!   names it. A task parked directly before or during the project's park
 //!   stays parked.
 //!
-//! Un-park only clears the columns and writes the ledger row. The
-//! reconciliation sequence (refresh the PR, route conflicts and red CI into
-//! their remediation paths, re-mint executions) is a separate capability.
+//! Un-park only clears the columns and writes the ledger row. Reconciliation
+//! on un-park (refresh the PR, route conflicts and red CI into their
+//! remediation paths, re-mint executions) is specified in section 1.5 of
+//! `tools/boss/docs/designs/task-persistence-parking-and-autonomous-progression.md`
+//! and follows in a separate PR.
 //!
 //! ## Who may park
 //!
