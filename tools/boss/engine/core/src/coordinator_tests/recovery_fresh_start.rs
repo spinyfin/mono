@@ -7,6 +7,12 @@ fn commit(repo: &std::path::Path, rev: &str) -> String {
     JjRepo::run(repo, &["log", "--no-graph", "-r", rev, "-T", "commit_id"])
 }
 
+fn advance_trunk(repo: &std::path::Path) {
+    JjRepo::run(repo, &["new", "main", "-m", "Upstream advance"]);
+    std::fs::write(repo.join("upstream.txt"), "someone else's work").unwrap();
+    JjRepo::run(repo, &["bookmark", "set", "main", "-r", "@"]);
+}
+
 /// Two concurrent operations move the recovery head to different commits,
 /// leaving the bookmark conflicted: a genuine integrity failure (unlike a
 /// rewritten or missing baseline, which is not one). The publication head
@@ -139,13 +145,20 @@ async fn fresh_start_on_host(kind: ExecutionKind, resume: bool, pr: bool, disabl
         JjRepo::run(&repo.repo, &["bookmark", "set", "pr/99", "-r", "@"]);
         assert_ne!(commit(&repo.repo, "pr/99"), current);
     }
+    if pr {
+        // Dispatch snapshots the bound PR's head before creating the pointer.
+        db.set_execution_pr_head_before(&next.id, &current).unwrap();
+    }
     let next = db.get_execution(&next.id).unwrap();
     let source_pointers = JjRepo::run(&repo.repo, &["bookmark", "list", &format!("glob:*{source}*")]);
+    let trunk_then = commit(&repo.repo, "main");
+    let shared = repo.repo.clone();
     let cube = Arc::new(FakeCubeClient {
         workspace_root: Some(dir.path().to_path_buf()),
         next_workspace_id: Mutex::new(Some("replacement".into())),
         real_bookmarks: true,
         position_real_workspace: true,
+        on_create_change: Some(Arc::new(move |_| advance_trunk(&shared))),
         ..Default::default()
     });
     let runner = Arc::new(FakeExecutionRunner {
@@ -182,8 +195,11 @@ async fn fresh_start_on_host(kind: ExecutionKind, resume: bool, pr: bool, disabl
         );
     }
     let fresh = db.execution_bookmark(&next.id).unwrap();
-    let expected = if pr { current } else { commit(&repo.repo, "main") };
+    let expected = if pr { current } else { trunk_then };
     assert_eq!(fresh.base_commit.as_deref(), Some(expected.as_str()));
+    if !pr {
+        assert_ne!(commit(&repo.repo, "main"), expected);
+    }
     assert!(recovery::diff(&LocalJj, &fresh).await.unwrap().is_empty());
     // Scheduler passes must not refire the running attempt or lease again.
     for _ in 0..3 {
@@ -799,7 +815,7 @@ impl crate::host_adapter::HostAdapter for ScratchDestination {
     fn host_id(&self) -> &str {
         "destination"
     }
-    async fn start_fresh_workspace(&self, workspace: &Path) -> Result<()> {
+    async fn start_fresh_workspace(&self, workspace: &Path) -> Result<String> {
         self.inner.start_fresh_workspace(workspace).await
     }
     async fn release_execution_bookmark_heads(
@@ -856,6 +872,10 @@ impl crate::host_adapter::HostAdapter for ScratchDestination {
         self.inner.create_change(workspace_path, title).await
     }
 
+    async fn positioned_parent(&self, workspace: &Path) -> Result<String> {
+        self.inner.positioned_parent(workspace).await
+    }
+
     async fn goto_workspace(&self, workspace_path: &Path, pr: u64) -> Result<()> {
         self.inner.goto_workspace(workspace_path, pr).await
     }
@@ -892,4 +912,140 @@ impl crate::host_adapter::HostAdapter for ScratchDestination {
             .spawn_worker(worker_id, execution, work_item, workspace_path, cube_change_id)
             .await
     }
+}
+
+#[tokio::test]
+async fn fresh_pointer_floor_is_the_positioned_commit_when_trunk_advances_afterwards() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Fresh work");
+    db.reconcile_product_executions(&product.id).unwrap();
+    let id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+    let repo = JjRepo::new(dir.path());
+    super::recovery::configure_recovery_origin(&repo.repo);
+    let trunk_then = commit(&repo.repo, "main");
+    let shared = repo.repo.clone();
+    let positioned = Arc::new(std::sync::Mutex::new(None::<String>));
+    let positioned_at_create = Arc::clone(&positioned);
+    let cube = Arc::new(
+        FakeCubeClient {
+            workspace_root: Some(dir.path().to_path_buf()),
+            real_bookmarks: true,
+            position_real_workspace: true,
+            on_create_change: Some(Arc::new(move |workspace| {
+                *positioned_at_create.lock().unwrap() = Some(commit(workspace, "@-"));
+                advance_trunk(&shared);
+            })),
+            ..Default::default()
+        }
+        .with_next_workspace_id("worker"),
+    );
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        cube,
+        Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..Default::default()
+        }),
+    ));
+    coordinator.kick();
+    wait_for_execution_status(&db, &id, ExecutionStatus::Running).await;
+    let trunk_now = commit(&repo.repo, "main");
+    let floor = positioned.lock().unwrap().clone().expect("create_change captures @-");
+    assert_ne!(trunk_now, trunk_then);
+    assert_ne!(
+        trunk_now, floor,
+        "the floor must be the positioned commit, not trunk() re-resolved after it advanced"
+    );
+    assert_eq!(
+        db.execution_bookmark(&id).unwrap().base_commit.as_deref(),
+        Some(floor.as_str())
+    );
+}
+
+#[tokio::test]
+async fn failed_positioned_commit_capture_retries_without_creating_a_pointer() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Fresh work");
+    db.reconcile_product_executions(&product.id).unwrap();
+    let id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+    let repo = JjRepo::new(dir.path());
+    super::recovery::configure_recovery_origin(&repo.repo);
+    let trunk_then = commit(&repo.repo, "main");
+    let shared = repo.repo.clone();
+    let positioned = Arc::new(std::sync::Mutex::new(None::<String>));
+    let positioned_at_create = Arc::clone(&positioned);
+    let cube = Arc::new(
+        FakeCubeClient {
+            workspace_root: Some(dir.path().to_path_buf()),
+            real_bookmarks: true,
+            position_real_workspace: true,
+            fail_first_n_positioned_parent: AtomicUsize::new(1),
+            on_create_change: Some(Arc::new(move |workspace| {
+                *positioned_at_create.lock().unwrap() = Some(commit(workspace, "@-"));
+                advance_trunk(&shared);
+            })),
+            ..Default::default()
+        }
+        .with_next_workspace_id("worker"),
+    );
+    let sink = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube,
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..Default::default()
+            }),
+        )
+        .with_pre_start_retry_delays(vec![Duration::from_millis(5)])
+        .with_dispatch_events(sink.clone()),
+    );
+    coordinator.kick();
+    for _ in 0..200 {
+        let events = sink.events_for(&id).await;
+        if events.iter().any(|event| event.stage == "pre_start_failure") {
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    let events = sink.events_for(&id).await;
+    let failure = events
+        .iter()
+        .find(|event| event.stage == "pre_start_failure")
+        .expect("capture failure must be a pre-start failure");
+    assert_eq!(failure.details["will_retry"], true);
+    assert!(
+        failure
+            .error_message
+            .as_deref()
+            .unwrap()
+            .contains("could not capture the positioned commit")
+    );
+    assert!(db.execution_bookmark_optional(&id).unwrap().is_none());
+    wait_for_execution_status(&db, &id, ExecutionStatus::Running).await;
+    let trunk_now = commit(&repo.repo, "main");
+    let floor = positioned
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("retry create_change captures @-");
+    assert_ne!(trunk_now, trunk_then);
+    assert_ne!(
+        trunk_now, floor,
+        "the retry must record the positioned commit, not a re-resolved trunk"
+    );
+    assert_eq!(
+        db.execution_bookmark(&id).unwrap().base_commit.as_deref(),
+        Some(floor.as_str()),
+        "the retry must record the positioned commit, not a re-resolved trunk"
+    );
 }

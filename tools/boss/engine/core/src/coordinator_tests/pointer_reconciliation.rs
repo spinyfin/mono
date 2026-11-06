@@ -3,7 +3,7 @@ use boss_engine_recovery::execution_bookmark::{self as recovery, LocalJj};
 use boss_engine_test_git::jj::JjRepo;
 
 #[tokio::test]
-async fn task_and_chore_recovery_keeps_verified_pr_files_and_persists_baseline() {
+async fn task_and_chore_recovery_keeps_verified_pr_files_without_persisting_a_baseline() {
     for kind in [ExecutionKind::TaskImplementation, ExecutionKind::ChoreImplementation] {
         let dir = tempdir().unwrap();
         let path = dir.path().join("boss.db");
@@ -44,12 +44,11 @@ async fn task_and_chore_recovery_keeps_verified_pr_files_and_persists_baseline()
             workspace_id: "replacement".into(),
             workspace_path: repo.replacement.clone(),
         };
-        let recovered = coordinator
+        coordinator
             .recover_execution_bookmark_for_test(&next, &lease, &coordinator.host_adapter(), "mono", None, Some(99))
             .await
             .unwrap()
             .unwrap();
-        assert!(recovered.reconciliation.is_none());
         assert_eq!(
             std::fs::read_to_string(repo.replacement.join("pr-only.txt")).unwrap(),
             "published implementation"
@@ -68,7 +67,8 @@ async fn task_and_chore_recovery_keeps_verified_pr_files_and_persists_baseline()
             std::fs::read_to_string(repo.replacement.join("pr-only.txt")).unwrap(),
             "published implementation"
         );
-        recovery::diff(&LocalJj, &reloaded).await.unwrap();
+        let patch = recovery::diff(&LocalJj, &reloaded).await.unwrap();
+        assert!(patch.contains("pr-only.txt"), "{patch}");
         assert!(
             db.record_execution_bookmark(&reloaded).is_err(),
             "live duplicates must fail"
@@ -269,7 +269,7 @@ async fn read_only_review_ignores_a_damaged_predecessor_record() {
 }
 
 #[tokio::test]
-async fn closed_pr_does_not_prevent_retiring_a_missing_baseline() {
+async fn closed_pr_with_a_missing_baseline_recovers_against_trunk_without_retiring() {
     let dir = tempdir().unwrap();
     let (db, prior, next) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
     let repo = JjRepo::new(dir.path());
@@ -304,7 +304,8 @@ async fn closed_pr_does_not_prevent_retiring_a_missing_baseline() {
             .unwrap()
             .is_none()
     );
-    assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_none());
+    // A missing floor falls back to trunk, so nothing is retired.
+    assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
 }
 
 #[tokio::test]

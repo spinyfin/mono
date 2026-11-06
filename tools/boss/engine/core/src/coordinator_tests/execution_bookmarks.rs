@@ -59,7 +59,15 @@ async fn failed_pr_head_snapshot_retries_without_creating_an_ancestry_floor() {
     bound_pr_snapshot_dispatch(true, true).await;
 }
 
-async fn bound_pr_snapshot_dispatch(revision: bool, fail_first: bool) {
+struct BoundPrFixture {
+    dir: tempfile::TempDir,
+    db: Arc<WorkDb>,
+    id: String,
+    repo: JjRepo,
+    head: String,
+}
+
+async fn bound_pr_fixture(revision: bool) -> BoundPrFixture {
     let dir = tempdir().unwrap();
     let path = dir.path().join("boss.db");
     let db = Arc::new(WorkDb::open(path.clone()).unwrap());
@@ -118,6 +126,17 @@ async fn bound_pr_snapshot_dispatch(revision: bool, fail_first: bool) {
         .await
         .unwrap();
     assert_ne!(ancestry.base_commit.as_deref(), Some(head.as_str()));
+    BoundPrFixture {
+        dir,
+        db,
+        id,
+        repo,
+        head,
+    }
+}
+
+async fn bound_pr_snapshot_dispatch(revision: bool, fail_first: bool) {
+    let BoundPrFixture { dir, db, id, head, .. } = bound_pr_fixture(revision).await;
     let cube = Arc::new(
         FakeCubeClient {
             workspace_root: Some(dir.path().to_path_buf()),
@@ -181,12 +200,12 @@ async fn wait_for_stage(
     execution_id: &str,
     stage: &str,
 ) -> Vec<crate::dispatch_events::DispatchEvent> {
-    for _ in 0..200 {
+    for _ in 0..500 {
         let events = sink.events_for(execution_id).await;
         if events.iter().any(|event| event.stage == stage) {
             return events;
         }
-        sleep(Duration::from_millis(10)).await;
+        sleep(Duration::from_millis(20)).await;
     }
     panic!(
         "no `{stage}` event for {execution_id}; got {:?}",
@@ -1053,4 +1072,225 @@ mod prune_sweep {
             "an unreadable record's pointers are untouched"
         );
     }
+}
+
+/// Dispatch a bound-PR revision through a coordinator with `retry_delays`
+/// and the given cube double, with `verifier` answering PR head lookups.
+fn bound_pr_coordinator(
+    fx: &BoundPrFixture,
+    cube: Arc<FakeCubeClient>,
+    verifier: &Arc<crate::completion::tests::StubBranchVerifier>,
+    retry_delays: Vec<Duration>,
+    sink: Arc<crate::dispatch_events::RecordingDispatchEventSink>,
+) -> (Arc<ExecutionCoordinator>, Arc<FakeExecutionRunner>) {
+    let handler = crate::completion::integration_handler(fx.db.clone(), "https://github.com/foo/bar/pull/99")
+        .with_branch_verifier(verifier.clone());
+    let runner = Arc::new(FakeExecutionRunner {
+        pending: true,
+        ..Default::default()
+    });
+    let mut coordinator = ExecutionCoordinator::new(fx.db.clone(), WorkerPool::new(1), cube, runner.clone())
+        .with_pre_start_retry_delays(retry_delays)
+        .with_dispatch_events(sink);
+    coordinator.set_execution_started_hook(Arc::new(handler));
+    (Arc::new(coordinator), runner)
+}
+
+fn bound_pr_cube(fx: &BoundPrFixture, failing_bookmark_creates: usize) -> Arc<FakeCubeClient> {
+    Arc::new(
+        FakeCubeClient {
+            workspace_root: Some(fx.dir.path().to_path_buf()),
+            real_bookmarks: true,
+            position_real_workspace: true,
+            fail_first_n_bookmark_creates: failing_bookmark_creates,
+            ..Default::default()
+        }
+        .with_next_workspace_id("worker"),
+    )
+}
+
+/// Move the bound PR forward by one commit and return the new head.
+fn advance_bound_pr(fx: &BoundPrFixture) -> String {
+    JjRepo::run(&fx.repo.worker, &["new", "pr/99", "-m", "PR head moved"]);
+    std::fs::write(fx.repo.worker.join("moved"), "pushed by someone else").unwrap();
+    JjRepo::run(&fx.repo.worker, &["bookmark", "set", "pr/99", "-r", "@"]);
+    let moved = JjRepo::run(
+        &fx.repo.worker,
+        &["log", "--no-graph", "-r", "pr/99", "-T", "commit_id"],
+    );
+    JjRepo::run(&fx.repo.worker, &["new", "pr/99", "-m", "PR checkout"]);
+    moved
+}
+
+#[tokio::test]
+async fn retry_after_a_post_snapshot_failure_uses_the_head_at_the_retry() {
+    let fx = bound_pr_fixture(true).await;
+    let cube = bound_pr_cube(&fx, 1);
+    let verifier = crate::completion::tests::StubBranchVerifier::ok("pr/99");
+    verifier.set_head_oid(Ok(fx.head.clone())).await;
+    let sink = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let (coordinator, runner) = bound_pr_coordinator(&fx, cube, &verifier, vec![Duration::from_secs(1)], sink.clone());
+    coordinator.kick();
+
+    let events = wait_for_stage(&sink, &fx.id, "pre_start_failure").await;
+    let failure = events.iter().find(|e| e.stage == "pre_start_failure").unwrap();
+    assert_eq!(failure.details["will_retry"], true);
+    assert!(
+        failure
+            .error_message
+            .as_deref()
+            .unwrap()
+            .contains("jj bookmark create failed")
+    );
+    assert_eq!(
+        fx.db.get_execution(&fx.id).unwrap().pr_head_before.as_deref(),
+        Some(fx.head.as_str()),
+        "the failed attempt had already taken its snapshot"
+    );
+    assert!(fx.db.execution_bookmark_optional(&fx.id).unwrap().is_none());
+    assert!(runner.calls.lock().await.is_empty());
+
+    let moved = advance_bound_pr(&fx);
+    assert_ne!(moved, fx.head);
+    verifier.set_head_oid(Ok(moved.clone())).await;
+    wait_for_execution_status(&fx.db, &fx.id, ExecutionStatus::Running).await;
+    assert_eq!(
+        fx.db.get_execution(&fx.id).unwrap().pr_head_before.as_deref(),
+        Some(moved.as_str())
+    );
+    assert_eq!(
+        fx.db.execution_bookmark(&fx.id).unwrap().base_commit.as_deref(),
+        Some(moved.as_str()),
+        "the pointer floor must be the head at the attempt that created it"
+    );
+}
+
+#[tokio::test]
+async fn spent_retry_budget_creates_the_pointer_without_a_head_but_earlier_attempts_still_retry() {
+    let fx = bound_pr_fixture(true).await;
+    let cube = bound_pr_cube(&fx, 0);
+    let verifier = crate::completion::tests::StubBranchVerifier::ok("pr/99");
+    verifier.set_head_oid(Err("github unavailable".into())).await;
+    let sink = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    // One retry delay: the first attempt (no failures yet) returns the error,
+    // the second (one failure == the retry budget) falls back.
+    let (coordinator, _runner) = bound_pr_coordinator(&fx, cube, &verifier, vec![Duration::from_secs(1)], sink.clone());
+    coordinator.kick();
+
+    let events = wait_for_stage(&sink, &fx.id, "pre_start_failure").await;
+    let failure = events.iter().find(|e| e.stage == "pre_start_failure").unwrap();
+    assert_eq!(failure.details["will_retry"], true);
+    assert!(failure.error_message.as_deref().unwrap().contains("github unavailable"));
+    assert!(fx.db.execution_bookmark_optional(&fx.id).unwrap().is_none());
+
+    wait_for_execution_status(&fx.db, &fx.id, ExecutionStatus::Running).await;
+    assert_eq!(fx.db.get_execution(&fx.id).unwrap().pr_head_before, None);
+    let record = fx.db.execution_bookmark(&fx.id).unwrap();
+    assert!(record.base_commit.is_some(), "the pointer falls back to a trunk floor");
+    assert_ne!(record.base_commit.as_deref(), Some(fx.head.as_str()));
+}
+
+#[tokio::test]
+async fn fallback_after_a_stale_snapshot_does_not_reuse_the_earlier_head_as_the_floor() {
+    let fx = bound_pr_fixture(true).await;
+    let cube = bound_pr_cube(&fx, 1);
+    let verifier = crate::completion::tests::StubBranchVerifier::ok("pr/99");
+    verifier.set_head_oid(Ok(fx.head.clone())).await;
+    let sink = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let (coordinator, _runner) = bound_pr_coordinator(&fx, cube, &verifier, vec![Duration::from_secs(1)], sink.clone());
+    coordinator.kick();
+
+    wait_for_stage(&sink, &fx.id, "pre_start_failure").await;
+    assert_eq!(
+        fx.db.get_execution(&fx.id).unwrap().pr_head_before.as_deref(),
+        Some(fx.head.as_str())
+    );
+
+    // The PR moves and GitHub is unreachable for the retry, which has spent
+    // its budget: the stale head must not survive as this run's floor.
+    advance_bound_pr(&fx);
+    verifier.set_head_oid(Err("github unavailable".into())).await;
+    wait_for_execution_status(&fx.db, &fx.id, ExecutionStatus::Running).await;
+    assert_eq!(fx.db.get_execution(&fx.id).unwrap().pr_head_before, None);
+    assert_ne!(
+        fx.db.execution_bookmark(&fx.id).unwrap().base_commit.as_deref(),
+        Some(fx.head.as_str())
+    );
+}
+
+#[tokio::test]
+async fn a_non_rate_limit_http_403_does_not_consume_a_pre_start_retry() {
+    let fx = bound_pr_fixture(true).await;
+    let cube = bound_pr_cube(&fx, 0);
+    let verifier = crate::completion::tests::StubBranchVerifier::ok("pr/99");
+    verifier
+        .set_head_oid(Err("Resource not accessible by integration (HTTP 403)".into()))
+        .await;
+    let sink = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let (coordinator, _runner) = bound_pr_coordinator(&fx, cube, &verifier, vec![Duration::from_secs(1)], sink.clone());
+    coordinator.kick();
+
+    wait_for_execution_status(&fx.db, &fx.id, ExecutionStatus::Running).await;
+    assert_eq!(fx.db.get_execution(&fx.id).unwrap().pr_head_before, None);
+    assert_eq!(fx.db.get_execution(&fx.id).unwrap().pre_start_failure_count, 0);
+    assert!(fx.db.execution_bookmark_optional(&fx.id).unwrap().is_some());
+    assert!(
+        sink.events_for(&fx.id)
+            .await
+            .iter()
+            .all(|event| event.stage != "pre_start_failure"),
+        "a classified 403 must not consume a pre-start retry"
+    );
+}
+
+#[tokio::test]
+async fn retry_after_a_run_start_failure_refreshes_the_head_even_when_the_pointer_exists() {
+    let fx = bound_pr_fixture(true).await;
+    let db_path = fx.dir.path().join("boss.db");
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_first_run_start BEFORE INSERT ON work_runs
+             BEGIN
+               SELECT RAISE(ABORT, 'injected run start failure');
+             END;",
+        )
+        .unwrap();
+    let cube = bound_pr_cube(&fx, 0);
+    let verifier = crate::completion::tests::StubBranchVerifier::ok("pr/99");
+    verifier.set_head_oid(Ok(fx.head.clone())).await;
+    let sink = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let (coordinator, runner) = bound_pr_coordinator(&fx, cube, &verifier, vec![Duration::from_secs(1)], sink.clone());
+    coordinator.kick();
+
+    let events = wait_for_stage(&sink, &fx.id, "pre_start_failure").await;
+    let failure = events.iter().find(|e| e.stage == "pre_start_failure").unwrap();
+    assert_eq!(failure.details["will_retry"], true);
+    assert!(
+        failure
+            .error_message
+            .as_deref()
+            .unwrap()
+            .contains("injected run start failure")
+    );
+    assert!(fx.db.execution_bookmark_optional(&fx.id).unwrap().is_some());
+    assert_eq!(
+        fx.db.get_execution(&fx.id).unwrap().pr_head_before.as_deref(),
+        Some(fx.head.as_str())
+    );
+    assert!(runner.calls.lock().await.is_empty());
+
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute("DROP TRIGGER fail_first_run_start", [])
+        .unwrap();
+    let moved = advance_bound_pr(&fx);
+    assert_ne!(moved, fx.head);
+    verifier.set_head_oid(Ok(moved.clone())).await;
+    wait_for_execution_status(&fx.db, &fx.id, ExecutionStatus::Running).await;
+    assert_eq!(
+        fx.db.get_execution(&fx.id).unwrap().pr_head_before.as_deref(),
+        Some(moved.as_str()),
+        "a retry after the pointer exists must still snapshot the head at that attempt"
+    );
 }

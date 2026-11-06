@@ -46,6 +46,20 @@ pub async fn release_lease_after_inferred_death(
     adapter: Option<&dyn boss_execution_contracts::HostAdapter>,
     do_release: impl Future<Output = Result<()>>,
 ) -> LeaseReleaseOutcome {
+    release_lease_after_inferred_death_with(work_db, execution, pane, adapter, None, do_release).await
+}
+
+/// [`release_lease_after_inferred_death`] with an explicit occupancy probe.
+/// `None` scans the host's process table; a caller that has to be
+/// deterministic injects its own probe.
+pub async fn release_lease_after_inferred_death_with(
+    work_db: &WorkDb,
+    execution: &WorkExecution,
+    pane: PaneStatus,
+    adapter: Option<&dyn boss_execution_contracts::HostAdapter>,
+    occupancy: Option<&dyn WorkspaceOccupancy>,
+    do_release: impl Future<Output = Result<()>>,
+) -> LeaseReleaseOutcome {
     let Some(lease_id) = execution.cube_lease_id.as_deref() else {
         return LeaseReleaseOutcome::NoLease;
     };
@@ -59,7 +73,14 @@ pub async fn release_lease_after_inferred_death(
             },
         };
     }
-    let snapshot = occupancy_snapshot().await;
+    let snapshot;
+    let occupancy: &dyn WorkspaceOccupancy = match occupancy {
+        Some(probe) => probe,
+        None => {
+            snapshot = ProcessSnapshot::capture_async().await;
+            &snapshot
+        }
+    };
     let db_gate = DbBookmarkGate { db: work_db, adapter };
     let bookmark = sweep_bookmark_gate(work_db, execution, &db_gate);
     apply_release(
@@ -69,32 +90,12 @@ pub async fn release_lease_after_inferred_death(
         ReleaseEvidence {
             cause: TerminalCause::Inferred,
             pane,
-            occupancy: &snapshot,
+            occupancy,
             bookmark,
         },
         do_release,
     )
     .await
-}
-
-/// Production walks every process cwd. Tests inject a complete empty
-/// snapshot: Bazel's linux-sandbox `/proc` walk is often incomplete, and
-/// an `Unknown` occupancy verdict would hold every inferred-death lease
-/// even when the fixture has already proven the worker gone. Occupancy
-/// itself is covered by the leftover-lease sweep tests that call
-/// [`ProcessSnapshot::capture`] and [`HostOccupancy`] directly.
-async fn occupancy_snapshot() -> ProcessSnapshot {
-    #[cfg(test)]
-    {
-        ProcessSnapshot {
-            cwds: Vec::new(),
-            complete: true,
-        }
-    }
-    #[cfg(not(test))]
-    {
-        ProcessSnapshot::capture_async().await
-    }
 }
 
 fn occupancy_of(workspace_path: &Path) -> Occupancy {
@@ -128,7 +129,6 @@ impl ProcessSnapshot {
     /// [`Self::capture`] for async callers: every enumeration runs on a
     /// blocking thread and the retry delay yields instead of parking a
     /// runtime worker.
-    #[cfg_attr(test, allow(dead_code))]
     async fn capture_async() -> Self {
         let mut snapshot = Self::capture_once_blocking().await;
         for _ in 1..CAPTURE_ATTEMPTS {

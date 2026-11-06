@@ -44,6 +44,10 @@ fn trunk_assets_override_stale_source_and_unmerged_workspace() {
     std::fs::write(root.join(".cube/clean.sh"), script).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(root.join(".cube/clean.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The shared fixture pre-creates `main` and a `trunk()` alias for the engine's
+    // tests; this test needs the repository's default trunk resolution.
+    JjRepo::run(root, &["config", "unset", "--repo", "revset-aliases.\"trunk()\""]);
+    JjRepo::run(root, &["bookmark", "delete", "main"]);
     JjRepo::run(root, &["bookmark", "create", "main", "-r", "@"]);
     JjRepo::run(root, &["git", "export"]);
     // A local origin provides a real remote-tracking bookmark without network.

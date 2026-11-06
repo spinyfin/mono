@@ -259,6 +259,12 @@ impl StubBranchVerifier {
         *self.head_oid_result.lock().await = oid;
     }
 
+    /// Make `fetch_pr_head_oid` fail the way a missing PR or rejected
+    /// credentials do: a typed error that retrying cannot fix.
+    pub async fn set_head_oid_deterministic_failure(&self, message: &str) {
+        *self.head_oid_result.lock().await = Err(format!("{DETERMINISTIC_FAILURE_PREFIX}{message}"));
+    }
+
     /// Override the head returned by the direct, teardown-time REST read.
     pub async fn set_fresh_head_oid(&self, oid: Result<String, String>) {
         *self.fresh_head_oid_result.lock().await = oid;
@@ -302,6 +308,9 @@ impl StubBranchVerifier {
     }
 }
 
+/// Marks a stubbed head lookup failure as deterministic.
+const DETERMINISTIC_FAILURE_PREFIX: &str = "\u{0}deterministic:";
+
 #[async_trait]
 impl BranchVerifier for StubBranchVerifier {
     async fn fetch_pr_head_ref(&self, _repo_slug: &str, _pr_number: u64) -> Result<String> {
@@ -327,7 +336,12 @@ impl BranchVerifier for StubBranchVerifier {
         let guard = self.head_oid_result.lock().await;
         match &*guard {
             Ok(oid) => Ok(oid.clone()),
-            Err(msg) => Err(anyhow::anyhow!(msg.clone())),
+            Err(msg) => match msg.strip_prefix(DETERMINISTIC_FAILURE_PREFIX) {
+                Some(message) => {
+                    Err(git_utils::gh_cli::GhError::new(git_utils::gh_cli::GhErrorKind::Deterministic, message).into())
+                }
+                None => Err(git_utils::gh_cli::error_from_stderr("gh pr view", msg)),
+            },
         }
     }
 

@@ -242,7 +242,7 @@ async fn create_from_ignores_an_unusable_inherited_base() {
     assert!(patch.contains("work.txt") && patch.contains("second.txt"), "{patch}");
 
     let fresh_fixture = Fixture::new().await;
-    let expected = positioned_base(&LocalJj, &fresh_fixture.worker).await.unwrap();
+    let expected = one_commit(&LocalJj, &fresh_fixture.worker, "trunk()").await.unwrap();
     let fresh = create_from(
         &LocalJj,
         &fresh_fixture.worker,
@@ -367,10 +367,13 @@ async fn empty_run_is_distinct_from_a_missing_pointer() {
 async fn only_missing_heads_fail_without_lineage_or_baseline_bookmark_checks() {
     let f = Fixture::new().await;
     let record = f.record("exec_integrity").await;
+    std::fs::write(f.worker.join("recovery-line.txt"), "recovery line\n").unwrap();
+    LocalJj.run(&f.worker, &["status"]).await.unwrap();
     LocalJj
         .run(&f.worker, &["new", "@-", "-m", "Divergent publication"])
         .await
         .unwrap();
+    std::fs::write(f.worker.join("publication-line.txt"), "publication line\n").unwrap();
     LocalJj
         .run(
             &f.worker,
@@ -378,8 +381,23 @@ async fn only_missing_heads_fail_without_lineage_or_baseline_bookmark_checks() {
         )
         .await
         .unwrap();
-    // Heads on different lines resume from the recovery head; no verdict.
-    diff(&LocalJj, &record).await.unwrap();
+    // Heads on different lines are both resumed; no lineage verdict.
+    let patch = diff(&LocalJj, &record).await.unwrap();
+    assert!(
+        patch.contains("recovery-line.txt") && patch.contains("publication-line.txt"),
+        "{patch}"
+    );
+
+    // A restore carries both lines' files into the successor workspace.
+    assert!(restore(&LocalJj, &record, &f.replacement).await.unwrap());
+    assert_eq!(
+        std::fs::read_to_string(f.replacement.join("recovery-line.txt")).unwrap(),
+        "recovery line\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.replacement.join("publication-line.txt")).unwrap(),
+        "publication line\n"
+    );
 
     // The baseline bookmark is never read.
     LocalJj
@@ -546,51 +564,27 @@ async fn shallow_history_below_trunk_does_not_affect_baseline_creation() {
     let boundary =
         boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
     boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["new", "-m", "Trunk base"]);
-    boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["bookmark", "create", "main", "-r", "@"]);
-    boss_engine_test_git::jj::JjRepo::run(
-        &repo.repo,
-        &["config", "set", "--repo", "revset-aliases.\"trunk()\"", "main"],
-    );
-    let base = boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+    boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["bookmark", "set", "main", "-r", "@"]);
+    let base =
+        boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["log", "-r", "main", "--no-graph", "-T", "commit_id"]);
     boss_engine_test_git::jj::JjRepo::run(&repo.worker, &["new", "main"]);
     boss_engine_test_git::jj::JjRepo::run(&repo.worker, &["new", "-m", "Execution"]);
     let git = repo.repo.join(".jj/repo/store/git");
     std::fs::write(git.join("shallow"), format!("{boundary}\n")).unwrap();
     std::fs::remove_file(git.join("objects").join(&missing[..2]).join(&missing[2..])).unwrap();
 
-    // The unbounded empty() walk needs the missing parent to test whether the
-    // boundary is empty.
-    let old = LocalJj
-        .run(
-            &repo.worker,
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                "heads((::@-) ~ (empty() & description(exact:\"\")))",
-                "-T",
-                "commit_id",
-            ],
-        )
-        .await;
-    let old_error = format!("{:#}", old.unwrap_err());
-    assert!(old_error.contains(&missing), "{old_error}");
     let record = create(&LocalJj, &repo.worker, "exec_shallow", "local").await.unwrap();
     assert_eq!(record.base_commit.as_deref(), Some(base.as_str()));
 
-    // A concurrently advancing trunk must not remove the positioned base
-    // from the candidate set, even when that base is an empty commit.
+    // The floor is the trunk commit, resolved without walking history below
+    // it, so a trunk that advances later is simply the next creation's floor.
     boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["new", "-m", "Advanced trunk"]);
     boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["bookmark", "set", "main", "-r", "@"]);
-    assert_eq!(positioned_base(&LocalJj, &repo.worker).await.unwrap(), base);
-
-    // If trunk itself cannot bound the missing history, preserve the failure
-    // and identify the shallow boundary instead of silently losing provenance.
-    boss_engine_test_git::jj::JjRepo::run(
-        &repo.repo,
-        &["config", "set", "--repo", "revset-aliases.\"trunk()\"", "root()"],
-    );
-    let error = positioned_base(&LocalJj, &repo.worker).await.unwrap_err();
-    assert!(error.to_string().contains("shallow boundaries"), "{error:#}");
-    assert!(error.to_string().contains(&boundary), "{error:#}");
+    let advanced = one_commit(&LocalJj, &repo.worker, "trunk()").await.unwrap();
+    assert_ne!(advanced, base);
+    assert_eq!(record.base_commit.as_deref(), Some(base.as_str()));
+    let next = create(&LocalJj, &repo.worker, "exec_shallow_next", "local")
+        .await
+        .unwrap();
+    assert_eq!(next.base_commit.as_deref(), Some(advanced.as_str()));
 }

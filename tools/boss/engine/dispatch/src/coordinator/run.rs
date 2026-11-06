@@ -1175,7 +1175,7 @@ impl ExecutionCoordinator {
                     _ => None,
                 };
                 let immutable = self.immutable_execution_target(execution)?;
-                super::fresh_start::position_fresh_workspace(
+                let positioned = super::fresh_start::position_fresh_workspace(
                     adapter.as_ref(),
                     Path::new(workspace),
                     &super::fresh_start::FreshStart {
@@ -1192,7 +1192,7 @@ impl ExecutionCoordinator {
                         Path::new(workspace),
                         &execution.id,
                         None,
-                        execution.pr_head_before.as_deref(),
+                        positioned.as_deref().or(execution.pr_head_before.as_deref()),
                     )
                     .await?;
                 self.work_db.record_execution_bookmark(&fresh)?;

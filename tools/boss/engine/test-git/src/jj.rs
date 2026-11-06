@@ -26,6 +26,12 @@ impl JjRepo {
         );
         std::fs::write(repo.join("base.txt"), "baseline\n").unwrap();
         Self::run(&repo, &["describe", "-m", "Baseline"]);
+        // Workers branch from trunk, so the baseline commit is the trunk commit.
+        Self::run(&repo, &["bookmark", "create", "main", "-r", "@"]);
+        Self::run(
+            &repo,
+            &["config", "set", "--repo", "revset-aliases.\"trunk()\"", "main"],
+        );
         for (name, path) in [("worker", &worker), ("replacement", &replacement)] {
             Self::run(
                 &repo,

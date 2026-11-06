@@ -13,6 +13,29 @@ use crate::test_support::*;
 use crate::work::WorkDb;
 use boss_host_execution::types::{CubeRepoSummary, CubeWorkspaceStatus};
 
+/// Heartbeat passes in these tests reap workers the fixtures have already
+/// proven gone, so the host's process table (which Bazel's sandbox can expose
+/// only partially) must not decide whether the lease is released. This shadows
+/// the production `run_one_pass` with an explicitly empty occupancy probe.
+async fn run_one_pass(
+    work_db: &WorkDb,
+    live_states: &LiveWorkerStateRegistry,
+    cubes: &dyn ExecutionCubes,
+    dispatch_events: &dyn DispatchEventSink,
+    breaker: &HeartbeatFailureBreaker,
+) -> HeartbeatSweepOutcome {
+    run_one_pass_impl(
+        work_db,
+        live_states,
+        cubes,
+        dispatch_events,
+        breaker,
+        HEARTBEAT_CUBE_TIMEOUT,
+        Some(&crate::workspace_lease_release::EmptyOccupancy),
+    )
+    .await
+}
+
 // ─── cube stub ────────────────────────────────────────────────────────────
 
 /// Records every `heartbeat_lease` call and can be told to fail them.
@@ -1043,7 +1066,16 @@ async fn hung_heartbeat_does_not_block_other_slots() {
 
     // Use a short timeout so the test does not wait 30 s.
     let breaker = HeartbeatFailureBreaker::default();
-    let outcome = run_one_pass_impl(&db, &live_states, &cube, &sink, &breaker, Duration::from_millis(50)).await;
+    let outcome = run_one_pass_impl(
+        &db,
+        &live_states,
+        &cube,
+        &sink,
+        &breaker,
+        Duration::from_millis(50),
+        None,
+    )
+    .await;
 
     assert_eq!(outcome.failed, 1, "the hung slot must count as failed");
     assert_eq!(outcome.heartbeated, 1, "the non-hung slot must succeed");
@@ -1078,7 +1110,7 @@ async fn db_fallback_heartbeats_unregistered_in_flight_executions() {
     let cube = Arc::new(RecordingCube::default());
     let sink = RecordingDispatchEventSink::new();
     let breaker = HeartbeatFailureBreaker::default();
-    let outcome = run_one_pass_impl(&db, &live_states, &cube, &sink, &breaker, HEARTBEAT_CUBE_TIMEOUT).await;
+    let outcome = run_one_pass_impl(&db, &live_states, &cube, &sink, &breaker, HEARTBEAT_CUBE_TIMEOUT, None).await;
 
     assert_eq!(
         outcome.db_fallback_heartbeated, 1,

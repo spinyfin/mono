@@ -104,6 +104,10 @@ impl HostAdapter for FlakyRestoreAdapter {
         self.inner.create_change(workspace_path, title).await
     }
 
+    async fn positioned_parent(&self, workspace: &Path) -> Result<String> {
+        self.inner.positioned_parent(workspace).await
+    }
+
     async fn goto_workspace(&self, workspace_path: &Path, pr: u64) -> Result<()> {
         self.inner.goto_workspace(workspace_path, pr).await
     }
@@ -112,7 +116,7 @@ impl HostAdapter for FlakyRestoreAdapter {
         self.inner.goto_workspace_revision(workspace_path, sha).await
     }
 
-    async fn start_fresh_workspace(&self, workspace: &Path) -> Result<()> {
+    async fn start_fresh_workspace(&self, workspace: &Path) -> Result<String> {
         self.inner.start_fresh_workspace(workspace).await
     }
 
@@ -141,17 +145,6 @@ impl HostAdapter for FlakyRestoreAdapter {
 
     async fn discard_orphaned_execution_baseline(&self, record: &ExecutionBookmark) -> Result<()> {
         self.inner.discard_orphaned_execution_baseline(record).await
-    }
-
-    async fn reconcile_execution_bookmark(
-        &self,
-        record: &ExecutionBookmark,
-        pr_bookmark: Option<&str>,
-        trunk: &str,
-    ) -> Result<Option<boss_engine_recovery::execution_bookmark::Reconciliation>> {
-        self.inner
-            .reconcile_execution_bookmark(record, pr_bookmark, trunk)
-            .await
     }
 
     async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus> {

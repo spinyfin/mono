@@ -84,7 +84,7 @@ async fn scene(dir: &Path, conflicted: bool, restore: bool) -> (Store, Execution
     JjRepo::run(&repo.worker, &["bookmark", "set", "published", "pr/7"]);
     let head = one(&repo.repo, "published");
     JjRepo::run(&repo.worker, &["new", "-m", "Revision"]);
-    let record = execution_bookmark::create(&LocalJj, &repo.worker, "exec_adapter", "local")
+    let record = execution_bookmark::create_from(&LocalJj, &repo.worker, "exec_adapter", "local", None, Some(&head))
         .await
         .unwrap();
     JjRepo::run(&repo.repo, &["new", "main", "-m", "Main advances"]);

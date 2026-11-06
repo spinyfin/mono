@@ -8,7 +8,8 @@
 //!   Enterprise `org-NNN@github.com:owner/repo.git` SSO remotes, HTTPS,
 //!   `ssh://`, and SCP shapes) into owner/repo slugs, plus the bare-slug
 //!   predicates used to distinguish a cube reponame from a clone URL.
-//! - [`gh_cli`] — small `gh`-CLI helpers for fetching PR head metadata.
+//! - [`gh_cli`] — small `gh`-CLI helpers for fetching PR head metadata, and
+//!   the shared classification of `gh` failures from stderr.
 //! - [`jj_provenance`] — the shared rule for proving one jj commit is a
 //!   recorded predecessor of a commit a head already contains.
 //! - [`pr_bookmark`] — the reserved local-only `pr/<n>` bookmark

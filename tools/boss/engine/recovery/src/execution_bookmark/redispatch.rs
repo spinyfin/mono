@@ -131,8 +131,38 @@ pub async fn restore_rebased(
         )
         .await?;
         let baseline = one_commit(jj, workspace, "@-").await?;
+        // A floor rewritten by a local rebase that was never pushed leaves
+        // rewritten variants of the PR's own commits above the recorded
+        // floor. The copy of `base_sha..pr` above already carries those
+        // changes, so a variant is dropped only when it has the PR commit's
+        // change id AND an empty interdiff against it. A variant that was
+        // amended, squashed into or conflict-resolved in place without being
+        // pushed shares the change id but holds extra content: it is staged.
+        let pr_changes: std::collections::HashMap<String, String> =
+            change_commits(jj, workspace, &format!("{base_sha}..{pr}"))
+                .await?
+                .into_iter()
+                .collect();
         let unpublished = format!("{} ~ (::{pr} | ::{base_sha})", above_floor(&floor, &head));
-        stage_unpublished(jj, workspace, &unpublished).await?;
+        let mut own_work: Vec<String> = Vec::new();
+        for (change, commit) in change_commits(jj, workspace, &unpublished).await? {
+            if let Some(published) = pr_changes.get(&change) {
+                let interdiff = jj
+                    .run(workspace, &["interdiff", "--from", &commit, "--to", published, "--git"])
+                    .await?;
+                if crate::recovery_apply::filter_bookkeeping(&interdiff)
+                    .text
+                    .trim()
+                    .is_empty()
+                {
+                    continue;
+                }
+            }
+            own_work.push(commit);
+        }
+        if !own_work.is_empty() {
+            stage_unpublished(jj, workspace, &own_work.join(" | ")).await?;
+        }
         Some(baseline)
     } else {
         jj.run(workspace, &["new", &base_sha, "-m", "Resume recovered execution work"])
@@ -172,6 +202,28 @@ pub async fn restore_rebased(
         .build())
 }
 
+/// `(change id, commit id)` of every commit in `revset`.
+async fn change_commits(jj: &dyn Jj, workspace: &Path, revset: &str) -> Result<Vec<(String, String)>> {
+    let output = jj
+        .run(
+            workspace,
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                revset,
+                "-T",
+                "change_id ++ \" \" ++ commit_id ++ \"\\n\"",
+            ],
+        )
+        .await?;
+    Ok(output
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .map(|(change, commit)| (change.to_owned(), commit.to_owned()))
+        .collect())
+}
+
 async fn stage_unpublished(jj: &dyn Jj, workspace: &Path, sources: &str) -> Result<()> {
     // `workspace goto` leaves an empty, undescribed editable child. Recovery
     // pointers retain it even if that run never edits anything. Copying it
@@ -183,22 +235,6 @@ async fn stage_unpublished(jj: &dyn Jj, workspace: &Path, sources: &str) -> Resu
     jj.run(workspace, &["duplicate", &sources, "--insert-before", "@"])
         .await?;
     Ok(())
-}
-
-async fn one_commit(jj: &dyn Jj, workspace: &Path, revset: &str) -> Result<String> {
-    let output = jj
-        .run(
-            workspace,
-            &["log", "--no-graph", "-r", revset, "-T", "commit_id ++ \"\\n\""],
-        )
-        .await?;
-    let commits: Vec<_> = output.lines().filter(|s| !s.is_empty()).collect();
-    ensure!(
-        commits.len() == 1,
-        "expected exactly one commit for {revset}; found {}",
-        commits.len()
-    );
-    Ok(commits[0].to_owned())
 }
 
 /// Like [`one_commit`], but a base that resolves to no commit is the typed

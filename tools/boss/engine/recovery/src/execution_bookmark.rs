@@ -576,16 +576,17 @@ pub async fn create_from(
             }
             diff(jj, prior).await?;
         }
-        // A restore-report or `pr_head_before` hash is the floor only when it
-        // still exists. A missing hash is not copied: `jj bookmark create`
-        // would fail on every retry. Fall back to the predecessor's resolved
-        // floor, then the trunk-bounded walk of the positioned workspace.
+        // A restore-report, positioned-commit, or `pr_head_before` hash is
+        // the floor only when it still exists. A missing hash is not copied:
+        // `jj bookmark create` would fail on every retry. Fall back to the
+        // predecessor's resolved floor, then the trunk commit. The positioned
+        // workspace's ancestry is never walked to infer a floor.
         let baseline = if let Some(commit) = usable_commit(jj, &record.repo_path, inherited_base).await? {
             commit
         } else if let Some(prior) = predecessor {
             predecessor_floor(jj, prior).await?
         } else {
-            positioned_base(jj, workspace).await?
+            one_commit(jj, workspace, "trunk()").await?
         };
         jj.run(workspace, &["bookmark", "create", &record.base(), "-r", &baseline])
             .await?;
@@ -595,7 +596,7 @@ pub async fn create_from(
         )
         .await?;
         // The bookmark is the convenience; the commit is the baseline's identity.
-        record.base_commit = Some(resolve_commit(jj, workspace, &baseline).await?);
+        record.base_commit = Some(one_commit(jj, workspace, &baseline).await?);
         // Validate through the shared store, not the workspace we just positioned.
         diff(jj, &record).await?;
         Ok(record.clone())
@@ -605,87 +606,27 @@ pub async fn create_from(
 }
 
 /// Effective floor of a predecessor whose restore report did not supply one:
-/// its recorded `base_commit` when that hash is still in the store, else
-/// `pr_head_before`, else trunk (the same order as `resolve_base`). The legacy
-/// `boss-base/` bookmark is never read. Never inferred from the successor workspace (which has already been
-/// restored onto the predecessor heads) and never an unchecked raw hash.
+/// the floor `resolve_base` computes (its recorded `base_commit`, else
+/// `pr_head_before`, else trunk), as a commit id. The legacy `boss-base/`
+/// bookmark is never read. Never inferred from the successor workspace (which
+/// has already been restored onto the predecessor heads) and never an
+/// unchecked raw hash.
 async fn predecessor_floor(jj: &dyn Jj, prior: &ExecutionBookmark) -> Result<String> {
-    if let Some(commit) = usable_commit(jj, &prior.repo_path, prior.base_commit.as_deref()).await? {
-        return Ok(commit);
-    }
-    if let Some(commit) = usable_commit(jj, &prior.repo_path, prior.pr_head_before.as_deref()).await? {
-        return Ok(commit);
-    }
-    resolve_commit(jj, &prior.repo_path, "trunk()").await
-}
-
-/// The commit a freshly positioned workspace sits on when the execution row
-/// has not yet recorded one: the PR head for a bound PR, the trunk commit for
-/// a fresh item. Cube leaves `@` as an empty, undescribed child of that commit
-/// (and `change create` adds the titled change above it). Only inspect
-/// emptiness above trunk; the parent of that floor may be outside a shallow
-/// clone. Callers that already have `pr_head_before` or a restore-report
-/// baseline pass it as `inherited_base` and never reach this path.
-pub(crate) async fn positioned_base(jj: &dyn Jj, workspace: &Path) -> Result<String> {
-    let output = jj
-        .run(
-            workspace,
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                r#"heads(heads(::trunk() & ::@-) | ((trunk()..@-) ~ (empty() & description(exact:""))))"#,
-                "-T",
-                "commit_id ++ \"\\n\"",
-            ],
-        )
-        .await;
-    let output = match output {
-        Ok(output) => output,
-        Err(error) => return Err(positioned_base_error(jj, workspace, error).await),
-    };
-    let ids: Vec<_> = output.lines().filter(|s| !s.is_empty()).collect();
-    ensure!(
-        ids.len() == 1,
-        "expected exactly one positioned baseline commit below @; found {}",
-        ids.len()
-    );
-    Ok(ids[0].to_owned())
-}
-
-/// Read jj's Git-store location rather than assuming a colocated checkout.
-async fn positioned_base_error(jj: &dyn Jj, workspace: &Path, error: anyhow::Error) -> anyhow::Error {
-    let boundaries = async {
-        let repo = jj.shared_repo(workspace).await?;
-        let store = repo.join(".jj/repo/store");
-        let target = std::fs::read_to_string(store.join("git_target"))?;
-        let shallow = store.join(target.trim()).join("shallow");
-        let boundaries = std::fs::read_to_string(&shallow)?;
-        Ok::<_, anyhow::Error>((shallow, boundaries))
-    }
-    .await;
-    match boundaries {
-        Ok((path, ids)) if !ids.trim().is_empty() => error.context(format!(
-            "cannot compute execution baseline in shallow repository; shallow boundaries in {}: {}",
-            path.display(),
-            ids.split_whitespace().collect::<Vec<_>>().join(", ")
-        )),
-        _ => error.context("cannot compute execution baseline above trunk"),
-    }
+    one_commit(jj, &prior.repo_path, &resolve_base(jj, prior).await?).await
 }
 
 /// Resolve a revset to exactly one commit id.
-async fn resolve_commit(jj: &dyn Jj, repo: &Path, revset: &str) -> Result<String> {
+pub async fn one_commit(jj: &dyn Jj, repo: &Path, revset: &str) -> Result<String> {
     let output = jj
         .run(repo, &["log", "--no-graph", "-r", revset, "-T", "commit_id ++ \"\\n\""])
         .await?;
-    let ids: Vec<_> = output.lines().filter(|s| !s.is_empty()).collect();
+    let commits: Vec<_> = output.lines().filter(|s| !s.is_empty()).collect();
     ensure!(
-        ids.len() == 1,
-        "expected exactly one baseline commit for {revset}; found {}",
-        ids.len()
+        commits.len() == 1,
+        "expected exactly one commit for {revset}; found {}",
+        commits.len()
     );
-    Ok(ids[0].to_owned())
+    Ok(commits[0].to_owned())
 }
 
 /// Clean reinitialisation for a self-retry whose own heads are both gone: drop
@@ -782,9 +723,10 @@ pub async fn diff(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
                     "diff",
                     "--git",
                     "--from",
-                    // The common ancestor tolerates a floor that the head no
-                    // longer descends from, after a rewrite or an abandon.
-                    &format!("fork_point(({}) | ({head}))", pointers.base),
+                    // Tolerates a floor that the head no longer descends from
+                    // (a rewrite or an abandon). Bounding by trunk keeps the
+                    // upstream changes a rebase pulled in out of the patch.
+                    &format!("fork_point(heads(::({head}) & (::({}) | ::trunk())))", pointers.base),
                     "--to",
                     &head,
                 ],

@@ -27,14 +27,16 @@ async fn fresh_start_target<'a>(adapter: &dyn HostAdapter, start: &FreshStart<'a
     None
 }
 
+/// Position the fresh workspace; returns the trunk commit it was positioned on
+/// when it started from trunk, which is then the pointer's floor.
 pub(super) async fn position_fresh_workspace(
     adapter: &dyn HostAdapter,
     workspace: &Path,
     start: &FreshStart<'_>,
-) -> Result<()> {
+) -> Result<Option<String>> {
     match fresh_start_target(adapter, start).await {
-        Some(GotoTarget::Revision(sha)) => adapter.goto_workspace_revision(workspace, sha).await,
-        Some(GotoTarget::Pr(pr)) => adapter.goto_workspace(workspace, pr).await,
-        None => adapter.start_fresh_workspace(workspace).await,
+        Some(GotoTarget::Revision(sha)) => adapter.goto_workspace_revision(workspace, sha).await.map(|()| None),
+        Some(GotoTarget::Pr(pr)) => adapter.goto_workspace(workspace, pr).await.map(|()| None),
+        None => adapter.start_fresh_workspace(workspace).await.map(Some),
     }
 }

@@ -421,6 +421,16 @@ pub trait CubeClient: Send + Sync {
         let _ = (workspace, execution_id, predecessor, inherited_base);
         anyhow::bail!("execution bookmarks are not supported by this CubeClient")
     }
+
+    /// The commit the workspace's working copy sits on (its parent).
+    async fn positioned_parent(&self, workspace: &Path) -> Result<String> {
+        boss_engine_recovery::execution_bookmark::one_commit(
+            &boss_engine_recovery::execution_bookmark::LocalJj,
+            workspace,
+            "@-",
+        )
+        .await
+    }
     async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle>;
     async fn lease_workspace(
         &self,
@@ -1536,21 +1546,20 @@ pub trait HostAdapter: Send + Sync {
         let _ = (record, workspace, repo_id, pr);
         bail!("recovery PR preparation is not supported by this host adapter")
     }
-    /// Repair stranded, diverged or baseline-less pointers from an
-    /// engine-recorded anchor. Returns None when the pointers are intact.
-    async fn reconcile_execution_bookmark(
-        &self,
-        record: &ExecutionBookmark,
-        pr_bookmark: Option<&str>,
-        trunk: &str,
-    ) -> Result<Option<execution_bookmark::Reconciliation>> {
-        let _ = (record, pr_bookmark, trunk);
-        bail!("execution bookmark reconciliation is not supported by this host adapter")
-    }
-    /// Position a fresh child of the repository's configured trunk.
-    async fn start_fresh_workspace(&self, workspace: &Path) -> Result<()> {
+    /// Position a fresh child of the repository's configured trunk, resolved
+    /// once, and return the commit it was positioned on so the recovery
+    /// pointer's floor is that commit rather than a later re-resolution.
+    async fn start_fresh_workspace(&self, workspace: &Path) -> Result<String> {
         let _ = workspace;
         bail!("fresh workspace positioning is not supported by this host adapter")
+    }
+    /// The commit the workspace's working copy sits on (its parent). After
+    /// cube's lease positioning this is the commit the workspace was
+    /// positioned on, which becomes a fresh pointer's floor even if trunk
+    /// advances before the pointer is created.
+    async fn positioned_parent(&self, workspace: &Path) -> Result<String> {
+        let _ = workspace;
+        bail!("workspace parent resolution is not supported by this host adapter")
     }
     /// Archive unpublished targets before optionally releasing names that the
     /// current execution must reuse. Predecessor publication names stay tracked.
