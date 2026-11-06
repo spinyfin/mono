@@ -452,8 +452,11 @@ async fn real_spawn_reaches_alive_without_waiting_out_the_brief_budget_and_deliv
         let delivered = supervisor.execute(&deliver, false, 1).await;
         assert_eq!(delivered.code, ResultCode::Ok as i32, "{}", delivered.reason);
     }
+    // Wait for Deliver's trailing Return after "second" before taking the
+    // Interrupt snapshot; otherwise the Return can land in the tail and
+    // fail a strict `\x1b` equality.
     let received = wait_for_file(&out, |bytes| {
-        bytes.windows(6).any(|w| w == b"second") && bytes.windows(4).any(|w| w == b"ping")
+        bytes.windows(4).any(|w| w == b"ping") && bytes.windows(7).any(|w| w == b"second\r")
     })
     .await;
 
@@ -469,8 +472,18 @@ async fn real_spawn_reaches_alive_without_waiting_out_the_brief_budget_and_deliv
     );
     let interrupted = supervisor.execute(&interrupt, false, 1).await;
     assert_eq!(interrupted.code, ResultCode::Ok as i32, "{}", interrupted.reason);
-    let after = wait_for_file(&out, |bytes| bytes.len() > mark).await;
-    assert_eq!(&after[mark..], b"\x1b", "interrupt must be one Escape and no Return");
+    let after = wait_for_file(&out, |bytes| bytes[mark..].contains(&b'\x1b')).await;
+    let tail = &after[mark..];
+    let escape = tail.iter().position(|b| *b == b'\x1b').expect("interrupt Escape");
+    assert_eq!(
+        tail.iter().filter(|b| **b == b'\x1b').count(),
+        1,
+        "interrupt must be one Escape, got {tail:?}"
+    );
+    assert!(
+        !tail[escape + 1..].contains(&b'\r'),
+        "no Return may follow the interrupt Escape, got {tail:?}"
+    );
 
     // Stop removes the run's input home and the settings file with it.
     let home = {

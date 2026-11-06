@@ -137,7 +137,6 @@ pub(super) async fn reconcile_dead_worker_pane(
     };
     persist_observed_pane_state(work_db, execution_id, spawn_token, session_name, &observation);
 
-    let reason = dead_pane_reason(session_name, pane_dead_status.as_deref(), last_output.as_deref());
     let execution = match work_db.get_execution(execution_id) {
         Ok(execution) => execution,
         Err(err) => {
@@ -151,6 +150,16 @@ pub(super) async fn reconcile_dead_worker_pane(
             return kill_retained_session(tmux, session_name, spawn_token, execution_id).await;
         }
     };
+    let home = execution
+        .driver_runtime_state
+        .as_ref()
+        .and_then(crate::driver::initial_prompt::owned_home_from_runtime_state);
+    let reason = dead_pane_reason(
+        session_name,
+        pane_dead_status.as_deref(),
+        last_output.as_deref(),
+        home.as_deref(),
+    );
 
     if !execution.status.is_terminal() {
         let prior_status = execution.status.as_str().to_owned();
@@ -213,9 +222,10 @@ pub(super) fn dead_pane_reason(
     session_name: &str,
     pane_dead_status: Option<&str>,
     last_output: Option<&str>,
+    home: Option<&std::path::Path>,
 ) -> String {
     let parsed_status = pane_dead_status.and_then(|status| status.parse::<i32>().ok());
-    let mut reason = if crate::driver::initial_prompt::is_brief_not_delivered_status(parsed_status, last_output) {
+    let mut reason = if crate::driver::initial_prompt::is_brief_not_delivered(parsed_status, home, last_output) {
         format!("tmux pane dead in session {session_name}: initial brief was not delivered")
     } else {
         match pane_dead_status {
@@ -275,7 +285,12 @@ mod tests {
 
     #[test]
     fn reason_includes_exit_status_and_last_output() {
-        let reason = dead_pane_reason("boss-worker-1", Some("127"), Some("zsh: command not found: codex\n"));
+        let reason = dead_pane_reason(
+            "boss-worker-1",
+            Some("127"),
+            Some("zsh: command not found: codex\n"),
+            None,
+        );
         assert!(
             reason.contains("pane_dead_status=127"),
             "reason must name the pane exit status, got {reason}"
@@ -292,6 +307,7 @@ mod tests {
             "boss-worker-1",
             Some("64"),
             Some("boss initial brief delivery failed: driver exited before receiving the initial brief\n"),
+            None,
         );
         assert!(
             reason.contains("initial brief was not delivered"),
@@ -300,6 +316,21 @@ mod tests {
         assert!(
             reason.contains("before receiving the initial brief"),
             "reason must still carry last output, got {reason}"
+        );
+    }
+
+    #[test]
+    fn delivered_marker_with_exit_64_is_a_normal_exit() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(crate::driver::initial_prompt::DELIVERED_MARKER), "").unwrap();
+        let reason = dead_pane_reason("boss-worker-1", Some("64"), None, Some(home.path()));
+        assert!(
+            reason.contains("pane_dead_status=64"),
+            "a delivered run that exits 64 is a normal exit, got {reason}"
+        );
+        assert!(
+            !reason.contains("initial brief was not delivered"),
+            "the delivered marker must outrank exit 64, got {reason}"
         );
     }
 }

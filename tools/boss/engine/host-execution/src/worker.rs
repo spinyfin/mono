@@ -305,7 +305,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         record.phase = Phase::Alive;
         self.persist(&record)?;
         let pane = self.wait_for_brief(&record).await;
-        self.settle(&mut record, &pane)?;
+        self.settle(&mut record, &pane).await?;
         let code = match pane_life(&pane) {
             PaneLife::Indeterminate => ResultCode::OutcomeUncertain,
             PaneLife::Missing => ResultCode::Absent,
@@ -316,18 +316,11 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
 
     /// Driver settings live beside the run's private homes, never in the
     /// worker's workspace tree where a VCS snapshot would pick them up.
+    /// The file name is a hex encoding of the spawn token so distinct
+    /// tokens cannot share or delete one file.
     fn settings_path(&self, spawn_token: &str) -> PathBuf {
-        let name: String = spawn_token
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        self.homes_root.join(format!("settings-{name}.json"))
+        self.homes_root
+            .join(format!("settings-{}.json", hex_token(spawn_token)))
     }
 
     async fn launch(
@@ -400,9 +393,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                 Ok(outcome(command, ResultCode::Ok, error.to_string(), Some(pane)))
             }
             PaneLife::Missing => {
-                self.reclaim(&mut record);
-                record.phase = Phase::Terminal;
-                self.persist(&record)?;
+                self.record_terminal(&mut record, &pane)?;
                 Ok(outcome(
                     command,
                     ResultCode::OutcomeUncertain,
@@ -445,9 +436,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                         Ok(outcome(command, ResultCode::Ok, String::new(), Some(pane)))
                     }
                     PaneLife::Missing => {
-                        self.reclaim(&mut record);
-                        record.phase = Phase::Terminal;
-                        self.persist(&record)?;
+                        self.record_terminal(&mut record, &pane)?;
                         Ok(outcome(
                             command,
                             ResultCode::OutcomeUncertain,
@@ -477,8 +466,13 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         let pane = self.observe(&record).await;
         // A worker found finished after a restart is settled here, the same
         // way the exit sweep would have.
-        self.settle(&mut record, &pane)?;
-        Ok(outcome(command, ResultCode::Ok, String::new(), Some(pane)))
+        self.settle(&mut record, &pane).await?;
+        Ok(outcome(
+            command,
+            ResultCode::Ok,
+            String::new(),
+            Some(self.observe(&record).await),
+        ))
     }
 
     async fn deliver(
@@ -536,7 +530,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                 ));
             }
             life => {
-                self.settle(&mut record, &pane)?;
+                self.settle(&mut record, &pane).await?;
                 let code = if life == PaneLife::Missing {
                     ResultCode::Absent
                 } else {
@@ -619,18 +613,17 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         };
         if interrupted && record.phase == Phase::Stopping {
             let pane = self.observe(&record).await;
-            if pane_life(&pane) == PaneLife::Missing {
-                self.reclaim(&mut record);
-                record.phase = Phase::Terminal;
-                self.persist(&record)?;
-                return Ok(outcome(command, ResultCode::Ok, String::new(), Some(pane)));
-            }
-            return Ok(outcome(
-                command,
-                ResultCode::OutcomeUncertain,
-                "stop interrupted",
-                Some(pane),
-            ));
+            self.settle(&mut record, &pane).await?;
+            return Ok(if record.phase == Phase::Terminal {
+                outcome(
+                    command,
+                    ResultCode::Ok,
+                    String::new(),
+                    Some(self.observe(&record).await),
+                )
+            } else {
+                outcome(command, ResultCode::OutcomeUncertain, "stop interrupted", Some(pane))
+            });
         }
         record.phase = Phase::Stopping;
         self.persist(&record)?;
@@ -650,9 +643,17 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             .await
         {
             Ok(KillSessionOutcome::Killed | KillSessionOutcome::Absent) => {
-                self.reclaim(&mut record);
-                record.phase = Phase::Terminal;
-                self.persist(&record)?;
+                // Record Missing from the kill outcome. Observe after reclaim
+                // answers from this evidence rather than from a gone session.
+                let pane = PaneState {
+                    session: record.session.clone(),
+                    pane_id: record.pane_id.clone().unwrap_or_default(),
+                    pid: record.pid.unwrap_or(0),
+                    boot_id: record.boot_id.clone(),
+                    life: PaneLife::Missing.into(),
+                    ..Default::default()
+                };
+                self.record_terminal(&mut record, &pane)?;
                 Ok(outcome(
                     command,
                     ResultCode::Ok,
@@ -717,6 +718,16 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             boot_id: record.boot_id.clone(),
             ..Default::default()
         };
+        // A Terminal record already classified the outcome. Re-deriving from
+        // the pane after reclaim would lose the delivered marker and treat a
+        // later exit 64 as BRIEF_NOT_DELIVERED.
+        if record.phase == Phase::Terminal
+            && let Some(evidence) = &record.terminal
+        {
+            pane.life = evidence.life;
+            pane.exit_code = evidence.exit_code;
+            return pane;
+        }
         match self.tmux.show_environment(&record.session, TMUX_SPAWN_TOKEN_ENV).await {
             Ok(Some(token)) if token == record.spawn_token => {}
             Ok(_) => {
@@ -778,10 +789,26 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         pane
     }
 
+    /// Persist the terminal classification before removing any files, then
+    /// reclaim. A crash between the two persists leaves a Terminal record
+    /// with `reclaimed == false` that the sweep retries.
+    fn record_terminal(&self, record: &mut ExecutionRecord, pane: &PaneState) -> Result<()> {
+        record.terminal = Some(TerminalEvidence {
+            life: pane.life,
+            exit_code: pane.exit_code,
+        });
+        record.phase = Phase::Terminal;
+        self.persist(record)?;
+        self.reclaim(record);
+        self.persist(record)
+    }
+
     /// Record terminal evidence, reclaim the run's files and retire the record
     /// when the pane is positively finished. Idempotent, and a no-op for
-    /// `Alive`/`Indeterminate` panes and for records mid-command.
-    fn settle(&self, record: &mut ExecutionRecord, pane: &PaneState) -> Result<()> {
+    /// `Alive`/`Indeterminate` panes and for records mid-command. `Stopping`
+    /// records are settled once the session is Missing, or once an
+    /// Exited/BriefNotDelivered pane's session has been killed.
+    async fn settle(&self, record: &mut ExecutionRecord, pane: &PaneState) -> Result<()> {
         match record.phase {
             Phase::Alive | Phase::Delivering => {
                 if !matches!(
@@ -790,14 +817,24 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                 ) {
                     return Ok(());
                 }
-                record.terminal = Some(TerminalEvidence {
-                    life: pane.life,
-                    exit_code: pane.exit_code,
-                });
-                self.reclaim(record);
-                record.phase = Phase::Terminal;
-                self.persist(record)
+                self.record_terminal(record, pane)
             }
+            Phase::Stopping => match pane_life(pane) {
+                PaneLife::Missing => self.record_terminal(record, pane),
+                PaneLife::Exited | PaneLife::BriefNotDelivered => {
+                    match self
+                        .tmux
+                        .kill_session_verified(&record.session, &record.spawn_token)
+                        .await
+                    {
+                        Ok(KillSessionOutcome::Killed | KillSessionOutcome::Absent) => {
+                            self.record_terminal(record, pane)
+                        }
+                        _ => Ok(()),
+                    }
+                }
+                _ => Ok(()),
+            },
             Phase::Terminal if !record.reclaimed => {
                 self.reclaim(record);
                 self.persist(record)
@@ -844,11 +881,11 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         let mut failures = Vec::new();
         for mut record in records {
             let pane = match record.phase {
-                Phase::Alive | Phase::Delivering => self.observe(&record).await,
+                Phase::Alive | Phase::Delivering | Phase::Stopping => self.observe(&record).await,
                 Phase::Terminal if !record.reclaimed => PaneState::default(),
                 _ => continue,
             };
-            if let Err(error) = self.settle(&mut record, &pane) {
+            if let Err(error) = self.settle(&mut record, &pane).await {
                 failures.push((record.run_id.clone(), format!("{error:#}")));
             } else if let Some(error) = record.reclaim_error.clone().filter(|_| !record.reclaimed) {
                 failures.push((record.run_id.clone(), error));
@@ -894,6 +931,14 @@ fn pane_command(plan: &SpawnPlan) -> String {
 
 fn pane_life(pane: &PaneState) -> PaneLife {
     PaneLife::try_from(pane.life).unwrap_or_default()
+}
+
+fn hex_token(spawn_token: &str) -> String {
+    spawn_token
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn outcome(command: &Command, code: ResultCode, reason: impl Into<String>, pane: Option<PaneState>) -> CommandResult {
@@ -942,6 +987,34 @@ mod tests {
         }
     }
 
+    /// Fails the Nth `save` so a crash between classification and the
+    /// post-reclaim persist can be exercised.
+    struct FailingStore {
+        inner: MemoryStore,
+        saves: Mutex<usize>,
+        fail_at: usize,
+    }
+
+    impl ExecutionStore for FailingStore {
+        fn load(&self, run_id: &str, spawn_token: &str) -> Result<Option<Vec<u8>>> {
+            self.inner.load(run_id, spawn_token)
+        }
+        fn save(&self, run_id: &str, spawn_token: &str, bytes: &[u8]) -> Result<()> {
+            let n = {
+                let mut saves = self.saves.lock().unwrap();
+                *saves += 1;
+                *saves
+            };
+            if n == self.fail_at {
+                anyhow::bail!("injected persist failure");
+            }
+            self.inner.save(run_id, spawn_token, bytes)
+        }
+        fn assigned(&self) -> Result<Vec<Vec<u8>>> {
+            self.inner.assigned()
+        }
+    }
+
     struct ListingCube {
         path: PathBuf,
         heartbeats: Mutex<Vec<String>>,
@@ -978,6 +1051,7 @@ mod tests {
         killed: Mutex<Vec<String>>,
         show_env_error: Mutex<bool>,
         dead_error: Mutex<bool>,
+        kill_error: Mutex<bool>,
         sent: Mutex<Vec<Vec<String>>>,
         envs: Mutex<HashMap<String, Vec<String>>>,
     }
@@ -1105,6 +1179,9 @@ mod tests {
                     Ok(ok(&stdout))
                 }
                 "detach-client" | "if-shell" => {
+                    if *self.kill_error.lock().unwrap() {
+                        return Ok(err("kill failed"));
+                    }
                     if let Some(target) = rest.iter().find(|arg| arg.starts_with('=')) {
                         let name = target.trim_start_matches('=').trim_end_matches(':');
                         self.killed.lock().unwrap().push(name.to_owned());
@@ -1155,6 +1232,14 @@ mod tests {
     }
 
     async fn supervisor(root: &Path, fake: Arc<FakeTmux>) -> Supervisor<ListingCube, MemoryStore> {
+        supervisor_with(root, fake, MemoryStore::default()).await
+    }
+
+    async fn supervisor_with<S: ExecutionStore>(
+        root: &Path,
+        fake: Arc<FakeTmux>,
+        store: S,
+    ) -> Supervisor<ListingCube, S> {
         let homes = homes::pin(shared_homes()).unwrap();
         let workspace = root.join("worker");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -1164,7 +1249,7 @@ mod tests {
                 heartbeats: Mutex::new(Vec::new()),
             },
             tmux: Tmux::with_runner_and_socket("/usr/bin/tmux", fake, root.join("tmux.sock")).unwrap(),
-            store: MemoryStore::default(),
+            store,
             host_id: "host".into(),
             homes_root: homes,
             boot_id: "boot".into(),
@@ -1316,6 +1401,12 @@ mod tests {
         home
     }
 
+    fn run_home_delivered(name: &str) -> PathBuf {
+        let home = run_home(name);
+        std::fs::write(home.join(initial_prompt::DELIVERED_MARKER), "").unwrap();
+        home
+    }
+
     fn live(fake: &FakeTmux) {
         fake.sessions
             .lock()
@@ -1464,6 +1555,182 @@ mod tests {
         assert_eq!(pane_life(&pane_of(&result)), PaneLife::Exited);
         assert_eq!(stored(&second.store).phase, Phase::Terminal);
         assert!(!home.exists());
+    }
+
+    #[tokio::test]
+    async fn failed_kill_then_session_gone_is_settled_by_sweep() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeTmux::default());
+        live(&fake);
+        *fake.kill_error.lock().unwrap() = true;
+        let supervisor = supervisor(root.path(), fake.clone()).await;
+        seed(&supervisor.store, Phase::Alive);
+        let home = run_home("stopping-sweep-home");
+        update(&supervisor.store, |r| r.home = Some(home.clone()));
+        let result = supervisor.execute(&stop_command(), false, 1).await;
+        assert_eq!(result.code, ResultCode::OutcomeUncertain as i32, "{}", result.reason);
+        assert_eq!(stored(&supervisor.store).phase, Phase::Stopping);
+        assert!(home.exists());
+        heartbeat_leases(&supervisor.cube, &supervisor.store).await;
+        assert_eq!(supervisor.cube.heartbeats.lock().unwrap().len(), 1);
+        fake.sessions.lock().unwrap().remove(&session_name("token"));
+        *fake.kill_error.lock().unwrap() = false;
+        assert!(supervisor.sweep().await.is_empty());
+        let record = stored(&supervisor.store);
+        assert_eq!(record.phase, Phase::Terminal);
+        assert!(record.reclaimed);
+        assert!(!home.exists());
+        supervisor.cube.heartbeats.lock().unwrap().clear();
+        heartbeat_leases(&supervisor.cube, &supervisor.store).await;
+        assert!(supervisor.cube.heartbeats.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn interrupted_stop_on_an_exited_pane_retries_kill_and_settles() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeTmux::default());
+        live(&fake);
+        fake.pane_dead
+            .lock()
+            .unwrap()
+            .insert(session_name("token"), ("1".into(), Some(0)));
+        let supervisor = supervisor(root.path(), fake.clone()).await;
+        seed(&supervisor.store, Phase::Stopping);
+        let home = run_home("interrupted-stop-home");
+        update(&supervisor.store, |r| r.home = Some(home.clone()));
+        let result = supervisor.execute(&stop_command(), true, 1).await;
+        assert_eq!(result.code, ResultCode::Ok as i32, "{}", result.reason);
+        let record = stored(&supervisor.store);
+        assert_eq!(record.phase, Phase::Terminal);
+        assert!(record.reclaimed);
+        assert_eq!(
+            record.terminal,
+            Some(TerminalEvidence {
+                life: PaneLife::Exited.into(),
+                exit_code: Some(0)
+            })
+        );
+        assert!(!home.exists());
+        assert!(!fake.killed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stopping_run_is_settled_by_adopt_after_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeTmux::default());
+        live(&fake);
+        let first = supervisor(root.path(), fake.clone()).await;
+        seed(&first.store, Phase::Stopping);
+        let home = run_home("stopping-adopt-home");
+        update(&first.store, |r| r.home = Some(home.clone()));
+        fake.sessions.lock().unwrap().remove(&session_name("token"));
+        let second = supervisor(root.path(), fake).await;
+        *second.store.0.lock().unwrap() = first.store.0.lock().unwrap().clone();
+        let result = second.execute(&adopt_command(), false, 1).await;
+        assert_eq!(result.code, ResultCode::Ok as i32);
+        assert_eq!(pane_life(&pane_of(&result)), PaneLife::Missing);
+        assert_eq!(stored(&second.store).phase, Phase::Terminal);
+        assert!(stored(&second.store).reclaimed);
+        assert!(!home.exists());
+    }
+
+    #[tokio::test]
+    async fn delivered_exit_64_stays_exited_across_sweep_and_repeated_adopt() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeTmux::default());
+        live(&fake);
+        fake.pane_dead
+            .lock()
+            .unwrap()
+            .insert(session_name("token"), ("1".into(), Some(64)));
+        let supervisor = supervisor(root.path(), fake).await;
+        seed(&supervisor.store, Phase::Alive);
+        let home = run_home_delivered("delivered-exit-64");
+        update(&supervisor.store, |r| r.home = Some(home.clone()));
+        assert!(supervisor.sweep().await.is_empty());
+        let record = stored(&supervisor.store);
+        assert_eq!(record.phase, Phase::Terminal);
+        assert!(record.reclaimed);
+        assert_eq!(
+            record.terminal,
+            Some(TerminalEvidence {
+                life: PaneLife::Exited.into(),
+                exit_code: Some(64)
+            })
+        );
+        assert!(!home.exists());
+        for _ in 0..2 {
+            let result = supervisor.execute(&adopt_command(), false, 1).await;
+            assert_eq!(result.code, ResultCode::Ok as i32);
+            assert_eq!(
+                pane_life(&pane_of(&result)),
+                PaneLife::Exited,
+                "re-observe must not fall back to brief-not-delivered after reclaim"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn persist_failure_after_reclaim_keeps_the_durable_classification() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeTmux::default());
+        live(&fake);
+        fake.pane_dead
+            .lock()
+            .unwrap()
+            .insert(session_name("token"), ("1".into(), Some(64)));
+        let inner = MemoryStore::default();
+        seed(&inner, Phase::Alive);
+        let home = run_home_delivered("persist-fail-home");
+        update(&inner, |r| r.home = Some(home.clone()));
+        // record_terminal persists classification, reclaims, then persists
+        // completion. Fail the second save.
+        let supervisor = supervisor_with(
+            root.path(),
+            fake,
+            FailingStore {
+                inner: inner.clone(),
+                saves: Mutex::new(0),
+                fail_at: 2,
+            },
+        )
+        .await;
+        let failures = supervisor.sweep().await;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(!home.exists());
+        let record = stored(&inner);
+        assert_eq!(record.phase, Phase::Terminal);
+        assert!(!record.reclaimed);
+        assert_eq!(
+            record.terminal,
+            Some(TerminalEvidence {
+                life: PaneLife::Exited.into(),
+                exit_code: Some(64)
+            })
+        );
+        let recovered = supervisor_with(root.path(), Arc::new(FakeTmux::default()), inner).await;
+        let result = recovered.execute(&adopt_command(), false, 1).await;
+        assert_eq!(result.code, ResultCode::Ok as i32);
+        assert_eq!(pane_life(&pane_of(&result)), PaneLife::Exited);
+        assert!(stored(&recovered.store).reclaimed);
+    }
+
+    #[tokio::test]
+    async fn distinct_tokens_that_sanitized_alike_keep_distinct_settings_files() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeTmux::default());
+        let supervisor = supervisor(root.path(), fake).await;
+        let plus = supervisor.settings_path("a+b");
+        let under = supervisor.settings_path("a_b");
+        assert_ne!(plus, under, "hex encoding must not collapse + and _");
+        std::fs::write(&plus, "{}").unwrap();
+        std::fs::write(&under, "{}").unwrap();
+        seed(&supervisor.store, Phase::Alive);
+        let mut record = stored(&supervisor.store);
+        record.settings_file = Some(plus.clone());
+        supervisor.reclaim(&mut record);
+        assert!(!plus.exists());
+        assert!(under.exists(), "reclaiming one run must leave the other's settings");
     }
 
     #[tokio::test]

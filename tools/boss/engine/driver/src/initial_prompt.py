@@ -390,5 +390,7 @@ if __name__ == "__main__":
         sys.exit(main())
     except Exception as error:
         print(f"boss initial brief delivery failed: {error}", file=sys.stderr)
+        if (prompt_home() / DELIVERED_MARKER).is_file():
+            sys.exit(1)
         write_marker(UNDELIVERED_MARKER)
         sys.exit(BRIEF_NOT_DELIVERED_EXIT)

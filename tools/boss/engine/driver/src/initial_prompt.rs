@@ -494,6 +494,23 @@ assert_processes_exited(lifetime_reader)
     }
 
     #[test]
+    fn exception_after_delivered_marker_does_not_claim_undelivered() {
+        let temp = tempfile::tempdir().unwrap();
+        provision(temp.path(), temp.path(), "private sentinel", &crate::ClaudeDriver).unwrap();
+        fs::write(temp.path().join(DELIVERED_MARKER), "").unwrap();
+        fs::remove_file(temp.path().join("initial-prompt.txt")).unwrap();
+        let output = std::process::Command::new("python3")
+            .arg(temp.path().join("initial-prompt.py"))
+            .args(["python3", "-c", "print('DRIVER_EXECUTED')"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(!undelivered_marker_present(temp.path()));
+        assert!(delivered_marker_present(temp.path()));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("boss initial brief delivery failed"));
+    }
+
+    #[test]
     fn early_driver_exit_is_a_launch_failure() {
         let temp = tempfile::tempdir().unwrap();
         provision(temp.path(), temp.path(), "private sentinel", &crate::ClaudeDriver).unwrap();
