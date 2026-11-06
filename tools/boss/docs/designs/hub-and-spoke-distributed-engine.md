@@ -1,6 +1,6 @@
 # Hub-and-spoke engine: durable host observations without distributed work authority
 
-- **Date:** 2026-10-21
+- **Date:** 2026-10-21 (rescoped 2026-11-04: manual enrollment is the supported install path; managed provisioning is deferred)
 - **Status:** proposed design; no implementation ships with this document
 - **Provenance:** [merged investigation, PR #3232](https://github.com/spinyfin/mono/pull/3232), read in full from `main`; merge commit `a0121ee144b8f3659565f4c66d94f7a03ce19451`
 - **Primary source:** [Hub-and-spoke investigation](../investigations/hub-and-spoke-distributed-engine-2026-10-21.md), particularly §§2.1–2.10 and the ordering in §3.2
@@ -10,7 +10,7 @@
 
 ## Verdict
 
-Adopt the investigation's outbound mTLS protobuf/gRPC spoke and laptop hub first. Ship remote capacity before local migration and full offline replay qualification; ship an always-on hub only after option B is complete and the genuine remote app path passes the investigation's performance gate. Keep summarisation on the hub, give managed remote hosts a dedicated worker user, and ship read-only pane snapshots over the stream.
+Adopt the investigation's outbound mTLS protobuf/gRPC spoke and laptop hub first. Ship remote capacity, on manually enrolled hosts, before local migration and full offline replay qualification; ship an always-on hub only after option B is complete and the genuine remote app path passes the investigation's performance gate. Keep summarisation on the hub, give remote hosts a dedicated worker user, and ship read-only pane snapshots over the stream.
 
 ## Goals
 
@@ -24,6 +24,8 @@ Adopt the investigation's outbound mTLS protobuf/gRPC spoke and laptop hub first
 
 - Multiple active hubs, replicated work databases, consensus, autonomous spoke scheduling or cross-host live migration of a running worker.
 - A generic remote shell, inbound spoke ports, automatic NAT traversal, relays, or SSH as a prerequisite for enrollment/control/upgrades.
+- Cloud-hosted spokes (GCE and similar) for now, because of cost; this may be revisited.
+- Managed provisioning jobs, managed Linux/macOS provisioning, hub-driven rolling upgrades and the app add-host/provisioning status UI in the current plan; they are kept as deferred future scope at the end of this document.
 - Replacing local app/CLI JSON IPC in option B, distributing the hub's model/GitHub credentials, or moving the summariser to spokes.
 - Isolation between workers sharing one Unix user. Host/user containment limits damage but does not make sibling processes mutually untrusted.
 - An interactive remote Ghostty terminal in this project. The required viewer is read-only; existing separately configured SSH remains an operator convenience, not a planned deliverable.
@@ -32,14 +34,14 @@ Adopt the investigation's outbound mTLS protobuf/gRPC spoke and laptop hub first
 
 The investigation is authoritative for the baseline and recommendation. References below to “§2.x” mean its sections; this design supplies missing contracts rather than repeating Part 1. No baseline correction is asserted. Source inspection of the existing adapter and proposal authentication identifies integration obligations, not a reason to change the recommendation.
 
-| Input                                  | Decision supplied here                                                                          |
-| -------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| §§2.1–2.2: ownership and wire sketch   | Crate boundaries, numbered schema, negotiation, authorization and adapter mapping               |
-| §§2.3, 2.5: autonomy and failures      | Durable receipt versus application, command uncertainty, replay barriers, clocks and retention  |
-| §2.4: capacity                         | Reservation accounting and an independent board work graph                                      |
-| §§2.6–2.7: deployment and trust        | Enrollment transaction, certificate lifecycle, service user, provisioning contract and rollback |
-| §§2.8–2.10: visibility and containment | Transcript custody, pane capture, prompt input and real-path acceptance                         |
-| §3.2: phases                           | PR-sized dependencies in the final section                                                      |
+| Input                                  | Decision supplied here                                                                               |
+| -------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| §§2.1–2.2: ownership and wire sketch   | Crate boundaries, numbered schema, negotiation, authorization and adapter mapping                    |
+| §§2.3, 2.5: autonomy and failures      | Durable receipt versus application, command uncertainty, replay barriers, clocks and retention       |
+| §2.4: capacity                         | Reservation accounting and an independent board work graph                                           |
+| §§2.6–2.7: deployment and trust        | Enrollment transaction, certificate lifecycle, service user, manual enrollment flow and hand upgrade |
+| §§2.8–2.10: visibility and containment | Transcript custody, pane capture, prompt input and real-path acceptance                              |
+| §3.2: phases                           | PR-sized dependencies in the final section                                                           |
 
 The toolchain check is **validation of the selected protobuf approach**, not a comparison with JSON. On this checkout, `MODULE.bazel:8` pins `rules_rust` 0.70.0, and `MODULE.bazel:120` onward configures Rust 1.99.0 / edition 2024. `Cargo.toml`, `Cargo.lock` and `MODULE.bazel` declare neither prost nor tonic. Upstream supplies prost as the separate [rules_rust_prost 0.70.0 module](https://github.com/bazelbuild/rules_rust/blob/0.70.0/extensions/prost/MODULE.bazel), including a prost/tonic generator toolchain, not an automatically enabled part of `rules_rust`.
 
@@ -360,23 +362,28 @@ Use a hub-specific CA and host-scoped client certificates with SAN `urn:boss:hos
 
 Enrollment is a server-authenticated TLS RPC with the single-use secret, rate-limited separately from Connect; renewal additionally requires valid host mTLS. A pending host is not schedulable. The hub generates a 256-bit token, stores only its hash with host/job/expiry (15 minutes), and receives a locally generated CSR. One transaction consumes the token and binds `(host_id, job_id, request_id, csr_digest)` to the issued certificate. Retries with exactly that tuple return the stored certificate even after token consumption within the job's bounded recovery window; different keys or revoked jobs fail. Responses do not imply host readiness.
 
-Renew at ten days remaining with jitter. Generate a replacement key locally, persist the request before sending, install the certificate/key atomically and reconnect; accept the previous certificate for at most 24 hours, capped by its expiry. Existing streams are closed at certificate expiry/revocation, not left authenticated indefinitely. Renewal, disable, revoke and remove are audited hub operations. Disable blocks new assignments but retains control/observations. Revoke closes streams and rejects renewal/re-enrollment until explicit new host authorization; it cannot kill an offline worker. Expired identities recover through the same managed provisioning job, preserving host journal and pending evidence when available. Rotate CA trust by an authenticated overlap bundle before replacing the issuer; emergency compromise requires managed reprovisioning rather than trusting a message from the compromised identity.
+Renew at ten days remaining with jitter. Generate a replacement key locally, persist the request before sending, install the certificate/key atomically and reconnect; accept the previous certificate for at most 24 hours, capped by its expiry. Existing streams are closed at certificate expiry/revocation, not left authenticated indefinitely. Renewal, disable, revoke and remove are audited hub operations. Disable blocks new assignments but retains control/observations. Revoke closes streams and rejects renewal/re-enrollment until explicit new host authorization; it cannot kill an offline worker. Expired identities recover by minting a new host-bound token for the same host and re-running enroll by hand, preserving host journal and pending evidence when available. Rotate CA trust by an authenticated overlap bundle before replacing the issuer; emergency compromise requires reinstalling and re-enrolling the host rather than trusting a message from the compromised identity.
 
-**Worker-user decision:** managed non-laptop hosts run the service, private tmux server, cube and drivers as a dedicated unprivileged `boss-worker` user, with its own home, jj store, Bazel caches and driver/GitHub credentials. Root installs packages and the service definition only. The hub does not copy the operator's credentials. The local spoke runs as the logged-in operator to preserve current keychain/driver access and the existing cube store; this is a deliberate containment difference, not equivalent security.
+**Worker-user decision:** non-laptop hosts run the service, private tmux server, cube and drivers as a dedicated unprivileged `boss-worker` user, with its own home, jj store, Bazel caches and driver/GitHub credentials. Root installs packages and the service definition only. The hub does not copy the operator's credentials. The local spoke runs as the logged-in operator to preserve current keychain/driver access and the existing cube store; this is a deliberate containment difference, not equivalent security.
 
-The provisioning preflight must run as the eventual service user using the installed service environment, not an administrator's interactive shell. It verifies tool versions (including the `python3` Unix PTY support that the [PR #3238](https://github.com/spinyfin/mono/pull/3238) brief relay requires), authenticated driver/GitHub operations without printing secrets, repo access, writable private storage, disk/capacity, hub reachability and clock/certificate validity. Credentials are provisioned through the fleet's secret mechanism or managed login policy. A missing credential leaves the host visibly unschedulable; enrollment alone cannot turn it ready. Same-user workers can read same-user secrets; dedicated-user containment protects the operator account, not each sibling.
+The enrollment preflight must run as the eventual service user using the installed service environment, not an administrator's interactive shell. It verifies tool versions (including the `python3` Unix PTY support that the [PR #3238](https://github.com/spinyfin/mono/pull/3238) brief relay requires), authenticated driver/GitHub operations without printing secrets, repo access, writable private storage, disk/capacity, hub reachability and clock/certificate validity. Credentials are set up by the person on the host as the service user. A missing credential leaves the host visibly unschedulable; enrollment alone cannot turn it ready. Same-user workers can read same-user secrets; dedicated-user containment protects the operator account, not each sibling.
 
-### Managed provisioning and upgrades
+### Manual enrollment and upgrades
 
-The [managed provisioner selection report](../investigations/managed-provisioner-selection-2026-10-22.md) supersedes the investigation's cloud-only Linux wording: initial Linux capacity is self-hosted over Tailscale, following the operator's prior CI cost analysis. Fleet Free's authenticated script channel is the initial candidate for both Linux and macOS, conditional on its pinned, unlicensed Free-edition secret-delivery acceptance gate; paid management is not a fallback. GCE is an optional cloud adapter, not a Linux prerequisite. Keep provider selection independent of OS and reuse the same job contract with platform-specific installers. Provider qualification does not block protocol, supervisor or hub work.
+Repo-owner rescope, approved 2026-11-04: **manual enrollment is the supported install path, and there are no cloud-hosted spokes for now.** GCE and other cloud hosts are too expensive; this may be revisited. Managed provisioning is deferred (see "Deferred future scope" below), not cancelled, and the core hub-and-spoke work is unchanged.
 
-The hub provisioning job contract is `CreateHost(platform, machine_selector, release, worker_user) -> job_id`, `DeliverSecret(job_id, expiry, secret)`, `Inspect(job_id) -> staged result`, `Retry(job_id)`, and `Cancel(job_id)`. Each uses a stable idempotency key and provider machine identity bound to the pending host. Jobs persist transitions `requested → package_verified → installed → enrolled → connected → preflight_passed → ready`, with typed stage errors. A retry resumes its stage and cannot authorize a different machine/key. Fleet jobs select already managed Linux/macOS hosts and invoke the systemd/launchd bootstrap respectively; an optional cloud adapter creates/selects an instance and invokes cloud-init. Initial provisioning requires an authenticated management agent or cloud channel, but no running spoke.
+A person installs the signed spoke package on a host and enrolls it with a single-use, host-bound token minted by the hub, following the manual host enrollment runbook (`tools/boss/docs/runbooks/manual-host-enrollment.md`, delivered by the "Manual host enrollment runbook" task below). No SSH is involved in enrollment, control or upgrades; the person works on the host directly (console, or whatever access they already have) and the spoke then dials out.
 
-The authenticated management channel delivers hub trust, the release verification key, host/job ID and desired version. A separate provider secret facility delivers the token into an owner-only temporary file only when the job is ready; it never appears in argv, logs or persistent user-data. Stored agent/cloud-init payloads contain secret references and public trust, not enrollment secrets. The installer fetches an HTTPS manifest/package, verifies the signature and digest, checks OS/architecture/version, installs owner-only state and the launchd/systemd service, enrolls as the worker user, deletes the credential file, then starts the daemon. No manual SSH/download/enroll step is accepted as the finished flow. Provider integration credentials remain hub-side and are restricted to the managed fleet; Fleet Free lacks per-host RBAC, so its API credential must be treated as fleet-wide privileged access.
+1. **Mint:** an authorized operator asks the hub for an enrollment token for one named host. The hub creates the pending host, generates the 256-bit token, stores only its hash with the host ID and a 15-minute expiry, and shows the token once. The token is host-bound: it is useless for any other host ID or CSR identity.
+2. **Install:** on the host, as root, install the signed package for the platform (Ed25519 manifest signature and digest verified before anything executes, against the release key, as under "Enrollment, service user and credential lifecycle"). The package installs the `boss-worker` user's service definition (launchd/systemd), owner-only state directories and hub trust; it enrolls nothing by itself.
+3. **Enroll:** as the `boss-worker` user, run the spoke's enroll command with the token read from an owner-only file or stdin, never argv. It generates the key locally, submits the CSR through the single-use Enroll RPC, installs the certificate, deletes the token file and starts the service.
+4. **Preflight and ready:** the as-user preflight (tool versions, `python3` PTY support, driver/GitHub credentials, repo access, writable private storage including the pinned private-home root, disk, clock) runs in the installed service environment. A failure leaves the host visibly unschedulable with `failed_preflights`; the person fixes the host and re-runs preflight. Enrollment alone never makes a host ready.
 
-Publish signed macOS arm64 and Linux amd64/arm64 packages through the repo's release infrastructure. Reuse `tools/release` for assets/checksum sidecars and the existing macOS codesign path; the sidecar is not an authenticity signature. Add an Ed25519 detached signature over the exact UTF-8 manifest bytes, verified before parsing, under a release key separate from the host CA. The manifest identifies release ID, platform, digest, URL, minimum management/execution contracts and journal-reader versions. An offered URL must be HTTPS on an approved package origin. Verify before execution; no unsigned fallback. Enrollment/upgrade management remains available even when execution epochs do not overlap.
+Credentials (driver and GitHub logins) are set up by the person on the host as the service user; the hub does not copy them.
 
-Upgrade stages a verified binary next to the active one, records a rollback marker, stops only the daemon, atomically switches and restarts under its service manager. Tmux workers, their environment and journals remain intact. Health requires lock acquisition, journal readability, local inventory and a successful compatible management handshake; use a two-minute startup deadline. Keep the previous binary until health passes. Journal migrations are expand/contract with an explicit oldest readable version; forbid automatic binary rollback if the old binary cannot read the new journal. Managed provisioning is the recovery path when neither binary starts or the management contract is incompatible. Security-minimum upgrades block new work while retaining active observations; they do not silently kill workers.
+**Upgrades in the current plan reinstall a newer signed package by hand.** The person installs the newer signed package; the package's service restart preserves tmux workers and journals as in the earlier lifecycle design, with the same startup health deadline and journal reader-compatibility rule. If the new binary cannot read the journal, the person reinstalls the previous package (forbid automatic rollback across an unreadable journal). There is no hub-driven rolling upgrade; the `Upgrade` message in the schema and the staged-updater state machine are deferred. Expired or lost identities recover by minting a new token for the same host ID and re-running enroll, preserving the host journal when available.
+
+Everything in the roadmap that previously assumed managed provisioning now assumes this flow: the Remote capacity milestone below is qualified on hosts enrolled by the runbook.
 
 ### Local spoke migration
 
@@ -402,14 +409,14 @@ Pane capture is a five-second-default, 64 KiB text snapshot with a renewable 30-
 
 ### Rollout and gates
 
-Every new transport/integration initially ships inert until the hub listener/trust, signed release and managed provisioning provider are configured by the fleet administrator and an enrolled host passes preflight. PRs must name their particular enabling action. A readiness flag is not a substitute for the remote acceptance below.
+Every new transport/integration initially ships inert until the hub listener/trust and signed release are configured by the fleet administrator and a manually enrolled host passes preflight. PRs must name their particular enabling action. A readiness flag is not a substitute for the remote acceptance below.
 
-| Milestone                    | Required evidence before enabling it                                                                                                                                                                                                          | What failure blocks                                                                                                |
-| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| Remote capacity              | Real installed spoke + isolated hub + real cube/tmux + one supported driver complete a task and publish a PR; controls, transcripts, proposals and signed provisioning work without SSH. Include hub/spoke restart and duplicate-spawn cases. | New spoke production dispatch, not independent protocol/package development.                                       |
-| Local migration and capacity | Adoption/crash barrier and reservation tests with actual tmux/cube; one execution owner and no local bypass.                                                                                                                                  | Migration/automatic capacity rollout.                                                                              |
-| Option B complete            | Genuine end-to-end fault campaign across disconnect, sleep, restart, reboot, replay, queued done and artifact recovery; repo test/report artifacts.                                                                                           | All option A implementation tasks. Already shipped remote capacity remains usable.                                 |
-| Option A client gate         | Genuine authenticated app/hub/spoke path at the §2.3 network matrix and thresholds; no duplicate writes or unbounded queues.                                                                                                                  | Always-on hub deployment/promotion. It cannot retroactively gate building the candidate app transport it measures. |
+| Milestone                    | Required evidence before enabling it                                                                                                                                                                                                                                                       | What failure blocks                                                                                                |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
+| Remote capacity              | Real installed spoke + isolated hub + real cube/tmux + one supported driver complete a task and publish a PR; controls, transcripts, proposals and the manual enrollment runbook (signed package, single-use token) work without SSH. Include hub/spoke restart and duplicate-spawn cases. | New spoke production dispatch, not independent protocol/package development.                                       |
+| Local migration and capacity | Adoption/crash barrier and reservation tests with actual tmux/cube; one execution owner and no local bypass.                                                                                                                                                                               | Migration/automatic capacity rollout.                                                                              |
+| Option B complete            | Genuine end-to-end fault campaign across disconnect, sleep, restart, reboot, replay, queued done and artifact recovery; repo test/report artifacts.                                                                                                                                        | All option A implementation tasks. Already shipped remote capacity remains usable.                                 |
+| Option A client gate         | Genuine authenticated app/hub/spoke path at the §2.3 network matrix and thresholds; no duplicate writes or unbounded queues.                                                                                                                                                               | Always-on hub deployment/promotion. It cannot retroactively gate building the candidate app transport it measures. |
 
 The B campaign covers every record kind and command phase, lost receipts, duplicated deliveries, disk pressure, certificate expiration/revocation, journal rollback/gaps, file rotation, stopped shim with no later hook, and hub crash between receipt/projection/external effect. Unit fault injection proves state-machine properties; real tmux, cube, sockets and the actual completion path prove integration. Fixtures run only through `bazel test` under the repository test sandbox, with isolated state roots and no production engine access.
 
@@ -424,11 +431,11 @@ Board scale follows §2.4 independently: measure invalidation sources first, cac
 ## Risks / open questions
 
 - **Toolchain gate:** prost/prost-build generation is not proven by the existing library build. The protocol task must land successful Bazel/CI evidence before consumers; fixing this requires implementation files prohibited in this design run. _Resolved by the protocol task; see the status update under "Basis and verification boundary". Consumers still wait for that task's CI run on the supported platforms._
-- **Provisioning qualification:** the selection report records Fleet identity/secret-delivery contracts and fixtures for both platforms, but Free entitlement and fresh-host behavior still require the documented live acceptance gate. An untrusted bootstrap URL or manual shell install cannot satisfy that gate.
+- **Manual enrollment qualification:** the runbook is the only supported install path; Remote capacity qualification exercises it on real fresh hosts. Managed-provisioner qualification (Fleet Free entitlement and the live run) is deferred with managed provisioning.
 - **Bounded autonomy:** disk exhaustion, lost source files and revoked/expired identity can prevent delivery. Preserve evidence and expose gaps; do not describe bounded journals as an unconditional no-loss guarantee.
 - **Non-transactional effects:** tmux input and some cube operations cannot share the journal transaction. Conservative uncertainty may need operator reconciliation; it is preferable to duplicate input or execution. This is a defined outcome, not a promised exactly-once effect.
 - **Authorization parity:** the worker gateway is a substantial migration because existing proposals authenticate local peers (`engine/core/src/app/proposals.rs:198`). The real acceptance must exercise the composed worker prompt's commands, including proposals and output capture, before remote dispatch is enabled.
-- **Same-user containment:** a managed worker can compromise sibling workers and the spoke identity under that user. This design does not claim per-worker security isolation; the host is the authenticated damage boundary.
+- **Same-user containment:** a worker can compromise sibling workers and the spoke identity under that user. This design does not claim per-worker security isolation; the host is the authenticated damage boundary.
 - **Sizing:** extraction may expose additional existing core dependencies. Keep one-way crate edges and split only if a capability exceeds a reviewable PR; do not place `WorkDb` in the spoke to make extraction easier.
 - **Status is perishable:** build results and missing integrations above describe this design review. Refresh those observations and the task evidence when they land without silently rewriting the durable ownership/replay argument.
 
@@ -436,11 +443,11 @@ No human choice is required before reviewing this proposal. The dedicated-user, 
 
 ## Proposed implementation task breakdown
 
-Breakdown size: 36 entries (36 in-scope, 0 deferred) — the wire/journal/executor and gateway, hub consumers, managed provisioning, three legacy transport removals, local/offline migrations, remote app rollout and independent board pipeline have separate reviewable callers and acceptance boundaries.
+Breakdown size: 32 active entries (32 in-scope), plus 5 deferred entries kept in the final section — the wire/journal/executor and gateway, hub consumers, manual enrollment, three legacy transport removals, local/offline migrations, remote app rollout and independent board pipeline have separate reviewable callers and acceptance boundaries.
 
 All entries deliver to `spinyfin/mono`, each as one PR, normally within about 1,500 changed lines / 25 files. Effort reflects one worker session per capability. The legacy removal split is grounded in current source: `ssh_spawn.rs` alone is 1,462 lines, the three observation/reconciliation files total 1,125, and the wrapper/distribution Rust files add 854 before their adapter callers. These are separate deletions after acceptance, not one oversized adapter PR. Dependencies below are gates, not an instruction to serialize the entire list. The source phases are §3.2: the in-flight brief-delivery prerequisite, then protocol/spoke/hub/provisioning first, local and capacity next, offline qualification next, A afterward; board work is independent.
 
-At depth zero, Protocol, Provisioner discovery and Invalidation measurement can run in parallel; §3.2 step 1 is not a new entry because [PR #3238](https://github.com/spinyfin/mono/pull/3238) already delivers it (see the prerequisite below), and it gates only the Spoke worker supervisor. After Protocol, Spoke journal and outbound session, Hub authenticated stream manager and Host enrollment and certificate lifecycle can run in parallel in separate crates. Managed package/provider work proceeds alongside hub consumers. Local spoke and Capacity scheduling develop in parallel after the hub contracts exist; their production rollout follows remote acceptance, without making provisioning a false implementation dependency. A's remote app endpoint begins only after B qualification; its client and gate then precede hub deployment. Board runtime caching and invalidation separation are parallel after measurement; hook batching and dispatch concurrency are independent of them.
+At depth zero, Protocol and Invalidation measurement can run in parallel; §3.2 step 1 is not a new entry because [PR #3238](https://github.com/spinyfin/mono/pull/3238) already delivers it (see the prerequisite below), and it gates only the Spoke worker supervisor. After Protocol, Spoke journal and outbound session, Hub authenticated stream manager and Host enrollment and certificate lifecycle can run in parallel in separate crates. Signed package work and the enrollment runbook proceed alongside hub consumers. Local spoke and Capacity scheduling develop in parallel after the hub contracts exist; their production rollout follows remote acceptance, without making provisioning a false implementation dependency. A's remote app endpoint begins only after B qualification; its client and gate then precede hub deployment. Board runtime caching and invalidation separation are parallel after measurement; hook batching and dispatch concurrency are independent of them.
 
 Substantial shared-file ordering is explicit: Workspace executor precedes Supervisor extraction; Hub adapter precedes Hub observation projection in `host_adapter.rs` / server wiring; Hub observation projection precedes hook-write batching in the ingress transaction code; the remote app endpoint precedes client behavior in shared request/envelope definitions. The later task must forward-port the earlier one's changes preservingly, never replace them with an older snapshot. Incidental BUILD/module registration conflicts do not serialize otherwise independent crates.
 
@@ -452,7 +459,7 @@ What this design needs that the PR's current diff does not deliver, each assigne
 
 - **Spoke-local provisioning and reclamation.** `driver::initial_prompt::provision` is reusable, but its callers live in `engine/core`: the local pane spawn wiring, `HostAdapter::cleanup_initial_input`, and the retention sweep of the recorded input home. The spoke must provision from `Spawn.prompt_utf8` (validated as UTF-8 before it touches the driver API, which takes `&str`) and reclaim the run's input home on Stop/exit through `host-execution`, with no `engine/core` import. Closed by Host workspace and recovery executor (extraction) and Spoke worker supervisor (caller).
 - **Private home root under the service user.** The brief lands under `codex_home_for_run`, rooted at `BOSS_CODEX_HOMES_DIR` or else `$TMPDIR/boss-codex-homes`. A spoke must pin that root inside its owner-only service state and preflight it as writable and private; an unset variable must not fall back to a shared temp directory on a managed host. Closed by Spoke worker supervisor and the service environment in Signed spoke packages and services.
-- **`python3` PTY support as a host prerequisite.** The relay needs `python3` with `fcntl`, `pty` and `termios`. The PR checks this in local provisioning and in `boss-remote-run.sh`, neither of which runs on a spoke host, and the wrapper's check is removed with it. The relay script itself needs no packaging work: it is compiled into the `driver` crate with `include_str!`, so any spoke binary linking `driver` carries it. Closed by the as-user preflight in Managed Linux host provisioning and Managed macOS host provisioning, and reported through `failed_preflights`.
+- **`python3` PTY support as a host prerequisite.** The relay needs `python3` with `fcntl`, `pty` and `termios`. The PR checks this in local provisioning and in `boss-remote-run.sh`, neither of which runs on a spoke host, and the wrapper's check is removed with it. The relay script itself needs no packaging work: it is compiled into the `driver` crate with `include_str!`, so any spoke binary linking `driver` carries it. Closed by the as-user preflight in Signed spoke packages and services (run by the runbook's preflight step), and reported through `failed_preflights`.
 - **Typed delivery outcome.** On a readiness timeout (30 s default) or a non-private brief file the relay exits `1` with a stderr line; the SSH path only learns this from the wrapper's exit-status log. The spoke's Spawn result must distinguish "brief never delivered" from an ordinary `Exited(exit_code)`, which needs a machine-readable signal from the relay (a distinct exit status or a delivery marker in the run home) that the PR does not define. Closed by Spoke worker supervisor, as a backward-compatible addition in `driver` that the local path keeps honoring until Local spoke adoption.
 
 No gap: prompt size is bounded by the wire limit (512 KiB prompt/settings combined, rejected hub-side before Spawn), so the relay's whole-file read needs no change; the PR's SSH staging (`stage_remote_initial_input`, `ship_file`) is legacy transport that Retire SSH wrapper provisioning and adapter deletes; coordinator startup stays on the hub and is unaffected. If the PR's diff changes before merge, refresh this list rather than re-adding a task.
@@ -573,7 +580,7 @@ Scope: in-scope
 
 Implement the trust boundary independently of platform installation (§3.2 step 5). Use host-bound single-use enrollment, atomic CSR retry identity, renewal overlap and revocation; keep management compatible independently of execution capabilities.
 
-- **Deliverables:** CA/issuer storage and restricted Enroll/Renew service; host credential lifecycle and revocation hooks consumed by the stream authorization boundary; Bazel tests for replayed tokens, changed keys, expiry, overlap and revoked reconnect.
+- **Deliverables:** CA/issuer storage and restricted Enroll/Renew service and an operator command that mints the host-bound single-use token; host credential lifecycle and revocation hooks consumed by the stream authorization boundary; Bazel tests for replayed tokens, changed keys, expiry, overlap and revoked reconnect.
 - **Effort:** large
 - **Dependencies:** Bazel spoke protocol and compatibility gate
 
@@ -581,74 +588,33 @@ Scope: in-scope
 
 ### Signed spoke packages and services
 
-Create independently installable daemon packages using the repository release pipeline (§2.6). Include the dedicated-user service environment and preserve live tmux/journal state across service restart; no host is enrolled merely by installing files.
+Create independently installable daemon packages using the repository release pipeline (§2.6). Include the dedicated-user service environment and preserve live tmux/journal state across service restart; no host is enrolled merely by installing files. Upgrades are a hand reinstall of a newer signed package.
 
 - **Deliverables:** signed manifests/platform packages and pinned verification trust; launchd/systemd definitions and idempotent bootstrap installer; Bazel packaging/verification tests for wrong platform, digest/signature failure and owner-only paths.
+  - Ship the as-user preflight command (tool versions, `python3` with `fcntl`, `pty` and `termios`, driver/GitHub credentials, private storage, disk, clock) run in the installed service environment; failures are reported through `failed_preflights` and keep the host unschedulable.
   - Pin `BOSS_CODEX_HOMES_DIR` inside owner-only service state in both service definitions and verify the root is writable and private as the service user, with no shared-temp fallback.
 - **Effort:** large
 - **Dependencies:** Spoke worker supervisor
 
 Scope: in-scope
 
-### Managed provisioner selection
+### Manual host enrollment runbook
 
-Resolve the investigation's unrecorded provider choice before implementing platform adapters. Inspect the actual managed fleet interfaces through authorized configuration/documentation and commit a concrete report and contract fixtures for authenticated Linux/macOS management. The selection report chooses self-hosted Linux first, Fleet Free subject to qualification on both platforms, and optional cloud providers independently of OS. Do not change private operator state as the deliverable.
+Document and exercise the supported install path (§2.6, §3.2 step 5) so a person can bring up a real host without SSH or managed tooling. The runbook is the operator-facing contract for the manual flow in "Manual enrollment and upgrades".
 
-- **Deliverables:** repo report naming providers, API versions, job/identity semantics and evidence; secret-delivery/readiness/failure mapping to the design's job contract; sanitized request/response fixtures and acceptance procedure for both platforms.
+- **Deliverables:** `tools/boss/docs/runbooks/manual-host-enrollment.md` covering token mint, package download and signature verification, install, as-user enroll, preflight failure triage, hand upgrade by reinstalling a newer signed package, and revoke/re-enroll, for macOS arm64 and Linux amd64/arm64; the hub operator command that mints the host-bound token (if not already delivered by Host enrollment and certificate lifecycle); a Bazel doc-link test or checkleft rule that the runbook's commands and paths match the shipped installer and enroll command.
 - **Effort:** medium
-- **Dependencies:** none
-
-Scope: in-scope
-
-### Hub managed provisioning jobs
-
-Replace shell-driven add-host setup with persistent provider jobs and typed readiness (§3.2 step 5). Reuse host registration and the existing app progress/error surface; provider-specific execution belongs to the following adapters.
-
-- **Deliverables:** persistent idempotent job stages and authenticated provider interface; host enrollment/release binding plus retry/cancel/status API; app add-host/status wiring and Bazel tests using the selected provider contract fixtures.
-- **Effort:** large
-- **Dependencies:** Managed provisioner selection; Host enrollment and certificate lifecycle; Signed spoke packages and services; Hub authenticated stream manager
-
-Scope: in-scope
-
-### Managed Linux host provisioning
-
-Implement the selected Fleet Free script adapter for existing self-hosted Linux machines over the private network against the job contract (§2.2), using the selection report's Linux identity and run/result fixtures. The provider channel installs the package, delivers the enrollment secret and credentials to the dedicated user, starts systemd and reports readiness without SSH. GCE remains an optional provider and supplies no credential or identity dependency to this path.
-
-- **Deliverables:** Fleet script run/results integration and versioned systemd bootstrap; Free-edition secret-delivery qualification and as-user tool/credential preflight; Bazel provider-contract tests plus a repo-owned fresh-host acceptance runner/report format. Share Fleet job logic with macOS while keeping service setup platform-specific.
-  - Preflight `python3` with `fcntl`, `pty` and `termios` as the service user in the installed service environment; report failures through `failed_preflights` and keep the host unschedulable.
-- **Effort:** large
-- **Dependencies:** Hub managed provisioning jobs
-
-Scope: in-scope
-
-### Managed macOS host provisioning
-
-Implement the selected Fleet Free script adapter for already managed Macs (§2.2), including job retries and service-user credential access, without paid MDM/package-management features. This can run in parallel with Linux provisioning once shared Fleet job logic is available; launchd/systemd payloads remain separate.
-
-- **Deliverables:** Fleet script run/results integration and launchd installer payload; Free-edition secret-delivery qualification and service-user/launchd preflight; Bazel provider-contract tests plus a repo-owned fresh-host acceptance runner/report format.
-  - Preflight `python3` with `fcntl`, `pty` and `termios` as the service user in the installed launchd environment; report failures through `failed_preflights` and keep the host unschedulable.
-- **Effort:** large
-- **Dependencies:** Hub managed provisioning jobs
-
-Scope: in-scope
-
-### Verified spoke rolling upgrades
-
-Offer, fetch, verify and atomically switch signed releases over the management contract (§2.6). Preserve workers, enforce reader compatibility and recover through the same managed installer if the service cannot update itself.
-
-- **Deliverables:** hub-approved release offer and spoke staged updater; service health/rollback state machine with journal reader checks; Bazel tests for interrupted switch, bad signatures, mixed versions and retained workers.
-- **Effort:** large
-- **Dependencies:** Signed spoke packages and services; Host enrollment and certificate lifecycle; Spoke journal and outbound session; Hub authenticated stream manager
+- **Dependencies:** Host enrollment and certificate lifecycle; Signed spoke packages and services
 
 Scope: in-scope
 
 ### Remote capacity qualification
 
-Complete and qualify the first production increment using the genuine installed path (§3.2 steps 3–5). This is an independent acceptance campaign for the already reviewed services, followed by separately sized legacy removals.
+Complete and qualify the first production increment using the genuine installed path (§3.2 steps 3–5): the live run on real hosts, enrolled by hand following the manual enrollment runbook. This is an independent acceptance campaign for the already reviewed services, followed by separately sized legacy removals.
 
-- **Deliverables:** repo-owned end-to-end harness and recorded fresh-host results for supported platforms, a real driver and real PR publication; explicit host-transport drain/readiness rollout; no-SSH regression checks and a drain prerequisite for removing legacy code.
+- **Deliverables:** repo-owned end-to-end harness and recorded fresh-host results for supported platforms (hosts installed and enrolled per the runbook, including a hand upgrade by reinstalling a newer signed package), a real driver and real PR publication; explicit host-transport drain/readiness rollout; no-SSH regression checks and a drain prerequisite for removing legacy code.
 - **Effort:** large
-- **Dependencies:** Hub transcript and artifact custody; Read-only remote pane viewer; Managed Linux host provisioning; Managed macOS host provisioning; Verified spoke rolling upgrades
+- **Dependencies:** Hub transcript and artifact custody; Read-only remote pane viewer; Manual host enrollment runbook
 
 Scope: in-scope
 
@@ -676,7 +642,7 @@ Scope: in-scope
 
 Delete the obsolete wrapper/distribution mechanism and remaining SshHostAdapter now that its execution and observation consumers have moved. Keep any separately used operator SSH utility intact; this capability removes worker execution's SSH dependency.
 
-- **Deliverables:** removal of the remote wrapper, its distribution/provisioning path and remaining adapter; host registration routed exclusively through managed enrollment; Bazel architecture checks preventing new worker SSH fallbacks.
+- **Deliverables:** removal of the remote wrapper, its distribution/provisioning path and remaining adapter; host registration routed exclusively through enrollment; Bazel architecture checks preventing new worker SSH fallbacks.
 - **Effort:** medium
 - **Dependencies:** Retire SSH launch handshakes
 
@@ -819,5 +785,77 @@ Remove the serial dispatch-drain bottleneck (§2.4) while preserving atomic exec
 - **Deliverables:** bounded parallel drain with per-execution exclusion; cancellation/error reconciliation without leaked reservations; Bazel contention tests and dispatch-backlog measurements.
 - **Effort:** medium
 - **Dependencies:** Capacity scheduling and unreachable hosts; Hub invalidation measurement
+
+Scope: in-scope
+
+## Deferred future scope (not part of the current plan)
+
+The items below are **deferred future scope. They are not part of the current plan**, have no tasks in the active breakdown, and no active task depends on them. Their design text and task entries are kept verbatim in spirit so they can be picked up later, after the repo owner decides to; where they say "required", "default" or "supported" they describe the deferred design, not the current plan. Deferred items: managed provisioning jobs, managed Linux (cloud/cloud-init and self-hosted fleet-script) and macOS (MDM/fleet-script) provisioning, verified rolling upgrades, the app add-host/provisioning status UI, and the managed-provisioner live run. Cloud-hosted spokes (GCE) are out for now because of cost and may be revisited.
+
+### Deferred design: managed provisioning and upgrades
+
+The [managed provisioner selection report](../investigations/managed-provisioner-selection-2026-10-22.md) supersedes the investigation's cloud-only Linux wording: initial Linux capacity is self-hosted over Tailscale, following the operator's prior CI cost analysis. Fleet Free's authenticated script channel is the initial candidate for both Linux and macOS, conditional on its pinned, unlicensed Free-edition secret-delivery acceptance gate; paid management is not a fallback. GCE is an optional cloud adapter, not a Linux prerequisite. Keep provider selection independent of OS and reuse the same job contract with platform-specific installers. Provider qualification does not block protocol, supervisor or hub work.
+
+The hub provisioning job contract is `CreateHost(platform, machine_selector, release, worker_user) -> job_id`, `DeliverSecret(job_id, expiry, secret)`, `Inspect(job_id) -> staged result`, `Retry(job_id)`, and `Cancel(job_id)`. Each uses a stable idempotency key and provider machine identity bound to the pending host. Jobs persist transitions `requested → package_verified → installed → enrolled → connected → preflight_passed → ready`, with typed stage errors. A retry resumes its stage and cannot authorize a different machine/key. Fleet jobs select already managed Linux/macOS hosts and invoke the systemd/launchd bootstrap respectively; an optional cloud adapter creates/selects an instance and invokes cloud-init. Initial provisioning requires an authenticated management agent or cloud channel, but no running spoke.
+
+The authenticated management channel delivers hub trust, the release verification key, host/job ID and desired version. A separate provider secret facility delivers the token into an owner-only temporary file only when the job is ready; it never appears in argv, logs or persistent user-data. Stored agent/cloud-init payloads contain secret references and public trust, not enrollment secrets. The installer fetches an HTTPS manifest/package, verifies the signature and digest, checks OS/architecture/version, installs owner-only state and the launchd/systemd service, enrolls as the worker user, deletes the credential file, then starts the daemon. No manual SSH/download/enroll step is accepted as the finished flow. Provider integration credentials remain hub-side and are restricted to the managed fleet; Fleet Free lacks per-host RBAC, so its API credential must be treated as fleet-wide privileged access.
+
+Publish signed macOS arm64 and Linux amd64/arm64 packages through the repo's release infrastructure. Reuse `tools/release` for assets/checksum sidecars and the existing macOS codesign path; the sidecar is not an authenticity signature. Add an Ed25519 detached signature over the exact UTF-8 manifest bytes, verified before parsing, under a release key separate from the host CA. The manifest identifies release ID, platform, digest, URL, minimum management/execution contracts and journal-reader versions. An offered URL must be HTTPS on an approved package origin. Verify before execution; no unsigned fallback. Enrollment/upgrade management remains available even when execution epochs do not overlap.
+
+Upgrade stages a verified binary next to the active one, records a rollback marker, stops only the daemon, atomically switches and restarts under its service manager. Tmux workers, their environment and journals remain intact. Health requires lock acquisition, journal readability, local inventory and a successful compatible management handshake; use a two-minute startup deadline. Keep the previous binary until health passes. Journal migrations are expand/contract with an explicit oldest readable version; forbid automatic binary rollback if the old binary cannot read the new journal. Managed provisioning is the recovery path when neither binary starts or the management contract is incompatible. Security-minimum upgrades block new work while retaining active observations; they do not silently kill workers.
+
+### Deferred task entries
+
+These entries were removed from the active breakdown and dependency list; no active entry depends on them. They include the managed-provisioner live run (the Free-edition fresh-host acceptance of the provisioning adapters), whose companion in the active plan is the live run on real hosts in Remote capacity qualification. If revived, Remote capacity qualification would regain a provisioning dependency only by an explicit new decision. Their dependency lists still name each other and active entries as they did when written.
+
+#### Managed provisioner selection (deferred)
+
+Resolve the investigation's unrecorded provider choice before implementing platform adapters. Inspect the actual managed fleet interfaces through authorized configuration/documentation and commit a concrete report and contract fixtures for authenticated Linux/macOS management. The selection report chooses self-hosted Linux first, Fleet Free subject to qualification on both platforms, and optional cloud providers independently of OS. Do not change private operator state as the deliverable.
+
+- **Deliverables:** repo report naming providers, API versions, job/identity semantics and evidence; secret-delivery/readiness/failure mapping to the design's job contract; sanitized request/response fixtures and acceptance procedure for both platforms.
+- **Effort:** medium
+- **Dependencies:** none
+
+Scope: in-scope
+
+#### Hub managed provisioning jobs (deferred)
+
+Replace shell-driven add-host setup with persistent provider jobs and typed readiness (§3.2 step 5). Reuse host registration and the existing app progress/error surface; provider-specific execution belongs to the following adapters.
+
+- **Deliverables:** persistent idempotent job stages and authenticated provider interface; host enrollment/release binding plus retry/cancel/status API; app add-host/provisioning status UI (deferred along with this entry) and Bazel tests using the selected provider contract fixtures.
+- **Effort:** large
+- **Dependencies:** Managed provisioner selection; Host enrollment and certificate lifecycle; Signed spoke packages and services; Hub authenticated stream manager
+
+Scope: in-scope
+
+#### Managed Linux host provisioning (deferred)
+
+Implement the selected Fleet Free script adapter for existing self-hosted Linux machines over the private network against the job contract (§2.2), using the selection report's Linux identity and run/result fixtures. The provider channel installs the package, delivers the enrollment secret and credentials to the dedicated user, starts systemd and reports readiness without SSH. GCE remains an optional provider and supplies no credential or identity dependency to this path.
+
+- **Deliverables:** Fleet script run/results integration and versioned systemd bootstrap; Free-edition secret-delivery qualification and as-user tool/credential preflight; Bazel provider-contract tests plus a repo-owned fresh-host acceptance runner/report format. Share Fleet job logic with macOS while keeping service setup platform-specific.
+  - Preflight `python3` with `fcntl`, `pty` and `termios` as the service user in the installed service environment; report failures through `failed_preflights` and keep the host unschedulable.
+- **Effort:** large
+- **Dependencies:** Hub managed provisioning jobs
+
+Scope: in-scope
+
+#### Managed macOS host provisioning (deferred)
+
+Implement the selected Fleet Free script adapter for already managed Macs (§2.2), including job retries and service-user credential access, without paid MDM/package-management features. This can run in parallel with Linux provisioning once shared Fleet job logic is available; launchd/systemd payloads remain separate.
+
+- **Deliverables:** Fleet script run/results integration and launchd installer payload; Free-edition secret-delivery qualification and service-user/launchd preflight; Bazel provider-contract tests plus a repo-owned fresh-host acceptance runner/report format.
+  - Preflight `python3` with `fcntl`, `pty` and `termios` as the service user in the installed launchd environment; report failures through `failed_preflights` and keep the host unschedulable.
+- **Effort:** large
+- **Dependencies:** Hub managed provisioning jobs
+
+Scope: in-scope
+
+#### Verified spoke rolling upgrades (deferred)
+
+Offer, fetch, verify and atomically switch signed releases over the management contract (§2.6). Preserve workers, enforce reader compatibility and recover through the same managed installer if the service cannot update itself.
+
+- **Deliverables:** hub-approved release offer and spoke staged updater; service health/rollback state machine with journal reader checks; Bazel tests for interrupted switch, bad signatures, mixed versions and retained workers.
+- **Effort:** large
+- **Dependencies:** Signed spoke packages and services; Host enrollment and certificate lifecycle; Spoke journal and outbound session; Hub authenticated stream manager
 
 Scope: in-scope
