@@ -200,12 +200,12 @@ async fn wait_for_stage(
     execution_id: &str,
     stage: &str,
 ) -> Vec<crate::dispatch_events::DispatchEvent> {
-    for _ in 0..200 {
+    for _ in 0..500 {
         let events = sink.events_for(execution_id).await;
         if events.iter().any(|event| event.stage == stage) {
             return events;
         }
-        sleep(Duration::from_millis(10)).await;
+        sleep(Duration::from_millis(20)).await;
     }
     panic!(
         "no `{stage}` event for {execution_id}; got {:?}",
@@ -1215,5 +1215,82 @@ async fn fallback_after_a_stale_snapshot_does_not_reuse_the_earlier_head_as_the_
     assert_ne!(
         fx.db.execution_bookmark(&fx.id).unwrap().base_commit.as_deref(),
         Some(fx.head.as_str())
+    );
+}
+
+#[tokio::test]
+async fn a_non_rate_limit_http_403_does_not_consume_a_pre_start_retry() {
+    let fx = bound_pr_fixture(true).await;
+    let cube = bound_pr_cube(&fx, 0);
+    let verifier = crate::completion::tests::StubBranchVerifier::ok("pr/99");
+    verifier
+        .set_head_oid(Err("Resource not accessible by integration (HTTP 403)".into()))
+        .await;
+    let sink = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let (coordinator, _runner) = bound_pr_coordinator(&fx, cube, &verifier, vec![Duration::from_secs(1)], sink.clone());
+    coordinator.kick();
+
+    wait_for_execution_status(&fx.db, &fx.id, ExecutionStatus::Running).await;
+    assert_eq!(fx.db.get_execution(&fx.id).unwrap().pr_head_before, None);
+    assert_eq!(fx.db.get_execution(&fx.id).unwrap().pre_start_failure_count, 0);
+    assert!(fx.db.execution_bookmark_optional(&fx.id).unwrap().is_some());
+    assert!(
+        sink.events_for(&fx.id)
+            .await
+            .iter()
+            .all(|event| event.stage != "pre_start_failure"),
+        "a classified 403 must not consume a pre-start retry"
+    );
+}
+
+#[tokio::test]
+async fn retry_after_a_run_start_failure_refreshes_the_head_even_when_the_pointer_exists() {
+    let fx = bound_pr_fixture(true).await;
+    let db_path = fx.dir.path().join("boss.db");
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_first_run_start BEFORE INSERT ON work_runs
+             BEGIN
+               SELECT RAISE(ABORT, 'injected run start failure');
+             END;",
+        )
+        .unwrap();
+    let cube = bound_pr_cube(&fx, 0);
+    let verifier = crate::completion::tests::StubBranchVerifier::ok("pr/99");
+    verifier.set_head_oid(Ok(fx.head.clone())).await;
+    let sink = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let (coordinator, runner) = bound_pr_coordinator(&fx, cube, &verifier, vec![Duration::from_secs(1)], sink.clone());
+    coordinator.kick();
+
+    let events = wait_for_stage(&sink, &fx.id, "pre_start_failure").await;
+    let failure = events.iter().find(|e| e.stage == "pre_start_failure").unwrap();
+    assert_eq!(failure.details["will_retry"], true);
+    assert!(
+        failure
+            .error_message
+            .as_deref()
+            .unwrap()
+            .contains("injected run start failure")
+    );
+    assert!(fx.db.execution_bookmark_optional(&fx.id).unwrap().is_some());
+    assert_eq!(
+        fx.db.get_execution(&fx.id).unwrap().pr_head_before.as_deref(),
+        Some(fx.head.as_str())
+    );
+    assert!(runner.calls.lock().await.is_empty());
+
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute("DROP TRIGGER fail_first_run_start", [])
+        .unwrap();
+    let moved = advance_bound_pr(&fx);
+    assert_ne!(moved, fx.head);
+    verifier.set_head_oid(Ok(moved.clone())).await;
+    wait_for_execution_status(&fx.db, &fx.id, ExecutionStatus::Running).await;
+    assert_eq!(
+        fx.db.get_execution(&fx.id).unwrap().pr_head_before.as_deref(),
+        Some(moved.as_str()),
+        "a retry after the pointer exists must still snapshot the head at that attempt"
     );
 }

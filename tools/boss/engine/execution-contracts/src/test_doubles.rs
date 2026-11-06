@@ -68,6 +68,9 @@ impl CubeClient for NoopCube {
     async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
         Ok(vec![])
     }
+    async fn positioned_parent(&self, _: &Path) -> Result<String> {
+        Ok("test-positioned-parent".into())
+    }
 }
 
 /// Implement [`CubeClient`](crate::CubeClient) for a test
@@ -272,6 +275,9 @@ macro_rules! stub_cube_client {
         #[::async_trait::async_trait]
         impl $crate::CubeClient for $ty {
             $($acc)*
+            async fn positioned_parent(&self, _workspace: &::std::path::Path) -> ::anyhow::Result<::std::string::String> {
+                Ok("test-positioned-parent".to_owned())
+            }
             async fn create_execution_bookmark(&self, workspace: &::std::path::Path, execution_id: &str, _predecessor: Option<&::boss_engine_recovery::execution_bookmark::ExecutionBookmark>, _inherited_base: Option<&str>) -> ::anyhow::Result<::boss_engine_recovery::execution_bookmark::ExecutionBookmark> {
                 Ok(::boss_engine_recovery::execution_bookmark::ExecutionBookmark {
                     execution_id: execution_id.to_owned(),
@@ -283,11 +289,12 @@ macro_rules! stub_cube_client {
             }
         }
     };
-    (@munch $ty:ty [$($acc:tt)*] @done async fn create_execution_bookmark $a:tt -> $r:ty $b:block) => {
+    (@munch $ty:ty [$($acc:tt)*] @done async fn create_execution_bookmark $a:tt -> $r:ty $b:block $($rest:tt)*) => {
         #[::async_trait::async_trait]
         impl $crate::CubeClient for $ty {
             $($acc)*
             async fn create_execution_bookmark $a -> $r $b
+            $($rest)*
         }
     };
 }

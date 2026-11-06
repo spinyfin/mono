@@ -1833,32 +1833,61 @@ impl ExecutionCoordinator {
         // The commit cube positioned this workspace on is the pointer floor for
         // a fresh start. Capture it now so a trunk that advances before the
         // pointer exists cannot move the floor onto unrelated upstream work.
+        // A failed capture is a pre-start positioning failure: retry rather
+        // than creating a pointer whose floor is a later re-resolution of
+        // trunk().
         let positioned_base = if change.is_some() {
-            adapter
-                .positioned_parent(&lease.workspace_path)
-                .await
-                .inspect_err(|err| tracing::warn!(?err, "could not capture the positioned commit"))
-                .ok()
+            match adapter.positioned_parent(&lease.workspace_path).await {
+                Ok(commit) => Some(commit),
+                Err(err) => {
+                    self.release_pre_start_workspace(
+                        execution,
+                        &lease,
+                        &adapter,
+                        PreStartStage::BeforeRecoveryBookmark,
+                    )
+                    .await;
+                    if had_requested_host {
+                        self.cancel_requested_host_pre_start_failure(execution, "positioned commit capture", &err)
+                            .await;
+                        return Err(err);
+                    }
+                    self.record_start_failure(
+                        Arc::clone(self),
+                        execution,
+                        worker_id,
+                        Some(repo.repo_id.as_str()),
+                        (
+                            "positioned_commit_capture_failed",
+                            "Could not capture the positioned commit",
+                        ),
+                        &err,
+                    )
+                    .await?;
+                    return Err(err);
+                }
+            }
         } else {
             None
         };
         let bookmark_result = async {
-            if self.work_db.execution_bookmark_optional(&execution.id)?.is_none() {
-                // A GitHub failure is retried like any pre-start failure, but a
-                // recovery floor never stops work from starting for good: once
-                // the retry budget is spent, the pointer falls back to trunk.
-                if let Err(err) = self.execution_started_hook.snapshot_pr_head_before(&execution.id).await {
-                    let spent = usize::try_from(execution.pre_start_failure_count.max(0))
-                        .is_ok_and(|failures| failures >= self.pre_start_retry_delays.len());
-                    if !spent {
-                        return Err(err);
-                    }
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        ?err,
-                        "pr_head_before snapshot failed on the final attempt; creating the pointer without it"
-                    );
+            // Refresh the contribution snapshot on every pre-start attempt,
+            // including a retry that already has a pointer row. The recovery
+            // floor stays on that row; pr_head_before is this attempt's
+            // SHA-delta baseline.
+            if let Err(err) = self.execution_started_hook.snapshot_pr_head_before(&execution.id).await {
+                let spent = usize::try_from(execution.pre_start_failure_count.max(0))
+                    .is_ok_and(|failures| failures >= self.pre_start_retry_delays.len());
+                if !spent {
+                    return Err(err);
                 }
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "pr_head_before snapshot failed on the final attempt; continuing without it"
+                );
+            }
+            if self.work_db.execution_bookmark_optional(&execution.id)?.is_none() {
                 let execution_for_pointer = self.work_db.get_execution(&execution.id)?;
                 let predecessor = match recovered.as_ref().filter(|recovered| recovered.has_work) {
                     Some(recovered) if self.work_db.preserved_tip(&recovered.predecessor)?.is_none() => {

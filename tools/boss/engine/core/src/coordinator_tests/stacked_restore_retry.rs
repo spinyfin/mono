@@ -104,6 +104,10 @@ impl HostAdapter for FlakyRestoreAdapter {
         self.inner.create_change(workspace_path, title).await
     }
 
+    async fn positioned_parent(&self, workspace: &Path) -> Result<String> {
+        self.inner.positioned_parent(workspace).await
+    }
+
     async fn goto_workspace(&self, workspace_path: &Path, pr: u64) -> Result<()> {
         self.inner.goto_workspace(workspace_path, pr).await
     }

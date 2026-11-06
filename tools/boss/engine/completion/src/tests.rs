@@ -340,7 +340,7 @@ impl BranchVerifier for StubBranchVerifier {
                 Some(message) => {
                     Err(git_utils::gh_cli::GhError::new(git_utils::gh_cli::GhErrorKind::Deterministic, message).into())
                 }
-                None => Err(anyhow::anyhow!(msg.clone())),
+                None => Err(git_utils::gh_cli::error_from_stderr("gh pr view", msg)),
             },
         }
     }

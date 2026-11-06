@@ -421,6 +421,16 @@ pub trait CubeClient: Send + Sync {
         let _ = (workspace, execution_id, predecessor, inherited_base);
         anyhow::bail!("execution bookmarks are not supported by this CubeClient")
     }
+
+    /// The commit the workspace's working copy sits on (its parent).
+    async fn positioned_parent(&self, workspace: &Path) -> Result<String> {
+        boss_engine_recovery::execution_bookmark::one_commit(
+            &boss_engine_recovery::execution_bookmark::LocalJj,
+            workspace,
+            "@-",
+        )
+        .await
+    }
     async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle>;
     async fn lease_workspace(
         &self,

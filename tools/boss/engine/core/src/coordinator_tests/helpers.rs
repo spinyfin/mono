@@ -24,7 +24,7 @@ pub(super) use crate::test_support::*;
 pub(super) use std::future::pending;
 pub(super) use std::path::PathBuf;
 pub(super) use std::sync::Arc;
-pub(super) use std::sync::atomic::{AtomicBool, Ordering};
+pub(super) use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 pub(super) use std::time::Duration;
 
 pub(super) use anyhow::{Result, anyhow};
@@ -57,6 +57,8 @@ pub(super) type LeaseCall = (String, String, Option<String>, bool, Vec<String>);
 // but checkleft's `rust/giant-structs` check parses each file in isolation and
 // cannot see the ancestor `cfg(test)`; the marker tells it this is the test-only
 // fixture it is meant to skip (the builder-pattern rule targets production types).
+type CreateChangeHook = Arc<dyn Fn(&std::path::Path) + Send + Sync>;
+
 #[cfg(test)]
 #[derive(Default)]
 pub(super) struct FakeCubeClient {
@@ -139,6 +141,10 @@ pub(super) struct FakeCubeClient {
     pub(super) fail_first_n_releases: usize,
     /// Fail the first N execution-bookmark creations, then succeed.
     pub(super) fail_first_n_bookmark_creates: usize,
+    /// Fail the first N `positioned_parent` captures, then succeed.
+    pub(super) fail_first_n_positioned_parent: AtomicUsize,
+    /// Runs after a successful `create_change`, before dispatch captures `@-`.
+    pub(super) on_create_change: Option<CreateChangeHook>,
     pub(super) closed_pr: bool,
     pub(super) goto_reset_bookmark: Option<String>,
     /// Make `recovery_pr_base` fail, as for a non-GitHub origin or a deleted PR base.
@@ -353,6 +359,9 @@ crate::stub_cube_client! { FakeCubeClient {
         if self.position_real_workspace {
             boss_engine_test_git::jj::JjRepo::run(workspace_path, &["describe", "-m", title]);
         }
+        if let Some(hook) = &self.on_create_change {
+            hook(workspace_path);
+        }
         Ok(CubeChangeHandle {
             change_id: "chg-1".to_owned(),
         })
@@ -493,6 +502,24 @@ crate::stub_cube_client! { FakeCubeClient {
         Ok(boss_engine_recovery::execution_bookmark::ExecutionBookmark {
             execution_id: execution_id.to_owned(), repo_path: workspace.to_path_buf(), host_id: "local".to_owned(), base_commit: None, pr_head_before: None,
         })
+    }
+    async fn positioned_parent(&self, workspace: &std::path::Path) -> Result<String> {
+        if self
+            .fail_first_n_positioned_parent
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n: usize| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(anyhow!("could not capture the positioned commit"));
+        }
+        if self.real_bookmarks || self.position_real_workspace {
+            return boss_engine_recovery::execution_bookmark::one_commit(
+                &boss_engine_recovery::execution_bookmark::LocalJj,
+                workspace,
+                "@-",
+            )
+            .await;
+        }
+        Ok("test-positioned-parent".into())
     }
 } }
 

@@ -34,7 +34,7 @@ async fn run_gh(args: &[&str], display: &str) -> Result<String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr = stderr.trim();
-        return Err(GhError::new(classify_stderr(stderr), format!("`{display}` failed: {stderr}")).into());
+        return Err(error_from_stderr(display, stderr));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
@@ -84,6 +84,11 @@ pub fn is_deterministic(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<GhError>()
         .is_some_and(|err| err.kind == GhErrorKind::Deterministic)
+}
+
+/// Typed error for a failed `gh` invocation, classified from `stderr`.
+pub fn error_from_stderr(display: &str, stderr: &str) -> anyhow::Error {
+    GhError::new(classify_stderr(stderr), format!("`{display}` failed: {stderr}")).into()
 }
 
 /// Retry policy for `gh` stderr: a missing resource or an authorization
@@ -387,6 +392,12 @@ mod tests {
         let transient: anyhow::Error = GhError::new(GhErrorKind::Transient, "offline").into();
         assert!(!is_deterministic(&transient));
         assert!(!is_deterministic(&anyhow!("untyped")));
+        let classified = error_from_stderr("gh pr view", "Resource not accessible by integration (HTTP 403)");
+        assert!(is_deterministic(&classified), "{classified:#}");
+        assert!(!is_deterministic(&error_from_stderr(
+            "gh pr view",
+            "error connecting to api.github.com"
+        )));
     }
 
     #[test]

@@ -576,11 +576,11 @@ pub async fn create_from(
             }
             diff(jj, prior).await?;
         }
-        // A restore-report or `pr_head_before` hash is the floor only when it
-        // still exists. A missing hash is not copied: `jj bookmark create`
-        // would fail on every retry. Fall back to the predecessor's resolved
-        // floor, then the trunk commit. The positioned workspace's ancestry is
-        // never walked to infer a floor.
+        // A restore-report, positioned-commit, or `pr_head_before` hash is
+        // the floor only when it still exists. A missing hash is not copied:
+        // `jj bookmark create` would fail on every retry. Fall back to the
+        // predecessor's resolved floor, then the trunk commit. The positioned
+        // workspace's ancestry is never walked to infer a floor.
         let baseline = if let Some(commit) = usable_commit(jj, &record.repo_path, inherited_base).await? {
             commit
         } else if let Some(prior) = predecessor {

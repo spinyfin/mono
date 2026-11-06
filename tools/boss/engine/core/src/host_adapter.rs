@@ -320,7 +320,7 @@ impl HostAdapter for LocalHostAdapter {
         Ok(true)
     }
     async fn positioned_parent(&self, workspace: &Path) -> Result<String> {
-        execution_bookmark::one_commit(&LocalJj, workspace, "@-").await
+        self.cube_client.positioned_parent(workspace).await
     }
     async fn start_fresh_workspace(&self, workspace: &Path) -> Result<String> {
         let trunk = execution_bookmark::one_commit(&LocalJj, workspace, "trunk()").await?;

@@ -2801,3 +2801,37 @@ async fn a_deterministic_head_lookup_failure_proceeds_without_a_snapshot_while_a
     handler.snapshot_pr_head_before(&execution_id).await.unwrap();
     assert_eq!(db.get_execution(&execution_id).unwrap().pr_head_before, None);
 }
+
+#[tokio::test]
+async fn a_non_rate_limit_http_403_proceeds_without_a_snapshot_and_clears_a_previous_head() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    db.update_work_item(
+        &chore_id,
+        crate::work::WorkItemPatch {
+            pr_url: Some("https://github.com/spinyfin/mono/pull/611".into()),
+            ..crate::work::WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    let verifier = StubBranchVerifier::ok("boss/exec_old");
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let handler = handler.with_branch_verifier(verifier.clone());
+
+    verifier.set_head_oid(Ok("first_attempt_head".into())).await;
+    handler.snapshot_pr_head_before(&execution_id).await.unwrap();
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().pr_head_before.as_deref(),
+        Some("first_attempt_head")
+    );
+
+    verifier
+        .set_head_oid(Err("Resource not accessible by integration (HTTP 403)".into()))
+        .await;
+    handler.snapshot_pr_head_before(&execution_id).await.unwrap();
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().pr_head_before,
+        None,
+        "a classified non-rate-limit 403 must not leave the earlier attempt's head as the floor"
+    );
+}

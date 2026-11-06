@@ -26,12 +26,12 @@ impl WorkerCompletionHandler {
     /// the pointer falls back to its trunk floor immediately; only transport
     /// failures are returned for retry.
     ///
-    /// The snapshot always belongs to the attempt that creates the pointer: a
-    /// head recorded by an earlier attempt that failed before the pointer
-    /// existed is cleared first, then replaced only when this attempt's own
-    /// lookup succeeds. A skipped or failed lookup leaves no head, so the
-    /// recovery floor and the SHA-delta baseline never credit movement
-    /// between attempts to this run.
+    /// The snapshot always belongs to this pre-start attempt, whether or not
+    /// a pointer row already exists: a head recorded by an earlier attempt
+    /// is cleared first, then replaced only when this attempt's own lookup
+    /// succeeds. A skipped or failed lookup leaves no head, so the
+    /// SHA-delta baseline never credits movement between attempts to this
+    /// run. The recovery floor on an existing pointer row is left alone.
     pub async fn snapshot_pr_head_before(&self, execution_id: &str) -> Result<()> {
         self.snapshot_bound_pr(execution_id, false).await
     }
@@ -92,8 +92,8 @@ impl WorkerCompletionHandler {
         let Some((repo_slug, pr_number, bound_pr_url)) = located else {
             return Ok(());
         };
-        // The pre-pointer call owns the snapshot for the attempt that creates
-        // the pointer; the running hook preserves it.
+        // The pre-pointer call owns the snapshot for this pre-start attempt;
+        // the running hook preserves it.
         if !include_metadata || execution.pr_head_before.is_none() {
             match self.branch_verifier.fetch_pr_head_oid(&repo_slug, pr_number).await {
                 Ok(head_oid) => self.work_db.set_execution_pr_head_before(execution_id, &head_oid)?,
