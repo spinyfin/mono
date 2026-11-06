@@ -234,7 +234,7 @@ def _host_tmux_repository_impl(repository_ctx):
             repository_ctx.file(
                 "BUILD.bazel",
                 content = """\
-exports_files([\"tmux\"], visibility = [\"@@//tools/boss/engine/core:__pkg__\"])
+exports_files([\"tmux\"], visibility = [\"@@//tools/boss/engine:__subpackages__\"])
 """,
             )
             return
@@ -249,7 +249,7 @@ exports_files([\"tmux\"], visibility = [\"@@//tools/boss/engine/core:__pkg__\"])
     repository_ctx.file(
         "BUILD.bazel",
         content = """\
-exports_files([\"tmux\"], visibility = [\"@@//tools/boss/engine/core:__pkg__\"])
+exports_files([\"tmux\"], visibility = [\"@@//tools/boss/engine:__subpackages__\"])
 """,
     )
 

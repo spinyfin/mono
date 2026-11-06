@@ -27,6 +27,7 @@ rust_library(
         "//tools/boss/engine/utils",
         "//tools/boss/protocol",
         "//tools/boss/protocol-spoke",
+        "//tools/boss/tmux",
     ] + all_crate_deps(normal = True),
 )
 

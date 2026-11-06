@@ -1,5 +1,6 @@
 //! Durable, single-owner spoke inbox and observation spool. No work authority.
 mod commands;
+mod executions;
 mod records;
 mod schema {
     use anyhow::{Result, ensure};
@@ -8,7 +9,7 @@ mod schema {
     pub fn migrate(db: &mut Connection) -> Result<()> {
         let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
         ensure!(
-            version <= 3,
+            version <= 4,
             "journal schema is newer than this reader; rollback refused"
         );
         if version == 0 {
@@ -58,6 +59,19 @@ mod schema {
                 "ALTER TABLE commands ADD COLUMN recovery BLOB;
                  ALTER TABLE identity ADD COLUMN result_limit INTEGER NOT NULL DEFAULT 262144;
                  PRAGMA user_version=3;",
+            )?;
+            tx.commit()?;
+        }
+        if version < 4 {
+            let tx = db.transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS executions (
+                    run_id TEXT NOT NULL,
+                    spawn_token TEXT NOT NULL,
+                    bytes BLOB NOT NULL,
+                    PRIMARY KEY (run_id, spawn_token)
+                 );
+                 PRAGMA user_version=4;",
             )?;
             tx.commit()?;
         }

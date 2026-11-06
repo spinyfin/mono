@@ -11,6 +11,36 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 pub const INITIAL_PROMPT_HOME_KEY: &str = "initial_prompt_home";
+/// sysexits.h `EX_USAGE`: the relay never delivered the brief. Distinct from a
+/// driver that exits nonzero after a delivered turn. Pair with [`UNDELIVERED_MARKER`].
+pub const BRIEF_NOT_DELIVERED_EXIT: i32 = 64;
+pub const DELIVERED_MARKER: &str = "initial-prompt.delivered";
+pub const UNDELIVERED_MARKER: &str = "initial-prompt.undelivered";
+
+pub fn undelivered_marker_present(home: &Path) -> bool {
+    home.join(UNDELIVERED_MARKER).is_file()
+}
+
+pub fn delivered_marker_present(home: &Path) -> bool {
+    home.join(DELIVERED_MARKER).is_file()
+}
+
+/// True when the pane exit or last output shows the relay never delivered.
+pub fn is_brief_not_delivered_status(exit_code: Option<i32>, last_output: Option<&str>) -> bool {
+    if exit_code == Some(BRIEF_NOT_DELIVERED_EXIT) {
+        return true;
+    }
+    last_output.is_some_and(|text| {
+        text.contains("boss initial brief delivery failed")
+            || text.contains("before receiving the initial brief")
+            || text.contains("did not become ready for initial brief")
+    })
+}
+
+/// Marker file, exit 64, or relay diagnostic: the brief was not delivered.
+pub fn is_brief_not_delivered(exit_code: Option<i32>, home: Option<&Path>, last_output: Option<&str>) -> bool {
+    home.is_some_and(undelivered_marker_present) || is_brief_not_delivered_status(exit_code, last_output)
+}
 
 /// The retained per-run home a driver's runtime state owns: a Codex
 /// `codex_home`, or the private input home Claude records as
@@ -445,9 +475,10 @@ assert_processes_exited(lifetime_reader)
                 .args(["python3", "-c", "print('DRIVER_EXECUTED')"])
                 .output()
                 .unwrap();
-            assert!(!output.status.success());
+            assert_eq!(output.status.code(), Some(BRIEF_NOT_DELIVERED_EXIT));
             assert!(!String::from_utf8_lossy(&output.stdout).contains("DRIVER_EXECUTED"));
             assert!(String::from_utf8_lossy(&output.stderr).contains("boss initial brief delivery failed"));
+            assert!(undelivered_marker_present(temp.path()));
         }
     }
 
@@ -468,8 +499,9 @@ assert_processes_exited(lifetime_reader)
             fs::read_to_string(temp.path().join("worker.pid")).unwrap(),
             pid.to_string()
         );
-        assert!(!output.status.success());
+        assert_eq!(output.status.code(), Some(BRIEF_NOT_DELIVERED_EXIT));
         assert!(String::from_utf8_lossy(&output.stderr).contains("before receiving the initial brief"));
+        assert!(undelivered_marker_present(temp.path()));
     }
 
     #[test]
@@ -502,9 +534,21 @@ assert_processes_exited(lifetime_reader)
             .status()
             .unwrap();
         assert_eq!(status.code(), Some(9));
+        assert!(delivered_marker_present(temp.path()));
         assert!(
             started.elapsed() < std::time::Duration::from_secs(20),
             "relay waited for the stray descendant"
         );
+    }
+
+    #[test]
+    fn exit_64_or_relay_text_is_the_brief_not_delivered_signal() {
+        assert!(is_brief_not_delivered_status(Some(BRIEF_NOT_DELIVERED_EXIT), None));
+        assert!(is_brief_not_delivered_status(
+            Some(1),
+            Some("boss initial brief delivery failed: timeout")
+        ));
+        assert!(!is_brief_not_delivered_status(Some(1), Some("worker finished")));
+        assert!(!is_brief_not_delivered(Some(1), None, None));
     }
 }

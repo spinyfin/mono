@@ -214,11 +214,16 @@ pub(super) fn dead_pane_reason(
     pane_dead_status: Option<&str>,
     last_output: Option<&str>,
 ) -> String {
-    let mut reason = match pane_dead_status {
-        Some(status) if !status.is_empty() => {
-            format!("tmux pane dead in session {session_name}: pane_dead_status={status}")
+    let parsed_status = pane_dead_status.and_then(|status| status.parse::<i32>().ok());
+    let mut reason = if crate::driver::initial_prompt::is_brief_not_delivered_status(parsed_status, last_output) {
+        format!("tmux pane dead in session {session_name}: initial brief was not delivered")
+    } else {
+        match pane_dead_status {
+            Some(status) if !status.is_empty() => {
+                format!("tmux pane dead in session {session_name}: pane_dead_status={status}")
+            }
+            _ => format!("tmux pane dead in session {session_name}"),
         }
-        _ => format!("tmux pane dead in session {session_name}"),
     };
     if let Some(output) = last_output.map(truncate_pane_output).filter(|text| !text.is_empty()) {
         reason.push_str("; last output: ");
@@ -278,6 +283,23 @@ mod tests {
         assert!(
             reason.contains("command not found: codex"),
             "reason must carry the dead pane last output, got {reason}"
+        );
+    }
+
+    #[test]
+    fn brief_not_delivered_exit_is_named_in_the_reason() {
+        let reason = dead_pane_reason(
+            "boss-worker-1",
+            Some("64"),
+            Some("boss initial brief delivery failed: driver exited before receiving the initial brief\n"),
+        );
+        assert!(
+            reason.contains("initial brief was not delivered"),
+            "reason must name brief-not-delivered, got {reason}"
+        );
+        assert!(
+            reason.contains("before receiving the initial brief"),
+            "reason must still carry last output, got {reason}"
         );
     }
 }

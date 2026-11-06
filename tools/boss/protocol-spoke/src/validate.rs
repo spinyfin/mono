@@ -503,7 +503,7 @@ impl Validate for v1::CommandResult {
 impl Validate for v1::PaneState {
     fn validate(&self) -> Check {
         let life = specified::<v1::PaneLife>("pane.life", self.life)?;
-        if self.exit_code.is_some() && life != v1::PaneLife::Exited {
+        if self.exit_code.is_some() && life != v1::PaneLife::Exited && life != v1::PaneLife::BriefNotDelivered {
             return Err(ValidationError::Forbidden {
                 field: "pane.exit_code",
                 context: "a pane that has not exited",
@@ -778,6 +778,12 @@ mod tests {
             .validate()
             .expect("exited with status");
         pane(v1::PaneLife::Exited, None).validate().expect("exited by signal");
+        pane(v1::PaneLife::BriefNotDelivered, Some(64))
+            .validate()
+            .expect("brief-not-delivered carries the relay exit");
+        pane(v1::PaneLife::BriefNotDelivered, None)
+            .validate()
+            .expect("brief-not-delivered from the marker alone");
         assert!(pane(v1::PaneLife::Alive, Some(0)).validate().is_err());
         assert!(pane(v1::PaneLife::Missing, None).validate().is_ok());
     }

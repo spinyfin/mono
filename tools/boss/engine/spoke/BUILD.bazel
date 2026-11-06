@@ -21,7 +21,10 @@ rust_binary(
 rust_test(
     name = "spoke_test",
     size = "small",
-    srcs = glob(["tests/**/*.rs"]),
+    srcs = glob(
+        ["tests/**/*.rs"],
+        exclude = ["tests/supervisor.rs"],
+    ),
     crate_root = "tests/session.rs",
     data = [":boss-spoke"],
     edition = "2024",
@@ -35,6 +38,42 @@ rust_test(
         "//tools/boss/engine/spoke-journal",
         "//tools/boss/engine/spoke-outbound",
         "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "spoke_supervisor_tmux_test",
+    size = "medium",
+    timeout = "moderate",
+    srcs = [
+        "tests/hub.rs",
+        "tests/supervisor.rs",
+    ],
+    crate_root = "tests/supervisor.rs",
+    data = [
+        ":boss-spoke",
+        "@host_tmux//:tmux",
+    ],
+    edition = "2024",
+    env = {
+        "HOME": "/tmp",
+        "SPOKE_BIN": "$(rootpath :boss-spoke)",
+    },
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    tags = ["manual"],
+    deps = [
+        "//tools/boss/engine/host-enrollment",
+        "//tools/boss/engine/host-execution",
+        "//tools/boss/engine/spoke-journal",
+        "//tools/boss/engine/spoke-outbound",
+        "//tools/boss/protocol-spoke",
+        "//tools/boss/tmux",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,
