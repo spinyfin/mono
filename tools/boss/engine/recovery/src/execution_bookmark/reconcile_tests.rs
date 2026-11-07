@@ -93,7 +93,7 @@ pub(super) async fn revision_on_pr_head(execution_id: &str) -> Scene {
             .await
             .unwrap();
     std::fs::write(repo.worker.join("revision.txt"), "revision work\n").unwrap();
-    JjRepo::run(&repo.worker, &["status"]);
+    JjRepo::snapshot(&repo.worker);
     JjRepo::run(&repo.repo, &["new", "main", "-m", "Main advances"]);
     std::fs::write(repo.repo.join("toolchain.txt"), "updated\n").unwrap();
     JjRepo::run(&repo.repo, &["bookmark", "set", "main", "-r", "@"]);
@@ -203,7 +203,7 @@ async fn heads_on_different_lines_are_both_resumed_without_a_verdict() {
     let work = one(repo, &revision(&s.record.head()));
     JjRepo::run(repo, &["new", "main", "-m", "Other line"]);
     std::fs::write(repo.join("other.txt"), "other\n").unwrap();
-    JjRepo::run(repo, &["status"]);
+    JjRepo::snapshot(repo);
     let other = one(repo, "@");
     bookmark(repo, &s.record.publication(), &other);
     let patch = diff(&LocalJj, &s.record).await.unwrap();
@@ -228,7 +228,7 @@ async fn a_foreign_head_is_preserved_work_not_an_integrity_failure() {
     let repo = &s.repo.repo;
     JjRepo::run(repo, &["new", "root()", "-m", "Someone else's history"]);
     std::fs::write(repo.join("foreign.txt"), "not ours\n").unwrap();
-    JjRepo::run(repo, &["status"]);
+    JjRepo::snapshot(repo);
     let foreign = one(repo, "@");
     bookmark(repo, &s.record.head(), &foreign);
     bookmark(repo, &s.record.publication(), &foreign);
@@ -287,13 +287,13 @@ async fn unpublished_amendments_are_not_adopted_by_matching_change_ids() {
         let s = revision_on_pr_head("exec_amendment").await;
         let pushed = one(&s.repo.repo, &revision(&s.record.head()));
         std::fs::write(s.repo.worker.join("local.txt"), "unpublished").unwrap();
-        JjRepo::run(&s.repo.worker, &["status"]);
+        JjRepo::snapshot(&s.repo.worker);
         let local = one(&s.repo.repo, &revision(&s.record.head()));
         keep_visible(&s.repo.repo, &pushed);
         let published = if unique_edits_on_both_sides {
             JjRepo::run(&s.repo.repo, &["edit", &pushed]);
             std::fs::write(s.repo.repo.join("remote.txt"), "published elsewhere").unwrap();
-            JjRepo::run(&s.repo.repo, &["status"]);
+            JjRepo::snapshot(&s.repo.repo);
             one(&s.repo.repo, "@")
         } else {
             pushed

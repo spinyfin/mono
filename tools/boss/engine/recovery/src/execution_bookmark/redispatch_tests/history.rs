@@ -14,8 +14,7 @@ fn checkpoint(repo: &Path, record: &ExecutionBookmark) {
 #[tokio::test]
 async fn retry_reuses_its_own_empty_positioning_change() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = JjRepo::new(dir.path());
-    origin(&repo);
+    let repo = JjRepo::with_origin(dir.path());
     let record = create(&LocalJj, &repo.worker, "exec_retry", "local").await.unwrap();
     let original = log(&repo.worker, "@", "commit_id");
     assert!(
@@ -37,122 +36,137 @@ async fn retry_reuses_its_own_empty_positioning_change() {
     assert!(diff(&LocalJj, &record).await.unwrap().contains("retry fix"));
 }
 
-#[tokio::test]
-async fn redispatch_does_not_promote_positioning_changes_into_pushed_history() {
-    for pr in [None, Some("pr/81")] {
-        for has_fixes in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let repo = JjRepo::new(dir.path());
-            origin(&repo);
-            if let Some(pr) = pr {
-                std::fs::write(repo.worker.join("feature"), "published feature\n").unwrap();
-                JjRepo::run(&repo.worker, &["describe", "-m", "Published feature"]);
-                JjRepo::run(&repo.worker, &["bookmark", "set", pr, "-r", "@"]);
-                // workspace goto creates this editable child, then dispatch pins it.
-                JjRepo::run(&repo.worker, &["new", pr]);
-            }
-            let prior = create(&LocalJj, &repo.worker, "exec_positioned", "local")
-                .await
-                .unwrap();
-            if has_fixes {
-                // Also cover an interior setup change and a post-commit empty tip.
-                JjRepo::run(&repo.worker, &["new", "-m", "Preserved fix"]);
-                std::fs::write(repo.worker.join("fix"), "preserved fix\n").unwrap();
-                JjRepo::run(&repo.worker, &["new"]);
-                checkpoint(&repo.worker, &prior);
-                JjRepo::run(&repo.worker, &["new", "-m", "Second preserved fix"]);
-                std::fs::write(repo.worker.join("fix"), "preserved fix\nsecond fix\n").unwrap();
-                JjRepo::run(&repo.worker, &["new"]);
-                checkpoint(&repo.worker, &prior);
-            }
-            let original = log(&repo.repo, &revision(&prior.head()), "commit_id");
-            let patch = diff(&LocalJj, &prior).await.unwrap();
-            let report = restore_rebased(&LocalJj, &prior, &repo.replacement, pr, "main", "origin")
-                .await
-                .unwrap();
-            assert!(report.conflicts.is_empty());
-            let next = create_from(
-                &LocalJj,
-                &repo.replacement,
-                "exec_successor",
-                "local",
-                Some(&prior),
-                report.inherited_base.as_deref(),
-            )
-            .await
-            .unwrap();
-            if has_fixes {
-                checkpoint(&repo.replacement, &next);
-            }
-            // A second redispatch must not promote positioning or setup changes
-            // into the history that gets pushed.
-            let second = restore_rebased(&LocalJj, &next, &repo.replacement, pr, "main", "origin").await;
-            if has_fixes {
-                second.unwrap();
-            } else {
-                // An empty successor has no recovery head: that is the explicit
-                // nothing-to-restore outcome, and the caller positions fresh.
-                assert!(log(&repo.repo, &revision(&next.head()), "commit_id").is_empty());
-                let error = second.unwrap_err();
-                assert!(is_missing_pointer_error(&error), "PR {pr:?}: {error:#}");
-                let parent = pr.unwrap_or("main");
-                JjRepo::run(
-                    &repo.replacement,
-                    &["new", parent, "-m", "Resume recovered execution work"],
-                );
-            }
-            std::fs::write(repo.replacement.join("review-fix"), "review correction\n").unwrap();
-            JjRepo::run(&repo.replacement, &["describe", "-m", "Correct review findings"]);
-            JjRepo::run(&repo.replacement, &["bookmark", "set", "feature", "-r", "@"]);
-            let offenders = log(
-                &repo.replacement,
-                "(main..feature) & empty() & description(exact:\"\")",
-                "commit_id",
-            );
-            assert!(offenders.is_empty(), "PR {pr:?}, fixes {has_fixes}: {offenders}");
-            assert_eq!(log(&repo.repo, &revision(&prior.head()), "commit_id"), original);
-            assert_eq!(diff(&LocalJj, &prior).await.unwrap(), patch);
-            if has_fixes {
-                assert_eq!(
-                    std::fs::read_to_string(repo.replacement.join("fix")).unwrap(),
-                    "preserved fix\nsecond fix\n"
-                );
-                assert!(log(&repo.replacement, "(main..feature) & merges()", "commit_id").is_empty());
-            }
-            if pr.is_some() {
-                assert!(repo.replacement.join("feature").exists());
-            }
-            // Exercise jj's real publication validation against a separate local remote.
-            let remote = dir.path().join("published");
-            JjRepo::run(&repo.repo, &["git", "init", remote.to_str().unwrap()]);
-            JjRepo::run(
-                &repo.replacement,
-                &[
-                    "git",
-                    "remote",
-                    "add",
-                    "publication",
-                    remote.join(".jj/repo/store/git").to_str().unwrap(),
-                ],
-            );
-            JjRepo::run(
-                &repo.replacement,
-                &["git", "push", "--remote", "publication", "-b", "feature", "--allow-new"],
-            );
-            JjRepo::run(&remote, &["git", "import"]);
-            assert_eq!(
-                log(&remote, "feature", "commit_id"),
-                log(&repo.replacement, "feature", "commit_id")
-            );
-        }
+/// Two redispatches of the same work, optionally bound to PR `pr` and
+/// optionally carrying preserved fixes, followed by a real push.
+async fn redispatch_does_not_promote_positioning_changes_into_pushed_history(pr: Option<&str>, has_fixes: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = JjRepo::with_origin(dir.path());
+    if let Some(pr) = pr {
+        std::fs::write(repo.worker.join("feature"), "published feature\n").unwrap();
+        JjRepo::run(&repo.worker, &["describe", "-m", "Published feature"]);
+        JjRepo::run(&repo.worker, &["bookmark", "set", pr, "-r", "@"]);
+        // workspace goto creates this editable child, then dispatch pins it.
+        JjRepo::run(&repo.worker, &["new", pr]);
     }
+    let prior = create(&LocalJj, &repo.worker, "exec_positioned", "local")
+        .await
+        .unwrap();
+    if has_fixes {
+        // Also cover an interior setup change and a post-commit empty tip.
+        JjRepo::run(&repo.worker, &["new", "-m", "Preserved fix"]);
+        std::fs::write(repo.worker.join("fix"), "preserved fix\n").unwrap();
+        JjRepo::run(&repo.worker, &["new"]);
+        checkpoint(&repo.worker, &prior);
+        JjRepo::run(&repo.worker, &["new", "-m", "Second preserved fix"]);
+        std::fs::write(repo.worker.join("fix"), "preserved fix\nsecond fix\n").unwrap();
+        JjRepo::run(&repo.worker, &["new"]);
+        checkpoint(&repo.worker, &prior);
+    }
+    let original = log(&repo.repo, &revision(&prior.head()), "commit_id");
+    let patch = diff(&LocalJj, &prior).await.unwrap();
+    let report = restore_rebased(&LocalJj, &prior, &repo.replacement, pr, "main", "origin")
+        .await
+        .unwrap();
+    assert!(report.conflicts.is_empty());
+    let next = create_from(
+        &LocalJj,
+        &repo.replacement,
+        "exec_successor",
+        "local",
+        Some(&prior),
+        report.inherited_base.as_deref(),
+    )
+    .await
+    .unwrap();
+    if has_fixes {
+        checkpoint(&repo.replacement, &next);
+    }
+    // A second redispatch must not promote positioning or setup changes
+    // into the history that gets pushed.
+    let second = restore_rebased(&LocalJj, &next, &repo.replacement, pr, "main", "origin").await;
+    if has_fixes {
+        second.unwrap();
+    } else {
+        // An empty successor has no recovery head: that is the explicit
+        // nothing-to-restore outcome, and the caller positions fresh.
+        assert!(log(&repo.repo, &revision(&next.head()), "commit_id").is_empty());
+        let error = second.unwrap_err();
+        assert!(is_missing_pointer_error(&error), "PR {pr:?}: {error:#}");
+        let parent = pr.unwrap_or("main");
+        JjRepo::run(
+            &repo.replacement,
+            &["new", parent, "-m", "Resume recovered execution work"],
+        );
+    }
+    std::fs::write(repo.replacement.join("review-fix"), "review correction\n").unwrap();
+    JjRepo::run(&repo.replacement, &["describe", "-m", "Correct review findings"]);
+    JjRepo::run(&repo.replacement, &["bookmark", "set", "feature", "-r", "@"]);
+    let offenders = log(
+        &repo.replacement,
+        "(main..feature) & empty() & description(exact:\"\")",
+        "commit_id",
+    );
+    assert!(offenders.is_empty(), "PR {pr:?}, fixes {has_fixes}: {offenders}");
+    assert_eq!(log(&repo.repo, &revision(&prior.head()), "commit_id"), original);
+    assert_eq!(diff(&LocalJj, &prior).await.unwrap(), patch);
+    if has_fixes {
+        assert_eq!(
+            std::fs::read_to_string(repo.replacement.join("fix")).unwrap(),
+            "preserved fix\nsecond fix\n"
+        );
+        assert!(log(&repo.replacement, "(main..feature) & merges()", "commit_id").is_empty());
+    }
+    if pr.is_some() {
+        assert!(repo.replacement.join("feature").exists());
+    }
+    // Exercise jj's real publication validation against a separate local remote.
+    let remote = dir.path().join("published");
+    JjRepo::run(&repo.repo, &["git", "init", remote.to_str().unwrap()]);
+    JjRepo::run(
+        &repo.replacement,
+        &[
+            "git",
+            "remote",
+            "add",
+            "publication",
+            remote.join(".jj/repo/store/git").to_str().unwrap(),
+        ],
+    );
+    JjRepo::run(
+        &repo.replacement,
+        &["git", "push", "--remote", "publication", "-b", "feature", "--allow-new"],
+    );
+    JjRepo::run(&remote, &["git", "import"]);
+    assert_eq!(
+        log(&remote, "feature", "commit_id"),
+        log(&repo.replacement, "feature", "commit_id")
+    );
+}
+
+#[tokio::test]
+async fn chore_redispatch_without_fixes_does_not_promote_positioning_changes_into_pushed_history() {
+    redispatch_does_not_promote_positioning_changes_into_pushed_history(None, false).await;
+}
+
+#[tokio::test]
+async fn chore_redispatch_with_fixes_does_not_promote_positioning_changes_into_pushed_history() {
+    redispatch_does_not_promote_positioning_changes_into_pushed_history(None, true).await;
+}
+
+#[tokio::test]
+async fn revision_redispatch_without_fixes_does_not_promote_positioning_changes_into_pushed_history() {
+    redispatch_does_not_promote_positioning_changes_into_pushed_history(Some("pr/81"), false).await;
+}
+
+#[tokio::test]
+async fn revision_redispatch_with_fixes_does_not_promote_positioning_changes_into_pushed_history() {
+    redispatch_does_not_promote_positioning_changes_into_pushed_history(Some("pr/81"), true).await;
 }
 
 #[tokio::test]
 async fn redispatch_preserves_authored_empty_and_undescribed_nonempty_changes() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = JjRepo::new(dir.path());
-    origin(&repo);
+    let repo = JjRepo::with_origin(dir.path());
     let prior = create(&LocalJj, &repo.worker, "exec_authored", "local").await.unwrap();
     JjRepo::run(&repo.worker, &["describe", "-m", "Intentional checkpoint"]);
     JjRepo::run(&repo.worker, &["new"]);
@@ -186,8 +200,7 @@ async fn redispatch_preserves_authored_empty_and_undescribed_nonempty_changes() 
 #[tokio::test]
 async fn redispatch_preserves_empty_merge_topology() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = JjRepo::new(dir.path());
-    origin(&repo);
+    let repo = JjRepo::with_origin(dir.path());
     let prior = create(&LocalJj, &repo.worker, "exec_merge", "local").await.unwrap();
     std::fs::write(repo.worker.join("left"), "left change\n").unwrap();
     JjRepo::run(&repo.worker, &["describe", "-m", "Left change"]);

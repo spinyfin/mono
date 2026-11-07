@@ -221,7 +221,7 @@ mod tests {
         let repo = JjRepo::new(dir.path());
         let record = create(&LocalJj, &repo.worker, "exec_real_1", "local").await.unwrap();
         std::fs::write(repo.worker.join("hello.txt"), "uncommitted work\n").unwrap();
-        JjRepo::run(&repo.worker, &["status"]);
+        JjRepo::snapshot(&repo.worker);
         std::fs::remove_dir_all(&repo.worker).unwrap();
         let patch = backup_execution_patch(dir.path(), &LocalJj, &record)
             .await

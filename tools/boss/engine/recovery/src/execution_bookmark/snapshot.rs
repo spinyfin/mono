@@ -20,15 +20,27 @@ pub(crate) async fn resolve_bookmark_targets(
     repo: &Path,
     bookmarks: &[String],
 ) -> Result<HashMap<String, Vec<String>>> {
-    let mut targets: HashMap<String, Vec<String>> = HashMap::new();
     if bookmarks.is_empty() {
-        return Ok(targets);
+        return Ok(HashMap::new());
     }
     let revset = bookmarks
         .iter()
         .map(|name| revision(name))
         .collect::<Vec<_>>()
         .join(" | ");
+    Ok(bookmark_targets_in(
+        &commits_with_bookmarks(jj, repo, &revset).await?,
+        bookmarks,
+    ))
+}
+
+/// Every commit `revset` names, with the local bookmarks it carries, in one
+/// `jj` invocation. Hidden commits named explicitly are listed too.
+pub(crate) async fn commits_with_bookmarks(
+    jj: &dyn Jj,
+    repo: &Path,
+    revset: &str,
+) -> Result<Vec<(String, Vec<String>)>> {
     let output = jj
         .run(
             repo,
@@ -37,22 +49,39 @@ pub(crate) async fn resolve_bookmark_targets(
                 "log",
                 "--no-graph",
                 "-r",
-                &revset,
+                revset,
                 "-T",
                 "commit_id ++ \"\\t\" ++ local_bookmarks.map(|b| b.name()).join(\"\\t\") ++ \"\\n\"",
             ],
         )
         .await?;
-    for line in output.lines().filter(|line| !line.is_empty()) {
-        let mut fields = line.split('\t');
-        let Some(commit) = fields.next().filter(|commit| !commit.is_empty()) else {
-            continue;
-        };
-        for name in fields.filter(|name| bookmarks.iter().any(|wanted| wanted == name)) {
-            targets.entry(name.to_owned()).or_default().push(commit.to_owned());
+    Ok(output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let commit = fields.next().filter(|commit| !commit.is_empty())?;
+            Some((
+                commit.to_owned(),
+                fields.filter(|name| !name.is_empty()).map(str::to_owned).collect(),
+            ))
+        })
+        .collect())
+}
+
+/// The commits each of `bookmarks` targets among `commits`: a conflicted
+/// bookmark lists more than one, an absent bookmark is missing from the map.
+pub(crate) fn bookmark_targets_in(
+    commits: &[(String, Vec<String>)],
+    bookmarks: &[String],
+) -> HashMap<String, Vec<String>> {
+    let mut targets: HashMap<String, Vec<String>> = HashMap::new();
+    for (commit, names) in commits {
+        for name in names.iter().filter(|name| bookmarks.contains(name)) {
+            targets.entry(name.clone()).or_default().push(commit.clone());
         }
     }
-    Ok(targets)
+    targets
 }
 
 /// The single commit each bookmark targets (`None` when absent). A

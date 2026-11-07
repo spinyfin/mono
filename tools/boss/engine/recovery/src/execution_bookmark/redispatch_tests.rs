@@ -10,25 +10,10 @@ fn publish_main(repo: &JjRepo) -> String {
     JjRepo::run(&repo.repo, &["log", "-r", "main", "--no-graph", "-T", "commit_id"])
 }
 
-fn origin(repo: &JjRepo) {
-    JjRepo::run(
-        &repo.repo,
-        &[
-            "git",
-            "remote",
-            "add",
-            "origin",
-            repo.repo.join(".jj/repo/store/git").to_str().unwrap(),
-        ],
-    );
-    publish_main(repo);
-}
-
 #[tokio::test]
 async fn chore_restores_all_commits_on_fetched_main_and_reports_provenance() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = JjRepo::new(dir.path());
-    origin(&repo);
+    let repo = JjRepo::with_origin(dir.path());
     let prior = create(&LocalJj, &repo.worker, "exec_prior", "local").await.unwrap();
     std::fs::write(repo.worker.join("one"), "first fix").unwrap();
     JjRepo::run(&repo.worker, &["describe", "-m", "First fix"]);
@@ -36,7 +21,7 @@ async fn chore_restores_all_commits_on_fetched_main_and_reports_provenance() {
     JjRepo::run(&repo.worker, &["new", "-m", "Second fix"]);
     JjRepo::run(&repo.worker, &["bookmark", "set", &prior.head(), "-r", "@"]);
     std::fs::write(repo.worker.join("two"), "second fix").unwrap();
-    JjRepo::run(&repo.worker, &["status"]);
+    JjRepo::snapshot(&repo.worker);
     JjRepo::run(&repo.repo, &["new", "main", "-m", "Toolchain fix"]);
     std::fs::write(repo.repo.join("toolchain"), "updated").unwrap();
     let main = publish_main(&repo);
@@ -75,15 +60,14 @@ async fn chore_restores_all_commits_on_fetched_main_and_reports_provenance() {
 #[tokio::test]
 async fn revision_preserves_unpushed_fixes_on_top_of_newer_bound_pr_head() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = JjRepo::new(dir.path());
-    origin(&repo);
+    let repo = JjRepo::with_origin(dir.path());
     std::fs::write(repo.worker.join("pr"), "published PR").unwrap();
     JjRepo::run(&repo.worker, &["describe", "-m", "Published PR"]);
     JjRepo::run(&repo.worker, &["bookmark", "set", "pr/77", "-r", "@"]);
     JjRepo::run(&repo.worker, &["new", "-m", "Unpushed revision"]);
     let prior = create(&LocalJj, &repo.worker, "exec_revision", "local").await.unwrap();
     std::fs::write(repo.worker.join("local-fix"), "preserved").unwrap();
-    JjRepo::run(&repo.worker, &["status"]);
+    JjRepo::snapshot(&repo.worker);
     JjRepo::run(&repo.repo, &["new", "pr/77", "-m", "New PR commit"]);
     std::fs::write(repo.repo.join("remote-fix"), "new PR work").unwrap();
     JjRepo::run(&repo.repo, &["bookmark", "set", "pr/77", "-r", "@"]);
@@ -122,11 +106,10 @@ async fn revision_preserves_unpushed_fixes_on_top_of_newer_bound_pr_head() {
 #[tokio::test]
 async fn conflicts_remain_in_history_and_are_an_explicit_first_task() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = JjRepo::new(dir.path());
-    origin(&repo);
+    let repo = JjRepo::with_origin(dir.path());
     let prior = create(&LocalJj, &repo.worker, "exec_conflict", "local").await.unwrap();
     std::fs::write(repo.worker.join("base.txt"), "worker change\n").unwrap();
-    JjRepo::run(&repo.worker, &["status"]);
+    JjRepo::snapshot(&repo.worker);
     JjRepo::run(&repo.repo, &["new", "main", "-m", "Conflicting main"]);
     std::fs::write(repo.repo.join("base.txt"), "main change\n").unwrap();
     publish_main(&repo);
@@ -152,8 +135,7 @@ async fn conflicts_remain_in_history_and_are_an_explicit_first_task() {
 #[tokio::test]
 async fn missing_preserved_pointer_fails_before_modifying_the_destination() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = JjRepo::new(dir.path());
-    origin(&repo);
+    let repo = JjRepo::with_origin(dir.path());
     let prior = create(&LocalJj, &repo.worker, "exec_missing", "local").await.unwrap();
     JjRepo::run(&repo.repo, &["bookmark", "delete", &prior.head(), &prior.publication()]);
     let before = JjRepo::run(&repo.replacement, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
@@ -173,8 +155,7 @@ async fn missing_preserved_pointer_fails_before_modifying_the_destination() {
 async fn publication_pointer_restores_newer_work_and_survives_a_missing_recovery_ref() {
     for missing_recovery in [false, true] {
         let dir = tempfile::tempdir().unwrap();
-        let repo = JjRepo::new(dir.path());
-        origin(&repo);
+        let repo = JjRepo::with_origin(dir.path());
         let prior = create(&LocalJj, &repo.worker, "exec_publication", "local")
             .await
             .unwrap();
@@ -208,8 +189,7 @@ async fn failed_fetch_is_not_a_pointer_integrity_error() {
 #[tokio::test]
 async fn rewritten_pr_head_does_not_replay_stale_published_commits() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = JjRepo::new(dir.path());
-    origin(&repo);
+    let repo = JjRepo::with_origin(dir.path());
     std::fs::write(repo.worker.join("stale-pr"), "old published").unwrap();
     JjRepo::run(&repo.worker, &["describe", "-m", "Old published PR"]);
     JjRepo::run(&repo.worker, &["bookmark", "set", "pr/78", "-r", "@"]);
@@ -239,7 +219,7 @@ async fn rewritten_pr_head_does_not_replay_stale_published_commits() {
         ],
     );
     std::fs::write(repo.worker.join("local-fix"), "preserved").unwrap();
-    JjRepo::run(&repo.worker, &["status"]);
+    JjRepo::snapshot(&repo.worker);
     // The PR branch is force-pushed to a sibling of the old published commit.
     JjRepo::run(&repo.repo, &["new", "main", "-m", "Rewritten PR"]);
     std::fs::write(repo.repo.join("rewritten-pr"), "force pushed").unwrap();
@@ -272,7 +252,7 @@ async fn rewritten_pr_head_does_not_replay_stale_published_commits() {
     .await
     .unwrap();
     std::fs::write(repo.replacement.join("successor-fix"), "successor work").unwrap();
-    JjRepo::run(&repo.replacement, &["status"]);
+    JjRepo::snapshot(&repo.replacement);
     assert_eq!(diff(&LocalJj, &prior).await.unwrap(), prior_patch);
     let patch = diff(&LocalJj, &next).await.unwrap();
     assert!(patch.contains("preserved") && patch.contains("successor work"));
@@ -286,12 +266,11 @@ async fn rewritten_pr_head_does_not_replay_stale_published_commits() {
 #[tokio::test]
 async fn abandoning_revision_child_keeps_predecessor_pointers_intact() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = JjRepo::new(dir.path());
-    origin(&repo);
+    let repo = JjRepo::with_origin(dir.path());
     JjRepo::run(&repo.repo, &["bookmark", "set", "pr/79", "-r", "main"]);
     let prior = create(&LocalJj, &repo.worker, "exec_abandon", "local").await.unwrap();
     std::fs::write(repo.worker.join("fix"), "preserved").unwrap();
-    JjRepo::run(&repo.worker, &["status"]);
+    JjRepo::snapshot(&repo.worker);
     let patch = diff(&LocalJj, &prior).await.unwrap();
     restore_rebased(&LocalJj, &prior, &repo.replacement, Some("pr/79"), "main", "origin")
         .await
@@ -304,8 +283,7 @@ async fn abandoning_revision_child_keeps_predecessor_pointers_intact() {
 #[tokio::test]
 async fn chore_stages_copies_on_configured_branch_and_remote() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = JjRepo::new(dir.path());
-    origin(&repo);
+    let repo = JjRepo::with_origin(dir.path());
     JjRepo::run(&repo.repo, &["git", "remote", "rename", "origin", "upstream"]);
     JjRepo::run(&repo.repo, &["bookmark", "rename", "main", "trunk"]);
     JjRepo::run(
@@ -317,7 +295,7 @@ async fn chore_stages_copies_on_configured_branch_and_remote() {
         .await
         .unwrap();
     std::fs::write(repo.worker.join("fix"), "preserved").unwrap();
-    JjRepo::run(&repo.worker, &["status"]);
+    JjRepo::snapshot(&repo.worker);
     let patch = diff(&LocalJj, &prior).await.unwrap();
     let report = restore_rebased(&LocalJj, &prior, &repo.replacement, None, "trunk", "upstream")
         .await
@@ -340,8 +318,7 @@ async fn chore_stages_copies_on_configured_branch_and_remote() {
 #[tokio::test]
 async fn stacked_revision_keeps_parent_commits_on_their_original_history() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = JjRepo::new(dir.path());
-    origin(&repo);
+    let repo = JjRepo::with_origin(dir.path());
     JjRepo::run(&repo.repo, &["new", "main", "-m", "Parent PR"]);
     std::fs::write(repo.repo.join("parent"), "parent work").unwrap();
     JjRepo::run(&repo.repo, &["bookmark", "set", "parent-pr", "-r", "@"]);
@@ -353,7 +330,7 @@ async fn stacked_revision_keeps_parent_commits_on_their_original_history() {
     JjRepo::run(&repo.worker, &["new"]);
     let prior = create(&LocalJj, &repo.worker, "exec_stacked", "local").await.unwrap();
     std::fs::write(repo.worker.join("fix"), "unpublished").unwrap();
-    JjRepo::run(&repo.worker, &["status"]);
+    JjRepo::snapshot(&repo.worker);
     let report = restore_rebased(
         &LocalJj,
         &prior,
@@ -381,8 +358,7 @@ async fn stacked_revision_keeps_parent_commits_on_their_original_history() {
 #[tokio::test]
 async fn unpushed_local_rebase_of_the_pr_line_does_not_replay_pr_commits() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = JjRepo::new(dir.path());
-    origin(&repo);
+    let repo = JjRepo::with_origin(dir.path());
     std::fs::write(repo.worker.join("pr-one"), "first").unwrap();
     JjRepo::run(&repo.worker, &["describe", "-m", "PR commit one"]);
     JjRepo::run(&repo.worker, &["new", "-m", "PR commit two"]);
@@ -402,7 +378,7 @@ async fn unpushed_local_rebase_of_the_pr_line_does_not_replay_pr_commits() {
     .unwrap();
     assert_eq!(prior.base_commit.as_deref(), Some(pr_head.as_str()));
     std::fs::write(repo.worker.join("local-fix"), "preserved").unwrap();
-    JjRepo::run(&repo.worker, &["status"]);
+    JjRepo::snapshot(&repo.worker);
     // The PR branch is published, which keeps the original head visible.
     let remote_dir = tempfile::tempdir().unwrap();
     let remote = JjRepo::new(remote_dir.path());
@@ -472,8 +448,7 @@ async fn unpushed_local_rebase_of_the_pr_line_does_not_replay_pr_commits() {
 #[tokio::test]
 async fn unpushed_amendment_to_a_published_pr_commit_is_retained_exactly_once() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = JjRepo::new(dir.path());
-    origin(&repo);
+    let repo = JjRepo::with_origin(dir.path());
     std::fs::write(repo.worker.join("pr-one"), "first").unwrap();
     JjRepo::run(&repo.worker, &["describe", "-m", "PR commit one"]);
     JjRepo::run(&repo.worker, &["bookmark", "set", "pr/80", "-r", "@"]);

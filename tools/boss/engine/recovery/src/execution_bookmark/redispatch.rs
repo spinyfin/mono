@@ -95,10 +95,11 @@ pub async fn restore_rebased(
         serde_json::to_string(upstream)?
     );
     let base_sha = base_commit(jj, workspace, &base_ref, base_branch, upstream).await?;
-    let heads = resume_heads_of(jj, record).await?;
+    let pointers = resolve_pointers(jj, record).await?;
+    let heads = resume_heads(jj, record, &pointers).await?;
     let pointer = heads.join(" + ");
     let head = heads_revset(&heads);
-    let floor = resolve_base(jj, record).await?;
+    let floor = pointers.base;
     let pr_head = match pr_bookmark {
         Some(bookmark) => Some(super::reconcile::resolve_pr_head(jj, record, bookmark).await?),
         None => None,

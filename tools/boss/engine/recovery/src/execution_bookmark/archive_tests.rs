@@ -10,7 +10,7 @@ async fn conflicted_and_diverged_targets_are_all_archived_before_release() {
     let original = one(repo, &revision(&scene.record.head()));
     JjRepo::run(repo, &["new", "main", "-m", "Other unpublished work"]);
     std::fs::write(repo.join("other.txt"), "other work").unwrap();
-    JjRepo::run(repo, &["status"]);
+    JjRepo::snapshot(repo);
     let other = one(repo, "@");
     bookmark(repo, &scene.record.publication(), &other);
     let op = JjRepo::run(repo, &["op", "log", "-n", "1", "--no-graph", "-T", "id"]);
@@ -240,7 +240,7 @@ async fn another_fresh_start_keeps_earlier_archives() {
         .await
         .unwrap();
     std::fs::write(scene.repo.worker.join("later.txt"), "later work").unwrap();
-    JjRepo::run(&scene.repo.worker, &["status"]);
+    JjRepo::snapshot(&scene.repo.worker);
     let second = release_heads(&LocalJj, &record, true).await.unwrap();
     for (name, commit) in first.iter().chain(&second) {
         assert_eq!(one(&scene.repo.repo, &revision(name)), *commit);
