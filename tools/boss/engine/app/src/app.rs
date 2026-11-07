@@ -2036,6 +2036,11 @@ impl ServerState {
         run_id: &str,
         remote_proven_dead: bool,
     ) -> PaneReleaseOutcome {
+        // A spoke worker is stopped by its own host's supervisor; whether it is
+        // gone is then decided by the same proof every remote worker needs.
+        if !remote_proven_dead {
+            self.stop_spoke_worker(run_id).await;
+        }
         // Terminal status alone does not prove a remote worker has stopped.
         if self.execution_is_terminal(run_id)
             && self

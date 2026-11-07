@@ -1,0 +1,31 @@
+[package]
+name = "boss-spoke-adapter"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bon = { workspace = true }
+boss-engine-recovery = { path = "../recovery" }
+boss-execution-contracts = { path = "../execution-contracts" }
+boss-protocol = { path = "../../protocol" }
+boss-protocol-spoke = { path = "../../protocol-spoke" }
+boss-spoke-stream = { path = "../spoke-stream" }
+boss-work-db = { path = "../work-db" }
+prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+boss-host-enrollment = { path = "../host-enrollment" }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+tokio-stream = { workspace = true, features = ["net"] }
+tonic = { workspace = true }

@@ -10,7 +10,7 @@ pub struct PreservedTip {
 
 /// Teardown result: the tip to record, plus an optional inspect verdict that
 /// must not hold the lease.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PreserveOutcome {
     pub tip: Option<PreservedTip>,
     pub inspect: Option<PreserveInspect>,
@@ -18,13 +18,32 @@ pub struct PreserveOutcome {
 
 /// Both the already-bookmarked work and the workspace tip, for a human to
 /// inspect. Nothing is deleted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreserveInspect {
     pub existing_commit_id: Option<String>,
     pub workspace_change_id: Option<String>,
     pub workspace_commit_id: Option<String>,
     pub workspace_count: Option<u64>,
     pub reason: String,
+}
+
+/// The arguments of the recovery operations a host executes for the hub, as the
+/// bounded JSON payload of a workspace command (`WorkspaceOp.request_json`).
+/// Unset fields take the local default, so an older hub's request still parses.
+/// It carries recovery values only: no path, argv or revset.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostRecoveryRequest {
+    /// The tip the hub recorded at an earlier teardown.
+    #[serde(default)]
+    pub recorded: Option<PreservedTip>,
+    #[serde(default)]
+    pub since_unix: Option<i64>,
+    /// `None` reads the live workspace.
+    #[serde(default)]
+    pub tip_source: Option<WorkspaceTipSource>,
+    /// `None` releases the names, as the host always did.
+    #[serde(default)]
+    pub release_names: Option<bool>,
 }
 
 pub fn preserved_name(execution_id: &str) -> String {
@@ -40,7 +59,7 @@ pub fn preserved_archive_prefix(execution_id: &str) -> String {
 }
 
 /// How teardown may read the workspace tip.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkspaceTipSource {
     /// The workspace still belongs to this execution. Snapshot live `@`.
     Live,
@@ -62,7 +81,7 @@ pub enum WorkspaceTipSource {
 /// longer provably holds. A workspace whose lease generation is unchanged
 /// since this execution's lease and that is free again has no other holder,
 /// so it is resolved as [`WorkspaceTipSource::Live`] and never reaches this.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BoundaryOwnership {
     /// The workspace is free, but a later lease cannot be ruled out. The
     /// working copy is snapshotted only to find work made after the boundary,

@@ -1820,6 +1820,107 @@ pub trait HostAdapter: Send + Sync {
     ) -> Result<CollectOutcome> {
         Ok(CollectOutcome::NotAvailable)
     }
+
+    // ── Worker control ──────────────────────────────────────────────────────
+    //
+    // Control of a worker that lives on this host's own supervisor (a spoke).
+    // Each method is addressed by execution id: the adapter resolves the
+    // durable assignment, so a caller never names a pane, pid or session.
+    // Defaults say "no control channel here"; a caller then keeps using the
+    // local tmux path it always had.
+
+    /// Type `text` into the worker's terminal. A successful delivery proves the
+    /// host wrote the bytes, not that the agent consumed them.
+    async fn deliver_worker_input(
+        &self,
+        _execution_id: &str,
+        _kind: WorkerInputKind,
+        _text: &str,
+    ) -> Result<ControlOutcome> {
+        Ok(ControlOutcome::NotSubmitted(
+            "this host adapter has no worker control channel".to_owned(),
+        ))
+    }
+
+    /// Send the run's driver-declared interrupt gesture.
+    async fn interrupt_worker(&self, _execution_id: &str) -> Result<ControlOutcome> {
+        Ok(ControlOutcome::NotSubmitted(
+            "this host adapter has no worker control channel".to_owned(),
+        ))
+    }
+
+    /// Stop the worker's session, waiting up to `grace` for it to exit first.
+    async fn stop_worker(&self, _execution_id: &str, _grace: std::time::Duration) -> Result<ControlOutcome> {
+        Ok(ControlOutcome::NotSubmitted(
+            "this host adapter has no worker control channel".to_owned(),
+        ))
+    }
+
+    /// What the host currently sees of the worker, or `None` when this adapter
+    /// does not supervise the execution's worker.
+    async fn observe_worker(&self, _execution_id: &str) -> Result<Option<WorkerPane>> {
+        Ok(None)
+    }
+}
+
+/// Which text a control request types into a worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerInputKind {
+    Probe,
+    Nudge,
+    Answer,
+}
+
+/// What the host observed of a worker's session. Distinct observations, each
+/// with its own consequence; none is inferred from silence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerLife {
+    Alive,
+    Exited,
+    /// No session carries the worker's token any more.
+    Missing,
+    /// The host could not read the session.
+    Indeterminate,
+    /// The worker launched, then the initial brief never reached it.
+    BriefNotDelivered,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerPane {
+    pub life: WorkerLife,
+    pub session: String,
+    pub pane_id: String,
+    pub pid: Option<u64>,
+    pub exit_code: Option<i32>,
+}
+
+/// How far a control request got. Receipt by the host is not delivery, and
+/// delivery is not consumption: whether the agent ended its turn or took the
+/// text arrives later as an observation, never from this result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlOutcome {
+    /// Nothing left the hub: the host is not connected, or the request was
+    /// invalid. Safe to retry or to fall back.
+    NotSubmitted(String),
+    /// The host refused before any side effect (stale token, worker not
+    /// running, expired request).
+    Rejected { reason: String, pane: Option<WorkerPane> },
+    /// The request may have reached the worker. Never resend automatically.
+    Uncertain(String),
+    /// The host performed the request and reports the pane it then saw.
+    Delivered(WorkerPane),
+}
+
+/// A spawn whose outcome is unknown: the host may have started the worker.
+/// The execution keeps its assignment and workspace and a retry reuses the
+/// same command, so nothing starts twice. Coordinators treat it like an
+/// unconfirmed abort and do not release the workspace.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("spawn outcome unknown on host {host_id} (command {command_id}): {reason}")]
+pub struct SpawnOutcomeUncertain {
+    pub host_id: String,
+    pub command_id: String,
+    pub reason: String,
 }
 
 /// Outcome of [`HostAdapter::collect_structured_output`]. See that method's
@@ -1849,6 +1950,15 @@ pub trait HostAdapterProvider: Send + Sync {
     /// a pre-start failure in the dispatch loop, leaving the execution
     /// recoverable on a later kick.
     async fn adapter_for(&self, host: &Host) -> Result<Arc<dyn HostAdapter>>;
+
+    /// The adapter to dispatch `execution_id` through. A transport that must
+    /// record which host owns an execution before any command leaves does so
+    /// here, and refuses while the execution is still owned elsewhere. Other
+    /// providers have no per-execution state.
+    async fn adapter_for_execution(&self, host: &Host, execution_id: &str) -> Result<Arc<dyn HostAdapter>> {
+        let _ = execution_id;
+        self.adapter_for(host).await
+    }
 }
 
 /// The default provider: hands back the one local adapter for every host.

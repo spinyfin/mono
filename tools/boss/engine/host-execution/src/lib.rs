@@ -1,6 +1,7 @@
 //! Host filesystem execution shared by the hub's local adapter and the spoke.
 //! Work policy, GitHub decisions and scheduling remain in the hub.
 pub mod homes;
+pub mod recovery_ops;
 pub mod worker;
 pub mod cube {
     //! Shared implementation of the `cube` CLI command surface.
@@ -1455,14 +1456,26 @@ mod validation {
                 allowed.trunk.clone_from(&op.trunk);
                 allowed.pr_bookmark.clone_from(&op.pr_bookmark);
             }
+            Kind::PositionedParent | Kind::StartFresh => {}
+            Kind::ConfirmRecovery | Kind::RestorePreserved => {
+                ensure!(
+                    !op.request_json.is_empty(),
+                    "recovery operation requires its request payload"
+                );
+                crate::recovery_ops::parse_request(&op.request_json)?;
+                allowed.request_json.clone_from(&op.request_json);
+            }
+            Kind::ReleaseHeads => {
+                crate::recovery_ops::parse_request(&op.request_json)?;
+                allowed.request_json.clone_from(&op.request_json);
+            }
             Kind::Release
             | Kind::Status
             | Kind::ListWorkspaces
             | Kind::ListRepos
             | Kind::DiffBookmark
             | Kind::DiscardBaseline
-            | Kind::CheckpointBaseline
-            | Kind::ReleaseHeads => {}
+            | Kind::CheckpointBaseline => {}
         }
         if matches!(
             kind,
@@ -1474,6 +1487,8 @@ mod validation {
                 | Kind::PrepareRecoveryPr
                 | Kind::ReconcileBookmark
                 | Kind::ReleaseHeads
+                | Kind::ConfirmRecovery
+                | Kind::RestorePreserved
         ) {
             let value = op
                 .bookmark
@@ -1633,7 +1648,12 @@ pub mod workspace {
             if interrupted
                 && !matches!(
                     kind,
-                    Kind::Lease | Kind::ListRepos | Kind::ListWorkspaces | Kind::Status | Kind::DiffBookmark
+                    Kind::Lease
+                        | Kind::ListRepos
+                        | Kind::ListWorkspaces
+                        | Kind::Status
+                        | Kind::DiffBookmark
+                        | Kind::PositionedParent
                 )
             {
                 result.code = ResultCode::OutcomeUncertain.into();
@@ -1870,6 +1890,7 @@ pub mod workspace {
                             | Kind::CreateChange
                             | Kind::GotoPr
                             | Kind::GotoRevision
+                            | Kind::StartFresh
                     ) {
                         *phase = Phase::Effect;
                     }
@@ -1896,6 +1917,8 @@ pub mod workspace {
                         Kind::GotoRevision => {
                             cube::goto_workspace(&self.cube, &path, "--revision", &op.revision).await?
                         }
+                        Kind::PositionedParent => value = crate::recovery_ops::positioned_parent(&path).await?,
+                        Kind::StartFresh => value = crate::recovery_ops::start_fresh(&path).await?,
                         _ => {
                             let record = self.record(&path, &run.execution_id, op.bookmark.as_ref()).await?;
                             value = match kind {
@@ -1968,7 +1991,25 @@ pub mod workspace {
                                 }
                                 Kind::ReleaseHeads => {
                                     *phase = Phase::Effect;
-                                    json!(recovery::release_heads(&LocalJj, &record, true).await?)
+                                    let request = crate::recovery_ops::parse_request(&op.request_json)?;
+                                    json!(
+                                        recovery::release_heads(
+                                            &LocalJj,
+                                            &record,
+                                            request.release_names.unwrap_or(true)
+                                        )
+                                        .await?
+                                    )
+                                }
+                                Kind::ConfirmRecovery => {
+                                    *phase = Phase::Effect;
+                                    let request = crate::recovery_ops::parse_request(&op.request_json)?;
+                                    crate::recovery_ops::confirm(&record, &path, &request).await?
+                                }
+                                Kind::RestorePreserved => {
+                                    *phase = Phase::Effect;
+                                    let request = crate::recovery_ops::parse_request(&op.request_json)?;
+                                    crate::recovery_ops::restore_preserved(&record, &path, &request).await?
                                 }
                                 _ => anyhow::bail!("unsupported workspace operation"),
                             };

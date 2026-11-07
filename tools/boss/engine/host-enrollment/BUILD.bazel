@@ -17,6 +17,7 @@ rust_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/engine/spoke:__pkg__",
+        "//tools/boss/engine/spoke-adapter:__pkg__",
         "//tools/boss/engine/spoke-stream:__pkg__",
         "//tools/boss/spoke-credentials:__pkg__",
     ],
