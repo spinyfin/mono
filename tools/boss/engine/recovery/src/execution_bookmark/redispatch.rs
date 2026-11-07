@@ -95,19 +95,7 @@ pub async fn restore_rebased(
         serde_json::to_string(upstream)?
     );
     let base_sha = base_commit(jj, workspace, &base_ref, base_branch, upstream).await?;
-    let heads = match resume_heads_of(jj, record).await {
-        Ok(heads) => heads,
-        Err(err) if is_missing_pointer_error(&err) => {
-            return Ok(RestoreReport::builder()
-                .pointer(String::new())
-                .commits(String::new())
-                .base_sha(base_sha)
-                .conflicts(String::new())
-                .pr_bound(pr_bookmark.is_some())
-                .build());
-        }
-        Err(err) => return Err(err),
-    };
+    let heads = resume_heads_of(jj, record).await?;
     let pointer = heads.join(" + ");
     let head = heads_revset(&heads);
     let floor = resolve_base(jj, record).await?;

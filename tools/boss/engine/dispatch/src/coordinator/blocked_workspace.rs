@@ -134,15 +134,10 @@ impl ExecutionCoordinator {
         if execution.kind.is_read_only_review() {
             return Ok(None);
         }
-        let prior = if self.work_db.preserved_tip(&execution.id)?.is_some()
-            || self.work_db.execution_bookmark_optional(&execution.id)?.is_some()
-        {
-            execution.clone()
-        } else if let Some(prior) = self.work_db.recovery_predecessor(execution)? {
-            prior
-        } else {
+        let Some(source) = self.work_db.recovery_source(execution)? else {
             return Ok(None);
         };
+        let prior = source.execution;
         // Preserved work is the source of truth whenever a tip exists,
         // including a retry of the same execution. Legacy pointers are
         // only used when no preserved tip is recorded.
@@ -232,10 +227,18 @@ impl ExecutionCoordinator {
         // was rewritten, abandoned or deleted needs no repair here.
         let patch = match adapter.execution_bookmark_diff(record).await {
             Ok(patch) => patch,
+            // A record with no recovery head is an empty run: nothing was left
+            // unpublished, so there is nothing to recover and nothing to report.
+            // A retry's own stale row is retired so dispatch records a fresh
+            // starting commit; a predecessor's row is left for the prune sweep.
             Err(err) if is_missing_pointer_error(&err) => {
-                self.degrade_missing_pointers(execution, Some(&prior.id), record, &err)
-                    .await;
-                return Err(err);
+                if prior.id == execution.id {
+                    adapter.release_execution_bookmark_heads(record, true).await?;
+                    self.work_db
+                        .retire_execution_bookmark(&prior.id, "no recovery head: no unpublished work to recover")?;
+                }
+                self.work_db.delete_execution_restore_report(&execution.id)?;
+                return Ok(None);
             }
             Err(err) => return Err(err),
         };

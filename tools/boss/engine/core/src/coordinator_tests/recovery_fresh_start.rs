@@ -493,6 +493,13 @@ async fn free_recovery_source_host_is_preferred_over_another_eligible_host() {
     db.record_execution_bookmark(&record).unwrap();
     std::fs::write(repo.worker.join("work.txt"), "intact source work").unwrap();
     JjRepo::run(&repo.worker, &["status"]);
+    // Only a source with recorded preserved work expresses a host preference.
+    let tip = recovery::preserve(&LocalJj, &record, &repo.worker, None, None)
+        .await
+        .unwrap()
+        .tip
+        .unwrap();
+    db.record_preserved_tip(&prior.id, &tip).unwrap();
     let cube = Arc::new(FakeCubeClient {
         real_bookmarks: true,
         position_real_workspace: true,

@@ -418,24 +418,17 @@ impl ExecutionCoordinator {
         self.pick_host(work_item, pinned, requested, required_driver, preferred)
     }
 
-    /// Host that holds this execution's restorable work, when a record exists.
-    /// Used only as a non-blocking placement preference.
+    /// Host that holds this execution's preserved work, when its recovery
+    /// source recorded a preserved tip. A bare record (an empty run) carries
+    /// nothing to restore and expresses no placement preference. Used only as a
+    /// non-blocking preference.
     fn recovery_source_host(&self, execution: &WorkExecution) -> Result<Option<String>> {
-        if execution.kind.is_read_only_review() {
-            return Ok(None);
-        }
-        let source_id = if self.work_db.preserved_tip(&execution.id)?.is_some()
-            || self.work_db.execution_bookmark_optional(&execution.id)?.is_some()
-        {
-            execution.id.clone()
-        } else if let Some(prior) = self.work_db.recovery_predecessor(execution)? {
-            prior.id
-        } else {
+        let Some(source) = self.work_db.recovery_source(execution)?.filter(|s| s.has_preserved_tip) else {
             return Ok(None);
         };
         Ok(self
             .work_db
-            .execution_bookmark_optional(&source_id)?
+            .execution_bookmark_optional(&source.execution.id)?
             .map(|record| record.host_id))
     }
 

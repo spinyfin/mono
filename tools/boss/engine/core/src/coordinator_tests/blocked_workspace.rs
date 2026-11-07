@@ -191,6 +191,51 @@ async fn blocked_recovery_missing_bookmark_yields_none_and_dispatch_proceeds() {
     }
 }
 
+#[tokio::test]
+async fn predecessor_record_without_heads_is_an_empty_run_not_a_recovery_failure() {
+    let dir = tempdir().unwrap();
+    let (db, prior, next) = blocked_pair(&dir.path().join("boss.db"));
+    let repo = record_then_delete_heads(&db, dir.path(), &prior.id).await;
+    let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            Arc::new(FakeCubeClient {
+                real_bookmarks: true,
+                ..FakeCubeClient::default()
+            }),
+            Arc::new(FakeExecutionRunner::default()),
+        )
+        .with_dispatch_events(recording.clone()),
+    );
+    let lease = CubeWorkspaceLease {
+        lease_id: "lease-new".into(),
+        workspace_id: "workspace-old".into(),
+        workspace_path: repo.worker.clone(),
+        dirty_verified: None,
+    };
+    let recovered = coordinator
+        .recover_execution_bookmark_for_test(&next, &lease, &coordinator.host_adapter(), "mono", None, None)
+        .await
+        .unwrap();
+    assert!(recovered.is_none());
+    assert!(
+        db.execution_bookmark_optional(&prior.id).unwrap().is_some(),
+        "the predecessor's record is not retired"
+    );
+    let retired: Vec<_> = db
+        .list_attention_items_for_work_item(&prior.work_item_id)
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.kind == crate::execution_bookmark_recovery::RECOVERY_RETIRED)
+        .collect();
+    assert!(retired.is_empty(), "{retired:?}");
+    let events = format!("{:?}", recording.events().await);
+    assert!(!events.contains("missing_bookmark"), "{events}");
+    assert!(!events.contains("pointers_retired"), "{events}");
+}
+
 /// Records `execution_id`'s pointers in `db`, then deletes both heads so only
 /// the baseline survives. Returns the repo holding them.
 async fn record_then_delete_heads(
@@ -1117,6 +1162,15 @@ async fn revision_start_retry_keeps_its_own_pointers_on_the_staged_history() {
             assert!(h.repo.replacement.join("later").exists());
             assert!(db.execution_restore_report(&h.next.id).unwrap().is_none());
             assert!(db.preserved_tip(&h.next.id).unwrap().is_none());
+            // The first attempt's record had no recovery head: an ordinary empty
+            // run is not a recovery failure and raises no attention item.
+            let retired: Vec<_> = db
+                .list_attention_items_for_work_item(&db.owning_work_item_id(&h.next.work_item_id))
+                .unwrap()
+                .into_iter()
+                .filter(|item| item.kind == crate::execution_bookmark_recovery::RECOVERY_RETIRED)
+                .collect();
+            assert!(retired.is_empty(), "{retired:?}");
             continue;
         }
         let restored_patch = || {
