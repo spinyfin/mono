@@ -324,18 +324,23 @@ fn clause_1_worker_failed_is_admitted_on_both_primary_and_revision_items() {
     // The revision is the stuck item.
     f.assert_candidate(&revision, true);
     assert_eq!(f.clauses(&revision).stuck_kind.as_deref(), Some("S13_revision_chain"));
-    // A later revision queued behind the dead one does not hide it:
-    // `waiting_dependency` on a later revision is the chain-serialization gate,
-    // not evidence anyone is working the PR.
+    // A later revision queued behind the dead one is pending work on the PR
+    // family (design 2.1 counts `waiting_dependency` everywhere), so the item is
+    // not nominated while that gate row exists.
     let later = f.revision_of(&primary, "Later revision");
     f.sql(&format!(
         "UPDATE tasks SET status = 'blocked', blocked_reason = 'dependency' WHERE id = '{later}'"
     ));
-    f.execution(
+    let gate = f.execution(
         &later,
         ExecutionKind::RevisionImplementation,
         ExecutionStatus::WaitingDependency,
     );
+    f.assert_candidate(&revision, false);
+    assert!(!f.clauses(&revision).no_live_work);
+    f.sql(&format!(
+        "UPDATE work_executions SET status = 'cancelled' WHERE id = '{gate}'"
+    ));
     f.assert_candidate(&revision, true);
 
     let plain = f.chore("Plain primary");
@@ -391,6 +396,46 @@ fn clause_2_live_work_on_the_item_its_revisions_or_its_pr_excludes_it() {
     f.assert_candidate(&item, false);
     f.sql(&format!(
         "UPDATE work_executions SET status = 'cancelled' WHERE id = '{sibling_gate}'"
+    ));
+    f.assert_candidate(&item, true);
+
+    // Live or pending work on a revision of the item excludes the item, in each
+    // status; a finished execution admits it again.
+    let revision = f.revision_of(&item, "Revision of the item");
+    f.stick(&revision, "status = 'active'", 0);
+    for status in [
+        ExecutionStatus::Queued,
+        ExecutionStatus::Ready,
+        ExecutionStatus::Claimed,
+        ExecutionStatus::Running,
+        ExecutionStatus::WaitingHuman,
+    ] {
+        let run = f.execution(&revision, ExecutionKind::RevisionImplementation, status.clone());
+        f.assert_candidate(&item, false);
+        assert!(!f.clauses(&item).no_live_work, "{status:?}");
+        f.sql(&format!(
+            "UPDATE work_executions SET status = 'failed' WHERE id = '{run}'"
+        ));
+        f.assert_candidate(&item, true);
+    }
+
+    // `waiting_dependency` on a revision of the primary item counts, whether the
+    // revision waits behind an earlier revision or behind an unrelated item.
+    let unrelated = f.chore("Unrelated prerequisite");
+    f.db.add_dependency(AddDependencyInput {
+        dependent: revision.clone(),
+        prerequisite: unrelated,
+        relation: None,
+    })
+    .unwrap();
+    let gate = f.execution(
+        &revision,
+        ExecutionKind::RevisionImplementation,
+        ExecutionStatus::WaitingDependency,
+    );
+    f.assert_candidate(&item, false);
+    f.sql(&format!(
+        "UPDATE work_executions SET status = 'cancelled' WHERE id = '{gate}'"
     ));
     f.assert_candidate(&item, true);
 
@@ -578,6 +623,150 @@ fn clause_4_a_dependent_is_progressed_through_its_prerequisite() {
     ));
     f.sql(&format!("UPDATE tasks SET status = 'done' WHERE id = '{prerequisite}'"));
     f.assert_candidate(&dependent, true);
+}
+
+impl Fixture {
+    /// A dependency-blocked chore gated on `prerequisite`, stuck for three hours.
+    fn dependent_on(&self, prerequisite: &str) -> String {
+        let dependent = self.chore(&format!("Dependent on {prerequisite}"));
+        self.sql(&format!(
+            "INSERT INTO work_item_dependencies (dependent_id, prerequisite_id, relation, created_at)
+             VALUES ('{dependent}', '{prerequisite}', 'blocks', '1')"
+        ));
+        self.stick(&dependent, "status = 'blocked', blocked_reason = 'dependency'", 3);
+        dependent
+    }
+}
+
+#[test]
+fn clause_4_an_open_project_holds_its_dependent_only_while_it_is_live_or_a_member_is_a_candidate() {
+    let f = fixture();
+    let project =
+        f.db.create_project(CreateProjectInput {
+            product_id: f.product.clone(),
+            name: "Prerequisite project".into(),
+            description: None,
+            goal: None,
+            autostart: false,
+            no_design_task: true,
+            design_reasoning_effort_xhigh: false,
+        })
+        .unwrap();
+    let member = f.chore("Idle member");
+    f.sql(&format!(
+        "UPDATE tasks SET project_id = '{}' WHERE id = '{member}'",
+        project.id
+    ));
+    let dependent = f.dependent_on(&project.id);
+
+    // Only idle, non-stuck members: the project holds nothing and the dependent
+    // is the candidate.
+    f.assert_candidate(&dependent, true);
+
+    // A running member task makes the project live.
+    let run = f.execution(&member, ExecutionKind::ChoreImplementation, ExecutionStatus::Running);
+    f.assert_candidate(&dependent, false);
+    assert!(!f.clauses(&dependent).dependency_clear);
+    f.sql(&format!(
+        "UPDATE work_executions SET status = 'failed' WHERE id = '{run}'"
+    ));
+    f.assert_candidate(&dependent, true);
+
+    // A member that is itself a candidate is progressed first.
+    f.stick(&member, "status = 'blocked', blocked_reason = 'merge_conflict'", 3);
+    f.assert_candidate(&member, true);
+    f.assert_candidate(&dependent, false);
+    // Once the member is in its cooldown it is not a candidate and holds nothing.
+    finished_progression_run(&f, &member, ExecutionStatus::Completed, 60);
+    f.assert_candidate(&member, false);
+    f.assert_candidate(&dependent, true);
+
+    // A parked project is the owner's decision.
+    f.db.park_work_item_as_actor(&project.id, true, None, "human").unwrap();
+    f.assert_candidate(&dependent, false);
+}
+
+#[test]
+fn clause_4_a_stuck_prerequisite_that_cannot_be_nominated_does_not_hold_the_dependent() {
+    let f = fixture();
+    let prerequisite = f.stuck_chore("Stuck prerequisite");
+    let dependent = f.dependent_on(&prerequisite);
+    f.assert_candidate(&prerequisite, true);
+    f.assert_candidate(&dependent, false);
+
+    // Inside its cooldown.
+    let run = finished_progression_run(&f, &prerequisite, ExecutionStatus::Completed, 60);
+    f.assert_candidate(&prerequisite, false);
+    f.assert_candidate(&dependent, true);
+    f.sql(&format!(
+        "UPDATE work_executions SET status = 'cancelled' WHERE id = '{run}'"
+    ));
+    f.assert_candidate(&dependent, false);
+
+    // Its create budget exhausted.
+    for i in 0..3 {
+        let child = f.revision_of(&prerequisite, &format!("progression child {i}"));
+        f.sql(&format!(
+            "UPDATE tasks SET created_via = 'progression:exec_{i}', created_at = '{}' WHERE id = '{child}'",
+            now()
+        ));
+    }
+    f.assert_candidate(&prerequisite, false);
+    f.assert_candidate(&dependent, true);
+    f.sql("UPDATE tasks SET created_at = '1' WHERE created_via LIKE 'progression:%'");
+    f.assert_candidate(&prerequisite, true);
+    f.assert_candidate(&dependent, false);
+
+    // At the infrastructure-failure cap.
+    finished_progression_run(&f, &prerequisite, ExecutionStatus::Failed, 30 * HOUR);
+    finished_progression_run(&f, &prerequisite, ExecutionStatus::Orphaned, 20 * HOUR);
+    assert!(f.clauses(&prerequisite).infrastructure_failing);
+    f.assert_candidate(&prerequisite, false);
+    f.assert_candidate(&dependent, true);
+
+    // Not yet stuck long enough (grace) holds nothing either.
+    let fresh = f.chore("Fresh prerequisite");
+    f.stick(&fresh, "status = 'blocked', blocked_reason = 'merge_conflict'", 0);
+    let waiting = f.dependent_on(&fresh);
+    f.assert_candidate(&fresh, false);
+    f.assert_candidate(&waiting, true);
+}
+
+#[test]
+fn the_stuck_report_reads_the_same_dependency_rule_as_the_view() {
+    let f = fixture();
+    // An idle, unparked prerequisite: the dependent is the candidate, so once
+    // the sweep mints it a run the report shows that run.
+    let idle = f.chore("Idle prerequisite");
+    let dependent = f.dependent_on(&idle);
+    f.assert_candidate(&dependent, true);
+    assert_eq!(bucket(&f.db, &dependent), Some(StuckBucket::EngineStuck));
+    f.db.mint_progression_executions().unwrap();
+    assert_eq!(bucket(&f.db, &dependent), Some(StuckBucket::ProgressionInFlight));
+
+    // The same for an open project whose members are all idle.
+    let project =
+        f.db.create_project(CreateProjectInput {
+            product_id: f.product.clone(),
+            name: "Idle project".into(),
+            description: None,
+            goal: None,
+            autostart: false,
+            no_design_task: true,
+            design_reasoning_effort_xhigh: false,
+        })
+        .unwrap();
+    let gated = f.dependent_on(&project.id);
+    f.assert_candidate(&gated, true);
+    f.db.mint_progression_executions().unwrap();
+    assert_eq!(bucket(&f.db, &gated), Some(StuckBucket::ProgressionInFlight));
+
+    // A live prerequisite is still waiting upstream.
+    let busy = f.chore("Busy prerequisite");
+    f.execution(&busy, ExecutionKind::ChoreImplementation, ExecutionStatus::Running);
+    let waiting = f.dependent_on(&busy);
+    f.assert_candidate(&waiting, false);
+    assert_eq!(bucket(&f.db, &waiting), Some(StuckBucket::WaitingOnDependency));
 }
 
 // ── Clause 5: stuck long enough, and the grace waiver ─────────────────────
@@ -1155,7 +1344,10 @@ fn the_migrations_are_idempotent_and_repair_a_database_that_lacks_them() {
              UPDATE task_status_audit SET changed_at = changed_at - 36000 WHERE work_item_id = '{id}';
              DROP VIEW progression_candidates;
              DROP VIEW progression_candidate_clauses;
+             DROP VIEW progression_candidate_base;
              DROP VIEW progression_run_state;
+             DROP VIEW progression_live_tasks;
+             DROP VIEW progression_ladder_families;
              DROP VIEW progression_live_families;
              DROP VIEW progression_family_keys;
              DROP VIEW progression_chain_roots;
@@ -1194,7 +1386,10 @@ fn dropping_the_views_without_rolling_back_the_migration_is_repaired_on_open() {
              UPDATE task_status_audit SET changed_at = changed_at - 36000 WHERE work_item_id = '{id}';
              DROP VIEW progression_candidates;
              DROP VIEW progression_candidate_clauses;
+             DROP VIEW progression_candidate_base;
              DROP VIEW progression_run_state;
+             DROP VIEW progression_live_tasks;
+             DROP VIEW progression_ladder_families;
              DROP VIEW progression_live_families;
              DROP VIEW progression_family_keys;
              DROP VIEW progression_chain_roots;"
