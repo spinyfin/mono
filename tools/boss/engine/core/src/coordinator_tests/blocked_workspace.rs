@@ -576,10 +576,28 @@ async fn blocked_revision_dispatch_restores_bookmark_with_or_without_original_wo
         let repo = JjRepo::new(dir.path());
         super::recovery::configure_recovery_origin(&repo.repo);
         JjRepo::run(&repo.repo, &["bookmark", "set", "pr/99", "-r", "main"]);
-        let record = create(&LocalJj, &repo.worker, &prior.id, "local").await.unwrap();
+        let record = if recovered {
+            let record = boss_engine_recovery::execution_bookmark::create_from(
+                &LocalJj,
+                &repo.worker,
+                &prior.id,
+                "local",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(record.has_recovery_head, Some(false));
+            record
+        } else {
+            create(&LocalJj, &repo.worker, &prior.id, "local").await.unwrap()
+        };
         db.record_execution_bookmark(&record).unwrap();
         std::fs::write(repo.worker.join("revision.txt"), "unpushed revision").unwrap();
         JjRepo::run(&repo.worker, &["status"]);
+        if recovered {
+            JjRepo::run(&repo.worker, &["bookmark", "set", &record.publication(), "-r", "@"]);
+        }
         if !recovered {
             std::fs::remove_dir_all(&repo.worker).unwrap();
         }

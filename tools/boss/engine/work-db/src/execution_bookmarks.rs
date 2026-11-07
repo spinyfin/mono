@@ -567,6 +567,9 @@ impl WorkDb {
         reason: &str,
         archives: &[(String, String)],
     ) -> Result<()> {
+        let preserved_note = self.preserved_tip(&prior.id)?.map(|tip| format!(
+            "Live workspace preservation: `preserved/{}` retains `{}`. This is separate from the legacy archive bookmarks above.", prior.id, tip.commit_id
+        )).unwrap_or_default();
         self.record_recovery_archive_note(
             prior,
             reason,
@@ -575,11 +578,11 @@ impl WorkDb {
                 "Recovery source retired; starting fresh",
                 &if archives.is_empty() {
                     format!(
-                        "Execution `{next_id}` starts fresh from an open PR, trunk, or the captured immutable review target. No action is required."
+                        "Execution `{next_id}` starts fresh from an open PR, trunk, or the captured immutable review target. {preserved_note} No action is required."
                     )
                 } else {
                     format!(
-                        "Execution `{next_id}` starts fresh from an open PR, trunk, or the captured immutable review target. Any unpublished work from the retired source remains at the archive bookmarks listed above; inspect them if that work is still wanted."
+                        "Execution `{next_id}` starts fresh from an open PR, trunk, or the captured immutable review target. {preserved_note} Legacy pointer targets remain at the archive bookmarks listed above; inspect the preserved live tip and archives if that work is still wanted."
                     )
                 },
             ),

@@ -880,6 +880,15 @@ async fn resume_archives_before_reusing_its_pointer_names() {
 
 #[tokio::test]
 async fn startup_pane_resume_archives_damaged_pointers_and_spawns() {
+    startup_resume(false).await;
+}
+
+#[tokio::test]
+async fn startup_pane_resume_retains_unrelated_preserved_and_live_tips() {
+    startup_resume(true).await;
+}
+
+async fn startup_resume(unrelated: bool) {
     let dir = tempdir().unwrap();
     let (db, _, next) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
     seed_local_claude_driver(&db);
@@ -893,6 +902,22 @@ async fn startup_pane_resume_archives_damaged_pointers_and_spawns() {
     JjRepo::run(&repo.worker, &["status"]);
     let old = commit(&repo.repo, &record.head());
     conflict_recovery_head(&repo.repo, &record);
+    let existing = if unrelated {
+        JjRepo::run(&repo.repo, &["new", "main", "-m", "Separate unpublished work"]);
+        std::fs::write(repo.repo.join("separate.txt"), "retain separately").unwrap();
+        JjRepo::run(
+            &repo.repo,
+            &["bookmark", "set", &recovery::preserved_name(&next.id), "-r", "@"],
+        );
+        Some(commit(&repo.repo, "@"))
+    } else {
+        None
+    };
+    JjRepo::run(&repo.worker, &["new", "@", "-m", "Live work after dispatch"]);
+    std::fs::write(repo.worker.join("newer.txt"), "newer than all legacy pointers").unwrap();
+    JjRepo::run(&repo.worker, &["status"]);
+    let live = commit(&repo.worker, "@");
+    assert_ne!(live, old);
     let (next, _) = db
         .start_execution_run(
             &next.id,
@@ -958,9 +983,32 @@ async fn startup_pane_resume_archives_damaged_pointers_and_spawns() {
     assert!(!repo.worker.join("work.txt").exists());
     assert_eq!(
         commit(&repo.repo, &recovery::preserved_name(&next.id)),
-        old,
+        existing.clone().unwrap_or_else(|| live.clone()),
         "startup resume must preserve the live workspace tip before repositioning"
     );
+    let notes = db
+        .list_attention_items_for_work_item(&db.owning_work_item_id(&next.work_item_id))
+        .unwrap();
+    let retired = notes
+        .iter()
+        .find(|note| note.kind == crate::execution_bookmark_recovery::RECOVERY_RETIRED)
+        .unwrap();
+    assert!(retired.body_markdown.contains(&recovery::preserved_name(&next.id)));
+    assert!(retired.body_markdown.contains(existing.as_deref().unwrap_or(&live)));
+    if let Some(existing) = existing {
+        let name = recovery::preserved_archive_name(&next.id, &live);
+        assert_eq!(commit(&repo.repo, &name), live);
+        let notes = db.list_attention_items(&next.id).unwrap();
+        let inspect = notes
+            .iter()
+            .find(|note| {
+                note.kind == boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND
+            })
+            .unwrap();
+        assert!(inspect.body_markdown.contains(&existing));
+        assert!(inspect.body_markdown.contains(&live));
+        assert!(inspect.body_markdown.contains(&name));
+    }
     for _ in 0..100 {
         if !runner.calls.lock().await.is_empty() {
             return;

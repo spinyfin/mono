@@ -226,8 +226,9 @@ pub struct ExecutionBookmark {
     #[serde(default)]
     pub pr_head_before: Option<String>,
     /// Whether `create_from` wrote a `boss-recovery/` head. `None` is a row
-    /// that predates this column: inspect the store. `Some(false)` is an empty
-    /// run and must not contact the source host to recover.
+    /// that predates this column: inspect the store. `Some(false)` records only
+    /// dispatch-time state; workers may subsequently create publication heads.
+    /// Inspect the local store; leave remote publication heads for pruning.
     #[serde(default)]
     pub has_recovery_head: Option<bool>,
 }
