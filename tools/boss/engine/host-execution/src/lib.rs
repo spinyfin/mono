@@ -26,6 +26,17 @@ pub mod cube {
     use async_trait::async_trait;
     use serde::Deserialize;
 
+    /// Cadence between lease heartbeat passes, hub and spoke alike. Deliberately
+    /// far below [`LEASE_TTL_SECS`] so many consecutive missed beats are tolerated.
+    pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
+
+    /// TTL (seconds) every heartbeat asks cube to set. Matches cube's own
+    /// default of 24 h (`DEFAULT_LEASE_TTL_SECS`) and is passed explicitly so the
+    /// interval-much-less-than-TTL relationship is owned here. A short TTL would
+    /// let cube's sweep free the workspace of a live worker during a daemon
+    /// outage or host sleep.
+    pub const LEASE_TTL_SECS: u64 = 86400;
+
     use crate::types::{CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus};
 
     /// Local CLI transport. Configuration belongs to the host, never to wire input.
@@ -1127,10 +1138,29 @@ pub mod input {
     /// Reclaim only the home recorded by provisioning, after the caller has retained
     /// any required transcript evidence. Never infer ownership from a workspace path.
     pub fn reclaim(state: &DriverRuntimeState) -> Result<()> {
+        if let Some(grok) = grok_state(state) {
+            // The container holds both the Grok home and the scoped process home.
+            if let Some(container) = grok.grok_home.parent() {
+                boss_engine_driver::grok::reclaim_grok_home(container)?;
+            }
+            return Ok(());
+        }
         if let Some(home) = boss_engine_driver::initial_prompt::owned_home_from_runtime_state(state) {
             reclaim_home(&home)?;
         }
         Ok(())
+    }
+
+    fn grok_state(state: &DriverRuntimeState) -> Option<boss_engine_driver::grok::GrokRuntimeState> {
+        state.as_value().get("grok_home")?;
+        boss_engine_driver::grok::GrokRuntimeState::from_driver_runtime_state(state).ok()
+    }
+
+    /// The per-run home a driver's runtime state owns and holds the delivery
+    /// markers: Codex and Claude via the shared rule, plus a Grok home.
+    pub fn owned_home(state: &DriverRuntimeState) -> Option<std::path::PathBuf> {
+        boss_engine_driver::initial_prompt::owned_home_from_runtime_state(state)
+            .or_else(|| grok_state(state).map(|grok| grok.grok_home))
     }
 
     /// Reclaim an already recorded home after hub retention authorizes it.

@@ -239,11 +239,13 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt().with_writer(std::io::stderr).init();
     let args = Args::parse();
     let homes_root = boss_host_execution::homes::pin(&args.state_dir.join("homes"))?;
+    let grok_root = boss_host_execution::homes::pin(&boss_host_execution::homes::grok_root(&homes_root))?;
     // SAFETY: the process is still single-threaded here; the async runtime and
     // every worker thread are built only after this, so nothing reads the
     // environment concurrently. Driver provisioning reads this variable.
     unsafe {
         std::env::set_var(boss_host_execution::homes::ROOT_ENV, &homes_root);
+        std::env::set_var(boss_host_execution::homes::GROK_ROOT_ENV, &grok_root);
     }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

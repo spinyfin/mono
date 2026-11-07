@@ -6,9 +6,12 @@
 //! construction without a live tmux daemon.
 
 mod diagnostics;
+mod probe;
+pub mod session_options;
 mod types;
 
 use diagnostics::{is_absent_server_stderr, is_absent_session_stderr, is_diagnostic};
+pub use probe::{PaneProbe, probe_pane};
 
 pub use boss_command_runner::{CommandOutput, CommandRunner, RealCommandRunner};
 pub use boss_shell_quote::shell_quote as quote_for_shell;
