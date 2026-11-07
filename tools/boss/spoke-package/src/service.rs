@@ -119,7 +119,6 @@ impl Spec {
             &[
                 ("credentials_dir", self.credentials_dir().display().to_string()),
                 ("user", self.user.clone()),
-                ("group", self.user.clone()),
                 ("state_dir", self.state_dir.display().to_string()),
                 ("environment", environment.trim_end().to_owned()),
                 ("exec_start", self.arguments().join(" ")),
@@ -143,7 +142,6 @@ impl Spec {
             &[
                 ("label", LAUNCHD_LABEL.to_owned()),
                 ("user", xml(&self.user)),
-                ("group", xml(&self.user)),
                 ("arguments", arguments.join("\n")),
                 ("environment", environment.join("\n")),
                 ("state_dir", xml(&self.state_dir.display().to_string())),

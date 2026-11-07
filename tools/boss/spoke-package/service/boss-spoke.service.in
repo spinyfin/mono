@@ -10,7 +10,6 @@ ConditionPathExists={{credentials_dir}}/key.pem
 [Service]
 Type=simple
 User={{user}}
-Group={{group}}
 UMask=0077
 WorkingDirectory={{state_dir}}
 {{environment}}

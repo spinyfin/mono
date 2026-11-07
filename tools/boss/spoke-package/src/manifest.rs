@@ -95,6 +95,11 @@ pub struct Manifest {
     pub release_id: String,
     pub platform: String,
     pub package: Package,
+    /// The standalone first-run installer published next to the tarball. Its
+    /// digest is covered by the same signature as the package, so a person can
+    /// check the bootstrap binary with a stock `sha256sum` after verifying the
+    /// manifest signature.
+    pub installer: Package,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,16 +121,31 @@ pub fn is_token(text: &str, max: usize) -> bool {
 }
 
 impl Manifest {
-    pub fn describe(release_id: &str, platform: Platform, url_base: &str, file: &str, package: &[u8]) -> Self {
+    pub fn describe(
+        release_id: &str,
+        platform: Platform,
+        url_base: &str,
+        file: &str,
+        package: &[u8],
+        installer: &[u8],
+    ) -> Self {
+        let url_base = url_base.trim_end_matches('/');
+        let installer_file = format!("boss-spoke-package-{}", platform.as_str());
         Self {
             schema: SCHEMA,
             release_id: release_id.to_owned(),
             platform: platform.as_str().to_owned(),
             package: Package {
                 file: file.to_owned(),
-                url: format!("{}/{file}", url_base.trim_end_matches('/')),
+                url: format!("{url_base}/{file}"),
                 sha256: sha256_hex(package),
                 size: package.len() as u64,
+            },
+            installer: Package {
+                file: installer_file.clone(),
+                url: format!("{url_base}/{installer_file}"),
+                sha256: sha256_hex(installer),
+                size: installer.len() as u64,
             },
         }
     }
@@ -148,8 +168,18 @@ impl Manifest {
         if !is_token(&self.package.file, 128) {
             return malformed("package.file must be a plain file name");
         }
+        if !is_token(&self.installer.file, 128) {
+            return malformed("installer.file must be a plain file name");
+        }
+        let installer_sha = &self.installer.sha256;
+        if installer_sha.len() != 64 || !installer_sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return malformed("installer.sha256 must be 64 lowercase hex digits");
+        }
         if !self.package.url.starts_with("https://") {
             return Err(Error::OriginNotHttps(self.package.url.clone()));
+        }
+        if !self.installer.url.starts_with("https://") {
+            return Err(Error::OriginNotHttps(self.installer.url.clone()));
         }
         let sha = &self.package.sha256;
         if sha.len() != 64 || !sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {

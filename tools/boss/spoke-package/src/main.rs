@@ -286,7 +286,13 @@ fn service_user_preflight(config: &Path, storage_only: bool, repos: &[String]) -
     for repo in repos {
         args.extend(["--repo".to_owned(), repo.clone()]);
     }
-    let output = run_as(&account, &spec.environment(), &std::env::current_exe()?, &args)
+    let installed = layout.current().join(boss_spoke_package::archive::INSTALLER_BINARY);
+    let program = if installed.is_file() {
+        installed
+    } else {
+        std::env::current_exe()?
+    };
+    let output = run_as(&account, &spec.environment(), &program, &args)
         .context("run preflight as root or as the service user")?;
     print!("{}", output.output);
     Ok(if output.success {

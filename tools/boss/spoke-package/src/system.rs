@@ -54,25 +54,39 @@ impl Host for System {
 
     fn create_user(&self, name: &str, home: &Path) -> Result<Account> {
         if self.platform.is_macos() {
-            bail!(
-                "the service user {name} does not exist. Create the account first (for example with \
-                 `sysadminctl -addUser {name} -home {} -shell /bin/zsh`), then run the installer again.",
-                home.display()
-            );
+            // A hidden role account: UniqueID in the 200-400 range, no login
+            // shell, not shown on the login window. The service definition
+            // names only the user, so launchd uses this account's primary group.
+            succeed(
+                "sysadminctl",
+                &[
+                    "-addUser",
+                    name,
+                    "-fullName",
+                    "Boss spoke worker",
+                    "-home",
+                    &home.display().to_string(),
+                    "-shell",
+                    "/usr/bin/false",
+                    "-roleAccount",
+                    "-hidden",
+                ],
+            )?;
+        } else {
+            succeed(
+                "useradd",
+                &[
+                    "--system",
+                    "--create-home",
+                    "--home-dir",
+                    &home.display().to_string(),
+                    "--shell",
+                    "/bin/bash",
+                    "--user-group",
+                    name,
+                ],
+            )?;
         }
-        succeed(
-            "useradd",
-            &[
-                "--system",
-                "--create-home",
-                "--home-dir",
-                &home.display().to_string(),
-                "--shell",
-                "/bin/bash",
-                "--user-group",
-                name,
-            ],
-        )?;
         self.lookup_user(name)?.context("the service user was not created")
     }
 
@@ -84,6 +98,18 @@ impl Host for System {
         } else {
             succeed("systemctl", &["daemon-reload"])?;
             succeed("systemctl", &["enable", SYSTEMD_UNIT])
+        }
+    }
+
+    fn service_registered(&self) -> Result<bool> {
+        if self.platform.is_macos() {
+            Ok(run("launchctl", &["print", &format!("system/{LAUNCHD_LABEL}")])?
+                .status
+                .success())
+        } else {
+            Ok(run("systemctl", &["is-enabled", "--quiet", SYSTEMD_UNIT])?
+                .status
+                .success())
         }
     }
 
@@ -135,6 +161,10 @@ impl Host for Staged {
 
     fn register_service(&self, _: &Path) -> Result<()> {
         Ok(())
+    }
+
+    fn service_registered(&self) -> Result<bool> {
+        Ok(true)
     }
 
     fn restart_service(&self) -> Result<()> {

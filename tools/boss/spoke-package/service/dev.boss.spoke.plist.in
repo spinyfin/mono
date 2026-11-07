@@ -6,8 +6,6 @@
 	<string>{{label}}</string>
 	<key>UserName</key>
 	<string>{{user}}</string>
-	<key>GroupName</key>
-	<string>{{group}}</string>
 	<key>ProgramArguments</key>
 	<array>
 {{arguments}}

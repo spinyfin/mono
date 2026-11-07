@@ -25,12 +25,19 @@ const INSTANT: Health = Health {
     stable: Duration::ZERO,
 };
 
+struct ServiceFlags {
+    running: Cell<bool>,
+    registered: Cell<bool>,
+    register_fails: Cell<bool>,
+    restart_stays_up: bool,
+}
+
 struct Recording {
     account: Account,
     user_exists: Cell<bool>,
-    running: Cell<bool>,
-    restart_stays_up: bool,
+    service: ServiceFlags,
     calls: RefCell<Vec<&'static str>>,
+    on_run_as: RefCell<Option<Box<dyn Fn()>>>,
 }
 
 impl Recording {
@@ -40,9 +47,14 @@ impl Recording {
         Self {
             account: Account { uid, gid },
             user_exists: Cell::new(true),
-            running: Cell::new(false),
-            restart_stays_up: true,
+            service: ServiceFlags {
+                running: Cell::new(false),
+                registered: Cell::new(false),
+                register_fails: Cell::new(false),
+                restart_stays_up: true,
+            },
             calls: RefCell::default(),
+            on_run_as: RefCell::default(),
         }
     }
 
@@ -64,17 +76,25 @@ impl Host for Recording {
 
     fn register_service(&self, _: &Path) -> Result<()> {
         self.calls.borrow_mut().push("register");
+        if self.service.register_fails.get() {
+            anyhow::bail!("registration failed");
+        }
+        self.service.registered.set(true);
         Ok(())
+    }
+
+    fn service_registered(&self) -> Result<bool> {
+        Ok(self.service.registered.get())
     }
 
     fn restart_service(&self) -> Result<()> {
         self.calls.borrow_mut().push("restart");
-        self.running.set(self.restart_stays_up);
+        self.service.running.set(self.service.restart_stays_up);
         Ok(())
     }
 
     fn service_running(&self) -> Result<bool> {
-        Ok(self.running.get())
+        Ok(self.service.running.get())
     }
 
     fn run_as(
@@ -84,7 +104,13 @@ impl Host for Recording {
         program: &Path,
         args: &[String],
     ) -> Result<RunOutput> {
-        system::run_as(account, env, program, args)
+        // The hook runs after the storage preflight so a swap of `credentials`
+        // for a symlink lands between the check and the later root write.
+        let output = system::run_as(account, env, program, args);
+        if let Some(hook) = self.on_run_as.borrow().as_ref() {
+            hook();
+        }
+        output
     }
 }
 
@@ -239,7 +265,7 @@ fn installing_again_changes_and_restarts_nothing() {
     let first = release("1.0.1");
     fixture.install(&first).unwrap();
     fixture.enroll();
-    fixture.host.running.set(true);
+    fixture.host.service.running.set(true);
 
     let report = fixture.install(&first).unwrap();
     assert!(report.changed.is_empty(), "{:?}", report.changed);
@@ -305,7 +331,7 @@ fn a_new_hub_ca_restarts_an_enrolled_host_but_a_new_host_id_is_refused() {
     let first = release("1.0.1");
     fixture.install(&first).unwrap();
     fixture.enroll();
-    fixture.host.running.set(true);
+    fixture.host.service.running.set(true);
 
     let rotated = b"-----BEGIN CERTIFICATE-----\nMIIC\n-----END CERTIFICATE-----\n";
     let request = |host_id: &'static str, ca: &'static [u8]| {
@@ -334,7 +360,7 @@ fn a_service_that_does_not_stay_up_is_reported_and_nothing_is_rolled_back() {
     let mut fixture = Fixture::new();
     fixture.install(&release("1.0.1")).unwrap();
     fixture.enroll();
-    fixture.host.restart_stays_up = false;
+    fixture.host.service.restart_stays_up = false;
 
     let error = fixture.install(&release("1.0.2")).unwrap_err().to_string();
     assert!(error.contains("did not stay running") && error.contains("reinstall the previous signed package"));
@@ -567,6 +593,10 @@ fn both_service_definitions_pin_the_homes_root_and_keep_workers_across_a_restart
         "workers must outlive a restart"
     );
     assert!(plist.contains("<key>UserName</key>\n\t<string>boss-worker</string>"));
+    assert!(
+        !unit.contains("Group=") && !plist.contains("GroupName"),
+        "both managers use the account's primary group"
+    );
     assert!(plist.contains("<key>PathState</key>") && plist.contains("cert.pem"));
 
     // The unit is made only of sections, comments and Key=Value lines.
@@ -605,4 +635,108 @@ fn service_definition_inputs_are_plain_tokens() {
     let mut bad_user = spec("host-one", "https://hub.example");
     bad_user.user = "Root; rm".into();
     assert!(bad_user.validate().is_err());
+}
+
+#[test]
+fn service_definitions_omit_a_group_named_after_the_user() {
+    let spec = Layout {
+        platform: Platform::MacosArm64,
+        user: "boss-worker".into(),
+        root: None,
+    }
+    .spec("host-one", "https://hub.example:7443");
+    let unit = spec.render_systemd();
+    let plist = spec.render_launchd();
+    // macOS sysadminctl role accounts have primary group `staff`, not a group
+    // named after the user. Linux accounts can also have a different primary
+    // group. Leaving Group/GroupName unset uses that primary group.
+    assert!(unit.contains("User=boss-worker") && !unit.contains("Group="));
+    assert!(plist.contains("<key>UserName</key>") && !plist.contains("GroupName"));
+}
+
+#[test]
+fn a_failed_registration_is_retried_when_the_definition_is_unchanged() {
+    let fixture = Fixture::new();
+    fixture.host.service.register_fails.set(true);
+    let first = release("1.0.1");
+    let error = fixture.install(&first).unwrap_err().to_string();
+    assert!(error.contains("registration failed"), "{error}");
+    assert_eq!(fixture.host.calls(), ["register"]);
+    assert!(!fixture.host.service.registered.get());
+
+    fixture.host.service.register_fails.set(false);
+    let report = fixture.install(&first).unwrap();
+    assert!(report.changed.contains(&"service registration"));
+    assert_eq!(
+        fixture.host.calls().iter().filter(|call| **call == "register").count(),
+        2
+    );
+}
+
+#[test]
+fn swapping_credentials_for_a_symlink_during_preflight_stops_the_install() {
+    let fixture = Fixture::new();
+    let layout = fixture.layout();
+    let credentials = fixture.at(layout.state_dir().join("credentials"));
+    let elsewhere = fixture.root.path().join("root-controlled");
+    fs::create_dir(&elsewhere).unwrap();
+    let elsewhere_for_assert = elsewhere.clone();
+    fixture.host.on_run_as.replace(Some(Box::new(move || {
+        let _ = fs::remove_dir(&credentials);
+        symlink(&elsewhere, &credentials).unwrap();
+    })));
+
+    let error = fixture.install(&release("1.0.1")).unwrap_err();
+    let detail = format!("{error:#}");
+    assert!(
+        detail.contains("symlink") || detail.contains("replaced after it was verified"),
+        "{detail}"
+    );
+    assert!(!elsewhere_for_assert.join("ca.pem").exists());
+}
+
+#[test]
+fn a_writable_or_symlinked_pinned_key_is_refused() {
+    let fixture = Fixture::new();
+    let first = release("1.0.1");
+    fixture.install(&first).unwrap();
+    let key_path = fixture.at(fixture.layout().etc().join("release-verify-key.pub"));
+
+    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o666)).unwrap();
+    let error = format!("{:#}", fixture.install(&release("1.0.2")).unwrap_err());
+    assert!(error.contains("writable by others"), "{error}");
+
+    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).unwrap();
+    let real = fixture.root.path().join("other.pub");
+    fs::copy(&key_path, &real).unwrap();
+    fs::remove_file(&key_path).unwrap();
+    symlink(&real, &key_path).unwrap();
+    let error = format!("{:#}", fixture.install(&release("1.0.2")).unwrap_err());
+    assert!(error.contains("symlink"), "{error}");
+}
+
+#[test]
+fn a_trust_directory_writable_by_others_is_refused() {
+    let fixture = Fixture::new();
+    fixture.install(&release("1.0.1")).unwrap();
+    let etc = fixture.at(fixture.layout().etc());
+    fs::set_permissions(&etc, fs::Permissions::from_mode(0o775)).unwrap();
+    let error = fixture.install(&release("1.0.2")).unwrap_err().to_string();
+    assert!(error.contains("writable by others"), "{error}");
+}
+
+#[test]
+fn a_corrupt_install_record_does_not_bypass_the_host_id_guard() {
+    let fixture = Fixture::new();
+    let etc = fixture.at(fixture.layout().etc());
+    fs::create_dir_all(&etc).unwrap();
+    fs::set_permissions(&etc, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(etc.join("install.json"), b"{not json").unwrap();
+
+    let error = fixture.install(&release("1.0.1")).unwrap_err().to_string();
+    assert!(error.contains("inspect") && error.contains("install.json"), "{error}");
+    assert!(
+        !fixture.at(fixture.layout().current()).exists(),
+        "a corrupt record must not be overwritten as a first install"
+    );
 }

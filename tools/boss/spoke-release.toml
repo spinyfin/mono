@@ -2,11 +2,13 @@
 #
 # Version arithmetic, skip/idempotency, notes, draft creation, checksum sidecars
 # and publish live in //tools/release; this file is the only per-product input
-# it consumes. Each platform contributes four assets: the package, its manifest,
-# the detached Ed25519 signature over the manifest, and the standalone installer
-# a person runs first on a new host. The `.sha256` sidecar `bin/release` adds is
-# an integrity check, not an authenticity signature; only the `.manifest.json.sig`
-# is verified against the pinned release key.
+# it consumes. Each platform contributes five assets: the package, its manifest,
+# the detached Ed25519 signature over the manifest, the standalone installer a
+# person runs first on a new host, and a detached signature over that installer.
+# The installer's digest is also listed in the signed manifest. The `.sha256`
+# sidecar `bin/release` adds is an integrity check, not an authenticity
+# signature; authenticity is the `.manifest.json.sig` and the installer `.sig`
+# against the pinned release key.
 #
 # change_paths lists the spoke's own crates. A change in a library it links (the
 # driver or tmux crates, say) does not by itself cut a scheduled release; a
@@ -32,10 +34,12 @@ required_assets = [
   "boss-spoke-macos-arm64.manifest.json",
   "boss-spoke-macos-arm64.manifest.json.sig",
   "boss-spoke-package-macos-arm64",
+  "boss-spoke-package-macos-arm64.sig",
   "boss-spoke-linux-amd64.tar.gz",
   "boss-spoke-linux-amd64.manifest.json",
   "boss-spoke-linux-amd64.manifest.json.sig",
   "boss-spoke-package-linux-amd64",
+  "boss-spoke-package-linux-amd64.sig",
 ]
 # No Linux arm64 build agent exists yet; the step script already builds it when
 # one runs the `build` phase, and `publish` accepts it when present.
@@ -44,6 +48,7 @@ optional_assets = [
   "boss-spoke-linux-arm64.manifest.json",
   "boss-spoke-linux-arm64.manifest.json.sig",
   "boss-spoke-package-linux-arm64",
+  "boss-spoke-package-linux-arm64.sig",
 ]
 
 [version]
