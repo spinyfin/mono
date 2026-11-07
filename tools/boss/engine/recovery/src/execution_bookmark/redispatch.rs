@@ -138,25 +138,14 @@ pub async fn restore_rebased(
         // change id AND an empty interdiff against it. A variant that was
         // amended, squashed into or conflict-resolved in place without being
         // pushed shares the change id but holds extra content: it is staged.
-        let pr_changes: std::collections::HashMap<String, String> =
-            change_commits(jj, workspace, &format!("{base_sha}..{pr}"))
-                .await?
-                .into_iter()
-                .collect();
+        let pr_changes = reconcile::changes_by_id(jj, workspace, &format!("{base_sha}..{pr}")).await?;
         let unpublished = format!("{} ~ (::{pr} | ::{base_sha})", above_floor(&floor, &head));
         let mut own_work: Vec<String> = Vec::new();
-        for (change, commit) in change_commits(jj, workspace, &unpublished).await? {
-            if let Some(published) = pr_changes.get(&change) {
-                let interdiff = jj
-                    .run(workspace, &["interdiff", "--from", &commit, "--to", published, "--git"])
-                    .await?;
-                if crate::recovery_apply::filter_bookkeeping(&interdiff)
-                    .text
-                    .trim()
-                    .is_empty()
-                {
-                    continue;
-                }
+        for (change, commit) in reconcile::changes(jj, workspace, &unpublished).await? {
+            if let Some(published) = pr_changes.get(&change)
+                && reconcile::same_change_content(jj, workspace, &commit, published).await?
+            {
+                continue;
             }
             own_work.push(commit);
         }
@@ -200,28 +189,6 @@ pub async fn restore_rebased(
         .maybe_inherited_base(inherited_base)
         .pr_bound(pr_bookmark.is_some())
         .build())
-}
-
-/// `(change id, commit id)` of every commit in `revset`.
-async fn change_commits(jj: &dyn Jj, workspace: &Path, revset: &str) -> Result<Vec<(String, String)>> {
-    let output = jj
-        .run(
-            workspace,
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                revset,
-                "-T",
-                "change_id ++ \" \" ++ commit_id ++ \"\\n\"",
-            ],
-        )
-        .await?;
-    Ok(output
-        .lines()
-        .filter_map(|line| line.split_once(' '))
-        .map(|(change, commit)| (change.to_owned(), commit.to_owned()))
-        .collect())
 }
 
 async fn stage_unpublished(jj: &dyn Jj, workspace: &Path, sources: &str) -> Result<()> {

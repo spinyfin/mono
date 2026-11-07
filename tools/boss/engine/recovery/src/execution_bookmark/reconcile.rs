@@ -167,6 +167,59 @@ fn change_commit_lines(output: &str) -> impl Iterator<Item = (&str, &str, &str)>
     })
 }
 
+/// `(change id, commit id)` of every commit in `revset`, in log order.
+pub(crate) async fn changes(jj: &dyn Jj, repo: &Path, revset: &str) -> Result<Vec<(String, String)>> {
+    let output = jj
+        .run(
+            repo,
+            &[
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-r",
+                revset,
+                "-T",
+                "change_id ++ \" \" ++ commit_id ++ \"\\n\"",
+            ],
+        )
+        .await?;
+    Ok(change_commit_lines(&output)
+        .map(|(change, commit, _)| (change.to_owned(), commit.to_owned()))
+        .collect())
+}
+
+/// Change id -> commit id of every commit in `revset`.
+pub(crate) async fn changes_by_id(
+    jj: &dyn Jj,
+    repo: &Path,
+    revset: &str,
+) -> Result<std::collections::HashMap<String, String>> {
+    Ok(changes(jj, repo, revset).await?.into_iter().collect())
+}
+
+/// Does `variant` (a rewrite of `commit` sharing its change id) carry the same
+/// content? An empty interdiff, ignoring bookkeeping paths, proves it.
+pub(crate) async fn same_change_content(jj: &dyn Jj, repo: &Path, commit: &str, variant: &str) -> Result<bool> {
+    let interdiff = jj
+        .run(
+            repo,
+            &[
+                "--ignore-working-copy",
+                "interdiff",
+                "--from",
+                commit,
+                "--to",
+                variant,
+                "--git",
+            ],
+        )
+        .await?;
+    Ok(crate::recovery_apply::filter_bookkeeping(&interdiff)
+        .text
+        .trim()
+        .is_empty())
+}
+
 fn upstream(trunk: &str) -> String {
     format!(
         "::remote_bookmarks(exact:{})",
@@ -223,58 +276,19 @@ pub(crate) async fn containment(
             ],
         )
         .await?;
-    let published: std::collections::HashMap<String, String> = match base {
-        Some(base) => {
-            let published = jj
-                .run(
-                    repo,
-                    &[
-                        "--ignore-working-copy",
-                        "log",
-                        "--no-graph",
-                        "-r",
-                        &vouching_range(base, vouching, trunk),
-                        "-T",
-                        "change_id ++ \" \" ++ commit_id ++ \"\\n\"",
-                    ],
-                )
-                .await?;
-            change_commit_lines(&published)
-                .map(|(change, commit, _)| (change.to_owned(), commit.to_owned()))
-                .collect()
-        }
+    let published = match base {
+        Some(base) => changes_by_id(jj, repo, &vouching_range(base, vouching, trunk)).await?,
         None => Default::default(),
     };
     let mut matched = Vec::new();
     let mut missing = Vec::new();
     for (change, commit, description) in change_commit_lines(&outside) {
         match published.get(change) {
-            Some(variant)
-                if crate::recovery_apply::filter_bookkeeping(
-                    &jj.run(
-                        repo,
-                        &[
-                            "--ignore-working-copy",
-                            "interdiff",
-                            "--from",
-                            commit,
-                            "--to",
-                            variant,
-                            "--git",
-                        ],
-                    )
-                    .await?,
-                )
-                .text
-                .trim()
-                .is_empty() =>
-            {
-                matched.push(RewrittenChange {
-                    change_id: change.to_owned(),
-                    preserved: commit.to_owned(),
-                    published: variant.clone(),
-                })
-            }
+            Some(variant) if same_change_content(jj, repo, commit, variant).await? => matched.push(RewrittenChange {
+                change_id: change.to_owned(),
+                preserved: commit.to_owned(),
+                published: variant.clone(),
+            }),
             _ => missing.push(MissingChange {
                 change_id: change.to_owned(),
                 commit: commit.to_owned(),

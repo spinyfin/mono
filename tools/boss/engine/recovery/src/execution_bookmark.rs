@@ -706,7 +706,9 @@ pub async fn release_heads(
     Ok(archived)
 }
 
-/// Diff from `fork_point(base | head)` for each resumed head, concatenated.
+/// Diff for each resumed head, concatenated, from the newest common ancestor
+/// of the head with the floor or trunk. Bounding by trunk keeps upstream
+/// changes a rebase pulled in out of the patch.
 /// A successful empty patch proves an empty run (including a head that shares
 /// no history with the floor beyond the fork, such as `root()`). Missing or
 /// conflicted references and unavailable jj are errors, never empty results.

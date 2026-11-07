@@ -6,7 +6,9 @@
 use super::*;
 
 impl WorkerCompletionHandler {
-    /// Capture metadata after start; the pre-pointer hook requires a durable head.
+    /// Capture the PR title and body after start, and record `pr_head_before`
+    /// only when the pre-pointer snapshot recorded none (a deterministic lookup
+    /// failure, an unlocatable PR or a spent retry budget).
     pub async fn on_execution_started(&self, execution_id: &str) {
         if let Err(err) = self.snapshot_bound_pr(execution_id, true).await {
             tracing::warn!(execution_id, ?err, "execution_started snapshot failed");
