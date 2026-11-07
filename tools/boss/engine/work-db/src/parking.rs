@@ -52,6 +52,39 @@
 //! `tools/boss/docs/designs/task-persistence-parking-and-autonomous-progression.md`
 //! specifies that sequence.
 //!
+//! ## Atrophy: who consults the predicate
+//!
+//! A parked row (or one whose project or revision chain root is parked) is
+//! never nominated by an upkeep producer. The exclusion is in each producer's
+//! SQL candidate listing ([`upkeep_eligible_task_sql`]) wherever the producer
+//! has one, so the row is never even considered:
+//!
+//! - orphan re-dispatch (`list_orphan_active_candidates`) and dispatch-failure
+//!   recovery (`list_dispatch_failed_recovery_candidates`);
+//! - AI review scheduling and recovery: dead-review recovery
+//!   (`list_dead_pr_review_candidates`, `list_dead_review_batch_member_candidates`),
+//!   the reviewer fallback (`list_tasks_with_stalled_reviewer`), deferred review
+//!   admission (`list_tasks_awaiting_pre_merge_review_admission`) and PR-binding
+//!   repair (`list_pr_binding_repair_candidates`);
+//! - the abandoned-branch sweep (`list_abandoned_pushed_branch_candidates`);
+//! - CI and conflict remediation rescue (`list_stranded_ci_remediation_attempts`,
+//!   `list_chores_stranded_blocked_remediation`);
+//! - the merge poller's speculative conflict prediction and stacked-PR offers
+//!   (`list_in_review_chores_for_upkeep`).
+//!
+//! Where the candidate is *shared with terminal-fact observation* the listing
+//! cannot drop the row, so the consumer gates the reaction instead: the merge
+//! poller still lists a parked `in_review` row and records that its PR merged
+//! (→ `done`) or closed unmerged, but runs no conflict, CI, review-guide,
+//! moot-revision, trunk-adoption or post-merge-review reaction for it
+//! (`boss_engine_merge_poller::sweep_one`); the CI and conflict producers'
+//! shared opt-out gates refuse a parked row; the project postmortem sweep
+//! skips a parked project; and the completion path that would enqueue the AI
+//! reviewer for a freshly detected PR advances the row to `in_review` without
+//! one. The dependency cascade still flips a parked `blocked: dependency` row
+//! to `todo`, but the park check in `reconcile_work_item_execution` mints
+//! nothing, exactly as `deferred` behaves.
+//!
 //! ## Who may park
 //!
 //! Only the `human` and `boss` caller tiers. Every other actor (a worker, a
@@ -361,6 +394,17 @@ pub fn parked_task_sql(alias: &str) -> String {
                     OR EXISTS (SELECT 1 FROM projects rp WHERE rp.id = root.project_id
                                AND rp.parked_at IS NOT NULL AND rp.status NOT IN ('done', 'archived')))))))"
     )
+}
+
+/// The negation of [`parked_task_sql`]: SQL, over `tasks` aliased `alias`, that
+/// is true when upkeep may run for the task. Every upkeep producer's SQL
+/// candidate listing ANDs this in, so a parked row is never even nominated —
+/// the exclusion happens where candidates are chosen, not where an action is
+/// finally attempted. The producers that do this are inventoried in the module
+/// documentation; the SQL listings are also registered in
+/// `tests/upkeep_producer_tests.rs`, which a parameterised test iterates.
+pub fn upkeep_eligible_task_sql(alias: &str) -> String {
+    format!("NOT {}", parked_task_sql(alias))
 }
 
 /// `true` when `work_item_id` is parked (see [`parked_task_sql`]). A project is

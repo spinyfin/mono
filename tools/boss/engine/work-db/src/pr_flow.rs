@@ -888,6 +888,7 @@ impl WorkDb {
         //      finalize_pr_review_pass but didn't, e.g. Stop hook was missed).
         //   2. Non-terminal but created before the stale cutoff (timeout).
         let review_result_outcomes = super::review_verdicts::review_result_gate_outcomes_sql();
+        let upkeep = super::parking::upkeep_eligible_task_sql("t");
         let sql = format!(
             "SELECT t.id, t.product_id, t.pr_url,
                     EXISTS (
@@ -909,6 +910,7 @@ impl WorkDb {
                AND t.pr_url IS NOT NULL
                AND t.pr_url != ''
                AND t.deleted_at IS NULL
+               AND {upkeep}
                AND (
                  -- Reviewer finished but task was not advanced (missed Stop hook)
                  we.status IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')
@@ -979,12 +981,14 @@ impl WorkDb {
         // walked cycle root, which the seed filter cannot see yet; the
         // outer WHERE narrows `in_review` rows to the marker and
         // readmission arms.
-        let walk = super::cycle_root_walk_cte(
+        let upkeep = super::parking::upkeep_eligible_task_sql("t");
+        let walk = super::cycle_root_walk_cte(&format!(
             "t.status IN ('active', 'in_review')
                  AND t.pr_url IS NOT NULL
                  AND t.pr_url != ''
-                 AND t.deleted_at IS NULL",
-        );
+                 AND t.deleted_at IS NULL
+                 AND {upkeep}",
+        ));
         let needs_readmission = super::review_batches::pre_merge_review_needs_readmission_sql("roots.cycle_root_id");
         let sql = format!(
             "{walk}
