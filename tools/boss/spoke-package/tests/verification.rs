@@ -58,6 +58,9 @@ fn a_correctly_signed_release_verifies() {
         verified.manifest.package.url,
         format!("{URL_BASE}/boss-spoke-linux-amd64.tar.gz")
     );
+    assert_eq!(verified.manifest.installer.file, "boss-spoke-package-linux-amd64");
+    assert_eq!(verified.manifest.installer.size, b"installer".len() as u64);
+    assert_eq!(verified.manifest.installer.sha256.len(), 64);
 }
 
 #[test]
@@ -174,6 +177,14 @@ fn a_signed_manifest_is_still_validated() {
     assert_eq!(
         mutate(&|m| m.package.sha256 = "ABC".into()).code(),
         "manifest_malformed"
+    );
+    assert_eq!(
+        mutate(&|m| m.installer.sha256 = "ABC".into()).code(),
+        "manifest_malformed"
+    );
+    assert_eq!(
+        mutate(&|m| m.installer.url = "http://example.com/installer".into()).code(),
+        "origin_not_https"
     );
     assert_eq!(
         mutate(&|m| m.platform = "windows-amd64".into()).code(),
@@ -308,4 +319,36 @@ fn setuid_bits_in_an_archive_do_not_survive() {
         .permissions()
         .mode();
     assert_eq!(mode & 0o7777, 0o755);
+}
+
+/// Mirrors `.buildkite/steps/spoke-release.sh`: the EXIT trap expands the
+/// work-dir path when it is set, because a function-local `work` is unset
+/// after the function returns and `set -u` would then skip the cleanup.
+#[test]
+fn release_build_trap_removes_the_signing_key_dir_after_the_function_returns() {
+    use std::process::Command;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("keydir");
+    fs::create_dir(&work).unwrap();
+    fs::write(work.join("release.key"), b"secret").unwrap();
+    let script = r#"
+set -euo pipefail
+phase_build() {
+  local work
+  work="$1"
+  trap "rm -rf -- $(printf '%q' "${work}")" EXIT
+}
+phase_build "$1"
+"#;
+    let output = Command::new("bash")
+        .args(["-c", script, "phase", work.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        !work.exists(),
+        "signing-key directory was left behind: {}",
+        work.display()
+    );
 }

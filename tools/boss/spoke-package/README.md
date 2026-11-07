@@ -17,6 +17,7 @@ For each platform (`macos-arm64`, `linux-amd64`, `linux-arm64`) a release is:
 | `boss-spoke-<platform>.manifest.json`     | Schema, release id, platform, and the package's file name, URL, SHA-256 and size.  |
 | `boss-spoke-<platform>.manifest.json.sig` | Detached Ed25519 signature over the manifest's exact bytes.                        |
 | `boss-spoke-package-<platform>`           | The installer on its own: what a person runs first on a host that has nothing yet. |
+| `boss-spoke-package-<platform>.sig`       | Detached Ed25519 signature over the standalone installer bytes.                    |
 
 Verification order is fixed and every step is a hard stop (there is no unsigned
 fallback): the **signature over the raw manifest bytes** (the manifest is never
@@ -48,6 +49,24 @@ This repository holds no release key: generating it, storing the secret and
 registering the release pipeline are the fleet administrator's steps, so
 packages ship inert until then.
 
+### Verifying the first-run installer
+
+The program a person runs first on a fresh host is itself a release asset. Its
+SHA-256 is listed as `installer` in the signed manifest, and the release also
+publishes `boss-spoke-package-<platform>.sig` over the binary bytes. Confirm the
+release public key's fingerprint with the owner, then either:
+
+1. Verify the **manifest** signature, then check the installer digest against
+   `installer.sha256` in that manifest (`sha256sum` / `shasum -a 256`).
+2. Verify the **installer** signature directly. The signature file is base64 of
+   a raw Ed25519 signature over the binary. Convert the `ed25519:<base64>`
+   public key to SPKI PEM (prefix `302a300506032b6570032100` plus the 32 raw
+   key bytes) and run `openssl pkeyutl -verify -rawin -pubin`.
+
+A host that already has a trusted copy of this installer can keep using
+`boss-spoke-package verify` for later packages. The tarball is verified the
+same way before `install` unpacks it.
+
 ## Installing (as root, on the worker host)
 
 ```sh
@@ -77,9 +96,10 @@ Directories the service user controls are verified, never repaired: an existing
 one that is a symlink, not owned by the service user, or not owner-only stops
 the install, because root must not chown or chmod paths another user can swap.
 
-The `boss-worker` account is created on Linux (`useradd --system`). **On macOS
-create it first** (for example with `sysadminctl -addUser`); the installer stops
-with that instruction rather than creating accounts it cannot test.
+The `boss-worker` account is created when missing: `useradd --system` on Linux,
+and a hidden role account (`sysadminctl -addUser … -shell /usr/bin/false
+-roleAccount -hidden`) on macOS. The service definition names only the user, so
+systemd and launchd use that account's primary group.
 
 ### The service environment
 
@@ -112,8 +132,10 @@ changes after the first install (the journal belongs to it).
 boss-spoke-package preflight [--storage-only] [--repo <url>]...
 ```
 
-Run as root or as `boss-worker`, it re-runs itself **as the service user with
-exactly the installed service environment** and prints one `PASS`/`FAIL` line
+Run as root or as `boss-worker`, it re-runs the **installed**
+`boss-spoke-package` (the root-owned 0755 copy under `current/`) **as the
+service user with exactly the installed service environment** and prints one
+`PASS`/`FAIL` line
 per check, then `failed_preflights: …` and a non-zero exit if any failed:
 
 | Check                                                 | Passes when                                                                     |
@@ -122,8 +144,11 @@ per check, then `failed_preflights: …` and a non-zero exit if any failed:
 | `private_homes`                                       | `BOSS_CODEX_HOMES_DIR` is **set**, is `<state>/homes`, owner-only and writable. |
 | `disk_space`, `clock`                                 | At least 16 GiB free; wall clock is not before 2026-01-01.                      |
 | `tmux`, `tool_cube`, `tool_jj`, `tool_git`, `tool_gh` | Present and runnable; tmux is at least the version Boss requires.               |
+| `tool_claude`, `tool_codex`                           | Present and runnable (`--version`).                                             |
 | `python_pty`                                          | `python3` can import `fcntl`, `pty` and `termios` (the brief relay needs them). |
 | `github_credentials`                                  | `gh auth status` succeeds. Its output is discarded: it names accounts.          |
+| `claude_credentials`                                  | `claude -p /usage --output-format json` succeeds. Output is discarded.          |
+| `codex_credentials`                                   | Codex `account/rateLimits/read` over app-server succeeds. Output is discarded.  |
 | `hub_reachable`                                       | A TCP connection to the hub opens.                                              |
 | `repo_access`                                         | `git ls-remote` reads every `--repo`. Failures name a count, never a URL.       |
 
@@ -133,8 +158,7 @@ same checks at startup and every five minutes (without `hub_reachable`, which a
 connected daemon proves, and `repo_access`) and reports the failing names as
 `Inventory.failed_preflights` (`preflight_pending` until the first run ends), so
 a host that has not proven itself stays unschedulable. The hub side of that is
-the capacity scheduling work. Driver (Claude/Codex) credentials are not probed:
-there is no non-interactive credential check for them yet.
+the capacity scheduling work.
 
 ## Releasing
 

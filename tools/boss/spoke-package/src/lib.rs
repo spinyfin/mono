@@ -46,10 +46,10 @@ pub fn build(
         },
         Entry {
             path: INSTALLER_BINARY,
-            bytes: installer,
+            bytes: installer.clone(),
         },
     ])?;
-    let manifest = Manifest::describe(release_id, platform, url_base, &file_name, &package);
+    let manifest = Manifest::describe(release_id, platform, url_base, &file_name, &package, &installer);
     Ok(Built {
         file_name,
         package,

@@ -2,7 +2,8 @@
 //!
 //! A host is only worth scheduling when workers started there can actually run:
 //! private storage, the pinned private-home root, the tools a worker shells out
-//! to, an authenticated GitHub login, a sane clock and room on disk. Every
+//! to, authenticated driver CLIs, an authenticated GitHub login, a sane clock
+//! and room on disk. Every
 //! check has a stable name. The daemon publishes the names of failing checks as
 //! `Inventory.failed_preflights`, and the installer's `preflight` command prints
 //! them for the person setting the host up. Enrollment alone never makes a host
@@ -57,6 +58,11 @@ pub struct Config {
     /// Repositories (URLs) the host must be able to read.
     #[builder(default)]
     pub repos: Vec<String>,
+    /// Driver CLIs. Defaults match how workers invoke them off `PATH`.
+    #[builder(default = PathBuf::from("claude"))]
+    pub claude_bin: PathBuf,
+    #[builder(default = PathBuf::from("codex"))]
+    pub codex_bin: PathBuf,
 }
 
 /// One check's result. `Ok` carries a short non-secret description of what was
@@ -105,8 +111,12 @@ pub async fn run(config: &Config) -> Vec<Outcome> {
     for (name, program) in [("tool_jj", "jj"), ("tool_git", "git"), ("tool_gh", "gh")] {
         outcomes.push(tool(name, OsStr::new(program)).await);
     }
+    outcomes.push(tool("tool_claude", config.claude_bin.as_os_str()).await);
+    outcomes.push(tool("tool_codex", config.codex_bin.as_os_str()).await);
     outcomes.push(python_pty().await);
     outcomes.push(github_credentials().await);
+    outcomes.push(claude_credentials(&config.claude_bin).await);
+    outcomes.push(codex_credentials(&config.codex_bin).await);
     if let Some(hub) = &config.hub {
         outcomes.push(hub_reachable(hub).await);
     }
@@ -210,12 +220,12 @@ async fn tmux(program: Option<&Path>, socket: &Path) -> Outcome {
 }
 
 async fn tool(name: &'static str, program: &OsStr) -> Outcome {
-    Outcome::of(name, probe(program, &["--version"], &[]).await)
+    Outcome::of(name, probe(program, &["--version"], &[], &[]).await)
 }
 
 /// Workers talk to their driver through the Python PTY relay.
 async fn python_pty() -> Outcome {
-    let result = probe(OsStr::new("python3"), &["-c", "import fcntl, pty, termios"], &[]).await;
+    let result = probe(OsStr::new("python3"), &["-c", "import fcntl, pty, termios"], &[], &[]).await;
     Outcome::of(
         "python_pty",
         result.map(|_| "python3 has fcntl, pty and termios".to_owned()),
@@ -225,13 +235,132 @@ async fn python_pty() -> Outcome {
 /// Whether `gh` holds a working login. The probe's output names accounts and
 /// token prefixes, so it is dropped.
 async fn github_credentials() -> Outcome {
-    let result = probe(OsStr::new("gh"), &["auth", "status"], &[("GH_PROMPT_DISABLED", "1")]).await;
+    let result = probe(
+        OsStr::new("gh"),
+        &["auth", "status"],
+        &[("GH_PROMPT_DISABLED", "1")],
+        &[],
+    )
+    .await;
     Outcome::of(
         "github_credentials",
         result
             .map(|_| "gh is authenticated".to_owned())
             .map_err(|_| "gh is not authenticated for the service user".to_owned()),
     )
+}
+
+/// Same non-interactive `/usage` print-mode probe as `ClaudeQuotaProbe`: no
+/// model turn, and the child's output is discarded so a token cannot leak.
+async fn claude_credentials(program: &Path) -> Outcome {
+    let result = probe(
+        program.as_os_str(),
+        &["-p", "/usage", "--output-format", "json"],
+        &[],
+        &["ANTHROPIC_API_KEY"],
+    )
+    .await;
+    Outcome::of(
+        "claude_credentials",
+        result
+            .map(|_| "claude is authenticated".to_owned())
+            .map_err(|_| "claude is not authenticated for the service user".to_owned()),
+    )
+}
+
+/// Same `account/rateLimits/read` app-server probe as `CodexQuotaProbe`. The
+/// handshake matches `codex app-server --listen stdio://` (`initialize`,
+/// `notifications/initialized`, then the method). The result payload is
+/// dropped: it is a quota figure, not a credential, but it is still not
+/// something a preflight line should print.
+async fn codex_credentials(program: &Path) -> Outcome {
+    let program = program.to_path_buf();
+    let result = tokio::time::timeout(
+        PROBE_TIMEOUT,
+        tokio::task::spawn_blocking(move || probe_codex_app_server(&program)),
+    )
+    .await;
+    let result = match result {
+        Ok(Ok(Ok(()))) => Ok("codex is authenticated".to_owned()),
+        Ok(Ok(Err(error))) => Err(error),
+        Ok(Err(_)) | Err(_) => Err("codex is not authenticated for the service user".to_owned()),
+    };
+    Outcome::of("codex_credentials", result)
+}
+
+/// Same JSON-RPC handshake as `CodexQuotaProbe` (`codex app-server --listen
+/// stdio://`, then `initialize` / `notifications/initialized` /
+/// `account/rateLimits/read`). Implemented here so preflight does not depend
+/// on the hook-trust crate.
+fn probe_codex_app_server(program: &Path) -> Result<(), String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+
+    let unauth = || "codex is not authenticated for the service user".to_owned();
+    let mut child = Command::new(program)
+        .args(["app-server", "--listen", "stdio://"])
+        .current_dir("/")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "codex is not installed or not on PATH".to_owned()
+            } else {
+                unauth()
+            }
+        })?;
+    let mut stdin = child.stdin.take().ok_or_else(unauth)?;
+    let stdout = child.stdout.take().ok_or_else(unauth)?;
+    let mut reader = BufReader::new(stdout);
+    let send = |stdin: &mut std::process::ChildStdin, msg: serde_json::Value| -> Result<(), String> {
+        writeln!(stdin, "{}", serde_json::to_string(&msg).map_err(|_| unauth())?).map_err(|_| unauth())?;
+        stdin.flush().map_err(|_| unauth())
+    };
+    send(
+        &mut stdin,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "boss-spoke-preflight", "version": "1.0.0"},
+                "capabilities": {},
+            },
+        }),
+    )?;
+    let mut line = String::new();
+    reader.read_line(&mut line).map_err(|_| unauth())?;
+    let init: serde_json::Value = serde_json::from_str(line.trim()).map_err(|_| unauth())?;
+    if init.get("error").is_some() {
+        return Err(unauth());
+    }
+    send(
+        &mut stdin,
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    )?;
+    send(
+        &mut stdin,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "account/rateLimits/read",
+            "params": {},
+        }),
+    )?;
+    line.clear();
+    reader.read_line(&mut line).map_err(|_| unauth())?;
+    let reply: serde_json::Value = serde_json::from_str(line.trim()).map_err(|_| unauth())?;
+    let _ = child.kill();
+    let _ = child.wait();
+    if reply.get("error").is_some() {
+        Err(unauth())
+    } else if reply.get("result").is_some() {
+        Ok(())
+    } else {
+        Err(unauth())
+    }
 }
 
 async fn hub_reachable(authority: &str) -> Outcome {
@@ -248,9 +377,14 @@ async fn repo_access(repos: &[String]) -> Outcome {
     let mut unreadable = 0;
     for repo in repos {
         let env = [("GIT_TERMINAL_PROMPT", "0")];
-        if probe(OsStr::new("git"), &["ls-remote", "--exit-code", repo, "HEAD"], &env)
-            .await
-            .is_err()
+        if probe(
+            OsStr::new("git"),
+            &["ls-remote", "--exit-code", repo, "HEAD"],
+            &env,
+            &[],
+        )
+        .await
+        .is_err()
         {
             unreadable += 1;
         }
@@ -265,7 +399,7 @@ async fn repo_access(repos: &[String]) -> Outcome {
 
 /// Runs `program`, returning the first line of its stdout. Failure carries no
 /// process output.
-async fn probe(program: &OsStr, args: &[&str], envs: &[(&str, &str)]) -> Result<String, String> {
+async fn probe(program: &OsStr, args: &[&str], envs: &[(&str, &str)], unset: &[&str]) -> Result<String, String> {
     let mut command = Command::new(program);
     command
         .args(args)
@@ -274,6 +408,9 @@ async fn probe(program: &OsStr, args: &[&str], envs: &[(&str, &str)]) -> Result<
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
+    for key in unset {
+        command.env_remove(*key);
+    }
     let name = Path::new(program).display().to_string();
     match tokio::time::timeout(PROBE_TIMEOUT, command.output()).await {
         Err(_) => Err(format!("{name} timed out")),
@@ -379,14 +516,14 @@ mod tests {
 
     #[tokio::test]
     async fn probe_reports_the_first_line_and_never_the_failure_output() {
-        let ok = probe(OsStr::new("/bin/sh"), &["-c", "echo first; echo second"], &[]).await;
+        let ok = probe(OsStr::new("/bin/sh"), &["-c", "echo first; echo second"], &[], &[]).await;
         assert_eq!(ok.unwrap(), "first");
-        let failed = probe(OsStr::new("/bin/sh"), &["-c", "echo secret >&2; exit 3"], &[])
+        let failed = probe(OsStr::new("/bin/sh"), &["-c", "echo secret >&2; exit 3"], &[], &[])
             .await
             .unwrap_err();
         assert!(failed.contains("exited") && !failed.contains("secret"));
         assert!(
-            probe(OsStr::new("/nonexistent/tool"), &[], &[])
+            probe(OsStr::new("/nonexistent/tool"), &[], &[], &[])
                 .await
                 .unwrap_err()
                 .contains("cannot run")
@@ -408,5 +545,75 @@ mod tests {
         assert_eq!(hub_authority("https://hub.example/path").unwrap(), "hub.example:443");
         assert_eq!(hub_authority("http://hub.example"), None);
         assert_eq!(hub_authority("https://user@hub.example"), None);
+    }
+
+    fn stub_script(name: &str, body: &str) -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        (temp, path)
+    }
+
+    #[tokio::test]
+    async fn driver_tools_and_credentials_distinguish_missing_invalid_and_working() {
+        let missing = PathBuf::from("/nonexistent/definitely-not-a-driver");
+        assert!(!tool("tool_claude", missing.as_os_str()).await.passed());
+        assert!(!claude_credentials(&missing).await.passed());
+        assert!(!tool("tool_codex", missing.as_os_str()).await.passed());
+        assert!(!codex_credentials(&missing).await.passed());
+
+        let (_claude_bad, claude_bad) = stub_script(
+            "claude",
+            r#"
+if [ "$1" = --version ]; then echo claude 1.0; exit 0; fi
+echo 'please login' >&2
+exit 1
+"#,
+        );
+        assert!(tool("tool_claude", claude_bad.as_os_str()).await.passed());
+        let failed = claude_credentials(&claude_bad).await;
+        assert!(!failed.passed());
+        assert_eq!(failed.name, "claude_credentials");
+        assert!(!message(&failed).contains("please login"));
+
+        let (_claude_ok, claude_ok) = stub_script(
+            "claude",
+            r#"
+if [ "$1" = --version ]; then echo claude 1.0; exit 0; fi
+echo '{"is_error":false,"result":"ok"}'
+"#,
+        );
+        assert!(claude_credentials(&claude_ok).await.passed());
+
+        let (_codex_bad, codex_bad) = stub_script(
+            "codex",
+            r#"
+if [ "$1" = --version ]; then echo codex 1.0; exit 0; fi
+read l1
+echo '{"id":1,"result":{}}'
+read l2
+read l3
+echo '{"id":2,"error":{"message":"not logged in; run login"}}'
+"#,
+        );
+        assert!(tool("tool_codex", codex_bad.as_os_str()).await.passed());
+        let failed = codex_credentials(&codex_bad).await;
+        assert!(!failed.passed());
+        assert_eq!(failed.name, "codex_credentials");
+        assert!(!message(&failed).contains("not logged in"));
+
+        let (_codex_ok, codex_ok) = stub_script(
+            "codex",
+            r#"
+if [ "$1" = --version ]; then echo codex 1.0; exit 0; fi
+read l1
+echo '{"id":1,"result":{}}'
+read l2
+read l3
+echo '{"id":2,"result":{}}'
+"#,
+        );
+        assert!(codex_credentials(&codex_ok).await.passed());
     }
 }

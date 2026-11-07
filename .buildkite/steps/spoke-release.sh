@@ -68,7 +68,10 @@ phase_build() {
   installer="$(binary_path "${INSTALLER_TARGET}")"
 
   work="$(mktemp -d)"
-  trap 'rm -rf "${work}"' EXIT
+  # Expand the path now: EXIT runs after this function returns, when a
+  # function-local `work` is unset. Under `set -u` a delayed expansion would
+  # fail and leave the signing key on the agent.
+  trap "rm -rf -- $(printf '%q' "${work}")" EXIT
   out="${work}/out"
   (umask 077 && printf '%s\n' "${key}" > "${work}/release.key")
 
@@ -82,12 +85,20 @@ phase_build() {
     --manifest "${out}/boss-spoke-${platform}.manifest.json" \
     --key "${work}/release.key" \
     --out "${out}/boss-spoke-${platform}.manifest.json.sig"
+  "${installer}" sign \
+    --manifest "${installer}" \
+    --key "${work}/release.key" \
+    --out "${out}/boss-spoke-package-${platform}.sig"
 
   bin/release upload --config "${CONFIG}" --tag "${tag}" \
     --asset "boss-spoke-${platform}.tar.gz=${out}/boss-spoke-${platform}.tar.gz" \
     --asset "boss-spoke-${platform}.manifest.json=${out}/boss-spoke-${platform}.manifest.json" \
     --asset "boss-spoke-${platform}.manifest.json.sig=${out}/boss-spoke-${platform}.manifest.json.sig" \
-    --asset "boss-spoke-package-${platform}=${installer}"
+    --asset "boss-spoke-package-${platform}=${installer}" \
+    --asset "boss-spoke-package-${platform}.sig=${out}/boss-spoke-package-${platform}.sig"
+
+  rm -rf -- "${work}"
+  trap - EXIT
 }
 
 phase_publish() {

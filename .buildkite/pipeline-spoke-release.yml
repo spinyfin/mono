@@ -2,7 +2,7 @@
 #
 # Cuts a GitHub Release of the signed `boss-spoke` worker-host packages on
 # spinyfin/mono, tagged boss-spoke-vX.Y.Z, with one package, manifest, detached
-# signature and standalone installer per platform. The hub-and-spoke design
+# signature, standalone installer and installer signature per platform. The hub-and-spoke design
 # (tools/boss/docs/designs/hub-and-spoke-distributed-engine.md, "Manual
 # enrollment and upgrades") installs these by hand on each worker host.
 #

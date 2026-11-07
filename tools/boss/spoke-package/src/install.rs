@@ -17,9 +17,9 @@
 //! service user) go through [`Host`], so the whole flow is exercised in tests
 //! against a staging root without being root.
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, fchown, symlink};
+use std::fs;
+use std::io;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -126,6 +126,10 @@ impl Layout {
             })
             .collect()
     }
+
+    fn base(&self) -> &Path {
+        self.root.as_deref().unwrap_or(Path::new("/"))
+    }
 }
 
 /// What the installer remembers about this host, root-owned and world-readable.
@@ -143,18 +147,39 @@ pub struct InstallRecord {
 
 impl InstallRecord {
     pub fn read(path: &Path) -> Result<Self> {
-        let record: Self = serde_json::from_slice(&fs::read(path).with_context(|| {
-            format!(
+        match Self::load(path)? {
+            Some(record) => Ok(record),
+            None => bail!(
                 "{} is unreadable; has the spoke package been installed on this host?",
                 path.display()
+            ),
+        }
+    }
+
+    /// `Ok(None)` only when the file is absent. Any other read or parse
+    /// problem is an error: a corrupt record must not be treated as a first
+    /// install.
+    pub fn load(path: &Path) -> Result<Option<Self>> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => bail!(
+                "{} cannot be read ({error}); inspect it before installing again",
+                path.display()
+            ),
+        };
+        let record: Self = serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "{} is not a valid install record; inspect it before installing again",
+                path.display()
             )
-        })?)?;
+        })?;
         ensure!(
             record.schema == 1,
             "unsupported install record schema {}",
             record.schema
         );
-        Ok(record)
+        Ok(Some(record))
     }
 
     pub fn layout(&self) -> Result<Layout> {
@@ -185,6 +210,9 @@ pub trait Host {
     /// Makes the service manager aware of a new or changed definition. It must
     /// not start a host that has no client certificate.
     fn register_service(&self, definition: &Path) -> Result<()>;
+    /// Whether the service is registered and enabled, regardless of whether
+    /// the definition bytes on disk changed.
+    fn service_registered(&self) -> Result<bool>;
     fn restart_service(&self) -> Result<()>;
     fn service_running(&self) -> Result<bool>;
     /// Runs `program` as `account` with exactly `env` and nothing inherited.
@@ -259,7 +287,7 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
     );
 
     // A host's journal is keyed by its id; changing it would strand the journal.
-    if let Ok(existing) = InstallRecord::read(&layout.on_disk(&layout.config_path())) {
+    if let Some(existing) = InstallRecord::load(&layout.on_disk(&layout.config_path()))? {
         ensure!(
             existing.host_id == request.host_id,
             "this host is installed as {}; a host id never changes because the journal belongs to it",
@@ -275,16 +303,11 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
             host.create_user(&layout.user, &layout.home())?
         }
     };
-    if ensure_root_dir(&layout.on_disk(&layout.etc()))? {
+    if ensure_root_dir(layout, &layout.etc())? {
         report.changed.push("etc directory");
     }
     if newly_pinned {
-        write_file(
-            &layout.on_disk(&layout.pinned_key_path()),
-            key.to_text().as_bytes(),
-            0o644,
-            None,
-        )?;
+        write_logical(layout, &layout.pinned_key_path(), key.to_text().as_bytes(), 0o644, None)?;
         report.changed.push("release key pinned");
     }
     if ensure_state(layout, &account)? {
@@ -315,8 +338,11 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
     if point_current(layout, &release_id)? {
         report.changed.push("current release switched");
     }
-    let credentials = layout.on_disk(&spec.credentials_dir());
-    let trust_changed = write_file(&credentials.join("ca.pem"), request.hub_ca, 0o600, Some(&account))?;
+    let credentials = spec.credentials_dir();
+    let credentials_dir = secure_fs::open_dir(layout.base(), &credentials)
+        .context("the credentials directory was replaced after it was verified")?;
+    secure_fs::verify_user_dir(&credentials_dir, &account, true, "credentials")?;
+    let trust_changed = secure_fs::write_file_at(&credentials_dir, "ca.pem", request.hub_ca, 0o600, Some(&account))?;
     if trust_changed {
         report.changed.push("hub trust installed");
     }
@@ -330,7 +356,7 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
         .build();
     let mut record_bytes = serde_json::to_vec_pretty(&record)?;
     record_bytes.push(b'\n');
-    if write_file(&layout.on_disk(&layout.config_path()), &record_bytes, 0o644, None)? {
+    if write_logical(layout, &layout.config_path(), &record_bytes, 0o644, None)? {
         report.changed.push("install record");
     }
     let definition = if layout.platform.is_macos() {
@@ -338,17 +364,24 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
     } else {
         spec.render_systemd()
     };
-    let definition_path = layout.on_disk(&layout.definition());
-    ensure_root_dir(definition_path.parent().context("service definition has no parent")?)?;
-    let definition_changed = write_file(&definition_path, definition.as_bytes(), 0o644, None)?;
+    let definition_path = layout.definition();
+    let definition_parent = definition_path.parent().context("service definition has no parent")?;
+    ensure_root_dir(layout, definition_parent)?;
+    let definition_changed = write_logical(layout, &definition_path, definition.as_bytes(), 0o644, None)?;
     if definition_changed {
         report.changed.push("service definition");
+    }
+    if definition_changed || !host.service_registered()? {
         host.register_service(&layout.definition())?;
+        if !definition_changed {
+            report.changed.push("service registration");
+        }
     }
 
+    let credentials_on_disk = layout.on_disk(&credentials);
     report.enrolled = ["cert.pem", "key.pem"]
         .iter()
-        .all(|name| credentials.join(name).is_file());
+        .all(|name| credentials_on_disk.join(name).is_file());
     let release_changed = report.changed.contains(&"current release switched");
     // The daemon reads its definition, binary and trust anchor only at startup.
     if report.enrolled && (definition_changed || release_changed || trust_changed || !host.service_running()?) {
@@ -360,9 +393,24 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
 }
 
 fn resolve_trust(layout: &Layout, supplied: Option<TrustedKey>) -> Result<(TrustedKey, bool)> {
-    match fs::read_to_string(layout.on_disk(&layout.pinned_key_path())) {
-        Ok(text) => {
-            let pinned = TrustedKey::parse(&text)?;
+    let etc = match secure_fs::open_installer_dir(layout.base(), &layout.etc()) {
+        Ok(dir) => {
+            secure_fs::verify_installer_dir(&dir, &layout.etc().display().to_string())?;
+            dir
+        }
+        Err(error) if secure_fs::is_not_found(&error) => {
+            let key = supplied.context(
+                "no release key is pinned on this host; pass --trusted-key with the release owner's public key \
+                 and confirm its fingerprint with them first",
+            )?;
+            return Ok((key, true));
+        }
+        Err(error) => return Err(error),
+    };
+    match secure_fs::read_file_at(&etc, "release-verify-key.pub") {
+        Ok((bytes, metadata)) => {
+            secure_fs::verify_installer_file(&metadata, &layout.pinned_key_path().display().to_string())?;
+            let pinned = TrustedKey::parse(&String::from_utf8(bytes).context("pinned release key is not UTF-8")?)?;
             if let Some(supplied) = supplied {
                 ensure!(
                     supplied == pinned,
@@ -375,116 +423,71 @@ fn resolve_trust(layout: &Layout, supplied: Option<TrustedKey>) -> Result<(Trust
             }
             Ok((pinned, false))
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Err(error) if secure_fs::is_not_found(&error) => {
             let key = supplied.context(
                 "no release key is pinned on this host; pass --trusted-key with the release owner's public key \
                  and confirm its fingerprint with them first",
             )?;
             Ok((key, true))
         }
-        Err(error) => Err(error.into()),
+        Err(error) => Err(error).context("pinned release key is not a trusted installer-owned file"),
     }
 }
 
-/// A root-owned directory anyone may read. Created when missing; an existing
-/// one must be a real directory that others cannot write to.
-fn ensure_root_dir(path: &Path) -> Result<bool> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            ensure!(metadata.is_dir(), "{} must be a directory", path.display());
-            ensure!(metadata.mode() & 0o022 == 0, "{} is writable by others", path.display());
-            Ok(false)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::DirBuilder::new().recursive(true).mode(0o755).create(path)?;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
-            Ok(true)
-        }
-        Err(error) => Err(error.into()),
-    }
+/// An installer-owned directory anyone may read. Created when missing; an
+/// existing one must be a real directory, owned by the installer, that others
+/// cannot write to.
+fn ensure_root_dir(layout: &Layout, logical: &Path) -> Result<bool> {
+    let (_, created) = secure_fs::ensure_installer_dir(layout.base(), logical)?;
+    Ok(created)
 }
 
 /// The service user's home, then its owner-only spoke state, credential and
 /// driver-home directories. An existing directory is verified, never repaired:
 /// the service user controls these paths, so root must not chown or chmod them.
 fn ensure_state(layout: &Layout, account: &Account) -> Result<bool> {
-    let home = layout.on_disk(&layout.home());
-    if let Some(parent) = home.parent() {
-        ensure_root_dir(parent)?;
-    }
-    let mut changed = ensure_user_dir(&home, account, false)?;
-    let state = layout.on_disk(&layout.state_dir());
-    for dir in [state.clone(), state.join("credentials"), state.join("homes")] {
-        changed |= ensure_user_dir(&dir, account, true)?;
+    let home = layout.home();
+    let parent = home.parent().context("home has no parent")?;
+    let parent_dir = {
+        let (dir, _) = secure_fs::ensure_installer_dir(layout.base(), parent)?;
+        dir
+    };
+    let home_name = home
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("home is not a plain name")?;
+    let (home_dir, mut changed) = secure_fs::ensure_user_dir_at(&parent_dir, home_name, account, false)?;
+    let state_path = layout.state_dir();
+    let state_name = state_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("state directory is not a plain name")?;
+    let (state_dir, state_created) = secure_fs::ensure_user_dir_at(&home_dir, state_name, account, true)?;
+    changed |= state_created;
+    for name in ["credentials", "homes"] {
+        let (_, created) = secure_fs::ensure_user_dir_at(&state_dir, name, account, true)?;
+        changed |= created;
     }
     Ok(changed)
 }
 
-fn ensure_user_dir(path: &Path, account: &Account, private: bool) -> Result<bool> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            ensure!(
-                metadata.is_dir(),
-                "{} must be a real directory, not a symlink or file",
-                path.display()
-            );
-            ensure!(
-                metadata.uid() == account.uid,
-                "{} is not owned by the service user",
-                path.display()
-            );
-            ensure!(
-                !private || metadata.mode() & 0o077 == 0,
-                "{} must be owner-only (0700); fix its mode and run the installer again",
-                path.display()
-            );
-            Ok(false)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::DirBuilder::new().mode(0o700).create(path)?;
-            let dir = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
-                .open(path)?;
-            fchown(&dir, Some(account.uid), Some(account.gid))?;
-            Ok(true)
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
-/// Writes `bytes` atomically (temp file in the same directory, then rename), so
-/// a reader sees the old file or the new one. A pre-planted symlink at the
-/// destination or the temp name is replaced, never followed. `None` for `owner`
-/// leaves the file owned by the installer's user.
-fn write_file(path: &Path, bytes: &[u8], mode: u32, owner: Option<&Account>) -> Result<bool> {
-    if let Ok(metadata) = fs::symlink_metadata(path)
-        && metadata.is_file()
-        && metadata.mode() & 0o7777 == mode
-        && owner.is_none_or(|account| metadata.uid() == account.uid)
-        && fs::read(path).is_ok_and(|existing| existing == bytes)
-    {
-        return Ok(false);
-    }
-    let parent = path.parent().context("destination has no parent")?;
-    let name = path.file_name().context("destination has no name")?.to_string_lossy();
-    let temp = parent.join(format!(".{name}.{}.tmp", std::process::id()));
-    let _ = fs::remove_file(&temp);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .mode(mode)
-        .open(&temp)
-        .with_context(|| format!("cannot write {}", path.display()))?;
-    file.write_all(bytes)?;
-    file.set_permissions(fs::Permissions::from_mode(mode))?;
-    if let Some(account) = owner {
-        fchown(&file, Some(account.uid), Some(account.gid))?;
-    }
-    file.sync_all()?;
-    fs::rename(&temp, path)?;
-    Ok(true)
+/// Writes `bytes` into an installer-owned directory walked from the layout
+/// base. The parent is re-checked (owner, no group/other write, not a symlink)
+/// before the file is created.
+fn write_logical(layout: &Layout, logical: &Path, bytes: &[u8], mode: u32, owner: Option<&Account>) -> Result<bool> {
+    let parent = logical.parent().context("destination has no parent")?;
+    let name = logical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("destination has no name")?;
+    let dir = if owner.is_none() {
+        let dir = secure_fs::open_installer_dir(layout.base(), parent)?;
+        secure_fs::verify_installer_dir(&dir, &parent.display().to_string())?;
+        dir
+    } else {
+        secure_fs::open_dir(layout.base(), parent)?
+    };
+    secure_fs::write_file_at(&dir, name, bytes, mode, owner)
 }
 
 /// Unpacks into a staging directory next to the final one and renames it into
@@ -492,8 +495,13 @@ fn write_file(path: &Path, bytes: &[u8], mode: u32, owner: Option<&Account>) -> 
 /// names one set of bytes forever.
 fn install_release(layout: &Layout, release_id: &str, package: &[u8], digest: &str) -> Result<bool> {
     let target = layout.on_disk(&layout.release_dir(release_id));
+    let releases_logical = layout
+        .release_dir(release_id)
+        .parent()
+        .context("release directory has no parent")?
+        .to_path_buf();
+    ensure_root_dir(layout, &releases_logical)?;
     let releases = target.parent().context("release directory has no parent")?;
-    ensure_root_dir(releases)?;
     if fs::symlink_metadata(&target).is_ok() {
         let recorded = fs::read_to_string(target.join(".package-sha256")).unwrap_or_default();
         ensure!(
@@ -542,5 +550,357 @@ fn wait_healthy(host: &dyn Host, health: &Health, layout: &Layout) -> Result<()>
             );
         }
         std::thread::sleep(health.poll);
+    }
+}
+
+mod secure_fs {
+    /// Path operations that never follow a swapped symlink.
+    ///
+    /// Root walks from a trusted base (`/` or the staging root), opens each
+    /// component with `O_NOFOLLOW|O_DIRECTORY`, and creates or writes through
+    /// `mkdirat` / `openat` / `renameat` on those descriptors. A service user who
+    /// replaces a directory with a symlink after the walk cannot redirect a later
+    /// root write.
+    use std::ffi::CString;
+    use std::fs::File;
+    use std::io::{self, Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{PermissionsExt, fchown};
+    use std::path::{Component, Path};
+
+    use anyhow::{Context, Result, bail, ensure};
+
+    use super::Account;
+
+    pub struct DirFd(OwnedFd);
+
+    impl DirFd {
+        /// Opens `path` itself with `O_DIRECTORY`. `nofollow` applies to the last
+        /// component; `/` is opened without it because the root cannot be swapped.
+        pub fn open(path: &Path, nofollow: bool) -> Result<Self> {
+            let mut flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+            if nofollow {
+                flags |= libc::O_NOFOLLOW;
+            }
+            Ok(Self(open_path(path, flags)?))
+        }
+
+        pub fn open_at(&self, name: &str) -> Result<Self> {
+            self.open_at_flags(name, true)
+        }
+
+        fn open_at_flags(&self, name: &str, nofollow: bool) -> Result<Self> {
+            let mut flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+            if nofollow {
+                flags |= libc::O_NOFOLLOW;
+            }
+            Ok(Self(open_at(&self.0, name, flags, 0)?))
+        }
+
+        /// Opens a child directory. A symlink is followed only when the target is
+        /// installer-owned and not writable by others (`/etc` → `/private/etc` on
+        /// macOS). User-controlled paths must call [`Self::open_at`] instead.
+        pub fn open_installer_at(&self, name: &str) -> Result<Self> {
+            match self.open_at(name) {
+                Ok(child) => Ok(child),
+                Err(error) if is_symlink_error(&error) => {
+                    let child = self.open_at_flags(name, false)?;
+                    verify_installer_dir(&child, name)?;
+                    Ok(child)
+                }
+                Err(error) => Err(error),
+            }
+        }
+
+        pub fn mkdir_at(&self, name: &str, mode: u32) -> Result<()> {
+            let c = cstr(name)?;
+            let rc = unsafe { libc::mkdirat(self.0.as_raw_fd(), c.as_ptr(), mode as libc::mode_t) };
+            if rc != 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(error).with_context(|| format!("cannot create {name}"));
+                }
+            }
+            Ok(())
+        }
+
+        pub fn stat(&self) -> Result<libc::stat> {
+            fstat(self.0.as_raw_fd())
+        }
+    }
+
+    /// The uid that must own installer-controlled paths: the process that is
+    /// installing. Production runs as root (0); `install --root` runs as the
+    /// person inspecting a release.
+    pub fn installer_uid() -> u32 {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        unsafe { libc::geteuid() }
+    }
+
+    pub fn verify_installer_dir(dir: &DirFd, what: &str) -> Result<()> {
+        let metadata = dir.stat()?;
+        ensure!(mode_is_dir(metadata.st_mode), "{what} must be a directory");
+        ensure!(
+            metadata.st_uid == installer_uid(),
+            "{what} must be owned by the installer"
+        );
+        ensure!(metadata.st_mode & 0o022 == 0, "{what} is writable by others");
+        Ok(())
+    }
+
+    pub fn verify_user_dir(dir: &DirFd, account: &Account, private: bool, what: &str) -> Result<()> {
+        let metadata = dir.stat()?;
+        ensure!(
+            mode_is_dir(metadata.st_mode),
+            "{what} must be a real directory, not a symlink or file"
+        );
+        ensure!(
+            metadata.st_uid == account.uid,
+            "{what} is not owned by the service user"
+        );
+        ensure!(
+            !private || metadata.st_mode & 0o077 == 0,
+            "{what} must be owner-only (0700); fix its mode and run the installer again"
+        );
+        Ok(())
+    }
+
+    /// Opens `logical` under `base`, creating any missing installer-owned
+    /// components. `logical` is an absolute path (`/etc/boss-spoke`); `base` is
+    /// `/` or the staging root.
+    pub fn ensure_installer_dir(base: &Path, logical: &Path) -> Result<(DirFd, bool)> {
+        let mut dir = DirFd::open(base, base != Path::new("/"))?;
+        verify_installer_dir(&dir, &base.display().to_string())?;
+        let mut created = false;
+        for name in components(logical)? {
+            match dir.open_installer_at(&name) {
+                Ok(child) => {
+                    verify_installer_dir(&child, &name)?;
+                    dir = child;
+                }
+                Err(error) if is_not_found(&error) => {
+                    dir.mkdir_at(&name, 0o755)?;
+                    let child = dir.open_at(&name)?;
+                    fchmod(&child.0, 0o755)?;
+                    verify_installer_dir(&child, &name)?;
+                    dir = child;
+                    created = true;
+                }
+                Err(error) => {
+                    return Err(error).context(format!("cannot open {name}"));
+                }
+            }
+        }
+        Ok((dir, created))
+    }
+
+    pub fn ensure_user_dir_at(parent: &DirFd, name: &str, account: &Account, private: bool) -> Result<(DirFd, bool)> {
+        match parent.open_at(name) {
+            Ok(child) => {
+                verify_user_dir(&child, account, private, name)?;
+                Ok((child, false))
+            }
+            Err(error) if is_not_found(&error) => {
+                parent.mkdir_at(name, 0o700)?;
+                let child = parent.open_at(name)?;
+                fchown(&child.0, Some(account.uid), Some(account.gid))
+                    .with_context(|| format!("cannot chown {name}"))?;
+                fchmod(&child.0, if private { 0o700 } else { 0o755 })?;
+                verify_user_dir(&child, account, private, name)?;
+                Ok((child, true))
+            }
+            Err(error) => Err(error).context(format!("{name} must be a real directory, not a symlink or file")),
+        }
+    }
+
+    /// Opens an existing directory by walking from `base`. Fails if any component
+    /// is a symlink or missing. For installer-owned trees (`/etc`, `/opt`, …)
+    /// use [`open_installer_dir`], which may follow a root-owned symlink.
+    pub fn open_dir(base: &Path, logical: &Path) -> Result<DirFd> {
+        walk_existing(base, logical, false)
+    }
+
+    pub fn open_installer_dir(base: &Path, logical: &Path) -> Result<DirFd> {
+        walk_existing(base, logical, true)
+    }
+
+    fn walk_existing(base: &Path, logical: &Path, installer: bool) -> Result<DirFd> {
+        let mut dir = DirFd::open(base, base != Path::new("/"))?;
+        for name in components(logical)? {
+            dir = if installer {
+                dir.open_installer_at(&name)
+                    .with_context(|| format!("cannot open {name}"))?
+            } else {
+                dir.open_at(&name)
+                    .with_context(|| format!("{} is a symlink or not a directory", name))?
+            };
+        }
+        Ok(dir)
+    }
+
+    pub fn write_file_at(dir: &DirFd, name: &str, bytes: &[u8], mode: u32, owner: Option<&Account>) -> Result<bool> {
+        if file_matches(dir, name, bytes, mode, owner)? {
+            return Ok(false);
+        }
+        let temp = format!(".{name}.{}.tmp", std::process::id());
+        let _ = unlink_at(dir, &temp);
+        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let fd = open_at(&dir.0, &temp, flags, mode)?;
+        let mut file = File::from(fd);
+        file.write_all(bytes).with_context(|| format!("cannot write {name}"))?;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        if let Some(account) = owner {
+            fchown(&file, Some(account.uid), Some(account.gid)).with_context(|| format!("cannot chown {name}"))?;
+        }
+        file.sync_all()?;
+        drop(file);
+        rename_at(dir, &temp, name)?;
+        Ok(true)
+    }
+
+    pub fn read_file_at(dir: &DirFd, name: &str) -> Result<(Vec<u8>, libc::stat)> {
+        let fd = open_at(&dir.0, name, libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0)?;
+        let metadata = fstat(fd.as_raw_fd())?;
+        let mut file = File::from(fd);
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok((bytes, metadata))
+    }
+
+    pub fn verify_installer_file(metadata: &libc::stat, what: &str) -> Result<()> {
+        ensure!(
+            metadata.st_mode & libc::S_IFMT == libc::S_IFREG,
+            "{what} must be a regular file, not a symlink"
+        );
+        ensure!(
+            metadata.st_uid == installer_uid(),
+            "{what} must be owned by the installer"
+        );
+        ensure!(metadata.st_mode & 0o022 == 0, "{what} is writable by others");
+        Ok(())
+    }
+
+    fn file_matches(dir: &DirFd, name: &str, bytes: &[u8], mode: u32, owner: Option<&Account>) -> Result<bool> {
+        let (existing, metadata) = match read_file_at(dir, name) {
+            Ok(value) => value,
+            Err(error) if is_not_found(&error) => return Ok(false),
+            Err(_) => return Ok(false),
+        };
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Ok(false);
+        }
+        if metadata.st_mode & 0o7777 != mode as libc::mode_t {
+            return Ok(false);
+        }
+        if owner.is_some_and(|account| metadata.st_uid != account.uid) {
+            return Ok(false);
+        }
+        Ok(existing == bytes)
+    }
+
+    fn components(logical: &Path) -> Result<Vec<String>> {
+        let mut names = Vec::new();
+        for part in logical.components() {
+            match part {
+                Component::RootDir => {}
+                Component::Normal(name) => {
+                    let name = name
+                        .to_str()
+                        .with_context(|| format!("{} is not a plain name", logical.display()))?;
+                    names.push(name.to_owned());
+                }
+                _ => bail!("{} has a component that is not a plain name", logical.display()),
+            }
+        }
+        Ok(names)
+    }
+
+    fn open_path(path: &Path, flags: i32) -> Result<OwnedFd> {
+        let c = CString::new(path.as_os_str().as_bytes()).context("path contains an interior NUL")?;
+        let fd = unsafe { libc::open(c.as_ptr(), flags, 0o755) };
+        if fd < 0 {
+            return Err(map_open_error(io::Error::last_os_error(), &path.display().to_string()));
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn open_at(dir: &OwnedFd, name: &str, flags: i32, mode: u32) -> Result<OwnedFd> {
+        let c = cstr(name)?;
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags, mode) };
+        if fd < 0 {
+            return Err(map_open_error(io::Error::last_os_error(), name));
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn map_open_error(error: io::Error, what: &str) -> anyhow::Error {
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            anyhow::anyhow!("{what} is a symlink")
+        } else {
+            anyhow::Error::from(error).context(format!("cannot open {what}"))
+        }
+    }
+
+    fn unlink_at(dir: &DirFd, name: &str) -> Result<()> {
+        let c = cstr(name)?;
+        let rc = unsafe { libc::unlinkat(dir.0.as_raw_fd(), c.as_ptr(), 0) };
+        if rc != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::NotFound {
+                return Err(error).with_context(|| format!("cannot remove {name}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn rename_at(dir: &DirFd, from: &str, to: &str) -> Result<()> {
+        let from_c = cstr(from)?;
+        let to_c = cstr(to)?;
+        let rc = unsafe { libc::renameat(dir.0.as_raw_fd(), from_c.as_ptr(), dir.0.as_raw_fd(), to_c.as_ptr()) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error()).with_context(|| format!("cannot replace {to}"));
+        }
+        Ok(())
+    }
+
+    fn fstat(fd: i32) -> Result<libc::stat> {
+        let mut metadata = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::fstat(fd, &mut metadata) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error()).context("cannot stat");
+        }
+        Ok(metadata)
+    }
+
+    fn fchmod(fd: &OwnedFd, mode: u32) -> Result<()> {
+        let rc = unsafe { libc::fchmod(fd.as_raw_fd(), mode as libc::mode_t) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error()).context("cannot chmod");
+        }
+        Ok(())
+    }
+
+    fn cstr(name: &str) -> Result<CString> {
+        CString::new(name).context("path component contains an interior NUL")
+    }
+
+    fn mode_is_dir(mode: libc::mode_t) -> bool {
+        mode & libc::S_IFMT == libc::S_IFDIR
+    }
+
+    pub fn is_not_found(error: &anyhow::Error) -> bool {
+        error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<io::Error>())
+            .any(|cause| cause.kind() == io::ErrorKind::NotFound)
+    }
+
+    fn is_symlink_error(error: &anyhow::Error) -> bool {
+        error.to_string().contains("is a symlink")
+            || error
+                .chain()
+                .filter_map(|cause| cause.downcast_ref::<io::Error>())
+                .any(|cause| cause.raw_os_error() == Some(libc::ELOOP))
     }
 }

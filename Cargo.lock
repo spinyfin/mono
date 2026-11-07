@@ -1762,6 +1762,7 @@ dependencies = [
  "boss-tmux",
  "fs4",
  "libc",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
