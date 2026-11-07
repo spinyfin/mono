@@ -11,10 +11,6 @@ use boss_tmux::{OptionScope, OptionSetting, Tmux};
 
 const BOSS_SESSION_OPTIONS: &[(&str, &str)] = &[("status", "off"), ("remain-on-exit", "on")];
 
-/// The bounded diagnostic history retained in each Boss window. Driver
-/// transcripts, not tmux history, are the durable record.
-const HISTORY_LIMIT: &str = "2000";
-
 /// Server-scoped options required for modified keys (e.g. Ctrl+Enter) to
 /// reach the pane, plus `focus-events` so attached clients receive
 /// FocusIn/FocusOut. Indexed `terminal-features` assignment is idempotent;
@@ -29,47 +25,21 @@ const BOSS_SERVER_OPTIONS: &[(&str, &str)] = &[
     ("focus-events", "on"),
 ];
 
-/// Color environment every Boss tmux session receives at creation.
-///
-/// Claude Code clamps chalk to 256-color whenever `$TMUX` is set, ignoring
-/// `COLORTERM` and `FORCE_COLOR`. `CLAUDE_CODE_TMUX_TRUECOLOR` is the escape
-/// hatch and is read at module load, so it must be present at process launch.
-/// `COLORTERM=truecolor` is explicit rather than inherited because tmux 3.6a
-/// injects it, while the installer supports tmux 3.2 and later. `FORCE_COLOR`
-/// is deliberately omitted because the clamp overrides it and some values
-/// disable a separate TERM-allowlist truecolor path.
+/// Color environment every Boss tmux session receives at creation; see
+/// [`boss_tmux::insert_color_environment`].
 pub(crate) fn insert_color_environment(environment: &mut BTreeMap<String, String>) {
-    environment.insert("CLAUDE_CODE_TMUX_TRUECOLOR".to_owned(), "1".to_owned());
-    environment.insert("COLORTERM".to_owned(), "truecolor".to_owned());
+    boss_tmux::insert_color_environment(environment);
 }
 
 /// Start Boss's private server and establish defaults before its first window.
 ///
-/// `history-limit` only affects windows created after it is set. Bootstrap
-/// sends all settings in one tmux command sequence, so `exit-empty=off` keeps
-/// the still-windowless private server alive while the global defaults reach
-/// the first worker window. [`apply`] repeats `remain-on-exit` per session
-/// after user config has loaded.
+/// Bootstrap sends all settings in one tmux command sequence (see
+/// [`Tmux::start_private_server`]). [`apply`] repeats `remain-on-exit` per
+/// session after user config has loaded.
 pub(crate) async fn prepare_server(tmux: &Tmux) -> Result<()> {
-    tmux.start_server_with_options(&[
-        OptionSetting {
-            scope: OptionScope::Server,
-            option: "exit-empty",
-            value: "off",
-        },
-        OptionSetting {
-            scope: OptionScope::Global,
-            option: "history-limit",
-            value: HISTORY_LIMIT,
-        },
-        OptionSetting {
-            scope: OptionScope::Global,
-            option: "remain-on-exit",
-            value: "on",
-        },
-    ])
-    .await
-    .context("starting Boss private tmux server before its first window")?;
+    tmux.start_private_server()
+        .await
+        .context("starting Boss private tmux server before its first window")?;
     crate::tmux_health::server_observed(tmux);
     Ok(())
 }

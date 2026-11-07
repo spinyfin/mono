@@ -301,8 +301,11 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30):
             if master in writable:
                 count = os.write(master, pending[:4096])
                 pending = pending[count:]
-                if not pending and submitting:
+                if not pending and submitting and not delivered:
                     delivered = True
+                    # Durable proof the moment the submit bytes are fully
+                    # written, not when the (long-lived) driver exits.
+                    write_marker(DELIVERED_MARKER)
                 elif not pending and paste_started and not delivered and submit_at is None:
                     # Let the TUI consume the paste event before Return; this
                     # is the same separation used by terminal paste delivery.
@@ -335,6 +338,34 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30):
             pass
 
 
+# EX_USAGE: the driver never received the brief. Distinct from a driver that
+# exits 1 after a delivered turn. The marker file is the durable signal.
+BRIEF_NOT_DELIVERED_EXIT = 64
+DELIVERED_MARKER = "initial-prompt.delivered"
+UNDELIVERED_MARKER = "initial-prompt.undelivered"
+
+
+def prompt_home():
+    prompt_path = Path(__file__).with_name("initial-prompt.txt")
+    try:
+        return prompt_path.resolve().parent
+    except OSError:
+        return Path(__file__).parent
+
+
+def write_marker(name):
+    path = prompt_home() / name
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
 def main():
     # Attempt-scoped evidence for remote cleanup; absent means inconclusive.
     Path(__file__).with_name("worker.pid").write_text(str(os.getpid()))
@@ -359,4 +390,7 @@ if __name__ == "__main__":
         sys.exit(main())
     except Exception as error:
         print(f"boss initial brief delivery failed: {error}", file=sys.stderr)
-        sys.exit(1)
+        if (prompt_home() / DELIVERED_MARKER).is_file():
+            sys.exit(1)
+        write_marker(UNDELIVERED_MARKER)
+        sys.exit(BRIEF_NOT_DELIVERED_EXIT)

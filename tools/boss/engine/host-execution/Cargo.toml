@@ -13,6 +13,7 @@ boss-engine-recovery = { path = "../recovery" }
 boss-engine-utils = { path = "../utils" }
 boss-protocol = { path = "../../protocol" }
 boss-protocol-spoke = { path = "../../protocol-spoke" }
+boss-tmux = { path = "../../tmux" }
 git-utils = { path = "../../../../lib/rust/git_utils" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

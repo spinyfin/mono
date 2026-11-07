@@ -1,3 +1,6 @@
+//! Shared spoke-daemon fixture. Each test crate_root uses a different subset.
+#![allow(dead_code)]
+
 use boss_host_enrollment::{EnrollInput, HostCredentials, Policy, SystemClock};
 use boss_protocol_spoke::v1::{
     self, hub_frame, spoke_frame,
@@ -223,10 +226,13 @@ impl Fixture {
             .unwrap()
     }
     pub fn start(&self) -> Daemon {
-        Daemon::start(self.dir.path(), &self.endpoint, Path::new("cube"))
+        Daemon::start(self.dir.path(), &self.endpoint, Path::new("cube"), None)
     }
     pub fn start_with_cube(&self, cube: &Path) -> Daemon {
-        Daemon::start(self.dir.path(), &self.endpoint, cube)
+        Daemon::start(self.dir.path(), &self.endpoint, cube, None)
+    }
+    pub fn start_with_tmux(&self, cube: &Path, tmux: &Path) -> Daemon {
+        Daemon::start(self.dir.path(), &self.endpoint, cube, Some(tmux))
     }
     pub async fn connection(&mut self) -> Connection {
         tokio::time::timeout(STEP, self.connections.recv())
@@ -241,9 +247,10 @@ pub struct Daemon {
     log: PathBuf,
 }
 impl Daemon {
-    fn start(dir: &Path, endpoint: &str, cube: &Path) -> Self {
+    fn start(dir: &Path, endpoint: &str, cube: &Path, tmux: Option<&Path>) -> Self {
         let log = dir.join("daemon.log");
-        let child = Command::new(std::env::var("SPOKE_BIN").unwrap())
+        let mut command = Command::new(std::env::var("SPOKE_BIN").unwrap());
+        command
             .arg("--cube-bin")
             .arg(cube)
             .arg("--state-dir")
@@ -252,9 +259,11 @@ impl Daemon {
             .arg("--tls-dir")
             .arg(dir)
             .stdout(Stdio::null())
-            .stderr(std::fs::File::create(&log).unwrap())
-            .spawn()
-            .unwrap();
+            .stderr(std::fs::File::create(&log).unwrap());
+        if let Some(tmux) = tmux {
+            command.arg("--tmux-bin").arg(tmux);
+        }
+        let child = command.spawn().unwrap();
         Self { child, log }
     }
     pub fn running(&mut self) -> bool {

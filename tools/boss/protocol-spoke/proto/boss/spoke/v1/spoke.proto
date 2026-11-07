@@ -312,14 +312,18 @@ message Deliver {
 message Stop {
   uint32 grace_ms = 1;
 }
-// ALIVE, EXITED (with exit_code when known), MISSING and INDETERMINATE are
-// distinct observations; only the hub's policy gives them work consequences.
+// ALIVE, EXITED (with exit_code when known), MISSING, INDETERMINATE and
+// BRIEF_NOT_DELIVERED are distinct observations; only the hub's policy gives
+// them work consequences. BRIEF_NOT_DELIVERED is a pane that launched then
+// failed initial-brief delivery (relay exit 64 / undelivered marker); it is
+// not a generic EXITED and not a pre-launch REJECTED.
 enum PaneLife {
   PANE_UNSPECIFIED = 0;
   ALIVE = 1;
   EXITED = 2;
   MISSING = 3;
   INDETERMINATE = 4;
+  BRIEF_NOT_DELIVERED = 5;
 }
 message PaneState {
   PaneLife life = 1;

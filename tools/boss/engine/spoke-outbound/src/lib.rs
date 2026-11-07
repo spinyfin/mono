@@ -205,11 +205,13 @@ mod session {
         let mut hello = hello(&*locked(journal)?, &stamp()?.boot_id, nonce)?;
         let mut selected_contracts = contracts();
         if external_executor {
-            selected_contracts.features.push(v1::Feature {
-                name: "workspace".into(),
-                revision: 1,
-            });
-            selected_contracts.required.push("workspace".into());
+            for name in ["workspace", "execution"] {
+                selected_contracts.features.push(v1::Feature {
+                    name: name.into(),
+                    revision: 1,
+                });
+                selected_contracts.required.push(name.into());
+            }
             hello.features = selected_contracts.features.clone();
         }
         send(

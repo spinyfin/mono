@@ -26,6 +26,10 @@ async fn actual_daemon_reconnects_replays_and_recovers_command_receipt_after_sig
             v1::Feature {
                 name: "workspace".into(),
                 revision: 1
+            },
+            v1::Feature {
+                name: "execution".into(),
+                revision: 1
             }
         ]
     );

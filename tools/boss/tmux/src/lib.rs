@@ -17,6 +17,7 @@ pub use types::{
     Session, TMUX_SPAWN_TOKEN_ENV, TmuxVersion,
 };
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
@@ -125,6 +126,23 @@ static PASTE_BUFFER_SEQ: AtomicU64 = AtomicU64::new(0);
 /// callers pass a resolved path from engine config instead of reading
 /// the environment here.
 pub const TEST_SOCKET_PATH: &str = "/state/boss/tmux.sock";
+
+/// The bounded diagnostic history retained in each Boss window.
+pub const PRIVATE_SERVER_HISTORY_LIMIT: &str = "2000";
+
+/// Color environment every Boss tmux session receives at creation.
+///
+/// Claude Code clamps chalk to 256-color whenever `$TMUX` is set, ignoring
+/// `COLORTERM` and `FORCE_COLOR`. `CLAUDE_CODE_TMUX_TRUECOLOR` is the escape
+/// hatch and is read at module load, so it must be present at process launch.
+/// `COLORTERM=truecolor` is explicit rather than inherited because tmux 3.6a
+/// injects it, while the installer supports tmux 3.2 and later. `FORCE_COLOR`
+/// is deliberately omitted because the clamp overrides it and some values
+/// disable a separate TERM-allowlist truecolor path.
+pub fn insert_color_environment(environment: &mut BTreeMap<String, String>) {
+    environment.insert("CLAUDE_CODE_TMUX_TRUECOLOR".to_owned(), "1".to_owned());
+    environment.insert("COLORTERM".to_owned(), "truecolor".to_owned());
+}
 
 /// Operator-facing command prefix for a tmux server addressed by a socket path.
 ///
@@ -378,6 +396,35 @@ impl Tmux {
         args.push("start-server".into());
         push_option_commands(&mut args, settings, true)?;
         self.invoke(args).await.map(|_| ())
+    }
+
+    /// Starts the private server with the defaults every Boss worker window
+    /// needs, in one command sequence so they land before the first window.
+    ///
+    /// `exit-empty=off` keeps the still-windowless server alive;
+    /// `history-limit` only affects windows created afterwards, so it must be
+    /// set here; `remain-on-exit` lets a dead pane's exit status be observed.
+    /// Driver transcripts, not tmux history, are the durable record, so the
+    /// history is bounded at [`PRIVATE_SERVER_HISTORY_LIMIT`].
+    pub async fn start_private_server(&self) -> Result<()> {
+        self.start_server_with_options(&[
+            OptionSetting {
+                scope: OptionScope::Server,
+                option: "exit-empty",
+                value: "off",
+            },
+            OptionSetting {
+                scope: OptionScope::Global,
+                option: "history-limit",
+                value: PRIVATE_SERVER_HISTORY_LIMIT,
+            },
+            OptionSetting {
+                scope: OptionScope::Global,
+                option: "remain-on-exit",
+                value: "on",
+            },
+        ])
+        .await
     }
 
     /// Creates a detached, single-command session with environment set atomically.

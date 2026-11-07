@@ -296,6 +296,39 @@ fn upgrades_received_commands_from_original_schema_without_losing_identity() {
 }
 
 #[test]
+fn execution_records_survive_reopen_and_schema_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("state");
+    let mut journal = open(&root);
+    journal
+        .save_execution("run-a", "token-a", b"{\"phase\":\"alive\"}")
+        .unwrap();
+    assert_eq!(
+        journal.load_execution("run-a", "token-a").unwrap().as_deref(),
+        Some(&b"{\"phase\":\"alive\"}"[..])
+    );
+    drop(journal);
+    let mut journal = open(&root);
+    journal
+        .save_execution("run-a", "token-a", b"{\"phase\":\"terminal\"}")
+        .unwrap();
+    assert_eq!(
+        journal.list_executions().unwrap(),
+        vec![b"{\"phase\":\"terminal\"}".to_vec()]
+    );
+    drop(journal);
+    let db = rusqlite::Connection::open(root.join("journal.db")).unwrap();
+    db.execute_batch("ALTER TABLE commands DROP COLUMN attempting; ALTER TABLE commands DROP COLUMN recovery; ALTER TABLE identity DROP COLUMN result_limit; PRAGMA user_version=1;")
+        .unwrap();
+    drop(db);
+    let journal = open(&root);
+    assert_eq!(
+        journal.load_execution("run-a", "token-a").unwrap().as_deref(),
+        Some(&b"{\"phase\":\"terminal\"}"[..])
+    );
+}
+
+#[test]
 fn negotiation_refuses_limits_below_retained_evidence_without_losing_it() {
     let dir = tempfile::tempdir().unwrap();
     let mut journal = open(&dir.path().join("state"));

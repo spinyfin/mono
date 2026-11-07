@@ -1,5 +1,7 @@
 //! Host filesystem execution shared by the hub's local adapter and the spoke.
 //! Work policy, GitHub decisions and scheduling remain in the hub.
+pub mod homes;
+pub mod worker;
 pub mod cube {
     //! Shared implementation of the `cube` CLI command surface.
     //!
@@ -27,6 +29,7 @@ pub mod cube {
     use crate::types::{CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus};
 
     /// Local CLI transport. Configuration belongs to the host, never to wire input.
+    #[derive(Clone)]
     pub struct LocalCube {
         pub command: PathBuf,
         pub args: Vec<String>,
