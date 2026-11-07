@@ -14,6 +14,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+#[path = "store_gc_fixture.rs"]
+mod fixture;
+
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
 struct Runner {
@@ -73,19 +76,22 @@ impl CommandRunner for Runner {
             output.is_ok()
         );
         let output = output?;
-        if invocation.args.iter().any(|arg| arg == "log")
+        if invocation
+            .args
+            .iter()
+            .any(|arg| arg == crate::app::store_gc::OP_LOG_TEMPLATE)
             && let Some(cut) = &self.cut
         {
-            // Keep the real DAG, but put the selected cut outside the keep
-            // window without sleeping three days to age a scratch fixture.
+            // Keep the real DAG and age only the selected cut. Cached fixture
+            // timestamps may be months old; retained operations must still be
+            // inside the keep window when this test runs again.
+            let now = crate::app::util::current_epoch_s().unwrap();
             return Ok(output
                 .lines()
                 .map(|line| {
-                    if line.starts_with(cut) {
-                        format!("{cut} 1")
-                    } else {
-                        line.to_owned()
-                    }
+                    let (id, _) = line.split_once(' ').expect("operation id and timestamp");
+                    let ended = if id == cut { 1 } else { now };
+                    format!("{id} {ended}")
                 })
                 .collect::<Vec<_>>()
                 .join("\n"));
@@ -189,56 +195,23 @@ fn real_leases_continue_during_collection_and_exclusivity_is_retryable() {
     assert!(busy < Duration::from_secs(4), "{busy:?}");
     drop(gate);
 
-    let cut = f.jj(&f.root, &["op", "log", "--no-graph", "--limit", "1", "-T", "id"]);
-    // Eight independent bookmark writers in a secondary workspace model a
-    // busy pool without racing exports to the primary Git index, and avoid
-    // serial process-startup overhead. Wait for every writer, including on
-    // failure; every operation comes from the declared real jj binary.
-    let script = r#"
-set -eu
-pids=""
-for worker in 0 1 2 3 4 5 6 7; do
-    (
-        i=0
-        while [ "$i" -lt 2100 ]; do
-            if [ "$((i % 2))" -eq 0 ]; then rev=main; else rev=feat; fi
-            "$1" --quiet --ignore-working-copy -R "$2" bookmark set "gc-scale-$worker" --allow-backwards -r "$rev"
-            i=$((i + 1))
-        done
-    ) &
-    pids="$pids $!"
-done
-status=0
-for pid in $pids; do wait "$pid" || status=1; done
-exit "$status"
-"#;
-    let mut seed = RealCommandRunner::invocation(
-        &f.root,
-        "sh",
-        &[
-            "-c",
-            script,
-            "seed-operations",
-            f.runner.binary.to_str().unwrap(),
-            f.ws.to_str().unwrap(),
-        ],
-    );
-    seed.env
-        .push(("JJ_CONFIG".into(), f.runner.config.display().to_string()));
-    RealCommandRunner
-        .run_with_timeout(&seed, Duration::from_secs(600))
-        .unwrap();
-    f.jj(
-        &f.root,
-        &["--ignore-working-copy", "log", "-r", "main", "-T", "commit_id"],
-    );
+    let cut = fixture::install(&f);
+    // This phase uses only private paths, so environment-dependent tests can
+    // run while we populate the unreachable views. Reacquire before spawning jj.
+    drop(_env);
     // Exercise a neglected operation store's file count and deletion I/O.
-    // Contents of unreachable views are never decoded by the collector.
+    // Contents of unreachable views are never decoded by the collector. Sparse
+    // files retain their count and logical size without writing a gigabyte of zeros.
     let views = f.root.join(".jj/repo/op_store/views");
-    let unreachable_view = vec![0_u8; 8192];
     for n in 1..=137_000_u64 {
-        std::fs::write(views.join(format!("{n:0128x}")), &unreachable_view).unwrap();
+        std::fs::File::create(views.join(format!("{n:0128x}")))
+            .unwrap()
+            .set_len(8192)
+            .unwrap();
     }
+    let _env = crate::app::tests::support::ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let (scale_baseline, before_gc) = lease();
     release(&before_gc);
     eprintln!("lease baseline: small store={baseline:?}, populated store={scale_baseline:?}");

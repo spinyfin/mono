@@ -1,5 +1,7 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load(":testdata/gc_store.bzl", "gc_store_fixture")
 
 exports_files(["Cargo.toml"])
 
@@ -36,6 +38,19 @@ rust_binary(
     ] + all_crate_deps(normal = True),
 )
 
+sh_binary(
+    name = "gc_store_builder",
+    testonly = True,
+    srcs = ["testdata/gc_store.sh"],
+)
+
+gc_store_fixture(
+    name = "gc_store_fixture",
+    testonly = True,
+    builder = ":gc_store_builder",
+    jj = "@jj_test_tools//:jj",
+)
+
 rust_test(
     name = "cube_lib_test",
     # Includes a real 16,800-operation GC rewrite and concurrent leases.
@@ -45,10 +60,12 @@ rust_test(
     # lifecycle tests; the binary is declared, never taken from PATH.
     data = [
         ":cube",
+        ":gc_store_fixture",
         "@jj_test_tools//:jj",
     ],
     env = {
         "BOSS_JJ_BIN": "$(rootpath @jj_test_tools//:jj)",
+        "CUBE_GC_STORE_FIXTURE": "$(rootpath :gc_store_fixture)",
         "CUBE_TEST_BIN": "$(rootpath :cube)",
     },
     proc_macro_deps = all_crate_deps(
