@@ -751,6 +751,9 @@ impl WorkDb {
 
         if cascade_project_to_revisions {
             cascade_project_id_to_revisions(&tx, id, task.project_id.as_deref(), &task.updated_at)?;
+            // Joining a parked project parks the item via the membership
+            // trigger; retire its not-yet-started executions too.
+            crate::parking::cancel_pending_for_parked_chain(&tx, &mut pending, id)?;
         }
 
         // Re-classifying an item as deferred pulls it out of the dispatch

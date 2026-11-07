@@ -777,7 +777,11 @@ fn set_project_parked(
 /// Cancel `work_item_id`'s never-started executions. A `claimed` row is
 /// mid-spawn and a `running` / `waiting_human` one is a live worker: both are
 /// left to finish.
-fn cancel_pending_executions(tx: &Connection, pending: &mut PendingEvents, work_item_id: &str) -> Result<usize> {
+pub(crate) fn cancel_pending_executions(
+    tx: &Connection,
+    pending: &mut PendingEvents,
+    work_item_id: &str,
+) -> Result<usize> {
     let ids: Vec<String> = tx
         .prepare(
             "SELECT id FROM work_executions
@@ -799,6 +803,31 @@ fn cancel_pending_executions(tx: &Connection, pending: &mut PendingEvents, work_
         )?;
     }
     Ok(ids.len())
+}
+
+/// After a task changes `project_id`, the membership trigger may have parked
+/// it (and the cascade its revisions). Cancel the never-started executions of
+/// every chain member that is now parked, matching the explicit park path.
+pub(crate) fn cancel_pending_for_parked_chain(
+    tx: &Connection,
+    pending: &mut PendingEvents,
+    root_id: &str,
+) -> Result<()> {
+    let mut ids = vec![root_id.to_owned()];
+    ids.extend(crate::chain_helpers::collect_chain_revision_ids_including_deleted(
+        tx, root_id,
+    )?);
+    for id in ids {
+        let parked: bool = tx
+            .query_row("SELECT parked_at IS NOT NULL FROM tasks WHERE id = ?1", [&id], |r| {
+                r.get(0)
+            })
+            .unwrap_or(false);
+        if parked {
+            cancel_pending_executions(tx, pending, &id)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1312,6 +1341,40 @@ mod tests {
         assert!(db.is_parked(&loose).unwrap());
         assert!(!db.is_parked(&p).unwrap());
         assert!(!db.is_parked(&product).unwrap());
+    }
+
+    #[test]
+    fn moving_a_task_into_a_parked_project_cancels_pending_executions_but_not_live_ones() {
+        let (_dir, db, product) = fixture();
+        let p = project(&db, &product, "Parked target");
+        park(&db, &p);
+        let parent = create_test_chore_manual(&db, &product, "mover");
+        let ready_exec = create_ready_chore_execution(&db, parent.id.clone());
+        let pending_rev = revision_of(&db, &parent.id, "pending-rev");
+        let rev_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(pending_rev.clone())
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        let live_rev = revision_of(&db, &parent.id, "live-rev");
+        let live_exec = create_spawned_execution(&db, &live_rev, 4244);
+
+        db.update_work_item(&parent.id, WorkItemPatch::builder().project_id(&p).build())
+            .unwrap();
+
+        assert!(get_task(&db, &parent.id).is_parked());
+        assert!(get_task(&db, &pending_rev).is_parked());
+        assert_eq!(execution_status(&db, &ready_exec.id), "cancelled");
+        assert_eq!(execution_status(&db, &rev_exec.id), "cancelled");
+        assert_eq!(
+            execution_status(&db, &live_exec),
+            "running",
+            "a live worker is never killed"
+        );
     }
 
     #[test]
