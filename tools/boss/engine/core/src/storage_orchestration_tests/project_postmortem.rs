@@ -151,6 +151,46 @@ async fn archiving_last_task_schedules_project() {
     assert_scheduled_once(&db, &p).await;
 }
 
+/// A parked project atrophies: the sweep schedules nothing for it. The signal
+/// that would have triggered the postmortem is durable, so the first sweep
+/// after the project is un-parked schedules it exactly once.
+#[tokio::test]
+async fn a_parked_project_gets_no_postmortem_until_it_is_unparked() {
+    let (_dir, db) = open_db();
+    let p = project(&db);
+    let t = task(&db, &p);
+    db.set_metadata("project_postmortem_sweep_watermark", &now_string())
+        .unwrap();
+    db.update_work_item(
+        &t.id,
+        WorkItemPatch {
+            status: Some("done".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.park_work_item_as_actor(&p.id, true, Some("not now"), "human")
+        .unwrap();
+
+    assert_eq!(
+        crate::project_postmortem_sweep::run_one_pass(&db)
+            .await
+            .postmortems_created,
+        0,
+        "a parked project gets no postmortem task",
+    );
+    let postmortems = db
+        .list_tasks(&p.product_id, Some(&p.id), None, true)
+        .unwrap()
+        .into_iter()
+        .filter(|task| task.kind == boss_protocol::TaskKind::DesignPostmortem)
+        .count();
+    assert_eq!(postmortems, 0);
+
+    db.park_work_item_as_actor(&p.id, false, None, "human").unwrap();
+    assert_scheduled_once(&db, &p).await;
+}
+
 #[tokio::test]
 async fn explicit_project_done_schedules_and_survives_restart() {
     let (dir, db) = open_db();

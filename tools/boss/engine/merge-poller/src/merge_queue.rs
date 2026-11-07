@@ -181,6 +181,9 @@ pub(crate) async fn run_merge_queue_rebounce_pass(
         .iter()
         .chain(blocked_ci.iter())
         .filter(|candidate| rebounce_seen.insert(candidate.work_item_id.clone()))
+        // Rebounce detection mints a CI-fix attempt and clearing an intent is
+        // merge-queue upkeep: neither runs for a parked row.
+        .filter(|candidate| !crate::parked::candidate_is_parked(work_db, candidate))
         .filter(|candidate| !is_trunk_queue_product(work_db, &candidate.product_id))
         .collect();
     let rebounce_urls: Vec<String> = rebounce_candidates.iter().map(|c| c.pr_url.clone()).collect();

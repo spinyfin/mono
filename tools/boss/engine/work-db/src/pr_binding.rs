@@ -177,6 +177,9 @@ impl WorkDb {
         // lookups below take their own.
         let selected = {
             let conn = self.connect()?;
+            // A parked row's binding is left as it is until un-park: repair is
+            // upkeep, and the un-park reconciliation re-checks it.
+            let upkeep = super::parking::upkeep_eligible_task_sql("t");
             let mut stmt = conn.prepare(&format!(
                 "SELECT t.id, t.product_id, t.status, t.pr_url, t.origin_pr_number, t.doc_branch,
                     we.id, we.repo_remote_url, we.branch_naming, we.worker_branch_prefix,
@@ -202,6 +205,7 @@ impl WorkDb {
              )
              WHERE t.deleted_at IS NULL
                AND t.kind IN ({CHORE_LIKE_KINDS_SQL})
+               AND {upkeep}
                AND (
                  t.status NOT IN ('done', 'archived')
                  OR (

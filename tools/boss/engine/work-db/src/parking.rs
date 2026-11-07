@@ -55,9 +55,9 @@
 //! ## Atrophy: who consults the predicate
 //!
 //! A parked row (or one whose project or revision chain root is parked) is
-//! never nominated by an upkeep producer. The exclusion is in each producer's
-//! SQL candidate listing ([`upkeep_eligible_task_sql`]) wherever the producer
-//! has one, so the row is never even considered:
+//! never nominated by an upkeep producer. Wherever a producer has its own SQL
+//! candidate listing, the exclusion is in that SQL
+//! ([`upkeep_eligible_task_sql`]), so the row is never even considered:
 //!
 //! - orphan re-dispatch (`list_orphan_active_candidates`) and dispatch-failure
 //!   recovery (`list_dispatch_failed_recovery_candidates`);
@@ -69,21 +69,48 @@
 //! - the abandoned-branch sweep (`list_abandoned_pushed_branch_candidates`);
 //! - CI and conflict remediation rescue (`list_stranded_ci_remediation_attempts`,
 //!   `list_chores_stranded_blocked_remediation`);
-//! - the merge poller's speculative conflict prediction and stacked-PR offers
-//!   (`list_in_review_chores_for_upkeep`).
+//! - the merge poller's speculative conflict prediction and stacked-PR offers,
+//!   which act only on an open PR and so list through
+//!   `list_chores_pending_upkeep_check`;
+//! - the dependency cascade's follow-ups: the stuck-execution promotion
+//!   (`promote_todo_autostart_stuck_executions`) and the waiting-writer wake-up
+//!   (`promote_waiting_writers`).
 //!
-//! Where the candidate is *shared with terminal-fact observation* the listing
-//! cannot drop the row, so the consumer gates the reaction instead: the merge
-//! poller still lists a parked `in_review` row and records that its PR merged
-//! (→ `done`) or closed unmerged, but runs no conflict, CI, review-guide,
-//! moot-revision, trunk-adoption or post-merge-review reaction for it
-//! (`boss_engine_merge_poller::sweep_one`); the CI and conflict producers'
-//! shared opt-out gates refuse a parked row; the project postmortem sweep
-//! skips a parked project; and the completion path that would enqueue the AI
-//! reviewer for a freshly detected PR advances the row to `in_review` without
-//! one. The dependency cascade still flips a parked `blocked: dependency` row
-//! to `todo`, but the park check in `reconcile_work_item_execution` mints
-//! nothing, exactly as `deferred` behaves.
+//! `tests/upkeep_producer_tests.rs` registers each of those listings, and the
+//! listings that deliberately stay shared, and runs one parameterised test over
+//! the registry: a producer added later must be registered there, and one whose
+//! listing forgets the predicate fails the test instead of upkeeping parked work.
+//!
+//! Where a candidate is *shared with observing facts about the world*, the
+//! listing cannot drop the row, so the consumer gates the reaction instead:
+//!
+//! - the merge poller's own lists (in-review PRs, PRs blocked on a conflict or
+//!   on CI) still contain a parked row, because a parked PR can still merge or
+//!   close. `sweep_one` records those two outcomes (merged → `done`, closed →
+//!   the closed-unmerged path) and does nothing about an open PR: no conflict
+//!   or CI remediation, moot-revision retirement, review-guide refresh,
+//!   poll-state or merge-queue upkeep, Trunk adoption or eviction handling, and
+//!   no post-merge deep review (`boss_engine_merge_poller::candidate_is_parked`).
+//!   The merge-queue rebounce pass skips parked rows, and the CI and conflict
+//!   watchers' shared opt-out gate refuses a parked row for any other caller;
+//!   a conflict remediation that was queued before the park aborts when its
+//!   turn comes;
+//! - the dependency cascade (`list_dependency_blocked_candidates`) still flips a
+//!   parked `blocked: dependency` row to `todo`, so its lifecycle position stays
+//!   truthful, but the park check in `reconcile_work_item_execution` mints
+//!   nothing, exactly as `deferred` behaves;
+//! - the completion path that would enqueue the AI reviewer for a freshly
+//!   detected PR (`finalize_pr_transition`, and the declared-delivery
+//!   equivalent) advances the row to `in_review` without one;
+//! - the project postmortem sweep skips a parked project;
+//! - an explicit operator request (`RequestExecution`, `bossctl review start`)
+//!   is refused with the typed "un-park it first" error
+//!   ([`WorkDb::refuse_if_parked`]).
+//!
+//! Two paths are state repair, not producers, and are deliberately not gated:
+//! `reconcile_orphaned_conflict_ladder_attempts` (startup only; it abandons an
+//! orphaned attempt and re-arms detection, which is itself gated) and the
+//! housekeeping that releases lease and pool reservations.
 //!
 //! ## Who may park
 //!
@@ -622,6 +649,20 @@ impl WorkDb {
     pub fn upkeep_eligible(&self, work_item_id: &str) -> Result<bool> {
         let conn = self.connect()?;
         upkeep_eligible(&conn, work_item_id)
+    }
+
+    /// Refuse, with the typed [`ParkingRefusal::UnparkFirst`], an explicit
+    /// request to start work on a parked item (an operator-triggered review, for
+    /// one). Returns `Ok(())` when the item is not parked. An explicit request
+    /// does not override a park for the same reason `RequestExecution` does not:
+    /// every automatic path would keep skipping the row, so whatever it started
+    /// would only strand.
+    pub fn refuse_if_parked(&self, work_item_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        match unpark_first_refusal(&conn, work_item_id)? {
+            Some(refusal) => Err(refusal.into()),
+            None => Ok(()),
+        }
     }
 }
 

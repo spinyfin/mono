@@ -554,6 +554,31 @@ async fn missing_metadata_and_closed_pr_never_fall_back() {
     assert!(state.work_db.review_batches_for_cycle_root(&id).unwrap().is_empty());
 }
 
+/// An explicit review does not override a park: a parked row is skipped by
+/// every automatic path, so a reviewer started here would only strand. The
+/// refusal names the way back, and the same request works once un-parked.
+#[tokio::test]
+async fn a_parked_row_refuses_an_explicit_review_until_it_is_unparked() {
+    for fanout in [true, false] {
+        let (state, _dir) = state(fanout);
+        let id = seed(&state, "example/repo", 42);
+        state
+            .work_db
+            .park_work_item_as_actor(&id, true, Some("not now"), "human")
+            .unwrap();
+
+        rejected(request(&state, 42, None, Ok(metadata("head"))).await, "unpark");
+        assert!(state.work_db.list_executions(Some(&id)).unwrap().is_empty());
+        assert!(state.work_db.review_batches_for_cycle_root(&id).unwrap().is_empty());
+
+        state
+            .work_db
+            .park_work_item_as_actor(&id, false, None, "human")
+            .unwrap();
+        triggered(request(&state, 42, None, Ok(metadata("head"))).await);
+    }
+}
+
 #[tokio::test]
 async fn flag_off_keeps_legacy_row_and_does_not_fetch_batch_metadata() {
     let (state, _dir) = state(false);

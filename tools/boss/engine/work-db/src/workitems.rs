@@ -2117,11 +2117,15 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let candidates: Vec<String> = {
-            let mut stmt = tx.prepare(
-                "SELECT id FROM tasks
-                 WHERE status = 'todo' AND autostart = 1 AND deleted_at IS NULL
-                 ORDER BY updated_at ASC, id ASC",
-            )?;
+            // Promoting a stuck execution is upkeep: a parked row stays `todo`
+            // with nothing minted until it is un-parked.
+            let upkeep = super::parking::upkeep_eligible_task_sql("t");
+            let mut stmt = tx.prepare(&format!(
+                "SELECT t.id FROM tasks t
+                 WHERE t.status = 'todo' AND t.autostart = 1 AND t.deleted_at IS NULL
+                   AND {upkeep}
+                 ORDER BY t.updated_at ASC, t.id ASC",
+            ))?;
             stmt.query_map([], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };

@@ -13,7 +13,7 @@ use super::*;
 /// each query filters on (e.g. `blocked` with a NULL `blocked_reason`, which
 /// no public flip produces). `updated_at` is set verbatim so ORDER-BY
 /// assertions are deterministic.
-fn set_blocking_state(
+pub(super) fn set_blocking_state(
     db: &WorkDb,
     task_id: &str,
     status: &str,
@@ -63,7 +63,13 @@ fn active_signal_reasons(db: &WorkDb, work_item_id: &str) -> Vec<String> {
 /// (optionally) point it at a revision task. `revision` = `Some(id)` sets
 /// `revision_task_id` (the "owned by the revision substrate" shape);
 /// `None` leaves it NULL.
-fn seed_conflict_resolution(db: &WorkDb, product_id: &str, work_item_id: &str, pr_url: &str, revision: Option<&str>) {
+pub(super) fn seed_conflict_resolution(
+    db: &WorkDb,
+    product_id: &str,
+    work_item_id: &str,
+    pr_url: &str,
+    revision: Option<&str>,
+) {
     db.insert_conflict_resolution(
         ConflictResolutionInsertInput::builder()
             .product_id(product_id)
@@ -88,7 +94,7 @@ fn seed_conflict_resolution(db: &WorkDb, product_id: &str, work_item_id: &str, p
 /// Insert a pending `ci_remediations` row for `work_item_id` (unique key is
 /// `(work_item_id, head_sha, attempt_kind)`, so `head_sha` varies per call
 /// site) and return its id. `revision` = `Some(id)` sets `revision_task_id`.
-fn seed_ci_remediation(
+pub(super) fn seed_ci_remediation(
     db: &WorkDb,
     product_id: &str,
     work_item_id: &str,
@@ -160,7 +166,7 @@ fn set_task_status(db: &WorkDb, task_id: &str, status: &str) {
         .unwrap();
 }
 
-fn pr(n: u32) -> String {
+pub(super) fn pr(n: u32) -> String {
     format!("https://github.com/spinyfin/mono/pull/{n}")
 }
 
