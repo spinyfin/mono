@@ -87,13 +87,24 @@ const NEVER_STARTS_ALERT_THRESHOLD_SECS: i64 = 2 * 60 * 60;
 
 /// Unified opt-out gate. Mirrors `conflict_watch::auto_pr_maintenance_disabled`;
 /// the design (Phase 6 #18 / §Q7) requires both auto-remediation
-/// paths to honour the same per-product flag and per-PR label.
+/// paths to honour the same per-product flag and per-PR label. A parked row is
+/// treated as opted out for the same reason.
 fn auto_pr_maintenance_disabled(work_db: &WorkDb, candidate: &PendingMergeCheck, labels: &[String]) -> bool {
     if pr_labels_opt_out(labels) {
         tracing::debug!(
             work_item_id = %candidate.work_item_id,
             pr_url = %candidate.pr_url,
             "ci_watch: PR labelled with opt-out; skipping",
+        );
+        return true;
+    }
+    // A parked row atrophies: CI remediation is upkeep, so every entry point
+    // that shares this gate leaves it alone until it is un-parked.
+    if crate::parked::candidate_is_parked(work_db, candidate) {
+        tracing::debug!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            "ci_watch: row is parked; skipping",
         );
         return true;
     }

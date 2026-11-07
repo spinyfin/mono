@@ -244,6 +244,12 @@ impl LadderRemediationJob {
                 );
             }
         }
+        // The owner may have parked the row while this job waited for its turn
+        // (or while the ladder held a lease): a parked row atrophies, so no
+        // further rebase or worker is spent on it.
+        if crate::merge_poller::candidate_is_parked(&self.work_db, candidate) {
+            return Some("work item was parked while the remediation was queued".to_owned());
+        }
         match self.pr_checker.check(&candidate.pr_url) {
             Ok(PrOpenState::Open) => None,
             Ok(other) => Some(format!("PR is no longer open ({other:?})")),
@@ -1216,6 +1222,30 @@ mod tests {
                 RemediationDisposition::Settled,
                 "an aborted job owes no retry, so it must not hold its PR in a cooldown",
             );
+        }
+
+        /// The owner parked the row while the job waited for its turn: a parked
+        /// row atrophies, so the job spends no lease and spawns no worker.
+        #[tokio::test]
+        async fn a_row_parked_while_the_job_waited_leases_and_spawns_nothing() {
+            let db = memory_db();
+            let f = fixture(&db, "parked-meanwhile", "https://github.com/foo/bar/pull/5", 5);
+            db.park_work_item_as_actor(&f.candidate.work_item_id, true, Some("not now"), "human")
+                .unwrap();
+            let (cube, origins) = RecordingCube::new();
+            let job = ladder_job(&db, cube, PrOpenState::Open);
+
+            let disposition = job
+                .run(f.candidate.clone(), f.attempt.clone(), probe(&f.candidate.pr_url))
+                .await;
+
+            assert_eq!(
+                RecordingCube::leased(&origins),
+                Vec::<String>::new(),
+                "a row parked while the job was queued must not be leased for",
+            );
+            assert_eq!(revision_task_id(&db, &f.attempt.id), None);
+            assert_eq!(disposition, RemediationDisposition::Settled);
         }
 
         /// The second checkpoint. The ladder holds a cube lease for minutes;

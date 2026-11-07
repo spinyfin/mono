@@ -690,7 +690,9 @@ pub fn spawn_loop<C: CompletionRequests + 'static>(
             // feature flag (default OFF) — off, this is a single cheap
             // local-DB read with no cube/GitHub activity.
             if completion_handler.speculative_conflict_prediction_enabled() {
-                match work_db.list_chores_pending_merge_check() {
+                // Parked rows are not nominated: a prediction exists only to
+                // act on the PR it concerns.
+                match work_db.list_chores_pending_upkeep_check() {
                     Ok(candidates) => {
                         gh_scope(
                             callers::SPECULATIVE_CONFLICT,
@@ -714,7 +716,8 @@ pub fn spawn_loop<C: CompletionRequests + 'static>(
             // read nor the sweep; co-scheduling it here is safe regardless
             // of how often the loop ticks.
             if completion_handler.stacked_pr_auto_structuring_enabled() && passes.stacking_pass_due(Instant::now()) {
-                match work_db.list_chores_pending_merge_check() {
+                // Parked rows are not offered a stack: restructuring a PR is upkeep.
+                match work_db.list_chores_pending_upkeep_check() {
                     Ok(candidates) => {
                         gh_scope(
                             callers::STACKED_PR_STRUCTURING,

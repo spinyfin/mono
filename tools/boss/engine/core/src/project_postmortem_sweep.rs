@@ -213,6 +213,12 @@ async fn evaluate_project(
         // so skip rather than create work nobody can act on.
         return Ok(EvalOutcome::Skipped);
     }
+    if project.is_parked() {
+        // The owner parked the project: a parked project atrophies, so it gets
+        // no postmortem task until it is un-parked (the signal that triggers
+        // one is durable, so the postmortem is scheduled then).
+        return Ok(EvalOutcome::Skipped);
+    }
     let signaled = work_db.has_project_postmortem_signal(&project.id)?;
     let tasks = work_db.list_project_trigger_tasks(&product.id, &project.id)?;
     let recent_completion = tasks.iter().any(|task| {

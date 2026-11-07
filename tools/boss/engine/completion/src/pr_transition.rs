@@ -255,6 +255,23 @@ impl WorkerCompletionHandler {
         // to the normal InReview path so the task is never left stuck.
         let enqueued_reviewer = if !merged && matches!(target, WorkerPrCompletionTarget::InReview) {
             match execution_result.as_ref() {
+                // A parked row atrophies: the run that was in flight when the
+                // owner parked it records its PR and advances to `in_review`,
+                // but no AI review is scheduled until it is un-parked.
+                Ok(producing)
+                    if super::run_done_declaration::reviewer_suppressed_by_park(
+                        &self.work_db,
+                        &producing.work_item_id,
+                    ) =>
+                {
+                    tracing::info!(
+                        execution_id,
+                        work_item_id = %producing.work_item_id,
+                        trigger = source,
+                        "row is parked: advancing to in_review without a reviewer pass",
+                    );
+                    false
+                }
                 Ok(producing)
                     if should_enqueue_reviewer_for_primary(&producing.kind)
                         || (producing.kind == ExecutionKind::RevisionImplementation
