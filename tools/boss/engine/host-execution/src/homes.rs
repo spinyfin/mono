@@ -8,6 +8,27 @@ use std::path::{Path, PathBuf};
 /// Same key the driver uses for per-run Codex/Claude input homes.
 pub const ROOT_ENV: &str = boss_engine_driver::codex::CODEX_HOMES_ROOT_ENV;
 
+/// Same key the Grok driver uses for its per-run containers.
+pub const GROK_ROOT_ENV: &str = boss_engine_driver::grok::GROK_HOMES_ROOT_ENV;
+
+/// The root drivers provision under for this process, read from its environment.
+/// A supervisor's `homes_root` must equal this for its runs to be accepted.
+pub fn process_root() -> PathBuf {
+    boss_engine_driver::codex::codex_homes_root()
+}
+
+/// Where Grok containers live under `homes_root`. The leading dot cannot
+/// collide with a run directory, whose names are sanitized to `[A-Za-z0-9_-]`.
+pub fn grok_root(homes_root: &Path) -> PathBuf {
+    homes_root.join(".grok")
+}
+
+/// Whether `home` is a strict child of the private root, so the supervisor
+/// owns it and may reclaim it.
+pub fn is_owned_child(root: &Path, home: &Path) -> bool {
+    home != root && home.starts_with(root) && !home.components().any(|c| c.as_os_str() == "..")
+}
+
 /// Refuse an unset, missing, world-readable, unwritable, or symlinked root.
 pub fn preflight(root: Option<&Path>) -> Result<PathBuf> {
     let Some(root) = root.filter(|path| !path.as_os_str().is_empty()) else {
@@ -77,6 +98,15 @@ mod tests {
         let link = temp.path().join("homes");
         symlink(&real, &link).unwrap();
         assert!(preflight(Some(&link)).unwrap_err().to_string().contains("symlink"));
+    }
+
+    #[test]
+    fn owned_child_is_strictly_below_the_root() {
+        let root = Path::new("/state/homes");
+        assert!(is_owned_child(root, Path::new("/state/homes/run-1")));
+        assert!(!is_owned_child(root, root));
+        assert!(!is_owned_child(root, Path::new("/tmp/boss-grok-homes/run-1")));
+        assert!(!is_owned_child(root, Path::new("/state/homes/../elsewhere")));
     }
 
     #[test]

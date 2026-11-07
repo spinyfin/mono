@@ -25,16 +25,24 @@ pub fn delivered_marker_present(home: &Path) -> bool {
     home.join(DELIVERED_MARKER).is_file()
 }
 
+/// Line the relay prints to stderr when it fails; the specific reasons
+/// ("before receiving the initial brief", "did not become ready ...") follow it.
+const RELAY_FAILURE_PREFIX: &str = "boss initial brief delivery failed";
+
 /// True when the pane exit or last output shows the relay never delivered.
+///
+/// A known exit status is decisive: only [`BRIEF_NOT_DELIVERED_EXIT`] means
+/// not delivered, because the relay also prints its failure line when an
+/// exception follows a delivered brief (exit 1), and a worker's screen can
+/// quote the phrase. Output is consulted only when there is no status, and
+/// then only the relay's own line, at the start of the last non-empty line.
 pub fn is_brief_not_delivered_status(exit_code: Option<i32>, last_output: Option<&str>) -> bool {
-    if exit_code == Some(BRIEF_NOT_DELIVERED_EXIT) {
-        return true;
+    if let Some(code) = exit_code {
+        return code == BRIEF_NOT_DELIVERED_EXIT;
     }
-    last_output.is_some_and(|text| {
-        text.contains("boss initial brief delivery failed")
-            || text.contains("before receiving the initial brief")
-            || text.contains("did not become ready for initial brief")
-    })
+    last_output
+        .and_then(|text| text.lines().rev().find(|line| !line.trim().is_empty()))
+        .is_some_and(|line| line.trim_start().starts_with(RELAY_FAILURE_PREFIX))
 }
 
 /// The markers are authoritative: a delivered marker means the brief reached
@@ -620,8 +628,18 @@ assert_processes_exited(lifetime_reader)
     fn exit_64_or_relay_text_is_the_brief_not_delivered_signal() {
         assert!(is_brief_not_delivered_status(Some(BRIEF_NOT_DELIVERED_EXIT), None));
         assert!(is_brief_not_delivered_status(
+            None,
+            Some("noise\nboss initial brief delivery failed: timeout\n\n")
+        ));
+        // A known status other than 64 is decisive, even with the relay's line on screen.
+        assert!(!is_brief_not_delivered_status(
             Some(1),
-            Some("boss initial brief delivery failed: timeout")
+            Some("boss initial brief delivery failed: boom")
+        ));
+        // A worker quoting the phrase mid-screen is not the relay's own last line.
+        assert!(!is_brief_not_delivered_status(
+            None,
+            Some("grep 'boss initial brief delivery failed' src\nok")
         ));
         assert!(!is_brief_not_delivered_status(Some(1), Some("worker finished")));
         assert!(!is_brief_not_delivered(Some(1), None, None));

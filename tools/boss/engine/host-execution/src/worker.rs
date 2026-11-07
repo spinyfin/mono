@@ -19,7 +19,7 @@ use boss_protocol_spoke::{
     },
 };
 use boss_tmux::{
-    DisplayField, KillSessionError, KillSessionOutcome, NewSession, TMUX_SPAWN_TOKEN_ENV, Tmux,
+    DisplayField, KillSessionError, KillSessionOutcome, NewSession, PaneProbe, TMUX_SPAWN_TOKEN_ENV, Tmux,
     insert_color_environment, quote_for_shell,
 };
 use serde::{Deserialize, Serialize};
@@ -27,8 +27,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
-pub const HEARTBEAT_TTL_SECONDS: u64 = 300;
+pub use crate::cube::{DEFAULT_HEARTBEAT_INTERVAL as HEARTBEAT_INTERVAL, LEASE_TTL_SECS as HEARTBEAT_TTL_SECONDS};
 pub const BRIEF_DELIVERY_BUDGET: Duration = Duration::from_secs(35);
 /// How often the command loop looks for workers that exited since the last look.
 pub const EXIT_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
@@ -38,6 +37,7 @@ const RUN_ID_ENV: &str = "BOSS_RUN_ID";
 const SPAWN_TOKEN_OPTION: &str = "@boss_spawn_token";
 const HOST_ENV_DENY: &[&str] = &[
     "BOSS_CODEX_HOMES_DIR",
+    "BOSS_GROK_HOMES_DIR",
     "HOME",
     "TMUX",
     "TMUX_TMPDIR",
@@ -279,7 +279,20 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             }
         };
         record.runtime_state = runtime.clone();
-        record.home = runtime.as_ref().and_then(initial_prompt::owned_home_from_runtime_state);
+        record.home = runtime.as_ref().and_then(input::owned_home);
+        // Provisioning reads the process environment for its root, so confirm
+        // it landed under the root this supervisor preflighted and can reclaim.
+        if let Some(state) = &runtime
+            && let Err(reason) = self.check_owned_home(state)
+        {
+            let _ = input::reclaim(state);
+            record.runtime_state = None;
+            record.home = None;
+            record.phase = Phase::Terminal;
+            record.reclaimed = true;
+            self.persist(&record)?;
+            return Ok(outcome(command, ResultCode::Rejected, reason, None));
+        }
         if !spawn.settings_json.is_empty() {
             record.settings_file = Some(self.settings_path(&record.spawn_token));
         }
@@ -312,6 +325,19 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             _ => ResultCode::Ok,
         };
         Ok(outcome(command, code, String::new(), Some(pane)))
+    }
+
+    /// A run's home must be one the supervisor owns: recognised from the runtime
+    /// state, and a strict child of the preflighted private root.
+    fn check_owned_home(&self, state: &DriverRuntimeState) -> std::result::Result<(), String> {
+        match input::owned_home(state) {
+            None => Err("driver home is not one the spoke can own".to_owned()),
+            Some(home) if !homes::is_owned_child(&self.homes_root, &home) => Err(format!(
+                "driver home {} is outside the private-home root",
+                home.display()
+            )),
+            Some(_) => Ok(()),
+        }
     }
 
     /// Driver settings live beside the run's private homes, never in the
@@ -364,15 +390,18 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                 command: pane_command(&plan),
             })
             .await?;
-        self.tmux.set_option(&record.session, "remain-on-exit", "on").await.ok();
+        boss_tmux::session_options::apply(&self.tmux, &record.session).await?;
         self.tmux
             .set_option(&record.session, SPAWN_TOKEN_OPTION, &record.spawn_token)
             .await?;
-        if let Some(config) = boss_engine_driver::tmux_session_config_for(&spawn.driver_id)
-            && let Ok(version) = self.tmux.version().await
-            && version.supports_source_file_target()
-        {
-            let _ = self.tmux.source_file(&record.session, config).await;
+        if let Some(config) = boss_engine_driver::tmux_session_config_for(&spawn.driver_id) {
+            match boss_tmux::session_options::source_driver_session_config(&self.tmux, &record.session, config).await? {
+                boss_tmux::session_options::SessionConfigOutcome::Sourced => {}
+                // A cosmetic scrollback setting never fails a spawn; an old or
+                // unreadable tmux simply runs without it.
+                boss_tmux::session_options::SessionConfigOutcome::UnsupportedTmux(_)
+                | boss_tmux::session_options::SessionConfigOutcome::VersionUnreadable(_) => {}
+            }
         }
         Ok(())
     }
@@ -761,56 +790,40 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             pane.exit_code = evidence.exit_code;
             return pane;
         }
-        match self.tmux.show_environment(&record.session, TMUX_SPAWN_TOKEN_ENV).await {
-            Ok(Some(token)) if token == record.spawn_token => {}
-            Ok(_) => {
+        let status = match boss_tmux::probe_pane(&self.tmux, &record.session, &record.spawn_token).await {
+            PaneProbe::Absent | PaneProbe::ForeignToken => {
                 pane.life = PaneLife::Missing.into();
                 return pane;
             }
-            Err(_) => {
+            PaneProbe::Unreadable { .. } => {
                 pane.life = PaneLife::Indeterminate.into();
                 return pane;
             }
-        }
-        match self.tmux.display_message(&record.session, DisplayField::PaneId).await {
-            Ok(id) if !id.is_empty() => pane.pane_id = id,
-            _ => {
-                pane.life = PaneLife::Indeterminate.into();
-                return pane;
-            }
-        }
-        if let Ok(pid) = self.tmux.display_message(&record.session, DisplayField::PanePid).await {
-            pane.pid = pid.parse().unwrap_or(pane.pid);
-        }
-        let dead = self.tmux.display_message(&record.session, DisplayField::PaneDead).await;
-        match dead.as_deref() {
-            Ok("0") => {
-                pane.life = PaneLife::Alive.into();
-                return pane;
-            }
-            Ok("1") => {}
-            _ => {
-                pane.life = PaneLife::Indeterminate.into();
-                return pane;
-            }
-        }
-        let status = match self
-            .tmux
-            .display_message(&record.session, DisplayField::PaneDeadStatus)
-            .await
-        {
-            // tmux leaves the status empty when a signal ended the pane.
-            Ok(text) if text.is_empty() => None,
-            Ok(text) => match text.parse::<i32>() {
-                Ok(status) => Some(status),
-                Err(_) => {
-                    pane.life = PaneLife::Indeterminate.into();
-                    return pane;
+            probe @ (PaneProbe::Alive | PaneProbe::Dead { .. }) => {
+                match self.tmux.display_message(&record.session, DisplayField::PaneId).await {
+                    Ok(id) if !id.is_empty() => pane.pane_id = id,
+                    _ => {
+                        pane.life = PaneLife::Indeterminate.into();
+                        return pane;
+                    }
                 }
-            },
-            Err(_) => {
-                pane.life = PaneLife::Indeterminate.into();
-                return pane;
+                if let Ok(pid) = self.tmux.display_message(&record.session, DisplayField::PanePid).await {
+                    pane.pid = pid.parse().unwrap_or(pane.pid);
+                }
+                match probe {
+                    PaneProbe::Dead { status: None } => None,
+                    PaneProbe::Dead { status: Some(text) } => match text.parse::<i32>() {
+                        Ok(status) => Some(status),
+                        Err(_) => {
+                            pane.life = PaneLife::Indeterminate.into();
+                            return pane;
+                        }
+                    },
+                    _ => {
+                        pane.life = PaneLife::Alive.into();
+                        return pane;
+                    }
+                }
             }
         };
         pane.exit_code = status;
@@ -843,11 +856,34 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
     /// Exited/BriefNotDelivered pane's session has been killed.
     async fn settle(&self, record: &mut ExecutionRecord, pane: &PaneState) -> Result<()> {
         match record.phase {
+            // An uncertain launch leaves the record here. Whatever the pane
+            // shows now decides it: a session that exists is a launched
+            // worker, and one that does not is a finished attempt.
+            Phase::Launching => match pane_life(pane) {
+                PaneLife::Alive | PaneLife::Exited | PaneLife::BriefNotDelivered => {
+                    record.phase = Phase::Alive;
+                    record.pane_id = (!pane.pane_id.is_empty()).then(|| pane.pane_id.clone());
+                    record.pid = (pane.pid > 0).then_some(pane.pid);
+                    self.persist(record)?;
+                    Box::pin(self.settle(record, pane)).await
+                }
+                PaneLife::Missing => self.record_terminal(record, pane),
+                _ => Ok(()),
+            },
             Phase::Alive | Phase::Delivering => {
                 if !matches!(
                     pane_life(pane),
                     PaneLife::Exited | PaneLife::BriefNotDelivered | PaneLife::Missing
                 ) {
+                    // Commands run one at a time, so a Delivering record seen
+                    // here is left over from a send whose completion was never
+                    // persisted. Return it to Alive, keeping the attempt on the
+                    // record so a replay of that command still reports it as
+                    // uncertain, and so later inputs are accepted.
+                    if record.phase == Phase::Delivering {
+                        record.phase = Phase::Alive;
+                        self.persist(record)?;
+                    }
                     return Ok(());
                 }
                 self.record_terminal(record, pane)
@@ -914,7 +950,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         let mut failures = Vec::new();
         for mut record in records {
             let pane = match record.phase {
-                Phase::Alive | Phase::Delivering | Phase::Stopping => self.observe(&record).await,
+                Phase::Launching | Phase::Alive | Phase::Delivering | Phase::Stopping => self.observe(&record).await,
                 Phase::Terminal if !record.reclaimed => PaneState::default(),
                 _ => continue,
             };
@@ -1051,6 +1087,7 @@ mod tests {
     struct ListingCube {
         path: PathBuf,
         heartbeats: Mutex<Vec<String>>,
+        heartbeat_args: Mutex<Vec<Vec<String>>>,
     }
 
     #[async_trait]
@@ -1069,6 +1106,10 @@ mod tests {
                 })),
                 ["--json", "workspace", "heartbeat", "--lease", lease, ..] => {
                     self.heartbeats.lock().unwrap().push((*lease).into());
+                    self.heartbeat_args
+                        .lock()
+                        .unwrap()
+                        .push(args.iter().map(|a| (*a).to_owned()).collect());
                     Ok(json!({}))
                 }
                 _ => Ok(json!({})),
@@ -1259,9 +1300,7 @@ mod tests {
     /// environment (which other tests in this binary share).
     fn shared_homes() -> &'static Path {
         static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-        ROOT.get_or_init(|| {
-            homes::pin(&boss_engine_driver::codex::codex_homes_root().join("worker-unit-tests")).unwrap()
-        })
+        ROOT.get_or_init(|| homes::pin(&homes::process_root()).unwrap())
     }
 
     async fn supervisor(root: &Path, fake: Arc<FakeTmux>) -> Supervisor<ListingCube, MemoryStore> {
@@ -1280,6 +1319,7 @@ mod tests {
             cube: ListingCube {
                 path: workspace,
                 heartbeats: Mutex::new(Vec::new()),
+                heartbeat_args: Mutex::new(Vec::new()),
             },
             tmux: Tmux::with_runner_and_socket("/usr/bin/tmux", fake, root.join("tmux.sock")).unwrap(),
             store,
@@ -1412,6 +1452,23 @@ mod tests {
         let failures = heartbeat_leases(&supervisor.cube, &supervisor.store).await;
         assert!(failures.is_empty(), "{failures:?}");
         assert_eq!(*supervisor.cube.heartbeats.lock().unwrap(), vec!["lease".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_sends_the_engine_owned_lease_ttl() {
+        assert_eq!(HEARTBEAT_TTL_SECONDS, 86400);
+        assert!(HEARTBEAT_INTERVAL.as_secs() * 10 < HEARTBEAT_TTL_SECONDS);
+        let root = tempfile::tempdir().unwrap();
+        let supervisor = supervisor(root.path(), Arc::new(FakeTmux::default())).await;
+        seed(&supervisor.store, Phase::Alive);
+        heartbeat_leases(&supervisor.cube, &supervisor.store).await;
+        let sent = supervisor.cube.heartbeat_args.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            sent[0].windows(2).any(|w| w[0] == "--ttl-seconds" && w[1] == "86400"),
+            "{:?}",
+            sent[0]
+        );
     }
 
     fn stored(store: &MemoryStore) -> ExecutionRecord {
@@ -1564,6 +1621,90 @@ mod tests {
         // Terminal records stop receiving lease heartbeats.
         heartbeat_leases(&supervisor.cube, &supervisor.store).await;
         assert!(supervisor.cube.heartbeats.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn launching_record_with_a_live_session_is_promoted_by_adopt() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeTmux::default());
+        live(&fake);
+        let supervisor = supervisor(root.path(), fake).await;
+        seed(&supervisor.store, Phase::Launching);
+        let result = supervisor.execute(&adopt_command(), false, 1).await;
+        assert_eq!(result.code, ResultCode::Ok as i32);
+        assert_eq!(pane_life(&pane_of(&result)), PaneLife::Alive);
+        assert_eq!(stored(&supervisor.store).phase, Phase::Alive);
+        let delivered = supervisor
+            .execute(&deliver_command("d1", DeliveryKind::Nudge, "hello"), false, 1)
+            .await;
+        assert_eq!(delivered.code, ResultCode::Ok as i32, "{}", delivered.reason);
+    }
+
+    #[tokio::test]
+    async fn launching_record_whose_pane_exited_is_reclaimed_by_the_sweep() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeTmux::default());
+        live(&fake);
+        fake.pane_dead
+            .lock()
+            .unwrap()
+            .insert(session_name("token"), ("1".into(), Some(0)));
+        let supervisor = supervisor(root.path(), fake).await;
+        seed(&supervisor.store, Phase::Launching);
+        let home = run_home("launching-sweep-home");
+        update(&supervisor.store, |r| r.home = Some(home.clone()));
+        assert!(supervisor.sweep().await.is_empty());
+        let record = stored(&supervisor.store);
+        assert_eq!(record.phase, Phase::Terminal);
+        assert!(record.reclaimed);
+        assert!(!home.exists());
+    }
+
+    #[tokio::test]
+    async fn stale_delivering_record_returns_to_alive_keeping_the_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeTmux::default());
+        live(&fake);
+        let supervisor = supervisor(root.path(), fake).await;
+        seed(&supervisor.store, Phase::Delivering);
+        update(&supervisor.store, |r| {
+            r.delivery = Some(DeliveryProgress {
+                command_id: "d1".into(),
+                completed: false,
+            })
+        });
+        let result = supervisor.execute(&adopt_command(), false, 1).await;
+        assert_eq!(result.code, ResultCode::Ok as i32);
+        let record = stored(&supervisor.store);
+        assert_eq!(record.phase, Phase::Alive);
+        assert!(record.delivery.is_some());
+        let replay = supervisor
+            .execute(&deliver_command("d1", DeliveryKind::Nudge, "x"), false, 1)
+            .await;
+        assert_eq!(replay.code, ResultCode::OutcomeUncertain as i32);
+    }
+
+    #[tokio::test]
+    async fn grok_state_outside_the_private_root_is_not_owned() {
+        let root = tempfile::tempdir().unwrap();
+        let supervisor = supervisor(root.path(), Arc::new(FakeTmux::default())).await;
+        let state = |home: &Path| {
+            boss_engine_driver::grok::GrokRuntimeState::builder()
+                .grok_home(home.join("grok-home"))
+                .process_home(home.join("process-home"))
+                .auth_source_path(PathBuf::from("/auth.json"))
+                .session_id("s")
+                .workspace_path(PathBuf::from("/ws"))
+                .build()
+                .to_driver_runtime_state()
+        };
+        let outside = state(Path::new("/tmp/boss-grok-homes/run-1"));
+        assert!(supervisor.check_owned_home(&outside).unwrap_err().contains("outside"));
+        let inside = state(&supervisor.homes_root.join(".grok").join("run-1"));
+        assert!(supervisor.check_owned_home(&inside).is_ok());
+        assert!(input::owned_home(&inside).unwrap().ends_with("grok-home"));
+        let unknown = DriverRuntimeState::new(json!({"unrelated": true}));
+        assert!(supervisor.check_owned_home(&unknown).is_err());
     }
 
     #[tokio::test]
