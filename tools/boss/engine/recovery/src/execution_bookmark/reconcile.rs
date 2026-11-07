@@ -421,9 +421,13 @@ pub async fn adopt_pushed_head(
             "an engine rebase rewrote the PR branch",
         ));
     }
-    // The baseline bookmark moves with the pointers so cube and humans see one
-    // line; recovery itself reads the baseline commit recorded on the row.
-    let mut bookmarks = vec![record.base()];
+    // Move names that already exist. A missing `boss-base/` is not created:
+    // it exists only for legacy executions, and recovery reads the floor from
+    // the row. `set_bookmarks` would otherwise `jj bookmark set` a new name.
+    let mut bookmarks = Vec::new();
+    if resolve_optional(jj, &record.repo_path, &record.base()).await?.is_some() {
+        bookmarks.push(record.base());
+    }
     bookmarks.extend(named.iter().map(|(bookmark, _)| bookmark.clone()));
     set_bookmarks(jj, record, &bookmarks, pushed_head).await?;
     Ok(Anchor::PrHead {

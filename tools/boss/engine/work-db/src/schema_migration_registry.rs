@@ -343,6 +343,11 @@ pub(super) fn all() -> Vec<Migration> {
             legacy_version: None,
             apply: parking::migrate_membership,
         },
+        Migration {
+            id: execution_bookmarks::HAS_RECOVERY_HEAD_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: execution_bookmarks::migrate_has_recovery_head,
+        },
     ]);
     migrations
 }

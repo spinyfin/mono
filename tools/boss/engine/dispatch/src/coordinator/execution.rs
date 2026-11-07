@@ -428,7 +428,7 @@ impl ExecutionCoordinator {
         };
         Ok(self
             .work_db
-            .execution_bookmark_optional(&source.execution.id)?
+            .preservation_source(&source.execution.id)?
             .map(|record| record.host_id))
     }
 

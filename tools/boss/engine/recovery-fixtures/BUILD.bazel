@@ -5,6 +5,7 @@ exports_files(["Cargo.toml"])
 
 rust_library(
     name = "recovery-fixtures",
+    testonly = True,
     srcs = glob(["src/**/*.rs"]),
     crate_name = "boss_engine_recovery_fixtures",
     crate_root = "src/lib.rs",

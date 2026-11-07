@@ -287,6 +287,7 @@ macro_rules! stub_cube_client {
                     host_id: "local".to_owned(),
                     base_commit: None,
                     pr_head_before: None,
+                    has_recovery_head: None,
                 })
             }
         }
