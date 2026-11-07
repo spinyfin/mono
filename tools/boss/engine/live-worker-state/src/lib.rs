@@ -1798,8 +1798,8 @@ impl LiveWorkerStateRegistry {
     ///   events after it did not clear);
     /// - a `Stop` overtaken by the resumed turn's tool hook still opened a
     ///   turn boundary, which is reported through
-    ///   [`HookApplied::resumed_after`] so the caller can end the wait the
-    ///   worker declared before it.
+    ///   [`HookApplied::resumed_after`] even though its activity transition
+    ///   must not overwrite the newer turn.
     ///
     /// Every other late event describes a state the worker has already left
     /// and is refused.
@@ -2518,9 +2518,8 @@ pub struct HookApplied {
     /// Set when this hook is proof the main session started a new turn
     /// after `TurnBoundary` — either the first main-session activity
     /// following a `Stop`, or the late `Stop` itself once main-session
-    /// activity numbered above it has already been applied. This is what
-    /// ends a wait declared before that boundary: it is keyed on turn
-    /// ordering, not on the activity the slot happened to show.
+    /// activity numbered above it has already been applied. This describes
+    /// turn ordering, not completion of a worker-declared background job.
     pub resumed_after: Option<TurnBoundary>,
     /// A late event was refused as [`ApplyEventOutcome::Stale`] but still
     /// repaired the slot's activity (a `Notification` overtaken by its

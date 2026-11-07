@@ -566,8 +566,8 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                 && !already_submitted
             {
                 let now = boss_engine_utils::epoch_time::now_epoch_secs();
-                // Order the wait against the worker's hook stream, so a turn
-                // boundary that predates the declaration cannot end it.
+                // Order the wait against the hook stream so the snapshot
+                // cannot use an earlier Stop to hide a current input prompt.
                 let declared_after_seq = Some(server_state.accepted_hook_seq.load(Ordering::SeqCst));
                 match server_state.wait_registry.declare_after(
                     &caller.execution_id,
