@@ -26,6 +26,8 @@ pub mod cube {
     use async_trait::async_trait;
     use serde::Deserialize;
 
+    use crate::types::{CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus};
+
     /// Cadence between lease heartbeat passes, hub and spoke alike. Deliberately
     /// far below [`LEASE_TTL_SECS`] so many consecutive missed beats are tolerated.
     pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
@@ -36,8 +38,6 @@ pub mod cube {
     /// let cube's sweep free the workspace of a live worker during a daemon
     /// outage or host sleep.
     pub const LEASE_TTL_SECS: u64 = 86400;
-
-    use crate::types::{CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus};
 
     /// Local CLI transport. Configuration belongs to the host, never to wire input.
     #[derive(Clone)]

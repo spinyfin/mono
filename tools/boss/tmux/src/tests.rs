@@ -1,4 +1,5 @@
 mod absence;
+mod probe;
 mod teardown;
 
 use std::collections::VecDeque;

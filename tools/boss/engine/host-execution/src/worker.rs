@@ -285,13 +285,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         if let Some(state) = &runtime
             && let Err(reason) = self.check_owned_home(state)
         {
-            let _ = input::reclaim(state);
-            record.runtime_state = None;
-            record.home = None;
-            record.phase = Phase::Terminal;
-            record.reclaimed = true;
-            self.persist(&record)?;
-            return Ok(outcome(command, ResultCode::Rejected, reason, None));
+            return self.reject_unowned_home(command, record, reason);
         }
         if !spawn.settings_json.is_empty() {
             record.settings_file = Some(self.settings_path(&record.spawn_token));
@@ -325,6 +319,21 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             _ => ResultCode::Ok,
         };
         Ok(outcome(command, code, String::new(), Some(pane)))
+    }
+
+    /// Retire a spawn whose provisioned home the supervisor cannot own. The
+    /// record keeps its runtime state so the reclaim outcome is real: a failed
+    /// removal leaves `reclaimed` false with the error, and the sweep retries.
+    fn reject_unowned_home(
+        &self,
+        command: &Command,
+        mut record: ExecutionRecord,
+        reason: String,
+    ) -> Result<CommandResult> {
+        record.phase = Phase::Terminal;
+        self.reclaim(&mut record);
+        self.persist(&record)?;
+        Ok(outcome(command, ResultCode::Rejected, reason, None))
     }
 
     /// A run's home must be one the supervisor owns: recognised from the runtime
@@ -926,7 +935,15 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             errors.push(format!("settings file: {error}"));
         }
         let home = if let Some(state) = &record.runtime_state {
-            input::reclaim(state)
+            // Provisioning wrote files somewhere; a state naming no home the
+            // spoke recognises cannot be cleaned up, so it never counts as done.
+            if input::owned_home(state).is_none() {
+                Err(anyhow::anyhow!(
+                    "driver runtime state names no home the spoke can reclaim"
+                ))
+            } else {
+                input::reclaim(state)
+            }
         } else if let Some(home) = &record.home {
             input::reclaim_home(home)
         } else {
@@ -1705,6 +1722,209 @@ mod tests {
         assert!(input::owned_home(&inside).unwrap().ends_with("grok-home"));
         let unknown = DriverRuntimeState::new(json!({"unrelated": true}));
         assert!(supervisor.check_owned_home(&unknown).is_err());
+    }
+
+    /// Pins Grok's per-run container root, auth source and transcript store for
+    /// one test, restoring the previous values on drop.
+    struct GrokEnv {
+        _homes: boss_engine_driver::test_support::GrokHomesOverride,
+        _transcripts: boss_engine_driver::test_support::TranscriptStoreOverride,
+        prior_auth: Option<std::ffi::OsString>,
+        prior_skip: Option<std::ffi::OsString>,
+    }
+
+    fn grok_env(container_root: &Path, scratch: &Path) -> GrokEnv {
+        let homes = boss_engine_driver::test_support::grok_homes_override(container_root);
+        let transcripts = boss_engine_driver::test_support::transcript_store_override(&scratch.join("transcripts"));
+        let auth = scratch.join("auth.json");
+        std::fs::write(&auth, r#"{"token":"test-only"}"#).unwrap();
+        let prior_auth = std::env::var_os(boss_engine_driver::grok::GROK_AUTH_SOURCE_ENV);
+        let prior_skip = std::env::var_os(boss_engine_driver::grok::GROK_SKIP_POSTURE_ASSERT_ENV);
+        // SAFETY: the Grok homes lock held by `_homes` serialises every test
+        // that touches these process-wide variables.
+        unsafe {
+            std::env::set_var(boss_engine_driver::grok::GROK_AUTH_SOURCE_ENV, &auth);
+            std::env::set_var(boss_engine_driver::grok::GROK_SKIP_POSTURE_ASSERT_ENV, "1");
+        }
+        GrokEnv {
+            _homes: homes,
+            _transcripts: transcripts,
+            prior_auth,
+            prior_skip,
+        }
+    }
+
+    impl Drop for GrokEnv {
+        fn drop(&mut self) {
+            // SAFETY: the lock is still held until the fields drop after this body.
+            unsafe {
+                match &self.prior_auth {
+                    Some(value) => std::env::set_var(boss_engine_driver::grok::GROK_AUTH_SOURCE_ENV, value),
+                    None => std::env::remove_var(boss_engine_driver::grok::GROK_AUTH_SOURCE_ENV),
+                }
+                match &self.prior_skip {
+                    Some(value) => std::env::set_var(boss_engine_driver::grok::GROK_SKIP_POSTURE_ASSERT_ENV, value),
+                    None => std::env::remove_var(boss_engine_driver::grok::GROK_SKIP_POSTURE_ASSERT_ENV),
+                }
+            }
+        }
+    }
+
+    fn grok_spawn_command() -> Command {
+        let mut command = spawn_command();
+        if let Some(command::Body::Spawn(spawn)) = &mut command.body {
+            spawn.driver_id = "grok".into();
+            spawn.model = "grok-4.6".into();
+        }
+        command
+    }
+
+    /// A supervisor whose private-home root is its own fresh directory.
+    async fn grok_supervisor(root: &Path, fake: Arc<FakeTmux>) -> Supervisor<ListingCube, MemoryStore> {
+        let mut supervisor = supervisor(root, fake).await;
+        supervisor.homes_root = homes::pin(&root.join("homes")).unwrap();
+        supervisor
+    }
+
+    #[tokio::test]
+    async fn grok_spawn_records_its_home_and_stop_reclaims_the_container() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeTmux::default());
+        let supervisor = grok_supervisor(root.path(), fake.clone()).await;
+        let _env = grok_env(&homes::grok_root(&supervisor.homes_root), root.path());
+        let result = supervisor.execute(&grok_spawn_command(), false, 1).await;
+        assert_eq!(result.code, ResultCode::Ok as i32, "{}", result.reason);
+        let record = stored(&supervisor.store);
+        assert_eq!(record.phase, Phase::Alive);
+        let home = record.home.clone().expect("grok home recorded");
+        assert!(home.ends_with("grok-home") && home.is_dir(), "{home:?}");
+        assert!(record.runtime_state.is_some());
+        let container = home.parent().unwrap().to_path_buf();
+        assert!(container.starts_with(homes::grok_root(&supervisor.homes_root)));
+        let stopped = supervisor.execute(&stop_command(), false, 1).await;
+        assert_eq!(stopped.code, ResultCode::Ok as i32, "{}", stopped.reason);
+        assert!(!container.exists(), "stop must remove the whole container");
+        let record = stored(&supervisor.store);
+        assert_eq!(record.phase, Phase::Terminal);
+        assert!(record.reclaimed);
+    }
+
+    #[tokio::test]
+    async fn grok_spawn_stops_waiting_once_the_delivered_marker_appears() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeTmux::default());
+        let mut supervisor = grok_supervisor(root.path(), fake).await;
+        supervisor.brief_budget = Duration::from_secs(60);
+        let grok_home = homes::grok_root(&supervisor.homes_root)
+            .join("run-test")
+            .join("grok-home");
+        let _env = grok_env(&homes::grok_root(&supervisor.homes_root), root.path());
+        let marker = grok_home.join(initial_prompt::DELIVERED_MARKER);
+        let started = Instant::now();
+        let command = grok_spawn_command();
+        let (result, ()) = tokio::join!(supervisor.execute(&command, false, 1), async {
+            for _ in 0..500 {
+                if grok_home.join("config.toml").exists() {
+                    std::fs::write(&marker, "").unwrap();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("grok home was never provisioned");
+        });
+        assert_eq!(result.code, ResultCode::Ok as i32, "{}", result.reason);
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the spawn waited out the brief budget instead of seeing the marker in the Grok home"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_whose_grok_home_is_outside_the_private_root_is_rejected_and_reclaimed() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeTmux::default());
+        let supervisor = grok_supervisor(root.path(), fake.clone()).await;
+        let elsewhere = root.path().join("elsewhere");
+        let _env = grok_env(&elsewhere, root.path());
+        let result = supervisor.execute(&grok_spawn_command(), false, 1).await;
+        assert_eq!(result.code, ResultCode::Rejected as i32, "{}", result.reason);
+        assert!(result.reason.contains("outside"), "{}", result.reason);
+        assert!(fake.sessions.lock().unwrap().is_empty(), "no session may be created");
+        let record = stored(&supervisor.store);
+        assert_eq!(record.phase, Phase::Terminal);
+        assert!(record.reclaimed, "{:?}", record.reclaim_error);
+        assert!(
+            !elsewhere.join("run-test").exists(),
+            "the brief must not be left behind"
+        );
+    }
+
+    fn grok_state_in(container: &Path) -> DriverRuntimeState {
+        boss_engine_driver::grok::GrokRuntimeState::builder()
+            .grok_home(container.join("grok-home"))
+            .process_home(container.join("process-home"))
+            .auth_source_path(PathBuf::from("/auth.json"))
+            .session_id("s")
+            .workspace_path(PathBuf::from("/ws"))
+            .build()
+            .to_driver_runtime_state()
+    }
+
+    #[tokio::test]
+    async fn rejected_home_that_cannot_be_removed_is_kept_and_retried_by_the_sweep() {
+        let root = tempfile::tempdir().unwrap();
+        let supervisor = grok_supervisor(root.path(), Arc::new(FakeTmux::default())).await;
+        let container = root.path().join("elsewhere").join("run-test");
+        std::fs::create_dir_all(container.join("grok-home")).unwrap();
+        std::fs::write(container.join("grok-home").join("initial-prompt.txt"), "brief").unwrap();
+        seed(&supervisor.store, Phase::Intent);
+        let mut record = stored(&supervisor.store);
+        record.driver_id = "grok".into();
+        record.runtime_state = Some(grok_state_in(&container));
+        record.home = Some(container.join("grok-home"));
+        {
+            // Cleanup refuses: the container is not under the Grok root in force.
+            let _env = grok_env(&homes::grok_root(&supervisor.homes_root), root.path());
+            let result = supervisor
+                .reject_unowned_home(&grok_spawn_command(), record, "outside the private-home root".into())
+                .unwrap();
+            assert_eq!(result.code, ResultCode::Rejected as i32);
+        }
+        let record = stored(&supervisor.store);
+        assert_eq!(record.phase, Phase::Terminal);
+        assert!(!record.reclaimed, "a failed cleanup must not be recorded as done");
+        assert!(record.reclaim_error.is_some());
+        assert!(record.runtime_state.is_some(), "the cleanup handle must be kept");
+        assert!(container.exists());
+        {
+            let _env = grok_env(&root.path().join("elsewhere"), root.path());
+            assert!(supervisor.sweep().await.is_empty());
+        }
+        let record = stored(&supervisor.store);
+        assert!(record.reclaimed, "{:?}", record.reclaim_error);
+        assert!(record.reclaim_error.is_none());
+        assert!(!container.exists());
+    }
+
+    #[tokio::test]
+    async fn rejected_unrecognised_driver_state_is_never_recorded_as_reclaimed() {
+        let root = tempfile::tempdir().unwrap();
+        let supervisor = supervisor(root.path(), Arc::new(FakeTmux::default())).await;
+        seed(&supervisor.store, Phase::Intent);
+        let mut record = stored(&supervisor.store);
+        record.runtime_state = Some(DriverRuntimeState::new(json!({"unrelated": true})));
+        supervisor
+            .reject_unowned_home(&spawn_command(), record, "not one the spoke can own".into())
+            .unwrap();
+        let record = stored(&supervisor.store);
+        assert_eq!(record.phase, Phase::Terminal);
+        assert!(!record.reclaimed);
+        assert!(record.reclaim_error.as_deref().unwrap().contains("reclaim"));
+        assert_eq!(
+            supervisor.sweep().await.len(),
+            1,
+            "the failure stays visible to the sweep"
+        );
     }
 
     #[tokio::test]
