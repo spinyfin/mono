@@ -271,6 +271,8 @@ mod tests {
                 "review_pool.reserved_units",
                 "task_stuck.engine_stuck",
                 "task_stuck.engine_stuck_max_age_seconds",
+                "task_stuck.parked",
+                "task_stuck.parked_upstream",
                 "task_stuck.waiting_on_capacity",
                 "task_stuck.waiting_on_dependency",
                 "task_stuck.waiting_on_human",

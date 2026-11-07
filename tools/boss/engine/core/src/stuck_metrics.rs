@@ -32,6 +32,17 @@ crate::register_gauge!(
     "Daily maximum engine-stuck state age in seconds."
 );
 
+crate::register_gauge!(
+    STUCK_PARKED,
+    "task_stuck.parked",
+    "Daily count of explicitly parked items."
+);
+crate::register_gauge!(
+    STUCK_PARKED_UPSTREAM,
+    "task_stuck.parked_upstream",
+    "Daily count of items waiting on parked prerequisites."
+);
+
 /// Tick hourly rather than daily: a 24h interval counts monotonic time, which
 /// stops while macOS sleeps and could skip whole UTC days. The per-day write
 /// is idempotent, so extra ticks are cheap.
@@ -44,6 +55,8 @@ pub fn register_metrics(registry: &Registry) {
         &STUCK_DEPENDENCY,
         &STUCK_ENGINE,
         &STUCK_MAX_AGE,
+        &STUCK_PARKED,
+        &STUCK_PARKED_UPSTREAM,
     ] {
         registry.register_gauge(gauge);
     }
@@ -77,6 +90,8 @@ pub(crate) fn record(registry: &Registry, report: &StuckReport) {
         (StuckBucket::WaitingOnCapacity, &STUCK_CAPACITY),
         (StuckBucket::WaitingOnDependency, &STUCK_DEPENDENCY),
         (StuckBucket::EngineStuck, &STUCK_ENGINE),
+        (StuckBucket::Parked, &STUCK_PARKED),
+        (StuckBucket::ParkedUpstream, &STUCK_PARKED_UPSTREAM),
     ] {
         gauge.set(
             registry,
@@ -121,6 +136,8 @@ mod tests {
             .minimum_age_secs(0)
             .rows(vec![
                 row(StuckBucket::WaitingOnHuman, 5),
+                row(StuckBucket::Parked, 100),
+                row(StuckBucket::ParkedUpstream, 200),
                 row(StuckBucket::EngineStuck, 40),
                 row(StuckBucket::EngineStuck, 90),
                 row(StuckBucket::WaitingOnDependency, 7),
@@ -133,6 +150,8 @@ mod tests {
         assert_eq!(registry.gauge_value("task_stuck.waiting_on_capacity"), Some(0));
         assert_eq!(registry.gauge_value("task_stuck.waiting_on_dependency"), Some(1));
         assert_eq!(registry.gauge_value("task_stuck.engine_stuck"), Some(2));
+        assert_eq!(registry.gauge_value("task_stuck.parked"), Some(1));
+        assert_eq!(registry.gauge_value("task_stuck.parked_upstream"), Some(1));
         assert_eq!(
             registry.gauge_value("task_stuck.engine_stuck_max_age_seconds"),
             Some(90)

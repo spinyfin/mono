@@ -116,7 +116,8 @@ pub(super) fn approve_in_tx(
     // A same-name task parked in the backlog (autostart off) would never be
     // dispatched, leaving the dependent waiting with no signal.
     let schedulable = matches!(prerequisite.status, TaskStatus::Todo | TaskStatus::Blocked);
-    let enabled_dispatch = !created && schedulable && !prerequisite.autostart;
+    let eligible = parking::upkeep_eligible(conn, &prerequisite.id)?;
+    let enabled_dispatch = eligible && !created && schedulable && !prerequisite.autostart;
     if enabled_dispatch {
         crate::task_status_audit::execute(
             conn,
@@ -129,7 +130,7 @@ pub(super) fn approve_in_tx(
 
     // Approval is an explicit restart, including after a terminal prior run.
     // Queue it here: the periodic reconciler intentionally cannot restart one.
-    if !created && schedulable && query_live_execution_for_work_item(conn, &prerequisite.id)?.is_none() {
+    if eligible && !created && schedulable && query_live_execution_for_work_item(conn, &prerequisite.id)?.is_none() {
         if deps::gating_prereqs_for(conn, &prerequisite.id)?.is_empty() {
             request_execution_in_tx_with_live_check(
                 pending,
@@ -259,6 +260,9 @@ fn order_project_prerequisites(conn: &Connection, task: &Task, prerequisite: &Ta
 /// so the resumed run lands where the branch state is. Revisions are left
 /// alone: their own reconciler mints the replacement when the gate clears.
 pub(super) fn queue_gated_execution(conn: &Connection, task: &Task, question: &OperatorQuestionView) -> Result<()> {
+    if !parking::upkeep_eligible(conn, &task.id)? {
+        return Ok(());
+    }
     let kind = execution_kind_for_work_item(conn, &task.id)?;
     if kind == ExecutionKind::RevisionImplementation
         || deps::gating_prereqs_for(conn, &task.id)?.is_empty()

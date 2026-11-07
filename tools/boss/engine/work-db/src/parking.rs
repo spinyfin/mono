@@ -46,11 +46,11 @@
 //!   names it. A task parked directly before or during the project's park
 //!   stays parked.
 //!
-//! Un-park only clears the columns and writes the ledger row. Reconciliation
-//! on un-park (refresh the PR, route conflicts and red CI into their
-//! remediation paths, re-mint executions) is specified in section 1.5 of
+//! Un-park only clears the columns and writes the ledger row; it does not
+//! refresh the PR, route conflicts or red CI, or re-mint executions.
+//! Section 1.5 of
 //! `tools/boss/docs/designs/task-persistence-parking-and-autonomous-progression.md`
-//! and follows in a separate PR.
+//! specifies that sequence.
 //!
 //! ## Who may park
 //!
@@ -187,6 +187,38 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     }
     conn.execute_batch(PARKING_AUDIT_TRIGGERS)?;
     conn.execute_batch(PARKING_MEMBERSHIP_TRIGGERS)?;
+    Ok(())
+}
+
+/// Replace membership triggers on existing databases as well as fresh installs.
+pub(super) fn migrate_membership(conn: &Connection) -> Result<()> {
+    conn.execute_batch("DROP TRIGGER IF EXISTS tasks_born_parked_in_parked_project;")?;
+    conn.execute_batch(&PARKING_MEMBERSHIP_TRIGGERS.replacen(
+        "WHEN NEW.parked_at IS NULL AND NEW.project_id IS NOT NULL",
+        "WHEN NEW.parked_at IS NULL AND NEW.project_id IS NOT NULL
+ AND NOT (NEW.kind = 'revision' AND EXISTS (
+    SELECT 1 FROM tasks p WHERE p.id = NEW.parent_task_id
+      AND p.parked_at IS NOT NULL AND p.status NOT IN ('done', 'archived')
+ ))",
+        1,
+    ))?;
+    conn.execute_batch(
+        "
+CREATE TRIGGER IF NOT EXISTS tasks_reopened_in_parked_project
+AFTER UPDATE OF status, deleted_at ON tasks
+WHEN NEW.status NOT IN ('done', 'archived') AND NEW.deleted_at IS NULL
+ AND (OLD.status IN ('done', 'archived') OR OLD.deleted_at IS NOT NULL)
+ AND NEW.parked_at IS NULL
+ AND EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id AND parked_at IS NOT NULL)
+BEGIN
+    UPDATE tasks SET
+        parked_at = (SELECT parked_at FROM projects WHERE id = NEW.project_id),
+        parked_by = (SELECT parked_by FROM projects WHERE id = NEW.project_id),
+        parked_reason = (SELECT parked_reason FROM projects WHERE id = NEW.project_id),
+        parked_via = 'project:' || NEW.project_id
+    WHERE id = NEW.id;
+END;",
+    )?;
     Ok(())
 }
 
@@ -837,6 +869,9 @@ mod tests {
     use boss_protocol::{
         CreateExecutionInput, CreateProjectInput, CreateTaskInput, ExecutionKind, ExecutionStatus, StuckBucket,
     };
+
+    #[path = "regressions.rs"]
+    mod regressions;
 
     type Fixture = (tempfile::TempDir, WorkDb, String);
 
