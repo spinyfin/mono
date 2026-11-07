@@ -69,6 +69,7 @@ async fn fresh_dispatch_records_the_floor_without_a_store_operation_and_teardown
         .await
         .unwrap();
     assert_eq!(operation().await, before, "empty dispatch must not mutate the store");
+    assert_eq!(record.has_recovery_head, Some(false));
     assert_eq!(
         record.base_commit,
         Some(one_commit(&LocalJj, &f.worker, "trunk()").await.unwrap())
@@ -188,6 +189,7 @@ async fn restored_dispatch_creates_only_one_recovery_head_and_uses_the_recorded_
         .await
         .unwrap();
     assert_eq!(parent, before, "restored dispatch must perform one store operation");
+    assert_eq!(next.has_recovery_head, Some(true));
     assert_eq!(next.base_commit, prior.base_commit);
     let names = LocalJj
         .run(

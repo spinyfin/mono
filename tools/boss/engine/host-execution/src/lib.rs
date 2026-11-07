@@ -1987,6 +1987,7 @@ pub mod workspace {
                 host_id: self.host_id.clone(),
                 base_commit: bookmark.and_then(|b| optional(&b.anchor_commit)).map(str::to_owned),
                 pr_head_before: bookmark.and_then(|b| optional(&b.pr_head_before)).map(str::to_owned),
+                has_recovery_head: None,
             })
         }
     }

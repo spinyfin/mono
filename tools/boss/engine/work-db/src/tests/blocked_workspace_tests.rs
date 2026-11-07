@@ -162,6 +162,7 @@ fn read_only_reviews_never_inherit_a_recovery_predecessor() {
             host_id: "local".into(),
             base_commit: None,
             pr_head_before: None,
+            has_recovery_head: None,
         })
         .unwrap();
         db.record_worker_failure(&prior.id, "died before start").unwrap();

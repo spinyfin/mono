@@ -1429,6 +1429,7 @@ async fn kept_pre_start_lease_does_not_block_redispatch() {
         host_id: "local".to_owned(),
         base_commit: None,
         pr_head_before: None,
+        has_recovery_head: None,
     })
     .unwrap();
     let cube = Arc::new(FakeCubeClient::default());

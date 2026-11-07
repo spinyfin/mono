@@ -1161,12 +1161,24 @@ impl ExecutionCoordinator {
             Err(err) => {
                 let record = self.work_db.execution_bookmark(&execution.id)?;
                 let adapter = self.host_adapter();
-                self.retire_unvouched_record(execution, execution, &record, &adapter, &err)
-                    .await?;
                 let workspace = execution
                     .workspace_path
                     .as_deref()
                     .ok_or_else(|| anyhow!("running execution has no workspace"))?;
+                // Name the live tip before archiving the record's (stale)
+                // bookmark targets and repositioning `@`. Workers no longer
+                // advance `boss-recovery/<exec>`, so post-dispatch edits are
+                // only at `@` until teardown preservation records them.
+                let recorded = self.work_db.preserved_tip(&execution.id)?;
+                let since = execution.started_epoch().or_else(|| execution.created_epoch());
+                let outcome = adapter
+                    .confirm_workspace_recovery(&record, Path::new(workspace), recorded.as_ref(), since)
+                    .await?;
+                if let Some(tip) = &outcome.tip {
+                    self.work_db.record_preserved_tip(&execution.id, tip)?;
+                }
+                self.retire_unvouched_record(execution, execution, &record, &adapter, &err)
+                    .await?;
                 let work_item = self.resolve_execution_work_item(execution)?;
                 let bound_pr = super::execution::pr_number_for_workspace_goto(&self.work_db, execution, &work_item);
                 let task_pr = match &work_item {

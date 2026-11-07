@@ -1710,6 +1710,7 @@ mod compose_worker_spawn_tests {
             host_id: "local".into(),
             base_commit: None,
             pr_head_before: None,
+            has_recovery_head: None,
         })
         .unwrap();
         db.record_bookmark_recovery(&execution.id, "exec_prior", false).unwrap();
