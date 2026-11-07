@@ -1,4 +1,4 @@
-use super::super::worker_events::extract_last_assistant_text;
+use super::super::probe_reply_text::extract_last_assistant_text;
 use super::*;
 
 use boss_engine_runtime::test_support::*;

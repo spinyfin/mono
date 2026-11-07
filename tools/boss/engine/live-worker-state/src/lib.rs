@@ -26,9 +26,11 @@ use crate::semantic_progress::{
 };
 use boss_engine_driver::ProgressFidelity;
 
+mod declaration_activity;
 mod declared_wait;
 mod never_started_reap;
 mod prompt_acceptance;
+pub use declaration_activity::DeclarationActivity;
 pub mod semantic_progress;
 pub use declared_wait::{DeclaredWait, DeclaredWaitSource};
 use declared_wait::{SharedWaitSource, is_idle_prompt_message, reconcile_parked, settle_parked};
@@ -295,6 +297,10 @@ struct NotificationRepair {
 
 #[derive(bon::Builder)]
 struct SlotMeta {
+    /// Last hook/driver activity other than Stop. A Stop makes delivery safe;
+    /// it must not erase the quiet stretch that led to that boundary.
+    #[builder(required, default = None)]
+    declaration_activity_at: Option<String>,
     /// Confirmed process/session death fences buffered transcript events until
     /// same-run re-adoption or a later `Alive` inspection restores the slot.
     /// Ordinary buffered hooks never clear this flag.
@@ -1085,6 +1091,7 @@ impl LiveWorkerStateRegistry {
         entry.meta.semantic_progress_at = Some(checkpoint.progress_at.clone());
         entry.meta.semantic_tool_condition = checkpoint.tool_condition;
         entry.meta.semantic_turn_condition = checkpoint.turn_condition;
+        entry.meta.declaration_activity_at = Some(checkpoint.progress_at.clone());
         // The turn condition, not the tool condition, decides busy vs idle:
         // the tool condition is `Idle` while thinking between completed tools.
         // Codex background commands are `InFlight` during blocking polls and
@@ -1945,6 +1952,11 @@ impl LiveWorkerStateRegistry {
                 resumed_after: None,
                 repaired: false,
             };
+        }
+        // Late hooks cannot rewind semantic state, but their ingress still
+        // proves responsiveness. Stop only establishes a delivery boundary.
+        if !matches!(event, WorkerEvent::Stop { .. }) {
+            meta.declaration_activity_at = Some(iso8601_utc(now_secs));
         }
         if let Some(ingress_seq) = ingress_seq {
             if matches!(

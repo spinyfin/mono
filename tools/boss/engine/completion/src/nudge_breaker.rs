@@ -282,6 +282,22 @@ impl NudgeBreaker {
         entry.delivery.failures
     }
 
+    /// A nudge charged by [`Self::record`] was never queued (the turn-boundary
+    /// ask found one already pending), so it must not count as a strike.
+    /// Unlike [`Self::settle_undelivered`] there is no nudge id to settle and
+    /// no delivery failure to record. A no-op for an untracked execution.
+    pub fn revert_undelivered(&self, execution_id: &str) {
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .expect("NudgeBreaker mutex poisoned")
+            .get_mut(execution_id)
+        {
+            entry.count = entry.count.saturating_sub(1);
+            entry.total_count = entry.total_count.saturating_sub(1);
+        }
+    }
+
     /// The most recent nudge reached the worker: end any run of consecutive
     /// delivery failures. Idempotent, and a no-op for an untracked execution.
     pub fn delivery_confirmed(&self, execution_id: &str) {
