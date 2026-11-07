@@ -25,15 +25,12 @@
 //!
 //! ## Observed incident (2026-05-13)
 //!
-//! T335 (`task_18af2d6114d16c70_26`, "Bazel installer rule + payload
-//! assembly") was blocked on T343 (`task_18af317331d4b960_1`, "Fix
-//! critical scoping bug: boss uninstall …"). T343 transitioned to
-//! `status=done` at 2026-05-13 19:33:09 Z (PR #424). T335 remained
-//! `status=blocked` for roughly three hours until ~23:18 Z, when it
-//! flipped to `todo` spontaneously via an unrelated request-execution
-//! path that happened to clear the stale block. Without this sweeper
-//! the only recovery path was manual operator action or an accidental
-//! trigger via `RequestExecution`.
+//! The Bazel installer task stayed dependency-blocked for about three hours
+//! after its prerequisite (the uninstall scoping fix) landed in PR #424, until
+//! an unrelated execution request cleared the stale block. Without this
+//! sweeper the stale block cleared only when something called `RequestExecution`
+//! on the row, whether an explicit start request or an unrelated path that
+//! triggered one.
 //!
 //! ## Cadence
 //!
@@ -254,6 +251,50 @@ mod tests {
         };
         assert_eq!(after.status, TaskStatus::Todo);
         assert!(after.blocked_reason.is_none(), "blocked_reason must be cleared");
+    }
+
+    /// A parked `blocked: dependency` row whose prerequisites complete still
+    /// advances to `todo` (its lifecycle position stays truthful) but nothing
+    /// is minted for it — exactly as `deferred` behaves — neither by the
+    /// cascade nor by the sweep's stuck-execution promotion.
+    #[tokio::test]
+    async fn sweep_unblocks_a_parked_dependent_without_minting_an_execution() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let prereq_id = create_test_chore(&db, &product_id, "prereq").id;
+        let dep_id = create_test_chore(&db, &product_id, "dependent").id;
+        db.add_dependency(AddDependencyInput {
+            dependent: dep_id.clone(),
+            prerequisite: prereq_id.clone(),
+            relation: None,
+        })
+        .unwrap();
+        db.park_work_item_as_actor(&dep_id, true, Some("not now"), "human")
+            .unwrap();
+        db.mark_task_done_for_test_no_cascade(&prereq_id).unwrap();
+
+        let db = Arc::new(db);
+        let outcome = run_one_pass(db.as_ref()).await;
+
+        assert_eq!(outcome.rows_evaluated, 1, "the parked row is still a cascade candidate");
+        assert_eq!(outcome.rows_unblocked, 1, "it still flips blocked -> todo");
+        assert_eq!(
+            outcome.rows_stuck_promoted, 0,
+            "stuck-execution promotion leaves it alone"
+        );
+        let boss_protocol::WorkItem::Chore(after) = db.get_work_item(&dep_id).unwrap() else {
+            panic!()
+        };
+        assert_eq!(after.status, TaskStatus::Todo);
+        assert!(after.blocked_reason.is_none(), "blocked_reason must be cleared");
+        assert!(after.is_parked(), "unblocking does not un-park");
+        let live: Vec<_> = db
+            .list_executions(Some(&dep_id))
+            .unwrap()
+            .into_iter()
+            .filter(|execution| !execution.status.is_terminal())
+            .collect();
+        assert!(live.is_empty(), "no execution is minted for a parked row: {live:?}");
     }
 
     /// Regression: an archived revision is tombstoned in the same transition.

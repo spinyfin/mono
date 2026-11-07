@@ -226,6 +226,43 @@ async fn sha_unchanged_skip_releases_the_hold_for_a_revision_whose_verdict_is_on
     );
 }
 
+/// A parked row atrophies: the run that was in flight when the owner parked it
+/// records its PR, but no reviewer is scheduled. The enqueuer must never be
+/// reached (fan-out is on, so it would have been), and the hold is released so
+/// the row advances to `in_review` instead of stranding in `active`.
+#[tokio::test]
+async fn a_parked_row_gets_no_reviewer_and_advances_to_in_review() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    stamp_pending_review_hold(&db, &chore_id, PR_URL);
+    db.park_work_item_as_actor(&chore_id, true, Some("not now"), "human")
+        .unwrap();
+
+    let publisher = std::sync::Arc::new(RecordingPublisher::default());
+    let verifier = StubBranchVerifier::ok("boss/test");
+    let flags_dir = tempdir().unwrap();
+    let flags = fanout_flags(flags_dir.path());
+    let execution = db.get_execution(&execution_id).unwrap();
+
+    maybe_enqueue_declared_delivery_reviewer(
+        &db,
+        publisher.as_ref(),
+        verifier.as_ref(),
+        &PanicsIfCalledEnqueuer,
+        &flags,
+        5,
+        0,
+        1,
+        &execution,
+        &chore_id,
+        &execution.repo_remote_url,
+        PR_URL,
+    )
+    .await;
+
+    assert_eq!(task_status(&db, &chore_id), TaskStatus::InReview);
+}
+
 /// The cycle-bound arm must also release the hold (it always runs after a
 /// prior review cycle, so an informative verdict is available under the same
 /// id the noop-skip arm above uses).

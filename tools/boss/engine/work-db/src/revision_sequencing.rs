@@ -187,14 +187,19 @@ pub(crate) fn promote_waiting_writers(
     conn: &Connection,
     task_ids: Option<&[String]>,
 ) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
+    // Waking a parked writer is upkeep. Parking cancels a revision's pending
+    // executions, so a parked chain normally has none to wake; the predicate
+    // keeps this listing correct for a stray row.
+    let upkeep = super::parking::upkeep_eligible_task_sql("t");
+    let mut stmt = conn.prepare(&format!(
         "SELECT we.id, we.work_item_id FROM work_executions we
          JOIN tasks t ON t.id = we.work_item_id
          WHERE we.status = 'waiting_dependency' AND we.kind = 'revision_implementation'
            AND t.kind = 'revision' AND t.deleted_at IS NULL
            AND t.status IN ('active', 'in_review')
+           AND {upkeep}
          ORDER BY we.created_at ASC, we.id ASC",
-    )?;
+    ))?;
     let rows = stmt
         .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;

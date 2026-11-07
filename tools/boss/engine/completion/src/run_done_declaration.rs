@@ -903,6 +903,18 @@ fn release_pending_review_hold_with_verdict(work_db: &crate::work::WorkDb, work_
     }
 }
 
+/// `true` when `work_item_id` is parked, so no automated reviewer may be
+/// scheduled for the PR this completion just produced. A parked row atrophies
+/// (see `boss_work_db::parking`): the run that was in flight when the owner
+/// parked it finishes and records its PR, and the row advances to `in_review`,
+/// but the AI review that would normally follow is not scheduled; scheduling it
+/// after un-park is part of the un-park reconciliation (design section 1.5). A
+/// failed read is logged and treated as "not parked", the fail-open stance the
+/// other upkeep gates take.
+pub(super) fn reviewer_suppressed_by_park(work_db: &crate::work::WorkDb, work_item_id: &str) -> bool {
+    work_db.is_parked_or_assume_not(work_item_id, "pr completion")
+}
+
 /// Release the `PendingReview` hold with no verdict-existence requirement —
 /// for arms whose decision not to enqueue a reviewer is NOT justified by an
 /// already-recorded verdict: a first delivery (`review_cycle == 0`, no
@@ -946,6 +958,14 @@ pub(super) async fn maybe_enqueue_declared_delivery_reviewer(
     repo_remote_url: &str,
     pr_url: &str,
 ) {
+    if reviewer_suppressed_by_park(work_db, work_item_id) {
+        tracing::info!(
+            work_item_id,
+            "run_done post-effects: row is parked; advancing to in_review without a reviewer pass",
+        );
+        release_pending_review_hold_unconditional(work_db, work_item_id);
+        return;
+    }
     let cycle_root_id = work_db.review_cycle_root_id(work_item_id);
     let (review_cycle, last_reviewed_sha) = match work_db.get_task_review_cycle_state(&cycle_root_id) {
         Ok(state) => state,

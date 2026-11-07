@@ -434,16 +434,21 @@ impl WorkDb {
         let conn = self.connect()?;
         let now_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
         let cutoff = now_secs - min_age_secs;
-        let mut stmt = conn.prepare(
-            "SELECT id FROM tasks
-             WHERE status IN ('todo', 'active')
-               AND deleted_at IS NULL
-               AND dispatch_failed_reason IS NOT NULL
-               AND autostart = 0
-               AND dispatch_failed_at IS NOT NULL
-               AND CAST(dispatch_failed_at AS INTEGER) < ?1
-             ORDER BY CAST(dispatch_failed_at AS INTEGER) ASC, id ASC",
-        )?;
+        // A parked row's stale failure stamp says nothing about now: the sweep
+        // must not retry a parked row, and it re-enters this listing once
+        // un-parked.
+        let upkeep = super::parking::upkeep_eligible_task_sql("t");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT t.id FROM tasks t
+             WHERE t.status IN ('todo', 'active')
+               AND t.deleted_at IS NULL
+               AND t.dispatch_failed_reason IS NOT NULL
+               AND t.autostart = 0
+               AND t.dispatch_failed_at IS NOT NULL
+               AND CAST(t.dispatch_failed_at AS INTEGER) < ?1
+               AND {upkeep}
+             ORDER BY CAST(t.dispatch_failed_at AS INTEGER) ASC, t.id ASC",
+        ))?;
         let rows = stmt.query_map([cutoff], |row| row.get::<_, String>(0))?;
         let mut out = Vec::new();
         for row in rows {
@@ -899,6 +904,7 @@ impl WorkDb {
         // and reconcile such a row to `orphaned`/`abandoned`. This query
         // legitimately picks the work item up on the pass after that.
         let unproductive_completed = super::review_verdicts::unproductive_completed_pr_review_sql();
+        let upkeep = super::parking::upkeep_eligible_task_sql("t");
         let walk = super::cycle_root_walk_cte("t.status = 'active'\n               AND t.deleted_at IS NULL");
         let stmt_sql = format!(
             "{walk}
@@ -906,6 +912,7 @@ impl WorkDb {
              JOIN roots ON roots.task_id = t.id
              WHERE t.status = 'active'
                AND t.deleted_at IS NULL
+               AND {upkeep}
                AND CAST(t.updated_at AS INTEGER) < ?1
                AND NOT EXISTS (
                    SELECT 1 FROM work_executions we
@@ -950,6 +957,7 @@ impl WorkDb {
                )
              ORDER BY t.updated_at ASC, t.id ASC",
             walk = walk,
+            upkeep = upkeep,
             permanent = ATTENTION_KIND_RECOVERY_PERMANENT,
             exhausted = ATTENTION_KIND_RECOVERY_EXHAUSTED,
         );
@@ -992,6 +1000,7 @@ impl WorkDb {
     pub fn list_dead_pr_review_candidates(&self) -> Result<Vec<DeadPrReviewCandidate>> {
         let conn = self.connect()?;
         let unproductive_completed = super::review_verdicts::unproductive_completed_pr_review_sql();
+        let upkeep = super::parking::upkeep_eligible_task_sql("t");
         // Releasing a never-started batch abandons its leaves and removes
         // their membership rows. The deferred marker routes those roots back
         // through batch admission rather than minting a legacy reviewer.
@@ -1001,6 +1010,7 @@ impl WorkDb {
              JOIN work_executions we ON we.work_item_id = t.id
              WHERE t.deleted_at IS NULL
                AND t.status NOT IN ('done', 'archived')
+               AND {upkeep}
                AND t.pr_url IS NOT NULL AND t.pr_url != ''
                AND we.kind = 'pr_review'
                AND NOT EXISTS (

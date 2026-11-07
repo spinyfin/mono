@@ -45,8 +45,8 @@ use crate::work::{
 use boss_execution_contracts::{CubeClient, ExecutionPublisher};
 
 /// Decide whether the unified `auto_pr_maintenance_enabled` opt-out
-/// (per-product flag or per-PR label) suppresses this conflict-watch
-/// transition. Returns `true` to gate the path off, logging at debug
+/// (per-product flag or per-PR label), or the row being parked, suppresses this
+/// conflict-watch transition. Returns `true` to gate the path off, logging at debug
 /// for traceability. DB-read errors fall through to "not opted out"
 /// so a transient lookup failure doesn't silently drop a real signal —
 /// the per-PR label is the second line of defence in that case.
@@ -59,6 +59,17 @@ fn auto_pr_maintenance_disabled(work_db: &WorkDb, candidate: &PendingMergeCheck,
             work_item_id = %candidate.work_item_id,
             pr_url = %candidate.pr_url,
             "conflict_watch: PR labelled with opt-out; skipping",
+        );
+        return true;
+    }
+    // A parked row atrophies: conflict resolution (including the mechanical
+    // rebase rung it hands to the ladder) is upkeep, so every entry point
+    // that shares this gate leaves the row alone until it is un-parked.
+    if work_db.is_parked_or_assume_not(&candidate.work_item_id, "conflict_watch") {
+        tracing::debug!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            "conflict_watch: row is parked; skipping",
         );
         return true;
     }

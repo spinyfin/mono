@@ -101,6 +101,19 @@ async fn handle_trigger_pr_review_with<F, Fut>(
                 return;
             }
         };
+        // An explicit review does not override a park: a parked row is skipped
+        // by every automatic path, so a reviewer started here would only strand.
+        // The same typed "un-park it first" refusal `RequestExecution` gives.
+        if let Err(err) = work_db.refuse_if_parked(&owner.id) {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::WorkError {
+                    message: err.to_string(),
+                },
+            );
+            return;
+        }
         let result = if server_state.feature_flags.is_enabled("review_batch_fanout") {
             async {
                 let pr_url = owner.pr_url.as_deref().ok_or_else(|| anyhow::anyhow!("task has no PR URL"))?;

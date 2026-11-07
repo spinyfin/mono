@@ -43,7 +43,10 @@ impl WorkDb {
     /// rows (all `revision_task_id IS NULL`) are recovered.
     pub fn list_stranded_ci_remediation_attempts(&self) -> Result<Vec<StrandedCiRemediationAttempt>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare(
+        // Re-emitting an execution for a stranded attempt is upkeep, so a
+        // parked parent's attempt stays stranded until the row is un-parked.
+        let upkeep = super::parking::upkeep_eligible_task_sql("t");
+        let mut stmt = conn.prepare(&format!(
             "SELECT cr.id, cr.work_item_id, cr.product_id, cr.pr_url
              FROM ci_remediations cr
              WHERE cr.status = 'pending'
@@ -54,6 +57,7 @@ impl WorkDb {
                      AND t.status = 'blocked'
                      AND t.blocked_reason = 'ci_failure'
                      AND t.deleted_at IS NULL
+                     AND {upkeep}
                )
                AND NOT EXISTS (
                    SELECT 1 FROM work_executions we
@@ -62,7 +66,7 @@ impl WorkDb {
                      AND we.status IN ('ready', 'claimed', 'running', 'waiting_human')
                )
              ORDER BY cr.created_at ASC",
-        )?;
+        ))?;
         let rows = stmt.query_map([], |row| {
             Ok(StrandedCiRemediationAttempt {
                 attempt_id: row.get(0)?,
@@ -145,8 +149,14 @@ impl WorkDb {
     /// prerequisite, leaving genuine dependency blocks to the
     /// dependency-unblock sweep.
     pub fn list_chores_stranded_blocked_remediation(&self) -> Result<Vec<PendingMergeCheck>> {
-        self.query_pending_merge_checks(
+        // Re-arming a stranded signal and spawning a fresh remediation revision
+        // is upkeep, so a parked parent is not reconciled here; unlike the
+        // merge poller's main lists this one carries no terminal-fact
+        // observation of its own, so the exclusion belongs in the listing.
+        let upkeep = super::parking::upkeep_eligible_task_sql("t");
+        self.query_pending_merge_checks(&format!(
             "t.status = 'blocked'
+               AND {upkeep}
                AND t.blocked_reason IS NULL
                AND NOT EXISTS (
                    SELECT 1 FROM task_blocked_signals s
@@ -165,7 +175,7 @@ impl WorkDb {
                           AND ci.revision_task_id IS NOT NULL
                    )
                )",
-        )
+        ))
     }
 
     /// Re-canonicalise a stranded NULL-reason blocked parent (see

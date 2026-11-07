@@ -760,6 +760,20 @@ impl WorkDb {
         self.query_pending_merge_checks("t.status = 'in_review'")
     }
 
+    /// [`Self::list_chores_pending_merge_check`] minus the parked rows: the
+    /// `in_review` PRs for which upkeep may run.
+    ///
+    /// The merge poller's own sweep must keep listing a parked `in_review` row
+    /// because it records terminal facts (the PR merged, the PR closed) that
+    /// are not upkeep. A producer that only ever *acts* on an open PR — the
+    /// speculative conflict prediction and the stacked-PR structuring pass —
+    /// has no such duty, so it lists through here and never nominates a parked
+    /// row.
+    pub fn list_chores_pending_upkeep_check(&self) -> Result<Vec<PendingMergeCheck>> {
+        let upkeep = super::parking::upkeep_eligible_task_sql("t");
+        self.query_pending_merge_checks(&format!("t.status = 'in_review' AND {upkeep}"))
+    }
+
     /// Executions whose bound chore is still `active` with no `pr_url`,
     /// whose execution row is `waiting_human` (i.e., the worker spawned,
     /// hit a Stop boundary, and is now idle), and that have a recorded
@@ -888,6 +902,7 @@ impl WorkDb {
         //      finalize_pr_review_pass but didn't, e.g. Stop hook was missed).
         //   2. Non-terminal but created before the stale cutoff (timeout).
         let review_result_outcomes = super::review_verdicts::review_result_gate_outcomes_sql();
+        let upkeep = super::parking::upkeep_eligible_task_sql("t");
         let sql = format!(
             "SELECT t.id, t.product_id, t.pr_url,
                     EXISTS (
@@ -909,6 +924,7 @@ impl WorkDb {
                AND t.pr_url IS NOT NULL
                AND t.pr_url != ''
                AND t.deleted_at IS NULL
+               AND {upkeep}
                AND (
                  -- Reviewer finished but task was not advanced (missed Stop hook)
                  we.status IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')
@@ -979,12 +995,14 @@ impl WorkDb {
         // walked cycle root, which the seed filter cannot see yet; the
         // outer WHERE narrows `in_review` rows to the marker and
         // readmission arms.
-        let walk = super::cycle_root_walk_cte(
+        let upkeep = super::parking::upkeep_eligible_task_sql("t");
+        let walk = super::cycle_root_walk_cte(&format!(
             "t.status IN ('active', 'in_review')
                  AND t.pr_url IS NOT NULL
                  AND t.pr_url != ''
-                 AND t.deleted_at IS NULL",
-        );
+                 AND t.deleted_at IS NULL
+                 AND {upkeep}",
+        ));
         let needs_readmission = super::review_batches::pre_merge_review_needs_readmission_sql("roots.cycle_root_id");
         let sql = format!(
             "{walk}
@@ -1296,6 +1314,9 @@ impl WorkDb {
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
         let grace_cutoff = (now - grace_secs).to_string();
         let lookback_cutoff = (now - max_lookback_secs).to_string();
+        // Opening a PR for a dead run's branch is upkeep: a parked row keeps
+        // its pushed branch until it is un-parked.
+        let upkeep = super::parking::upkeep_eligible_task_sql("t");
         let mut stmt = conn.prepare(&format!(
             "SELECT we.id, we.work_item_id, we.repo_remote_url, we.branch_naming, we.worker_branch_prefix
              FROM work_executions we
@@ -1310,6 +1331,7 @@ impl WorkDb {
                AND t.deleted_at IS NULL
                AND t.kind IN ({CHORE_LIKE_KINDS_SQL})
                AND t.status NOT IN ('done', 'archived')
+               AND {upkeep}
                AND (t.pr_url IS NULL OR t.pr_url = '')
                AND NOT EXISTS (
                  SELECT 1 FROM work_executions live

@@ -2033,6 +2033,7 @@ impl WorkDb {
     pub fn list_dead_review_batch_member_candidates(&self) -> Result<Vec<DeadPrReviewCandidate>> {
         let conn = self.connect()?;
         let unproductive_completed = super::review_verdicts::unproductive_completed_pr_review_sql();
+        let upkeep = super::parking::upkeep_eligible_task_sql("task");
         let sql = format!(
             "SELECT we.work_item_id, we.id, we.status
              FROM pr_review_batch_members member
@@ -2040,6 +2041,7 @@ impl WorkDb {
              JOIN work_executions we ON we.id = member.execution_id
              JOIN tasks task ON task.id = we.work_item_id
              WHERE batch.phase = 'pre_merge'
+               AND {upkeep}
                AND (
                    (
                      member.role IN ('claude_reviewer', 'codex_reviewer', 'grok_reviewer')
