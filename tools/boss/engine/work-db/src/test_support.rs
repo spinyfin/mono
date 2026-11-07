@@ -2,6 +2,10 @@
 use super::{CiRemediation, WorkDb};
 use boss_protocol::QueueCiEvidence;
 
+#[path = "test_db_template.rs"]
+mod db_template;
+pub(crate) use db_template::open_memory_db;
+
 /// Run a synchronization callback while holding the database connection.
 /// The callback must not call another operation on this database.
 pub fn with_connection_held(db: &WorkDb, callback: impl FnOnce()) {
@@ -106,7 +110,9 @@ mod db_helpers {
 
     pub fn open_db() -> (TempDir, WorkDb) {
         let dir = TempDir::new().unwrap();
-        let db = WorkDb::open(dir.path().join("state.db")).unwrap();
+        let path = dir.path().join("state.db");
+        super::db_template::copy_to(&path);
+        let db = WorkDb::open_existing(path).unwrap();
         (dir, db)
     }
 

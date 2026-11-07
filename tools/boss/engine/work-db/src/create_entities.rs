@@ -56,6 +56,11 @@ pub(crate) fn create_project_in_tx(
 impl WorkDb {
     pub fn open(path: PathBuf) -> Result<Self> {
         if path == Path::new(":memory:") {
+            // Reuse the migrated schema for ordinary test fixtures. Direct
+            // open_in_memory() calls still exercise cold in-memory startup.
+            #[cfg(any(test, feature = "test-support"))]
+            return super::test_support::open_memory_db();
+            #[cfg(not(any(test, feature = "test-support")))]
             return Self::open_in_memory();
         }
 
@@ -99,11 +104,18 @@ impl WorkDb {
     /// connection opened here (held in `WorkDb::conn`) keeps the shared-cache
     /// database alive until the `WorkDb` (and every clone of it) is dropped.
     pub fn open_in_memory() -> Result<Self> {
+        let db = Self::empty_in_memory()?;
+        db.init()?;
+        Ok(db)
+    }
+
+    /// Keep connection setup identical for cold startup and copied test schemas.
+    pub(crate) fn empty_in_memory() -> Result<Self> {
         let id = NEXT_MEM_DB_ID.fetch_add(1, Ordering::Relaxed);
         let uri = format!("file:boss_mem_{id}?mode=memory&cache=shared");
         let anchor = InMemoryAnchor { uri };
         let conn = Self::open_raw_connection(&PathBuf::from(":memory:"), Some(&anchor))?;
-        let db = Self {
+        Ok(Self {
             path: PathBuf::from(":memory:"),
             memory: Some(anchor),
             conn: Arc::new(Mutex::new(conn)),
@@ -112,9 +124,7 @@ impl WorkDb {
             persona_metrics: personas::new_metrics_registry(),
             engine_build_identity: None,
             token_generator: super::default_token_generator(),
-        };
-        db.init()?;
-        Ok(db)
+        })
     }
 
     /// Replace this handle's event bus with `bus`, so every clone shares
