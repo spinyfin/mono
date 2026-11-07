@@ -736,6 +736,7 @@ mod github_merge_intents;
 pub mod parking;
 pub mod parking_reconcile;
 pub mod personas;
+mod progression_candidates;
 mod progression_scope;
 mod project_postmortem;
 #[cfg(test)]
@@ -868,6 +869,7 @@ pub use pr_flow::WorkerFailureBasis;
 pub use pr_flow::insert_question;
 #[cfg(test)]
 pub use products_design::resolve_task_doc_pointer;
+pub use progression_candidates::{ProgressionCandidate, ProgressionClauses, ProgressionMint};
 pub use proposal_apply::*;
 pub use query_ensure::*;
 pub use review_batches::{

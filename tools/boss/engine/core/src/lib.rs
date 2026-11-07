@@ -157,6 +157,7 @@ pub mod board_notification_bridge;
 pub mod hung_worker;
 pub mod pr_review_recovery;
 pub mod pre_start_streak;
+pub mod progression_sweep;
 pub mod project_postmortem_sweep;
 pub use boss_execution_runner::prompt_fragments;
 pub mod proposal_expiry_sweep;

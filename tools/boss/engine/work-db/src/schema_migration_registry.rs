@@ -339,6 +339,21 @@ pub(super) fn all() -> Vec<Migration> {
             apply: parking::migrate,
         },
         Migration {
+            id: progression_candidates::GRACE_COLUMN_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: progression_candidates::migrate_grace_column,
+        },
+        Migration {
+            id: progression_candidates::EXECUTION_PROVENANCE_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: progression_candidates::migrate_execution_provenance,
+        },
+        Migration {
+            id: progression_candidates::VIEWS_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: progression_candidates::migrate_views,
+        },
+        Migration {
             id: spoke_hub::MIGRATION_ID.into(),
             legacy_version: None,
             apply: spoke_hub::migrate,

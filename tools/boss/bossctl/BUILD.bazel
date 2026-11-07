@@ -18,6 +18,7 @@ rust_binary(
         "src/main.rs",
         "src/pause.rs",
         "src/probe.rs",
+        "src/progression.rs",
         "src/proposals.rs",
         "src/review.rs",
         "src/selected_product.rs",

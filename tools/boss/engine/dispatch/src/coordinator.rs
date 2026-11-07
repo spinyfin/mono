@@ -89,8 +89,8 @@ enum PreemptionAttempt {
 }
 
 pub use boss_execution_contracts::{
-    DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_REVIEW_POOL_SIZE, MAX_WORKER_POOL_SIZE, WORKER_PAGE_COUNT,
-    WORKER_PAGE_SIZE,
+    DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_PROGRESSION_POOL_SIZE, MAX_REVIEW_POOL_SIZE,
+    MAX_WORKER_POOL_SIZE, WORKER_PAGE_COUNT, WORKER_PAGE_SIZE,
 };
 
 /// Default (and compile-time floor) for the interactive-pool concurrency
@@ -157,11 +157,13 @@ pub const MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO: usize = 2;
 
 pub use boss_engine_storage_values::dispatch_wait::{
     DISPATCH_WAIT_REASON_AUTOMATION_PAUSED, DISPATCH_WAIT_REASON_DISPATCH_PAUSED, DISPATCH_WAIT_REASON_FOCUS_MODE,
-    DISPATCH_WAIT_REASON_POOL_EXHAUSTED, WAITING_FOR_WORKSPACE_REASON, interactive_cap_wait_reason,
-    is_capacity_wait_reason,
+    DISPATCH_WAIT_REASON_POOL_EXHAUSTED, DISPATCH_WAIT_REASON_PROGRESSION_UNAVAILABLE, WAITING_FOR_WORKSPACE_REASON,
+    interactive_cap_wait_reason, is_capacity_wait_reason,
 };
 
-use boss_engine_storage_values::pool_policy::{AUTOMATION_WORKER_ID_PREFIX, REVIEW_WORKER_ID_PREFIX};
+use boss_engine_storage_values::pool_policy::{
+    AUTOMATION_WORKER_ID_PREFIX, PROGRESSION_WORKER_ID_PREFIX, REVIEW_WORKER_ID_PREFIX,
+};
 
 /// Execution kind string for reviewer agent runs. A `pr_review` execution
 /// reviews a worker's PR read-only and always routes to the dedicated review
@@ -196,7 +198,7 @@ const CUBE_REPO_ENSURE_TIMEOUT: Duration = crate::cube_op_budget::REPO_ENSURE;
 /// cube timeout).
 ///
 /// The real bound on concurrent dispatches is the worker pools: a row is only
-/// handed off *after* it claims a slot, so the three pools' combined hard caps
+/// handed off *after* it claims a slot, so the four pools' combined hard caps
 /// already cap in-flight dispatches. This constant is deliberately derived from
 /// those caps rather than picked independently, so it is a backstop against
 /// unbounded task spawning (a future hand-off path that forgets to claim first)
@@ -204,7 +206,8 @@ const CUBE_REPO_ENSURE_TIMEOUT: Duration = crate::cube_op_budget::REPO_ENSURE;
 /// semaphore bind during exactly the workload this change exists to fix —
 /// draining a large backlog into a fully free pool — quietly reintroducing the
 /// head-of-line blocking one permit-width at a time.
-const MAX_INFLIGHT_DISPATCHES: usize = MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE + MAX_REVIEW_POOL_SIZE;
+const MAX_INFLIGHT_DISPATCHES: usize =
+    MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE + MAX_REVIEW_POOL_SIZE + MAX_PROGRESSION_POOL_SIZE;
 
 /// Backoff delays between successive pre-start retry attempts. Element N
 /// is the sleep before attempt N+2 (the first retry, the second retry, …).
@@ -489,6 +492,24 @@ pub struct ExecutionCoordinator {
     /// the main and automation pools.
     #[builder(default = WorkerPool::new_review(DEFAULT_REVIEW_POOL_SIZE))]
     review_pool: WorkerPool,
+    /// Dedicated pool for `progression` administrative agents. Its own small
+    /// pool (`progression.pool_size`) so a progression run never takes an
+    /// interactive slot: it is invisible to the interactive concurrency cap and
+    /// to Lower Decks spillover, nothing spills into it, and it honours the
+    /// operator and breaker pauses like every other non-review pool.
+    #[builder(default = WorkerPool::new_progression(
+        boss_engine_storage_values::progression::DEFAULT_POOL_SIZE
+    ))]
+    progression_pool: WorkerPool,
+    /// `true` once the engine can actually spawn a `progression` agent (the
+    /// progression worker kind exists and its tier is registered). Until then a
+    /// minted `progression` execution is held in `ready` rather than spawned:
+    /// without a worker kind of its own it would otherwise start as an ordinary
+    /// coding worker holding a repo checkout, which is exactly what the
+    /// progression design rules out. Off by default; the worker-kind task flips
+    /// it, and tests turn it on to exercise pool routing and admission.
+    #[builder(default = false)]
+    progression_spawn_enabled: bool,
     /// The local-host adapter. Retained as the `local` special case and
     /// the backing adapter for the default provider; the dispatch loop
     /// resolves the per-execution adapter through `host_adapter_provider`.

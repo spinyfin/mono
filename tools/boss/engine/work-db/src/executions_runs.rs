@@ -692,8 +692,13 @@ impl WorkDb {
     /// [`Self::list_critical_ready_execution_ids`].
     pub fn list_ready_executions(&self) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
+        // A progression run is ranked by how long its item has been stuck (the
+        // sweep mints oldest-stuck first, and `created_at` then `id` keep that
+        // order), not by the class of the item it is bound to: it competes only
+        // with other progression runs, for the progression pool's own slots.
         let class_case = format!(
             "CASE \
+               WHEN we.kind = 'progression' THEN 5 \
                WHEN t.kind = 'revision' AND t.created_via GLOB '{merge_conflict}*' THEN 1 \
                WHEN t.kind = 'revision' AND t.created_via GLOB '{ci_fix}*' THEN 2 \
                WHEN t.kind = 'revision' AND t.created_via GLOB '{pr_review}*' THEN 3 \

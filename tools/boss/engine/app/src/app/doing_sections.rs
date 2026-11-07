@@ -214,7 +214,8 @@ fn section_for_live_kind(kind: Option<&ExecutionKind>) -> DoingSection {
     match kind {
         Some(ExecutionKind::PrReview | ExecutionKind::PrReviewGuide) => DoingSection::Reviewing,
         // Coding includes all non-review work on an item, including design,
-        // investigation, automation triage and answering. An untyped live
+        // investigation, automation triage, answering and progression (an
+        // administrative agent is still an agent working the item). An untyped live
         // worker also stays visibly active rather than falsely claiming a wait.
         Some(
             ExecutionKind::TaskImplementation
@@ -226,7 +227,8 @@ fn section_for_live_kind(kind: Option<&ExecutionKind>) -> DoingSection {
             | ExecutionKind::ProductDesign
             | ExecutionKind::ProjectDesign
             | ExecutionKind::AutomationTriage
-            | ExecutionKind::AnswerAgent,
+            | ExecutionKind::AnswerAgent
+            | ExecutionKind::Progression,
         )
         | None => DoingSection::Coding,
     }

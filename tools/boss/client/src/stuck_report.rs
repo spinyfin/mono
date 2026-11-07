@@ -158,6 +158,8 @@ mod tests {
              waiting_on_capacity: 0\n\
              waiting_on_dependency: 0\n\
              parked_upstream: 0\n\
+             progression_in_flight: 0\n\
+             progression_failing: 0\n\
              engine_stuck: 1\n  \
              task_a  >=90s  S7_worker_failed:worker_failed  basis=declared_blocked  Stuck chore\n\
              Questions filed (last 60s): 4\n\

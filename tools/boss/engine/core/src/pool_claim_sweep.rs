@@ -206,6 +206,7 @@ impl TeardownRetries {
             coordinator.worker_pool(),
             coordinator.automation_worker_pool(),
             coordinator.review_worker_pool(),
+            coordinator.progression_worker_pool(),
         ] {
             claimed.extend(pool.claims().await.into_iter().map(|claim| claim.execution_id));
         }
@@ -345,6 +346,7 @@ pub async fn run_one_pass(
         (coordinator.worker_pool(), "main"),
         (coordinator.automation_worker_pool(), "automation"),
         (coordinator.review_worker_pool(), "review"),
+        (coordinator.progression_worker_pool(), "progression"),
     ] {
         for claim in pool.claims().await {
             // A live pane still backs this slot — the completion /

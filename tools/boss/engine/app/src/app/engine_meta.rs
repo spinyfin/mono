@@ -141,11 +141,12 @@ pub(super) async fn handle_worker_pool_summary(ctx: Dispatch, req: FrontendReque
             .map(|state| state.run_id)
             .collect();
 
-        let mut pools = Vec::with_capacity(3);
+        let mut pools = Vec::with_capacity(4);
         for (pool, name) in [
             (coordinator.worker_pool(), "main"),
             (coordinator.automation_worker_pool(), "automation"),
             (coordinator.review_worker_pool(), "review"),
+            (coordinator.progression_worker_pool(), "progression"),
         ] {
             let capacity = pool.capacity().await;
             let mut claims = Vec::new();

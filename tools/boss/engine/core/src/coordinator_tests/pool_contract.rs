@@ -7,11 +7,13 @@ async fn backend_pool_geometry_is_fixed() {
     assert_eq!(MAX_AUTOMATION_POOL_SIZE, 8);
     assert_eq!(MAX_REVIEW_POOL_SIZE, 16);
     assert_eq!(DEFAULT_REVIEW_POOL_SIZE, 16);
+    assert_eq!(MAX_PROGRESSION_POOL_SIZE, 4);
     assert_eq!(MAX_CONCURRENT_INTERACTIVE_WORKERS, 8);
     for (pool, prefix, first, last) in [
         (WorkerPool::new(100), "worker-", 1u8, 16u8),
         (WorkerPool::new_automation(100), "auto-worker-", 17, 24),
         (WorkerPool::new_review(100), "review-", 25, 40),
+        (WorkerPool::new_progression(100), "progression-", 41, 44),
     ] {
         assert_eq!(pool.capacity().await, usize::from(last - first + 1));
         for slot in first..=last {

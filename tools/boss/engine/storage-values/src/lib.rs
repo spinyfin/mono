@@ -13,6 +13,7 @@ pub mod merge_mechanism;
 pub mod merge_parent_signoff;
 pub mod pool_policy;
 pub mod postmortem_brief;
+pub mod progression;
 
 mod semantic_progress;
 pub use semantic_progress::{

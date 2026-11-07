@@ -136,6 +136,7 @@ pub fn declaration_horizon_secs(kind: &ExecutionKind) -> i64 {
         | ExecutionKind::PrReviewGuide
         | ExecutionKind::ProductDesign
         | ExecutionKind::ProjectDesign
+        | ExecutionKind::Progression
         | ExecutionKind::TaskImplementation => DEFAULT_DECLARATION_HORIZON_SECS,
     }
 }

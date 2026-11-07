@@ -671,6 +671,7 @@ mod tests {
     }
 
     fn drop_audit_ledger(conn: &rusqlite::Connection) {
+        crate::progression_candidates::drop_views(conn).unwrap();
         for property in ["status", "blocked_reason", "dispatch_failed_reason", "autostart"] {
             conn.execute_batch(&format!(
                 "DROP TRIGGER IF EXISTS task_status_audit_insert_{property};

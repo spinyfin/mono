@@ -9,7 +9,9 @@ pub(super) use crate::coordinator::*;
 // Items the coordinator module uses internally but does not re-export; the
 // integration tests name them directly.
 pub(super) use boss_engine_storage_values::Host;
-pub(super) use boss_engine_storage_values::pool_policy::{AUTOMATION_WORKER_ID_PREFIX, REVIEW_WORKER_ID_PREFIX};
+pub(super) use boss_engine_storage_values::pool_policy::{
+    AUTOMATION_WORKER_ID_PREFIX, PROGRESSION_WORKER_ID_PREFIX, REVIEW_WORKER_ID_PREFIX,
+};
 pub(super) use boss_event_bus::{Event, EventKind, TopicFilter};
 pub(super) use boss_execution_contracts::{HostAdapter, HostAdapterProvider, LocalHostAdapterProvider};
 pub(super) use boss_protocol::{ExecutionKind, PauseReason};

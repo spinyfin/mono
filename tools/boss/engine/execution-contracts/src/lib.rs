@@ -40,7 +40,9 @@ use boss_engine_recovery::execution_bookmark::{
     self, ExecutionBookmark, PreserveOutcome, PreservedTip, WorkspaceTipSource,
 };
 use boss_engine_storage_values::Host;
-use boss_engine_storage_values::pool_policy::{AUTOMATION_WORKER_ID_PREFIX, REVIEW_WORKER_ID_PREFIX};
+use boss_engine_storage_values::pool_policy::{
+    AUTOMATION_WORKER_ID_PREFIX, PROGRESSION_WORKER_ID_PREFIX, REVIEW_WORKER_ID_PREFIX,
+};
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_host_execution::recovery_pr::{ClosedRecoveryPr, fetch_recovery_pr_base};
 pub use boss_host_execution::types::{
@@ -354,7 +356,9 @@ pub const MAX_WORKER_POOL_SIZE: usize = WORKER_PAGE_SIZE * WORKER_PAGE_COUNT;
 /// pool.
 pub const MAX_AUTOMATION_POOL_SIZE: usize = 8;
 
-pub use boss_engine_storage_values::pool_policy::{DEFAULT_REVIEW_POOL_SIZE, MAX_REVIEW_POOL_SIZE};
+pub use boss_engine_storage_values::pool_policy::{
+    DEFAULT_REVIEW_POOL_SIZE, MAX_PROGRESSION_POOL_SIZE, MAX_REVIEW_POOL_SIZE,
+};
 
 /// Outcome of an engine-direct `cube workspace rebase` (rung 1 of the
 /// merge-conflict escalation ladder — see
@@ -686,6 +690,15 @@ impl WorkerPool {
     /// automation-pool slots. Capped at [`MAX_REVIEW_POOL_SIZE`].
     pub fn new_review(size: usize) -> Self {
         Self::new_with_prefix(size, REVIEW_WORKER_ID_PREFIX, MAX_REVIEW_POOL_SIZE)
+    }
+
+    /// Construct the progression pool. Slots are named `progression-N` so
+    /// `pool_for_worker_id` routes their release to this pool and nothing
+    /// counts them as interactive capacity. Capped at
+    /// [`MAX_PROGRESSION_POOL_SIZE`]; nothing spills into it and it spills into
+    /// nothing.
+    pub fn new_progression(size: usize) -> Self {
+        Self::new_with_prefix(size, PROGRESSION_WORKER_ID_PREFIX, MAX_PROGRESSION_POOL_SIZE)
     }
 
     fn new_with_prefix(size: usize, prefix: &'static str, hard_cap: usize) -> Self {
@@ -1082,12 +1095,15 @@ impl WorkerPool {
 /// Regular-pool `worker-{N}` ids map directly to slot N.
 /// Automation-pool `auto-worker-{N}` ids map to slot
 /// `N + MAX_WORKER_POOL_SIZE`; review-pool `review-{N}` ids map to
-/// slot `N + MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE` so the
-/// three pools occupy disjoint slot ranges. With the current geometry
+/// slot `N + MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE`; progression-pool
+/// `progression-{N}` ids map to slot
+/// `N + MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE + MAX_REVIEW_POOL_SIZE`,
+/// so the four pools occupy disjoint slot ranges. With the current geometry
 /// (`MAX_WORKER_POOL_SIZE = 16`) that is `1..=16` interactive (Bridge
 /// Crew 1..=8, Lower Decks 9..=16), `17..=24` automation, `25..=40`
-/// review — so "auto-worker-1" → slot 17, "review-1" → slot 25, never
-/// colliding with another pool's range. Every boundary is derived from
+/// review, `41..=44` progression — so "auto-worker-1" → slot 17,
+/// "review-1" → slot 25, "progression-1" → slot 41, never colliding with
+/// another pool's range. Every boundary is derived from
 /// the pool-size constants, so bumping [`WORKER_PAGE_COUNT`] shifts the
 /// automation/review ranges up in lock-step on both the engine and app.
 ///
@@ -1096,6 +1112,10 @@ impl WorkerPool {
 /// `None` as a programming error — the only producer is
 /// [`WorkerPool::claim_worker`].
 pub fn slot_id_from_worker_id(worker_id: &str) -> Option<u8> {
+    if let Some(suffix) = worker_id.strip_prefix(PROGRESSION_WORKER_ID_PREFIX) {
+        let ordinal = suffix.parse::<u8>().ok().filter(|n| *n >= 1)? as usize;
+        return u8::try_from(ordinal + MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE + MAX_REVIEW_POOL_SIZE).ok();
+    }
     if let Some(suffix) = worker_id.strip_prefix(REVIEW_WORKER_ID_PREFIX) {
         let ordinal = suffix.parse::<u8>().ok().filter(|n| *n >= 1)? as usize;
         return u8::try_from(ordinal + MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE).ok();
@@ -1120,8 +1140,9 @@ pub use boss_engine_storage_values::pool_policy::{
 /// (1..=MAX_WORKER_POOL_SIZE) produce `"worker-{N}"`; automation-pool
 /// slots (MAX_WORKER_POOL_SIZE < slot ≤ MAX_WORKER_POOL_SIZE +
 /// MAX_AUTOMATION_POOL_SIZE) produce `"auto-worker-{M}"`; review-pool
-/// slots (beyond that) produce `"review-{M}"`, where M is the slot's
-/// offset from the start of the owning pool's range. Callers that
+/// slots (the next [`MAX_REVIEW_POOL_SIZE`]) produce `"review-{M}"`, and
+/// progression-pool slots (beyond that) produce `"progression-{M}"`, where M
+/// is the slot's offset from the start of the owning pool's range. Callers that
 /// release a pane slot must use this instead of
 /// [`WorkerPool::worker_id_for_slot`] to ensure the release is
 /// routed to the correct pool.
@@ -1131,11 +1152,17 @@ pub fn worker_id_for_slot(slot_id: u8) -> String {
         format!("worker-{}", slot_id)
     } else if slot <= MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE {
         format!("{}{}", AUTOMATION_WORKER_ID_PREFIX, slot - MAX_WORKER_POOL_SIZE)
-    } else {
+    } else if slot <= MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE + MAX_REVIEW_POOL_SIZE {
         format!(
             "{}{}",
             REVIEW_WORKER_ID_PREFIX,
             slot - MAX_WORKER_POOL_SIZE - MAX_AUTOMATION_POOL_SIZE
+        )
+    } else {
+        format!(
+            "{}{}",
+            PROGRESSION_WORKER_ID_PREFIX,
+            slot - MAX_WORKER_POOL_SIZE - MAX_AUTOMATION_POOL_SIZE - MAX_REVIEW_POOL_SIZE
         )
     }
 }
@@ -2057,6 +2084,33 @@ mod tests {
                 "slot {slot} must produce a review-pool worker_id, got {back:?}"
             );
         }
+    }
+
+    #[test]
+    fn progression_pool_slots_follow_the_review_range_and_round_trip() {
+        // progression-N maps past the interactive (16), automation (8) and
+        // review (16) ranges, so it never collides with another pool.
+        let review_ceiling = MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE + MAX_REVIEW_POOL_SIZE;
+        for ordinal in 1u8..=MAX_PROGRESSION_POOL_SIZE as u8 {
+            let wid = format!("progression-{ordinal}");
+            let slot = slot_id_from_worker_id(&wid).unwrap();
+            assert_eq!(slot as usize, review_ceiling + ordinal as usize);
+            assert_eq!(worker_id_for_slot(slot), wid);
+            assert_eq!(
+                worker_page_label(slot),
+                None,
+                "no interactive page for a progression slot"
+            );
+            assert_eq!(pool_dispatch_policy_for_worker_id(&wid), None);
+        }
+        assert_eq!(slot_id_from_worker_id("progression-0"), None);
+        assert_eq!(slot_id_from_worker_id("progression-"), None);
+        assert_eq!(slot_id_from_worker_id("progression-abc"), None);
+        // The last review slot is still a review slot.
+        assert_eq!(
+            worker_id_for_slot(review_ceiling as u8),
+            format!("review-{MAX_REVIEW_POOL_SIZE}")
+        );
     }
 
     #[test]

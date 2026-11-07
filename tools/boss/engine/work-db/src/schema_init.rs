@@ -698,6 +698,9 @@ mod floor_tests {
         preserved_work::migrate_lease_boundary(&expected).unwrap();
         preserved_work::migrate_lease_generation(&expected).unwrap();
         super::super::parking::migrate(&expected).unwrap();
+        super::super::progression_candidates::migrate_grace_column(&expected).unwrap();
+        super::super::progression_candidates::migrate_execution_provenance(&expected).unwrap();
+        super::super::progression_candidates::migrate_views(&expected).unwrap();
         super::super::spoke_hub::migrate(&expected).unwrap();
         super::super::parking::migrate_membership(&expected).unwrap();
         execution_bookmarks::migrate_has_recovery_head(&expected).unwrap();

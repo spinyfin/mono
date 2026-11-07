@@ -414,7 +414,9 @@ impl WorkDb {
                  dispatch_failed_reason = ?2,
                  dispatch_failed_error = ?3,
                  dispatch_failed_at = ?4,
-                 updated_at = ?4
+                 updated_at = ?4,
+                 progression_grace_waived_at = CASE WHEN ?2 = 'deliberate_park' THEN strftime('%s','now')
+                                                    ELSE progression_grace_waived_at END
              WHERE id = ?1
                AND status IN ('todo', 'active')
                AND deleted_at IS NULL",
@@ -1099,7 +1101,7 @@ impl WorkDb {
         conn.query_row(
             "SELECT COUNT(*) FROM work_executions
               WHERE work_item_id = ?1
-                AND (?2 IS NULL OR kind = ?2)
+                AND (kind = ?2 OR (?2 IS NULL AND kind <> 'progression'))
                 AND status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
                 AND CAST(created_at AS INTEGER) >= ?3",
             params![work_item_id, kind.map(|k| k.as_str()), since_epoch_secs],
@@ -1123,7 +1125,7 @@ impl WorkDb {
         let mut stmt = conn.prepare(
             "SELECT id FROM work_executions
               WHERE work_item_id = ?1
-                AND (?2 IS NULL OR kind = ?2)
+                AND (kind = ?2 OR (?2 IS NULL AND kind <> 'progression'))
                 AND status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
                 AND CAST(created_at AS INTEGER) >= ?3
               ORDER BY created_at DESC, id DESC",
@@ -1161,7 +1163,11 @@ impl WorkDb {
     /// Every execution `kind` counts, matching the orphan sweep's own
     /// `kind = None` trailing-window count: that sweep redispatches the
     /// work item, not a particular kind, so every dead run on the row is
-    /// evidence about the row.
+    /// evidence about the row. The one exception is `progression`: it is the
+    /// engine's own administrative run bound to the stuck item, not an attempt
+    /// at the item's work, so a progression run neither strikes the item nor
+    /// (by completing) resets its streak. Progression keeps its own failure
+    /// accounting (`progression_candidates`).
     pub fn list_consecutive_unproductive_terminal_execution_ids(&self, work_item_id: &str) -> Result<Vec<String>> {
         self.list_consecutive_unproductive_terminal_execution_ids_since(work_item_id, None)
     }
@@ -1180,7 +1186,7 @@ impl WorkDb {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT id, status, CAST(created_at AS INTEGER) FROM work_executions
-              WHERE work_item_id = ?1
+              WHERE work_item_id = ?1 AND kind <> 'progression'
               ORDER BY created_at DESC, id DESC",
         )?;
         let rows = stmt.query_map(params![work_item_id], |row| {

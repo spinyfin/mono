@@ -33,6 +33,7 @@ mod hosts;
 mod logs;
 mod pause;
 mod probe;
+mod progression;
 mod proposals;
 mod review;
 mod selected_product;

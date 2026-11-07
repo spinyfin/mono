@@ -64,11 +64,14 @@ pub(super) fn build(
     let mut stmt = conn.prepare(
         "SELECT id FROM tasks t WHERE deleted_at IS NULL AND status NOT IN ('done','archived')
          AND NOT EXISTS (SELECT 1 FROM work_executions e WHERE e.work_item_id = t.id
-                         AND e.status IN ('claimed','running')) ORDER BY id",
+                         AND e.kind <> 'progression' AND e.status IN ('claimed','running')) ORDER BY id",
     )?;
     let ids = stmt
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    // The progression footprint of every item, read once: a per-item read would
+    // evaluate the view once for each stuck item in the report.
+    let progression_runs = super::progression_candidates::run_states(conn)?;
     let mut rows = Vec::new();
     let mut unconverted = 0;
     for id in ids {
@@ -141,9 +144,24 @@ pub(super) fn build(
         if age < minimum_age_secs {
             continue;
         }
+        // A progression run is not an attempt at the item's work, so the latest
+        // execution above skips it. A progression run that is queued behind a
+        // pause or a full pool still explains why nothing is moving, though.
+        let progression_wait: Option<String> = conn
+            .query_row(
+                "SELECT dispatch_wait_reason FROM work_executions
+                 WHERE work_item_id = ?1 AND kind = 'progression' AND status IN ('queued', 'ready')
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+                [&id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
         let capacity = wait
-            .as_deref()
-            .is_some_and(boss_engine_storage_values::dispatch_wait::is_capacity_wait_reason);
+            .iter()
+            .chain(progression_wait.iter())
+            .any(|reason| boss_engine_storage_values::dispatch_wait::is_capacity_wait_reason(reason));
+        let progression = progression_runs.get(&id).copied().unwrap_or_default();
         let classification = classification(conn, &task, wait.as_deref())?;
         let dependency =
             task.blocked_reason.as_deref() == Some("dependency") && progressing_prerequisite(conn, &id, now)?;
@@ -161,6 +179,16 @@ pub(super) fn build(
             StuckBucket::WaitingOnCapacity
         } else if dependency {
             StuckBucket::WaitingOnDependency
+        } else if progression.infrastructure_failing {
+            // Progression could not unstick the item: its last runs ended in
+            // infrastructure failure, so the sweep no longer nominates it. The
+            // engine has admitted defeat; this counts as waiting on a human.
+            StuckBucket::ProgressionFailing
+        } else if progression.live || progression.in_cooldown {
+            // An agent is working the item, or has just been and the item is
+            // inside the cooldown that follows a run (four times as long after a
+            // run that judged the item not stuck).
+            StuckBucket::ProgressionInFlight
         } else if super::stuck_activity::has_pending_execution(conn, &id)?
             || (super::stuck_activity::has_waiting_dependency_execution(conn, &id)?
                 && progressing_prerequisite(conn, &id, now)?)

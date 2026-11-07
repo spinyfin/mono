@@ -982,7 +982,7 @@ impl ExecutionCoordinator {
     /// immediately (queue empty + pending wakeup) or yield (pool
     /// exhausted).
     /// Drain the `ready` execution queue, routing each execution to the
-    /// correct pool (main, automation, or review). Per-pool exhaustion is
+    /// correct pool (main, automation, review, or progression). Per-pool exhaustion is
     /// handled independently: a full pool does not block dispatch on the
     /// other pools.
     ///
@@ -1111,9 +1111,12 @@ impl ExecutionCoordinator {
             let now_secs = boss_engine_utils::epoch_time::now_epoch_secs();
             let mut snapshot = crate::dispatch_metrics::QueueSnapshot::default();
             for execution in &executions {
+                let is_progression = self.execution_targets_progression_pool(execution);
                 let is_review = self.execution_targets_review_pool(execution);
                 let is_automation = !is_review && self.execution_targets_automation_pool(execution);
-                let sample = if is_review {
+                let sample = if is_progression {
+                    &mut snapshot.progression
+                } else if is_review {
                     &mut snapshot.review
                 } else if is_automation {
                     &mut snapshot.automation
@@ -1235,6 +1238,7 @@ impl ExecutionCoordinator {
         let mut main_pool_exhausted = false;
         let mut auto_pool_exhausted = false;
         let mut review_pool_exhausted = false;
+        let mut progression_pool_exhausted = false;
         // Automation rows whose home pool was full. Placed onto free Lower
         // Decks slots in pass 2, after every mainline/review row has had
         // its claim attempt. Queue order is preserved.
@@ -1272,7 +1276,9 @@ impl ExecutionCoordinator {
             for execution in executions.iter().filter(|e| !out_of_focus.contains(&e.id)) {
                 let is_review = self.execution_targets_review_pool(execution);
                 let is_automation = !is_review && self.execution_targets_automation_pool(execution);
-                let label = if is_review {
+                let label = if self.execution_targets_progression_pool(execution) {
+                    "progression"
+                } else if is_review {
                     "review"
                 } else if is_automation {
                     "automation"
@@ -1289,14 +1295,20 @@ impl ExecutionCoordinator {
             // Classify the target pool. Review is checked first (and excludes
             // the others) so a reviewer of an automation-produced task is
             // counted against the review pool, not the automation pool.
+            let is_progression = self.execution_targets_progression_pool(&execution);
             let is_review = self.execution_targets_review_pool(&execution);
             let is_automation = !is_review && self.execution_targets_automation_pool(&execution);
-            let is_main = !is_review && !is_automation;
+            // A progression run is none of main, review, or automation: it
+            // never counts against the interactive cap, never spills into
+            // Lower Decks, and nothing spills into its pool.
+            let is_main = !is_review && !is_automation && !is_progression;
             // The `critical` exemptions apply to interactive (main-pool)
-            // work only: review and automation rows are governed by their
-            // own pools and are never held by the cap this bypasses.
+            // work only: review, automation and progression rows are governed
+            // by their own pools and are never held by the cap this bypasses.
             let is_critical = is_main && critical_ids.contains(&execution.id);
-            let pool_label = if is_review {
+            let pool_label = if is_progression {
+                "progression"
+            } else if is_review {
                 "review"
             } else if is_automation {
                 "automation"
@@ -1392,6 +1404,23 @@ impl ExecutionCoordinator {
                 continue;
             }
 
+            // A `progression` row cannot spawn until the engine has a
+            // progression worker kind: spawned today it would be an ordinary
+            // coding worker with a repo checkout, which is exactly what the
+            // administrative agent must never be. Hold it `ready`, before any
+            // slot, lease or pane is touched. Operator-forced rows get no
+            // exemption: forcing the dispatch of a row that has no agent to run
+            // would only fail it, and that failure would be recorded against
+            // the stuck item it is meant to help.
+            if is_progression && !self.progression_spawn_enabled {
+                changed_waits.extend(self.record_dispatch_wait_reason(
+                    &execution,
+                    DISPATCH_WAIT_REASON_PROGRESSION_UNAVAILABLE,
+                    None,
+                ));
+                continue;
+            }
+
             // Skip executions for pools we already know are full.
             // They remain `ready` and will be retried on the next kick.
             //
@@ -1405,6 +1434,14 @@ impl ExecutionCoordinator {
             // leave the rest of Lower Decks idle. The redundant home claim
             // this costs is one in-memory mutex acquisition per row.
             if is_review && review_pool_exhausted {
+                changed_waits.extend(self.record_dispatch_wait_reason(
+                    &execution,
+                    DISPATCH_WAIT_REASON_POOL_EXHAUSTED,
+                    None,
+                ));
+                continue;
+            }
+            if is_progression && progression_pool_exhausted {
                 changed_waits.extend(self.record_dispatch_wait_reason(
                     &execution,
                     DISPATCH_WAIT_REASON_POOL_EXHAUSTED,
@@ -1950,7 +1987,9 @@ impl ExecutionCoordinator {
                     None,
                 ));
 
-                if is_review {
+                if is_progression {
+                    progression_pool_exhausted = true;
+                } else if is_review {
                     review_pool_exhausted = true;
                 } else {
                     main_pool_exhausted = true;
@@ -2087,7 +2126,7 @@ impl ExecutionCoordinator {
         // All deferred pickup claims have dropped before clients refetch their runtime.
         self.publish_dispatch_runtime_changed(&changed_waits, "dispatch_wait_changed")
             .await;
-        if main_pool_exhausted || auto_pool_exhausted || review_pool_exhausted {
+        if main_pool_exhausted || auto_pool_exhausted || review_pool_exhausted || progression_pool_exhausted {
             DrainOutcome::PoolExhausted
         } else {
             DrainOutcome::QueueEmpty

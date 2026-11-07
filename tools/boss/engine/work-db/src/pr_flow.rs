@@ -43,6 +43,19 @@ macro_rules! worker_failure_basis_variants {
     };
 }
 
+impl WorkerFailureBasis {
+    /// Whether a failure with this basis is a worker's declared blocker that
+    /// was never turned into a typed question (design section 2.9): the worker
+    /// stopped and asked for a human without saying what it needs. Such a row
+    /// is not a hold; it is a progression candidate with the
+    /// `progression.stuck_after` grace waived, so it is picked up within one
+    /// sweep interval. The other bases are real failures that age like any other
+    /// stuck state, and `OperatorNo` is the owner's recorded refusal.
+    pub fn waives_progression_grace(self) -> bool {
+        matches!(self, Self::DeclaredBlocked | Self::NudgeBreaker)
+    }
+}
+
 worker_failure_basis_variants! {
     NudgeBreaker => "nudge_breaker",
     DeclaredBlocked => "declared_blocked",
@@ -656,13 +669,19 @@ impl WorkDb {
                 )?);
             }
             (Some(task), _) if matches!(task.status, TaskStatus::Active | TaskStatus::Todo) => {
+                // A declared blocker with no typed question waives the progression
+                // grace in the same statement, with the database clock, so the
+                // stamp is never older than the ledger row the same statement
+                // writes (the candidate views compare the two).
                 crate::task_status_audit::execute(
                     &tx,
                     basis.as_str(),
                     "engine",
                     "UPDATE tasks
                      SET status = 'blocked', blocked_reason = ?4, blocked_detail = ?2,
-                         autostart = 0, last_status_actor = 'engine', updated_at = ?3
+                         autostart = 0, last_status_actor = 'engine', updated_at = ?3,
+                         progression_grace_waived_at = CASE WHEN ?5 THEN strftime('%s','now')
+                                                            ELSE progression_grace_waived_at END
                      WHERE id = ?1 AND deleted_at IS NULL AND status IN ('active', 'todo')",
                     params![
                         work_item_id,
@@ -672,7 +691,8 @@ impl WorkDb {
                             "awaiting_operator_answer"
                         } else {
                             "worker_failed"
-                        }
+                        },
+                        question.is_none() && basis.waives_progression_grace(),
                     ],
                 )?;
             }
@@ -686,14 +706,27 @@ impl WorkDb {
                     Some(existing) => format!("{existing}\n\n{trimmed}"),
                     None => trimmed.to_owned(),
                 };
+                // A repeat observation of a declared blocker is a fresh episode for
+                // the ledger (see `task_status_audit::install_property_triggers`),
+                // so it re-arms the grace waiver too.
                 crate::task_status_audit::execute(
                     &tx,
                     basis.as_str(),
                     "engine",
                     "UPDATE tasks
-                     SET blocked_detail = ?2, updated_at = ?3, blocked_reason = ?4
+                     SET blocked_detail = ?2, updated_at = ?3, blocked_reason = ?4,
+                         progression_grace_waived_at = CASE WHEN ?5 THEN strftime('%s','now')
+                                                            ELSE progression_grace_waived_at END
                      WHERE id = ?1 AND deleted_at IS NULL AND status = 'blocked' AND blocked_reason IS NOT NULL",
-                    params![work_item_id, folded, now, task.blocked_reason.as_deref()],
+                    params![
+                        work_item_id,
+                        folded,
+                        now,
+                        task.blocked_reason.as_deref(),
+                        question.is_none()
+                            && basis.waives_progression_grace()
+                            && task.blocked_reason.as_deref() == Some("worker_failed"),
+                    ],
                 )?;
             }
             _ => {}

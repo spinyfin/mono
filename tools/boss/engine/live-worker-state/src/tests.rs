@@ -154,6 +154,10 @@ fn attributed_pool_label_matches_coordinator_routing() {
         attributed_pool_label(ExecutionKind::RevisionImplementation, false),
         "main"
     );
+    // A progression run is its own pool even when the stuck item it is bound to
+    // came from an automation.
+    assert_eq!(attributed_pool_label(ExecutionKind::Progression, false), "progression");
+    assert_eq!(attributed_pool_label(ExecutionKind::Progression, true), "progression");
 }
 
 /// The badge type (`AgentType::for_execution`) and the pool stamped on the same
@@ -173,6 +177,7 @@ fn agent_type_agrees_with_attributed_pool_label_for_every_kind() {
         ExecutionKind::PrReviewGuide,
         ExecutionKind::ProductDesign,
         ExecutionKind::ProjectDesign,
+        ExecutionKind::Progression,
         ExecutionKind::RevisionImplementation,
         ExecutionKind::TaskImplementation,
     ];
@@ -189,6 +194,7 @@ fn agent_type_agrees_with_attributed_pool_label_for_every_kind() {
             | ExecutionKind::PrReviewGuide
             | ExecutionKind::ProductDesign
             | ExecutionKind::ProjectDesign
+            | ExecutionKind::Progression
             | ExecutionKind::RevisionImplementation
             | ExecutionKind::TaskImplementation => {}
         }
@@ -202,9 +208,11 @@ fn agent_type_agrees_with_attributed_pool_label_for_every_kind() {
                 pool == "review",
                 "review split diverged for {kind:?} (automation={has_source_automation})"
             );
+            // A progression run is badged as automation (no human asked for it)
+            // until the app grows a dedicated badge, but it reports its own pool.
             assert_eq!(
                 agent_type == AgentType::Automation,
-                pool == "automation",
+                matches!(pool, "automation" | "progression"),
                 "automation split diverged for {kind:?} (automation={has_source_automation})"
             );
         }
