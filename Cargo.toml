@@ -39,6 +39,7 @@ members = [
   "tools/boss/engine/merge-poller",
   "tools/boss/engine/single-flight",
   "tools/boss/engine/spoke-journal",
+  "tools/boss/engine/spoke-preflight",
   "tools/boss/engine/spoke-outbound",
   "tools/boss/engine/spoke",
   "tools/boss/engine/host-execution",
@@ -82,6 +83,7 @@ members = [
   "tools/boss/protocol-spoke",
   "tools/boss/shell-quote",
   "tools/boss/spoke-credentials",
+  "tools/boss/spoke-package",
   "tools/boss/engine/ssh-transport",
   "tools/boss/engine/stdout-progress",
   "tools/boss/engine/storage-values",
@@ -169,6 +171,9 @@ rcgen = { version = "0.14.10", default-features = false, features = [
   "x509-parser",
 ] }
 rayon = "1.10"
+# Ed25519 for the signed spoke release manifest: sign in the release step,
+# verify on the host. Already in the graph through rustls and rcgen.
+ring = "0.17.14"
 rsa = "0.9"
 regex = "1.11.1"
 reqwest = { version = "0.13.2", default-features = false, features = ["rustls-no-provider"] }

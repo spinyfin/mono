@@ -1,0 +1,91 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+# Signed spoke packages: the manifest and signature format, the package archive,
+# the launchd/systemd definitions and the idempotent installer. The `boss-spoke`
+# daemon is bundled by the release step, not linked: this package depends on
+# the daemon's readiness checks only.
+rust_library(
+    name = "spoke-package",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    compile_data = glob(["service/*.in"]),
+    crate_name = "boss_spoke_package",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = ["//tools/boss/engine/spoke-preflight"] + all_crate_deps(normal = True),
+)
+
+# Run on the worker host by the person installing; also bundled into each
+# platform package so a reinstall can use the previously installed copy.
+rust_binary(
+    name = "boss-spoke-package",
+    srcs = ["src/main.rs"],
+    crate_root = "src/main.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = [
+        ":spoke-package",
+        "//tools/boss/engine/spoke-preflight",
+    ] + all_crate_deps(normal = True),
+)
+
+# Signature, digest, platform and archive-safety checks.
+rust_test(
+    name = "verification_test",
+    size = "small",
+    srcs = ["tests/verification.rs"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [":spoke-package"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# The installer against a staging root, with the real installed binaries.
+rust_test(
+    name = "install_test",
+    size = "small",
+    srcs = ["tests/install.rs"],
+    data = [
+        ":boss-spoke-package",
+        "//tools/boss/engine/spoke:boss-spoke",
+    ],
+    edition = "2024",
+    env = {
+        "INSTALLER_BIN": "$(rootpath :boss-spoke-package)",
+        "SPOKE_BIN": "$(rootpath //tools/boss/engine/spoke:boss-spoke)",
+    },
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [":spoke-package"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "spoke-package_test",
+    size = "small",
+    crate = ":spoke-package",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

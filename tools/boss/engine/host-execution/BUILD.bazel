@@ -18,6 +18,7 @@ rust_library(
         "//tools/boss/engine/execution-contracts:__pkg__",
         "//tools/boss/engine/execution-runner:__pkg__",
         "//tools/boss/engine/spoke:__pkg__",
+        "//tools/boss/engine/spoke-preflight:__pkg__",
         "//tools/boss/engine/work-db:__pkg__",
     ],
     deps = [
