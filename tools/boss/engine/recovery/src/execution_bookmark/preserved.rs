@@ -631,6 +631,9 @@ pub async fn preserve_from(
 ) -> Result<PreserveOutcome> {
     let resolved = workspace_tip(jj, record, workspace, since_unix, tip_source).await?;
     let unclaimed = resolved.unclaimed;
+    let live = matches!(tip_source, WorkspaceTipSource::Live)
+        .then(|| resolved.commit.clone())
+        .flatten();
     let mut outcome = preserve_resolved(jj, record, workspace, recorded, tip_source, resolved.commit).await?;
     if let Some(first) = unclaimed.first() {
         let note = unclaimed
@@ -656,6 +659,18 @@ pub async fn preserve_from(
                 });
             }
         }
+    }
+    if let (Some(commit), Some(inspect)) = (live, outcome.inspect.as_mut())
+        && inspect.workspace_change_id.is_some()
+        && inspect.workspace_count.is_some_and(|count| count > 0)
+    {
+        // Keep the owned live tip separately when the primary name retains
+        // unrelated work. Repositioning requires this write to succeed.
+        let name = preserved_archive_name(&record.execution_id, &commit);
+        point_bookmark(jj, &record.repo_path, &name, &commit, false).await?;
+        inspect
+            .reason
+            .push_str(&format!("; live workspace retained at {name} ({commit})"));
     }
     Ok(outcome)
 }
