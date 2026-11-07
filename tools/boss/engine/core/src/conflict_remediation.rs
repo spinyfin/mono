@@ -247,7 +247,10 @@ impl LadderRemediationJob {
         // The owner may have parked the row while this job waited for its turn
         // (or while the ladder held a lease): a parked row atrophies, so no
         // further rebase or worker is spent on it.
-        if crate::merge_poller::candidate_is_parked(&self.work_db, candidate) {
+        if self
+            .work_db
+            .is_parked_or_assume_not(&candidate.work_item_id, "conflict_remediation")
+        {
             return Some("work item was parked while the remediation was queued".to_owned());
         }
         match self.pr_checker.check(&candidate.pr_url) {

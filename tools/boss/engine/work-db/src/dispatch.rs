@@ -434,8 +434,9 @@ impl WorkDb {
         let conn = self.connect()?;
         let now_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
         let cutoff = now_secs - min_age_secs;
-        // A parked row's stale failure stamp says nothing about now: un-park
-        // reconciliation clears it, so the sweep must not retry it meanwhile.
+        // A parked row's stale failure stamp says nothing about now: the sweep
+        // must not retry a parked row, and it re-enters this listing once
+        // un-parked.
         let upkeep = super::parking::upkeep_eligible_task_sql("t");
         let mut stmt = conn.prepare(&format!(
             "SELECT t.id FROM tasks t

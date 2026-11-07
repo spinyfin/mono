@@ -65,7 +65,7 @@ fn auto_pr_maintenance_disabled(work_db: &WorkDb, candidate: &PendingMergeCheck,
     // A parked row atrophies: conflict resolution (including the mechanical
     // rebase rung it hands to the ladder) is upkeep, so every entry point
     // that shares this gate leaves the row alone until it is un-parked.
-    if crate::merge_poller::candidate_is_parked(work_db, candidate) {
+    if work_db.is_parked_or_assume_not(&candidate.work_item_id, "conflict_watch") {
         tracing::debug!(
             work_item_id = %candidate.work_item_id,
             pr_url = %candidate.pr_url,

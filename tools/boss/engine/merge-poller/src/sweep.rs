@@ -1251,7 +1251,7 @@ pub(crate) async fn sweep_one(
     let mut known_active_queue_failure: Option<Option<CiRemediation>> = None;
     // Read before any transition: a merge moves the row to `done`, after which
     // it no longer reads as parked.
-    let parked = crate::parked::candidate_is_parked(work_db, candidate);
+    let parked = work_db.is_parked_or_assume_not(&candidate.work_item_id, "merge poller sweep");
     match &probe_result.state {
         PrLifecycleState::Merged => {
             match work_db.retire_github_merge_intent(&candidate.work_item_id, &candidate.pr_url, "merged") {
@@ -1292,18 +1292,23 @@ pub(crate) async fn sweep_one(
             // and a scheduler kick, never a worker spawn, so it cannot make
             // the merge poller's sweep pass block on the reviewer actually
             // running.
-            if !parked {
-                maybe_trigger_post_merge_review(work_db, publisher, candidate, &probe_result).await;
-            }
+            //
+            // Runs for a parked row too: the merge is a terminal fact, the row
+            // is `done` now and no later path would trigger this review, so
+            // skipping it would drop the review permanently.
+            maybe_trigger_post_merge_review(work_db, publisher, candidate, &probe_result).await;
         }
         // A parked row atrophies: merged and closed-unmerged are recorded
-        // (those arms), but nothing is done about an open PR until un-park.
+        // (those arms), but no remediation or other upkeep runs for an open PR
+        // while parked. The poll-state columns are only indicators (they mint
+        // nothing), so they are still refreshed to keep the badges truthful.
         PrLifecycleState::Open(_) if parked => {
             tracing::debug!(
                 work_item_id = %candidate.work_item_id,
                 pr_url = %candidate.pr_url,
                 "merge poller: row is parked; skipping open-PR upkeep",
             );
+            update_pr_poll_state(work_db, publisher, candidate, &probe_result, None, caller).await;
             return;
         }
         PrLifecycleState::Open(open) => {

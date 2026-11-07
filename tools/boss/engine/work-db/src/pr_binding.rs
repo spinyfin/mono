@@ -177,8 +177,8 @@ impl WorkDb {
         // lookups below take their own.
         let selected = {
             let conn = self.connect()?;
-            // A parked row's binding is left as it is until un-park: repair is
-            // upkeep, and the un-park reconciliation re-checks it.
+            // A parked row's binding is left as it is while parked: repair is
+            // upkeep, and the row re-enters this listing once un-parked.
             let upkeep = super::parking::upkeep_eligible_task_sql("t");
             let mut stmt = conn.prepare(&format!(
                 "SELECT t.id, t.product_id, t.status, t.pr_url, t.origin_pr_number, t.doc_branch,

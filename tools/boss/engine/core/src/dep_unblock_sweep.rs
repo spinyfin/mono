@@ -25,15 +25,11 @@
 //!
 //! ## Observed incident (2026-05-13)
 //!
-//! T335 (`task_18af2d6114d16c70_26`, "Bazel installer rule + payload
-//! assembly") was blocked on T343 (`task_18af317331d4b960_1`, "Fix
-//! critical scoping bug: boss uninstall …"). T343 transitioned to
-//! `status=done` at 2026-05-13 19:33:09 Z (PR #424). T335 remained
-//! `status=blocked` for roughly three hours until ~23:18 Z, when it
-//! flipped to `todo` spontaneously via an unrelated request-execution
-//! path that happened to clear the stale block. Without this sweeper
-//! the only recovery path was manual operator action or an accidental
-//! trigger via `RequestExecution`.
+//! The Bazel installer task stayed dependency-blocked for about three hours
+//! after its prerequisite (the uninstall scoping fix) landed in PR #424, until
+//! an unrelated execution request cleared the stale block. Without this
+//! sweeper the only recovery path was an explicit start request or an
+//! accidental trigger via `RequestExecution`.
 //!
 //! ## Cadence
 //!

@@ -582,3 +582,138 @@ fn registered_producer_names_are_unique() {
     names.dedup();
     assert_eq!(names.len(), total, "two registry entries share a name");
 }
+
+/// Candidate-listing functions that are deliberately not upkeep producers, each
+/// with the reason a parked row needs no exclusion there.
+const NOT_UPKEEP: &[(&str, &str)] = &[
+    (
+        "list_dead_post_merge_review_batch_member_candidates",
+        "its owning task is `done` (the PR merged), and a done row is never parked",
+    ),
+    (
+        "list_executions_pending_pr_detection",
+        "records a PR the worker already opened, so a fact about the world rather than upkeep",
+    ),
+    (
+        "list_recently_terminal_executions_pending_pr_detection",
+        "records a PR the worker already pushed, so a fact about the world rather than upkeep",
+    ),
+    (
+        "list_orphaned_review_guide_submissions",
+        "re-submits a guide body already produced by a finished attempt; no work item is acted on",
+    ),
+    (
+        "list_prune_candidates",
+        "housekeeping of terminal executions' recovery bookmarks; no work item is acted on",
+    ),
+    (
+        "list_unranked_pending_executions",
+        "a read-only board display listing; it mints nothing",
+    ),
+];
+
+const LISTING_KEYWORDS: &[&str] = &[
+    "candidate",
+    "stalled",
+    "stranded",
+    "pending",
+    "awaiting",
+    "promote",
+    "stuck",
+    "waiting",
+    "dead",
+    "abandoned",
+    "orphan",
+    "blocked_on",
+];
+
+fn collect_source_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if path.file_name().is_some_and(|name| name == "tests") {
+                continue;
+            }
+            collect_source_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs")
+            && !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with("_tests.rs"))
+        {
+            out.push(path);
+        }
+    }
+}
+
+/// Every non-test `pub` function named `list_*` / `promote_*` in the crate.
+fn declared_listing_functions() -> Vec<String> {
+    let mut files = Vec::new();
+    // Read at run time: under Bazel the compile-time value names a sandbox that
+    // no longer exists, while the test wrapper points this at the runfiles.
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_owned());
+    collect_source_files(&std::path::Path::new(&manifest_dir).join("src"), &mut files);
+    let mut names = Vec::new();
+    for file in files {
+        let text = std::fs::read_to_string(&file).unwrap();
+        for line in text.lines() {
+            let line = line.trim_start();
+            let Some(rest) = line.strip_prefix("pub") else { continue };
+            let Some(rest) = rest.split_once("fn ").map(|(_, rest)| rest) else {
+                continue;
+            };
+            let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            if name.starts_with("list_") || name.starts_with("promote_") {
+                names.push(name);
+            }
+        }
+    }
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// The registry only protects producers someone remembers to register. This
+/// closes that gap: a candidate-listing function that is neither registered in
+/// [`PRODUCERS`] nor exempted in [`NOT_UPKEEP`] fails here, so adding a listing
+/// forces a decision about parked rows.
+#[test]
+fn every_candidate_listing_is_registered_or_exempted() {
+    let declared = declared_listing_functions();
+    let registered: Vec<&str> = PRODUCERS
+        .iter()
+        .filter_map(|producer| {
+            let (_, tail) = producer.name.rsplit_once('(')?;
+            tail.strip_suffix(')')
+        })
+        .collect();
+    assert_eq!(
+        registered.len(),
+        PRODUCERS.len(),
+        "every registry name must end in `(function_name)`"
+    );
+
+    let mut failures = Vec::new();
+    for name in &declared {
+        let looks_like_listing = LISTING_KEYWORDS.iter().any(|keyword| name.contains(keyword));
+        let known = registered.contains(&name.as_str()) || NOT_UPKEEP.iter().any(|(exempt, _)| exempt == name);
+        if looks_like_listing && !known {
+            failures.push(format!(
+                "`{name}` looks like a candidate listing but is not in `PRODUCERS` or `NOT_UPKEEP`: register it \
+                 (and AND in `parking::upkeep_eligible_task_sql`) or exempt it with a reason"
+            ));
+        }
+    }
+    for name in registered
+        .iter()
+        .copied()
+        .chain(NOT_UPKEEP.iter().map(|(name, _)| *name))
+    {
+        if !declared.iter().any(|declared| declared == name) {
+            failures.push(format!(
+                "`{name}` is registered or exempted but no such listing function exists any more"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "upkeep listing coverage:\n{}", failures.join("\n"));
+}
