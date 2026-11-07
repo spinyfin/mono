@@ -443,9 +443,7 @@ async fn snapshot_free_unproven(
     // The successor holds every pending working-copy edit, whose owner is
     // unproven, so it is reported and excluded from automatic restore.
     resolved.commit = None;
-    if resolved.rewritten_to.is_none() {
-        resolved.rewritten_to = ids.first().map(|id| (*id).to_owned());
-    }
+    resolved.rewritten_to = ids.first().map(|id| (*id).to_owned());
     Ok(resolved)
 }
 

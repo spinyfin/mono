@@ -29,6 +29,18 @@ pub(super) async fn finalize_tip(
     // The live registered tip leads: it is what a human inspects first.
     let mut unclaimed = Vec::new();
     let mut unsafe_commits = Vec::new();
+    if ownership.is_some() && !commit_is_visible(jj, &record.repo_path, tip).await? {
+        unsafe_commits.extend(rewritten_ancestors(jj, &record.repo_path, tip).await?);
+        if resolved.rewritten_to.is_none()
+            && let Some(successor) = unsafe_commits.first()
+        {
+            unclaimed.push(Unclaimed {
+                note: format!("the lease boundary tip {tip} is hidden and its unpublished ancestry was rewritten afterwards; retaining successor {successor} only in an inspection archive because the edits may belong to a later holder"),
+                commit: successor.clone(),
+                count: unsafe_commits.len() as u64,
+            });
+        }
+    }
     if let Some(rewrite) = resolved.rewritten_to.as_ref() {
         unsafe_commits.push(rewrite.clone());
     }
@@ -110,11 +122,40 @@ pub(super) async fn finalize_tip(
     })
 }
 
+/// Freeze changed identities throughout the hidden boundary's unpublished
+/// ancestry, including ancestors rewritten before teardown began.
+async fn rewritten_ancestors(jj: &dyn Jj, repo: &Path, tip: &str) -> Result<Vec<String>> {
+    let originals = log(
+        jj,
+        repo,
+        &format!("::{tip} ~ ::remote_bookmarks()"),
+        "commit_id ++ \" \" ++ change_id ++ \"\\n\"",
+    )
+    .await?;
+    let mut rewritten = Vec::new();
+    for line in originals.lines() {
+        let Some((original, change)) = line.split_once(' ') else {
+            continue;
+        };
+        let visible = log_change(jj, repo, &format!("{} ~ ::remote_bookmarks()", change_revset(change))).await?;
+        for successor in visible.lines().filter(|id| *id != original) {
+            if !rewritten.iter().any(|seen| seen == successor) {
+                rewritten.push(successor.to_owned());
+            }
+        }
+    }
+    Ok(rewritten)
+}
+
 /// Keep rejected work in inspection archives, separate from restorable work.
 /// Freeze the rejected identity in the name: the archive target can follow
 /// rewrites or move to a parent on abandonment without changing the verdict.
 pub(super) async fn quarantine(jj: &dyn Jj, record: &ExecutionBookmark, commits: &[String]) -> Result<()> {
     for commit in commits {
+        // Inspection must never revive a version hidden by a later snapshot.
+        if !commit_is_visible(jj, &record.repo_path, commit).await? {
+            continue;
+        }
         let change = log(jj, &record.repo_path, commit, "change_id").await?;
         let name = format!(
             "{}unsafe/{}/{commit}",

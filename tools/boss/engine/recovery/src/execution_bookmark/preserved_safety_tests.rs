@@ -1,3 +1,4 @@
+use super::preserved::commit_is_visible;
 use super::preserved_tests::fixture;
 use super::*;
 use boss_engine_test_git::jj::JjRepo;
@@ -260,12 +261,38 @@ async fn pending_edits_absorbed_by_a_preserved_ancestor_are_never_restaged() {
             }
             JjRepo::run(&repo.worker, &["new", "-m", "Child work"]);
             std::fs::write(repo.worker.join("child"), "boundary work").unwrap();
+            let child = tip(&repo);
+            let child_change = JjRepo::run(
+                &repo.repo,
+                &["log", "--no-graph", "-r", child.trim(), "-T", "change_id"],
+            );
             let source = boundary(ownership).await;
             JjRepo::run(&repo.worker, &["edit", parent.trim()]);
             std::fs::write(repo.worker.join("theirs"), "foreign pending edits").unwrap();
-            preserve_from(&LocalJj, &record, &repo.worker, Some(&saved), None, source)
+            let outcome = preserve_from(&LocalJj, &record, &repo.worker, Some(&saved), None, source)
                 .await
                 .unwrap();
+            let reason = outcome.inspect.unwrap().reason;
+            assert!(reason.contains(child.trim()), "{reason}");
+            let archives = JjRepo::run(&repo.repo, &["bookmark", "list", "-T", "name ++ \"\\n\""]);
+            assert!(
+                archives.contains(&format!(
+                    "{}unsafe/{}/",
+                    preserved_archive_prefix(&record.execution_id),
+                    saved.change_id
+                )),
+                "{archives}"
+            );
+            if ownership == BoundaryOwnership::FreeUnproven {
+                let successor = JjRepo::run(
+                    &repo.repo,
+                    &["log", "--no-graph", "-r", child_change.trim(), "-T", "commit_id"],
+                );
+                assert!(
+                    reason.contains(&format!("tip {} was rewritten to {}", child.trim(), successor.trim())),
+                    "{reason}"
+                );
+            }
             JjRepo::run(&repo.worker, &["git", "fetch"]);
             JjRepo::run(&repo.worker, &["new", "main"]);
             let restored = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
@@ -278,4 +305,109 @@ async fn pending_edits_absorbed_by_a_preserved_ancestor_are_never_restaged() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn snapshotted_ancestor_rewrites_are_never_restaged() {
+    for ownership in [BoundaryOwnership::Reassigned, BoundaryOwnership::FreeUnproven] {
+        for keep_bookmark in [true, false] {
+            for squash in [true, false] {
+                let dir = tempfile::tempdir().unwrap();
+                let repo = fixture(dir.path());
+                let record = create(&LocalJj, &repo.worker, "exec_rewritten_ancestor", "local")
+                    .await
+                    .unwrap();
+                std::fs::write(repo.worker.join("ours"), "first holder").unwrap();
+                let saved = preserve(&LocalJj, &record, &repo.worker, None, None)
+                    .await
+                    .unwrap()
+                    .tip
+                    .unwrap();
+                if !keep_bookmark {
+                    JjRepo::run(
+                        &repo.repo,
+                        &["bookmark", "forget", &preserved_name(&record.execution_id)],
+                    );
+                }
+                JjRepo::run(&repo.worker, &["new", "-m", "Child work"]);
+                std::fs::write(repo.worker.join("child"), "boundary work").unwrap();
+                let child = tip(&repo);
+                let source = boundary(ownership).await;
+                if squash {
+                    std::fs::write(repo.worker.join("theirs"), "foreign squashed edits").unwrap();
+                    JjRepo::run(&repo.worker, &["squash", "-m", "Combined work"]);
+                } else {
+                    JjRepo::run(&repo.worker, &["edit", &saved.commit_id]);
+                    std::fs::write(repo.worker.join("theirs"), "foreign snapshotted edits").unwrap();
+                    JjRepo::run(&repo.worker, &["status"]);
+                }
+                let outcome = preserve_from(&LocalJj, &record, &repo.worker, Some(&saved), None, source)
+                    .await
+                    .unwrap();
+                assert!(
+                    outcome.tip.is_none(),
+                    "{ownership:?}/{keep_bookmark}/{squash}: {outcome:?}"
+                );
+                assert!(outcome.inspect.unwrap().reason.contains(child.trim()));
+                let archives = JjRepo::run(&repo.repo, &["bookmark", "list", "-T", "name ++ \"\\n\""]);
+                assert!(
+                    archives.contains(&format!(
+                        "{}unsafe/{}/",
+                        preserved_archive_prefix(&record.execution_id),
+                        saved.change_id
+                    )),
+                    "{archives}"
+                );
+                JjRepo::run(&repo.worker, &["new", "main"]);
+                assert!(
+                    restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(!repo.replacement.join("theirs").exists());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn snapshot_reports_current_successors_without_reviving_stale_rewrites() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_snapshot_successor", "local")
+        .await
+        .unwrap();
+    std::fs::write(repo.worker.join("ours"), "parent work").unwrap();
+    let parent = tip(&repo);
+    JjRepo::run(&repo.worker, &["new", "-m", "Child work"]);
+    let empty_child = tip(&repo);
+    let source = boundary(BoundaryOwnership::FreeUnproven).await;
+    std::fs::write(repo.worker.join("child"), "child work").unwrap();
+    let stale_child = tip(&repo);
+    JjRepo::run(&repo.worker, &["edit", parent.trim()]);
+    std::fs::write(repo.worker.join("theirs"), "foreign pending edits").unwrap();
+    let outcome = preserve_from(&LocalJj, &record, &repo.worker, None, None, source)
+        .await
+        .unwrap();
+    let successor = tip(&repo);
+    let reason = outcome.inspect.unwrap().reason;
+    assert!(
+        reason.contains(&format!("tip {} was rewritten to {}", parent.trim(), successor.trim())),
+        "{reason}"
+    );
+    assert!(
+        !reason.contains(&format!("rewritten to {}", stale_child.trim())),
+        "{reason}"
+    );
+    assert!(
+        !commit_is_visible(&LocalJj, &repo.repo, stale_child.trim())
+            .await
+            .unwrap()
+    );
+    assert!(
+        !commit_is_visible(&LocalJj, &repo.repo, empty_child.trim())
+            .await
+            .unwrap()
+    );
 }
