@@ -398,6 +398,16 @@ private struct ProjectFilterPopover: View {
 
             Divider()
 
+            Toggle("Show parked", isOn: Binding(
+                get: { model.showParked },
+                set: { model.setShowParked($0) }
+            ))
+            .help("Add parked tasks and projects' tasks back to the board.")
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+
+            Divider()
+
             ForEach(model.projectsForSelectedProduct) { project in
                 let isOn = model.selectedProjectFilterIDs.contains(project.id)
                 Button {

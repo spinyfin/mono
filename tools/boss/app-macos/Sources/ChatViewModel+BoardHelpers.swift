@@ -215,28 +215,39 @@ extension ChatViewModel {
     /// unsatisfied dependency gating it — if it did, the engine would
     /// have set `status = "blocked"`. These are tasks ready to dispatch.
     func unblockedTaskCount(forProjectID projectID: String) -> Int {
-        (tasksByProjectID[projectID] ?? []).filter { $0.status == "todo" }.count
+        let parkedProjects = parkedProjectsByID
+        return (tasksByProjectID[projectID] ?? []).filter {
+            $0.status == "todo" && !isParked($0, parkedProjects: parkedProjects)
+        }.count
     }
 
     /// Count of dependency-blocked tasks for `projectID`. The engine
     /// sets `blocked_reason = "dependency"` when a task is gated by at
     /// least one unsatisfied prerequisite edge.
     func blockedTaskCount(forProjectID projectID: String) -> Int {
-        (tasksByProjectID[projectID] ?? []).filter {
+        let parkedProjects = parkedProjectsByID
+        return (tasksByProjectID[projectID] ?? []).filter {
             $0.status == "blocked" && $0.blockedReason == "dependency"
+                && !isParked($0, parkedProjects: parkedProjects)
         }.count
     }
 
     var unblockedChoreCount: Int {
         guard let productID = currentSelectedProductID else { return 0 }
-        let chores = (choresByProductID[productID] ?? []).filter { $0.status == "todo" }
-        let projectlessTasks = (productLevelTasksByProductID[productID] ?? []).filter { $0.status == "todo" }
+        let parkedProjects = parkedProjectsByID
+        let isTodo: (WorkTask) -> Bool = { $0.status == "todo" && !self.isParked($0, parkedProjects: parkedProjects) }
+        let chores = (choresByProductID[productID] ?? []).filter(isTodo)
+        let projectlessTasks = (productLevelTasksByProductID[productID] ?? []).filter(isTodo)
         return chores.count + projectlessTasks.count
     }
 
     var blockedChoreCount: Int {
         guard let productID = currentSelectedProductID else { return 0 }
-        let isBlocked: (WorkTask) -> Bool = { $0.status == "blocked" && $0.blockedReason == "dependency" }
+        let parkedProjects = parkedProjectsByID
+        let isBlocked: (WorkTask) -> Bool = {
+            $0.status == "blocked" && $0.blockedReason == "dependency"
+                && !self.isParked($0, parkedProjects: parkedProjects)
+        }
         let chores = (choresByProductID[productID] ?? []).filter(isBlocked)
         let projectlessTasks = (productLevelTasksByProductID[productID] ?? []).filter(isBlocked)
         return chores.count + projectlessTasks.count
@@ -520,6 +531,7 @@ extension ChatViewModel {
                 parentShortID: parentShortID,
                 deferredScopeItems: deferredScopeItems,
                 deferredScopeActionInFlightIDs: deferredScopeActionInFlightIDs,
+                parked: parkedChipPresentation(for: task, now: now),
                 operatorAnswerInFlight: operatorAnswerInFlightByTaskID[task.id] != nil,
                 operatorAnswerError: operatorAnswerError(for: task),
                 showsTerminalButton: showsTerminalButton,

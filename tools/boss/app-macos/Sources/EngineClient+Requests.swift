@@ -593,6 +593,23 @@ extension EngineClient {
         ])
     }
 
+    /// Park (`parked == true`) or un-park a task, chore or project. Its own
+    /// request rather than an `update_work_item` patch so the engine applies
+    /// the parking-only rules (a park never rides along with another edit).
+    /// Returns the request id of the line, or `nil` when it was not sent.
+    @discardableResult
+    func sendParkWorkItem(id: String, parked: Bool, reason: String? = nil) -> String? {
+        var payload: [String: Any] = [
+            "type": "park_work_item",
+            "id": id,
+            "parked": parked,
+        ]
+        if let reason, !reason.isEmpty {
+            payload["reason"] = reason
+        }
+        return sendLine(payload)
+    }
+
     /// Report where a kanban drag ended and let the engine decide what the
     /// drop meant. We send the observed drop target — never a status —
     /// because the board's columns and groups are both *derived* from engine

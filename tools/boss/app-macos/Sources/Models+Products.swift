@@ -265,24 +265,44 @@ struct WorkProject: Identifiable, Hashable {
     /// (the engine backfills these at startup, so `nil` is transient).
     /// Mirrors `Project.short_id` on the wire.
     var shortID: Int? = nil
+    /// Parking provenance, mirroring `Project.parked_*` on the wire.
+    /// `parkedAt` non-`nil` means the owner parked the project (and the
+    /// engine stamped its open children); see `isParked`.
+    var parkedAt: String? = nil
+    var parkedBy: String? = nil
+    var parkedReason: String? = nil
+    var parkedVia: String? = nil
 }
 
 extension WorkProject {
+    /// Mirrors `Project::is_parked`: stamped and still open. A done or
+    /// archived project keeps its stamp as history but is not parked.
+    var isParked: Bool {
+        parkedAt != nil && status != "done" && status != "archived"
+    }
+
     /// Sidebar copy derived from the authoritative stored project status.
     /// `done` is intentionally visible rather than inferred from child rows.
-    var sidebarSubtitle: String? {
+    /// `parkedItemCount` is the number of parked open tasks in the project;
+    /// a parked project always says so, an un-parked one only when some of
+    /// its tasks are individually parked.
+    func sidebarSubtitle(parkedItemCount: Int = 0) -> String? {
         let parts = [
             shortID.map { "P" + String($0) },
             status == "done" ? "Done" : nil,
+            isParked ? "Parked" : nil,
+            parkedItemCount > 0 ? "\(parkedItemCount) parked" : nil,
         ].compactMap { $0 }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
+
+    var sidebarSubtitle: String? { sidebarSubtitle() }
 
     var sidebarSystemImage: String {
         switch status {
         case "archived": "archivebox"
         case "done": "checkmark.circle"
-        default: "folder"
+        default: isParked ? "pause.circle" : "folder"
         }
     }
 }

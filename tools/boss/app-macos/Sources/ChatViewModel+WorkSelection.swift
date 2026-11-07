@@ -172,6 +172,12 @@ extension ChatViewModel {
         defaults.set(value, forKey: showArchivedProjectsDefaultsKey)
     }
 
+    func setShowParked(_ value: Bool) {
+        guard showParked != value else { return }
+        showParked = value
+        defaults.set(value, forKey: showParkedDefaultsKey)
+    }
+
     /// Persist (or clear, when `nil`) the selected product so the next
     /// launch restores the board the operator left open.
     func persistSelectedProductID(_ productID: String?) {

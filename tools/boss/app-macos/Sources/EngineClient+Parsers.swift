@@ -182,7 +182,11 @@ extension EngineClient {
             designDocRepoRemoteURL: payload["design_doc_repo_remote_url"] as? String,
             designDocBranch: payload["design_doc_branch"] as? String,
             designDocPath: payload["design_doc_path"] as? String,
-            shortID: (payload["short_id"] as? NSNumber)?.intValue
+            shortID: (payload["short_id"] as? NSNumber)?.intValue,
+            parkedAt: payload["parked_at"] as? String,
+            parkedBy: payload["parked_by"] as? String,
+            parkedReason: payload["parked_reason"] as? String,
+            parkedVia: payload["parked_via"] as? String
         )
     }
 
@@ -250,6 +254,10 @@ extension EngineClient {
             reasoning: (payload["reasoning"] as? String)
                 .flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 },
             sourceAutomationId: payload["source_automation_id"] as? String,
+            parkedAt: payload["parked_at"] as? String,
+            parkedBy: payload["parked_by"] as? String,
+            parkedReason: payload["parked_reason"] as? String,
+            parkedVia: payload["parked_via"] as? String,
             aiReviewing: (payload["ai_reviewing"] as? Bool) ?? false,
             aiReviewStage: payload["ai_review_stage"] as? String,
             boardFoldedRevision: payload["board_folded_revision"] as? Bool ?? false,

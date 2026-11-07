@@ -341,6 +341,15 @@ final class ChatViewModel: ObservableObject {
     @Published var showArchivedProjects: Bool = false {
         didSet { notePublishedWorkInputChanged() }
     }
+    /// When false (the default) parked tasks, chores and projects' tasks are
+    /// left off the board. When true they are added back in their lifecycle
+    /// columns, each carrying a "Parked" chip; un-parked rows are never hidden
+    /// by it.
+    @Published var showParked: Bool = false {
+        didSet { notePublishedWorkInputChanged() }
+    }
+    /// The park confirmation sheet's target, presented from `ContentView`.
+    @Published var pendingParkRequest: ParkRequest?
     @Published var selectedWorkCardID: String?
     /// Task id that the reveal animation is currently highlighting.
     /// Set after viewport confirmation; cleared after 1.5 s. Views observe
@@ -889,6 +898,7 @@ final class ChatViewModel: ObservableObject {
     let includeChoresDefaultsKey = "boss.work.includeChores"
     let showBlockedOnlyDefaultsKey = "boss.work.showBlockedOnly"
     let showArchivedProjectsDefaultsKey = "boss.work.showArchivedProjects"
+    let showParkedDefaultsKey = "boss.work.showParked"
     let workBoardGroupingDefaultsKey = "boss.work.grouping"
     let legacyReviewReadyOnlyDefaultsKey = "boss.work.reviewReadyOnly"
     let bossPanelCollapsedDefaultsKey = "boss.work.bossPanelCollapsed"
@@ -955,6 +965,7 @@ final class ChatViewModel: ObservableObject {
         }
         showBlockedOnly = defaults.bool(forKey: showBlockedOnlyDefaultsKey)
         showArchivedProjects = defaults.bool(forKey: showArchivedProjectsDefaultsKey)
+        showParked = defaults.bool(forKey: showParkedDefaultsKey)
         // Remove the unused preference left by earlier builds.
         defaults.removeObject(forKey: legacyReviewReadyOnlyDefaultsKey)
         if let groupingRaw = defaults.string(forKey: workBoardGroupingDefaultsKey),

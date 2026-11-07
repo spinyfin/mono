@@ -180,6 +180,14 @@ struct WorkTask: Identifiable, Hashable {
     /// the kanban — the purple wand icon distinguishes them from human-filed
     /// work so the user can still review and merge their PRs.
     var sourceAutomationId: String? = nil
+    /// Parking provenance. `parkedAt` (epoch seconds, decimal string) is the
+    /// single load-bearing fact: non-`nil` means the owner parked this row.
+    /// `parkedVia` is `"direct"` or `"project:<id>"` (stamped by the project's
+    /// park cascade). Mirror `Task.parked_*` on the wire; see `isParked`.
+    var parkedAt: String? = nil
+    var parkedBy: String? = nil
+    var parkedReason: String? = nil
+    var parkedVia: String? = nil
     /// Engine-resolved review activity, including a held revision's started
     /// batch across reviewer re-admission, consolidation and verdict apply.
     /// First admission to the review pool remains queued.
@@ -642,6 +650,20 @@ extension WorkTask {
             && mergeQueueState == nil
     }
 
+    /// Mirrors `Task::is_parked`: the row carries its own park stamp and is
+    /// still open. A merged or archived row keeps its stamp as history but is
+    /// finished work and must not hide behind the parked filter. This reads
+    /// only the row's own stamp; `ChatViewModel.isParked(_:)` adds the
+    /// parked-project backstop.
+    var hasOwnParkStamp: Bool {
+        parkedAt != nil && status != "done" && status != "archived"
+    }
+
+    /// `true` when the stamp came from the project's park cascade, so only
+    /// un-parking the project (not this row) can clear it.
+    var isParkedViaProject: Bool {
+        parkedVia?.hasPrefix("project:") == true
+    }
 }
 
 struct WorkTaskRuntime: Hashable {

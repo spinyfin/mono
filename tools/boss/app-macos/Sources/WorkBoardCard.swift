@@ -308,6 +308,23 @@ struct WorkBoardCardItem: View {
                     .help(reviewGuideMenuPresentation?.tooltip ?? title)
                 }
                 Divider()
+                switch model.parkMenuAction(for: task) {
+                case .unpark:
+                    Button("Unpark") {
+                        model.unpark(id: task.id)
+                    }
+                case .unparkDisabled(let reason):
+                    Button("Unpark") {}
+                        .disabled(true)
+                        .help(reason)
+                case .park:
+                    Button("Park…") {
+                        model.requestPark(task: task)
+                    }
+                case .none:
+                    EmptyView()
+                }
+                Divider()
                 Button("Delete", role: .destructive) {
                     showingDeleteConfirmation = true
                 }
@@ -551,6 +568,10 @@ struct WorkBoardCardView: View, @MainActor Equatable {
                 .equatable()
             if let liveStatus = WorkBoardCardLiveStatusRowSlice(snapshot: snap) {
                 WorkBoardCardLiveStatusRow(slice: liveStatus, onRevealBlocker: onRevealQueueBlocker)
+                    .equatable()
+            }
+            if let parked = snap.parked {
+                WorkBoardCardParkedRow(presentation: parked)
                     .equatable()
             }
             if let operatorQuestion = WorkBoardCardOperatorQuestionSlice(snapshot: snap) {

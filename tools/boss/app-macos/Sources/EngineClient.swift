@@ -788,6 +788,20 @@ final class EngineClient: @unchecked Sendable {
             if finished { emit(.retriedActionsStatus(message: nil)) }
         }
 
+        if decodeBoardReply(type: type, payload: payload, envelope: envelope, lineRecvNanos: lineRecvNanos, lineByteCount: lineByteCount) { return }
+        if decodeReviewReply(type: type, payload: payload, requestId: envelopeRequestId) { return }
+        if decodeSettingsReply(type: type, payload: payload, requestId: envelopeRequestId) { return }
+        _ = decodeActionReply(type: type, payload: payload, requestId: envelopeRequestId)
+    }
+
+    // Keep reply families in separate stack frames: the large event values in a
+    // single unoptimized switch can exhaust a Dispatch worker thread stack.
+    @inline(never)
+    private func decodeBoardReply(
+        type: String, payload: [String: Any], envelope: [String: Any],
+        lineRecvNanos: UInt64, lineByteCount: Int
+    ) -> Bool {
+        let envelopeRequestId = envelope["request_id"] as? String
         switch type {
         case "topic_event":
             let topic = payload["topic"] as? String ?? ""
@@ -1047,22 +1061,33 @@ final class EngineClient: @unchecked Sendable {
         case "worker_live_states_list":
             guard let raw = payload["states"] as? [[String: Any]] else {
                 emit(.error(message: "worker_live_states_list missing states"))
-                return
+                return true
             }
             let states = raw.compactMap(parseWorkerLiveState)
             guard states.count == raw.count else {
                 emit(.error(message: "worker_live_states_list contains invalid state"))
-                return
+                return true
             }
             guard WorkerLiveState.hasUniqueIds(states) else {
                 emit(.error(message: "worker_live_states_list contains duplicate ids"))
-                return
+                return true
             }
             let rawSections = payload["doing_sections"] as? [String: String] ?? [:]
             let sections = rawSections.compactMapValues(DoingSection.init(rawValue:))
             let rawDispatch = payload["queued_dispatch"] as? [String: [String: Any]] ?? [:]
             let queuedDispatch = rawDispatch.compactMapValues(QueuedDispatch.init(payload:))
             emit(.workerLiveStatesList(states: states, doingSections: sections, queuedDispatch: queuedDispatch))
+        default:
+            return false
+        }
+        return true
+    }
+
+    @inline(never)
+    private func decodeReviewReply(
+        type: String, payload: [String: Any], requestId envelopeRequestId: String?
+    ) -> Bool {
+        switch type {
         case "project_design_doc_resolved":
             guard let outputPayload = payload["output"] as? [String: Any],
                   let outputData = try? JSONSerialization.data(withJSONObject: outputPayload),
@@ -1260,6 +1285,17 @@ final class EngineClient: @unchecked Sendable {
                 attemptsUsed: (payload["attempts_used"] as? NSNumber)?.intValue ?? 0,
                 budget: (payload["budget"] as? NSNumber)?.intValue ?? 0
             ))
+        default:
+            return false
+        }
+        return true
+    }
+
+    @inline(never)
+    private func decodeSettingsReply(
+        type: String, payload: [String: Any], requestId envelopeRequestId: String?
+    ) -> Bool {
+        switch type {
         case "feature_flags_list":
             let raw = payload["flags"] as? [[String: Any]] ?? []
             let flags = raw.compactMap(parseFeatureFlag)
@@ -1304,7 +1340,7 @@ final class EngineClient: @unchecked Sendable {
             emit(.driverTrafficSplitResult(split: decoded.isValid ? decoded : .engineDefault))
         case "codex_sol_percentage":
             guard let percentage = (payload["percentage"] as? NSNumber)?.intValue,
-                  (0...100).contains(percentage) else { return }
+                  (0...100).contains(percentage) else { return true }
             emit(.codexSolPercentage(percentage: percentage))
         case "driver_quota_usage_result":
             let raw = payload["snapshot"] as? [String: Any] ?? [:]
@@ -1487,6 +1523,17 @@ final class EngineClient: @unchecked Sendable {
                     workspacePath: workspacePath
                 ))
             }
+        default:
+            return false
+        }
+        return true
+    }
+
+    @inline(never)
+    private func decodeActionReply(
+        type: String, payload: [String: Any], requestId envelopeRequestId: String?
+    ) -> Bool {
+        switch type {
         case "merge_confirmation_required":
             guard let workItemID = payload["work_item_id"] as? String,
                   let raw = payload["revisions"],
@@ -1694,8 +1741,9 @@ final class EngineClient: @unchecked Sendable {
             }
             emit(.commentsReviseDocResult(outcome: outcome))
         default:
-            break
+            return false
         }
+        return true
     }
 
     /// Decode a `Codable` wire type from a `JSONSerialization` dict, mirroring

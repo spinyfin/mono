@@ -54,6 +54,10 @@ enum BossRevealCapture {
             BossRevisionReviewCapture.start(path: path, folded: state == "revision-folded")
             return
         }
+        if state == "parking-default" || state == "parking-shown" || state == "parking-sheet" {
+            BossParkingCapture.start(path: path, state: state, updateModel: updateModel)
+            return
+        }
         if state == "revision-brief" {
             BossRevisionBriefCapture.start(path: path)
             return
