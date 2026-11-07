@@ -558,6 +558,41 @@ impl WorkDb {
             .flatten())
     }
 
+    /// File a preserved-work inspection verdict for `execution_id`, or fold it
+    /// into the open item: earlier commit references are kept and only commits
+    /// the body does not yet name are appended.
+    pub fn raise_preserved_work_inspect_attention(
+        &self,
+        execution_id: &str,
+        inspect: &boss_engine_recovery::execution_bookmark::PreserveInspect,
+    ) -> Result<String> {
+        let kind = boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND;
+        let title = "Preserved work needs inspection";
+        let open = self
+            .list_attention_items(execution_id)?
+            .into_iter()
+            .find(|item| item.kind == kind && item.status == "open");
+        let Some(existing) = open else {
+            return self.upsert_execution_attention(execution_id, kind, title, &inspect_body(inspect));
+        };
+        let mut body = existing.body_markdown;
+        if let Some(commit) = inspect.existing_commit_id.as_deref()
+            && !body.contains(&format!("`{commit}`"))
+        {
+            body.push_str(&format!("\n- existing preserved commit: `{commit}`"));
+        }
+        if let Some(line) = inspect_workspace_line(inspect)
+            && inspect
+                .workspace_commit_id
+                .as_deref()
+                .is_none_or(|commit| !body.contains(&format!("commit `{commit}`")))
+        {
+            body.push('\n');
+            body.push_str(&line);
+        }
+        self.upsert_execution_attention(execution_id, kind, title, &body)
+    }
+
     /// A resolved informational note: archiving is successful recovery handling,
     /// never a request for intervention or a reason to disable autostart.
     pub fn record_recovery_fresh_start(
@@ -568,7 +603,7 @@ impl WorkDb {
         archives: &[(String, String)],
     ) -> Result<()> {
         let preserved_note = self.preserved_tip(&prior.id)?.map(|tip| format!(
-            "Live workspace preservation: `preserved/{}` retains `{}`. This is separate from the legacy archive bookmarks above.", prior.id, tip.commit_id
+            "Preserved work: `preserved/{}` retains `{}`. This is separate from the legacy archive bookmarks above.", prior.id, tip.commit_id
         )).unwrap_or_default();
         self.record_recovery_archive_note(
             prior,
@@ -700,4 +735,32 @@ mod pr_head_before_loader_tests {
             Some("abc123def456abc123def456abc123def456abc1")
         );
     }
+}
+
+fn inspect_workspace_line(inspect: &boss_engine_recovery::execution_bookmark::PreserveInspect) -> Option<String> {
+    match (
+        inspect.workspace_change_id.as_deref(),
+        inspect.workspace_commit_id.as_deref(),
+        inspect.workspace_count,
+    ) {
+        (Some(change), Some(commit), Some(count)) => Some(format!(
+            "- workspace tip: change `{change}`, commit `{commit}`, {count} unpublished commits"
+        )),
+        _ => None,
+    }
+}
+
+fn inspect_body(inspect: &boss_engine_recovery::execution_bookmark::PreserveInspect) -> String {
+    let existing = inspect.existing_commit_id.as_deref().unwrap_or("none");
+    let mut body = format!(
+        "{}. Existing preserved commit: `{existing}`. Nothing was deleted.",
+        inspect.reason
+    );
+    if let Some(line) = inspect_workspace_line(inspect) {
+        body.push('\n');
+        body.push_str(&line);
+    } else {
+        body.push_str(" New workspace tip: unavailable.");
+    }
+    body
 }

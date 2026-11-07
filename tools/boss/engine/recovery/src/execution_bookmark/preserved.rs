@@ -817,7 +817,10 @@ pub async fn preserve_from(
             }
         }
     }
+    let primary_is_live =
+        |tip: &Option<PreservedTip>, commit: &str| tip.as_ref().is_some_and(|tip| tip.commit_id == commit);
     if let (Some(commit), Some(inspect)) = (live, outcome.inspect.as_mut())
+        && !primary_is_live(&outcome.tip, &commit)
         && inspect.workspace_change_id.is_some()
         && inspect.workspace_count.is_some_and(|count| count > 0)
     {

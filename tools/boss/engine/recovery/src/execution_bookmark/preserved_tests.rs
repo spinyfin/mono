@@ -208,7 +208,21 @@ async fn recycled_workspace_cannot_replace_unadopted_preserved_work() {
     let outcome = preserve(&LocalJj, &record, &repo.replacement, None, None)
         .await
         .unwrap();
-    assert!(outcome.inspect.is_some(), "teardown must inspect, not refuse");
+    let inspect = outcome.inspect.as_ref().expect("teardown must inspect, not refuse");
+    let live = inspect
+        .workspace_commit_id
+        .clone()
+        .expect("live workspace tip is reported");
+    let archive = preserved_archive_name(&record.execution_id, &live);
+    assert!(
+        names(&repo).contains(&archive),
+        "single unrelated tip archives the live tip"
+    );
+    assert!(
+        inspect
+            .reason
+            .contains(&format!("live workspace retained at {archive}"))
+    );
     assert_eq!(
         outcome.tip.as_ref().map(|tip| tip.commit_id.as_str()),
         Some(saved.commit_id.as_str())
@@ -472,7 +486,21 @@ async fn conflicted_preservation_requires_current_work_to_be_retained() {
     let outcome = preserve(&LocalJj, &record, &repo.replacement, None, None)
         .await
         .unwrap();
-    assert!(outcome.inspect.is_some(), "teardown must inspect, not refuse");
+    let inspect = outcome.inspect.as_ref().expect("teardown must inspect, not refuse");
+    let live = inspect
+        .workspace_commit_id
+        .clone()
+        .expect("live workspace tip is reported");
+    let archive = preserved_archive_name(&record.execution_id, &live);
+    assert!(
+        names(&repo).contains(&archive),
+        "multiple unrelated tips archive the live tip"
+    );
+    assert!(
+        inspect
+            .reason
+            .contains(&format!("live workspace retained at {archive}"))
+    );
     assert_eq!(
         JjRepo::run(
             &repo.repo,
@@ -742,6 +770,10 @@ async fn missing_bookmark_and_absent_recorded_preserves_fresh_unpublished_tip() 
     assert_eq!(inspect.existing_commit_id.as_deref(), Some(recorded.commit_id.as_str()));
     assert_eq!(inspect.workspace_commit_id.as_deref(), Some(tip.commit_id.as_str()));
     assert_eq!(inspect.workspace_count, Some(1));
+    assert!(
+        !names(&repo).contains("preserved-archive/exec_absent"),
+        "preserved/<exec> already points at the live commit; no redundant archive"
+    );
 }
 
 #[tokio::test]

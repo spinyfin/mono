@@ -592,66 +592,12 @@ pub async fn release_lease_after_proven_never_started(
     .await
 }
 
-fn inspect_workspace_line(inspect: &boss_engine_recovery::execution_bookmark::PreserveInspect) -> Option<String> {
-    match (
-        inspect.workspace_change_id.as_deref(),
-        inspect.workspace_commit_id.as_deref(),
-        inspect.workspace_count,
-    ) {
-        (Some(change), Some(commit), Some(count)) => Some(format!(
-            "- workspace tip: change `{change}`, commit `{commit}`, {count} unpublished commits"
-        )),
-        _ => None,
-    }
-}
-
-fn inspect_body(inspect: &boss_engine_recovery::execution_bookmark::PreserveInspect) -> String {
-    let existing = inspect.existing_commit_id.as_deref().unwrap_or("none");
-    let mut body = format!(
-        "{}. Existing preserved commit: `{existing}`. Nothing was deleted.",
-        inspect.reason
-    );
-    if let Some(line) = inspect_workspace_line(inspect) {
-        body.push('\n');
-        body.push_str(&line);
-    } else {
-        body.push_str(" New workspace tip: unavailable.");
-    }
-    body
-}
-
 fn raise_inspect_attention(
     db: &WorkDb,
     execution: &WorkExecution,
     inspect: boss_engine_recovery::execution_bookmark::PreserveInspect,
 ) {
-    let kind = boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND;
-    let title = "Preserved work needs inspection";
-    let open = db.list_attention_items(&execution.id).ok().and_then(|items| {
-        items
-            .into_iter()
-            .find(|item| item.kind == kind && item.status == "open")
-    });
-    let Some(existing) = open else {
-        raise_attention(db, execution, kind, title, &inspect_body(&inspect));
-        return;
-    };
-    let mut body = existing.body_markdown;
-    if let Some(commit) = inspect.existing_commit_id.as_deref()
-        && !body.contains(&format!("`{commit}`"))
-    {
-        body.push_str(&format!("\n- existing preserved commit: `{commit}`"));
-    }
-    if let Some(line) = inspect_workspace_line(&inspect)
-        && inspect
-            .workspace_commit_id
-            .as_deref()
-            .is_none_or(|commit| !body.contains(&format!("commit `{commit}`")))
-    {
-        body.push('\n');
-        body.push_str(&line);
-    }
-    if let Err(err) = db.upsert_execution_attention(&execution.id, kind, title, &body) {
+    if let Err(err) = db.raise_preserved_work_inspect_attention(&execution.id, &inspect) {
         tracing::error!(
             execution_id = %execution.id,
             error = %format!("{err:#}"),

@@ -1178,17 +1178,8 @@ impl ExecutionCoordinator {
                     self.work_db.record_preserved_tip(&execution.id, tip)?;
                 }
                 if let Some(inspect) = &outcome.inspect {
-                    self.work_db.upsert_execution_attention(
-                        &execution.id,
-                        boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND,
-                        "Preserved work needs inspection",
-                        &format!(
-                            "{}. Existing preserved commit: `{}`. Workspace commit: `{}`.",
-                            inspect.reason,
-                            inspect.existing_commit_id.as_deref().unwrap_or("unavailable"),
-                            inspect.workspace_commit_id.as_deref().unwrap_or("unavailable")
-                        ),
-                    )?;
+                    self.work_db
+                        .raise_preserved_work_inspect_attention(&execution.id, inspect)?;
                 }
                 self.retire_unvouched_record(execution, execution, &record, &adapter, &err)
                     .await?;
