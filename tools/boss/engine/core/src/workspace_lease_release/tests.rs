@@ -403,6 +403,7 @@ async fn db_bookmark_gate_rejects_a_record_without_a_pointer() {
         host_id: "local".to_owned(),
         base_commit: None,
         pr_head_before: None,
+        has_recovery_head: None,
     })
     .unwrap();
     assert!(matches!(

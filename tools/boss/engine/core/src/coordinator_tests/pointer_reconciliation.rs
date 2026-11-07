@@ -895,6 +895,7 @@ mod rebase_adoption {
                 host_id: "local".into(),
                 base_commit: None,
                 pr_head_before: None,
+                has_recovery_head: None,
             })
             .unwrap();
     }

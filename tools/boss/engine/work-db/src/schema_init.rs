@@ -796,6 +796,7 @@ mod floor_tests {
             preserved_work::migrate_lease_generation(&expected).unwrap();
             super::super::parking::migrate(&expected).unwrap();
             super::super::parking::migrate_membership(&expected).unwrap();
+            execution_bookmarks::migrate_has_recovery_head(&expected).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {

@@ -337,6 +337,62 @@ fn expected_branch_name_suppressed_when_pr_url_set() {
 }
 
 #[test]
+fn task_and_chore_prompts_create_publication_bookmark_before_pr_create() {
+    for kind in [ExecutionKind::TaskImplementation, ExecutionKind::ChoreImplementation] {
+        let mut execution = base_execution();
+        execution.kind = kind.clone();
+        let expected_branch = boss_engine_storage_values::branch_identity::expected_branch_name(
+            &execution.id,
+            &execution.branch_naming,
+            execution.worker_branch_prefix.as_deref(),
+        );
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .review_signal_checks(|_| &[])
+                .execution(&execution)
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
+        );
+        let create = format!("jj bookmark set {expected_branch} -r @");
+        let create_pos = prompt
+            .find(&create)
+            .unwrap_or_else(|| panic!("{kind:?} prompt must create the publication bookmark:\n{prompt}"));
+        let pr_create_pos = prompt
+            .find("pr create")
+            .unwrap_or_else(|| panic!("{kind:?} prompt must mention pr create:\n{prompt}"));
+        assert!(
+            create_pos < pr_create_pos,
+            "{kind:?} must set the publication bookmark before pr create:\n{prompt}"
+        );
+    }
+}
+
+#[test]
+fn revision_prompt_does_not_create_the_publication_bookmark() {
+    let execution = revision_execution("https://github.com/org/repo/pull/250");
+    let expected_branch = boss_engine_storage_values::branch_identity::expected_branch_name(
+        &execution.id,
+        &execution.branch_naming,
+        execution.worker_branch_prefix.as_deref(),
+    );
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&execution)
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        !prompt.contains(&format!("jj bookmark set {expected_branch} -r @")),
+        "revision prompt must not create a publication bookmark:\n{prompt}"
+    );
+}
+
+#[test]
 fn expected_branch_name_present_when_no_pr_url() {
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()

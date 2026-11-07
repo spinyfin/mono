@@ -28,7 +28,7 @@ pub async fn create_legacy_three_bookmark_fixture_from(
     predecessor: Option<&ExecutionBookmark>,
     inherited_base: Option<&str>,
 ) -> Result<ExecutionBookmark> {
-    let record = create_from(jj, workspace, execution_id, host_id, predecessor, inherited_base).await?;
+    let mut record = create_from(jj, workspace, execution_id, host_id, predecessor, inherited_base).await?;
     let baseline = record.base_commit.as_deref().unwrap();
     jj.run(workspace, &["bookmark", "set", &record.base(), "-r", baseline])
         .await?;
@@ -37,5 +37,6 @@ pub async fn create_legacy_three_bookmark_fixture_from(
         &["bookmark", "set", &record.head(), &record.publication(), "-r", "@"],
     )
     .await?;
+    record.has_recovery_head = Some(true);
     Ok(record)
 }
