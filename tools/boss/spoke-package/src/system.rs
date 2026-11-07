@@ -54,24 +54,23 @@ impl Host for System {
 
     fn create_user(&self, name: &str, home: &Path) -> Result<Account> {
         if self.platform.is_macos() {
-            // A hidden role account: UniqueID in the 200-400 range, no login
-            // shell, not shown on the login window. The service definition
-            // names only the user, so launchd uses this account's primary group.
-            succeed(
-                "sysadminctl",
-                &[
-                    "-addUser",
-                    name,
-                    "-fullName",
-                    "Boss spoke worker",
-                    "-home",
-                    &home.display().to_string(),
-                    "-shell",
-                    "/usr/bin/false",
-                    "-roleAccount",
-                    "-hidden",
-                ],
-            )?;
+            // Hidden, non-login service account with a free system UID.
+            let listed = run("dscl", &[".", "-list", "/Users", "UniqueID"])?;
+            ensure!(listed.status.success(), "cannot enumerate macOS account IDs");
+            let uid = free_service_uid(&String::from_utf8(listed.stdout)?)?;
+            let record = format!("/Users/{name}");
+            succeed("dscl", &[".", "-create", &record])?;
+            for (attribute, value) in [
+                ("UniqueID", uid.to_string()),
+                ("PrimaryGroupID", "20".into()),
+                ("UserShell", "/usr/bin/false".into()),
+                ("NFSHomeDirectory", home.display().to_string()),
+                ("RealName", "Boss spoke worker".into()),
+                ("Password", "*".into()),
+                ("IsHidden", "1".into()),
+            ] {
+                succeed("dscl", &[".", "-create", &record, attribute, &value])?;
+            }
         } else {
             succeed(
                 "useradd",
@@ -214,4 +213,39 @@ pub fn run_as(account: &Account, env: &[(String, String)], program: &Path, args:
         success: output.status.success(),
         output: text,
     })
+}
+
+fn free_service_uid(listing: &str) -> Result<i64> {
+    let used = listing
+        .lines()
+        .map(|line| {
+            line.split_whitespace()
+                .last()
+                .context("missing macOS account UID")?
+                .parse::<i64>()
+                .context("invalid macOS account UID")
+        })
+        .collect::<Result<std::collections::HashSet<_>>>()?;
+    (200..=400)
+        .find(|uid| !used.contains(uid))
+        .context("no free macOS service UID in 200-400")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_uid_skips_occupied_ids_and_accepts_negative_system_ids() {
+        assert_eq!(
+            free_service_uid("nobody -2\nroot 0\nexisting 200\nother 202").unwrap(),
+            201
+        );
+        assert!(free_service_uid("broken not-a-number").is_err());
+        let full = (200..=400)
+            .map(|id| format!("user{id} {id}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(free_service_uid(&full).is_err());
+    }
 }

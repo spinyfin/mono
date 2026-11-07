@@ -367,11 +367,23 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
     let definition_path = layout.definition();
     let definition_parent = definition_path.parent().context("service definition has no parent")?;
     ensure_root_dir(layout, definition_parent)?;
+    // Only acknowledge a definition after registration and any required restart.
+    // A failed/interrupted attempt leaves the previous acknowledgement intact.
+    let reconciled_path = layout.etc().join("service-reconciled");
+    let etc = secure_fs::open_installer_dir(layout.base(), &layout.etc())?;
+    let pending = match secure_fs::read_file_at(&etc, "service-reconciled") {
+        Ok((bytes, metadata)) => {
+            secure_fs::verify_installer_file(&metadata, "service reconciliation record")?;
+            bytes != definition.as_bytes()
+        }
+        Err(error) if secure_fs::is_not_found(&error) => true,
+        Err(error) => return Err(error),
+    };
     let definition_changed = write_logical(layout, &definition_path, definition.as_bytes(), 0o644, None)?;
     if definition_changed {
         report.changed.push("service definition");
     }
-    if definition_changed || !host.service_registered()? {
+    if pending || definition_changed || !host.service_registered()? {
         host.register_service(&layout.definition())?;
         if !definition_changed {
             report.changed.push("service registration");
@@ -384,11 +396,14 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
         .all(|name| credentials_on_disk.join(name).is_file());
     let release_changed = report.changed.contains(&"current release switched");
     // The daemon reads its definition, binary and trust anchor only at startup.
-    if report.enrolled && (definition_changed || release_changed || trust_changed || !host.service_running()?) {
+    if report.enrolled
+        && (pending || definition_changed || release_changed || trust_changed || !host.service_running()?)
+    {
         host.restart_service()?;
         wait_healthy(host, &request.health, layout)?;
         report.restarted = true;
     }
+    write_logical(layout, &reconciled_path, definition.as_bytes(), 0o644, None)?;
     Ok(report)
 }
 

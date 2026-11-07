@@ -70,6 +70,14 @@ pub mod parse {
     /// be exactly the misleading-number failure this parser exists to prevent.
     const CLAUDE_WEEK_PREFIX: &str = "Current week (all models):";
 
+    /// Whether the usage response proves a working login; reject unknown output.
+    pub fn claude_usage_authenticated(stdout: &str) -> bool {
+        matches!(
+            parse_claude_usage_json(stdout, crate::now_epoch_s()),
+            DriverQuotaOutcome::Reading(_)
+        )
+    }
+
     /// Parse the JSON envelope `claude -p "/usage" --output-format json` emits.
     ///
     /// `/usage` is handled locally by the CLI: the envelope comes back with

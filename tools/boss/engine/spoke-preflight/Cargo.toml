@@ -5,6 +5,8 @@ edition.workspace = true
 workspace = "../../../.."
 
 [dependencies]
+boss-engine-codex-hook-trust = { path = "../codex-hook-trust" }
+boss-engine-driver-quota = { path = "../driver-quota" }
 bon = { workspace = true }
 boss-host-execution = { path = "../host-execution" }
 boss-tmux = { path = "../../tmux" }
