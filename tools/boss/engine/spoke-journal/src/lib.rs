@@ -151,6 +151,10 @@ pub enum Fault {
     Full,
     #[error("negotiated transport limits cannot carry retained command identities or records")]
     TransportLimit,
+    #[error("producer checkpoint changed")]
+    CheckpointConflict,
+    #[error("journal owner panicked")]
+    LockPoisoned,
 }
 
 impl Fault {
@@ -165,8 +169,10 @@ impl Fault {
         if Self::is_full(error) {
             return true;
         }
-        let text = error.to_string();
-        if text.contains("producer checkpoint changed") || text.contains("journal owner panicked") {
+        if matches!(
+            error.downcast_ref::<Fault>(),
+            Some(Fault::CheckpointConflict | Fault::LockPoisoned)
+        ) {
             return true;
         }
         error.chain().any(|cause| {

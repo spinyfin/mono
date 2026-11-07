@@ -47,7 +47,9 @@ impl Journal {
         if old.as_deref() == Some(checkpoint) {
             return Ok(());
         }
-        ensure!(old.as_deref() == expected, "producer checkpoint changed");
+        if old.as_deref() != expected {
+            return Err(crate::Fault::CheckpointConflict.into());
+        }
         let mirror_latest = source.starts_with("hook:");
         let latest_old: Option<Vec<u8>> = if mirror_latest {
             tx.query_row(
