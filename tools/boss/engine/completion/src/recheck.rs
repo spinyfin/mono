@@ -117,7 +117,7 @@ impl WorkerCompletionHandler {
                     "pr-recheck: staged PR URL present but no `delivered` run_done declaration \
                      yet; declaration remains required — deferring staged finalization",
                 );
-                return self.await_run_done_declaration(&execution, &staged_url).await;
+                return self.await_run_done_declaration(&execution, &staged_url, false).await;
             }
             tracing::info!(
                 execution_id,
