@@ -35,6 +35,7 @@ const SESSION_SCHEMA: &str = "1";
 const SESSION_SCHEMA_ENV: &str = "BOSS_SESSION_SCHEMA";
 const RUN_ID_ENV: &str = "BOSS_RUN_ID";
 const SPAWN_TOKEN_OPTION: &str = "@boss_spawn_token";
+pub const EVENT_SPOOL_ENV: &str = "BOSS_EVENT_SPOOL";
 pub const HOST_ENV_DENY: &[&str] = &[
     "BOSS_CODEX_HOMES_DIR",
     "BOSS_GROK_HOMES_DIR",
@@ -43,7 +44,7 @@ pub const HOST_ENV_DENY: &[&str] = &[
     "TMUX_TMPDIR",
     "BOSS_CONTROL_SOCKET",
     "BOSS_EVENTS_SOCKET",
-    "BOSS_EVENT_SPOOL",
+    EVENT_SPOOL_ENV,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +134,9 @@ pub trait ExecutionStore: Send + Sync {
     }
     fn observations_drained(&self, _record: &ExecutionRecord) -> Result<bool> {
         Ok(true)
+    }
+    fn prune_observation_sources(&self, _record: &ExecutionRecord) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -512,7 +516,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         environment.insert(SESSION_SCHEMA_ENV.to_owned(), SESSION_SCHEMA.to_owned());
         environment.insert(RUN_ID_ENV.to_owned(), record.execution_id.clone());
         if let Some(observation) = &record.observation {
-            environment.insert("BOSS_EVENT_SPOOL".into(), observation.pending.display().to_string());
+            environment.insert(EVENT_SPOOL_ENV.into(), observation.pending.display().to_string());
         }
         environment.insert(homes::ROOT_ENV.to_owned(), self.homes_root.display().to_string());
         self.tmux
@@ -1087,6 +1091,16 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             }
         }
         let mut errors = Vec::new();
+        if let Some(pending) = record.observation.as_ref().map(|o| o.pending.clone()) {
+            if let Err(error) = std::fs::remove_dir_all(&pending)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                errors.push(format!("observation directory: {error}"));
+            }
+            if let Err(error) = self.store.prune_observation_sources(record) {
+                errors.push(format!("observation sources: {error}"));
+            }
+        }
         if let Some(path) = &record.settings_file
             && let Err(error) = std::fs::remove_file(path)
             && error.kind() != std::io::ErrorKind::NotFound
@@ -1705,13 +1719,16 @@ mod tests {
             0o700
         );
         record.phase = Phase::Terminal;
+        let pending = observation.pending.clone();
         supervisor.reclaim(&mut record);
         assert!(!record.reclaimed);
         assert!(record.home.as_ref().unwrap().exists());
+        assert!(pending.exists());
         supervisor.store.1.store(true, std::sync::atomic::Ordering::SeqCst);
         supervisor.reclaim(&mut record);
         assert!(record.reclaimed);
         assert!(!record.home.as_ref().unwrap().exists());
+        assert!(!pending.exists());
     }
 
     #[tokio::test]

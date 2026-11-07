@@ -25,8 +25,16 @@ use tokio::{
 const MAX_HOOK: usize = 256 * 1024;
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Receipt {
-    pub digest: Vec<u8>,
+    pub digest: String,
     pub path: Option<PathBuf>,
+}
+
+fn digest_hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut out, b| {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+        out
+    })
 }
 
 pub fn authenticate(records: &[ExecutionRecord], peer: i32, uid: u32, boot: &str) -> Result<ExecutionRecord> {
@@ -70,7 +78,7 @@ pub async fn ingest(journal: &SharedJournal, execution: &ExecutionRecord, bytes:
         .filter(|s| *s > 0)
         .context("invalid producer sequence")?;
     let source = format!("hook:{id}:{sequence}");
-    let digest = Sha256::digest(bytes).to_vec();
+    let digest = digest_hex(&Sha256::digest(bytes));
     let previous = {
         let journal = journal.lock().map_err(|_| anyhow::anyhow!("journal owner panicked"))?;
         if let Some(old) = journal.source(&run, &source)? {
@@ -80,7 +88,7 @@ pub async fn ingest(journal: &SharedJournal, execution: &ExecutionRecord, bytes:
             );
             return Ok(());
         }
-        journal.latest_source(&run, "hook:")?
+        journal.latest_source(&run)?
     };
     let driver = DriverRegistry::default().require(&execution.driver_id)?;
     let previous: Option<Receipt> = previous.map(|bytes| serde_json::from_slice(&bytes)).transpose()?;
@@ -191,30 +199,98 @@ pub async fn drain(journal: &SharedJournal, execution: &ExecutionRecord, stamp: 
         }
     }
     for path in paths {
-        let file = match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
-        };
-        let metadata = file.metadata()?;
-        ensure!(
-            metadata.is_file() && metadata.nlink() == 1 && metadata.permissions().mode() & 0o077 == 0,
-            "unsafe pending hook file"
-        );
-        let mut bytes = Vec::new();
-        file.take(MAX_HOOK as u64 + 1).read_to_end(&mut bytes)?;
-        ingest(journal, execution, &bytes, stamp).await?;
-        if let Err(error) = std::fs::remove_file(&path)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(error.into());
+        match ingest_pending(journal, execution, stamp, &path).await {
+            Ok(()) => {
+                if let Err(error) = std::fs::remove_file(&path)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    return Err(error.into());
+                }
+                std::fs::File::open(pending)?.sync_all()?;
+            }
+            Err(error) if boss_spoke_journal::Fault::is_retryable(&error) => return Err(error),
+            Err(error) => {
+                tracing::warn!(
+                    run = execution.run_id,
+                    path = %path.display(),
+                    %error,
+                    "quarantining undecodable pending hook"
+                );
+                quarantine_pending(journal, execution, stamp, pending, &path, &error)?;
+            }
         }
-        std::fs::File::open(pending)?.sync_all()?;
     }
+    Ok(())
+}
+
+async fn ingest_pending(
+    journal: &SharedJournal,
+    execution: &ExecutionRecord,
+    stamp: &Stamp,
+    path: &Path,
+) -> Result<()> {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file() && metadata.nlink() == 1 && metadata.permissions().mode() & 0o077 == 0,
+        "unsafe pending hook file"
+    );
+    let mut bytes = Vec::new();
+    file.take(MAX_HOOK as u64 + 1).read_to_end(&mut bytes)?;
+    ingest(journal, execution, &bytes, stamp).await
+}
+
+fn quarantine_pending(
+    journal: &SharedJournal,
+    execution: &ExecutionRecord,
+    stamp: &Stamp,
+    pending: &Path,
+    path: &Path,
+    error: &anyhow::Error,
+) -> Result<()> {
+    let name = path
+        .file_name()
+        .context("pending hook file name")?
+        .to_string_lossy()
+        .into_owned();
+    let resource = format!("pending:{name}");
+    let run = crate::run_identity(execution);
+    let records = vec![(
+        Record {
+            observed: Some(stamp.clone()),
+            run: Some(run.clone()),
+            body: Some(record::Body::Gap(Gap {
+                resource: resource.clone(),
+                reason: format!("undecodable pending hook: {error}"),
+                ..Default::default()
+            })),
+            ..Default::default()
+        },
+        Admission::Lifecycle,
+    )];
+    {
+        let mut journal = journal.lock().map_err(|_| anyhow::anyhow!("journal owner panicked"))?;
+        if journal.source(&run, &resource)?.is_none() {
+            journal.commit_source(&run, &resource, None, b"quarantined", records)?;
+        }
+    }
+    let quarantine = pending.join("quarantine");
+    std::fs::create_dir_all(&quarantine)?;
+    std::fs::set_permissions(&quarantine, std::fs::Permissions::from_mode(0o700))?;
+    if let Err(move_error) = std::fs::rename(path, quarantine.join(&name))
+        && move_error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(move_error.into());
+    }
+    std::fs::File::open(pending)?.sync_all()?;
     Ok(())
 }
 
@@ -247,7 +323,16 @@ pub fn bind(path: &Path) -> Result<UnixListener> {
 
 pub async fn serve(listener: UnixListener, journal: SharedJournal, stamp: impl Fn() -> Result<Stamp>) -> Result<()> {
     loop {
-        let (mut stream, _) = listener.accept().await?;
+        let mut stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(error) => {
+                tracing::warn!(%error, "hook accept failed");
+                if matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                continue;
+            }
+        };
         // Read and attribute before accepting another peer; bounded deadline
         // and bytes keep an idle or oversized client from pinning ingress.
         let result = tokio::time::timeout(

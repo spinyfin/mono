@@ -17,13 +17,18 @@ pub fn run_identity(record: &ExecutionRecord) -> Run {
 }
 
 pub fn registered(journal: &SharedJournal) -> Result<Vec<ExecutionRecord>> {
-    journal
+    let rows = journal
         .lock()
         .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
-        .list_executions()?
-        .iter()
-        .map(|bytes| serde_json::from_slice(bytes).map_err(Into::into))
-        .collect()
+        .list_executions()?;
+    let mut records = Vec::new();
+    for bytes in rows {
+        match serde_json::from_slice(&bytes) {
+            Ok(record) => records.push(record),
+            Err(error) => tracing::warn!(%error, "skipping undecodable execution record"),
+        }
+    }
+    Ok(records)
 }
 
 /// Also runs offline and immediately after daemon restart. One run's malformed
@@ -33,13 +38,19 @@ pub async fn observe(journal: SharedJournal, stamp: impl Fn() -> Result<Stamp>) 
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
-        for record in registered(&journal)? {
+        let records = match registered(&journal) {
+            Ok(records) => records,
+            Err(error) => {
+                tracing::warn!(%error, "execution listing failed; skipping observe tick");
+                continue;
+            }
+        };
+        for record in records {
             if record.observation.is_none() || record.reclaimed {
                 continue;
             }
             if let Err(error) = hooks::drain(&journal, &record, &stamp()?).await {
                 tracing::warn!(run = record.run_id, %error, "pending hooks retained");
-                continue;
             }
             if let Err(error) = transcripts::poll(&journal, &record, &stamp()?).await
                 && !boss_spoke_journal::Fault::is_full(&error)
@@ -118,6 +129,26 @@ mod tests {
     }))
     .unwrap()
     }
+    fn receipt_through(journal: &SharedJournal) {
+        let mut journal = journal.lock().unwrap();
+        let (_, id) = journal.identity().unwrap();
+        let through = journal.record_bounds().unwrap().1;
+        journal
+            .receipt(&boss_protocol_spoke::v1::Cursor {
+                journal_id: id,
+                through,
+            })
+            .unwrap();
+    }
+    async fn poll_available(journal: &SharedJournal, execution: &ExecutionRecord) {
+        for _ in 0..16 {
+            match transcripts::poll(journal, execution, &stamp().unwrap()).await {
+                Ok(()) => receipt_through(journal),
+                Err(error) if Fault::is_full(&error) => receipt_through(journal),
+                Err(error) => panic!("{error}"),
+            }
+        }
+    }
     fn records(journal: &SharedJournal) -> Vec<Record> {
         let journal = journal.lock().unwrap();
         let mut after = 0;
@@ -134,7 +165,7 @@ mod tests {
             .join(std::env::var("SHIM_BIN").unwrap());
         let mut child = tokio::process::Command::new(binary)
             .env("BOSS_EVENTS_SOCKET", socket)
-            .env("BOSS_EVENT_SPOOL", root.join("pending"))
+            .env(boss_host_execution::worker::EVENT_SPOOL_ENV, root.join("pending"))
             .env("BOSS_RUN_ID", "run")
             .env("BOSS_EVENT_RETRY_DELAYS_MS", "0")
             .stdin(std::process::Stdio::piped())
@@ -486,6 +517,180 @@ mod tests {
                 .source(&run_identity(&execution), "drained")
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_oldest_pending_does_not_wedge_drain_or_transcript() {
+        let root = tempfile::tempdir().unwrap();
+        let mut execution = execution(root.path());
+        let producer = "0123456789abcdef0123456789abcdef";
+        let pending = root.path().join("pending");
+        let empty = pending.join(format!("00000000000000000001-{producer}.tmp"));
+        std::fs::File::create(&empty).unwrap();
+        std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut wrong: serde_json::Value = serde_json::from_slice(&hook(None)).unwrap();
+        wrong["_boss_run_id"] = "other".into();
+        wrong["_boss_producer_sequence"] = 2.into();
+        let wrong_path = pending.join(format!("00000000000000000002-{producer}.json"));
+        std::fs::write(&wrong_path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+        std::fs::set_permissions(&wrong_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let path = root.path().join("transcript.jsonl");
+        std::fs::write(&path, b"later\n").unwrap();
+        let mut stop: serde_json::Value = serde_json::from_slice(&hook(Some(&path))).unwrap();
+        stop["_boss_producer_sequence"] = 3.into();
+        let stop_path = pending.join(format!("00000000000000000003-{producer}.json"));
+        std::fs::write(&stop_path, serde_json::to_vec(&stop).unwrap()).unwrap();
+        std::fs::set_permissions(&stop_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        execution.phase = Phase::Terminal;
+        let original = journal(root.path(), limits());
+        original
+            .lock()
+            .unwrap()
+            .save_execution("run", "token", &serde_json::to_vec(&execution).unwrap())
+            .unwrap();
+        let observer = tokio::spawn(crate::observe(original.clone(), stamp));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while original
+                .lock()
+                .unwrap()
+                .source(&run_identity(&execution), "drained")
+                .unwrap()
+                .is_none()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        observer.abort();
+        let _ = observer.await;
+        assert!(!empty.exists());
+        assert!(!wrong_path.exists());
+        assert!(!stop_path.exists());
+        let captured = records(&original);
+        assert!(
+            captured
+                .iter()
+                .filter(|record| matches!(&record.body, Some(record::Body::Gap(gap)) if gap.resource.starts_with("pending:")))
+                .count()
+                >= 2
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|record| matches!(&record.body, Some(record::Body::Event(_))))
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|record| matches!(&record.body, Some(record::Body::Transcript(t)) if t.data == b"later\n"))
+        );
+        drop(original);
+        let reopened = journal(root.path(), limits());
+        let observer = tokio::spawn(crate::observe(reopened.clone(), stamp));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        observer.abort();
+        let _ = observer.await;
+        assert!(
+            reopened
+                .lock()
+                .unwrap()
+                .source(&run_identity(&execution), "drained")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(records(&reopened).len(), captured.len());
+    }
+
+    #[tokio::test]
+    async fn oversized_unterminated_entry_does_not_stall_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        let mut execution = execution(root.path());
+        execution.driver_id = "codex".into();
+        let directory = root.path().join("sessions");
+        std::fs::create_dir(&directory).unwrap();
+        execution.observation.as_mut().unwrap().file = Some((
+            boss_engine_driver::AgentJsonlFileIngress {
+                directory: directory.clone(),
+                filename_prefix: "rollout-".into(),
+                filename_suffix: ".jsonl".into(),
+                workspace_path: root.path().into(),
+            },
+            Vec::new(),
+        ));
+        let path = directory.join("rollout-example-session.jsonl");
+        let meta = serde_json::json!({"type":"session_meta", "payload":{"id":"session", "cwd":root.path()}});
+        let mut body = meta.to_string();
+        body.push('\n');
+        body.push_str(&"x".repeat(6 * 64 * 1024));
+        std::fs::write(&path, &body).unwrap();
+        let journal = journal(
+            root.path(),
+            Limits {
+                spool_bytes: 8 * 1024 * 1024,
+                lifecycle_reserve: 64 * 1024,
+            },
+        );
+        hooks::ingest(&journal, &execution, &hook(None), &stamp().unwrap())
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            transcripts::poll(&journal, &execution, &stamp().unwrap())
+                .await
+                .unwrap();
+        }
+        receipt_through(&journal);
+        drop(journal);
+        let reopened = self::journal(
+            root.path(),
+            Limits {
+                spool_bytes: 8 * 1024 * 1024,
+                lifecycle_reserve: 64 * 1024,
+            },
+        );
+        poll_available(&reopened, &execution).await;
+        use std::io::Write;
+        let complete = serde_json::json!({"type":"event_msg", "payload":{
+            "type":"task_complete", "last_agent_message":"done"
+        }});
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(format!("\n{complete}\n").as_bytes())
+            .unwrap();
+        execution.phase = Phase::Terminal;
+        poll_available(&reopened, &execution).await;
+        let captured = records(&reopened);
+        assert!(captured.iter().any(|record| matches!(
+            &record.body,
+            Some(record::Body::Gap(gap)) if gap.reason.contains("256 KiB")
+        )));
+        assert!(captured.iter().any(|record| match &record.body {
+            Some(record::Body::Event(event)) =>
+                matches!(event.event, Some(boss_protocol_spoke::v1::worker_event::Event::Stop(_))),
+            _ => false,
+        }));
+        assert!(
+            reopened
+                .lock()
+                .unwrap()
+                .source(&run_identity(&execution), "drained")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            captured
+                .iter()
+                .filter_map(|record| match &record.body {
+                    Some(record::Body::Transcript(t)) => Some(t.offset),
+                    _ => None,
+                })
+                .max()
+                .unwrap()
+                + 64 * 1024
+                >= std::fs::metadata(&path).unwrap().len()
         );
     }
 }

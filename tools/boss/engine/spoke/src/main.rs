@@ -24,6 +24,12 @@ mod commands {
                 .source(&run, "drained")?
                 .is_some())
         }
+        fn prune_observation_sources(&self, record: &worker::ExecutionRecord) -> Result<()> {
+            self.0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
+                .prune_sources(&boss_spoke_ingress::run_identity(record))
+        }
         fn load(&self, run_id: &str, spawn_token: &str) -> Result<Option<Vec<u8>>> {
             self.0
                 .lock()
@@ -250,7 +256,10 @@ fn main() -> Result<()> {
     unsafe {
         std::env::set_var(boss_host_execution::homes::ROOT_ENV, &homes_root);
         std::env::set_var(boss_host_execution::homes::GROK_ROOT_ENV, &grok_root);
-        std::env::set_var("BOSS_WORKER_TRANSCRIPTS_ROOT", args.state_dir.join("transcripts"));
+        std::env::set_var(
+            boss_engine_driver::transcript_store::WORKER_TRANSCRIPTS_ROOT_ENV,
+            args.state_dir.join("transcripts"),
+        );
     }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

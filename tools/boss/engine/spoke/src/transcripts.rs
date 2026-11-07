@@ -12,11 +12,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
+const MAX_PARTIAL: usize = 256 * 1024;
+
 #[derive(Default, Serialize, Deserialize)]
 struct Progress {
     #[serde(with = "partial_bytes")]
     partial: Vec<u8>,
     normalizer: Option<serde_json::Value>,
+    /// Raw cursor still advances; JSON assembly waits for the next newline.
+    #[serde(default)]
+    skip_until_newline: bool,
 }
 
 // Byte arrays expand up to fourfold in JSON. Base64 keeps even a partial
@@ -81,7 +86,7 @@ pub async fn poll(journal: &SharedJournal, execution: &ExecutionRecord, stamp: &
         let journal = journal.lock().map_err(|_| anyhow::anyhow!("journal owner panicked"))?;
         (
             journal.source(&run, "transcript")?,
-            journal.latest_source(&run, "hook:")?,
+            journal.latest_source(&run)?,
             journal.bulk_credit(),
         )
     };
@@ -222,6 +227,14 @@ pub async fn poll(journal: &SharedJournal, execution: &ExecutionRecord, stamp: &
         {
             checkpoint.progress.partial.push(b'\n');
         }
+        if checkpoint.progress.skip_until_newline {
+            if let Some(index) = checkpoint.progress.partial.iter().position(|&b| b == b'\n') {
+                checkpoint.progress.partial.drain(..=index);
+                checkpoint.progress.skip_until_newline = false;
+            } else {
+                checkpoint.progress.partial.clear();
+            }
+        }
         let mut consumed = 0;
         for (index, byte) in checkpoint.progress.partial.iter().enumerate() {
             if *byte != b'\n' {
@@ -253,10 +266,19 @@ pub async fn poll(journal: &SharedJournal, execution: &ExecutionRecord, stamp: &
             }
         }
         checkpoint.progress.partial.drain(..consumed);
-        ensure!(
-            checkpoint.progress.partial.len() <= 256 * 1024,
-            "unterminated transcript entry exceeds limit"
-        );
+        if checkpoint.progress.partial.len() > MAX_PARTIAL {
+            records.push((
+                make(record::Body::Gap(Gap {
+                    resource: format!("transcript:{generation}:entry"),
+                    from_offset: checkpoint.cursor.offset,
+                    through_offset: chunk.cursor.offset,
+                    reason: "unterminated transcript entry exceeds 256 KiB; skipped until the next newline".into(),
+                })),
+                Admission::Lifecycle,
+            ));
+            checkpoint.progress.skip_until_newline = true;
+            checkpoint.progress.partial.clear();
+        }
         checkpoint.progress.normalizer = session.resume_state();
     }
     checkpoint.cursor = chunk.cursor;
