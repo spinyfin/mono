@@ -1,6 +1,7 @@
 //! Restage preserved changes without manufacturing new change identities.
 use super::preserved::{
-    OP_VIEW_LOAD_LIMIT, RecordedPresence, change_revset, log, log_change, operations, resolve_recorded_presence, unpublished,
+    OP_VIEW_LOAD_LIMIT, RecordedPresence, change_revset, log, log_change, operations, resolve_recorded_presence,
+    unpublished,
 };
 use super::*;
 
@@ -88,8 +89,7 @@ async fn select_tip(
         // orders those updates, without trusting author/committer clocks.
         let change = changes.iter().next().unwrap();
         let mut latest: Option<((i64, u32), String)> = None;
-        let mut loads = 0;
-        for (seconds, nanos, operation) in operations(jj, &record.repo_path).await? {
+        for (loads, (seconds, nanos, operation)) in operations(jj, &record.repo_path).await?.into_iter().enumerate() {
             if latest.as_ref().is_some_and(|(time, _)| *time > (seconds, nanos)) {
                 return Ok(latest.map(|(_, selected)| (selected, candidates.clone())));
             }
@@ -99,7 +99,6 @@ async fn select_tip(
             if loads >= OP_VIEW_LOAD_LIMIT {
                 break;
             }
-            loads += 1;
             let visible = jj
                 .run(
                     &record.repo_path,

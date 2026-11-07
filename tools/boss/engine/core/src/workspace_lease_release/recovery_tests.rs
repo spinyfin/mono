@@ -936,7 +936,15 @@ async fn leftover_sweep_never_adopts_an_allow_dirty_successors_edits() {
             let files = JjRepo::run(&repo.repo, &["file", "list", "-r", &tip.commit_id]);
             assert!(!files.contains("theirs"), "ran_jj={successor_ran_jj}: {files}");
         }
-        assert!(open_kinds(&db, &execution.id).contains(&"preserved_work_needs_inspection".to_owned()));
+        // The claim counter moved, so the workspace belongs to the successor
+        // and is never snapshotted. Inspection is raised only when the
+        // successor's own jj command rewrote the boundary change, so the
+        // worker's last change could not be bookmarked.
+        assert_eq!(
+            open_kinds(&db, &execution.id).contains(&"preserved_work_needs_inspection".to_owned()),
+            successor_ran_jj,
+            "ran_jj={successor_ran_jj}"
+        );
     }
 }
 

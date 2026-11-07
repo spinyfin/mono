@@ -1511,7 +1511,9 @@ pub trait HostAdapter: Send + Sync {
         tip_source: WorkspaceTipSource,
     ) -> anyhow::Result<PreserveOutcome> {
         if !matches!(tip_source, WorkspaceTipSource::Live) {
-            bail!("this host adapter cannot honor a workspace lease boundary; refusing to snapshot a workspace it may no longer hold");
+            bail!(
+                "this host adapter cannot honor a workspace lease boundary; refusing to snapshot a workspace it may no longer hold"
+            );
         }
         self.confirm_workspace_recovery(record, workspace, recorded, since_unix)
             .await

@@ -1925,7 +1925,9 @@ mod tests {
             workspace_id: "mono-agent-120".to_string(),
             workspace_path: workspace_root.join("mono-agent-120"),
         };
-        store.sync_workspaces("mono", std::slice::from_ref(&candidate)).expect("sync");
+        store
+            .sync_workspaces("mono", std::slice::from_ref(&candidate))
+            .expect("sync");
         let first = store
             .claim_specific_workspace("mono", "mono-agent-120", "boss", "a", "lease-a", 1_700_000_000, None)
             .expect("claim")
