@@ -588,6 +588,15 @@ impl WorkDb {
         let mut redispatched = Vec::new();
         let mut pending = PendingEvents::new();
         for work_item_id in candidate_ids {
+            if !parking::upkeep_eligible(&tx, &work_item_id)? {
+                tracing::debug!(%work_item_id, "active dispatch: skipping parked row");
+                continue;
+            }
+            if work_item_is_human_driven(&tx, &work_item_id)?
+                || !deps::gating_prereqs_for(&tx, &work_item_id)?.is_empty()
+            {
+                continue;
+            }
             if super::local_worker_quarantine_store::work_item_is_quarantined_in(&tx, &work_item_id)? {
                 continue;
             }
@@ -718,6 +727,15 @@ impl WorkDb {
         let mut redispatched = Vec::new();
         let mut pending = PendingEvents::new();
         for (work_item_id, autostart) in candidates {
+            if !parking::upkeep_eligible(&tx, &work_item_id)? {
+                tracing::debug!(%work_item_id, "active dispatch: skipping parked row");
+                continue;
+            }
+            if work_item_is_human_driven(&tx, &work_item_id)?
+                || !deps::gating_prereqs_for(&tx, &work_item_id)?.is_empty()
+            {
+                continue;
+            }
             if super::local_worker_quarantine_store::work_item_is_quarantined_in(&tx, &work_item_id)? {
                 continue;
             }
@@ -756,12 +774,6 @@ impl WorkDb {
                     );
                     continue;
                 }
-            }
-            // Silently skip gated items so the rescan keeps going.
-            // request_execution_in_tx_with_live_check would bail and
-            // roll back the entire transaction otherwise.
-            if !deps::gating_prereqs_for(&tx, &work_item_id)?.is_empty() {
-                continue;
             }
             request_execution_in_tx_with_live_check(
                 &mut pending,

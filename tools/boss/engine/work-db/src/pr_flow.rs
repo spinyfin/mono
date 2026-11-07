@@ -2608,6 +2608,9 @@ pub(super) fn restart_after_answer(
          blocked_detail = NULL, autostart = 1, last_status_actor = 'human', updated_at = ?3 WHERE id = ?1",
         params![task.id, description, now],
     )?;
+    if !parking::upkeep_eligible(tx, &task.id)? {
+        return Ok(false);
+    }
     if !deps::gating_prereqs_for(tx, &task.id)?.is_empty() {
         maybe_engine_block_dependent(pending, tx, &task.id, now)?;
         let task = query_task(tx, &task.id).require("task", &task.id)?;

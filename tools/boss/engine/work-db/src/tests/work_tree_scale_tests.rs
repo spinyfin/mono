@@ -4,76 +4,174 @@ use boss_metrics::population_timing::{PopulationTrace, segment};
 use std::time::Instant;
 
 pub(super) fn seed(conn: &Connection) {
-    conn.execute_batch("BEGIN").unwrap();
-    for i in 0..5 {
-        conn.execute(
-            "INSERT INTO products(id,name,slug,status,created_at,updated_at) VALUES (?1,?1,?1,'active','1','1')",
-            [format!("scale-product-{i}")],
-        )
+    // Fixture load is not the thing under measurement. Skip durable commit
+    // cost so ~70k inserts finish well inside the test budget.
+    conn.execute_batch("PRAGMA synchronous = OFF; PRAGMA journal_mode = MEMORY; PRAGMA temp_store = MEMORY;")
         .unwrap();
+    conn.execute_batch("BEGIN").unwrap();
+    {
+        let mut insert_product = conn
+            .prepare(
+                "INSERT INTO products(id,name,slug,status,created_at,updated_at) VALUES (?1,?1,?1,'active','1','1')",
+            )
+            .unwrap();
+        for i in 0..5 {
+            insert_product.execute([format!("scale-product-{i}")]).unwrap();
+        }
     }
-    for i in 0..131 {
-        conn.execute("INSERT INTO projects(id,product_id,name,slug,status,priority,created_at,updated_at) VALUES (?1,'scale-product-0',?1,?1,'active','medium','1','1')", [format!("scale-project-{i}")]).unwrap();
+    {
+        let mut insert_project = conn
+            .prepare("INSERT INTO projects(id,product_id,name,slug,status,priority,created_at,updated_at) VALUES (?1,'scale-product-0',?1,?1,'active','medium','1','1')")
+            .unwrap();
+        for i in 0..131 {
+            insert_project.execute([format!("scale-project-{i}")]).unwrap();
+        }
     }
     // Put the large board in one product; reserve four small empty products.
     // Fixed 3 KiB briefs approximate the observed multi-megabyte tree without
     // claiming to reproduce unknown production text or revision topology.
     let description = "Synthetic work item description. ".repeat(96);
-    for i in 0..8030 {
-        let status = match i {
-            0..6640 => "done",
-            6640..7085 => "archived",
-            7085..7435 => "in_review",
-            7435..7756 => "todo",
-            7756..7953 => "blocked",
-            _ => "active",
-        };
-        let parent = (i % 4 == 3).then(|| format!("scale-task-{}", i - 1));
-        let kind = if parent.is_some() { "revision" } else { "project_task" };
-        conn.execute("INSERT INTO tasks(id,product_id,project_id,kind,name,description,status,created_at,updated_at,pr_url,pr_head_sha,parent_task_id,completed_at) VALUES (?1,'scale-product-0',?2,?3,?1,?4,?5,'1','1',?6,'synthetic-head',?7,?8)", params![format!("scale-task-{i}"),format!("scale-project-{}",(i / 4) % 131),kind,description,status,format!("https://github.com/example/fixture/pull/{}",i + 1),parent,(status == "done").then_some("1")]).unwrap();
+    {
+        let mut insert_task = conn
+            .prepare("INSERT INTO tasks(id,product_id,project_id,kind,name,description,status,created_at,updated_at,pr_url,pr_head_sha,parent_task_id,completed_at) VALUES (?1,'scale-product-0',?2,?3,?1,?4,?5,'1','1',?6,'synthetic-head',?7,?8)")
+            .unwrap();
+        for i in 0..8030 {
+            let status = match i {
+                0..6640 => "done",
+                6640..7085 => "archived",
+                7085..7435 => "in_review",
+                7435..7756 => "todo",
+                7756..7953 => "blocked",
+                _ => "active",
+            };
+            let parent = (i % 4 == 3).then(|| format!("scale-task-{}", i - 1));
+            let kind = if parent.is_some() { "revision" } else { "project_task" };
+            insert_task
+                .execute(params![
+                    format!("scale-task-{i}"),
+                    format!("scale-project-{}", (i / 4) % 131),
+                    kind,
+                    description,
+                    status,
+                    format!("https://github.com/example/fixture/pull/{}", i + 1),
+                    parent,
+                    (status == "done").then_some("1")
+                ])
+                .unwrap();
+        }
     }
-    for i in 0..21127 {
-        conn.execute("INSERT INTO work_executions(id,work_item_id,kind,status,repo_remote_url,created_at,finished_at) VALUES (?1,?2,'pr_review','completed','https://github.com/example/fixture','1','2')", params![format!("scale-exec-{i}"),format!("scale-task-{}",if i < 1818 { i * 4 } else { i % 8030 })]).unwrap();
+    {
+        let mut insert_execution = conn
+            .prepare("INSERT INTO work_executions(id,work_item_id,kind,status,repo_remote_url,created_at,finished_at) VALUES (?1,?2,'pr_review','completed','https://github.com/example/fixture','1','2')")
+            .unwrap();
+        for i in 0..21127 {
+            insert_execution
+                .execute(params![
+                    format!("scale-exec-{i}"),
+                    format!("scale-task-{}", if i < 1818 { i * 4 } else { i % 8030 })
+                ])
+                .unwrap();
+        }
     }
-    for i in 0..19703 {
-        conn.execute("INSERT INTO work_runs(id,execution_id,agent_id,status,created_at,finished_at) VALUES (?1,?2,'synthetic','completed','1','2')", params![format!("scale-run-{i}"),format!("scale-exec-{i}")]).unwrap();
+    {
+        let mut insert_run = conn
+            .prepare(
+                "INSERT INTO work_runs(id,execution_id,agent_id,status,created_at,finished_at) VALUES (?1,?2,'synthetic','completed','1','2')",
+            )
+            .unwrap();
+        for i in 0..19703 {
+            insert_run
+                .execute(params![format!("scale-run-{i}"), format!("scale-exec-{i}")])
+                .unwrap();
+        }
     }
-    for i in 0..4131 {
-        conn.execute("INSERT INTO worker_proposals(id,execution_id,work_item_id,kind,payload_json,idempotency_key,state,created_at) VALUES (?1,?2,?3,'done','{}',?1,'applied','1')", params![format!("scale-proposal-{i}"),format!("scale-exec-{i}"),format!("scale-task-{}",if i < 1818 { i * 4 } else { i % 8030 })]).unwrap();
+    {
+        let mut insert_proposal = conn
+            .prepare("INSERT INTO worker_proposals(id,execution_id,work_item_id,kind,payload_json,idempotency_key,state,created_at) VALUES (?1,?2,?3,'done','{}',?1,'applied','1')")
+            .unwrap();
+        for i in 0..4131 {
+            insert_proposal
+                .execute(params![
+                    format!("scale-proposal-{i}"),
+                    format!("scale-exec-{i}"),
+                    format!("scale-task-{}", if i < 1818 { i * 4 } else { i % 8030 })
+                ])
+                .unwrap();
+        }
     }
-    for i in 0..786 {
-        conn.execute("INSERT INTO pr_review_batches(id,cycle_root_id,base_sha,classification_json,created_at,phase,pr_number,pr_url,status,target_sha,updated_at) VALUES (?1,?2,'base','{}','1','pre_merge',?3,'https://github.com/example/fixture/pull/1','completed','synthetic-head','2')", params![format!("scale-batch-{i}"),format!("scale-task-{}",i * 4),i + 1]).unwrap();
+    {
+        let mut insert_batch = conn
+            .prepare("INSERT INTO pr_review_batches(id,cycle_root_id,base_sha,classification_json,created_at,phase,pr_number,pr_url,status,target_sha,updated_at) VALUES (?1,?2,'base','{}','1','pre_merge',?3,'https://github.com/example/fixture/pull/1','completed','synthetic-head','2')")
+            .unwrap();
+        for i in 0..786 {
+            insert_batch
+                .execute(params![
+                    format!("scale-batch-{i}"),
+                    format!("scale-task-{}", i * 4),
+                    i + 1
+                ])
+                .unwrap();
+        }
     }
-    for i in 0..1818 {
-        conn.execute("INSERT INTO pr_review_verdicts(id,execution_id,work_item_id,head_sha,gate_outcome,created_at) VALUES (?1,?2,?3,'synthetic-head','completed_clean','2')", params![format!("scale-verdict-{i}"),format!("scale-exec-{i}"),format!("scale-task-{}",i * 4)]).unwrap();
+    {
+        let mut insert_verdict = conn
+            .prepare("INSERT INTO pr_review_verdicts(id,execution_id,work_item_id,head_sha,gate_outcome,created_at) VALUES (?1,?2,?3,'synthetic-head','completed_clean','2')")
+            .unwrap();
+        for i in 0..1818 {
+            insert_verdict
+                .execute(params![
+                    format!("scale-verdict-{i}"),
+                    format!("scale-exec-{i}"),
+                    format!("scale-task-{}", i * 4)
+                ])
+                .unwrap();
+        }
     }
     // Guide history and epochs in another product must not enlarge a board
     // or single-card lookup's result set.
-    for i in 0..2000 {
-        let root = format!("unrelated-task-{i}");
-        let series = format!("unrelated-series-{i}");
-        let comparison = format!("unrelated-comparison-{i}");
-        conn.execute(
-            "INSERT INTO tasks(id, product_id, kind, name, status, created_at, updated_at)
+    {
+        let mut insert_unrelated = conn
+            .prepare(
+                "INSERT INTO tasks(id, product_id, kind, name, status, created_at, updated_at)
              VALUES (?1, 'scale-product-1', 'chore', ?1, 'done', '1', '1')",
-            [&root],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO pr_review_guide_source_series(id, root_task_id, canonical_pr_url, selected_comparison_id, guide_lifecycle, created_at, updated_at)
+            )
+            .unwrap();
+        let mut insert_series = conn
+            .prepare(
+                "INSERT INTO pr_review_guide_source_series(id, root_task_id, canonical_pr_url, selected_comparison_id, guide_lifecycle, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, 'failed', '1', '1')",
-            params![series, root, format!("https://github.com/example/unrelated/pull/{i}"), comparison],
-        ).unwrap();
-        conn.execute(
-            "INSERT INTO pr_review_guide_source_comparisons(id, series_id, observation_sequence, observed_base_sha, merge_base_sha, head_sha, trigger, packet_hash, complete, captured_at)
+            )
+            .unwrap();
+        let mut insert_comparison = conn
+            .prepare(
+                "INSERT INTO pr_review_guide_source_comparisons(id, series_id, observation_sequence, observed_base_sha, merge_base_sha, head_sha, trigger, packet_hash, complete, captured_at)
              VALUES (?1, ?2, 1, 'base', 'base', 'head', 'manual', 'hash', 1, '1')",
-            params![comparison, series],
-        ).unwrap();
-        conn.execute(
-            "INSERT INTO pr_review_guide_attempts(id, series_id, comparison_id, request_epoch, ordinal, status, prompt_version, error, created_at, finished_at)
+            )
+            .unwrap();
+        let mut insert_attempt = conn
+            .prepare(
+                "INSERT INTO pr_review_guide_attempts(id, series_id, comparison_id, request_epoch, ordinal, status, prompt_version, error, created_at, finished_at)
              VALUES (?1, ?2, ?3, 0, 1, 'failed', 'v1', 'unrelated failure', '1', '2')",
-            params![format!("unrelated-attempt-{i}"), series, comparison],
-        ).unwrap();
+            )
+            .unwrap();
+        for i in 0..2000 {
+            let root = format!("unrelated-task-{i}");
+            let series = format!("unrelated-series-{i}");
+            let comparison = format!("unrelated-comparison-{i}");
+            insert_unrelated.execute([&root]).unwrap();
+            insert_series
+                .execute(params![
+                    &series,
+                    &root,
+                    format!("https://github.com/example/unrelated/pull/{i}"),
+                    &comparison
+                ])
+                .unwrap();
+            insert_comparison.execute(params![&comparison, &series]).unwrap();
+            insert_attempt
+                .execute(params![format!("unrelated-attempt-{i}"), &series, &comparison])
+                .unwrap();
+        }
     }
     conn.execute_batch("COMMIT").unwrap();
 }

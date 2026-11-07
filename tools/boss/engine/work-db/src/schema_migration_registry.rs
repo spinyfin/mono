@@ -338,6 +338,11 @@ pub(super) fn all() -> Vec<Migration> {
             legacy_version: None,
             apply: parking::migrate,
         },
+        Migration {
+            id: "20261107_0543_parking_membership".into(),
+            legacy_version: None,
+            apply: parking::migrate_membership,
+        },
     ]);
     migrations
 }
