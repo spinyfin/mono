@@ -2226,7 +2226,8 @@ impl WorkDb {
     /// This is the ONLY writer of `waiting_human` for a pane-hosted worker,
     /// and the only clearer of it — called from `awaiting_input_status`'s
     /// two producers (the hook-dispatch mirror and the stalled-spawn sweep
-    /// mirror), never directly by a runner or a completion path. The
+    /// mirror), or the declaration backstop when unanswered asks park a run
+    /// for human direction without releasing its pane or lease. The
     /// signal driving it — the driver's own awaiting-input notification,
     /// surfaced as [`boss_protocol::WorkerActivity::WaitingForInput`] — is
     /// the pane's positive evidence that a worker is blocked on a human,

@@ -89,6 +89,42 @@ async fn deliver_owned_nudge(
 }
 
 impl ProbeQueuer for ServerStateProbeQueuer {
+    fn clear_pending_turn_boundary_probes(&self, run_id: &str, reason: &str) {
+        if let Some(server) = self.server.get().and_then(Weak::upgrade) {
+            server.drain_pending_probes_matching(run_id, ProbeDeliveryState::Dropped, reason, |probe| {
+                probe.requires_turn_boundary
+            });
+        }
+    }
+
+    fn can_queue_turn_boundary_probe(&self, run_id: &str) -> bool {
+        self.server.get().and_then(Weak::upgrade).is_some_and(|server| {
+            !server.has_pending_probe(run_id)
+                && !server.has_blocking_probe_for_declaration(run_id)
+                && server
+                    .live_worker_states
+                    .declaration_activity_for_run(run_id)
+                    .is_some_and(|activity| activity.at_turn_boundary)
+        })
+    }
+
+    fn queue_probe_at_turn_boundary(&self, run_id: &str, text: &str) -> bool {
+        let Some(server) = self.server.get().and_then(Weak::upgrade) else {
+            return false;
+        };
+        if server.has_pending_probe(run_id) || server.has_blocking_probe_for_declaration(run_id) {
+            return false;
+        }
+        server.queue_probe_inner(run_id.to_owned(), text.to_owned(), false, false, true);
+        let run_id = run_id.to_owned();
+        // This path never takes interrupt ownership. Reservation checks the
+        // real turn state again, including when a resumed hook races us.
+        boss_task_scope::spawn(async move {
+            super::worker_events::dispatch_probe_now(&server, &run_id).await;
+        });
+        true
+    }
+
     fn queue_probe(&self, run_id: &str, text: &str) {
         let Some(weak) = self.server.get() else {
             tracing::warn!(run_id, "probe queuer called before server state was bound");
@@ -288,6 +324,7 @@ impl ProbeDispatchOutcome {
 pub(super) struct PendingProbe {
     pub(super) probe_id: String,
     pub(super) text: String,
+    pub(super) requires_turn_boundary: bool,
 }
 
 /// One probe that has been written into the worker's pane and is
@@ -297,6 +334,10 @@ pub(super) struct PendingProbe {
 #[derive(Debug, Clone, bon::Builder)]
 #[builder(on(String, into))]
 pub(super) struct InFlightProbe {
+    /// A delivered declaration ask may yield its reply slot to the next
+    /// bounded ask while the worker remains at Stop, retaining its reply.
+    #[builder(default)]
+    requires_turn_boundary: bool,
     /// A Stop reader holds this snapshot; keep it tracked until that read settles.
     #[builder(default)]
     reply_reading: bool,
@@ -379,7 +420,7 @@ impl ServerState {
     /// `PostToolUse`, then at every `Stop`). One probe is delivered per
     /// reply cycle: see [`Self::has_in_flight_probe`].
     pub fn queue_probe(&self, run_id: String, text: String, urgent: bool) -> String {
-        self.queue_probe_inner(run_id, text, urgent, false)
+        self.queue_probe_inner(run_id, text, urgent, false, false)
     }
 
     /// Same as [`Self::queue_probe`], but additionally tags the minted probe
@@ -399,14 +440,22 @@ impl ServerState {
     /// Use this method for any probe whose delivery is meant to ack an
     /// open `worker_signal` attention item.
     pub fn queue_probe_resolving_worker_signal(&self, run_id: String, text: String, urgent: bool) -> String {
-        self.queue_probe_inner(run_id, text, urgent, true)
+        self.queue_probe_inner(run_id, text, urgent, true, false)
     }
 
-    fn queue_probe_inner(&self, run_id: String, text: String, urgent: bool, resolves_worker_signal: bool) -> String {
+    fn queue_probe_inner(
+        &self,
+        run_id: String,
+        text: String,
+        urgent: bool,
+        resolves_worker_signal: bool,
+        requires_turn_boundary: bool,
+    ) -> String {
         let probe_id = self.allocate_probe_id();
         let probe = PendingProbe {
             probe_id: probe_id.clone(),
             text,
+            requires_turn_boundary,
         };
         // Urgency lives on the queue (position) and on the lifecycle record
         // below (`ProbeRecord::urgent`, what `bossctl probe-status` reports).
@@ -528,6 +577,42 @@ impl ServerState {
             .contains_key(run_id)
     }
 
+    pub(super) fn next_probe_requires_turn_boundary(&self, run_id: &str) -> bool {
+        self.pending_probes
+            .lock()
+            .expect("pending_probes mutex poisoned")
+            .get(run_id)
+            .and_then(|queue| queue.front())
+            .is_some_and(|probe| probe.requires_turn_boundary)
+    }
+
+    fn declaration_reply_can_yield(&self, held: &InFlightProbe) -> bool {
+        held.requires_turn_boundary
+            && !held.reply_reading
+            && self
+                .probe_lifecycle
+                .lock()
+                .expect("probe_lifecycle mutex poisoned")
+                .get(&held.probe_id)
+                .is_some_and(|record| awaits_reply_after_submission(record.state) && record.submitted != Some(false))
+    }
+
+    fn has_blocking_probe_for_declaration(&self, run_id: &str) -> bool {
+        self.in_flight_probes
+            .lock()
+            .expect("in_flight_probes mutex poisoned")
+            .get(run_id)
+            .is_some_and(|held| !self.declaration_reply_can_yield(held))
+    }
+
+    pub(super) fn probe_delivery_slot_blocked(&self, run_id: &str) -> bool {
+        if self.next_probe_requires_turn_boundary(run_id) {
+            self.has_blocking_probe_for_declaration(run_id)
+        } else {
+            self.has_in_flight_probe(run_id)
+        }
+    }
+
     /// Claim the next queued probe for `run_id` **and** the run's single
     /// in-flight slot in one atomic step, or return `None` if either is
     /// unavailable.
@@ -558,18 +643,38 @@ impl ServerState {
         offset_bytes: u64,
     ) -> Option<PendingProbe> {
         let mut in_flight = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
-        if in_flight.contains_key(run_id) {
-            return None;
-        }
         let mut pending = self.pending_probes.lock().expect("pending_probes mutex poisoned");
         let queue = pending.get_mut(run_id)?;
+        if let Some(held) = in_flight.get(run_id)
+            && (!queue.front()?.requires_turn_boundary || !self.declaration_reply_can_yield(held))
+        {
+            return None;
+        }
+        if queue.front()?.requires_turn_boundary
+            && (self
+                .wait_registry
+                .active(run_id, boss_engine_utils::epoch_time::now_epoch_secs())
+                .is_some()
+                || !self
+                    .live_worker_states
+                    .declaration_activity_for_run(run_id)
+                    .is_some_and(|activity| activity.at_turn_boundary))
+        {
+            return None;
+        }
         let probe = queue.pop_front()?;
         if queue.is_empty() {
             pending.remove(run_id);
         }
+        let mut previous_reply = in_flight.remove(run_id).map(Box::new);
+        if let Some(previous) = previous_reply.as_deref_mut() {
+            previous.end_offset = Some(offset_bytes);
+        }
         in_flight.insert(
             run_id.to_owned(),
             InFlightProbe::builder()
+                .requires_turn_boundary(probe.requires_turn_boundary)
+                .maybe_previous_reply(previous_reply)
                 .probe_id(&probe.probe_id)
                 .maybe_transcript_path(transcript_path)
                 .offset_bytes(offset_bytes)
@@ -625,6 +730,11 @@ impl ServerState {
         let mut pending = self.pending_probes.lock().expect("pending_probes mutex poisoned");
         let queue = pending.get_mut(run_id)?;
         let position = queue.iter().position(|probe| probe.probe_id == probe_id)?;
+        // Completion questions never enter the interrupting delivery path,
+        // even if another caller attempts to claim their specific id.
+        if queue.get(position)?.requires_turn_boundary {
+            return None;
+        }
         let probe = queue.remove(position)?;
         if queue.is_empty() {
             pending.remove(run_id);
@@ -752,18 +862,31 @@ impl ServerState {
     /// Leaves any already-injected in-flight probe untouched: those are past
     /// the queue and their outcome is settled by the reply path.
     pub(super) fn drain_pending_probes(&self, run_id: &str, state: ProbeDeliveryState, detail: &str) -> Vec<String> {
+        self.drain_pending_probes_matching(run_id, state, detail, |_| true)
+    }
+
+    fn drain_pending_probes_matching(
+        &self,
+        run_id: &str,
+        state: ProbeDeliveryState,
+        detail: &str,
+        matches: impl Fn(&PendingProbe) -> bool,
+    ) -> Vec<String> {
         debug_assert!(
             state.is_undeliverable(),
             "draining a queued probe means it will never be delivered; \
              {} is not an undeliverable state",
             state.as_str(),
         );
-        let drained = self
-            .pending_probes
-            .lock()
-            .expect("pending_probes mutex poisoned")
-            .remove(run_id)
-            .unwrap_or_default();
+        let drained = {
+            let mut pending = self.pending_probes.lock().expect("pending_probes mutex poisoned");
+            let queued = pending.remove(run_id).unwrap_or_default();
+            let (drained, retained): (VecDeque<_>, VecDeque<_>) = queued.into_iter().partition(matches);
+            if !retained.is_empty() {
+                pending.insert(run_id.to_owned(), retained);
+            }
+            drained
+        };
         let mut ids = Vec::with_capacity(drained.len());
         for probe in drained {
             tracing::warn!(

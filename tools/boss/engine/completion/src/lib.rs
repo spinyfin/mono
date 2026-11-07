@@ -119,6 +119,7 @@ pub mod reconcile_audit;
 pub mod remote_host;
 pub mod review_guide_capture;
 pub mod run_done_backstop;
+mod run_done_gate;
 pub mod teardown_registry;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -1194,6 +1195,25 @@ pub trait ProbeQueuer: Send + Sync {
     /// recurring sweep has no boundary to ride and needs
     /// [`Self::deliver_queued_probes_now`].
     fn queue_probe(&self, run_id: &str, text: &str);
+
+    /// Queue a completion question that must never interrupt a turn. The
+    /// adapter retains it until a real Stop and may deliver immediately only
+    /// while the worker is still at that boundary. False means no new ask was
+    /// queued (for example one is already pending); do not count a strike.
+    fn queue_probe_at_turn_boundary(&self, _run_id: &str, _text: &str) -> bool {
+        false
+    }
+
+    /// Do not spend further strikes while a prior question awaits delivery.
+    /// Concrete adapters also verify the live Stop and preserve reply records
+    /// when an already-delivered declaration ask remains unanswered.
+    fn can_queue_turn_boundary_probe(&self, _run_id: &str) -> bool {
+        true
+    }
+
+    /// A structured wait answers pending completion questions, but must
+    /// leave ordinary human probes available for delivery.
+    fn clear_pending_turn_boundary_probes(&self, _run_id: &str, _reason: &str) {}
 
     /// Deliver whatever is queued for `run_id` **now**, without waiting for a
     /// hook boundary.
