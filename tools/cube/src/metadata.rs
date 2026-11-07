@@ -156,12 +156,14 @@ pub struct WorkspaceRecord {
     /// that nobody wants the workspace, and the reuse probe still gates
     /// anything destructive.
     pub last_activity_at_epoch_s: Option<i64>,
-    /// Number of times a lease has been claimed on this workspace, incremented
-    /// on every claim and never reset or cleared on release. A caller that
-    /// recorded the generation of its own lease can later prove no other lease
-    /// was claimed since: the workspace is free and the generation is unchanged.
-    /// A deleted-and-rediscovered row restarts at zero, which never matches a
-    /// recorded non-zero generation.
+    /// Stamp of the latest claim on this workspace. Every claim draws a new
+    /// value from a per-repo counter that outlives workspace rows, so a stamp
+    /// is never issued twice in a repo, even to a workspace id re-minted after
+    /// its row was deleted. The stamp is never changed or cleared on release.
+    /// A caller that recorded the generation of its own lease can later prove
+    /// no other lease was claimed since: the workspace is free and the
+    /// generation is unchanged. A deleted-and-rediscovered row restarts at
+    /// zero, which never matches a recorded non-zero generation.
     pub lease_generation: i64,
 }
 

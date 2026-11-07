@@ -20,6 +20,8 @@ const EMPTY_SETUP_CHANGES: &str = r#"(empty() & description(exact:"")) ~ (merges
 
 mod preserved;
 #[cfg(test)]
+mod preserved_retry_tests;
+#[cfg(test)]
 mod preserved_tests;
 pub use preserved::{
     BoundaryOwnership, PreserveInspect, PreserveOutcome, PreservedTip, WorkspaceTipSource, preserve, preserve_from,

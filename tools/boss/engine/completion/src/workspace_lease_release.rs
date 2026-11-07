@@ -145,7 +145,9 @@ impl BookmarkGate for CubeBookmarkGate<'_> {
 /// evidence: it still holds this execution's lease, or it is free again and
 /// cube's claim counter equals the one recorded for this lease, so no other
 /// lease was ever claimed on it. Anything else resolves only at this lease's
-/// boundary and never adopts later changes.
+/// boundary and never adopts later changes; a free workspace whose counter
+/// moved is never snapshotted and unrelated work is never reported. Rewrites
+/// of this execution's boundary change are still reported for inspection.
 async fn workspace_tip_source(
     execution: &WorkExecution,
     boundary: Option<i64>,
@@ -176,8 +178,12 @@ async fn workspace_tip_source(
         .and_then(|id| workspaces.iter().find(|ws| ws.workspace_id == id));
     // A workspace cube no longer lists cannot be held by anyone either.
     let free = registered.is_none_or(|ws| ws.state == "free");
-    let sole_holder = registered.is_some_and(|ws| ws.state == "free")
-        && matches!((lease_generation, registered.and_then(|ws| ws.lease_generation)), (Some(held), Some(now)) if held == now);
+    let generations = (lease_generation, registered.and_then(|ws| ws.lease_generation));
+    let registered_free = registered.is_some_and(|ws| ws.state == "free");
+    let sole_holder = registered_free && matches!(generations, (Some(held), Some(now)) if held == now);
+    // Cube's claim counter moved: another lease was claimed after this one, so
+    // the free workspace carries that holder's leftovers, not this execution's.
+    let claimed_since = registered_free && matches!(generations, (Some(held), Some(now)) if held != now);
     if sole_holder {
         return Ok((WorkspaceTipSource::Live, String::new()));
     }
@@ -196,7 +202,7 @@ async fn workspace_tip_source(
         match boundary {
             Some(unix_millis) => WorkspaceTipSource::LeaseBoundary {
                 unix_millis,
-                ownership: if free {
+                ownership: if free && !claimed_since {
                     BoundaryOwnership::FreeUnproven
                 } else {
                     BoundaryOwnership::Reassigned

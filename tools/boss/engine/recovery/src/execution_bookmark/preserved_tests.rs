@@ -1,7 +1,7 @@
 use super::*;
 use boss_engine_test_git::jj::JjRepo;
 
-fn fixture(root: &Path) -> JjRepo {
+pub(super) fn fixture(root: &Path) -> JjRepo {
     let repo = JjRepo::new(root);
     JjRepo::run(&repo.repo, &["bookmark", "set", "main", "-r", "@"]);
     JjRepo::run(&repo.repo, &["git", "export"]);
@@ -904,6 +904,160 @@ fn tip_of_workspace(repo: &JjRepo) -> String {
         .to_owned()
 }
 
+fn commit_at(workspace: &std::path::Path, rev: &str) -> String {
+    JjRepo::run(
+        workspace,
+        &[
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            rev,
+            "-T",
+            "commit_id",
+        ],
+    )
+    .trim()
+    .to_owned()
+}
+
+fn change_at(workspace: &std::path::Path, rev: &str) -> String {
+    JjRepo::run(
+        workspace,
+        &[
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            rev,
+            "-T",
+            "change_id",
+        ],
+    )
+    .trim()
+    .to_owned()
+}
+
+fn visible_change_commits(repo: &JjRepo, change_id: &str) -> String {
+    JjRepo::run(
+        &repo.repo,
+        &[
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            &format!("present({change_id}) & ~root()"),
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
+    )
+}
+
+/// A store with many operations in which the workspace never resolves: the
+/// journal is listed in full, but the walk may load only a bounded number of
+/// operation views.
+struct CountingViews {
+    tip: String,
+    loads: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl Jj for CountingViews {
+    async fn run(&self, repo: &Path, args: &[&str]) -> Result<String> {
+        if args.contains(&"--at-op") {
+            self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Ok(if args.contains(&"op1743") {
+                self.tip.clone()
+            } else {
+                String::new()
+            });
+        }
+        if args.iter().any(|arg| arg.starts_with("time.end().format(\"%s.%f\")")) {
+            return Ok((0..2_000)
+                .map(|n| format!("{}.000000000 op{n}\n", 1_700_000_000 + n))
+                .collect());
+        }
+        LocalJj.run(repo, args).await
+    }
+
+    async fn shared_repo(&self, workspace: &Path) -> Result<PathBuf> {
+        LocalJj.shared_repo(workspace).await
+    }
+}
+
+#[tokio::test]
+async fn live_journal_walks_exhaust_with_an_error_that_keeps_the_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_view_bound", "local")
+        .await
+        .unwrap();
+    std::fs::write(repo.worker.join("work"), "work beyond the view budget").unwrap();
+    let jj = CountingViews {
+        tip: tip_of_workspace(&repo),
+        loads: Default::default(),
+    };
+    let error = preserve_from(
+        &jj,
+        &record,
+        &repo.worker.join("gone"),
+        None,
+        None,
+        WorkspaceTipSource::Live,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("exhausted"), "{error}");
+    let loads = jj.loads.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        loads <= preserved::OP_VIEW_LOAD_LIMIT,
+        "{loads} operation views were loaded"
+    );
+}
+
+#[tokio::test]
+async fn lease_boundary_view_exhaustion_is_terminal_inspection() {
+    for ownership in [BoundaryOwnership::Reassigned, BoundaryOwnership::FreeUnproven] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = fixture(dir.path());
+        let record = create(&LocalJj, &repo.worker, "exec_view_bound_inspect", "local")
+            .await
+            .unwrap();
+        std::fs::write(repo.worker.join("work"), "work beyond the view budget").unwrap();
+        let source = WorkspaceTipSource::LeaseBoundary {
+            unix_millis: now_millis().await + 60_000,
+            ownership,
+        };
+        let jj = CountingViews {
+            tip: tip_of_workspace(&repo),
+            loads: Default::default(),
+        };
+        let outcome = preserve_from(&jj, &record, &repo.worker.join("gone"), None, None, source)
+            .await
+            .unwrap();
+        assert!(outcome.tip.is_none(), "{ownership:?}: {outcome:?}");
+        let inspect = outcome
+            .inspect
+            .as_ref()
+            .unwrap_or_else(|| panic!("{ownership:?}: {outcome:?}"));
+        assert!(inspect.reason.contains("exhausted"), "{ownership:?}: {inspect:?}");
+        let first_loads = jj.loads.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            first_loads <= preserved::OP_VIEW_LOAD_LIMIT,
+            "{ownership:?}: {first_loads} operation views were loaded"
+        );
+        let retry = preserve_from(&jj, &record, &repo.worker.join("gone"), None, None, source)
+            .await
+            .unwrap();
+        assert!(
+            retry
+                .inspect
+                .as_ref()
+                .is_some_and(|item| item.reason.contains("exhausted"))
+        );
+    }
+}
+
 #[tokio::test]
 async fn unknown_boundary_resolves_nothing_and_raises_inspection() {
     let dir = tempfile::tempdir().unwrap();
@@ -982,8 +1136,9 @@ fn free_unproven(boundary: i64) -> WorkspaceTipSource {
 }
 
 /// A worker dies after its last confirmed lease boundary. Whatever it did
-/// next, with no jj command between its last write and teardown, must surface
-/// as an inspection item naming the live registered tip.
+/// next on a later change, with no jj command between its last write and
+/// teardown, must surface as an inspection item naming the live registered tip.
+/// Pending edits on the boundary change itself must remain unsnapshotted.
 #[tokio::test]
 async fn work_after_the_boundary_is_reported_not_dropped() {
     for action in ["commit", "abandon", "new", "edit"] {
@@ -994,6 +1149,8 @@ async fn work_after_the_boundary_is_reported_not_dropped() {
             .unwrap();
         std::fs::write(repo.worker.join("first.txt"), "first").unwrap();
         JjRepo::run(&repo.worker, &["status"]);
+        let original = commit_at(&repo.worker, "@");
+        let change_id = change_at(&repo.worker, "@");
         let boundary = now_millis().await;
         match action {
             "commit" => {
@@ -1013,6 +1170,33 @@ async fn work_after_the_boundary_is_reported_not_dropped() {
         let outcome = preserve_from(&LocalJj, &record, &repo.worker, None, None, free_unproven(boundary))
             .await
             .unwrap();
+        if action == "edit" {
+            let saved = outcome.tip.as_ref().unwrap();
+            let inspect = outcome
+                .inspect
+                .as_ref()
+                .unwrap_or_else(|| panic!("pending boundary edits must be inspected: {outcome:?}"));
+            assert!(inspect.reason.contains(&original), "{inspect:?}");
+            assert!(inspect.reason.contains(&saved.commit_id), "{inspect:?}");
+            assert_ne!(saved.commit_id, original);
+            let visible = visible_change_commits(&repo, &change_id);
+            assert_eq!(visible.trim(), saved.commit_id, "hidden original must not be revived");
+            assert!(
+                !super::preserved::commit_is_visible(&LocalJj, &repo.repo, &original)
+                    .await
+                    .unwrap()
+            );
+            JjRepo::run(&repo.replacement, &["new", "main"]);
+            restore_preserved(&LocalJj, &record, &repo.replacement, Some(saved))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(repo.replacement.join("first.txt")).unwrap(),
+                "edited without any jj command"
+            );
+            continue;
+        }
         // Inspecting the live tip afterwards is safe: preservation has already
         // snapshotted the free workspace.
         let live = tip_of_workspace(&repo);
@@ -1037,6 +1221,102 @@ async fn work_after_the_boundary_is_reported_not_dropped() {
         );
         assert_ne!(preserved.trim(), live, "{action}: live tip must not be bookmarked");
     }
+}
+
+#[tokio::test]
+async fn dirty_ancestor_working_copy_does_not_revive_the_hidden_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_dirty_ancestor", "local")
+        .await
+        .unwrap();
+    std::fs::write(repo.worker.join("a.txt"), "A").unwrap();
+    JjRepo::run(&repo.worker, &["status"]);
+    let parent = commit_at(&repo.worker, "@");
+    JjRepo::run(&repo.worker, &["new", "-m", "Boundary work"]);
+    std::fs::write(repo.worker.join("b.txt"), "B").unwrap();
+    JjRepo::run(&repo.worker, &["status"]);
+    let boundary_commit = commit_at(&repo.worker, "@");
+    let change_id = change_at(&repo.worker, "@");
+    let boundary = now_millis().await;
+    JjRepo::run(&repo.worker, &["edit", &parent]);
+    std::fs::write(repo.worker.join("a.txt"), "A dirty").unwrap();
+    let outcome = preserve_from(&LocalJj, &record, &repo.worker, None, None, free_unproven(boundary))
+        .await
+        .unwrap();
+    let saved = outcome.tip.as_ref().unwrap();
+    let inspect = outcome
+        .inspect
+        .as_ref()
+        .unwrap_or_else(|| panic!("hidden boundary rewrite must be inspected: {outcome:?}"));
+    assert!(inspect.reason.contains(&boundary_commit), "{inspect:?}");
+    assert!(inspect.reason.contains(&saved.commit_id), "{inspect:?}");
+    assert_ne!(saved.commit_id, boundary_commit);
+    let visible = visible_change_commits(&repo, &change_id);
+    assert_eq!(visible.trim(), saved.commit_id, "{visible}");
+    assert!(
+        !super::preserved::commit_is_visible(&LocalJj, &repo.repo, &boundary_commit)
+            .await
+            .unwrap(),
+        "hidden original must not be revived"
+    );
+    let pointer = revision(&preserved_name("exec_dirty_ancestor"));
+    assert_eq!(commit_at(&repo.repo, &pointer), saved.commit_id);
+    JjRepo::run(&repo.replacement, &["new", "main"]);
+    restore_preserved(&LocalJj, &record, &repo.replacement, Some(saved))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(repo.replacement.join("a.txt")).unwrap(),
+        "A dirty"
+    );
+    assert_eq!(std::fs::read_to_string(repo.replacement.join("b.txt")).unwrap(), "B");
+}
+
+#[tokio::test]
+async fn dirty_boundary_then_cube_reset_does_not_silently_adopt_pending_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_dirty_reset", "local")
+        .await
+        .unwrap();
+    std::fs::write(repo.worker.join("first.txt"), "first").unwrap();
+    JjRepo::run(&repo.worker, &["status"]);
+    let original = commit_at(&repo.worker, "@");
+    let change_id = change_at(&repo.worker, "@");
+    let boundary = now_millis().await;
+    std::fs::write(repo.worker.join("first.txt"), "edited after the boundary").unwrap();
+    let outcome = preserve_from(&LocalJj, &record, &repo.worker, None, None, free_unproven(boundary))
+        .await
+        .unwrap();
+    let saved = outcome.tip.as_ref().unwrap();
+    let inspect = outcome
+        .inspect
+        .as_ref()
+        .unwrap_or_else(|| panic!("pending boundary edits must be inspected: {outcome:?}"));
+    assert!(inspect.reason.contains(&original), "{inspect:?}");
+    assert!(inspect.reason.contains(&saved.commit_id), "{inspect:?}");
+    let pointer = revision(&preserved_name("exec_dirty_reset"));
+    assert_eq!(commit_at(&repo.repo, &pointer), saved.commit_id);
+    let visible = visible_change_commits(&repo, &change_id);
+    assert_eq!(visible.trim(), saved.commit_id, "{visible}");
+    JjRepo::run(&repo.worker, &["new", "main@origin"]);
+    assert_eq!(
+        commit_at(&repo.repo, &pointer),
+        saved.commit_id,
+        "cube reset must not move the preserved bookmark onto later working-copy edits"
+    );
+    assert_eq!(visible_change_commits(&repo, &change_id).trim(), saved.commit_id);
+    JjRepo::run(&repo.replacement, &["new", "main"]);
+    restore_preserved(&LocalJj, &record, &repo.replacement, Some(saved))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(repo.replacement.join("first.txt")).unwrap(),
+        "edited after the boundary"
+    );
 }
 
 #[tokio::test]
@@ -1113,6 +1393,8 @@ async fn a_successors_rewrite_of_the_inherited_change_is_not_adopted() {
                 .unwrap();
             std::fs::write(repo.worker.join("ours.txt"), "first holder").unwrap();
             JjRepo::run(&repo.worker, &["status"]);
+            let original = commit_at(&repo.worker, "@");
+            let change_id = change_at(&repo.worker, "@");
             let boundary = now_millis().await;
             std::fs::write(repo.worker.join("theirs.txt"), "successor edits").unwrap();
             if successor_runs_jj {
@@ -1142,7 +1424,7 @@ async fn a_successors_rewrite_of_the_inherited_change_is_not_adopted() {
                     "preserved/exec_inherited_rewrite",
                 ],
             );
-            if successor_runs_jj || ownership == BoundaryOwnership::FreeUnproven {
+            if successor_runs_jj {
                 // The inherited change was rewritten to include the successor's
                 // file: nothing may be bookmarked, and inspection is raised.
                 assert!(preserved.trim().is_empty(), "{label}: bookmarked {preserved}");
@@ -1152,9 +1434,19 @@ async fn a_successors_rewrite_of_the_inherited_change_is_not_adopted() {
                     .as_ref()
                     .unwrap_or_else(|| panic!("{label}: {outcome:?}"));
                 assert!(inspect.workspace_count >= Some(1), "{label}: {inspect:?}");
-            } else {
-                // Reassigned and never snapshotted: the registered boundary
-                // commit is untouched, so it is the safe tip.
+            } else if ownership == BoundaryOwnership::Reassigned {
+                // Pending edits must not rewrite the boundary change during
+                // teardown; it remains the only visible variant and restages.
+                assert!(outcome.inspect.is_none(), "{label}: {outcome:?}");
+                let saved = outcome.tip.as_ref().unwrap();
+                let visible = visible_change_commits(&repo, &change_id);
+                assert_eq!(visible.trim(), saved.commit_id, "{label}: {visible}");
+                assert_eq!(saved.commit_id, original, "{label}");
+                JjRepo::run(&repo.replacement, &["new", "main"]);
+                restore_preserved(&LocalJj, &record, &repo.replacement, Some(saved))
+                    .await
+                    .unwrap()
+                    .unwrap();
                 let files = JjRepo::run(
                     &repo.repo,
                     &[
@@ -1168,6 +1460,17 @@ async fn a_successors_rewrite_of_the_inherited_change_is_not_adopted() {
                     files.contains("ours.txt") && !files.contains("theirs.txt"),
                     "{label}: {files}"
                 );
+            } else {
+                let saved = outcome.tip.as_ref().unwrap();
+                let inspect = outcome
+                    .inspect
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{label}: {outcome:?}"));
+                assert!(inspect.reason.contains(&original), "{label}: {inspect:?}");
+                assert!(inspect.reason.contains(&saved.commit_id), "{label}: {inspect:?}");
+                let visible = visible_change_commits(&repo, &change_id);
+                assert_eq!(visible.trim(), saved.commit_id, "{label}: {visible}");
+                assert_ne!(saved.commit_id, original, "{label}");
             }
         }
     }
