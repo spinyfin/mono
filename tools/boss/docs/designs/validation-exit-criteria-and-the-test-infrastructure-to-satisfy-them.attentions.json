@@ -1,0 +1,48 @@
+[
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Where should the validation requirement collection be authoritative? The design proposes `validation_requirements` as child rows authored by the coordinator at filing time, with the PR body naming evidence against each filed requirement.",
+    "choices": [
+      "Work-item child rows, authored at filing time (as designed)",
+      "PR-body section only, enforced by the review lane",
+      "Both, with the filed rows authoritative and the PR body required to cite evidence for each",
+      "Both, with the PR body allowed to add requirements beyond those filed, when the worker justifies it"
+    ],
+    "anchor": "51-the-taxonomy-and-where-the-declaration-lives"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Under the adapter-first evidence model, `unit`/`automated` evidence resolves named Bazel targets against Build Event Protocol or `bazel-testlogs/**/test.xml` artifacts plus a green PR-head CI result (§5.2(a)), instead of a worker self-report that the target ran. Is that resolution mechanism sufficient, or should it also require the specific target's per-test XML to exist (stronger, but couples the checker to test-runner output shape rather than the coarser commit-status signal)?",
+    "anchor": "52-evidence-not-assertion"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "§4.6 chooses an adapter-first hybrid — evidence providers (Bazel first) import diagnostics automatically, and `boss validate run` covers only commands with no provider. Is that the right default, or should the wrapper remain mandatory for every validation command regardless of provider coverage, for uniform auditability at the cost of the friction §4.6 was written to avoid?",
+    "choices": [
+      "Adapter-first hybrid, wrapper only for uncovered commands (as designed)",
+      "Wrapper mandatory for every command, even where a provider exists",
+      "Adapter-first for Bazel only in v1; require the wrapper for every other tool until a second provider ships"
+    ],
+    "anchor": "46-wrapper-only-command-recording-vs-tool-native-evidence"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Should the `scripted` fake agent driver be registered in the production DriverRegistry, or gated so it only exists in test builds? Registering it means the production spawn path is genuinely what runs in tests, but it also means a fake driver slug is visible in shipped binaries.",
+    "choices": [
+      "Register it unconditionally — production path fidelity matters more",
+      "Register it only under a testonly cfg / feature flag",
+      "Register it unconditionally but hide it from user-facing driver listings"
+    ],
+    "anchor": "54-faking-the-outside-world"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Should `DispatchEvent` become a stability-committed interface (additive-only evolution, wire goldens, compat obligations)? It is already read by bossctl and the macOS app, so this mostly formalises reality — but it does constrain future changes.",
+    "anchor": "511-observability-as-an-assertion-surface"
+  },
+  {
+    "question_type": "prompt",
+    "prompt": "Flakiness budget: the design proposes at most 5 quarantined targets repo-wide and a 14-day maximum quarantine age before it escalates to a blocking attention item. Are those the right numbers, and who owns the escalation?",
+    "anchor": "513-flakiness-policy"
+  }
+]
