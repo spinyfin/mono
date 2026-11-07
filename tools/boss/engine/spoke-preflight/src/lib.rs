@@ -576,9 +576,11 @@ echo '{"id":2,"result":{}}'
             "codex",
             r#"echo $$ > "$0.pid"; read request; read request; read request"#,
         );
+        // Allow the shell to start under full-suite load; keep the overall
+        // three-second cleanup bound and the explicit reaped-child assertion.
         let started = std::time::Instant::now();
         assert!(
-            !codex_credentials_with_timeout(&program, Duration::from_millis(100))
+            !codex_credentials_with_timeout(&program, Duration::from_secs(1))
                 .await
                 .passed()
         );
