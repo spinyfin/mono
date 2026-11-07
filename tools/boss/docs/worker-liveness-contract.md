@@ -259,23 +259,37 @@ Three things close the ordering hole:
   from the pane's activity at write time, inside a gate that serializes the
   writes, so an older handler that stalls can never leave `waiting_human`
   over a pane that has since moved on.
-- **A declared wait ends on turn ordering, not on the activity the slot
-  showed.** A wait (`boss propose wait`) describes the idle period that
-  follows the declaration. The registry tracks the turn boundary (`Stop`)
-  the main session is parked behind and reports when the main session
-  starts a new turn after it (`HookApplied::resumed_after`): the first
-  main-session `UserPromptSubmit`/`PreToolUse`/`PostToolUse` after the
-  `Stop`, or the late `Stop` itself once main-session activity numbered above
-  it has already been applied. The ingress then calls
-  `WaitRegistry::end_if_declared_before`, which ends the wait only if it was
-  declared before that boundary (the wait records the newest accepted hook
-  sequence, including hooks still outstanding), so a late `Stop` cannot end a wait declared in the turn
-  that overtook it. Hooks stamped with an `agent_id` (a backgrounded
-  subagent's tools) are not main-session activity, a permission-prompt
-  `Notification` is not a turn boundary, and a wait declared mid-turn
-  survives the rest of that turn. The per-execution wait budget stays
-  charged. Workers are told, in their prompt, to re-declare before ending a
-  resumed turn if they are still waiting.
+- **A declared wait survives turns until its bounded deadline.** A wait
+  (`boss propose wait`) reserves time for a background job. A human asking
+  for status, a coordinator prompt, or an autonomous wakeup does not prove
+  that job finished. Main-session hooks, including late or reordered hooks,
+  therefore neither revoke nor extend the grant. The live snapshot hides
+  its wait caption during an active turn (and keeps permission prompts
+  visible); after Stop the unexpired wait is visible again. The declaration
+  still records hook order so a Stop before the declaration cannot turn a
+  current permission prompt into a job wait.
+
+  Completion checks the active wait before recording a nudge: status replies
+  consume no consecutive or total breaker strikes, and do not clear earlier
+  legitimate strikes. A renewal replaces the deadline and charges its full
+  duration against the existing per-execution cap. The two-hour declaration
+  limit, cumulative cap, expiry, teardown cleanup, and other safety checks
+  are unchanged. Workers need to renew only when the job needs more time.
+
+  Expiry does not itself run a timer callback or fail the execution. The
+  merge poller retains a `WorkerWait` nudge intent and calls
+  `recheck_background_nudge` on subsequent sweeps. Once activity, mid-turn,
+  live-child and build-wait guards permit it, that path re-enters
+  `nudge_or_park`. Three identical nudges are allowed; the next eligible
+  attempt trips the breaker and calls `fail_for_unproductive_nudges`, without
+  sending a fourth nudge or requiring a new Stop. This explains how the
+  2026-11-07 status-question incident could fail at 03:25:24 UTC after its
+  last Stop at 01:49 and wait expiry at 02:19:17: the retained sweep used the
+  three earlier strikes. It was the same nudge breaker, not a separate wait
+  timeout. There is no fixed 66-minute post-expiry delay in this path. The
+  exact sweep timing and suppression observations require the incident
+  engine logs; the historical transcript alone cannot establish which guard
+  or sweep delay accounted for that interval.
 
 ## Rules of thumb for future work here
 

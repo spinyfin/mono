@@ -104,7 +104,16 @@ impl ServerState {
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
         let mut states = self.live_worker_states.snapshot();
         for state in &mut states {
-            if let Some(wait) = self.wait_registry.active(&state.run_id, now) {
+            let in_turn = self
+                .live_worker_states
+                .semantic_progress_for_slot(state.slot_id)
+                .is_some_and(|progress| {
+                    progress.turn_condition
+                        == boss_engine_live_worker_state::semantic_progress::SemanticTurnCondition::InTurn
+                });
+            if let Some(wait) = self.wait_registry.active(&state.run_id, now)
+                && !in_turn
+            {
                 state.wait_reason = Some(wait.reason);
                 state.wait_expires_at = Some(boss_engine_utils::iso8601::format_epoch_iso8601(wait.expires_at_epoch));
                 // An unexpired declared wait means the worker is waiting on a
