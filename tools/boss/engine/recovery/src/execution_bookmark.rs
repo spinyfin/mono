@@ -24,8 +24,9 @@ mod preserved_retry_tests;
 #[cfg(test)]
 mod preserved_tests;
 pub use preserved::{
-    BoundaryOwnership, PreserveInspect, PreserveOutcome, PreservedTip, WorkspaceTipSource, preserve, preserve_from,
-    preserved_archive_name, preserved_archive_prefix, preserved_name, preserved_work_unpublished,
+    BoundaryOwnership, HostRecoveryRequest, PreserveInspect, PreserveOutcome, PreservedTip, WorkspaceTipSource,
+    preserve, preserve_from, preserved_archive_name, preserved_archive_prefix, preserved_name,
+    preserved_work_unpublished,
 };
 mod preserved_restore;
 pub use preserved_restore::restore_preserved;
@@ -42,7 +43,7 @@ mod redispatch;
 pub use redispatch::{RestoreReport, restore_rebased};
 
 mod prune;
-pub use prune::{PruneOutcome, Voucher, prune};
+pub use prune::{HostVoucher, PruneOutcome, Voucher, prune};
 
 #[cfg(test)]
 mod prune_tests;
@@ -652,6 +653,21 @@ pub async fn one_commit(jj: &dyn Jj, repo: &Path, revset: &str) -> Result<String
         commits.len()
     );
     Ok(commits[0].to_owned())
+}
+
+/// The commit a workspace's working copy sits on top of: after cube positions
+/// a workspace this is the floor a fresh recovery pointer starts from.
+pub async fn positioned_parent(jj: &dyn Jj, workspace: &Path) -> Result<String> {
+    one_commit(jj, workspace, "@-").await
+}
+
+/// Position a fresh child of the repository's trunk, resolved once, and return
+/// the trunk commit it landed on. The one implementation shared by the local
+/// adapter and the remote host executor.
+pub async fn start_fresh(jj: &dyn Jj, workspace: &Path) -> Result<String> {
+    let trunk = one_commit(jj, workspace, "trunk()").await?;
+    jj.run(workspace, &["new", &trunk, "-m", "Fresh execution"]).await?;
+    Ok(trunk)
 }
 
 /// Clean reinitialisation for a self-retry whose own heads are both gone: drop

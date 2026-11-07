@@ -355,9 +355,7 @@ impl HostAdapter for LocalHostAdapter {
         self.cube_client.positioned_parent(workspace).await
     }
     async fn start_fresh_workspace(&self, workspace: &Path) -> Result<String> {
-        let trunk = execution_bookmark::one_commit(&LocalJj, workspace, "trunk()").await?;
-        execution_bookmark::Jj::run(&LocalJj, workspace, &["new", &trunk, "-m", "Fresh execution"]).await?;
-        Ok(trunk)
+        execution_bookmark::start_fresh(&LocalJj, workspace).await
     }
     async fn release_execution_bookmark_heads(
         &self,
@@ -995,12 +993,10 @@ impl HostAdapter for SshHostAdapter {
         Ok(true)
     }
     async fn positioned_parent(&self, workspace: &Path) -> Result<String> {
-        execution_bookmark::one_commit(self, workspace, "@-").await
+        execution_bookmark::positioned_parent(self, workspace).await
     }
     async fn start_fresh_workspace(&self, workspace: &Path) -> Result<String> {
-        let trunk = execution_bookmark::one_commit(self, workspace, "trunk()").await?;
-        execution_bookmark::Jj::run(self, workspace, &["new", &trunk, "-m", "Fresh execution"]).await?;
-        Ok(trunk)
+        execution_bookmark::start_fresh(self, workspace).await
     }
     async fn release_execution_bookmark_heads(
         &self,

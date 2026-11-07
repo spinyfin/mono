@@ -339,6 +339,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: parking::migrate,
         },
         Migration {
+            id: spoke_hub::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: spoke_hub::migrate,
+        },
+        Migration {
             id: "20261107_0543_parking_membership".into(),
             legacy_version: None,
             apply: parking::migrate_membership,

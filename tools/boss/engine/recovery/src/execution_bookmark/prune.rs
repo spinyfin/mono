@@ -70,6 +70,42 @@ impl Voucher {
     }
 }
 
+/// A voucher as a host receives it from the hub: plain values that are
+/// validated before they become a revset, so the peer never supplies one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HostVoucher {
+    /// A full commit id, as GitHub reports a PR head.
+    Commit { label: String, commit_id: String },
+    /// A pushed branch's remote-tracking bookmark.
+    RemoteBookmark { name: String, remote: String },
+}
+
+impl HostVoucher {
+    /// Longest label, bookmark or remote name a host accepts.
+    pub const MAX_NAME_BYTES: usize = 512;
+
+    /// Resolve into a [`Voucher`], refusing a value that is not a plain name or
+    /// a hexadecimal commit id.
+    pub fn into_voucher(self) -> Result<Voucher> {
+        fn plain(value: &str) -> bool {
+            !value.is_empty()
+                && value.len() <= HostVoucher::MAX_NAME_BYTES
+                && !value.starts_with('-')
+                && value.chars().all(|c| !c.is_control())
+        }
+        match self {
+            Self::Commit { label, commit_id } => {
+                ensure!(plain(&label), "invalid voucher label");
+                Voucher::commit(label, &commit_id).ok_or_else(|| anyhow::anyhow!("voucher is not a commit id"))
+            }
+            Self::RemoteBookmark { name, remote } => {
+                ensure!(plain(&name) && plain(&remote), "invalid remote bookmark voucher");
+                Ok(Voucher::remote_bookmark(&name, &remote))
+            }
+        }
+    }
+}
+
 /// What [`prune`] did with the record's pointers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PruneOutcome {
