@@ -6,7 +6,6 @@ pub struct FreshStart<'a> {
     pub immutable_target: Option<&'a str>,
     pub bound_pr: Option<u64>,
     pub task_pr: Option<u64>,
-    pub title: &'a str,
 }
 
 /// Only an explicitly bound PR bypasses the optional task PR's open-state check.
@@ -39,19 +38,5 @@ pub(super) async fn position_workspace(
         Some(GotoTarget::Revision(sha)) => adapter.goto_workspace_revision(workspace, sha).await.map(|()| None),
         Some(GotoTarget::Pr(pr)) => adapter.goto_workspace(workspace, pr).await.map(|()| None),
         None => adapter.start_fresh_workspace(workspace).await.map(Some),
-    }
-}
-
-/// Position the fresh workspace; returns the commit it was positioned on,
-/// which is then the pointer's floor: the trunk commit for a fresh start, or
-/// the PR head / target commit a goto landed on.
-pub(super) async fn position_fresh_workspace(
-    adapter: &dyn HostAdapter,
-    workspace: &Path,
-    start: &FreshStart<'_>,
-) -> Result<Option<String>> {
-    match position_workspace(adapter, workspace, start).await? {
-        Some(commit) => Ok(Some(commit)),
-        None => adapter.positioned_parent(workspace).await.map(Some),
     }
 }

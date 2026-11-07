@@ -157,6 +157,15 @@ async fn record_recovery_work(db: &WorkDb, id: &str, workspace: &std::path::Path
     db.record_execution_bookmark(&record).unwrap();
 }
 
+pub(super) async fn preserve_work(db: &WorkDb, id: &str, workspace: &Path) {
+    use boss_engine_recovery::execution_bookmark::{LocalJj, preserve};
+    let record = db.execution_bookmark(id).unwrap();
+    let saved = preserve(&LocalJj, &record, workspace, None, None).await.unwrap();
+    if let Some(tip) = saved.tip {
+        db.record_preserved_tip(id, &tip).unwrap();
+    }
+}
+
 fn lease_for(workspace_path: &std::path::Path, dirty_verified: Option<bool>) -> CubeWorkspaceLease {
     CubeWorkspaceLease {
         lease_id: "lease-resume".into(),
@@ -176,6 +185,7 @@ async fn recovery_uses_bookmark_without_replaying_a_legacy_patch() {
     record_recovery_work(&db, &dead_id, &repo.worker).await;
     std::fs::write(repo.worker.join("hello.txt"), "recovered work\n").unwrap();
     JjRepo::run(&repo.worker, &["status"]);
+    preserve_work(&db, &dead_id, &repo.worker).await;
     let patch = dir.path().join(format!("{dead_id}.patch"));
     std::fs::write(&patch, "obsolete patch, must never replay").unwrap();
     let coordinator = recovery_coordinator(db);
@@ -236,6 +246,7 @@ async fn recovery_uses_shared_store_when_cube_recovered_nothing() {
     record_recovery_work(&db, &dead_id, &repo.worker).await;
     std::fs::write(repo.worker.join("hello.txt"), "recovered work\n").unwrap();
     JjRepo::run(&repo.worker, &["status"]);
+    preserve_work(&db, &dead_id, &repo.worker).await;
     JjRepo::run(&repo.worker, &["new", "root()", "-m", "Unrelated lease"]);
     std::fs::write(repo.worker.join("foreign.txt"), "foreign work").unwrap();
     let coordinator = recovery_coordinator(db);
@@ -283,6 +294,7 @@ async fn missing_baseline_bookmark_is_not_an_integrity_failure() {
         record_recovery_work(&db, &dead_id, &repo.worker).await;
         std::fs::write(repo.worker.join("hello.txt"), "recovered work\n").unwrap();
         JjRepo::run(&repo.worker, &["status"]);
+        preserve_work(&db, &dead_id, &repo.worker).await;
         JjRepo::run(&repo.repo, &["bookmark", "delete", &format!("boss-base/{dead_id}")]);
         if !recorded_commit {
             db.connect()
@@ -342,6 +354,7 @@ async fn bookkeeping_only_work_is_not_reported_as_a_recovery() {
     std::fs::create_dir(repo.worker.join(".boss")).unwrap();
     std::fs::write(repo.worker.join(".boss/events-pending.jsonl"), "bookkeeping").unwrap();
     JjRepo::run(&repo.worker, &["status"]);
+    // No preserved tip was recorded for bookkeeping-only work.
     let coordinator = recovery_coordinator(db);
     let restored = coordinator
         .recover_execution_bookmark_for_test(
@@ -354,7 +367,7 @@ async fn bookkeeping_only_work_is_not_reported_as_a_recovery() {
         )
         .await
         .unwrap();
-    assert_eq!(restored.map(|r| (r.predecessor, r.has_work)), Some((dead_id, false)));
+    assert!(restored.is_none());
 }
 
 #[tokio::test]
@@ -848,8 +861,8 @@ async fn resume_pane_spawn_reenters_the_runner_for_a_running_leased_execution() 
             .filter(|e| e.stage == crate::dispatch_events::Stage::WorkspaceRecovery.as_str()
                 && e.outcome == crate::dispatch_events::Outcome::Skipped.as_str())
             .count(),
-        1,
-        "a resume with no bookmark row must emit the skipped-recovery event once"
+        0,
+        "resuming a held workspace never enters recovery"
     );
 
     let mut saw_call = false;

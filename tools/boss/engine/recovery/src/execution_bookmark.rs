@@ -594,37 +594,9 @@ pub async fn create_from(
             one_commit(jj, workspace, "trunk()").await?
         };
         record.base_commit = Some(baseline.clone());
-        // Fresh dispatch records only its starting commit. Retain the legacy
-        // recovery head only when the positioned lease carries unpublished work;
-        // teardown preserves subsequent edits from the workspace itself.
-        let unpublished = jj
-            .run(
-                workspace,
-                &[
-                    "log",
-                    "--no-graph",
-                    "-r",
-                    &format!("({baseline}..@) ~ (::remote_bookmarks() | empty())"),
-                    "-T",
-                    "commit_id",
-                ],
-            )
-            .await?;
-        let created_head = !unpublished.trim().is_empty();
-        if created_head {
-            // Only the recovery head is created here. A leftover baseline or
-            // publication name from a partial legacy initialization is not a
-            // conflict: dispatch neither writes nor needs those names.
-            let targets = snapshot::resolve_bookmark_targets(jj, &record.repo_path, &[record.head()]).await?;
-            if !targets.is_empty() {
-                return Err(pointer_integrity_error(
-                    "execution recovery pointer names already exist",
-                ));
-            }
-            jj.run(workspace, &["bookmark", "create", &record.head(), "-r", "@"])
-                .await?;
-        }
-        record.has_recovery_head = Some(created_head);
+        // Dispatch records only its starting commit and never creates a
+        // recovery head; teardown preserves workspace edits itself.
+        record.has_recovery_head = Some(false);
         Ok(record.clone())
     }
     .await;

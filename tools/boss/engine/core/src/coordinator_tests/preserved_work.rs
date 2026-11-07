@@ -45,6 +45,15 @@ async fn dispatch_prefers_preserved_work_over_retired_legacy_pointers() {
             &record.publication(),
         ],
     );
+    let head = JjRepo::run(&repo.repo, &["log", "-r", "main", "--no-graph", "-T", "commit_id"]);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = 'https://github.com/spinyfin/mono/pull/99', pr_head_sha = ?2 WHERE id = ?1",
+            rusqlite::params![next.work_item_id, head],
+        )
+        .unwrap();
+    JjRepo::run(&repo.repo, &["bookmark", "delete", "pr/99"]);
     let cube = Arc::new(FakeCubeClient {
         position_real_workspace: true,
         ..FakeCubeClient::default()
@@ -52,7 +61,7 @@ async fn dispatch_prefers_preserved_work_over_retired_legacy_pointers() {
     let coordinator = ExecutionCoordinator::new(
         db.clone(),
         WorkerPool::new(1),
-        cube,
+        cube.clone(),
         Arc::new(FakeExecutionRunner::default()),
     );
     let lease = CubeWorkspaceLease {
@@ -66,6 +75,11 @@ async fn dispatch_prefers_preserved_work_over_retired_legacy_pointers() {
         .await
         .unwrap()
         .unwrap();
+    assert!(
+        cube.goto_calls.lock().await.is_empty(),
+        "a recorded head needs no PR alias"
+    );
+    assert_eq!(cube.goto_revision_calls.lock().await[0].1, head);
     assert!(recovered.has_work);
     assert_eq!(recovered.predecessor, prior.id);
     assert_eq!(

@@ -148,28 +148,8 @@ fn remote_driver_config_paths(workspace: &str, descriptor: &crate::driver::Drive
     (directory, gitignore)
 }
 
-use boss_host_execution::recovery_pr::ClosedRecoveryPr;
 #[cfg(test)]
 pub(crate) use boss_host_execution::recovery_pr::closed_recovery_pr_error;
-
-mod pr_anchor;
-
-/// Check the structured PR lookup before cube positioning, on either host.
-async fn recovery_pr_is_open(adapter: &dyn HostAdapter, repo_id: &str, pr: u64) -> Result<bool> {
-    let repos = adapter.list_repos().await?;
-    let repo = repos
-        .iter()
-        .find(|repo| repo.repo_id == repo_id)
-        .ok_or_else(|| anyhow::anyhow!("recovery repository {repo_id} is absent from cube repo list"))?;
-    match adapter.recovery_pr_base(&repo.origin, pr).await {
-        Ok(_) => Ok(true),
-        Err(err) if err.is::<ClosedRecoveryPr>() => Ok(false),
-        // An unavailable base keeps the existing repository-main fallback;
-        // it does not establish that the PR itself is closed.
-        Err(err) if execution_bookmark::is_base_unresolvable_error(&err) => Ok(true),
-        Err(err) => Err(err),
-    }
-}
 
 #[cfg(test)]
 pub use boss_execution_contracts::{CollectOutcome, HostAdapter};
@@ -317,40 +297,7 @@ impl HostAdapter for LocalHostAdapter {
         }
         execution_bookmark::discard_orphaned_baseline(&LocalJj, record).await
     }
-    async fn restore_rebased_execution_bookmark(
-        &self,
-        record: &ExecutionBookmark,
-        workspace: &Path,
-        pr_bookmark: Option<&str>,
-        base_branch: &str,
-    ) -> Result<execution_bookmark::RestoreReport> {
-        if record.host_id != self.host_id() {
-            return Err(execution_bookmark::pointer_integrity_error(
-                "recovery store belongs to another host",
-            ));
-        }
-        let remote = boss_host_execution::workspace::recovery_remote(&LocalJj, workspace).await?;
-        pr_anchor::restore_rebased(&LocalJj, self, record, workspace, pr_bookmark, base_branch, &remote).await
-    }
-    async fn prepare_recovery_pr(
-        &self,
-        record: &ExecutionBookmark,
-        workspace: &Path,
-        repo_id: &str,
-        pr: u64,
-    ) -> Result<bool> {
-        if record.host_id != self.host_id() {
-            return Err(execution_bookmark::pointer_integrity_error(
-                "recovery store belongs to another host",
-            ));
-        }
-        if !recovery_pr_is_open(self, repo_id, pr).await? {
-            return Ok(false);
-        }
-        boss_host_execution::workspace::preserve_recovery_pointers(record, self.goto_workspace(workspace, pr)).await?;
-        pr_anchor::ensure(&LocalJj, self, record, pr).await?;
-        Ok(true)
-    }
+
     async fn positioned_parent(&self, workspace: &Path) -> Result<String> {
         self.cube_client.positioned_parent(workspace).await
     }
@@ -955,43 +902,7 @@ impl HostAdapter for SshHostAdapter {
         }
         execution_bookmark::discard_orphaned_baseline(self, record).await
     }
-    async fn restore_rebased_execution_bookmark(
-        &self,
-        record: &ExecutionBookmark,
-        workspace: &Path,
-        pr_bookmark: Option<&str>,
-        base_branch: &str,
-    ) -> Result<execution_bookmark::RestoreReport> {
-        if record.host_id != self.host_id() {
-            return Err(execution_bookmark::pointer_integrity_error(
-                "recovery store belongs to another host",
-            ));
-        }
-        let remote = boss_host_execution::workspace::recovery_remote(self, workspace).await?;
-        pr_anchor::restore_rebased(self, self, record, workspace, pr_bookmark, base_branch, &remote).await
-    }
-    async fn prepare_recovery_pr(
-        &self,
-        record: &ExecutionBookmark,
-        workspace: &Path,
-        repo_id: &str,
-        pr: u64,
-    ) -> Result<bool> {
-        if record.host_id != self.host_id() {
-            return Err(execution_bookmark::pointer_integrity_error(
-                "recovery store belongs to another host",
-            ));
-        }
-        if !recovery_pr_is_open(self, repo_id, pr).await? {
-            return Ok(false);
-        }
-        let saved = execution_bookmark::snapshot_pointers(self, record).await?;
-        let result = self.goto_workspace(workspace, pr).await;
-        execution_bookmark::restore_pointers(self, record, &saved).await?;
-        result?;
-        pr_anchor::ensure(self, self, record, pr).await?;
-        Ok(true)
-    }
+
     async fn positioned_parent(&self, workspace: &Path) -> Result<String> {
         execution_bookmark::positioned_parent(self, workspace).await
     }

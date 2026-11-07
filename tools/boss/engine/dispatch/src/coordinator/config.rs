@@ -242,22 +242,6 @@ impl ExecutionCoordinator {
             .await
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub async fn create_or_start_fresh_for_test(
-        &self,
-        execution: &WorkExecution,
-        lease: &CubeWorkspaceLease,
-        adapter: &Arc<dyn HostAdapter>,
-        inheritance: (
-            Option<&boss_engine_recovery::execution_bookmark::ExecutionBookmark>,
-            Option<&str>,
-        ),
-        positioning: FreshStart<'_>,
-    ) -> Result<(boss_engine_recovery::execution_bookmark::ExecutionBookmark, bool)> {
-        self.create_or_start_fresh(execution, lease, adapter, inheritance, positioning)
-            .await
-    }
-
     /// The local-host adapter. `app.rs` reads this to seed the production
     /// `boss_engine::host_adapter::SshHostAdapterProvider` (which returns it
     /// verbatim for `host_id = "local"`).
