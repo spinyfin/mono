@@ -21,29 +21,13 @@ impl ExecutionCoordinator {
             (None, Some(task_pr)) if adapter.recovery_pr_is_open(repo_id, task_pr).await? => Some(task_pr),
             _ => None,
         };
-        // The poller's recorded head is independent of cube's disposable PR
-        // aliases. Without a recorded head, cube fetches and positions the PR;
-        // restaging reads that positioned commit rather than an alias.
-        let owner = self
-            .work_db
-            .get_revision_chain_root_task_id(&execution.work_item_id)
-            .unwrap_or_else(|| execution.work_item_id.clone());
-        let recorded_head = self
-            .work_db
-            .get_pr_status_snapshot(&owner)?
-            .filter(|snapshot| {
-                pr.is_some()
-                    && snapshot
-                        .pr_url
-                        .as_deref()
-                        .and_then(boss_github::pr_url::pr_number_from_url)
-                        == pr
-            })
-            .and_then(|snapshot| snapshot.head_sha)
-            .filter(|head| !head.is_empty());
+        // Cube positions the PR itself: it refuses merged or closed PRs, fetches
+        // fork heads and sets the branch bookmark. Restaging reads that
+        // positioned commit rather than a poller-recorded head, which can lag
+        // the real head.
         let positioning = FreshStart {
             repo_id,
-            immutable_target: recorded_head.as_deref(),
+            immutable_target: None,
             bound_pr: pr,
             task_pr: None,
         };

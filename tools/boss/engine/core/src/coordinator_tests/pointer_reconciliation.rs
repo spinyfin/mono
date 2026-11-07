@@ -143,8 +143,8 @@ async fn checkout_of_predecessor_publication_cannot_hide_unpublished_work() {
     }
 }
 
-/// A read-only review inherits nothing from the reviewer before it: the same
-/// damaged record is not even
+/// A read-only review inherits nothing from the reviewer before it: a damaged
+/// predecessor record is not even
 /// consulted, so the review dispatches on the PR's current head, the
 /// pointers are not moved and nothing is retired or filed. This is the
 /// mono#3201 shape: sixteen reviews died in pre-start recovery against one

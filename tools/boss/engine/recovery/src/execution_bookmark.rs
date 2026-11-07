@@ -535,11 +535,10 @@ pub(crate) use test_support::{
     create_legacy_three_bookmark_fixture as create, create_legacy_three_bookmark_fixture_from,
 };
 
-/// Pointer initialization failed after identifying the shared store. Dispatch
-/// archives these pointers before creating fresh ones.
+/// Baseline recording failed after identifying the shared store.
 #[derive(Debug)]
 pub struct CreationFailure {
-    /// Includes partially created pointers, even before the database row exists.
+    /// Whatever was recorded before the failure.
     pub record: ExecutionBookmark,
 }
 
@@ -551,8 +550,8 @@ impl std::fmt::Display for CreationFailure {
 
 impl std::error::Error for CreationFailure {}
 
-/// Preserve inherited unpublished work across consecutive interrupted runs.
-/// A staged revision supplies its copied PR baseline through the restore report.
+/// Resolve and record the baseline commit for an execution; no bookmarks are
+/// created. A staged revision supplies its copied PR baseline through the restore report.
 pub async fn create_from(
     jj: &dyn Jj,
     workspace: &Path,

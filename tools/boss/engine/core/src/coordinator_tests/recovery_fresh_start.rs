@@ -1042,17 +1042,6 @@ impl crate::host_adapter::HostAdapter for ScratchDestination {
         self.inner.execution_bookmark_diff(&self.on_inner_store(record)).await
     }
 
-    async fn restore_execution_bookmark(
-        &self,
-        record: &recovery::ExecutionBookmark,
-        workspace: &Path,
-        self_retry: bool,
-    ) -> Result<bool> {
-        self.inner
-            .restore_execution_bookmark(&self.on_inner_store(record), workspace, self_retry)
-            .await
-    }
-
     async fn restore_preserved_work(
         &self,
         record: &recovery::ExecutionBookmark,

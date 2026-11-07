@@ -274,20 +274,6 @@ impl HostAdapter for LocalHostAdapter {
         execution_bookmark::unpublished_diff(&LocalJj, record).await
     }
 
-    async fn restore_execution_bookmark(
-        &self,
-        record: &ExecutionBookmark,
-        workspace: &Path,
-        self_retry: bool,
-    ) -> Result<bool> {
-        if record.host_id != "local" {
-            return Err(execution_bookmark::pointer_integrity_error(format!(
-                "recovery bookmark belongs to host {}",
-                record.host_id
-            )));
-        }
-        execution_bookmark::restore_for_retry(&LocalJj, record, workspace, self_retry).await
-    }
     async fn discard_orphaned_execution_baseline(&self, record: &ExecutionBookmark) -> Result<()> {
         if record.host_id != "local" {
             return Err(execution_bookmark::pointer_integrity_error(format!(
@@ -879,20 +865,6 @@ impl HostAdapter for SshHostAdapter {
         execution_bookmark::unpublished_diff(self, record).await
     }
 
-    async fn restore_execution_bookmark(
-        &self,
-        record: &ExecutionBookmark,
-        workspace: &Path,
-        self_retry: bool,
-    ) -> Result<bool> {
-        if record.host_id != self.host_id() {
-            return Err(execution_bookmark::pointer_integrity_error(format!(
-                "recovery bookmark belongs to host {}",
-                record.host_id
-            )));
-        }
-        execution_bookmark::restore_for_retry(self, record, workspace, self_retry).await
-    }
     async fn discard_orphaned_execution_baseline(&self, record: &ExecutionBookmark) -> Result<()> {
         if record.host_id != self.host_id() {
             return Err(execution_bookmark::pointer_integrity_error(format!(

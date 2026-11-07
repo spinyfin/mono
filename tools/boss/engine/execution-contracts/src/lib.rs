@@ -1529,15 +1529,6 @@ pub trait HostAdapter: Send + Sync {
         bail!("execution bookmark inspection is not supported by this host adapter")
     }
 
-    async fn restore_execution_bookmark(
-        &self,
-        record: &ExecutionBookmark,
-        workspace: &Path,
-        self_retry: bool,
-    ) -> Result<bool> {
-        let _ = (record, workspace, self_retry);
-        bail!("execution bookmark recovery is not supported by this host adapter")
-    }
     /// Drop the baseline left behind when both of an execution's heads are
     /// gone, so a self-retry can create fresh pointers.
     async fn discard_orphaned_execution_baseline(&self, record: &ExecutionBookmark) -> Result<()> {

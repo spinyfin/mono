@@ -120,17 +120,6 @@ impl HostAdapter for FlakyRestoreAdapter {
             .await
     }
 
-    async fn restore_execution_bookmark(
-        &self,
-        record: &ExecutionBookmark,
-        workspace: &Path,
-        self_retry: bool,
-    ) -> Result<bool> {
-        self.inner
-            .restore_execution_bookmark(record, workspace, self_retry)
-            .await
-    }
-
     async fn discard_orphaned_execution_baseline(&self, record: &ExecutionBookmark) -> Result<()> {
         self.inner.discard_orphaned_execution_baseline(record).await
     }

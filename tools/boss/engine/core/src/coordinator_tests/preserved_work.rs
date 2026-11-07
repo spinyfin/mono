@@ -53,7 +53,15 @@ async fn dispatch_prefers_preserved_work_over_retired_legacy_pointers() {
             rusqlite::params![next.work_item_id, head],
         )
         .unwrap();
-    JjRepo::run(&repo.repo, &["bookmark", "delete", "pr/99"]);
+    // The poller's recorded head is stale relative to the PR; positioning must
+    // not trust it.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_head_sha = '0000000000000000000000000000000000000000' WHERE id = ?1",
+            rusqlite::params![next.work_item_id],
+        )
+        .unwrap();
     let cube = Arc::new(FakeCubeClient {
         position_real_workspace: true,
         ..FakeCubeClient::default()
@@ -76,10 +84,10 @@ async fn dispatch_prefers_preserved_work_over_retired_legacy_pointers() {
         .unwrap()
         .unwrap();
     assert!(
-        cube.goto_calls.lock().await.is_empty(),
-        "a recorded head needs no PR alias"
+        cube.goto_revision_calls.lock().await.is_empty(),
+        "a poller-recorded head must not bypass PR-aware positioning"
     );
-    assert_eq!(cube.goto_revision_calls.lock().await[0].1, head);
+    assert_eq!(cube.goto_calls.lock().await[0].1, 99);
     assert!(recovered.has_work);
     assert_eq!(recovered.predecessor, prior.id);
     assert_eq!(
