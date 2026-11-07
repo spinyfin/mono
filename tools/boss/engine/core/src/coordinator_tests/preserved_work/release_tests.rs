@@ -776,6 +776,7 @@ async fn db_bookmark_gate_holds_a_remote_row_without_an_adapter() {
         host_id: "anaplian".into(),
         base_commit: None,
         pr_head_before: None,
+        has_recovery_head: None,
     })
     .unwrap();
     let status = DbBookmarkGate { db: &db, adapter: None }.status(&execution).await;

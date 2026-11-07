@@ -105,7 +105,9 @@ impl ExecutionCoordinator {
     /// Restore the predecessor's engine-created reference into the new lease.
     /// No read of its old workspace or lease history occurs.
     ///
-    /// Missing predecessor heads degrade to clean dispatch with a warning.
+    /// Local records are inspected for worker-created publication heads. Remote
+    /// records without dispatch-created heads or preserved tips start fresh;
+    /// worker-created publication heads remain for the source-host prune sweep.
     /// Integrity failures archive their source and dispatch fresh; transport failures retry.
     /// Failure to write the archive leaves all source pointers intact.
     ///
@@ -208,6 +210,17 @@ impl ExecutionCoordinator {
     ) -> Result<Option<Recovered>> {
         let (prior, record) = source;
         let (pr_for_goto, pr_for_reconcile) = prs;
+        // The caller already checked preserved tips. Inspect local stores for
+        // publication heads created by workers after dispatch; leave remote
+        // publication heads for the source-host prune sweep.
+        if record.has_recovery_head == Some(false) && record.host_id != adapter.host_id() {
+            if prior.id == execution.id {
+                self.work_db
+                    .retire_execution_bookmark(&prior.id, "no recovery head: no unpublished work to recover")?;
+            }
+            self.work_db.delete_execution_restore_report(&execution.id)?;
+            return Ok(None);
+        }
         if record.host_id != adapter.host_id() {
             return Err(pointer_integrity_error(format!(
                 "execution {} recovery store is on host {}; dispatch selected {}",
@@ -373,10 +386,12 @@ impl ExecutionCoordinator {
         }
         .await;
         let heads = archive?;
-        if heads.is_empty() && is_missing_pointer_error(reason) && !is_pointer_integrity_error(reason) {
-            // Nothing was archived and nothing was damaged: the execution never
-            // preserved work. Drop the row so dispatch records a fresh baseline,
-            // without a recovery-problem note or a skipped-recovery event.
+        if heads.is_empty() && self.work_db.preserved_tip(&prior.id)?.is_none() {
+            // Nothing was archived: there is no unpublished work to keep.
+            // Skip the recovery-retired note and the pointers_retired event
+            // regardless of why the archive was empty (missing heads, a
+            // cross-host empty run, or an integrity error whose range was
+            // already published).
             tracing::debug!(execution_id = %execution.id, predecessor = %prior.id, "no recovery source to retire beyond the row");
             self.work_db
                 .retire_execution_bookmark(&prior.id, "no preserved work; nothing to recover")?;

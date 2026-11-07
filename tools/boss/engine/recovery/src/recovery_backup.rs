@@ -185,6 +185,7 @@ mod tests {
             host_id: "local".into(),
             base_commit: None,
             pr_head_before: None,
+            has_recovery_head: None,
         };
         assert!(
             backup_execution_patch(dir.path(), &crate::execution_bookmark::LocalJj, &record)
@@ -203,6 +204,7 @@ mod tests {
             host_id: "local".into(),
             base_commit: None,
             pr_head_before: None,
+            has_recovery_head: None,
         };
         assert!(
             backup_execution_patch(dir.path(), &crate::execution_bookmark::LocalJj, &record)

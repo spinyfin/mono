@@ -51,7 +51,7 @@ pub async fn create_from(
     predecessor: Option<&ExecutionBookmark>,
     inherited_base: Option<&str>,
 ) -> Result<ExecutionBookmark> {
-    let record = boss_engine_recovery::execution_bookmark::create_from(
+    let mut record = boss_engine_recovery::execution_bookmark::create_from(
         jj,
         workspace,
         execution_id,
@@ -76,5 +76,6 @@ pub async fn create_from(
         &["bookmark", "set", &record.head(), &record.publication(), "-r", "@"],
     )
     .await?;
+    record.has_recovery_head = Some(true);
     Ok(record)
 }

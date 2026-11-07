@@ -1,7 +1,18 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
+use crate::schema_init::table_has_column;
 use boss_engine_recovery::execution_bookmark::{ExecutionBookmark, Jj, LocalJj, PointerSnapshot};
+use rusqlite::Connection;
+
+pub(crate) const HAS_RECOVERY_HEAD_MIGRATION_ID: &str = "20261107_0815_execution_bookmark_has_recovery_head";
+
+pub(crate) fn migrate_has_recovery_head(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "execution_bookmarks", "has_recovery_head")? {
+        conn.execute_batch("ALTER TABLE execution_bookmarks ADD COLUMN has_recovery_head INTEGER")?;
+    }
+    Ok(())
+}
 
 /// [`LocalJj`] with a child-process count, so a pointer snapshot / restore
 /// pass can publish how many `jj` processes it spawned
@@ -217,9 +228,11 @@ impl WorkDb {
     /// attention item filed at retirement keeps that history.
     pub fn record_execution_bookmark(&self, record: &ExecutionBookmark) -> Result<()> {
         let changed = self.connect()?.execute(
-            "INSERT INTO execution_bookmarks (execution_id, repo_path, host_id, base_commit) VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO execution_bookmarks (execution_id, repo_path, host_id, base_commit, has_recovery_head)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(execution_id) DO UPDATE SET
                 repo_path = excluded.repo_path, host_id = excluded.host_id, base_commit = excluded.base_commit,
+                has_recovery_head = excluded.has_recovery_head,
                 recovered_from = NULL, recovered_work = NULL, reconciliation_note = NULL,
                 retired_at = NULL, retired_reason = NULL
              WHERE retired_at IS NOT NULL",
@@ -228,6 +241,7 @@ impl WorkDb {
                 record.repo_path.to_str().context("shared repo path is not UTF-8")?,
                 record.host_id,
                 record.base_commit,
+                record.has_recovery_head.map(i64::from),
             ],
         )?;
         anyhow::ensure!(changed == 1, "execution bookmark record already exists and is live");
@@ -317,7 +331,8 @@ impl WorkDb {
         Ok(self
             .connect()?
             .query_row(
-                "SELECT eb.execution_id, eb.repo_path, eb.host_id, eb.base_commit, we.pr_head_before
+                "SELECT eb.execution_id, eb.repo_path, eb.host_id, eb.base_commit, we.pr_head_before,
+                        eb.has_recovery_head
                  FROM execution_bookmarks eb
                  LEFT JOIN work_executions we ON we.id = eb.execution_id
                  WHERE eb.execution_id = ?1 AND eb.retired_at IS NULL",
@@ -329,6 +344,7 @@ impl WorkDb {
                         host_id: row.get(2)?,
                         base_commit: row.get(3)?,
                         pr_head_before: row.get(4)?,
+                        has_recovery_head: row.get::<_, Option<i64>>(5)?.map(|value| value != 0),
                     })
                 },
             )
@@ -551,6 +567,9 @@ impl WorkDb {
         reason: &str,
         archives: &[(String, String)],
     ) -> Result<()> {
+        let preserved_note = self.preserved_tip(&prior.id)?.map(|tip| format!(
+            "Live workspace preservation: `preserved/{}` retains `{}`. This is separate from the legacy archive bookmarks above.", prior.id, tip.commit_id
+        )).unwrap_or_default();
         self.record_recovery_archive_note(
             prior,
             reason,
@@ -559,11 +578,11 @@ impl WorkDb {
                 "Recovery source retired; starting fresh",
                 &if archives.is_empty() {
                     format!(
-                        "Execution `{next_id}` starts fresh from an open PR, trunk, or the captured immutable review target. No action is required."
+                        "Execution `{next_id}` starts fresh from an open PR, trunk, or the captured immutable review target. {preserved_note} No action is required."
                     )
                 } else {
                     format!(
-                        "Execution `{next_id}` starts fresh from an open PR, trunk, or the captured immutable review target. Any unpublished work from the retired source remains at the archive bookmarks listed above; inspect them if that work is still wanted."
+                        "Execution `{next_id}` starts fresh from an open PR, trunk, or the captured immutable review target. {preserved_note} Legacy pointer targets remain at the archive bookmarks listed above; inspect the preserved live tip and archives if that work is still wanted."
                     )
                 },
             ),
@@ -621,6 +640,36 @@ impl WorkDb {
 }
 
 #[cfg(test)]
+mod has_recovery_head_migration_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    #[test]
+    fn upgrade_leaves_existing_rows_unknown() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE execution_bookmarks (
+                execution_id TEXT PRIMARY KEY,
+                repo_path TEXT NOT NULL,
+                host_id TEXT NOT NULL
+            );
+            INSERT INTO execution_bookmarks VALUES ('old', '/repo', 'local');",
+        )
+        .unwrap();
+        migrate_has_recovery_head(&conn).unwrap();
+        migrate_has_recovery_head(&conn).unwrap();
+        let flag: Option<i64> = conn
+            .query_row(
+                "SELECT has_recovery_head FROM execution_bookmarks WHERE execution_id = 'old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(flag, None);
+    }
+}
+
+#[cfg(test)]
 mod pr_head_before_loader_tests {
     use super::*;
     use crate::test_support::{create_ready_chore_execution, create_test_chore_manual, create_test_product};
@@ -641,6 +690,7 @@ mod pr_head_before_loader_tests {
             host_id: "local".into(),
             base_commit: None,
             pr_head_before: None,
+            has_recovery_head: None,
         })
         .unwrap();
         let record = db.execution_bookmark(&execution.id).unwrap();

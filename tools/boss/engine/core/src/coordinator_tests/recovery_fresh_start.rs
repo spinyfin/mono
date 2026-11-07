@@ -544,6 +544,147 @@ async fn free_recovery_source_host_is_preferred_over_another_eligible_host() {
     );
 }
 
+#[tokio::test]
+async fn host_preference_uses_a_retired_row_that_still_holds_preserved_work() {
+    let dir = tempdir().unwrap();
+    let (db, prior, next) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
+    seed_local_claude_driver(&db);
+    db.add_host("destination", "user@destination", 2, &[]).unwrap();
+    db.add_host("source", "user@source", 2, &[]).unwrap();
+    for host in ["destination", "source"] {
+        crate::test_support::insert_host_capability(&db, host, "driver=claude", "auto");
+    }
+    db.set_host_enabled("local", false).unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET kind = 'task_implementation' WHERE id IN (?1, ?2)",
+            rusqlite::params![prior.id, next.id],
+        )
+        .unwrap();
+    let next = db.get_execution(&next.id).unwrap();
+    let repo = JjRepo::new(dir.path());
+    super::recovery::configure_recovery_origin(&repo.repo);
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "source")
+        .await
+        .unwrap();
+    db.record_execution_bookmark(&record).unwrap();
+    std::fs::write(repo.worker.join("work.txt"), "preserved on a retired row").unwrap();
+    JjRepo::run(&repo.worker, &["status"]);
+    let tip = recovery::preserve(&LocalJj, &record, &repo.worker, None, None)
+        .await
+        .unwrap()
+        .tip
+        .unwrap();
+    db.record_preserved_tip(&prior.id, &tip).unwrap();
+    db.retire_execution_bookmark(&prior.id, "legacy pointers retired")
+        .unwrap();
+    let cube = Arc::new(FakeCubeClient {
+        real_bookmarks: true,
+        position_real_workspace: true,
+        workspace_root: Some(dir.path().to_owned()),
+        next_workspace_id: Mutex::new(Some("replacement".into())),
+        ..Default::default()
+    });
+    let chosen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut coordinator = ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        cube.clone(),
+        Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..Default::default()
+        }),
+    );
+    coordinator.set_host_adapter_provider(Arc::new(ChosenHostProvider {
+        inner: coordinator.host_adapter(),
+        chosen: Arc::clone(&chosen),
+    }));
+    let coordinator = Arc::new(coordinator);
+    let worker = coordinator.worker_pool().claim_worker(&next.id, None).await.unwrap();
+    coordinator
+        .schedule_execution_for_test(&next, &worker, DispatchAdmission::Queued)
+        .await
+        .unwrap();
+    assert_eq!(*chosen.lock().await, vec!["source".to_owned()]);
+}
+
+/// A predecessor that preserved nothing has no recovery head. Dispatch on
+/// another host must start fresh without contacting the source adapter,
+/// filing a recovery-retired note, or emitting pointers_retired.
+#[tokio::test]
+async fn cross_host_empty_predecessor_starts_fresh_without_the_source_adapter() {
+    let dir = tempdir().unwrap();
+    let (db, prior, next) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
+    seed_local_claude_driver(&db);
+    db.add_host("destination", "user@destination", 2, &[]).unwrap();
+    db.add_host("source", "user@source", 1, &[]).unwrap();
+    for host in ["destination", "source"] {
+        crate::test_support::insert_host_capability(&db, host, "driver=claude", "auto");
+    }
+    db.set_host_enabled("local", false).unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET kind = 'task_implementation' WHERE id IN (?1, ?2)",
+            rusqlite::params![prior.id, next.id],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET status = 'active', host_id = 'source' WHERE execution_id = ?1",
+            [&prior.id],
+        )
+        .unwrap();
+    let next = db.get_execution(&next.id).unwrap();
+    let repo = JjRepo::new(dir.path());
+    super::recovery::configure_recovery_origin(&repo.repo);
+    let record = recovery::create_from(&LocalJj, &repo.worker, &prior.id, "source", None, None)
+        .await
+        .unwrap();
+    assert_eq!(record.has_recovery_head, Some(false));
+    db.record_execution_bookmark(&record).unwrap();
+    let cube = Arc::new(FakeCubeClient {
+        real_bookmarks: true,
+        position_real_workspace: true,
+        workspace_root: Some(dir.path().to_owned()),
+        next_workspace_id: Mutex::new(Some("replacement".into())),
+        ..Default::default()
+    });
+    let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let mut coordinator = ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        cube.clone(),
+        Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..Default::default()
+        }),
+    );
+    coordinator.set_host_adapter_provider(Arc::new(UnreachableSourceProvider(coordinator.host_adapter())));
+    let coordinator = Arc::new(coordinator.with_dispatch_events(recording.clone()));
+    let worker = coordinator.worker_pool().claim_worker(&next.id, None).await.unwrap();
+    coordinator
+        .schedule_execution_for_test(&next, &worker, DispatchAdmission::Queued)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.latest_run_host_for_execution(&next.id).unwrap().as_deref(),
+        Some("destination")
+    );
+    assert_eq!(db.get_execution(&next.id).unwrap().status, ExecutionStatus::Running);
+    let retired: Vec<_> = db
+        .list_attention_items_for_work_item(&db.owning_work_item_id(&next.work_item_id))
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.kind == crate::execution_bookmark_recovery::RECOVERY_RETIRED)
+        .collect();
+    assert!(retired.is_empty(), "{retired:?}");
+    let events = format!("{:?}", recording.events().await);
+    assert!(!events.contains("pointers_retired"), "{events}");
+}
+
 struct ChosenHostProvider {
     inner: Arc<dyn crate::host_adapter::HostAdapter>,
     chosen: Arc<Mutex<Vec<String>>>,
@@ -739,6 +880,15 @@ async fn resume_archives_before_reusing_its_pointer_names() {
 
 #[tokio::test]
 async fn startup_pane_resume_archives_damaged_pointers_and_spawns() {
+    startup_resume(false).await;
+}
+
+#[tokio::test]
+async fn startup_pane_resume_retains_unrelated_preserved_and_live_tips() {
+    startup_resume(true).await;
+}
+
+async fn startup_resume(unrelated: bool) {
     let dir = tempdir().unwrap();
     let (db, _, next) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
     seed_local_claude_driver(&db);
@@ -752,6 +902,22 @@ async fn startup_pane_resume_archives_damaged_pointers_and_spawns() {
     JjRepo::run(&repo.worker, &["status"]);
     let old = commit(&repo.repo, &record.head());
     conflict_recovery_head(&repo.repo, &record);
+    let existing = if unrelated {
+        JjRepo::run(&repo.repo, &["new", "main", "-m", "Separate unpublished work"]);
+        std::fs::write(repo.repo.join("separate.txt"), "retain separately").unwrap();
+        JjRepo::run(
+            &repo.repo,
+            &["bookmark", "set", &recovery::preserved_name(&next.id), "-r", "@"],
+        );
+        Some(commit(&repo.repo, "@"))
+    } else {
+        None
+    };
+    JjRepo::run(&repo.worker, &["new", "@", "-m", "Live work after dispatch"]);
+    std::fs::write(repo.worker.join("newer.txt"), "newer than all legacy pointers").unwrap();
+    JjRepo::run(&repo.worker, &["status"]);
+    let live = commit(&repo.worker, "@");
+    assert_ne!(live, old);
     let (next, _) = db
         .start_execution_run(
             &next.id,
@@ -815,6 +981,34 @@ async fn startup_pane_resume_archives_damaged_pointers_and_spawns() {
         .is_empty()
     );
     assert!(!repo.worker.join("work.txt").exists());
+    assert_eq!(
+        commit(&repo.repo, &recovery::preserved_name(&next.id)),
+        existing.clone().unwrap_or_else(|| live.clone()),
+        "startup resume must preserve the live workspace tip before repositioning"
+    );
+    let notes = db
+        .list_attention_items_for_work_item(&db.owning_work_item_id(&next.work_item_id))
+        .unwrap();
+    let retired = notes
+        .iter()
+        .find(|note| note.kind == crate::execution_bookmark_recovery::RECOVERY_RETIRED)
+        .unwrap();
+    assert!(retired.body_markdown.contains(&recovery::preserved_name(&next.id)));
+    assert!(retired.body_markdown.contains(existing.as_deref().unwrap_or(&live)));
+    if let Some(existing) = existing {
+        let name = recovery::preserved_archive_name(&next.id, &live);
+        assert_eq!(commit(&repo.repo, &name), live);
+        let notes = db.list_attention_items(&next.id).unwrap();
+        let inspect = notes
+            .iter()
+            .find(|note| {
+                note.kind == boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND
+            })
+            .unwrap();
+        assert!(inspect.body_markdown.contains(&existing));
+        assert!(inspect.body_markdown.contains(&live));
+        assert!(inspect.body_markdown.contains(&name));
+    }
     for _ in 0..100 {
         if !runner.calls.lock().await.is_empty() {
             return;

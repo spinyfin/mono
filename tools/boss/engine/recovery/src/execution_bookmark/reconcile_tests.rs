@@ -326,6 +326,30 @@ async fn intact_pointers_are_never_reconciled_and_missing_heads_are_missing() {
     ));
 }
 
+#[tokio::test]
+async fn adopt_pushed_head_does_not_create_a_missing_baseline_bookmark() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = JjRepo::new(dir.path());
+    std::fs::write(repo.worker.join("work.txt"), "unpublished").unwrap();
+    JjRepo::run(&repo.worker, &["describe", "-m", "Work"]);
+    let record = create_from(&LocalJj, &repo.worker, "exec_new_layout", "local", None, None)
+        .await
+        .unwrap();
+    assert_eq!(record.has_recovery_head, Some(true));
+    assert!(!bookmark_exists(&repo.repo, &record.base()));
+    let work = one(&repo.repo, &revision(&record.head()));
+    JjRepo::run(&repo.repo, &["new", "main", "-m", "Main advances"]);
+    std::fs::write(repo.repo.join("upstream.txt"), "up").unwrap();
+    JjRepo::run(&repo.repo, &["bookmark", "set", "main", "-r", "@"]);
+    JjRepo::run(&repo.repo, &["rebase", "-b", &work, "-d", "bookmarks(exact:\"main\")"]);
+    let rebased = one(&repo.repo, &revision(&record.head()));
+    keep_visible(&repo.repo, &work);
+    bookmark(&repo.repo, &record.head(), &work);
+    adopt_pushed_head(&LocalJj, &record, &rebased, "main").await.unwrap();
+    assert!(!bookmark_exists(&repo.repo, &record.base()));
+    assert_eq!(one(&repo.repo, &revision(&record.head())), rebased);
+}
+
 #[test]
 fn legacy_blockers_are_recognised_by_exact_shape_only() {
     let id = "exec_18dcff786c983aa8_13";

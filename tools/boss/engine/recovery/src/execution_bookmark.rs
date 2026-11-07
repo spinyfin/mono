@@ -207,7 +207,8 @@ pub fn is_base_unresolvable_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<BaseUnresolvableError>())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct ExecutionBookmark {
     pub execution_id: String,
     pub repo_path: PathBuf,
@@ -222,6 +223,12 @@ pub struct ExecutionBookmark {
     /// is missing or no longer in the store, before falling back to trunk.
     #[serde(default)]
     pub pr_head_before: Option<String>,
+    /// Whether `create_from` wrote a `boss-recovery/` head. `None` is a row
+    /// that predates this column: inspect the store. `Some(false)` records only
+    /// dispatch-time state; workers may subsequently create publication heads.
+    /// Inspect the local store; leave remote publication heads for pruning.
+    #[serde(default)]
+    pub has_recovery_head: Option<bool>,
 }
 
 impl ExecutionBookmark {
@@ -561,6 +568,7 @@ pub async fn create_from(
         host_id: host_id.to_owned(),
         base_commit: None,
         pr_head_before: None,
+        has_recovery_head: None,
     };
     let result = async {
         if let Some(prior) = predecessor
@@ -599,7 +607,8 @@ pub async fn create_from(
                 ],
             )
             .await?;
-        if !unpublished.trim().is_empty() {
+        let created_head = !unpublished.trim().is_empty();
+        if created_head {
             // Only the recovery head is created here. A leftover baseline or
             // publication name from a partial legacy initialization is not a
             // conflict: dispatch neither writes nor needs those names.
@@ -612,6 +621,7 @@ pub async fn create_from(
             jj.run(workspace, &["bookmark", "create", &record.head(), "-r", "@"])
                 .await?;
         }
+        record.has_recovery_head = Some(created_head);
         Ok(record.clone())
     }
     .await;
