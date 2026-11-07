@@ -337,6 +337,45 @@ impl WorkDb {
             .build())
     }
 
+    /// Refuse to hand `execution_id` to `host_id` through any transport while an
+    /// unresolved assignment that may have started work names another host. The
+    /// same rule [`Self::reserve_spoke_assignment`] applies, as a read for the
+    /// destinations (local, SSH, enrolled-but-pending) that reserve nothing.
+    pub fn ensure_spoke_ownership(&self, execution_id: &str, host_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let open = conn
+            .query_row(
+                &format!("SELECT {ASSIGNMENT_COLUMNS} FROM spoke_assignments WHERE execution_id = ?1 AND resolved_at_ms IS NULL"),
+                [execution_id],
+                map_assignment,
+            )
+            .optional()?;
+        match open {
+            Some(open)
+                if open.host_id != host_id
+                    && assignment_may_have_started(&conn, execution_id, open.assignment_generation as i64)? =>
+            {
+                Err(SpokeHeldByOtherHost {
+                    execution_id: execution_id.to_owned(),
+                    held_by: open.host_id,
+                    generation: open.assignment_generation,
+                }
+                .into())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether any unresolved spoke assignment is held on `host_id`: its workspaces
+    /// exist only on the host's spoke, whatever transport new work uses.
+    pub fn host_has_open_spoke_assignment(&self, host_id: &str) -> Result<bool> {
+        Ok(self.connect()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM spoke_assignments WHERE host_id = ?1 AND resolved_at_ms IS NULL)",
+            [host_id],
+            |row| row.get(0),
+        )?)
+    }
+
     /// The execution's open assignment, else its latest resolved one. Recovery
     /// operations stay addressable after the lease is released.
     pub fn spoke_assignment_for_execution(&self, execution_id: &str) -> Result<Option<SpokeAssignment>> {
@@ -1020,6 +1059,56 @@ mod tests {
 
     fn fault_of(error: &anyhow::Error) -> Option<HostOutboxFault> {
         error.downcast_ref::<HostOutboxFault>().copied()
+    }
+
+    #[test]
+    fn ownership_is_checked_without_reserving_anything() {
+        let db = spoke_db();
+        db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
+        // An idle reservation pins nothing, so any destination may take the run.
+        db.ensure_spoke_ownership("exec_1", "host-b").unwrap();
+        db.bind_spoke_lease("exec_1", 1, "ws-a", "lease-a", "/a").unwrap();
+        let refused = db.ensure_spoke_ownership("exec_1", "host-b").unwrap_err();
+        assert_eq!(
+            refused
+                .downcast_ref::<SpokeHeldByOtherHost>()
+                .map(|held| held.held_by.as_str()),
+            Some("host-a")
+        );
+        db.ensure_spoke_ownership("exec_1", "host-a").unwrap();
+        db.ensure_spoke_ownership("never_seen", "host-b").unwrap();
+        assert!(db.host_has_open_spoke_assignment("host-a").unwrap());
+        assert!(!db.host_has_open_spoke_assignment("host-b").unwrap());
+        db.resolve_spoke_assignment("exec_1", 1, "released").unwrap();
+        db.ensure_spoke_ownership("exec_1", "host-b").unwrap();
+        assert!(!db.host_has_open_spoke_assignment("host-a").unwrap());
+    }
+
+    #[test]
+    fn new_work_is_admitted_only_while_the_assignment_is_open() {
+        let db = spoke_db();
+        let assignment = db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
+        let run = key(&assignment);
+        let admit = |id: &str, start: bool| {
+            db.append_host_command(
+                "host-a",
+                id,
+                Some(&run),
+                if start { RunAdmission::Start } else { RunAdmission::Recovery },
+                id.as_bytes(),
+                &|n| n.to_be_bytes().to_vec(),
+            )
+        };
+        admit("lease-1", true).unwrap();
+        db.resolve_spoke_assignment("exec_1", 1, "released").unwrap();
+        assert_eq!(
+            fault_of(&admit("lease-2", true).unwrap_err()),
+            Some(HostOutboxFault::Denied)
+        );
+        // Recovery and teardown stay addressable on the resolved generation, and
+        // a command already stored is returned to its retry.
+        admit("recovery-1", false).unwrap();
+        admit("lease-1", true).unwrap();
     }
 
     #[test]

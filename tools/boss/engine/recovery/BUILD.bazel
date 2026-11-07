@@ -25,6 +25,7 @@ rust_library(
         "//tools/boss/engine/host-execution:__pkg__",
         "//tools/boss/engine/merge-poller:__pkg__",
         "//tools/boss/engine/recovery-fixtures:__pkg__",
+        "//tools/boss/engine/spoke-adapter:__pkg__",
         "//tools/boss/engine/work-db:__pkg__",
     ],
     deps = all_crate_deps(normal = True),
