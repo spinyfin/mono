@@ -429,6 +429,8 @@ const EXECUTOR_FEATURES: &[&str] = &[
     feature::WORKSPACE_RESET_RELEASE,
     feature::SPAWN_LAUNCH_INPUTS,
     feature::SPAWN_WORKER_POSTURE,
+    feature::WORKER_EVENT,
+    feature::TRANSCRIPT_DELTA,
 ];
 
 /// Journal contracts plus the executor-backed workspace/execution set.
