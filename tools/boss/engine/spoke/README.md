@@ -8,9 +8,10 @@ OS boot identity. It advertises `journal/1` and `workspace/1`; capacity still ha
 zero worker slots. Workspace commands execute through the shared host executor.
 Other commands receive durable receipts and explicit rejected results.
 
-This ships inert: neither installation nor production hub dispatch is wired.
-An administrator with a compatible test hub and provisioned client credentials
-can run the daemon explicitly:
+This ships inert: production hub dispatch is not wired. `boss-spoke-package`
+([README](../../spoke-package/README.md)) installs the daemon as a launchd or
+systemd service on a worker host. An administrator with a compatible test hub and
+provisioned client credentials can also run the daemon explicitly:
 
 ```sh
 bazel run //tools/boss/engine/spoke:boss-spoke -- \

@@ -1,0 +1,16 @@
+[package]
+name = "boss-spoke-preflight"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+bon = { workspace = true }
+boss-host-execution = { path = "../host-execution" }
+boss-tmux = { path = "../../tmux" }
+fs4 = { workspace = true }
+libc = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "process", "rt", "time"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
