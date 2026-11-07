@@ -93,14 +93,18 @@ pub enum BoundaryOwnership {
     /// working copy is snapshotted to find work made after the boundary,
     /// which is reported for inspection and never bookmarked as extra
     /// unpublished changes. If that snapshot hides the boundary commit, the
-    /// unique visible successor of the same change is bookmarked and both
-    /// commits are named for inspection; the hidden original is never revived.
+    /// successor holds edits of unproven ownership: nothing is bookmarked, both
+    /// commits are named for inspection, and the hidden original is never
+    /// revived (it stays recoverable by commit id).
     FreeUnproven,
     /// The workspace is leased under another id, or cube's claim counter
     /// shows another lease was claimed since this one even though it is free
     /// again. Its working copy and registered tip belong to someone else: no
     /// snapshot, and unrelated work is never reported. A rewrite of this
-    /// execution's own boundary change is still reported for inspection.
+    /// execution's own boundary change is still reported for inspection, and
+    /// so is a boundary commit that is still the workspace's working-copy
+    /// commit (or a descendant of it): the next snapshot there would move a
+    /// bookmark onto the holder's pending edits, so it is not bookmarked.
     Reassigned,
 }
 
@@ -220,7 +224,7 @@ async fn workspace_tip(
     }
     // A free workspace is snapshotted after the boundary tip is resolved so
     // later work can be inspected. If that snapshot hides the boundary
-    // commit, preservation retargets onto the unique visible successor.
+    // commit, its successor is reported and nothing is bookmarked.
     let snapshot = if matches!(
         tip_source,
         WorkspaceTipSource::LeaseBoundary {
@@ -299,6 +303,17 @@ async fn historical_workspace_tip(
         }
         if loads >= OP_VIEW_LOAD_LIMIT {
             if boundary.is_some() {
+                // A forget operation at or before the boundary names the tip
+                // with one journal listing and one view load, however many
+                // operations the walk would have had to cross to reach it.
+                if let Some(tip) = forgotten_tip(jj, record, name, &rev, since_unix, boundary).await? {
+                    return Ok(WorkspaceTip {
+                        commit: visible_historical_tip(jj, &record.repo_path, &tip, follow_rewrites)
+                            .await?
+                            .commit,
+                        ..WorkspaceTip::default()
+                    });
+                }
                 return Ok(WorkspaceTip {
                     terminal_inspect: Some(
                         "workspace journal inspection exhausted the operation view limit; the lease-boundary tip is unresolved"
@@ -330,17 +345,32 @@ async fn historical_workspace_tip(
         {
             unclaimed.push(extra);
         }
+        if snapshot.is_none()
+            && ownership.is_some()
+            && let Some(commit) = resolved.commit.clone()
+            && pending_working_copy_boundary(jj, &record.repo_path, &rev, &commit).await?
+        {
+            // Not snapshotted: the boundary commit may still be the working-copy
+            // commit of a later holder whose edits are pending on disk. jj moves
+            // a bookmark along with the rewrite its next command snapshots, so
+            // a bookmark here would end up on those edits.
+            let work = log(jj, &record.repo_path, &unpublished(&commit), "change_id ++ \"\\n\"").await?;
+            unclaimed.push(Unclaimed {
+                note: format!(
+                    "the lease boundary tip {commit} is still the workspace's working-copy commit, which may now hold a later holder's pending edits; leaving it unbookmarked (it stays recoverable by commit id)"
+                ),
+                count: work.lines().count() as u64,
+                commit,
+            });
+            resolved.commit = None;
+        }
         if let Some(hidden) = resolved.snapshot_hid.as_deref() {
-            let visible = resolved
-                .commit
-                .as_deref()
-                .or(resolved.rewritten_to.as_deref())
-                .unwrap_or(hidden);
+            let visible = resolved.rewritten_to.as_deref().unwrap_or(hidden);
             let work = log(jj, &record.repo_path, &unpublished(visible), "change_id ++ \"\n\"").await?;
             let count = work.lines().count() as u64;
             unclaimed.push(Unclaimed {
                 note: format!(
-                    "the lease boundary tip {hidden} was rewritten to {visible} by snapshotting a working copy in its ancestry; both are post-boundary edits of unproven ownership"
+                    "the lease boundary tip {hidden} was rewritten to {visible} by snapshotting a working copy in its ancestry; the successor holds post-boundary edits of unproven ownership, so neither commit is bookmarked and the boundary commit stays recoverable by id"
                 ),
                 commit: visible.to_owned(),
                 count,
@@ -377,6 +407,13 @@ async fn historical_workspace_tip(
         });
     }
     Ok(WorkspaceTip::default())
+}
+
+/// Whether `commit` is the workspace's working-copy commit or a descendant of
+/// it, so the next snapshot of that working copy would rewrite it.
+async fn pending_working_copy_boundary(jj: &dyn Jj, repo: &Path, rev: &str, commit: &str) -> Result<bool> {
+    let found = log_change(jj, repo, &format!("({commit}) & ({rev})::")).await?;
+    Ok(found.lines().any(|id| id == commit))
 }
 
 /// A forgotten workspace's journaled tip, read from its pre-forget view.
@@ -456,17 +493,11 @@ async fn unclaimed_registered_work(
     }))
 }
 
-/// Never bookmark a hidden pre-rewrite or deliberately abandoned commit. With
-/// `follow_rewrites`, an unpublished amendment of a pushed change wins over the
-/// pushed commit. Without it the change id proves nothing: a later holder that
-/// inherited the commit and ran any jj command rewrote it under the same change
-/// id. Such a rewrite is never followed; it is returned as `rewritten_to` for
-/// inspection, and the boundary commit is used only while it is still visible
-/// as it was.
 /// Snapshot a free workspace after resolving the boundary tip. If that rewrite
-/// hides the boundary commit, retarget onto its unique visible successor so
-/// preservation never revives the hidden original. Pending working-copy edits
-/// are then in the successor and are named for inspection.
+/// hides the boundary commit, the pending working-copy edits now live in its
+/// visible successor, whose owner is unproven: nothing is bookmarked, so
+/// preservation never revives the hidden original nor adopts the edits. Both
+/// commits are named for inspection.
 async fn snapshot_free_unproven(
     jj: &dyn Jj,
     repo: &Path,
@@ -486,21 +517,22 @@ async fn snapshot_free_unproven(
     let visible = log_change(jj, repo, &change_revset(change.trim())).await?;
     let ids: Vec<&str> = visible.lines().filter(|id| !id.is_empty()).collect();
     resolved.snapshot_hid = Some(boundary);
-    match ids.as_slice() {
-        [one] => {
-            resolved.commit = Some((*one).to_owned());
-            resolved.rewritten_to = Some((*one).to_owned());
-        }
-        _ => {
-            resolved.commit = None;
-            if resolved.rewritten_to.is_none() {
-                resolved.rewritten_to = ids.first().map(|id| (*id).to_owned());
-            }
-        }
+    // The successor holds every pending working-copy edit, whose owner is
+    // unproven, so it is reported and never bookmarked.
+    resolved.commit = None;
+    if resolved.rewritten_to.is_none() {
+        resolved.rewritten_to = ids.first().map(|id| (*id).to_owned());
     }
     Ok(resolved)
 }
 
+/// Never bookmark a hidden pre-rewrite or deliberately abandoned commit. With
+/// `follow_rewrites`, an unpublished amendment of a pushed change wins over the
+/// pushed commit. Without it the change id proves nothing: a later holder that
+/// inherited the commit and ran any jj command rewrote it under the same change
+/// id. Such a rewrite is never followed; it is returned as `rewritten_to` for
+/// inspection, and the boundary commit is used only while it is still visible
+/// as it was.
 async fn visible_historical_tip(jj: &dyn Jj, repo: &Path, tip: &str, follow_rewrites: bool) -> Result<HistoricalTip> {
     let found = |commit: Option<String>| HistoricalTip {
         commit,
