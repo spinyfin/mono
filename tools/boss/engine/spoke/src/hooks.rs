@@ -80,7 +80,9 @@ pub async fn ingest(journal: &SharedJournal, execution: &ExecutionRecord, bytes:
     let source = format!("hook:{id}:{sequence}");
     let digest = digest_hex(&Sha256::digest(bytes));
     let previous = {
-        let journal = journal.lock().map_err(|_| anyhow::anyhow!("journal owner panicked"))?;
+        let journal = journal
+            .lock()
+            .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
         if let Some(old) = journal.source(&run, &source)? {
             ensure!(
                 serde_json::from_slice::<Receipt>(&old)?.digest == digest,
@@ -146,7 +148,9 @@ pub async fn ingest(journal: &SharedJournal, execution: &ExecutionRecord, bytes:
         ));
         observations
     };
-    let mut journal = journal.lock().map_err(|_| anyhow::anyhow!("journal owner panicked"))?;
+    let mut journal = journal
+        .lock()
+        .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
     if let Some(old) = journal.source(&run, &source)? {
         ensure!(
             serde_json::from_slice::<Receipt>(&old)?.digest == digest,
@@ -236,15 +240,19 @@ async fn ingest_pending(
     {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
+        Err(error) => anyhow::bail!("pending hook file unreadable: {error}"),
     };
-    let metadata = file.metadata()?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| anyhow::anyhow!("pending hook file unreadable: {error}"))?;
     ensure!(
         metadata.is_file() && metadata.nlink() == 1 && metadata.permissions().mode() & 0o077 == 0,
         "unsafe pending hook file"
     );
     let mut bytes = Vec::new();
-    file.take(MAX_HOOK as u64 + 1).read_to_end(&mut bytes)?;
+    file.take(MAX_HOOK as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| anyhow::anyhow!("pending hook file unreadable: {error}"))?;
     ingest(journal, execution, &bytes, stamp).await
 }
 
@@ -277,7 +285,9 @@ fn quarantine_pending(
         Admission::Lifecycle,
     )];
     {
-        let mut journal = journal.lock().map_err(|_| anyhow::anyhow!("journal owner panicked"))?;
+        let mut journal = journal
+            .lock()
+            .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
         if journal.source(&run, &resource)?.is_none() {
             journal.commit_source(&run, &resource, None, b"quarantined", records)?;
         }
@@ -322,14 +332,22 @@ pub fn bind(path: &Path) -> Result<UnixListener> {
 }
 
 pub async fn serve(listener: UnixListener, journal: SharedJournal, stamp: impl Fn() -> Result<Stamp>) -> Result<()> {
+    let mut failures = 0u32;
     loop {
         let mut stream = match listener.accept().await {
-            Ok((stream, _)) => stream,
+            Ok((stream, _)) => {
+                failures = 0;
+                stream
+            }
             Err(error) => {
                 tracing::warn!(%error, "hook accept failed");
-                if matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
+                let delay = if matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) {
+                    50
+                } else {
+                    (10u64 << failures.min(6)).min(500)
+                };
+                failures = failures.saturating_add(1);
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 continue;
             }
         };

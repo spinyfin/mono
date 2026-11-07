@@ -19,7 +19,7 @@ pub fn run_identity(record: &ExecutionRecord) -> Run {
 pub fn registered(journal: &SharedJournal) -> Result<Vec<ExecutionRecord>> {
     let rows = journal
         .lock()
-        .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
+        .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
         .list_executions()?;
     let mut records = Vec::new();
     for bytes in rows {
@@ -48,6 +48,13 @@ pub async fn observe(journal: SharedJournal, stamp: impl Fn() -> Result<Stamp>) 
         for record in records {
             if record.observation.is_none() || record.reclaimed {
                 continue;
+            }
+            // Once durably drained, sources may be pruned during reclaim; a
+            // later poll would otherwise replay a surviving transcript from 0.
+            match journal.lock().map(|j| j.source(&run_identity(&record), "drained")) {
+                Ok(Ok(Some(_))) => continue,
+                Ok(Ok(None)) => {}
+                _ => continue,
             }
             if let Err(error) = hooks::drain(&journal, &record, &stamp()?).await {
                 tracing::warn!(run = record.run_id, %error, "pending hooks retained");
@@ -601,6 +608,88 @@ mod tests {
                 .is_some()
         );
         assert_eq!(records(&reopened).len(), captured.len());
+    }
+
+    #[tokio::test]
+    async fn symlinked_oldest_pending_is_quarantined_and_later_stop_drains() {
+        let root = tempfile::tempdir().unwrap();
+        let mut execution = execution(root.path());
+        let producer = "0123456789abcdef0123456789abcdef";
+        let pending = root.path().join("pending");
+        let target = root.path().join("target.json");
+        std::fs::write(&target, b"{}").unwrap();
+        std::os::unix::fs::symlink(&target, pending.join(format!("00000000000000000001-{producer}.json"))).unwrap();
+        let path = root.path().join("transcript.jsonl");
+        std::fs::write(&path, b"later\n").unwrap();
+        let mut stop: serde_json::Value = serde_json::from_slice(&hook(Some(&path))).unwrap();
+        stop["_boss_producer_sequence"] = 2.into();
+        let stop_path = pending.join(format!("00000000000000000002-{producer}.json"));
+        std::fs::write(&stop_path, serde_json::to_vec(&stop).unwrap()).unwrap();
+        std::fs::set_permissions(&stop_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        execution.phase = Phase::Terminal;
+        let journal = journal(root.path(), limits());
+        hooks::drain(&journal, &execution, &stamp().unwrap()).await.unwrap();
+        assert!(!stop_path.exists());
+        assert!(
+            records(&journal)
+                .iter()
+                .any(|r| matches!(&r.body, Some(record::Body::Event(_))))
+        );
+    }
+
+    #[tokio::test]
+    async fn drained_run_is_not_replayed_after_sources_are_pruned() {
+        let root = tempfile::tempdir().unwrap();
+        let mut execution = execution(root.path());
+        execution.driver_id = "codex".into();
+        execution.phase = Phase::Terminal;
+        let directory = root.path().join("sessions");
+        std::fs::create_dir(&directory).unwrap();
+        execution.observation.as_mut().unwrap().file = Some((
+            boss_engine_driver::AgentJsonlFileIngress {
+                directory: directory.clone(),
+                filename_prefix: "rollout-".into(),
+                filename_suffix: ".jsonl".into(),
+                workspace_path: root.path().into(),
+            },
+            Vec::new(),
+        ));
+        let path = directory.join("rollout-example-session.jsonl");
+        let meta = serde_json::json!({"type":"session_meta", "payload":{"id":"session", "cwd":root.path()}});
+        std::fs::write(&path, format!("{meta}\n")).unwrap();
+        let journal = journal(root.path(), limits());
+        journal
+            .lock()
+            .unwrap()
+            .save_execution("run", "token", &serde_json::to_vec(&execution).unwrap())
+            .unwrap();
+        let observer = tokio::spawn(crate::observe(journal.clone(), stamp));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while journal
+                .lock()
+                .unwrap()
+                .source(&run_identity(&execution), "drained")
+                .unwrap()
+                .is_none()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        observer.abort();
+        let _ = observer.await;
+        let before = records(&journal).len();
+        journal
+            .lock()
+            .unwrap()
+            .prune_sources(&run_identity(&execution))
+            .unwrap();
+        let observer = tokio::spawn(crate::observe(journal.clone(), stamp));
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        observer.abort();
+        let _ = observer.await;
+        assert_eq!(records(&journal).len(), before);
     }
 
     #[tokio::test]

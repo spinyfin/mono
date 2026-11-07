@@ -15,13 +15,13 @@ mod commands {
         fn load(&self, sequence: u64) -> Result<Option<Vec<u8>>> {
             self.0
                 .lock()
-                .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
+                .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
                 .recovery_snapshot(sequence)
         }
         fn save(&self, sequence: u64, bytes: &[u8]) -> Result<()> {
             self.0
                 .lock()
-                .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
+                .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
                 .save_recovery_snapshot(sequence, bytes)
         }
     }
@@ -36,32 +36,32 @@ mod commands {
             Ok(self
                 .0
                 .lock()
-                .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
+                .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
                 .source(&run, "drained")?
                 .is_some())
         }
         fn prune_observation_sources(&self, record: &worker::ExecutionRecord) -> Result<()> {
             self.0
                 .lock()
-                .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
+                .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
                 .prune_sources(&boss_spoke_ingress::run_identity(record))
         }
         fn load(&self, run_id: &str, spawn_token: &str) -> Result<Option<Vec<u8>>> {
             self.0
                 .lock()
-                .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
+                .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
                 .load_execution(run_id, spawn_token)
         }
         fn save(&self, run_id: &str, spawn_token: &str, bytes: &[u8]) -> Result<()> {
             self.0
                 .lock()
-                .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
+                .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
                 .save_execution(run_id, spawn_token, bytes)
         }
         fn assigned(&self) -> Result<Vec<Vec<u8>>> {
             self.0
                 .lock()
-                .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
+                .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
                 .list_executions()
         }
     }
@@ -82,7 +82,7 @@ mod commands {
             interval.tick().await;
             let pending = journal
                 .lock()
-                .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
+                .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
                 .begin_pending()?;
             let Some((command, interrupted)) = pending else {
                 // Idle: look for workers that finished since the last look. This
@@ -132,7 +132,7 @@ mod commands {
             loop {
                 let completed = journal
                     .lock()
-                    .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
+                    .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
                     .complete_command(&command, result.clone(), &observed);
                 match completed {
                     Ok(()) => break,
@@ -343,7 +343,9 @@ async fn produce(journal: &SharedJournal, root: &std::path::Path, boot: &str, tm
     loop {
         interval.tick().await;
         let observed = host::stamp(boot)?;
-        let mut journal = journal.lock().map_err(|_| anyhow::anyhow!("journal owner panicked"))?;
+        let mut journal = journal
+            .lock()
+            .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
         journal.compact(observed.wall_unix_ms)?;
         let failed_preflights = if tmux_ready {
             Vec::new()

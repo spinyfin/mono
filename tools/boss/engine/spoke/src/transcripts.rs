@@ -56,7 +56,7 @@ pub async fn watermark(
 ) -> Result<(String, u64)> {
     let saved = journal
         .lock()
-        .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
+        .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
         .source(&crate::run_identity(execution), "transcript")?;
     let mut checkpoint: Checkpoint = saved
         .map(|b| serde_json::from_slice(&b))
@@ -83,7 +83,9 @@ pub async fn poll(journal: &SharedJournal, execution: &ExecutionRecord, stamp: &
         .context("missing observation configuration")?;
     let run = crate::run_identity(execution);
     let (saved, hint, credit) = {
-        let journal = journal.lock().map_err(|_| anyhow::anyhow!("journal owner panicked"))?;
+        let journal = journal
+            .lock()
+            .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
         (
             journal.source(&run, "transcript")?,
             journal.latest_source(&run)?,
@@ -283,7 +285,9 @@ pub async fn poll(journal: &SharedJournal, execution: &ExecutionRecord, stamp: &
     }
     checkpoint.cursor = chunk.cursor;
     checkpoint.eof = chunk.eof;
-    let mut journal = journal.lock().map_err(|_| anyhow::anyhow!("journal owner panicked"))?;
+    let mut journal = journal
+        .lock()
+        .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
     journal.commit_source(
         &run,
         "transcript",
@@ -327,7 +331,7 @@ fn finish_missing(
     };
     journal
         .lock()
-        .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
+        .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
         .commit_source(run, "drained", None, b"true", records)?;
     Ok(())
 }
