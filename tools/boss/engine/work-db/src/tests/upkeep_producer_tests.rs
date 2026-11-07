@@ -275,6 +275,12 @@ fn seed_blocked_ci(db: &WorkDb, product: &str) -> String {
     id
 }
 
+fn seed_blocked_other_with_pr(db: &WorkDb, product: &str) -> String {
+    let id = chore(db, product, "dependency blocked with PR");
+    set_blocking_state(db, &id, "blocked", Some("dependency"), Some(&fresh_pr()), "100");
+    id
+}
+
 fn seed_dependency_blocked(db: &WorkDb, product: &str) -> String {
     let id = chore(db, product, "blocked on a dependency");
     set_blocking_state(db, &id, "blocked", Some("dependency"), None, "100");
@@ -475,6 +481,18 @@ const PRODUCERS: &[Producer] = &[
         },
     },
     Producer {
+        name: "merge poller, blocked on other reasons (list_chores_blocked_other_with_pr)",
+        stance: Stance::KeepsParked {
+            why: "a dependency-blocked PR can still merge or close; terminal facts are recorded, remediation is gated",
+        },
+        seed: seed_blocked_other_with_pr,
+        nominated: |db| {
+            ids(db.list_chores_blocked_other_with_pr().unwrap(), |c| {
+                c.work_item_id.clone()
+            })
+        },
+    },
+    Producer {
         name: "dependency cascade (list_dependency_blocked_candidates)",
         stance: Stance::KeepsParked {
             why: "a parked blocked:dependency row still flips to todo so its lifecycle position stays truthful; the mint point refuses to create an execution",
@@ -624,7 +642,7 @@ const LISTING_KEYWORDS: &[&str] = &[
     "dead",
     "abandoned",
     "orphan",
-    "blocked_on",
+    "blocked",
 ];
 
 fn collect_source_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
