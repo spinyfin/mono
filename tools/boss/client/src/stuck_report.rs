@@ -22,12 +22,14 @@ pub async fn fetch(client: &mut crate::BossClient, since: &str) -> Result<StuckR
 
 /// Every bucket, in the order the report prints them. `engine_stuck` is last
 /// because it is the one the end-state claim is about.
-const BUCKETS: [&str; 6] = [
+const BUCKETS: [&str; 8] = [
     "parked",
     "waiting_on_human",
     "waiting_on_capacity",
     "waiting_on_dependency",
     "parked_upstream",
+    "progression_in_flight",
+    "progression_failing",
     "engine_stuck",
 ];
 

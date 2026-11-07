@@ -770,14 +770,14 @@ impl ExecutionCoordinator {
             self.work_db.classify_work_item_for_dispatch(&execution.work_item_id),
             Ok(DispatchClass::OtherWork) | Err(_)
         );
-        let all_review_siblings = siblings.iter().all(|s| s.kind.is_read_only_review());
+        let all_review_siblings = siblings.iter().all(|s| s.kind.never_writes_pr_branch());
         if is_revision {
             // Reviews are read-only: drop them from the hold entirely so a
             // revision is neither blocked by one nor shown as "blocked by"
             // its parent task on the card because of one.
             let writers: Vec<WorkExecution> = siblings
                 .iter()
-                .filter(|s| !s.kind.is_read_only_review())
+                .filter(|s| !s.kind.never_writes_pr_branch())
                 .cloned()
                 .collect();
             return match writers.first().cloned() {
@@ -797,7 +797,7 @@ impl ExecutionCoordinator {
         let queue_len = siblings.len();
         let sibling = siblings
             .iter()
-            .find(|s| !s.kind.is_read_only_review())
+            .find(|s| !s.kind.never_writes_pr_branch())
             .cloned()
             .unwrap_or(first_sibling);
         ChainHold::Blocked {

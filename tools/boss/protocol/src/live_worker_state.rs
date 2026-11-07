@@ -387,6 +387,9 @@ impl AgentType {
             | ExecutionKind::CiRemediation
             | ExecutionKind::ConflictResolution => AgentType::Coding,
             ExecutionKind::AnswerAgent => AgentType::Answer,
+            // An engine-spawned administrative agent: no human asked for it, so it
+            // reads as automation until the app grows a dedicated badge.
+            ExecutionKind::Progression => AgentType::Automation,
         };
         if has_source_automation && by_kind != AgentType::Review {
             AgentType::Automation

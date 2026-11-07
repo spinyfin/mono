@@ -70,16 +70,26 @@ pub enum ExecutionKind {
     PrReviewGuide,
     ProductDesign,
     ProjectDesign,
+    /// Administrative agent that diagnoses and unsticks one non-parked work
+    /// item that has no live work (design: task-persistence-parking-and-
+    /// autonomous-progression, section 2.2). Bound to the stuck item itself
+    /// (`work_executions.work_item_id`), minted by the engine's
+    /// `progression_sweep` and run in its own pool. It never writes a repository
+    /// or a PR branch: anything that needs a diff is expressed as a revision or
+    /// a task for a coding agent.
+    Progression,
     RevisionImplementation,
     TaskImplementation,
 }
 
 impl ExecutionKind {
-    /// Kinds that only ever read the PR and never write to its branch. They
-    /// cannot race a writer for the shared jj backing store, so per-PR
-    /// writer serialization (chain serialization) does not apply to them.
-    pub fn is_read_only_review(&self) -> bool {
-        matches!(self, Self::PrReview | Self::PrReviewGuide)
+    /// Kinds that never write to a PR branch: the read-only review kinds, which
+    /// only read the PR, and `progression`, which holds no checkout at all. They
+    /// cannot race a writer for the shared jj backing store, so per-PR writer
+    /// serialization (chain serialization) does not apply to them, and a live
+    /// one is never a writer on the PR chain.
+    pub fn never_writes_pr_branch(&self) -> bool {
+        matches!(self, Self::PrReview | Self::PrReviewGuide | Self::Progression)
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -94,6 +104,7 @@ impl ExecutionKind {
             Self::PrReviewGuide => "pr_review_guide",
             Self::ProductDesign => "product_design",
             Self::ProjectDesign => "project_design",
+            Self::Progression => "progression",
             Self::RevisionImplementation => "revision_implementation",
             Self::TaskImplementation => "task_implementation",
         }
@@ -120,13 +131,14 @@ impl std::str::FromStr for ExecutionKind {
             "pr_review_guide" => Ok(Self::PrReviewGuide),
             "product_design" => Ok(Self::ProductDesign),
             "project_design" => Ok(Self::ProjectDesign),
+            "progression" => Ok(Self::Progression),
             "revision_implementation" => Ok(Self::RevisionImplementation),
             "task_implementation" => Ok(Self::TaskImplementation),
             other => Err(format!(
                 "unknown execution kind: `{other}`; expected one of: \
                  answer_agent, automation_triage, chore_implementation, ci_remediation, \
                  conflict_resolution, investigation_implementation, pr_review, pr_review_guide, \
-                 product_design, project_design, revision_implementation, task_implementation"
+                 product_design, project_design, progression, revision_implementation, task_implementation"
             )),
         }
     }

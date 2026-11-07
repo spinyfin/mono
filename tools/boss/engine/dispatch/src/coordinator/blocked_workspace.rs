@@ -19,7 +19,7 @@ impl ExecutionCoordinator {
         pr_for_goto: Option<u64>,
         task_pr: Option<u64>,
     ) -> Result<Option<Recovered>> {
-        if execution.kind.is_read_only_review() {
+        if execution.kind.never_writes_pr_branch() {
             return Ok(None);
         }
         let source = self.work_db.recovery_source(execution)?;

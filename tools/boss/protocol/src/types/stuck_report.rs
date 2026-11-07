@@ -13,6 +13,12 @@ pub enum StuckBucket {
     /// `blocked: dependency` on a prerequisite the owner parked. The owner's
     /// decision about the prerequisite is also the decision about this item.
     ParkedUpstream,
+    /// A progression agent is live or pending for the item, or the item is
+    /// inside the cooldown that follows a progression run. Being handled.
+    ProgressionInFlight,
+    /// Progression could not unstick the item: its last two progression runs
+    /// ended in infrastructure failure, so the sweep no longer nominates it.
+    ProgressionFailing,
     EngineStuck,
 }
 
@@ -24,6 +30,8 @@ impl StuckBucket {
             Self::WaitingOnCapacity => "waiting_on_capacity",
             Self::WaitingOnDependency => "waiting_on_dependency",
             Self::ParkedUpstream => "parked_upstream",
+            Self::ProgressionInFlight => "progression_in_flight",
+            Self::ProgressionFailing => "progression_failing",
             Self::EngineStuck => "engine_stuck",
         }
     }
