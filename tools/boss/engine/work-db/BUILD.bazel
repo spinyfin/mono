@@ -110,7 +110,7 @@ rust_test(
     data = [
         "//tools/boss/app-macos:work_board_banners_swift",
         "@jj_test_tools//:jj",
-    ],
+    ] + glob(["src/**/*.rs"]),
     edition = "2024",
     env = {
         "BOSS_JJ_BIN": "$(rootpath @jj_test_tools//:jj)",

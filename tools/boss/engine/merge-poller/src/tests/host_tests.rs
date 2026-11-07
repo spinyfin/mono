@@ -392,3 +392,131 @@ async fn mergeable_prs_ask_the_host_to_retire_moot_conflict_revisions_and_confli
         "only the definitively mergeable PR may retire moot conflict revisions"
     );
 }
+
+// ── Parked rows ────────────────────────────────────────────────────────────
+//
+// A parked row atrophies: the poller keeps recording the facts about the world
+// (the PR merged, the PR closed) and does nothing about an open PR.
+
+fn park(db: &WorkDb, id: &str) {
+    db.park_work_item_as_actor(id, true, Some("not now"), "human").unwrap();
+}
+
+fn unpark(db: &WorkDb, id: &str) {
+    db.park_work_item_as_actor(id, false, None, "human").unwrap();
+}
+
+#[tokio::test]
+async fn a_parked_in_review_row_whose_pr_merges_still_goes_to_done() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/7101";
+    let (_product, chore) = make_chore_in_review(&db, "C-parked-merged", pr);
+    park(&db, &chore);
+    let probe = StubProbe::new();
+    probe.set_with_base_head(pr, PrLifecycleState::Merged, "base-1", "head-1");
+    let publisher = Arc::new(RecordingPublisher::default());
+    let host = RecordingHost::default();
+
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, Some(&host)).await;
+
+    assert_eq!(outcome.merged, 1, "a merge is a fact about the world, not upkeep");
+    match db.get_work_item(&chore).unwrap() {
+        WorkItem::Chore(task) => assert_eq!(task.status, crate::work::TaskStatus::Done),
+        other => panic!("expected chore, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_parked_row_whose_pr_closes_unmerged_takes_the_closed_unmerged_path() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/7102";
+    let (_product, chore) = make_chore_in_review(&db, "C-parked-closed", pr);
+    park(&db, &chore);
+    let probe = StubProbe::new();
+    probe.set(pr, PrLifecycleState::ClosedUnmerged);
+    let publisher = Arc::new(RecordingPublisher::default());
+
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
+
+    assert_eq!(outcome.closed_unmerged, 1);
+    match db.get_work_item(&chore).unwrap() {
+        WorkItem::Chore(task) => assert_eq!(task.status, crate::work::TaskStatus::Done),
+        other => panic!("expected chore, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_parked_row_with_a_conflicting_pr_is_not_handed_to_the_host_until_unparked() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/7103";
+    let (_product, chore) = make_chore_in_review(&db, "C-parked-conflict", pr);
+    park(&db, &chore);
+    let probe = StubProbe::new();
+    probe.set_with_base_head(
+        pr,
+        PrLifecycleState::Open(OpenPrStatus::conflict_only()),
+        "base-1",
+        "head-1",
+    );
+    let publisher = Arc::new(RecordingPublisher::default());
+    let host = RecordingHost::default();
+
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, Some(&host)).await;
+    assert_eq!(outcome.conflict_flagged, 0);
+    assert_eq!(
+        host.calls(),
+        Vec::new(),
+        "no conflict handling, no moot-revision retirement"
+    );
+
+    unpark(&db, &chore);
+    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, Some(&host)).await;
+    assert_eq!(
+        host.calls(),
+        vec![HostCall::ConflictDetected {
+            ladder_enabled: false,
+            has_cube_client: false,
+        }],
+        "the same PR is handed to the host once the row is un-parked",
+    );
+}
+
+#[tokio::test]
+async fn a_parked_row_with_red_ci_gets_no_ci_fix_revision_until_unparked() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/7104";
+    let (_product, chore) = make_chore_in_review(&db, "C-parked-ci", pr);
+    park(&db, &chore);
+    let probe = StubProbe::new();
+    probe
+        .states
+        .lock()
+        .unwrap()
+        .insert(pr.to_owned(), Ok(probe_ci_failing(pr, "head-1")));
+    let publisher = Arc::new(RecordingPublisher::default());
+
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
+    assert_eq!(outcome.ci_flagged, 0, "CI remediation is upkeep");
+    assert!(
+        db.list_ci_remediations(None, &[], Some(&chore), None)
+            .unwrap()
+            .is_empty(),
+        "no remediation attempt is recorded for a parked row",
+    );
+    match db.get_work_item(&chore).unwrap() {
+        WorkItem::Chore(task) => assert_eq!(task.status, crate::work::TaskStatus::InReview),
+        other => panic!("expected chore, got {other:?}"),
+    }
+
+    unpark(&db, &chore);
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
+    assert_eq!(
+        outcome.ci_flagged, 1,
+        "the same red CI is remediated once the row is un-parked"
+    );
+    assert_eq!(db.list_ci_remediations(None, &[], Some(&chore), None).unwrap().len(), 1);
+}

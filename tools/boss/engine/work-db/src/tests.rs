@@ -643,3 +643,5 @@ mod stuck_report_tests;
 
 mod conflict_mismatch_tests;
 mod stuck_snapshot_tests;
+
+mod upkeep_producer_tests;
