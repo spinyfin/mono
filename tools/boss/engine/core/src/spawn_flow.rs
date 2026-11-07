@@ -365,15 +365,13 @@ async fn start_tmux_worker(
     // sending it — an older server rejects the flag outright, which would
     // otherwise fail the whole spawn over a cosmetic scrollback fix.
     if let Some(config) = crate::driver::tmux_session_config_for(driver_name) {
-        match host.tmux().version().await {
-            Ok(version) if version.supports_source_file_target() => {
-                host.tmux()
-                    .source_file(host.session_name(), config)
-                    .await
-                    .with_context(|| format!("sourcing {driver_name} tmux session config"))
-                    .map_err(StartWorkerError::Tmux)?;
-            }
-            Ok(version) => {
+        match boss_tmux::session_options::source_driver_session_config(host.tmux(), host.session_name(), config)
+            .await
+            .with_context(|| format!("sourcing {driver_name} tmux session config"))
+            .map_err(StartWorkerError::Tmux)?
+        {
+            boss_tmux::session_options::SessionConfigOutcome::Sourced => {}
+            boss_tmux::session_options::SessionConfigOutcome::UnsupportedTmux(version) => {
                 tracing::warn!(
                     execution_id = %execution_id,
                     driver_name = %driver_name,
@@ -382,7 +380,7 @@ async fn start_tmux_worker(
                     "tmux predates 3.4's `source-file -t`; skipping session-scoped tmux config for this driver",
                 );
             }
-            Err(error) => {
+            boss_tmux::session_options::SessionConfigOutcome::VersionUnreadable(error) => {
                 tracing::warn!(
                     execution_id = %execution_id,
                     driver_name = %driver_name,

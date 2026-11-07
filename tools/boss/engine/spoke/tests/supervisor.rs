@@ -185,7 +185,7 @@ async fn create_session(tmux: &Tmux, token: &str, command: &str) {
 }
 
 fn supervisor(root: &Path, tmux: Tmux) -> Supervisor<ListingCube, MemoryStore> {
-    let homes = homes::pin(&root.join("homes")).unwrap();
+    let homes = homes::pin(&homes::process_root()).unwrap();
     let workspace = root.join("worker");
     std::fs::create_dir_all(&workspace).unwrap();
     Supervisor {
@@ -245,7 +245,7 @@ async fn restart_adopts_the_token_session() {
         tmux: tmux.clone(),
         store: MemoryStore::default(),
         host_id: "host".into(),
-        homes_root: root.path().join("homes"),
+        homes_root: homes::process_root(),
         boot_id: "boot".into(),
         brief_budget: Duration::ZERO,
     };
