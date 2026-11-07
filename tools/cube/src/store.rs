@@ -463,6 +463,7 @@ impl Store {
             return Ok(None);
         };
 
+        let generation = next_lease_generation(&transaction, repo)?;
         transaction
             .execute(
                 r#"
@@ -479,7 +480,7 @@ impl Store {
                     health_status = NULL,
                     unhealthy_since_epoch_s = NULL,
                     last_activity_at_epoch_s = ?5,
-                    lease_generation = lease_generation + 1
+                    lease_generation = ?10
                 WHERE repo = ?7 AND workspace_id = ?8 AND state = ?9 AND cleanup_status IS NULL
                 "#,
                 params![
@@ -492,6 +493,7 @@ impl Store {
                     repo,
                     workspace_id,
                     WorkspaceState::Free.as_str(),
+                    generation,
                 ],
             )
             .map_err(CubeError::Storage)?;
@@ -720,6 +722,7 @@ impl Store {
     ) -> Result<Option<WorkspaceRecord>, CubeError> {
         let transaction = self.connection.transaction().map_err(CubeError::Storage)?;
 
+        let generation = next_lease_generation(&transaction, repo)?;
         let rows_updated = transaction
             .execute(
                 r#"
@@ -736,7 +739,7 @@ impl Store {
                     health_status = NULL,
                     unhealthy_since_epoch_s = NULL,
                     last_activity_at_epoch_s = ?5,
-                    lease_generation = lease_generation + 1
+                    lease_generation = ?10
                 WHERE repo = ?7 AND workspace_id = ?8 AND state = ?9 AND cleanup_status IS NULL
                 "#,
                 params![
@@ -749,6 +752,7 @@ impl Store {
                     repo,
                     workspace_id,
                     WorkspaceState::Free.as_str(),
+                    generation,
                 ],
             )
             .map_err(CubeError::Storage)?;
@@ -1608,11 +1612,22 @@ impl Store {
             &self.connection,
             "ALTER TABLE workspaces ADD COLUMN last_cleaned_at_epoch_s INTEGER",
         )?;
-        // Monotonic count of claims on this workspace; see `WorkspaceRecord::lease_generation`.
+        // Claim stamp of this workspace; see `WorkspaceRecord::lease_generation`.
         try_add_column(
             &self.connection,
             "ALTER TABLE workspaces ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0",
         )?;
+        // Per-repo high-water mark of issued stamps. It outlives workspace
+        // rows, so a workspace id re-minted after its row was deleted can never
+        // be stamped with a value an earlier incarnation already issued.
+        self.connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS repo_lease_generations (
+                    repo TEXT PRIMARY KEY,
+                    high INTEGER NOT NULL
+                );",
+            )
+            .map_err(CubeError::Storage)?;
 
         // Created after the ALTERs above so it also lands on a database whose
         // `workspaces` table pre-dates the `health_status` column.
@@ -1633,6 +1648,30 @@ impl Store {
 
         Ok(())
     }
+}
+
+/// Issue the next lease generation for a claim in `repo`. Stamps are drawn from
+/// a per-repo counter seeded above every stamp already on a workspace row, so
+/// they are unique across the repo's whole history, including rows that were
+/// deleted and later re-minted under the same workspace id.
+fn next_lease_generation(transaction: &rusqlite::Transaction<'_>, repo: &str) -> Result<i64, CubeError> {
+    transaction
+        .execute(
+            r#"
+            INSERT INTO repo_lease_generations (repo, high)
+            VALUES (?1, (SELECT COALESCE(MAX(lease_generation), 0) + 1 FROM workspaces WHERE repo = ?1))
+            ON CONFLICT(repo) DO UPDATE SET high = high + 1
+            "#,
+            params![repo],
+        )
+        .map_err(CubeError::Storage)?;
+    transaction
+        .query_row(
+            "SELECT high FROM repo_lease_generations WHERE repo = ?1",
+            params![repo],
+            |row| row.get(0),
+        )
+        .map_err(CubeError::Storage)
 }
 
 fn try_add_column(connection: &Connection, sql: &str) -> Result<(), CubeError> {
@@ -1862,6 +1901,44 @@ mod tests {
             .expect("claim")
             .expect("claimed");
         assert_eq!(reclaimed.lease_generation, 2);
+    }
+
+    /// A workspace id re-minted after its row was deleted must not reuse a
+    /// claim stamp the earlier incarnation already issued, or a holder of the
+    /// old lease could mistake the new incarnation for its own.
+    #[test]
+    fn lease_generation_is_not_reissued_after_a_workspace_row_is_recreated() {
+        let (tempdir, mut store) = open_store();
+        let workspace_root = tempdir.path().join("workspaces");
+        store
+            .upsert_repo(&RepoRecord {
+                repo: "mono".to_string(),
+                origin: "git@github.com:spinyfin/mono.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: workspace_root.clone(),
+                workspace_prefix: "mono-agent-".to_string(),
+                source: None,
+                clone_command: None,
+            })
+            .expect("repo");
+        let candidate = WorkspaceCandidate {
+            workspace_id: "mono-agent-120".to_string(),
+            workspace_path: workspace_root.join("mono-agent-120"),
+        };
+        store.sync_workspaces("mono", std::slice::from_ref(&candidate)).expect("sync");
+        let first = store
+            .claim_specific_workspace("mono", "mono-agent-120", "boss", "a", "lease-a", 1_700_000_000, None)
+            .expect("claim")
+            .expect("claimed");
+        store.release_workspace("lease-a", None).expect("release");
+        store.forget_workspace("mono", "mono-agent-120").expect("forget");
+        store.sync_workspaces("mono", &[candidate]).expect("resync");
+        let recreated = store
+            .claim_specific_workspace("mono", "mono-agent-120", "boss", "b", "lease-b", 1_700_000_100, None)
+            .expect("claim")
+            .expect("claimed");
+        assert_ne!(first.lease_generation, recreated.lease_generation);
+        assert!(recreated.lease_generation > first.lease_generation);
     }
 
     /// TTL expiry frees a workspace without anyone calling `release`, so it has

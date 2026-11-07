@@ -96,6 +96,18 @@ crate::stub_cube_client! { RecordingCube {
         self.released.lock().unwrap().push(lease_id.to_owned());
         Ok(())
     }
+    async fn list_workspaces(&self) -> anyhow::Result<Vec<boss_execution_contracts::CubeWorkspaceStatus>> {
+        // The registry still shows the spawned execution's workspace leased
+        // under its own lease, as cube does when the spawn is reaped.
+        Ok(vec![
+            boss_execution_contracts::CubeWorkspaceStatus::builder()
+                .workspace_id("ws-1")
+                .workspace_path(std::path::PathBuf::from("/tmp/ws"))
+                .state("leased")
+                .lease_id("lease-1")
+                .build(),
+        ])
+    }
 } }
 
 #[derive(Default)]
@@ -314,12 +326,7 @@ async fn assert_incident_detected_and_released(fixture: &IncidentFixture) {
     );
 
     let attentions = db.list_attention_items(execution_id).unwrap();
-    assert_eq!(attentions.len(), 2, "an attention item must be raised");
-    assert!(
-        attentions
-            .iter()
-            .any(|item| item.kind == "preserved_work_needs_inspection")
-    );
+    assert_eq!(attentions.len(), 1, "an attention item must be raised");
     let attentions: Vec<_> = attentions
         .iter()
         .filter(|item| item.kind == DRIVER_START_ATTENTION_KIND)

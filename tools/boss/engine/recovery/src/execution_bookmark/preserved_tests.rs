@@ -904,6 +904,62 @@ fn tip_of_workspace(repo: &JjRepo) -> String {
         .to_owned()
 }
 
+/// A store with many operations in which the workspace never resolves: the
+/// journal is listed in full, but the walk may load only a bounded number of
+/// operation views.
+struct CountingViews {
+    loads: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl Jj for CountingViews {
+    async fn run(&self, repo: &Path, args: &[&str]) -> Result<String> {
+        if args.contains(&"--at-op") {
+            self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Ok(String::new());
+        }
+        if args.iter().any(|arg| arg.starts_with("time.end().format(\"%s.%f\")")) {
+            return Ok((0..2_000)
+                .map(|n| format!("{}.000000000 op{n}\n", 1_700_000_000 + n))
+                .collect());
+        }
+        LocalJj.run(repo, args).await
+    }
+
+    async fn shared_repo(&self, workspace: &Path) -> Result<PathBuf> {
+        LocalJj.shared_repo(workspace).await
+    }
+}
+
+#[tokio::test]
+async fn journal_walks_load_a_bounded_number_of_operation_views() {
+    for source in [
+        WorkspaceTipSource::Live,
+        WorkspaceTipSource::LeaseBoundary {
+            unix_millis: now_millis().await + 60_000,
+            ownership: BoundaryOwnership::Reassigned,
+        },
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = fixture(dir.path());
+        let record = create(&LocalJj, &repo.worker, "exec_view_bound", "local")
+            .await
+            .unwrap();
+        let jj = CountingViews {
+            loads: Default::default(),
+        };
+        let outcome = preserve_from(&jj, &record, &repo.worker.join("gone"), None, None, source)
+            .await
+            .unwrap();
+        assert!(outcome.tip.is_none(), "{source:?}: {outcome:?}");
+        let loads = jj.loads.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            loads <= preserved::OP_VIEW_LOAD_LIMIT,
+            "{source:?}: {loads} operation views were loaded"
+        );
+    }
+}
+
 #[tokio::test]
 async fn unknown_boundary_resolves_nothing_and_raises_inspection() {
     let dir = tempfile::tempdir().unwrap();
@@ -1142,7 +1198,7 @@ async fn a_successors_rewrite_of_the_inherited_change_is_not_adopted() {
                     "preserved/exec_inherited_rewrite",
                 ],
             );
-            if successor_runs_jj || ownership == BoundaryOwnership::FreeUnproven {
+            if successor_runs_jj {
                 // The inherited change was rewritten to include the successor's
                 // file: nothing may be bookmarked, and inspection is raised.
                 assert!(preserved.trim().is_empty(), "{label}: bookmarked {preserved}");
@@ -1153,8 +1209,15 @@ async fn a_successors_rewrite_of_the_inherited_change_is_not_adopted() {
                     .unwrap_or_else(|| panic!("{label}: {outcome:?}"));
                 assert!(inspect.workspace_count >= Some(1), "{label}: {inspect:?}");
             } else {
-                // Reassigned and never snapshotted: the registered boundary
-                // commit is untouched, so it is the safe tip.
+                // The registered boundary commit was untouched when it was
+                // resolved, so it is the safe tip. A free workspace is
+                // snapshotted only afterwards, so the snapshot cannot hide it,
+                // and the snapshot's work is reported rather than adopted.
+                assert_eq!(
+                    outcome.inspect.is_some(),
+                    ownership == BoundaryOwnership::FreeUnproven,
+                    "{label}: {outcome:?}"
+                );
                 let files = JjRepo::run(
                     &repo.repo,
                     &[

@@ -1498,7 +1498,10 @@ pub trait HostAdapter: Send + Sync {
 
     /// Confirm preservation using an explicit workspace-tip source. Inferred-death
     /// teardown passes an ownership boundary through to the owning host.
-    /// Adapters must honor that boundary rather than snapshot another holder.
+    /// Adapters must honor that boundary rather than snapshot another holder,
+    /// so the default serves only a live source and refuses any other: an
+    /// adapter that cannot honor a boundary fails the inferred gate, which
+    /// keeps the lease, instead of silently snapshotting a reassigned workspace.
     async fn confirm_workspace_recovery_from(
         &self,
         record: &ExecutionBookmark,
@@ -1507,7 +1510,9 @@ pub trait HostAdapter: Send + Sync {
         since_unix: Option<i64>,
         tip_source: WorkspaceTipSource,
     ) -> anyhow::Result<PreserveOutcome> {
-        let _ = tip_source;
+        if !matches!(tip_source, WorkspaceTipSource::Live) {
+            bail!("this host adapter cannot honor a workspace lease boundary; refusing to snapshot a workspace it may no longer hold");
+        }
         self.confirm_workspace_recovery(record, workspace, recorded, since_unix)
             .await
     }

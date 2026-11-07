@@ -314,11 +314,13 @@ async fn leftover_sweep_uses_original_heartbeat_after_intervening_holders() {
         .await;
         assert_eq!(outcome.released, 1, "{state}: {outcome:?}");
         assert_eq!(db.preserved_tip(&execution.id).unwrap().unwrap().commit_id, ours);
-        // Another holder's stack is reported only when no one else holds the
-        // workspace now; while it is leased under another id it is theirs.
+        // Another holder's stack is reported only when cube shows no evidence
+        // of a later holder. A workspace leased under another id, or free
+        // with an advanced claim counter, is theirs: never snapshotted and
+        // never reported. An unlisted workspace has no such evidence.
         assert_eq!(
             open_kinds(&db, &execution.id).contains(&"preserved_work_needs_inspection".to_owned()),
-            state != "leased",
+            state == "unlisted",
             "{state}: {:?}",
             open_kinds(&db, &execution.id)
         );

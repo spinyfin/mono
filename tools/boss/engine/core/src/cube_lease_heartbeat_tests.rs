@@ -1861,17 +1861,32 @@ async fn heartbeat_reap_never_adopts_an_allow_dirty_successors_edits() {
         }
         let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
         assert_eq!(outcome.auto_reaped, 1);
-        assert!(
-            preserved_names(&repo, &execution_id).is_empty(),
-            "ran_jj={successor_ran_jj}: the successor's edits were bookmarked"
-        );
-        assert!(db.preserved_tip(&execution_id).unwrap().is_none());
-        assert!(
-            db.list_attention_items(&execution_id)
-                .unwrap()
-                .iter()
-                .any(|item| item.kind == "preserved_work_needs_inspection")
-        );
+        // The claim counter moved, so the workspace is the successor's: it is
+        // never snapshotted by the reap.
+        let inspected = db
+            .list_attention_items(&execution_id)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == "preserved_work_needs_inspection");
+        if successor_ran_jj {
+            // The successor's own jj command rewrote the inherited change to
+            // include its edits: nothing may be bookmarked, and the rewrite
+            // is surfaced for inspection.
+            assert!(
+                preserved_names(&repo, &execution_id).is_empty(),
+                "the successor's edits were bookmarked"
+            );
+            assert!(db.preserved_tip(&execution_id).unwrap().is_none());
+            assert!(inspected);
+        } else {
+            // Its edits were never snapshotted, so the boundary commit is
+            // untouched and holds only the reaped worker's file.
+            assert!(!preserved_names(&repo, &execution_id).is_empty());
+            let tip = db.preserved_tip(&execution_id).unwrap().expect("preserved tip");
+            let files = JjRepo::run(&repo.repo, &["file", "list", "-r", &tip.commit_id]);
+            assert!(files.contains("ours.txt") && !files.contains("theirs.txt"), "{files}");
+            assert!(!inspected, "a later holder's workspace is not reported");
+        }
     }
 }
 

@@ -257,12 +257,7 @@ async fn absent_transcript_reaps_and_the_record_states_what_was_checked() {
     );
 
     let attentions = db.list_attention_items(&execution_id).unwrap();
-    assert_eq!(attentions.len(), 2);
-    assert!(
-        attentions
-            .iter()
-            .any(|item| item.kind == "preserved_work_needs_inspection")
-    );
+    assert_eq!(attentions.len(), 1);
     let attention = attentions
         .iter()
         .find(|item| item.kind == DRIVER_START_ATTENTION_KIND)
@@ -969,12 +964,7 @@ async fn zero_pid_driver_start_timeout_is_classed_no_shell() {
     let evidence = spawn_health.evidence_in_window(boss_engine_utils::epoch_time::now_epoch_secs());
     assert_eq!(evidence[0].class, crate::spawn_health::SpawnFailureClass::NoShell);
     let attentions = db.list_attention_items(&execution_id).unwrap();
-    assert_eq!(attentions.len(), 2);
-    assert!(
-        attentions
-            .iter()
-            .any(|item| item.kind == "preserved_work_needs_inspection")
-    );
+    assert_eq!(attentions.len(), 1);
     let attention = attentions
         .iter()
         .find(|item| item.kind == DRIVER_START_ATTENTION_KIND)

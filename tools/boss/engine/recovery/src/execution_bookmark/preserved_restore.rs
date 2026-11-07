@@ -1,5 +1,7 @@
 //! Restage preserved changes without manufacturing new change identities.
-use super::preserved::{RecordedPresence, log, operations, resolve_recorded_presence, unpublished};
+use super::preserved::{
+    OP_VIEW_LOAD_LIMIT, RecordedPresence, change_revset, log, log_change, operations, resolve_recorded_presence, unpublished,
+};
 use super::*;
 
 async fn recorded_candidates(jj: &dyn Jj, record: &ExecutionBookmark, recorded: &PreservedTip) -> Result<Vec<String>> {
@@ -86,10 +88,18 @@ async fn select_tip(
         // orders those updates, without trusting author/committer clocks.
         let change = changes.iter().next().unwrap();
         let mut latest: Option<((i64, u32), String)> = None;
+        let mut loads = 0;
         for (seconds, nanos, operation) in operations(jj, &record.repo_path).await? {
             if latest.as_ref().is_some_and(|(time, _)| *time > (seconds, nanos)) {
                 return Ok(latest.map(|(_, selected)| (selected, candidates.clone())));
             }
+            // Each iteration loads one operation view. A change that has been
+            // divergent for a long time would otherwise spawn a process per
+            // store operation on the dispatch path.
+            if loads >= OP_VIEW_LOAD_LIMIT {
+                break;
+            }
+            loads += 1;
             let visible = jj
                 .run(
                     &record.repo_path,
@@ -162,7 +172,6 @@ pub async fn restore_preserved(
         .filter(|candidate| *candidate != &tip)
         .cloned()
         .collect();
-    let mut unrestaged = Vec::new();
     for candidate in &discarded {
         let unique = log(
             jj,
@@ -188,7 +197,6 @@ pub async fn restore_preserved(
             ],
         )
         .await?;
-        unrestaged.push(format!("{candidate} ({archive})"));
     }
     if !discarded.is_empty() {
         jj.run(
@@ -205,6 +213,27 @@ pub async fn restore_preserved(
         )
         .await?;
     }
+    // List the archives that exist, not only the ones created by this call: a
+    // restore that failed after writing them is retried with a single-target
+    // pointer, and the variants must still be disclosed. Only unpublished
+    // variants of the selected change count, which also excludes the
+    // pointer-integrity archives of unrelated commits.
+    let tip_change = log(jj, &record.repo_path, &tip, "change_id").await?;
+    let archived = log_change(
+        jj,
+        &record.repo_path,
+        &format!(
+            "bookmarks(glob:\"{}*\") & {} & ~::{tip} & ~::remote_bookmarks()",
+            preserved_archive_prefix(&record.execution_id),
+            change_revset(tip_change.trim())
+        ),
+    )
+    .await?;
+    let unrestaged: Vec<String> = archived
+        .lines()
+        .filter(|commit| !commit.is_empty())
+        .map(|commit| format!("{commit} ({})", preserved_archive_name(&record.execution_id, commit)))
+        .collect();
     let sources = format!("({}) ~ ::{base}", unpublished(&tip));
     let commits = log(
         jj,
