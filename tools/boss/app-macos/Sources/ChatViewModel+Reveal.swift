@@ -3,6 +3,12 @@ import Foundation
 extension ChatViewModel {
     @discardableResult
     func prepareReveal(_ taskID: String) -> RevealCardResult {
+        // Reveal's contract is "show me this card", so a parked target turns
+        // "Show parked" on for the session (not persisted: it is not the
+        // user's standing preference).
+        if !showParked, let target = task(withID: taskID), isParked(target) {
+            showParked = true
+        }
         let outcome = revealCardTarget(for: taskID)
         guard case .revealed(let cardID) = outcome else {
             let reason: String

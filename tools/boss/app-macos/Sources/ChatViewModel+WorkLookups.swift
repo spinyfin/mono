@@ -149,6 +149,13 @@ extension ChatViewModel {
         // Do NOT filter them out here: a chore in in_review status needs to
         // be visible so the operator can review and merge the PR.
 
+        // Parked rows are left off the board unless "Show parked" is on. The
+        // toggle only ever adds rows back: un-parked rows are never hidden by
+        // it, and every other filter below still applies to parked rows.
+        if !showParked {
+            items = items.filter { !isParked($0) }
+        }
+
         if showBlockedOnly {
             items = items.filter { $0.status == "blocked" }
         }

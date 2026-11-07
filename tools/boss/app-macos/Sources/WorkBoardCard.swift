@@ -308,6 +308,29 @@ struct WorkBoardCardItem: View {
                     .help(reviewGuideMenuPresentation?.tooltip ?? title)
                 }
                 Divider()
+                if snapshot.parked != nil {
+                    if task.kind == "revision" {
+                        Button("Unpark") {}
+                            .disabled(true)
+                            .help("A revision follows its parent PR. Unpark the parent instead.")
+                    } else if task.isParkedViaProject || task.parkedAt == nil {
+                        // Parked by its project's cascade (or, as a backstop,
+                        // by the project itself): only un-parking the project
+                        // clears it, so the engine refuses a per-row un-park.
+                        Button("Unpark") {}
+                            .disabled(true)
+                            .help("Parked with its project. Unpark the project to bring it back.")
+                    } else {
+                        Button("Unpark") {
+                            model.unpark(id: task.id)
+                        }
+                    }
+                } else if model.canPark(task) {
+                    Button("Park…") {
+                        model.requestPark(task: task)
+                    }
+                }
+                Divider()
                 Button("Delete", role: .destructive) {
                     showingDeleteConfirmation = true
                 }
@@ -551,6 +574,10 @@ struct WorkBoardCardView: View, @MainActor Equatable {
                 .equatable()
             if let liveStatus = WorkBoardCardLiveStatusRowSlice(snapshot: snap) {
                 WorkBoardCardLiveStatusRow(slice: liveStatus, onRevealBlocker: onRevealQueueBlocker)
+                    .equatable()
+            }
+            if let parked = snap.parked {
+                WorkBoardCardParkedRow(presentation: parked)
                     .equatable()
             }
             if let operatorQuestion = WorkBoardCardOperatorQuestionSlice(snapshot: snap) {

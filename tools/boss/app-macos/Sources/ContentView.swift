@@ -399,6 +399,13 @@ struct ContentView: View {
                 }
             )
         }
+        .sheet(item: $model.pendingParkRequest) { request in
+            ParkWorkItemSheet(
+                request: request,
+                onCancel: { model.dismissParkRequest() },
+                onPark: { reason in model.submitPark(request, reason: reason) }
+            )
+        }
         .sheet(isPresented: Binding(
             get: { model.plannerInspectorProjectID != nil },
             set: { if !$0 { model.closePlannerInspector() } }
@@ -793,6 +800,8 @@ struct ContentView: View {
                         let isOn = model.selectedProjectFilterIDs.contains(project.id)
                         let isArchived = project.status == "archived"
                         let isArchiving = model.archivingProjectIDs.contains(project.id)
+                        let isParked = project.isParked
+                        let parkedCount = model.parkedTaskCount(forProjectID: project.id)
                         let unblocked = model.unblockedTaskCount(forProjectID: project.id)
                         let blocked = model.blockedTaskCount(forProjectID: project.id)
                         let docPresentation = ProjectDesignDocAffordancePresentation.from(
@@ -800,13 +809,13 @@ struct ContentView: View {
                         )
                         WorkSidebarFilterRow(
                             title: project.name,
-                            subtitle: isArchiving ? "Archiving…" : project.sidebarSubtitle,
+                            subtitle: isArchiving ? "Archiving…" : project.sidebarSubtitle(parkedItemCount: parkedCount),
                             systemImage: project.sidebarSystemImage,
                             isSelected: isOn,
                             trailing: nil,
                             showsCheckbox: true,
                             isCheckboxOn: isOn,
-                            dimmed: isArchived || isArchiving,
+                            dimmed: isArchived || isArchiving || isParked,
                             unblockedCount: unblocked > 0 ? unblocked : nil,
                             blockedCount: blocked > 0 ? blocked : nil,
                             designDocPresentation: docPresentation,
@@ -819,6 +828,15 @@ struct ContentView: View {
                             model.toggleProjectFilter(project.id)
                         }
                         .contextMenu {
+                            if isParked {
+                                Button("Unpark") {
+                                    model.unpark(id: project.id)
+                                }
+                            } else if !isArchived && project.status != "done" {
+                                Button("Park…") {
+                                    model.requestPark(project: project)
+                                }
+                            }
                             if !isArchived {
                                 Button("Archive") {
                                     model.archiveProject(id: project.id)
@@ -843,6 +861,14 @@ struct ContentView: View {
                         get: { model.showBlockedOnly },
                         set: { model.setShowBlockedOnly($0) }
                     ))
+                    .listRowInsets(EdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8))
+                    .listRowBackground(Color.clear)
+
+                    Toggle("Show parked", isOn: Binding(
+                        get: { model.showParked },
+                        set: { model.setShowParked($0) }
+                    ))
+                    .help("Add parked tasks and projects' tasks back to the board. Un-parked work is never hidden by this.")
                     .listRowInsets(EdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8))
                     .listRowBackground(Color.clear)
 

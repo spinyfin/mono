@@ -80,6 +80,9 @@ struct WorkCardSnapshotContext: Equatable {
     var parentShortID: Int? = nil
     var deferredScopeItems: [DeferredScopeAttention] = []
     var deferredScopeActionInFlightIDs: Set<String> = []
+    /// Pre-resolved "Parked · <relative time> · <reason>" chip for a parked
+    /// card (time-relative text is fixed here so the snapshot stays pure).
+    var parked: ParkedChipPresentation? = nil
     /// An answer to this card's open question is awaiting the engine's
     /// reply (`ChatViewModel.operatorAnswerInFlightByTaskID`).
     var operatorAnswerInFlight: Bool = false
@@ -192,6 +195,9 @@ struct WorkCardSnapshot: Equatable {
     let showsEffortChip: Bool
     let showsReasoningChip: Bool
     let showsDeferredBadge: Bool
+    /// Non-nil for a parked card; drives the chip and, when the card still
+    /// has a live execution, the "finishing current run" sub-label.
+    let parked: ParkedChipPresentation?
     let showsHumanDrivenBadge: Bool
     let showsProjectBadge: Bool
     let aiReviewState: String?
@@ -440,6 +446,7 @@ struct WorkCardSnapshot: Equatable {
             showsEffortChip: effortNonEmpty,
             showsReasoningChip: task.reasoning == "investigation",
             showsDeferredBadge: task.deferred,
+            parked: context.parked,
             showsHumanDrivenBadge: task.humanDriven,
             showsProjectBadge: projectNameNonEmpty,
             aiReviewState: column == .review ? task.aiReviewState : nil,

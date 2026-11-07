@@ -215,7 +215,7 @@ extension ChatViewModel {
     /// unsatisfied dependency gating it — if it did, the engine would
     /// have set `status = "blocked"`. These are tasks ready to dispatch.
     func unblockedTaskCount(forProjectID projectID: String) -> Int {
-        (tasksByProjectID[projectID] ?? []).filter { $0.status == "todo" }.count
+        (tasksByProjectID[projectID] ?? []).filter { $0.status == "todo" && !isParked($0) }.count
     }
 
     /// Count of dependency-blocked tasks for `projectID`. The engine
@@ -223,20 +223,23 @@ extension ChatViewModel {
     /// least one unsatisfied prerequisite edge.
     func blockedTaskCount(forProjectID projectID: String) -> Int {
         (tasksByProjectID[projectID] ?? []).filter {
-            $0.status == "blocked" && $0.blockedReason == "dependency"
+            $0.status == "blocked" && $0.blockedReason == "dependency" && !isParked($0)
         }.count
     }
 
     var unblockedChoreCount: Int {
         guard let productID = currentSelectedProductID else { return 0 }
-        let chores = (choresByProductID[productID] ?? []).filter { $0.status == "todo" }
-        let projectlessTasks = (productLevelTasksByProductID[productID] ?? []).filter { $0.status == "todo" }
+        let isTodo: (WorkTask) -> Bool = { $0.status == "todo" && !self.isParked($0) }
+        let chores = (choresByProductID[productID] ?? []).filter(isTodo)
+        let projectlessTasks = (productLevelTasksByProductID[productID] ?? []).filter(isTodo)
         return chores.count + projectlessTasks.count
     }
 
     var blockedChoreCount: Int {
         guard let productID = currentSelectedProductID else { return 0 }
-        let isBlocked: (WorkTask) -> Bool = { $0.status == "blocked" && $0.blockedReason == "dependency" }
+        let isBlocked: (WorkTask) -> Bool = {
+            $0.status == "blocked" && $0.blockedReason == "dependency" && !self.isParked($0)
+        }
         let chores = (choresByProductID[productID] ?? []).filter(isBlocked)
         let projectlessTasks = (productLevelTasksByProductID[productID] ?? []).filter(isBlocked)
         return chores.count + projectlessTasks.count
@@ -520,6 +523,7 @@ extension ChatViewModel {
                 parentShortID: parentShortID,
                 deferredScopeItems: deferredScopeItems,
                 deferredScopeActionInFlightIDs: deferredScopeActionInFlightIDs,
+                parked: parkedChipPresentation(for: task, now: now),
                 operatorAnswerInFlight: operatorAnswerInFlightByTaskID[task.id] != nil,
                 operatorAnswerError: operatorAnswerError(for: task),
                 showsTerminalButton: showsTerminalButton,

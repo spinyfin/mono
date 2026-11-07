@@ -121,6 +121,12 @@ final class WorkCardSnapshotTests: XCTestCase {
         "dispatchFailedError",
         "dispatchFailedAt",
         "completionSummary",
+        // The parked chip reaches the snapshot as `context.parked` (the stamp
+        // may come from the project), so the raw stamp fields are not read.
+        "parkedAt",
+        "parkedBy",
+        "parkedReason",
+        "parkedVia",
     ]
 
     /// Fails when a new stored property is added to `WorkTask` without
@@ -182,6 +188,10 @@ final class WorkCardSnapshotTests: XCTestCase {
         base.externalRef = nil
         base.docLinkState = nil
         base.completionSummary = nil
+        base.parkedAt = nil
+        base.parkedBy = nil
+        base.parkedReason = nil
+        base.parkedVia = nil
 
         var other = Self.makeTask(
             id: "task_shared",
@@ -213,6 +223,10 @@ final class WorkCardSnapshotTests: XCTestCase {
         )
         other.docLinkState = .broken(reason: "missing path")
         other.completionSummary = "done by hand, no agent run"
+        other.parkedAt = "1799990000"
+        other.parkedBy = "human"
+        other.parkedReason = "not now"
+        other.parkedVia = "direct"
 
         let context = WorkCardSnapshotContext(column: .backlog)
         let a = WorkCardSnapshot.build(task: base, context: context)
@@ -287,6 +301,18 @@ final class WorkCardSnapshotTests: XCTestCase {
             }),
             ("completionSummary", { t in
                 var t = t; t.completionSummary = "shipped without agent run"; return t
+            }),
+            ("parkedAt", { t in
+                var t = t; t.parkedAt = "1799990000"; return t
+            }),
+            ("parkedBy", { t in
+                var t = t; t.parkedBy = "human"; return t
+            }),
+            ("parkedReason", { t in
+                var t = t; t.parkedReason = "not now"; return t
+            }),
+            ("parkedVia", { t in
+                var t = t; t.parkedVia = "project:proj_a"; return t
             }),
         ]
 
