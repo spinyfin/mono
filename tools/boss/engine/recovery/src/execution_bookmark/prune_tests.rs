@@ -368,3 +368,45 @@ async fn a_later_voucher_that_descends_from_both_heads_publishes_them_after_an_e
         other => panic!("expected published: {other:?}"),
     }
 }
+
+#[test]
+fn host_vouchers_accept_only_plain_values() {
+    let commit = "a".repeat(40);
+    let ok = HostVoucher::Commit {
+        label: "PR #1 head".into(),
+        commit_id: commit.clone(),
+    };
+    assert_eq!(ok.into_voucher().unwrap(), voucher("PR #1 head", &commit));
+    assert!(
+        HostVoucher::RemoteBookmark {
+            name: "boss/exec_1".into(),
+            remote: "origin".into()
+        }
+        .into_voucher()
+        .is_ok()
+    );
+    for bad in [
+        HostVoucher::Commit {
+            label: "x".into(),
+            commit_id: "main".into(),
+        },
+        HostVoucher::Commit {
+            label: "".into(),
+            commit_id: commit.clone(),
+        },
+        HostVoucher::RemoteBookmark {
+            name: "--revision".into(),
+            remote: "origin".into(),
+        },
+        HostVoucher::RemoteBookmark {
+            name: "a\nb".into(),
+            remote: "origin".into(),
+        },
+        HostVoucher::RemoteBookmark {
+            name: "a".repeat(HostVoucher::MAX_NAME_BYTES + 1),
+            remote: "origin".into(),
+        },
+    ] {
+        assert!(bad.clone().into_voucher().is_err(), "{bad:?}");
+    }
+}

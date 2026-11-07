@@ -1,6 +1,7 @@
 //! Host filesystem execution shared by the hub's local adapter and the spoke.
 //! Work policy, GitHub decisions and scheduling remain in the hub.
 pub mod homes;
+pub mod recovery_ops;
 pub mod worker;
 pub mod cube {
     //! Shared implementation of the `cube` CLI command surface.
@@ -1273,6 +1274,8 @@ mod validation {
                 | Kind::CheckpointBaseline
                 | Kind::ReconcileBookmark
                 | Kind::ReleaseHeads
+                | Kind::CheckPreservedUnpublished
+                | Kind::PruneBookmark
         )
     }
 
@@ -1455,14 +1458,38 @@ mod validation {
                 allowed.trunk.clone_from(&op.trunk);
                 allowed.pr_bookmark.clone_from(&op.pr_bookmark);
             }
+            Kind::PositionedParent | Kind::StartFresh => {}
+            Kind::ConfirmRecovery | Kind::RestorePreserved | Kind::CheckPreservedUnpublished | Kind::PruneBookmark => {
+                ensure!(
+                    !op.request_json.is_empty(),
+                    "recovery operation requires its request payload"
+                );
+                let request = crate::recovery_ops::parse_request(&op.request_json)?;
+                match kind {
+                    Kind::CheckPreservedUnpublished => ensure!(
+                        request.recorded.is_some(),
+                        "preserved-work check requires the recorded tip"
+                    ),
+                    Kind::PruneBookmark => {
+                        reference(&op.trunk)?;
+                        crate::recovery_ops::vouchers(&request)?;
+                        allowed.trunk.clone_from(&op.trunk);
+                    }
+                    _ => {}
+                }
+                allowed.request_json.clone_from(&op.request_json);
+            }
+            Kind::ReleaseHeads => {
+                crate::recovery_ops::parse_request(&op.request_json)?;
+                allowed.request_json.clone_from(&op.request_json);
+            }
             Kind::Release
             | Kind::Status
             | Kind::ListWorkspaces
             | Kind::ListRepos
             | Kind::DiffBookmark
             | Kind::DiscardBaseline
-            | Kind::CheckpointBaseline
-            | Kind::ReleaseHeads => {}
+            | Kind::CheckpointBaseline => {}
         }
         if matches!(
             kind,
@@ -1474,6 +1501,10 @@ mod validation {
                 | Kind::PrepareRecoveryPr
                 | Kind::ReconcileBookmark
                 | Kind::ReleaseHeads
+                | Kind::ConfirmRecovery
+                | Kind::RestorePreserved
+                | Kind::CheckPreservedUnpublished
+                | Kind::PruneBookmark
         ) {
             let value = op
                 .bookmark
@@ -1633,7 +1664,12 @@ pub mod workspace {
             if interrupted
                 && !matches!(
                     kind,
-                    Kind::Lease | Kind::ListRepos | Kind::ListWorkspaces | Kind::Status | Kind::DiffBookmark
+                    Kind::Lease
+                        | Kind::ListRepos
+                        | Kind::ListWorkspaces
+                        | Kind::Status
+                        | Kind::DiffBookmark
+                        | Kind::PositionedParent
                 )
             {
                 result.code = ResultCode::OutcomeUncertain.into();
@@ -1870,6 +1906,7 @@ pub mod workspace {
                             | Kind::CreateChange
                             | Kind::GotoPr
                             | Kind::GotoRevision
+                            | Kind::StartFresh
                     ) {
                         *phase = Phase::Effect;
                     }
@@ -1896,6 +1933,8 @@ pub mod workspace {
                         Kind::GotoRevision => {
                             cube::goto_workspace(&self.cube, &path, "--revision", &op.revision).await?
                         }
+                        Kind::PositionedParent => value = crate::recovery_ops::positioned_parent(&path).await?,
+                        Kind::StartFresh => value = crate::recovery_ops::start_fresh(&path).await?,
                         _ => {
                             let record = self.record(&path, &run.execution_id, op.bookmark.as_ref()).await?;
                             value = match kind {
@@ -1968,7 +2007,34 @@ pub mod workspace {
                                 }
                                 Kind::ReleaseHeads => {
                                     *phase = Phase::Effect;
-                                    json!(recovery::release_heads(&LocalJj, &record, true).await?)
+                                    let request = crate::recovery_ops::parse_request(&op.request_json)?;
+                                    json!(
+                                        recovery::release_heads(
+                                            &LocalJj,
+                                            &record,
+                                            request.release_names.unwrap_or(true)
+                                        )
+                                        .await?
+                                    )
+                                }
+                                Kind::ConfirmRecovery => {
+                                    *phase = Phase::Effect;
+                                    let request = crate::recovery_ops::parse_request(&op.request_json)?;
+                                    crate::recovery_ops::confirm(&record, &path, &request).await?
+                                }
+                                Kind::RestorePreserved => {
+                                    *phase = Phase::Effect;
+                                    let request = crate::recovery_ops::parse_request(&op.request_json)?;
+                                    crate::recovery_ops::restore_preserved(&record, &path, &request).await?
+                                }
+                                Kind::CheckPreservedUnpublished => {
+                                    let request = crate::recovery_ops::parse_request(&op.request_json)?;
+                                    crate::recovery_ops::preserved_unpublished(&record, &request).await?
+                                }
+                                Kind::PruneBookmark => {
+                                    *phase = Phase::Effect;
+                                    let request = crate::recovery_ops::parse_request(&op.request_json)?;
+                                    crate::recovery_ops::prune(&record, &request, &op.trunk).await?
                                 }
                                 _ => anyhow::bail!("unsupported workspace operation"),
                             };
@@ -2276,7 +2342,7 @@ mod tests {
             anchor_commit: "a".repeat(40),
             pr_head_before: String::new(),
         };
-        for number in 1..=20 {
+        for number in 1..=26 {
             let kind = Kind::try_from(number).unwrap();
             let mut request = op(kind);
             match kind {
@@ -2297,13 +2363,24 @@ mod tests {
                 Kind::GotoRevision => request.revision = "a".repeat(40),
                 Kind::ForceRelease => request.reason = "hub authorized release".into(),
                 Kind::RestoreRebased | Kind::ReconcileBookmark => request.trunk = "main".into(),
+                Kind::PruneBookmark => {
+                    request.trunk = "main".into();
+                    request.request_json = b"{}".to_vec();
+                }
+                Kind::ConfirmRecovery | Kind::RestorePreserved => request.request_json = b"{}".to_vec(),
+                Kind::CheckPreservedUnpublished => {
+                    request.request_json = serde_json::to_vec(
+                        &serde_json::json!({"recorded": {"commit_id": "a", "change_id": "b", "count": 1}}),
+                    )
+                    .unwrap();
+                }
                 _ => {}
             }
             if crate::validation::store_operation(kind) {
                 request.workspace_id.clear();
                 request.lease_id.clear();
             }
-            if matches!(number, 13..=20) {
+            if matches!(number, 13..=20 | 23..=26) {
                 request.bookmark = Some(bookmark.clone());
             }
             assert_eq!(validate_workspace(&request, Some(&assignment)).unwrap(), kind);

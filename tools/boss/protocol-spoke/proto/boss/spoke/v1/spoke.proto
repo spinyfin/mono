@@ -254,6 +254,28 @@ enum WorkspaceKind {
   PREPARE_RECOVERY_PR = 18;
   RECONCILE_BOOKMARK = 19;
   RELEASE_HEADS = 20;
+  // The commit the workspace was positioned on (its working copy's parent);
+  // the result is a JSON string in cube_result_json.
+  POSITIONED_PARENT = 21;
+  // Position a fresh child of the repository's trunk; the result is the trunk
+  // commit it was positioned on, as a JSON string.
+  START_FRESH = 22;
+  // Confirm that unpublished work in the workspace is preserved (request_json
+  // names the recorded tip, lease time and tip source; the result is the
+  // outcome as JSON).
+  CONFIRM_RECOVERY = 23;
+  // Restore preserved work into the workspace (request_json names the recorded
+  // tip; the result is the report as JSON, or null when nothing was preserved).
+  RESTORE_PRESERVED = 24;
+  // Whether preserved work still holds changes no remote bookmark carries;
+  // request_json carries the recorded tip and the result is a JSON boolean.
+  // A store operation: it needs no lease.
+  CHECK_PRESERVED_UNPUBLISHED = 25;
+  // Forget a finished execution's pointers once a voucher proves its preserved
+  // work is published. request_json carries the vouchers, `trunk` names the
+  // repository's main branch, and the result is the prune outcome as JSON.
+  // A store operation: it needs no lease.
+  PRUNE_BOOKMARK = 26;
 }
 // A discriminated, typed operation, not an argv tunnel: kind selects which
 // fields are required and which are forbidden. Paths from a peer are display
@@ -278,6 +300,12 @@ message WorkspaceOp {
   bool self_retry = 17;
   string pr_bookmark = 18;
   string trunk = 19;
+  // A bounded, versioned JSON compatibility payload for the recovery kinds
+  // whose arguments are the recovery crate's own value types. Required for
+  // CONFIRM_RECOVERY, RESTORE_PRESERVED, CHECK_PRESERVED_UNPUBLISHED and
+  // PRUNE_BOOKMARK, optional for RELEASE_HEADS, and forbidden for every other
+  // kind. It names no path, argv or revset.
+  bytes request_json = 20;
 }
 message Bookmark {
   string repo_id = 1;
