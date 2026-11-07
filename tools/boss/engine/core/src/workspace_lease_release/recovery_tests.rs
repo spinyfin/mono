@@ -314,11 +314,13 @@ async fn leftover_sweep_uses_original_heartbeat_after_intervening_holders() {
         .await;
         assert_eq!(outcome.released, 1, "{state}: {outcome:?}");
         assert_eq!(db.preserved_tip(&execution.id).unwrap().unwrap().commit_id, ours);
-        // Another holder's stack is reported only when no one else holds the
-        // workspace now; while it is leased under another id it is theirs.
+        // Another holder's stack is reported only when cube shows no evidence
+        // of a later holder. A workspace leased under another id, or free
+        // with an advanced claim counter, is theirs: never snapshotted and
+        // never reported. An unlisted workspace has no such evidence.
         assert_eq!(
             open_kinds(&db, &execution.id).contains(&"preserved_work_needs_inspection".to_owned()),
-            state != "leased",
+            state == "unlisted",
             "{state}: {:?}",
             open_kinds(&db, &execution.id)
         );
@@ -934,14 +936,23 @@ async fn leftover_sweep_never_adopts_an_allow_dirty_successors_edits() {
             let files = JjRepo::run(&repo.repo, &["file", "list", "-r", &tip.commit_id]);
             assert!(!files.contains("theirs"), "ran_jj={successor_ran_jj}: {files}");
         }
-        assert!(open_kinds(&db, &execution.id).contains(&"preserved_work_needs_inspection".to_owned()));
+        // The claim counter moved, so the workspace belongs to the successor
+        // and is never snapshotted. Inspection is raised only when the
+        // successor's own jj command rewrote the boundary change, so the
+        // worker's last change could not be bookmarked.
+        assert_eq!(
+            open_kinds(&db, &execution.id).contains(&"preserved_work_needs_inspection".to_owned()),
+            successor_ran_jj,
+            "ran_jj={successor_ran_jj}"
+        );
     }
 }
 
-/// A free workspace with no ownership evidence: the dead worker's unsnapshotted
-/// edits after its last confirmed boundary are reported, not dropped.
+/// Snapshot pending edits on the boundary change onto its unique visible
+/// successor and inspect both commits; snapshot and report pending work on a
+/// later registered change.
 #[tokio::test]
-async fn leftover_sweep_reports_unsnapshotted_work_in_a_free_workspace_without_ownership_evidence() {
+async fn leftover_sweep_snapshots_boundary_edits_for_inspection_and_reports_later_changes() {
     use boss_engine_test_git::jj::JjRepo;
     for action in ["edit", "new"] {
         let (dir, db) = open_db();
@@ -969,6 +980,35 @@ async fn leftover_sweep_reports_unsnapshotted_work_in_a_free_workspace_without_o
         })
         .await;
         assert_eq!(outcome.released, 1, "{action}: {outcome:?}");
+        if action == "edit" {
+            let saved = db.preserved_tip(&execution.id).unwrap().unwrap();
+            let visible = JjRepo::run(
+                &repo.repo,
+                &[
+                    "--ignore-working-copy",
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    &saved.change_id,
+                    "-T",
+                    "commit_id ++ \"\\n\"",
+                ],
+            );
+            assert_eq!(
+                visible.trim(),
+                saved.commit_id,
+                "the boundary must have one visible variant"
+            );
+            assert_eq!(
+                JjRepo::run(&repo.repo, &["file", "show", "-r", &saved.commit_id, "root:ours"]),
+                "edited after the boundary"
+            );
+            assert!(
+                open_kinds(&db, &execution.id).contains(&"preserved_work_needs_inspection".to_owned()),
+                "pending boundary edits must be inspected"
+            );
+            continue;
+        }
         assert!(
             open_kinds(&db, &execution.id).contains(&"preserved_work_needs_inspection".to_owned()),
             "{action}: post-boundary work was dropped silently"

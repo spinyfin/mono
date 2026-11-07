@@ -196,7 +196,7 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     entry(
         PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND,
         ClearedBy::HumanDecision,
-        "Teardown kept the existing preserved bookmark and released the lease because the workspace tip and the existing work could not be combined. A later restage of the old tip does not recover the new workspace tip named in the item.",
+        "Teardown released the lease without bookmarking because it could not safely preserve the workspace: the tip and the existing work could not be combined, no lease boundary or journaled tip at it was available, unpublished registered work was absent from the boundary tip, or the boundary change was rewritten afterwards. The item can name both tips, one, or none. A later restage of the old tip does not recover work the item names.",
     ),
     entry(
         LEASE_UNRELEASED_ATTENTION_KIND,

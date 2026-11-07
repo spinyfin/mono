@@ -196,9 +196,13 @@ pub const PRESERVED_WORK_NOT_RESTAGED_ATTENTION_KIND: &str = "preserved_work_not
 /// restage of the selected tip does not lower this signal.
 pub const PRESERVED_WORK_ARCHIVED_ATTENTION_KIND: &str = "preserved_work_archived";
 
-/// Filed at teardown when unpublished work in the workspace and the existing
-/// preserved bookmark (or recorded tip) cannot be combined. The lease is
-/// still released; nothing is deleted. A human inspects both tips.
+/// Filed at teardown when it cannot safely preserve the workspace: the
+/// workspace work and the existing preserved bookmark (or recorded tip) cannot
+/// be combined; no lease boundary was confirmed for an inferred release; no tip
+/// was journaled at the boundary; unpublished registered work in a free
+/// workspace is absent from the boundary tip; or the boundary change was
+/// rewritten afterwards. The lease is still released; nothing is deleted. A
+/// human inspects the item, which can name both tips, one tip, or none.
 pub const PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND: &str = "preserved_work_needs_inspection";
 
 pub const REVISION_CHAIN_RECOVERY_BLOCKED_ATTENTION_KIND: &str = "revision_chain_recovery_blocked";

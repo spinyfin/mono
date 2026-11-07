@@ -1344,6 +1344,18 @@ mod tests {
             self.released.lock().unwrap().push((lease_id.to_owned(), reason.map(str::to_owned)));
             Ok(())
         }
+        async fn list_workspaces(&self) -> anyhow::Result<Vec<boss_execution_contracts::CubeWorkspaceStatus>> {
+            // The registry still shows the spawned execution's workspace leased
+            // under its own lease, as cube does when the spawn is reaped.
+            Ok(vec![
+                boss_execution_contracts::CubeWorkspaceStatus::builder()
+                    .workspace_id("ws-1")
+                    .workspace_path(std::path::PathBuf::from("/tmp/ws"))
+                    .state("leased")
+                    .lease_id("lease-1")
+                    .build(),
+            ])
+        }
     } }
 
     /// Records every cube lease force-release so a reap can be asserted to
@@ -1969,16 +1981,7 @@ mod tests {
         );
 
         let attentions = db.list_attention_items(&execution_id).unwrap();
-        assert_eq!(
-            attentions.len(),
-            2,
-            "the reap and unresolved preservation each raise attention"
-        );
-        assert!(
-            attentions
-                .iter()
-                .any(|item| item.kind == "preserved_work_needs_inspection")
-        );
+        assert_eq!(attentions.len(), 1, "only the reap raises attention");
         let attentions: Vec<_> = attentions
             .iter()
             .filter(|item| item.kind == DRIVER_START_ATTENTION_KIND)

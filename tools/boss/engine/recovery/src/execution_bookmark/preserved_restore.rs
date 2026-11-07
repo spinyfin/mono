@@ -1,5 +1,5 @@
 //! Restage preserved changes without manufacturing new change identities.
-use super::preserved::{RecordedPresence, log, operations, resolve_recorded_presence, unpublished};
+use super::preserved::{OP_VIEW_LOAD_LIMIT, RecordedPresence, log, operations, resolve_recorded_presence, unpublished};
 use super::*;
 
 async fn recorded_candidates(jj: &dyn Jj, record: &ExecutionBookmark, recorded: &PreservedTip) -> Result<Vec<String>> {
@@ -20,7 +20,7 @@ async fn recorded_candidates(jj: &dyn Jj, record: &ExecutionBookmark, recorded: 
 
 /// Prefer a variant in the PR history, then the newest visible variant in
 /// jj's evolution log and operation journal. Unrelated changes are undecidable.
-async fn select_tip(
+pub(super) async fn select_tip(
     jj: &dyn Jj,
     record: &ExecutionBookmark,
     base: &str,
@@ -86,9 +86,17 @@ async fn select_tip(
         // orders those updates, without trusting author/committer clocks.
         let change = changes.iter().next().unwrap();
         let mut latest: Option<((i64, u32), String)> = None;
-        for (seconds, nanos, operation) in operations(jj, &record.repo_path).await? {
+        for (loads, (seconds, nanos, operation)) in operations(jj, &record.repo_path).await?.into_iter().enumerate() {
             if latest.as_ref().is_some_and(|(time, _)| *time > (seconds, nanos)) {
                 return Ok(latest.map(|(_, selected)| (selected, candidates.clone())));
+            }
+            // Each iteration loads one operation view. A change that has been
+            // divergent for a long time would otherwise spawn a process per
+            // store operation on the dispatch path.
+            if loads >= OP_VIEW_LOAD_LIMIT {
+                return Err(pointer_integrity_error(
+                    "preserved variant selection exhausted the operation view limit",
+                ));
             }
             let visible = jj
                 .run(
@@ -162,7 +170,6 @@ pub async fn restore_preserved(
         .filter(|candidate| *candidate != &tip)
         .cloned()
         .collect();
-    let mut unrestaged = Vec::new();
     for candidate in &discarded {
         let unique = log(
             jj,
@@ -174,7 +181,7 @@ pub async fn restore_preserved(
         if unique.trim().is_empty() {
             continue;
         }
-        let archive = preserved_archive_name(&record.execution_id, candidate);
+        let archive = variant_archive_name(&record.execution_id, candidate);
         jj.run(
             &record.repo_path,
             &[
@@ -188,7 +195,6 @@ pub async fn restore_preserved(
             ],
         )
         .await?;
-        unrestaged.push(format!("{candidate} ({archive})"));
     }
     if !discarded.is_empty() {
         jj.run(
@@ -213,6 +219,7 @@ pub async fn restore_preserved(
         "change_id ++ \" \" ++ description.first_line() ++ \"\\n\"",
     )
     .await?;
+    let mut selected_tip = tip.clone();
     if !commits.is_empty() {
         let change = log(jj, &record.repo_path, &tip, "change_id").await?;
         // Include empty connectors in the roots; exclude published history.
@@ -248,6 +255,7 @@ pub async fn restore_preserved(
         }
         let selected = selected
             .ok_or_else(|| pointer_integrity_error("rebased preserved change has no identifiable evolution"))?;
+        selected_tip = selected.to_owned();
         jj.run(workspace, &["edit", selected]).await?;
         if discard_positioning {
             let remaining = log(
@@ -275,6 +283,35 @@ pub async fn restore_preserved(
             ],
         )
         .await?;
+    // Variant-selection provenance is independent of change identity and
+    // survives retries. Read actual names after rebase rewrites their targets.
+    let archived = jj
+        .run(
+            &record.repo_path,
+            &[
+                "--ignore-working-copy",
+                "bookmark",
+                "list",
+                &format!("glob:{}variants/*", preserved_archive_prefix(&record.execution_id)),
+                "-T",
+                "name ++ \" \" ++ normal_target.commit_id() ++ \"\\n\"",
+            ],
+        )
+        .await?;
+    let mut unrestaged = Vec::new();
+    for line in archived.lines() {
+        let (name, commit) = line.split_once(' ').context("archive listing omitted target")?;
+        let unique = log(
+            jj,
+            &record.repo_path,
+            &format!("{} ~ ::{selected_tip}", unpublished(commit)),
+            "commit_id",
+        )
+        .await?;
+        if !unique.trim().is_empty() {
+            unrestaged.push(format!("{commit} ({name})"));
+        }
+    }
     Ok(Some(
         RestoreReport::builder()
             .pointer(preserved_name(&record.execution_id))
@@ -286,4 +323,9 @@ pub async fn restore_preserved(
             .unrestaged_unpublished(unrestaged.join("\n"))
             .build(),
     ))
+}
+
+/// Keep variant-selection provenance separate from integrity archives.
+pub(super) fn variant_archive_name(execution: &str, commit: &str) -> String {
+    format!("{}variants/{commit}", preserved_archive_prefix(execution))
 }

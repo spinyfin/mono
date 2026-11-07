@@ -64,13 +64,21 @@ pub enum WorkspaceTipSource {
 /// so it is resolved as [`WorkspaceTipSource::Live`] and never reaches this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoundaryOwnership {
-    /// The workspace is free, but a later lease cannot be ruled out. The
-    /// working copy is snapshotted only to find work made after the boundary,
-    /// which is reported for inspection and never bookmarked.
+    /// The workspace is free (or no longer listed by cube, so nobody holds
+    /// it) and cube shows no evidence that another lease was claimed since:
+    /// the recorded lease generation is missing or not reported. A later
+    /// lease cannot be ruled out. After the boundary tip is resolved, the
+    /// working copy is snapshotted to find work made after the boundary,
+    /// which is reported for inspection and never bookmarked as extra
+    /// unpublished changes. If that snapshot hides the boundary commit, the
+    /// unique visible successor of the same change is bookmarked and both
+    /// commits are named for inspection; the hidden original is never revived.
     FreeUnproven,
-    /// The workspace is leased under another id (or gone from the registry).
-    /// Its working copy and registered tip belong to someone else: no
-    /// snapshot, and nothing about it is reported against this execution.
+    /// The workspace is leased under another id, or cube's claim counter
+    /// shows another lease was claimed since this one even though it is free
+    /// again. Its working copy and registered tip belong to someone else: no
+    /// snapshot, and unrelated work is never reported. A rewrite of this
+    /// execution's own boundary change is still reported for inspection.
     Reassigned,
 }
 
@@ -86,11 +94,20 @@ pub(super) fn unpublished(tip: &str) -> String {
     format!("(::{tip} ~ ::remote_bookmarks()) ~ empty()")
 }
 
-/// Safety cap for the metadata-only operation journal. Walks print only
-/// operation ids and timestamps and load a view for at most the operations
-/// they actually resolve, so the bound covers the whole store log and a lost
-/// or long-reassigned workspace remains findable after a busy period.
+/// Safety cap for the metadata-only operation journal. Listing prints only
+/// operation ids and timestamps, so it can cover the whole store log and a
+/// lost or long-reassigned workspace remains findable after a busy period.
+/// It does not bound walks that load a view per operation; see
+/// [`OP_VIEW_LOAD_LIMIT`].
 pub(super) const FORGET_OP_LOG_LIMIT: &str = "100000";
+
+/// Most `--at-op` view loads any one journal walk may perform. Each load spawns
+/// a jj process, and an unbounded walk of views stalls lease release and
+/// dispatch. Exhaustion is undecidable and must not be guessed: a Live source
+/// returns an error that keeps the lease, a LeaseBoundary source raises
+/// terminal inspection so a later lease-release retry does not re-spend the
+/// budget, and restore selection reports a pointer-integrity failure.
+pub(super) const OP_VIEW_LOAD_LIMIT: usize = 256;
 
 /// Concurrent operation branches are topologically displayed by jj, not
 /// necessarily in time order. Sort their journal timestamps before choosing.
@@ -136,6 +153,9 @@ struct WorkspaceTip {
     /// Unpublished work that is not in `commit` and whose owner cannot be
     /// established. Reported for inspection, never bookmarked.
     unclaimed: Vec<Unclaimed>,
+    /// Terminal inspection that still releases the lease, used when a
+    /// LeaseBoundary journal walk cannot finish.
+    terminal_inspect: Option<String>,
 }
 
 struct Unclaimed {
@@ -149,6 +169,9 @@ struct Unclaimed {
 struct HistoricalTip {
     commit: Option<String>,
     rewritten_to: Option<String>,
+    /// Pre-snapshot boundary commit hidden by snapshotting a working copy in
+    /// its ancestry. Named for inspection alongside the visible successor.
+    snapshot_hid: Option<String>,
 }
 
 /// Snapshot after the writer stops only with current ownership evidence.
@@ -170,10 +193,13 @@ async fn workspace_tip(
                 jj.run(workspace, &["log", "--no-graph", "-r", "@", "-T", "commit_id"])
                     .await?,
             ),
-            unclaimed: Vec::new(),
+            ..WorkspaceTip::default()
         });
     }
-    if matches!(
+    // A free workspace is snapshotted after the boundary tip is resolved so
+    // later work can be inspected. If that snapshot hides the boundary
+    // commit, preservation retargets onto the unique visible successor.
+    let snapshot = if matches!(
         tip_source,
         WorkspaceTipSource::LeaseBoundary {
             ownership: BoundaryOwnership::FreeUnproven,
@@ -185,13 +211,11 @@ async fn workspace_tip(
             jj.shared_repo(workspace).await? == record.repo_path,
             "workspace recovery store changed"
         );
-        // Nobody holds the workspace, so writing its pending edits into the
-        // journal is harmless. The result is only compared with the boundary
-        // tip; it is never adopted.
-        jj.run(workspace, &["log", "--no-graph", "-r", "@", "-T", "commit_id"])
-            .await?;
-    }
-    historical_workspace_tip(jj, record, workspace, since_unix, tip_source).await
+        Some(workspace)
+    } else {
+        None
+    };
+    historical_workspace_tip(jj, record, workspace, since_unix, tip_source, snapshot).await
 }
 
 async fn historical_workspace_tip(
@@ -200,6 +224,7 @@ async fn historical_workspace_tip(
     workspace: &Path,
     since_unix: Option<i64>,
     tip_source: WorkspaceTipSource,
+    snapshot: Option<&Path>,
 ) -> Result<WorkspaceTip> {
     let (boundary, ownership) = match tip_source {
         WorkspaceTipSource::LeaseBoundary { unix_millis, ownership } => (Some(unix_millis), Some(ownership)),
@@ -213,8 +238,36 @@ async fn historical_workspace_tip(
         .and_then(|s| s.to_str())
         .context("workspace name unavailable")?;
     let rev = format!("present({}@)", serde_json::to_string(name)?);
-    // Metadata-only journal: load a view only for the newest operation at or
-    // before the boundary, never for the operations after it.
+    if boundary.is_none() {
+        // This execution still owns the workspace, so the newest state answers
+        // directly. Answer from the current operation and the forget lookup
+        // before any per-operation walk.
+        match working_copy_at(jj, &record.repo_path, None, &rev).await {
+            Ok(tip) if !tip.trim().is_empty() => {
+                return Ok(WorkspaceTip {
+                    commit: visible_historical_tip(jj, &record.repo_path, tip.trim(), follow_rewrites)
+                        .await?
+                        .commit,
+                    ..WorkspaceTip::default()
+                });
+            }
+            Ok(_) => {}
+            Err(err) if is_missing_revision_error(&err) => {}
+            Err(err) => return Err(err),
+        }
+        if let Some(tip) = forgotten_tip(jj, record, name, &rev, since_unix, boundary).await? {
+            return Ok(WorkspaceTip {
+                commit: visible_historical_tip(jj, &record.repo_path, &tip, follow_rewrites)
+                    .await?
+                    .commit,
+                ..WorkspaceTip::default()
+            });
+        }
+    }
+    // Metadata-only journal: load a view only for the newest operations at or
+    // before the boundary, never for the operations after it, and give up
+    // after OP_VIEW_LOAD_LIMIT loads.
+    let mut loads = 0;
     for (seconds, nanos, id) in operations(jj, &record.repo_path).await? {
         if since_unix.is_some_and(|since| seconds < since) {
             continue;
@@ -222,6 +275,19 @@ async fn historical_workspace_tip(
         if boundary.is_some_and(|before| seconds * 1000 + i64::from(nanos / 1_000_000) > before) {
             continue;
         }
+        if loads >= OP_VIEW_LOAD_LIMIT {
+            if boundary.is_some() {
+                return Ok(WorkspaceTip {
+                    terminal_inspect: Some(
+                        "workspace journal inspection exhausted the operation view limit; the lease-boundary tip is unresolved"
+                            .into(),
+                    ),
+                    ..WorkspaceTip::default()
+                });
+            }
+            anyhow::bail!("workspace journal inspection exhausted the operation view limit");
+        }
+        loads += 1;
         let tip = match working_copy_at(jj, &record.repo_path, Some(&id), &rev).await {
             Ok(tip) => tip.trim().to_owned(),
             Err(err) if is_missing_revision_error(&err) => continue,
@@ -230,7 +296,10 @@ async fn historical_workspace_tip(
         if tip.is_empty() {
             continue;
         }
-        let resolved = visible_historical_tip(jj, &record.repo_path, &tip, follow_rewrites).await?;
+        let mut resolved = visible_historical_tip(jj, &record.repo_path, &tip, follow_rewrites).await?;
+        if let Some(workspace) = snapshot {
+            resolved = snapshot_free_unproven(jj, &record.repo_path, workspace, resolved).await?;
+        }
         // The live registered tip leads: it is what a human inspects first.
         let mut unclaimed = Vec::new();
         if ownership == Some(BoundaryOwnership::FreeUnproven)
@@ -239,7 +308,22 @@ async fn historical_workspace_tip(
         {
             unclaimed.push(extra);
         }
-        if let Some(rewrite) = resolved.rewritten_to
+        if let Some(hidden) = resolved.snapshot_hid.as_deref() {
+            let visible = resolved
+                .commit
+                .as_deref()
+                .or(resolved.rewritten_to.as_deref())
+                .unwrap_or(hidden);
+            let work = log(jj, &record.repo_path, &unpublished(visible), "change_id ++ \"\n\"").await?;
+            let count = work.lines().count() as u64;
+            unclaimed.push(Unclaimed {
+                note: format!(
+                    "the lease boundary tip {hidden} was rewritten to {visible} by snapshotting a working copy in its ancestry; both are post-boundary edits of unproven ownership"
+                ),
+                commit: visible.to_owned(),
+                count,
+            });
+        } else if let Some(rewrite) = resolved.rewritten_to
             && !unclaimed.iter().any(|seen| seen.commit == rewrite)
         {
             let work = log(jj, &record.repo_path, &unpublished(&rewrite), "change_id ++ \"\n\"").await?;
@@ -257,9 +341,31 @@ async fn historical_workspace_tip(
         return Ok(WorkspaceTip {
             commit: resolved.commit,
             unclaimed,
+            terminal_inspect: None,
         });
     }
-    // A forgotten workspace's journaled tip is read from its pre-forget view.
+    if boundary.is_some()
+        && let Some(tip) = forgotten_tip(jj, record, name, &rev, since_unix, boundary).await?
+    {
+        return Ok(WorkspaceTip {
+            commit: visible_historical_tip(jj, &record.repo_path, &tip, follow_rewrites)
+                .await?
+                .commit,
+            ..WorkspaceTip::default()
+        });
+    }
+    Ok(WorkspaceTip::default())
+}
+
+/// A forgotten workspace's journaled tip, read from its pre-forget view.
+async fn forgotten_tip(
+    jj: &dyn Jj,
+    record: &ExecutionBookmark,
+    name: &str,
+    rev: &str,
+    since_unix: Option<i64>,
+    boundary: Option<i64>,
+) -> Result<Option<String>> {
     let forget = format!("forget workspace {name}");
     let forgotten = jj
         .run(
@@ -285,17 +391,12 @@ async fn historical_workspace_tip(
         if since_unix.is_some_and(|since| seconds < since) || boundary.is_some_and(|before| seconds * 1000 > before) {
             continue;
         }
-        let tip = working_copy_at(jj, &record.repo_path, Some(&format!("{id}-")), &rev).await?;
+        let tip = working_copy_at(jj, &record.repo_path, Some(&format!("{id}-")), rev).await?;
         if !tip.trim().is_empty() {
-            return Ok(WorkspaceTip {
-                commit: visible_historical_tip(jj, &record.repo_path, tip.trim(), follow_rewrites)
-                    .await?
-                    .commit,
-                unclaimed: Vec::new(),
-            });
+            return Ok(Some(tip.trim().to_owned()));
         }
     }
-    Ok(WorkspaceTip::default())
+    Ok(None)
 }
 
 /// The current registered tip's unpublished work that the resolved boundary
@@ -340,10 +441,49 @@ async fn unclaimed_registered_work(
 /// id. Such a rewrite is never followed; it is returned as `rewritten_to` for
 /// inspection, and the boundary commit is used only while it is still visible
 /// as it was.
+/// Snapshot a free workspace after resolving the boundary tip. If that rewrite
+/// hides the boundary commit, retarget onto its unique visible successor so
+/// preservation never revives the hidden original. Pending working-copy edits
+/// are then in the successor and are named for inspection.
+async fn snapshot_free_unproven(
+    jj: &dyn Jj,
+    repo: &Path,
+    workspace: &Path,
+    mut resolved: HistoricalTip,
+) -> Result<HistoricalTip> {
+    let boundary = resolved.commit.clone();
+    jj.run(workspace, &["log", "--no-graph", "-r", "@", "-T", "commit_id"])
+        .await?;
+    let Some(boundary) = boundary else {
+        return Ok(resolved);
+    };
+    if commit_is_visible(jj, repo, &boundary).await? {
+        return Ok(resolved);
+    }
+    let change = log(jj, repo, &boundary, "change_id").await?;
+    let visible = log_change(jj, repo, &change_revset(change.trim())).await?;
+    let ids: Vec<&str> = visible.lines().filter(|id| !id.is_empty()).collect();
+    resolved.snapshot_hid = Some(boundary);
+    match ids.as_slice() {
+        [one] => {
+            resolved.commit = Some((*one).to_owned());
+            resolved.rewritten_to = Some((*one).to_owned());
+        }
+        _ => {
+            resolved.commit = None;
+            if resolved.rewritten_to.is_none() {
+                resolved.rewritten_to = ids.first().map(|id| (*id).to_owned());
+            }
+        }
+    }
+    Ok(resolved)
+}
+
 async fn visible_historical_tip(jj: &dyn Jj, repo: &Path, tip: &str, follow_rewrites: bool) -> Result<HistoricalTip> {
     let found = |commit: Option<String>| HistoricalTip {
         commit,
         rewritten_to: None,
+        snapshot_hid: None,
     };
     let change = log(jj, repo, tip, "change_id").await?;
     let mut rewritten_to = None;
@@ -367,6 +507,7 @@ async fn visible_historical_tip(jj: &dyn Jj, repo: &Path, tip: &str, follow_rewr
     let mut resolved = HistoricalTip {
         commit: None,
         rewritten_to,
+        snapshot_hid: None,
     };
     let published = log_change(
         jj,
@@ -631,6 +772,22 @@ pub async fn preserve_from(
 ) -> Result<PreserveOutcome> {
     let resolved = workspace_tip(jj, record, workspace, since_unix, tip_source).await?;
     let unclaimed = resolved.unclaimed;
+    if let Some(reason) = resolved.terminal_inspect {
+        let mut outcome = preserve_resolved(jj, record, workspace, recorded, tip_source, None).await?;
+        match outcome.inspect.as_mut() {
+            Some(inspect) => inspect.reason = reason,
+            None => {
+                outcome.inspect = Some(PreserveInspect {
+                    existing_commit_id: outcome.tip.as_ref().map(|tip| tip.commit_id.clone()),
+                    workspace_change_id: None,
+                    workspace_commit_id: None,
+                    workspace_count: None,
+                    reason,
+                });
+            }
+        }
+        return Ok(outcome);
+    }
     let mut outcome = preserve_resolved(jj, record, workspace, recorded, tip_source, resolved.commit).await?;
     if let Some(first) = unclaimed.first() {
         let note = unclaimed

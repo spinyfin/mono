@@ -25,6 +25,9 @@ crate::stub_host_adapter! { RemoteReleaseAdapter {
     async fn confirm_workspace_recovery(&self, record: &boss_engine_recovery::execution_bookmark::ExecutionBookmark, workspace: &std::path::Path, _recorded: Option<&boss_engine_recovery::execution_bookmark::PreservedTip>, _since_unix: Option<i64>) -> anyhow::Result<boss_engine_recovery::execution_bookmark::PreserveOutcome> {
         crate::test_support::confirm_remote_test_recovery(record, workspace, "remote").map(|()| Default::default())
     }
+    async fn confirm_workspace_recovery_from(&self, record: &boss_engine_recovery::execution_bookmark::ExecutionBookmark, workspace: &std::path::Path, _recorded: Option<&boss_engine_recovery::execution_bookmark::PreservedTip>, _since_unix: Option<i64>, _tip_source: boss_engine_recovery::execution_bookmark::WorkspaceTipSource) -> anyhow::Result<boss_engine_recovery::execution_bookmark::PreserveOutcome> {
+        crate::test_support::confirm_remote_test_recovery(record, workspace, "remote").map(|()| Default::default())
+    }
 } }
 
 struct Provider(Arc<RemoteReleaseAdapter>);
