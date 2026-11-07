@@ -1139,6 +1139,54 @@ async fn lease_boundary_view_exhaustion_still_finds_a_forgotten_workspace_tip() 
 }
 
 #[tokio::test]
+async fn forgotten_tip_fallback_applies_ownership_guards_to_a_registered_dirty_workspace() {
+    for ownership in [BoundaryOwnership::Reassigned, BoundaryOwnership::FreeUnproven] {
+        for ancestor in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = fixture(dir.path());
+            let record = create(&LocalJj, &repo.worker, "exec_dirty_forgotten", "local")
+                .await
+                .unwrap();
+            std::fs::write(repo.worker.join("ours"), "original work").unwrap();
+            let parent = tip_of_workspace(&repo);
+            if ancestor {
+                JjRepo::run(&repo.worker, &["new", "-m", "Boundary child"]);
+                std::fs::write(repo.worker.join("child"), "child work").unwrap();
+            }
+            let original = tip_of_workspace(&repo);
+            if ancestor {
+                JjRepo::run(&repo.worker, &["edit", parent.trim()]);
+            }
+            std::fs::write(repo.worker.join("theirs"), "later holder edits").unwrap();
+            let jj = CountingViews {
+                tip: original.clone(),
+                loads: Default::default(),
+                forgotten: true,
+            };
+            let source = WorkspaceTipSource::LeaseBoundary {
+                unix_millis: now_millis().await,
+                ownership,
+            };
+            let outcome = preserve_from(&jj, &record, &repo.worker, None, None, source)
+                .await
+                .unwrap();
+            assert!(outcome.tip.is_none(), "{ownership:?}/{ancestor}: {outcome:?}");
+            let inspect = outcome.inspect.unwrap();
+            assert!(inspect.reason.contains(&original), "{inspect:?}");
+            assert!(!inspect.reason.contains("exhausted"), "{inspect:?}");
+            JjRepo::run(&repo.worker, &["new", "main"]);
+            assert!(
+                restore_preserved(&LocalJj, &record, &repo.replacement, None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!repo.replacement.join("theirs").exists());
+        }
+    }
+}
+
+#[tokio::test]
 async fn unknown_boundary_resolves_nothing_and_raises_inspection() {
     let dir = tempfile::tempdir().unwrap();
     let repo = fixture(dir.path());
@@ -1266,6 +1314,8 @@ async fn work_after_the_boundary_is_reported_not_dropped() {
                 .as_ref()
                 .unwrap_or_else(|| panic!("pending boundary edits must be inspected: {outcome:?}"));
             assert!(inspect.reason.contains(&original), "{inspect:?}");
+            assert_eq!(inspect.reason.matches("unproven ownership").count(), 1, "{inspect:?}");
+            assert!(!inspect.reason.contains("absent from the work resolved"), "{inspect:?}");
             let visible = visible_change_commits(&repo, &change_id);
             assert!(inspect.reason.contains(visible.trim()), "{inspect:?}");
             assert_ne!(visible.trim(), original);

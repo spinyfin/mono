@@ -1833,6 +1833,18 @@ async fn heartbeat_reap_never_adopts_an_allow_dirty_successors_edits() {
         db.record_execution_bookmark(&record).unwrap();
         std::fs::write(repo.worker.join("ours.txt"), "reaped worker edits").unwrap();
         JjRepo::run(&repo.worker, &["status"]);
+        let original = JjRepo::run(
+            &repo.worker,
+            &[
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-r",
+                "@",
+                "-T",
+                "commit_id",
+            ],
+        );
         db.confirm_workspace_lease(
             &execution_id,
             "lease-reaped",
@@ -1868,25 +1880,22 @@ async fn heartbeat_reap_never_adopts_an_allow_dirty_successors_edits() {
             .unwrap()
             .iter()
             .any(|item| item.kind == "preserved_work_needs_inspection");
-        if successor_ran_jj {
-            // The successor's own jj command rewrote the inherited change to
-            // include its edits: nothing may be bookmarked, and the rewrite
-            // is surfaced for inspection.
-            assert!(
-                preserved_names(&repo, &execution_id).is_empty(),
-                "the successor's edits were bookmarked"
-            );
-            assert!(db.preserved_tip(&execution_id).unwrap().is_none());
-            assert!(inspected);
-        } else {
-            // Its edits were never snapshotted, so the boundary commit is
-            // untouched and holds only the reaped worker's file.
-            assert!(!preserved_names(&repo, &execution_id).is_empty());
-            let tip = db.preserved_tip(&execution_id).unwrap().expect("preserved tip");
-            let files = JjRepo::run(&repo.repo, &["file", "list", "-r", &tip.commit_id]);
-            assert!(files.contains("ours.txt") && !files.contains("theirs.txt"), "{files}");
-            assert!(!inspected, "a later holder's workspace is not reported");
-        }
+        // Both a visible rewrite and pending edits on the boundary require inspection.
+        assert!(preserved_names(&repo, &execution_id).is_empty());
+        assert!(db.preserved_tip(&execution_id).unwrap().is_none());
+        assert!(inspected);
+        let items = db.list_attention_items(&execution_id).unwrap();
+        let item = items
+            .iter()
+            .find(|item| item.kind == "preserved_work_needs_inspection")
+            .unwrap();
+        assert!(item.body_markdown.contains(original.trim()), "{item:?}");
+        JjRepo::run(&repo.worker, &["new", "main"]);
+        let restored = recovery::restore_preserved(&LocalJj, &record, &repo.worker, None)
+            .await
+            .unwrap();
+        assert!(restored.is_none());
+        assert!(!repo.worker.join("theirs.txt").exists());
     }
 }
 

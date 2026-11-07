@@ -11,6 +11,9 @@ impl Jj for DivergentViews {
         LocalJj.shared_repo(workspace).await
     }
     async fn run(&self, _: &Path, args: &[&str]) -> Result<String> {
+        if args.iter().any(|arg| arg.contains("unsafe/*")) {
+            return Ok(String::new());
+        }
         if args.contains(&"--at-op") {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return Ok("a\nb\n".into());
