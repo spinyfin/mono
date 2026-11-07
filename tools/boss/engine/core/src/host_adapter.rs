@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use boss_engine_recovery::execution_bookmark::{self, ExecutionBookmark, Jj, LocalJj};
+use boss_engine_recovery::execution_bookmark::{self, ExecutionBookmark, Jj, LocalJj, WorkspaceTipSource};
 use boss_protocol::ExecutionKind;
 use tokio::sync::Mutex;
 
@@ -240,8 +240,20 @@ impl HostAdapter for LocalHostAdapter {
         recorded: Option<&execution_bookmark::PreservedTip>,
         since_unix: Option<i64>,
     ) -> anyhow::Result<execution_bookmark::PreserveOutcome> {
+        self.confirm_workspace_recovery_from(record, workspace, recorded, since_unix, WorkspaceTipSource::Live)
+            .await
+    }
+
+    async fn confirm_workspace_recovery_from(
+        &self,
+        record: &ExecutionBookmark,
+        workspace: &Path,
+        recorded: Option<&execution_bookmark::PreservedTip>,
+        since_unix: Option<i64>,
+        tip_source: WorkspaceTipSource,
+    ) -> anyhow::Result<execution_bookmark::PreserveOutcome> {
         anyhow::ensure!(record.host_id == self.host_id(), "recovery host mismatch");
-        execution_bookmark::preserve(&LocalJj, record, workspace, recorded, since_unix).await
+        execution_bookmark::preserve_from(&LocalJj, record, workspace, recorded, since_unix, tip_source).await
     }
     async fn restore_preserved_work(
         &self,
@@ -846,8 +858,20 @@ impl HostAdapter for SshHostAdapter {
         recorded: Option<&execution_bookmark::PreservedTip>,
         since_unix: Option<i64>,
     ) -> anyhow::Result<execution_bookmark::PreserveOutcome> {
+        self.confirm_workspace_recovery_from(record, workspace, recorded, since_unix, WorkspaceTipSource::Live)
+            .await
+    }
+
+    async fn confirm_workspace_recovery_from(
+        &self,
+        record: &ExecutionBookmark,
+        workspace: &Path,
+        recorded: Option<&execution_bookmark::PreservedTip>,
+        since_unix: Option<i64>,
+        tip_source: WorkspaceTipSource,
+    ) -> anyhow::Result<execution_bookmark::PreserveOutcome> {
         anyhow::ensure!(record.host_id == self.host_id(), "recovery host mismatch");
-        execution_bookmark::preserve(self, record, workspace, recorded, since_unix).await
+        execution_bookmark::preserve_from(self, record, workspace, recorded, since_unix, tip_source).await
     }
     async fn restore_preserved_work(
         &self,

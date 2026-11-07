@@ -962,16 +962,15 @@ pub(crate) async fn reap_never_started_spawn(
     // deliberately leaves the lease columns intact (a live workspace may
     // hold in-flight commits a resume should reclaim) and nothing above
     // this line talks to cube — so before this call the lease survived
-    // every reap on this path and stayed `leased` until TTL, kept warm by
-    // the engine's own DB-fallback heartbeat.
+    // every reap on this path.
     //
     // An overdue or failed ingress does not prove the workspace was
-    // unoccupied: a driver may have run unobserved. Release relies on the
-    // pane teardown above preventing further pane-hosted worker progress,
-    // not on missing signals. The inferred-death helper still runs the
-    // preservation gate before cube release, so unpushed work is bookmarked.
-    // Keeping the lease after teardown would leave it warmed by DB
-    // heartbeats until TTL, as in the 2026-07-30 incident. Mirrors
+    // unoccupied: a driver may have run unobserved. Release goes through
+    // the inferred-death gates: a process whose cwd is in the workspace
+    // keeps the lease, and a started run with no preservation source keeps
+    // it too. A kept lease is retried by the leftover-lease sweep and
+    // otherwise bounded by cube's TTL. The row is already `orphaned`
+    // (terminal), so the DB-fallback heartbeat does not refresh it. Mirrors
     // `lost_workspace_sweep::run_one_pass`. Best-effort: a lease already
     // gone is the common benign case, so failure is `debug`, not `warn`.
     if execution.cube_lease_id.is_some() {
@@ -980,6 +979,7 @@ pub(crate) async fn reap_never_started_spawn(
             execution,
             crate::workspace_lease_release::PaneStatus::Gone,
             None,
+            Some(ctx.cube_client),
             ctx.cube_client.force_release_lease(
                 execution.cube_lease_id.as_deref().expect("lease checked"),
                 Some(orphan_reason.as_str()),
@@ -1969,7 +1969,22 @@ mod tests {
         );
 
         let attentions = db.list_attention_items(&execution_id).unwrap();
-        assert_eq!(attentions.len(), 1, "the reap must raise exactly one attention item");
+        assert_eq!(
+            attentions.len(),
+            2,
+            "the reap and unresolved preservation each raise attention"
+        );
+        assert!(
+            attentions
+                .iter()
+                .any(|item| item.kind == "preserved_work_needs_inspection")
+        );
+        let attentions: Vec<_> = attentions
+            .iter()
+            .filter(|item| item.kind == DRIVER_START_ATTENTION_KIND)
+            .collect();
+        assert_eq!(attentions.len(), 1);
+
         assert_eq!(attentions[0].kind, DRIVER_START_ATTENTION_KIND);
         assert!(
             attentions[0].body_markdown.contains("92697"),

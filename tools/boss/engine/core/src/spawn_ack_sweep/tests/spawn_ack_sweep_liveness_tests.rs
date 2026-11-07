@@ -257,8 +257,17 @@ async fn absent_transcript_reaps_and_the_record_states_what_was_checked() {
     );
 
     let attentions = db.list_attention_items(&execution_id).unwrap();
-    assert_eq!(attentions.len(), 1);
-    let body = &attentions[0].body_markdown;
+    assert_eq!(attentions.len(), 2);
+    assert!(
+        attentions
+            .iter()
+            .any(|item| item.kind == "preserved_work_needs_inspection")
+    );
+    let attention = attentions
+        .iter()
+        .find(|item| item.kind == DRIVER_START_ATTENTION_KIND)
+        .unwrap();
+    let body = &attention.body_markdown;
     assert!(
         body.contains("no rollout file newer than the pre-spawn baseline"),
         "the attention body must state the liveness probe's finding; got: {body}",
@@ -276,9 +285,9 @@ async fn absent_transcript_reaps_and_the_record_states_what_was_checked() {
         "the body must name both explanations for the missing signal; got: {body}",
     );
     assert!(
-        attentions[0].title.contains("no driver signal was observed"),
+        attention.title.contains("no driver signal was observed"),
         "got: {}",
-        attentions[0].title,
+        attention.title,
     );
 
     let events = sink.events().await;
@@ -960,15 +969,25 @@ async fn zero_pid_driver_start_timeout_is_classed_no_shell() {
     let evidence = spawn_health.evidence_in_window(boss_engine_utils::epoch_time::now_epoch_secs());
     assert_eq!(evidence[0].class, crate::spawn_health::SpawnFailureClass::NoShell);
     let attentions = db.list_attention_items(&execution_id).unwrap();
+    assert_eq!(attentions.len(), 2);
     assert!(
-        attentions[0].body_markdown.contains("no shell pid was ever reported"),
+        attentions
+            .iter()
+            .any(|item| item.kind == "preserved_work_needs_inspection")
+    );
+    let attention = attentions
+        .iter()
+        .find(|item| item.kind == DRIVER_START_ATTENTION_KIND)
+        .unwrap();
+    assert!(
+        attention.body_markdown.contains("no shell pid was ever reported"),
         "got: {}",
-        attentions[0].body_markdown
+        attention.body_markdown
     );
     assert!(
-        !attentions[0].body_markdown.contains("and came up, but"),
+        !attention.body_markdown.contains("and came up, but"),
         "got: {}",
-        attentions[0].body_markdown
+        attention.body_markdown
     );
 }
 

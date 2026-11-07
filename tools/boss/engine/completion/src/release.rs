@@ -153,10 +153,7 @@ impl WorkerCompletionHandler {
                 cause,
                 pane: crate::workspace_lease_release::PaneStatus::Gone,
                 occupancy: &crate::workspace_lease_release::EmptyOccupancy,
-                bookmark: &crate::workspace_lease_release::DbBookmarkGate {
-                    db: &self.work_db,
-                    adapter: None,
-                },
+                bookmark: &crate::workspace_lease_release::DbBookmarkGate::new(&self.work_db, None),
             },
             self.cube_client.release_workspace_with_reset(&lease_id),
         )

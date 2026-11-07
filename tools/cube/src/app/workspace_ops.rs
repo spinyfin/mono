@@ -504,8 +504,8 @@ pub(super) enum BookmarkPolicy<'a> {
     /// Any bookmark blocks the collapse (the rebase path).
     Strict,
     /// The push path: the branch about to be advanced to `@` and the engine's
-    /// own `boss-recovery/` / `boss-base/` pointers are not stack boundaries.
-    /// Anything else (notably a published `pr/<n>` pointer) still blocks.
+    /// own pointer namespaces are not stack boundaries. Anything else
+    /// (notably a published `pr/<n>` pointer) still blocks.
     PushBranch(&'a str),
 }
 
@@ -519,7 +519,11 @@ pub(super) fn commit_has_blocking_bookmark(
     };
     let out = ctx.run(&["bookmark", "list", "-r", revision, "-T", r#"if(!remote, name ++ "\n")"#])?;
     Ok(out.lines().map(str::trim).any(|name| {
-        !name.is_empty() && name != branch && !name.starts_with("boss-recovery/") && !name.starts_with("boss-base/")
+        !name.is_empty()
+            && name != branch
+            && !super::health::ENGINE_POINTER_BOOKMARK_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
     }))
 }
 

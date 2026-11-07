@@ -1565,6 +1565,7 @@ async fn execute_auto_reap(
             execution,
             crate::workspace_lease_release::PaneStatus::Gone,
             None,
+            Some(cube_client),
             cube_client.force_release_lease(lease_id, Some("stale-worker auto-reap: two-hour idle tmux worker")),
         )
         .await;

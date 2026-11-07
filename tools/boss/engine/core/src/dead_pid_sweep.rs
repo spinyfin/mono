@@ -711,6 +711,7 @@ async fn reap_dead_execution(
             execution,
             crate::workspace_lease_release::PaneStatus::Gone,
             None,
+            Some(cube_client),
             cube_client.force_release_lease(
                 execution.cube_lease_id.as_deref().expect("lease checked"),
                 Some("dead-pid reconcile: worker process gone"),

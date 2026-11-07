@@ -478,6 +478,7 @@ async fn maybe_force_release_reconciled_lease(
         execution,
         crate::workspace_lease_release::PaneStatus::Gone,
         None,
+        Some(cube),
         cube.force_release_lease(lease_id, Some("execution-liveness reconcile: worker pane gone")),
     )
     .await;
@@ -638,6 +639,12 @@ mod tests {
         db.record_execution_bookmark(&record).unwrap();
         std::fs::write(repo.worker.join("work.txt"), "journaled worker edits").unwrap();
         boss_engine_test_git::jj::JjRepo::run(&repo.worker, &["status"]);
+        db.confirm_workspace_lease(
+            &exec.id,
+            "lease-1",
+            boss_engine_utils::epoch_time::now_epoch_ms() as i64,
+        )
+        .unwrap();
         std::fs::remove_dir_all(&repo.worker).unwrap();
         let cube = RecordingCube(Default::default());
 

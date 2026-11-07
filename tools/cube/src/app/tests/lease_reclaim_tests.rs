@@ -947,6 +947,7 @@ fn record(id: &str, health: Option<WorkspaceHealth>, since: Option<i64>) -> Work
         last_holder: None,
         last_task: None,
         last_activity_at_epoch_s: None,
+        lease_generation: 0,
     }
 }
 

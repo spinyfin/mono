@@ -125,10 +125,7 @@ impl LifecycleServices for CoreLifecycleServices {
                 cause,
                 pane: PaneStatus::Gone,
                 occupancy: &crate::workspace_lease_release::EmptyOccupancy,
-                bookmark: &crate::workspace_lease_release::DbBookmarkGate {
-                    db: &self.work_db,
-                    adapter: Some(adapter),
-                },
+                bookmark: &crate::workspace_lease_release::DbBookmarkGate::new(&self.work_db, Some(adapter)),
             },
             adapter.release_workspace_with_reset(lease_id),
         )
@@ -176,6 +173,7 @@ impl LifecycleServices for CoreLifecycleServices {
             execution,
             pane,
             Some(adapter),
+            None,
             adapter.force_release_lease(lease_id, Some(reason)),
         )
         .await

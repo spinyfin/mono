@@ -23,6 +23,69 @@ fn names(repo: &JjRepo) -> String {
     JjRepo::run(&repo.repo, &["bookmark", "list", "-T", "name ++ \"\\n\""])
 }
 
+#[tokio::test]
+async fn lease_boundary_reads_never_resurrect_hidden_work() {
+    for (action, ownership) in ["commit", "squash", "abandon"]
+        .into_iter()
+        .flat_map(|action| [BoundaryOwnership::FreeUnproven, BoundaryOwnership::Reassigned].map(|o| (action, o)))
+    {
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = fixture(dir.path());
+            let record = create(&LocalJj, &repo.worker, "exec_hidden_history", "local")
+                .await
+                .unwrap();
+            if action == "squash" {
+                std::fs::write(repo.worker.join("parent"), "parent work").unwrap();
+                JjRepo::run(&repo.worker, &["new", "-m", "Child work"]);
+            }
+            std::fs::write(repo.worker.join("work"), "work to rewrite or abandon").unwrap();
+            let hidden = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+            let boundary = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            match action {
+                "commit" => {
+                    JjRepo::run(&repo.worker, &["commit", "-m", "Published work"]);
+                }
+                "squash" => {
+                    JjRepo::run(&repo.worker, &["squash", "-m", "Published combined work"]);
+                }
+                _ => {
+                    JjRepo::run(&repo.worker, &["abandon", "@"]);
+                }
+            }
+            if action != "abandon" {
+                JjRepo::run(&repo.worker, &["bookmark", "set", "published", "-r", "@-"]);
+                JjRepo::run(&repo.worker, &["git", "export"]);
+                JjRepo::run(&repo.repo, &["git", "fetch"]);
+            }
+            let source = WorkspaceTipSource::LeaseBoundary {
+                unix_millis: boundary,
+                ownership,
+            };
+            assert!(
+                !super::preserved::commit_is_visible(&LocalJj, &repo.repo, hidden.trim())
+                    .await
+                    .unwrap()
+            );
+            let outcome = preserve_from(&LocalJj, &record, &repo.worker, None, None, source)
+                .await
+                .unwrap();
+            assert!(outcome.tip.is_none(), "{action}: {outcome:?}");
+            assert!(outcome.inspect.is_none(), "{action}: {outcome:?}");
+            assert!(!names(&repo).contains("preserved/exec_hidden_history"));
+            assert!(
+                !super::preserved::commit_is_visible(&LocalJj, &repo.repo, hidden.trim())
+                    .await
+                    .unwrap()
+            );
+        }
+    }
+}
+
 async fn preserve_tip(jj: &LocalJj, record: &ExecutionBookmark, workspace: &Path) -> Result<Option<PreservedTip>> {
     Ok(preserve(jj, record, workspace, None, None).await?.tip)
 }
@@ -729,9 +792,10 @@ async fn hidden_recorded_tip_does_not_replace_fresh_unpublished_work() {
     let tip = outcome.tip.expect("fresh unpublished work must be recorded");
     assert_ne!(tip.commit_id, saved.commit_id);
     assert!(names(&repo).contains("preserved/exec_hidden_fresh"));
-    let inspect = outcome.inspect.expect("hidden recorded tip must raise inspect");
-    assert_eq!(inspect.existing_commit_id.as_deref(), Some(saved.commit_id.as_str()));
-    assert_eq!(inspect.workspace_commit_id.as_deref(), Some(tip.commit_id.as_str()));
+    assert!(
+        outcome.inspect.is_none(),
+        "abandoning restaged work and starting a new unpublished tip is routine; no inspect verdict"
+    );
     assert!(
         restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
             .await
@@ -743,4 +807,416 @@ async fn hidden_recorded_tip_does_not_replace_fresh_unpublished_work() {
         std::fs::read_to_string(repo.replacement.join("fresh")).unwrap(),
         "new unpublished"
     );
+}
+
+#[tokio::test]
+async fn historical_tip_does_not_snapshot_a_reassigned_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_reassigned", "local")
+        .await
+        .unwrap();
+    std::fs::write(repo.worker.join("ours.txt"), "reaped worker edits").unwrap();
+    let ours = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    let boundary = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    JjRepo::run(&repo.worker, &["new", "main", "-m", "Unrelated holder stack"]);
+    std::fs::write(repo.worker.join("theirs.txt"), "other holder's unpublished").unwrap();
+    let theirs = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    assert_ne!(ours.trim(), theirs.trim());
+    let outcome = preserve_from(
+        &LocalJj,
+        &record,
+        &repo.worker,
+        None,
+        None,
+        WorkspaceTipSource::LeaseBoundary {
+            unix_millis: boundary,
+            ownership: BoundaryOwnership::Reassigned,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        outcome.inspect.is_none(),
+        "a reassigned workspace's own stack is not reported against this execution: {outcome:?}"
+    );
+    let tip = outcome
+        .tip
+        .expect("historical lookup must recover the reaped worker tip");
+    assert_eq!(tip.commit_id, ours.trim());
+    assert_ne!(tip.commit_id, theirs.trim());
+    assert_eq!(
+        JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]).trim(),
+        theirs.trim(),
+        "the other holder's stack must not be rewritten"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.worker.join("theirs.txt")).unwrap(),
+        "other holder's unpublished"
+    );
+}
+
+#[tokio::test]
+async fn restore_reports_only_archives_it_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_legacy_archive", "local")
+        .await
+        .unwrap();
+    std::fs::write(repo.worker.join("work"), "preserved work").unwrap();
+    let saved = preserve_tip(&LocalJj, &record, &repo.worker).await.unwrap().unwrap();
+    JjRepo::run(&repo.worker, &["new", "main", "-m", "Legacy integrity archive"]);
+    std::fs::write(repo.worker.join("legacy.txt"), "pointer-integrity archive").unwrap();
+    let legacy = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    let archive = preserved_archive_name(&record.execution_id, legacy.trim());
+    JjRepo::run(
+        &repo.repo,
+        &["bookmark", "set", &archive, "-r", legacy.trim(), "--allow-backwards"],
+    );
+    JjRepo::run(&repo.replacement, &["new", "main", "-m", "Current PR head"]);
+    let report = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !report.unrestaged_unpublished.contains(&archive),
+        "legacy integrity archives must not be reported as unrestaged variants: {}",
+        report.unrestaged_unpublished
+    );
+}
+
+async fn now_millis() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    now
+}
+
+fn tip_of_workspace(repo: &JjRepo) -> String {
+    JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"])
+        .trim()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn unknown_boundary_resolves_nothing_and_raises_inspection() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_unknown_boundary", "local")
+        .await
+        .unwrap();
+    std::fs::write(repo.worker.join("work"), "work").unwrap();
+    let outcome = preserve_from(
+        &LocalJj,
+        &record,
+        &repo.worker,
+        None,
+        None,
+        WorkspaceTipSource::UnknownBoundary,
+    )
+    .await
+    .unwrap();
+    assert!(outcome.tip.is_none());
+    assert!(outcome.inspect.is_some());
+}
+
+#[tokio::test]
+async fn lease_boundary_never_snapshots_a_successors_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_successor_edits", "local")
+        .await
+        .unwrap();
+    std::fs::write(repo.worker.join("ours.txt"), "first holder").unwrap();
+    JjRepo::run(&repo.worker, &["status"]);
+    let ours = tip_of_workspace(&repo);
+    let boundary = now_millis().await;
+    // A successor leases the workspace dirty, writes without running jj, and
+    // releases: the registered tip is unchanged.
+    std::fs::write(repo.worker.join("theirs.txt"), "successor edits").unwrap();
+    let outcome = preserve_from(
+        &LocalJj,
+        &record,
+        &repo.worker,
+        None,
+        None,
+        WorkspaceTipSource::LeaseBoundary {
+            unix_millis: boundary,
+            ownership: BoundaryOwnership::Reassigned,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(outcome.inspect.is_none(), "{outcome:?}");
+    assert_eq!(outcome.tip.unwrap().commit_id, ours);
+    let preserved = JjRepo::run(
+        &repo.repo,
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            &revision(&preserved_name("exec_successor_edits")),
+            "-T",
+            "commit_id",
+        ],
+    );
+    assert_eq!(preserved.trim(), ours);
+    let files = JjRepo::run(
+        &repo.repo,
+        &["file", "list", "-r", &revision(&preserved_name("exec_successor_edits"))],
+    );
+    assert!(files.contains("ours.txt") && !files.contains("theirs.txt"), "{files}");
+}
+
+fn free_unproven(boundary: i64) -> WorkspaceTipSource {
+    WorkspaceTipSource::LeaseBoundary {
+        unix_millis: boundary,
+        ownership: BoundaryOwnership::FreeUnproven,
+    }
+}
+
+/// A worker dies after its last confirmed lease boundary. Whatever it did
+/// next, with no jj command between its last write and teardown, must surface
+/// as an inspection item naming the live registered tip.
+#[tokio::test]
+async fn work_after_the_boundary_is_reported_not_dropped() {
+    for action in ["commit", "abandon", "new", "edit"] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = fixture(dir.path());
+        let record = create(&LocalJj, &repo.worker, "exec_post_boundary", "local")
+            .await
+            .unwrap();
+        std::fs::write(repo.worker.join("first.txt"), "first").unwrap();
+        JjRepo::run(&repo.worker, &["status"]);
+        let boundary = now_millis().await;
+        match action {
+            "commit" => {
+                JjRepo::run(&repo.worker, &["commit", "-m", "Later work"]);
+                std::fs::write(repo.worker.join("later.txt"), "later").unwrap();
+            }
+            "abandon" => {
+                JjRepo::run(&repo.worker, &["abandon", "@"]);
+                std::fs::write(repo.worker.join("redo.txt"), "redo").unwrap();
+            }
+            "new" => {
+                JjRepo::run(&repo.worker, &["new", "-m", "Newer change"]);
+                std::fs::write(repo.worker.join("newer.txt"), "newer").unwrap();
+            }
+            _ => std::fs::write(repo.worker.join("first.txt"), "edited without any jj command").unwrap(),
+        }
+        let outcome = preserve_from(&LocalJj, &record, &repo.worker, None, None, free_unproven(boundary))
+            .await
+            .unwrap();
+        // Inspecting the live tip afterwards is safe: preservation has already
+        // snapshotted the free workspace.
+        let live = tip_of_workspace(&repo);
+        let inspect = outcome
+            .inspect
+            .as_ref()
+            .unwrap_or_else(|| panic!("{action}: post-boundary work was dropped silently: {outcome:?}"));
+        assert_eq!(inspect.workspace_commit_id.as_deref(), Some(live.as_str()), "{action}");
+        assert!(inspect.workspace_count >= Some(1), "{action}: {inspect:?}");
+        assert!(inspect.reason.contains("lease boundary"), "{action}: {inspect:?}");
+        // Reported work is never bookmarked as this execution's.
+        let preserved = JjRepo::run(
+            &repo.repo,
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                &format!("present({})", revision(&preserved_name("exec_post_boundary"))),
+                "-T",
+                "commit_id",
+            ],
+        );
+        assert_ne!(preserved.trim(), live, "{action}: live tip must not be bookmarked");
+    }
+}
+
+#[tokio::test]
+async fn a_reassigned_workspace_is_never_snapshotted_or_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_reassigned_quiet", "local")
+        .await
+        .unwrap();
+    std::fs::write(repo.worker.join("ours.txt"), "first holder").unwrap();
+    JjRepo::run(&repo.worker, &["status"]);
+    let boundary = now_millis().await;
+    JjRepo::run(&repo.worker, &["new", "main", "-m", "Other holder stack"]);
+    std::fs::write(repo.worker.join("theirs.txt"), "other holder, unsnapshotted").unwrap();
+    let before = JjRepo::run(
+        &repo.repo,
+        &[
+            "--ignore-working-copy",
+            "op",
+            "log",
+            "--no-graph",
+            "-n",
+            "1",
+            "-T",
+            "id",
+        ],
+    );
+    let outcome = preserve_from(
+        &LocalJj,
+        &record,
+        &repo.worker,
+        None,
+        None,
+        WorkspaceTipSource::LeaseBoundary {
+            unix_millis: boundary,
+            ownership: BoundaryOwnership::Reassigned,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(outcome.inspect.is_none(), "{outcome:?}");
+    assert_eq!(
+        JjRepo::run(
+            &repo.repo,
+            &[
+                "--ignore-working-copy",
+                "op",
+                "log",
+                "--no-graph",
+                "-n",
+                "2",
+                "-T",
+                "id ++ \"\\n\""
+            ]
+        )
+        .lines()
+        .nth(1),
+        Some(before.trim()),
+        "teardown of a reassigned workspace may bookmark but must not snapshot its working copy"
+    );
+}
+
+/// A successor that inherits the boundary change, edits it and runs any jj
+/// command rewrites it under the same change id. That rewrite is the
+/// successor's work: it is never bookmarked as this execution's.
+#[tokio::test]
+async fn a_successors_rewrite_of_the_inherited_change_is_not_adopted() {
+    for ownership in [BoundaryOwnership::Reassigned, BoundaryOwnership::FreeUnproven] {
+        for successor_runs_jj in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = fixture(dir.path());
+            let record = create(&LocalJj, &repo.worker, "exec_inherited_rewrite", "local")
+                .await
+                .unwrap();
+            std::fs::write(repo.worker.join("ours.txt"), "first holder").unwrap();
+            JjRepo::run(&repo.worker, &["status"]);
+            let boundary = now_millis().await;
+            std::fs::write(repo.worker.join("theirs.txt"), "successor edits").unwrap();
+            if successor_runs_jj {
+                JjRepo::run(&repo.worker, &["status"]);
+            }
+            let outcome = preserve_from(
+                &LocalJj,
+                &record,
+                &repo.worker,
+                None,
+                None,
+                WorkspaceTipSource::LeaseBoundary {
+                    unix_millis: boundary,
+                    ownership,
+                },
+            )
+            .await
+            .unwrap();
+            let label = format!("{ownership:?} jj={successor_runs_jj}");
+            let preserved = JjRepo::run(
+                &repo.repo,
+                &[
+                    "bookmark",
+                    "list",
+                    "-T",
+                    "name ++ \"\\n\"",
+                    "preserved/exec_inherited_rewrite",
+                ],
+            );
+            if successor_runs_jj || ownership == BoundaryOwnership::FreeUnproven {
+                // The inherited change was rewritten to include the successor's
+                // file: nothing may be bookmarked, and inspection is raised.
+                assert!(preserved.trim().is_empty(), "{label}: bookmarked {preserved}");
+                assert!(outcome.tip.is_none(), "{label}: {outcome:?}");
+                let inspect = outcome
+                    .inspect
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{label}: {outcome:?}"));
+                assert!(inspect.workspace_count >= Some(1), "{label}: {inspect:?}");
+            } else {
+                // Reassigned and never snapshotted: the registered boundary
+                // commit is untouched, so it is the safe tip.
+                let files = JjRepo::run(
+                    &repo.repo,
+                    &[
+                        "file",
+                        "list",
+                        "-r",
+                        &revision(&preserved_name("exec_inherited_rewrite")),
+                    ],
+                );
+                assert!(
+                    files.contains("ours.txt") && !files.contains("theirs.txt"),
+                    "{label}: {files}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn unpublished_amendment_of_a_pushed_change_is_preserved() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_amended_push", "local")
+        .await
+        .unwrap();
+    std::fs::write(repo.worker.join("work"), "pushed").unwrap();
+    JjRepo::run(&repo.worker, &["describe", "-m", "Pushed work"]);
+    JjRepo::run(&repo.worker, &["bookmark", "set", "published", "-r", "@"]);
+    JjRepo::run(&repo.worker, &["git", "export"]);
+    JjRepo::run(&repo.repo, &["git", "fetch"]);
+    std::fs::write(repo.worker.join("work"), "pushed then amended").unwrap();
+    JjRepo::run(&repo.worker, &["status"]);
+    let amended = tip_of_workspace(&repo);
+    let boundary = now_millis().await;
+    JjRepo::run(&repo.worker, &["new", "main"]);
+    let outcome = preserve_from(
+        &LocalJj,
+        &record,
+        &repo.worker,
+        None,
+        None,
+        WorkspaceTipSource::LeaseBoundary {
+            unix_millis: boundary,
+            ownership: BoundaryOwnership::Reassigned,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        outcome.tip.as_ref().map(|tip| tip.commit_id.as_str()),
+        Some(amended.as_str())
+    );
+    let preserved = JjRepo::run(
+        &repo.repo,
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            &revision(&preserved_name("exec_amended_push")),
+            "-T",
+            "commit_id",
+        ],
+    );
+    assert_eq!(preserved.trim(), amended);
 }

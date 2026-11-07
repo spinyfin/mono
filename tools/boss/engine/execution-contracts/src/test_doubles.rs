@@ -252,7 +252,9 @@ macro_rules! stub_cube_client {
     };
     (@munch $ty:ty [$($acc:tt)*] @list_workspaces $($rest:tt)*) => {
         $crate::stub_cube_client!(@munch $ty [$($acc)*
-            async fn list_workspaces(&self) -> ::anyhow::Result<::std::vec::Vec<$crate::CubeWorkspaceStatus>> { ::core::unimplemented!() }
+            async fn list_workspaces(&self) -> ::anyhow::Result<::std::vec::Vec<$crate::CubeWorkspaceStatus>> {
+                ::std::result::Result::Ok(::std::vec::Vec::new())
+            }
         ] @list_repos $($rest)*);
     };
 
@@ -434,7 +436,9 @@ macro_rules! stub_host_adapter {
     };
     (@munch $ty:ty [$($acc:tt)*] @list_workspaces $($rest:tt)*) => {
         $crate::stub_host_adapter!(@munch $ty [$($acc)*
-            async fn list_workspaces(&self) -> ::anyhow::Result<::std::vec::Vec<$crate::CubeWorkspaceStatus>> { ::core::unimplemented!() }
+            async fn list_workspaces(&self) -> ::anyhow::Result<::std::vec::Vec<$crate::CubeWorkspaceStatus>> {
+                ::std::result::Result::Ok(::std::vec::Vec::new())
+            }
         ] @list_repos $($rest)*);
     };
 
@@ -520,8 +524,12 @@ macro_rules! stub_host_adapter {
         $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn restore_preserved_work $a -> $r $b] @done $($rest)*);
     };
 
-    (@munch $ty:ty [$($acc:tt)*] @done async fn confirm_workspace_recovery $a:tt -> $r:ty $b:block) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn confirm_workspace_recovery $a -> $r $b] @done);
+    (@munch $ty:ty [$($acc:tt)*] @done async fn confirm_workspace_recovery_from $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn confirm_workspace_recovery_from $a -> $r $b] @done $($rest)*);
+    };
+
+    (@munch $ty:ty [$($acc:tt)*] @done async fn confirm_workspace_recovery $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn confirm_workspace_recovery $a -> $r $b] @done $($rest)*);
     };
 
     // ── emit ────────────────────────────────────────────────────────────────

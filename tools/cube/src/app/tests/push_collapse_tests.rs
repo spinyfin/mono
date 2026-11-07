@@ -299,4 +299,14 @@ fn recovery_bookmark_is_not_a_stack_boundary_but_a_published_pr_bookmark_is() {
         commit_has_blocking_bookmark(&published_ctx, ancestor, BookmarkPolicy::PushBranch("boss/exec_x")).unwrap(),
         "a published pr/ bookmark on a conflicted ancestor is a stack boundary"
     );
+
+    let preserved_repo = Repo::new();
+    preserved_repo.lockfile_conflict_with_resolved_child(Some("preserved/x"));
+    let preserved_ctx = ctx(&preserved_repo);
+    let conflicted = preserved_repo.conflicted("main..@");
+    let ancestor = conflicted.lines().next().expect("conflicted ancestor").trim();
+    assert!(
+        !commit_has_blocking_bookmark(&preserved_ctx, ancestor, BookmarkPolicy::PushBranch("boss/exec_x")).unwrap(),
+        "preserved/ bookmarks are engine pointers, not stack boundaries"
+    );
 }

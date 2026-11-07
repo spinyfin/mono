@@ -201,26 +201,25 @@ const PR_REPAIR_FETCH_BUDGET: std::time::Duration = std::time::Duration::from_se
 /// (further capped by what remains of [`PR_REPAIR_TOTAL_BUDGET`]).
 const PR_REPAIR_LOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// Engine-owned pointer namespaces: per-execution recovery and base
+/// bookmarks, teardown-preserved tips, and archived unpublished heads.
+/// These are not stacked-PR boundaries.
+pub(super) const ENGINE_POINTER_BOOKMARK_PREFIXES: [&str; 4] =
+    ["boss-recovery/", "boss-base/", "preserved/", "preserved-archive/"];
+
 /// Bookmark namespaces that are shared, repo-global pointers owned by the PR
 /// flow or the Boss engine rather than by the workspace being repaired:
-/// `pr/<n>` aliases, the per-execution publication, recovery and base
-/// bookmarks, teardown-preserved tips, and archived unpublished heads.
-/// Bookmarks live in the shared jj store, so forgetting one here
-/// would also drop it for every other lease that depends on it. (`pr/<n>`
-/// aliases never reach the forget path: [`repair_conflicted_bookmarks`]
-/// repairs them in place instead.)
-const SHARED_POINTER_BOOKMARK_PREFIXES: [&str; 6] = [
-    "pr/",
-    "boss/",
-    "boss-recovery/",
-    "boss-base/",
-    "preserved/",
-    "preserved-archive/",
-];
+/// `pr/<n>` aliases, the per-execution publication bookmark, and the
+/// engine-owned pointer namespaces. Bookmarks live in the shared jj store,
+/// so forgetting one here would also drop it for every other lease that
+/// depends on it. (`pr/<n>` aliases never reach the forget path:
+/// [`repair_conflicted_bookmarks`] repairs them in place instead.)
+const PUBLICATION_POINTER_BOOKMARK_PREFIXES: [&str; 2] = ["pr/", "boss/"];
 
 fn is_shared_pointer_bookmark(bookmark: &str) -> bool {
-    SHARED_POINTER_BOOKMARK_PREFIXES
+    PUBLICATION_POINTER_BOOKMARK_PREFIXES
         .iter()
+        .chain(ENGINE_POINTER_BOOKMARK_PREFIXES.iter())
         .any(|prefix| bookmark.starts_with(prefix))
 }
 
