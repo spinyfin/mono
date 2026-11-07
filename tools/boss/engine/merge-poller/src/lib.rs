@@ -95,7 +95,6 @@ pub use host::{
 mod classify;
 mod deferred_review_admission;
 mod merge_queue;
-mod parked;
 mod poll_metrics;
 mod post_merge_review;
 mod probe;
@@ -116,7 +115,6 @@ pub use boss_observation_contracts::MergeQueueDequeueEvent;
 pub use classify::*;
 pub use merge_queue::QUEUED_NO_POSITION_SECTION_ORDER;
 pub(crate) use merge_queue::*;
-pub use parked::candidate_is_parked;
 pub use poll_metrics::*;
 #[cfg(test)]
 pub(crate) use post_merge_review::maybe_trigger_post_merge_review;

@@ -89,8 +89,11 @@
 //!   close. `sweep_one` records those two outcomes (merged → `done`, closed →
 //!   the closed-unmerged path) and does nothing about an open PR: no conflict
 //!   or CI remediation, moot-revision retirement, review-guide refresh,
-//!   poll-state or merge-queue upkeep, Trunk adoption or eviction handling, and
-//!   no post-merge deep review (`boss_engine_merge_poller::candidate_is_parked`).
+//!   merge-queue upkeep, or Trunk adoption or eviction handling. The poll-state
+//!   indicators are still refreshed (they mint nothing), and the post-merge
+//!   deep review still runs when a parked PR merges: the row is `done` by then
+//!   and no later path would trigger it. The shared gate is
+//!   `WorkDb::is_parked_or_assume_not`.
 //!   The merge-queue rebounce pass skips parked rows, and the CI and conflict
 //!   watchers' shared opt-out gate refuses a parked row for any other caller;
 //!   a conflict remediation that was queued before the park aborts when its
@@ -102,8 +105,13 @@
 //! - the completion path that would enqueue the AI reviewer for a freshly
 //!   detected PR (`finalize_pr_transition`, and the declared-delivery
 //!   equivalent) advances the row to `in_review` without one;
-//! - the project postmortem sweep skips a parked project;
-//! - an explicit operator request (`RequestExecution`, `bossctl review start`)
+//! - the project postmortem sweep skips a parked project in Rust
+//!   (`evaluate_project`), not in a listing: it has no candidate listing of its
+//!   own (it reads every project through the general `list_projects`, and its
+//!   archived and design-doc filters are in Rust too), and a parked project
+//!   records no terminal fact that needs the row kept. The gate sits beside
+//!   those filters and is covered by a test next to the sweep;
+//! - an explicit request to start work (`RequestExecution`, `bossctl review start`)
 //!   is refused with the typed "un-park it first" error
 //!   ([`WorkDb::refuse_if_parked`]).
 //!
@@ -613,6 +621,25 @@ impl WorkDb {
         is_parked(&conn, work_item_id)
     }
 
+    /// [`WorkDb::is_parked`] for upkeep gates that must not fail closed: a
+    /// failed read is logged with `context` and reported as "not parked", so a
+    /// transient lookup error does not silently drop a real signal for an
+    /// un-parked row.
+    pub fn is_parked_or_assume_not(&self, work_item_id: &str, context: &str) -> bool {
+        match self.is_parked(work_item_id) {
+            Ok(parked) => parked,
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id,
+                    context,
+                    ?err,
+                    "failed to read the parked state; treating the row as not parked",
+                );
+                false
+            }
+        }
+    }
+
     /// See [`upkeep_eligible`].
     pub fn upkeep_eligible(&self, work_item_id: &str) -> Result<bool> {
         let conn = self.connect()?;
@@ -620,7 +647,7 @@ impl WorkDb {
     }
 
     /// Refuse, with the typed [`ParkingRefusal::UnparkFirst`], an explicit
-    /// request to start work on a parked item (an operator-triggered review, for
+    /// request to start work on a parked item (an explicitly requested review, for
     /// one). Returns `Ok(())` when the item is not parked. An explicit request
     /// does not override a park for the same reason `RequestExecution` does not:
     /// every automatic path would keep skipping the row, so whatever it started

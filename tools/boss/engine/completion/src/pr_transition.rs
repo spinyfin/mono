@@ -257,7 +257,8 @@ impl WorkerCompletionHandler {
             match execution_result.as_ref() {
                 // A parked row atrophies: the run that was in flight when the
                 // owner parked it records its PR and advances to `in_review`,
-                // but no AI review is scheduled until it is un-parked.
+                // with no AI review; scheduling it after un-park is part of the
+                // un-park reconciliation (design section 1.5).
                 Ok(producing)
                     if super::run_done_declaration::reviewer_suppressed_by_park(
                         &self.work_db,
@@ -1387,6 +1388,62 @@ mod observation_seam_tests {
             assert_eq!(caller, "completion");
             assert_eq!(url, PR);
         }
+    }
+
+    /// Drive `finalize_pr_transition` for a chore, parked or not, and report
+    /// whether a `pr_review` execution exists afterwards plus the task status.
+    async fn finalize_in_review(park: bool) -> (StopOutcome, bool, boss_protocol::TaskStatus) {
+        let (dir, db) = open_db_arc();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, product.id.clone(), "parked completion");
+        let execution = create_ready_chore_execution(&db, chore.id.clone());
+        let (execution, run) = db
+            .start_execution_run(
+                &execution.id,
+                "worker",
+                "mono",
+                "lease",
+                "workspace",
+                dir.path().to_str().unwrap(),
+            )
+            .unwrap();
+        finish_run_worker_pane_alive(&db, &execution.id, &run.id, None);
+        if park {
+            db.park_work_item_as_actor(&chore.id, true, Some("not now"), "human")
+                .unwrap();
+        }
+        let handler = super::super::tests::integration_handler(db.clone(), PR);
+        let outcome = handler
+            .finalize_pr_transition(&execution.id, PR.into(), WorkerPrCompletionTarget::InReview, "stop")
+            .await;
+        let has_reviewer = db
+            .list_executions(Some(&chore.id))
+            .unwrap()
+            .iter()
+            .any(|execution| execution.kind == ExecutionKind::PrReview);
+        let status = match db.get_work_item(&chore.id).unwrap() {
+            WorkItem::Task(t) | WorkItem::Chore(t) => t.status,
+            other => panic!("expected a task/chore, got {other:?}"),
+        };
+        (outcome, has_reviewer, status)
+    }
+
+    /// A parked row atrophies: the Stop-hook completion path records the PR and
+    /// advances the row to `in_review`, but schedules no AI review. The
+    /// un-parked control proves the same fixture does create a reviewer.
+    #[tokio::test]
+    async fn parked_row_completion_schedules_no_reviewer() {
+        let (control_outcome, control_has_reviewer, _) = finalize_in_review(false).await;
+        assert_eq!(control_outcome, StopOutcome::ReviewerEnqueued { pr_url: PR.into() });
+        assert!(
+            control_has_reviewer,
+            "control: an un-parked row gets a pr_review execution"
+        );
+
+        let (outcome, has_reviewer, status) = finalize_in_review(true).await;
+        assert_eq!(outcome, StopOutcome::PrDetected { pr_url: PR.into() });
+        assert!(!has_reviewer, "a parked row must not get a pr_review execution");
+        assert_eq!(status, boss_protocol::TaskStatus::InReview);
     }
 
     #[tokio::test]

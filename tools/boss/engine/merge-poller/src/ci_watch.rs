@@ -100,7 +100,7 @@ fn auto_pr_maintenance_disabled(work_db: &WorkDb, candidate: &PendingMergeCheck,
     }
     // A parked row atrophies: CI remediation is upkeep, so every entry point
     // that shares this gate leaves it alone until it is un-parked.
-    if crate::parked::candidate_is_parked(work_db, candidate) {
+    if work_db.is_parked_or_assume_not(&candidate.work_item_id, "ci_watch") {
         tracing::debug!(
             work_item_id = %candidate.work_item_id,
             pr_url = %candidate.pr_url,
