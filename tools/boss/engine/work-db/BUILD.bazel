@@ -101,7 +101,9 @@ rust_library(
 rust_test(
     name = "work_db_test",
     size = "small",
-    timeout = "moderate",
+    # 2000+ tests plus a production-cardinality work-tree measurement exceed
+    # the 300s moderate budget on loaded CI agents.
+    timeout = "long",
     srcs = glob(["src/**/*.rs"]),
     compile_data = ["//tools/boss/app-macos:work_board_banners_swift"],
     crate_root = "src/lib.rs",

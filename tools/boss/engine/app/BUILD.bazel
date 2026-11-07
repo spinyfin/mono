@@ -75,7 +75,9 @@ rust_library(
 rust_test(
     name = "app_test",
     size = "small",
-    timeout = "moderate",
+    # One combinatorial question-surface test alone exceeds 300s on loaded
+    # agents; the rest of shard 3 then misses the moderate budget.
+    timeout = "long",
     # crate inheritance keeps the production dependency; compile this test
     # against the fixture variant under its usual Rust name instead. App also
     # depends on the runtime crate, so swap that too.
