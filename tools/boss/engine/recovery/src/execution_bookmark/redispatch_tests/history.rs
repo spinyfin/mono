@@ -81,10 +81,23 @@ async fn redispatch_does_not_promote_positioning_changes_into_pushed_history() {
             )
             .await
             .unwrap();
-            // A second redispatch with no edits must not reintroduce the setup entry.
-            restore_rebased(&LocalJj, &next, &repo.replacement, pr, "main", "origin")
-                .await
-                .unwrap();
+            // A second redispatch must not promote positioning or setup changes
+            // into the history that gets pushed.
+            let second = restore_rebased(&LocalJj, &next, &repo.replacement, pr, "main", "origin").await;
+            if has_fixes {
+                second.unwrap();
+            } else {
+                // An empty successor has no recovery head: that is the explicit
+                // nothing-to-restore outcome, and the caller positions fresh.
+                assert!(log(&repo.repo, &revision(&next.head()), "commit_id").is_empty());
+                let error = second.unwrap_err();
+                assert!(is_missing_pointer_error(&error), "PR {pr:?}: {error:#}");
+                let parent = pr.unwrap_or("main");
+                JjRepo::run(
+                    &repo.replacement,
+                    &["new", parent, "-m", "Resume recovered execution work"],
+                );
+            }
             std::fs::write(repo.replacement.join("review-fix"), "review correction\n").unwrap();
             JjRepo::run(&repo.replacement, &["describe", "-m", "Correct review findings"]);
             JjRepo::run(&repo.replacement, &["bookmark", "set", "feature", "-r", "@"]);

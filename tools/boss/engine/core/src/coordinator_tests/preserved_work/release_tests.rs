@@ -48,7 +48,7 @@ async fn failed_self_retry_then_pre_start_release_retains_recorded_work() {
         let db_path = dir.path().join("boss.db");
         let (db, execution, _) = super::super::blocked_workspace::blocked_pair(&db_path);
         export_origin(&repo);
-        let record = recovery::create(&LocalJj, &repo.worker, &execution.id, "local")
+        let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &execution.id, "local")
             .await
             .unwrap();
         db.record_execution_bookmark(&record).unwrap();
@@ -147,7 +147,7 @@ async fn conflicted_preserved_bookmark_releases_clean_workspace_without_moving_v
     let db_path = dir.path().join("boss.db");
     let (db, execution, _) = super::super::blocked_workspace::blocked_pair(&db_path);
     export_origin(&repo);
-    let record = recovery::create(&LocalJj, &repo.worker, &execution.id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &execution.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -208,7 +208,7 @@ async fn missing_bookmark_failed_restore_then_release_keeps_recorded_tip() {
     let db_path = dir.path().join("boss.db");
     let (db, execution, _) = super::super::blocked_workspace::blocked_pair(&db_path);
     export_origin(&repo);
-    let record = recovery::create(&LocalJj, &repo.worker, &execution.id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &execution.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -286,7 +286,7 @@ async fn conflicted_preserved_bookmark_is_resolved_so_later_work_can_be_preserve
     let db_path = dir.path().join("boss.db");
     let (db, execution, _) = super::super::blocked_workspace::blocked_pair(&db_path);
     export_origin(&repo);
-    let record = recovery::create(&LocalJj, &repo.worker, &execution.id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &execution.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -391,7 +391,7 @@ async fn inspect_verdict_releases_the_lease_and_raises_inspection_attention() {
     let db_path = dir.path().join("boss.db");
     let (db, execution, _) = super::super::blocked_workspace::blocked_pair(&db_path);
     export_origin(&repo);
-    let record = recovery::create(&LocalJj, &repo.worker, &execution.id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &execution.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -453,7 +453,7 @@ async fn second_inspect_teardown_appends_the_new_workspace_tip() {
     let db_path = dir.path().join("boss.db");
     let (db, execution, _) = super::super::blocked_workspace::blocked_pair(&db_path);
     export_origin(&repo);
-    let record = recovery::create(&LocalJj, &repo.worker, &execution.id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &execution.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -559,7 +559,7 @@ async fn abandoning_a_restaged_tip_clears_the_row_and_is_not_restaged() {
     let db_path = dir.path().join("boss.db");
     let (db, execution, _) = super::super::blocked_workspace::blocked_pair(&db_path);
     export_origin(&repo);
-    let record = recovery::create(&LocalJj, &repo.worker, &execution.id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &execution.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -669,7 +669,7 @@ async fn absent_recorded_tip_bookmarks_fresh_unpublished_work_and_releases() {
     let db_path = dir.path().join("boss.db");
     let (db, execution, _) = super::super::blocked_workspace::blocked_pair(&db_path);
     export_origin(&repo);
-    let record = recovery::create(&LocalJj, &repo.worker, &execution.id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &execution.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();

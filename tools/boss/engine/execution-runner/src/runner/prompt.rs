@@ -297,11 +297,10 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
     prompt.push_str(&format!("- workspace: `{}`\n", workspace_path.display()));
     prompt.push_str(&format!("- task: `{}`\n", work_item_name(work_item)));
     // Publication uses the execution branch only for a new PR. Revisions
-    // maintain their engine-owned recovery bookmark locally and publish
-    // to the existing parent PR branch.
+    // publish to the existing parent PR branch.
     if existing_pr_url.is_none() && execution.kind != ExecutionKind::RevisionImplementation {
         prompt.push_str(&format!(
-            "- expected branch name: `{expected_branch}` — the engine creates the execution recovery bookmark at dispatch and uses this branch name to find your PR. Push to this exact bookmark name.\n",
+            "- expected branch name: `{expected_branch}` — the engine uses this branch name to find your PR. Create it with `jj bookmark set {expected_branch} -r @` immediately before `\"$CUBE_BIN\" pr create` and push to this exact bookmark name.\n",
         ));
     }
     if let Some(cube_change_id) = cube_change_id {
@@ -490,7 +489,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
             ));
         } else {
             prompt.push_str(&format!(
-                "- Publication bookmark: `jj bookmark set {expected_branch} -r @`.\n"
+                "- Immediately before `\"$CUBE_BIN\" pr create`, create the publication bookmark: `jj bookmark set {expected_branch} -r @`.\n"
             ));
         }
         prompt.push_str(&format!(
@@ -1716,7 +1715,7 @@ fn compose_revision_directive(
     let is_conflict_resolution = conflict_attempt.is_some();
     let mut out = String::new();
     out.push_str("Expected outcome for this run:\n");
-    out.push_str("- This is a **REVISION** task. Your deliverable is an update to an EXISTING pull request — typically a new commit on the PR branch, or a rebase if that is all that is needed. A revision never opens a new PR. The engine owns your `boss-recovery/exec_*` recovery bookmark; keep it advanced locally.\n");
+    out.push_str("- This is a **REVISION** task. Your deliverable is an update to an EXISTING pull request — typically a new commit on the PR branch, or a rebase if that is all that is needed. A revision never opens a new PR. The engine preserves unpublished workspace edits at teardown.\n");
     out.push_str(&format!("- The parent PR is #{pr_number} at {parent_pr_url}.\n"));
     out.push_str("- Implement the requested changes in the Task description at the end of this prompt.\n");
     if let WorkItem::Task(task) | WorkItem::Chore(task) = work_item
@@ -1920,7 +1919,7 @@ fn compose_revision_directive(
             "- If a guard, policy, or decision blocks progress, emit a `[blocked] reason=\"<specific question>\"` marker instead of declaring you could not complete.\n",
         );
     }
-    out.push_str("- The engine owns your `boss-recovery/exec_*` recovery bookmark; keep it advanced locally — push to the existing parent branch.\n");
+    out.push_str("- Push to the existing parent branch.\n");
     out.push_str("- Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty and this is NOT a rebase-only revision, stop and explain.\n");
     out.push('\n');
     out.push_str(check_bypass_prohibition_text());
@@ -2048,7 +2047,7 @@ fn compose_queue_ci_fragment(attempt: &CiRemediation, bazel_workspace: Option<bo
 Before any verdict (including flaky, infra, unfixable or cannot complete):
 
 1. Read the failing queue build's jobs and logs. Record its queue commit and queue base commit. Fetch the queue commit's parents with `gh api repos/<owner>/<repo>/commits/<queue-sha> --jq '.parents[].sha'` and use the build's checkout/merge metadata to identify the base (a batch can contain sibling PRs). This is the historical queue base, distinct from today's main. Fetch statuses at that queue SHA if the build was not captured: `gh api repos/<owner>/<repo>/commits/<queue-sha>/status`; also inspect `/check-runs`.
-2. Run `"$CUBE_BIN" workspace local-rebase --pr <bound-pr-number>` to fetch the actual GitHub remote and rebase onto the PR's actual base branch. Resolve conflicts by integrating both sides. Record the full destination SHA and the final tested head SHA. Preserve and advance the execution recovery bookmarks after rebasing. Do this even if the base is already an ancestor: verify and record that fact.
+2. Run `"$CUBE_BIN" workspace local-rebase --pr <bound-pr-number>` to fetch the actual GitHub remote and rebase onto the PR's actual base branch. Resolve conflicts by integrating both sides. Record the full destination SHA and the final tested head SHA. Preserve published PR bookmarks after rebasing. Do this even if the base is already an ancestor: verify and record that fact.
 {step3}
 4. Run `checkleft run`. Push substantive changes or a changed rebase through `"$CUBE_BIN" pr update` to the existing PR. If the verified head is unchanged, do not make an empty or cosmetic commit: requeue that same head as described below.
 

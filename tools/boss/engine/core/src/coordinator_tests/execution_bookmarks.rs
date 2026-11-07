@@ -1,7 +1,132 @@
 use super::helpers::*;
 use crate::work::{FakePrStateChecker, PrOpenState};
-use boss_engine_recovery::execution_bookmark::{LocalJj, create};
+use boss_engine_recovery::execution_bookmark::LocalJj;
+use boss_engine_recovery_fixtures::create;
 use boss_engine_test_git::jj::JjRepo;
+
+#[tokio::test]
+async fn fresh_dispatch_preserves_and_reports_work_without_legacy_bookmark_failures() {
+    use crate::workspace_lease_release::{BookmarkGate, BookmarkStatus, DbBookmarkGate};
+    use boss_engine_recovery::execution_bookmark::{create_from, preserved_name};
+    for has_work in [false, true] {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+        let chore = create_test_chore_manual(&db, product.id, "Preserve workspace work");
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id)
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        let repo = JjRepo::new(dir.path());
+        super::recovery::configure_recovery_origin(&repo.repo);
+        JjRepo::run(&repo.repo, &["git", "fetch", "--remote", "origin", "--branch", "main"]);
+        let record = create_from(&LocalJj, &repo.worker, &execution.id, "local", None, None)
+            .await
+            .unwrap();
+        db.record_execution_bookmark(&record).unwrap();
+        db.start_execution_run(
+            &execution.id,
+            "worker",
+            "mono",
+            "lease",
+            "worker",
+            repo.worker.to_str().unwrap(),
+        )
+        .unwrap();
+        let execution = db.get_execution(&execution.id).unwrap();
+        if has_work {
+            std::fs::write(repo.worker.join("first.txt"), "unpublished first edit").unwrap();
+            JjRepo::run(&repo.worker, &["new", "-m", "Second edit"]);
+            std::fs::write(repo.worker.join("second.txt"), "unpublished second edit").unwrap();
+        }
+        assert!(
+            crate::execution_bookmark_recovery::backup_dead_execution(&db, &execution)
+                .await
+                .is_none()
+        );
+        assert!(db.list_attention_items(&execution.id).unwrap().is_empty());
+        assert_eq!(
+            DbBookmarkGate { db: &db, adapter: None }.status(&execution).await,
+            BookmarkStatus::Confirmed
+        );
+        assert_eq!(db.preserved_tip(&execution.id).unwrap().is_some(), has_work);
+        db.mark_execution_orphaned(&execution.id, "worker terminated").unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET finished_at = CAST(unixepoch('now') - 1000 AS TEXT) WHERE id = ?1",
+                [&execution.id],
+            )
+            .unwrap();
+        let coordinator = ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            Arc::new(FakeCubeClient::default()),
+            Arc::new(FakeExecutionRunner::default()),
+        );
+        for _ in 0..2 {
+            crate::abandoned_execution_bookmarks::run_one_pass(&db, &coordinator)
+                .await
+                .unwrap();
+        }
+        let notes = db.list_attention_items(&execution.id).unwrap();
+        assert_eq!(notes.len(), usize::from(has_work));
+        if has_work {
+            assert_eq!(notes[0].kind, crate::abandoned_execution_bookmarks::RECOVERABLE_WORK);
+            assert!(notes[0].body_markdown.contains(&preserved_name(&execution.id)));
+            for file in ["first.txt", "second.txt"] {
+                assert!(
+                    JjRepo::run(
+                        &repo.repo,
+                        &[
+                            "file",
+                            "show",
+                            "-r",
+                            &preserved_name(&execution.id),
+                            &format!("root:{file}")
+                        ]
+                    )
+                    .contains("unpublished")
+                );
+            }
+            // A successor publishes the preserved work while the teardown count
+            // stays frozen on the row; the next scan must resolve, not re-raise.
+            let preserved = preserved_name(&execution.id);
+            // jj refuses to push undescribed commits; describing keeps change ids.
+            JjRepo::run(
+                &repo.repo,
+                &[
+                    "describe",
+                    "-m",
+                    "published work",
+                    &format!("trunk()..bookmarks(exact:\"{preserved}\")"),
+                ],
+            );
+            JjRepo::run(&repo.repo, &["bookmark", "create", "published", "-r", &preserved]);
+            JjRepo::run(
+                &repo.repo,
+                &["git", "push", "--remote", "origin", "-b", "published", "--allow-new"],
+            );
+            assert!(db.preserved_tip(&execution.id).unwrap().unwrap().count > 0);
+            crate::abandoned_execution_bookmarks::run_one_pass(&db, &coordinator)
+                .await
+                .unwrap();
+            let notes = db.list_attention_items(&execution.id).unwrap();
+            assert!(
+                notes.iter().all(
+                    |note| note.kind != crate::abandoned_execution_bookmarks::RECOVERABLE_WORK
+                        || note.status == "resolved"
+                ),
+                "{notes:?}"
+            );
+        }
+    }
+}
 
 #[tokio::test]
 async fn bookmark_creation_failure_is_recorded_before_a_worker_can_start() {
@@ -536,7 +661,8 @@ mod prune_sweep {
     use super::super::helpers::*;
     use crate::execution_bookmark_prune::{BATCH_SIZE, GH_LOOKUPS_PER_PASS, UNPROVEN, run_one_pass};
     use crate::work::{PrOpenState, PrStateChecker, prune_outcome};
-    use boss_engine_recovery::execution_bookmark::{ExecutionBookmark, LocalJj, create};
+    use boss_engine_recovery::execution_bookmark::{ExecutionBookmark, LocalJj};
+    use boss_engine_recovery_fixtures::create;
     use boss_engine_test_git::jj::JjRepo;
     use std::sync::atomic::AtomicUsize;
 

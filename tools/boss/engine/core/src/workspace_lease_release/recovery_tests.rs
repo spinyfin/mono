@@ -23,7 +23,7 @@ async fn fixture(db: &WorkDb, workspace: &Path) -> WorkExecution {
                 .build(),
         )
         .unwrap();
-    let record = execution_bookmark::create(&LocalJj, workspace, &execution.id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, workspace, &execution.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -268,7 +268,7 @@ async fn leftover_sweep_uses_original_heartbeat_after_intervening_holders() {
             repo.worker.to_str().unwrap(),
         )
         .unwrap();
-        let record = execution_bookmark::create(&LocalJj, &repo.worker, &execution.id, "local")
+        let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &execution.id, "local")
             .await
             .unwrap();
         db.record_execution_bookmark(&record).unwrap();
@@ -380,7 +380,7 @@ async fn reaped_worker_preserves_exactly_one_bookmark_only_for_unpushed_work() {
             repo.worker.to_str().unwrap(),
         )
         .unwrap();
-        let record = execution_bookmark::create(&LocalJj, &repo.worker, &execution.id, "local")
+        let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &execution.id, "local")
             .await
             .unwrap();
         db.record_execution_bookmark(&record).unwrap();
@@ -498,7 +498,7 @@ async fn sweep_requires_both_durable_pane_death_and_empty_cwds() {
         repo.worker.to_str().unwrap(),
     )
     .unwrap();
-    let record = execution_bookmark::create(&LocalJj, &repo.worker, &execution.id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &execution.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -584,7 +584,7 @@ async fn sweep_retries_a_cancelled_row_after_a_transient_cube_failure() {
         repo.worker.to_str().unwrap(),
     )
     .unwrap();
-    let record = execution_bookmark::create(&LocalJj, &repo.worker, &execution.id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &execution.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -867,7 +867,7 @@ async fn orphaned_worker(db: &WorkDb, repo: &boss_engine_test_git::jj::JjRepo) -
         repo.worker.to_str().unwrap(),
     )
     .unwrap();
-    let record = execution_bookmark::create(&LocalJj, &repo.worker, &execution.id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &execution.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();

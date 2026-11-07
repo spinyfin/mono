@@ -1556,7 +1556,7 @@ async fn reap_dead_lease_with_workspace(pushed: bool) {
             rusqlite::params![execution_id, repo.worker.to_str().unwrap()],
         )
         .unwrap();
-    let record = recovery::create(&LocalJj, &repo.worker, &execution_id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &execution_id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -1640,7 +1640,7 @@ async fn remote_reap_with_adapter_preserves_unpushed_work() {
             rusqlite::params![execution_id, repo.worker.to_str().unwrap()],
         )
         .unwrap();
-    let record = recovery::create(&LocalJj, &repo.worker, &execution_id, "anaplian")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &execution_id, "anaplian")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -1713,7 +1713,7 @@ async fn reap_after_handoff(holder: &str) {
             rusqlite::params![execution_id, repo.worker.to_str().unwrap()],
         )
         .unwrap();
-    let record = recovery::create(&LocalJj, &repo.worker, &execution_id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &execution_id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -1827,7 +1827,7 @@ async fn heartbeat_reap_never_adopts_an_allow_dirty_successors_edits() {
                 rusqlite::params![execution_id, repo.worker.to_str().unwrap()],
             )
             .unwrap();
-        let record = recovery::create(&LocalJj, &repo.worker, &execution_id, "local")
+        let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &execution_id, "local")
             .await
             .unwrap();
         db.record_execution_bookmark(&record).unwrap();
@@ -1893,7 +1893,7 @@ async fn heartbeat_reap_reports_unsnapshotted_work_without_ownership_evidence() 
             rusqlite::params![execution_id, repo.worker.to_str().unwrap()],
         )
         .unwrap();
-    let record = recovery::create(&LocalJj, &repo.worker, &execution_id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &execution_id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();

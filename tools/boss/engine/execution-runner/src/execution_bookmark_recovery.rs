@@ -1,12 +1,5 @@
-use boss_protocol::WorkExecution;
-
-pub fn worker_instructions(execution: &WorkExecution) -> String {
-    let bookmark = format!("boss-recovery/{}", execution.id);
-    let publication = format!("boss/{}", execution.id);
-    let text = format!(
-        "## Execution recovery bookmark\n\nThe engine created and owns recovery bookmark `{bookmark}` and publication bookmark `{publication}` in the shared jj store for this execution, including revisions. Advance both existing bookmarks to `@` before editing a new change (`jj bookmark set {bookmark} {publication} -r @`). jj follows rewrites of that change automatically. After every `jj new`, `jj commit`, split, squash, rebase, or checkout, advance it again before editing; checkpoint file edits with `jj status` and keep the bookmark at the latest work before ending a turn or stopping. Never delete or push the recovery bookmark. Its separate namespace retains work even when cube cleans up a merged publication bookmark. A revision still publishes only to its existing PR branch; its execution bookmark is a local recovery pointer.\n\nThe engine has already positioned this lease. Inspect its current changes before any checkout; do not reset it to main or re-run PR positioning from generic setup instructions. If you produce nothing, leave the engine-created bookmark in place so an empty run remains distinguishable from a missing recovery pointer.\n\n"
-    );
-    text
+pub fn worker_instructions() -> &'static str {
+    "## Workspace state\n\nThe engine has already positioned this lease. Inspect its current changes before any checkout; do not reset it to main or re-run PR positioning from generic setup instructions. Checkpoint file edits with `jj status` before ending a turn or stopping. The engine preserves unpublished work from the workspace when the execution ends.\n\n"
 }
 
 /// `reconciliation_note` is the persisted [`Reconciliation::note`] when

@@ -1,0 +1,21 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "recovery-fixtures",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "boss_engine_recovery_fixtures",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = [
+        "//tools/boss/engine/completion:__pkg__",
+        "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/host-execution:__pkg__",
+    ],
+    deps = [
+        "//tools/boss/engine/recovery",
+    ] + all_crate_deps(normal = True),
+)

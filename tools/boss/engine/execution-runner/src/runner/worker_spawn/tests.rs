@@ -76,7 +76,9 @@ async fn first_prompt_sizes_by_driver_and_kind() {
                 Some(path) => prompt.replace(&path, "/tmp/prompt-measure/output.json"),
                 None => prompt,
             };
-            assert!(prompt.contains("Execution recovery bookmark"));
+            assert!(prompt.contains("Workspace state"));
+            assert!(!prompt.contains("boss-recovery/"));
+            assert!(!prompt.contains("advance the execution recovery"));
             if kind == ExecutionKind::PrReview {
                 assert!(prompt.starts_with("# PR review"));
             }
@@ -334,7 +336,7 @@ mod compose_worker_spawn_tests {
         .unwrap();
         let prompt = composed.prompt_text;
         let opening = prompt.find("You are a reusable worker").unwrap();
-        let recovery = prompt.find("## Execution recovery bookmark").unwrap();
+        let recovery = prompt.find("## Workspace state").unwrap();
         let notice = prompt.find("Conflict known at dispatch").unwrap();
         assert!(opening < recovery && recovery < notice, "{prompt}");
     }
@@ -1633,7 +1635,7 @@ mod compose_worker_spawn_tests {
             composed.prompt_text
         );
         assert!(
-            !composed.prompt_text.contains("## Execution recovery bookmark"),
+            !composed.prompt_text.contains("## Workspace state"),
             "{}",
             composed.prompt_text
         );

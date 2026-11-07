@@ -1,11 +1,12 @@
 //! Engine-created recovery references in the shared jj repository.
 //!
-//! The worker advances the execution bookmark before editing a new change;
-//! jj itself follows rewrites of the bookmarked change. Recovery never reads
-//! the originating working copy. The baseline is the commit id recorded on the
-//! execution row at dispatch (`pr_head_before` for a bound PR, the trunk commit
-//! for a fresh item), so rewriting or abandoning any bookmark never invalidates
-//! it; published upstream history is excluded when checking for abandoned work.
+//! Teardown preserves unpublished workspace edits; workers create their
+//! publication branch immediately before opening a PR. Legacy recovery
+//! references remain readable so existing records still restore. The baseline
+//! is the commit id recorded on the execution row at dispatch (`pr_head_before`
+//! for a bound PR, the trunk commit for a fresh item), so rewriting or
+//! abandoning any bookmark never invalidates it; published upstream history is
+//! excluded when checking for abandoned work.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -22,7 +23,7 @@ mod preserved;
 mod preserved_tests;
 pub use preserved::{
     BoundaryOwnership, PreserveInspect, PreserveOutcome, PreservedTip, WorkspaceTipSource, preserve, preserve_from,
-    preserved_archive_name, preserved_archive_prefix, preserved_name,
+    preserved_archive_name, preserved_archive_prefix, preserved_name, preserved_work_unpublished,
 };
 mod preserved_restore;
 pub use preserved_restore::restore_preserved;
@@ -515,11 +516,14 @@ pub(crate) async fn resume_heads_of(jj: &dyn Jj, record: &ExecutionBookmark) -> 
     resume_heads(jj, record, &pointers).await
 }
 
-/// Called after positioning, before a worker can run. Existing refs are errors:
-/// retry callers must use their persisted record, never overwrite provenance.
-pub async fn create(jj: &dyn Jj, workspace: &Path, execution_id: &str, host_id: &str) -> Result<ExecutionBookmark> {
-    create_from(jj, workspace, execution_id, host_id, None, None).await
-}
+/// Compatibility fixtures for the pre-migration three-bookmark layout, used only by this
+/// crate's own tests. Other crates use `boss_engine_recovery_fixtures`.
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+pub(crate) use test_support::{
+    create_legacy_three_bookmark_fixture as create, create_legacy_three_bookmark_fixture_from,
+};
 
 /// Pointer initialization failed after identifying the shared store. Dispatch
 /// archives these pointers before creating fresh ones.
@@ -559,22 +563,12 @@ pub async fn create_from(
         pr_head_before: None,
     };
     let result = async {
-        // Existing names are an integrity verdict. Command failures (including
-        // a race creating names after this read) remain retryable.
-        let names = [record.base(), record.head(), record.publication()];
-        let targets = snapshot::resolve_bookmark_targets(jj, &record.repo_path, &names).await?;
-        if !targets.is_empty() {
+        if let Some(prior) = predecessor
+            && (prior.repo_path != record.repo_path || prior.host_id != record.host_id)
+        {
             return Err(pointer_integrity_error(
-                "execution recovery pointer names already exist",
+                "inherited baseline belongs to another recovery store",
             ));
-        }
-        if let Some(prior) = predecessor {
-            if prior.repo_path != record.repo_path || prior.host_id != record.host_id {
-                return Err(pointer_integrity_error(
-                    "inherited baseline belongs to another recovery store",
-                ));
-            }
-            diff(jj, prior).await?;
         }
         // A restore-report, positioned-commit, or `pr_head_before` hash is
         // the floor only when it still exists. A missing hash is not copied:
@@ -588,17 +582,36 @@ pub async fn create_from(
         } else {
             one_commit(jj, workspace, "trunk()").await?
         };
-        jj.run(workspace, &["bookmark", "create", &record.base(), "-r", &baseline])
+        record.base_commit = Some(baseline.clone());
+        // Fresh dispatch records only its starting commit. Retain the legacy
+        // recovery head only when the positioned lease carries unpublished work;
+        // teardown preserves subsequent edits from the workspace itself.
+        let unpublished = jj
+            .run(
+                workspace,
+                &[
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    &format!("({baseline}..@) ~ (::remote_bookmarks() | empty())"),
+                    "-T",
+                    "commit_id",
+                ],
+            )
             .await?;
-        jj.run(
-            workspace,
-            &["bookmark", "create", &record.head(), &record.publication(), "-r", "@"],
-        )
-        .await?;
-        // The bookmark is the convenience; the commit is the baseline's identity.
-        record.base_commit = Some(one_commit(jj, workspace, &baseline).await?);
-        // Validate through the shared store, not the workspace we just positioned.
-        diff(jj, &record).await?;
+        if !unpublished.trim().is_empty() {
+            // Only the recovery head is created here. A leftover baseline or
+            // publication name from a partial legacy initialization is not a
+            // conflict: dispatch neither writes nor needs those names.
+            let targets = snapshot::resolve_bookmark_targets(jj, &record.repo_path, &[record.head()]).await?;
+            if !targets.is_empty() {
+                return Err(pointer_integrity_error(
+                    "execution recovery pointer names already exist",
+                ));
+            }
+            jj.run(workspace, &["bookmark", "create", &record.head(), "-r", "@"])
+                .await?;
+        }
         Ok(record.clone())
     }
     .await;

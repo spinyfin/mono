@@ -762,6 +762,7 @@ dependencies = [
  "boss-engine-live-worker-state",
  "boss-engine-proposal-validation",
  "boss-engine-recovery",
+ "boss-engine-recovery-fixtures",
  "boss-engine-storage-values",
  "boss-engine-structured-output",
  "boss-engine-test-git",
@@ -1053,6 +1054,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-engine-recovery-fixtures"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "boss-engine-recovery",
+]
+
+[[package]]
 name = "boss-engine-runtime"
 version = "0.1.0"
 dependencies = [
@@ -1089,6 +1098,7 @@ dependencies = [
  "boss-engine-offsite-backup",
  "boss-engine-planner-validation",
  "boss-engine-recovery",
+ "boss-engine-recovery-fixtures",
  "boss-engine-stdout-progress",
  "boss-engine-storage-values",
  "boss-engine-structured-output",
@@ -1415,6 +1425,7 @@ dependencies = [
  "bon",
  "boss-engine-driver",
  "boss-engine-recovery",
+ "boss-engine-recovery-fixtures",
  "boss-engine-test-git",
  "boss-engine-utils",
  "boss-protocol",

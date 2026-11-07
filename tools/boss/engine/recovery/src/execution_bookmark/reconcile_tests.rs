@@ -88,9 +88,10 @@ pub(super) async fn revision_on_pr_head(execution_id: &str) -> Scene {
     JjRepo::run(&repo.worker, &["new", "-m", "Revision work"]);
     // Dispatch records the bound PR's head as the floor.
     let pr_head = one(&repo.repo, "pr/7");
-    let record = create_from(&LocalJj, &repo.worker, execution_id, "local", None, Some(&pr_head))
-        .await
-        .unwrap();
+    let record =
+        create_legacy_three_bookmark_fixture_from(&LocalJj, &repo.worker, execution_id, "local", None, Some(&pr_head))
+            .await
+            .unwrap();
     std::fs::write(repo.worker.join("revision.txt"), "revision work\n").unwrap();
     JjRepo::run(&repo.worker, &["status"]);
     JjRepo::run(&repo.repo, &["new", "main", "-m", "Main advances"]);

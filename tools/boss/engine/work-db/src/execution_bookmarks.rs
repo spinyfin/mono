@@ -335,6 +335,29 @@ impl WorkDb {
             .optional()?)
     }
 
+    /// The execution whose recovery state a dispatch of `execution` consumes:
+    /// `execution` itself when it already has a preserved tip or a live
+    /// record (a retry), otherwise its recovery predecessor. Both dispatch
+    /// recovery and host placement start from this one lookup.
+    pub fn recovery_source(&self, execution: &WorkExecution) -> Result<Option<RecoverySource>> {
+        if execution.kind.is_read_only_review() {
+            return Ok(None);
+        }
+        let own_tip = self.preserved_tip(&execution.id)?.is_some();
+        let source = if own_tip || self.execution_bookmark_optional(&execution.id)?.is_some() {
+            execution.clone()
+        } else if let Some(prior) = self.recovery_predecessor(execution)? {
+            prior
+        } else {
+            return Ok(None);
+        };
+        let has_preserved_tip = own_tip || self.preserved_tip(&source.id)?.is_some();
+        Ok(Some(RecoverySource {
+            execution: source,
+            has_preserved_tip,
+        }))
+    }
+
     /// Resolve the predecessor by recorded execution identity alone. Workspace
     /// preferences, lease ownership, and filesystem existence are irrelevant.
     ///
@@ -373,6 +396,14 @@ impl WorkDb {
         let prior = query_execution(&conn, &id)?.context("recovery predecessor disappeared")?;
         Ok(prior.status.is_terminal().then_some(prior))
     }
+}
+
+/// The execution a dispatch recovers from, and whether it carries a recorded
+/// preserved tip (restorable unpublished work).
+#[derive(Debug, Clone)]
+pub struct RecoverySource {
+    pub execution: WorkExecution,
+    pub has_preserved_tip: bool,
 }
 
 /// Where the prune sweep left a record. Stored in
@@ -526,9 +557,15 @@ impl WorkDb {
             archives,
             (
                 "Recovery source retired; starting fresh",
-                &format!(
-                    "Execution `{next_id}` starts fresh from an open PR, trunk, or the captured immutable review target. No action is required."
-                ),
+                &if archives.is_empty() {
+                    format!(
+                        "Execution `{next_id}` starts fresh from an open PR, trunk, or the captured immutable review target. No action is required."
+                    )
+                } else {
+                    format!(
+                        "Execution `{next_id}` starts fresh from an open PR, trunk, or the captured immutable review target. Any unpublished work from the retired source remains at the archive bookmarks listed above; inspect them if that work is still wanted."
+                    )
+                },
             ),
         )
     }

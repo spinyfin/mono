@@ -488,6 +488,48 @@ async fn tip_of(jj: &dyn Jj, repo: &Path, commit: &str) -> Result<PreservedTip> 
     })
 }
 
+/// Whether the preserved work still holds non-empty changes that no remote
+/// bookmark carries. Changes are matched by change id, so work a successor
+/// restored, rebased and published no longer counts. Lost or hidden work is
+/// not recoverable and reports false.
+pub async fn preserved_work_unpublished(
+    jj: &dyn Jj,
+    record: &ExecutionBookmark,
+    recorded: &PreservedTip,
+) -> Result<bool> {
+    let repo = &record.repo_path;
+    let pointer = log(
+        jj,
+        repo,
+        &revision(&preserved_name(&record.execution_id)),
+        "commit_id ++ \"\\n\"",
+    )
+    .await?;
+    let mut tips: Vec<String> = pointer.lines().filter(|id| !id.is_empty()).map(str::to_owned).collect();
+    if tips.is_empty()
+        && let RecordedPresence::Visible(visible) = resolve_recorded_presence(jj, repo, recorded).await?
+    {
+        tips = visible.lines().filter(|id| !id.is_empty()).map(str::to_owned).collect();
+    }
+    if tips.is_empty() {
+        return Ok(false);
+    }
+    let changes = log(
+        jj,
+        repo,
+        &unpublished(&format!("({})", tips.join("|"))),
+        "change_id ++ \"\\n\"",
+    )
+    .await?;
+    for change in changes.lines().filter(|id| !id.is_empty()) {
+        let published = log_change(jj, repo, &format!("{} & ::remote_bookmarks()", change_revset(change))).await?;
+        if published.trim().is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(super) fn is_missing_revision_error(err: &anyhow::Error) -> bool {
     let text = format!("{err:#}").to_ascii_lowercase();
     text.contains("no such revision")

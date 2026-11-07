@@ -1522,6 +1522,12 @@ pub trait HostAdapter: Send + Sync {
         bail!("preserved work restoration is not supported by this host adapter")
     }
 
+    /// Whether the preserved tip still has unpublished, non-empty changes.
+    async fn preserved_work_unpublished(&self, record: &ExecutionBookmark, recorded: &PreservedTip) -> Result<bool> {
+        let _ = (record, recorded);
+        bail!("preserved work inspection is not supported by this host adapter")
+    }
+
     async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {
         let _ = record;
         bail!("execution bookmark inspection is not supported by this host adapter")

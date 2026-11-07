@@ -2390,7 +2390,7 @@ mod tests {
         use boss_engine_recovery::execution_bookmark::{self as recovery, Jj, LocalJj};
         let root = tempfile::tempdir().unwrap();
         let repo = boss_engine_test_git::jj::JjRepo::new(root.path());
-        let record = recovery::create(&LocalJj, &repo.worker, "exec_test", "host")
+        let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, "exec_test", "host")
             .await
             .unwrap();
         std::fs::write(repo.worker.join("work.txt"), "preserved work").unwrap();
@@ -2534,13 +2534,13 @@ mod tests {
             cube,
             host_id: "host".into(),
         };
+        std::fs::write(repo.worker.join("preserved.txt"), "survives workspace removal").unwrap();
+        LocalJj.run(&repo.worker, &["status"]).await.unwrap();
         let result = executor.execute(&command(op(Kind::CreateBookmark)), false, 1).await;
         assert_eq!(result.code, v1::ResultCode::Ok as i32, "{}", result.reason);
         let Some(command_result::Value::Workspace(created)) = result.value else {
             panic!("missing bookmark result")
         };
-        std::fs::write(repo.worker.join("preserved.txt"), "survives workspace removal").unwrap();
-        LocalJj.run(&repo.worker, &["status"]).await.unwrap();
         LocalJj
             .run(&repo.repo, &["workspace", "forget", "worker"])
             .await
@@ -2597,6 +2597,11 @@ mod tests {
         };
         std::fs::write(repo.worker.join("work.txt"), "worker edit").unwrap();
         LocalJj.run(&repo.worker, &["status"]).await.unwrap();
+        // Dispatch creates no publication branch; create it as a worker does before publishing.
+        LocalJj
+            .run(&repo.worker, &["bookmark", "set", "boss/exec_test", "-r", "@"])
+            .await
+            .unwrap();
         for anchor in [String::new(), "0123456789abcdef0123456789abcdef01234567".to_owned()] {
             let mut bookmark = created.bookmark.clone().unwrap();
             bookmark.anchor_commit = anchor;
@@ -2701,7 +2706,7 @@ mod recovery_tests {
         for interrupt in [false, true] {
             let root = tempfile::tempdir().unwrap();
             let repo = boss_engine_test_git::jj::JjRepo::new(root.path());
-            let record = recovery::create(&LocalJj, &repo.worker, "exec_test", "host")
+            let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, "exec_test", "host")
                 .await
                 .unwrap();
             let saved = recovery::snapshot_pointers(&LocalJj, &record).await.unwrap();
@@ -2792,13 +2797,13 @@ mod recovery_tests {
             cube,
             host_id: "host".into(),
         };
+        std::fs::write(repo.worker.join("work.txt"), "preserved").unwrap();
+        LocalJj.run(&repo.worker, &["status"]).await.unwrap();
         let created = executor.execute(&command(op(Kind::CreateBookmark)), false, 1).await;
         assert_eq!(created.code, v1::ResultCode::Ok as i32, "{}", created.reason);
         let Some(command_result::Value::Workspace(created)) = created.value else {
             panic!("missing bookmark")
         };
-        std::fs::write(repo.worker.join("work.txt"), "preserved").unwrap();
-        LocalJj.run(&repo.worker, &["status"]).await.unwrap();
         for kind in [Kind::CheckpointBaseline, Kind::ReconcileBookmark, Kind::RestoreBookmark] {
             let mut request = op(kind);
             request.bookmark = created.bookmark.clone();

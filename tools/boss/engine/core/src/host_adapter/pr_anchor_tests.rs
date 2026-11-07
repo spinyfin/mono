@@ -84,9 +84,10 @@ async fn scene(dir: &Path, conflicted: bool, restore: bool) -> (Store, Execution
     JjRepo::run(&repo.worker, &["bookmark", "set", "published", "pr/7"]);
     let head = one(&repo.repo, "published");
     JjRepo::run(&repo.worker, &["new", "-m", "Revision"]);
-    let record = execution_bookmark::create_from(&LocalJj, &repo.worker, "exec_adapter", "local", None, Some(&head))
-        .await
-        .unwrap();
+    let record =
+        boss_engine_recovery_fixtures::create_from(&LocalJj, &repo.worker, "exec_adapter", "local", None, Some(&head))
+            .await
+            .unwrap();
     JjRepo::run(&repo.repo, &["new", "main", "-m", "Main advances"]);
     std::fs::write(repo.repo.join("toolchain.txt"), "new baseline\n").unwrap();
     JjRepo::run(&repo.repo, &["bookmark", "set", "main"]);

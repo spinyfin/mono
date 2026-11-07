@@ -1013,7 +1013,7 @@ async fn preempted_automation_work_redispatches_once_capacity_frees() {
     // Only the preempted execution crosses the real recovery boundary in
     // this scheduler test. Give that fake dispatch a real empty reference;
     // unrelated slot allocation must not wait on concurrent jj processes.
-    let record = boss_engine_recovery::execution_bookmark::create(
+    let record = boss_engine_recovery_fixtures::create(
         &boss_engine_recovery::execution_bookmark::LocalJj,
         &repo.worker,
         &spilled_execution_id,

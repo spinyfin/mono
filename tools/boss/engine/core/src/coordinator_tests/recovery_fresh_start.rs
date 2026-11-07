@@ -73,7 +73,7 @@ async fn fresh_start_on_host(kind: ExecutionKind, resume: bool, pr: bool, disabl
     let source = if resume { next.id.clone() } else { prior.id.clone() };
     let repo = JjRepo::new(dir.path());
     super::recovery::configure_recovery_origin(&repo.repo);
-    let record = recovery::create(&LocalJj, &repo.worker, &source, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &source, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -84,6 +84,9 @@ async fn fresh_start_on_host(kind: ExecutionKind, resume: bool, pr: bool, disabl
     std::fs::write(repo.repo.join("shared.txt"), "current published work\n").unwrap();
     JjRepo::run(&repo.repo, &["bookmark", "set", "pr/99", "-r", "@"]);
     let current = commit(&repo.repo, "@");
+    if pr {
+        db.set_execution_pr_head_before(&next.id, &current).unwrap();
+    }
     if !disabled_source {
         // Two concurrent operations move the recovery head to different
         // commits, leaving the bookmark conflicted: a genuine integrity failure
@@ -200,7 +203,20 @@ async fn fresh_start_on_host(kind: ExecutionKind, resume: bool, pr: bool, disabl
     if !pr {
         assert_ne!(commit(&repo.repo, "main"), expected);
     }
-    assert!(recovery::diff(&LocalJj, &fresh).await.unwrap().is_empty());
+    assert!(
+        JjRepo::run(
+            &repo.repo,
+            &["bookmark", "list", &fresh.base(), &fresh.head(), &fresh.publication()]
+        )
+        .is_empty()
+    );
+    assert!(
+        JjRepo::run(
+            &repo.replacement,
+            &["diff", "--git", "--from", fresh.base_commit.as_deref().unwrap()]
+        )
+        .is_empty()
+    );
     // Scheduler passes must not refire the running attempt or lease again.
     for _ in 0..3 {
         coordinator.drain_ready_queue_for_test().await;
@@ -347,6 +363,7 @@ impl crate::host_adapter::HostAdapterProvider for ScratchHostProvider {
         }
         Ok(Arc::new(ScratchDestination {
             inner: self.local.clone(),
+            host_id: host.id.clone(),
         }))
     }
 }
@@ -357,7 +374,7 @@ async fn unreachable_source_transport_retries_without_retiring_source() {
 }
 
 #[tokio::test]
-async fn full_remote_source_waits_without_retiring_recoverable_work() {
+async fn full_remote_source_does_not_pin_dispatch_to_its_occupied_slot() {
     source_host_dispatch(true).await;
 }
 
@@ -392,7 +409,7 @@ async fn source_host_dispatch(full: bool) {
     let next = db.get_execution(&next.id).unwrap();
     let repo = JjRepo::new(dir.path());
     super::recovery::configure_recovery_origin(&repo.repo);
-    let record = recovery::create(&LocalJj, &repo.worker, &prior.id, "source")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "source")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -421,25 +438,22 @@ async fn source_host_dispatch(full: bool) {
     let result = coordinator
         .schedule_execution_for_test(&next, &worker, DispatchAdmission::Queued)
         .await;
-    if full {
-        let err = result.unwrap_err();
-        assert!(format!("{err:#}").contains("no free slot"), "{err:#}");
-        assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
-        assert!(db.execution_bookmark_retired_reason(&prior.id).unwrap().is_none());
-        assert!(cube.lease_calls.lock().await.is_empty());
-    } else {
-        let error = result.unwrap_err();
-        assert!(
-            format!("{error:#}").contains("source transport unavailable"),
-            "{error:#}"
-        );
-        let next = db.get_execution(&next.id).unwrap();
-        assert!(next.started_at.is_none());
-        assert_eq!(next.pre_start_failure_count, 1);
-        assert!(next.dispatch_not_before.is_some());
-        assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
-        assert!(db.execution_bookmark_retired_reason(&prior.id).unwrap().is_none());
-    }
+    let error = result.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("source transport unavailable"),
+        "{error:#}"
+    );
+    assert_eq!(
+        cube.lease_calls.lock().await.len(),
+        1,
+        "dispatch chose an available host"
+    );
+    let next = db.get_execution(&next.id).unwrap();
+    assert!(next.started_at.is_none());
+    assert_eq!(next.pre_start_failure_count, 1);
+    assert!(next.dispatch_not_before.is_some());
+    assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
+    assert!(db.execution_bookmark_retired_reason(&prior.id).unwrap().is_none());
     for name in [record.head(), record.publication()] {
         assert_eq!(commit(&repo.repo, &name), old);
     }
@@ -452,6 +466,103 @@ async fn source_host_dispatch(full: bool) {
     );
 }
 
+#[tokio::test]
+async fn free_recovery_source_host_is_preferred_over_another_eligible_host() {
+    let dir = tempdir().unwrap();
+    let (db, prior, next) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
+    seed_local_claude_driver(&db);
+    db.add_host("destination", "user@destination", 2, &[]).unwrap();
+    db.add_host("source", "user@source", 2, &[]).unwrap();
+    for host in ["destination", "source"] {
+        crate::test_support::insert_host_capability(&db, host, "driver=claude", "auto");
+    }
+    db.set_host_enabled("local", false).unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET kind = 'task_implementation' WHERE id IN (?1, ?2)",
+            rusqlite::params![prior.id, next.id],
+        )
+        .unwrap();
+    let next = db.get_execution(&next.id).unwrap();
+    let repo = JjRepo::new(dir.path());
+    super::recovery::configure_recovery_origin(&repo.repo);
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "source")
+        .await
+        .unwrap();
+    db.record_execution_bookmark(&record).unwrap();
+    std::fs::write(repo.worker.join("work.txt"), "intact source work").unwrap();
+    JjRepo::run(&repo.worker, &["status"]);
+    // Only a source with recorded preserved work expresses a host preference.
+    let tip = recovery::preserve(&LocalJj, &record, &repo.worker, None, None)
+        .await
+        .unwrap()
+        .tip
+        .unwrap();
+    db.record_preserved_tip(&prior.id, &tip).unwrap();
+    let cube = Arc::new(FakeCubeClient {
+        real_bookmarks: true,
+        position_real_workspace: true,
+        workspace_root: Some(dir.path().to_owned()),
+        next_workspace_id: Mutex::new(Some("replacement".into())),
+        ..Default::default()
+    });
+    let chosen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut coordinator = ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        cube.clone(),
+        Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..Default::default()
+        }),
+    );
+    coordinator.set_host_adapter_provider(Arc::new(ChosenHostProvider {
+        inner: coordinator.host_adapter(),
+        chosen: Arc::clone(&chosen),
+    }));
+    let coordinator = Arc::new(coordinator);
+    let worker = coordinator.worker_pool().claim_worker(&next.id, None).await.unwrap();
+    coordinator
+        .schedule_execution_for_test(&next, &worker, DispatchAdmission::Queued)
+        .await
+        .unwrap();
+    assert_eq!(*chosen.lock().await, vec!["source".to_owned()]);
+    assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
+    assert!(db.execution_bookmark_retired_reason(&prior.id).unwrap().is_none());
+    assert!(
+        JjRepo::run(
+            &repo.repo,
+            &["bookmark", "list", &format!("glob:preserved-archive/{}/*", prior.id)]
+        )
+        .is_empty()
+    );
+    assert!(
+        db.list_attention_items_for_work_item(&db.owning_work_item_id(&next.work_item_id))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+struct ChosenHostProvider {
+    inner: Arc<dyn crate::host_adapter::HostAdapter>,
+    chosen: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl crate::host_adapter::HostAdapterProvider for ChosenHostProvider {
+    async fn adapter_for(
+        &self,
+        host: &crate::host_registry::Host,
+    ) -> Result<Arc<dyn crate::host_adapter::HostAdapter>> {
+        self.chosen.lock().await.push(host.id.clone());
+        Ok(Arc::new(ScratchDestination {
+            inner: self.inner.clone(),
+            host_id: host.id.clone(),
+        }))
+    }
+}
+
 struct UnreachableSourceProvider(Arc<dyn crate::host_adapter::HostAdapter>);
 
 #[async_trait]
@@ -461,7 +572,10 @@ impl crate::host_adapter::HostAdapterProvider for UnreachableSourceProvider {
         host: &crate::host_registry::Host,
     ) -> Result<Arc<dyn crate::host_adapter::HostAdapter>> {
         anyhow::ensure!(host.id == "destination", "source transport unavailable");
-        Ok(Arc::new(ScratchDestination { inner: self.0.clone() }))
+        Ok(Arc::new(ScratchDestination {
+            inner: self.0.clone(),
+            host_id: host.id.clone(),
+        }))
     }
 }
 
@@ -481,7 +595,7 @@ async fn stale_current_names_retry_adoption_without_retiring_valid_predecessor()
     let (db, prior, next) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
     let repo = JjRepo::new(dir.path());
     super::recovery::configure_recovery_origin(&repo.repo);
-    let source = recovery::create(&LocalJj, &repo.worker, &prior.id, "local")
+    let source = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&source).unwrap();
@@ -489,7 +603,7 @@ async fn stale_current_names_retry_adoption_without_retiring_valid_predecessor()
     JjRepo::run(&repo.worker, &["status"]);
     let head = commit(&repo.repo, &source.head());
     JjRepo::run(&repo.replacement, &["new", &head, "-m", "Recovered"]);
-    let stale = recovery::create(&LocalJj, &repo.replacement, &next.id, "local")
+    let stale = boss_engine_recovery_fixtures::create(&LocalJj, &repo.replacement, &next.id, "local")
         .await
         .unwrap();
     std::fs::write(repo.replacement.join("stale.txt"), "distinct stale work").unwrap();
@@ -630,7 +744,7 @@ async fn startup_pane_resume_archives_damaged_pointers_and_spawns() {
     seed_local_claude_driver(&db);
     let repo = JjRepo::new(dir.path());
     super::recovery::configure_recovery_origin(&repo.repo);
-    let record = recovery::create(&LocalJj, &repo.worker, &next.id, "local")
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &next.id, "local")
         .await
         .unwrap();
     db.record_execution_bookmark(&record).unwrap();
@@ -686,7 +800,20 @@ async fn startup_pane_resume_archives_damaged_pointers_and_spawns() {
     assert_eq!(commit(&repo.repo, &format!("preserved-archive/{}/{old}", next.id)), old);
     let fresh = db.execution_bookmark(&next.id).unwrap();
     assert_eq!(fresh.base_commit, Some(commit(&repo.repo, "main")));
-    assert!(recovery::diff(&LocalJj, &fresh).await.unwrap().is_empty());
+    assert!(
+        JjRepo::run(
+            &repo.repo,
+            &["bookmark", "list", &fresh.base(), &fresh.head(), &fresh.publication()]
+        )
+        .is_empty()
+    );
+    assert!(
+        JjRepo::run(
+            &repo.replacement,
+            &["diff", "--git", "--from", fresh.base_commit.as_deref().unwrap()]
+        )
+        .is_empty()
+    );
     assert!(!repo.worker.join("work.txt").exists());
     for _ in 0..100 {
         if !runner.calls.lock().await.is_empty() {
@@ -698,12 +825,12 @@ async fn startup_pane_resume_archives_damaged_pointers_and_spawns() {
 }
 
 #[tokio::test]
-async fn partial_pointer_initialization_archives_before_recreating_the_names() {
+async fn leftover_pointer_names_do_not_archive_empty_initialization() {
     initialization_fallback(false).await;
 }
 
 #[tokio::test]
-async fn inherited_baseline_adoption_failure_archives_and_starts_fresh() {
+async fn staged_work_survives_a_later_conflict_in_the_predecessor_bookmark() {
     initialization_fallback(true).await;
 }
 
@@ -729,7 +856,7 @@ async fn initialization_fallback(inherited: bool) {
     let source_id = if inherited { &source.id } else { &next.id };
     let repo = JjRepo::new(dir.path());
     super::recovery::configure_recovery_origin(&repo.repo);
-    let prior = recovery::create(&LocalJj, &repo.worker, source_id, "local")
+    let prior = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, source_id, "local")
         .await
         .unwrap();
     std::fs::write(repo.worker.join("lost.txt"), "keep this work").unwrap();
@@ -794,26 +921,63 @@ async fn initialization_fallback(inherited: bool) {
             )
             .await
             .unwrap();
-        assert!(!retained);
-        fresh
+        assert!(retained);
+        assert_eq!(fresh.base_commit, prior.base_commit);
+        assert!(repo.replacement.join("lost.txt").exists());
+        assert!(
+            recovery::diff(&LocalJj, &fresh)
+                .await
+                .unwrap()
+                .contains("keep this work")
+        );
+        assert!(
+            db.list_attention_items_for_work_item(&next.work_item_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            recovery::diff(&LocalJj, &prior).await.is_err(),
+            "the conflicted predecessor was left intact"
+        );
+        return;
     };
-    assert_eq!(fresh.base_commit.unwrap(), commit(&repo.repo, "main"));
-    assert!(!repo.replacement.join("lost.txt").exists());
-    assert_eq!(commit(&repo.repo, &format!("preserved-archive/{source_id}/{old}")), old);
-    assert_eq!(
-        db.list_attention_items_for_work_item(&next.work_item_id).unwrap()[0].status,
-        "resolved"
+    // Leftover names from a crash between writing refs and inserting the
+    // row are not an integrity failure when the positioned workspace has
+    // no unpublished range above its floor. Initialization records that
+    // floor and leaves the leftover names in place.
+    assert_eq!(fresh.base_commit.as_deref(), Some(old.as_str()));
+    assert!(repo.replacement.join("lost.txt").exists());
+    assert!(
+        JjRepo::run(
+            &repo.repo,
+            &["bookmark", "list", &format!("glob:preserved-archive/{}/*", source_id)]
+        )
+        .is_empty()
+    );
+    assert!(
+        db.list_attention_items_for_work_item(&next.work_item_id)
+            .unwrap()
+            .is_empty()
     );
 }
 
 struct ScratchDestination {
     inner: Arc<dyn crate::host_adapter::HostAdapter>,
+    host_id: String,
+}
+
+impl ScratchDestination {
+    fn on_inner_store(&self, record: &recovery::ExecutionBookmark) -> recovery::ExecutionBookmark {
+        let mut record = record.clone();
+        record.host_id = self.inner.host_id().to_owned();
+        record
+    }
 }
 
 #[async_trait]
 impl crate::host_adapter::HostAdapter for ScratchDestination {
     fn host_id(&self) -> &str {
-        "destination"
+        &self.host_id
     }
     async fn start_fresh_workspace(&self, workspace: &Path) -> Result<String> {
         self.inner.start_fresh_workspace(workspace).await
@@ -823,7 +987,9 @@ impl crate::host_adapter::HostAdapter for ScratchDestination {
         record: &recovery::ExecutionBookmark,
         release_names: bool,
     ) -> Result<Vec<(String, String)>> {
-        self.inner.release_execution_bookmark_heads(record, release_names).await
+        self.inner
+            .release_execution_bookmark_heads(&self.on_inner_store(record), release_names)
+            .await
     }
     async fn create_execution_bookmark(
         &self,
@@ -832,12 +998,96 @@ impl crate::host_adapter::HostAdapter for ScratchDestination {
         predecessor: Option<&recovery::ExecutionBookmark>,
         inherited_base: Option<&str>,
     ) -> Result<recovery::ExecutionBookmark> {
+        let predecessor = predecessor.map(|record| self.on_inner_store(record));
         let mut record = self
             .inner
-            .create_execution_bookmark(workspace, execution_id, predecessor, inherited_base)
+            .create_execution_bookmark(workspace, execution_id, predecessor.as_ref(), inherited_base)
             .await?;
-        record.host_id = "destination".into();
+        record.host_id = self.host_id.clone();
         Ok(record)
+    }
+
+    async fn execution_bookmark_diff(&self, record: &recovery::ExecutionBookmark) -> Result<String> {
+        self.inner.execution_bookmark_diff(&self.on_inner_store(record)).await
+    }
+
+    async fn restore_execution_bookmark(
+        &self,
+        record: &recovery::ExecutionBookmark,
+        workspace: &Path,
+        self_retry: bool,
+    ) -> Result<bool> {
+        self.inner
+            .restore_execution_bookmark(&self.on_inner_store(record), workspace, self_retry)
+            .await
+    }
+
+    async fn restore_rebased_execution_bookmark(
+        &self,
+        record: &recovery::ExecutionBookmark,
+        workspace: &Path,
+        pr_bookmark: Option<&str>,
+        base_branch: &str,
+    ) -> Result<recovery::RestoreReport> {
+        self.inner
+            .restore_rebased_execution_bookmark(&self.on_inner_store(record), workspace, pr_bookmark, base_branch)
+            .await
+    }
+
+    async fn restore_preserved_work(
+        &self,
+        record: &recovery::ExecutionBookmark,
+        workspace: &Path,
+        recorded: Option<&recovery::PreservedTip>,
+    ) -> Result<Option<recovery::RestoreReport>> {
+        self.inner
+            .restore_preserved_work(&self.on_inner_store(record), workspace, recorded)
+            .await
+    }
+
+    async fn confirm_workspace_recovery(
+        &self,
+        record: &recovery::ExecutionBookmark,
+        workspace: &Path,
+        recorded: Option<&recovery::PreservedTip>,
+        since_unix: Option<i64>,
+    ) -> Result<recovery::PreserveOutcome> {
+        self.inner
+            .confirm_workspace_recovery(&self.on_inner_store(record), workspace, recorded, since_unix)
+            .await
+    }
+
+    async fn prepare_recovery_pr(
+        &self,
+        record: &recovery::ExecutionBookmark,
+        workspace: &Path,
+        repo_id: &str,
+        pr: u64,
+    ) -> Result<bool> {
+        self.inner
+            .prepare_recovery_pr(&self.on_inner_store(record), workspace, repo_id, pr)
+            .await
+    }
+
+    async fn discard_orphaned_execution_baseline(&self, record: &recovery::ExecutionBookmark) -> Result<()> {
+        self.inner
+            .discard_orphaned_execution_baseline(&self.on_inner_store(record))
+            .await
+    }
+
+    async fn prune_execution_bookmark(
+        &self,
+        record: &recovery::ExecutionBookmark,
+        vouchers: &[recovery::Voucher],
+        trunk: &str,
+    ) -> Result<recovery::PruneOutcome> {
+        self.inner
+            .prune_execution_bookmark(&self.on_inner_store(record), vouchers, trunk)
+            .await
+    }
+
+    async fn recovery_pr_base(&self, origin: &str, pr: u64) -> Result<String> {
+        self.inner.recovery_pr_base(origin, pr).await
     }
     async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle> {
         self.inner.ensure_repo(origin).await

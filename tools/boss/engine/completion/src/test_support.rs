@@ -74,7 +74,7 @@ pub fn declare_no_changes_needed(db: &WorkDb, execution_id: &str) {
 pub async fn seed_empty_execution_bookmark(db: &WorkDb, execution_id: &str) -> TempDir {
     let root = tempfile::tempdir().unwrap();
     let repo = boss_engine_test_git::jj::JjRepo::new(root.path());
-    let record = boss_engine_recovery::execution_bookmark::create(
+    let record = boss_engine_recovery_fixtures::create(
         &boss_engine_recovery::execution_bookmark::LocalJj,
         &repo.worker,
         execution_id,

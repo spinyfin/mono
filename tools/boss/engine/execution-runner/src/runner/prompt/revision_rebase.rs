@@ -31,7 +31,7 @@ pub(super) const REBASE_FIRST: &str = r#"
 "$CUBE_BIN" workspace local-rebase --pr <bound-pr-number> --json
 ```
 
-This resolves the actual GitHub remote and the PR's actual base branch (including a parent PR branch for stacked PRs), fetches that remote, and rebases the preserved working-copy history onto the freshly fetched tracking ref. It preserves published `pr/<n>` bookmarks and never publishes, repositions the working copy, or collapses commits. Do not use plain `"$CUBE_BIN" workspace rebase`: it can push immediately or collapse intermediate commits. Advance both execution recovery bookmarks after the rebase.
+This resolves the actual GitHub remote and the PR's actual base branch (including a parent PR branch for stacked PRs), fetches that remote, and rebases the preserved working-copy history onto the freshly fetched tracking ref. It preserves published `pr/<n>` bookmarks and never publishes, repositions the working copy, or collapses commits. Do not use plain `"$CUBE_BIN" workspace rebase`: it can push immediately or collapse intermediate commits.
 
 Resolve every conflicted commit from the base upward, integrating the PR's intent and the base branch's changes. Never take either side wholesale, drop commits, squash, or reword existing descriptions. Use full commit ids to identify conflicted ancestors without divergent change-id ambiguity. Keep a local bookmark on the rebased working-copy tip before editing any ancestor, and return via that bookmark after resolving: descendants get new commit ids, while the bookmark follows those rewrites. Never return to a pre-resolution commit id. Check every commit:
 

@@ -33,11 +33,12 @@ Compared to the other terminal statuses:
 - `orphaned`: the row had a live worker once; the engine no longer
   has signal that it does.
 
-**Lease handling:** resume reads preserved work from
-`boss-recovery/<execution>` bookmarks in the shared jj store, not from
-the originating workspace. After an orphan is recorded, the engine
-releases the cube lease once the recovery bookmark preserves the current
-workspace commit, the pane is confirmed gone, and no process has its cwd
+**Lease handling:** resume reads preserved work from the
+`preserved/<execution>` bookmark in the shared jj store (or, for a legacy
+execution, its `boss-recovery/<execution>` head), not from the originating
+workspace. After an orphan is recorded, the engine releases the cube lease
+once teardown has preserved the current workspace commit (or found nothing
+unpublished to preserve), the pane is confirmed gone, and no process has its cwd
 inside the workspace. Inconclusive probes keep the lease held, with cube's
 24-hour TTL as the backstop. A release attempt atomically claims
 `cube_lease_id` before calling cube; a genuine failure restores the claim.

@@ -628,7 +628,7 @@ mod tests {
         let exec = parked_triage_execution(&db, &automation, repo.worker.to_str().unwrap(), "local");
         seed_dispatch_run(&db, &automation, &exec.id, 1_700_000_000);
         // The journaled working copy lives in the shared store after the directory is lost.
-        let record = boss_engine_recovery::execution_bookmark::create(
+        let record = boss_engine_recovery_fixtures::create(
             &boss_engine_recovery::execution_bookmark::LocalJj,
             &repo.worker,
             &exec.id,
