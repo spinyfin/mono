@@ -32,6 +32,7 @@ rust_library(
         "//tools/boss/engine/host-enrollment:__pkg__",
         "//tools/boss/engine/host-execution:__pkg__",
         "//tools/boss/engine/spoke:__pkg__",
+        "//tools/boss/engine/spoke-adapter:__pkg__",
         "//tools/boss/engine/spoke-journal:__pkg__",
         "//tools/boss/engine/spoke-outbound:__pkg__",
         "//tools/boss/engine/spoke-stream:__pkg__",

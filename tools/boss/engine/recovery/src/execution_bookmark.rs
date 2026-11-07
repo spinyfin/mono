@@ -22,8 +22,9 @@ mod preserved;
 #[cfg(test)]
 mod preserved_tests;
 pub use preserved::{
-    BoundaryOwnership, PreserveInspect, PreserveOutcome, PreservedTip, WorkspaceTipSource, preserve, preserve_from,
-    preserved_archive_name, preserved_archive_prefix, preserved_name, preserved_work_unpublished,
+    BoundaryOwnership, HostRecoveryRequest, PreserveInspect, PreserveOutcome, PreservedTip, WorkspaceTipSource,
+    preserve, preserve_from, preserved_archive_name, preserved_archive_prefix, preserved_name,
+    preserved_work_unpublished,
 };
 mod preserved_restore;
 pub use preserved_restore::restore_preserved;

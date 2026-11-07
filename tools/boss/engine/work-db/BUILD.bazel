@@ -20,6 +20,7 @@ rust_library(
         "//tools/boss/engine/merge-poller:__pkg__",
         "//tools/boss/engine/observation-contracts:__pkg__",
         "//tools/boss/engine/pane-summary:__pkg__",
+        "//tools/boss/engine/spoke-adapter:__pkg__",
     ],
     deps = [
         "//lib/rust/git_utils",
@@ -67,6 +68,7 @@ rust_library(
         "//tools/boss/engine/merge-poller:__pkg__",
         "//tools/boss/engine/observation-contracts:__pkg__",
         "//tools/boss/engine/pane-summary:__pkg__",
+        "//tools/boss/engine/spoke-adapter:__pkg__",
     ],
     deps = [
         "//lib/rust/git_utils",

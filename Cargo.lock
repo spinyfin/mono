@@ -1638,6 +1638,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-spoke-adapter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bon",
+ "boss-engine-recovery",
+ "boss-execution-contracts",
+ "boss-host-enrollment",
+ "boss-protocol",
+ "boss-protocol-spoke",
+ "boss-spoke-stream",
+ "boss-work-db",
+ "prost",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+]
+
+[[package]]
 name = "boss-spoke-credentials"
 version = "0.1.0"
 dependencies = [

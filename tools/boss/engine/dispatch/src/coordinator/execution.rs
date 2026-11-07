@@ -1096,7 +1096,13 @@ impl ExecutionCoordinator {
                 return Err(err);
             }
         };
-        let adapter = match self.host_adapter_provider.adapter_for(&selected_host).await {
+        // Resolved per execution so a transport that records which host owns an
+        // execution does so before any command for it can be sent.
+        let adapter = match self
+            .host_adapter_provider
+            .adapter_for_execution(&selected_host, &execution.id)
+            .await
+        {
             Ok(adapter) => adapter,
             Err(err) => {
                 // Same silent-gap fix as the host-selection branch above:

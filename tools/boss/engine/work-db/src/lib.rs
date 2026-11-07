@@ -800,6 +800,7 @@ pub use schema_init::table_exists;
 use schema_init::table_has_column;
 mod execution_wait_history;
 mod semantic_progress;
+mod spoke_hub;
 mod stuck_activity;
 mod stuck_report;
 mod stuck_snapshot;
@@ -961,6 +962,10 @@ pub use review_verdicts::{
     is_informative_gate_outcome,
 };
 pub use revision_helpers::normalize_priority;
+pub use spoke_hub::{
+    HostOutboxFault, HostTransport, MAX_UNSETTLED_HOST_COMMAND_BYTES, MAX_UNSETTLED_HOST_COMMANDS, SpokeAssignment,
+    SpokeHeldByOtherHost, SpokeRunKey, StoredHostCommand,
+};
 pub use trunk_merge_intents::{ActiveTrunkMergeIntent, TrunkMergeIntent, TrunkMergeIntentInsertInput};
 
 mod preserved_work;
