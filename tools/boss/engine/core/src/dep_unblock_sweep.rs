@@ -28,8 +28,9 @@
 //! The Bazel installer task stayed dependency-blocked for about three hours
 //! after its prerequisite (the uninstall scoping fix) landed in PR #424, until
 //! an unrelated execution request cleared the stale block. Without this
-//! sweeper the only recovery path was an explicit start request or an
-//! accidental trigger via `RequestExecution`.
+//! sweeper the stale block cleared only when something called `RequestExecution`
+//! on the row, whether an explicit start request or an unrelated path that
+//! triggered one.
 //!
 //! ## Cadence
 //!

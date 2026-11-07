@@ -1390,9 +1390,40 @@ mod observation_seam_tests {
         }
     }
 
-    /// Drive `finalize_pr_transition` for a chore, parked or not, and report
-    /// whether a `pr_review` execution exists afterwards plus the task status.
-    async fn finalize_in_review(park: bool) -> (StopOutcome, bool, boss_protocol::TaskStatus) {
+    #[derive(Default)]
+    struct RecordingBatchEnqueuer {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ReviewBatchEnqueuer for RecordingBatchEnqueuer {
+        async fn enqueue(
+            &self,
+            db: &WorkDb,
+            work_item_id: &str,
+            repo_remote_url: &str,
+            pr_url: &str,
+            review_pool_size: usize,
+        ) -> anyhow::Result<crate::work::ReviewBatchDispatch> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let input = review_batch_input_from_metadata(
+                db,
+                work_item_id,
+                pr_url,
+                serde_json::json!({
+                    "baseRefOid": "base-sha",
+                    "headRefOid": "head-sha",
+                    "files": [{"path": "src/lib.rs"}],
+                    "additions": 12,
+                    "deletions": 3
+                }),
+            )?;
+            db.create_pre_merge_review_batch_for_pool(input, repo_remote_url, review_pool_size)
+        }
+    }
+
+    /// Exercise both scheduling modes with the same parked and unparked fixture.
+    async fn check_parked_completion(park: bool, fanout: bool) {
         let (dir, db) = open_db_arc();
         let product = create_test_product(&db);
         let chore = create_test_chore(&db, product.id.clone(), "parked completion");
@@ -1412,7 +1443,15 @@ mod observation_seam_tests {
             db.park_work_item_as_actor(&chore.id, true, Some("not now"), "human")
                 .unwrap();
         }
-        let handler = super::super::tests::integration_handler(db.clone(), PR);
+        let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            dir.path().join("feature-flags.toml"),
+        ));
+        flags.load().unwrap();
+        flags.set("review_batch_fanout", fanout).unwrap();
+        let enqueuer = Arc::new(RecordingBatchEnqueuer::default());
+        let handler = super::super::tests::integration_handler(db.clone(), PR)
+            .with_feature_flags(flags)
+            .with_review_batch_enqueuer(enqueuer.clone());
         let outcome = handler
             .finalize_pr_transition(&execution.id, PR.into(), WorkerPrCompletionTarget::InReview, "stop")
             .await;
@@ -1421,29 +1460,42 @@ mod observation_seam_tests {
             .unwrap()
             .iter()
             .any(|execution| execution.kind == ExecutionKind::PrReview);
-        let status = match db.get_work_item(&chore.id).unwrap() {
-            WorkItem::Task(t) | WorkItem::Chore(t) => t.status,
-            other => panic!("expected a task/chore, got {other:?}"),
-        };
-        (outcome, has_reviewer, status)
+        let batches = db.review_batches_for_cycle_root(&chore.id).unwrap();
+        assert_eq!(
+            enqueuer.calls.load(std::sync::atomic::Ordering::Relaxed),
+            usize::from(fanout && !park),
+            "only an unparked row in fanout mode may call the batch enqueuer"
+        );
+        if park {
+            assert_eq!(outcome, StopOutcome::PrDetected { pr_url: PR.into() });
+            assert!(!has_reviewer, "a parked row must not get a pr_review execution");
+            assert!(batches.is_empty(), "a parked row must not get a review batch");
+            let status = match db.get_work_item(&chore.id).unwrap() {
+                WorkItem::Task(t) | WorkItem::Chore(t) => t.status,
+                other => panic!("expected a task/chore, got {other:?}"),
+            };
+            assert_eq!(status, boss_protocol::TaskStatus::InReview);
+        } else {
+            assert_eq!(outcome, StopOutcome::ReviewerEnqueued { pr_url: PR.into() });
+            if fanout {
+                assert_eq!(batches.len(), 1, "control: fanout creates a review batch");
+            } else {
+                assert!(has_reviewer, "control: legacy mode creates a pr_review execution");
+                assert!(batches.is_empty());
+            }
+        }
     }
 
-    /// A parked row atrophies: the Stop-hook completion path records the PR and
-    /// advances the row to `in_review`, but schedules no AI review. The
-    /// un-parked control proves the same fixture does create a reviewer.
     #[tokio::test]
     async fn parked_row_completion_schedules_no_reviewer() {
-        let (control_outcome, control_has_reviewer, _) = finalize_in_review(false).await;
-        assert_eq!(control_outcome, StopOutcome::ReviewerEnqueued { pr_url: PR.into() });
-        assert!(
-            control_has_reviewer,
-            "control: an un-parked row gets a pr_review execution"
-        );
+        check_parked_completion(false, false).await;
+        check_parked_completion(true, false).await;
+    }
 
-        let (outcome, has_reviewer, status) = finalize_in_review(true).await;
-        assert_eq!(outcome, StopOutcome::PrDetected { pr_url: PR.into() });
-        assert!(!has_reviewer, "a parked row must not get a pr_review execution");
-        assert_eq!(status, boss_protocol::TaskStatus::InReview);
+    #[tokio::test]
+    async fn parked_row_completion_schedules_no_review_batch() {
+        check_parked_completion(false, true).await;
+        check_parked_completion(true, true).await;
     }
 
     #[tokio::test]
