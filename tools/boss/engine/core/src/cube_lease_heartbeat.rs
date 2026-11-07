@@ -276,20 +276,14 @@ pub const HEARTBEAT_INTERVAL_SECS_ENV: &str = "BOSS_CUBE_LEASE_HEARTBEAT_INTERVA
 
 /// Default cadence between heartbeat passes. Deliberately far below the
 /// [`LEASE_TTL_SECS`] window so several passes refresh every lease
-/// before it could expire.
-pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
+/// before it could expire. Shared with the spoke's own lease heartbeat.
+pub use boss_host_execution::cube::DEFAULT_HEARTBEAT_INTERVAL;
 
 /// TTL (seconds) the engine asks cube to set on every heartbeat.
 ///
-/// Matches cube's own default of 86400 s / 24 h (`tools/cube` —
-/// `DEFAULT_LEASE_TTL_SECS`). The engine still passes the value
-/// *explicitly* so the interval-≪-TTL relationship is owned here and
-/// cannot silently re-clamp every heartbeated lease if cube's default
-/// moves again. With [`DEFAULT_HEARTBEAT_INTERVAL`] = 300 s this is a
-/// ~288× margin — enormous headroom; the real reclaim paths (confirm-dead
-/// auto-reap and force-release) do not depend on this TTL at all. TTL is
-/// only the last-resort backstop for a lease nothing is watching.
-pub const LEASE_TTL_SECS: u64 = 86400;
+/// Matches cube's own default of 86400 s / 24 h. Owned in
+/// `boss_host_execution::cube` so the hub and the spoke cannot drift apart.
+pub use boss_host_execution::cube::LEASE_TTL_SECS;
 
 /// Per-call timeout for a single `cube workspace heartbeat` subprocess
 /// invocation. Addresses the same cube-hang failure mode that prompted

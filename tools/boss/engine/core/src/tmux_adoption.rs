@@ -235,51 +235,26 @@ pub async fn observe_tmux_identity(
             current_command: None,
         };
     }
-    let token = match session_spawn_token(tmux, session_name).await {
-        Ok(token) => token,
-        Err(err) => {
+    let (pane_dead, pane_dead_status) = match boss_tmux::probe_pane(tmux, session_name, expected_spawn_token).await {
+        boss_tmux::PaneProbe::Absent | boss_tmux::PaneProbe::ForeignToken => {
+            return TmuxIdentityObservation {
+                adoption_state: boss_protocol::TmuxAdoptionState::TokenMismatch,
+                pane_dead: None,
+                pane_dead_status: None,
+                window_activity_epoch_secs: None,
+                current_command: None,
+            };
+        }
+        boss_tmux::PaneProbe::Unreadable { stage, error } => {
             tracing::debug!(
                 session = %session_name,
-                error = %format!("{err:#}"),
-                "tmux identity probe: spawn token unreadable"
+                error = %format!("{error:#}"),
+                "tmux identity probe: {stage} unreadable"
             );
             return probe_unavailable_observation();
         }
-    };
-    if token.as_deref() != Some(expected_spawn_token) {
-        return TmuxIdentityObservation {
-            adoption_state: boss_protocol::TmuxAdoptionState::TokenMismatch,
-            pane_dead: None,
-            pane_dead_status: None,
-            window_activity_epoch_secs: None,
-            current_command: None,
-        };
-    }
-    let pane_dead = match tmux.display_message(session_name, DisplayField::PaneDead).await {
-        Ok(value) => value == "1",
-        Err(err) => {
-            tracing::debug!(
-                session = %session_name,
-                error = %format!("{err:#}"),
-                "tmux identity probe: pane_dead unreadable"
-            );
-            return probe_unavailable_observation();
-        }
-    };
-    let pane_dead_status = if pane_dead {
-        match tmux.display_message(session_name, DisplayField::PaneDeadStatus).await {
-            Ok(status) => (!status.is_empty()).then_some(status),
-            Err(err) => {
-                tracing::debug!(
-                    session = %session_name,
-                    error = %format!("{err:#}"),
-                    "tmux identity probe: pane_dead_status unreadable"
-                );
-                return probe_unavailable_observation();
-            }
-        }
-    } else {
-        None
+        boss_tmux::PaneProbe::Alive => (false, None),
+        boss_tmux::PaneProbe::Dead { status } => (true, status),
     };
     let window_activity_epoch_secs = match tmux.display_message(session_name, DisplayField::WindowActivity).await {
         Ok(value) => match value.parse::<i64>() {
