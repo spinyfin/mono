@@ -948,10 +948,11 @@ async fn leftover_sweep_never_adopts_an_allow_dirty_successors_edits() {
     }
 }
 
-/// Keep pending edits on the boundary change untouched to avoid divergence;
-/// snapshot and report pending work on a later registered change.
+/// Snapshot pending edits on the boundary change onto its unique visible
+/// successor and inspect both commits; snapshot and report pending work on a
+/// later registered change.
 #[tokio::test]
-async fn leftover_sweep_keeps_boundary_edits_unsnapshotted_and_reports_later_changes() {
+async fn leftover_sweep_snapshots_boundary_edits_for_inspection_and_reports_later_changes() {
     use boss_engine_test_git::jj::JjRepo;
     for action in ["edit", "new"] {
         let (dir, db) = open_db();
@@ -1000,13 +1001,12 @@ async fn leftover_sweep_keeps_boundary_edits_unsnapshotted_and_reports_later_cha
             );
             assert_eq!(
                 JjRepo::run(&repo.repo, &["file", "show", "-r", &saved.commit_id, "root:ours"]),
-                "original worker"
-            );
-            assert_eq!(
-                std::fs::read_to_string(repo.worker.join("ours")).unwrap(),
                 "edited after the boundary"
             );
-            assert!(!open_kinds(&db, &execution.id).contains(&"preserved_work_needs_inspection".to_owned()));
+            assert!(
+                open_kinds(&db, &execution.id).contains(&"preserved_work_needs_inspection".to_owned()),
+                "pending boundary edits must be inspected"
+            );
             continue;
         }
         assert!(
