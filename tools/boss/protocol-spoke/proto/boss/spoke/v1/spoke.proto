@@ -276,6 +276,10 @@ enum WorkspaceKind {
   // repository's main branch, and the result is the prune outcome as JSON.
   // A store operation: it needs no lease.
   PRUNE_BOOKMARK = 26;
+  // Release recovery heads with request_json.release_names controlling whether
+  // publication names are released (default true). Older peers reject this
+  // kind rather than silently ignoring publication-preserving options.
+  RELEASE_HEADS_CONFIGURED = 27;
 }
 // A discriminated, typed operation, not an argv tunnel: kind selects which
 // fields are required and which are forbidden. Paths from a peer are display
@@ -303,7 +307,7 @@ message WorkspaceOp {
   // A bounded, versioned JSON compatibility payload for the recovery kinds
   // whose arguments are the recovery crate's own value types. Required for
   // CONFIRM_RECOVERY, RESTORE_PRESERVED, CHECK_PRESERVED_UNPUBLISHED and
-  // PRUNE_BOOKMARK, optional for RELEASE_HEADS, and forbidden for every other
+  // PRUNE_BOOKMARK and RELEASE_HEADS_CONFIGURED, and forbidden for every other
   // kind. It names no path, argv or revset.
   bytes request_json = 20;
 }

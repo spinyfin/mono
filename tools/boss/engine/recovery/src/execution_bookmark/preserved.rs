@@ -41,7 +41,7 @@ pub struct HostRecoveryRequest {
     /// `None` reads the live workspace.
     #[serde(default)]
     pub tip_source: Option<WorkspaceTipSource>,
-    /// `None` releases the names, as the host always did.
+    /// `None` releases the names (the default when the request omits it).
     #[serde(default)]
     pub release_names: Option<bool>,
     /// Vouchers a bookmark prune may use to prove preserved work is published.

@@ -1274,6 +1274,7 @@ mod validation {
                 | Kind::CheckpointBaseline
                 | Kind::ReconcileBookmark
                 | Kind::ReleaseHeads
+                | Kind::ReleaseHeadsConfigured
                 | Kind::CheckPreservedUnpublished
                 | Kind::PruneBookmark
         )
@@ -1479,11 +1480,16 @@ mod validation {
                 }
                 allowed.request_json.clone_from(&op.request_json);
             }
-            Kind::ReleaseHeads => {
+            Kind::ReleaseHeadsConfigured => {
+                ensure!(
+                    !op.request_json.is_empty(),
+                    "configured release requires its request payload"
+                );
                 crate::recovery_ops::parse_request(&op.request_json)?;
                 allowed.request_json.clone_from(&op.request_json);
             }
-            Kind::Release
+            Kind::ReleaseHeads
+            | Kind::Release
             | Kind::Status
             | Kind::ListWorkspaces
             | Kind::ListRepos
@@ -1501,6 +1507,7 @@ mod validation {
                 | Kind::PrepareRecoveryPr
                 | Kind::ReconcileBookmark
                 | Kind::ReleaseHeads
+                | Kind::ReleaseHeadsConfigured
                 | Kind::ConfirmRecovery
                 | Kind::RestorePreserved
                 | Kind::CheckPreservedUnpublished
@@ -1670,6 +1677,7 @@ pub mod workspace {
                         | Kind::Status
                         | Kind::DiffBookmark
                         | Kind::PositionedParent
+                        | Kind::CheckPreservedUnpublished
                 )
             {
                 result.code = ResultCode::OutcomeUncertain.into();
@@ -2005,17 +2013,16 @@ pub mod workspace {
                                             .await?,
                                     )?
                                 }
-                                Kind::ReleaseHeads => {
+                                Kind::ReleaseHeads | Kind::ReleaseHeadsConfigured => {
                                     *phase = Phase::Effect;
-                                    let request = crate::recovery_ops::parse_request(&op.request_json)?;
-                                    json!(
-                                        recovery::release_heads(
-                                            &LocalJj,
-                                            &record,
-                                            request.release_names.unwrap_or(true)
-                                        )
-                                        .await?
-                                    )
+                                    let release_names = if kind == Kind::ReleaseHeadsConfigured {
+                                        crate::recovery_ops::parse_request(&op.request_json)?
+                                            .release_names
+                                            .unwrap_or(true)
+                                    } else {
+                                        true
+                                    };
+                                    json!(recovery::release_heads(&LocalJj, &record, release_names).await?)
                                 }
                                 Kind::ConfirmRecovery => {
                                     *phase = Phase::Effect;
@@ -2342,7 +2349,7 @@ mod tests {
             anchor_commit: "a".repeat(40),
             pr_head_before: String::new(),
         };
-        for number in 1..=26 {
+        for number in 1..=27 {
             let kind = Kind::try_from(number).unwrap();
             let mut request = op(kind);
             match kind {
@@ -2367,10 +2374,12 @@ mod tests {
                     request.trunk = "main".into();
                     request.request_json = b"{}".to_vec();
                 }
-                Kind::ConfirmRecovery | Kind::RestorePreserved => request.request_json = b"{}".to_vec(),
+                Kind::ConfirmRecovery | Kind::RestorePreserved | Kind::ReleaseHeadsConfigured => {
+                    request.request_json = b"{}".to_vec()
+                }
                 Kind::CheckPreservedUnpublished => {
                     request.request_json = serde_json::to_vec(
-                        &serde_json::json!({"recorded": {"commit_id": "a", "change_id": "b", "count": 1}}),
+                        &serde_json::json!({"recorded": {"commit_id": "a".repeat(40), "change_id": "k".repeat(32), "count": 1}}),
                     )
                     .unwrap();
                 }
@@ -2380,7 +2389,7 @@ mod tests {
                 request.workspace_id.clear();
                 request.lease_id.clear();
             }
-            if matches!(number, 13..=20 | 23..=26) {
+            if matches!(number, 13..=20 | 23..=27) {
                 request.bookmark = Some(bookmark.clone());
             }
             assert_eq!(validate_workspace(&request, Some(&assignment)).unwrap(), kind);

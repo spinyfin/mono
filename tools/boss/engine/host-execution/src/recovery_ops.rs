@@ -29,7 +29,19 @@ pub fn parse_request(bytes: &[u8]) -> Result<HostRecoveryRequest> {
     if bytes.is_empty() {
         return Ok(HostRecoveryRequest::default());
     }
-    serde_json::from_slice(bytes).context("recovery request is not valid JSON for this operation")
+    let request: HostRecoveryRequest =
+        serde_json::from_slice(bytes).context("recovery request is not valid JSON for this operation")?;
+    if let Some(tip) = &request.recorded {
+        ensure!(
+            tip.commit_id.len() == 40 && tip.commit_id.bytes().all(|b| b.is_ascii_hexdigit()),
+            "recorded commit id must be full-length hexadecimal"
+        );
+        ensure!(
+            tip.change_id.len() == 32 && tip.change_id.bytes().all(|b| (b'k'..=b'z').contains(&b)),
+            "recorded change id must be full-length jj change-id text"
+        );
+    }
+    Ok(request)
 }
 
 /// The commit the working copy sits on top of: after cube positions a workspace
@@ -188,6 +200,42 @@ mod tests {
             "the unpublished change is reported as unpublished"
         );
 
+        let mut interrupted_check = op(Kind::CheckPreservedUnpublished);
+        interrupted_check.bookmark = created.bookmark.clone();
+        (interrupted_check.workspace_id, interrupted_check.lease_id) = Default::default();
+        interrupted_check.request_json = payload(&HostRecoveryRequest {
+            recorded: outcome.tip.clone(),
+            ..Default::default()
+        });
+        let checked = executor.execute(&command(interrupted_check), true, 1).await;
+        assert_eq!(checked.code, v1::ResultCode::Ok as i32, "{}", checked.reason);
+
+        let bookmark = created.bookmark.as_ref().unwrap();
+        boss_engine_test_git::jj::JjRepo::run(&repo.worker, &["bookmark", "set", &bookmark.head, "-r", "@"]);
+        // The old kind must reject the new payload rather than delete names.
+        let mut old_release = op(Kind::ReleaseHeads);
+        old_release.bookmark = created.bookmark.clone();
+        (old_release.workspace_id, old_release.lease_id) = Default::default();
+        old_release.request_json = payload(&HostRecoveryRequest {
+            release_names: Some(false),
+            ..Default::default()
+        });
+        let rejected = executor.execute(&command(old_release), false, 1).await;
+        assert_eq!(rejected.code, v1::ResultCode::Rejected as i32, "{}", rejected.reason);
+
+        let mut release = op(Kind::ReleaseHeadsConfigured);
+        release.request_json = payload(&HostRecoveryRequest {
+            release_names: Some(false),
+            ..Default::default()
+        });
+        release.bookmark = created.bookmark.clone();
+        (release.workspace_id, release.lease_id) = Default::default();
+        let released = executor.execute(&command(release), false, 1).await;
+        assert_eq!(released.code, v1::ResultCode::Ok as i32, "{}", released.reason);
+        let bookmark = created.bookmark.as_ref().unwrap();
+        let names = boss_engine_test_git::jj::JjRepo::run(&repo.worker, &["bookmark", "list", &bookmark.head]);
+        assert!(names.contains(&bookmark.head), "publication bookmark retained: {names}");
+
         let fresh = executor.execute(&command(op(Kind::StartFresh)), false, 1).await;
         assert_eq!(fresh.code, v1::ResultCode::Ok as i32, "{}", fresh.reason);
         let Some(command_result::Value::Workspace(fresh)) = fresh.value else {
@@ -278,6 +326,47 @@ mod tests {
         for request in [missing, garbage, stray, unrecorded, flooded, unsafe_voucher, no_trunk] {
             let result = executor.execute(&command(request), false, 1).await;
             assert_eq!(result.code, v1::ResultCode::Rejected as i32, "{}", result.reason);
+        }
+        // No preserved bookmark has been created: malformed recorded tips must
+        // still be rejected before fallback revsets can inspect unrelated history.
+        for kind in [
+            Kind::ConfirmRecovery,
+            Kind::RestorePreserved,
+            Kind::CheckPreservedUnpublished,
+            Kind::PruneBookmark,
+        ] {
+            for (commit, change) in [
+                ("a".into(), "k".repeat(32)),
+                ("g".repeat(40), "k".repeat(32)),
+                ("a".repeat(40), "b".repeat(32)),
+                ("all()".into(), "k".repeat(32)),
+                ("a".repeat(40), "latest(all())".into()),
+            ] {
+                let mut request = op(kind);
+                request.bookmark = created.bookmark.clone();
+                if crate::validation::store_operation(kind) {
+                    (request.workspace_id, request.lease_id) = Default::default();
+                }
+                if kind == Kind::PruneBookmark {
+                    request.trunk = "main".into();
+                }
+                request.request_json = payload(&HostRecoveryRequest {
+                    recorded: Some(recovery::PreservedTip {
+                        commit_id: commit.clone(),
+                        change_id: change.clone(),
+                        count: 1,
+                    }),
+                    ..Default::default()
+                });
+                let result = executor.execute(&command(request), false, 1).await;
+                assert_eq!(
+                    result.code,
+                    v1::ResultCode::Rejected as i32,
+                    "{kind:?}: {}",
+                    result.reason
+                );
+                assert!(result.reason.contains("recorded"), "{}", result.reason);
+            }
         }
         // A bookmark naming another execution cannot be confirmed through this run.
         let mut foreign = op(Kind::ConfirmRecovery);

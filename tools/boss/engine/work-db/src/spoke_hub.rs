@@ -209,17 +209,15 @@ fn map_assignment(row: &Row<'_>) -> rusqlite::Result<SpokeAssignment> {
 }
 
 /// Whether anything may already have run for this assignment: it holds a lease,
-/// a command is in doubt, or a command naming the run is unsettled or was
-/// settled by the host. A command the hub rejected before it was ever sent
-/// (no wire sequence left) is definitive evidence that nothing ran.
+/// a command is in doubt, or any command names the run. A hub rejection does
+/// not prove that an earlier connection never delivered the command.
 fn assignment_may_have_started(conn: &Connection, execution_id: &str, generation: i64) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT
             (SELECT lease_id IS NOT NULL OR in_doubt <> 0 FROM spoke_assignments
               WHERE execution_id = ?1 AND assignment_generation = ?2)
             OR EXISTS(SELECT 1 FROM host_commands
-                       WHERE run_execution_id = ?1 AND run_generation = ?2
-                         AND (result IS NULL OR sequence IS NOT NULL))",
+                       WHERE run_execution_id = ?1 AND run_generation = ?2)",
         params![execution_id, generation],
         |row| row.get(0),
     )?)
@@ -591,7 +589,14 @@ impl WorkDb {
                 ],
                 |row| row.get(0),
             )?;
-            if !owned {
+            let legacy: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM host_transports WHERE host_id = ?1 AND transport = 'legacy_ssh')",
+                [host_id],
+                |row| row.get(0),
+            )?;
+            if !owned
+                || (legacy && !assignment_may_have_started(&tx, &run.execution_id, run.assignment_generation as i64)?)
+            {
                 return Err(fault(HostOutboxFault::Denied));
             }
         }
@@ -601,11 +606,11 @@ impl WorkDb {
             [host_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        if unsettled >= MAX_UNSETTLED_HOST_COMMANDS || bytes + request.len() as i64 > MAX_UNSETTLED_HOST_COMMAND_BYTES {
-            return Err(fault(HostOutboxFault::Full));
-        }
         let sequence = highest_sequence(&tx, host_id)? + 1;
         let wire = encode(sequence);
+        if unsettled >= MAX_UNSETTLED_HOST_COMMANDS || bytes + wire.len() as i64 > MAX_UNSETTLED_HOST_COMMAND_BYTES {
+            return Err(fault(HostOutboxFault::Full));
+        }
         tx.execute(
             "INSERT INTO host_commands
                 (host_id, command_id, sequence, run_execution_id, run_generation, run_id, spawn_token,
@@ -646,10 +651,11 @@ impl WorkDb {
             .optional()?)
     }
 
-    /// Settle an undelivered command with a terminal result and close the hole
+    /// Settle an unreceipted command with a terminal result and close the hole
     /// it leaves: every later command moves down one wire sequence, re-encoded
     /// by `reseq`. Returns the command id and the stored result. A sequence the
-    /// peer may have received, or that names no live command, is refused.
+    /// peer acknowledged, or that names no live command, is refused. A missing
+    /// receipt does not prove it was never delivered on an earlier stream.
     pub fn reject_host_command(
         &self,
         host_id: &str,
@@ -1057,15 +1063,27 @@ mod tests {
     }
 
     #[test]
-    fn a_command_rejected_before_it_was_sent_proves_nothing_ran() {
+    fn quota_counts_encoded_wire_bytes() {
+        let db = db();
+        let error = db
+            .append_host_command("h", "large", None, b"small", &|_| {
+                vec![0; MAX_UNSETTLED_HOST_COMMAND_BYTES as usize + 1]
+            })
+            .unwrap_err();
+        assert_eq!(fault_of(&error), Some(HostOutboxFault::Full));
+        assert!(db.host_command_after("h", 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_rejected_command_that_was_offered_still_pins_the_execution() {
         let db = db();
         let owned = db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
         append(&db, "host-a", "lease", Some(&key(&owned)), b"lease").unwrap();
         let result = |id: &str| id.as_bytes().to_vec();
         let reseq = |wire: &[u8], _: u64| Ok(wire.to_vec());
+        assert!(db.host_command_after("host-a", 0).unwrap().is_some());
         db.reject_host_command("host-a", 1, &result, &reseq).unwrap();
-        let moved = db.reserve_spoke_assignment("exec_1", "host-b").unwrap();
-        assert_eq!(moved.assignment_generation, 2);
+        assert!(db.reserve_spoke_assignment("exec_1", "host-b").is_err());
     }
 
     #[test]
@@ -1073,9 +1091,13 @@ mod tests {
         let db = db();
         db.set_host_transport("host-a", HostTransport::SpokeReady).unwrap();
         // A reservation that started nothing does not block the downgrade.
-        db.reserve_spoke_assignment("exec_idle", "host-a").unwrap();
+        let idle = db.reserve_spoke_assignment("exec_idle", "host-a").unwrap();
         db.set_host_transport("host-a", HostTransport::SpokePending).unwrap();
         db.set_host_transport("host-a", HostTransport::LegacySsh).unwrap();
+        assert_eq!(
+            fault_of(&append(&db, "host-a", "late-lease", Some(&key(&idle)), b"lease").unwrap_err()),
+            Some(HostOutboxFault::Denied)
+        );
         db.set_host_transport("host-a", HostTransport::SpokeReady).unwrap();
         db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
         lease(&db, "exec_1", 1, "lease-a");
