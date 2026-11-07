@@ -205,7 +205,11 @@ pub const PRESERVED_WORK_ARCHIVED_ATTENTION_KIND: &str = "preserved_work_archive
 /// operation-view budget; snapshotting a free workspace hid the boundary
 /// commit; or the boundary commit is still a reassigned workspace's
 /// working-copy commit. The lease is still released; nothing is deleted. A
-/// human inspects the item, which can name both tips, one tip, or none.
+/// human inspects the item, which can name both tips, one tip, or none. A
+/// change rejected as unsafe (including an otherwise-kept existing bookmark
+/// that contains one) is retained only under inspection-only
+/// `preserved-archive/<exec>/unsafe/<change>/<commit>` references, which are
+/// never restored automatically.
 pub const PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND: &str = "preserved_work_needs_inspection";
 
 pub const REVISION_CHAIN_RECOVERY_BLOCKED_ATTENTION_KIND: &str = "revision_chain_recovery_blocked";

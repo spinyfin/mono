@@ -11,6 +11,18 @@ pub(super) async fn finalize_tip(
     snapshot: Option<&Path>,
 ) -> Result<WorkspaceTip> {
     let mut resolved = visible_historical_tip(jj, &record.repo_path, tip, ownership.is_none()).await?;
+    // The registered working-copy commit before any snapshot: when it is a
+    // strict ancestor of the boundary, a later holder's pending edits land in
+    // its change, so that change must be frozen too.
+    let registered = if ownership.is_some() && jj.workspace_exists(workspace).await? {
+        log_change(jj, &record.repo_path, rev)
+            .await?
+            .lines()
+            .next()
+            .map(str::to_owned)
+    } else {
+        None
+    };
     if let Some(workspace) = snapshot {
         resolved = snapshot_free_unproven(jj, &record.repo_path, workspace, resolved).await?;
     }
@@ -39,6 +51,9 @@ pub(super) async fn finalize_tip(
         let work = log(jj, &record.repo_path, &unpublished(&commit), "change_id ++ \"\\n\"").await?;
         if !work.trim().is_empty() {
             unsafe_commits.push(commit.clone());
+            if let Some(registered) = registered.as_ref().filter(|registered| **registered != commit) {
+                unsafe_commits.push(registered.clone());
+            }
             unclaimed.push(Unclaimed {
                 note: format!(
                     "the lease boundary tip {commit} is still the workspace's working-copy commit, which may now hold a later holder's pending edits; excluding it from automatic restore and retaining it only in an inspection archive"
@@ -52,6 +67,17 @@ pub(super) async fn finalize_tip(
     if let Some(hidden) = resolved.snapshot_hid.as_deref() {
         let visible = resolved.rewritten_to.as_deref().unwrap_or(hidden);
         unsafe_commits.push(visible.to_owned());
+        if let Some(registered) = registered.as_deref() {
+            // The commit that received the pending edits: the snapshot's
+            // visible successor of the registered working-copy change.
+            let change = log(jj, &record.repo_path, registered, "change_id").await?;
+            let successors = log_change(jj, &record.repo_path, &change_revset(change.trim())).await?;
+            if let Some(successor) = successors.lines().find(|id| !id.is_empty())
+                && !unsafe_commits.iter().any(|seen| seen == successor)
+            {
+                unsafe_commits.push(successor.to_owned());
+            }
+        }
         let work = log(jj, &record.repo_path, &unpublished(visible), "change_id ++ \"\n\"").await?;
         let count = work.lines().count() as u64;
         unclaimed.push(Unclaimed {

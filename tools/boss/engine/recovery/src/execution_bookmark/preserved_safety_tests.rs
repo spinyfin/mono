@@ -235,3 +235,47 @@ async fn a_removed_working_directory_cannot_hold_pending_foreign_edits() {
         );
     }
 }
+
+#[tokio::test]
+async fn pending_edits_absorbed_by_a_preserved_ancestor_are_never_restaged() {
+    for ownership in [BoundaryOwnership::Reassigned, BoundaryOwnership::FreeUnproven] {
+        for keep_bookmark in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = fixture(dir.path());
+            let record = create(&LocalJj, &repo.worker, "exec_absorbing_ancestor", "local")
+                .await
+                .unwrap();
+            std::fs::write(repo.worker.join("ours"), "first holder").unwrap();
+            let parent = tip(&repo);
+            let saved = preserve(&LocalJj, &record, &repo.worker, None, None)
+                .await
+                .unwrap()
+                .tip
+                .unwrap();
+            if !keep_bookmark {
+                JjRepo::run(
+                    &repo.repo,
+                    &["bookmark", "forget", &preserved_name(&record.execution_id)],
+                );
+            }
+            JjRepo::run(&repo.worker, &["new", "-m", "Child work"]);
+            std::fs::write(repo.worker.join("child"), "boundary work").unwrap();
+            let source = boundary(ownership).await;
+            JjRepo::run(&repo.worker, &["edit", parent.trim()]);
+            std::fs::write(repo.worker.join("theirs"), "foreign pending edits").unwrap();
+            preserve_from(&LocalJj, &record, &repo.worker, Some(&saved), None, source)
+                .await
+                .unwrap();
+            JjRepo::run(&repo.worker, &["git", "fetch"]);
+            JjRepo::run(&repo.worker, &["new", "main"]);
+            let restored = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+                .await
+                .unwrap();
+            drop(restored);
+            assert!(
+                !repo.replacement.join("theirs").exists(),
+                "{ownership:?}/{keep_bookmark}: foreign edits restaged"
+            );
+        }
+    }
+}
