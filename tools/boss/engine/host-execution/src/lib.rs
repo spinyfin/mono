@@ -1294,7 +1294,7 @@ mod validation {
         Ok(())
     }
 
-    fn commit(value: &str) -> Result<()> {
+    pub(crate) fn commit(value: &str) -> Result<()> {
         ensure!(
             matches!(value.len(), 40 | 64) && value.bytes().all(|b| b.is_ascii_hexdigit()),
             "expected full commit identity"

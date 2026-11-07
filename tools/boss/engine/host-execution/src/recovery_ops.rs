@@ -32,10 +32,7 @@ pub fn parse_request(bytes: &[u8]) -> Result<HostRecoveryRequest> {
     let request: HostRecoveryRequest =
         serde_json::from_slice(bytes).context("recovery request is not valid JSON for this operation")?;
     if let Some(tip) = &request.recorded {
-        ensure!(
-            tip.commit_id.len() == 40 && tip.commit_id.bytes().all(|b| b.is_ascii_hexdigit()),
-            "recorded commit id must be full-length hexadecimal"
-        );
+        crate::validation::commit(&tip.commit_id).context("recorded commit id must be a full commit identity")?;
         ensure!(
             tip.change_id.len() == 32 && tip.change_id.bytes().all(|b| (b'k'..=b'z').contains(&b)),
             "recorded change id must be full-length jj change-id text"

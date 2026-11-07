@@ -212,10 +212,23 @@ fn map_assignment(row: &Row<'_>) -> rusqlite::Result<SpokeAssignment> {
 /// a command is in doubt, or any command names the run. A hub rejection does
 /// not prove that an earlier connection never delivered the command.
 fn assignment_may_have_started(conn: &Connection, execution_id: &str, generation: i64) -> Result<bool> {
+    Ok(assignment_committed_to_spoke(conn, execution_id, generation)?
+        || conn.query_row(
+            "SELECT COALESCE((SELECT in_doubt <> 0 FROM spoke_assignments
+                               WHERE execution_id = ?1 AND assignment_generation = ?2), 0)",
+            params![execution_id, generation],
+            |row| row.get(0),
+        )?)
+}
+
+/// Whether the spoke has real evidence of this assignment: it holds a lease or a
+/// command names the run. Unlike [`assignment_may_have_started`] this ignores the
+/// in-doubt flag, which a caller can set without any command existing.
+fn assignment_committed_to_spoke(conn: &Connection, execution_id: &str, generation: i64) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT
-            (SELECT lease_id IS NOT NULL OR in_doubt <> 0 FROM spoke_assignments
-              WHERE execution_id = ?1 AND assignment_generation = ?2)
+            COALESCE((SELECT lease_id IS NOT NULL FROM spoke_assignments
+                       WHERE execution_id = ?1 AND assignment_generation = ?2), 0)
             OR EXISTS(SELECT 1 FROM host_commands
                        WHERE run_execution_id = ?1 AND run_generation = ?2)",
         params![execution_id, generation],
@@ -247,9 +260,9 @@ impl WorkDb {
             if open.host_id == host_id {
                 return Ok(open);
             }
-            // A reservation that never leased, has no command in doubt and has no
-            // command that could still reach its host cannot have started
-            // anything, so it does not pin the execution to that host.
+            // A reservation that never leased, has no command in doubt and has
+            // never had a command stored for it cannot have started anything, so
+            // it does not pin the execution to that host.
             if assignment_may_have_started(&tx, execution_id, open.assignment_generation as i64)? {
                 return Err(SpokeHeldByOtherHost {
                     execution_id: execution_id.to_owned(),
@@ -590,12 +603,12 @@ impl WorkDb {
                 |row| row.get(0),
             )?;
             let legacy: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM host_transports WHERE host_id = ?1 AND transport = 'legacy_ssh')",
+                "SELECT COALESCE((SELECT transport FROM host_transports WHERE host_id = ?1), 'legacy_ssh') = 'legacy_ssh'",
                 [host_id],
                 |row| row.get(0),
             )?;
             if !owned
-                || (legacy && !assignment_may_have_started(&tx, &run.execution_id, run.assignment_generation as i64)?)
+                || (legacy && !assignment_committed_to_spoke(&tx, &run.execution_id, run.assignment_generation as i64)?)
             {
                 return Err(fault(HostOutboxFault::Denied));
             }
@@ -858,6 +871,16 @@ mod tests {
         WorkDb::open(PathBuf::from(":memory:")).expect("open in-memory work db")
     }
 
+    /// A db whose test hosts route through the spoke; a host with no transport
+    /// row is legacy and does not admit run-bound commands.
+    fn spoke_db() -> WorkDb {
+        let db = db();
+        for host in ["host-a", "host-b", "h"] {
+            db.set_host_transport(host, HostTransport::SpokeReady).unwrap();
+        }
+        db
+    }
+
     fn key(assignment: &SpokeAssignment) -> SpokeRunKey {
         SpokeRunKey {
             execution_id: assignment.execution_id.clone(),
@@ -927,7 +950,7 @@ mod tests {
 
     #[test]
     fn commands_need_an_owned_run_and_keep_their_identity() {
-        let db = db();
+        let db = spoke_db();
         let owned = db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
         let run = key(&owned);
         let stored = append(&db, "host-a", "c1", Some(&run), b"one").unwrap();
@@ -946,7 +969,7 @@ mod tests {
 
     #[test]
     fn results_settle_once_and_only_for_the_issuing_run() {
-        let db = db();
+        let db = spoke_db();
         let owned = db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
         let run = key(&owned);
         append(&db, "host-a", "c1", Some(&run), b"one").unwrap();
@@ -1032,7 +1055,7 @@ mod tests {
 
     #[test]
     fn a_superseded_attempt_is_not_admitted_but_the_latest_stays_addressable() {
-        let db = db();
+        let db = spoke_db();
         let first = db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
         let stale = key(&first);
         append(&db, "host-a", "c1", Some(&stale), b"lease").unwrap();
@@ -1050,7 +1073,7 @@ mod tests {
 
     #[test]
     fn a_reservation_with_a_command_in_flight_still_pins_the_execution() {
-        let db = db();
+        let db = spoke_db();
         let owned = db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
         let run = key(&owned);
         // The lease command is stored but its doubt flag was never set.
@@ -1076,7 +1099,7 @@ mod tests {
 
     #[test]
     fn a_rejected_command_that_was_offered_still_pins_the_execution() {
-        let db = db();
+        let db = spoke_db();
         let owned = db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
         append(&db, "host-a", "lease", Some(&key(&owned)), b"lease").unwrap();
         let result = |id: &str| id.as_bytes().to_vec();
@@ -1084,6 +1107,25 @@ mod tests {
         assert!(db.host_command_after("host-a", 0).unwrap().is_some());
         db.reject_host_command("host-a", 1, &result, &reseq).unwrap();
         assert!(db.reserve_spoke_assignment("exec_1", "host-b").is_err());
+    }
+
+    #[test]
+    fn in_doubt_alone_does_not_admit_a_command_on_a_legacy_host() {
+        let db = db();
+        db.set_host_transport("host-a", HostTransport::SpokeReady).unwrap();
+        let idle = db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
+        db.set_host_transport("host-a", HostTransport::LegacySsh).unwrap();
+        db.set_spoke_in_doubt("exec_1", 1, true).unwrap();
+        assert_eq!(
+            fault_of(&append(&db, "host-a", "lease", Some(&key(&idle)), b"lease").unwrap_err()),
+            Some(HostOutboxFault::Denied)
+        );
+        // A host with no transport row is legacy too.
+        let other = db.reserve_spoke_assignment("exec_2", "host-b").unwrap();
+        assert_eq!(
+            fault_of(&append(&db, "host-b", "lease", Some(&key(&other)), b"lease").unwrap_err()),
+            Some(HostOutboxFault::Denied)
+        );
     }
 
     #[test]
@@ -1122,7 +1164,7 @@ mod tests {
 
     #[test]
     fn retention_keeps_what_receipts_and_open_assignments_still_need() {
-        let db = db();
+        let db = spoke_db();
         let owned = db.reserve_spoke_assignment("exec_1", "h").unwrap();
         let run = key(&owned);
         let names = ["a", "b", "c", "d", "unsettled", "run"];
