@@ -146,7 +146,8 @@ impl BookmarkGate for CubeBookmarkGate<'_> {
 /// cube's claim counter equals the one recorded for this lease, so no other
 /// lease was ever claimed on it. Anything else resolves only at this lease's
 /// boundary and never adopts later changes; a free workspace whose counter
-/// moved is never snapshotted or reported.
+/// moved is never snapshotted and unrelated work is never reported. Rewrites
+/// of this execution's boundary change are still reported for inspection.
 async fn workspace_tip_source(
     execution: &WorkExecution,
     boundary: Option<i64>,

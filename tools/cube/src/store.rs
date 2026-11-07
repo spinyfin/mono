@@ -1625,7 +1625,10 @@ impl Store {
                 "CREATE TABLE IF NOT EXISTS repo_lease_generations (
                     repo TEXT PRIMARY KEY,
                     high INTEGER NOT NULL
-                );",
+                );
+                INSERT INTO repo_lease_generations (repo, high)
+                SELECT repo, MAX(lease_generation) FROM workspaces GROUP BY repo
+                ON CONFLICT(repo) DO UPDATE SET high = MAX(high, excluded.high);",
             )
             .map_err(CubeError::Storage)?;
 
@@ -1933,6 +1936,12 @@ mod tests {
             .expect("claim")
             .expect("claimed");
         store.release_workspace("lease-a", None).expect("release");
+        // Simulate an upgraded database before the high-water table existed.
+        store
+            .connection
+            .execute_batch("DROP TABLE repo_lease_generations")
+            .unwrap();
+        store.migrate().unwrap();
         store.forget_workspace("mono", "mono-agent-120").expect("forget");
         store.sync_workspaces("mono", &[candidate]).expect("resync");
         let recreated = store

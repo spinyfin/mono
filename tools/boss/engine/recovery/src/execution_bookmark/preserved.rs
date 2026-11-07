@@ -69,12 +69,14 @@ pub enum BoundaryOwnership {
     /// the recorded lease generation is missing or not reported. A later
     /// lease cannot be ruled out. After the boundary tip is resolved, the
     /// working copy is snapshotted only to find work made after the boundary,
-    /// which is reported for inspection and never bookmarked.
+    /// which is reported for inspection and never bookmarked. Snapshotting is
+    /// skipped when it would rewrite the boundary commit itself.
     FreeUnproven,
     /// The workspace is leased under another id, or cube's claim counter
     /// shows another lease was claimed since this one even though it is free
     /// again. Its working copy and registered tip belong to someone else: no
-    /// snapshot, and nothing about it is reported against this execution.
+    /// snapshot, and unrelated work is never reported. A rewrite of this
+    /// execution's own boundary change is still reported for inspection.
     Reassigned,
 }
 
@@ -184,10 +186,8 @@ async fn workspace_tip(
             unclaimed: Vec::new(),
         });
     }
-    // Nobody provably holds a free workspace, so writing its pending edits into
-    // the journal is harmless, but only after the boundary tip is resolved: the
-    // snapshot rewrites the change `@` was at and would hide the boundary
-    // commit. The result is only compared with the boundary tip.
+    // A free workspace may be snapshotted to inspect later work, provided its
+    // registered tip differs from the boundary commit we must preserve.
     let snapshot = if matches!(
         tip_source,
         WorkspaceTipSource::LeaseBoundary {
@@ -265,7 +265,7 @@ async fn historical_workspace_tip(
             continue;
         }
         if loads >= OP_VIEW_LOAD_LIMIT {
-            break;
+            anyhow::bail!("workspace journal inspection exhausted the operation view limit");
         }
         loads += 1;
         let tip = match working_copy_at(jj, &record.repo_path, Some(&id), &rev).await {
@@ -278,8 +278,13 @@ async fn historical_workspace_tip(
         }
         let resolved = visible_historical_tip(jj, &record.repo_path, &tip, follow_rewrites).await?;
         if let Some(workspace) = snapshot {
-            jj.run(workspace, &["log", "--no-graph", "-r", "@", "-T", "commit_id"])
-                .await?;
+            // Snapshotting the boundary change would hide it, then preserving
+            // the old commit would revive a divergent variant.
+            let current = log(jj, workspace, "@", "commit_id").await?;
+            if resolved.commit.as_deref() != Some(current.trim()) {
+                jj.run(workspace, &["log", "--no-graph", "-r", "@", "-T", "commit_id"])
+                    .await?;
+            }
         }
         // The live registered tip leads: it is what a human inspects first.
         let mut unclaimed = Vec::new();

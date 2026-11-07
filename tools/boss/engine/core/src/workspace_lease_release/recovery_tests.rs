@@ -948,10 +948,10 @@ async fn leftover_sweep_never_adopts_an_allow_dirty_successors_edits() {
     }
 }
 
-/// A free workspace with no ownership evidence: the dead worker's unsnapshotted
-/// edits after its last confirmed boundary are reported, not dropped.
+/// Keep pending edits on the boundary change untouched to avoid divergence;
+/// snapshot and report pending work on a later registered change.
 #[tokio::test]
-async fn leftover_sweep_reports_unsnapshotted_work_in_a_free_workspace_without_ownership_evidence() {
+async fn leftover_sweep_keeps_boundary_edits_unsnapshotted_and_reports_later_changes() {
     use boss_engine_test_git::jj::JjRepo;
     for action in ["edit", "new"] {
         let (dir, db) = open_db();
@@ -979,6 +979,36 @@ async fn leftover_sweep_reports_unsnapshotted_work_in_a_free_workspace_without_o
         })
         .await;
         assert_eq!(outcome.released, 1, "{action}: {outcome:?}");
+        if action == "edit" {
+            let saved = db.preserved_tip(&execution.id).unwrap().unwrap();
+            let visible = JjRepo::run(
+                &repo.repo,
+                &[
+                    "--ignore-working-copy",
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    &saved.change_id,
+                    "-T",
+                    "commit_id ++ \"\\n\"",
+                ],
+            );
+            assert_eq!(
+                visible.trim(),
+                saved.commit_id,
+                "the boundary must have one visible variant"
+            );
+            assert_eq!(
+                JjRepo::run(&repo.repo, &["file", "show", "-r", &saved.commit_id, "root:ours"]),
+                "original worker"
+            );
+            assert_eq!(
+                std::fs::read_to_string(repo.worker.join("ours")).unwrap(),
+                "edited after the boundary"
+            );
+            assert!(!open_kinds(&db, &execution.id).contains(&"preserved_work_needs_inspection".to_owned()));
+            continue;
+        }
         assert!(
             open_kinds(&db, &execution.id).contains(&"preserved_work_needs_inspection".to_owned()),
             "{action}: post-boundary work was dropped silently"

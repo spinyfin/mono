@@ -1,7 +1,7 @@
 use super::*;
 use boss_engine_test_git::jj::JjRepo;
 
-fn fixture(root: &Path) -> JjRepo {
+pub(super) fn fixture(root: &Path) -> JjRepo {
     let repo = JjRepo::new(root);
     JjRepo::run(&repo.repo, &["bookmark", "set", "main", "-r", "@"]);
     JjRepo::run(&repo.repo, &["git", "export"]);
@@ -908,6 +908,7 @@ fn tip_of_workspace(repo: &JjRepo) -> String {
 /// journal is listed in full, but the walk may load only a bounded number of
 /// operation views.
 struct CountingViews {
+    tip: String,
     loads: std::sync::atomic::AtomicUsize,
 }
 
@@ -916,7 +917,11 @@ impl Jj for CountingViews {
     async fn run(&self, repo: &Path, args: &[&str]) -> Result<String> {
         if args.contains(&"--at-op") {
             self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            return Ok(String::new());
+            return Ok(if args.contains(&"op1743") {
+                self.tip.clone()
+            } else {
+                String::new()
+            });
         }
         if args.iter().any(|arg| arg.starts_with("time.end().format(\"%s.%f\")")) {
             return Ok((0..2_000)
@@ -945,13 +950,15 @@ async fn journal_walks_load_a_bounded_number_of_operation_views() {
         let record = create(&LocalJj, &repo.worker, "exec_view_bound", "local")
             .await
             .unwrap();
+        std::fs::write(repo.worker.join("work"), "work beyond the view budget").unwrap();
         let jj = CountingViews {
+            tip: tip_of_workspace(&repo),
             loads: Default::default(),
         };
-        let outcome = preserve_from(&jj, &record, &repo.worker.join("gone"), None, None, source)
+        let error = preserve_from(&jj, &record, &repo.worker.join("gone"), None, None, source)
             .await
-            .unwrap();
-        assert!(outcome.tip.is_none(), "{source:?}: {outcome:?}");
+            .unwrap_err();
+        assert!(error.to_string().contains("exhausted"), "{source:?}: {error}");
         let loads = jj.loads.load(std::sync::atomic::Ordering::SeqCst);
         assert!(
             loads <= preserved::OP_VIEW_LOAD_LIMIT,
@@ -1038,8 +1045,9 @@ fn free_unproven(boundary: i64) -> WorkspaceTipSource {
 }
 
 /// A worker dies after its last confirmed lease boundary. Whatever it did
-/// next, with no jj command between its last write and teardown, must surface
-/// as an inspection item naming the live registered tip.
+/// next on a later change, with no jj command between its last write and
+/// teardown, must surface as an inspection item naming the live registered tip.
+/// Pending edits on the boundary change itself must remain unsnapshotted.
 #[tokio::test]
 async fn work_after_the_boundary_is_reported_not_dropped() {
     for action in ["commit", "abandon", "new", "edit"] {
@@ -1069,6 +1077,41 @@ async fn work_after_the_boundary_is_reported_not_dropped() {
         let outcome = preserve_from(&LocalJj, &record, &repo.worker, None, None, free_unproven(boundary))
             .await
             .unwrap();
+        if action == "edit" {
+            let saved = outcome.tip.as_ref().unwrap();
+            assert!(outcome.inspect.is_none(), "{outcome:?}");
+            let visible = JjRepo::run(
+                &repo.repo,
+                &[
+                    "--ignore-working-copy",
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    &saved.change_id,
+                    "-T",
+                    "commit_id ++ \"\\n\"",
+                ],
+            );
+            assert_eq!(visible.trim(), saved.commit_id, "no divergent snapshot may be created");
+            assert_eq!(
+                std::fs::read_to_string(repo.worker.join("first.txt")).unwrap(),
+                "edited without any jj command"
+            );
+            JjRepo::run(&repo.replacement, &["new", "main"]);
+            restore_preserved(&LocalJj, &record, &repo.replacement, Some(saved))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(repo.replacement.join("first.txt")).unwrap(),
+                "first"
+            );
+            assert_eq!(
+                std::fs::read_to_string(repo.worker.join("first.txt")).unwrap(),
+                "edited without any jj command"
+            );
+            continue;
+        }
         // Inspecting the live tip afterwards is safe: preservation has already
         // snapshotted the free workspace.
         let live = tip_of_workspace(&repo);
@@ -1209,15 +1252,28 @@ async fn a_successors_rewrite_of_the_inherited_change_is_not_adopted() {
                     .unwrap_or_else(|| panic!("{label}: {outcome:?}"));
                 assert!(inspect.workspace_count >= Some(1), "{label}: {inspect:?}");
             } else {
-                // The registered boundary commit was untouched when it was
-                // resolved, so it is the safe tip. A free workspace is
-                // snapshotted only afterwards, so the snapshot cannot hide it,
-                // and the snapshot's work is reported rather than adopted.
-                assert_eq!(
-                    outcome.inspect.is_some(),
-                    ownership == BoundaryOwnership::FreeUnproven,
-                    "{label}: {outcome:?}"
+                // Pending edits must not rewrite the boundary change during
+                // teardown; it remains the only visible variant and restages.
+                assert!(outcome.inspect.is_none(), "{label}: {outcome:?}");
+                let saved = outcome.tip.as_ref().unwrap();
+                let visible = JjRepo::run(
+                    &repo.repo,
+                    &[
+                        "--ignore-working-copy",
+                        "log",
+                        "--no-graph",
+                        "-r",
+                        &saved.change_id,
+                        "-T",
+                        "commit_id ++ \"\\n\"",
+                    ],
                 );
+                assert_eq!(visible.trim(), saved.commit_id, "{label}: {visible}");
+                JjRepo::run(&repo.replacement, &["new", "main"]);
+                restore_preserved(&LocalJj, &record, &repo.replacement, Some(saved))
+                    .await
+                    .unwrap()
+                    .unwrap();
                 let files = JjRepo::run(
                     &repo.repo,
                     &[
