@@ -1,11 +1,12 @@
 //! Engine-created recovery references in the shared jj repository.
 //!
-//! Teardown preserves unpublished workspace edits; workers maintain only their
-//! publication branch. Legacy recovery references remain readable during the
-//! transition. The baseline is the commit id recorded on the
-//! execution row at dispatch (`pr_head_before` for a bound PR, the trunk commit
-//! for a fresh item), so rewriting or abandoning any bookmark never invalidates
-//! it; published upstream history is excluded when checking for abandoned work.
+//! Teardown preserves unpublished workspace edits; workers create their
+//! publication branch immediately before opening a PR. Legacy recovery
+//! references remain readable so existing records still restore. The baseline
+//! is the commit id recorded on the execution row at dispatch (`pr_head_before`
+//! for a bound PR, the trunk commit for a fresh item), so rewriting or
+//! abandoning any bookmark never invalidates it; published upstream history is
+//! excluded when checking for abandoned work.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -515,28 +516,12 @@ pub(crate) async fn resume_heads_of(jj: &dyn Jj, record: &ExecutionBookmark) -> 
     resume_heads(jj, record, &pointers).await
 }
 
-/// Construct a legacy three-bookmark record for recovery compatibility fixtures.
-/// Dispatch uses `create_from`, which never creates baseline or publication names.
-pub async fn create(jj: &dyn Jj, workspace: &Path, execution_id: &str, host_id: &str) -> Result<ExecutionBookmark> {
-    let record = create_from(jj, workspace, execution_id, host_id, None, None).await?;
-    jj.run(
-        workspace,
-        &[
-            "bookmark",
-            "set",
-            &record.base(),
-            "-r",
-            record.base_commit.as_deref().unwrap(),
-        ],
-    )
-    .await?;
-    jj.run(
-        workspace,
-        &["bookmark", "set", &record.head(), &record.publication(), "-r", "@"],
-    )
-    .await?;
-    Ok(record)
-}
+/// Compatibility fixtures that still need the pre-migration three-bookmark layout.
+pub mod test_support;
+
+/// Compatibility alias for [`test_support::create_legacy_three_bookmark_fixture`].
+/// Dispatch uses [`create_from`], which never creates baseline or publication names.
+pub use test_support::{create_legacy_three_bookmark_fixture as create, create_legacy_three_bookmark_fixture_from};
 
 /// Pointer initialization failed after identifying the shared store. Dispatch
 /// archives these pointers before creating fresh ones.
@@ -576,15 +561,6 @@ pub async fn create_from(
         pr_head_before: None,
     };
     let result = async {
-        // Existing names are an integrity verdict. Command failures (including
-        // a race creating names after this read) remain retryable.
-        let names = [record.base(), record.head(), record.publication()];
-        let targets = snapshot::resolve_bookmark_targets(jj, &record.repo_path, &names).await?;
-        if !targets.is_empty() {
-            return Err(pointer_integrity_error(
-                "execution recovery pointer names already exist",
-            ));
-        }
         if let Some(prior) = predecessor
             && (prior.repo_path != record.repo_path || prior.host_id != record.host_id)
         {
@@ -622,6 +598,15 @@ pub async fn create_from(
             )
             .await?;
         if !unpublished.trim().is_empty() {
+            // Only the recovery head is created here. A leftover baseline or
+            // publication name from a partial legacy initialization is not a
+            // conflict: dispatch neither writes nor needs those names.
+            let targets = snapshot::resolve_bookmark_targets(jj, &record.repo_path, &[record.head()]).await?;
+            if !targets.is_empty() {
+                return Err(pointer_integrity_error(
+                    "execution recovery pointer names already exist",
+                ));
+            }
             jj.run(workspace, &["bookmark", "create", &record.head(), "-r", "@"])
                 .await?;
         }

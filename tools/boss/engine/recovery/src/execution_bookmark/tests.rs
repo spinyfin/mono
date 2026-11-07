@@ -73,7 +73,14 @@ async fn fresh_dispatch_records_the_floor_without_a_store_operation_and_teardown
         record.base_commit,
         Some(one_commit(&LocalJj, &f.worker, "trunk()").await.unwrap())
     );
-    assert!(LocalJj.run(&f.repo, &["bookmark", "list"]).await.unwrap().is_empty());
+    let names = LocalJj
+        .run(&f.repo, &["bookmark", "list", "-T", "name ++ \"\\n\""])
+        .await
+        .unwrap();
+    assert!(
+        !names.lines().any(|name| name.starts_with("boss-")),
+        "empty dispatch must not write execution bookmarks; got {names}"
+    );
 
     // The worker need not advance any recovery bookmark, even across new changes.
     std::fs::write(f.worker.join("first.txt"), "first edit").unwrap();
@@ -86,7 +93,8 @@ async fn fresh_dispatch_records_the_floor_without_a_store_operation_and_teardown
         .run(&f.repo, &["bookmark", "list", "-T", "name ++ \"\\n\""])
         .await
         .unwrap();
-    assert_eq!(names.trim(), preserved_name(&record.execution_id));
+    let names: Vec<_> = names.lines().filter(|name| *name != "main").collect();
+    assert_eq!(names, vec![preserved_name(&record.execution_id).as_str()]);
     for file in ["first.txt", "second.txt"] {
         let content = LocalJj
             .run(
@@ -103,6 +111,60 @@ async fn fresh_dispatch_records_the_floor_without_a_store_operation_and_teardown
             .unwrap();
         assert!(content.contains("edit"));
     }
+}
+
+#[tokio::test]
+async fn empty_initialization_ignores_a_leftover_legacy_baseline_name() {
+    let f = Fixture::new().await;
+    let trunk = one_commit(&LocalJj, &f.repo, "@").await.unwrap();
+    LocalJj
+        .run(
+            &f.repo,
+            &["config", "set", "--repo", "revset-aliases.\"trunk()\"", &trunk],
+        )
+        .await
+        .unwrap();
+    LocalJj
+        .run(
+            &f.worker,
+            &["bookmark", "create", "boss-base/exec_leftover", "-r", "trunk()"],
+        )
+        .await
+        .unwrap();
+    let operation = || async {
+        LocalJj
+            .run(&f.repo, &["op", "log", "--no-graph", "-n", "1", "-T", "id"])
+            .await
+            .unwrap()
+    };
+    let before = operation().await;
+    let record = create_from(&LocalJj, &f.worker, "exec_leftover", "local", None, None)
+        .await
+        .unwrap();
+    assert_eq!(operation().await, before, "empty dispatch must not mutate the store");
+    assert_eq!(record.base_commit.as_deref(), Some(trunk.as_str()));
+    let names = LocalJj
+        .run(&f.repo, &["bookmark", "list", "-T", "name ++ \"\\n\""])
+        .await
+        .unwrap();
+    assert!(names.lines().any(|name| name == "boss-base/exec_leftover"), "{names}");
+    assert!(
+        LocalJj
+            .run(
+                &f.repo,
+                &[
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    &format!("bookmarks(exact:{})", record.head()),
+                    "-T",
+                    "commit_id"
+                ],
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -611,11 +673,11 @@ async fn conflicted_pointer_bookmark_is_a_pointer_integrity_error() {
 }
 
 #[tokio::test]
-async fn existing_initialization_names_are_an_integrity_failure() {
+async fn existing_recovery_head_is_an_integrity_failure_when_creating_a_head() {
     let f = Fixture::new().await;
     let record = f.record("exec_existing").await;
     f.edit(&record).await;
-    let error = create(&LocalJj, &f.worker, &record.execution_id, "local")
+    let error = create_from(&LocalJj, &f.worker, &record.execution_id, "local", None, None)
         .await
         .unwrap_err();
     assert_eq!(pointer_integrity_kind(&error), Some(PointerIntegrityKind::Other));

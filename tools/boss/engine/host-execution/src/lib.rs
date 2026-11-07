@@ -2504,13 +2504,13 @@ mod tests {
             cube,
             host_id: "host".into(),
         };
+        std::fs::write(repo.worker.join("preserved.txt"), "survives workspace removal").unwrap();
+        LocalJj.run(&repo.worker, &["status"]).await.unwrap();
         let result = executor.execute(&command(op(Kind::CreateBookmark)), false, 1).await;
         assert_eq!(result.code, v1::ResultCode::Ok as i32, "{}", result.reason);
         let Some(command_result::Value::Workspace(created)) = result.value else {
             panic!("missing bookmark result")
         };
-        std::fs::write(repo.worker.join("preserved.txt"), "survives workspace removal").unwrap();
-        LocalJj.run(&repo.worker, &["status"]).await.unwrap();
         LocalJj
             .run(&repo.repo, &["workspace", "forget", "worker"])
             .await
@@ -2567,7 +2567,7 @@ mod tests {
         };
         std::fs::write(repo.worker.join("work.txt"), "worker edit").unwrap();
         LocalJj.run(&repo.worker, &["status"]).await.unwrap();
-        // The publication branch is now created by the worker, not dispatch.
+        // The worker creates the publication branch immediately before opening a PR.
         LocalJj
             .run(&repo.worker, &["bookmark", "set", "boss/exec_test", "-r", "@"])
             .await
@@ -2767,13 +2767,13 @@ mod recovery_tests {
             cube,
             host_id: "host".into(),
         };
+        std::fs::write(repo.worker.join("work.txt"), "preserved").unwrap();
+        LocalJj.run(&repo.worker, &["status"]).await.unwrap();
         let created = executor.execute(&command(op(Kind::CreateBookmark)), false, 1).await;
         assert_eq!(created.code, v1::ResultCode::Ok as i32, "{}", created.reason);
         let Some(command_result::Value::Workspace(created)) = created.value else {
             panic!("missing bookmark")
         };
-        std::fs::write(repo.worker.join("work.txt"), "preserved").unwrap();
-        LocalJj.run(&repo.worker, &["status"]).await.unwrap();
         for kind in [Kind::CheckpointBaseline, Kind::ReconcileBookmark, Kind::RestoreBookmark] {
             let mut request = op(kind);
             request.bookmark = created.bookmark.clone();

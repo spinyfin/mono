@@ -248,8 +248,8 @@ async fn self_retry_with_deleted_own_heads_drops_the_stale_row_and_continues() {
         db.execution_bookmark_optional(&next.id).unwrap().is_none(),
         "a stale row would make dispatch skip creating fresh pointers"
     );
-    // Dispatch records a fresh baseline for the same execution id; a
-    // surviving legacy name must not make that fail.
+    // Empty initialization records the starting commit for the same
+    // execution id even when a leftover baseline name is still present.
     let fresh = coordinator
         .host_adapter()
         .create_execution_bookmark(&repo.worker, &next.id, None, None)
@@ -1093,7 +1093,8 @@ async fn revision_start_retry_keeps_its_own_pointers_on_the_staged_history() {
             diff(&LocalJj, &record).await.unwrap()
         };
         conn.execute_batch("DROP TRIGGER fail_run_start; UPDATE work_executions SET status = 'ready', dispatch_not_before = NULL WHERE started_at IS NULL;").unwrap();
-        // A retry preserves staged work, or follows the current PR when there was none.
+        // A retry restores staged work when the first attempt had some, and
+        // positions on the current PR when it did not.
         JjRepo::run(&h.repo.repo, &["new", "main", "-m", "Main advanced before retry"]);
         std::fs::write(h.repo.repo.join("later"), "later main").unwrap();
         JjRepo::run(&h.repo.repo, &["bookmark", "set", "main", "pr/99", "-r", "@"]);

@@ -150,19 +150,19 @@ async fn conflicts_remain_in_history_and_are_an_explicit_first_task() {
 }
 
 #[tokio::test]
-async fn missing_preserved_pointer_fails_before_modifying_the_destination() {
+async fn missing_preserved_pointer_restores_nothing_without_modifying_the_destination() {
     let dir = tempfile::tempdir().unwrap();
     let repo = JjRepo::new(dir.path());
     origin(&repo);
     let prior = create(&LocalJj, &repo.worker, "exec_missing", "local").await.unwrap();
     JjRepo::run(&repo.repo, &["bookmark", "delete", &prior.head(), &prior.publication()]);
     let before = JjRepo::run(&repo.replacement, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
-    let error = restore_rebased(&LocalJj, &prior, &repo.replacement, None, "main", "origin")
+    let report = restore_rebased(&LocalJj, &prior, &repo.replacement, None, "main", "origin")
         .await
-        .unwrap_err();
-    assert!(error.to_string().contains(&prior.head()));
-    assert!(is_missing_pointer_error(&error));
-    assert!(!is_pointer_integrity_error(&error));
+        .unwrap();
+    assert!(report.pointer.is_empty());
+    assert!(report.commits.trim().is_empty());
+    assert!(report.conflicts.is_empty());
     assert_eq!(
         before,
         JjRepo::run(&repo.replacement, &["log", "-r", "@", "--no-graph", "-T", "commit_id"])
@@ -215,9 +215,16 @@ async fn rewritten_pr_head_does_not_replay_stale_published_commits() {
     JjRepo::run(&repo.worker, &["bookmark", "set", "pr/78", "-r", "@"]);
     JjRepo::run(&repo.worker, &["new", "-m", "Unpushed revision"]);
     let old_pr = one(&repo.worker, "pr/78");
-    let prior = create_from(&LocalJj, &repo.worker, "exec_rewritten", "local", None, Some(&old_pr))
-        .await
-        .unwrap();
+    let prior = create_legacy_three_bookmark_fixture_from(
+        &LocalJj,
+        &repo.worker,
+        "exec_rewritten",
+        "local",
+        None,
+        Some(&old_pr),
+    )
+    .await
+    .unwrap();
     // The publication pointer may still be at the old PR baseline while
     // recovery has advanced to unpublished work.
     JjRepo::run(
@@ -383,7 +390,7 @@ async fn unpushed_local_rebase_of_the_pr_line_does_not_replay_pr_commits() {
     JjRepo::run(&repo.worker, &["bookmark", "set", "pr/79", "-r", "@"]);
     let pr_head = one(&repo.worker, "pr/79");
     JjRepo::run(&repo.worker, &["new", "-m", "Unpushed revision"]);
-    let prior = create_from(
+    let prior = create_legacy_three_bookmark_fixture_from(
         &LocalJj,
         &repo.worker,
         "exec_local_rebase",
@@ -472,7 +479,7 @@ async fn unpushed_amendment_to_a_published_pr_commit_is_retained_exactly_once() 
     JjRepo::run(&repo.worker, &["bookmark", "set", "pr/80", "-r", "@"]);
     let pr_head = one(&repo.worker, "pr/80");
     JjRepo::run(&repo.worker, &["new", "-m", "Unpushed revision"]);
-    let prior = create_from(
+    let prior = create_legacy_three_bookmark_fixture_from(
         &LocalJj,
         &repo.worker,
         "exec_amended_pr_commit",

@@ -109,7 +109,7 @@ impl ExecutionCoordinator {
         }
         let work_item = self.work_db.get_work_item(work_item_id)?;
         let required_driver = self.requested_host_driver(&work_item)?;
-        self.pick_host(&work_item, None, Some(host_id.to_string()), required_driver)
+        self.pick_host(&work_item, None, Some(host_id.to_string()), required_driver, None)
             .map(|_| ())
             .map_err(|err| anyhow!("requested host '{host_id}' is ineligible: {err}"))
     }
@@ -290,6 +290,7 @@ impl ExecutionCoordinator {
         pinned_host_id: Option<String>,
         requested_host_id: Option<String>,
         required_driver: Option<String>,
+        preferred_host_id: Option<String>,
     ) -> Result<Host> {
         // Capability requirements union over the chore + its product +
         // its project. Empty today (no writer yet), which leaves every
@@ -355,6 +356,13 @@ impl ExecutionCoordinator {
             requested_host_id,
         };
         let (picked, report) = select_host(&requirements, &slots);
+        // Prefer the host that already holds restorable work when it is
+        // eligible. An ineligible source (full, disabled, missing caps)
+        // does not wait: another eligible host is chosen and recovery
+        // archives then starts fresh.
+        let picked = preferred_host_id
+            .filter(|id| report.iter().any(|row| row.eligible && row.host_id == *id))
+            .or(picked);
         match picked {
             Some(host_id) => hosts
                 .into_iter()
@@ -402,10 +410,33 @@ impl ExecutionCoordinator {
                 Some("local".to_owned()),
                 requested,
                 self.resolve_spawn_driver(execution, worker_id)?,
+                None,
             );
         }
         let required_driver = self.resolve_spawn_driver(execution, worker_id)?;
-        self.pick_host(work_item, pinned, requested, required_driver)
+        let preferred = self.recovery_source_host(execution)?;
+        self.pick_host(work_item, pinned, requested, required_driver, preferred)
+    }
+
+    /// Host that holds this execution's restorable work, when a record exists.
+    /// Used only as a non-blocking placement preference.
+    fn recovery_source_host(&self, execution: &WorkExecution) -> Result<Option<String>> {
+        if execution.kind.is_read_only_review() {
+            return Ok(None);
+        }
+        let source_id = if self.work_db.preserved_tip(&execution.id)?.is_some()
+            || self.work_db.execution_bookmark_optional(&execution.id)?.is_some()
+        {
+            execution.id.clone()
+        } else if let Some(prior) = self.work_db.recovery_predecessor(execution)? {
+            prior.id
+        } else {
+            return Ok(None);
+        };
+        Ok(self
+            .work_db
+            .execution_bookmark_optional(&source_id)?
+            .map(|record| record.host_id))
     }
 
     pub(super) fn immutable_execution_target(&self, execution: &WorkExecution) -> Result<Option<String>> {

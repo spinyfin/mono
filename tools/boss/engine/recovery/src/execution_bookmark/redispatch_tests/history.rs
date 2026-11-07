@@ -82,14 +82,15 @@ async fn redispatch_does_not_promote_positioning_changes_into_pushed_history() {
             .await
             .unwrap();
             // A second redispatch with no edits must not reintroduce the setup entry.
-            if has_fixes {
-                restore_rebased(&LocalJj, &next, &repo.replacement, pr, "main", "origin")
-                    .await
-                    .unwrap();
-            } else {
+            let second = restore_rebased(&LocalJj, &next, &repo.replacement, pr, "main", "origin")
+                .await
+                .unwrap();
+            if !has_fixes {
                 assert!(log(&repo.repo, &revision(&next.head()), "commit_id").is_empty());
-                // No unpublished work means normal positioning, with no pointer to restore.
-                JjRepo::run(&repo.replacement, &["new", pr.unwrap_or("main")]);
+                assert!(
+                    second.commits.trim().is_empty() && second.pointer.is_empty(),
+                    "PR {pr:?}: empty successor has nothing to restore"
+                );
             }
             std::fs::write(repo.replacement.join("review-fix"), "review correction\n").unwrap();
             JjRepo::run(&repo.replacement, &["describe", "-m", "Correct review findings"]);
