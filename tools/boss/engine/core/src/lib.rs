@@ -218,6 +218,7 @@ pub mod trace_rotation;
 pub use boss_engine_transient_error as transient_error;
 pub mod tmux_health;
 pub mod tmux_preflight;
+pub mod unpark_reconcile;
 pub mod transcript_liveness;
 pub mod transient_recovery;
 pub use boss_engine_utility_model as utility_model;

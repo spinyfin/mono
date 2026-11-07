@@ -735,6 +735,7 @@ mod feedback_target;
 mod github_api_usage_db;
 mod github_merge_intents;
 pub mod parking;
+pub mod parking_reconcile;
 pub mod personas;
 mod progression_scope;
 mod project_postmortem;

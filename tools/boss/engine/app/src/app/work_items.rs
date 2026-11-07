@@ -866,8 +866,18 @@ pub(super) async fn apply_work_item_patch(
                 return;
             }
         };
-        match work_db.update_work_item_as_actor(&id, patch, actor) {
-            Ok(mut item) => {
+        // An un-park reports the rows it released, so the reconciliation
+        // sequence's background steps can be scheduled from them below.
+        let unparking = patch.parked == Some(false);
+        let applied = if patch.parked.is_some() || patch.parked_reason.is_some() {
+            work_db
+                .apply_parking_patch_reporting(&id, &patch, actor)
+                .map(|(item, report)| (item, Some(report)))
+        } else {
+            work_db.update_work_item_as_actor(&id, patch, actor).map(|item| (item, None))
+        };
+        match applied {
+            Ok((mut item, unpark_report)) => {
                 // Dispatch refusals roll back the move and return the engine reason.
                 let mut dispatch_failure_response: Option<String> = None;
                 // Set only inside the pause-bypass arm's genuine claim branch
@@ -1267,6 +1277,12 @@ pub(super) async fn apply_work_item_patch(
                     vec![work_item_id(&item)],
                 )
                 .await;
+                // Un-park reconciliation (design section 1.5): the database
+                // steps are done and the board has been told; leave their trace
+                // and run the steps that call GitHub in the background.
+                if unparking && let Some(report) = unpark_report {
+                    server_state.begin_unpark_reconcile(actor, &id, report).await;
+                }
                 if let Some(reason) = dispatch_failure_response {
                     // The status patch was reverted above; answer this
                     // request with a refusal (not the reverted item as a

@@ -358,6 +358,11 @@ pub(super) fn all() -> Vec<Migration> {
             legacy_version: None,
             apply: spoke_hub::migrate_host_commands_run_idx,
         },
+        Migration {
+            id: parking_reconcile::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: parking_reconcile::migrate,
+        },
     ]);
     migrations
 }

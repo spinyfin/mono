@@ -1738,11 +1738,7 @@ async fn serve_scoped(
             // Conflict remediation, design-doc pointer maintenance and project
             // population are carried out by the services that own them; the
             // poller reaches them through this host.
-            host: Arc::new(boss_engine_runtime::merge_poller_adapters::CoreSweepHost::new(
-                server_state.work_db.clone(),
-                server_state.publisher.clone(),
-                server_state.cube_client.clone(),
-            )),
+            host: server_state.sweep_host.clone(),
         },
         Duration::from_secs(60),
         server_state.metrics.clone(),

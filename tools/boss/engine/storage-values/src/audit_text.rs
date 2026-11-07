@@ -16,6 +16,12 @@ pub const DOC_DETECTOR_MARKER: &str = "[doc-detector]";
 /// stripped before brief / emptiness checks see it.
 pub const PR_REVIEW_SKIP_MARKER: &str = "[pr-review-skip]";
 
+/// `[parking]` audit-line marker: one line per step of the un-park
+/// reconciliation sequence, appended by `unpark_reconcile` in the engine core
+/// crate. Shared with [`ENGINE_AUDIT_LINE_PREFIXES`] so the trail is stripped
+/// from the brief a worker or reviewer reads.
+pub const PARKING_MARKER: &str = "[parking]";
+
 /// Prefixes of engine-appended description lines. Shared by
 /// `WorkDb::append_work_item_description_line` writers and [`strip_engine_audit_lines`] so the
 /// vocabulary of audit lines lives in one place: a line whose trimmed text
@@ -35,6 +41,7 @@ pub const ENGINE_AUDIT_LINE_PREFIXES: &[&str] = &[
     DEFERRED_SCOPE_MARKER,
     PR_REVIEW_SKIP_MARKER,
     PROCESSED_MARKER,
+    PARKING_MARKER,
 ];
 
 /// True when `line` is an engine-appended audit line rather than

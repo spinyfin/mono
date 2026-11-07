@@ -1163,19 +1163,42 @@ impl WorkDb {
     /// work item, not a particular kind, so every dead run on the row is
     /// evidence about the row.
     pub fn list_consecutive_unproductive_terminal_execution_ids(&self, work_item_id: &str) -> Result<Vec<String>> {
+        self.list_consecutive_unproductive_terminal_execution_ids_since(work_item_id, None)
+    }
+
+    /// [`Self::list_consecutive_unproductive_terminal_execution_ids`] that stops
+    /// at the first execution created before `since_epoch_secs`, as if the
+    /// streak began there. The orphan sweep passes the item's last un-park time
+    /// (see [`Self::last_unparked_at`]): executions that died before the owner
+    /// decided to try again are not strikes against the first attempt after it.
+    /// `None` counts the whole history.
+    pub fn list_consecutive_unproductive_terminal_execution_ids_since(
+        &self,
+        work_item_id: &str,
+        since_epoch_secs: Option<i64>,
+    ) -> Result<Vec<String>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT id, status FROM work_executions
+            "SELECT id, status, CAST(created_at AS INTEGER) FROM work_executions
               WHERE work_item_id = ?1
               ORDER BY created_at DESC, id DESC",
         )?;
         let rows = stmt.query_map(params![work_item_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, status) = row?;
+            let (id, status, created_at) = row?;
             if !matches!(status.as_str(), "orphaned" | "abandoned" | "failed" | "cancelled") {
+                break;
+            }
+            if let (Some(floor), Some(created_at)) = (since_epoch_secs, created_at)
+                && created_at < floor
+            {
                 break;
             }
             out.push(id);

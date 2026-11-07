@@ -1070,136 +1070,7 @@ impl WorkDb {
         let mut result = ExecutionReconcileResult::default();
         let mut pending = PendingEvents::new();
 
-        // Per-row repo resolution lives inside
-        // `reconcile_work_item_execution` now — the product default
-        // is one of several fallbacks the resolver applies, not the
-        // sole signal threaded through here.
-
-        // Bucket the product's project-bound tasks by parent. Both
-        // `kind = 'design'` and `kind = 'project_task'` share the
-        // same first-incomplete-is-`ready` chain — design tasks live
-        // at `ordinal = 0` so they sort to the head of the list and
-        // dispatch first. The execution kind diverges per-row:
-        // design dispatches as `project_design`, project_tasks as
-        // `task_implementation`. This is the single point where the
-        // project_design lifecycle plugs into the existing per-task
-        // dispatch machinery; once routed the rest of the lifecycle
-        // (PR detection, in_review→done, dependency cascade) is the
-        // unchanged task path.
-        let mut project_tasks: HashMap<String, Vec<Task>> = HashMap::new();
-        for task in tasks {
-            match task.kind {
-                TaskKind::Chore | TaskKind::Followup => {
-                    if task_accepts_execution(&task) {
-                        reconcile_work_item_execution(
-                            &tx,
-                            &mut result,
-                            &task.id,
-                            ExecutionKind::ChoreImplementation,
-                            ExecutionStatus::Ready,
-                        )?;
-                    }
-                }
-                // Investigation tasks dispatch independently (no project
-                // dependency chain) — each produces one standalone doc PR.
-                TaskKind::Investigation => {
-                    if task_accepts_execution(&task) {
-                        reconcile_work_item_execution(
-                            &tx,
-                            &mut result,
-                            &task.id,
-                            ExecutionKind::InvestigationImplementation,
-                            ExecutionStatus::Ready,
-                        )?;
-                    }
-                }
-                // Design postmortems dispatch independently too — they are
-                // scheduled by `project_postmortem_sweep` only once the
-                // project's ordinal-based task chain is fully drained, so
-                // there is never a chain to serialize against.
-                TaskKind::DesignPostmortem => {
-                    if task_accepts_execution(&task) {
-                        reconcile_work_item_execution(
-                            &tx,
-                            &mut result,
-                            &task.id,
-                            ExecutionKind::ProjectDesign,
-                            ExecutionStatus::Ready,
-                        )?;
-                    }
-                }
-                // Revision tasks dispatch independently like investigations.
-                // Each pushes a new commit to the *parent's* existing PR
-                // branch rather than opening a new PR.  The gate checks
-                // the chain root's status first (cached): if the parent PR
-                // has already merged (chain root is `done`), the revision
-                // is auto-blocked here rather than dispatched.
-                TaskKind::Revision => {
-                    if task_accepts_execution(&task) {
-                        reconcile_revision_execution(&mut pending, &tx, &mut result, &task)?;
-                    }
-                }
-                TaskKind::ProjectTask | TaskKind::Design => {
-                    if let Some(project_id) = &task.project_id {
-                        project_tasks.entry(project_id.clone()).or_default().push(task);
-                    }
-                }
-                TaskKind::Task => {
-                    // Plain task: no standalone execution; must be in a project.
-                }
-            }
-        }
-
-        for tasks in project_tasks.values_mut() {
-            tasks.sort_by(|left, right| {
-                left.ordinal
-                    .unwrap_or(i64::MAX)
-                    .cmp(&right.ordinal.unwrap_or(i64::MAX))
-                    .then_with(|| left.created_at.cmp(&right.created_at))
-                    .then_with(|| left.id.cmp(&right.id))
-            });
-
-            // Ordinal-chain readiness: only the single lowest-ordinal
-            // incomplete task in a project is `ready`; every other project
-            // task is forced to `waiting_dependency`. The declared `blocks`
-            // prerequisite graph is NOT consulted here — that gate lives in
-            // `reconcile_work_item_execution` (and the dispatcher). The two
-            // rules disagree: a later-ordinal task with an empty prerequisite
-            // list is still flipped to `waiting_dependency` by this loop.
-            // That disagreement is what made the ready-window race reachable
-            // (the scheduler had already picked the row up as `ready`). The
-            // `claimed` status + CAS write close the race; aligning this
-            // rule with the prerequisite graph is a separate change.
-            let first_incomplete = tasks.iter().position(task_accepts_execution);
-
-            for (index, task) in tasks.iter().enumerate() {
-                if !task_accepts_execution(task) {
-                    continue;
-                }
-                let desired_status = if Some(index) == first_incomplete {
-                    ExecutionStatus::Ready
-                } else {
-                    ExecutionStatus::WaitingDependency
-                };
-                let execution_kind = match task.kind {
-                    TaskKind::Design => ExecutionKind::ProjectDesign,
-                    // Never actually reached: DesignPostmortem rows are
-                    // routed to the independent-dispatch arm above and never
-                    // land in `project_tasks`. Mapped defensively in case
-                    // that invariant ever breaks.
-                    TaskKind::DesignPostmortem => ExecutionKind::ProjectDesign,
-                    // All remaining kinds in this bucket are project_task rows;
-                    // the other variants are handled before being bucketed here.
-                    TaskKind::ProjectTask
-                    | TaskKind::Chore
-                    | TaskKind::Followup
-                    | TaskKind::Investigation
-                    | TaskKind::Revision
-                    | TaskKind::Task => ExecutionKind::TaskImplementation,
-                };
-                reconcile_work_item_execution(&tx, &mut result, &task.id, execution_kind, desired_status)?;
-            }
-        }
+        reconcile_tasks(&tx, &mut pending, &mut result, tasks)?;
 
         commit_and_publish(tx, pending, self.event_bus())?;
         Ok(result)
@@ -2412,6 +2283,151 @@ pub(super) fn cancel_execution_in_tx(
     );
     stage_execution_terminal(pending, tx, execution_id, &updated.work_item_id)?;
     Ok(updated)
+}
+
+/// Reconcile the execution rows of `tasks` (one product's rows, or the rows an
+/// item-level reconcile needs): mint, promote or demote each task's execution
+/// exactly as an ordinary board invalidation would. Shared by
+/// [`WorkDb::reconcile_product_executions`] and
+/// [`WorkDb::reconcile_item_execution`].
+pub(crate) fn reconcile_tasks(
+    tx: &Connection,
+    pending: &mut PendingEvents,
+    result: &mut ExecutionReconcileResult,
+    tasks: Vec<Task>,
+) -> Result<()> {
+    // Per-row repo resolution lives inside
+    // `reconcile_work_item_execution` now — the product default
+    // is one of several fallbacks the resolver applies, not the
+    // sole signal threaded through here.
+
+    // Bucket the product's project-bound tasks by parent. Both
+    // `kind = 'design'` and `kind = 'project_task'` share the
+    // same first-incomplete-is-`ready` chain — design tasks live
+    // at `ordinal = 0` so they sort to the head of the list and
+    // dispatch first. The execution kind diverges per-row:
+    // design dispatches as `project_design`, project_tasks as
+    // `task_implementation`. This is the single point where the
+    // project_design lifecycle plugs into the existing per-task
+    // dispatch machinery; once routed the rest of the lifecycle
+    // (PR detection, in_review→done, dependency cascade) is the
+    // unchanged task path.
+    let mut project_tasks: HashMap<String, Vec<Task>> = HashMap::new();
+    for task in tasks {
+        match task.kind {
+            TaskKind::Chore | TaskKind::Followup => {
+                if task_accepts_execution(&task) {
+                    reconcile_work_item_execution(
+                        tx,
+                        result,
+                        &task.id,
+                        ExecutionKind::ChoreImplementation,
+                        ExecutionStatus::Ready,
+                    )?;
+                }
+            }
+            // Investigation tasks dispatch independently (no project
+            // dependency chain) — each produces one standalone doc PR.
+            TaskKind::Investigation => {
+                if task_accepts_execution(&task) {
+                    reconcile_work_item_execution(
+                        tx,
+                        result,
+                        &task.id,
+                        ExecutionKind::InvestigationImplementation,
+                        ExecutionStatus::Ready,
+                    )?;
+                }
+            }
+            // Design postmortems dispatch independently too — they are
+            // scheduled by `project_postmortem_sweep` only once the
+            // project's ordinal-based task chain is fully drained, so
+            // there is never a chain to serialize against.
+            TaskKind::DesignPostmortem => {
+                if task_accepts_execution(&task) {
+                    reconcile_work_item_execution(
+                        tx,
+                        result,
+                        &task.id,
+                        ExecutionKind::ProjectDesign,
+                        ExecutionStatus::Ready,
+                    )?;
+                }
+            }
+            // Revision tasks dispatch independently like investigations.
+            // Each pushes a new commit to the *parent's* existing PR
+            // branch rather than opening a new PR.  The gate checks
+            // the chain root's status first (cached): if the parent PR
+            // has already merged (chain root is `done`), the revision
+            // is auto-blocked here rather than dispatched.
+            TaskKind::Revision => {
+                if task_accepts_execution(&task) {
+                    reconcile_revision_execution(pending, tx, result, &task)?;
+                }
+            }
+            TaskKind::ProjectTask | TaskKind::Design => {
+                if let Some(project_id) = &task.project_id {
+                    project_tasks.entry(project_id.clone()).or_default().push(task);
+                }
+            }
+            TaskKind::Task => {
+                // Plain task: no standalone execution; must be in a project.
+            }
+        }
+    }
+
+    for tasks in project_tasks.values_mut() {
+        tasks.sort_by(|left, right| {
+            left.ordinal
+                .unwrap_or(i64::MAX)
+                .cmp(&right.ordinal.unwrap_or(i64::MAX))
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        // Ordinal-chain readiness: only the single lowest-ordinal
+        // incomplete task in a project is `ready`; every other project
+        // task is forced to `waiting_dependency`. The declared `blocks`
+        // prerequisite graph is NOT consulted here — that gate lives in
+        // `reconcile_work_item_execution` (and the dispatcher). The two
+        // rules disagree: a later-ordinal task with an empty prerequisite
+        // list is still flipped to `waiting_dependency` by this loop.
+        // That disagreement is what made the ready-window race reachable
+        // (the scheduler had already picked the row up as `ready`). The
+        // `claimed` status + CAS write close the race; aligning this
+        // rule with the prerequisite graph is a separate change.
+        let first_incomplete = tasks.iter().position(task_accepts_execution);
+
+        for (index, task) in tasks.iter().enumerate() {
+            if !task_accepts_execution(task) {
+                continue;
+            }
+            let desired_status = if Some(index) == first_incomplete {
+                ExecutionStatus::Ready
+            } else {
+                ExecutionStatus::WaitingDependency
+            };
+            let execution_kind = match task.kind {
+                TaskKind::Design => ExecutionKind::ProjectDesign,
+                // Never actually reached: DesignPostmortem rows are
+                // routed to the independent-dispatch arm above and never
+                // land in `project_tasks`. Mapped defensively in case
+                // that invariant ever breaks.
+                TaskKind::DesignPostmortem => ExecutionKind::ProjectDesign,
+                // All remaining kinds in this bucket are project_task rows;
+                // the other variants are handled before being bucketed here.
+                TaskKind::ProjectTask
+                | TaskKind::Chore
+                | TaskKind::Followup
+                | TaskKind::Investigation
+                | TaskKind::Revision
+                | TaskKind::Task => ExecutionKind::TaskImplementation,
+            };
+            reconcile_work_item_execution(tx, result, &task.id, execution_kind, desired_status)?;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

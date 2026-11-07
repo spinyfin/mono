@@ -841,6 +841,18 @@ pub enum Stage {
     /// this one run (`details.reason`). The run stays live but unobserved
     /// until it is reaped or re-adopted; readoption re-arms discovery.
     FileIngressDiscoveryFailed,
+    /// One step of the un-park reconciliation sequence ran for a work item the
+    /// owner just un-parked (`engine/core/src/unpark_reconcile.rs`). Keyed by
+    /// the work item id rather than an execution id, like `dispatch_decision`:
+    /// the sequence concerns the item, not any one run, so it is a timeline
+    /// observation that never re-opens a dispatched execution's timeline.
+    /// `details.step` names the step (`clear_halt_stamps`, `refresh_pr`,
+    /// `conflict_probe`, `ci_probe`, `ai_review`, `reconcile_execution`,
+    /// `revisions`, `progression_grace`, `rate_limit`, `progress`),
+    /// `details.outcome` what it did, and `outcome` is `ok` when the step
+    /// acted or found nothing to do, `skipped` when its precondition did not
+    /// hold, and `error` when it failed (the sequence continues past it).
+    UnparkReconcile,
 }
 
 /// How a dispatch record participates in an execution timeline.
@@ -856,7 +868,7 @@ pub enum TimelineStageClass {
 
 impl Stage {
     /// Every stable stage name, for exhaustive schema-contract tests.
-    pub const ALL: [Stage; 67] = [
+    pub const ALL: [Stage; 68] = [
         Stage::StatusTransition,
         Stage::RequestRecorded,
         Stage::WorkerClaimed,
@@ -924,6 +936,7 @@ impl Stage {
         Stage::FileIngressAttached,
         Stage::FileIngressDiscoveryOverdue,
         Stage::FileIngressDiscoveryFailed,
+        Stage::UnparkReconcile,
     ];
 
     /// Classify this stage's effect on an execution timeline.
@@ -933,9 +946,10 @@ impl Stage {
             // its dispatch pipeline. In particular, a heartbeat must not
             // hide a dispatch that is stuck before pane spawn, and the
             // victim-side preemption record must not reopen a finished run.
-            Stage::DispatchDecision | Stage::AutomationPreempted | Stage::CubeLeaseHeartbeat => {
-                TimelineStageClass::Observation
-            }
+            Stage::DispatchDecision
+            | Stage::AutomationPreempted
+            | Stage::CubeLeaseHeartbeat
+            | Stage::UnparkReconcile => TimelineStageClass::Observation,
             stage if stage.is_post_dispatch() => TimelineStageClass::PostDispatch,
             _ => TimelineStageClass::Pipeline,
         }
@@ -1010,6 +1024,7 @@ impl Stage {
             Stage::FileIngressAttached => "file_ingress_attached",
             Stage::FileIngressDiscoveryOverdue => "file_ingress_discovery_overdue",
             Stage::FileIngressDiscoveryFailed => "file_ingress_discovery_failed",
+            Stage::UnparkReconcile => "unpark_reconcile",
         }
     }
 
@@ -1091,6 +1106,7 @@ impl Stage {
             | Stage::DispatchDecision
             | Stage::AutomationPreempted
             | Stage::CubeLeaseHeartbeat
+            | Stage::UnparkReconcile
             // Not a stage at all — the detector's own flag, folded
             // separately by every reader before terminality is asked.
             | Stage::StageStalled => false,
@@ -1928,6 +1944,7 @@ mod tests {
             Stage::FileIngressDiscoveryFailed.as_str(),
             "file_ingress_discovery_failed"
         );
+        assert_eq!(Stage::UnparkReconcile.as_str(), "unpark_reconcile");
         assert_eq!(Stage::ExecutionFinalized.as_str(), "execution_finalized");
     }
 
@@ -1958,6 +1975,7 @@ mod tests {
             Stage::DispatchDecision,
             Stage::AutomationPreempted,
             Stage::CubeLeaseHeartbeat,
+            Stage::UnparkReconcile,
         ] {
             assert_eq!(
                 stage.timeline_class(),

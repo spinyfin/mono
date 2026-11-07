@@ -38,6 +38,27 @@ pub fn append_reconcile_audit(
 
 pub use boss_engine_storage_values::audit_text::*;
 
+/// Append a `[parking]` audit line to `work_item_id`'s description: one line of
+/// the un-park reconciliation trail.
+///
+/// The emitted line is `\n[parking] epoch {now_epoch_secs}: {step}: {detail}.`
+/// where `step` is the reconciliation step's stable name. The caller formats
+/// `detail` (without the trailing period); this helper owns the marker and the
+/// shape, so the vocabulary stays registered in [`ENGINE_AUDIT_LINE_PREFIXES`].
+pub fn append_parking_audit(
+    work_db: &WorkDb,
+    work_item_id: &str,
+    now_epoch_secs: i64,
+    step: &str,
+    detail: &str,
+) -> anyhow::Result<()> {
+    append_description_line(
+        work_db,
+        work_item_id,
+        &format!("\n{PARKING_MARKER} epoch {now_epoch_secs}: {step}: {detail}."),
+    )
+}
+
 /// Append `line` verbatim to `work_item_id`'s description. Shared by
 /// [`append_reconcile_audit`] and [`crate::WorkerCompletionHandler::record_deferred_scope_item`]
 /// (the `[deferred-scope]` audit trail) — both use the same atomic append,
@@ -191,6 +212,27 @@ mod tests {
     }
 
     #[test]
+    fn parking_audit_line_has_the_registered_marker_and_shape() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_active_chore(&db, &product.id, "unparked");
+        set_description(&db, &chore, "brief");
+
+        append_parking_audit(&db, &chore, EPOCH, "refresh_pr", "PR is still open").unwrap();
+
+        let description = description_of(&db, &chore);
+        assert_eq!(
+            description,
+            "brief\n[parking] epoch 1700000000: refresh_pr: PR is still open."
+        );
+        assert_eq!(
+            strip_engine_audit_lines(&description),
+            "brief",
+            "the parking trail must not leak into the brief a worker reads",
+        );
+    }
+
+    #[test]
     fn best_effort_swallows_lookup_failure() {
         let (_dir, db) = open_db();
         let missing = "task_does_not_exist";
@@ -250,6 +292,7 @@ mod tests {
             crate::deferred_scope::DEFERRED_SCOPE_MARKER,
             PR_REVIEW_SKIP_MARKER,
             crate::postmortem_followups::PROCESSED_MARKER,
+            PARKING_MARKER,
         ];
         for marker in known_writer_markers {
             assert!(

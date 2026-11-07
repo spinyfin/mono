@@ -72,6 +72,26 @@ crate::register_gauge!(
     "REST requests left in the current hourly window, as of the last response that reported it."
 );
 
+/// A GraphQL `remaining` reading older than this is treated as absent: GitHub's
+/// quota window is hourly, so a low reading from before the last reset says
+/// nothing about the budget now.
+const GRAPHQL_REMAINING_MAX_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// GraphQL points left in the current hourly window, as of the last response
+/// that reported it, or `None` if none has (or the last one is older than the
+/// window). The un-park reconciliation job reads this before spending
+/// GitHub quota on a project's worth of children; absence means "unknown", and
+/// callers must not treat it as exhausted.
+pub fn graphql_points_remaining(registry: &Registry) -> Option<i64> {
+    let gauge = registry.gauge_snapshot_one(GITHUB_API_GRAPHQL_REMAINING.name())?;
+    if gauge.observed_at_ms <= 0 {
+        return None;
+    }
+    let now_ms = boss_engine_utils::epoch_time::now_epoch_secs().saturating_mul(1000);
+    let age_ms = u64::try_from(now_ms.saturating_sub(gauge.observed_at_ms)).unwrap_or(0);
+    (Duration::from_millis(age_ms) <= GRAPHQL_REMAINING_MAX_AGE).then_some(gauge.value)
+}
+
 /// Register the static handles. Called from
 /// `boss_engine::metrics_init::init_all` at engine startup.
 pub fn register_metrics(registry: &Registry) {
