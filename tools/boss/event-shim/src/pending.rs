@@ -2,6 +2,16 @@
 use super::*;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+struct UnlinkOnDrop(Option<PathBuf>);
+
+impl Drop for UnlinkOnDrop {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 pub fn deliver(directory: &Path, socket: &str, payload: &[u8], deadline: Instant) -> Result<()> {
     let metadata = std::fs::symlink_metadata(directory)?;
     anyhow::ensure!(
@@ -63,9 +73,11 @@ pub fn deliver(directory: &Path, socket: &str, payload: &[u8], deadline: Instant
         .write(true)
         .mode(0o600)
         .open(&temporary)?;
+    let mut guard = UnlinkOnDrop(Some(temporary.clone()));
     file.write_all(&bytes)?;
     file.sync_all()?;
     std::fs::rename(&temporary, &path)?;
+    guard.0 = None;
     File::open(directory)?.sync_all()?;
     FileExt::unlock(&lock)?;
     match connect_with_retry(socket, deadline).and_then(|stream| send_to_stream(stream, &bytes, deadline)) {
@@ -84,5 +96,49 @@ pub fn deliver(directory: &Path, socket: &str, payload: &[u8], deadline: Instant
             eprintln!("boss-event: pending event retained for spoke recovery");
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn full_spool_rejects_without_advancing_sequence() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("pending");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let producer = "0123456789abcdef0123456789abcdef";
+        std::fs::write(
+            directory.join("producer.state"),
+            serde_json::to_vec(&(producer, 7u64)).unwrap(),
+        )
+        .unwrap();
+        let existing = directory.join(format!("00000000000000000006-{producer}.json"));
+        let filler = std::fs::File::create(&existing).unwrap();
+        filler.set_len(64 * 1024 * 1024).unwrap();
+        drop(filler);
+        let error = deliver(
+            &directory,
+            "/tmp/boss-event-missing.sock",
+            br#"{"hook_event_name":"Stop"}"#,
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("pending hook spool full"), "{error}");
+        assert_eq!(std::fs::metadata(&existing).unwrap().len(), 64 * 1024 * 1024);
+        let pending: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(|e| {
+                let path = e.unwrap().path();
+                matches!(path.extension().and_then(|s| s.to_str()), Some("json" | "tmp")).then_some(path)
+            })
+            .collect();
+        assert_eq!(pending, vec![existing]);
+        let (id, sequence): (String, u64) =
+            serde_json::from_slice(&std::fs::read(directory.join("producer.state")).unwrap()).unwrap();
+        assert_eq!((id, sequence), (producer.to_owned(), 7));
     }
 }

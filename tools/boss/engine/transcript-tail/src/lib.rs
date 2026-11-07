@@ -62,12 +62,6 @@ pub mod raw {
         pub observed_size: u64,
     }
 
-    /// Uses the same no-follow opens and prefix/suffix rewrite detection as the
-    /// JSONL tail. The caller persists the returned cursor only with the bytes.
-    pub async fn read(path: &Path, cursor: &Cursor, max_bytes: usize) -> Result<Chunk, TailError> {
-        read_contained(path, None, cursor, max_bytes).await
-    }
-
     pub async fn read_contained(
         path: &Path,
         root: Option<&Path>,

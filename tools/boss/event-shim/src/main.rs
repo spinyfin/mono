@@ -92,6 +92,8 @@ use fs4::fs_std::FileExt;
 
 /// Engine events socket path. Required.
 const SOCKET_ENV: &str = "BOSS_EVENTS_SOCKET";
+/// Pending-hook spool directory. Must match `boss_host_execution::worker::EVENT_SPOOL_ENV`.
+const EVENT_SPOOL_ENV: &str = "BOSS_EVENT_SPOOL";
 /// Run id to splice into payloads. Optional — splice falls back to
 /// forwarding the original payload when unset.
 const RUN_ID_ENV: &str = "BOSS_RUN_ID";
@@ -247,7 +249,7 @@ fn run() -> Result<()> {
         Err(_) => payload,
     };
 
-    if let Some(directory) = env::var_os("BOSS_EVENT_SPOOL") {
+    if let Some(directory) = env::var_os(EVENT_SPOOL_ENV) {
         return pending::deliver(Path::new(&directory), &socket_path, &payload_line, deadline);
     }
 
