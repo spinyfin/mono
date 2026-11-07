@@ -29,6 +29,7 @@ struct ServiceFlags {
     running: Cell<bool>,
     registered: Cell<bool>,
     register_fails: Cell<bool>,
+    restart_fails: Cell<bool>,
     restart_stays_up: bool,
 }
 
@@ -51,6 +52,7 @@ impl Recording {
                 running: Cell::new(false),
                 registered: Cell::new(false),
                 register_fails: Cell::new(false),
+                restart_fails: Cell::new(false),
                 restart_stays_up: true,
             },
             calls: RefCell::default(),
@@ -89,6 +91,9 @@ impl Host for Recording {
 
     fn restart_service(&self) -> Result<()> {
         self.calls.borrow_mut().push("restart");
+        if self.service.restart_fails.get() {
+            anyhow::bail!("restart failed");
+        }
         self.service.running.set(self.service.restart_stays_up);
         Ok(())
     }
@@ -305,7 +310,7 @@ fn an_upgrade_switches_current_and_restarts_an_enrolled_host_keeping_its_state()
 
     assert!(report.changed.contains(&"current release switched"));
     assert!(report.enrolled && report.restarted);
-    assert_eq!(fixture.host.calls(), ["register", "restart"]);
+    assert_eq!(fixture.host.calls(), ["register", "register", "restart"]);
     assert_eq!(fixture.current_target(), Path::new("releases/1.0.2"));
     assert!(
         fixture.at(fixture.layout().release_dir("1.0.1")).is_dir(),
@@ -348,7 +353,7 @@ fn a_new_hub_ca_restarts_an_enrolled_host_but_a_new_host_id_is_refused() {
             .build()
     };
     let report = install::install(&fixture.host, &request("host-one", rotated)).unwrap();
-    assert_eq!(report.changed, ["hub trust installed"]);
+    assert_eq!(report.changed, ["hub trust installed", "service registration"]);
     assert!(report.restarted, "the daemon reads its CA only at startup");
 
     let error = install::install(&fixture.host, &request("host-two", rotated)).unwrap_err();
@@ -739,6 +744,66 @@ fn a_corrupt_install_record_does_not_bypass_the_host_id_guard() {
         !fixture.at(fixture.layout().current()).exists(),
         "a corrupt record must not be overwritten as a first install"
     );
+}
+
+#[test]
+fn startup_input_changes_retry_until_an_enabled_running_service_is_reconciled() {
+    for upgrade in [true, false] {
+        for fail_registration in [true, false] {
+            let fixture = Fixture::new();
+            fixture.install(&release("1.0.1")).unwrap();
+            fixture.enroll();
+            fixture.install(&release("1.0.1")).unwrap();
+            fixture.host.calls.borrow_mut().clear();
+            let next = release(if upgrade { "1.0.2" } else { "1.0.1" });
+            let ca = if upgrade {
+                CA
+            } else {
+                b"-----BEGIN CERTIFICATE-----\nROTATED\n"
+            };
+            let request = Request::builder()
+                .manifest(&next.manifest)
+                .signature(&next.signature)
+                .package(&next.package)
+                .host_id("host-one")
+                .hub_url("https://hub.example:7443")
+                .hub_ca(ca)
+                .platform(Platform::host().unwrap())
+                .layout(fixture.layout())
+                .health(INSTANT)
+                .build();
+            let record = fixture.at(fixture.layout().etc().join("service-reconciled"));
+            let previous = fs::read(&record).unwrap();
+            fixture.host.service.register_fails.set(fail_registration);
+            fixture.host.service.restart_fails.set(!fail_registration);
+            let error = install::install(&fixture.host, &request).unwrap_err();
+            assert!(error.to_string().contains(if fail_registration {
+                "registration failed"
+            } else {
+                "restart failed"
+            }));
+            assert_eq!(fs::read(&record).unwrap(), previous);
+            assert!(fixture.host.service.registered.get());
+            assert!(fixture.host.service.running.get());
+            assert_eq!(
+                fs::read(fixture.at(fixture.layout().state_dir().join("credentials/ca.pem"))).unwrap(),
+                ca
+            );
+            assert_eq!(
+                fixture.current_target(),
+                Path::new("releases").join(if upgrade { "1.0.2" } else { "1.0.1" })
+            );
+            fixture.host.service.register_fails.set(false);
+            fixture.host.service.restart_fails.set(false);
+            fixture.host.calls.borrow_mut().clear();
+            assert!(install::install(&fixture.host, &request).unwrap().restarted);
+            assert_eq!(fixture.host.calls(), ["register", "restart"]);
+            fixture.host.calls.borrow_mut().clear();
+            let report = install::install(&fixture.host, &request).unwrap();
+            assert!(!report.restarted && report.changed.is_empty());
+            assert!(fixture.host.calls().is_empty());
+        }
+    }
 }
 
 #[test]

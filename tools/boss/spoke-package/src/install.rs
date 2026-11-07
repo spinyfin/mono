@@ -367,14 +367,19 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
     let definition_path = layout.definition();
     let definition_parent = definition_path.parent().context("service definition has no parent")?;
     ensure_root_dir(layout, definition_parent)?;
-    // Only acknowledge a definition after registration and any required restart.
+    // Only acknowledge startup inputs after registration and any required restart.
     // A failed/interrupted attempt leaves the previous acknowledgement intact.
+    let reconciled = serde_json::to_vec(&serde_json::json!({
+        "definition": definition,
+        "release_id": release_id,
+        "hub_ca_sha256": manifest::sha256_hex(request.hub_ca),
+    }))?;
     let reconciled_path = layout.etc().join("service-reconciled");
     let etc = secure_fs::open_installer_dir(layout.base(), &layout.etc())?;
     let pending = match secure_fs::read_file_at(&etc, "service-reconciled") {
         Ok((bytes, metadata)) => {
             secure_fs::verify_installer_file(&metadata, "service reconciliation record")?;
-            bytes != definition.as_bytes()
+            bytes != reconciled
         }
         Err(error) if secure_fs::is_not_found(&error) => true,
         Err(error) => return Err(error),
@@ -403,7 +408,7 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
         wait_healthy(host, &request.health, layout)?;
         report.restarted = true;
     }
-    write_logical(layout, &reconciled_path, definition.as_bytes(), 0o644, None)?;
+    write_logical(layout, &reconciled_path, &reconciled, 0o644, None)?;
     Ok(report)
 }
 

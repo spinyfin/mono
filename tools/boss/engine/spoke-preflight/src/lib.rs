@@ -562,6 +562,7 @@ echo '{"id":2,"result":{}}'
         for output in [
             r#"{"is_error":true,"result":"Current week (all models): 3% used"}"#,
             r#"{"is_error":false,"result":"Not logged in · Please run /login"}"#,
+            r#"{"is_error":false}"#,
             "malformed",
             "",
         ] {
@@ -571,13 +572,25 @@ echo '{"id":2,"result":{}}'
     }
 
     #[tokio::test]
+    async fn claude_login_does_not_require_a_weekly_quota_reading() {
+        for report in [
+            "Current session: 3% used",
+            "Current week (all models): three percent used",
+        ] {
+            let output = serde_json::json!({"is_error": false, "result": report});
+            let (_temp, program) = stub_script("claude", &format!("echo '{output}'"));
+            assert!(claude_credentials(&program).await.passed(), "{report}");
+        }
+    }
+
+    #[tokio::test]
     async fn stalled_codex_is_bounded_and_reaped() {
         let (temp, program) = stub_script(
             "codex",
             r#"echo $$ > "$0.pid"; read request; read request; read request"#,
         );
-        // Allow the shell to start under full-suite load; keep the overall
-        // three-second cleanup bound and the explicit reaped-child assertion.
+        // The 1s probe timeout leaves room for the stub shell to start under load;
+        // cleanup must still finish within 3s and leave no live child.
         let started = std::time::Instant::now();
         assert!(
             !codex_credentials_with_timeout(&program, Duration::from_secs(1))
