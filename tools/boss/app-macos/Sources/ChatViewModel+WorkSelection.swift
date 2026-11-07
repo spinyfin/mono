@@ -55,6 +55,7 @@ extension ChatViewModel {
     }
 
     func selectWorkProduct(_ productID: String) {
+        if selectedWorkProductID == productID { selectionHistory.useProduct(productID) }
         let isAlreadyShowingProductBoard =
             selectedWorkProductID == productID
             && selectedProjectFilterIDs.isEmpty

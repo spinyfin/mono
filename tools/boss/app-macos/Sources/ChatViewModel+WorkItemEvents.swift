@@ -36,6 +36,7 @@ extension ChatViewModel {
             selectedWorkProductID = product.id
         }
         applyPlannerRunSummaries(plannerRuns, forProductID: product.id, projects: projects)
+        selectionHistory.pruneProjects(productID: product.id, validIDs: Set(projects.filter { $0.status != "archived" }.map(\.id)))
         projectsByProductID[product.id] = projects.sorted(by: projectSort)
         let popBucketStartNanos = PopulationTiming.now()
         // Evict exactly this product's previous buckets (tracked
@@ -115,6 +116,7 @@ extension ChatViewModel {
     }
 
     func upsertProduct(_ product: WorkProduct) {
+        if product.status == "archived" { selectionHistory.forgetProduct(product.id) }
         if let index = products.firstIndex(where: { $0.id == product.id }) {
             products[index] = product
         } else {
@@ -129,6 +131,7 @@ extension ChatViewModel {
     /// visibility and board grouping, and a project row is tiny next to a
     /// `GetWorkTree` round trip.
     func upsertProject(_ project: WorkProject) {
+        if project.status == "archived" { selectionHistory.forgetProject(project.id, productID: project.productID) }
         var projects = projectsByProductID[project.productID] ?? []
         if let index = projects.firstIndex(where: { $0.id == project.id }) {
             projects[index] = project

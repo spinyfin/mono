@@ -26,7 +26,10 @@ struct ContentView: View {
     #endif
     @StateObject private var updateQuitRequest = UpdateQuitRequest()
     @State private var isSearchExpanded: Bool = false
-    @State private var workColumnVisibility: NavigationSplitViewVisibility = .all
+    private var workColumnVisibility: Binding<NavigationSplitViewVisibility> {
+        Binding(get: { model.isWorkSidebarHidden ? .detailOnly : .all },
+                set: { model.isWorkSidebarHidden = $0 == .detailOnly })
+    }
     @State private var showCoordinatorResetConfirmFromBanner = false
     @Environment(\.openWindow) private var openWindow
     @AppStorage("boss.ui.standardSearch", store: BossDefaults.store) private var useStandardSearch: Bool = false
@@ -65,7 +68,7 @@ struct ContentView: View {
             // Both branches keep the same opacity/hitTesting treatment so navigation-mode
             // switching never tears down NSViews in agentsView (see comment above).
             if useStandardSearch {
-                NavigationSplitView(columnVisibility: $workColumnVisibility) {
+                NavigationSplitView(columnVisibility: workColumnVisibility) {
                     sidebar
                 } detail: {
                     detail
@@ -85,7 +88,7 @@ struct ContentView: View {
                     prompt: "Search tasks…"
                 )
             } else {
-                NavigationSplitView(columnVisibility: $workColumnVisibility) {
+                NavigationSplitView(columnVisibility: workColumnVisibility) {
                     sidebar
                 } detail: {
                     detail
@@ -247,6 +250,10 @@ struct ContentView: View {
             model.startIfNeeded()
         }
         .toolbar {
+            if WorkSwitcherToolbar.isVisible(model: model) {
+                ToolbarItem(placement: .navigation) { WorkSwitcherToolbar(model: model) }
+                    .separatedFromNeighborGlass()
+            }
             ToolbarItem(placement: .navigation) {
                 NativeSegmentedPicker(
                     "Mode",
