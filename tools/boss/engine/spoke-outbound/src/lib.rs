@@ -205,7 +205,7 @@ mod session {
         let mut hello = hello(&*locked(journal)?, &stamp()?.boot_id, nonce)?;
         let mut selected_contracts = contracts();
         if external_executor {
-            for name in ["workspace", "execution"] {
+            for name in ["workspace", "execution", "worker-event", "transcript-delta"] {
                 selected_contracts.features.push(v1::Feature {
                     name: name.into(),
                     revision: 1,

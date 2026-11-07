@@ -285,7 +285,7 @@ fn upgrades_received_commands_from_original_schema_without_losing_identity() {
     journal.receive_command(&command(1, "before-upgrade")).unwrap();
     drop(journal);
     let db = rusqlite::Connection::open(root.join("journal.db")).unwrap();
-    db.execute_batch("ALTER TABLE commands DROP COLUMN attempting; ALTER TABLE commands DROP COLUMN recovery; ALTER TABLE identity DROP COLUMN result_limit; PRAGMA user_version=1;")
+    db.execute_batch("DROP TABLE sources; ALTER TABLE commands DROP COLUMN attempting; ALTER TABLE commands DROP COLUMN recovery; ALTER TABLE identity DROP COLUMN result_limit; PRAGMA user_version=1;")
         .unwrap();
     drop(db);
     let mut journal = open(&root);
@@ -318,7 +318,7 @@ fn execution_records_survive_reopen_and_schema_upgrade() {
     );
     drop(journal);
     let db = rusqlite::Connection::open(root.join("journal.db")).unwrap();
-    db.execute_batch("ALTER TABLE commands DROP COLUMN attempting; ALTER TABLE commands DROP COLUMN recovery; ALTER TABLE identity DROP COLUMN result_limit; PRAGMA user_version=1;")
+    db.execute_batch("DROP TABLE sources; ALTER TABLE commands DROP COLUMN attempting; ALTER TABLE commands DROP COLUMN recovery; ALTER TABLE identity DROP COLUMN result_limit; PRAGMA user_version=1;")
         .unwrap();
     drop(db);
     let journal = open(&root);

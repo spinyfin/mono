@@ -12,6 +12,69 @@ fn capacity(body: spoke_frame::Body) -> v1::Record {
 }
 
 #[tokio::test]
+async fn actual_daemon_drains_pending_hook_without_another_peer_connection() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut hub = Fixture::new().await;
+    let pending = hub.dir.path().join("pending");
+    std::fs::create_dir(&pending).unwrap();
+    std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let source = pending.join("00000000000000000001-0123456789abcdef0123456789abcdef.json");
+    std::fs::write(
+        &source,
+        serde_json::to_vec(&serde_json::json!({
+            "_boss_run_id":"run", "_boss_producer_id":"0123456789abcdef0123456789abcdef", "_boss_producer_sequence":1,
+            "session_id":"session", "hook_event_name":"Stop", "stop_hook_active":false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut journal = Journal::open(&hub.root(), "host", Limits::default()).unwrap();
+    journal
+        .save_execution(
+            "run",
+            "token",
+            &serde_json::to_vec(&serde_json::json!({
+                "execution_id":"execution", "run_id":"run", "spawn_token":"token", "assignment_generation":1,
+                "lease_id":"lease", "workspace_id":"workspace", "session":"session", "phase":"Alive",
+                "boot_id":"old-boot", "driver_id":"claude",
+                "observation":{"workspace":hub.dir.path(), "pending":pending, "file":null, "pid_start":null}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    drop(journal);
+    let daemon = hub.start();
+    let mut connection = hub.connection().await;
+    connection.welcome(0).await;
+    loop {
+        if let spoke_frame::Body::Record(record) = connection.next().await {
+            connection.receipt(record.sequence).await;
+            if matches!(record.body, Some(record::Body::Event(_))) {
+                break;
+            }
+        }
+    }
+    assert!(!source.exists(), "daemon independently drained the pending event");
+    drop(daemon);
+    let journal = Journal::open(&hub.root(), "host", Limits::default()).unwrap();
+    assert!(
+        journal
+            .source(
+                &v1::Run {
+                    execution_id: "execution".into(),
+                    run_id: "run".into(),
+                    spawn_token: "token".into(),
+                    assignment_generation: 1
+                },
+                "hook:0123456789abcdef0123456789abcdef:1"
+            )
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn actual_daemon_reconnects_replays_and_recovers_command_receipt_after_sigkill() {
     let mut hub = Fixture::new().await;
     let daemon = hub.start();
@@ -29,6 +92,14 @@ async fn actual_daemon_reconnects_replays_and_recovers_command_receipt_after_sig
             },
             v1::Feature {
                 name: "execution".into(),
+                revision: 1
+            },
+            v1::Feature {
+                name: "worker-event".into(),
+                revision: 1
+            },
+            v1::Feature {
+                name: "transcript-delta".into(),
                 revision: 1
             }
         ]

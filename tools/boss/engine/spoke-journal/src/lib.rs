@@ -2,6 +2,7 @@
 mod commands;
 mod executions;
 mod records;
+mod sources;
 mod schema {
     use anyhow::{Result, ensure};
     use rusqlite::Connection;
@@ -9,7 +10,7 @@ mod schema {
     pub fn migrate(db: &mut Connection) -> Result<()> {
         let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
         ensure!(
-            version <= 4,
+            version <= 5,
             "journal schema is newer than this reader; rollback refused"
         );
         if version == 0 {
@@ -74,6 +75,23 @@ mod schema {
                  PRAGMA user_version=4;",
             )?;
             tx.commit()?;
+        }
+        if version < 5 {
+            db.execute_batch(
+                "BEGIN;
+                 CREATE TABLE sources (
+                    run_id TEXT NOT NULL, spawn_token TEXT NOT NULL, source TEXT NOT NULL,
+                    checkpoint BLOB NOT NULL, PRIMARY KEY(run_id,spawn_token,source)
+                 );
+                 CREATE TRIGGER source_added AFTER INSERT ON sources BEGIN
+                    UPDATE identity SET queued_bytes=queued_bytes+length(new.checkpoint)+length(new.source)+128;
+                 END;
+                 CREATE TRIGGER source_updated AFTER UPDATE ON sources BEGIN
+                    UPDATE identity SET queued_bytes=queued_bytes+length(new.checkpoint)-length(old.checkpoint);
+                 END;
+                 PRAGMA user_version=5;
+                 COMMIT;",
+            )?;
         }
         Ok(())
     }

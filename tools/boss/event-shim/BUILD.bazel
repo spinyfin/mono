@@ -3,7 +3,8 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
 
 rust_binary(
     name = "boss-event",
-    srcs = ["src/main.rs"],
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/main.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = ["//visibility:public"],
