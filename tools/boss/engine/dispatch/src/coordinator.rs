@@ -810,13 +810,10 @@ mod blocked_workspace;
 mod config;
 mod dispatch_admission;
 mod execution;
-mod fresh_start;
 mod lease_limiter;
 mod preserved_work;
 mod run;
 mod scheduler;
-
-pub use fresh_start::FreshStart;
 
 pub use config::{LOCAL_CAPABILITY_DISCOVERY_PENDING_REASON, STARTUP_RECOVERY_PENDING_REASON};
 pub use dispatch_admission::{PauseBypassOutcome, pause_bypass_decision};

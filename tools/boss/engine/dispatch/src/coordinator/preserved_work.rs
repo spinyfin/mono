@@ -1,10 +1,20 @@
+use std::path::Path;
+
 use super::blocked_workspace::Recovered;
-use super::fresh_start::{FreshStart, position_workspace};
 use super::*;
 use boss_engine_recovery::execution_bookmark::{is_pointer_integrity_error, pointer_integrity_error, preserved_name};
 use boss_engine_storage_values::attention_kinds::{
     PRESERVED_WORK_ARCHIVED_ATTENTION_KIND, PRESERVED_WORK_NOT_RESTAGED_ATTENTION_KIND,
 };
+
+/// Cube positions a bound or open task PR (`goto --pr`); restaging reads that
+/// `@` rather than a poller-recorded head, which can lag the real head.
+async fn position_workspace(adapter: &dyn HostAdapter, workspace: &Path, pr: Option<u64>) -> Result<()> {
+    match pr {
+        Some(pr) => adapter.goto_workspace(workspace, pr).await,
+        None => adapter.start_fresh_workspace(workspace).await.map(|_| ()),
+    }
+}
 
 impl ExecutionCoordinator {
     pub(super) async fn recover_preserved_work(
@@ -21,17 +31,7 @@ impl ExecutionCoordinator {
             (None, Some(task_pr)) if adapter.recovery_pr_is_open(repo_id, task_pr).await? => Some(task_pr),
             _ => None,
         };
-        // Cube positions the PR itself: it refuses merged or closed PRs, fetches
-        // fork heads and sets the branch bookmark. Restaging reads that
-        // positioned commit rather than a poller-recorded head, which can lag
-        // the real head.
-        let positioning = FreshStart {
-            repo_id,
-            immutable_target: None,
-            bound_pr: pr,
-            task_pr: None,
-        };
-        position_workspace(adapter.as_ref(), &lease.workspace_path, &positioning).await?;
+        position_workspace(adapter.as_ref(), &lease.workspace_path, pr).await?;
         let restored = async {
             let record = self
                 .work_db
@@ -71,7 +71,7 @@ impl ExecutionCoordinator {
                     tracing::error!(?note_error, "could not raise preserved-work attention");
                 }
                 self.work_db.delete_execution_restore_report(&execution.id)?;
-                position_workspace(adapter.as_ref(), &lease.workspace_path, &positioning).await?;
+                position_workspace(adapter.as_ref(), &lease.workspace_path, pr).await?;
                 Ok(None)
             }
             Err(err) if is_pointer_integrity_error(&err) => {
@@ -81,7 +81,7 @@ impl ExecutionCoordinator {
                     tracing::error!(?note_error, "could not raise preserved-work attention");
                 }
                 self.work_db.delete_execution_restore_report(&execution.id)?;
-                position_workspace(adapter.as_ref(), &lease.workspace_path, &positioning).await?;
+                position_workspace(adapter.as_ref(), &lease.workspace_path, pr).await?;
                 Ok(None)
             }
             Err(err) => Err(err),
