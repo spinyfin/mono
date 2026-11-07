@@ -769,6 +769,87 @@ fn the_stuck_report_reads_the_same_dependency_rule_as_the_view() {
     assert_eq!(bucket(&f.db, &waiting), Some(StuckBucket::WaitingOnDependency));
 }
 
+#[test]
+fn clause_4_a_prerequisite_held_only_by_its_own_clause_4_does_not_hold_its_dependent() {
+    let f = fixture();
+    let upstream = f.stuck_chore("Upstream");
+    let middle = f.dependent_on(&upstream);
+    let downstream = f.dependent_on(&middle);
+    f.assert_candidate(&upstream, true);
+    f.assert_candidate(&middle, false);
+    // Middle is excluded only by clause 4. Treating `candidate_ex_dependency` as
+    // candidacy would hold downstream behind middle; real candidacy does not.
+    assert!(f.clauses(&middle).eligible_item);
+    assert!(f.clauses(&middle).stuck_long_enough);
+    assert!(f.clauses(&middle).cooldown_and_budget_clear);
+    f.assert_candidate(&downstream, true);
+    assert!(f.clauses(&downstream).dependency_clear);
+
+    // A project whose only stuck member is that middle item also does not hold
+    // a dependent: the member is not a candidate.
+    let project =
+        f.db.create_project(CreateProjectInput {
+            product_id: f.product.clone(),
+            name: "Middle's project".into(),
+            description: None,
+            goal: None,
+            autostart: false,
+            no_design_task: true,
+            design_reasoning_effort_xhigh: false,
+        })
+        .unwrap();
+    f.sql(&format!(
+        "UPDATE tasks SET project_id = '{}' WHERE id = '{middle}'",
+        project.id
+    ));
+    let gated_on_project = f.dependent_on(&project.id);
+    f.assert_candidate(&middle, false);
+    f.assert_candidate(&gated_on_project, true);
+}
+
+#[test]
+fn clause_4_a_task_that_depends_on_its_own_project_is_still_a_candidate() {
+    let f = fixture();
+    let project =
+        f.db.create_project(CreateProjectInput {
+            product_id: f.product.clone(),
+            name: "Self project".into(),
+            description: None,
+            goal: None,
+            autostart: false,
+            no_design_task: true,
+            design_reasoning_effort_xhigh: false,
+        })
+        .unwrap();
+    let sibling = f.chore("Idle sibling");
+    f.sql(&format!(
+        "UPDATE tasks SET project_id = '{}', autostart = 1 WHERE id = '{sibling}'",
+        project.id
+    ));
+    let member = f.dependent_on(&project.id);
+    f.sql(&format!(
+        "UPDATE tasks SET project_id = '{}' WHERE id = '{member}'",
+        project.id
+    ));
+    f.assert_candidate(&member, true);
+}
+
+#[test]
+fn clause_4_a_same_family_idle_prerequisite_does_not_hide_the_dependent_run() {
+    let f = fixture();
+    let prerequisite = f.chore("Idle same-family prerequisite");
+    f.sql(&format!(
+        "UPDATE tasks SET autostart = 1, pr_url = 'https://github.com/o/r/pull/9' WHERE id = '{prerequisite}'"
+    ));
+    let dependent = f.dependent_on(&prerequisite);
+    f.sql(&format!(
+        "UPDATE tasks SET pr_url = 'https://github.com/o/r/pull/9' WHERE id = '{dependent}'"
+    ));
+    f.assert_candidate(&dependent, true);
+    f.db.mint_progression_executions().unwrap();
+    assert_eq!(bucket(&f.db, &dependent), Some(StuckBucket::ProgressionInFlight));
+}
+
 // ── Clause 5: stuck long enough, and the grace waiver ─────────────────────
 
 #[test]
@@ -1344,13 +1425,16 @@ fn the_migrations_are_idempotent_and_repair_a_database_that_lacks_them() {
              UPDATE task_status_audit SET changed_at = changed_at - 36000 WHERE work_item_id = '{id}';
              DROP VIEW progression_candidates;
              DROP VIEW progression_candidate_clauses;
+             DROP VIEW progression_real_candidates;
              DROP VIEW progression_candidate_base;
              DROP VIEW progression_run_state;
              DROP VIEW progression_live_tasks;
+             DROP VIEW progression_live_execution_tasks;
              DROP VIEW progression_ladder_families;
              DROP VIEW progression_live_families;
              DROP VIEW progression_family_keys;
              DROP VIEW progression_chain_roots;
+             DROP VIEW progression_prereq_task_edges;
              ALTER TABLE tasks DROP COLUMN progression_grace_waived_at;
              ALTER TABLE work_executions DROP COLUMN created_via;
              DELETE FROM schema_migrations WHERE id IN (
@@ -1386,13 +1470,16 @@ fn dropping_the_views_without_rolling_back_the_migration_is_repaired_on_open() {
              UPDATE task_status_audit SET changed_at = changed_at - 36000 WHERE work_item_id = '{id}';
              DROP VIEW progression_candidates;
              DROP VIEW progression_candidate_clauses;
+             DROP VIEW progression_real_candidates;
              DROP VIEW progression_candidate_base;
              DROP VIEW progression_run_state;
              DROP VIEW progression_live_tasks;
+             DROP VIEW progression_live_execution_tasks;
              DROP VIEW progression_ladder_families;
              DROP VIEW progression_live_families;
              DROP VIEW progression_family_keys;
-             DROP VIEW progression_chain_roots;"
+             DROP VIEW progression_chain_roots;
+             DROP VIEW progression_prereq_task_edges;"
         ))
         .unwrap();
     drop(db);

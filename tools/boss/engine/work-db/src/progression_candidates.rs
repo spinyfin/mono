@@ -15,15 +15,22 @@
 //! - `progression_candidates` keeps the rows where every clause holds. The sweep
 //!   reads this view.
 //! - `progression_candidate_base` is every clause but 4 plus
-//!   `candidate_ex_dependency`, which clause 4 reads for a prerequisite's
-//!   candidacy.
+//!   `candidate_ex_dependency`. Clause 4 does not treat that flag as a
+//!   prerequisite's candidacy: a prerequisite held only by its own clause 4 is
+//!   not a candidate and does not hold its dependent.
+//! - `progression_prereq_task_edges` expands each `blocks` edge to task
+//!   prerequisites (a project becomes its open members, excluding the
+//!   dependent). `progression_real_candidates` walks that DAG bottom-up so
+//!   each item's clause 4 sees its prerequisites' real candidacy. The result
+//!   is a non-correlated set tested with `IN`.
 //! - `progression_chain_roots`, `progression_family_keys`,
-//!   `progression_live_families`, `progression_live_tasks` and
-//!   `progression_ladder_families` are the helpers that give clause 2 its "item,
-//!   its revisions and its PR chain" reach. They are non-correlated sets tested
-//!   with `IN`, so the recursive chain walk runs once per statement, not once per
-//!   candidate row (the sweep evaluates the view inside an `IMMEDIATE`
-//!   transaction that holds the writer lock).
+//!   `progression_live_families`, `progression_live_execution_tasks`,
+//!   `progression_live_tasks` and `progression_ladder_families` are the
+//!   helpers that give clause 2 its "item, its revisions and its PR chain"
+//!   reach. They are non-correlated sets tested with `IN`, so the recursive
+//!   chain walk runs once per statement, not once per candidate row (the sweep
+//!   evaluates the view inside an `IMMEDIATE` transaction that holds the
+//!   writer lock). The same is true of the clause-4 candidacy walk.
 //! - `progression_run_state` is the cheap per-item subset the stuck report
 //!   reads: the item's own progression runs, nothing about the rest of the graph.
 //!
@@ -50,14 +57,18 @@
 //!    slot, cap, workspace or pause wait reason. Waiting for bandwidth is not
 //!    stuck.
 //! 4. **Dependency clear.** A `blocked: dependency` item is progressed through
-//!    its prerequisite, not itself, when that prerequisite is live, parked, or a
-//!    progression candidate (on every clause but this one, so the views stay
-//!    acyclic). A project prerequisite counts when it is parked or any open
-//!    member task is live or such a candidate. A stuck prerequisite that grace,
-//!    cooldown, the create budget or the failure cap keeps from being nominated
-//!    is not a candidate and does not hold the dependent; nor does an idle,
-//!    unparked one, a human-held one or a dangling edge. The stuck report reads
-//!    the same value as `dependency_held`.
+//!    its prerequisite, not itself, when that prerequisite is live, parked, or
+//!    itself a progression candidate (every clause, including the prerequisite's
+//!    own clause 4). A project prerequisite counts when it is parked or any
+//!    open member task other than the dependent is live, parked, or such a
+//!    candidate. The dependent is excluded from every prerequisite-side test, so
+//!    its own candidacy, its own live executions (including a progression run
+//!    the sweep just minted) and a `blocks` edge onto its own project cannot
+//!    hold it. A stuck prerequisite that grace, cooldown, the create budget or
+//!    the failure cap keeps from being nominated is not a candidate and does
+//!    not hold the dependent; nor does an idle, unparked one, a human-held one,
+//!    a dangling edge, or a middle item held only by *its* prerequisite. The
+//!    stuck report reads the same value as `dependency_held`.
 //! 5. **Stuck long enough.** In one of the stuck states the enumeration marks as
 //!    progression-eligible ([`stuck_kind_sql`]) continuously for at least
 //!    `progression.stuck_after`, measured from the task status ledger exactly as
@@ -143,13 +154,16 @@ pub(super) fn migrate_views(conn: &Connection) -> Result<()> {
 /// Every view this module defines, dropped dependents first.
 const DROP_VIEWS: &str = "DROP VIEW IF EXISTS progression_candidates;
          DROP VIEW IF EXISTS progression_candidate_clauses;
+         DROP VIEW IF EXISTS progression_real_candidates;
          DROP VIEW IF EXISTS progression_candidate_base;
          DROP VIEW IF EXISTS progression_run_state;
          DROP VIEW IF EXISTS progression_live_tasks;
+         DROP VIEW IF EXISTS progression_live_execution_tasks;
          DROP VIEW IF EXISTS progression_ladder_families;
          DROP VIEW IF EXISTS progression_live_families;
          DROP VIEW IF EXISTS progression_family_keys;
-         DROP VIEW IF EXISTS progression_chain_roots;";
+         DROP VIEW IF EXISTS progression_chain_roots;
+         DROP VIEW IF EXISTS progression_prereq_task_edges;";
 
 /// Drop the views. The views read the task status ledger, and SQLite re-parses
 /// every view when an `ALTER TABLE` runs, so a test that simulates an older
@@ -344,6 +358,23 @@ fn ladder_families_select() -> String {
     )
 }
 
+/// True when `task` holds dependents of `excluded`: it is parked, something in
+/// its PR family other than `excluded` is live or pending, or it is a real
+/// progression candidate (clause 4 resolved through the DAG).
+fn task_holds_dependent_sql(task: &str, excluded: &str) -> String {
+    let parked = parked_task_sql(task);
+    format!(
+        "({parked}
+          OR EXISTS (
+              SELECT 1 FROM progression_family_keys pk
+              JOIN progression_family_keys other ON other.family_key = pk.family_key
+              WHERE pk.task_id = {task}.id
+                AND other.task_id <> {excluded}.id
+                AND other.task_id IN (SELECT work_item_id FROM progression_live_execution_tasks))
+          OR {task}.id IN (SELECT work_item_id FROM progression_real_candidates))"
+    )
+}
+
 /// Clause 4, the raw test: some open prerequisite of the item is live, parked,
 /// or itself a progression candidate, so progress goes through it rather than
 /// through the item (design 2.1). It does not look at the item's own
@@ -351,21 +382,25 @@ fn ladder_families_select() -> String {
 /// report reads this value as `dependency_held`.
 ///
 /// - A **task** prerequisite holds when it is parked, when anything in its PR
-///   family is live or pending, or when it is a candidate on every clause but
-///   this one (`progression_candidate_base.candidate_ex_dependency`). A stuck
-///   prerequisite that grace, cooldown, the create budget or the
-///   infrastructure-failure cap keeps from being nominated is *not* a
-///   candidate, so it does not hold the dependent.
+///   family *other than the dependent* is live or pending, or when it is a
+///   real candidate (`progression_real_candidates`, which includes the
+///   prerequisite's own clause 4). A stuck prerequisite that grace, cooldown,
+///   the create budget or the infrastructure-failure cap keeps from being
+///   nominated is *not* a candidate, so it does not hold the dependent. A
+///   middle item held only by *its* prerequisite is not a candidate either.
 /// - A **project** prerequisite holds when it is parked, or when any open
-///   member task is live (family-wide) or such a candidate. An open project
-///   whose members are all idle and not stuck holds nothing: the dependent is
-///   then the candidate and can drop the edge or ask.
+///   member task *other than the dependent* is live (independently of the
+///   dependent), parked, or such a candidate. An open project whose members
+///   are all idle and not stuck holds nothing: the dependent is then the
+///   candidate and can drop the edge or ask.
 ///
-/// A human-held prerequisite, an idle one and a dangling edge hold nothing.
-/// Candidacy of the prerequisite ignores *its own* clause 4, which keeps the
-/// view acyclic and keeps a dependent behind a chain whose upstream end is live.
+/// The dependent is excluded from every prerequisite-side test: its own
+/// candidacy, its own live executions, and a `blocks` edge onto its own
+/// project cannot hold it. A human-held prerequisite, an idle one and a
+/// dangling edge hold nothing.
 fn dependency_held_sql(a: &str) -> String {
-    let parked = parked_task_sql("p");
+    let member_holds = task_holds_dependent_sql("m", a);
+    let prereq_holds = task_holds_dependent_sql("p", a);
     format!(
         "EXISTS (
             SELECT 1 FROM work_item_dependencies d
@@ -376,17 +411,101 @@ fn dependency_held_sql(a: &str) -> String {
                                OR EXISTS (SELECT 1 FROM tasks m
                                           WHERE m.project_id = pj.id AND m.deleted_at IS NULL
                                             AND m.status NOT IN ('done', 'archived')
-                                            AND (m.id IN (SELECT task_id FROM progression_live_tasks)
-                                                 OR EXISTS (SELECT 1 FROM progression_candidate_base mb
-                                                            WHERE mb.work_item_id = m.id
-                                                              AND mb.candidate_ex_dependency)))))
+                                            AND m.id <> {a}.id
+                                            AND {member_holds})))
                 OR EXISTS (SELECT 1 FROM tasks p
                            WHERE p.id = d.prerequisite_id AND p.deleted_at IS NULL
                              AND p.status NOT IN ('done', 'archived')
-                             AND ({parked}
-                                  OR p.id IN (SELECT task_id FROM progression_live_tasks)
-                                  OR EXISTS (SELECT 1 FROM progression_candidate_base pb
-                                             WHERE pb.work_item_id = p.id AND pb.candidate_ex_dependency)))))"
+                             AND p.id <> {a}.id
+                             AND {prereq_holds})))"
+    )
+}
+
+/// `blocks` edges expanded to task prerequisites. A project prerequisite
+/// becomes each of its open members except the dependent, so a task that
+/// depends on its own project is not held by itself. Parked projects are
+/// omitted here: they hold dependents directly, not through members.
+fn prereq_task_edges_sql() -> &'static str {
+    "SELECT d.dependent_id AS dependent_id, d.prerequisite_id AS prerequisite_task_id
+             FROM work_item_dependencies d
+             JOIN tasks p ON p.id = d.prerequisite_id
+             WHERE d.relation = 'blocks'
+               AND p.deleted_at IS NULL AND p.status NOT IN ('done', 'archived')
+             UNION
+             SELECT d.dependent_id, m.id
+             FROM work_item_dependencies d
+             JOIN projects pj ON pj.id = d.prerequisite_id
+               AND pj.status NOT IN ('done', 'archived') AND pj.parked_at IS NULL
+             JOIN tasks m ON m.project_id = pj.id AND m.deleted_at IS NULL
+               AND m.status NOT IN ('done', 'archived') AND m.id <> d.dependent_id
+             WHERE d.relation = 'blocks'"
+}
+
+/// Real progression candidates: `candidate_ex_dependency` and clause 4, with
+/// each prerequisite's own clause 4 resolved bottom-up over the acyclic
+/// `blocks` DAG. Live and parked items are holding too, so a live or parked
+/// prerequisite keeps its dependent out of this set. The walk is one
+/// statement: a topological pass that accumulates holding ids, then an `IN`
+/// set for clause 4.
+fn real_candidates_view_sql() -> String {
+    let parked = parked_task_sql("t");
+    format!(
+        "CREATE VIEW progression_real_candidates AS
+         WITH RECURSIVE
+         paths(id, d) AS (
+             SELECT t.id, 0
+             FROM tasks t
+             WHERE t.deleted_at IS NULL AND t.status NOT IN ('done', 'archived')
+               AND NOT EXISTS (
+                   SELECT 1 FROM progression_prereq_task_edges e WHERE e.dependent_id = t.id)
+             UNION
+             SELECT e.dependent_id, paths.d + 1
+             FROM paths
+             JOIN progression_prereq_task_edges e ON e.prerequisite_task_id = paths.id
+             WHERE paths.d < (SELECT COUNT(*) FROM tasks)
+         ),
+         topo AS (
+             SELECT t.id AS id,
+                    ROW_NUMBER() OVER (
+                        ORDER BY COALESCE(p.max_d, 1000000), t.id
+                    ) - 1 AS ord
+             FROM tasks t
+             LEFT JOIN (SELECT id, MAX(d) AS max_d FROM paths GROUP BY id) p ON p.id = t.id
+             WHERE t.deleted_at IS NULL AND t.status NOT IN ('done', 'archived')
+         ),
+         walk(ord, holding) AS (
+             SELECT -1, ''
+             UNION ALL
+             SELECT tord.ord,
+                    CASE
+                      WHEN t.id IN (SELECT task_id FROM progression_live_tasks)
+                           OR {parked}
+                           OR (COALESCE(b.candidate_ex_dependency, 0)
+                               AND (t.blocked_reason IS NOT 'dependency'
+                                    OR (NOT EXISTS (
+                                            SELECT 1 FROM work_item_dependencies d
+                                            JOIN projects pj ON pj.id = d.prerequisite_id
+                                            WHERE d.dependent_id = t.id AND d.relation = 'blocks'
+                                              AND pj.parked_at IS NOT NULL
+                                              AND pj.status NOT IN ('done', 'archived'))
+                                        AND NOT EXISTS (
+                                            SELECT 1 FROM progression_prereq_task_edges e
+                                            WHERE e.dependent_id = t.id
+                                              AND INSTR(',' || walk.holding || ',',
+                                                        ',' || e.prerequisite_task_id || ',') > 0))))
+                      THEN walk.holding || ',' || t.id
+                      ELSE walk.holding
+                    END
+             FROM walk
+             JOIN topo tord ON tord.ord = walk.ord + 1
+             JOIN tasks t ON t.id = tord.id
+             LEFT JOIN progression_candidate_base b ON b.work_item_id = t.id
+         )
+         SELECT b.work_item_id AS work_item_id
+         FROM progression_candidate_base b
+         JOIN walk w ON w.ord = (SELECT MAX(ord) FROM topo)
+         WHERE b.candidate_ex_dependency
+           AND INSTR(',' || w.holding || ',', ',' || b.work_item_id || ',') > 0"
     )
 }
 
@@ -477,8 +596,15 @@ fn views_sql() -> String {
     let c6 = "(NOT s.in_cooldown AND NOT s.infrastructure_failing AND NOT s.create_budget_exhausted)";
     let create_budget_exhausted = create_budget_exhausted_sql("t", &max_creates, &create_window);
     let run_state = run_state_select(&cooldown);
+    let prereq_edges = prereq_task_edges_sql();
+    let real_candidates = real_candidates_view_sql();
     format!(
         "{DROP_VIEWS}
+
+         -- `blocks` edges expanded to task ids (project members except the
+         -- dependent). The real-candidate walk is over this DAG.
+         CREATE VIEW progression_prereq_task_edges AS
+         {prereq_edges};
 
          -- Every task with the root of its revision chain. A revision whose parent
          -- is missing roots at itself, as `chain_root` does.
@@ -515,6 +641,14 @@ fn views_sql() -> String {
          CREATE VIEW progression_ladder_families AS
          {ladder_families};
 
+         -- Tasks that themselves carry a live or pending execution. Clause 4
+         -- uses this (not the family expansion) so a dependent's own run cannot
+         -- make a same-family prerequisite look live.
+         CREATE VIEW progression_live_execution_tasks AS
+         SELECT DISTINCT work_item_id AS work_item_id
+         FROM work_executions
+         WHERE status IN {LIVE_OR_PENDING};
+
          -- Every task that belongs to a family with live or pending work.
          CREATE VIEW progression_live_tasks AS
          SELECT k.task_id AS task_id
@@ -527,8 +661,8 @@ fn views_sql() -> String {
          WHERE t.deleted_at IS NULL AND t.status NOT IN ('done', 'archived');
 
          -- Every clause except clause 4, and whether the item would be a candidate
-         -- without it. Clause 4 reads this for the candidacy of an item's
-         -- prerequisites, which keeps the views acyclic.
+         -- without it. The real-candidate walk uses this as the per-item input;
+         -- clause 4 then applies each prerequisite's own clause 4.
          CREATE VIEW progression_candidate_base AS
          SELECT s.work_item_id AS work_item_id,
                 s.stuck_kind AS stuck_kind,
@@ -561,6 +695,8 @@ fn views_sql() -> String {
              LEFT JOIN tasks root ON root.id = fk.root_id
              WHERE t.deleted_at IS NULL AND t.status NOT IN ('done', 'archived')
          ) s;
+
+         {real_candidates};
 
          CREATE VIEW progression_candidate_clauses AS
          SELECT b.work_item_id AS work_item_id,
