@@ -153,7 +153,8 @@ extension ChatViewModel {
         // toggle only ever adds rows back: un-parked rows are never hidden by
         // it, and every other filter below still applies to parked rows.
         if !showParked {
-            items = items.filter { !isParked($0) }
+            let parkedProjects = parkedProjectsByID
+            items = items.filter { !isParked($0, parkedProjects: parkedProjects) }
         }
 
         if showBlockedOnly {

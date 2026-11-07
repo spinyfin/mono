@@ -308,27 +308,21 @@ struct WorkBoardCardItem: View {
                     .help(reviewGuideMenuPresentation?.tooltip ?? title)
                 }
                 Divider()
-                if snapshot.parked != nil {
-                    if task.kind == "revision" {
-                        Button("Unpark") {}
-                            .disabled(true)
-                            .help("A revision follows its parent PR. Unpark the parent instead.")
-                    } else if task.isParkedViaProject || task.parkedAt == nil {
-                        // Parked by its project's cascade (or, as a backstop,
-                        // by the project itself): only un-parking the project
-                        // clears it, so the engine refuses a per-row un-park.
-                        Button("Unpark") {}
-                            .disabled(true)
-                            .help("Parked with its project. Unpark the project to bring it back.")
-                    } else {
-                        Button("Unpark") {
-                            model.unpark(id: task.id)
-                        }
+                switch model.parkMenuAction(for: task) {
+                case .unpark:
+                    Button("Unpark") {
+                        model.unpark(id: task.id)
                     }
-                } else if model.canPark(task) {
+                case .unparkDisabled(let reason):
+                    Button("Unpark") {}
+                        .disabled(true)
+                        .help(reason)
+                case .park:
                     Button("Park…") {
                         model.requestPark(task: task)
                     }
+                case .none:
+                    EmptyView()
                 }
                 Divider()
                 Button("Delete", role: .destructive) {

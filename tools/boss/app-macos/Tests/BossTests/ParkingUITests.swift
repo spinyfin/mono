@@ -170,12 +170,36 @@ final class ParkingUITests: XCTestCase {
 
     func testSidebarSubtitleAndImageForParkedProject() {
         var project = makeProject("p")
-        project.shortID = 12
-        XCTAssertEqual(project.sidebarSubtitle, "P12")
-        XCTAssertEqual(project.sidebarSubtitle(parkedItemCount: 2), "P12 · 2 parked")
+        project.shortID = nil
+        XCTAssertNil(project.sidebarSubtitle)
+        XCTAssertEqual(project.sidebarSubtitle(parkedItemCount: 2), "2 parked")
         project.parkedAt = "1799990000"
-        XCTAssertEqual(project.sidebarSubtitle(parkedItemCount: 5), "P12 · Parked · 5 parked")
+        XCTAssertEqual(project.sidebarSubtitle(parkedItemCount: 5), "Parked · 5 parked")
         XCTAssertEqual(project.sidebarSystemImage, "pause.circle")
+    }
+
+    func testParkMenuActionBranches() {
+        typealias A = ParkMenuAction
+        func decide(
+            kind: String = "task", status: String = "todo", parked: Bool, direct: Bool = false, project: Bool = false
+        ) -> A {
+            A.decide(kind: kind, status: status, isParked: parked, hasDirectStamp: direct, projectParked: project)
+        }
+        XCTAssertEqual(decide(parked: false), .park)
+        XCTAssertEqual(decide(status: "done", parked: false), .none)
+        XCTAssertEqual(decide(kind: "revision", parked: false), .none)
+        XCTAssertEqual(decide(parked: true, direct: true), .unpark)
+        // Park task, then park its project: the engine refuses a per-row unpark.
+        if case .unparkDisabled = decide(parked: true, direct: true, project: true) {} else { XCTFail() }
+        if case .unparkDisabled = decide(parked: true, direct: false, project: true) {} else { XCTFail() }
+        if case .unparkDisabled = decide(kind: "revision", parked: true, direct: true) {} else { XCTFail() }
+    }
+
+    func testMenuActionForDirectlyParkedTaskInParkedProject() {
+        var project = makeProject("proj_test")
+        project.parkedAt = "1799990000"
+        let model = makeModel(tasks: [parked(makeTask("t"))], project: project)
+        if case .unparkDisabled = model.parkMenuAction(for: model.task(withID: "t")!) {} else { XCTFail() }
     }
 
     func testParkedTasksDoNotCountAsActionableInTheSidebar() {
@@ -226,9 +250,9 @@ final class ParkingUITests: XCTestCase {
     func testRevisionsAndFinishedWorkAreNotParkable() {
         let model = makeModel(tasks: [])
         let revision = makeTask("rev", kind: "revision")
-        XCTAssertFalse(model.canPark(revision))
-        XCTAssertFalse(model.canPark(makeTask("done", status: "done")))
-        XCTAssertTrue(model.canPark(makeTask("open")))
+        XCTAssertEqual(model.parkMenuAction(for: revision), .none)
+        XCTAssertEqual(model.parkMenuAction(for: makeTask("done", status: "done")), .none)
+        XCTAssertEqual(model.parkMenuAction(for: makeTask("open")), .park)
     }
 
     // MARK: - Helpers

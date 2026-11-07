@@ -18,6 +18,33 @@ struct ParkRequest: Identifiable, Equatable {
     let isProject: Bool
 }
 
+/// The Park / Unpark entry a card's context menu shows. Pure so each branch
+/// is unit-tested.
+enum ParkMenuAction: Equatable {
+    case park
+    case unpark
+    case unparkDisabled(String)
+    case none
+
+    static func decide(
+        kind: String, status: String, isParked: Bool, hasDirectStamp: Bool, projectParked: Bool
+    ) -> ParkMenuAction {
+        if isParked {
+            if kind == "revision" {
+                return .unparkDisabled("A revision follows its parent PR. Unpark the parent instead.")
+            }
+            if projectParked || !hasDirectStamp {
+                // The engine refuses a per-row un-park while the project is
+                // parked, even when the row also carries its own stamp.
+                return .unparkDisabled("Its project is parked. Unpark the project first.")
+            }
+            return .unpark
+        }
+        if kind != "revision", status != "done", status != "archived" { return .park }
+        return .none
+    }
+}
+
 /// The "Parked · <relative time> · <reason>" chip, with the strings fixed at
 /// snapshot-build time so the card snapshot stays pure and `Equatable`.
 struct ParkedChipPresentation: Equatable {
@@ -169,31 +196,60 @@ extension ChatViewModel {
     /// card in one of these is "finishing its current run".
     static let liveExecutionStatuses: Set<String> = ["claimed", "running", "waiting_human"]
 
+    /// Parked projects across every product, keyed by id. Built once per
+    /// pass (board filter, sidebar counts) so per-row checks are dictionary
+    /// lookups instead of a linear project scan per task.
+    var parkedProjectsByID: [String: WorkProject] {
+        var result: [String: WorkProject] = [:]
+        for projects in projectsByProductID.values {
+            for project in projects where project.isParked { result[project.id] = project }
+        }
+        return result
+    }
+
     /// The park stamp that applies to `task`: its own, else its project's
     /// (the engine's predicate treats a row in a parked project as parked even
     /// before the cascade stamp lands). `nil` when the row is not parked.
-    func parkStamp(for task: WorkTask) -> (parkedAt: String?, reason: String?, viaProject: Bool)? {
+    /// A revision relies on the stamp the engine inherits onto it from its
+    /// chain root; the app does not resolve the root itself.
+    /// Pass `parkedProjects` when checking many rows in one pass.
+    func parkStamp(
+        for task: WorkTask, parkedProjects: [String: WorkProject]? = nil
+    ) -> (parkedAt: String?, reason: String?, viaProject: Bool)? {
         if task.hasOwnParkStamp {
             return (task.parkedAt, task.parkedReason, task.isParkedViaProject)
         }
         guard task.status != "done", task.status != "archived",
               let projectID = task.projectID,
-              let project = projectsByProductID[task.productID]?.first(where: { $0.id == projectID }),
-              project.isParked
+              let project = (parkedProjects ?? parkedProjectsByID)[projectID]
         else { return nil }
         return (project.parkedAt, project.parkedReason, true)
     }
 
     /// Whether the default board leaves `task` off. Finished work is never
     /// parked, matching the engine.
-    func isParked(_ task: WorkTask) -> Bool {
-        parkStamp(for: task) != nil
+    func isParked(_ task: WorkTask, parkedProjects: [String: WorkProject]? = nil) -> Bool {
+        parkStamp(for: task, parkedProjects: parkedProjects) != nil
     }
 
     /// Parked open tasks and chores in `projectID`, for the sidebar count.
     /// Revision rows follow their parent and are not counted separately.
     func parkedTaskCount(forProjectID projectID: String) -> Int {
-        (tasksByProjectID[projectID] ?? []).filter { $0.kind != "revision" && isParked($0) }.count
+        let parkedProjects = parkedProjectsByID
+        return (tasksByProjectID[projectID] ?? []).filter {
+            $0.kind != "revision" && isParked($0, parkedProjects: parkedProjects)
+        }.count
+    }
+
+    /// What the card context menu offers for `task`.
+    func parkMenuAction(for task: WorkTask) -> ParkMenuAction {
+        let projectParked = task.projectID.map { parkedProjectsByID[$0] != nil } ?? false
+        return ParkMenuAction.decide(
+            kind: task.kind, status: task.status,
+            isParked: isParked(task),
+            hasDirectStamp: task.hasOwnParkStamp && !task.isParkedViaProject,
+            projectParked: projectParked
+        )
     }
 
     func parkedChipPresentation(for task: WorkTask, now: Date = Date()) -> ParkedChipPresentation? {
@@ -206,12 +262,6 @@ extension ChatViewModel {
             finishingCurrentRun: Self.liveExecutionStatuses.contains(status),
             now: now
         )
-    }
-
-    /// Whether the card menu offers Park / Unpark for `task` at all. A
-    /// revision follows its parent PR and finished work has nothing to park.
-    func canPark(_ task: WorkTask) -> Bool {
-        task.kind != "revision" && task.status != "done" && task.status != "archived"
     }
 
     func requestPark(task: WorkTask) {
@@ -228,6 +278,8 @@ extension ChatViewModel {
 
     func submitPark(_ request: ParkRequest, reason: String?) {
         pendingParkRequest = nil
+        // Engine refusals come back as an unattributed `workError` and land on
+        // the passive `workErrorMessage` banner, so the request id is not kept.
         engine.sendParkWorkItem(id: request.id, parked: true, reason: reason)
     }
 
