@@ -204,9 +204,22 @@ pub fn run_as(account: &Account, env: &[(String, String)], program: &Path, args:
     if account.gid != egid {
         command.gid(account.gid);
     }
-    let output = command
-        .output()
-        .with_context(|| format!("cannot run {}", program.display()))?;
+    // A freshly written executable can be briefly "text file busy" when another
+    // thread forked while its write descriptor was still open; that clears as
+    // soon as the forked child execs, so retry for a short bounded time.
+    let mut attempts = 0;
+    let output = loop {
+        match command.output() {
+            Ok(output) => break output,
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && attempts < 50 => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot run {}", program.display()));
+            }
+        }
+    };
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     Ok(RunOutput {
