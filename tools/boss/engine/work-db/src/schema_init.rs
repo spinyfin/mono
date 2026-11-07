@@ -798,6 +798,7 @@ mod floor_tests {
             super::super::spoke_hub::migrate(&expected).unwrap();
             super::super::parking::migrate_membership(&expected).unwrap();
             execution_bookmarks::migrate_has_recovery_head(&expected).unwrap();
+            super::super::spoke_hub::migrate_host_commands_run_idx(&expected).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {

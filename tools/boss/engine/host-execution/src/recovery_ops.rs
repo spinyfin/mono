@@ -128,8 +128,171 @@ mod tests {
         assert_eq!(parse_request(&[]).unwrap(), HostRecoveryRequest::default());
         assert!(parse_request(&vec![b' '; MAX_REQUEST_BYTES + 1]).is_err());
         assert!(parse_request(b"{\"tip_source\": \"Nowhere\"}").is_err());
-        // Fields a newer hub adds are ignored, not an error.
+        // Unknown fields are ignored: new semantics always use a new WorkspaceKind,
+        // so an extra JSON field must not change this kind's meaning.
         assert!(parse_request(b"{\"release_names\": false, \"future\": 1}").is_ok());
+    }
+
+    #[test]
+    fn recovery_json_payloads_round_trip_the_golden_field_names() {
+        let commit = "a".repeat(40);
+        let change = "k".repeat(32);
+        let request = HostRecoveryRequest {
+            recorded: Some(recovery::PreservedTip {
+                change_id: change.clone(),
+                commit_id: commit.clone(),
+                count: 2,
+            }),
+            since_unix: Some(1_700_000_000),
+            tip_source: Some(WorkspaceTipSource::Live),
+            release_names: Some(false),
+            vouchers: vec![
+                recovery::HostVoucher::Commit {
+                    label: "PR #1 head".into(),
+                    commit_id: commit.clone(),
+                },
+                recovery::HostVoucher::RemoteBookmark {
+                    name: "boss/exec_1".into(),
+                    remote: "origin".into(),
+                },
+            ],
+        };
+        let request_json = serde_json::json!({
+            "recorded": {
+                "change_id": change.as_str(),
+                "commit_id": commit.as_str(),
+                "count": 2
+            },
+            "since_unix": 1_700_000_000,
+            "tip_source": "Live",
+            "release_names": false,
+            "vouchers": [
+                {"Commit": {"label": "PR #1 head", "commit_id": commit.as_str()}},
+                {"RemoteBookmark": {"name": "boss/exec_1", "remote": "origin"}}
+            ]
+        });
+        assert_eq!(serde_json::to_value(&request).unwrap(), request_json);
+        assert_eq!(
+            parse_request(&serde_json::to_vec(&request_json).unwrap()).unwrap(),
+            request
+        );
+
+        let preserve = recovery::PreserveOutcome {
+            tip: Some(recovery::PreservedTip {
+                change_id: change.clone(),
+                commit_id: commit.clone(),
+                count: 1,
+            }),
+            inspect: Some(recovery::PreserveInspect {
+                existing_commit_id: None,
+                workspace_change_id: Some(change.clone()),
+                workspace_commit_id: Some(commit.clone()),
+                workspace_count: Some(1),
+                reason: "inspect".into(),
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(&preserve).unwrap(),
+            serde_json::json!({
+                "tip": {"change_id": change.as_str(), "commit_id": commit.as_str(), "count": 1},
+                "inspect": {
+                    "existing_commit_id": null,
+                    "workspace_change_id": change.as_str(),
+                    "workspace_commit_id": commit.as_str(),
+                    "workspace_count": 1,
+                    "reason": "inspect"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<recovery::PreserveOutcome>(serde_json::to_value(&preserve).unwrap()).unwrap(),
+            preserve
+        );
+
+        let published = recovery::PruneOutcome::Published {
+            vouched_by: "PR #1 head".into(),
+            commit: commit.clone(),
+            forgotten: vec!["boss-base/exec_1".into(), "boss/exec_1".into()],
+            rewritten: 0,
+        };
+        let unproven = recovery::PruneOutcome::Unproven {
+            kept: vec!["boss-recovery/exec_1".into()],
+            missing: vec![recovery::MissingChange {
+                change_id: change.clone(),
+                commit: commit.clone(),
+                description: "work".into(),
+            }],
+            forgotten: vec!["boss-base/exec_1".into()],
+            tried: vec!["remote bookmarks: unpublished changes remain".into()],
+        };
+        let gone = recovery::PruneOutcome::AlreadyGone {
+            forgotten: vec!["boss-base/exec_1".into()],
+        };
+        assert_eq!(
+            serde_json::to_value(&published).unwrap(),
+            serde_json::json!({
+                "Published": {
+                    "vouched_by": "PR #1 head",
+                    "commit": commit.as_str(),
+                    "forgotten": ["boss-base/exec_1", "boss/exec_1"],
+                    "rewritten": 0
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&unproven).unwrap(),
+            serde_json::json!({
+                "Unproven": {
+                    "kept": ["boss-recovery/exec_1"],
+                    "missing": [{
+                        "change_id": change.as_str(),
+                        "commit": commit.as_str(),
+                        "description": "work"
+                    }],
+                    "forgotten": ["boss-base/exec_1"],
+                    "tried": ["remote bookmarks: unpublished changes remain"]
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&gone).unwrap(),
+            serde_json::json!({"AlreadyGone": {"forgotten": ["boss-base/exec_1"]}})
+        );
+        for outcome in [published, unproven, gone] {
+            let value = serde_json::to_value(&outcome).unwrap();
+            assert_eq!(
+                serde_json::from_value::<recovery::PruneOutcome>(value).unwrap(),
+                outcome
+            );
+        }
+
+        let restore = recovery::RestoreReport::builder()
+            .pointer("boss-recovery/exec_1")
+            .commits("aaa")
+            .base_sha(commit.clone())
+            .conflicts("")
+            .inherited_base("main")
+            .pr_bound(true)
+            .base_fallback("used origin/main")
+            .discarded_tips("bbb")
+            .unrestaged_unpublished("ccc")
+            .build();
+        let restore_json = serde_json::json!({
+            "pointer": "boss-recovery/exec_1",
+            "commits": "aaa",
+            "base_sha": commit.as_str(),
+            "conflicts": "",
+            "inherited_base": "main",
+            "pr_bound": true,
+            "base_fallback": "used origin/main",
+            "discarded_tips": "bbb",
+            "unrestaged_unpublished": "ccc"
+        });
+        assert_eq!(serde_json::to_value(&restore).unwrap(), restore_json);
+        assert_eq!(
+            serde_json::from_value::<recovery::RestoreReport>(restore_json).unwrap(),
+            restore
+        );
     }
 
     #[tokio::test]
@@ -267,6 +430,82 @@ mod tests {
             !matches!(outcome, recovery::PruneOutcome::Published { .. }),
             "{outcome:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn executor_prunes_as_published_when_a_remote_bookmark_voucher_carries_the_work() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = boss_engine_test_git::jj::JjRepo::new(root.path());
+        let cube = Cube::new(root.path());
+        *cube.owner.lock().unwrap() = Some(workspace::lease_owner(&run()));
+        let executor = workspace::Executor {
+            cube,
+            host_id: "host".into(),
+        };
+        let created = executor.execute(&command(op(Kind::CreateBookmark)), false, 1).await;
+        assert_eq!(created.code, v1::ResultCode::Ok as i32, "{}", created.reason);
+        let Some(command_result::Value::Workspace(created)) = created.value else {
+            panic!("missing bookmark")
+        };
+        let bookmark = created.bookmark.as_ref().unwrap();
+        std::fs::write(repo.worker.join("published.txt"), "on the branch").unwrap();
+        let mut confirm = op(Kind::ConfirmRecovery);
+        confirm.bookmark = created.bookmark.clone();
+        confirm.request_json = payload(&HostRecoveryRequest {
+            tip_source: Some(WorkspaceTipSource::Live),
+            ..Default::default()
+        });
+        let confirmed = executor.execute(&command(confirm), false, 1).await;
+        assert_eq!(confirmed.code, v1::ResultCode::Ok as i32, "{}", confirmed.reason);
+        boss_engine_test_git::jj::JjRepo::run(&repo.worker, &["bookmark", "set", &bookmark.head, "-r", "@"]);
+        boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["git", "export"]);
+        let git_store = repo.repo.join(".jj/repo/store/git");
+        boss_engine_test_git::jj::JjRepo::run(
+            &repo.repo,
+            &["git", "remote", "add", "origin", git_store.to_str().unwrap()],
+        );
+        boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["git", "fetch"]);
+        let present: Vec<String> = [&bookmark.base, &bookmark.recovery, &bookmark.head]
+            .into_iter()
+            .filter(|name| {
+                boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["bookmark", "list", "-T", "name ++ \"\\n\"", name])
+                    .lines()
+                    .any(|line| line == *name)
+            })
+            .cloned()
+            .collect();
+        assert!(!present.is_empty(), "expected pointers to forget");
+
+        let mut prune = op(Kind::PruneBookmark);
+        prune.bookmark = created.bookmark.clone();
+        (prune.workspace_id, prune.lease_id) = Default::default();
+        prune.trunk = "main".into();
+        prune.request_json = payload(&HostRecoveryRequest {
+            vouchers: vec![recovery::HostVoucher::RemoteBookmark {
+                name: bookmark.head.clone(),
+                remote: "origin".into(),
+            }],
+            ..Default::default()
+        });
+        let pruned = executor.execute(&command(prune), false, 1).await;
+        assert_eq!(pruned.code, v1::ResultCode::Ok as i32, "{}", pruned.reason);
+        let Some(command_result::Value::Workspace(pruned)) = pruned.value else {
+            panic!("missing prune outcome")
+        };
+        let outcome: recovery::PruneOutcome = serde_json::from_slice(&pruned.cube_result_json).unwrap();
+        match outcome {
+            recovery::PruneOutcome::Published { forgotten, .. } => {
+                for name in &present {
+                    assert!(forgotten.contains(name), "{name} not forgotten: {forgotten:?}");
+                    let listed = boss_engine_test_git::jj::JjRepo::run(
+                        &repo.repo,
+                        &["bookmark", "list", "-T", "name ++ \"\\n\"", name],
+                    );
+                    assert!(!listed.lines().any(|line| line == name), "{name} survived: {listed}");
+                }
+            }
+            other => panic!("expected published: {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -377,6 +377,15 @@ fn host_vouchers_accept_only_plain_values() {
         commit_id: commit.clone(),
     };
     assert_eq!(ok.into_voucher().unwrap(), voucher("PR #1 head", &commit));
+    let sha256 = "b".repeat(64);
+    assert!(
+        HostVoucher::Commit {
+            label: "PR #1 head".into(),
+            commit_id: sha256,
+        }
+        .into_voucher()
+        .is_ok()
+    );
     assert!(
         HostVoucher::RemoteBookmark {
             name: "boss/exec_1".into(),
@@ -389,6 +398,14 @@ fn host_vouchers_accept_only_plain_values() {
         HostVoucher::Commit {
             label: "x".into(),
             commit_id: "main".into(),
+        },
+        HostVoucher::Commit {
+            label: "x".into(),
+            commit_id: "abc".into(),
+        },
+        HostVoucher::Commit {
+            label: "x".into(),
+            commit_id: "deadbeef".into(),
         },
         HostVoucher::Commit {
             label: "".into(),

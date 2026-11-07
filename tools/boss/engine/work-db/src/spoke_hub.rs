@@ -18,6 +18,7 @@
 use crate::*;
 
 pub(crate) const MIGRATION_ID: &str = "20261106_1500_spoke_hub_assignments_and_outbox";
+pub(crate) const RUN_INDEX_MIGRATION_ID: &str = "20261107_1600_host_commands_run_idx";
 
 /// Most unsettled commands and encoded bytes one host may hold.
 pub const MAX_UNSETTLED_HOST_COMMANDS: i64 = 1024;
@@ -81,6 +82,15 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn migrate_host_commands_run_idx(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS host_commands_run_idx
+         ON host_commands(run_execution_id, run_generation)
+         WHERE run_execution_id IS NOT NULL",
+    )?;
+    Ok(())
+}
+
 /// The durable ownership of one execution attempt by one spoke host.
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 #[builder(on(String, into))]
@@ -117,9 +127,21 @@ pub type Resequence<'a> = &'a dyn Fn(&[u8], u64) -> Result<Vec<u8>>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostTransport {
     LegacySsh,
-    /// Enrolled, readiness not proven: new work still goes over SSH.
+    /// Enrolled, readiness not proven: new work still goes over SSH. An
+    /// assignment that already has spoke evidence stays addressable.
     SpokePending,
     SpokeReady,
+}
+
+/// Whether a run-bound command may start new work, or only address an already
+/// assigned attempt (including a resolved newest generation, for recovery).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunAdmission {
+    /// Lease, spawn, or any command that starts work. The assignment must be
+    /// the newest generation and still unresolved.
+    Start,
+    /// Recovery operations stay addressable after the assignment resolves.
+    Recovery,
 }
 
 impl HostTransport {
@@ -176,6 +198,20 @@ pub enum HostOutboxFault {
     Denied,
     #[error("durable quota exhausted")]
     Full,
+}
+
+/// More than one open assignment matched a pid or workspace lookup. Those
+/// keys never identify a worker on their own, so the caller must treat
+/// liveness as unknown.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "host {host_id} has more than one open assignment matching {kind} {value}; \
+     pids and pane numbers alone never identify a worker"
+)]
+pub struct AmbiguousSpokeAssignment {
+    pub host_id: String,
+    pub kind: &'static str,
+    pub value: String,
 }
 
 fn fault(fault: HostOutboxFault) -> anyhow::Error {
@@ -330,38 +366,43 @@ impl WorkDb {
     }
 
     /// The open assignment using `workspace_id` on `host_id`. Workspaces are
-    /// leased repeatedly, so only an unresolved assignment can own one.
+    /// leased repeatedly, so only an unresolved assignment can own one. Two
+    /// open matches is unknown liveness, not an arbitrary winner.
     pub fn open_spoke_assignment_for_workspace(
         &self,
         host_id: &str,
         workspace_id: &str,
     ) -> Result<Option<SpokeAssignment>> {
-        Ok(self
-            .connect()?
-            .query_row(
-                &format!(
-                    "SELECT {ASSIGNMENT_COLUMNS} FROM spoke_assignments
-                     WHERE host_id = ?1 AND workspace_id = ?2 AND resolved_at_ms IS NULL"
-                ),
-                params![host_id, workspace_id],
-                map_assignment,
-            )
-            .optional()?)
+        let conn = self.connect()?;
+        unique_open_assignment(
+            &conn,
+            &format!(
+                "SELECT {ASSIGNMENT_COLUMNS} FROM spoke_assignments
+                 WHERE host_id = ?1 AND workspace_id = ?2 AND resolved_at_ms IS NULL LIMIT 2"
+            ),
+            params![host_id, workspace_id],
+            host_id,
+            "workspace_id",
+            workspace_id,
+        )
     }
 
-    /// The open assignment whose worker pane had `pid` when it launched.
+    /// The open assignment whose worker pane had `pid` when it launched. Two
+    /// open matches is unknown liveness: a recycled pid must not observe the
+    /// wrong run.
     pub fn open_spoke_assignment_for_pane_pid(&self, host_id: &str, pid: i64) -> Result<Option<SpokeAssignment>> {
-        Ok(self
-            .connect()?
-            .query_row(
-                &format!(
-                    "SELECT {ASSIGNMENT_COLUMNS} FROM spoke_assignments
-                     WHERE host_id = ?1 AND pane_pid = ?2 AND resolved_at_ms IS NULL"
-                ),
-                params![host_id, pid],
-                map_assignment,
-            )
-            .optional()?)
+        let conn = self.connect()?;
+        unique_open_assignment(
+            &conn,
+            &format!(
+                "SELECT {ASSIGNMENT_COLUMNS} FROM spoke_assignments
+                 WHERE host_id = ?1 AND pane_pid = ?2 AND resolved_at_ms IS NULL LIMIT 2"
+            ),
+            params![host_id, pid],
+            host_id,
+            "pane_pid",
+            &pid.to_string(),
+        )
     }
 
     /// Record the repository an assignment is leasing in, before the lease
@@ -402,10 +443,31 @@ impl WorkDb {
     }
 
     pub fn record_spoke_pane_pid(&self, execution_id: &str, generation: u64, pid: i64) -> Result<()> {
-        self.connect()?.execute(
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let host_id: Option<String> = tx
+            .query_row(
+                "SELECT host_id FROM spoke_assignments WHERE execution_id = ?1 AND assignment_generation = ?2",
+                params![execution_id, generation as i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(host_id) = host_id else {
+            return Ok(());
+        };
+        // A reused pid proves the previous process is gone, so any other open
+        // assignment on this host holding it no longer identifies a live pane.
+        tx.execute(
+            "UPDATE spoke_assignments SET pane_pid = NULL
+             WHERE host_id = ?1 AND pane_pid = ?2 AND resolved_at_ms IS NULL
+               AND NOT (execution_id = ?3 AND assignment_generation = ?4)",
+            params![host_id, pid, execution_id, generation as i64],
+        )?;
+        tx.execute(
             "UPDATE spoke_assignments SET pane_pid = ?3 WHERE execution_id = ?1 AND assignment_generation = ?2",
             params![execution_id, generation as i64, pid],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -562,6 +624,7 @@ impl WorkDb {
         host_id: &str,
         command_id: &str,
         run: Option<&SpokeRunKey>,
+        admission: RunAdmission,
         request: &[u8],
         encode: &dyn Fn(u64) -> Vec<u8>,
     ) -> Result<StoredHostCommand> {
@@ -586,29 +649,35 @@ impl WorkDb {
         if let Some(run) = run {
             // Only the execution's newest generation on this host is admitted: a
             // superseded attempt's key is stale, whatever else it still matches.
-            // A resolved newest generation stays addressable for recovery.
+            // Start-class commands also require the assignment still be open, so
+            // a fenced or released newest generation cannot spawn or lease.
+            // Recovery keeps a resolved newest generation addressable.
+            let start = matches!(admission, RunAdmission::Start);
             let owned: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM spoke_assignments
                   WHERE execution_id = ?1 AND assignment_generation = ?2 AND run_id = ?3
                     AND spawn_token = ?4 AND host_id = ?5
                     AND assignment_generation = (SELECT MAX(assignment_generation) FROM spoke_assignments
-                                                  WHERE execution_id = ?1))",
+                                                  WHERE execution_id = ?1)
+                    AND (?6 = 0 OR resolved_at_ms IS NULL))",
                 params![
                     run.execution_id,
                     run.assignment_generation as i64,
                     run.run_id,
                     run.spawn_token,
-                    host_id
+                    host_id,
+                    start as i64
                 ],
                 |row| row.get(0),
             )?;
-            let legacy: bool = tx.query_row(
-                "SELECT COALESCE((SELECT transport FROM host_transports WHERE host_id = ?1), 'legacy_ssh') = 'legacy_ssh'",
+            let needs_spoke_evidence: bool = tx.query_row(
+                "SELECT COALESCE((SELECT transport FROM host_transports WHERE host_id = ?1), 'legacy_ssh') <> 'spoke_ready'",
                 [host_id],
                 |row| row.get(0),
             )?;
             if !owned
-                || (legacy && !assignment_committed_to_spoke(&tx, &run.execution_id, run.assignment_generation as i64)?)
+                || (needs_spoke_evidence
+                    && !assignment_committed_to_spoke(&tx, &run.execution_id, run.assignment_generation as i64)?)
             {
                 return Err(fault(HostOutboxFault::Denied));
             }
@@ -729,7 +798,8 @@ impl WorkDb {
     ///
     /// * has no result yet, which includes every unresolved lease or spawn;
     /// * has a wire sequence the peer has not durably received, or the highest
-    ///   sequence stored (sequences are allocated from it and never reused);
+    ///   sequence stored (allocation is max(stored sequence, durable receipt)
+    ///   and never reuses a sequence);
     /// * belongs to an assignment that is still unresolved, whose commands are
     ///   the evidence it may have started;
     /// * settled at or after `settled_before_ms`, or is among the `keep_recent`
@@ -855,9 +925,34 @@ impl WorkDb {
     }
 }
 
+fn unique_open_assignment(
+    conn: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+    host_id: &str,
+    kind: &'static str,
+    value: &str,
+) -> Result<Option<SpokeAssignment>> {
+    let mut statement = conn.prepare(sql)?;
+    let mut rows = statement.query_map(params, map_assignment)?;
+    let first = rows.next().transpose()?;
+    if first.is_some() && rows.next().transpose()?.is_some() {
+        return Err(AmbiguousSpokeAssignment {
+            host_id: host_id.to_owned(),
+            kind,
+            value: value.to_owned(),
+        }
+        .into());
+    }
+    Ok(first)
+}
+
 fn highest_sequence(conn: &Connection, host_id: &str) -> Result<u64> {
     Ok(conn.query_row(
-        "SELECT COALESCE(MAX(sequence), 0) FROM host_commands WHERE host_id = ?1",
+        "SELECT MAX(
+            COALESCE((SELECT MAX(sequence) FROM host_commands WHERE host_id = ?1), 0),
+            COALESCE((SELECT received FROM host_command_journals WHERE host_id = ?1), 0)
+         )",
         [host_id],
         |row| row.get::<_, i64>(0),
     )? as u64)
@@ -891,7 +986,18 @@ mod tests {
     }
 
     fn append(db: &WorkDb, host: &str, id: &str, run: Option<&SpokeRunKey>, body: &[u8]) -> Result<StoredHostCommand> {
-        db.append_host_command(host, id, run, body, &|sequence| {
+        append_with(db, host, id, run, RunAdmission::Start, body)
+    }
+
+    fn append_with(
+        db: &WorkDb,
+        host: &str,
+        id: &str,
+        run: Option<&SpokeRunKey>,
+        admission: RunAdmission,
+        body: &[u8],
+    ) -> Result<StoredHostCommand> {
+        db.append_host_command(host, id, run, admission, body, &|sequence| {
             let mut wire = sequence.to_be_bytes().to_vec();
             wire.extend_from_slice(body);
             wire
@@ -920,6 +1026,13 @@ mod tests {
         assert_ne!(next.spawn_token, first.spawn_token);
         assert_ne!(next.run_id, first.run_id);
         // The resolved attempt stays addressable by its lease for late recovery.
+        assert_eq!(
+            db.spoke_assignment_for_lease("host-a", "lease-a")
+                .unwrap()
+                .unwrap()
+                .execution_id,
+            "exec_1"
+        );
         db.bind_spoke_lease("exec_1", 2, "ws", "lease", "/w").unwrap();
         assert_eq!(
             db.spoke_assignment_for_lease("host-b", "lease")
@@ -1063,7 +1176,7 @@ mod tests {
         lease(&db, "exec_1", 1, "lease-a");
         // The newest generation stays admissible after it resolves, for recovery.
         assert!(db.resolve_spoke_assignment("exec_1", 1, "released").unwrap());
-        append(&db, "host-a", "c2", Some(&stale), b"restore").unwrap();
+        append_with(&db, "host-a", "c2", Some(&stale), RunAdmission::Recovery, b"restore").unwrap();
         let second = db.reserve_spoke_assignment("exec_1", "host-b").unwrap();
         // Once a newer attempt exists the old key is stale, even on its own host.
         let refused = append(&db, "host-a", "c3", Some(&stale), b"late").unwrap_err();
@@ -1089,7 +1202,7 @@ mod tests {
     fn quota_counts_encoded_wire_bytes() {
         let db = db();
         let error = db
-            .append_host_command("h", "large", None, b"small", &|_| {
+            .append_host_command("h", "large", None, RunAdmission::Start, b"small", &|_| {
                 vec![0; MAX_UNSETTLED_HOST_COMMAND_BYTES as usize + 1]
             })
             .unwrap_err();
@@ -1146,7 +1259,7 @@ mod tests {
         let refused = db.set_host_transport("host-a", HostTransport::LegacySsh).unwrap_err();
         assert_eq!(refused.downcast_ref::<SpokeHostInUse>().unwrap().execution_id, "exec_1");
         assert_eq!(db.host_transport("host-a").unwrap(), HostTransport::SpokeReady);
-        // Pending still routes through the spoke, so it is allowed.
+        // Pending does not flip the host back to SSH, so a running spoke assignment may stay.
         db.set_host_transport("host-a", HostTransport::SpokePending).unwrap();
         // Another host is unaffected.
         db.set_host_transport("host-b", HostTransport::LegacySsh).unwrap();
@@ -1219,5 +1332,101 @@ mod tests {
             .unwrap();
         assert_eq!(db.prune_settled_host_commands("other", i64::MAX, 0).unwrap(), 1);
         assert_eq!(db.host_command_result("other", "x").unwrap(), None);
+    }
+
+    #[test]
+    fn allocation_never_falls_below_the_durable_receipt_after_prune_and_reject() {
+        let db = db();
+        for (id, body) in [("a", b"1"), ("b", b"2"), ("c", b"3")] {
+            append(&db, "h", id, None, body).unwrap();
+        }
+        db.settle_host_command("h", "a", None, b"r").unwrap();
+        db.settle_host_command("h", "b", None, b"r").unwrap();
+        let (journal, _) = db.resume_host_command_journal("h", None).unwrap();
+        db.record_host_command_receipt("h", &journal, 2).unwrap();
+        assert_eq!(db.prune_settled_host_commands("h", i64::MAX, 0).unwrap(), 2);
+        let result = |id: &str| id.as_bytes().to_vec();
+        db.reject_host_command("h", 3, &result, &|wire: &[u8], _| Ok(wire.to_vec()))
+            .unwrap();
+        let next = append(&db, "h", "d", None, b"4").unwrap();
+        assert_eq!(next.sequence, 3);
+        let after = db.host_command_after("h", 2).unwrap().unwrap();
+        assert_eq!(after.sequence, 3);
+        assert_eq!(&after.wire[8..], b"4");
+        db.record_host_command_receipt("h", &journal, 2).unwrap();
+        assert_eq!(db.resume_host_command_journal("h", Some((&journal, 2))).unwrap().1, 2);
+    }
+
+    #[test]
+    fn a_resolved_newest_generation_admits_recovery_but_not_start() {
+        let db = spoke_db();
+        let first = db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
+        let run = key(&first);
+        lease(&db, "exec_1", 1, "lease-a");
+        assert!(db.resolve_spoke_assignment("exec_1", 1, "operator_fenced").unwrap());
+        assert_eq!(
+            fault_of(&append(&db, "host-a", "spawn", Some(&run), b"spawn").unwrap_err()),
+            Some(HostOutboxFault::Denied)
+        );
+        append_with(&db, "host-a", "restore", Some(&run), RunAdmission::Recovery, b"restore").unwrap();
+    }
+
+    #[test]
+    fn pid_and_workspace_lookups_fail_closed_when_two_open_assignments_match() {
+        let db = db();
+        db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
+        db.reserve_spoke_assignment("exec_2", "host-a").unwrap();
+        db.bind_spoke_lease("exec_1", 1, "ws-shared", "lease-a", "/a").unwrap();
+        db.bind_spoke_lease("exec_2", 1, "ws-shared", "lease-b", "/b").unwrap();
+        let workspace = db
+            .open_spoke_assignment_for_workspace("host-a", "ws-shared")
+            .unwrap_err();
+        assert_eq!(
+            workspace.downcast_ref::<AmbiguousSpokeAssignment>().unwrap().kind,
+            "workspace_id"
+        );
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE spoke_assignments SET pane_pid = 42
+                 WHERE host_id = 'host-a' AND execution_id IN ('exec_1', 'exec_2')",
+                [],
+            )
+            .unwrap();
+        let pid = db.open_spoke_assignment_for_pane_pid("host-a", 42).unwrap_err();
+        assert_eq!(pid.downcast_ref::<AmbiguousSpokeAssignment>().unwrap().kind, "pane_pid");
+    }
+
+    #[test]
+    fn recording_a_pane_pid_clears_the_same_pid_on_other_open_assignments() {
+        let db = db();
+        db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
+        db.reserve_spoke_assignment("exec_2", "host-a").unwrap();
+        db.record_spoke_pane_pid("exec_1", 1, 42).unwrap();
+        db.record_spoke_pane_pid("exec_2", 1, 42).unwrap();
+        let found = db.open_spoke_assignment_for_pane_pid("host-a", 42).unwrap().unwrap();
+        assert_eq!(found.execution_id, "exec_2");
+        assert_eq!(
+            db.spoke_assignment_for_execution("exec_1").unwrap().unwrap().pane_pid,
+            None
+        );
+    }
+
+    #[test]
+    fn an_idle_reservation_cannot_start_after_the_host_drops_to_pending() {
+        let db = db();
+        db.set_host_transport("host-a", HostTransport::SpokeReady).unwrap();
+        let idle = db.reserve_spoke_assignment("exec_idle", "host-a").unwrap();
+        db.set_host_transport("host-a", HostTransport::SpokePending).unwrap();
+        assert_eq!(
+            fault_of(&append(&db, "host-a", "lease", Some(&key(&idle)), b"lease").unwrap_err()),
+            Some(HostOutboxFault::Denied)
+        );
+        db.set_host_transport("host-a", HostTransport::SpokeReady).unwrap();
+        let started = db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
+        lease(&db, "exec_1", 1, "lease-a");
+        append(&db, "host-a", "lease", Some(&key(&started)), b"lease").unwrap();
+        db.set_host_transport("host-a", HostTransport::SpokePending).unwrap();
+        append(&db, "host-a", "spawn", Some(&key(&started)), b"spawn").unwrap();
     }
 }
