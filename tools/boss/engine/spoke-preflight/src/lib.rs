@@ -263,7 +263,11 @@ async fn claude_credentials(program: &Path) -> Outcome {
     Outcome::of(
         "claude_credentials",
         result
-            .map(|_| "claude is authenticated".to_owned())
+            .and_then(|output| {
+                boss_engine_driver_quota::parse::claude_usage_authenticated(&output)
+                    .then(|| "claude is authenticated".to_owned())
+                    .ok_or_else(|| "invalid usage response".to_owned())
+            })
             .map_err(|_| "claude is not authenticated for the service user".to_owned()),
     )
 }
@@ -274,93 +278,30 @@ async fn claude_credentials(program: &Path) -> Outcome {
 /// dropped: it is a quota figure, not a credential, but it is still not
 /// something a preflight line should print.
 async fn codex_credentials(program: &Path) -> Outcome {
-    let program = program.to_path_buf();
-    let result = tokio::time::timeout(
-        PROBE_TIMEOUT,
-        tokio::task::spawn_blocking(move || probe_codex_app_server(&program)),
-    )
-    .await;
-    let result = match result {
-        Ok(Ok(Ok(()))) => Ok("codex is authenticated".to_owned()),
-        Ok(Ok(Err(error))) => Err(error),
-        Ok(Err(_)) | Err(_) => Err("codex is not authenticated for the service user".to_owned()),
-    };
-    Outcome::of("codex_credentials", result)
+    codex_credentials_with_timeout(program, PROBE_TIMEOUT).await
 }
 
-/// Same JSON-RPC handshake as `CodexQuotaProbe` (`codex app-server --listen
-/// stdio://`, then `initialize` / `notifications/initialized` /
-/// `account/rateLimits/read`). Implemented here so preflight does not depend
-/// on the hook-trust crate.
-fn probe_codex_app_server(program: &Path) -> Result<(), String> {
-    use std::io::{BufRead, BufReader, Write};
-    use std::process::{Command, Stdio};
-
-    let unauth = || "codex is not authenticated for the service user".to_owned();
-    let mut child = Command::new(program)
-        .args(["app-server", "--listen", "stdio://"])
-        .current_dir("/")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                "codex is not installed or not on PATH".to_owned()
-            } else {
-                unauth()
-            }
-        })?;
-    let mut stdin = child.stdin.take().ok_or_else(unauth)?;
-    let stdout = child.stdout.take().ok_or_else(unauth)?;
-    let mut reader = BufReader::new(stdout);
-    let send = |stdin: &mut std::process::ChildStdin, msg: serde_json::Value| -> Result<(), String> {
-        writeln!(stdin, "{}", serde_json::to_string(&msg).map_err(|_| unauth())?).map_err(|_| unauth())?;
-        stdin.flush().map_err(|_| unauth())
+async fn codex_credentials_with_timeout(program: &Path, timeout: Duration) -> Outcome {
+    use boss_engine_codex_hook_trust::{AppServer, AppServerError, ClientInfo};
+    let server = AppServer {
+        program: program.to_path_buf(),
+        extra_env: vec![],
+        cwd: Some(PathBuf::from("/")),
+        client_info: ClientInfo {
+            name: "boss-spoke-preflight".into(),
+            title: None,
+            version: "1.0.0".into(),
+        },
+        timeout,
     };
-    send(
-        &mut stdin,
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "clientInfo": {"name": "boss-spoke-preflight", "version": "1.0.0"},
-                "capabilities": {},
-            },
-        }),
-    )?;
-    let mut line = String::new();
-    reader.read_line(&mut line).map_err(|_| unauth())?;
-    let init: serde_json::Value = serde_json::from_str(line.trim()).map_err(|_| unauth())?;
-    if init.get("error").is_some() {
-        return Err(unauth());
-    }
-    send(
-        &mut stdin,
-        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-    )?;
-    send(
-        &mut stdin,
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "account/rateLimits/read",
-            "params": {},
-        }),
-    )?;
-    line.clear();
-    reader.read_line(&mut line).map_err(|_| unauth())?;
-    let reply: serde_json::Value = serde_json::from_str(line.trim()).map_err(|_| unauth())?;
-    let _ = child.kill();
-    let _ = child.wait();
-    if reply.get("error").is_some() {
-        Err(unauth())
-    } else if reply.get("result").is_some() {
-        Ok(())
-    } else {
-        Err(unauth())
-    }
+    let result =
+        tokio::task::spawn_blocking(move || server.request("account/rateLimits/read", serde_json::json!({}))).await;
+    let result = match result {
+        Ok(Ok(_)) => Ok("codex is authenticated".to_owned()),
+        Ok(Err(AppServerError::NotFound { .. })) => Err("codex is not installed or not on PATH".to_owned()),
+        _ => Err("codex is not authenticated for the service user".to_owned()),
+    };
+    Outcome::of("codex_credentials", result)
 }
 
 async fn hub_reachable(authority: &str) -> Outcome {
@@ -397,7 +338,7 @@ async fn repo_access(repos: &[String]) -> Outcome {
     Outcome::of("repo_access", result)
 }
 
-/// Runs `program`, returning the first line of its stdout. Failure carries no
+/// Runs `program`, returning its stdout. Failure carries no
 /// process output.
 async fn probe(program: &OsStr, args: &[&str], envs: &[(&str, &str)], unset: &[&str]) -> Result<String, String> {
     let mut command = Command::new(program);
@@ -415,11 +356,7 @@ async fn probe(program: &OsStr, args: &[&str], envs: &[(&str, &str)], unset: &[&
     match tokio::time::timeout(PROBE_TIMEOUT, command.output()).await {
         Err(_) => Err(format!("{name} timed out")),
         Ok(Err(error)) => Err(format!("{name} cannot run: {error}")),
-        Ok(Ok(output)) if output.status.success() => Ok(String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_owned()),
+        Ok(Ok(output)) if output.status.success() => Ok(String::from_utf8_lossy(&output.stdout).into_owned()),
         Ok(Ok(output)) => Err(format!("{name} exited with {}", output.status)),
     }
 }
@@ -515,9 +452,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_reports_the_first_line_and_never_the_failure_output() {
+    async fn probe_reports_stdout_and_never_the_failure_output() {
         let ok = probe(OsStr::new("/bin/sh"), &["-c", "echo first; echo second"], &[], &[]).await;
-        assert_eq!(ok.unwrap(), "first");
+        assert_eq!(ok.unwrap(), "first\nsecond\n");
         let failed = probe(OsStr::new("/bin/sh"), &["-c", "echo secret >&2; exit 3"], &[], &[])
             .await
             .unwrap_err();
@@ -581,7 +518,7 @@ exit 1
             "claude",
             r#"
 if [ "$1" = --version ]; then echo claude 1.0; exit 0; fi
-echo '{"is_error":false,"result":"ok"}'
+echo '{"is_error":false,"result":"Current week (all models): 3% used"}'
 "#,
         );
         assert!(claude_credentials(&claude_ok).await.passed());
@@ -591,9 +528,11 @@ echo '{"is_error":false,"result":"ok"}'
             r#"
 if [ "$1" = --version ]; then echo codex 1.0; exit 0; fi
 read l1
+echo '{"method":"configWarning","params":{}}'
 echo '{"id":1,"result":{}}'
 read l2
 read l3
+echo '{"method":"configWarning","params":{}}'
 echo '{"id":2,"error":{"message":"not logged in; run login"}}'
 "#,
         );
@@ -608,12 +547,49 @@ echo '{"id":2,"error":{"message":"not logged in; run login"}}'
             r#"
 if [ "$1" = --version ]; then echo codex 1.0; exit 0; fi
 read l1
+echo '{"method":"configWarning","params":{}}'
 echo '{"id":1,"result":{}}'
 read l2
 read l3
+echo '{"method":"configWarning","params":{}}'
 echo '{"id":2,"result":{}}'
 "#,
         );
         assert!(codex_credentials(&codex_ok).await.passed());
+    }
+    #[tokio::test]
+    async fn claude_rejects_successful_exit_with_invalid_credentials_or_output() {
+        for output in [
+            r#"{"is_error":true,"result":"Current week (all models): 3% used"}"#,
+            r#"{"is_error":false,"result":"Not logged in · Please run /login"}"#,
+            "malformed",
+            "",
+        ] {
+            let (_temp, program) = stub_script("claude", &format!("echo '{output}'"));
+            assert!(!claude_credentials(&program).await.passed(), "{output}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_codex_is_bounded_and_reaped() {
+        let (temp, program) = stub_script(
+            "codex",
+            r#"echo $$ > "$0.pid"; read request; read request; read request"#,
+        );
+        let started = std::time::Instant::now();
+        assert!(
+            !codex_credentials_with_timeout(&program, Duration::from_millis(100))
+                .await
+                .passed()
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let pid: libc::pid_t = fs::read_to_string(temp.path().join("codex.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal zero checks existence without delivering a signal.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
     }
 }

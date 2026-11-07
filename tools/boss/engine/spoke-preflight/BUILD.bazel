@@ -18,6 +18,8 @@ rust_library(
         "//tools/boss/spoke-package:__pkg__",
     ],
     deps = [
+        "//tools/boss/engine/codex-hook-trust",
+        "//tools/boss/engine/driver-quota",
         "//tools/boss/engine/host-execution",
         "//tools/boss/tmux",
     ] + all_crate_deps(normal = True),

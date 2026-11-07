@@ -97,8 +97,8 @@ one that is a symlink, not owned by the service user, or not owner-only stops
 the install, because root must not chown or chmod paths another user can swap.
 
 The `boss-worker` account is created when missing: `useradd --system` on Linux,
-and a hidden role account (`sysadminctl -addUser … -shell /usr/bin/false
--roleAccount -hidden`) on macOS. The service definition names only the user, so
+and a hidden non-login account (created with `dscl`, a free UID in 200–400,
+primary group `staff`, and shell `/usr/bin/false`) on macOS. The service definition names only the user, so
 systemd and launchd use that account's primary group.
 
 ### The service environment

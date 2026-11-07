@@ -1758,6 +1758,8 @@ name = "boss-spoke-preflight"
 version = "0.1.0"
 dependencies = [
  "bon",
+ "boss-engine-codex-hook-trust",
+ "boss-engine-driver-quota",
  "boss-host-execution",
  "boss-tmux",
  "fs4",

@@ -647,7 +647,7 @@ fn service_definitions_omit_a_group_named_after_the_user() {
     .spec("host-one", "https://hub.example:7443");
     let unit = spec.render_systemd();
     let plist = spec.render_launchd();
-    // macOS sysadminctl role accounts have primary group `staff`, not a group
+    // macOS service accounts have primary group `staff`, not a group
     // named after the user. Linux accounts can also have a different primary
     // group. Leaving Group/GroupName unset uses that primary group.
     assert!(unit.contains("User=boss-worker") && !unit.contains("Group="));
@@ -739,4 +739,40 @@ fn a_corrupt_install_record_does_not_bypass_the_host_id_guard() {
         !fixture.at(fixture.layout().current()).exists(),
         "a corrupt record must not be overwritten as a first install"
     );
+}
+
+#[test]
+fn changed_definition_retries_registration_and_restart_for_an_enabled_service() {
+    let fixture = Fixture::new();
+    let first = release("1.0.1");
+    fixture.install(&first).unwrap();
+    fixture.enroll();
+    fixture.host.service.running.set(true);
+    fixture.host.service.register_fails.set(true);
+    let request = Request::builder()
+        .manifest(&first.manifest)
+        .signature(&first.signature)
+        .package(&first.package)
+        .host_id("host-one")
+        .hub_url("https://new-hub.example:7443")
+        .hub_ca(CA)
+        .platform(Platform::host().unwrap())
+        .layout(fixture.layout())
+        .health(INSTANT)
+        .build();
+    assert!(
+        install::install(&fixture.host, &request)
+            .unwrap_err()
+            .to_string()
+            .contains("registration failed")
+    );
+    assert!(fixture.host.service.registered.get());
+    assert!(fixture.host.service.running.get());
+    fixture.host.service.register_fails.set(false);
+    let report = install::install(&fixture.host, &request).unwrap();
+    assert!(report.restarted);
+    assert_eq!(fixture.host.calls(), ["register", "register", "register", "restart"]);
+    let report = install::install(&fixture.host, &request).unwrap();
+    assert!(!report.restarted);
+    assert!(report.changed.is_empty());
 }
