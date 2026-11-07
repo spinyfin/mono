@@ -1,0 +1,8 @@
+[
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Final heartbeat shape: keep one minimal, bounded live-owner refresh (recommended; ~150 lines, closes the non-Boss-caller and cube-GC exposure for workers past 24 h), or drop heartbeats entirely (no heartbeat code; accepts that exposure for roughly 1 in 600 executions, bounded to unsnapshotted edits and a cold rebuild)?",
+    "choices": ["keep the minimal live-owner refresh", "drop heartbeats entirely"],
+    "anchor": "live-worker-heartbeat-the-two-options"
+  }
+]
