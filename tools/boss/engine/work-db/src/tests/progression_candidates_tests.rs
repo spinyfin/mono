@@ -112,6 +112,55 @@ impl Fixture {
         ));
         id
     }
+
+    fn product_id(&self, task_id: &str) -> String {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row("SELECT product_id FROM tasks WHERE id = ?1", [task_id], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    fn insert_ci_attempt(&self, item: &str, head_sha: &str) -> String {
+        self.db
+            .insert_ci_remediation(CiRemediationInsertInput {
+                product_id: self.product_id(item),
+                work_item_id: item.to_owned(),
+                pr_url: "https://github.com/o/r/pull/7".into(),
+                pr_number: 7,
+                head_branch: "feature".into(),
+                head_sha_at_trigger: head_sha.into(),
+                attempt_kind: "fix".into(),
+                consumes_budget: 1,
+                failed_checks: "[]".into(),
+                failure_kind: "pr_branch_ci".into(),
+                before_commit_sha: None,
+            })
+            .unwrap()
+            .expect("ci attempt")
+            .id
+    }
+
+    fn insert_conflict_attempt(&self, item: &str, base_sha: &str) -> String {
+        self.db
+            .insert_conflict_resolution(
+                ConflictResolutionInsertInput::builder()
+                    .product_id(self.product_id(item))
+                    .work_item_id(item)
+                    .pr_url("https://github.com/o/r/pull/7")
+                    .pr_number(7)
+                    .head_branch("feature")
+                    .base_branch("main")
+                    .base_sha_at_trigger(base_sha)
+                    .head_sha_before(format!("head-{base_sha}"))
+                    .build(),
+            )
+            .unwrap()
+            .expect("conflict attempt")
+            .id
+    }
 }
 
 #[test]
@@ -222,27 +271,37 @@ fn clause_1_human_holds_are_never_candidates() {
     f.assert_candidate(&asked, true);
 
     // The owner's recorded refusal is a human hold; every other producer of a
-    // worker failure is not.
-    for basis in [
-        WorkerFailureBasis::DeliveredWithoutPr,
-        WorkerFailureBasis::ForeignPrBinding,
-        WorkerFailureBasis::DeclaredBlocked,
-        WorkerFailureBasis::NudgeBreaker,
-        WorkerFailureBasis::OperatorNo,
-    ] {
-        let (_, id, execution) = make_waiting_human_chore(&f.db, basis.as_str());
-        f.db.record_worker_failure_with_basis(&execution, "failed", basis)
-            .unwrap();
-        f.age(&id, 3 * HOUR);
-        let expected = basis != WorkerFailureBasis::OperatorNo;
-        f.assert_candidate(&id, expected);
-        assert_eq!(
-            f.clauses(&id).stuck_kind.as_deref(),
-            Some("S7_worker_failed"),
-            "{}",
-            basis.as_str()
-        );
-        assert_eq!(f.clauses(&id).eligible_item, expected, "{}", basis.as_str());
+    // worker failure is not. Each producer admits both a primary item and a
+    // revision (the revision's parent is not green-CI `in_review`, so this is
+    // S7, not the S13 dead-chain-head shape).
+    for item_kind in ["primary", "revision"] {
+        for basis in [
+            WorkerFailureBasis::DeliveredWithoutPr,
+            WorkerFailureBasis::ForeignPrBinding,
+            WorkerFailureBasis::DeclaredBlocked,
+            WorkerFailureBasis::NudgeBreaker,
+            WorkerFailureBasis::OperatorNo,
+        ] {
+            let label = format!("{item_kind}-{}", basis.as_str());
+            let (_, id, execution) = make_waiting_human_chore(&f.db, &label);
+            if item_kind == "revision" {
+                let parent = f.chore(&format!("parent-{label}"));
+                f.sql(&format!(
+                    "UPDATE tasks SET kind = 'revision', parent_task_id = '{parent}' WHERE id = '{id}'"
+                ));
+            }
+            f.db.record_worker_failure_with_basis(&execution, "failed", basis)
+                .unwrap();
+            f.age(&id, 3 * HOUR);
+            let expected = basis != WorkerFailureBasis::OperatorNo;
+            f.assert_candidate(&id, expected);
+            assert_eq!(
+                f.clauses(&id).stuck_kind.as_deref(),
+                Some("S7_worker_failed"),
+                "{label}"
+            );
+            assert_eq!(f.clauses(&id).eligible_item, expected, "{label}");
+        }
     }
 }
 
@@ -261,12 +320,13 @@ fn clause_1_worker_failed_is_admitted_on_both_primary_and_revision_items() {
     let revision = f.revision_of(&primary, "Hidden revision");
     f.stick(&primary, "status = 'in_review', ci_required_state = 'success'", 3);
     f.stick(&revision, "status = 'blocked', blocked_reason = 'worker_failed'", 3);
-    // The brief's mutual-block shape: a hidden revision `worker_failed` while CI
-    // is green, holding up its parent. The revision is the stuck item.
+    // A failed hidden revision while parent CI is green holds up its parent.
+    // The revision is the stuck item.
     f.assert_candidate(&revision, true);
     assert_eq!(f.clauses(&revision).stuck_kind.as_deref(), Some("S13_revision_chain"));
-    // A later revision queued behind the dead one does not hide it: a
-    // `waiting_dependency` row is a gate, not evidence anyone is working.
+    // A later revision queued behind the dead one does not hide it:
+    // `waiting_dependency` on a later revision is the chain-serialization gate,
+    // not evidence anyone is working the PR.
     let later = f.revision_of(&primary, "Later revision");
     f.sql(&format!(
         "UPDATE tasks SET status = 'blocked', blocked_reason = 'dependency' WHERE id = '{later}'"
@@ -308,22 +368,31 @@ fn clause_2_live_work_on_the_item_its_revisions_or_its_pr_excludes_it() {
     ));
     f.assert_candidate(&item, true);
 
-    // An in-flight CI-fix attempt: a revision of the item with a live run.
-    let fixer = f.revision_of(&item, "ci-fix: Conflicted PR");
-    for status in [
-        ExecutionStatus::Queued,
-        ExecutionStatus::Ready,
-        ExecutionStatus::Claimed,
-        ExecutionStatus::Running,
-        ExecutionStatus::WaitingHuman,
-    ] {
-        let attempt = f.execution(&fixer, ExecutionKind::RevisionImplementation, status.clone());
-        f.assert_candidate(&item, false);
-        f.sql(&format!(
-            "UPDATE work_executions SET status = 'failed' WHERE id = '{attempt}'"
-        ));
-        f.assert_candidate(&item, true);
-    }
+    // `waiting_dependency` on the item itself is pending work.
+    let gated = f.execution(
+        &item,
+        ExecutionKind::ChoreImplementation,
+        ExecutionStatus::WaitingDependency,
+    );
+    f.assert_candidate(&item, false);
+    assert!(!f.clauses(&item).no_live_work);
+    f.sql(&format!(
+        "UPDATE work_executions SET status = 'cancelled' WHERE id = '{gated}'"
+    ));
+    f.assert_candidate(&item, true);
+
+    // `waiting_dependency` on another item that shares the PR (not a revision)
+    // is pending work on the family.
+    let sibling_gate = f.execution(
+        &sharing,
+        ExecutionKind::ChoreImplementation,
+        ExecutionStatus::WaitingDependency,
+    );
+    f.assert_candidate(&item, false);
+    f.sql(&format!(
+        "UPDATE work_executions SET status = 'cancelled' WHERE id = '{sibling_gate}'"
+    ));
+    f.assert_candidate(&item, true);
 
     // Live work on the item itself, and a progression run bound to it.
     for kind in [ExecutionKind::ChoreImplementation, ExecutionKind::Progression] {
@@ -338,6 +407,82 @@ fn clause_2_live_work_on_the_item_its_revisions_or_its_pr_excludes_it() {
     // Unrelated live work elsewhere in the product does not matter.
     let other = f.chore("Unrelated");
     f.execution(&other, ExecutionKind::ChoreImplementation, ExecutionStatus::Running);
+    f.assert_candidate(&item, true);
+}
+
+#[test]
+fn clause_2_an_inflight_ci_or_conflict_attempt_excludes_the_item() {
+    let f = fixture();
+    let item = f.stuck_chore("Conflicted PR");
+    f.sql(&format!(
+        "UPDATE tasks SET pr_url = 'https://github.com/o/r/pull/7' WHERE id = '{item}'"
+    ));
+    f.assert_candidate(&item, true);
+
+    // A pending CI-fix attempt with no revision yet (the window after ci_watch
+    // inserts the row and before the revision or execution exists).
+    let ci = f.insert_ci_attempt(&item, "head-pending");
+    f.assert_candidate(&item, false);
+    assert!(!f.clauses(&item).no_inflight_ladder);
+    assert!(f.clauses(&item).no_live_work, "no execution is live");
+    assert!(
+        f.clauses(&item)
+            .failing_clauses()
+            .iter()
+            .any(|(n, reason)| *n == 2 && reason.contains("CI-fix or conflict-resolution")),
+        "{:?}",
+        f.clauses(&item).failing_clauses()
+    );
+
+    // Running, revision non-terminal, still no live execution.
+    f.sql(&format!(
+        "UPDATE ci_remediations SET status = 'running' WHERE id = '{ci}'"
+    ));
+    let fixer = f.revision_of(&item, "ci-fix: Conflicted PR");
+    f.sql(&format!(
+        "UPDATE ci_remediations SET revision_task_id = '{fixer}' WHERE id = '{ci}'"
+    ));
+    f.stick(&fixer, "status = 'blocked', blocked_reason = 'worker_failed'", 3);
+    f.assert_candidate(&item, false);
+    assert!(!f.clauses(&item).no_inflight_ladder);
+
+    // The revision going terminal admits the item again.
+    f.sql(&format!("UPDATE tasks SET status = 'done' WHERE id = '{fixer}'"));
+    f.assert_candidate(&item, true);
+    assert!(f.clauses(&item).no_inflight_ladder);
+
+    // A succeeded attempt with no revision also admits.
+    f.sql(&format!(
+        "UPDATE ci_remediations SET status = 'pending', revision_task_id = NULL WHERE id = '{ci}'"
+    ));
+    f.assert_candidate(&item, false);
+    f.sql(&format!(
+        "UPDATE ci_remediations SET status = 'succeeded' WHERE id = '{ci}'"
+    ));
+    f.assert_candidate(&item, true);
+
+    // The same pair for conflict_resolutions.
+    let conflict = f.insert_conflict_attempt(&item, "base-pending");
+    f.assert_candidate(&item, false);
+    assert!(!f.clauses(&item).no_inflight_ladder);
+    f.sql(&format!(
+        "UPDATE conflict_resolutions SET status = 'running' WHERE id = '{conflict}'"
+    ));
+    let resolver = f.revision_of(&item, "merge-conflict: Conflicted PR");
+    f.sql(&format!(
+        "UPDATE conflict_resolutions SET revision_task_id = '{resolver}' WHERE id = '{conflict}'"
+    ));
+    f.stick(&resolver, "status = 'todo'", 0);
+    f.assert_candidate(&item, false);
+    f.sql(&format!("UPDATE tasks SET status = 'archived' WHERE id = '{resolver}'"));
+    f.assert_candidate(&item, true);
+    f.sql(&format!(
+        "UPDATE conflict_resolutions SET status = 'pending', revision_task_id = NULL WHERE id = '{conflict}'"
+    ));
+    f.assert_candidate(&item, false);
+    f.sql(&format!(
+        "UPDATE conflict_resolutions SET status = 'succeeded' WHERE id = '{conflict}'"
+    ));
     f.assert_candidate(&item, true);
 }
 
@@ -377,12 +522,13 @@ fn clause_4_a_dependent_is_progressed_through_its_prerequisite() {
     f.stick(&dependent, "status = 'blocked', blocked_reason = 'dependency'", 3);
     assert_eq!(f.clauses(&dependent).stuck_kind.as_deref(), Some("S4_dependency"));
 
-    // A healthy prerequisite is being progressed by someone else: not the dependent's problem.
+    // An idle, unparked prerequisite that is in no stuck state does not hold
+    // the dependent: the dependent is the candidate.
     f.sql(&format!("UPDATE tasks SET autostart = 1 WHERE id = '{prerequisite}'"));
-    f.assert_candidate(&dependent, false);
-    assert!(!f.clauses(&dependent).dependency_clear);
+    f.assert_candidate(&dependent, true);
+    assert!(f.clauses(&dependent).dependency_clear);
 
-    // So is a live one...
+    // A live one does...
     let run = f.execution(
         &prerequisite,
         ExecutionKind::ChoreImplementation,
@@ -630,6 +776,40 @@ fn clause_6_two_infrastructure_failures_in_a_row_stop_the_nominations() {
     f.assert_candidate(&id, true);
 }
 
+#[test]
+fn clause_6_an_exhausted_create_budget_stops_the_nominations() {
+    let f = fixture();
+    let id = f.stuck_chore("Already created three");
+    for i in 0..3 {
+        let child = f.revision_of(&id, &format!("progression child {i}"));
+        f.sql(&format!(
+            "UPDATE tasks SET created_via = 'progression:exec_{i}', created_at = '{}' WHERE id = '{child}'",
+            now()
+        ));
+    }
+    let clauses = f.clauses(&id);
+    assert!(!clauses.cooldown_and_budget_clear, "{clauses:?}");
+    f.assert_candidate(&id, false);
+
+    // Raising the published budget admits it again; the placeholder of 3 is
+    // what the view reads when the key is absent.
+    f.db.publish_progression_limits(&ProgressionSettings::builder().max_creates_per_item_window(10).build())
+        .unwrap();
+    f.assert_candidate(&id, true);
+    f.sql(&format!(
+        "DELETE FROM metadata WHERE key = '{}'",
+        boss_engine_storage_values::progression::METADATA_KEY_MAX_CREATES_PER_ITEM_WINDOW
+    ));
+    f.assert_candidate(&id, false);
+
+    // Age the creates out of the rolling window.
+    f.sql(&format!(
+        "UPDATE tasks SET created_at = '{}' WHERE created_via LIKE 'progression:%'",
+        now() - 8 * 24 * HOUR
+    ));
+    f.assert_candidate(&id, true);
+}
+
 // ── The sweep's mint ──────────────────────────────────────────────────────
 
 #[test]
@@ -775,13 +955,23 @@ fn ready_progression_runs_are_ordered_by_age_not_by_the_class_of_their_item() {
     f.sql(&format!(
         "UPDATE work_executions SET created_at = '200' WHERE id = '{second}'"
     ));
+    // A newer critical item must not jump ahead of an older ordinary one: the
+    // critical ordering term does not apply to progression rows.
+    let critical = f.chore("Critical");
+    f.sql(&format!(
+        "UPDATE tasks SET priority = 'critical' WHERE id = '{critical}'"
+    ));
+    let third = f.execution(&critical, ExecutionKind::Progression, ExecutionStatus::Ready);
+    f.sql(&format!(
+        "UPDATE work_executions SET created_at = '300' WHERE id = '{third}'"
+    ));
     let order: Vec<_> =
         f.db.list_ready_executions()
             .unwrap()
             .into_iter()
             .map(|execution| execution.id)
             .collect();
-    assert_eq!(order, vec![first, second]);
+    assert_eq!(order, vec![first, second, third]);
 }
 
 // ── The report ────────────────────────────────────────────────────────────
@@ -992,6 +1182,32 @@ fn the_migrations_are_idempotent_and_repair_a_database_that_lacks_them() {
 }
 
 #[test]
+fn dropping_the_views_without_rolling_back_the_migration_is_repaired_on_open() {
+    let (_dir, path) = disk_db_path("progression-views-refresh");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_named(&db, "Refresh");
+    let id = create_test_chore_manual(&db, &product.id, "Stuck").id;
+    db.connect()
+        .unwrap()
+        .execute_batch(&format!(
+            "UPDATE tasks SET status = 'blocked', blocked_reason = 'merge_conflict' WHERE id = '{id}';
+             UPDATE task_status_audit SET changed_at = changed_at - 36000 WHERE work_item_id = '{id}';
+             DROP VIEW progression_candidates;
+             DROP VIEW progression_candidate_clauses;
+             DROP VIEW progression_run_state;
+             DROP VIEW progression_live_families;
+             DROP VIEW progression_family_keys;
+             DROP VIEW progression_chain_roots;"
+        ))
+        .unwrap();
+    drop(db);
+    let db = WorkDb::open(path).unwrap();
+    let candidates = db.list_progression_candidates(None).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].work_item_id, id);
+}
+
+#[test]
 fn a_batch_mint_queues_every_candidate_oldest_first_and_isolates_a_failing_item() {
     let f = fixture();
     let newer = f.chore("Newer");
@@ -1037,4 +1253,53 @@ fn a_batch_mint_queues_every_candidate_oldest_first_and_isolates_a_failing_item(
     assert!(again.minted.iter().all(|(c, _)| c.work_item_id == unresolvable) || again.minted.is_empty());
     assert_eq!(f.db.list_executions(Some(&oldest)).unwrap().len(), 1);
     assert_eq!(f.db.list_executions(Some(&newer)).unwrap().len(), 1);
+}
+
+#[test]
+fn a_batch_mint_gives_one_run_per_pr_family_to_the_oldest_stuck_item() {
+    let f = fixture();
+
+    // Parent in_review with red CI (S6) and its CI-fix revision blocked
+    // worker_failed (S7) share the chain, so they share a family_key.
+    let parent = f.chore("Parent with red CI");
+    f.sql(&format!(
+        "UPDATE tasks SET pr_url = 'https://github.com/o/r/pull/11' WHERE id = '{parent}'"
+    ));
+    f.stick(&parent, "status = 'in_review', ci_required_state = 'fail'", 30);
+    let fixer = f.revision_of(&parent, "ci-fix: Parent with red CI");
+    f.stick(&fixer, "status = 'blocked', blocked_reason = 'worker_failed'", 3);
+    f.assert_candidate(&parent, true);
+    f.assert_candidate(&fixer, true);
+
+    // Two unrelated items bound to the same PR share a family_key too.
+    let older_share = f.chore("Older share");
+    let newer_share = f.chore("Newer share");
+    f.sql(&format!(
+        "UPDATE tasks SET pr_url = 'https://github.com/o/r/pull/12' WHERE id IN ('{older_share}', '{newer_share}')"
+    ));
+    f.stick(
+        &older_share,
+        "status = 'blocked', blocked_reason = 'merge_conflict'",
+        20,
+    );
+    f.stick(&newer_share, "status = 'blocked', blocked_reason = 'merge_conflict'", 4);
+    f.assert_candidate(&older_share, true);
+    f.assert_candidate(&newer_share, true);
+
+    let mint = f.db.mint_progression_executions().unwrap();
+    let minted: Vec<_> = mint.minted.iter().map(|(c, _)| c.work_item_id.clone()).collect();
+    assert_eq!(
+        minted,
+        vec![parent.clone(), older_share.clone()],
+        "one run per family, oldest-stuck wins: {minted:?}"
+    );
+    assert!(mint.failed.is_empty(), "{:?}", mint.failed);
+    assert_eq!(f.db.list_executions(Some(&fixer)).unwrap().len(), 0);
+    assert_eq!(f.db.list_executions(Some(&newer_share)).unwrap().len(), 0);
+    assert_eq!(bucket(&f.db, &parent), Some(StuckBucket::ProgressionInFlight));
+    assert_eq!(bucket(&f.db, &older_share), Some(StuckBucket::ProgressionInFlight));
+    // The rest of each family is hidden as "related work is live": the minted
+    // `ready` run is the progression activity the report exposes.
+    assert_eq!(bucket(&f.db, &fixer), None);
+    assert_eq!(bucket(&f.db, &newer_share), None);
 }

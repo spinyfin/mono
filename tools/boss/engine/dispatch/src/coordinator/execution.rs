@@ -512,9 +512,9 @@ impl ExecutionCoordinator {
     ) -> Result<()> {
         // A `progression` row has no agent to run until the engine has a
         // progression worker kind. The drain holds it before claiming a slot;
-        // this is the chokepoint backstop for `force_dispatch`, so an operator
-        // forcing the row by hand cannot start it as an ordinary coding worker
-        // with a repo checkout. Not a spawn failure: the claim is handed back.
+        // this is the chokepoint backstop for `force_dispatch`, so the row
+        // cannot start as an ordinary coding worker with a repo checkout. Not a
+        // spawn failure: the claim is handed back.
         if self.execution_targets_progression_pool(execution) && !self.progression_spawn_enabled {
             tracing::warn!(
                 execution_id = %execution.id,

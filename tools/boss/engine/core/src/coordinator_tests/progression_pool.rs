@@ -274,9 +274,9 @@ async fn until_the_engine_can_spawn_one_a_progression_run_is_held_ready_and_touc
     assert_eq!(coordinator.progression_worker_pool().claims().await.len(), 0);
     assert_eq!(coordinator.worker_pool().claims().await.len(), 0);
 
-    // An operator forcing the row by hand is refused too: it must not start as
-    // an ordinary coding worker with a repo checkout. The refusal is a hold, not
-    // a spawn failure, so the row is neither failed nor bounced.
+    // `force_dispatch` is refused too: it must not start as an ordinary coding
+    // worker with a repo checkout. The refusal is a hold, not a spawn failure,
+    // so the row is neither failed nor bounced.
     let error = coordinator
         .force_dispatch(&run.id, DispatchAdmission::OperatorForced)
         .await

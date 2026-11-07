@@ -79,6 +79,11 @@ impl WorkDb {
         // Required runtime data, not a historical migration. Capability
         // discovery remains outside DB startup (no processes or network).
         super::host_storage::ensure_local_host(&tx)?;
+        // The candidate views interpolate live Rust helpers (stuck-kind SQL,
+        // human-hold SQL, wait-reason constants, parking). Recreate them on
+        // every open so an existing database evaluates the predicate this
+        // binary ships, not the CREATE VIEW text frozen at first migrate.
+        super::progression_candidates::migrate_views(&tx)?;
         refresh_query_planner_stats(&tx)?;
         tx.commit()?;
         Ok(())

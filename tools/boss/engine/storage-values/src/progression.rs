@@ -8,17 +8,14 @@
 //!
 //! Every value in [`ProgressionSettings`] defaults to the **placeholder** from
 //! the design's section 2.6 table. The placeholders exist so the feature can be
-//! exercised in a test instance; the constants task replaces each one with a
-//! value set from measured traffic (and records the measurements in its PR).
-//! Until then none of them is a tuned number, and none of them may be read as
-//! one.
+//! exercised in a test instance; they are not yet tuned from measured traffic.
+//! None of them may be read as a measured number.
 //!
-//! The two values the candidate view itself needs ([`ProgressionSettings::stuck_after_secs`]
-//! and [`ProgressionSettings::cooldown_secs`]) are published by the engine into
-//! the `metadata` table under [`METADATA_KEY_STUCK_AFTER_SECS`] and
-//! [`METADATA_KEY_COOLDOWN_SECS`], so every reader of the view — the sweep, the
-//! stuck report, `bossctl dispatch diagnose` (which reads `state.db` directly,
-//! with the engine down) — applies the same numbers.
+//! The values the candidate view itself needs ([`ProgressionSettings::stuck_after_secs`],
+//! [`ProgressionSettings::cooldown_secs`], and the create-budget pair) are
+//! published by the engine into the `metadata` table, so every reader of the
+//! view — the sweep, the stuck report, `bossctl dispatch diagnose` (which reads
+//! `state.db` directly, with the engine down) — applies the same numbers.
 
 /// Feature flag gating the whole feature (default off). With it off nothing is
 /// minted and no progression pool slot is ever used; the parking tasks and the
@@ -34,6 +31,12 @@ pub const METADATA_KEY_STUCK_AFTER_SECS: &str = "progression.stuck_after_secs";
 
 /// `metadata` key holding the published `progression.cooldown`.
 pub const METADATA_KEY_COOLDOWN_SECS: &str = "progression.cooldown_secs";
+
+/// `metadata` key holding the published `progression.max_creates_per_item_window`.
+pub const METADATA_KEY_MAX_CREATES_PER_ITEM_WINDOW: &str = "progression.max_creates_per_item_window";
+
+/// `metadata` key holding the published rolling window the create budget counts over.
+pub const METADATA_KEY_MAX_CREATES_WINDOW_SECS: &str = "progression.max_creates_window_secs";
 
 /// A run that ended `no_changes_needed` judged the item not stuck in any way a
 /// verb addresses, so the item is re-nominated only after the cooldown times

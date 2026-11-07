@@ -108,7 +108,7 @@ pub fn worker_kind_for_execution(kind: &ExecutionKind) -> WorkerKind {
         // reach a spawn path anyway, it gets the most restricted surface that
         // exists today — the answer agent's deny-by-default allowlist, with no
         // write access to a repo — and never `Standard`'s full write and push
-        // access. The progression worker kind replaces this arm with its own.
+        // access.
         ExecutionKind::Progression => WorkerKind::AnswerAgent,
         ExecutionKind::ChoreImplementation
         | ExecutionKind::CiRemediation

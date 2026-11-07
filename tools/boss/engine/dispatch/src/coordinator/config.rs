@@ -116,9 +116,9 @@ impl ExecutionCoordinator {
     }
 
     /// Declare that a `progression` agent can actually be spawned (see the
-    /// `progression_spawn_enabled` field). Until this is set, `progression`
-    /// executions are held `ready` and never reach a worker slot, a cube lease,
-    /// or a pane.
+    /// `progression_spawn_enabled` field). Until a progression worker kind is
+    /// registered this stays false, so `progression` executions are held `ready`
+    /// and never reach a worker slot, a cube lease, or a pane.
     pub fn set_progression_spawn_enabled(&mut self, enabled: bool) {
         self.progression_spawn_enabled = enabled;
     }

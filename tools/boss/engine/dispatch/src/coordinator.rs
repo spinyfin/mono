@@ -506,8 +506,9 @@ pub struct ExecutionCoordinator {
     /// minted `progression` execution is held in `ready` rather than spawned:
     /// without a worker kind of its own it would otherwise start as an ordinary
     /// coding worker holding a repo checkout, which is exactly what the
-    /// progression design rules out. Off by default; the worker-kind task flips
-    /// it, and tests turn it on to exercise pool routing and admission.
+    /// progression design rules out. Off by default; enable once a progression
+    /// worker kind is registered. Tests turn it on to exercise pool routing and
+    /// admission.
     #[builder(default = false)]
     progression_spawn_enabled: bool,
     /// The local-host adapter. Retained as the `local` special case and

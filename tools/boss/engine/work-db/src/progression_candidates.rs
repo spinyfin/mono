@@ -28,39 +28,60 @@
 //!    `blocked: awaiting_operator_answer`, an operator-refused `worker_failed`
 //!    and the other holds the stuck report counts as waiting on a human. Done,
 //!    archived and soft-deleted rows are not rows of the view at all.
-//! 2. **No live or pending work** (`queued | ready | claimed | running |
-//!    waiting_human`) on the item, on its revisions, or on any item sharing its
-//!    PR. `waiting_dependency` deliberately does not count, matching
-//!    `stuck_activity::related_work_is_live`: it is a gate, not evidence that
-//!    anyone is working the PR, and counting it would let the dead revision at
-//!    the head of a chain hide behind the later revisions queued behind it.
+//! 2. **No live or pending work** (`queued | ready | waiting_dependency |
+//!    claimed | running | waiting_human`) on the item, on its revisions, or on
+//!    any item sharing its PR, and no in-flight `ci_remediations` /
+//!    `conflict_resolutions` attempt on that family whose revision is missing or
+//!    still open. `waiting_dependency` on a *later revision* of the same chain
+//!    is the one exception: that row is the chain-serialization gate behind a
+//!    dead head (S13), not evidence anyone is working the PR. Counting it would
+//!    hide the dead revision the design exists to unstick. An in-flight ladder
+//!    attempt is named separately in [`ProgressionClauses::no_inflight_ladder`]
+//!    so diagnose can say which half of the clause failed.
 //! 3. **Not waiting on capacity.** No queued execution of the item carries a
 //!    slot, cap, workspace or pause wait reason. Waiting for bandwidth is not
 //!    stuck.
 //! 4. **Dependency clear.** A `blocked: dependency` item is progressed through
-//!    its prerequisite, not itself, unless every open prerequisite is held by a
-//!    human or the edge dangles. The same notion as the stuck report's
-//!    `waiting_on_dependency` and `parked_upstream` buckets.
+//!    its prerequisite, not itself, when that prerequisite is live, parked, or
+//!    itself in a stuck state a progression agent addresses. An idle, unparked
+//!    prerequisite that is in no stuck state does not hold the dependent: the
+//!    dependent is the candidate (it can drop the edge or ask). A human-held
+//!    prerequisite or a dangling edge also admits the dependent.
 //! 5. **Stuck long enough.** In one of the stuck states the enumeration marks as
 //!    progression-eligible ([`stuck_kind_sql`]) continuously for at least
 //!    `progression.stuck_after`, measured from the task status ledger exactly as
 //!    the stuck report ages it; or the grace was waived since the item entered
 //!    that state (`tasks.progression_grace_waived_at`).
 //! 6. **Cooldown and budget.** No progression run within `progression.cooldown`
-//!    (four times that after a `no_changes_needed` run), and the last
-//!    [`INFRASTRUCTURE_FAILURE_CAP`] runs were not all infrastructure failures.
-//!    The per-item create budget (`progression.max_creates_per_item_window`) is
-//!    not an input here: it limits what a run may do, enforced by the verbs that
-//!    consume it, and exhausting it makes the agent ask rather than makes the
-//!    item un-nominatable.
+//!    (four times that after a `no_changes_needed` run), the last
+//!    [`INFRASTRUCTURE_FAILURE_CAP`] runs were not all infrastructure failures,
+//!    and the item's create budget (`progression.max_creates_per_item_window`
+//!    revisions-plus-precursors in the rolling window) is not exhausted. A run
+//!    that is already in flight still sees the same cap at the verbs (exhaustion
+//!    there is a refusal so the agent can ask); an item that arrives at the
+//!    sweep already over budget is not nominated again.
+//!
+//! ## Keeping the views current
+//!
+//! [`views_sql`] interpolates the same Rust helpers the stuck report uses
+//! (`stuck_kind_sql`, `human_held_sql`, the wait-reason constants, the
+//! infrastructure-failure cap, the cooldown multiplier, [`parked_task_sql`]).
+//! The named migration creates the views once; [`WorkDb::init`] then recreates
+//! them on every open after migrations so an existing `state.db` always
+//! evaluates the predicate this binary ships, not the text frozen at first
+//! migrate. A later edit to those helpers is therefore a behaviour change on
+//! existing databases without a new migration. Tests that drop the views to
+//! simulate an older schema get them back on reopen.
 //!
 //! ## Limits
 //!
-//! `progression.stuck_after` and `progression.cooldown` are read from the
-//! `metadata` table (the engine publishes them with
+//! `progression.stuck_after`, `progression.cooldown`, and the create-budget
+//! pair are read from the `metadata` table (the engine publishes them with
 //! [`WorkDb::publish_progression_limits`]); an absent key falls back to the
 //! design's placeholder, so the views are usable by a process that never ran the
 //! engine, such as `bossctl` against a copied database.
+use std::collections::HashSet;
+
 use super::*;
 use crate::parking::parked_task_sql;
 use boss_engine_storage_values::dispatch_wait::{
@@ -68,8 +89,10 @@ use boss_engine_storage_values::dispatch_wait::{
     DISPATCH_WAIT_REASON_POOL_EXHAUSTED, WAITING_FOR_WORKSPACE_REASON,
 };
 use boss_engine_storage_values::progression::{
-    CREATED_VIA_PROGRESSION_SWEEP, DEFAULT_COOLDOWN_SECS, DEFAULT_STUCK_AFTER_SECS, INFRASTRUCTURE_FAILURE_CAP,
-    METADATA_KEY_COOLDOWN_SECS, METADATA_KEY_STUCK_AFTER_SECS, NO_ACTION_COOLDOWN_MULTIPLIER, ProgressionSettings,
+    CREATED_VIA_PROGRESSION_SWEEP, DEFAULT_COOLDOWN_SECS, DEFAULT_MAX_CREATES_PER_ITEM_WINDOW,
+    DEFAULT_MAX_CREATES_WINDOW_SECS, DEFAULT_STUCK_AFTER_SECS, INFRASTRUCTURE_FAILURE_CAP, METADATA_KEY_COOLDOWN_SECS,
+    METADATA_KEY_MAX_CREATES_PER_ITEM_WINDOW, METADATA_KEY_MAX_CREATES_WINDOW_SECS, METADATA_KEY_STUCK_AFTER_SECS,
+    NO_ACTION_COOLDOWN_MULTIPLIER, ProgressionSettings,
 };
 
 pub(super) const GRACE_COLUMN_MIGRATION_ID: &str = "20261106_1200_progression_grace_waived_at";
@@ -96,8 +119,11 @@ pub(super) fn migrate_execution_provenance(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// (Re)create the candidate views. Idempotent, and written as drop-then-create
-/// so a later migration can re-run it to ship a changed definition.
+/// (Re)create the candidate views. Idempotent drop-then-create. The named
+/// migration installs them on first upgrade; [`WorkDb::init`] also calls this
+/// after migrations on every open so an existing database evaluates the
+/// predicate this binary ships (the helpers interpolated into [`views_sql`]
+/// are live Rust, not frozen SQL).
 pub(super) fn migrate_views(conn: &Connection) -> Result<()> {
     conn.execute_batch(&views_sql())?;
     Ok(())
@@ -114,7 +140,7 @@ const DROP_VIEWS: &str = "DROP VIEW IF EXISTS progression_candidates;
 /// Drop the views. The views read the task status ledger, and SQLite re-parses
 /// every view when an `ALTER TABLE` runs, so a test that simulates an older
 /// database by dropping the ledger drops these first; reopening the database
-/// replays the migration that recreates them.
+/// recreates them from [`views_sql`] during [`WorkDb::init`].
 #[cfg(test)]
 pub(crate) fn drop_views(conn: &Connection) -> Result<()> {
     conn.execute_batch(DROP_VIEWS)?;
@@ -124,7 +150,9 @@ pub(crate) fn drop_views(conn: &Connection) -> Result<()> {
 const NOW: &str = "CAST(strftime('%s','now') AS INTEGER)";
 
 /// Execution statuses that mean someone or something is working the item, or is
-/// about to. `waiting_dependency` is excluded on purpose; see the module docs.
+/// about to, *except* `waiting_dependency`. That status is a gate; see
+/// [`no_live_work_sql`] for the narrower rule that still counts it on the item
+/// itself and on non-revision family members.
 const LIVE_OR_PENDING: &str = "('queued','ready','claimed','running','waiting_human')";
 
 /// Execution statuses of a progression run that died rather than reported.
@@ -261,33 +289,98 @@ fn not_capacity_wait_sql(a: &str) -> String {
     )
 }
 
-/// Clause 2: nothing live or pending anywhere in the item's family. `family` is
-/// the alias of the item's `progression_family_keys` row, joined by the caller:
-/// the family test is a join and a one-time `IN` set, not a correlated lookup,
-/// because the chain walk behind it is a recursive query that must be evaluated
-/// once per statement rather than once per candidate row.
-fn no_live_work_sql(family: &str) -> String {
-    format!("NOT COALESCE({family}.family_key IN (SELECT family_key FROM progression_live_families), 0)")
+/// Clause 2, execution half: nothing live or pending anywhere in the item's
+/// family. `family` is the alias of the item's `progression_family_keys` row
+/// and `item` is the candidate `tasks` alias, joined by the caller. The family
+/// test is a join and a one-time `IN` set, not a correlated lookup, because the
+/// chain walk behind it is a recursive query that must be evaluated once per
+/// statement rather than once per candidate row.
+///
+/// `waiting_dependency` counts on the candidate itself and on non-revision
+/// family members (design 2.1). It does not count on a later revision of the
+/// same chain: that row is the serialization gate behind a dead head, and
+/// counting it would hide S13.
+fn no_live_work_sql(item: &str, family: &str) -> String {
+    format!(
+        "NOT COALESCE({family}.family_key IN (SELECT family_key FROM progression_live_families), 0)
+         AND NOT EXISTS (SELECT 1 FROM work_executions gx
+                         WHERE gx.work_item_id = {item}.id AND gx.status = 'waiting_dependency')
+         AND NOT EXISTS (
+             SELECT 1 FROM progression_family_keys gk
+             JOIN work_executions ge ON ge.work_item_id = gk.task_id
+             JOIN tasks go ON go.id = gk.task_id
+             WHERE gk.family_key = {family}.family_key
+               AND ge.status = 'waiting_dependency'
+               AND go.kind <> 'revision'
+               AND go.id <> {item}.id)"
+    )
+}
+
+/// Clause 2, ladder half: no in-flight `ci_remediations` or
+/// `conflict_resolutions` attempt on the family whose revision is missing or
+/// still open. An attempt that has already finished, or whose revision is
+/// `done`/`archived`, does not exclude the item even if a live execution is
+/// also absent — that is the window the generic live-work check cannot see.
+fn no_inflight_ladder_sql(family: &str) -> String {
+    let attempt = |table: &str| {
+        format!(
+            "EXISTS (
+                SELECT 1 FROM {table} r
+                JOIN progression_family_keys rk ON rk.task_id = r.work_item_id
+                LEFT JOIN tasks rt ON rt.id = r.revision_task_id AND rt.deleted_at IS NULL
+                WHERE rk.family_key = {family}.family_key
+                  AND r.status IN ('pending', 'running')
+                  AND (r.revision_task_id IS NULL
+                       OR (rt.id IS NOT NULL AND rt.status NOT IN ('done', 'archived'))))"
+        )
+    };
+    format!(
+        "NOT {} AND NOT {}",
+        attempt("ci_remediations"),
+        attempt("conflict_resolutions")
+    )
 }
 
 /// Clause 4: a dependency-blocked item is a candidate only when none of its open
-/// prerequisites is being progressed or is the owner's decision to make.
+/// prerequisites is live, parked, or itself in a stuck state a progression
+/// agent addresses. An idle unparked prerequisite with no stuck state does not
+/// hold the dependent.
 fn dependency_clear_sql(a: &str) -> String {
     let parked = parked_task_sql("p");
     let held = human_held_sql("p");
+    let stuck = stuck_kind_sql("p", "proot");
     format!(
         "({a}.blocked_reason IS NOT 'dependency' OR NOT EXISTS (
             SELECT 1 FROM work_item_dependencies d
             WHERE d.dependent_id = {a}.id AND d.relation = 'blocks' AND (
                 EXISTS (SELECT 1 FROM projects pj
-                        WHERE pj.id = d.prerequisite_id AND pj.status NOT IN ('done', 'archived'))
+                        WHERE pj.id = d.prerequisite_id AND pj.status NOT IN ('done', 'archived')
+                          AND pj.parked_at IS NOT NULL)
                 OR EXISTS (SELECT 1 FROM tasks p
+                           LEFT JOIN progression_family_keys pfk ON pfk.task_id = p.id
+                           LEFT JOIN tasks proot ON proot.id = pfk.root_id
                            WHERE p.id = d.prerequisite_id AND p.deleted_at IS NULL
                              AND p.status NOT IN ('done', 'archived')
                              AND ({parked}
                                   OR EXISTS (SELECT 1 FROM work_executions px
                                              WHERE px.work_item_id = p.id AND px.status IN {LIVE_OR_PENDING})
-                                  OR NOT {held})))))"
+                                  OR (NOT {held} AND ({stuck}) IS NOT NULL))))))"
+    )
+}
+
+/// Clause 6, create-budget half: revisions and precursors a progression run
+/// minted for this item inside the rolling window, identified by
+/// `created_via LIKE 'progression:%'` (design 2.4).
+fn create_budget_exhausted_sql(a: &str, max_creates: &str, window: &str) -> String {
+    format!(
+        "(SELECT COUNT(*) FROM tasks created
+          WHERE created.created_via LIKE 'progression:%'
+            AND created.deleted_at IS NULL
+            AND CAST(created.created_at AS INTEGER) > {NOW} - ({window})
+            AND (created.parent_task_id = {a}.id
+                 OR EXISTS (SELECT 1 FROM work_item_dependencies d
+                            WHERE d.dependent_id = {a}.id AND d.prerequisite_id = created.id)))
+         >= ({max_creates})"
     )
 }
 
@@ -340,13 +433,20 @@ fn run_state_select(cooldown: &str) -> String {
 fn views_sql() -> String {
     let stuck_after = limit_sql(METADATA_KEY_STUCK_AFTER_SECS, DEFAULT_STUCK_AFTER_SECS);
     let cooldown = limit_sql(METADATA_KEY_COOLDOWN_SECS, DEFAULT_COOLDOWN_SECS);
+    let max_creates = limit_sql(
+        METADATA_KEY_MAX_CREATES_PER_ITEM_WINDOW,
+        i64::from(DEFAULT_MAX_CREATES_PER_ITEM_WINDOW),
+    );
+    let create_window = limit_sql(METADATA_KEY_MAX_CREATES_WINDOW_SECS, DEFAULT_MAX_CREATES_WINDOW_SECS);
     let parked = parked_task_sql("t");
     let human_held = human_held_sql("t");
     let stuck_kind = stuck_kind_sql("t", "root");
     let stuck_since = stuck_since_sql("t");
-    let no_live_work = no_live_work_sql("fk");
+    let no_live_work = no_live_work_sql("t", "fk");
+    let no_inflight_ladder = no_inflight_ladder_sql("fk");
     let not_capacity_wait = not_capacity_wait_sql("t");
     let dependency_clear = dependency_clear_sql("t");
+    let create_budget_exhausted = create_budget_exhausted_sql("t", &max_creates, &create_window);
     let run_state = run_state_select(&cooldown);
     format!(
         "{DROP_VIEWS}
@@ -374,7 +474,9 @@ fn views_sql() -> String {
          JOIN tasks r ON r.id = c.root_id
          JOIN tasks m ON m.id = c.task_id;
 
-         -- The families with live or pending work in them.
+         -- The families with live or pending work in them. `waiting_dependency`
+         -- is applied per candidate in `c2_no_live_work` so later revisions
+         -- gated behind a dead head do not hide it.
          CREATE VIEW progression_live_families AS
          SELECT DISTINCT k.family_key AS family_key
          FROM progression_family_keys k
@@ -393,12 +495,14 @@ fn views_sql() -> String {
                 (s.grace_stamp IS NOT NULL AND CAST(s.grace_stamp AS INTEGER) >= s.stuck_since) AS grace_waived,
                 s.c1_eligible AS c1_eligible,
                 s.c2_no_live_work AS c2_no_live_work,
+                s.c2_no_inflight_ladder AS c2_no_inflight_ladder,
                 s.c3_not_capacity_wait AS c3_not_capacity_wait,
                 s.c4_dependency_clear AS c4_dependency_clear,
                 (s.stuck_kind IS NOT NULL
                  AND ((s.grace_stamp IS NOT NULL AND CAST(s.grace_stamp AS INTEGER) >= s.stuck_since)
                       OR {NOW} - s.stuck_since >= {stuck_after})) AS c5_stuck_long_enough,
-                (NOT s.in_cooldown AND NOT s.infrastructure_failing) AS c6_cooldown_and_budget_clear,
+                (NOT s.in_cooldown AND NOT s.infrastructure_failing
+                 AND NOT s.create_budget_exhausted) AS c6_cooldown_and_budget_clear,
                 s.progression_live AS progression_live,
                 s.in_cooldown AS in_cooldown,
                 s.infrastructure_failing AS infrastructure_failing
@@ -409,8 +513,10 @@ fn views_sql() -> String {
                     t.progression_grace_waived_at AS grace_stamp,
                     (NOT {parked} AND NOT {human_held}) AS c1_eligible,
                     {no_live_work} AS c2_no_live_work,
+                    {no_inflight_ladder} AS c2_no_inflight_ladder,
                     {not_capacity_wait} AS c3_not_capacity_wait,
                     {dependency_clear} AS c4_dependency_clear,
+                    {create_budget_exhausted} AS create_budget_exhausted,
                     {run_state}
              FROM tasks t
              LEFT JOIN progression_family_keys fk ON fk.task_id = t.id
@@ -422,7 +528,8 @@ fn views_sql() -> String {
          SELECT work_item_id, stuck_kind, stuck_since, grace_waived
          FROM progression_candidate_clauses
          WHERE c1_eligible AND c5_stuck_long_enough AND c6_cooldown_and_budget_clear
-           AND c3_not_capacity_wait AND c4_dependency_clear AND c2_no_live_work;"
+           AND c3_not_capacity_wait AND c4_dependency_clear
+           AND c2_no_live_work AND c2_no_inflight_ladder;"
     )
 }
 
@@ -453,15 +560,22 @@ pub struct ProgressionClauses {
     pub grace_waived: bool,
     /// Clause 1: not parked and not a human hold.
     pub eligible_item: bool,
-    /// Clause 2: nothing live or pending on the item, its revisions or its PR.
+    /// Clause 2, execution half: nothing live or pending on the item, its
+    /// revisions or its PR.
     pub no_live_work: bool,
+    /// Clause 2, ladder half: no in-flight CI-fix or conflict-resolution
+    /// attempt on the family whose revision is missing or still open.
+    #[builder(default = true)]
+    pub no_inflight_ladder: bool,
     /// Clause 3: not waiting on capacity.
     pub not_capacity_wait: bool,
-    /// Clause 4: no prerequisite is carrying the item.
+    /// Clause 4: no prerequisite is live, parked, or itself stuck in a way a
+    /// progression agent addresses.
     pub dependency_clear: bool,
     /// Clause 5: in a stuck state for long enough, or the grace was waived.
     pub stuck_long_enough: bool,
-    /// Clause 6: outside the cooldown and under the failure budget.
+    /// Clause 6: outside the cooldown, under the failure budget, and under the
+    /// per-item create budget.
     pub cooldown_and_budget_clear: bool,
     /// A progression execution of the item is live or pending.
     pub progression_live: bool,
@@ -487,8 +601,12 @@ impl ProgressionClauses {
             ),
             (
                 2,
-                self.no_live_work,
-                "work is already live or pending on the item, its revisions, or its PR",
+                self.no_live_work && self.no_inflight_ladder,
+                if self.no_live_work {
+                    "a CI-fix or conflict-resolution attempt is in flight on the item, its revisions, or its PR"
+                } else {
+                    "work is already live or pending on the item, its revisions, or its PR"
+                },
             ),
             (
                 3,
@@ -498,7 +616,7 @@ impl ProgressionClauses {
             (
                 4,
                 self.dependency_clear,
-                "waiting on a prerequisite that is being worked or is the owner's decision",
+                "waiting on a prerequisite that is live, parked, or itself stuck",
             ),
             (
                 5,
@@ -508,7 +626,7 @@ impl ProgressionClauses {
             (
                 6,
                 self.cooldown_and_budget_clear,
-                "inside the cooldown after a progression run, or progression failed twice in a row",
+                "inside the cooldown after a progression run, progression failed twice in a row, or the create budget is exhausted",
             ),
         ]
         .into_iter()
@@ -529,6 +647,11 @@ impl WorkDb {
         for (key, value) in [
             (METADATA_KEY_STUCK_AFTER_SECS, settings.stuck_after_secs),
             (METADATA_KEY_COOLDOWN_SECS, settings.cooldown_secs),
+            (
+                METADATA_KEY_MAX_CREATES_PER_ITEM_WINDOW,
+                i64::from(settings.max_creates_per_item_window),
+            ),
+            (METADATA_KEY_MAX_CREATES_WINDOW_SECS, settings.max_creates_window_secs),
         ] {
             tx.execute(
                 "INSERT INTO metadata (key, value) VALUES (?1, ?2)
@@ -562,10 +685,10 @@ impl WorkDb {
 
     /// Mint a `ready` progression execution for `work_item_id`, bound to the
     /// stuck item itself, if the item is *still* a candidate. The check and the
-    /// insert share one transaction, so an item that a worker, a revision or an
-    /// operator picked up since it was listed is not minted a second writer.
-    /// Consumes the item's grace-waiver stamp. Returns `None` when the item is
-    /// no longer a candidate.
+    /// insert share one transaction, so an item that other work picked up since
+    /// it was listed is not minted a second writer. Consumes the item's
+    /// grace-waiver stamp. Returns `None` when the item is no longer a
+    /// candidate.
     ///
     /// Re-evaluating the predicate for one item costs about as much as listing
     /// every candidate, so a caller with many items uses
@@ -590,30 +713,42 @@ impl WorkDb {
     /// stuck first, in one transaction. The candidates are read inside the
     /// transaction that inserts the executions, so none can be picked up by
     /// other work between being listed and being minted, and the write lock is
-    /// held for one evaluation of the predicate rather than one per item. An
-    /// item whose execution cannot be inserted (for example its repository
-    /// cannot be resolved) is skipped and reported; it does not stop the rest.
+    /// held for one evaluation of the predicate rather than one per item. A
+    /// freshly minted `ready` run is live work on that family: later candidates
+    /// that share its `family_key` are skipped so one pass never gives two
+    /// writers to the same PR family. An item whose execution cannot be inserted
+    /// (for example its repository cannot be resolved) is skipped and reported;
+    /// it does not stop the rest.
     pub fn mint_progression_executions(&self) -> Result<ProgressionMint> {
         let mut conn = self.connect()?;
         let mut tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let candidates = {
             let mut stmt = tx.prepare(
-                "SELECT work_item_id, stuck_kind, stuck_since, grace_waived FROM progression_candidates
-                 ORDER BY stuck_since ASC, work_item_id ASC",
+                "SELECT c.work_item_id, c.stuck_kind, c.stuck_since, c.grace_waived,
+                        COALESCE(fk.family_key, c.work_item_id)
+                 FROM progression_candidates c
+                 LEFT JOIN progression_family_keys fk ON fk.task_id = c.work_item_id
+                 ORDER BY c.stuck_since ASC, c.work_item_id ASC",
             )?;
-            let rows = stmt.query_map([], read_candidate)?;
+            let rows = stmt.query_map([], |row| Ok((read_candidate(row)?, row.get::<_, String>(4)?)))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut mint = ProgressionMint::default();
-        for candidate in candidates {
+        let mut minted_families = HashSet::new();
+        for (candidate, family_key) in candidates {
+            if minted_families.contains(&family_key) {
+                continue;
+            }
             let savepoint = tx.savepoint()?;
             match insert_progression_execution(&savepoint, &candidate.work_item_id) {
                 Ok(execution) => {
                     savepoint.commit()?;
+                    minted_families.insert(family_key);
                     mint.minted.push((candidate, execution));
                 }
                 Err(error) => {
-                    // Dropping the savepoint rolls this item back.
+                    // Dropping the savepoint rolls this item back. The family is
+                    // still free, so a later member can be tried.
                     drop(savepoint);
                     mint.failed.push((candidate, format!("{error:#}")));
                 }
@@ -721,7 +856,7 @@ pub(crate) fn read_clauses(conn: &Connection, work_item_id: &str) -> Result<Opti
     Ok(conn
         .query_row(
             "SELECT work_item_id, stuck_kind, stuck_since, grace_waived, c1_eligible, c2_no_live_work,
-                    c3_not_capacity_wait, c4_dependency_clear, c5_stuck_long_enough,
+                    c2_no_inflight_ladder, c3_not_capacity_wait, c4_dependency_clear, c5_stuck_long_enough,
                     c6_cooldown_and_budget_clear, progression_live, in_cooldown, infrastructure_failing
              FROM progression_candidate_clauses WHERE work_item_id = ?1",
             [work_item_id],
@@ -733,13 +868,14 @@ pub(crate) fn read_clauses(conn: &Connection, work_item_id: &str) -> Result<Opti
                     .grace_waived(row.get(3)?)
                     .eligible_item(row.get(4)?)
                     .no_live_work(row.get(5)?)
-                    .not_capacity_wait(row.get(6)?)
-                    .dependency_clear(row.get(7)?)
-                    .stuck_long_enough(row.get(8)?)
-                    .cooldown_and_budget_clear(row.get(9)?)
-                    .progression_live(row.get(10)?)
-                    .in_cooldown(row.get(11)?)
-                    .infrastructure_failing(row.get(12)?)
+                    .no_inflight_ladder(row.get(6)?)
+                    .not_capacity_wait(row.get(7)?)
+                    .dependency_clear(row.get(8)?)
+                    .stuck_long_enough(row.get(9)?)
+                    .cooldown_and_budget_clear(row.get(10)?)
+                    .progression_live(row.get(11)?)
+                    .in_cooldown(row.get(12)?)
+                    .infrastructure_failing(row.get(13)?)
                     .build())
             },
         )

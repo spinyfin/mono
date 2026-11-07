@@ -257,8 +257,8 @@ pub struct WorkConfig {
     /// The limits that bound progression agents (design section 2.6): pool size,
     /// sweep interval, stuck-after grace, cooldown, create budget, run timeout.
     /// Each is configured via a `BOSS_PROGRESSION_*` variable and defaults to the
-    /// design's placeholder until the constants task replaces them with measured
-    /// values. See [`ProgressionSettings`].
+    /// design's placeholder; they are not yet tuned from measured traffic. See
+    /// [`ProgressionSettings`].
     #[builder(default)]
     pub progression: ProgressionSettings,
     /// Model slug the Boss coordinator session launches with, pushed to the
