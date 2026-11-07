@@ -1,0 +1,546 @@
+//! The idempotent bootstrap installer.
+//!
+//! It runs as root on the worker host, verifies a signed release before it
+//! executes or unpacks anything, and lays out: an immutable release directory,
+//! a `current` pointer, the service user's owner-only state, the hub's CA, the
+//! service definition and a small install record. It **never enrolls** the host
+//! and never starts a service that has no client certificate: enrollment is a
+//! separate step the person takes as the service user.
+//!
+//! Running it again with the same inputs changes nothing and restarts nothing.
+//! Running it with a newer release switches `current`, then restarts an
+//! enrolled host's service. The service definitions leave the tmux server and
+//! its worker panes running through that restart, and the daemon re-adopts them.
+//!
+//! All the host-changing steps that cannot be done with plain file operations
+//! (creating the user, talking to systemd or launchd, running a command as the
+//! service user) go through [`Host`], so the whole flow is exercised in tests
+//! against a staging root without being root.
+
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, fchown, symlink};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail, ensure};
+use serde::{Deserialize, Serialize};
+
+use crate::archive::{self, INSTALLER_BINARY, SPOKE_BINARY};
+use crate::manifest::{self, Platform, TrustedKey};
+use crate::service::{self, Spec};
+
+pub const DEFAULT_USER: &str = "boss-worker";
+
+/// Where everything goes. Paths are the real ones; `root` stages them under a
+/// directory instead of `/` (tests, image builds), and the service definitions
+/// still name the real paths.
+#[derive(Debug, Clone)]
+pub struct Layout {
+    pub platform: Platform,
+    pub user: String,
+    pub root: Option<PathBuf>,
+}
+
+impl Layout {
+    pub fn on_disk(&self, logical: &Path) -> PathBuf {
+        match &self.root {
+            Some(root) => root.join(logical.strip_prefix("/").unwrap_or(logical)),
+            None => logical.to_path_buf(),
+        }
+    }
+
+    pub fn prefix(&self) -> PathBuf {
+        PathBuf::from(if self.platform.is_macos() {
+            "/usr/local/lib/boss-spoke"
+        } else {
+            "/opt/boss-spoke"
+        })
+    }
+
+    pub fn etc(&self) -> PathBuf {
+        PathBuf::from("/etc/boss-spoke")
+    }
+
+    pub fn home(&self) -> PathBuf {
+        PathBuf::from(if self.platform.is_macos() { "/Users" } else { "/var/lib" }).join(&self.user)
+    }
+
+    pub fn state_dir(&self) -> PathBuf {
+        self.home().join("spoke")
+    }
+
+    pub fn release_dir(&self, release_id: &str) -> PathBuf {
+        self.prefix().join("releases").join(release_id)
+    }
+
+    pub fn current(&self) -> PathBuf {
+        self.prefix().join("current")
+    }
+
+    pub fn definition(&self) -> PathBuf {
+        if self.platform.is_macos() {
+            Path::new("/Library/LaunchDaemons").join(format!("{}.plist", service::LAUNCHD_LABEL))
+        } else {
+            Path::new("/etc/systemd/system").join(service::SYSTEMD_UNIT)
+        }
+    }
+
+    pub fn config_path(&self) -> PathBuf {
+        self.etc().join("install.json")
+    }
+
+    fn pinned_key_path(&self) -> PathBuf {
+        self.etc().join("release-verify-key.pub")
+    }
+
+    fn path_env(&self) -> String {
+        let home = self.home().display().to_string();
+        if self.platform.is_macos() {
+            format!("{home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+        } else {
+            format!("{home}/.local/bin:/usr/local/bin:/usr/bin:/bin")
+        }
+    }
+
+    pub fn spec(&self, host_id: &str, hub_url: &str) -> Spec {
+        Spec::builder()
+            .user(self.user.clone())
+            .home(self.home())
+            .state_dir(self.state_dir())
+            .binary(self.current().join(SPOKE_BINARY))
+            .host_id(host_id)
+            .hub_url(hub_url)
+            .path(self.path_env())
+            .build()
+    }
+
+    /// The service environment with every path pointed at the staging root, for
+    /// running checks against what was actually written.
+    pub fn disk_environment(&self, spec: &Spec) -> Vec<(String, String)> {
+        spec.environment()
+            .into_iter()
+            .map(|(key, value)| match key.as_str() {
+                "PATH" => (key, value),
+                _ => (key, self.on_disk(Path::new(&value)).display().to_string()),
+            })
+            .collect()
+    }
+}
+
+/// What the installer remembers about this host, root-owned and world-readable.
+/// Nothing in it is secret.
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct InstallRecord {
+    pub schema: u32,
+    pub release_id: String,
+    pub platform: String,
+    pub user: String,
+    pub host_id: String,
+    pub hub_url: String,
+}
+
+impl InstallRecord {
+    pub fn read(path: &Path) -> Result<Self> {
+        let record: Self = serde_json::from_slice(&fs::read(path).with_context(|| {
+            format!(
+                "{} is unreadable; has the spoke package been installed on this host?",
+                path.display()
+            )
+        })?)?;
+        ensure!(
+            record.schema == 1,
+            "unsupported install record schema {}",
+            record.schema
+        );
+        Ok(record)
+    }
+
+    pub fn layout(&self) -> Result<Layout> {
+        Ok(Layout {
+            platform: Platform::parse(&self.platform)?,
+            user: self.user.clone(),
+            root: None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Account {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+pub struct RunOutput {
+    pub success: bool,
+    pub output: String,
+}
+
+/// The parts of installing that need the operating system's cooperation.
+pub trait Host {
+    fn lookup_user(&self, name: &str) -> Result<Option<Account>>;
+    /// Creates the unprivileged service account with `home` as its home.
+    fn create_user(&self, name: &str, home: &Path) -> Result<Account>;
+    /// Makes the service manager aware of a new or changed definition. It must
+    /// not start a host that has no client certificate.
+    fn register_service(&self, definition: &Path) -> Result<()>;
+    fn restart_service(&self) -> Result<()>;
+    fn service_running(&self) -> Result<bool>;
+    /// Runs `program` as `account` with exactly `env` and nothing inherited.
+    fn run_as(&self, account: &Account, env: &[(String, String)], program: &Path, args: &[String])
+    -> Result<RunOutput>;
+}
+
+/// How long to wait for a restarted service to prove itself.
+#[derive(Debug, Clone, Copy)]
+pub struct Health {
+    pub deadline: Duration,
+    pub poll: Duration,
+    pub stable: Duration,
+}
+
+impl Default for Health {
+    fn default() -> Self {
+        Self {
+            deadline: Duration::from_secs(120),
+            poll: Duration::from_secs(1),
+            stable: Duration::from_secs(10),
+        }
+    }
+}
+
+#[derive(bon::Builder)]
+pub struct Request<'a> {
+    pub manifest: &'a [u8],
+    pub signature: &'a str,
+    pub package: &'a [u8],
+    pub trusted_key: Option<TrustedKey>,
+    pub host_id: &'a str,
+    pub hub_url: &'a str,
+    pub hub_ca: &'a [u8],
+    pub platform: Platform,
+    pub layout: Layout,
+    #[builder(default)]
+    pub health: Health,
+}
+
+#[derive(Debug, Default)]
+pub struct Report {
+    pub release_id: String,
+    pub key_fingerprint: String,
+    /// Each step that changed the host. Empty when the host already matched.
+    pub changed: Vec<&'static str>,
+    pub enrolled: bool,
+    pub restarted: bool,
+}
+
+pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
+    let layout = &request.layout;
+    let mut report = Report::default();
+
+    let (key, newly_pinned) = resolve_trust(layout, request.trusted_key.clone())?;
+    report.key_fingerprint = key.fingerprint();
+    let verified = manifest::verify_release(
+        &key,
+        request.manifest,
+        request.signature,
+        request.package,
+        request.platform,
+    )?;
+    let release_id = verified.manifest.release_id.clone();
+    report.release_id = release_id.clone();
+
+    let spec = layout.spec(request.host_id, request.hub_url);
+    spec.validate()?;
+    ensure!(
+        request.hub_ca.windows(27).any(|w| w == b"-----BEGIN CERTIFICATE-----"),
+        "the hub CA must be a PEM certificate"
+    );
+
+    // A host's journal is keyed by its id; changing it would strand the journal.
+    if let Ok(existing) = InstallRecord::read(&layout.on_disk(&layout.config_path())) {
+        ensure!(
+            existing.host_id == request.host_id,
+            "this host is installed as {}; a host id never changes because the journal belongs to it",
+            existing.host_id
+        );
+    }
+
+    // Nothing is installed before this point.
+    let account = match host.lookup_user(&layout.user)? {
+        Some(account) => account,
+        None => {
+            report.changed.push("service user created");
+            host.create_user(&layout.user, &layout.home())?
+        }
+    };
+    if ensure_root_dir(&layout.on_disk(&layout.etc()))? {
+        report.changed.push("etc directory");
+    }
+    if newly_pinned {
+        write_file(
+            &layout.on_disk(&layout.pinned_key_path()),
+            key.to_text().as_bytes(),
+            0o644,
+            None,
+        )?;
+        report.changed.push("release key pinned");
+    }
+    if ensure_state(layout, &account)? {
+        report.changed.push("service state directories");
+    }
+    if install_release(layout, &release_id, request.package, &verified.manifest.package.sha256)? {
+        report.changed.push("release unpacked");
+    }
+
+    // Prove, as the service user and in the service's own environment, that the
+    // state is private and the driver-home root is pinned inside it, before any
+    // service definition points at this release.
+    let checker = layout.on_disk(&layout.release_dir(&release_id).join(INSTALLER_BINARY));
+    let args = vec![
+        "preflight".to_owned(),
+        "--inline".into(),
+        "--storage-only".into(),
+        "--state-dir".into(),
+        layout.on_disk(&layout.state_dir()).display().to_string(),
+    ];
+    let checked = host.run_as(&account, &layout.disk_environment(&spec), &checker, &args)?;
+    ensure!(
+        checked.success,
+        "the service user cannot use its state directory:\n{}",
+        checked.output.trim_end()
+    );
+
+    if point_current(layout, &release_id)? {
+        report.changed.push("current release switched");
+    }
+    let credentials = layout.on_disk(&spec.credentials_dir());
+    let trust_changed = write_file(&credentials.join("ca.pem"), request.hub_ca, 0o600, Some(&account))?;
+    if trust_changed {
+        report.changed.push("hub trust installed");
+    }
+    let record = InstallRecord::builder()
+        .schema(1)
+        .release_id(release_id.clone())
+        .platform(verified.platform.as_str())
+        .user(layout.user.clone())
+        .host_id(request.host_id)
+        .hub_url(request.hub_url)
+        .build();
+    let mut record_bytes = serde_json::to_vec_pretty(&record)?;
+    record_bytes.push(b'\n');
+    if write_file(&layout.on_disk(&layout.config_path()), &record_bytes, 0o644, None)? {
+        report.changed.push("install record");
+    }
+    let definition = if layout.platform.is_macos() {
+        spec.render_launchd()
+    } else {
+        spec.render_systemd()
+    };
+    let definition_path = layout.on_disk(&layout.definition());
+    ensure_root_dir(definition_path.parent().context("service definition has no parent")?)?;
+    let definition_changed = write_file(&definition_path, definition.as_bytes(), 0o644, None)?;
+    if definition_changed {
+        report.changed.push("service definition");
+        host.register_service(&layout.definition())?;
+    }
+
+    report.enrolled = ["cert.pem", "key.pem"]
+        .iter()
+        .all(|name| credentials.join(name).is_file());
+    let release_changed = report.changed.contains(&"current release switched");
+    // The daemon reads its definition, binary and trust anchor only at startup.
+    if report.enrolled && (definition_changed || release_changed || trust_changed || !host.service_running()?) {
+        host.restart_service()?;
+        wait_healthy(host, &request.health, layout)?;
+        report.restarted = true;
+    }
+    Ok(report)
+}
+
+fn resolve_trust(layout: &Layout, supplied: Option<TrustedKey>) -> Result<(TrustedKey, bool)> {
+    match fs::read_to_string(layout.on_disk(&layout.pinned_key_path())) {
+        Ok(text) => {
+            let pinned = TrustedKey::parse(&text)?;
+            if let Some(supplied) = supplied {
+                ensure!(
+                    supplied == pinned,
+                    "trusted_key_changed: this host pins release key {} and was given {}; \
+                     remove {} as root to trust a different key",
+                    pinned.fingerprint(),
+                    supplied.fingerprint(),
+                    layout.pinned_key_path().display()
+                );
+            }
+            Ok((pinned, false))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let key = supplied.context(
+                "no release key is pinned on this host; pass --trusted-key with the release owner's public key \
+                 and confirm its fingerprint with them first",
+            )?;
+            Ok((key, true))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// A root-owned directory anyone may read. Created when missing; an existing
+/// one must be a real directory that others cannot write to.
+fn ensure_root_dir(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            ensure!(metadata.is_dir(), "{} must be a directory", path.display());
+            ensure!(metadata.mode() & 0o022 == 0, "{} is writable by others", path.display());
+            Ok(false)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::DirBuilder::new().recursive(true).mode(0o755).create(path)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+            Ok(true)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The service user's home, then its owner-only spoke state, credential and
+/// driver-home directories. An existing directory is verified, never repaired:
+/// the service user controls these paths, so root must not chown or chmod them.
+fn ensure_state(layout: &Layout, account: &Account) -> Result<bool> {
+    let home = layout.on_disk(&layout.home());
+    if let Some(parent) = home.parent() {
+        ensure_root_dir(parent)?;
+    }
+    let mut changed = ensure_user_dir(&home, account, false)?;
+    let state = layout.on_disk(&layout.state_dir());
+    for dir in [state.clone(), state.join("credentials"), state.join("homes")] {
+        changed |= ensure_user_dir(&dir, account, true)?;
+    }
+    Ok(changed)
+}
+
+fn ensure_user_dir(path: &Path, account: &Account, private: bool) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.is_dir(),
+                "{} must be a real directory, not a symlink or file",
+                path.display()
+            );
+            ensure!(
+                metadata.uid() == account.uid,
+                "{} is not owned by the service user",
+                path.display()
+            );
+            ensure!(
+                !private || metadata.mode() & 0o077 == 0,
+                "{} must be owner-only (0700); fix its mode and run the installer again",
+                path.display()
+            );
+            Ok(false)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::DirBuilder::new().mode(0o700).create(path)?;
+            let dir = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+                .open(path)?;
+            fchown(&dir, Some(account.uid), Some(account.gid))?;
+            Ok(true)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Writes `bytes` atomically (temp file in the same directory, then rename), so
+/// a reader sees the old file or the new one. A pre-planted symlink at the
+/// destination or the temp name is replaced, never followed. `None` for `owner`
+/// leaves the file owned by the installer's user.
+fn write_file(path: &Path, bytes: &[u8], mode: u32, owner: Option<&Account>) -> Result<bool> {
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && metadata.is_file()
+        && metadata.mode() & 0o7777 == mode
+        && owner.is_none_or(|account| metadata.uid() == account.uid)
+        && fs::read(path).is_ok_and(|existing| existing == bytes)
+    {
+        return Ok(false);
+    }
+    let parent = path.parent().context("destination has no parent")?;
+    let name = path.file_name().context("destination has no name")?.to_string_lossy();
+    let temp = parent.join(format!(".{name}.{}.tmp", std::process::id()));
+    let _ = fs::remove_file(&temp);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(mode)
+        .open(&temp)
+        .with_context(|| format!("cannot write {}", path.display()))?;
+    file.write_all(bytes)?;
+    file.set_permissions(fs::Permissions::from_mode(mode))?;
+    if let Some(account) = owner {
+        fchown(&file, Some(account.uid), Some(account.gid))?;
+    }
+    file.sync_all()?;
+    fs::rename(&temp, path)?;
+    Ok(true)
+}
+
+/// Unpacks into a staging directory next to the final one and renames it into
+/// place, so a release directory is either absent or complete. A release id
+/// names one set of bytes forever.
+fn install_release(layout: &Layout, release_id: &str, package: &[u8], digest: &str) -> Result<bool> {
+    let target = layout.on_disk(&layout.release_dir(release_id));
+    let releases = target.parent().context("release directory has no parent")?;
+    ensure_root_dir(releases)?;
+    if fs::symlink_metadata(&target).is_ok() {
+        let recorded = fs::read_to_string(target.join(".package-sha256")).unwrap_or_default();
+        ensure!(
+            recorded.trim() == digest,
+            "release {release_id} is already installed with different contents; a release id is never reused"
+        );
+        return Ok(false);
+    }
+    let staging = tempfile::Builder::new().prefix(".staging-").tempdir_in(releases)?;
+    archive::unpack(package, staging.path())?;
+    fs::write(staging.path().join(".package-sha256"), format!("{digest}\n"))?;
+    fs::set_permissions(staging.path(), fs::Permissions::from_mode(0o755))?;
+    fs::rename(staging.keep(), &target)?;
+    Ok(true)
+}
+
+/// Points `current` at the release with an atomic rename of a relative link.
+fn point_current(layout: &Layout, release_id: &str) -> Result<bool> {
+    let link = layout.on_disk(&layout.current());
+    let target = Path::new("releases").join(release_id);
+    if fs::read_link(&link).is_ok_and(|existing| existing == target) {
+        return Ok(false);
+    }
+    let temp = link.with_file_name(".current.new");
+    let _ = fs::remove_file(&temp);
+    symlink(&target, &temp)?;
+    fs::rename(&temp, &link)?;
+    Ok(true)
+}
+
+fn wait_healthy(host: &dyn Host, health: &Health, layout: &Layout) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        if host.service_running()? {
+            std::thread::sleep(health.stable);
+            if host.service_running()? {
+                return Ok(());
+            }
+        }
+        if started.elapsed() >= health.deadline {
+            bail!(
+                "the spoke service did not stay running within {:?} of its restart. Nothing was rolled back: \
+                 the previous release is still in {}. Read the service log, then reinstall the previous signed package.",
+                health.deadline,
+                layout.prefix().join("releases").display()
+            );
+        }
+        std::thread::sleep(health.poll);
+    }
+}

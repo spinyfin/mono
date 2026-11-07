@@ -1,0 +1,29 @@
+[Unit]
+Description=Boss spoke worker-host daemon
+After=network-online.target
+Wants=network-online.target
+# Installing this file enrolls nothing. The daemon needs the client certificate
+# and key that enrollment installs; until both exist, starting it is a no-op.
+ConditionPathExists={{credentials_dir}}/cert.pem
+ConditionPathExists={{credentials_dir}}/key.pem
+
+[Service]
+Type=simple
+User={{user}}
+Group={{group}}
+UMask=0077
+WorkingDirectory={{state_dir}}
+{{environment}}
+ExecStart={{exec_start}}
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+# The daemon starts the host's private tmux server, so every worker pane lives in
+# this unit's control group. The default KillMode=control-group would kill them
+# all when the unit stops or restarts; "process" signals only the daemon. The
+# restarted daemon adopts the surviving panes by spawn token and replays its
+# journal.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

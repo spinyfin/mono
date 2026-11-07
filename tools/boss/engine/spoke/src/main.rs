@@ -194,7 +194,14 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use tokio::sync::watch;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
+
+/// How often host readiness is re-checked. The first check runs at startup.
+const PREFLIGHT_INTERVAL: Duration = Duration::from_secs(300);
+/// Reported until the first check finishes, so a host that has not yet proven
+/// itself is not schedulable.
+const PREFLIGHT_PENDING: &str = "preflight_pending";
 
 #[derive(Parser)]
 #[command(about = "Boss spoke workspace executor and worker supervisor")]
@@ -270,6 +277,15 @@ async fn serve(args: Args, homes_root: PathBuf) -> Result<()> {
         }
     };
     let tmux_ready = tmux.is_some();
+    let (failures, preflights) = watch::channel(vec![PREFLIGHT_PENDING.to_owned()]);
+    // No hub-reachability check here: a connected daemon is the proof, and a stale
+    // failure would keep a reconnected host unschedulable for a whole interval.
+    let readiness = boss_spoke_preflight::Config::builder()
+        .state_dir(args.state_dir.clone())
+        .maybe_homes_root(std::env::var_os(boss_host_execution::homes::ROOT_ENV).map(PathBuf::from))
+        .cube_bin(cube.command.clone())
+        .maybe_tmux_bin(args.tmux_bin.clone())
+        .build();
     let supervisor = tmux.map(|tmux| boss_host_execution::worker::Supervisor {
         cube: cube.clone(),
         tmux,
@@ -282,13 +298,37 @@ async fn serve(args: Args, homes_root: PathBuf) -> Result<()> {
     tokio::select! {
         result = boss_spoke_outbound::run_with_executor(Arc::clone(&journal), endpoint, stamp, true) => result,
         result = commands::run(Arc::clone(&journal), executor, supervisor, stamp) => result,
-        result = produce(&journal, &args.state_dir, &boot, tmux_ready) => result,
+        result = produce(&journal, &args.state_dir, &boot, tmux_ready, preflights) => result,
+        result = preflight_loop(readiness, failures) => result,
         result = commands::heartbeat(cube, executions) => result,
         result = tokio::signal::ctrl_c() => { result?; Ok(()) }
     }
 }
 
-async fn produce(journal: &SharedJournal, root: &std::path::Path, boot: &str, tmux_ready: bool) -> Result<()> {
+/// Keeps the failing-check list current. It never decides anything itself: the
+/// hub reads the list from capacity reports and holds back new work.
+async fn preflight_loop(config: boss_spoke_preflight::Config, failures: watch::Sender<Vec<String>>) -> Result<()> {
+    let mut interval = tokio::time::interval(PREFLIGHT_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        let outcomes = boss_spoke_preflight::run(&config).await;
+        for outcome in &outcomes {
+            if let Err(reason) = &outcome.result {
+                tracing::warn!(check = outcome.name, reason, "host preflight failed");
+            }
+        }
+        failures.send_replace(boss_spoke_preflight::failed(&outcomes));
+    }
+}
+
+async fn produce(
+    journal: &SharedJournal,
+    root: &std::path::Path,
+    boot: &str,
+    tmux_ready: bool,
+    preflights: watch::Receiver<Vec<String>>,
+) -> Result<()> {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -296,11 +336,12 @@ async fn produce(journal: &SharedJournal, root: &std::path::Path, boot: &str, tm
         let observed = host::stamp(boot)?;
         let mut journal = journal.lock().map_err(|_| anyhow::anyhow!("journal owner panicked"))?;
         journal.compact(observed.wall_unix_ms)?;
-        let failed_preflights = if tmux_ready {
-            Vec::new()
-        } else {
-            vec!["tmux unavailable".into()]
-        };
+        let mut failed_preflights = preflights.borrow().clone();
+        if !tmux_ready {
+            // Startup state: the supervisor stays off until the daemon restarts,
+            // even if a later check finds tmux.
+            failed_preflights.push("tmux unavailable".into());
+        }
         let capacity = Capacity {
             generation: journal.record_bounds()?.1 + 1,
             free_disk_bytes: fs4::available_space(root)?,

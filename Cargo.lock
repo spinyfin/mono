@@ -1620,6 +1620,7 @@ dependencies = [
  "boss-protocol-spoke",
  "boss-spoke-journal",
  "boss-spoke-outbound",
+ "boss-spoke-preflight",
  "boss-tmux",
  "clap",
  "fs4",
@@ -1729,6 +1730,40 @@ dependencies = [
  "tonic",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "boss-spoke-package"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bon",
+ "boss-spoke-preflight",
+ "clap",
+ "flate2",
+ "libc",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "boss-spoke-preflight"
+version = "0.1.0"
+dependencies = [
+ "bon",
+ "boss-host-execution",
+ "boss-tmux",
+ "fs4",
+ "libc",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
