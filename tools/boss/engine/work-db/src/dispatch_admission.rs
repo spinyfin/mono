@@ -21,11 +21,14 @@ pub struct DispatchAdmissionFacts {
     pub resolved_work_item_id: String,
     /// `Some(reason)` when the work item is ineligible for dispatch
     /// outright — unknown, not a dispatchable kind, deleted, terminal,
-    /// human-driven, or (once the status axis clears) no resolvable repo —
-    /// mirrors the `bail!` conditions `request_execution_in_tx_with_live_check`
-    /// enforces before ever creating a row. Deliberately does NOT include
-    /// `in_review`: see `status_ineligibility`'s doc for why that stays
-    /// eligible on both the ordinary and the forced path.
+    /// parked, human-driven, or (once the status axis clears) no resolvable
+    /// repo — mirrors the `bail!` conditions
+    /// `request_execution_in_tx_with_live_check` enforces before ever
+    /// creating a row. Deliberately does NOT include `in_review`: see
+    /// `status_ineligibility`'s doc for why that stays eligible on both
+    /// the ordinary and the forced path. Parking uses
+    /// [`parking::unpark_first_refusal`] so this evaluator and the
+    /// mutating request path cannot disagree.
     pub ineligible_reason: Option<String>,
     /// Work items gating this one, per [`WorkDb::gating_prereqs_for`].
     /// Always empty when `ineligible_reason` is `Some` (there is no point
@@ -266,6 +269,8 @@ impl WorkDb {
                             )
                         }
                     })
+                } else if let Some(refusal) = parking::unpark_first_refusal(&conn, &resolved_work_item_id)? {
+                    Some(refusal.to_string())
                 } else if primary_pr_awaits_review(&conn, &resolved_work_item_id)?
                     && query_live_execution_for_work_item(&conn, &resolved_work_item_id)?.is_none()
                     && query_latest_execution_for_work_item(&conn, &resolved_work_item_id)?
@@ -545,5 +550,74 @@ mod deliberate_parked_fact_tests {
 
         let facts = db.dispatch_admission_facts(&work_item_id).unwrap();
         assert!(!facts.deliberate_parked);
+    }
+}
+
+#[cfg(test)]
+mod owner_park_admission_tests {
+    use crate::test_support::*;
+    use boss_protocol::{CreateProjectInput, CreateTaskInput, LAST_STATUS_ACTOR_HUMAN};
+
+    fn request_refusal(db: &crate::WorkDb, work_item_id: &str) -> String {
+        db.request_execution(
+            boss_protocol::RequestExecutionInput::builder()
+                .work_item_id(work_item_id)
+                .build(),
+        )
+        .unwrap_err()
+        .to_string()
+    }
+
+    #[test]
+    fn admission_agrees_with_request_execution_for_a_directly_parked_task() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_test_chore_manual(&db, &product_id, "parked start").id;
+        db.park_work_item_as_actor(&work_item_id, true, Some("not now"), LAST_STATUS_ACTOR_HUMAN)
+            .unwrap();
+
+        let facts = db.dispatch_admission_facts(&work_item_id).unwrap();
+        let request = request_refusal(&db, &work_item_id);
+        let reason = facts.ineligible_reason.expect("parked row is ineligible");
+        assert_eq!(reason, request);
+        assert!(reason.contains("un-park it first"), "{reason}");
+    }
+
+    #[test]
+    fn admission_agrees_with_request_execution_for_a_child_of_a_parked_project() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let project_id = db
+            .create_project(
+                CreateProjectInput::builder()
+                    .product_id(&product_id)
+                    .name("Parked project")
+                    .no_design_task(true)
+                    .build(),
+            )
+            .unwrap()
+            .id;
+        let child = db
+            .create_task(
+                CreateTaskInput::builder()
+                    .product_id(&product_id)
+                    .project_id(&project_id)
+                    .name("child")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap()
+            .id;
+        db.park_work_item_as_actor(&project_id, true, Some("focus elsewhere"), LAST_STATUS_ACTOR_HUMAN)
+            .unwrap();
+
+        let facts = db.dispatch_admission_facts(&child).unwrap();
+        let request = request_refusal(&db, &child);
+        let reason = facts.ineligible_reason.expect("project-parked child is ineligible");
+        assert_eq!(reason, request);
+        assert!(
+            reason.contains(&format!("because project {project_id} is parked")),
+            "{reason}"
+        );
     }
 }

@@ -507,8 +507,10 @@ pub enum FrontendRequest {
     /// source fields in the input. Replies with
     /// [`FrontendEvent::AttentionCreated`].
     CreateAttention {
+        /// Boxed so `FrontendRequest` stays within clippy's
+        /// `large_enum_variant` budget; serde output is identical.
         #[serde(flatten)]
-        input: CreateAttentionInput,
+        input: Box<CreateAttentionInput>,
     },
 
     CreateAttentionItem {
@@ -1939,6 +1941,13 @@ pub enum FrontendRequest {
         work_item_id: String,
     },
 
+    ParkWorkItem {
+        id: String,
+        parked: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
     /// Operator entry point for the auto-populate Planner/Materializer
     /// (design P783 §2 "Reusability" #2 — "plan this project now" /
     /// replan). Builds the same `PlannerInput` the design-PR-merge
@@ -2932,7 +2941,9 @@ pub enum FrontendRequest {
 
     UpdateWorkItem {
         id: String,
-        patch: WorkItemPatch,
+        /// Boxed so `FrontendRequest` stays within clippy's
+        /// `large_enum_variant` budget; serde output is identical.
+        patch: Box<WorkItemPatch>,
     },
 
     /// Snapshot every engine worker pool's (main, automation, review)
@@ -2975,19 +2986,14 @@ mod topic_event_payload;
 pub use topic_event_payload::TopicEventPayload;
 
 #[cfg(test)]
-mod editorial_controls_tests;
-
+mod coordinator_reset_tests;
 #[cfg(test)]
-mod frontend_event_wire_tests;
-
+mod editorial_controls_tests;
 #[cfg(test)]
 mod feature_flags_wire_tests;
-
 #[cfg(test)]
-mod topic_and_envelope_tests;
-
+mod frontend_event_wire_tests;
 #[cfg(test)]
 mod sorted_request_variants_test;
-
 #[cfg(test)]
-mod coordinator_reset_tests;
+mod topic_and_envelope_tests;

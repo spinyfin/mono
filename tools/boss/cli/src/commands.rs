@@ -406,6 +406,10 @@ pub(crate) enum ProjectCommand {
     List(ProjectListArgs),
     Show(ProjectShowArgs),
     Update(ProjectUpdateArgs),
+    /// Park a project and cascade onto its open children.
+    Park(ProjectParkArgs),
+    /// Un-park a project. Directly-parked children stay parked.
+    Unpark(ProjectSelectorArgs),
     /// Archive a project. Projects are not hard-deleted; the engine convention
     /// is to set status=archived so the row stays available for history.
     Delete(ProjectSelectorArgs),
@@ -567,6 +571,10 @@ pub(crate) enum TaskCommand {
     /// (`T43`). Find tombstoned ids with `boss task list --deleted`.
     #[command(alias = "undelete")]
     Restore(TaskRestoreArgs),
+    /// Park a task or chore. Keeps status; skipped by dispatch until un-parked.
+    Park(TaskParkArgs),
+    /// Un-park a task or chore. A project-cascaded stamp needs `project unpark`.
+    Unpark(TaskIdArg),
     Reorder(TaskReorderArgs),
     /// Manage dependency edges (`A depends on B` ⇒ B gates A).
     Depend {
@@ -668,6 +676,10 @@ pub(crate) enum ChoreCommand {
     /// Alias for `boss task restore`. Accepts any leaf work item id.
     #[command(alias = "undelete")]
     Restore(TaskRestoreArgs),
+    /// Alias for `boss task park`. Accepts any leaf work item id.
+    Park(TaskParkArgs),
+    /// Alias for `boss task unpark`. Accepts any leaf work item id.
+    Unpark(TaskIdArg),
     /// Alias for `boss task depend`. The engine doesn't care about kind.
     Depend {
         #[command(subcommand)]
@@ -2042,6 +2054,9 @@ pub(crate) struct ProjectListArgs {
     pub(crate) repo: Option<String>,
 
     #[command(flatten)]
+    pub(crate) parked: ParkedListArgs,
+
+    #[command(flatten)]
     pub(crate) dep: DependencyFilterArgs,
 }
 
@@ -2345,6 +2360,9 @@ pub(crate) struct TaskListArgs {
     /// their history and can be reopened.
     #[arg(long = "include-archived")]
     pub(crate) include_archived: bool,
+
+    #[command(flatten)]
+    pub(crate) parked: ParkedListArgs,
 
     /// Filter by resolved repo. Accepts a full URL or a short
     /// name (basename of the URL minus `.git`). Resolution falls
@@ -2652,6 +2670,9 @@ pub(crate) struct RevisionListArgs {
     #[arg(long = "include-archived")]
     pub(crate) include_archived: bool,
 
+    #[command(flatten)]
+    pub(crate) parked: ParkedListArgs,
+
     /// Restrict to revisions whose parent is this task. Accepts `T<n>` short
     /// ids (e.g. `T651`) or full `task_<hex>` ids.
     #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
@@ -2747,31 +2768,15 @@ pub(crate) struct ChoreListArgs {
     #[arg(long = "include-archived")]
     pub(crate) include_archived: bool,
 
+    #[command(flatten)]
+    pub(crate) parked: ParkedListArgs,
+
     /// Filter by resolved repo. See `boss task list --help`.
     #[arg(long = "repo")]
     pub(crate) repo: Option<String>,
 
     #[command(flatten)]
     pub(crate) dep: DependencyFilterArgs,
-}
-
-#[derive(Debug, Clone, Args)]
-pub(crate) struct TaskIdArg {
-    /// Task/chore id. Accepts: primary id (`task_…`), friendly short id
-    /// (`T441`, `t441`, `42`, or `#42`), or cross-product form
-    /// (`boss/42` or `boss/#42`). Globally unique short ids resolve
-    /// without `--product`; ambiguous ones error listing every candidate.
-    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
-    pub(crate) id: String,
-    /// Resolve a friendly short id (`42` or `#42`) against this product
-    /// (slug or id). Optional when the short id is globally unique.
-    /// Ignored when the selector already embeds a product slug
-    /// (`boss/42`) or when the selector is a primary id.
-    #[arg(long)]
-    pub(crate) product: Option<String>,
-    /// Also display the primary id alongside the friendly id.
-    #[arg(long = "with-primary-id")]
-    pub(crate) with_primary_id: bool,
 }
 
 /// Args for `boss task complete` — the human close ritual for

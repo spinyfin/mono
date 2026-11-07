@@ -4,18 +4,26 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StuckBucket {
+    /// The owner parked the item (itself, through its project, or through its
+    /// revision chain root). An explicit decision, shown for completeness.
+    Parked,
     WaitingOnHuman,
     WaitingOnCapacity,
     WaitingOnDependency,
+    /// `blocked: dependency` on a prerequisite the owner parked. The owner's
+    /// decision about the prerequisite is also the decision about this item.
+    ParkedUpstream,
     EngineStuck,
 }
 
 impl StuckBucket {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Parked => "parked",
             Self::WaitingOnHuman => "waiting_on_human",
             Self::WaitingOnCapacity => "waiting_on_capacity",
             Self::WaitingOnDependency => "waiting_on_dependency",
+            Self::ParkedUpstream => "parked_upstream",
             Self::EngineStuck => "engine_stuck",
         }
     }

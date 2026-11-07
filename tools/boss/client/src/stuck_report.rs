@@ -20,15 +20,21 @@ pub async fn fetch(client: &mut crate::BossClient, since: &str) -> Result<StuckR
     }
 }
 
+/// Every bucket, in the order the report prints them. `engine_stuck` is last
+/// because it is the one the end-state claim is about.
+const BUCKETS: [&str; 6] = [
+    "parked",
+    "waiting_on_human",
+    "waiting_on_capacity",
+    "waiting_on_dependency",
+    "parked_upstream",
+    "engine_stuck",
+];
+
 pub fn render(report: &StuckReport) -> String {
     use std::fmt::Write;
     let mut out = String::new();
-    for bucket in [
-        "waiting_on_human",
-        "waiting_on_capacity",
-        "waiting_on_dependency",
-        "engine_stuck",
-    ] {
+    for bucket in BUCKETS {
         let rows: Vec<_> = report.rows.iter().filter(|r| r.bucket.as_str() == bucket).collect();
         writeln!(out, "{bucket}: {}", rows.len()).unwrap();
         for row in rows {
@@ -88,12 +94,7 @@ mod tests {
             .unconverted_declared_blockers(3)
             .build();
         let rendered = render(&report);
-        for bucket in [
-            "waiting_on_human",
-            "waiting_on_capacity",
-            "waiting_on_dependency",
-            "engine_stuck",
-        ] {
+        for bucket in BUCKETS {
             assert!(rendered.contains(&format!("{bucket}: 0")));
         }
         assert!(rendered.contains("Questions filed (last 604800s): 2"));
@@ -150,9 +151,11 @@ mod tests {
         );
         assert_eq!(
             render(&report),
-            "waiting_on_human: 0\n\
+            "parked: 0\n\
+             waiting_on_human: 0\n\
              waiting_on_capacity: 0\n\
              waiting_on_dependency: 0\n\
+             parked_upstream: 0\n\
              engine_stuck: 1\n  \
              task_a  >=90s  S7_worker_failed:worker_failed  basis=declared_blocked  Stuck chore\n\
              Questions filed (last 60s): 4\n\

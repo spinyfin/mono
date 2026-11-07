@@ -158,6 +158,32 @@ pub struct Project {
     /// separate-doc-repo case at work).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub design_doc_repo_remote_url: Option<String>,
+
+    /// When the owner parked this project (epoch seconds, decimal string).
+    /// `None` → not parked. Parking a project also stamps every open child
+    /// task (see [`Task::parked_via`](super::task::Task::parked_via)); its
+    /// `parked_via` is always `direct` in v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_at: Option<String>,
+
+    /// Status actor that parked the project (`human` or `boss`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_by: Option<String>,
+
+    /// Optional free text from the owner explaining the park.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_reason: Option<String>,
+
+    /// Always `direct` for projects in v1; present for symmetry with tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_via: Option<String>,
+}
+
+impl Project {
+    /// `true` when the owner parked this project and it is still open.
+    pub fn is_parked(&self) -> bool {
+        self.parked_at.is_some() && !matches!(self.status, ProjectStatus::Done | ProjectStatus::Archived)
+    }
 }
 
 /// Wire-level state returned by `ResolveProjectDesignDoc`. The UI

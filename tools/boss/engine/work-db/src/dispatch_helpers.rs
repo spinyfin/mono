@@ -597,6 +597,17 @@ pub fn reconcile_work_item_execution(
         );
         return Ok(());
     }
+    // Parked items are never minted an execution on any automatic path. Gated
+    // here for the same reason as `deferred` above: the dependency cascade
+    // calls this function directly and bypasses `task_accepts_execution`, and
+    // a row can be parked through its project without carrying its own stamp.
+    if !parking::upkeep_eligible(conn, work_item_id)? {
+        tracing::debug!(
+            work_item_id,
+            "reconcile: item is parked — suppressing execution mint until it is un-parked",
+        );
+        return Ok(());
+    }
     let insert_fresh = |result: &mut ExecutionReconcileResult, predecessor: Option<&WorkExecution>| -> Result<()> {
         if primary_pr_awaits_review(conn, work_item_id)? {
             return Ok(());
@@ -1081,6 +1092,15 @@ pub fn reconcile_revision_execution(
         );
         return Ok(());
     }
+    // A revision follows its parent PR: parked when the chain root (or its
+    // project) is parked, with or without a stamp of its own.
+    if !parking::upkeep_eligible(conn, &task.id)? {
+        tracing::debug!(
+            task_id = %task.id,
+            "reconcile_revision: item is parked — suppressing execution mint until it is un-parked",
+        );
+        return Ok(());
+    }
     if revision_implementation_completed(conn, &task.id)? {
         return Ok(());
     }
@@ -1311,6 +1331,14 @@ pub fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
     } = input;
 
     let preferred_workspace_id = normalize_optional_text(preferred_workspace_id);
+    // An explicit start does not override a park: the row stays skipped by every
+    // automatic path until it is un-parked, so a `ready` execution minted here
+    // would only strand. Typed so a caller can tell the owner what to do next.
+    if work_item_id.starts_with("task_")
+        && let Some(refusal) = parking::unpark_first_refusal(conn, &work_item_id)?
+    {
+        return Err(refusal.into());
+    }
     let kind = execution_kind_for_work_item(conn, &work_item_id)?;
 
     // Every successful request can clear blocks or change revision readiness.

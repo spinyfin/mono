@@ -333,6 +333,11 @@ pub(super) fn all() -> Vec<Migration> {
             legacy_version: None,
             apply: conflict_mismatch::migrate_operator_forced_admission,
         },
+        Migration {
+            id: parking::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: parking::migrate,
+        },
     ]);
     migrations
 }

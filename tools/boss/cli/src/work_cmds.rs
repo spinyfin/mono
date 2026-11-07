@@ -2,6 +2,54 @@
 
 use crate::*;
 
+/// Args for `boss project park`.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ProjectParkArgs {
+    #[arg(long)]
+    pub(crate) product: Option<String>,
+
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
+    pub(crate) selector: String,
+
+    /// Optional free-text reason recorded with the park.
+    #[arg(long)]
+    pub(crate) reason: Option<String>,
+}
+
+/// Args for `boss task park`.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct TaskParkArgs {
+    /// Task/chore id. Accepts primary id, friendly short id, or
+    /// cross-product form (same as `boss task show`).
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
+    pub(crate) id: String,
+    /// Resolve a friendly short id against this product (slug or id).
+    #[arg(long)]
+    pub(crate) product: Option<String>,
+    /// Optional free-text reason recorded with the park.
+    #[arg(long)]
+    pub(crate) reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct TaskIdArg {
+    /// Task/chore id. Accepts: primary id (`task_…`), friendly short id
+    /// (`42`, `#42`, or the product-local `T`-prefix form), or cross-product
+    /// form (`boss/42` or `boss/#42`). Globally unique short ids resolve
+    /// without `--product`; ambiguous ones error listing every candidate.
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
+    pub(crate) id: String,
+    /// Resolve a friendly short id (`42` or `#42`) against this product
+    /// (slug or id). Optional when the short id is globally unique.
+    /// Ignored when the selector already embeds a product slug
+    /// (`boss/42`) or when the selector is a primary id.
+    #[arg(long)]
+    pub(crate) product: Option<String>,
+    /// Also display the primary id alongside the friendly id.
+    #[arg(long = "with-primary-id")]
+    pub(crate) with_primary_id: bool,
+}
+
 pub(crate) async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Result<(), CliError> {
     let mut client = connect_for_work(ctx).await?;
     match command {
@@ -355,10 +403,13 @@ pub(crate) async fn run_project_command(command: ProjectCommand, ctx: &RunContex
             };
             let projects = apply_project_list_filters(
                 projects,
-                &args.status,
-                args.match_term.as_deref(),
-                &resolved_ids,
-                args.limit,
+                ProjectListCriteria::builder()
+                    .statuses(&args.status)
+                    .maybe_match_term(args.match_term.as_deref())
+                    .ids(&resolved_ids)
+                    .maybe_limit(args.limit)
+                    .parked(args.parked.filter())
+                    .build(),
                 repo_selector.as_ref(),
                 product.repo_remote_url.as_deref(),
             );
@@ -426,6 +477,12 @@ pub(crate) async fn run_project_command(command: ProjectCommand, ctx: &RunContex
             print_entity(ctx, &serde_json::json!({ "project": project }), || {
                 print_project_details("Updated project", &project, None, false);
             })
+        }
+        ProjectCommand::Park(args) => {
+            run_park_project(&mut client, ctx, args.product, args.selector, true, args.reason).await
+        }
+        ProjectCommand::Unpark(args) => {
+            run_park_project(&mut client, ctx, args.product, args.selector, false, None).await
         }
         ProjectCommand::Delete(args) => {
             let product = resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx).await?;
@@ -810,6 +867,7 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
                     .ids(&resolved_ids)
                     .maybe_limit(args.limit)
                     .include_archived(args.include_archived)
+                    .parked(args.parked.filter())
                     .maybe_parent_task_id(parent_task_id.as_deref())
                     .build(),
                 repo_selector.as_ref(),
@@ -854,6 +912,20 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
         TaskCommand::Move(args) => run_move_leaf(&mut client, ctx, args).await,
         TaskCommand::Delete(args) => run_delete_leaf(&mut client, ctx, args).await,
         TaskCommand::Restore(args) => run_restore_leaf(&mut client, ctx, args).await,
+        TaskCommand::Park(args) => run_park_leaf(&mut client, ctx, args, true).await,
+        TaskCommand::Unpark(args) => {
+            run_park_leaf(
+                &mut client,
+                ctx,
+                TaskParkArgs {
+                    id: args.id,
+                    product: args.product,
+                    reason: None,
+                },
+                false,
+            )
+            .await
+        }
         TaskCommand::Reorder(args) => {
             let product = resolve_product_inferable(&mut client, args.product, args.project.as_deref(), ctx).await?;
             let project = resolve_project(&mut client, &product.id, args.project, ctx).await?;
@@ -972,6 +1044,7 @@ pub(crate) async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -
                     .ids(&resolved_ids)
                     .maybe_limit(args.limit)
                     .include_archived(args.include_archived)
+                    .parked(args.parked.filter())
                     .build(),
                 repo_selector.as_ref(),
                 product.repo_remote_url.as_deref(),
@@ -988,6 +1061,20 @@ pub(crate) async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -
         ChoreCommand::Move(args) => run_move_leaf(&mut client, ctx, args).await,
         ChoreCommand::Delete(args) => run_delete_leaf(&mut client, ctx, args).await,
         ChoreCommand::Restore(args) => run_restore_leaf(&mut client, ctx, args).await,
+        ChoreCommand::Park(args) => run_park_leaf(&mut client, ctx, args, true).await,
+        ChoreCommand::Unpark(args) => {
+            run_park_leaf(
+                &mut client,
+                ctx,
+                TaskParkArgs {
+                    id: args.id,
+                    product: args.product,
+                    reason: None,
+                },
+                false,
+            )
+            .await
+        }
         ChoreCommand::Depend { command } => run_depend_command(command, &mut client, ctx).await,
         ChoreCommand::BindPr(args) => run_bind_pr(&mut client, ctx, args).await,
         ChoreCommand::LinkExternal(args) => run_link_external(&mut client, ctx, args).await,
@@ -1896,6 +1983,40 @@ pub(crate) async fn run_restore_leaf(
         if !ctx.quiet {
             println!("Restored {label} {friendly}");
         }
+    })
+}
+
+pub(crate) async fn run_park_leaf(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    args: TaskParkArgs,
+    parked: bool,
+) -> Result<(), CliError> {
+    let resolved_id = resolve_selector_to_primary_id(client, ctx, &args.id, args.product).await?;
+    let item = park_work_item(client, &resolved_id, parked, args.reason).await?;
+    let (task, label) = expect_leaf_work_item(item)?;
+    let task = with_display_status(task);
+    let verb = if parked { "Parked" } else { "Unparked" };
+    print_entity(ctx, &serde_json::json!({ "item": task }), || {
+        print_task_details(&format!("{verb} {}", label_titlecase(label)), &task, None, false);
+    })
+}
+
+pub(crate) async fn run_park_project(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    product: Option<String>,
+    selector: String,
+    parked: bool,
+    reason: Option<String>,
+) -> Result<(), CliError> {
+    let product = resolve_product_inferable(client, product, Some(&selector), ctx).await?;
+    let project = resolve_project(client, &product.id, Some(selector), ctx).await?;
+    let item = park_work_item(client, &project.id, parked, reason).await?;
+    let project = expect_project(item)?;
+    let verb = if parked { "Parked" } else { "Unparked" };
+    print_entity(ctx, &serde_json::json!({ "project": project }), || {
+        print_project_details(&format!("{verb} project"), &project, None, false);
     })
 }
 
