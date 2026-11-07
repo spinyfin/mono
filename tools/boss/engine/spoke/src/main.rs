@@ -15,35 +15,53 @@ mod commands {
         fn load(&self, sequence: u64) -> Result<Option<Vec<u8>>> {
             self.0
                 .lock()
-                .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
+                .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
                 .recovery_snapshot(sequence)
         }
         fn save(&self, sequence: u64, bytes: &[u8]) -> Result<()> {
             self.0
                 .lock()
-                .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
+                .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
                 .save_recovery_snapshot(sequence, bytes)
         }
     }
 
-    pub struct JournalExecutions(pub SharedJournal);
+    pub struct JournalExecutions(pub SharedJournal, pub std::path::PathBuf, pub std::path::PathBuf);
     impl ExecutionStore for JournalExecutions {
+        fn observation_paths(&self) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+            Some((self.1.clone(), self.2.clone()))
+        }
+        fn observations_drained(&self, record: &worker::ExecutionRecord) -> Result<bool> {
+            let run = boss_spoke_ingress::run_identity(record);
+            Ok(self
+                .0
+                .lock()
+                .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
+                .source(&run, "drained")?
+                .is_some())
+        }
+        fn prune_observation_sources(&self, record: &worker::ExecutionRecord) -> Result<()> {
+            self.0
+                .lock()
+                .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
+                .prune_sources(&boss_spoke_ingress::run_identity(record))
+        }
         fn load(&self, run_id: &str, spawn_token: &str) -> Result<Option<Vec<u8>>> {
             self.0
                 .lock()
-                .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
+                .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
                 .load_execution(run_id, spawn_token)
         }
         fn save(&self, run_id: &str, spawn_token: &str, bytes: &[u8]) -> Result<()> {
             self.0
                 .lock()
-                .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
+                .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
                 .save_execution(run_id, spawn_token, bytes)
         }
         fn assigned(&self) -> Result<Vec<Vec<u8>>> {
             self.0
                 .lock()
-                .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
+                .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
                 .list_executions()
         }
     }
@@ -64,7 +82,7 @@ mod commands {
             interval.tick().await;
             let pending = journal
                 .lock()
-                .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
+                .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
                 .begin_pending()?;
             let Some((command, interrupted)) = pending else {
                 // Idle: look for workers that finished since the last look. This
@@ -114,7 +132,7 @@ mod commands {
             loop {
                 let completed = journal
                     .lock()
-                    .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
+                    .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
                     .complete_command(&command, result.clone(), &observed);
                 match completed {
                     Ok(()) => break,
@@ -233,11 +251,15 @@ struct Args {
     /// Host-configured tmux executable; never accepted from a wire command.
     #[arg(long)]
     tmux_bin: Option<PathBuf>,
+    /// Host-installed hook shim, regenerated into driver wiring.
+    #[arg(long, default_value = "boss-event")]
+    event_bin: PathBuf,
 }
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt().with_writer(std::io::stderr).init();
-    let args = Args::parse();
+    let mut args = Args::parse();
+    args.state_dir = std::path::absolute(&args.state_dir)?;
     let homes_root = boss_host_execution::homes::pin(&args.state_dir.join("homes"))?;
     let grok_root = boss_host_execution::homes::pin(&boss_host_execution::homes::grok_root(&homes_root))?;
     // SAFETY: the process is still single-threaded here; the async runtime and
@@ -246,6 +268,10 @@ fn main() -> Result<()> {
     unsafe {
         std::env::set_var(boss_host_execution::homes::ROOT_ENV, &homes_root);
         std::env::set_var(boss_host_execution::homes::GROK_ROOT_ENV, &grok_root);
+        std::env::set_var(
+            boss_engine_driver::transcript_store::WORKER_TRANSCRIPTS_ROOT_ENV,
+            args.state_dir.join("transcripts"),
+        );
     }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -279,7 +305,9 @@ async fn serve(args: Args, homes_root: PathBuf) -> Result<()> {
         cube: cube.clone(),
         host_id: args.host_id.clone(),
     };
-    let executions = commands::JournalExecutions(Arc::clone(&journal));
+    let hook_path = args.state_dir.join("events.sock");
+    let hooks = boss_spoke_ingress::hooks::bind(&hook_path)?;
+    let executions = commands::JournalExecutions(Arc::clone(&journal), hook_path.clone(), args.event_bin.clone());
     let tmux = match boss_host_execution::worker::open_tmux(args.tmux_bin.as_deref(), args.state_dir.join("tmux.sock"))
     {
         Ok(tmux) => Some(tmux),
@@ -292,7 +320,7 @@ async fn serve(args: Args, homes_root: PathBuf) -> Result<()> {
     let supervisor = tmux.map(|tmux| boss_host_execution::worker::Supervisor {
         cube: cube.clone(),
         tmux,
-        store: commands::JournalExecutions(Arc::clone(&journal)),
+        store: commands::JournalExecutions(Arc::clone(&journal), hook_path, args.event_bin),
         host_id: args.host_id.clone(),
         homes_root,
         boot_id: boot.clone(),
@@ -303,6 +331,8 @@ async fn serve(args: Args, homes_root: PathBuf) -> Result<()> {
         result = commands::run(Arc::clone(&journal), executor, supervisor, stamp) => result,
         result = produce(&journal, &args.state_dir, &boot, tmux_ready) => result,
         result = commands::heartbeat(cube, executions) => result,
+        result = boss_spoke_ingress::hooks::serve(hooks, Arc::clone(&journal), stamp) => result,
+        result = boss_spoke_ingress::observe(Arc::clone(&journal), stamp) => result,
         result = tokio::signal::ctrl_c() => { result?; Ok(()) }
     }
 }
@@ -313,7 +343,9 @@ async fn produce(journal: &SharedJournal, root: &std::path::Path, boot: &str, tm
     loop {
         interval.tick().await;
         let observed = host::stamp(boot)?;
-        let mut journal = journal.lock().map_err(|_| anyhow::anyhow!("journal owner panicked"))?;
+        let mut journal = journal
+            .lock()
+            .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
         journal.compact(observed.wall_unix_ms)?;
         let failed_preflights = if tmux_ready {
             Vec::new()

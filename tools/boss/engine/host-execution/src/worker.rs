@@ -35,6 +35,7 @@ const SESSION_SCHEMA: &str = "1";
 const SESSION_SCHEMA_ENV: &str = "BOSS_SESSION_SCHEMA";
 const RUN_ID_ENV: &str = "BOSS_RUN_ID";
 const SPAWN_TOKEN_OPTION: &str = "@boss_spawn_token";
+pub const EVENT_SPOOL_ENV: &str = "BOSS_EVENT_SPOOL";
 const HOST_ENV_DENY: &[&str] = &[
     "BOSS_CODEX_HOMES_DIR",
     "BOSS_GROK_HOMES_DIR",
@@ -43,6 +44,7 @@ const HOST_ENV_DENY: &[&str] = &[
     "TMUX_TMPDIR",
     "BOSS_CONTROL_SOCKET",
     "BOSS_EVENTS_SOCKET",
+    EVENT_SPOOL_ENV,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,12 +113,31 @@ pub struct ExecutionRecord {
     pub reclaimed: bool,
     #[serde(default)]
     pub reclaim_error: Option<String>,
+    #[serde(default)]
+    pub observation: Option<ObservationConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservationConfig {
+    pub workspace: PathBuf,
+    pub pending: PathBuf,
+    pub file: Option<(boss_engine_driver::AgentJsonlFileIngress, Vec<PathBuf>)>,
+    pub pid_start: Option<u64>,
 }
 
 pub trait ExecutionStore: Send + Sync {
     fn load(&self, run_id: &str, spawn_token: &str) -> Result<Option<Vec<u8>>>;
     fn save(&self, run_id: &str, spawn_token: &str, bytes: &[u8]) -> Result<()>;
     fn assigned(&self) -> Result<Vec<Vec<u8>>>;
+    fn observation_paths(&self) -> Option<(PathBuf, PathBuf)> {
+        None
+    }
+    fn observations_drained(&self, _record: &ExecutionRecord) -> Result<bool> {
+        Ok(true)
+    }
+    fn prune_observation_sources(&self, _record: &ExecutionRecord) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(bon::Builder)]
@@ -246,6 +267,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             terminal: None,
             reclaimed: false,
             reclaim_error: None,
+            observation: None,
         };
         self.persist(&record)?;
         if interrupted {
@@ -287,12 +309,28 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         {
             return self.reject_unowned_home(command, record, reason);
         }
-        if !spawn.settings_json.is_empty() {
+        if !spawn.settings_json.is_empty() || self.store.observation_paths().is_some() {
             record.settings_file = Some(self.settings_path(&record.spawn_token));
+        }
+        let mut provisioned = spawn.clone();
+        if let Some((socket, forwarder)) = self.store.observation_paths() {
+            let config = boss_engine_driver::ProgressObservationConfig {
+                events_socket_path: socket,
+                forwarder_binary: forwarder,
+                lease_id: record.lease_id.clone(),
+                run_id: record.run_id.clone(),
+                workspace_path: workspace.clone(),
+            };
+            if let Err(error) = self.prepare_observation(&mut record, &mut provisioned, driver.as_ref(), config) {
+                record.phase = Phase::Terminal;
+                self.reclaim(&mut record);
+                self.persist(&record)?;
+                return Ok(outcome(command, ResultCode::Rejected, error.to_string(), None));
+            }
         }
         record.phase = Phase::Launching;
         self.persist(&record)?;
-        if let Err(error) = self.launch(&record, spawn, driver.as_ref(), &workspace).await {
+        if let Err(error) = self.launch(&record, &provisioned, driver.as_ref(), &workspace).await {
             return self.launch_failed(command, record, error).await;
         }
         let pane_id = self
@@ -309,6 +347,11 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             .filter(|pid: &u64| *pid > 0);
         record.pane_id = pane_id;
         record.pid = pid;
+        if let Some(observation) = &mut record.observation {
+            observation.pid_start = pid
+                .and_then(|pid| crate::process::process_snapshot(pid as i32).ok())
+                .map(|p| p.start);
+        }
         record.phase = Phase::Alive;
         self.persist(&record)?;
         let pane = self.wait_for_brief(&record).await;
@@ -347,6 +390,68 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             )),
             Some(_) => Ok(()),
         }
+    }
+
+    fn prepare_observation(
+        &self,
+        record: &mut ExecutionRecord,
+        spawn: &mut Spawn,
+        driver: &dyn boss_engine_driver::AgentDriver,
+        config: boss_engine_driver::ProgressObservationConfig,
+    ) -> Result<()> {
+        use boss_engine_driver::{HookWiringDestination, ProgressIngress, discovery};
+        use std::os::unix::fs::DirBuilderExt;
+        let pending = self
+            .homes_root
+            .join(format!("observations-{}", hex_token(&record.spawn_token)));
+        let file = match driver.progress_observation_wiring(&config) {
+            ProgressIngress::AgentJsonlFile(ingress) => {
+                let prepared = discovery::PreparedSource::new(ingress.clone()).map_err(anyhow::Error::msg)?;
+                Some((ingress, prepared.baseline.into_iter().collect()))
+            }
+            ProgressIngress::HookCallback(wiring) => {
+                ensure!(
+                    wiring.destination == HookWiringDestination::WorkerSettingsFile,
+                    "driver-owned hook installation requires provisioned worker policy"
+                );
+                let mut settings: serde_json::Value = if spawn.settings_json.is_empty() {
+                    serde_json::json!({})
+                } else {
+                    serde_json::from_slice(&spawn.settings_json)?
+                };
+                let hooks = settings
+                    .as_object_mut()
+                    .context("settings must be an object")?
+                    .entry("hooks")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+                    .context("hooks must be an object")?;
+                for (name, entries) in wiring.hooks {
+                    hooks
+                        .entry(name)
+                        .or_insert_with(|| serde_json::json!([]))
+                        .as_array_mut()
+                        .context("hook entries must be an array")?
+                        .extend(
+                            entries
+                                .as_array()
+                                .context("driver hook entries must be an array")?
+                                .clone(),
+                        );
+                }
+                spawn.settings_json = serde_json::to_vec(&settings)?;
+                None
+            }
+            ProgressIngress::StdoutJsonl => anyhow::bail!("pane driver cannot use stdout ingress"),
+        };
+        std::fs::DirBuilder::new().mode(0o700).create(&pending)?;
+        record.observation = Some(ObservationConfig {
+            workspace: config.workspace_path,
+            pending,
+            file,
+            pid_start: None,
+        });
+        Ok(())
     }
 
     /// Driver settings live beside the run's private homes, never in the
@@ -390,6 +495,9 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         environment.insert(TMUX_SPAWN_TOKEN_ENV.to_owned(), record.spawn_token.clone());
         environment.insert(SESSION_SCHEMA_ENV.to_owned(), SESSION_SCHEMA.to_owned());
         environment.insert(RUN_ID_ENV.to_owned(), record.execution_id.clone());
+        if let Some(observation) = &record.observation {
+            environment.insert(EVENT_SPOOL_ENV.into(), observation.pending.display().to_string());
+        }
         environment.insert(homes::ROOT_ENV.to_owned(), self.homes_root.display().to_string());
         self.tmux
             .new_session(&NewSession {
@@ -427,6 +535,12 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                 record.phase = Phase::Alive;
                 record.pane_id = (!pane.pane_id.is_empty()).then(|| pane.pane_id.clone());
                 record.pid = (pane.pid > 0).then_some(pane.pid);
+                if let Some(observation) = &mut record.observation {
+                    observation.pid_start = record
+                        .pid
+                        .and_then(|pid| crate::process::process_snapshot(pid as i32).ok())
+                        .map(|p| p.start);
+                }
                 self.persist(&record)?;
                 Ok(outcome(command, ResultCode::Ok, error.to_string(), Some(pane)))
             }
@@ -470,6 +584,12 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                         record.phase = Phase::Alive;
                         record.pane_id = (!pane.pane_id.is_empty()).then(|| pane.pane_id.clone());
                         record.pid = (pane.pid > 0).then_some(pane.pid);
+                        if let Some(observation) = &mut record.observation {
+                            observation.pid_start = record
+                                .pid
+                                .and_then(|pid| crate::process::process_snapshot(pid as i32).ok())
+                                .map(|p| p.start);
+                        }
                         self.persist(&record)?;
                         Ok(outcome(command, ResultCode::Ok, String::new(), Some(pane)))
                     }
@@ -927,7 +1047,27 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         if record.reclaimed {
             return;
         }
+        if record.observation.is_some() {
+            match self.store.observations_drained(record) {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(error) => {
+                    record.reclaim_error = Some(error.to_string());
+                    return;
+                }
+            }
+        }
         let mut errors = Vec::new();
+        if let Some(pending) = record.observation.as_ref().map(|o| o.pending.clone()) {
+            if let Err(error) = std::fs::remove_dir_all(&pending)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                errors.push(format!("observation directory: {error}"));
+            }
+            if let Err(error) = self.store.prune_observation_sources(record) {
+                errors.push(format!("observation sources: {error}"));
+            }
+        }
         if let Some(path) = &record.settings_file
             && let Err(error) = std::fs::remove_file(path)
             && error.kind() != std::io::ErrorKind::NotFound
@@ -1050,9 +1190,12 @@ mod tests {
     type StoredExecutions = HashMap<(String, String), Vec<u8>>;
 
     #[derive(Clone, Default)]
-    struct MemoryStore(Arc<Mutex<StoredExecutions>>);
+    struct MemoryStore(Arc<Mutex<StoredExecutions>>, Arc<std::sync::atomic::AtomicBool>);
 
     impl ExecutionStore for MemoryStore {
+        fn observations_drained(&self, _record: &ExecutionRecord) -> Result<bool> {
+            Ok(self.1.load(std::sync::atomic::Ordering::SeqCst))
+        }
         fn load(&self, run_id: &str, spawn_token: &str) -> Result<Option<Vec<u8>>> {
             Ok(self
                 .0
@@ -1368,6 +1511,7 @@ mod tests {
             terminal: None,
             reclaimed: false,
             reclaim_error: None,
+            observation: None,
         };
         store
             .save(
@@ -1376,6 +1520,57 @@ mod tests {
                 &serde_json::to_vec(&record).unwrap(),
             )
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn observation_wiring_preserves_policy_and_retains_home_until_durable_drain() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let supervisor = supervisor(root.path(), Arc::new(FakeTmux::default())).await;
+        seed(&supervisor.store, Phase::Alive);
+        let mut record = stored(&supervisor.store);
+        record.spawn_token = "observation-token".into();
+        record.home = Some(run_home("observation-home"));
+        let original = json!({"matcher":"Bash", "hooks":[{"type":"command", "command":"policy-guard"}]});
+        let mut spawn = Spawn {
+            settings_json: serde_json::to_vec(&json!({"hooks":{"PreToolUse":[original.clone()]}})).unwrap(),
+            ..Default::default()
+        };
+        supervisor
+            .prepare_observation(
+                &mut record,
+                &mut spawn,
+                &boss_engine_driver::ClaudeDriver,
+                boss_engine_driver::ProgressObservationConfig {
+                    events_socket_path: root.path().join("events.sock"),
+                    forwarder_binary: "/test/boss-event".into(),
+                    lease_id: "lease".into(),
+                    run_id: "run-test".into(),
+                    workspace_path: root.path().into(),
+                },
+            )
+            .unwrap();
+        let settings: Value = serde_json::from_slice(&spawn.settings_json).unwrap();
+        assert_eq!(settings["hooks"]["PreToolUse"][0], original);
+        assert!(settings["hooks"]["PreToolUse"].as_array().unwrap().len() > 1);
+        assert!(settings["hooks"]["Stop"].to_string().contains("/test/boss-event"));
+        let observation = record.observation.as_ref().unwrap();
+        assert!(observation.file.is_none());
+        assert_eq!(
+            std::fs::metadata(&observation.pending).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        record.phase = Phase::Terminal;
+        let pending = observation.pending.clone();
+        supervisor.reclaim(&mut record);
+        assert!(!record.reclaimed);
+        assert!(record.home.as_ref().unwrap().exists());
+        assert!(pending.exists());
+        supervisor.store.1.store(true, std::sync::atomic::Ordering::SeqCst);
+        supervisor.reclaim(&mut record);
+        assert!(record.reclaimed);
+        assert!(!record.home.as_ref().unwrap().exists());
+        assert!(!pending.exists());
     }
 
     #[tokio::test]

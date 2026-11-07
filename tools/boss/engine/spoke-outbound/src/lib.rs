@@ -205,7 +205,7 @@ mod session {
         let mut hello = hello(&*locked(journal)?, &stamp()?.boot_id, nonce)?;
         let mut selected_contracts = contracts();
         if external_executor {
-            for name in ["workspace", "execution"] {
+            for name in ["workspace", "execution", "worker-event", "transcript-delta"] {
                 selected_contracts.features.push(v1::Feature {
                     name: name.into(),
                     revision: 1,
@@ -486,7 +486,9 @@ pub async fn run_with_executor(
 }
 
 pub(crate) fn locked(journal: &SharedJournal) -> Result<std::sync::MutexGuard<'_, Journal>> {
-    journal.lock().map_err(|_| anyhow::anyhow!("journal owner panicked"))
+    journal
+        .lock()
+        .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))
 }
 
 pub(crate) fn network(error: impl std::fmt::Display) -> anyhow::Error {

@@ -1,12 +1,12 @@
-# Workspace-capable spoke
+# Worker observation spoke
 
 `boss-spoke` owns a private SQLite WAL journal and initiates one mTLS gRPC
 stream. It samples capacity every five seconds even while disconnected, journals
 before sending, and replays original encoded records from the hub's durable
 receipt. Restart preserves its journal identity and sequence; reboot changes the
-OS boot identity. It advertises `journal/1` and `workspace/1`; capacity still has
-zero worker slots. Workspace commands execute through the shared host executor.
-Other commands receive durable receipts and explicit rejected results.
+OS boot identity. It advertises `journal/1`, `workspace/1`, `execution/1`,
+`worker-event/1` and `transcript-delta/1`; capacity still has zero worker slots.
+Workspace and worker commands execute through the shared host executor.
 
 This ships inert: neither installation nor production hub dispatch is wired.
 An administrator with a compatible test hub and provisioned client credentials
@@ -57,12 +57,39 @@ PR positioning saves its pointer snapshot in the command journal before goto;
 restart restores those pointers before returning the interrupted result.
 Pre-effect authorization refusals and failed reads return rejected results.
 
-Journal schema 3 adds durable pointer snapshots and the last negotiated result
+Journal schema 3 added durable pointer snapshots and the last negotiated result
 bound. Result admission measures the encoded record with envelope overhead and
 replaces an oversized payload with a bounded diagnostic. Reads are rejected;
 operations that may have changed the host report uncertainty. A later negotiation
 too small for retained records or pending command identities is retried without
-discarding evidence. Older journal readers refuse schema 3.
+discarding evidence. Schema 4 added execution ownership; schema 5 adds producer
+receipts and transcript checkpoints. Older readers refuse newer schemas.
+
+The daemon binds an owner-only `events.sock` inside its state directory. It
+authenticates hook peers by OS user, process ancestry, boot identity and the
+registered worker's process start time. Payload run IDs only check consistency.
+`--event-bin` selects the installed `boss-event` forwarder (default `boss-event`).
+Claude settings receive the forwarder hooks; Codex uses its correlated rollout
+file as the authoritative progress feed. Drivers requiring driver-owned policy
+installation are rejected until that policy is provisioned.
+
+Each run has a private pending directory beside its worker home. The shim saves
+producer identity, sequence and payload before connecting and removes a payload
+only after an explicit durable receipt. The daemon independently drains these
+directories on startup and while offline; no later hook is needed. Duplicate
+delivery is accepted only when its original payload digest matches. Each pending
+directory is bounded at 64 MiB; exhaustion retains earlier events and fails the
+new hook explicitly.
+
+Transcript discovery and normalizers are shared with local execution. Raw chunks
+are at most 64 KiB and retain generation, byte offset, checksum and EOF. Their
+source cursor and file normalizer state commit atomically with journal records.
+Rotation or truncation starts a new generation and records an explicit gap for
+any unavailable suffix. Bulk admission and outstanding byte credit pause reads
+without advancing the cursor; lifecycle hooks retain their reserved allowance.
+Stop carries the observed transcript watermark even while bulk admission is
+paused. Worker homes cannot be reclaimed until pending events and transcript
+bytes are durable. Hub projection remains a separate journal consumer.
 
 `--cube-bin` selects the host's cube executable (default `cube`). Commands cannot
 select an executable or filesystem path. Workspace IDs resolve through cube's
