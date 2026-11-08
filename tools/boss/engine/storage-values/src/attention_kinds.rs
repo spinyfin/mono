@@ -200,9 +200,16 @@ pub const PRESERVED_WORK_ARCHIVED_ATTENTION_KIND: &str = "preserved_work_archive
 /// workspace work and the existing preserved bookmark (or recorded tip) cannot
 /// be combined; no lease boundary was confirmed for an inferred release; no tip
 /// was journaled at the boundary; unpublished registered work in a free
-/// workspace is absent from the boundary tip; or the boundary change was
-/// rewritten afterwards. The lease is still released; nothing is deleted. A
-/// human inspects the item, which can name both tips, one tip, or none.
+/// workspace is absent from the boundary tip; the boundary change was
+/// rewritten afterwards; a lease-boundary journal walk exhausted its
+/// operation-view budget; snapshotting a free workspace hid the boundary
+/// commit; or the boundary commit is still a reassigned workspace's
+/// working-copy commit. The lease is still released; nothing is deleted. A
+/// human inspects the item, which can name both tips, one tip, or none. A
+/// change rejected as unsafe (including an otherwise-kept existing bookmark
+/// that contains one) is retained only under inspection-only
+/// `preserved-archive/<exec>/unsafe/<change>/<commit>` references, which are
+/// never restored automatically.
 pub const PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND: &str = "preserved_work_needs_inspection";
 
 pub const REVISION_CHAIN_RECOVERY_BLOCKED_ATTENTION_KIND: &str = "revision_chain_recovery_blocked";

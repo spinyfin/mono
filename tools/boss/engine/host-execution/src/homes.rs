@@ -86,6 +86,10 @@ mod tests {
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
         assert!(preflight(Some(&root)).unwrap_err().to_string().contains("owner-only"));
+        // Default `mkdir` mode on Linux CI (umask 022) is 0755, not 0777.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(preflight(Some(&root)).unwrap_err().to_string().contains("owner-only"));
+        assert!(pin(&root).unwrap_err().to_string().contains("owner-only"));
         fs::set_permissions(&root, fs::Permissions::from_mode(0o500)).unwrap();
         assert!(preflight(Some(&root)).unwrap_err().to_string().contains("writable"));
     }

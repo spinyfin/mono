@@ -22,6 +22,8 @@ mod preserved;
 #[cfg(test)]
 mod preserved_retry_tests;
 #[cfg(test)]
+mod preserved_safety_tests;
+#[cfg(test)]
 mod preserved_tests;
 pub use preserved::{
     BoundaryOwnership, HostRecoveryRequest, PreserveInspect, PreserveOutcome, PreservedTip, WorkspaceTipSource,

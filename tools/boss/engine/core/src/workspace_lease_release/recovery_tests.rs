@@ -905,9 +905,34 @@ async fn leftover_sweep_never_adopts_an_allow_dirty_successors_edits() {
     for successor_ran_jj in [true, false] {
         let (dir, db) = open_db();
         let repo = JjRepo::new(dir.path());
+        // Only the worker's edits are unpublished; trunk is already upstream.
+        JjRepo::run(&repo.repo, &["git", "export"]);
+        JjRepo::run(
+            &repo.repo,
+            &[
+                "git",
+                "remote",
+                "add",
+                "origin",
+                repo.repo.join(".jj/repo/store/git").to_str().unwrap(),
+            ],
+        );
+        JjRepo::run(&repo.repo, &["git", "fetch"]);
         let execution = orphaned_worker(&db, &repo).await;
         std::fs::write(repo.worker.join("ours"), "original worker").unwrap();
         JjRepo::run(&repo.worker, &["status"]);
+        let original = JjRepo::run(
+            &repo.worker,
+            &[
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-r",
+                "@",
+                "-T",
+                "commit_id",
+            ],
+        );
         db.confirm_workspace_lease(
             &execution.id,
             "lease",
@@ -932,25 +957,31 @@ async fn leftover_sweep_never_adopts_an_allow_dirty_successors_edits() {
             !preserved.contains("theirs"),
             "ran_jj={successor_ran_jj}: the successor's edits were bookmarked: {preserved}"
         );
-        if let Some(tip) = db.preserved_tip(&execution.id).unwrap() {
-            let files = JjRepo::run(&repo.repo, &["file", "list", "-r", &tip.commit_id]);
-            assert!(!files.contains("theirs"), "ran_jj={successor_ran_jj}: {files}");
-        }
-        // The claim counter moved, so the workspace belongs to the successor
-        // and is never snapshotted. Inspection is raised only when the
-        // successor's own jj command rewrote the boundary change, so the
-        // worker's last change could not be bookmarked.
-        assert_eq!(
+        assert!(preserved.is_empty());
+        assert!(db.preserved_tip(&execution.id).unwrap().is_none());
+        // A rewrite and a still-pending boundary are both unsafe to restore.
+        assert!(
             open_kinds(&db, &execution.id).contains(&"preserved_work_needs_inspection".to_owned()),
-            successor_ran_jj,
             "ran_jj={successor_ran_jj}"
         );
+        let items = db.list_attention_items(&execution.id).unwrap();
+        let item = items
+            .iter()
+            .find(|item| item.kind == "preserved_work_needs_inspection")
+            .unwrap();
+        assert!(item.body_markdown.contains(original.trim()), "{item:?}");
+        JjRepo::run(&repo.worker, &["new", "main"]);
+        let record = db.execution_bookmark(&execution.id).unwrap();
+        let restored = execution_bookmark::restore_preserved(&LocalJj, &record, &repo.worker, None)
+            .await
+            .unwrap();
+        assert!(restored.is_none());
+        assert!(!repo.worker.join("theirs").exists());
     }
 }
 
-/// Snapshot pending edits on the boundary change onto its unique visible
-/// successor and inspect both commits; snapshot and report pending work on a
-/// later registered change.
+/// Snapshot pending boundary edits for inspection without preserving their
+/// unproven successor; report pending work on a later registered change.
 #[tokio::test]
 async fn leftover_sweep_snapshots_boundary_edits_for_inspection_and_reports_later_changes() {
     use boss_engine_test_git::jj::JjRepo;
@@ -960,6 +991,18 @@ async fn leftover_sweep_snapshots_boundary_edits_for_inspection_and_reports_late
         let execution = orphaned_worker(&db, &repo).await;
         std::fs::write(repo.worker.join("ours"), "original worker").unwrap();
         JjRepo::run(&repo.worker, &["status"]);
+        let original = JjRepo::run(
+            &repo.worker,
+            &[
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-r",
+                "@",
+                "-T",
+                "commit_id",
+            ],
+        );
         db.confirm_workspace_lease(
             &execution.id,
             "lease",
@@ -981,32 +1024,40 @@ async fn leftover_sweep_snapshots_boundary_edits_for_inspection_and_reports_late
         .await;
         assert_eq!(outcome.released, 1, "{action}: {outcome:?}");
         if action == "edit" {
-            let saved = db.preserved_tip(&execution.id).unwrap().unwrap();
-            let visible = JjRepo::run(
-                &repo.repo,
+            assert!(db.preserved_tip(&execution.id).unwrap().is_none());
+            assert!(preserved_files(&repo, &execution).is_empty());
+            assert!(
+                open_kinds(&db, &execution.id).contains(&"preserved_work_needs_inspection".to_owned()),
+                "pending boundary edits must be inspected"
+            );
+            let live = JjRepo::run(
+                &repo.worker,
                 &[
                     "--ignore-working-copy",
                     "log",
                     "--no-graph",
                     "-r",
-                    &saved.change_id,
+                    "@",
                     "-T",
-                    "commit_id ++ \"\\n\"",
+                    "commit_id",
                 ],
             );
-            assert_eq!(
-                visible.trim(),
-                saved.commit_id,
-                "the boundary must have one visible variant"
-            );
-            assert_eq!(
-                JjRepo::run(&repo.repo, &["file", "show", "-r", &saved.commit_id, "root:ours"]),
-                "edited after the boundary"
-            );
+            let items = db.list_attention_items(&execution.id).unwrap();
+            let item = items
+                .iter()
+                .find(|item| item.kind == "preserved_work_needs_inspection")
+                .unwrap();
+            assert!(item.body_markdown.contains(original.trim()), "{item:?}");
+            assert!(item.body_markdown.contains(live.trim()), "{item:?}");
+            JjRepo::run(&repo.worker, &["new", "main"]);
+            let record = db.execution_bookmark(&execution.id).unwrap();
             assert!(
-                open_kinds(&db, &execution.id).contains(&"preserved_work_needs_inspection".to_owned()),
-                "pending boundary edits must be inspected"
+                execution_bookmark::restore_preserved(&LocalJj, &record, &repo.worker, None)
+                    .await
+                    .unwrap()
+                    .is_none()
             );
+            assert!(!repo.worker.join("ours").exists());
             continue;
         }
         assert!(

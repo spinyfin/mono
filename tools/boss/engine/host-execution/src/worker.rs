@@ -1045,6 +1045,7 @@ mod tests {
     use serde_json::{Value, json};
     use std::collections::HashMap;
     use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Mutex};
 
     type StoredExecutions = HashMap<(String, String), Vec<u8>>;
@@ -1317,7 +1318,27 @@ mod tests {
     /// environment (which other tests in this binary share).
     fn shared_homes() -> &'static Path {
         static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-        ROOT.get_or_init(|| homes::pin(&homes::process_root()).unwrap())
+        ROOT.get_or_init(|| {
+            let root = homes::process_root();
+            // `pin` creates a 0700 leaf only when the path is missing. The
+            // hermetic wrapper's TMPDIR is 0755, and a sibling `create_dir_all`
+            // or leftover temp-backed root can leave `process_root()` already
+            // present and too open — Linux CI then panics here.
+            if let Ok(meta) = std::fs::symlink_metadata(&root)
+                && meta.is_dir()
+            {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o700);
+                std::fs::set_permissions(&root, perms).unwrap();
+            }
+            homes::pin(&root).unwrap()
+        })
+    }
+
+    #[test]
+    fn shared_homes_root_is_owner_only() {
+        let mode = std::fs::symlink_metadata(shared_homes()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
     async fn supervisor(root: &Path, fake: Arc<FakeTmux>) -> Supervisor<ListingCube, MemoryStore> {
