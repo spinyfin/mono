@@ -621,6 +621,7 @@ mod t32;
 mod t33;
 mod t34;
 mod tmux_pane_observation_tests;
+mod unpark_reconcile_tests;
 mod updated_reply_projections;
 mod work_item_tags_tests;
 mod work_item_write_tests;

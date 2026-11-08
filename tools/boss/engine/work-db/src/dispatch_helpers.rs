@@ -688,6 +688,12 @@ pub fn reconcile_work_item_execution(
                 // scoped to the `Cancelled` case only — a completed or
                 // failed revision has no uncommitted edits worth reclaiming.
                 insert_fresh(result, Some(&execution))?;
+            } else if execution.kind == kind && parking_reconcile::cancelled_by_park(conn, &execution)? {
+                // A park cancelled this row's never-started execution and the
+                // owner has since un-parked it: that cancel was the park's
+                // doing, not a decision about the work, so the row is minted
+                // afresh exactly as one that had never had an execution.
+                insert_fresh(result, Some(&execution))?;
             }
         }
         None => insert_fresh(result, None)?,

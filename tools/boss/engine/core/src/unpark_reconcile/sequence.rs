@@ -8,7 +8,7 @@ use boss_engine_merge_poller::{MergeProbe, SweepHost, SweepOutcome, reconcile_on
 use boss_execution_contracts::{CubeClient, ExecutionPublisher};
 use boss_observation_contracts::CompletionRequests;
 use boss_protocol::{TaskKind, TaskStatus};
-use boss_work_db::parking_reconcile::{HaltStamp, UnparkReport, UnparkedRow};
+use boss_work_db::parking_reconcile::{HaltStamp, KeptHold, UnparkReport, UnparkedRow};
 
 use crate::completion::reconcile_audit::append_parking_audit;
 use crate::coordinator::ExecutionCoordinator;
@@ -127,7 +127,10 @@ pub enum GithubAccess {
     Allowed,
     /// The job is out of GitHub quota headroom: steps 3 and 4 are recorded as
     /// skipped and left to the merge poller's ordinary sweep.
-    Deferred { remaining: i64, reserve: i64 },
+    Deferred {
+        remaining: i64,
+        reserve: i64,
+    },
 }
 
 /// The GitHub quota the engine last saw. A trait so the job's rate limiting can
@@ -192,7 +195,12 @@ pub(super) async fn emit(env: &UnparkEnv, key: &str, kind: StepKind, details: se
 async fn leave_trace(env: &UnparkEnv, work_item_id: &str, record: &StepRecord) {
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
     if let Err(err) = append_parking_audit(&env.work_db, work_item_id, now, record.step.name(), &record.detail) {
-        tracing::warn!(work_item_id, step = record.step.name(), ?err, "unpark: audit line not written");
+        tracing::warn!(
+            work_item_id,
+            step = record.step.name(),
+            ?err,
+            "unpark: audit line not written"
+        );
     }
     emit(
         env,
@@ -228,11 +236,7 @@ pub async fn record_released_rows(env: &UnparkEnv, actor: &str, report: &UnparkR
 }
 
 fn halt_stamp_record(row: &UnparkedRow) -> StepRecord {
-    let hold = row
-        .kept_hold
-        .as_deref()
-        .map(|hold| format!("; kept the `{hold}` hold, which a human or a progression agent resolves"))
-        .unwrap_or_default();
+    let hold = row.kept_hold.as_ref().map(kept_hold_clause).unwrap_or_default();
     match &row.halt_stamp {
         HaltStamp::Cleared { reason } => StepRecord::ok(
             Step::ClearHaltStamps,
@@ -248,6 +252,23 @@ fn halt_stamp_record(row: &UnparkedRow) -> StepRecord {
             Step::ClearHaltStamps,
             "nothing_to_clear",
             format!("no dispatch-failure stamp to clear{hold}"),
+        ),
+    }
+}
+
+/// The audit-line clause naming the blocked state step 2 preserved and who
+/// resolves it.
+fn kept_hold_clause(hold: &KeptHold) -> String {
+    match hold {
+        KeptHold::OperatorQuestion => {
+            "; kept `awaiting_operator_answer`, because a question is already in front of the owner".to_owned()
+        }
+        KeptHold::OperatorRefusal => {
+            "; kept `worker_failed`, because the owner refused this work and only the owner reverses that".to_owned()
+        }
+        KeptHold::FailureEvidence { basis } => format!(
+            "; kept `worker_failed` (recorded as `{}`) as failure evidence, which progression clears",
+            basis.as_deref().unwrap_or("unknown")
         ),
     }
 }
@@ -325,7 +346,10 @@ async fn pr_steps(env: &UnparkEnv, task: &Task, github: GithubAccess, outcome: &
             .map(|step| StepRecord::skipped(step, code, detail.clone()))
     };
     let skipped = match (task.kind == TaskKind::Revision, pr_url, task.status.clone(), github) {
-        (true, ..) => Some(skip("follows_parent", "a revision follows its parent's PR; the parent's pass covers it".into())),
+        (true, ..) => Some(skip(
+            "follows_parent",
+            "a revision follows its parent's PR; the parent's pass covers it".into(),
+        )),
         (_, None, ..) => Some(skip("no_pr", "no PR is bound to this item; nothing to refresh".into())),
         (_, Some(_), status, _) if !matches!(status, TaskStatus::InReview | TaskStatus::Blocked) => Some(skip(
             "no_open_pr_lifecycle",
@@ -353,6 +377,23 @@ async fn pr_steps(env: &UnparkEnv, task: &Task, github: GithubAccess, outcome: &
     // now asking the engine to look at again.
     let budget = prepare_ci_budget(env, task, pr_url);
 
+    // What was already running before the probe. The sweep counts a conflict or
+    // red CI it finds again as "flagged" whether or not it started anything, so
+    // the attempt rows are what tell a fix this probe routed from one already
+    // under way.
+    let conflict_before = env
+        .work_db
+        .active_conflict_resolution_for_work_item(&task.id)
+        .ok()
+        .flatten()
+        .is_some();
+    let ci_before = env
+        .work_db
+        .active_ci_remediation_for_work_item(&task.id)
+        .ok()
+        .flatten()
+        .is_some();
+
     let (sweep, tier) = reconcile_one(
         &env.work_db,
         env.probe.as_ref(),
@@ -378,7 +419,26 @@ async fn pr_steps(env: &UnparkEnv, task: &Task, github: GithubAccess, outcome: &
         }
         return;
     }
-    let conflict = if sweep.conflict_flagged > 0 {
+    let conflict_now = env
+        .work_db
+        .active_conflict_resolution_for_work_item(&task.id)
+        .ok()
+        .flatten()
+        .is_some();
+    let ci_now = env
+        .work_db
+        .active_ci_remediation_for_work_item(&task.id)
+        .ok()
+        .flatten()
+        .is_some();
+    let conflict_first = sweep.conflict_flagged > 0 || conflict_now;
+    let conflict = if conflict_before && conflict_first {
+        StepRecord::ok(
+            Step::ConflictProbe,
+            "conflict_in_flight",
+            "the PR conflicts with its base and a conflict-resolution attempt is already running for it",
+        )
+    } else if conflict_first {
         StepRecord::ok(
             Step::ConflictProbe,
             "conflict_routed",
@@ -387,7 +447,22 @@ async fn pr_steps(env: &UnparkEnv, task: &Task, github: GithubAccess, outcome: &
     } else {
         StepRecord::ok(Step::ConflictProbe, "clear", "the PR has no merge conflict")
     };
-    let ci = if sweep.ci_flagged > 0 {
+    let ci_red = sweep.ci_flagged > 0 || ci_now;
+    let ci = if conflict_first {
+        // A conflict is resolved before CI is looked at: the probe does not
+        // route red checks while the PR cannot merge.
+        StepRecord::skipped(
+            Step::CiProbe,
+            "conflict_first",
+            "the PR conflicts with its base; conflict resolution runs before CI is examined",
+        )
+    } else if ci_red && ci_before {
+        StepRecord::ok(
+            Step::CiProbe,
+            "ci_in_flight",
+            format!("required checks are red and a CI-fix attempt is already running for the PR ({budget})"),
+        )
+    } else if ci_red {
         StepRecord::ok(
             Step::CiProbe,
             "ci_remediation_routed",
@@ -402,9 +477,9 @@ async fn pr_steps(env: &UnparkEnv, task: &Task, github: GithubAccess, outcome: &
     };
     push(env, outcome, conflict).await;
     push(env, outcome, ci).await;
-    let routed = sweep.conflict_flagged > 0 || sweep.ci_flagged > 0;
+    let fix_in_flight = conflict_first || ci_red;
     let in_review = after.as_ref().is_some_and(|task| task.status == TaskStatus::InReview);
-    let record = if routed || !in_review {
+    let record = if fix_in_flight || !in_review {
         StepRecord::skipped(
             Step::AiReview,
             "fix_in_flight",
@@ -519,7 +594,10 @@ async fn ai_review_step(env: &UnparkEnv, task: &Task, pr_url: &str) -> StepRecor
             StepRecord::ok(
                 Step::AiReview,
                 "scheduled",
-                format!("scheduled an automated review of the current head (execution {})", execution.id),
+                format!(
+                    "scheduled an automated review of the current head (execution {})",
+                    execution.id
+                ),
             )
         }
         Err(err) => StepRecord::error(Step::AiReview, "admission_refused", err),
@@ -557,9 +635,14 @@ async fn batch_review(env: &UnparkEnv, task: &Task, pr_url: &str) -> StepRecord 
                 format!("admitted an automated review batch for the current head ({})", batch.id),
             )
         }
-        Ok(crate::work::ReviewBatchDispatch::ExistingBatch { .. } | crate::work::ReviewBatchDispatch::LegacyExecution(_)) => {
-            StepRecord::ok(Step::AiReview, "in_flight", "an automated review of this head is already in flight")
-        }
+        Ok(
+            crate::work::ReviewBatchDispatch::ExistingBatch { .. }
+            | crate::work::ReviewBatchDispatch::LegacyExecution(_),
+        ) => StepRecord::ok(
+            Step::AiReview,
+            "in_flight",
+            "an automated review of this head is already in flight",
+        ),
         Ok(crate::work::ReviewBatchDispatch::AlreadyReviewed) => StepRecord::ok(
             Step::AiReview,
             "current",
@@ -589,7 +672,9 @@ async fn reconcile_execution_step(env: &UnparkEnv, task: &Task) -> StepRecord {
         return StepRecord::skipped(
             step,
             "held",
-            format!("the item is held as `{hold}`; it is not redispatched, and the progression sweep takes it from here"),
+            format!(
+                "the item is held as `{hold}`; it is not redispatched, and the progression sweep takes it from here"
+            ),
         );
     }
     match task.status {
@@ -641,7 +726,11 @@ async fn orphan_redispatch(env: &UnparkEnv, task: &Task) -> StepRecord {
     )
     .await;
     if pass.redispatched > 0 {
-        StepRecord::ok(step, "redispatched", "no worker was running; a fresh execution was queued")
+        StepRecord::ok(
+            step,
+            "redispatched",
+            "no worker was running; a fresh execution was queued",
+        )
     } else if pass.churn_skipped > 0 {
         StepRecord::skipped(
             step,
@@ -649,15 +738,31 @@ async fn orphan_redispatch(env: &UnparkEnv, task: &Task) -> StepRecord {
             "the churn guard tripped on executions since the un-park, so the item was returned to Backlog",
         )
     } else if pass.dispatch_paused_skipped > 0 {
-        StepRecord::skipped(step, "dispatch_paused", "dispatch is paused; the orphan sweep redispatches it on resume")
+        StepRecord::skipped(
+            step,
+            "dispatch_paused",
+            "dispatch is paused; the orphan sweep redispatches it on resume",
+        )
     } else if pass.live_execution_skipped + pass.running_reviewer_skipped + pass.live_process_skipped > 0 {
         StepRecord::ok(step, "live_worker", "a worker is already running for this item")
     } else if pass.deliberate_park_skipped > 0 {
-        StepRecord::skipped(step, "held", "the item's last run ended in a deliberate park; it is not redispatched")
+        StepRecord::skipped(
+            step,
+            "held",
+            "the item's last run ended in a deliberate park; it is not redispatched",
+        )
     } else if pass.admission_unknown_skipped > 0 {
-        StepRecord::error(step, "admission_unknown", "the item's dispatch admission could not be read")
+        StepRecord::error(
+            step,
+            "admission_unknown",
+            "the item's dispatch admission could not be read",
+        )
     } else {
-        StepRecord::ok(step, "not_orphaned", "the item is not an orphan: it already has an execution")
+        StepRecord::ok(
+            step,
+            "not_orphaned",
+            "the item is not an orphan: it already has an execution",
+        )
     }
 }
 

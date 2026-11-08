@@ -23,10 +23,10 @@
 //! | # | Step (`details.step`) | Reuses |
 //! |---|---|---|
 //! | 1 | `clear_park` | the un-park write and its ledger row |
-//! | 2 | `clear_halt_stamps` | stale `dispatch_failed_*` cleared; operator-question and worker-failed holds kept |
+//! | 2 | `clear_halt_stamps` | stale `dispatch_failed_*` cleared; operator-question and worker-failed holds kept (an operator refusal as a human hold, any other worker failure as evidence for progression) |
 //! | 3 | `refresh_pr` | the merge poller's targeted reconcile (`boss_engine_merge_poller::reconcile_one`): one live probe, and merged / closed PRs take their ordinary path to `done` |
 //! | 4 | `conflict_probe`, `ci_probe`, `ai_review` | the same reconcile's conflict and CI paths, with the CI attempt budget reset first; the AI review admission that `bossctl review start` uses |
-//! | 5 | `reconcile_execution` | [`WorkDb::reconcile_item_execution`] for `todo` / `blocked`; the orphan sweep's re-dispatch for `active`, with the churn guard counting only from the un-park |
+//! | 5 | `reconcile_execution` | [`WorkDb::reconcile_item_execution`] for `todo` / `blocked` (a never-started execution the park cancelled counts as absent, so a fresh one is minted); the orphan sweep's re-dispatch for `active`, with the churn guard counting only from the un-park |
 //! | 6 | `revisions` | the same reconcile for the item's open revisions, so they re-enter per-PR chain serialization |
 //! | 7 | `progression_grace` | stamps `tasks.progression_grace_waived_at` |
 //!
@@ -50,9 +50,11 @@
 //! - **It is idempotent.** Re-running it on an item that is already un-parked
 //!   performs steps 3 to 7 only (steps 1 and 2 have nothing to clear), and each
 //!   probe is a no-op when its signal is clear.
-//! - **Holds are not overridden.** `blocked: awaiting_operator_answer` and
-//!   `blocked: worker_failed` stay as the evidence a human or a progression
-//!   agent resolves; step 5 never redispatches them.
+//! - **Holds are not overridden.** `blocked: awaiting_operator_answer` stays
+//!   because a question is already in front of the owner, and `blocked:
+//!   worker_failed` stays as the evidence a human (when the ledger basis is the
+//!   owner's `operator_no`) or a progression agent resolves. Step 5 never
+//!   redispatches either, and step 7 flags both for progression.
 //! - **It never fights live work.** Step 5 for an `active` item goes through the
 //!   orphan sweep, whose liveness guards refuse to put a second worker on a row
 //!   whose previous worker still runs.

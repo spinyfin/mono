@@ -184,7 +184,7 @@ impl UnparkReconciler {
             summary.completed = index + 1;
             summary.outcomes.push(outcome);
             let every = self.limits.progress_every.max(1);
-            if summary.completed % every == 0 && summary.completed < total {
+            if summary.completed.is_multiple_of(every) && summary.completed < total {
                 self.progress(env, &job, &summary, "running").await;
             }
         }
@@ -280,7 +280,12 @@ impl Pacer {
             .await;
             let deadline = Instant::now() + limits.quota_max_wait;
             while low(env.gh_budget.graphql_remaining()).is_some() && Instant::now() < deadline {
-                tokio::time::sleep(limits.quota_poll.min(deadline.saturating_duration_since(Instant::now()))).await;
+                tokio::time::sleep(
+                    limits
+                        .quota_poll
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                )
+                .await;
             }
         }
         match low(env.gh_budget.graphql_remaining()) {

@@ -10,17 +10,28 @@
 //! - **Step 2, clear stale halt stamps.** A `churn_guard` or dispatch-failure
 //!   stamp (`dispatch_failed_reason` / `_error` / `_at`) that predates the park
 //!   says nothing about now, so un-parking clears it in the same transaction
-//!   that clears the park. Three holds are deliberately left alone, because
-//!   they record a decision a human has not yet made:
-//!   `blocked: awaiting_operator_answer`, `blocked: worker_failed` (whatever
-//!   produced it) and a `deliberate_park` stamp. They stay as evidence until a
-//!   progression agent or the owner resolves them, and step 5 never redispatches
-//!   them (`task_accepts_execution` refuses both blocked reasons). A stamp
-//!   written *after* the park (an in-flight run that finished failing while the
-//!   row was parked) is newer evidence and is kept too.
+//!   that clears the park. Holds are deliberately left alone, because they
+//!   record a decision a human has not yet made, or evidence a progression
+//!   agent has not yet read: `blocked: awaiting_operator_answer` (a question is
+//!   already in front of the human), `blocked: worker_failed` and a
+//!   `deliberate_park` stamp. A `worker_failed` row the owner refused (ledger
+//!   basis `operator_no`) is a recorded decision, a [`KeptHold::OperatorRefusal`];
+//!   every other producer's `worker_failed` is [`KeptHold::FailureEvidence`],
+//!   retained until progression clears it. Step 5 never redispatches either
+//!   (`task_accepts_execution` refuses both blocked reasons), and step 7 flags
+//!   them for progression. A stamp written *after* the park (an in-flight run
+//!   that finished failing while the row was parked) is newer evidence and is
+//!   kept too.
 //! - **Step 5, per-item execution reconcile.** [`WorkDb::reconcile_item_execution`]
 //!   runs exactly the code the board's ordinary invalidation reconcile runs, for
-//!   one item (or the one project chain it belongs to).
+//!   one item (or the one project chain it belongs to). A park cancels the
+//!   item's never-started executions, and the ordinary reconcile never mints
+//!   over a cancelled latest execution (an operator's cancel is a decision), so
+//!   [`cancelled_by_park`] tells the reconcile which cancelled row was the
+//!   park's doing: one cancelled while the item was parked is as good as absent
+//!   once the item is un-parked, and is minted afresh "exactly as for a fresh
+//!   row". An `active` row is left to the orphan sweep, which has the churn
+//!   guard.
 //! - **Step 7, the progression grace stamp.** `tasks.progression_grace_waived_at`
 //!   marks an item whose stuck-age grace period the progression sweep must skip
 //!   once. This entry only writes it; the sweep that consumes it is a later
@@ -52,6 +63,36 @@ pub enum HaltStamp {
     Kept { reason: String, why: &'static str },
 }
 
+/// A blocked state step 2 preserved across the un-park, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeptHold {
+    /// `blocked: awaiting_operator_answer`: a question is already in front of
+    /// the human, so nothing about the un-park answers it.
+    OperatorQuestion,
+    /// `blocked: worker_failed` whose ledger basis is `operator_no`: the owner
+    /// refused the work, a recorded decision that stays a human hold.
+    OperatorRefusal,
+    /// `blocked: worker_failed` from any other producer (a declared blocker, the
+    /// nudge breaker, a PR-binding guard, delivery without a PR). Not a human
+    /// decision: the failure evidence is retained until progression clears it.
+    FailureEvidence { basis: Option<String> },
+}
+
+impl KeptHold {
+    /// The `blocked_reason` the hold is recorded under.
+    pub fn blocked_reason(&self) -> &'static str {
+        match self {
+            KeptHold::OperatorQuestion => "awaiting_operator_answer",
+            KeptHold::OperatorRefusal | KeptHold::FailureEvidence { .. } => "worker_failed",
+        }
+    }
+
+    /// True when only a human can resolve the hold.
+    pub fn is_human_hold(&self) -> bool {
+        !matches!(self, KeptHold::FailureEvidence { .. })
+    }
+}
+
 /// One row the un-park released, with what step 2 did to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnparkedRow {
@@ -60,9 +101,9 @@ pub struct UnparkedRow {
     /// Set for a revision: the chain root it follows.
     pub parent_task_id: Option<String>,
     pub halt_stamp: HaltStamp,
-    /// The human hold step 2 preserved (`awaiting_operator_answer` or
+    /// The blocked state step 2 preserved (`awaiting_operator_answer` or
     /// `worker_failed`), if the row has one.
-    pub kept_hold: Option<String>,
+    pub kept_hold: Option<KeptHold>,
 }
 
 impl UnparkedRow {
@@ -117,11 +158,16 @@ pub(crate) fn release_row(tx: &Connection, task: &Task, actor: &str) -> Result<U
             }
         }
     };
-    let kept_hold = task
-        .blocked_reason
-        .as_deref()
-        .filter(|reason| matches!(*reason, "awaiting_operator_answer" | "worker_failed"))
-        .map(str::to_owned);
+    let kept_hold = match task.blocked_reason.as_deref() {
+        Some("awaiting_operator_answer") => Some(KeptHold::OperatorQuestion),
+        Some("worker_failed") => Some(
+            match crate::stuck_report::latest_basis(tx, &task.id, "blocked_reason")? {
+                Some(basis) if basis == WorkerFailureBasis::OperatorNo.as_str() => KeptHold::OperatorRefusal,
+                basis => KeptHold::FailureEvidence { basis },
+            },
+        ),
+        _ => None,
+    };
     Ok(UnparkedRow {
         id: task.id.clone(),
         product_id: task.product_id.clone(),
@@ -131,6 +177,57 @@ pub(crate) fn release_row(tx: &Connection, task: &Task, actor: &str) -> Result<U
         halt_stamp,
         kept_hold,
     })
+}
+
+/// The ledger stamps its rows from SQLite's clock and an execution's `finished_at`
+/// comes from the engine's, each truncated to whole seconds at a different
+/// instant of the same transaction, so a cancel can read one second earlier than
+/// the park that caused it. The window [`cancelled_by_park`] checks is widened by
+/// this much at both ends.
+const LEDGER_CLOCK_SLACK_SECS: i64 = 1;
+
+/// True when `execution` is a never-started execution that a park cancelled and
+/// the item has since been un-parked, so the reconcile should treat it as if it
+/// had never been minted.
+///
+/// A park records no cancel reason on the execution (a reason in `last_error`
+/// would read as a pre-start failure), so the ledger supplies the window: the
+/// execution was cancelled at or after the item's latest park and no later than
+/// its latest un-park (give or take [`LEDGER_CLOCK_SLACK_SECS`]). An operator cancelling a pending execution after the
+/// un-park falls outside the window and stays cancelled. An `active` row is
+/// never re-minted here; the orphan sweep owns it.
+pub(crate) fn cancelled_by_park(conn: &Connection, execution: &WorkExecution) -> Result<bool> {
+    if execution.status != ExecutionStatus::Cancelled || execution.started_at.is_some() {
+        return Ok(false);
+    }
+    let Some(cancelled_at) = execution.finished_at.as_deref().and_then(|at| at.parse::<i64>().ok()) else {
+        return Ok(false);
+    };
+    let status: Option<String> = conn
+        .query_row(
+            "SELECT status FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+            [&execution.work_item_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if status.as_deref() != Some("todo") && status.as_deref() != Some("blocked") {
+        return Ok(false);
+    }
+    let window = conn.query_row(
+        "SELECT MAX(CASE WHEN new_value IS NOT NULL THEN CAST(changed_at AS INTEGER) END),
+                MAX(CASE WHEN new_value IS NULL THEN CAST(changed_at AS INTEGER) END)
+         FROM task_status_audit WHERE work_item_id = ?1 AND property = 'parked_at'",
+        [&execution.work_item_id],
+        |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+    );
+    match window {
+        Ok((Some(parked), Some(unparked))) => {
+            Ok(parked - LEDGER_CLOCK_SLACK_SECS <= cancelled_at && cancelled_at <= unparked + LEDGER_CLOCK_SLACK_SECS)
+        }
+        Ok(_) => Ok(false),
+        Err(err) if crate::parking::sqlite_missing_table(&err, "task_status_audit") => Ok(false),
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// True when the row's halt stamp is strictly newer than its park, i.e. it was

@@ -645,7 +645,10 @@ impl WorkDb {
             }
             ItemKind::Project => {
                 let report = set_project_parked(&tx, &mut pending, id, parked, reason, actor, &now)?;
-                (WorkItem::Project(query_project(&tx, id).require("project", id)?), report)
+                (
+                    WorkItem::Project(query_project(&tx, id).require("project", id)?),
+                    report,
+                )
             }
             ItemKind::Product => bail!("cannot park product {id}: parking applies to tasks, chores and projects"),
             ItemKind::Comment | ItemKind::Comparison => bail!("{id} is not a task, chore or project"),

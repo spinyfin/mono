@@ -554,19 +554,18 @@ async fn run_one_pass_filtered(
         // window — so the guard has a second, time-independent half: the
         // unbroken streak of unproductive terminal executions since the
         // row last completed a run. Either half tripping parks the row.
-        let consecutive_terminal_ids = match work_db
-            .list_consecutive_unproductive_terminal_execution_ids_since(&work_item_id, unpark_floor)
-        {
-            Ok(ids) => ids,
-            Err(err) => {
-                tracing::warn!(
-                    work_item_id = %work_item_id,
-                    ?err,
-                    "orphan sweep: failed to count consecutive terminal executions; skipping item",
-                );
-                continue;
-            }
-        };
+        let consecutive_terminal_ids =
+            match work_db.list_consecutive_unproductive_terminal_execution_ids_since(&work_item_id, unpark_floor) {
+                Ok(ids) => ids,
+                Err(err) => {
+                    tracing::warn!(
+                        work_item_id = %work_item_id,
+                        ?err,
+                        "orphan sweep: failed to count consecutive terminal executions; skipping item",
+                    );
+                    continue;
+                }
+            };
         let consecutive_terminal = consecutive_terminal_ids.len() as i64;
         let window_tripped = recent_terminal >= ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD;
         let consecutive_tripped = consecutive_terminal >= ORPHAN_REDISPATCH_CHURN_GUARD_CONSECUTIVE_THRESHOLD;

@@ -874,7 +874,9 @@ pub(super) async fn apply_work_item_patch(
                 .apply_parking_patch_reporting(&id, &patch, actor)
                 .map(|(item, report)| (item, Some(report)))
         } else {
-            work_db.update_work_item_as_actor(&id, patch, actor).map(|item| (item, None))
+            work_db
+                .update_work_item_as_actor(&id, patch, actor)
+                .map(|item| (item, None))
         };
         match applied {
             Ok((mut item, unpark_report)) => {

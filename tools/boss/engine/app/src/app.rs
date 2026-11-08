@@ -132,7 +132,6 @@ mod server;
 mod sessions;
 mod shutdown;
 mod subscriptions;
-mod unpark;
 #[cfg(test)]
 mod tests;
 mod tmux_health;
@@ -140,6 +139,7 @@ mod tmux_teardown;
 mod transcript_persist;
 mod trunk_auth;
 mod trust;
+mod unpark;
 mod viewer_reconcile;
 mod work_items;
 mod worker_events;
