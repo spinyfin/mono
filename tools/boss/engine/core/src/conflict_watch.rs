@@ -959,6 +959,20 @@ pub async fn on_conflict_detected_with(
                     } => {
                         use_small_agent_profile = conflict_ladder::rung2_eligible(residual_conflict_files);
                     }
+                    conflict_ladder::LadderOutcome::DeferredForLiveWriter => {
+                        // A worker is live on this PR's chain, so the engine
+                        // must not rebase under it. Like an unavailable
+                        // rung: spawn nothing and leave the attempt
+                        // `pending`; a later tick re-enters the ladder.
+                        mechanical_rungs_unavailable = true;
+                        tracing::info!(
+                            work_item_id = %candidate.work_item_id,
+                            pr_url = %candidate.pr_url,
+                            attempt_id = %a.id,
+                            "conflict_watch: a worker is live on this PR's chain; engine rebase deferred, \
+                             no worker spawned, ladder will retry on the next tick",
+                        );
+                    }
                     conflict_ladder::LadderOutcome::MechanicalRungsUnavailable => {
                         // Rung 1's workspace lease failed even after a
                         // retry — an infra hiccup, not evidence of a

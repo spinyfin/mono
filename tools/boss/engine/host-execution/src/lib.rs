@@ -1215,11 +1215,19 @@ mod validation {
             Kind::DiffBookmark
                 | Kind::DiscardBaseline
                 | Kind::CheckpointBaseline
-                | Kind::ReconcileBookmark
                 | Kind::ReleaseHeads
                 | Kind::ReleaseHeadsConfigured
                 | Kind::CheckPreservedUnpublished
                 | Kind::PruneBookmark
+        )
+    }
+
+    /// Operations retired together with execution-pointer reconciliation. A peer
+    /// that still sends one is told so, rather than having it silently ignored.
+    pub(crate) fn retired_operation(kind: Kind) -> bool {
+        matches!(
+            kind,
+            Kind::RestoreRebased | Kind::PrepareRecoveryPr | Kind::ReconcileBookmark
         )
     }
 
@@ -1274,6 +1282,10 @@ mod validation {
     /// workspace command cannot become an argv/path tunnel as the schema evolves.
     pub fn validate_workspace(op: &WorkspaceOp, run: Option<&Run>) -> Result<Kind> {
         let kind = Kind::try_from(op.kind)?;
+        ensure!(
+            !retired_operation(kind),
+            "workspace operation {kind:?} is retired and no longer supported"
+        );
         let mut allowed = WorkspaceOp {
             kind: op.kind,
             ..Default::default()
@@ -1373,7 +1385,7 @@ mod validation {
                 );
                 allowed.title.clone_from(&op.title);
             }
-            Kind::GotoPr | Kind::PrepareRecoveryPr => {
+            Kind::GotoPr => {
                 ensure!(op.pr_number > 0, "missing PR number");
                 allowed.pr_number = op.pr_number;
             }
@@ -1394,13 +1406,8 @@ mod validation {
             Kind::RestoreBookmark => {
                 allowed.self_retry = op.self_retry;
             }
-            Kind::RestoreRebased | Kind::ReconcileBookmark => {
-                reference(&op.trunk)?;
-                if !op.pr_bookmark.is_empty() {
-                    reference(&op.pr_bookmark)?;
-                }
-                allowed.trunk.clone_from(&op.trunk);
-                allowed.pr_bookmark.clone_from(&op.pr_bookmark);
+            Kind::RestoreRebased | Kind::PrepareRecoveryPr | Kind::ReconcileBookmark => {
+                unreachable!("retired operations are rejected before field validation")
             }
             Kind::PositionedParent | Kind::StartFresh => {}
             Kind::ConfirmRecovery | Kind::RestorePreserved | Kind::CheckPreservedUnpublished | Kind::PruneBookmark => {
@@ -1445,10 +1452,7 @@ mod validation {
             Kind::DiffBookmark
                 | Kind::RestoreBookmark
                 | Kind::DiscardBaseline
-                | Kind::RestoreRebased
                 | Kind::CheckpointBaseline
-                | Kind::PrepareRecoveryPr
-                | Kind::ReconcileBookmark
                 | Kind::ReleaseHeads
                 | Kind::ReleaseHeadsConfigured
                 | Kind::ConfirmRecovery
@@ -1512,27 +1516,6 @@ pub mod workspace {
         (!value.is_empty()).then_some(value)
     }
 
-    /// Durable command-attempt storage supplied by the daemon journal.
-    pub trait RecoveryStore: Sync {
-        fn load(&self, sequence: u64) -> Result<Option<Vec<u8>>>;
-        fn save(&self, sequence: u64, bytes: &[u8]) -> Result<()>;
-    }
-
-    #[derive(serde::Serialize, serde::Deserialize)]
-    struct SavedPointers {
-        record: ExecutionBookmark,
-        pointers: recovery::PointerSnapshot,
-    }
-
-    #[derive(Debug)]
-    struct RestoreFailed;
-    impl std::fmt::Display for RestoreFailed {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("recovery pointer restoration failed; retain command attempt")
-        }
-    }
-    impl std::error::Error for RestoreFailed {}
-
     #[derive(Default)]
     enum Phase {
         #[default]
@@ -1550,7 +1533,7 @@ pub mod workspace {
 
     impl<T: CubeJsonTransport> Executor<T> {
         pub async fn execute(&self, command: &Command, interrupted: bool, now_ms: i64) -> CommandResult {
-            self.execute_with_store(command, interrupted, now_ms, None)
+            self.try_execute(command, interrupted, now_ms)
                 .await
                 .unwrap_or_else(|error| CommandResult {
                     command_id: command.command_id.clone(),
@@ -1560,13 +1543,7 @@ pub mod workspace {
                 })
         }
 
-        pub async fn execute_with_store(
-            &self,
-            command: &Command,
-            interrupted: bool,
-            now_ms: i64,
-            store: Option<&dyn RecoveryStore>,
-        ) -> Result<CommandResult> {
+        pub async fn try_execute(&self, command: &Command, interrupted: bool, now_ms: i64) -> Result<CommandResult> {
             let mut result = CommandResult {
                 command_id: command.command_id.clone(),
                 ..Default::default()
@@ -1588,24 +1565,6 @@ pub mod workspace {
             if !interrupted && command.not_after_unix_ms <= now_ms {
                 result.code = ResultCode::Rejected.into();
                 result.reason = "command expired".into();
-                return Ok(result);
-            }
-            if interrupted && kind == Kind::PrepareRecoveryPr {
-                result.code = ResultCode::OutcomeUncertain.into();
-                if let Some(store) = store {
-                    if let Some(bytes) = store.load(command.sequence)? {
-                        let saved: SavedPointers = serde_json::from_slice(&bytes)?;
-                        recovery::restore_pointers(&LocalJj, &saved.record, &saved.pointers)
-                            .await
-                            .context(RestoreFailed)?;
-                        result.reason = "recovery pointers restored; PR positioning outcome is unknown".into();
-                    } else {
-                        result.reason =
-                            "no saved snapshot for interrupted PR positioning; hub reconciliation required".into();
-                    }
-                } else {
-                    result.reason = "recovery attempt storage unavailable".into();
-                }
                 return Ok(result);
             }
             // Only reads and acquisition reconciliation may run after an uncertain
@@ -1630,7 +1589,7 @@ pub mod workspace {
             let mut phase = Phase::Authorizing;
             let outcome = tokio::time::timeout(
                 std::time::Duration::from_secs(300),
-                self.dispatch(command, op, kind, interrupted, &mut phase, store),
+                self.dispatch(command, op, kind, interrupted, &mut phase),
             )
             .await;
             match outcome {
@@ -1647,16 +1606,10 @@ pub mod workspace {
                     result.value = Some(command_result::Value::Workspace(value));
                 }
                 Ok(Err(error)) => {
-                    if error.downcast_ref::<RestoreFailed>().is_some() {
-                        return Err(error);
-                    }
                     result.code = phase.failure().into();
                     result.reason = format!("workspace operation failed: {error:#}");
                 }
                 Err(_) => {
-                    if kind == Kind::PrepareRecoveryPr && store.is_some() && matches!(phase, Phase::Effect) {
-                        anyhow::bail!("PR positioning timed out; retain saved pointers for restart restoration");
-                    }
                     result.code = phase.failure().into();
                     result.reason = "workspace operation timed out".into();
                 }
@@ -1813,7 +1766,6 @@ pub mod workspace {
             kind: Kind,
             interrupted: bool,
             phase: &mut Phase,
-            store: Option<&dyn RecoveryStore>,
         ) -> Result<(WorkspaceResult, bool)> {
             let run = command.run.as_ref();
             let mut result = WorkspaceResult {
@@ -1921,41 +1873,6 @@ pub mod workspace {
                                     *phase = Phase::Effect;
                                     json!(record.base_commit.clone().unwrap_or_default())
                                 }
-                                Kind::RestoreRebased => {
-                                    *phase = Phase::Effect;
-                                    serde_json::to_value(
-                                        restore_rebased(&LocalJj, &record, &path, optional(&op.pr_bookmark), &op.trunk)
-                                            .await?,
-                                    )?
-                                }
-                                Kind::PrepareRecoveryPr => {
-                                    let pointers = recovery::snapshot_pointers(&LocalJj, &record).await?;
-                                    if let Some(store) = store {
-                                        store.save(
-                                            command.sequence,
-                                            &serde_json::to_vec(&SavedPointers {
-                                                record: record.clone(),
-                                                pointers: pointers.clone(),
-                                            })?,
-                                        )?;
-                                    }
-                                    *phase = Phase::Effect;
-                                    let positioned =
-                                        cube::goto_workspace(&self.cube, &path, "--pr", &op.pr_number.to_string())
-                                            .await;
-                                    recovery::restore_pointers(&LocalJj, &record, &pointers)
-                                        .await
-                                        .context(RestoreFailed)?;
-                                    positioned?;
-                                    json!(true)
-                                }
-                                Kind::ReconcileBookmark => {
-                                    *phase = Phase::Effect;
-                                    serde_json::to_value(
-                                        recovery::reconcile(&LocalJj, &record, optional(&op.pr_bookmark), &op.trunk)
-                                            .await?,
-                                    )?
-                                }
                                 Kind::ReleaseHeads | Kind::ReleaseHeadsConfigured => {
                                     *phase = Phase::Effect;
                                     let release_names = if kind == Kind::ReleaseHeadsConfigured {
@@ -2018,29 +1935,6 @@ pub mod workspace {
             anchor_commit: record.base_commit.clone().unwrap_or_default(),
             pr_head_before: record.pr_head_before.clone().unwrap_or_default(),
         }
-    }
-
-    /// Preserve all recovery pointers across cube's PR positioning side effects.
-    pub async fn preserve_recovery_pointers(
-        record: &ExecutionBookmark,
-        position: impl std::future::Future<Output = Result<()>>,
-    ) -> Result<()> {
-        let saved = recovery::snapshot_pointers(&LocalJj, record).await?;
-        let result = position.await;
-        recovery::restore_pointers(&LocalJj, record, &saved).await?;
-        result
-    }
-
-    /// Restore on the repository's GitHub remote, falling back to origin.
-    pub async fn restore_rebased(
-        jj: &impl Jj,
-        record: &ExecutionBookmark,
-        workspace: &Path,
-        pr_bookmark: Option<&str>,
-        base_branch: &str,
-    ) -> Result<recovery::RestoreReport> {
-        let remote = recovery_remote(jj, workspace).await?;
-        recovery::restore_rebased(jj, record, workspace, pr_bookmark, base_branch, &remote).await
     }
 
     /// Discover the recovery remote for both host execution and hub PR repair.
@@ -2296,6 +2190,11 @@ mod tests {
         for number in 1..=27 {
             let kind = Kind::try_from(number).unwrap();
             let mut request = op(kind);
+            if crate::validation::retired_operation(kind) {
+                let error = validate_workspace(&request, Some(&assignment)).unwrap_err();
+                assert!(error.to_string().contains("retired"), "{kind:?}: {error}");
+                continue;
+            }
             match kind {
                 Kind::EnsureRepo | Kind::ListRepos | Kind::ListWorkspaces => {
                     request = v1::WorkspaceOp {
@@ -2310,10 +2209,9 @@ mod tests {
                     request.lease_id.clear();
                 }
                 Kind::CreateChange => request.title = "Implement workspace execution".into(),
-                Kind::GotoPr | Kind::PrepareRecoveryPr => request.pr_number = 1,
+                Kind::GotoPr => request.pr_number = 1,
                 Kind::GotoRevision => request.revision = "a".repeat(40),
                 Kind::ForceRelease => request.reason = "hub authorized release".into(),
-                Kind::RestoreRebased | Kind::ReconcileBookmark => request.trunk = "main".into(),
                 Kind::PruneBookmark => {
                     request.trunk = "main".into();
                     request.request_json = b"{}".to_vec();
@@ -2416,40 +2314,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_pointers_survive_failed_pr_positioning() {
-        use boss_engine_recovery::execution_bookmark::{self as recovery, Jj, LocalJj};
+    async fn retired_pointer_operations_are_rejected_without_touching_cube() {
         let root = tempfile::tempdir().unwrap();
-        let repo = boss_engine_test_git::jj::JjRepo::new(root.path());
-        let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, "exec_test", "host")
-            .await
-            .unwrap();
-        std::fs::write(repo.worker.join("work.txt"), "preserved work").unwrap();
-        LocalJj.run(&repo.worker, &["status"]).await.unwrap();
-        let saved = recovery::snapshot_pointers(&LocalJj, &record).await.unwrap();
-        let result = workspace::preserve_recovery_pointers(&record, async {
-            LocalJj
-                .run(
-                    &repo.worker,
-                    &[
-                        "bookmark",
-                        "delete",
-                        &record.head(),
-                        &record.publication(),
-                        &record.base(),
-                    ],
-                )
-                .await?;
-            anyhow::bail!("PR positioning failed after removing pointers")
-        })
-        .await;
-        assert!(result.is_err());
-        assert_eq!(recovery::snapshot_pointers(&LocalJj, &record).await.unwrap(), saved);
-        assert!(
-            recovery::unpublished_diff(&LocalJj, &record)
-                .await
-                .unwrap()
-                .contains("preserved work")
-        );
+        let executor = workspace::Executor {
+            cube: Cube::new(root.path()),
+            host_id: "host".into(),
+        };
+        for kind in [Kind::RestoreRebased, Kind::PrepareRecoveryPr, Kind::ReconcileBookmark] {
+            let result = executor.execute(&command(op(kind)), false, 1).await;
+            assert_eq!(result.code, v1::ResultCode::Rejected as i32, "{kind:?}");
+            assert!(result.reason.contains("retired"), "{kind:?}: {}", result.reason);
+        }
+        assert!(executor.cube.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2695,140 +2571,11 @@ mod tests {
 #[cfg(test)]
 mod recovery_tests {
     use crate::{
-        cube::CubeJsonTransport,
         tests::{Cube, command, op, run},
-        workspace::{self, RecoveryStore},
+        workspace,
     };
-    use anyhow::Result;
-    use async_trait::async_trait;
-    use boss_engine_recovery::execution_bookmark::{self as recovery, Jj, LocalJj};
+    use boss_engine_recovery::execution_bookmark::{Jj, LocalJj};
     use boss_protocol_spoke::v1::{self, WorkspaceKind as Kind, command_result};
-
-    struct PositioningCube {
-        cube: Cube,
-        record: recovery::ExecutionBookmark,
-        hang: bool,
-    }
-    #[async_trait]
-    impl CubeJsonTransport for PositioningCube {
-        async fn run_cube_json(&self, args: &[&str]) -> Result<serde_json::Value> {
-            if args.get(2) == Some(&"goto") {
-                LocalJj
-                    .run(
-                        &self.record.repo_path,
-                        &[
-                            "bookmark",
-                            "delete",
-                            &self.record.base(),
-                            &self.record.head(),
-                            &self.record.publication(),
-                        ],
-                    )
-                    .await?;
-                if self.hang {
-                    std::future::pending::<()>().await;
-                }
-                anyhow::bail!("positioning failed after deleting pointers");
-            }
-            self.cube.run_cube_json(args).await
-        }
-    }
-    struct AttemptFile(std::path::PathBuf);
-    impl RecoveryStore for AttemptFile {
-        fn load(&self, _: u64) -> Result<Option<Vec<u8>>> {
-            Ok(Some(std::fs::read(&self.0)?))
-        }
-        fn save(&self, _: u64, bytes: &[u8]) -> Result<()> {
-            std::fs::write(&self.0, bytes)?;
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn executor_restores_pointers_on_failed_and_interrupted_positioning() {
-        for interrupt in [false, true] {
-            let root = tempfile::tempdir().unwrap();
-            let repo = boss_engine_test_git::jj::JjRepo::new(root.path());
-            let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, "exec_test", "host")
-                .await
-                .unwrap();
-            let saved = recovery::snapshot_pointers(&LocalJj, &record).await.unwrap();
-            let cube = Cube::new(root.path());
-            *cube.owner.lock().unwrap() = Some(workspace::lease_owner(&run()));
-            let executor = workspace::Executor {
-                cube: PositioningCube {
-                    cube,
-                    record: record.clone(),
-                    hang: interrupt,
-                },
-                host_id: "host".into(),
-            };
-            let request = command(v1::WorkspaceOp {
-                pr_number: 42,
-                bookmark: Some(v1::Bookmark {
-                    repo_id: "repo".into(),
-                    execution_id: record.execution_id.clone(),
-                    head: record.publication(),
-                    recovery: record.head(),
-                    base: record.base(),
-                    anchor_commit: record.base_commit.clone().unwrap(),
-                    pr_head_before: String::new(),
-                }),
-                ..op(Kind::PrepareRecoveryPr)
-            });
-            let store = AttemptFile(root.path().join("attempt.json"));
-            if interrupt {
-                let mut effect = Box::pin(executor.execute_with_store(&request, false, 1, Some(&store)));
-                tokio::select! {
-                    _ = &mut effect => panic!("positioning should remain in progress"),
-                    _ = async {
-                        loop {
-                            if store.0.exists() && recovery::snapshot_pointers(&LocalJj, &record).await.unwrap().iter().all(|(_, id)| id.is_none()) {
-                                break;
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                        }
-                    } => {}
-                }
-                drop(effect);
-                // A new store handle reads the pre-effect snapshot after interruption.
-                let reopened = AttemptFile(store.0.clone());
-                let snapshot = std::fs::read(&store.0).unwrap();
-                let offline = root.path().join("offline-store");
-                std::fs::rename(&record.repo_path, &offline).unwrap();
-                assert!(
-                    executor
-                        .execute_with_store(&request, true, 2000, Some(&reopened))
-                        .await
-                        .is_err()
-                );
-                assert_eq!(std::fs::read(&store.0).unwrap(), snapshot);
-                std::fs::rename(&offline, &record.repo_path).unwrap();
-                let result = executor
-                    .execute_with_store(&request, true, 2000, Some(&reopened))
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    result.code,
-                    v1::ResultCode::OutcomeUncertain as i32,
-                    "{}",
-                    result.reason
-                );
-            } else {
-                let result = executor
-                    .execute_with_store(&request, false, 1, Some(&store))
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    result.code,
-                    v1::ResultCode::OutcomeUncertain as i32,
-                    "{}",
-                    result.reason
-                );
-            }
-            assert_eq!(recovery::snapshot_pointers(&LocalJj, &record).await.unwrap(), saved);
-        }
-    }
 
     #[tokio::test]
     async fn executor_runs_store_and_workspace_recovery_operations() {
@@ -2852,15 +2599,12 @@ mod recovery_tests {
             .run(&repo.worker, &["bookmark", "set", "boss/exec_test", "-r", "@"])
             .await
             .unwrap();
-        for kind in [Kind::CheckpointBaseline, Kind::ReconcileBookmark, Kind::RestoreBookmark] {
+        for kind in [Kind::CheckpointBaseline, Kind::RestoreBookmark] {
             let mut request = op(kind);
             request.bookmark = created.bookmark.clone();
             if kind != Kind::RestoreBookmark {
                 request.workspace_id.clear();
                 request.lease_id.clear();
-            }
-            if kind == Kind::ReconcileBookmark {
-                request.trunk = "main".into();
             }
             let result = executor.execute(&command(request), false, 1).await;
             assert_eq!(result.code, v1::ResultCode::Ok as i32, "{kind:?}: {}", result.reason);

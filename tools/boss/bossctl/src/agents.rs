@@ -495,6 +495,17 @@ async fn print_parked_work_item_status(client: &mut BossClient, json: bool, work
         FrontendEvent::TaskRuntimeResult { runtime } => Some(runtime),
         _ => None,
     };
+    let execution = match runtime.as_ref().and_then(|runtime| runtime.execution_id.clone()) {
+        Some(id) => match client
+            .send_request(&FrontendRequest::GetExecution { id })
+            .await
+            .context("sending GetExecution")?
+        {
+            FrontendEvent::ExecutionResult { execution } => Some(execution),
+            _ => None,
+        },
+        None => None,
+    };
     let attention_items = match client
         .send_request(&FrontendRequest::ListAttentionItemsForWorkItem {
             work_item_id: primary_id.clone(),
@@ -517,6 +528,8 @@ async fn print_parked_work_item_status(client: &mut BossClient, json: bool, work
                 "work_item": work_item,
                 "live_worker_state": serde_json::Value::Null,
                 "task_runtime": runtime,
+                "execution": execution,
+                "errors": stored_errors_json(None, execution.as_ref()),
                 "open_attention_items": open_attention_items,
             })
         );
@@ -549,6 +562,9 @@ async fn print_parked_work_item_status(client: &mut BossClient, json: bool, work
                 .unwrap_or_else(|| "-".to_owned())
         );
     }
+    for line in stored_error_lines(None, execution.as_ref()) {
+        println!("{line}");
+    }
     if open_attention_items.is_empty() {
         println!("  (no open attention items)");
     } else {
@@ -558,6 +574,32 @@ async fn print_parked_work_item_status(client: &mut BossClient, json: bool, work
         }
     }
     Ok(())
+}
+
+/// Failure text the engine stored for a run (`work_runs.error_text`) and for
+/// its execution (`work_executions.last_error`). A pre-start failure is
+/// recorded here and nowhere the status output used to show, so a worker that
+/// never started read as a bare `failed` with no cause.
+fn stored_errors_json(run: Option<&WorkRun>, execution: Option<&WorkExecution>) -> serde_json::Value {
+    serde_json::json!({
+        "run_error_text": run.and_then(|run| run.error_text.as_deref()),
+        "execution_last_error": execution.and_then(|execution| execution.last_error.as_deref()),
+    })
+}
+
+/// Text-mode lines for the stored failure text; empty when neither is set.
+fn stored_error_lines(run: Option<&WorkRun>, execution: Option<&WorkExecution>) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(error) = run.and_then(|run| run.error_text.as_deref()).filter(|e| !e.is_empty()) {
+        lines.push(format!("  run error:     {error}"));
+    }
+    if let Some(error) = execution
+        .and_then(|execution| execution.last_error.as_deref())
+        .filter(|e| !e.is_empty())
+    {
+        lines.push(format!("  last error:    {error}"));
+    }
+    lines
 }
 
 /// Renders a historical `GetRun` lookup alongside the worker's actual
@@ -581,6 +623,7 @@ fn print_run_lifecycle(json: bool, run: &WorkRun, live: Option<&LiveWorkerState>
                          lifecycle. Use live_worker_state (if present) or execution for that.",
                 "live_worker_state": live,
                 "execution": execution,
+                "errors": stored_errors_json(Some(run), execution),
             })
         );
         return;
@@ -594,6 +637,9 @@ fn print_run_lifecycle(json: bool, run: &WorkRun, live: Option<&LiveWorkerState>
     }
     if let Some(f) = &run.finished_at {
         println!("  spawn finished:{f}");
+    }
+    for line in stored_error_lines(Some(run), None) {
+        println!("{line}");
     }
 
     match live {
@@ -612,6 +658,9 @@ fn print_run_lifecycle(json: bool, run: &WorkRun, live: Option<&LiveWorkerState>
                 }
                 if let Some(f) = &exec.finished_at {
                     println!("  finished: {f}");
+                }
+                for line in stored_error_lines(None, Some(exec)) {
+                    println!("{line}");
                 }
             }
             None => {

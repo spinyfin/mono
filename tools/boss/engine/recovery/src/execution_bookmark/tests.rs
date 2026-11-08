@@ -707,12 +707,12 @@ async fn initialization_leaves_existing_recovery_work_intact() {
     let f = Fixture::new().await;
     let record = f.record("exec_existing").await;
     f.edit(&record).await;
-    let before = snapshot_pointers(&LocalJj, &record).await.unwrap();
+    let before = test_support::pointer_targets(&LocalJj, &record).await.unwrap();
     let initialized = create_from(&LocalJj, &f.worker, &record.execution_id, "local", None, None)
         .await
         .unwrap();
     assert_eq!(initialized.base_commit, record.base_commit);
-    assert_eq!(snapshot_pointers(&LocalJj, &record).await.unwrap(), before);
+    assert_eq!(test_support::pointer_targets(&LocalJj, &record).await.unwrap(), before);
     assert!(diff(&LocalJj, &record).await.unwrap().contains("second.txt"));
 }
 

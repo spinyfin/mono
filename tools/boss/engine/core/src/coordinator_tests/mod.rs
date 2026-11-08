@@ -13,6 +13,7 @@ mod focus_mode;
 mod helpers;
 mod lease_pending;
 mod lease_retry;
+mod live_writer_deferral;
 mod local_worker_quarantine;
 mod pause_admission;
 mod pause_all_spawns;

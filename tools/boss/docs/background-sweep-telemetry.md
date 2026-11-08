@@ -20,32 +20,24 @@ metrics registry (`bossctl metrics list --prefix <sweep>`; values flush to
 | `<sweep>.tick_interval_ms` | observed gap between the starts of the two most recent passes |
 | `<sweep>.passes`           | monotonic pass count; its rate is the real tick rate          |
 
-| Sweep prefix                  | What a pass is                                                                             | What `items_per_pass` counts                                                       |
-| ----------------------------- | ------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------- |
-| `envelope_watch`              | one 60 s envelope-watchdog sweep                                                           | live worker slots evaluated                                                        |
-| `terminal_work_sweep`         | the candidate-gathering phase of one 60 s terminal-work pass                               | live worker slots inspected                                                        |
-| `dead_pane_terminal`          | the terminal execution scan plus the process probes of one pane-death sweep pass           | recent terminal execution rows probed                                              |
-| `agent_jsonl_stream`          | one 50 ms tail poll iteration of any live JSONL stream                                     | sessions-root revalidations (`lstat` + `canonicalize`) performed in that iteration |
-| `execution_bookmark_pointers` | one recovery-pointer snapshot or restore over a PR chain (mechanical / speculative rebase) | recovery-bookmark records covered                                                  |
+| Sweep prefix          | What a pass is                                                                   | What `items_per_pass` counts                                                       |
+| --------------------- | -------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `envelope_watch`      | one 60 s envelope-watchdog sweep                                                 | live worker slots evaluated                                                        |
+| `terminal_work_sweep` | the candidate-gathering phase of one 60 s terminal-work pass                     | live worker slots inspected                                                        |
+| `dead_pane_terminal`  | the terminal execution scan plus the process probes of one pane-death sweep pass | recent terminal execution rows probed                                              |
+| `agent_jsonl_stream`  | one 50 ms tail poll iteration of any live JSONL stream                           | sessions-root revalidations (`lstat` + `canonicalize`) performed in that iteration |
 
 Only the singleton envelope and terminal-work sweeps publish tick intervals.
 `dead_pane_terminal` has no `tick_interval_ms`. Concurrent tails and bookmark
 operations have no shared cadence. Root revalidation counts are isolated per
 tail, excluding discovery and other tails.
 
-The periodic `speculative_conflict` sweep drives the pointer snapshot/restore
-series, as do mechanical rebases. The separate five-minute
-`abandoned_execution_bookmarks` pass is not part of the sampled pointer hotspot
-and is not represented by this series.
-
-Two extra counters:
+One extra counter:
 
 - `agent_jsonl_stream.root_revalidations` — total root revalidations across
   every stream. Its rate relative to `agent_jsonl_stream.passes` is the
   per-poll pathname-walk cost; after the fix below an idle poll contributes
   zero.
-- `execution_bookmark_pointers.jj_spawns` — total `jj` child processes
-  spawned by pointer passes. Spawns are the whole cost of those passes.
 
 `agent_jsonl_stream.*` gauges are last-sample values across all live
 streams (each stream overwrites them); the counters are the aggregate.
@@ -83,12 +75,10 @@ as before.
 Full-row mapping of every recent terminal execution once a minute to read
 three columns. Fix: `list_recent_terminal_execution_refs_with_local_shell_pid`.
 
-**~7 % spawning `jj` for recovery-pointer snapshots and restores.** Each
-record in a PR chain cost three `jj log` spawns to snapshot and three
-`jj bookmark set` spawns to restore, including pointers that had not
-moved. Fix: one `jj log` resolves all three bookmarks of a record; a
-restore reads the current pointers once, leaves unchanged ones alone, and
-groups the moved ones per target commit into one `bookmark set`.
+**~7 % spawning `jj` for recovery-pointer snapshots and restores.** Removed
+outright: the conflict ladder and the speculative pass no longer snapshot or
+restore execution pointers around a rebase, so there is no pointer pass left
+to measure.
 
 **Sweeps ran their SQLite work inline on tokio async worker threads.** The
 envelope watchdog's pass, deadline reconciliation and deadline handling,

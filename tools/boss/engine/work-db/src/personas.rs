@@ -21,7 +21,6 @@ pub(super) fn new_metrics_registry() -> Arc<boss_metrics::Registry> {
     register_metrics(&registry);
     crate::db_diagnostics::register_metrics(&registry);
     crate::lock_stats::register_metrics(&registry);
-    crate::execution_bookmark_metrics::register_metrics(&registry);
     // Sweeps publish through `WorkDb::metrics_registry`, so a standalone
     // WorkDb (every unit test) needs those handles too. Production injects
     // the engine registry, which `metrics_init::init_all` already fills.

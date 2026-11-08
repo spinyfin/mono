@@ -1,4 +1,4 @@
-use super::reconcile_tests::{bookmark, one, revision_on_pr_head};
+use super::test_support::{bookmark, one, pointer_targets, revision_on_pr_head};
 use super::*;
 use boss_engine_test_git::jj::JjRepo;
 
@@ -29,8 +29,8 @@ async fn conflicted_and_diverged_targets_are_all_archived_before_release() {
             ],
         );
     }
-    assert!(snapshot_pointers(&LocalJj, &scene.record).await.is_err());
-    let targets = snapshot::resolve_bookmark_targets(
+    assert!(pointer_targets(&LocalJj, &scene.record).await.is_err());
+    let targets = resolve_bookmark_targets(
         &LocalJj,
         repo,
         &[scene.record.base(), scene.record.head(), scene.record.publication()],
@@ -66,7 +66,7 @@ async fn conflicted_and_diverged_targets_are_all_archived_before_release() {
             .any(|(_, commit)| commit == scene.record.base_commit.as_ref().unwrap())
     );
     assert!(
-        snapshot_pointers(&LocalJj, &scene.record)
+        pointer_targets(&LocalJj, &scene.record)
             .await
             .unwrap()
             .iter()
@@ -223,12 +223,12 @@ impl Jj for ArchiveWriteFailure {
 #[tokio::test]
 async fn archive_write_failure_never_releases_original_pointers() {
     let scene = revision_on_pr_head("exec_archive_failure").await;
-    let before = snapshot_pointers(&LocalJj, &scene.record).await.unwrap();
+    let before = pointer_targets(&LocalJj, &scene.record).await.unwrap();
     let err = release_heads(&ArchiveWriteFailure, &scene.record, true)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("archive storage unavailable"));
-    assert_eq!(snapshot_pointers(&LocalJj, &scene.record).await.unwrap(), before);
+    assert_eq!(pointer_targets(&LocalJj, &scene.record).await.unwrap(), before);
 }
 
 #[tokio::test]

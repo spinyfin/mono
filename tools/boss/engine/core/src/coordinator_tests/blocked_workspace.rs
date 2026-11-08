@@ -1078,12 +1078,7 @@ async fn positioning_transport_failure_retries_without_archiving() {
         _ => panic!("expected implementation item"),
     };
     let record = db.execution_bookmark(&prior.id).unwrap();
-    let pointers = boss_engine_recovery::execution_bookmark::snapshot_pointers(
-        &boss_engine_recovery::execution_bookmark::LocalJj,
-        &record,
-    )
-    .await
-    .unwrap();
+    let pointers = bookmark_targets(&record);
     let error = h.dispatch().await.unwrap_err();
     assert!(format!("{error:#}").contains("cube workspace goto failed"), "{error:#}");
     assert!(!boss_engine_recovery::execution_bookmark::is_pointer_integrity_error(
@@ -1101,15 +1096,7 @@ async fn positioning_transport_failure_retries_without_archiving() {
     assert_eq!(item.autostart, autostart);
     assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
     assert!(db.execution_bookmark_retired_reason(&prior.id).unwrap().is_none());
-    assert_eq!(
-        boss_engine_recovery::execution_bookmark::snapshot_pointers(
-            &boss_engine_recovery::execution_bookmark::LocalJj,
-            &record,
-        )
-        .await
-        .unwrap(),
-        pointers
-    );
+    assert_eq!(bookmark_targets(&record), pointers);
     assert!(
         JjRepo::run(
             &h.repo.repo,

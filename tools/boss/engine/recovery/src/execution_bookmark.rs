@@ -35,37 +35,18 @@ pub use preserved::{
 mod preserved_restore;
 pub use preserved_restore::restore_preserved;
 
-mod pr_anchor;
-pub use pr_anchor::is_legacy_pr_anchor_blocker;
-#[cfg(test)]
-mod pr_anchor_tests;
-
+mod restore_report;
 mod snapshot;
-pub use snapshot::{PointerSnapshot, restore_pointers, snapshot_pointers};
-
-mod redispatch;
-pub use redispatch::{RestoreReport, restore_rebased};
+pub use restore_report::RestoreReport;
 
 mod prune;
-pub use prune::{HostVoucher, PruneOutcome, Voucher, prune};
+pub use prune::{HostVoucher, MissingChange, PruneOutcome, RewrittenChange, Voucher, prune};
 
 #[cfg(test)]
 mod prune_tests;
 
 #[cfg(test)]
 mod archive_tests;
-
-#[cfg(test)]
-mod redispatch_tests;
-
-mod reconcile;
-pub use reconcile::{
-    Anchor, Containment, MissingChange, Reconciliation, RewrittenChange, SupersededPointer, adopt_pushed_head,
-    reconcile, resolve_bookmark_commit,
-};
-
-#[cfg(test)]
-mod reconcile_tests;
 
 /// Which invariant a damaged pointer broke. Lineage between the pointers and
 /// the baseline is deliberately not an invariant: jj rewrites commits and
@@ -338,6 +319,52 @@ fn revision(bookmark: &str) -> String {
     )
 }
 
+/// Resolve several bookmarks of one repository in a single `jj` invocation.
+///
+/// Returns every visible commit each named bookmark points at (a conflicted
+/// bookmark lists more than one; an absent bookmark is missing from the
+/// map). Bookmark names are matched by the template's `name()`, never the
+/// decorated `name*` / `name??` rendering.
+pub(crate) async fn resolve_bookmark_targets(
+    jj: &dyn Jj,
+    repo: &Path,
+    bookmarks: &[String],
+) -> Result<std::collections::HashMap<String, Vec<String>>> {
+    let mut targets: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    if bookmarks.is_empty() {
+        return Ok(targets);
+    }
+    let revset = bookmarks
+        .iter()
+        .map(|name| revision(name))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let output = jj
+        .run(
+            repo,
+            &[
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-r",
+                &revset,
+                "-T",
+                "commit_id ++ \"\\t\" ++ local_bookmarks.map(|b| b.name()).join(\"\\t\") ++ \"\\n\"",
+            ],
+        )
+        .await?;
+    for line in output.lines().filter(|line| !line.is_empty()) {
+        let mut fields = line.split('\t');
+        let Some(commit) = fields.next().filter(|commit| !commit.is_empty()) else {
+            continue;
+        };
+        for name in fields.filter(|name| bookmarks.iter().any(|wanted| wanted == name)) {
+            targets.entry(name.to_owned()).or_default().push(commit.to_owned());
+        }
+    }
+    Ok(targets)
+}
+
 /// Resolve a bookmark to the single commit it targets. Commit ids, unlike
 /// change ids, stay unique when a change is divergent (two visible commits
 /// sharing one change id), so ancestry checks built on them cannot match a
@@ -498,10 +525,6 @@ impl PointerQuery {
     }
 }
 
-pub(crate) async fn resolve_heads(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<Heads> {
-    query_pointers(jj, record).await?.heads(record)
-}
-
 /// See [`PointerQuery::base`]. Works for a record whose heads are gone.
 pub(crate) async fn resolve_base(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
     Ok(query_pointers(jj, record).await?.base(record))
@@ -556,7 +579,7 @@ pub(crate) async fn descends(jj: &dyn Jj, repo: &Path, ancestor: &str, descendan
 /// are resumed, so work that only one of them carries is still recovered.
 pub(crate) async fn resume_heads(jj: &dyn Jj, record: &ExecutionBookmark, pointers: &Pointers) -> Result<Vec<String>> {
     match (&pointers.heads.recovery, &pointers.heads.publication) {
-        // Unreachable while `resolve_heads` rejects two missing heads;
+        // Unreachable while `resolve_pointers` rejects two missing heads;
         // typed so an edit that moves it degrades instead of panicking.
         (None, None) => Err(missing_heads_error(record)),
         (Some(recovery), Some(publication)) if recovery != publication => {
@@ -604,9 +627,7 @@ pub(crate) async fn reject_quarantined_heads(jj: &dyn Jj, record: &ExecutionBook
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
-pub(crate) use test_support::{
-    create_legacy_three_bookmark_fixture as create, create_legacy_three_bookmark_fixture_from,
-};
+pub(crate) use test_support::create_legacy_three_bookmark_fixture as create;
 
 /// Baseline recording failed after identifying the shared store.
 #[derive(Debug)]
@@ -744,7 +765,7 @@ pub async fn release_heads(
     release_names: bool,
 ) -> Result<Vec<(String, String)>> {
     let names = [record.base(), record.head(), record.publication()];
-    let targets = snapshot::resolve_bookmark_targets(jj, &record.repo_path, &names).await?;
+    let targets = resolve_bookmark_targets(jj, &record.repo_path, &names).await?;
     let mut commits: std::collections::BTreeSet<String> = targets.values().flatten().cloned().collect();
     if let Some(base) = &record.base_commit
         && commit_exists(jj, &record.repo_path, base).await?

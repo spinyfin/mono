@@ -137,6 +137,10 @@ pub async fn run_speculative_pass(
     let due: Vec<&PendingMergeCheck> = candidates
         .iter()
         .filter(|c| schedule.due(&c.work_item_id, now))
+        // A live writer owns the PR branch. Skip without marking the PR
+        // checked, so it is rechecked on the next pass once the writer is
+        // gone rather than waiting out a whole recheck interval.
+        .filter(|c| crate::conflict_ladder::live_writers_blocking_rebase(work_db, &c.work_item_id).is_none())
         .take(MAX_CHECKS_PER_PASS)
         .collect();
     if due.is_empty() {
@@ -270,9 +274,7 @@ pub(crate) async fn run_in_lease(
     pr_number: u64,
     workspace_path: &Path,
 ) {
-    let saved = work_db.snapshot_rebase_pointers(&candidate.work_item_id).await;
     if let Err(err) = cube_client.goto_workspace(workspace_path, pr_number).await {
-        work_db.restore_rebase_pointers(&saved).await;
         tracing::warn!(
             work_item_id = %candidate.work_item_id,
             pr = pr_number,
@@ -285,7 +287,6 @@ pub(crate) async fn run_in_lease(
     let rebase = match cube_client.rebase_workspace_no_push(workspace_path, pr_number).await {
         Ok(outcome) => outcome,
         Err(err) => {
-            work_db.restore_rebase_pointers(&saved).await;
             // Includes the default trait-method error on any `CubeClient`
             // that hasn't implemented the no-push rebase — expected and
             // silent-ish (debug, not warn) for every test double and for
@@ -299,8 +300,6 @@ pub(crate) async fn run_in_lease(
             return;
         }
     };
-
-    work_db.restore_rebase_pointers(&saved).await;
 
     if rebase.clean {
         SPECULATIVE_CONFLICT_CLEAN.inc(metrics);

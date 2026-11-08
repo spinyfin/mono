@@ -1,4 +1,4 @@
-use super::reconcile_tests::{bookmark, keep_visible, one, revision_on_pr_head};
+use super::test_support::{Scene, bookmark, keep_visible, one, revision_on_pr_head};
 use super::*;
 use boss_engine_test_git::jj::JjRepo;
 
@@ -73,7 +73,7 @@ async fn work_carried_by_the_pr_head_by_ancestry_forgets_every_pointer() {
     for name in [s.record.base(), s.record.head(), s.record.publication()] {
         assert!(!bookmark_exists(repo, &name), "{name} survived");
     }
-    let err = resolve_heads(&LocalJj, &s.record).await.unwrap_err();
+    let err = resolve_pointers(&LocalJj, &s.record).await.unwrap_err();
     assert!(is_missing_pointer_error(&err), "{err:#}");
     // The commits themselves stay in the store: only the references went.
     assert_eq!(one(repo, &head), head);
@@ -186,38 +186,6 @@ async fn pointers_already_gone_leave_only_a_baseline_to_forget() {
 }
 
 #[tokio::test]
-async fn restoring_unmoved_pointers_records_no_operation() {
-    let s = revision_on_pr_head("exec_prune_noop_restore").await;
-    let repo = &s.repo.repo;
-    let saved = snapshot_pointers(&LocalJj, &s.record).await.unwrap();
-    let before = op_head(repo);
-    restore_pointers(&LocalJj, &s.record, &saved).await.unwrap();
-    assert_eq!(
-        op_head(repo),
-        before,
-        "restoring pointers that did not move must be free"
-    );
-    // A pointer that did move is still put back.
-    let work = one(repo, &revision(&s.record.head()));
-    let pr_head = one(repo, "pr/7");
-    bookmark(repo, &s.record.head(), &pr_head);
-    restore_pointers(&LocalJj, &s.record, &saved).await.unwrap();
-    assert_eq!(one(repo, &revision(&s.record.head())), work);
-}
-
-#[tokio::test]
-async fn adopting_an_already_adopted_head_records_no_operation() {
-    let s = revision_on_pr_head("exec_prune_noop_adopt").await;
-    let repo = &s.repo.repo;
-    let work = one(repo, &revision(&s.record.head()));
-    adopt_pushed_head(&LocalJj, &s.record, &work, "main").await.unwrap();
-    assert_eq!(one(repo, &revision(&s.record.base())), work);
-    let before = op_head(repo);
-    adopt_pushed_head(&LocalJj, &s.record, &work, "main").await.unwrap();
-    assert_eq!(op_head(repo), before, "re-adopting the same head must be free");
-}
-
-#[tokio::test]
 async fn work_reachable_from_a_remote_bookmark_needs_no_voucher() {
     let s = revision_on_pr_head("exec_prune_remote").await;
     let repo = &s.repo.repo;
@@ -254,7 +222,7 @@ async fn work_reachable_from_a_remote_bookmark_needs_no_voucher() {
 }
 
 /// The publication head carries a commit the recovery head lacks.
-async fn publication_ahead_of_recovery(execution_id: &str) -> (super::reconcile_tests::Scene, String, String) {
+async fn publication_ahead_of_recovery(execution_id: &str) -> (Scene, String, String) {
     let s = revision_on_pr_head(execution_id).await;
     let repo = &s.repo.repo;
     let work = one(repo, &revision(&s.record.head()));

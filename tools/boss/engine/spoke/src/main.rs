@@ -10,22 +10,6 @@ mod commands {
     use boss_spoke_journal::Fault;
     use boss_spoke_outbound::SharedJournal;
 
-    struct AttemptJournal(SharedJournal);
-    impl boss_host_execution::workspace::RecoveryStore for AttemptJournal {
-        fn load(&self, sequence: u64) -> Result<Option<Vec<u8>>> {
-            self.0
-                .lock()
-                .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
-                .recovery_snapshot(sequence)
-        }
-        fn save(&self, sequence: u64, bytes: &[u8]) -> Result<()> {
-            self.0
-                .lock()
-                .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
-                .save_recovery_snapshot(sequence, bytes)
-        }
-    }
-
     pub struct JournalExecutions(pub SharedJournal);
     impl ExecutionStore for JournalExecutions {
         fn load(&self, run_id: &str, spawn_token: &str) -> Result<Option<Vec<u8>>> {
@@ -82,11 +66,10 @@ mod commands {
                 continue;
             };
             let observed = stamp()?;
-            let store = AttemptJournal(std::sync::Arc::clone(&journal));
             let result = match &command.body {
                 Some(command::Body::Workspace(_)) => {
                     executor
-                        .execute_with_store(&command, interrupted, observed.wall_unix_ms, Some(&store))
+                        .try_execute(&command, interrupted, observed.wall_unix_ms)
                         .await?
                 }
                 Some(

@@ -1704,6 +1704,41 @@ impl WorkDb {
         Ok(live_executions)
     }
 
+    /// Executions of the PR's whole chain (the root and every revision,
+    /// including `work_item_id` itself) that may be writing the PR branch
+    /// right now: status `claimed`, `running` or `waiting_human`, and not a
+    /// review (`pr_review` / `pr_review_guide` never rewrite PR history).
+    ///
+    /// The engine's own rebases (the conflict ladder's rung 1 and rung 0 push
+    /// and the speculative no-push rebase) rewrite the PR branch's commits in
+    /// the shared jj store. A live writer's workspace shares that store and
+    /// follows rewrites concurrently, so the two sides race. Callers defer
+    /// the engine rebase while this returns anything; the live writer owns
+    /// the branch until it finishes.
+    pub fn live_writers_in_chain(&self, work_item_id: &str) -> Result<Vec<WorkExecution>> {
+        let conn = self.connect()?;
+        let member_ids = chain_member_ids_on(&conn, work_item_id)?;
+        let mut writers = Vec::new();
+        for member_id in &member_ids {
+            let mut statement = conn.prepare(
+                "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                        cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                        created_at, started_at, finished_at,
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                 FROM work_executions
+                 WHERE work_item_id = ?1
+                   AND status IN ('claimed', 'running', 'waiting_human')
+                   AND kind NOT IN ('pr_review', 'pr_review_guide')
+                 ORDER BY created_at DESC, id DESC",
+            )?;
+            let rows = statement.query_map(rusqlite::params![member_id], map_execution)?;
+            for row in rows {
+                writers.push(row?);
+            }
+        }
+        Ok(writers)
+    }
+
     /// Mark an execution `abandoned` without touching any other
     /// execution or task state. Used by the double-spawn guard to
     /// discard a redundant `ready` execution before it ever reaches

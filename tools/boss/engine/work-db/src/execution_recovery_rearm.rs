@@ -28,6 +28,22 @@ pub(super) fn is_false_not_descended_blocker(detail: &str) -> bool {
         .is_some_and(|id| !id.is_empty() && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'))
 }
 
+/// The schema-59 recognizer: exact legacy failures about the local `pr/<n>`
+/// alias that can be repaired once on upgrade. New repair failures
+/// deliberately use different text, so they cannot re-arm forever.
+pub(super) fn is_legacy_pr_anchor_blocker(detail: &str) -> bool {
+    let Some((number, suffix)) = detail
+        .strip_prefix("PR head bookmark pr/")
+        .and_then(|s| s.split_once(' '))
+    else {
+        return false;
+    };
+    !number.is_empty()
+        && number.bytes().all(|b| b.is_ascii_digit())
+        && (suffix == "does not exist in the shared store; the bound-PR checkout must write it before reconciliation"
+            || suffix == "must resolve to exactly one change; it is conflicted")
+}
+
 /// Items whose recorded blocker `recognizes` as repairable are moved back to
 /// `todo` with autostart on. Failures outside this migration's recognizer
 /// stay blocked: this step makes no claim that dispatch can repair them.
@@ -144,6 +160,27 @@ mod tests {
     use boss_engine_recovery::execution_bookmark::{
         DIVERGED_MESSAGE, UNRESOLVED_MESSAGE, is_legacy_reconcilable_blocker,
     };
+
+    #[test]
+    fn only_legacy_pr_anchor_failures_are_rearmed() {
+        for suffix in [
+            "does not exist in the shared store; the bound-PR checkout must write it before reconciliation",
+            "must resolve to exactly one change; it is conflicted",
+        ] {
+            assert!(is_legacy_pr_anchor_blocker(&format!(
+                "PR head bookmark pr/139 {suffix}"
+            )));
+            assert!(!is_legacy_pr_anchor_blocker(&format!(
+                "PR head bookmark pr/not-a-number {suffix}"
+            )));
+        }
+        assert!(!is_legacy_pr_anchor_blocker(
+            "cannot repair pr/139 from GitHub: unavailable"
+        ));
+        assert!(!is_legacy_pr_anchor_blocker(
+            "recovery bookmark boss-recovery/exec_test must resolve to exactly one change"
+        ));
+    }
 
     /// Undo every schema step after 38 so reopening replays them.
     const RESET_TO_38: &str =

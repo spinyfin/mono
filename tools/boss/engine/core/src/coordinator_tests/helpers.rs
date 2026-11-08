@@ -744,3 +744,32 @@ pub(super) fn make_pr_review_fixture(db: &WorkDb, pr_url: Option<&str>) -> (Stri
     }
     (product.id, chore.id)
 }
+
+/// Where each of a record's three legacy bookmarks points now, as sorted commit
+/// ids joined by commas (`None` when absent). Tests compare it before and after
+/// an operation to prove the bookmarks did not move.
+pub(super) fn bookmark_targets(
+    record: &boss_engine_recovery::execution_bookmark::ExecutionBookmark,
+) -> Vec<(String, Option<String>)> {
+    [record.base(), record.head(), record.publication()]
+        .into_iter()
+        .map(|name| {
+            let out = boss_engine_test_git::jj::JjRepo::run(
+                &record.repo_path,
+                &[
+                    "--ignore-working-copy",
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    &format!("bookmarks(exact:\"{name}\")"),
+                    "-T",
+                    "commit_id ++ \"\\n\"",
+                ],
+            );
+            let mut ids: Vec<&str> = out.lines().filter(|line| !line.is_empty()).collect();
+            ids.sort_unstable();
+            let target = (!ids.is_empty()).then(|| ids.join(","));
+            (name, target)
+        })
+        .collect()
+}

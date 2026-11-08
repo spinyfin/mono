@@ -725,7 +725,6 @@ mod editorial;
 pub mod event_publish;
 mod exec_status_helpers;
 mod exec_tail;
-pub mod execution_bookmark_metrics;
 mod execution_bookmarks;
 mod execution_launch_config;
 mod execution_recovery_rearm;
