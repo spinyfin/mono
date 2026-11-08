@@ -1011,7 +1011,8 @@ fn insert_progression_execution(conn: &Connection, work_item_id: &str) -> Result
 /// current stuck state is ignored by the views, so a stale one is harmless.
 pub(crate) fn waive_grace(conn: &Connection, work_item_id: &str) -> rusqlite::Result<usize> {
     conn.execute(
-        "UPDATE tasks SET progression_grace_waived_at = strftime('%s','now') WHERE id = ?1",
+        "UPDATE tasks SET progression_grace_waived_at = strftime('%s','now')
+         WHERE id = ?1 AND deleted_at IS NULL AND parked_at IS NULL AND status NOT IN ('done', 'archived')",
         [work_item_id],
     )
 }

@@ -813,21 +813,16 @@ fn set_task_parked(
     )?;
     // An item that is still stuck once it is un-parked is diagnosed straight
     // away, not after the normal progression grace period (design section 1.5,
-    // step 7). The stamp is harmless on a healthy item: the candidate views
-    // ignore a stamp older than the item's current stuck state.
-    waive_progression_grace_on_unpark(tx, id)?;
+    // step 7). Only open rows are stamped: a finished item has nothing for
+    // progression to look at. Parking again clears the stamp (see `stamp_task`).
+    crate::progression_candidates::waive_grace(tx, id)?;
     tx.execute(
         "UPDATE tasks SET progression_grace_waived_at = strftime('%s','now')
          WHERE parent_task_id = ?1 AND kind = 'revision'
-           AND deleted_at IS NULL AND status NOT IN ('done', 'archived')",
+           AND deleted_at IS NULL AND parked_at IS NULL AND status NOT IN ('done', 'archived')",
         [id],
     )?;
     Ok(report)
-}
-
-fn waive_progression_grace_on_unpark(tx: &Connection, id: &str) -> Result<()> {
-    crate::progression_candidates::waive_grace(tx, id)?;
-    Ok(())
 }
 
 fn stamp_task(
@@ -843,7 +838,8 @@ fn stamp_task(
         tx,
         basis,
         actor,
-        "UPDATE tasks SET parked_at = ?2, parked_by = ?3, parked_reason = ?4, parked_via = ?5, updated_at = ?2
+        "UPDATE tasks SET parked_at = ?2, parked_by = ?3, parked_reason = ?4, parked_via = ?5, updated_at = ?2,
+             progression_grace_waived_at = NULL
          WHERE id = ?1",
         params![id, now, actor, reason, via],
     )?;
@@ -969,10 +965,6 @@ fn set_project_parked(
             params![id, now],
         )?;
     }
-    let cascaded: Vec<String> = tx
-        .prepare("SELECT id FROM tasks WHERE parked_via = ?1 AND deleted_at IS NULL")?
-        .query_map([&via], |row| row.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
     // Always clear the cascaded rows, even when the project was already
     // un-parked: a stale stamp naming it would otherwise strand a hidden row.
     // Step 2 of the reconciliation sequence reads each as it was parked.
@@ -991,9 +983,6 @@ fn set_project_parked(
          WHERE parked_via = ?1",
         params![via, now],
     )?;
-    for child in &cascaded {
-        waive_progression_grace_on_unpark(tx, child)?;
-    }
     Ok(report)
 }
 

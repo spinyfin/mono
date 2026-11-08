@@ -942,13 +942,18 @@ fn clause_5_declared_blockers_and_a_fresh_unpark_are_admitted_before_the_grace()
 
     // Un-parking an item that is still stuck waives the grace, so it is
     // diagnosed straight away.
+    // The failure stamp is written after the park, so the un-park reconcile
+    // keeps it as current evidence (an older stamp is cleared as stale).
     let unparked = f.chore("Parked then released");
-    f.sql(&format!("UPDATE tasks SET status = 'active' WHERE id = '{unparked}'"));
+    f.db.park_work_item_as_actor(&unparked, true, None, "human").unwrap();
+    f.sql(&format!(
+        "UPDATE tasks SET status = 'active', parked_at = CAST(CAST(parked_at AS INTEGER) - 10 AS TEXT)
+         WHERE id = '{unparked}'"
+    ));
     assert!(
         f.db.bounce_dispatch_failed_to_backlog(&unparked, "churn_guard", "x")
             .unwrap()
     );
-    f.db.park_work_item_as_actor(&unparked, true, None, "human").unwrap();
     f.assert_candidate(&unparked, false);
     f.db.park_work_item_as_actor(&unparked, false, None, "human").unwrap();
     assert!(f.clauses(&unparked).grace_waived);

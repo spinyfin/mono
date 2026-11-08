@@ -414,7 +414,7 @@ impl ExecutionCoordinator {
             );
         }
         let required_driver = self.resolve_spawn_driver(execution, worker_id)?;
-        let preferred = if execution.kind.is_read_only_review() {
+        let preferred = if execution.kind.never_writes_pr_branch() {
             None
         } else {
             self.recovery_source_host(execution)?
@@ -1605,7 +1605,7 @@ impl ExecutionCoordinator {
                 return Err(err);
             }
         };
-        let recovered_blocked = !execution.kind.is_read_only_review()
+        let recovered_blocked = !execution.kind.never_writes_pr_branch()
             && (recovered.as_ref().is_some_and(|recovered| recovered.has_work)
                 || self.work_db.execution_restore_report(&execution.id)?.is_some());
         let goto_target = match (pr_for_goto, immutable_target_sha.as_deref()) {
@@ -1903,7 +1903,7 @@ impl ExecutionCoordinator {
             }
             if self.work_db.execution_bookmark_optional(&execution.id)?.is_none() {
                 let execution_for_pointer = self.work_db.get_execution(&execution.id)?;
-                let report = if execution.kind.is_read_only_review() {
+                let report = if execution.kind.never_writes_pr_branch() {
                     None
                 } else {
                     self.work_db.execution_restore_report(&execution.id)?

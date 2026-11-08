@@ -264,7 +264,8 @@ mod tests {
         let (_on_dir, on) = flags(true);
         let handle = spawn_loop(db.clone(), ProgressionSettings::default(), kick, on);
         for _ in 0..100 {
-            if !progression_runs(&db, &id).is_empty() {
+            // The kick follows the mint, so wait for both before aborting.
+            if !progression_runs(&db, &id).is_empty() && kicks.load(Ordering::SeqCst) > 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
