@@ -366,6 +366,96 @@ impl WorkDb {
         }
     }
 
+    /// Make `host_id` the destination of `execution_id` for a transport that
+    /// reserves no spoke assignment (local, SSH, a host whose spoke is pending).
+    /// An unresolved assignment on another host is retired in the same
+    /// transaction that commands are admitted in when nothing can have started
+    /// there, so a bound adapter for that host is fenced out from now on; if
+    /// something may have started the move is refused. Returns the assignment
+    /// the execution already holds on `host_id`, which keeps being used.
+    pub fn claim_legacy_destination(&self, execution_id: &str, host_id: &str) -> Result<Option<SpokeAssignment>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let open = tx
+            .query_row(
+                &format!("SELECT {ASSIGNMENT_COLUMNS} FROM spoke_assignments WHERE execution_id = ?1 AND resolved_at_ms IS NULL"),
+                [execution_id],
+                map_assignment,
+            )
+            .optional()?;
+        let held = match open {
+            None => None,
+            Some(open) if open.host_id == host_id => Some(open),
+            Some(open) => {
+                if assignment_may_have_started(&tx, execution_id, open.assignment_generation as i64)? {
+                    return Err(SpokeHeldByOtherHost {
+                        execution_id: execution_id.to_owned(),
+                        held_by: open.host_id,
+                        generation: open.assignment_generation,
+                    }
+                    .into());
+                }
+                tx.execute(
+                    "UPDATE spoke_assignments SET resolved_at_ms = ?3, resolution = 'never_started'
+                     WHERE execution_id = ?1 AND assignment_generation = ?2",
+                    params![execution_id, open.assignment_generation as i64, now_ms()],
+                )?;
+                None
+            }
+        };
+        tx.commit()?;
+        Ok(held)
+    }
+
+    /// Whether `host_id` has ever held a spoke assignment, resolved or not.
+    pub fn host_has_spoke_history(&self, host_id: &str) -> Result<bool> {
+        Ok(self.connect()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM spoke_assignments WHERE host_id = ?1)",
+            [host_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Whether an execution on `host_id` holds a cube lease that no spoke
+    /// assignment recorded: a run still using the legacy transport.
+    pub fn host_has_legacy_lease(&self, host_id: &str) -> Result<bool> {
+        Ok(self.connect()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_executions e
+                            WHERE e.host_id = ?1 AND e.cube_lease_id IS NOT NULL
+                              AND NOT EXISTS(SELECT 1 FROM spoke_assignments a
+                                              WHERE a.lease_id = e.cube_lease_id))",
+            [host_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Whether `execution_id` already holds a cube lease no spoke assignment
+    /// recorded, so it started on the legacy transport.
+    pub fn execution_holds_legacy_lease(&self, execution_id: &str) -> Result<bool> {
+        Ok(self.connect()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_executions e
+                            WHERE e.id = ?1 AND e.cube_lease_id IS NOT NULL
+                              AND NOT EXISTS(SELECT 1 FROM spoke_assignments a
+                                              WHERE a.lease_id = e.cube_lease_id))",
+            [execution_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Whether `path` lies in a workspace a spoke assignment on `host_id` leased:
+    /// the workspace directory itself, or the same directory in the encoded form
+    /// the driver names its per-project state directories by.
+    pub fn spoke_owns_path(&self, host_id: &str, path: &str) -> Result<bool> {
+        Ok(self.connect()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM spoke_assignments
+                            WHERE host_id = ?1 AND display_path IS NOT NULL AND display_path <> ''
+                              AND (instr(?2, display_path) > 0
+                                   OR instr(?2, replace(replace(display_path, '/', '-'), '.', '-')) > 0))",
+            params![host_id, path],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Whether any unresolved spoke assignment is held on `host_id`: its workspaces
     /// exist only on the host's spoke, whatever transport new work uses.
     pub fn host_has_open_spoke_assignment(&self, host_id: &str) -> Result<bool> {
@@ -1094,7 +1184,11 @@ mod tests {
                 "host-a",
                 id,
                 Some(&run),
-                if start { RunAdmission::Start } else { RunAdmission::Recovery },
+                if start {
+                    RunAdmission::Start
+                } else {
+                    RunAdmission::Recovery
+                },
                 id.as_bytes(),
                 &|n| n.to_be_bytes().to_vec(),
             )

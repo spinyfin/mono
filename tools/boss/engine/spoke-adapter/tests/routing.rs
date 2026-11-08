@@ -11,7 +11,7 @@ use boss_engine_recovery::execution_bookmark::{
 };
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_execution_contracts::{CollectOutcome, ControlOutcome, Occupancy};
-use boss_protocol_spoke::v1::{Command, PaneLife, WorkspaceKind as Kind, command};
+use boss_protocol_spoke::v1::{Command, PaneLife, ResultCode, WorkspaceKind as Kind, command};
 use boss_work_db::HostTransport;
 use serde_json::json;
 
@@ -295,6 +295,14 @@ async fn operations_without_a_wire_form_follow_the_run_that_owns_them() {
         unbound.probe_workspace_occupancy(Path::new("/other/ws")).await.unwrap(),
         Occupancy::Occupied
     );
+    assert_eq!(
+        unbound
+            .read_transcript_tail_bytes("/home/u/.claude/projects/-elsewhere/run.jsonl", 10)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("legacy transcript")
+    );
     let kind = StructuredOutputKind::PrUrl;
     assert!(matches!(
         unbound
@@ -324,6 +332,7 @@ async fn operations_without_a_wire_form_follow_the_run_that_owns_them() {
             "reattach_events_forward:exec_other",
             "read_worker_log_tail",
             "probe_workspace_occupancy",
+            "read_transcript_tail_bytes",
             "collect_structured_output:exec_other",
             "preserved_work_unpublished:exec_other",
             "prune_execution_bookmark:exec_other",
@@ -339,6 +348,15 @@ async fn operations_without_a_wire_form_follow_the_run_that_owns_them() {
         Occupancy::Unknown
     );
     assert!(unbound.read_worker_log_tail(PATH, 10).await.unwrap().is_none());
+    // A transcript under the spoke run's workspace, in either the plain or the
+    // encoded form the driver names its state directories by, is never read
+    // over the legacy transport.
+    for owned in [
+        format!("{PATH}/transcript.jsonl"),
+        "/home/u/.claude/projects/-hosts-workspaces-worker/run.jsonl".to_owned(),
+    ] {
+        assert!(unbound.read_transcript_tail_bytes(&owned, 10).await.unwrap().is_none());
+    }
     assert!(matches!(
         unbound
             .collect_structured_output("exec_1", kind, Path::new("/tmp/out"))
@@ -485,4 +503,329 @@ fn command_result_repo(c: &Command, repo: &str) -> boss_protocol_spoke::v1::comm
     };
     result.repo_id = repo.into();
     boss_protocol_spoke::v1::command_result::Value::Workspace(result)
+}
+
+/// Answers a lease with the given refusals in order, then grants it.
+fn lease_refusals(refusals: Vec<ResultCode>) -> Script {
+    let mut refusals = refusals.into_iter();
+    Box::new(move |c| {
+        if workspace_kind(c) == Some(Kind::Lease)
+            && let Some(code) = refusals.next()
+        {
+            return Some(refused(c, code, "command expired"));
+        }
+        standard(c)
+    })
+}
+
+#[tokio::test]
+async fn a_refused_or_uncertain_lease_is_asked_again_as_a_new_attempt() {
+    let fx = Fixture::new().await;
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let peer = fx
+        .spoke(
+            lease_refusals(vec![ResultCode::Rejected, ResultCode::OutcomeUncertain]),
+            None,
+            0,
+        )
+        .await;
+    let first = adapter
+        .lease_workspace("repo", "task", None, false, &[])
+        .await
+        .unwrap_err();
+    assert!(format!("{first:#}").contains("command expired"), "{first:#}");
+    let second = adapter
+        .lease_workspace("repo", "task", None, false, &[])
+        .await
+        .unwrap_err();
+    assert!(format!("{second:#}").contains("uncertain"), "{second:#}");
+    // The run is not stranded: the next attempt reaches the host and succeeds.
+    assert_eq!(
+        adapter
+            .lease_workspace("repo", "task", None, false, &[])
+            .await
+            .unwrap()
+            .lease_id,
+        "lease-1"
+    );
+    let ids: Vec<_> = lease_commands(&peer.commands())
+        .into_iter()
+        .map(|c| c.command_id)
+        .collect();
+    assert_eq!(ids.len(), 3);
+    assert!(ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2], "{ids:?}");
+    // A repeat after the lease was granted is answered from the stored result.
+    adapter.lease_workspace("repo", "task", None, false, &[]).await.unwrap();
+    assert_eq!(lease_commands(&peer.commands()).len(), 3);
+}
+
+#[tokio::test]
+async fn retrying_a_stored_stop_without_a_stream_stays_uncertain() {
+    let fx = Fixture::with(short(400)).await;
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let peer = fx
+        .spoke(
+            Box::new(|c| match &c.body {
+                Some(command::Body::Stop(_)) => None,
+                _ => standard(c),
+            }),
+            None,
+            0,
+        )
+        .await;
+    lease(&adapter).await;
+    spawn(&adapter).await.unwrap();
+
+    // The stop is stored and goes unanswered; then the stream drops.
+    let grace = Duration::from_millis(100);
+    assert!(matches!(
+        adapter.stop_worker("exec_1", grace).await.unwrap(),
+        ControlOutcome::Uncertain(_)
+    ));
+    peer.disconnect();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The earlier connection may have run it, so "never submitted" would be false.
+    assert!(matches!(
+        adapter.stop_worker("exec_1", grace).await.unwrap(),
+        ControlOutcome::Uncertain(_)
+    ));
+}
+
+#[tokio::test]
+async fn retrying_a_stored_lease_without_a_stream_stays_uncertain() {
+    let fx = Fixture::with(short(400)).await;
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let peer = fx
+        .spoke(
+            Box::new(|c| (workspace_kind(c) != Some(Kind::Lease)).then(|| standard(c)).flatten()),
+            None,
+            0,
+        )
+        .await;
+    let first = adapter
+        .lease_workspace("repo", "task", None, false, &[])
+        .await
+        .unwrap_err();
+    assert!(format!("{first:#}").contains("uncertain"), "{first:#}");
+    peer.disconnect();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let retry = format!(
+        "{:#}",
+        adapter
+            .lease_workspace("repo", "task", None, false, &[])
+            .await
+            .unwrap_err()
+    );
+    assert!(
+        retry.contains("uncertain") && !retry.contains("nothing was sent"),
+        "{retry}"
+    );
+}
+
+#[tokio::test]
+async fn a_stop_that_settled_uncertain_is_asked_again() {
+    let fx = Fixture::new().await;
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let mut uncertain = true;
+    let peer = fx
+        .spoke(
+            Box::new(move |c| match &c.body {
+                Some(command::Body::Stop(_)) if std::mem::take(&mut uncertain) => {
+                    Some(refused(c, ResultCode::OutcomeUncertain, "daemon restarted mid-stop"))
+                }
+                Some(command::Body::Stop(_)) => Some(ok(c, Some(pane(PaneLife::Exited)))),
+                _ => standard(c),
+            }),
+            None,
+            0,
+        )
+        .await;
+    lease(&adapter).await;
+    spawn(&adapter).await.unwrap();
+    let grace = Duration::from_secs(1);
+    assert!(matches!(
+        adapter.stop_worker("exec_1", grace).await.unwrap(),
+        ControlOutcome::Uncertain(_)
+    ));
+    assert!(matches!(
+        adapter.stop_worker("exec_1", grace).await.unwrap(),
+        ControlOutcome::Delivered(_)
+    ));
+    let stops = peer
+        .commands()
+        .iter()
+        .filter(|c| matches!(c.body, Some(command::Body::Stop(_))))
+        .count();
+    assert_eq!(stops, 2);
+}
+
+#[tokio::test]
+async fn a_replacement_stop_is_reused_until_it_settles() {
+    let fx = Fixture::with(short(400)).await;
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let mut stops = 0;
+    let peer = fx
+        .spoke(
+            Box::new(move |c| match &c.body {
+                Some(command::Body::Stop(_)) => {
+                    stops += 1;
+                    // The first is refused; the replacement is never answered in time.
+                    (stops == 1).then(|| refused(c, ResultCode::Rejected, "not yet"))
+                }
+                _ => standard(c),
+            }),
+            None,
+            0,
+        )
+        .await;
+    lease(&adapter).await;
+    spawn(&adapter).await.unwrap();
+    let grace = Duration::from_millis(100);
+    assert!(matches!(
+        adapter.stop_worker("exec_1", grace).await.unwrap(),
+        ControlOutcome::Rejected { .. }
+    ));
+    assert!(matches!(
+        adapter.stop_worker("exec_1", grace).await.unwrap(),
+        ControlOutcome::Uncertain(_)
+    ));
+
+    // The third call retries the replacement under its own id and its late
+    // result completes it; nothing new is sent.
+    let retrying = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { adapter.stop_worker("exec_1", grace).await })
+    };
+    let replacement = peer
+        .commands()
+        .into_iter()
+        .filter(|c| matches!(c.body, Some(command::Body::Stop(_))))
+        .nth(1)
+        .expect("the replacement stop reached the spoke");
+    peer.answer_late(&replacement, ok(&replacement, Some(pane(PaneLife::Exited))))
+        .await;
+    assert!(matches!(retrying.await.unwrap().unwrap(), ControlOutcome::Delivered(_)));
+    // A fourth call is answered by the replacement's stored result.
+    assert!(matches!(
+        adapter.stop_worker("exec_1", grace).await.unwrap(),
+        ControlOutcome::Delivered(_)
+    ));
+    let ids: Vec<_> = peer
+        .commands()
+        .into_iter()
+        .filter(|c| matches!(c.body, Some(command::Body::Stop(_))))
+        .map(|c| c.command_id)
+        .collect();
+    assert_eq!(ids.len(), 2, "{ids:?}");
+}
+
+#[tokio::test]
+async fn moving_to_a_legacy_destination_fences_the_old_reservation() {
+    let fx = Fixture::new().await;
+    fx.serve_legacy();
+    fx.ready(HOST);
+    fx.db
+        .set_host_transport("pending", HostTransport::SpokePending)
+        .unwrap();
+    for (n, destination) in ["local", "ssh-host", "pending"].into_iter().enumerate() {
+        let exec = format!("exec_{n}");
+        // Nothing has started on the spoke host yet, so the move is allowed...
+        let old = fx.adapter(HOST, &exec).await.unwrap();
+        fx.adapter(destination, &exec).await.unwrap();
+        // ...and the old reservation can no longer admit anything.
+        assert!(
+            fx.db.spoke_assignment_for_execution(&exec).unwrap().unwrap().resolved,
+            "{destination}"
+        );
+        assert!(old.lease_workspace("repo", "task", None, false, &[]).await.is_err());
+        assert!(
+            old.spawn_worker("w", &execution(&exec), &work_item(), Path::new(PATH), None)
+                .await
+                .is_err()
+        );
+        assert!(fx.db.host_command_after(HOST, 0).unwrap().is_none(), "{destination}");
+    }
+}
+
+#[tokio::test]
+async fn a_ready_host_still_lists_the_leases_of_legacy_runs() {
+    let fx = Fixture::new().await;
+    fx.serve_legacy();
+    fx.ready(HOST);
+    let unbound = fx.provider_adapter(HOST).await;
+    let _peer = fx
+        .spoke(
+            Box::new(|c| match workspace_kind(c) {
+                Some(Kind::ListWorkspaces) => Some(ok(c, Some(workspace(c, json!([]))))),
+                _ => standard(c),
+            }),
+            None,
+            0,
+        )
+        .await;
+    // No legacy run holds a lease: only the spoke is asked.
+    assert!(unbound.list_workspaces().await.unwrap().is_empty());
+    assert!(fx.legacy_calls().is_empty());
+
+    // An SSH run still holds one, so it must stay visible to the callers that
+    // read an unlisted lease as already released.
+    fx.legacy_execution(HOST, "exec_ssh", "ssh-lease");
+    let listed = unbound.list_workspaces().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].lease_id.as_deref(), Some("ssh-lease"));
+    assert_eq!(fx.legacy_calls(), ["list_workspaces"]);
+}
+
+#[tokio::test]
+async fn an_execution_that_started_over_ssh_is_not_given_a_spoke_assignment() {
+    let fx = Fixture::new().await;
+    fx.serve_legacy();
+    fx.ready(HOST);
+    fx.legacy_execution(HOST, "exec_ssh", "ssh-lease");
+    let adapter = fx.adapter(HOST, "exec_ssh").await.unwrap();
+    assert_eq!(adapter.host_id(), HOST);
+    assert!(fx.db.spoke_assignment_for_execution("exec_ssh").unwrap().is_none());
+    // A fresh execution on the same host still gets the spoke.
+    fx.adapter(HOST, "exec_new").await.unwrap();
+    assert!(fx.db.spoke_assignment_for_execution("exec_new").unwrap().is_some());
+}
+
+#[tokio::test]
+async fn recovery_for_a_resolved_spoke_run_crosses_the_stream_after_the_host_returns_to_ssh() {
+    let fx = Fixture::new().await;
+    fx.serve_legacy();
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let peer = fx
+        .spoke(
+            Box::new(|c| match workspace_kind(c) {
+                Some(Kind::DiffBookmark) => Some(ok(c, Some(workspace(c, json!("diff --git"))))),
+                _ => standard(c),
+            }),
+            None,
+            0,
+        )
+        .await;
+    lease(&adapter).await;
+    adapter.release_workspace("lease-1").await.unwrap();
+    fx.db.set_host_transport(HOST, HostTransport::LegacySsh).unwrap();
+
+    let fresh = fx.provider_adapter(HOST).await;
+    let record = ExecutionBookmark::builder()
+        .execution_id("exec_1")
+        .repo_path("/spoke/repo".into())
+        .host_id(HOST)
+        .build();
+    assert_eq!(fresh.execution_bookmark_diff(&record).await.unwrap(), "diff --git");
+    assert!(
+        peer.commands()
+            .iter()
+            .any(|c| workspace_kind(c) == Some(Kind::DiffBookmark))
+    );
+    assert!(fx.legacy_calls().is_empty(), "{:?}", fx.legacy_calls());
 }

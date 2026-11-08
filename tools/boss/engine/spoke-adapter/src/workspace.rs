@@ -187,11 +187,21 @@ impl SpokeHostAdapter {
             exclude_workspace_ids: exclude_workspace_ids.iter().map(|id| (*id).to_owned()).collect(),
             ..Default::default()
         };
-        let id = format!(
-            "lease-{}-{:016x}",
-            assignment.run_id,
-            request_digest(&op.encode_to_vec())
-        );
+        // A lease that settled as a refusal, or as uncertain with no lease to
+        // show for it, is asked again as a new recorded attempt: the host
+        // recognises its own lease by the run, so a new id cannot make a second.
+        let id = self
+            .hub
+            .current_attempt(
+                self.host_name(),
+                &format!(
+                    "lease-{}-{:016x}",
+                    assignment.run_id,
+                    request_digest(&op.encode_to_vec())
+                ),
+                lease_attempt_is_spent,
+            )
+            .await?;
         self.set_doubt(&assignment, true).await?;
         let sent = self
             .hub
@@ -690,5 +700,17 @@ impl SpokeHostAdapter {
             })
             .await?;
         json(&result, "bookmark prune")
+    }
+}
+
+/// Whether a settled lease attempt can no longer produce a lease: the host
+/// refused it, or its outcome is unknown and names no lease.
+fn lease_attempt_is_spent(result: &boss_protocol_spoke::v1::CommandResult) -> bool {
+    match ResultCode::try_from(result.code) {
+        Ok(ResultCode::Ok) => false,
+        Ok(ResultCode::OutcomeUncertain) => {
+            !matches!(&result.value, Some(command_result::Value::Workspace(w)) if !w.lease_id.is_empty())
+        }
+        _ => true,
     }
 }

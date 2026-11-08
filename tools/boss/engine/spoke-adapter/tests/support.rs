@@ -205,7 +205,15 @@ impl HostAdapter for LegacyAdapter {
         self.used("workspace_status")
     }
     async fn list_workspaces(&self) -> anyhow::Result<Vec<CubeWorkspaceStatus>> {
-        self.used("list_workspaces")
+        self.legacy.record("list_workspaces");
+        Ok(vec![
+            CubeWorkspaceStatus::builder()
+                .workspace_id("ssh-workspace")
+                .workspace_path("/ssh/workspaces/ssh-workspace".into())
+                .state("leased")
+                .lease_id("ssh-lease")
+                .build(),
+        ])
     }
     async fn list_repos(&self) -> anyhow::Result<Vec<CubeRepoSummary>> {
         self.used("list_repos")
@@ -241,6 +249,10 @@ impl HostAdapter for LegacyAdapter {
     async fn read_worker_log_tail(&self, _: &str, _: u64) -> anyhow::Result<Option<String>> {
         self.legacy.record("read_worker_log_tail");
         Ok(Some("legacy log".into()))
+    }
+    async fn read_transcript_tail_bytes(&self, _: &str, _: u64) -> anyhow::Result<Option<String>> {
+        self.legacy.record("read_transcript_tail_bytes");
+        Ok(Some("legacy transcript".into()))
     }
     async fn probe_workspace_occupancy(&self, _: &Path) -> anyhow::Result<Occupancy> {
         self.legacy.record("probe_workspace_occupancy");
@@ -419,6 +431,20 @@ impl Fixture {
     /// Every call that reached the legacy transport's adapter, in order.
     pub fn legacy_calls(&self) -> Vec<String> {
         self.legacy.calls.lock().unwrap().clone()
+    }
+
+    /// An execution on `host` that started over SSH and still holds `lease`.
+    pub fn legacy_execution(&self, host: &str, execution_id: &str, lease: &str) {
+        self.db
+            .connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO work_executions
+                    (id, work_item_id, kind, status, repo_remote_url, created_at, host_id, cube_lease_id)
+                 VALUES (?1, 'chore_1', 'task_implementation', 'running', 'https://example.test/r', '1', ?2, ?3)",
+                (execution_id, host, lease),
+            )
+            .unwrap();
     }
 
     pub fn ready(&self, id: &str) {

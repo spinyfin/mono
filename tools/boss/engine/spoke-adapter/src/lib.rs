@@ -158,34 +158,87 @@ impl Hub {
         body: command::Body,
         deadline: Duration,
     ) -> Result<CommandResult, HostCallError> {
+        let uncertain = |reason: String| HostCallError::Uncertain {
+            host_id: host_id.to_owned(),
+            op,
+            command_id: command_id.clone(),
+            reason,
+        };
         let (db_host, id) = (host_id.to_owned(), command_id.clone());
         let db = Arc::clone(&self.db);
-        let stored = tokio::task::spawn_blocking(move || db.host_command_wire(&db_host, &id))
-            .await
-            .map_err(|error| HostCallError::NotSent {
-                host_id: host_id.to_owned(),
-                op,
-                reason: format!("work database task failed: {error}"),
-            })?
-            .map_err(|error| HostCallError::NotSent {
-                host_id: host_id.to_owned(),
-                op,
-                reason: format!("reading the stored command failed: {error:#}"),
-            })?;
-        let command = match stored {
-            Some(wire) => {
-                let mut command = Command::decode(wire.as_slice()).map_err(|error| HostCallError::Uncertain {
-                    host_id: host_id.to_owned(),
-                    op,
-                    command_id: command_id.clone(),
-                    reason: format!("the stored command cannot be decoded: {error}"),
-                })?;
-                command.sequence = 0;
-                command
+        // What an earlier attempt left behind: the stored command and, once it
+        // settled, its result. Failing to read either is not evidence that
+        // nothing was stored, so it is reported as uncertain, never as unsent.
+        let prior = tokio::task::spawn_blocking(move || -> Result<_> {
+            let wire = db.host_command_wire(&db_host, &id)?;
+            let result = match wire {
+                Some(_) => db.host_command_result(&db_host, &id)?,
+                None => None,
+            };
+            Ok((wire, result))
+        })
+        .await
+        .map_err(|error| uncertain(format!("work database task failed: {error}")))?
+        .map_err(|error| uncertain(format!("reading the stored command failed: {error:#}")))?;
+        let (command, existed) = match prior {
+            (Some(_), Some(settled)) => {
+                // A settled command answers from its stored result even with no
+                // live stream.
+                return CommandResult::decode(settled.as_slice())
+                    .map_err(|error| uncertain(format!("the stored result cannot be decoded: {error}")));
             }
-            None => self.new_command(&command_id, run, body),
+            (Some(wire), None) => {
+                let mut command = Command::decode(wire.as_slice())
+                    .map_err(|error| uncertain(format!("the stored command cannot be decoded: {error}")))?;
+                command.sequence = 0;
+                (command, true)
+            }
+            (None, _) => (self.new_command(&command_id, run, body), false),
         };
-        self.send_command(host_id, op, command, deadline).await
+        match self.send_command(host_id, op, command, deadline).await {
+            // An earlier connection may already have executed the stored
+            // command, so a retry that cannot reach the host does not make it
+            // "never sent".
+            Err(HostCallError::NotSent { reason, .. }) if existed => Err(uncertain(format!(
+                "an earlier attempt stored this command and it may have run; this retry could not be sent: {reason}"
+            ))),
+            other => other,
+        }
+    }
+
+    /// The id of the current attempt at a repeatable request. Attempts are
+    /// `base`, `base-a1`, `base-a2`, ... and the current one is the first not
+    /// settled in a way `superseded` calls final: an unsettled attempt is reused
+    /// (its late result still answers it), a settled-usable one is returned as
+    /// stored, and anything else moves on to a new attempt. The chain is read
+    /// from the stored commands themselves, so it survives a restart.
+    pub(crate) async fn current_attempt(
+        &self,
+        host_id: &str,
+        base: &str,
+        superseded: fn(&CommandResult) -> bool,
+    ) -> Result<String> {
+        let db = Arc::clone(&self.db);
+        let (host, base) = (host_id.to_owned(), base.to_owned());
+        tokio::task::spawn_blocking(move || -> Result<String> {
+            let mut attempt = 0_u32;
+            loop {
+                let id = if attempt == 0 {
+                    base.clone()
+                } else {
+                    format!("{base}-a{attempt}")
+                };
+                if let Some(bytes) = db.host_command_result(&host, &id)?
+                    && superseded(&CommandResult::decode(bytes.as_slice())?)
+                {
+                    attempt += 1;
+                    continue;
+                }
+                return Ok(id);
+            }
+        })
+        .await
+        .context("work database task failed")?
     }
 
     /// Send an already-built command, for a retry that must reuse the stored one.
@@ -399,6 +452,16 @@ impl SpokeHostAdapter {
         .await
     }
 
+    /// Whether an execution still using the legacy transport holds a lease on
+    /// this host. An adapter without a legacy transport has none to cover.
+    async fn legacy_leases_remain(&self) -> Result<bool> {
+        if self.legacy.is_none() {
+            return Ok(false);
+        }
+        let host = self.host.id.clone();
+        self.db(move |db| db.host_has_legacy_lease(&host)).await
+    }
+
     /// The assignment an execution-addressed control request acts on.
     pub(crate) async fn control_target(&self, execution_id: &str) -> Result<Option<SpokeAssignment>> {
         let (host, execution) = (self.host.id.clone(), execution_id.to_owned());
@@ -433,7 +496,15 @@ impl HostAdapter for SpokeHostAdapter {
         if !self.host_scoped_uses_spoke().await? {
             return self.legacy_adapter("a repo listing").await?.list_repos().await;
         }
-        self.ws_list_repos().await
+        let mut repos = self.ws_list_repos().await?;
+        if self.legacy_leases_remain().await? {
+            for repo in self.legacy_adapter("a repo listing").await?.list_repos().await? {
+                if !repos.iter().any(|known| known.repo_id == repo.repo_id) {
+                    repos.push(repo);
+                }
+            }
+        }
+        Ok(repos)
     }
 
     async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
@@ -444,7 +515,19 @@ impl HostAdapter for SpokeHostAdapter {
                 .list_workspaces()
                 .await;
         }
-        self.ws_list_workspaces().await
+        let mut workspaces = self.ws_list_workspaces().await?;
+        // A legacy run's lease lives in the SSH user's store. Callers read a
+        // lease missing from this listing as already released, so while any
+        // remain the listing covers both transports.
+        if self.legacy_leases_remain().await? {
+            workspaces.extend(
+                self.legacy_adapter("a workspace listing")
+                    .await?
+                    .list_workspaces()
+                    .await?,
+            );
+        }
+        Ok(workspaces)
     }
 
     async fn lease_workspace(
@@ -708,12 +791,12 @@ impl HostAdapter for SpokeHostAdapter {
 
     async fn read_transcript_tail_bytes(&self, path: &str, max_bytes: u64) -> Result<Option<String>> {
         // A spoke run's transcript is materialized on the hub by run identity;
-        // its recorded path is a path on the host and is never opened here.
-        if self.bound.is_some() {
-            bail!(
-                "the transcript of a spoke worker on host {} is read from hub custody, not by path",
-                self.host.id
-            );
+        // its recorded path is a path on the host and is never opened here, or
+        // sent over SSH. Only a path no spoke assignment owns is the legacy
+        // transport's to read.
+        let (host, owned) = (self.host.id.clone(), path.to_owned());
+        if self.db(move |db| db.spoke_owns_path(&host, &owned)).await? {
+            return Ok(None);
         }
         self.legacy_adapter("a transcript read")
             .await?
@@ -889,7 +972,20 @@ impl HostAdapterProvider for SpokeHostAdapterProvider {
             return self.inner.adapter_for(host).await;
         }
         match self.transport(host).await? {
-            HostTransport::LegacySsh => self.inner.adapter_for(host).await,
+            // A host that once ran spokes keeps the ownership-aware adapter: the
+            // recovery pointers of its resolved spoke runs live with the spoke,
+            // not in the SSH user's store.
+            HostTransport::LegacySsh => {
+                let (db, id) = (Arc::clone(&self.hub.db), host.id.clone());
+                let history = tokio::task::spawn_blocking(move || db.host_has_spoke_history(&id))
+                    .await
+                    .context("work database task failed")??;
+                if history {
+                    Ok(self.adapter(host, None, true))
+                } else {
+                    self.inner.adapter_for(host).await
+                }
+            }
             // Runs started over either transport can address this host, and
             // each operation finds its own by the lease or workspace it names.
             HostTransport::SpokePending | HostTransport::SpokeReady => Ok(self.adapter(host, None, true)),
@@ -902,22 +998,20 @@ impl HostAdapterProvider for SpokeHostAdapterProvider {
         let transport = self.transport(host).await?;
         let local = host.id == boss_protocol::LOCAL_HOST_ID;
         let reserved = tokio::task::spawn_blocking(move || -> Result<Option<SpokeAssignment>> {
-            // Ownership is settled before the destination is chosen, whatever
-            // the destination is: an unresolved assignment on another host pins
-            // the execution there, so the local host, an SSH host and a host
-            // whose spoke is still pending all refuse it, not just a ready spoke.
-            db.ensure_spoke_ownership(&execution, &host_id)?;
-            if local {
-                return Ok(None);
+            // Only a ready spoke takes new work, and never the local host. Every
+            // other destination (local, SSH, a spoke still pending) reserves
+            // nothing, but still takes ownership atomically: an unused
+            // reservation on another host is retired in the same transaction
+            // that fences command admission, and one that may have started is
+            // refused, so two hosts can never both run the execution.
+            //
+            // An execution that already holds a legacy lease started over SSH
+            // and stays there: reserving a spoke assignment would strand that
+            // lease while the spoke leased a second workspace.
+            if local || transport != HostTransport::SpokeReady || db.execution_holds_legacy_lease(&execution)? {
+                return db.claim_legacy_destination(&execution, &host_id);
             }
-            if transport == HostTransport::SpokeReady {
-                return db.reserve_spoke_assignment(&execution, &host_id).map(Some);
-            }
-            // Not ready for new spoke work: only a run that already holds an
-            // assignment here keeps using it.
-            Ok(db
-                .spoke_assignment_for_execution(&execution)?
-                .filter(|assignment| assignment.host_id == host_id && !assignment.resolved))
+            db.reserve_spoke_assignment(&execution, &host_id).map(Some)
         })
         .await
         .context("work database task failed")??;

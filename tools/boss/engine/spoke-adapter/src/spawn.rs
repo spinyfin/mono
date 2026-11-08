@@ -301,28 +301,18 @@ impl SpokeHostAdapter {
         })
     }
 
-    /// The id a repeatable control request uses for this run. Retrying a stop
-    /// whose outcome is unknown, or repeating one that already succeeded, must
-    /// land on the same stored command rather than queue another, so the id is
-    /// the run's and `prefix`. Only a stop the host refused or found nothing to
-    /// stop is final in the other direction: asking again is a new request, so it
-    /// gets a fresh id instead of the stored refusal.
+    /// The id a repeatable control request uses for this run. A retry of a stop
+    /// whose outcome is unknown, or a repeat of one that already succeeded, lands
+    /// on the same stored command rather than queueing another. A stop that
+    /// settled as anything but success (refused, nothing to stop, or an
+    /// uncertain outcome) is asked again as a new, recorded attempt, which is
+    /// itself reused until it settles.
     async fn stable_control_id(&self, assignment: &SpokeAssignment, prefix: &str) -> Result<String> {
-        let id = format!("{prefix}-{}", assignment.run_id);
-        let (host, stored_id) = (self.host_name().to_owned(), id.clone());
-        let stored = self.db(move |db| db.host_command_result(&host, &stored_id)).await?;
-        let refused = match stored {
-            Some(bytes) => matches!(
-                ResultCode::try_from(CommandResult::decode(bytes.as_slice())?.code),
-                Ok(ResultCode::Rejected | ResultCode::Absent)
-            ),
-            None => false,
-        };
-        Ok(if refused {
-            self.hub.unique_id(prefix, &assignment.run_id)
-        } else {
-            id
-        })
+        self.hub
+            .current_attempt(self.host_name(), &format!("{prefix}-{}", assignment.run_id), |result| {
+                ResultCode::try_from(result.code) != Ok(ResultCode::Ok)
+            })
+            .await
     }
 
     fn control_outcome(result: CommandResult) -> ControlOutcome {
