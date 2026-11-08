@@ -5,7 +5,7 @@ use crate::host_adapter::HostAdapter;
 use boss_engine_recovery::execution_bookmark::{ExecutionBookmark, RestoreReport};
 
 /// Delegates to a real adapter, but fails the first
-/// `restore_rebased_execution_bookmark` with an ordinary (transient) error and
+/// `restore_preserved_work` with an ordinary (transient) error and
 /// records every base it is asked to restage onto.
 struct FlakyRestoreAdapter {
     inner: Arc<dyn HostAdapter>,
@@ -15,14 +15,28 @@ struct FlakyRestoreAdapter {
 
 #[async_trait]
 impl HostAdapter for FlakyRestoreAdapter {
-    async fn prepare_recovery_pr(
+    async fn restore_preserved_work(
         &self,
         record: &ExecutionBookmark,
         workspace: &Path,
-        repo_id: &str,
-        pr: u64,
-    ) -> Result<bool> {
-        self.inner.prepare_recovery_pr(record, workspace, repo_id, pr).await
+        recorded: Option<&boss_engine_recovery::execution_bookmark::PreservedTip>,
+    ) -> Result<Option<RestoreReport>> {
+        let base = self.inner.positioned_parent(workspace).await?;
+        let first = {
+            let mut bases = self.bases.lock().unwrap();
+            bases.push(base);
+            bases.len() == 1
+        };
+        if first {
+            if let Some(kind) = self.integrity {
+                return Err(boss_engine_recovery::execution_bookmark::pointer_integrity_error_of(
+                    kind,
+                    "injected integrity verdict",
+                ));
+            }
+            return Err(anyhow!("injected transient fetch failure"));
+        }
+        self.inner.restore_preserved_work(record, workspace, recorded).await
     }
 
     async fn recovery_pr_base(&self, origin: &str, pr: u64) -> Result<String> {
@@ -39,32 +53,6 @@ impl HostAdapter for FlakyRestoreAdapter {
 
     async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {
         self.inner.execution_bookmark_diff(record).await
-    }
-
-    async fn restore_rebased_execution_bookmark(
-        &self,
-        record: &ExecutionBookmark,
-        workspace: &Path,
-        pr_bookmark: Option<&str>,
-        base_branch: &str,
-    ) -> Result<RestoreReport> {
-        let first = {
-            let mut bases = self.bases.lock().unwrap();
-            bases.push(base_branch.to_owned());
-            bases.len() == 1
-        };
-        if first {
-            if let Some(kind) = self.integrity {
-                return Err(boss_engine_recovery::execution_bookmark::pointer_integrity_error_of(
-                    kind,
-                    "injected integrity verdict",
-                ));
-            }
-            return Err(anyhow!("injected transient fetch failure"));
-        }
-        self.inner
-            .restore_rebased_execution_bookmark(record, workspace, pr_bookmark, base_branch)
-            .await
     }
 
     fn host_id(&self) -> &str {
@@ -129,17 +117,6 @@ impl HostAdapter for FlakyRestoreAdapter {
     ) -> Result<ExecutionBookmark> {
         self.inner
             .create_execution_bookmark(workspace, execution_id, predecessor, inherited_base)
-            .await
-    }
-
-    async fn restore_execution_bookmark(
-        &self,
-        record: &ExecutionBookmark,
-        workspace: &Path,
-        self_retry: bool,
-    ) -> Result<bool> {
-        self.inner
-            .restore_execution_bookmark(record, workspace, self_retry)
             .await
     }
 
@@ -253,7 +230,10 @@ async fn restore_transport_failure_retries_on_the_same_stacked_base() {
         .unwrap()
         .unwrap();
     assert!(recovered.has_work);
-    assert_eq!(*flaky.bases.lock().unwrap(), vec!["stack-parent", "stack-parent"]);
+    let bases = flaky.bases.lock().unwrap();
+    assert_eq!(bases.len(), 2);
+    assert_eq!(bases[0], bases[1]);
+    drop(bases);
     assert_eq!(
         std::fs::read_to_string(h.repo.replacement.join("revision.txt")).unwrap(),
         "unpushed revision"
@@ -273,7 +253,7 @@ async fn restore_transport_failure_retries_on_the_same_stacked_base() {
 }
 
 #[tokio::test]
-async fn every_integrity_verdict_archives_and_allows_fresh_dispatch() {
+async fn every_integrity_verdict_retains_saved_work_and_allows_fresh_dispatch() {
     use boss_engine_recovery::execution_bookmark::PointerIntegrityKind;
     use boss_engine_test_git::jj::JjRepo;
     for kind in [
@@ -303,16 +283,12 @@ async fn every_integrity_verdict_archives_and_allows_fresh_dispatch() {
                 .is_none(),
             "{kind:?}"
         );
-        assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_none(), "{kind:?}");
+        assert!(db.preserved_tip(&prior.id).unwrap().is_some(), "{kind:?}");
         assert!(
-            !JjRepo::run(
-                &h.repo.repo,
-                &["bookmark", "list", &format!("glob:preserved-archive/{}/*", prior.id)]
-            )
-            .is_empty(),
+            !JjRepo::run(&h.repo.repo, &["bookmark", "list", &format!("preserved/{}", prior.id)]).is_empty(),
             "{kind:?}"
         );
-        let notes = db.list_attention_items_for_work_item(&prior.work_item_id).unwrap();
+        let notes = db.list_attention_items(&prior.id).unwrap();
         assert!(
             notes
                 .iter()
@@ -327,7 +303,7 @@ async fn every_integrity_verdict_archives_and_allows_fresh_dispatch() {
 }
 
 #[tokio::test]
-async fn conflicted_recovery_bookmark_archives_both_heads_and_starts_worker() {
+async fn legacy_conflicts_remain_untouched_and_never_prevent_start() {
     use boss_engine_recovery::execution_bookmark::{LocalJj, PointerIntegrityKind, diff, pointer_integrity_kind};
     use boss_engine_test_git::jj::JjRepo;
     for kind in [
@@ -348,6 +324,7 @@ async fn conflicted_recovery_bookmark_archives_both_heads_and_starts_worker() {
         let db = &h.coordinator.work_db();
         // Resolve the fixture predecessor before changing its execution kind.
         let prior = db.recovery_predecessor(&h.next).unwrap().unwrap();
+        db.clear_preserved_tip(&prior.id).unwrap();
         db.connect()
             .unwrap()
             .execute(
@@ -421,15 +398,25 @@ async fn conflicted_recovery_bookmark_archives_both_heads_and_starts_worker() {
             );
             continue;
         }
-        assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_none());
-        let notes = db.list_attention_items_for_work_item(&prior.work_item_id).unwrap();
-        assert!(notes.iter().any(|note| note.body_markdown.contains("exactly one")));
-        for twin in twins.lines() {
-            let archive = format!("preserved-archive/{}/{twin}", prior.id);
-            assert_eq!(
-                JjRepo::run(&h.repo.repo, &["log", "-r", &archive, "--no-graph", "-T", "commit_id"]),
-                twin
-            );
-        }
+        assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
+        assert!(
+            db.list_attention_items_for_work_item(&prior.work_item_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            JjRepo::run(
+                &h.repo.repo,
+                &[
+                    "log",
+                    "-r",
+                    &format!("bookmarks(exact:{})", record.head()),
+                    "--no-graph",
+                    "-T",
+                    "commit_id ++ \"\\n\""
+                ]
+            ),
+            twins
+        );
     }
 }

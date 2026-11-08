@@ -169,7 +169,7 @@ async fn empty_initialization_ignores_a_leftover_legacy_baseline_name() {
 }
 
 #[tokio::test]
-async fn restored_dispatch_creates_only_one_recovery_head_and_uses_the_recorded_floor() {
+async fn restored_dispatch_creates_no_bookmarks_and_uses_the_recorded_floor() {
     let f = Fixture::new().await;
     let prior = f.record("exec_prior").await;
     f.edit(&prior).await;
@@ -182,14 +182,11 @@ async fn restored_dispatch_creates_only_one_recovery_head_and_uses_the_recorded_
         .await
         .unwrap();
     let parent = LocalJj
-        .run(
-            &f.repo,
-            &["op", "log", "--no-graph", "--at-op", "@-", "-n", "1", "-T", "id"],
-        )
+        .run(&f.repo, &["op", "log", "--no-graph", "-n", "1", "-T", "id"])
         .await
         .unwrap();
-    assert_eq!(parent, before, "restored dispatch must perform one store operation");
-    assert_eq!(next.has_recovery_head, Some(true));
+    assert_eq!(parent, before, "restored dispatch must not mutate the store");
+    assert_eq!(next.has_recovery_head, Some(false));
     assert_eq!(next.base_commit, prior.base_commit);
     let names = LocalJj
         .run(
@@ -198,8 +195,13 @@ async fn restored_dispatch_creates_only_one_recovery_head_and_uses_the_recorded_
         )
         .await
         .unwrap();
-    assert_eq!(names.trim(), next.head());
-    assert!(unpublished_diff(&LocalJj, &next).await.unwrap().contains("second.txt"));
+    assert!(names.trim().is_empty());
+    let saved = preserve(&LocalJj, &next, &f.replacement, None, None).await.unwrap();
+    assert!(saved.tip.is_some());
+    assert_eq!(
+        std::fs::read_to_string(f.replacement.join("second.txt")).unwrap(),
+        "second change\n"
+    );
 }
 
 #[tokio::test]
@@ -258,9 +260,16 @@ async fn consecutive_recoveries_keep_inherited_work_when_the_next_run_makes_no_e
     let prior = f.record("exec_prior").await;
     f.edit(&prior).await;
     assert!(restore(&LocalJj, &prior, &f.replacement).await.unwrap());
-    let next = create_from(&LocalJj, &f.replacement, "exec_next", "local", Some(&prior), None)
-        .await
-        .unwrap();
+    let next = test_support::create_legacy_three_bookmark_fixture_from(
+        &LocalJj,
+        &f.replacement,
+        "exec_next",
+        "local",
+        Some(&prior),
+        None,
+    )
+    .await
+    .unwrap();
     std::fs::remove_dir_all(&f.worker).unwrap();
     std::fs::remove_dir_all(&f.replacement).unwrap();
     let patch = unpublished_diff(&LocalJj, &next).await.unwrap();
@@ -277,7 +286,7 @@ async fn consecutive_recoveries_keep_work_when_the_predecessor_has_no_recorded_b
     legacy.base_commit = None;
     legacy.pr_head_before = Some(floor.clone());
     assert!(restore(&LocalJj, &legacy, &f.replacement).await.unwrap());
-    let next = create_from(
+    let next = test_support::create_legacy_three_bookmark_fixture_from(
         &LocalJj,
         &f.replacement,
         "exec_legacy_null_next",
@@ -330,7 +339,7 @@ async fn a_conflicted_legacy_boss_base_is_ignored_when_inheriting_a_predecessor_
             .unwrap();
     }
     assert!(restore(&LocalJj, &legacy, &f.replacement).await.unwrap());
-    let next = create_from(
+    let next = test_support::create_legacy_three_bookmark_fixture_from(
         &LocalJj,
         &f.replacement,
         "exec_conflicted_boss_base_next",
@@ -359,7 +368,7 @@ async fn consecutive_recoveries_keep_work_when_the_predecessors_baseline_hash_is
         .unwrap();
     gone.pr_head_before = Some(floor.clone());
     assert!(restore(&LocalJj, &gone, &f.replacement).await.unwrap());
-    let next = create_from(
+    let next = test_support::create_legacy_three_bookmark_fixture_from(
         &LocalJj,
         &f.replacement,
         "exec_missing_hash_next",
@@ -382,7 +391,7 @@ async fn create_from_ignores_an_unusable_inherited_base() {
     f.edit(&prior).await;
     assert!(restore(&LocalJj, &prior, &f.replacement).await.unwrap());
     let missing = "0123456789abcdef0123456789abcdef01234567";
-    let next = create_from(
+    let next = test_support::create_legacy_three_bookmark_fixture_from(
         &LocalJj,
         &f.replacement,
         "exec_unusable_inherited_next",
@@ -398,7 +407,7 @@ async fn create_from_ignores_an_unusable_inherited_base() {
 
     let fresh_fixture = Fixture::new().await;
     let expected = one_commit(&LocalJj, &fresh_fixture.worker, "trunk()").await.unwrap();
-    let fresh = create_from(
+    let fresh = test_support::create_legacy_three_bookmark_fixture_from(
         &LocalJj,
         &fresh_fixture.worker,
         "exec_unusable_inherited_fresh",
@@ -675,15 +684,17 @@ async fn conflicted_pointer_bookmark_is_a_pointer_integrity_error() {
 }
 
 #[tokio::test]
-async fn existing_recovery_head_is_an_integrity_failure_when_creating_a_head() {
+async fn initialization_leaves_existing_recovery_work_intact() {
     let f = Fixture::new().await;
     let record = f.record("exec_existing").await;
     f.edit(&record).await;
-    let error = create_from(&LocalJj, &f.worker, &record.execution_id, "local", None, None)
+    let before = snapshot_pointers(&LocalJj, &record).await.unwrap();
+    let initialized = create_from(&LocalJj, &f.worker, &record.execution_id, "local", None, None)
         .await
-        .unwrap_err();
-    assert_eq!(pointer_integrity_kind(&error), Some(PointerIntegrityKind::Other));
-    assert!(error.downcast_ref::<CreationFailure>().is_some());
+        .unwrap();
+    assert_eq!(initialized.base_commit, record.base_commit);
+    assert_eq!(snapshot_pointers(&LocalJj, &record).await.unwrap(), before);
+    assert!(diff(&LocalJj, &record).await.unwrap().contains("second.txt"));
 }
 
 struct UnavailableInitialization;

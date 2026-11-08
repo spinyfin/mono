@@ -624,24 +624,6 @@ impl WorkDb {
         )
     }
 
-    /// Stale current-attempt names were archived while predecessor adoption continues.
-    pub fn record_recovery_adoption_archive(
-        &self,
-        execution: &WorkExecution,
-        reason: &str,
-        archives: &[(String, String)],
-    ) -> Result<()> {
-        self.record_recovery_archive_note(
-            execution,
-            reason,
-            archives,
-            (
-                "Stale recovery names archived; continuing predecessor adoption",
-                "Stale current-attempt names were archived. Predecessor adoption continues; no action is required.",
-            ),
-        )
-    }
-
     fn record_recovery_archive_note(
         &self,
         prior: &WorkExecution,

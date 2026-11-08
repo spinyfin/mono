@@ -27,9 +27,11 @@ async fn task_and_chore_recovery_keeps_verified_pr_files_without_persisting_a_ba
         JjRepo::run(&repo.worker, &["describe", "-m", "Published implementation"]);
         JjRepo::run(&repo.worker, &["bookmark", "set", "pr/99", "-r", "@"]);
         JjRepo::run(&repo.repo, &["bookmark", "delete", &record.base()]);
+        super::recovery::preserve_work(&db, &prior.id, &repo.worker).await;
         let cube = Arc::new(FakeCubeClient {
             workspace_root: Some(dir.path().to_path_buf()),
             real_bookmarks: true,
+            position_real_workspace: true,
             ..Default::default()
         });
         let coordinator = ExecutionCoordinator::new(
@@ -97,10 +99,12 @@ async fn checkout_of_predecessor_publication_cannot_hide_unpublished_work() {
         &repo.repo,
         &["bookmark", "set", &record.publication(), "-r", "@", "--allow-backwards"],
     );
+    super::recovery::preserve_work(&db, &prior.id, &repo.repo).await;
     let before = recovery::snapshot_pointers(&LocalJj, &record).await.unwrap();
     let cube = Arc::new(FakeCubeClient {
         workspace_root: Some(dir.path().to_path_buf()),
         real_bookmarks: true,
+        position_real_workspace: true,
         goto_reset_bookmark: Some(record.publication()),
         ..Default::default()
     });
@@ -111,8 +115,8 @@ async fn checkout_of_predecessor_publication_cannot_hide_unpublished_work() {
         workspace_id: "replacement".into(),
         workspace_path: repo.replacement.clone(),
     };
-    // The publication head carries work the recovery head lacks. Neither head
-    // is dropped: both are restaged into the new workspace.
+    // Teardown saved the unpublished tip before checkout moves the publication
+    // branch. The saved changes still restage on the current PR head.
     let recovered = coordinator
         .recover_execution_bookmark_for_test(&next, &lease, &coordinator.host_adapter(), "mono", Some(99), Some(99))
         .await
@@ -128,7 +132,10 @@ async fn checkout_of_predecessor_publication_cannot_hide_unpublished_work() {
                 continue;
             }
             assert_eq!(
-                JjRepo::run(&repo.repo, &["log", "--no-graph", "-r", &commit, "-T", "commit_id"]),
+                JjRepo::run(
+                    &repo.replacement,
+                    &["log", "--no-graph", "-r", &commit, "-T", "commit_id"]
+                ),
                 commit,
                 "{name} stays reachable"
             );
@@ -136,8 +143,8 @@ async fn checkout_of_predecessor_publication_cannot_hide_unpublished_work() {
     }
 }
 
-/// A read-only review inherits nothing from the reviewer before it: the same
-/// damaged record that blocks an implementation kind (above) is not even
+/// A read-only review inherits nothing from the reviewer before it: a damaged
+/// predecessor record is not even
 /// consulted, so the review dispatches on the PR's current head, the
 /// pointers are not moved and nothing is retired or filed. This is the
 /// mono#3201 shape: sixteen reviews died in pre-start recovery against one

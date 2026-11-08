@@ -461,17 +461,6 @@ pub trait CubeClient: Send + Sync {
         let _ = (workspace_path, sha);
         Err(anyhow!("goto_workspace_revision is not supported by this CubeClient"))
     }
-    /// Repair the shared `pr/<pr>` alias in the store at `store` from GitHub's
-    /// current head through Cube's guarded writer (`cube workspace
-    /// repair-pr-bookmark`). Never moves a working copy.
-    ///
-    /// The default implementation errors so the many test doubles and the
-    /// host-adapter layers need no change; only `CommandCubeClient`
-    /// provides a real implementation.
-    async fn repair_pr_bookmark(&self, store: &Path, pr: u64) -> Result<()> {
-        let _ = (store, pr);
-        Err(anyhow!("repair_pr_bookmark is not supported by this CubeClient"))
-    }
     /// Run an engine-direct `cube workspace rebase --pr <pr>` inside the
     /// leased workspace at `workspace_path`, rebasing the PR's boss branch
     /// onto the repo's integration branch. On a clean rebase the command
@@ -1540,43 +1529,13 @@ pub trait HostAdapter: Send + Sync {
         bail!("execution bookmark inspection is not supported by this host adapter")
     }
 
-    async fn restore_execution_bookmark(
-        &self,
-        record: &ExecutionBookmark,
-        workspace: &Path,
-        self_retry: bool,
-    ) -> Result<bool> {
-        let _ = (record, workspace, self_retry);
-        bail!("execution bookmark recovery is not supported by this host adapter")
-    }
     /// Drop the baseline left behind when both of an execution's heads are
     /// gone, so a self-retry can create fresh pointers.
     async fn discard_orphaned_execution_baseline(&self, record: &ExecutionBookmark) -> Result<()> {
         let _ = record;
         bail!("execution bookmark cleanup is not supported by this host adapter")
     }
-    async fn restore_rebased_execution_bookmark(
-        &self,
-        record: &ExecutionBookmark,
-        workspace: &Path,
-        pr_bookmark: Option<&str>,
-        base_branch: &str,
-    ) -> Result<execution_bookmark::RestoreReport> {
-        let _ = (record, workspace, pr_bookmark, base_branch);
-        bail!("rebased execution recovery is not supported by this host adapter")
-    }
-    /// Resolve an open PR while preserving the pre-checkout recovery pointers.
-    /// Returns false for a closed or merged PR, which cannot anchor recovery.
-    async fn prepare_recovery_pr(
-        &self,
-        record: &ExecutionBookmark,
-        workspace: &Path,
-        repo_id: &str,
-        pr: u64,
-    ) -> Result<bool> {
-        let _ = (record, workspace, repo_id, pr);
-        bail!("recovery PR preparation is not supported by this host adapter")
-    }
+
     /// Position a fresh child of the repository's configured trunk, resolved
     /// once, and return the commit it was positioned on so the recovery
     /// pointer's floor is that commit rather than a later re-resolution.

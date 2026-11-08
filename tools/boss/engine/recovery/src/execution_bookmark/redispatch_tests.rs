@@ -54,7 +54,7 @@ async fn chore_restores_all_commits_on_fetched_main_and_reports_provenance() {
     assert!(report.instructions().contains(&prior.head()));
     assert!(!report.instructions().contains("--allow-backwards"));
     assert!(report.instructions().contains("earlier validation does not satisfy"));
-    let next = create_from(
+    let next = test_support::create_legacy_three_bookmark_fixture_from(
         &LocalJj,
         &repo.replacement,
         "exec_next",
@@ -137,7 +137,7 @@ async fn conflicts_remain_in_history_and_are_an_explicit_first_task() {
     assert!(report.instructions().contains("FIRST TASK"));
     let text = std::fs::read_to_string(repo.replacement.join("base.txt")).unwrap();
     assert!(text.contains("worker change") && text.contains("main change"));
-    create_from(
+    test_support::create_legacy_three_bookmark_fixture_from(
         &LocalJj,
         &repo.replacement,
         "exec_conflict_next",
@@ -261,7 +261,7 @@ async fn rewritten_pr_head_does_not_replay_stale_published_commits() {
     let prior_patch = diff(&LocalJj, &prior).await.unwrap();
     assert!(prior_patch.contains("preserved"));
     assert!(!prior_patch.contains("old published"));
-    let next = create_from(
+    let next = test_support::create_legacy_three_bookmark_fixture_from(
         &LocalJj,
         &repo.replacement,
         "exec_successor",
@@ -322,7 +322,7 @@ async fn chore_stages_copies_on_configured_branch_and_remote() {
     let report = restore_rebased(&LocalJj, &prior, &repo.replacement, None, "trunk", "upstream")
         .await
         .unwrap();
-    let next = create_from(
+    let next = test_support::create_legacy_three_bookmark_fixture_from(
         &LocalJj,
         &repo.replacement,
         "exec_chore_next",

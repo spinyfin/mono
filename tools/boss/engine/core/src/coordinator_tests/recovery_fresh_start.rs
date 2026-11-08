@@ -1,5 +1,5 @@
 use super::helpers::*;
-use crate::coordinator::{CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceStatus, FreshStart};
+use crate::coordinator::{CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceStatus};
 use boss_engine_recovery::execution_bookmark::{self as recovery, LocalJj};
 use boss_engine_test_git::jj::JjRepo;
 
@@ -198,25 +198,28 @@ async fn fresh_start_on_host(kind: ExecutionKind, resume: bool, pr: bool, disabl
         );
     }
     let fresh = db.execution_bookmark(&next.id).unwrap();
-    let expected = if pr { current } else { trunk_then };
+    let positioned = if pr { current.clone() } else { trunk_then.clone() };
+    let expected = if resume {
+        record.base_commit.clone().unwrap()
+    } else if pr {
+        current
+    } else {
+        trunk_then
+    };
     assert_eq!(fresh.base_commit.as_deref(), Some(expected.as_str()));
     if !pr {
         assert_ne!(commit(&repo.repo, "main"), expected);
     }
-    assert!(
-        JjRepo::run(
-            &repo.repo,
-            &["bookmark", "list", &fresh.base(), &fresh.head(), &fresh.publication()]
-        )
-        .is_empty()
-    );
-    assert!(
-        JjRepo::run(
-            &repo.replacement,
-            &["diff", "--git", "--from", fresh.base_commit.as_deref().unwrap()]
-        )
-        .is_empty()
-    );
+    if !resume {
+        assert!(
+            JjRepo::run(
+                &repo.repo,
+                &["bookmark", "list", &fresh.base(), &fresh.head(), &fresh.publication()]
+            )
+            .is_empty()
+        );
+    }
+    assert!(JjRepo::run(&repo.replacement, &["diff", "--git", "--from", &positioned]).is_empty());
     // Scheduler passes must not refire the running attempt or lease again.
     for _ in 0..3 {
         coordinator.drain_ready_queue_for_test().await;
@@ -230,120 +233,17 @@ async fn fresh_start_on_host(kind: ExecutionKind, resume: bool, pr: bool, disabl
     assert_eq!(db.get_execution(&next.id).unwrap().status, ExecutionStatus::Running);
     assert_eq!(db.get_execution(&next.id).unwrap().pre_start_failure_count, 0);
     assert_eq!(cube.lease_calls.lock().await.len(), 1);
-    let archive = format!("preserved-archive/{source}/{preserved}");
-    if kind.is_read_only_review() {
-        assert_eq!(
-            JjRepo::run(&repo.repo, &["bookmark", "list", &format!("glob:*{source}*")]),
-            source_pointers
-        );
-        assert_eq!(db.execution_bookmark(&source).unwrap(), record);
-        assert!(db.execution_bookmark_retired_reason(&source).unwrap().is_none());
-        assert!(
-            db.list_attention_items_for_work_item(&db.owning_work_item_id(&next.work_item_id))
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            JjRepo::run(
-                &repo.repo,
-                &["bookmark", "list", &format!("glob:preserved-archive/{source}/*")]
-            )
-            .is_empty()
-        );
-        assert!(
-            db.list_open_attention_items_of_kind(crate::execution_bookmark_recovery::CHAIN_BLOCKED)
-                .unwrap()
-                .is_empty()
-        );
-        return;
-    }
-    assert_eq!(commit(&repo.repo, &archive), preserved);
-    assert!(JjRepo::run(&repo.repo, &["file", "show", "-r", &archive, "root:shared.txt"]).contains("non-compiling"));
-    let notes = db
-        .list_attention_items_for_work_item(&db.owning_work_item_id(&next.work_item_id))
-        .unwrap();
-    let notes: Vec<_> = notes
-        .iter()
-        .filter(|note| note.kind == crate::execution_bookmark_recovery::RECOVERY_RETIRED)
-        .collect();
-    assert_eq!(notes.len(), 1);
-    assert_eq!(notes[0].status, "resolved");
-    assert!(notes[0].body_markdown.contains(&archive));
-    if disabled_source {
-        assert!(
-            notes[0]
-                .body_markdown
-                .contains("recovery store is on host local; dispatch selected destination")
-        );
-    }
-    if !resume {
-        for name in [record.base(), record.head()] {
-            assert!(
-                JjRepo::run(
-                    &repo.repo,
-                    &[
-                        "log",
-                        "--no-graph",
-                        "-r",
-                        &format!("bookmarks(exact:{name})"),
-                        "-T",
-                        "commit_id"
-                    ]
-                )
-                .is_empty()
-            );
-        }
-        assert_eq!(commit(&repo.repo, &record.publication()), preserved);
-    }
+    assert_eq!(
+        JjRepo::run(&repo.repo, &["bookmark", "list", &format!("glob:*{source}*")]),
+        source_pointers
+    );
+    assert!(db.execution_bookmark_retired_reason(&source).unwrap().is_none());
     assert!(
-        db.list_open_attention_items_of_kind(crate::execution_bookmark_recovery::CHAIN_BLOCKED)
+        db.list_attention_items_for_work_item(&db.owning_work_item_id(&next.work_item_id))
             .unwrap()
             .is_empty()
     );
-    assert_eq!(
-        commit(&repo.repo, &archive),
-        preserved,
-        "later prune must retain archives"
-    );
-    for name in [fresh.head(), fresh.publication()] {
-        JjRepo::run(
-            &repo.repo,
-            &["bookmark", "set", &name, "-r", &preserved, "--allow-backwards"],
-        );
-    }
-    db.connect()
-        .unwrap()
-        .execute(
-            "UPDATE work_executions SET status = 'completed', finished_at = '1' WHERE id = ?1",
-            [&next.id],
-        )
-        .unwrap();
-    let candidates = db.list_prune_candidates(0, 0, 0, 100).unwrap();
-    let records = if disabled_source {
-        assert!(
-            !candidates.iter().any(|candidate| candidate.execution.id == next.id),
-            "local prune sweep excludes remote records"
-        );
-        vec![fresh]
-    } else {
-        assert!(candidates.iter().any(|candidate| candidate.execution.id == next.id));
-        candidates
-            .into_iter()
-            .map(|candidate| db.execution_bookmark(&candidate.execution.id).unwrap())
-            .collect()
-    };
-    for live in records {
-        let outcome = recovery::prune(
-            &LocalJj,
-            &live,
-            &[recovery::Voucher::commit("published", &preserved).unwrap()],
-            "main",
-        )
-        .await
-        .unwrap();
-        assert!(matches!(outcome, recovery::PruneOutcome::Published { .. }));
-    }
-    assert_eq!(commit(&repo.repo, &archive), preserved);
+    assert!(JjRepo::run(&repo.repo, &["file", "show", "-r", &preserved, "root:shared.txt"]).contains("non-compiling"));
 }
 
 struct ScratchHostProvider {
@@ -369,7 +269,7 @@ impl crate::host_adapter::HostAdapterProvider for ScratchHostProvider {
 }
 
 #[tokio::test]
-async fn unreachable_source_transport_retries_without_retiring_source() {
+async fn legacy_source_transport_is_not_queried() {
     source_host_dispatch(false).await;
 }
 
@@ -438,20 +338,11 @@ async fn source_host_dispatch(full: bool) {
     let result = coordinator
         .schedule_execution_for_test(&next, &worker, DispatchAdmission::Queued)
         .await;
-    let error = result.unwrap_err();
-    assert!(
-        format!("{error:#}").contains("source transport unavailable"),
-        "{error:#}"
-    );
-    assert_eq!(
-        cube.lease_calls.lock().await.len(),
-        1,
-        "dispatch chose an available host"
-    );
+    result.unwrap();
+    assert_eq!(cube.lease_calls.lock().await.len(), 1);
     let next = db.get_execution(&next.id).unwrap();
-    assert!(next.started_at.is_none());
-    assert_eq!(next.pre_start_failure_count, 1);
-    assert!(next.dispatch_not_before.is_some());
+    assert!(next.started_at.is_some());
+    assert_eq!(next.pre_start_failure_count, 0);
     assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
     assert!(db.execution_bookmark_retired_reason(&prior.id).unwrap().is_none());
     for name in [record.head(), record.publication()] {
@@ -726,12 +617,12 @@ async fn disabled_recovery_host_does_not_prevent_fresh_dispatch() {
 }
 
 #[tokio::test]
-async fn task_archives_and_starts_from_main() {
+async fn task_ignores_legacy_pointers_and_starts_from_main() {
     fresh_start(ExecutionKind::TaskImplementation, false, false).await;
 }
 
 #[tokio::test]
-async fn stale_current_names_retry_adoption_without_retiring_valid_predecessor() {
+async fn stale_current_names_do_not_change_initialization_or_predecessor() {
     let dir = tempdir().unwrap();
     let (db, prior, next) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
     let repo = JjRepo::new(dir.path());
@@ -768,35 +659,19 @@ async fn stale_current_names_retry_adoption_without_retiring_valid_predecessor()
         workspace_path: repo.replacement.clone(),
         dirty_verified: None,
     };
-    let (record, retained) = coordinator
-        .create_or_start_fresh_for_test(
-            &next,
-            &lease,
-            &coordinator.host_adapter(),
-            (Some(&source), None),
-            FreshStart {
-                repo_id: "mono",
-                immutable_target: None,
-                bound_pr: None,
-                task_pr: None,
-                title: "Fresh",
-            },
-        )
+    let record = coordinator
+        .host_adapter()
+        .create_execution_bookmark(&lease.workspace_path, &next.id, None, source.base_commit.as_deref())
         .await
         .unwrap();
-    assert!(retained);
-    let archive = format!("preserved-archive/{}/{stale_head}", next.id);
-    assert_eq!(commit(&repo.repo, &archive), stale_head);
-    let notes = db.list_attention_items_for_work_item(&next.work_item_id).unwrap();
-    assert!(notes.iter().any(|note| note.body_markdown.contains(&archive)
-        && note.title.contains("continuing predecessor adoption")));
-    assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
+    assert_eq!(commit(&repo.repo, &stale.head()), stale_head);
     assert!(
-        recovery::diff(&LocalJj, &record)
-            .await
+        db.list_attention_items_for_work_item(&next.work_item_id)
             .unwrap()
-            .contains("recovered work")
+            .is_empty()
     );
+    assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
+    assert_eq!(record.base_commit, source.base_commit);
     assert!(repo.replacement.join("work.txt").exists());
 }
 
@@ -822,6 +697,15 @@ async fn task_with_merged_pr_and_no_recovery_starts_without_pr_goto() {
     let next = db.get_execution(&next.id).unwrap();
     let cube = Arc::new(FakeCubeClient {
         closed_pr: true,
+        repos: Mutex::new(vec![
+            CubeRepoSummary::builder()
+                .repo_id("mono")
+                .origin(crate::test_support::TEST_REPO_REMOTE_URL)
+                .main_branch("main")
+                .workspace_root(dir.path().to_path_buf())
+                .workspace_prefix("test")
+                .build(),
+        ]),
         ..Default::default()
     });
     let coordinator = Arc::new(ExecutionCoordinator::new(
@@ -844,22 +728,22 @@ async fn task_with_merged_pr_and_no_recovery_starts_without_pr_goto() {
 }
 
 #[tokio::test]
-async fn chore_archives_and_starts_from_pr() {
+async fn chore_ignores_legacy_pointers_and_starts_from_pr() {
     fresh_start(ExecutionKind::ChoreImplementation, false, true).await;
 }
 
 #[tokio::test]
-async fn revision_archives_and_starts_from_pr() {
+async fn revision_ignores_legacy_pointers_and_starts_from_pr() {
     fresh_start(ExecutionKind::RevisionImplementation, false, true).await;
 }
 
 #[tokio::test]
-async fn conflict_resolution_archives_and_starts_fresh() {
+async fn conflict_resolution_ignores_legacy_pointers() {
     fresh_start(ExecutionKind::ConflictResolution, false, true).await;
 }
 
 #[tokio::test]
-async fn ci_fix_archives_and_starts_fresh() {
+async fn ci_fix_ignores_legacy_pointers() {
     fresh_start(ExecutionKind::CiRemediation, false, true).await;
 }
 
@@ -874,17 +758,17 @@ async fn review_guide_keeps_historical_pointers_and_starts_at_captured_target() 
 }
 
 #[tokio::test]
-async fn resume_archives_before_reusing_its_pointer_names() {
+async fn resume_leaves_legacy_pointer_names_intact() {
     fresh_start(ExecutionKind::RevisionImplementation, true, true).await;
 }
 
 #[tokio::test]
-async fn startup_pane_resume_archives_damaged_pointers_and_spawns() {
+async fn startup_pane_resume_ignores_damaged_pointers_and_keeps_edits() {
     startup_resume(false).await;
 }
 
 #[tokio::test]
-async fn startup_pane_resume_retains_unrelated_preserved_and_live_tips() {
+async fn startup_pane_resume_leaves_unrelated_preserved_tips_alone() {
     startup_resume(true).await;
 }
 
@@ -963,51 +847,15 @@ async fn startup_resume(unrelated: bool) {
         .resume_pane_spawn_for_running_execution(&next)
         .await
         .unwrap();
-    assert_eq!(commit(&repo.repo, &format!("preserved-archive/{}/{old}", next.id)), old);
-    let fresh = db.execution_bookmark(&next.id).unwrap();
-    assert_eq!(fresh.base_commit, Some(commit(&repo.repo, "main")));
-    assert!(
-        JjRepo::run(
-            &repo.repo,
-            &["bookmark", "list", &fresh.base(), &fresh.head(), &fresh.publication()]
-        )
-        .is_empty()
-    );
-    assert!(
-        JjRepo::run(
-            &repo.replacement,
-            &["diff", "--git", "--from", fresh.base_commit.as_deref().unwrap()]
-        )
-        .is_empty()
-    );
-    assert!(!repo.worker.join("work.txt").exists());
-    assert_eq!(
-        commit(&repo.repo, &recovery::preserved_name(&next.id)),
-        existing.clone().unwrap_or_else(|| live.clone()),
-        "startup resume must preserve the live workspace tip before repositioning"
-    );
-    let notes = db
-        .list_attention_items_for_work_item(&db.owning_work_item_id(&next.work_item_id))
-        .unwrap();
-    let retired = notes
-        .iter()
-        .find(|note| note.kind == crate::execution_bookmark_recovery::RECOVERY_RETIRED)
-        .unwrap();
-    assert!(retired.body_markdown.contains(&recovery::preserved_name(&next.id)));
-    assert!(retired.body_markdown.contains(existing.as_deref().unwrap_or(&live)));
+    assert_eq!(commit(&repo.repo, &record.publication()), old);
+    assert_eq!(db.execution_bookmark(&next.id).unwrap(), record);
+    assert!(repo.worker.join("work.txt").exists());
     if let Some(existing) = existing {
-        let name = recovery::preserved_archive_name(&next.id, &live);
-        assert_eq!(commit(&repo.repo, &name), live);
-        let notes = db.list_attention_items(&next.id).unwrap();
-        let inspect = notes
-            .iter()
-            .find(|note| {
-                note.kind == boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND
-            })
-            .unwrap();
-        assert!(inspect.body_markdown.contains(&existing));
-        assert!(inspect.body_markdown.contains(&live));
-        assert!(inspect.body_markdown.contains(&name));
+        assert_eq!(
+            commit(&repo.repo, &recovery::preserved_name(&next.id)),
+            existing,
+            "pane resume must not rewrite an unrelated preserved tip"
+        );
     }
     for _ in 0..100 {
         if !runner.calls.lock().await.is_empty() {
@@ -1099,30 +947,19 @@ async fn initialization_fallback(inherited: bool) {
         assert_eq!(db.get_execution(&next.id).unwrap().pre_start_failure_count, 0);
         db.execution_bookmark(&next.id).unwrap()
     } else {
-        let (fresh, retained) = coordinator
-            .create_or_start_fresh_for_test(
-                &next,
-                &lease,
-                &coordinator.host_adapter(),
-                (inherited.then_some(&prior), None),
-                FreshStart {
-                    repo_id: "mono",
-                    immutable_target: None,
-                    bound_pr: None,
-                    task_pr: Some(99),
-                    title: "Fresh work",
-                },
-            )
+        let fresh = coordinator
+            .host_adapter()
+            .create_execution_bookmark(&lease.workspace_path, &next.id, None, prior.base_commit.as_deref())
             .await
             .unwrap();
-        assert!(retained);
         assert_eq!(fresh.base_commit, prior.base_commit);
         assert!(repo.replacement.join("lost.txt").exists());
         assert!(
-            recovery::diff(&LocalJj, &fresh)
-                .await
-                .unwrap()
-                .contains("keep this work")
+            JjRepo::run(
+                &repo.replacement,
+                &["diff", "--git", "--from", fresh.base_commit.as_deref().unwrap()]
+            )
+            .contains("keep this work")
         );
         assert!(
             db.list_attention_items_for_work_item(&next.work_item_id)
@@ -1205,29 +1042,6 @@ impl crate::host_adapter::HostAdapter for ScratchDestination {
         self.inner.execution_bookmark_diff(&self.on_inner_store(record)).await
     }
 
-    async fn restore_execution_bookmark(
-        &self,
-        record: &recovery::ExecutionBookmark,
-        workspace: &Path,
-        self_retry: bool,
-    ) -> Result<bool> {
-        self.inner
-            .restore_execution_bookmark(&self.on_inner_store(record), workspace, self_retry)
-            .await
-    }
-
-    async fn restore_rebased_execution_bookmark(
-        &self,
-        record: &recovery::ExecutionBookmark,
-        workspace: &Path,
-        pr_bookmark: Option<&str>,
-        base_branch: &str,
-    ) -> Result<recovery::RestoreReport> {
-        self.inner
-            .restore_rebased_execution_bookmark(&self.on_inner_store(record), workspace, pr_bookmark, base_branch)
-            .await
-    }
-
     async fn restore_preserved_work(
         &self,
         record: &recovery::ExecutionBookmark,
@@ -1248,18 +1062,6 @@ impl crate::host_adapter::HostAdapter for ScratchDestination {
     ) -> Result<recovery::PreserveOutcome> {
         self.inner
             .confirm_workspace_recovery(&self.on_inner_store(record), workspace, recorded, since_unix)
-            .await
-    }
-
-    async fn prepare_recovery_pr(
-        &self,
-        record: &recovery::ExecutionBookmark,
-        workspace: &Path,
-        repo_id: &str,
-        pr: u64,
-    ) -> Result<bool> {
-        self.inner
-            .prepare_recovery_pr(&self.on_inner_store(record), workspace, repo_id, pr)
             .await
     }
 

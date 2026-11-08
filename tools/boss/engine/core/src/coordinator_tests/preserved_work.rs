@@ -45,6 +45,15 @@ async fn dispatch_prefers_preserved_work_over_retired_legacy_pointers() {
             &record.publication(),
         ],
     );
+    // The poller's recorded head is stale relative to the PR; positioning must
+    // not trust it.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = 'https://github.com/spinyfin/mono/pull/99', pr_head_sha = '0000000000000000000000000000000000000000' WHERE id = ?1",
+            rusqlite::params![next.work_item_id],
+        )
+        .unwrap();
     let cube = Arc::new(FakeCubeClient {
         position_real_workspace: true,
         ..FakeCubeClient::default()
@@ -52,7 +61,7 @@ async fn dispatch_prefers_preserved_work_over_retired_legacy_pointers() {
     let coordinator = ExecutionCoordinator::new(
         db.clone(),
         WorkerPool::new(1),
-        cube,
+        cube.clone(),
         Arc::new(FakeExecutionRunner::default()),
     );
     let lease = CubeWorkspaceLease {
@@ -66,6 +75,11 @@ async fn dispatch_prefers_preserved_work_over_retired_legacy_pointers() {
         .await
         .unwrap()
         .unwrap();
+    assert!(
+        cube.goto_revision_calls.lock().await.is_empty(),
+        "a poller-recorded head must not bypass PR-aware positioning"
+    );
+    assert_eq!(cube.goto_calls.lock().await[0].1, 99);
     assert!(recovered.has_work);
     assert_eq!(recovered.predecessor, prior.id);
     assert_eq!(
@@ -77,6 +91,87 @@ async fn dispatch_prefers_preserved_work_over_retired_legacy_pointers() {
         tip.change_id
     );
     assert!(db.execution_restore_report(&next.id).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn restage_keeps_newer_published_commit_when_recorded_head_lags() {
+    let dir = tempdir().unwrap();
+    let repo = JjRepo::new(dir.path());
+    let (db, prior, next) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
+    export_origin(&repo);
+    let h0 = JjRepo::run(&repo.repo, &["log", "-r", "main", "--no-graph", "-T", "commit_id"]);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = 'https://github.com/spinyfin/mono/pull/99', pr_head_sha = ?2 WHERE id = ?1",
+            rusqlite::params![next.work_item_id, h0],
+        )
+        .unwrap();
+    JjRepo::run(&repo.repo, &["new", "pr/99", "-m", "Pushed PR commit"]);
+    std::fs::write(repo.repo.join("pushed"), "published X").unwrap();
+    JjRepo::run(&repo.repo, &["bookmark", "set", "pr/99", "-r", "@"]);
+    JjRepo::run(&repo.repo, &["git", "export"]);
+    JjRepo::run(&repo.repo, &["git", "fetch"]);
+    let x = JjRepo::run(&repo.repo, &["log", "-r", "pr/99", "--no-graph", "-T", "commit_id"]);
+    assert_ne!(x, h0, "the published PR head must be newer than the recorded SHA");
+    JjRepo::run(&repo.worker, &["new", "pr/99", "-m", "Unpublished worker edit"]);
+    std::fs::write(repo.worker.join("fix"), "unpushed fix").unwrap();
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "local")
+        .await
+        .unwrap();
+    db.record_execution_bookmark(&record).unwrap();
+    let tip = recovery::preserve(&LocalJj, &record, &repo.worker, None, None)
+        .await
+        .unwrap()
+        .tip
+        .unwrap();
+    db.record_preserved_tip(&prior.id, &tip).unwrap();
+    db.retire_execution_bookmark(&prior.id, "legacy pointers retired")
+        .unwrap();
+    JjRepo::run(
+        &repo.repo,
+        &[
+            "bookmark",
+            "delete",
+            &record.head(),
+            &record.base(),
+            &record.publication(),
+        ],
+    );
+    let (coordinator, cube) = coordinator_for(db.clone());
+    let lease = CubeWorkspaceLease {
+        workspace_id: "replacement".into(),
+        workspace_path: repo.replacement.clone(),
+        lease_id: "next".into(),
+        dirty_verified: None,
+    };
+    let recovered = coordinator
+        .recover_execution_bookmark_for_test(&next, &lease, &coordinator.host_adapter(), "mono", Some(99), Some(99))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        cube.goto_revision_calls.lock().await.is_empty(),
+        "a lagging recorded head must not bypass PR-aware positioning"
+    );
+    assert_eq!(cube.goto_calls.lock().await[0].1, 99);
+    assert!(recovered.has_work);
+    assert_eq!(
+        std::fs::read_to_string(repo.replacement.join("fix")).unwrap(),
+        "unpushed fix"
+    );
+    assert_eq!(
+        JjRepo::run(&repo.replacement, &["log", "-r", "@", "--no-graph", "-T", "change_id"]),
+        tip.change_id
+    );
+    assert_eq!(
+        JjRepo::run(
+            &repo.replacement,
+            &["log", "-r", &format!("{x} & ::@"), "--no-graph", "-T", "commit_id",],
+        ),
+        x,
+        "the restaged stack must keep the newer published commit the preserved tip descends from"
+    );
 }
 
 #[tokio::test]

@@ -1,8 +1,7 @@
 //! Legacy three-bookmark layout for recovery compatibility fixtures.
 //!
 //! Production dispatch uses [`super::create_from`], which records the starting
-//! commit and creates a recovery head only when the positioned lease already
-//! carries unpublished work.
+//! commit without creating any bookmarks.
 
 use super::*;
 

@@ -537,11 +537,10 @@ pub(crate) use test_support::{
     create_legacy_three_bookmark_fixture as create, create_legacy_three_bookmark_fixture_from,
 };
 
-/// Pointer initialization failed after identifying the shared store. Dispatch
-/// archives these pointers before creating fresh ones.
+/// Baseline recording failed after identifying the shared store.
 #[derive(Debug)]
 pub struct CreationFailure {
-    /// Includes partially created pointers, even before the database row exists.
+    /// Whatever was recorded before the failure.
     pub record: ExecutionBookmark,
 }
 
@@ -553,8 +552,8 @@ impl std::fmt::Display for CreationFailure {
 
 impl std::error::Error for CreationFailure {}
 
-/// Preserve inherited unpublished work across consecutive interrupted runs.
-/// A staged revision supplies its copied PR baseline through the restore report.
+/// Resolve and record the baseline commit for an execution; no bookmarks are
+/// created. A staged revision supplies its copied PR baseline through the restore report.
 pub async fn create_from(
     jj: &dyn Jj,
     workspace: &Path,
@@ -596,37 +595,9 @@ pub async fn create_from(
             one_commit(jj, workspace, "trunk()").await?
         };
         record.base_commit = Some(baseline.clone());
-        // Fresh dispatch records only its starting commit. Retain the legacy
-        // recovery head only when the positioned lease carries unpublished work;
-        // teardown preserves subsequent edits from the workspace itself.
-        let unpublished = jj
-            .run(
-                workspace,
-                &[
-                    "log",
-                    "--no-graph",
-                    "-r",
-                    &format!("({baseline}..@) ~ (::remote_bookmarks() | empty())"),
-                    "-T",
-                    "commit_id",
-                ],
-            )
-            .await?;
-        let created_head = !unpublished.trim().is_empty();
-        if created_head {
-            // Only the recovery head is created here. A leftover baseline or
-            // publication name from a partial legacy initialization is not a
-            // conflict: dispatch neither writes nor needs those names.
-            let targets = snapshot::resolve_bookmark_targets(jj, &record.repo_path, &[record.head()]).await?;
-            if !targets.is_empty() {
-                return Err(pointer_integrity_error(
-                    "execution recovery pointer names already exist",
-                ));
-            }
-            jj.run(workspace, &["bookmark", "create", &record.head(), "-r", "@"])
-                .await?;
-        }
-        record.has_recovery_head = Some(created_head);
+        // Dispatch records only its starting commit and never creates a
+        // recovery head; teardown preserves workspace edits itself.
+        record.has_recovery_head = Some(false);
         Ok(record.clone())
     }
     .await;

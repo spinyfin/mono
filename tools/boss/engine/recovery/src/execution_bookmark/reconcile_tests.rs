@@ -335,7 +335,10 @@ async fn adopt_pushed_head_does_not_create_a_missing_baseline_bookmark() {
     let record = create_from(&LocalJj, &repo.worker, "exec_new_layout", "local", None, None)
         .await
         .unwrap();
-    assert_eq!(record.has_recovery_head, Some(true));
+    // Dispatch no longer creates a recovery head; stage a legacy one to
+    // exercise adoption of a pre-existing record.
+    assert_eq!(record.has_recovery_head, Some(false));
+    JjRepo::run(&repo.worker, &["bookmark", "create", &record.head(), "-r", "@"]);
     assert!(!bookmark_exists(&repo.repo, &record.base()));
     let work = one(&repo.repo, &revision(&record.head()));
     JjRepo::run(&repo.repo, &["new", "main", "-m", "Main advances"]);

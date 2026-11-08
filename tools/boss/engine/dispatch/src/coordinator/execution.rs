@@ -414,7 +414,11 @@ impl ExecutionCoordinator {
             );
         }
         let required_driver = self.resolve_spawn_driver(execution, worker_id)?;
-        let preferred = self.recovery_source_host(execution)?;
+        let preferred = if execution.kind.is_read_only_review() {
+            None
+        } else {
+            self.recovery_source_host(execution)?
+        };
         self.pick_host(work_item, pinned, requested, required_driver, preferred)
     }
 
@@ -1544,7 +1548,7 @@ impl ExecutionCoordinator {
                 .and_then(boss_github::pr_url::pr_number_from_url),
             _ => None,
         });
-        let mut recovered = match self
+        let recovered = match self
             .recover_execution_bookmark(
                 execution,
                 &lease,
@@ -1576,16 +1580,9 @@ impl ExecutionCoordinator {
                 return Err(err);
             }
         };
-        let is_implementation = matches!(
-            execution.kind,
-            ExecutionKind::ChoreImplementation
-                | ExecutionKind::TaskImplementation
-                | ExecutionKind::RevisionImplementation
-        );
-        let recovered_blocked = (is_implementation
-            && self.work_db.execution_bookmark_optional(&execution.id)?.is_some())
-            || recovered.as_ref().is_some_and(|recovered| recovered.has_work)
-            || self.work_db.execution_restore_report(&execution.id)?.is_some();
+        let recovered_blocked = !execution.kind.is_read_only_review()
+            && (recovered.as_ref().is_some_and(|recovered| recovered.has_work)
+                || self.work_db.execution_restore_report(&execution.id)?.is_some());
         let goto_target = match (pr_for_goto, immutable_target_sha.as_deref()) {
             _ if recovered_blocked => None,
             (_, Some(sha)) => Some(GotoTarget::Revision(sha)),
@@ -1881,41 +1878,19 @@ impl ExecutionCoordinator {
             }
             if self.work_db.execution_bookmark_optional(&execution.id)?.is_none() {
                 let execution_for_pointer = self.work_db.get_execution(&execution.id)?;
-                let predecessor = match recovered.as_ref().filter(|recovered| recovered.has_work) {
-                    Some(recovered) if self.work_db.preserved_tip(&recovered.predecessor)?.is_none() => {
-                        Some(self.work_db.execution_bookmark(&recovered.predecessor)?)
-                    }
-                    _ => None,
+                let report = if execution.kind.is_read_only_review() {
+                    None
+                } else {
+                    self.work_db.execution_restore_report(&execution.id)?
                 };
-                let report = self.work_db.execution_restore_report(&execution.id)?;
-                let (record, retained) = self
-                    .create_or_start_fresh(
-                        &execution_for_pointer,
-                        &lease,
-                        &adapter,
-                        (
-                            predecessor.as_ref(),
-                            // Fresh with no PR head and no restore report: the floor
-                            // is the commit cube positioned the workspace on.
-                            report
-                                .as_ref()
-                                .and_then(|r| r.inherited_base.as_deref())
-                                .or(positioned_base.as_deref().filter(|_| {
-                                    predecessor.is_none() && execution_for_pointer.pr_head_before.is_none()
-                                })),
-                        ),
-                        super::fresh_start::FreshStart {
-                            repo_id: &repo.repo_id,
-                            immutable_target: immutable_target_sha.as_deref(),
-                            bound_pr: pr_for_goto,
-                            task_pr: pr_for_reconcile,
-                            title: &change_title,
-                        },
-                    )
+                let baseline = report
+                    .as_ref()
+                    .and_then(|r| r.inherited_base.as_deref())
+                    .or(execution_for_pointer.pr_head_before.as_deref())
+                    .or(positioned_base.as_deref());
+                let record = adapter
+                    .create_execution_bookmark(&lease.workspace_path, &execution.id, None, baseline)
                     .await?;
-                if !retained {
-                    recovered = None;
-                }
                 self.work_db.record_execution_bookmark(&record)?;
             }
             if let Some(recovered) = recovered
@@ -1943,7 +1918,7 @@ impl ExecutionCoordinator {
             .await?;
             return Err(err);
         }
-        // This attempt wrote its own bookmark in a freshly leased workspace.
+        // This attempt recorded its recovery metadata in a freshly leased workspace.
         // Creation or backup failures filed by an earlier attempt describe a
         // lease that is no longer this execution's (a retained one was
         // released or detached before this lease), and would otherwise keep

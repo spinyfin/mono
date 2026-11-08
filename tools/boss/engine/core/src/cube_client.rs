@@ -224,10 +224,6 @@ impl CubeClient for CommandCubeClient {
         crate::cube_commands::goto_workspace(self, workspace_path, "--revision", sha).await
     }
 
-    async fn repair_pr_bookmark(&self, store: &Path, pr: u64) -> Result<()> {
-        crate::cube_commands::repair_pr_bookmark(self, store, pr, crate::cube_op_budget::REPAIR_PR_BOOKMARK).await
-    }
-
     async fn rebase_workspace(&self, workspace_path: &Path, pr: u64) -> Result<RebaseOutcome> {
         let pr_str = pr.to_string();
         // `cube workspace rebase` resolves the workspace from the current
