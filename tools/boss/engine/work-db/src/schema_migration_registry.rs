@@ -404,6 +404,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: preserved_cleanup::migrate_archive_cleanup,
         },
         Migration {
+            id: spoke_hub::LEGACY_DESTINATION_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: spoke_hub::migrate_legacy_destinations,
+        },
+        Migration {
             id: "20261110_0730_wait_input_invalidation".into(),
             legacy_version: None,
             apply: board_projection_schema::refine_triggers,

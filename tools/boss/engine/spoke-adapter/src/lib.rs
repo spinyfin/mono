@@ -27,6 +27,7 @@ mod outbox;
 mod spawn;
 mod workspace;
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -108,6 +109,11 @@ pub(crate) struct Hub {
     pub(crate) config: SpokeAdapterConfig,
     #[builder(skip)]
     nonce: AtomicU64,
+    /// One lock per `(host, command id)` that [`Hub::send_stable`] is working
+    /// on, so two overlapping calls for the same stable request cannot both
+    /// decide nothing was stored.
+    #[builder(skip)]
+    stable_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Hub {
@@ -149,7 +155,75 @@ impl Hub {
     /// command (same body, same expiry) or the outbox refuses it as a different
     /// request under a known id; the stored sequence is the outbox's to assign,
     /// so it goes out as zero. A settled command answers from its stored result.
+    ///
+    /// Calls for the same `(host, command id)` are serialized from the read of
+    /// the stored state through the send, so a second overlapping call sees what
+    /// the first stored (or its settled result) instead of building a command of
+    /// its own that the outbox would refuse as a duplicate.
     pub(crate) async fn send_stable(
+        &self,
+        host_id: &str,
+        op: &'static str,
+        command_id: String,
+        run: Option<Run>,
+        body: command::Body,
+        deadline: Duration,
+    ) -> Result<CommandResult, HostCallError> {
+        let key = format!("{host_id}\0{command_id}");
+        let lock = Arc::clone(
+            self.stable_locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(key.clone())
+                .or_default(),
+        );
+        let guard = lock.lock().await;
+        let outcome = self
+            .send_stable_locked(host_id, op, command_id, run, body, deadline)
+            .await;
+        drop(guard);
+        let mut locks = self
+            .stable_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Only the map and this call hold it: nobody is waiting, so forget it.
+        if Arc::strong_count(&lock) == 2 {
+            locks.remove(&key);
+        }
+        outcome
+    }
+
+    /// What an earlier attempt left behind for `command_id`: the stored command
+    /// and, once it settled, its result. Failing to read either is not evidence
+    /// that nothing was stored, so it is reported as uncertain, never as unsent.
+    async fn stored_state(
+        &self,
+        host_id: &str,
+        op: &'static str,
+        command_id: &str,
+    ) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), HostCallError> {
+        let uncertain = |reason: String| HostCallError::Uncertain {
+            host_id: host_id.to_owned(),
+            op,
+            command_id: command_id.to_owned(),
+            reason,
+        };
+        let (db_host, id) = (host_id.to_owned(), command_id.to_owned());
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || -> Result<_> {
+            let wire = db.host_command_wire(&db_host, &id)?;
+            let result = match wire {
+                Some(_) => db.host_command_result(&db_host, &id)?,
+                None => None,
+            };
+            Ok((wire, result))
+        })
+        .await
+        .map_err(|error| uncertain(format!("work database task failed: {error}")))?
+        .map_err(|error| uncertain(format!("reading the stored command failed: {error:#}")))
+    }
+
+    async fn send_stable_locked(
         &self,
         host_id: &str,
         op: &'static str,
@@ -164,29 +238,14 @@ impl Hub {
             command_id: command_id.clone(),
             reason,
         };
-        let (db_host, id) = (host_id.to_owned(), command_id.clone());
-        let db = Arc::clone(&self.db);
-        // What an earlier attempt left behind: the stored command and, once it
-        // settled, its result. Failing to read either is not evidence that
-        // nothing was stored, so it is reported as uncertain, never as unsent.
-        let prior = tokio::task::spawn_blocking(move || -> Result<_> {
-            let wire = db.host_command_wire(&db_host, &id)?;
-            let result = match wire {
-                Some(_) => db.host_command_result(&db_host, &id)?,
-                None => None,
-            };
-            Ok((wire, result))
-        })
-        .await
-        .map_err(|error| uncertain(format!("work database task failed: {error}")))?
-        .map_err(|error| uncertain(format!("reading the stored command failed: {error:#}")))?;
-        let (command, existed) = match prior {
-            (Some(_), Some(settled)) => {
-                // A settled command answers from its stored result even with no
-                // live stream.
-                return CommandResult::decode(settled.as_slice())
-                    .map_err(|error| uncertain(format!("the stored result cannot be decoded: {error}")));
-            }
+        let settled_result = |settled: Vec<u8>| {
+            CommandResult::decode(settled.as_slice())
+                .map_err(|error| uncertain(format!("the stored result cannot be decoded: {error}")))
+        };
+        let (command, existed) = match self.stored_state(host_id, op, &command_id).await? {
+            // A settled command answers from its stored result even with no
+            // live stream.
+            (Some(_), Some(settled)) => return settled_result(settled),
             (Some(wire), None) => {
                 let mut command = Command::decode(wire.as_slice())
                     .map_err(|error| uncertain(format!("the stored command cannot be decoded: {error}")))?;
@@ -202,6 +261,20 @@ impl Hub {
             Err(HostCallError::NotSent { reason, .. }) if existed => Err(uncertain(format!(
                 "an earlier attempt stored this command and it may have run; this retry could not be sent: {reason}"
             ))),
+            // A refusal of a command believed new is only believable if nothing
+            // was stored meanwhile (another hub task, or a stream that stored it
+            // before failing): look again, and treat a failed look as uncertain.
+            Err(HostCallError::NotSent { reason, .. }) => match self.stored_state(host_id, op, &command_id).await? {
+                (None, _) => Err(HostCallError::NotSent {
+                    host_id: host_id.to_owned(),
+                    op,
+                    reason,
+                }),
+                (Some(_), Some(settled)) => settled_result(settled),
+                (Some(_), None) => Err(uncertain(format!(
+                    "this command was stored while it was being sent and may have run: {reason}"
+                ))),
+            },
             other => other,
         }
     }
@@ -792,10 +865,10 @@ impl HostAdapter for SpokeHostAdapter {
     async fn read_transcript_tail_bytes(&self, path: &str, max_bytes: u64) -> Result<Option<String>> {
         // A spoke run's transcript is materialized on the hub by run identity;
         // its recorded path is a path on the host and is never opened here, or
-        // sent over SSH. Only a path no spoke assignment owns is the legacy
-        // transport's to read.
+        // sent over SSH. Only a transcript a legacy run on this host recorded is
+        // the legacy transport's to read, whatever layout its driver used.
         let (host, owned) = (self.host.id.clone(), path.to_owned());
-        if self.db(move |db| db.spoke_owns_path(&host, &owned)).await? {
+        if !self.db(move |db| db.transcript_is_legacy(&host, &owned)).await? {
             return Ok(None);
         }
         self.legacy_adapter("a transcript read")
@@ -1000,16 +1073,18 @@ impl HostAdapterProvider for SpokeHostAdapterProvider {
         let reserved = tokio::task::spawn_blocking(move || -> Result<Option<SpokeAssignment>> {
             // Only a ready spoke takes new work, and never the local host. Every
             // other destination (local, SSH, a spoke still pending) reserves
-            // nothing, but still takes ownership atomically: an unused
-            // reservation on another host is retired in the same transaction
-            // that fences command admission, and one that may have started is
-            // refused, so two hosts can never both run the execution.
+            // nothing, but still takes ownership atomically: it records a
+            // legacy claim in the transaction that retires an unused
+            // reservation on any host (fencing that host's bound adapter out of
+            // command admission), and one that may have started is refused, so
+            // two hosts can never both run the execution.
             //
-            // An execution that already holds a legacy lease started over SSH
-            // and stays there: reserving a spoke assignment would strand that
-            // lease while the spoke leased a second workspace.
-            if local || transport != HostTransport::SpokeReady || db.execution_holds_legacy_lease(&execution)? {
-                return db.claim_legacy_destination(&execution, &host_id);
+            // An execution a legacy destination already holds (a claim, or a
+            // cube lease no spoke recorded) stays on that destination: another
+            // host is refused, and the same host is not given a spoke
+            // assignment that would run it a second time.
+            if local || transport != HostTransport::SpokeReady || db.legacy_destination_host(&execution)?.is_some() {
+                return db.claim_legacy_destination(&execution, &host_id, transport);
             }
             db.reserve_spoke_assignment(&execution, &host_id).map(Some)
         })

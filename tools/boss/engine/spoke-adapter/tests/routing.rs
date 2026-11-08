@@ -256,6 +256,9 @@ async fn every_destination_refuses_an_execution_another_host_holds() {
     fx.db.resolve_spoke_assignment("exec_1", 1, "operator_fenced").unwrap();
     for destination in ["local", "ssh-host", "pending", "ready"] {
         assert_eq!(fx.adapter(destination, "exec_1").await.unwrap().host_id(), destination);
+        // A legacy destination's claim stays until it is released, which is what
+        // lets the next one take the execution.
+        fx.db.release_legacy_destination("exec_1", destination).unwrap();
     }
 }
 
@@ -266,6 +269,7 @@ async fn operations_without_a_wire_form_follow_the_run_that_owns_them() {
     fx.ready(HOST);
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
     let unbound = fx.provider_adapter(HOST).await;
+    fx.legacy_run(HOST, "exec_other", "/home/u/.claude/projects/-elsewhere/run.jsonl");
     let peer = fx
         .spoke(
             Box::new(|c| match &c.body {
@@ -354,6 +358,13 @@ async fn operations_without_a_wire_form_follow_the_run_that_owns_them() {
     for owned in [
         format!("{PATH}/transcript.jsonl"),
         "/home/u/.claude/projects/-hosts-workspaces-worker/run.jsonl".to_owned(),
+        // Layouts that name no workspace path at all: per-run homes, the durable
+        // run-based store, an encoding that rewrites characters, and a path that
+        // merely shares a prefix with a workspace.
+        "/state/executions/exec_1-g1/transcripts/codex/sessions/rollout.jsonl".to_owned(),
+        "/state/grok/runs/exec_1-g1/home/sessions/s.jsonl".to_owned(),
+        "/home/u/.claude/projects/-hosts-workspaces-wor_ker/run.jsonl".to_owned(),
+        "/hosts/workspaces/worker-10/transcript.jsonl".to_owned(),
     ] {
         assert!(unbound.read_transcript_tail_bytes(&owned, 10).await.unwrap().is_none());
     }
@@ -749,6 +760,118 @@ async fn moving_to_a_legacy_destination_fences_the_old_reservation() {
                 .is_err()
         );
         assert!(fx.db.host_command_after(HOST, 0).unwrap().is_none(), "{destination}");
+    }
+}
+
+#[tokio::test]
+async fn a_fresh_adapter_for_the_old_host_is_refused_after_a_legacy_handoff() {
+    let fx = Fixture::new().await;
+    fx.serve_legacy();
+    fx.ready(HOST);
+    let _old = fx.adapter(HOST, "exec_1").await.unwrap();
+    fx.adapter("ssh-host", "exec_1").await.unwrap();
+    // Before the destination's lease is recorded the claim alone holds the
+    // execution, and again after it is.
+    for leased in [false, true] {
+        if leased {
+            fx.legacy_execution("ssh-host", "exec_1", "ssh-lease");
+        }
+        let refused = fx
+            .adapter(HOST, "exec_1")
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("leased={leased}: a second owner was admitted"));
+        assert!(
+            format!("{refused:#}").contains("claimed by legacy destination ssh-host"),
+            "leased={leased}: {refused:#}"
+        );
+        let generation = fx.db.spoke_assignment_for_execution("exec_1").unwrap().unwrap();
+        assert_eq!((generation.assignment_generation, generation.resolved), (1, true));
+    }
+    // Nothing reached the old host, and the claimant keeps getting its adapter.
+    assert!(fx.db.host_command_after(HOST, 0).unwrap().is_none());
+    assert_eq!(fx.adapter("ssh-host", "exec_1").await.unwrap().host_id(), "ssh-host");
+}
+
+#[tokio::test]
+async fn a_lease_held_on_another_host_is_never_routed_to_this_one() {
+    let fx = Fixture::new().await;
+    fx.serve_legacy();
+    fx.ready(HOST);
+    fx.legacy_execution("ssh-host", "exec_ssh", "ssh-lease");
+    let refused = fx.adapter(HOST, "exec_ssh").await.err().expect("another host's lease");
+    assert!(
+        format!("{refused:#}").contains("claimed by legacy destination ssh-host"),
+        "{refused:#}"
+    );
+    assert!(fx.db.spoke_assignment_for_execution("exec_ssh").unwrap().is_none());
+    assert!(fx.legacy_calls().is_empty(), "no SSH run was started on the spoke host");
+    // The host that holds the lease is the one that gets the legacy adapter.
+    assert_eq!(fx.adapter("ssh-host", "exec_ssh").await.unwrap().host_id(), "ssh-host");
+}
+
+#[tokio::test]
+async fn an_unused_reservation_is_retired_when_its_host_moves_off_the_spoke() {
+    for transport in [HostTransport::LegacySsh, HostTransport::SpokePending] {
+        let fx = Fixture::new().await;
+        fx.serve_legacy();
+        fx.ready(HOST);
+        let old = fx.adapter(HOST, "exec_1").await.unwrap();
+        fx.db.set_host_transport(HOST, transport).unwrap();
+        // The execution never started, so it gets the legacy adapter instead of
+        // a spoke adapter whose commands admission now denies.
+        let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+        assert!(adapter.lease_workspace("repo", "task", None, false, &[]).await.is_err());
+        assert_eq!(fx.legacy_calls(), ["lease_workspace"], "{transport:?}");
+        assert!(
+            fx.db
+                .spoke_assignment_for_execution("exec_1")
+                .unwrap()
+                .unwrap()
+                .resolved
+        );
+        assert!(old.lease_workspace("repo", "task", None, false, &[]).await.is_err());
+        assert!(fx.db.host_command_after(HOST, 0).unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn overlapping_stable_requests_share_one_command_and_never_report_not_sent() {
+    let fx = Fixture::with(short(2000)).await;
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let peer = fx
+        .spoke(
+            Box::new(|c| match &c.body {
+                // The stop is held back so both calls are in flight together.
+                Some(command::Body::Stop(_)) => None,
+                _ => standard(c),
+            }),
+            None,
+            0,
+        )
+        .await;
+    lease(&adapter).await;
+    spawn(&adapter).await.unwrap();
+    let grace = Duration::from_millis(100);
+    let calls: Vec<_> = (0..2)
+        .map(|_| {
+            let adapter = Arc::clone(&adapter);
+            tokio::spawn(async move { adapter.stop_worker("exec_1", grace).await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let stops: Vec<_> = peer
+        .commands()
+        .into_iter()
+        .filter(|c| matches!(c.body, Some(command::Body::Stop(_))))
+        .collect();
+    assert_eq!(stops.len(), 1, "{stops:?}");
+    peer.answer_late(&stops[0], ok(&stops[0], Some(pane(PaneLife::Exited))))
+        .await;
+    for call in calls {
+        let outcome = call.await.unwrap().unwrap();
+        assert!(matches!(outcome, ControlOutcome::Delivered(_)), "{outcome:?}");
     }
 }
 

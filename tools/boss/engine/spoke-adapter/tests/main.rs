@@ -314,6 +314,7 @@ async fn runs_keep_their_transport_and_a_spoke_lease_is_never_sent_over_ssh() {
         .unwrap();
     assert!(format!("{:#}", fx.adapter(HOST, "exec_9").await.err().unwrap()).contains("legacy transport was used"));
     assert!(fx.db.spoke_assignment_for_execution("exec_9").unwrap().is_none());
+    fx.db.release_legacy_destination("exec_9", HOST).unwrap();
     fx.db
         .set_host_transport("local", boss_work_db::HostTransport::SpokeReady)
         .unwrap();

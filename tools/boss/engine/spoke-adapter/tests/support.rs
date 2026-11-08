@@ -447,6 +447,24 @@ impl Fixture {
             .unwrap();
     }
 
+    /// A finished SSH run on `host` that recorded `transcript` and holds no lease.
+    pub fn legacy_run(&self, host: &str, execution_id: &str, transcript: &str) {
+        let conn = self.db.connect().unwrap();
+        conn.execute(
+            "INSERT INTO work_executions
+                (id, work_item_id, kind, status, repo_remote_url, created_at, host_id)
+             VALUES (?1, 'chore_1', 'task_implementation', 'succeeded', 'https://example.test/r', '1', ?2)",
+            (execution_id, host),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO work_runs (id, execution_id, agent_id, status, transcript_path, created_at, host_id)
+             VALUES (?1, ?2, 'agent', 'succeeded', ?3, '1', ?4)",
+            (format!("run_{execution_id}"), execution_id, transcript, host),
+        )
+        .unwrap();
+    }
+
     pub fn ready(&self, id: &str) {
         self.db.set_host_transport(id, HostTransport::SpokeReady).unwrap();
     }
