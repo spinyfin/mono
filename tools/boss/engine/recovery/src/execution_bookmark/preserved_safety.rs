@@ -216,6 +216,10 @@ pub(super) async fn reject_unsafe_outcome(
             .await?
             .is_empty()
     {
+        let dropped = tip.commit_id.clone();
+        // Dropping the primary name must not lose the only name: keep the
+        // commit in an inspection archive and say so.
+        quarantine(jj, record, std::slice::from_ref(&dropped)).await?;
         let name = preserved_name(&record.execution_id);
         if !log_change(jj, &record.repo_path, &revision(&name))
             .await?
@@ -225,6 +229,113 @@ pub(super) async fn reject_unsafe_outcome(
             forget_preserved(jj, &record.repo_path, &name).await?;
         }
         outcome.tip = None;
+        let note = format!(
+            "the preserved tip {dropped} descends from work already quarantined as possibly belonging to a later holder; excluding it from automatic restore and retaining it only in an inspection archive"
+        );
+        match outcome.inspect.as_mut() {
+            Some(inspect) => {
+                if !inspect.reason.contains(&dropped) {
+                    inspect.reason.push_str(&format!("; {note}"));
+                }
+            }
+            None => {
+                outcome.inspect = Some(PreserveInspect {
+                    existing_commit_id: Some(dropped),
+                    workspace_change_id: None,
+                    workspace_commit_id: None,
+                    workspace_count: None,
+                    reason: note,
+                });
+            }
+        }
     }
     Ok(outcome)
+}
+
+/// One commit's added and removed lines, ignoring context, blob ids and
+/// offsets so a pure rebase compares equal.
+async fn commit_changes(jj: &dyn Jj, repo: &Path, commit: &str) -> Result<Vec<String>> {
+    let patch = jj
+        .run(repo, &["--ignore-working-copy", "diff", "--git", "-r", commit])
+        .await?;
+    Ok(patch
+        .lines()
+        .filter(|line| {
+            (line.starts_with('+') || line.starts_with('-')) && !line.starts_with("+++") && !line.starts_with("---")
+        })
+        .map(str::to_owned)
+        .collect())
+}
+
+/// A bookmark follows its change through every rewrite a later holder makes
+/// (`jj squash`, `jj absorb`, `jj diffedit`). Only a pure rebase, which leaves
+/// the added and removed lines untouched, may move `preserved/<exec>` off the
+/// commit teardown recorded; any other evolution may carry foreign edits.
+pub(in super::super) async fn reject_content_evolution(
+    jj: &dyn Jj,
+    record: &ExecutionBookmark,
+    pointer: &str,
+    recorded: &PreservedTip,
+) -> Result<()> {
+    if pointer == recorded.commit_id {
+        return Ok(());
+    }
+    // A recorded commit that no longer resolves cannot be compared.
+    if log_change(jj, &record.repo_path, &recorded.commit_id)
+        .await?
+        .trim()
+        .is_empty()
+    {
+        return Ok(());
+    }
+    // Only an evolution of the recorded commit can carry a later holder's
+    // edits under the same name; unrelated changes are other teardowns.
+    let evolution = jj
+        .run(
+            &record.repo_path,
+            &[
+                "--ignore-working-copy",
+                "evolog",
+                "--no-graph",
+                "-r",
+                pointer,
+                "-T",
+                "commit_id ++ \"\\n\"",
+            ],
+        )
+        .await?;
+    if !evolution.lines().any(|id| id == recorded.commit_id) {
+        return Ok(());
+    }
+    let stack = log(
+        jj,
+        &record.repo_path,
+        &unpublished(&recorded.commit_id),
+        "change_id ++ \" \" ++ commit_id ++ \"\\n\"",
+    )
+    .await?;
+    for line in stack.lines() {
+        let Some((change, original)) = line.split_once(' ') else {
+            continue;
+        };
+        let moved = log_change(
+            jj,
+            &record.repo_path,
+            &format!("({}) & ::{pointer}", change_revset(change)),
+        )
+        .await?;
+        let original = commit_changes(jj, &record.repo_path, original).await?;
+        let mut unchanged = moved.lines().next().is_none();
+        for candidate in moved.lines() {
+            unchanged |= commit_changes(jj, &record.repo_path, candidate).await? == original;
+        }
+        if !unchanged {
+            return Err(pointer_integrity_error(format!(
+                "{} moved off the recorded commit {} to {pointer} and change {change} has different content; it may hold a later holder's edits, so it is not restaged",
+                preserved_name(&record.execution_id),
+                recorded.commit_id
+            )));
+        }
+    }
+    Ok(())
 }

@@ -36,7 +36,11 @@ pub(super) async fn select_tip(
     } else {
         output.lines().filter(|id| !id.is_empty()).map(str::to_owned).collect()
     };
+    let pointed = !output.trim().is_empty();
     let candidates = super::preserved::safe_candidates(jj, record, candidates).await?;
+    if let (true, Some(recorded), [only]) = (pointed, recorded, candidates.as_slice()) {
+        super::preserved::reject_content_evolution(jj, record, only, recorded).await?;
+    }
     match candidates.as_slice() {
         [] => return Ok(None),
         [tip] => return Ok(Some((tip.clone(), candidates))),
