@@ -745,6 +745,11 @@ pub async fn release_heads(
     Ok(archived)
 }
 
+/// Deliberately unguarded by the quarantine: `backup_execution_patch` exports
+/// quarantined heads so their content is kept, and nothing here restages them.
+/// Any caller that restages must go through `unpublished_diff` or
+/// `resume_heads_of`, which call `reject_quarantined_heads`.
+///
 /// Diff for each resumed head, concatenated, from the newest common ancestor
 /// of the head with the floor or trunk. Bounding by trunk keeps upstream
 /// changes a rebase pulled in out of the patch.

@@ -252,25 +252,15 @@ pub(super) async fn reject_unsafe_outcome(
     Ok(outcome)
 }
 
-/// One commit's added and removed lines, ignoring context, blob ids and
-/// offsets so a pure rebase compares equal.
-async fn commit_changes(jj: &dyn Jj, repo: &Path, commit: &str) -> Result<Vec<String>> {
-    let patch = jj
-        .run(repo, &["--ignore-working-copy", "diff", "--git", "-r", commit])
-        .await?;
-    Ok(patch
-        .lines()
-        .filter(|line| {
-            (line.starts_with('+') || line.starts_with('-')) && !line.starts_with("+++") && !line.starts_with("---")
-        })
-        .map(str::to_owned)
-        .collect())
-}
-
 /// A bookmark follows its change through every rewrite a later holder makes
 /// (`jj squash`, `jj absorb`, `jj diffedit`). Only a pure rebase, which leaves
 /// the added and removed lines untouched, may move `preserved/<exec>` off the
 /// commit teardown recorded; any other evolution may carry foreign edits.
+/// Content is compared with `reconcile::same_change_content` (an `interdiff`,
+/// so paths, modes and binary changes count), for every commit of the recorded
+/// ancestry including empty ones: a later holder can squash text into an empty
+/// boundary. A rebase onto a moved base compares equal even when it leaves
+/// the commit conflicted; the restore reports those conflicts.
 pub(in super::super) async fn reject_content_evolution(
     jj: &dyn Jj,
     record: &ExecutionBookmark,
@@ -310,7 +300,7 @@ pub(in super::super) async fn reject_content_evolution(
     let stack = log(
         jj,
         &record.repo_path,
-        &unpublished(&recorded.commit_id),
+        &format!("::{} ~ ::remote_bookmarks()", recorded.commit_id),
         "change_id ++ \" \" ++ commit_id ++ \"\\n\"",
     )
     .await?;
@@ -324,10 +314,10 @@ pub(in super::super) async fn reject_content_evolution(
             &format!("({}) & ::{pointer}", change_revset(change)),
         )
         .await?;
-        let original = commit_changes(jj, &record.repo_path, original).await?;
-        let mut unchanged = moved.lines().next().is_none();
-        for candidate in moved.lines() {
-            unchanged |= commit_changes(jj, &record.repo_path, candidate).await? == original;
+        let mut unchanged = true;
+        for candidate in moved.lines().filter(|id| !id.is_empty()) {
+            unchanged &= candidate == original
+                || super::reconcile::same_change_content(jj, &record.repo_path, original, candidate).await?;
         }
         if !unchanged {
             return Err(pointer_integrity_error(format!(

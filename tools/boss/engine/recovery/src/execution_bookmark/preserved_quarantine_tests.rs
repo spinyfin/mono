@@ -76,7 +76,7 @@ async fn a_pointer_squashed_by_a_later_holder_is_not_restaged() {
         .unwrap_or_else(|| panic!("an ancestor of the working copy is bookmarked: {outcome:?}"));
     assert!(outcome.inspect.is_none());
     std::fs::write(repo.worker.join("theirs"), "later holder").unwrap();
-    JjRepo::run(&repo.worker, &["squash"]);
+    JjRepo::run(&repo.worker, &["squash", "-u"]);
     let err = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
         .await
         .unwrap_err();
@@ -101,11 +101,173 @@ async fn a_pure_rebase_of_the_recorded_tip_is_still_restored() {
     JjRepo::run(&repo.replacement, &["new", "main", "-m", "New base"]);
     std::fs::write(repo.replacement.join("base"), "new base").unwrap();
     JjRepo::run(&repo.replacement, &["new"]);
+    // The pointer is rewritten onto the new base, so it no longer equals the
+    // recorded commit and the content comparison must accept it.
+    let pointer = preserved_name("exec_rebased_tip");
+    JjRepo::run(&repo.replacement, &["rebase", "-s", &pointer, "-d", "@-"]);
+    let moved = JjRepo::run(
+        &repo.replacement,
+        &["log", "--no-graph", "-r", &pointer, "-T", "commit_id"],
+    );
+    assert_ne!(moved.trim(), saved.commit_id);
     let restored = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
         .await
         .unwrap();
     assert!(restored.is_some());
     assert!(repo.replacement.join("ours").exists());
+}
+
+/// Preserve a tip whose child is the next holder's working copy, let that
+/// holder apply `edit` and squash it into the boundary, then restore.
+async fn restore_after_holder_squash(
+    name: &str,
+    boundary_empty: bool,
+    forget: bool,
+    edit: impl FnOnce(&std::path::Path),
+) -> (JjRepo, Result<Option<RestoreReport>>) {
+    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, name, "local").await.unwrap();
+    std::fs::write(repo.worker.join("ours"), "first holder").unwrap();
+    JjRepo::run(&repo.worker, &["status"]);
+    if boundary_empty {
+        JjRepo::run(&repo.worker, &["new", "-m", "Empty boundary"]);
+    }
+    let source = boundary_now(BoundaryOwnership::Reassigned).await;
+    JjRepo::run(&repo.worker, &["new", "-m", "Later holder"]);
+    let saved = preserve_from(&LocalJj, &record, &repo.worker, None, None, source)
+        .await
+        .unwrap()
+        .tip
+        .expect("an ancestor of the working copy is bookmarked");
+    edit(&repo.worker);
+    JjRepo::run(&repo.worker, &["squash", "-u"]);
+    if forget {
+        JjRepo::run(&repo.repo, &["bookmark", "forget", &preserved_name(name)]);
+    }
+    let result = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved)).await;
+    (repo, result)
+}
+
+#[tokio::test]
+async fn a_squash_is_refused_after_the_bookmark_was_forgotten() {
+    let (repo, result) = restore_after_holder_squash("exec_forgotten_squash", false, true, |worker| {
+        std::fs::write(worker.join("theirs"), "later holder").unwrap();
+    })
+    .await;
+    assert!(is_pointer_integrity_error(&result.unwrap_err()));
+    assert!(!repo.replacement.join("theirs").exists());
+}
+
+#[tokio::test]
+async fn a_squash_into_an_empty_recorded_boundary_is_refused() {
+    let (repo, result) = restore_after_holder_squash("exec_empty_boundary_squash", true, false, |worker| {
+        std::fs::write(worker.join("theirs"), "later holder").unwrap();
+    })
+    .await;
+    assert!(is_pointer_integrity_error(&result.unwrap_err()));
+    assert!(!repo.replacement.join("theirs").exists());
+}
+
+#[tokio::test]
+async fn a_rename_by_a_later_holder_is_refused() {
+    let (repo, result) = restore_after_holder_squash("exec_renamed_boundary", false, false, |worker| {
+        std::fs::rename(worker.join("ours"), worker.join("renamed")).unwrap();
+    })
+    .await;
+    assert!(is_pointer_integrity_error(&result.unwrap_err()));
+    assert!(!repo.replacement.join("renamed").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_mode_change_by_a_later_holder_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_repo, result) = restore_after_holder_squash("exec_mode_boundary", false, false, |worker| {
+        std::fs::set_permissions(worker.join("ours"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    })
+    .await;
+    assert!(is_pointer_integrity_error(&result.unwrap_err()));
+}
+
+/// A stale operation rewrites the preserved change while a later holder
+/// squashes foreign edits into it, leaving two visible variants. Whichever
+/// variant selection prefers, the foreign edits must not be restaged.
+async fn divergent_foreign_edits_are_never_restaged(name: &str, stale_first: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, name, "local").await.unwrap();
+    std::fs::write(repo.worker.join("ours"), "first holder").unwrap();
+    JjRepo::run(&repo.worker, &["status"]);
+    let source = boundary_now(BoundaryOwnership::Reassigned).await;
+    JjRepo::run(&repo.worker, &["new", "-m", "Later holder"]);
+    let saved = preserve_from(&LocalJj, &record, &repo.worker, None, None, source)
+        .await
+        .unwrap()
+        .tip
+        .unwrap();
+    let before = JjRepo::run(&repo.worker, &["op", "log", "--no-graph", "-n1", "-T", "id.short(12)"]);
+    let stale = |repo: &JjRepo| {
+        JjRepo::run(
+            &repo.worker,
+            &[
+                "--at-op",
+                before.trim(),
+                "describe",
+                "-r",
+                &saved.commit_id,
+                "-m",
+                "stale rewrite",
+            ],
+        );
+    };
+    if stale_first {
+        stale(&repo);
+    }
+    std::fs::write(repo.worker.join("theirs"), "later holder").unwrap();
+    JjRepo::run(&repo.worker, &["squash", "-u"]);
+    if !stale_first {
+        stale(&repo);
+    }
+    let result = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved)).await;
+    assert!(
+        result.is_err() || !repo.replacement.join("theirs").exists(),
+        "foreign edits restaged: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_divergent_variant_carrying_foreign_edits_is_never_restaged() {
+    divergent_foreign_edits_are_never_restaged("exec_divergent_foreign_last", false).await;
+    divergent_foreign_edits_are_never_restaged("exec_divergent_foreign_first", true).await;
+}
+
+#[tokio::test]
+async fn a_rebase_that_conflicts_is_still_restored_with_its_conflicts_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_conflicting_rebase", "local")
+        .await
+        .unwrap();
+    std::fs::write(repo.worker.join("clash"), "first holder").unwrap();
+    JjRepo::run(&repo.worker, &["status"]);
+    let saved = preserve(&LocalJj, &record, &repo.worker, None, None)
+        .await
+        .unwrap()
+        .tip
+        .unwrap();
+    JjRepo::run(&repo.replacement, &["new", "main", "-m", "New base"]);
+    std::fs::write(repo.replacement.join("clash"), "base edit").unwrap();
+    JjRepo::run(&repo.replacement, &["new"]);
+    let pointer = preserved_name("exec_conflicting_rebase");
+    JjRepo::run(&repo.replacement, &["rebase", "-s", &pointer, "-d", "@-"]);
+    // A rebase onto a moved base is not a content change: the guard accepts
+    // it and the restore reports the conflicts for the worker to resolve.
+    let restored = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+        .await
+        .unwrap()
+        .expect("the preserved work is restaged");
+    assert!(!restored.conflicts.trim().is_empty(), "{restored:?}");
 }
 
 #[tokio::test]
