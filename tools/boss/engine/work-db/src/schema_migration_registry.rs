@@ -353,6 +353,11 @@ pub(super) fn all() -> Vec<Migration> {
             legacy_version: None,
             apply: execution_bookmarks::migrate_has_recovery_head,
         },
+        Migration {
+            id: spoke_hub::RUN_INDEX_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: spoke_hub::migrate_host_commands_run_idx,
+        },
     ]);
     migrations
 }

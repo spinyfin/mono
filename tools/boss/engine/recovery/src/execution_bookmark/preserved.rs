@@ -30,7 +30,9 @@ pub struct PreserveInspect {
 /// The arguments of the recovery operations a host executes for the hub, as the
 /// bounded JSON payload of a workspace command (`WorkspaceOp.request_json`).
 /// Unset fields take the local default, so an older hub's request still parses.
-/// It carries recovery values only: no path, argv or revset.
+/// It carries recovery values only: no path, argv or revset. There is no
+/// version marker: new semantics always need a new `WorkspaceKind` so older
+/// hosts reject the operation rather than silently dropping unknown fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostRecoveryRequest {
     /// The tip the hub recorded at an earlier teardown.

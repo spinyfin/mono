@@ -963,9 +963,9 @@ pub use review_verdicts::{
 };
 pub use revision_helpers::normalize_priority;
 pub use spoke_hub::{
-    HostOutboxFault, HostTransport, MAX_UNSETTLED_HOST_COMMAND_BYTES, MAX_UNSETTLED_HOST_COMMANDS,
-    MIN_RETAINED_SETTLED_HOST_COMMANDS, SETTLED_HOST_COMMAND_RETENTION_MS, SpokeAssignment, SpokeHeldByOtherHost,
-    SpokeHostInUse, SpokeRunKey, StoredHostCommand,
+    AmbiguousSpokeAssignment, HostOutboxFault, HostTransport, MAX_UNSETTLED_HOST_COMMAND_BYTES,
+    MAX_UNSETTLED_HOST_COMMANDS, MIN_RETAINED_SETTLED_HOST_COMMANDS, RunAdmission, SETTLED_HOST_COMMAND_RETENTION_MS,
+    SpokeAssignment, SpokeHeldByOtherHost, SpokeHostInUse, SpokeRunKey, StoredHostCommand,
 };
 pub use trunk_merge_intents::{ActiveTrunkMergeIntent, TrunkMergeIntent, TrunkMergeIntentInsertInput};
 

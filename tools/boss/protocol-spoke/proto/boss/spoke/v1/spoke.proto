@@ -304,11 +304,13 @@ message WorkspaceOp {
   bool self_retry = 17;
   string pr_bookmark = 18;
   string trunk = 19;
-  // A bounded, versioned JSON compatibility payload for the recovery kinds
-  // whose arguments are the recovery crate's own value types. Required for
-  // CONFIRM_RECOVERY, RESTORE_PRESERVED, CHECK_PRESERVED_UNPUBLISHED and
+  // A bounded JSON compatibility payload for the recovery kinds whose
+  // arguments are the recovery crate's own value types. Required for
+  // CONFIRM_RECOVERY, RESTORE_PRESERVED, CHECK_PRESERVED_UNPUBLISHED,
   // PRUNE_BOOKMARK and RELEASE_HEADS_CONFIGURED, and forbidden for every other
-  // kind. It names no path, argv or revset.
+  // kind. It names no path, argv or revset. It carries no version marker: new
+  // semantics always need a new WorkspaceKind so older hosts reject the
+  // operation rather than silently dropping unknown fields.
   bytes request_json = 20;
 }
 message Bookmark {

@@ -96,6 +96,10 @@ impl HostVoucher {
         match self {
             Self::Commit { label, commit_id } => {
                 ensure!(plain(&label), "invalid voucher label");
+                ensure!(
+                    matches!(commit_id.len(), 40 | 64) && commit_id.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "voucher is not a full commit identity"
+                );
                 Voucher::commit(label, &commit_id).ok_or_else(|| anyhow::anyhow!("voucher is not a commit id"))
             }
             Self::RemoteBookmark { name, remote } => {
