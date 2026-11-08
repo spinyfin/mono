@@ -117,6 +117,16 @@ pub(crate) struct Hub {
 }
 
 impl Hub {
+    pub(crate) fn stable_callers(&self) -> usize {
+        self.stable_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            // The map's own handle is not a caller.
+            .map(|lock| Arc::strong_count(lock) - 1)
+            .sum()
+    }
+
     pub(crate) fn unique_id(&self, prefix: &str, run_id: &str) -> String {
         format!(
             "{prefix}-{run_id}-{}-{:x}",
@@ -757,63 +767,10 @@ impl HostAdapter for SpokeHostAdapter {
         }
     }
 
-    async fn restore_execution_bookmark(
-        &self,
-        record: &ExecutionBookmark,
-        workspace: &Path,
-        self_retry: bool,
-    ) -> Result<bool> {
-        match self.route_path(workspace).await? {
-            Route::Spoke(assignment) => self.rec_restore(&assignment, record, self_retry).await,
-            Route::Legacy(legacy) => legacy.restore_execution_bookmark(record, workspace, self_retry).await,
-        }
-    }
-
     async fn discard_orphaned_execution_baseline(&self, record: &ExecutionBookmark) -> Result<()> {
         match self.route_execution(&record.execution_id).await? {
             Route::Spoke(assignment) => self.rec_discard(&assignment, record).await,
             Route::Legacy(legacy) => legacy.discard_orphaned_execution_baseline(record).await,
-        }
-    }
-
-    async fn restore_rebased_execution_bookmark(
-        &self,
-        record: &ExecutionBookmark,
-        workspace: &Path,
-        pr_bookmark: Option<&str>,
-        base_branch: &str,
-    ) -> Result<RestoreReport> {
-        match self.route_path(workspace).await? {
-            Route::Spoke(assignment) => {
-                self.rec_restore_rebased(&assignment, record, pr_bookmark, base_branch)
-                    .await
-            }
-            Route::Legacy(legacy) => {
-                legacy
-                    .restore_rebased_execution_bookmark(record, workspace, pr_bookmark, base_branch)
-                    .await
-            }
-        }
-    }
-
-    async fn prepare_recovery_pr(
-        &self,
-        record: &ExecutionBookmark,
-        workspace: &Path,
-        repo_id: &str,
-        pr: u64,
-    ) -> Result<bool> {
-        match self.route_path(workspace).await? {
-            Route::Spoke(assignment) => {
-                // Whether the PR is still open is hub-side GitHub policy; only
-                // the pointer-preserving positioning crosses the wire.
-                if !self.recovery_pr_is_open(repo_id, pr).await? {
-                    return Ok(false);
-                }
-                self.rec_prepare_pr(&assignment, record, pr).await?;
-                Ok(true)
-            }
-            Route::Legacy(legacy) => legacy.prepare_recovery_pr(record, workspace, repo_id, pr).await,
         }
     }
 
@@ -869,7 +826,12 @@ impl HostAdapter for SpokeHostAdapter {
         // the legacy transport's to read, whatever layout its driver used.
         let (host, owned) = (self.host.id.clone(), path.to_owned());
         if !self.db(move |db| db.transcript_is_legacy(&host, &owned)).await? {
-            return Ok(None);
+            // `Ok(None)` would tell the caller the transcript is engine-local
+            // and to open the path on the hub; a host-side path must not be.
+            bail!(
+                "the transcript at {path} belongs to a spoke run on host {}; it is not readable from the hub by path",
+                self.host.id
+            );
         }
         self.legacy_adapter("a transcript read")
             .await?
@@ -1018,6 +980,14 @@ impl SpokeHostAdapterProvider {
     /// adapter store commands in the same database.
     pub fn outbox(&self) -> WorkDbOutbox {
         self.hub.outbox.clone()
+    }
+
+    /// How many stable-request calls are in flight, counting each one that is
+    /// working on a request and each one waiting for it. Lets a test observe an
+    /// overlap instead of sleeping for one.
+    #[doc(hidden)]
+    pub fn stable_callers(&self) -> usize {
+        self.hub.stable_callers()
     }
 
     fn adapter(&self, host: &Host, bound: Option<SpokeAssignment>, legacy: bool) -> Arc<dyn HostAdapter> {

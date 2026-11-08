@@ -481,27 +481,6 @@ impl SpokeHostAdapter {
         json(&result, "bookmark diff")
     }
 
-    pub(crate) async fn rec_restore(
-        &self,
-        assignment: &SpokeAssignment,
-        record: &ExecutionBookmark,
-        self_retry: bool,
-    ) -> Result<bool> {
-        let result = self
-            .recovery_op(
-                "restore_bookmark",
-                assignment,
-                record,
-                Kind::RestoreBookmark,
-                true,
-                |op| {
-                    op.self_retry = self_retry;
-                },
-            )
-            .await?;
-        json(&result, "bookmark restore")
-    }
-
     pub(crate) async fn rec_discard(&self, assignment: &SpokeAssignment, record: &ExecutionBookmark) -> Result<()> {
         self.recovery_op(
             "discard_baseline",
@@ -510,49 +489,6 @@ impl SpokeHostAdapter {
             Kind::DiscardBaseline,
             false,
             |_| {},
-        )
-        .await?;
-        Ok(())
-    }
-
-    pub(crate) async fn rec_restore_rebased(
-        &self,
-        assignment: &SpokeAssignment,
-        record: &ExecutionBookmark,
-        pr_bookmark: Option<&str>,
-        base_branch: &str,
-    ) -> Result<RestoreReport> {
-        let result = self
-            .recovery_op(
-                "restore_rebased",
-                assignment,
-                record,
-                Kind::RestoreRebased,
-                true,
-                |op| {
-                    op.pr_bookmark = pr_bookmark.unwrap_or_default().to_owned();
-                    op.trunk = base_branch.to_owned();
-                },
-            )
-            .await?;
-        json(&result, "rebased restore")
-    }
-
-    pub(crate) async fn rec_prepare_pr(
-        &self,
-        assignment: &SpokeAssignment,
-        record: &ExecutionBookmark,
-        pr: u64,
-    ) -> Result<()> {
-        self.recovery_op(
-            "prepare_recovery_pr",
-            assignment,
-            record,
-            Kind::PrepareRecoveryPr,
-            true,
-            |op| {
-                op.pr_number = pr;
-            },
         )
         .await?;
         Ok(())

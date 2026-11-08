@@ -151,6 +151,11 @@ impl WorkDb {
             [execution_id],
         )?;
         if let Some(lease_id) = prior {
+            // The legacy destination's hold ends with its lease.
+            tx.execute(
+                "DELETE FROM legacy_destinations WHERE execution_id = ?1",
+                [execution_id],
+            )?;
             tx.execute(
                 "UPDATE work_executions
                  SET cube_lease_id = NULL,
@@ -173,11 +178,19 @@ impl WorkDb {
     /// Only one releaser may call cube for an execution's expected lease.
     pub fn claim_execution_workspace_release(&self, execution_id: &str, lease_id: &str) -> Result<bool> {
         let conn = self.connect()?;
-        Ok(conn.execute(
+        let claimed = conn.execute(
             "UPDATE work_executions SET cube_lease_id = NULL
              WHERE id = ?1 AND cube_lease_id = ?2",
             params![execution_id, lease_id],
-        )? == 1)
+        )? == 1;
+        if claimed {
+            // The legacy destination's hold ends with its lease.
+            conn.execute(
+                "DELETE FROM legacy_destinations WHERE execution_id = ?1",
+                [execution_id],
+            )?;
+        }
+        Ok(claimed)
     }
 
     pub fn finish_execution_workspace_release(&self, execution: &WorkExecution) -> Result<()> {

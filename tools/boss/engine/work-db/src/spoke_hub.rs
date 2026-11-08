@@ -319,12 +319,29 @@ fn legacy_binding(conn: &Connection, execution_id: &str) -> Result<Option<String
     }
     Ok(conn
         .query_row(
-            "SELECT host_id FROM legacy_destinations WHERE execution_id = ?1",
-            [execution_id],
+            // A claim binds while its destination can be leasing or running: a
+            // run was recorded on the claimed host, or the claim is recent and
+            // the host still has the transport it was made under. A claim whose
+            // destination never leased (an unreachable SSH host) expires, and
+            // one made while the host was `spoke_pending` stops binding once the
+            // host's transport moves on.
+            "SELECT d.host_id FROM legacy_destinations d
+              WHERE d.execution_id = ?1
+                AND (EXISTS(SELECT 1 FROM work_runs r
+                             WHERE r.execution_id = d.execution_id AND COALESCE(r.host_id, 'local') = d.host_id)
+                     OR (d.claimed_at_ms > ?2
+                         AND d.transport = COALESCE((SELECT transport FROM host_transports WHERE host_id = d.host_id),
+                                                    'legacy_ssh')))",
+            params![execution_id, now_ms() - LEGACY_CLAIM_GRACE_MS],
             |row| row.get(0),
         )
         .optional()?)
 }
+
+/// How long a legacy claim with no lease and no run binds the execution: long
+/// enough for the destination to lease its workspace, short enough that a
+/// destination that failed before leasing does not pin the execution.
+const LEGACY_CLAIM_GRACE_MS: i64 = 10 * 60 * 1000;
 
 fn now_ms() -> i64 {
     boss_engine_utils::epoch_time::now_epoch_ms() as i64
@@ -350,6 +367,13 @@ impl WorkDb {
             }
             .into());
         }
+        // Nothing binds the execution to a legacy destination any more, so a
+        // leftover expired claim must not revive if that host's transport
+        // changes back.
+        tx.execute(
+            "DELETE FROM legacy_destinations WHERE execution_id = ?1",
+            [execution_id],
+        )?;
         let open = tx
             .query_row(
                 &format!("SELECT {ASSIGNMENT_COLUMNS} FROM spoke_assignments WHERE execution_id = ?1 AND resolved_at_ms IS NULL"),
@@ -462,12 +486,19 @@ impl WorkDb {
                 params![execution_id, generation, now_ms()],
             )?;
         }
-        tx.execute(
-            "INSERT INTO legacy_destinations(execution_id, host_id, transport, claimed_at_ms)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(execution_id) DO NOTHING",
-            params![execution_id, host_id, transport.as_str(), now_ms()],
-        )?;
+        // A claim that still binds is on this host (checked above) and is kept
+        // as it is; an expired or superseded one is replaced.
+        if legacy_binding(&tx, execution_id)?.is_none() {
+            tx.execute(
+                "INSERT INTO legacy_destinations(execution_id, host_id, transport, claimed_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(execution_id) DO UPDATE SET
+                    host_id = excluded.host_id,
+                    transport = excluded.transport,
+                    claimed_at_ms = excluded.claimed_at_ms",
+                params![execution_id, host_id, transport.as_str(), now_ms()],
+            )?;
+        }
         tx.commit()?;
         Ok(None)
     }
@@ -540,14 +571,16 @@ impl WorkDb {
         )?)
     }
 
-    /// The execution's open assignment, else its latest resolved one. Recovery
+    /// The execution's open assignment, else its latest resolved one that held
+    /// or could have held a run (not one retired as `never_started`). Recovery
     /// operations stay addressable after the lease is released.
     pub fn spoke_assignment_for_execution(&self, execution_id: &str) -> Result<Option<SpokeAssignment>> {
         Ok(self
             .connect()?
             .query_row(
                 &format!(
-                    "SELECT {ASSIGNMENT_COLUMNS} FROM spoke_assignments WHERE execution_id = ?1
+                    "SELECT {ASSIGNMENT_COLUMNS} FROM spoke_assignments
+                     WHERE execution_id = ?1 AND COALESCE(resolution, '') <> 'never_started'
                      ORDER BY resolved_at_ms IS NULL DESC, assignment_generation DESC LIMIT 1"
                 ),
                 [execution_id],
@@ -879,7 +912,10 @@ impl WorkDb {
                 |row| row.get(0),
             )?;
             if !owned
-                || legacy_binding(&tx, &run.execution_id)?.is_some()
+                // The legacy fence guards new work only: preserved work and
+                // bookmarks on a resolved spoke generation stay recoverable
+                // through the stream after a legacy handoff.
+                || (start && legacy_binding(&tx, &run.execution_id)?.is_some())
                 || (needs_spoke_evidence
                     && !assignment_committed_to_spoke(&tx, &run.execution_id, run.assignment_generation as i64)?)
             {
@@ -1259,8 +1295,8 @@ mod tests {
                 .unwrap(),
             None
         );
-        let retired = db.spoke_assignment_for_execution("exec_1").unwrap().unwrap();
-        assert!(retired.resolved);
+        // Retired as never started, it is no longer what the execution routes to.
+        assert_eq!(db.spoke_assignment_for_execution("exec_1").unwrap(), None);
         assert!(!db.host_has_open_spoke_assignment("host-a").unwrap());
         // The retired reservation is fenced out of admission.
         let stale = append(&db, "host-a", "lease-1", Some(&key(&reserved)), b"lease");
@@ -1344,7 +1380,7 @@ mod tests {
                 None,
                 "{transport:?}"
             );
-            assert!(db.spoke_assignment_for_execution("exec_1").unwrap().unwrap().resolved);
+            assert_eq!(db.spoke_assignment_for_execution("exec_1").unwrap(), None);
             assert_eq!(db.legacy_destination_host("exec_1").unwrap().as_deref(), Some("host-a"));
             // A started one is kept, and the commands it admitted stay addressable.
             db.reserve_spoke_assignment("exec_2", "host-b").unwrap();
@@ -1430,6 +1466,103 @@ mod tests {
         db.claim_legacy_destination("exec_moved", "host-c", HostTransport::LegacySsh)
             .unwrap();
         assert!(db.transcript_is_legacy("host-b", "/idle/host.jsonl").unwrap());
+    }
+
+    fn backdate_claim(db: &WorkDb, execution_id: &str) {
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE legacy_destinations SET claimed_at_ms = 0 WHERE execution_id = ?1",
+                [execution_id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn recovery_for_a_resolved_generation_is_admitted_after_a_legacy_handoff() {
+        let db = spoke_db();
+        let assignment = db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
+        let run = key(&assignment);
+        append(&db, "host-a", "lease-1", Some(&run), b"lease").unwrap();
+        db.resolve_spoke_assignment("exec_1", 1, "released").unwrap();
+        // A legacy destination on another host claims the execution.
+        assert_eq!(
+            db.claim_legacy_destination("exec_1", "ssh-host", HostTransport::LegacySsh)
+                .unwrap(),
+            None
+        );
+        let check = append_with(&db, "host-a", "check-1", Some(&run), RunAdmission::Recovery, b"check");
+        assert!(check.is_ok(), "{check:?}");
+        let spawn = append(&db, "host-a", "lease-2", Some(&run), b"lease");
+        assert_eq!(fault_of(&spawn.unwrap_err()), Some(HostOutboxFault::Denied));
+    }
+
+    #[test]
+    fn a_claim_whose_destination_never_leased_is_replaceable() {
+        let db = spoke_db();
+        db.claim_legacy_destination("exec_1", "ssh-a", HostTransport::LegacySsh)
+            .unwrap();
+        // Recent, so the destination may still be leasing.
+        let refused = db
+            .claim_legacy_destination("exec_1", "ssh-b", HostTransport::LegacySsh)
+            .unwrap_err();
+        assert_eq!(legacy_held_by(&refused).as_deref(), Some("ssh-a"));
+        backdate_claim(&db, "exec_1");
+        assert_eq!(db.legacy_destination_host("exec_1").unwrap(), None);
+        assert_eq!(
+            db.claim_legacy_destination("exec_1", "ssh-b", HostTransport::LegacySsh)
+                .unwrap(),
+            None
+        );
+        assert_eq!(db.legacy_destination_host("exec_1").unwrap().as_deref(), Some("ssh-b"));
+    }
+
+    #[test]
+    fn an_old_claim_with_a_run_on_its_host_keeps_binding() {
+        let db = spoke_db();
+        db.claim_legacy_destination("exec_1", "ssh-a", HostTransport::LegacySsh)
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, created_at, host_id)
+             VALUES ('exec_1', 'chore_1', 'task_implementation', 'running', 'https://example.test/r', '1', 'ssh-a')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO work_runs (id, execution_id, agent_id, status, created_at, host_id)
+             VALUES ('run_1', 'exec_1', 'agent', 'running', '1', 'ssh-a')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        backdate_claim(&db, "exec_1");
+        assert_eq!(db.legacy_destination_host("exec_1").unwrap().as_deref(), Some("ssh-a"));
+        let refused = db.reserve_spoke_assignment("exec_1", "host-a").unwrap_err();
+        assert_eq!(legacy_held_by(&refused).as_deref(), Some("ssh-a"));
+    }
+
+    #[test]
+    fn a_claim_made_while_the_host_was_pending_yields_to_the_ready_spoke() {
+        let db = spoke_db();
+        db.set_host_transport("host-p", HostTransport::SpokePending).unwrap();
+        db.claim_legacy_destination("exec_1", "host-p", HostTransport::SpokePending)
+            .unwrap();
+        assert_eq!(db.legacy_destination_host("exec_1").unwrap().as_deref(), Some("host-p"));
+        db.set_host_transport("host-p", HostTransport::SpokeReady).unwrap();
+        assert_eq!(db.legacy_destination_host("exec_1").unwrap(), None);
+        let assignment = db.reserve_spoke_assignment("exec_1", "host-p").unwrap();
+        assert_eq!(assignment.host_id, "host-p");
+    }
+
+    #[test]
+    fn releasing_the_lease_ends_the_legacy_claim() {
+        let db = spoke_db();
+        db.claim_legacy_destination("exec_1", "ssh-host", HostTransport::LegacySsh)
+            .unwrap();
+        legacy_execution(&db, "ssh-host", "exec_1", "ssh-lease");
+        assert!(db.claim_execution_workspace_release("exec_1", "ssh-lease").unwrap());
+        assert_eq!(db.legacy_destination_host("exec_1").unwrap(), None);
     }
 
     #[test]

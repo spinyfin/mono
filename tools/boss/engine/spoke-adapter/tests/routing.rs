@@ -366,7 +366,7 @@ async fn operations_without_a_wire_form_follow_the_run_that_owns_them() {
         "/home/u/.claude/projects/-hosts-workspaces-wor_ker/run.jsonl".to_owned(),
         "/hosts/workspaces/worker-10/transcript.jsonl".to_owned(),
     ] {
-        assert!(unbound.read_transcript_tail_bytes(&owned, 10).await.unwrap().is_none());
+        assert!(unbound.read_transcript_tail_bytes(&owned, 10).await.is_err(), "{owned}");
     }
     assert!(matches!(
         unbound
@@ -749,8 +749,9 @@ async fn moving_to_a_legacy_destination_fences_the_old_reservation() {
         let old = fx.adapter(HOST, &exec).await.unwrap();
         fx.adapter(destination, &exec).await.unwrap();
         // ...and the old reservation can no longer admit anything.
+        // Retired as never started, so nothing routes to it any more.
         assert!(
-            fx.db.spoke_assignment_for_execution(&exec).unwrap().unwrap().resolved,
+            fx.db.spoke_assignment_for_execution(&exec).unwrap().is_none(),
             "{destination}"
         );
         assert!(old.lease_workspace("repo", "task", None, false, &[]).await.is_err());
@@ -785,8 +786,7 @@ async fn a_fresh_adapter_for_the_old_host_is_refused_after_a_legacy_handoff() {
             format!("{refused:#}").contains("claimed by legacy destination ssh-host"),
             "leased={leased}: {refused:#}"
         );
-        let generation = fx.db.spoke_assignment_for_execution("exec_1").unwrap().unwrap();
-        assert_eq!((generation.assignment_generation, generation.resolved), (1, true));
+        assert!(fx.db.spoke_assignment_for_execution("exec_1").unwrap().is_none());
     }
     // Nothing reached the old host, and the claimant keeps getting its adapter.
     assert!(fx.db.host_command_after(HOST, 0).unwrap().is_none());
@@ -823,16 +823,87 @@ async fn an_unused_reservation_is_retired_when_its_host_moves_off_the_spoke() {
         let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
         assert!(adapter.lease_workspace("repo", "task", None, false, &[]).await.is_err());
         assert_eq!(fx.legacy_calls(), ["lease_workspace"], "{transport:?}");
-        assert!(
-            fx.db
-                .spoke_assignment_for_execution("exec_1")
-                .unwrap()
-                .unwrap()
-                .resolved
-        );
+        assert!(fx.db.spoke_assignment_for_execution("exec_1").unwrap().is_none());
         assert!(old.lease_workspace("repo", "task", None, false, &[]).await.is_err());
         assert!(fx.db.host_command_after(HOST, 0).unwrap().is_none());
+        // A fresh adapter for the host (it has spoke history) must not route the
+        // execution's other operations to the retired reservation.
+        let fresh = fx.provider_adapter(HOST).await;
+        assert!(fresh.reattach_events_forward("exec_1", "sock").await.unwrap());
+        assert!(
+            fx.legacy_calls().contains(&"reattach_events_forward:exec_1".to_owned()),
+            "{transport:?}: {:?}",
+            fx.legacy_calls()
+        );
     }
+}
+
+#[tokio::test]
+async fn a_pending_host_claim_yields_to_the_spoke_once_the_host_is_ready() {
+    let fx = Fixture::new().await;
+    fx.serve_legacy();
+    fx.db.set_host_transport("pend", HostTransport::SpokePending).unwrap();
+    // Nothing started over the legacy transport, so the claim made while the
+    // spoke was pending must not keep the execution on SSH.
+    fx.adapter("pend", "exec_p").await.unwrap();
+    assert!(fx.db.spoke_assignment_for_execution("exec_p").unwrap().is_none());
+    fx.ready("pend");
+    fx.adapter("pend", "exec_p").await.unwrap();
+    assert!(fx.db.spoke_assignment_for_execution("exec_p").unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_spoke_owned_transcript_is_never_reported_as_engine_local() {
+    let fx = Fixture::new().await;
+    fx.serve_legacy();
+    fx.ready(HOST);
+    fx.adapter(HOST, "exec_1").await.unwrap();
+    let unbound = fx.provider_adapter(HOST).await;
+    // `Ok(None)` would send the caller to open this host-side path on the hub.
+    let read = unbound.read_transcript_tail_bytes("/host/only/spoke.jsonl", 100).await;
+    assert!(read.is_err(), "{read:?}");
+    assert!(fx.legacy_calls().is_empty(), "{:?}", fx.legacy_calls());
+}
+
+#[tokio::test]
+async fn recovery_on_the_old_spoke_host_crosses_the_stream_after_a_legacy_handoff() {
+    let fx = Fixture::new().await;
+    fx.serve_legacy();
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let peer = fx
+        .spoke(
+            Box::new(|c| match workspace_kind(c) {
+                Some(Kind::DiffBookmark) => Some(ok(c, Some(workspace(c, json!("diff --git"))))),
+                _ => standard(c),
+            }),
+            None,
+            0,
+        )
+        .await;
+    lease(&adapter).await;
+    adapter.release_workspace("lease-1").await.unwrap();
+    // A legacy destination on another host now holds the execution.
+    fx.adapter("ssh-host", "exec_1").await.unwrap();
+    assert_eq!(
+        fx.db.legacy_destination_host("exec_1").unwrap().as_deref(),
+        Some("ssh-host")
+    );
+
+    let fresh = fx.provider_adapter(HOST).await;
+    let record = ExecutionBookmark::builder()
+        .execution_id("exec_1")
+        .repo_path("/spoke/repo".into())
+        .host_id(HOST)
+        .build();
+    assert_eq!(fresh.execution_bookmark_diff(&record).await.unwrap(), "diff --git");
+    assert!(
+        peer.commands()
+            .iter()
+            .any(|c| workspace_kind(c) == Some(Kind::DiffBookmark))
+    );
+    // New work is still fenced.
+    assert!(adapter.lease_workspace("repo", "task", None, false, &[]).await.is_err());
 }
 
 #[tokio::test]
@@ -860,7 +931,24 @@ async fn overlapping_stable_requests_share_one_command_and_never_report_not_sent
             tokio::spawn(async move { adapter.stop_worker("exec_1", grace).await })
         })
         .collect();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The first call has stored and sent its stop, and the second is positively
+    // waiting on it at the keyed serialization boundary: only then is the stop
+    // answered, so the overlap is certain rather than assumed.
+    let overlap = async {
+        loop {
+            let stop_sent = peer
+                .commands()
+                .iter()
+                .any(|c| matches!(c.body, Some(command::Body::Stop(_))));
+            if stop_sent && fx.provider.stable_callers() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), overlap)
+        .await
+        .expect("both stop calls reach the serialization boundary");
     let stops: Vec<_> = peer
         .commands()
         .into_iter()
