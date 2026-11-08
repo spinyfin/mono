@@ -508,75 +508,64 @@ fn reconcile_item_execution_mints_the_execution_a_park_cancelled() {
     );
 }
 
-/// Park and un-park a chore with a pending execution, then place the
-/// execution's cancel at `cancelled_at` on a fixed timeline: park at 100,
-/// un-park at 200. Returns what the item-level reconcile minted.
-fn reconcile_with_cancel_at(db: &WorkDb, product: &str, label: &str, cancelled_at: &str, patch: &str) -> usize {
-    let chore = create_test_chore(db, product, label).id;
-    db.reconcile_item_execution(&chore).unwrap();
-    park(db, &chore);
-    unpark(db, &chore);
-    {
-        // The connection is the database's one shared handle: release it before
-        // the reconcile asks for it again.
-        let conn = db.connect().unwrap();
-        for (changed_at, parking) in [("100", "new_value IS NOT NULL"), ("200", "new_value IS NULL")] {
-            conn.execute(
-                &format!(
-                    "UPDATE task_status_audit SET changed_at = '{changed_at}'
-                     WHERE work_item_id = ?1 AND property = 'parked_at' AND {parking}"
-                ),
-                [&chore],
+#[test]
+fn explicit_cancels_adjacent_to_parking_stay_cancelled() {
+    let db = open();
+    let product = create_test_product_named(&db, "cancel-provenance").id;
+    for before_park in [true, false] {
+        let name = if before_park {
+            "cancel before park"
+        } else {
+            "cancel after unpark"
+        };
+        let chore = create_test_chore(&db, &product, name).id;
+        let first = db.reconcile_item_execution(&chore).unwrap().created[0].clone();
+        let cancelled = if before_park {
+            db.cancel_execution(&first.id).unwrap();
+            park(&db, &chore);
+            unpark(&db, &chore);
+            first
+        } else {
+            park(&db, &chore);
+            unpark(&db, &chore);
+            let next = db.reconcile_item_execution(&chore).unwrap().created[0].clone();
+            db.cancel_execution(&next.id).unwrap();
+            next
+        };
+        // Force the explicit cancellation into the same second as the park
+        // or un-park: clock proximity never authorizes a fresh execution.
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET finished_at = (
+                SELECT MAX(changed_at) FROM task_status_audit
+                WHERE work_item_id = ?2 AND property = 'parked_at'
+            ) WHERE id = ?1",
+                rusqlite::params![cancelled.id, chore],
             )
             .unwrap();
-        }
-        conn.execute(
-            &format!("UPDATE work_executions SET finished_at = '{cancelled_at}' {patch} WHERE work_item_id = ?1"),
-            [&chore],
-        )
-        .unwrap();
+        let result = db.reconcile_item_execution(&chore).unwrap();
+        assert!(result.created.is_empty() && result.updated.is_empty(), "{result:?}");
+        assert_eq!(execution_status(&db, &cancelled.id), "cancelled");
     }
-    db.reconcile_item_execution(&chore).unwrap().created.len()
 }
 
 #[test]
-fn only_an_execution_cancelled_while_parked_is_minted_again() {
+fn review_admission_refuses_a_parked_item_in_the_database() {
     let db = open();
-    let product = create_test_product_named(&db, "cancel-window").id;
-
-    assert_eq!(
-        reconcile_with_cancel_at(&db, &product, "cancelled by the park", "150", ""),
-        1,
-        "cancelled between the park and the un-park: the park's doing"
+    let product = create_test_product_named(&db, "parked-review").id;
+    let chore = create_test_chore_manual(&db, &product, "review").id;
+    sql(
+        &db,
+        "UPDATE tasks SET status = 'in_review', pr_url = 'https://github.com/foo/bar/pull/1' WHERE id = ?1",
+        &chore,
     );
-    assert_eq!(
-        reconcile_with_cancel_at(&db, &product, "cancelled by the operator", "300", ""),
-        0,
-        "cancelled after the un-park: an operator decision, which stays"
-    );
-    assert_eq!(
-        reconcile_with_cancel_at(&db, &product, "cancelled before the park", "50", ""),
-        0,
-        "cancelled before the park: not the park's doing"
-    );
-    // The two clocks can disagree by a second either way.
-    for (label, cancelled_at, minted) in [
-        ("a second before the park", "99", 1),
-        ("two seconds before the park", "98", 0),
-        ("a second after the un-park", "201", 1),
-        ("two seconds after the un-park", "202", 0),
-    ] {
-        assert_eq!(
-            reconcile_with_cancel_at(&db, &product, label, cancelled_at, ""),
-            minted,
-            "{label}"
-        );
-    }
-    assert_eq!(
-        reconcile_with_cancel_at(&db, &product, "stopped worker", "150", ", started_at = '120'"),
-        0,
-        "a run that started was not a never-started cancel"
-    );
+    park(&db, &chore);
+    let error = db
+        .request_pr_review(&chore, &StaticPrStateChecker(PrOpenState::Open))
+        .unwrap_err();
+    assert!(error.to_string().contains("parked"), "{error}");
+    assert!(db.list_executions(Some(&chore)).unwrap().is_empty());
 }
 
 #[test]

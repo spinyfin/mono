@@ -750,6 +750,13 @@ async fn revisions_parked_with_the_parent_re_enter_chain_serialization() {
         vec![ExecutionStatus::WaitingDependency],
         "the chain is serialized exactly as before the park: one writer on the PR"
     );
+    for id in [&first, &second] {
+        assert!(f.db.progression_grace_waived_at(id).unwrap().is_some());
+        let steps = f.event_steps(id).await;
+        assert!(steps.contains(&"reconcile_execution".into()), "{steps:?}");
+        assert!(steps.contains(&"progression_grace".into()), "{steps:?}");
+        assert!(f.parking_lines(id).iter().any(|line| line.contains("grace")));
+    }
     assert!(f.task(&first).parked_at.is_none() && f.task(&second).parked_at.is_none());
 }
 

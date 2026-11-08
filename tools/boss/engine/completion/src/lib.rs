@@ -117,6 +117,7 @@ pub mod pr_url_capture;
 pub mod proposal_channel_error;
 pub mod reconcile_audit;
 pub mod remote_host;
+pub mod review_admission;
 pub mod review_guide_capture;
 pub mod run_done_backstop;
 pub mod teardown_registry;

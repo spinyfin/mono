@@ -991,6 +991,10 @@ pub(crate) fn cancel_pending_executions(
         .query_map([work_item_id], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     for execution_id in &ids {
+        tx.execute(
+            "INSERT OR IGNORE INTO parking_cancelled_executions (execution_id) VALUES (?1)",
+            [execution_id],
+        )?;
         crate::executions_runs::cancel_execution_in_tx(
             tx,
             pending,

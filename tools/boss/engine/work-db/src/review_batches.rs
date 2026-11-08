@@ -1585,6 +1585,12 @@ impl WorkDb {
         }
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if super::parking::is_parked(&tx, &input.cycle_root_id)? {
+            bail!(
+                "cannot review {}: item is parked; un-park it first",
+                input.cycle_root_id
+            );
+        }
         if explicit {
             let task = super::query_task(&tx, &input.cycle_root_id)?
                 .filter(|task| task.deleted_at.is_none())

@@ -23,7 +23,7 @@
 //! | # | Step (`details.step`) | Reuses |
 //! |---|---|---|
 //! | 1 | `clear_park` | the un-park write and its ledger row |
-//! | 2 | `clear_halt_stamps` | stale `dispatch_failed_*` cleared; operator-question and worker-failed holds kept (an operator refusal as a human hold, any other worker failure as evidence for progression) |
+//! | 2 | `clear_halt_stamps` | stale `dispatch_failed_*` cleared; operator-question and worker-failed holds kept (an explicit refusal as a human hold, any other worker failure as evidence for progression) |
 //! | 3 | `refresh_pr` | the merge poller's targeted reconcile (`boss_engine_merge_poller::reconcile_one`): one live probe, and merged / closed PRs take their ordinary path to `done` |
 //! | 4 | `conflict_probe`, `ci_probe`, `ai_review` | the same reconcile's conflict and CI paths, with the CI attempt budget reset first; the AI review admission that `bossctl review start` uses |
 //! | 5 | `reconcile_execution` | [`WorkDb::reconcile_item_execution`] for `todo` / `blocked` (a never-started execution the park cancelled counts as absent, so a fresh one is minted); the orphan sweep's re-dispatch for `active`, with the churn guard counting only from the un-park |

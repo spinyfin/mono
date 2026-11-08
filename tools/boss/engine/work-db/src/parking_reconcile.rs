@@ -26,9 +26,9 @@
 //!   runs exactly the code the board's ordinary invalidation reconcile runs, for
 //!   one item (or the one project chain it belongs to). A park cancels the
 //!   item's never-started executions, and the ordinary reconcile never mints
-//!   over a cancelled latest execution (an operator's cancel is a decision), so
+//!   over a cancelled latest execution (an explicit cancel is a decision), so
 //!   [`cancelled_by_park`] tells the reconcile which cancelled row was the
-//!   park's doing: one cancelled while the item was parked is as good as absent
+//!   park's doing, recorded by execution id in the parking transaction, and is as good as absent
 //!   once the item is un-parked, and is minted afresh "exactly as for a fresh
 //!   row". An `active` row is left to the orphan sweep, which has the churn
 //!   guard.
@@ -179,55 +179,28 @@ pub(crate) fn release_row(tx: &Connection, task: &Task, actor: &str) -> Result<U
     })
 }
 
-/// The ledger stamps its rows from SQLite's clock and an execution's `finished_at`
-/// comes from the engine's, each truncated to whole seconds at a different
-/// instant of the same transaction, so a cancel can read one second earlier than
-/// the park that caused it. The window [`cancelled_by_park`] checks is widened by
-/// this much at both ends.
-const LEDGER_CLOCK_SLACK_SECS: i64 = 1;
-
-/// True when `execution` is a never-started execution that a park cancelled and
-/// the item has since been un-parked, so the reconcile should treat it as if it
-/// had never been minted.
-///
-/// A park records no cancel reason on the execution (a reason in `last_error`
-/// would read as a pre-start failure), so the ledger supplies the window: the
-/// execution was cancelled at or after the item's latest park and no later than
-/// its latest un-park (give or take [`LEDGER_CLOCK_SLACK_SECS`]). An operator cancelling a pending execution after the
-/// un-park falls outside the window and stays cancelled. An `active` row is
-/// never re-minted here; the orphan sweep owns it.
+/// True only for never-started executions cancelled in a parking transaction.
+/// Explicit cancellations remain decisions about the work, regardless of time.
 pub(crate) fn cancelled_by_park(conn: &Connection, execution: &WorkExecution) -> Result<bool> {
     if execution.status != ExecutionStatus::Cancelled || execution.started_at.is_some() {
         return Ok(false);
     }
-    let Some(cancelled_at) = execution.finished_at.as_deref().and_then(|at| at.parse::<i64>().ok()) else {
-        return Ok(false);
-    };
-    let status: Option<String> = conn
-        .query_row(
-            "SELECT status FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
-            [&execution.work_item_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if status.as_deref() != Some("todo") && status.as_deref() != Some("blocked") {
-        return Ok(false);
-    }
-    let window = conn.query_row(
-        "SELECT MAX(CASE WHEN new_value IS NOT NULL THEN CAST(changed_at AS INTEGER) END),
-                MAX(CASE WHEN new_value IS NULL THEN CAST(changed_at AS INTEGER) END)
-         FROM task_status_audit WHERE work_item_id = ?1 AND property = 'parked_at'",
-        [&execution.work_item_id],
-        |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
-    );
-    match window {
-        Ok((Some(parked), Some(unparked))) => {
-            Ok(parked - LEDGER_CLOCK_SLACK_SECS <= cancelled_at && cancelled_at <= unparked + LEDGER_CLOCK_SLACK_SECS)
-        }
-        Ok(_) => Ok(false),
-        Err(err) if crate::parking::sqlite_missing_table(&err, "task_status_audit") => Ok(false),
-        Err(err) => Err(err.into()),
-    }
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM parking_cancelled_executions WHERE execution_id = ?1)
+         AND EXISTS(SELECT 1 FROM tasks WHERE id = ?2 AND deleted_at IS NULL
+                    AND status IN ('todo', 'blocked') AND parked_at IS NULL)",
+        params![execution.id, execution.work_item_id],
+        |row| row.get(0),
+    )?)
+}
+
+pub(super) fn migrate_cancel_provenance(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS parking_cancelled_executions (
+            execution_id TEXT PRIMARY KEY REFERENCES work_executions(id) ON DELETE CASCADE
+        )",
+    )?;
+    Ok(())
 }
 
 /// True when the row's halt stamp is strictly newer than its park, i.e. it was
@@ -304,7 +277,7 @@ impl WorkDb {
         let conn = self.connect()?;
         let updated = conn.execute(
             "UPDATE tasks SET progression_grace_waived_at = ?2
-             WHERE id = ?1 AND deleted_at IS NULL AND status NOT IN ('done', 'archived')",
+             WHERE id = ?1 AND deleted_at IS NULL AND parked_at IS NULL AND status NOT IN ('done', 'archived')",
             params![work_item_id, now_string()],
         )?;
         Ok(updated > 0)

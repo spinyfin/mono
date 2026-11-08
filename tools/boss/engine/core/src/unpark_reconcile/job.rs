@@ -29,8 +29,7 @@ const DEFAULT_PROGRESS_EVERY: usize = 10;
 /// The job's pacing limits.
 ///
 /// **How these were chosen, and what they were not.** They come from arithmetic
-/// on known per-call costs, not from production telemetry (none was available
-/// to the change that introduced them). A child that touches GitHub costs at
+/// on known per-call costs, not from measured traffic; retune them from measured un-park spend. A child that touches GitHub costs at
 /// most three GraphQL points: the targeted reconcile's one batched probe and its
 /// one merge-queue dequeue query are each billed `max(1, nodes / 100)`, which is
 /// 1 for a single PR, and the optional review-metadata fetch is one more. Even
@@ -136,6 +135,11 @@ impl UnparkReconciler {
         }
     }
 
+    #[cfg(test)]
+    pub(super) async fn hold_queue(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.one_job_at_a_time.lock().await
+    }
+
     pub fn limits(&self) -> &UnparkLimits {
         &self.limits
     }
@@ -236,7 +240,7 @@ fn touches_github(env: &UnparkEnv, item_id: &str) -> bool {
 #[derive(Default)]
 struct Pacer {
     last_github: Option<Instant>,
-    /// Set once a wait for the quota to recover has timed out in this job, so
+    /// Set once a wait for the quota to recover has started in this job, so
     /// later items are deferred without waiting again.
     quota_wait_spent: bool,
 }
@@ -260,10 +264,10 @@ impl Pacer {
         let reserve = limits.quota_reserve;
         let low = |remaining: Option<i64>| remaining.filter(|remaining| *remaining < reserve);
         let Some(remaining) = low(env.gh_budget.graphql_remaining()) else {
-            self.quota_wait_spent = false;
             return GithubAccess::Allowed;
         };
         if !self.quota_wait_spent {
+            self.quota_wait_spent = true;
             emit(
                 env,
                 key,
@@ -289,10 +293,7 @@ impl Pacer {
             }
         }
         match low(env.gh_budget.graphql_remaining()) {
-            None => {
-                self.quota_wait_spent = false;
-                GithubAccess::Allowed
-            }
+            None => GithubAccess::Allowed,
             Some(remaining) => {
                 self.quota_wait_spent = true;
                 emit(

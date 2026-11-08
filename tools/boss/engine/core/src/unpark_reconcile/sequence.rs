@@ -292,6 +292,9 @@ pub async fn reconcile_unparked_item(env: &UnparkEnv, work_item_id: &str, github
             return outcome;
         }
     };
+    if stop_if_reparked(env, &mut outcome).await {
+        return outcome;
+    }
     if task.deleted_at.is_some() || task.status.is_terminal() {
         let record = StepRecord::skipped(
             Step::RefreshPr,
@@ -315,6 +318,9 @@ pub async fn reconcile_unparked_item(env: &UnparkEnv, work_item_id: &str, github
             _ => None,
         })
         .unwrap_or(task);
+    if stop_if_reparked(env, &mut outcome).await {
+        return outcome;
+    }
     let record = reconcile_execution_step(env, &task).await;
     push(env, &mut outcome, record).await;
     if task.kind != TaskKind::Revision {
@@ -324,6 +330,26 @@ pub async fn reconcile_unparked_item(env: &UnparkEnv, work_item_id: &str, github
     let record = progression_grace_step(env, &task);
     push(env, &mut outcome, record).await;
     outcome
+}
+
+async fn stop_if_reparked(env: &UnparkEnv, outcome: &mut ItemOutcome) -> bool {
+    if !env
+        .work_db
+        .is_parked_or_assume_not(&outcome.work_item_id, "unpark reconciliation")
+    {
+        return false;
+    }
+    push(
+        env,
+        outcome,
+        StepRecord::skipped(
+            Step::RefreshPr,
+            "re_parked",
+            "item was parked again; reconciliation stops",
+        ),
+    )
+    .await;
+    true
 }
 
 async fn push(env: &UnparkEnv, outcome: &mut ItemOutcome, record: StepRecord) {
@@ -344,6 +370,14 @@ async fn pr_steps(env: &UnparkEnv, task: &Task, github: GithubAccess, outcome: &
     let skip = |code: &'static str, detail: String| {
         [Step::RefreshPr, Step::ConflictProbe, Step::CiProbe, Step::AiReview]
             .map(|step| StepRecord::skipped(step, code, detail.clone()))
+    };
+    let budget = if task.kind != TaskKind::Revision
+        && matches!(task.status, TaskStatus::InReview | TaskStatus::Blocked)
+        && let Some(pr_url) = pr_url
+    {
+        prepare_ci_budget(env, task, pr_url)
+    } else {
+        String::new()
     };
     let skipped = match (task.kind == TaskKind::Revision, pr_url, task.status.clone(), github) {
         (true, ..) => Some(skip(
@@ -371,11 +405,6 @@ async fn pr_steps(env: &UnparkEnv, task: &Task, github: GithubAccess, outcome: &
         return;
     }
     let pr_url = pr_url.expect("checked above");
-
-    // Part of step 4, run first so the CI detection below sees a fresh budget:
-    // attempts spent before the park are stale evidence about CI the owner is
-    // now asking the engine to look at again.
-    let budget = prepare_ci_budget(env, task, pr_url);
 
     // What was already running before the probe. The sweep counts a conflict or
     // red CI it finds again as "flagged" whether or not it started anything, so
@@ -479,11 +508,23 @@ async fn pr_steps(env: &UnparkEnv, task: &Task, github: GithubAccess, outcome: &
     push(env, outcome, ci).await;
     let fix_in_flight = conflict_first || ci_red;
     let in_review = after.as_ref().is_some_and(|task| task.status == TaskStatus::InReview);
-    let record = if fix_in_flight || !in_review {
+    let record = if fix_in_flight {
         StepRecord::skipped(
             Step::AiReview,
             "fix_in_flight",
             "a conflict or CI fix is being routed; the review runs on the fix's push",
+        )
+    } else if !in_review {
+        StepRecord::skipped(
+            Step::AiReview,
+            "not_in_review",
+            format!(
+                "item is {}; AI review requires in_review",
+                after
+                    .as_ref()
+                    .map(|task| task.status.to_string())
+                    .unwrap_or_else(|| "unreadable".into())
+            ),
         )
     } else {
         ai_review_step(env, task, pr_url).await
@@ -582,73 +623,54 @@ async fn ai_review_step(env: &UnparkEnv, task: &Task, pr_url: &str) -> StepRecor
             ),
         );
     }
-    if env.completion.review_batch_fanout_enabled() {
-        return batch_review(env, task, pr_url).await;
-    }
-    match env
-        .work_db
-        .request_pr_review(&task.id, &StaticPrStateChecker(PrOpenState::Open))
-    {
-        Ok(execution) => {
-            env.coordinator.kick();
-            StepRecord::ok(
-                Step::AiReview,
-                "scheduled",
-                format!(
-                    "scheduled an automated review of the current head (execution {})",
-                    execution.id
-                ),
-            )
-        }
-        Err(err) => StepRecord::error(Step::AiReview, "admission_refused", err),
-    }
-}
-
-/// The review-batch flavour of [`ai_review_step`], used when `review_batch_fanout`
-/// is on: the same admission `bossctl review start` performs.
-async fn batch_review(env: &UnparkEnv, task: &Task, pr_url: &str) -> StepRecord {
-    let metadata = match boss_github::pr_files::fetch_pr_view_json(
-        pr_url,
-        "state,baseRefOid,headRefOid,files,additions,deletions",
+    use boss_engine_completion::review_admission::{ReviewAdmission, admit_review};
+    let pool = env
+        .completion
+        .review_batch_fanout_enabled()
+        .then_some(env.completion.review_pool_size());
+    match admit_review(
+        &env.work_db,
+        &task.id,
+        Some(pr_url),
+        pool,
+        &StaticPrStateChecker(PrOpenState::Open),
+        |url| async move {
+            boss_github::pr_files::fetch_pr_view_json(&url, "state,baseRefOid,headRefOid,files,additions,deletions")
+                .await
+        },
     )
     .await
     {
-        Ok(metadata) => metadata,
-        Err(err) => return StepRecord::error(Step::AiReview, "metadata_unavailable", err),
-    };
-    if metadata.get("state").and_then(serde_json::Value::as_str) != Some("OPEN") {
-        return StepRecord::skipped(Step::AiReview, "pr_not_open", "the PR is no longer open");
-    }
-    let input = match crate::completion::review_batch_input_from_metadata(&env.work_db, &task.id, pr_url, metadata) {
-        Ok(input) => input,
-        Err(err) => return StepRecord::error(Step::AiReview, "metadata_invalid", err),
-    };
-    match env
-        .work_db
-        .request_pre_merge_review_batch_for_pool(input, env.completion.review_pool_size())
-    {
-        Ok(crate::work::ReviewBatchDispatch::Created { batch, .. }) => {
+        Ok(ReviewAdmission::Legacy(execution)) => {
             env.coordinator.kick();
             StepRecord::ok(
                 Step::AiReview,
                 "scheduled",
-                format!("admitted an automated review batch for the current head ({})", batch.id),
+                format!("scheduled an automated review (execution {})", execution.id),
             )
         }
-        Ok(
+        Ok(ReviewAdmission::Batch(crate::work::ReviewBatchDispatch::Created { batch, .. })) => {
+            env.coordinator.kick();
+            StepRecord::ok(
+                Step::AiReview,
+                "scheduled",
+                format!("admitted an automated review batch ({})", batch.id),
+            )
+        }
+        Ok(ReviewAdmission::Batch(
             crate::work::ReviewBatchDispatch::ExistingBatch { .. }
             | crate::work::ReviewBatchDispatch::LegacyExecution(_),
-        ) => StepRecord::ok(
+        )) => StepRecord::ok(
             Step::AiReview,
             "in_flight",
             "an automated review of this head is already in flight",
         ),
-        Ok(crate::work::ReviewBatchDispatch::AlreadyReviewed) => StepRecord::ok(
+        Ok(ReviewAdmission::Batch(crate::work::ReviewBatchDispatch::AlreadyReviewed)) => StepRecord::ok(
             Step::AiReview,
             "current",
-            "an automated review already covers the PR's current head",
+            "an automated review already covers the current head",
         ),
-        Ok(other) => StepRecord::skipped(
+        Ok(ReviewAdmission::Batch(other)) => StepRecord::skipped(
             Step::AiReview,
             "deferred",
             format!("review admission was deferred ({other:?}); the deferred-admission sweep retries it"),
@@ -778,30 +800,34 @@ async fn revisions_step(env: &UnparkEnv, task: &Task) -> StepRecord {
     if revision_ids.is_empty() {
         return StepRecord::skipped(step, "no_revisions", "the item has no open revisions");
     }
-    let mut minted = 0;
     let mut failures = Vec::new();
     for revision_id in &revision_ids {
-        match env.work_db.reconcile_item_execution(revision_id) {
-            Ok(result) => {
-                minted += result
-                    .created
-                    .iter()
-                    .chain(result.updated.iter())
-                    .filter(|execution| &execution.work_item_id == revision_id)
-                    .count();
-            }
-            Err(err) => failures.push(format!("{revision_id}: {err:#}")),
+        let Ok(WorkItem::Task(revision) | WorkItem::Chore(revision)) = env.work_db.get_work_item(revision_id) else {
+            failures.push(format!("{revision_id}: unreadable"));
+            continue;
+        };
+        if env.work_db.is_parked_or_assume_not(revision_id, "unpark revision") {
+            leave_trace(
+                env,
+                revision_id,
+                &StepRecord::skipped(step, "re_parked", "revision was parked again"),
+            )
+            .await;
+            continue;
         }
-    }
-    if minted > 0 {
-        env.coordinator.kick();
+        let record = reconcile_execution_step(env, &revision).await;
+        if record.kind == StepKind::Error {
+            failures.push(format!("{revision_id}: {}", record.detail));
+        }
+        leave_trace(env, revision_id, &record).await;
+        leave_trace(env, revision_id, &progression_grace_step(env, &revision)).await;
     }
     if failures.is_empty() {
         StepRecord::ok(
             step,
             "re_entered",
             format!(
-                "{} open revision(s) re-entered per-PR chain serialization ({minted} execution(s) minted or promoted)",
+                "{} open revision(s) re-entered per-PR chain serialization",
                 revision_ids.len()
             ),
         )

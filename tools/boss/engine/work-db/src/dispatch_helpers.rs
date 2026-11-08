@@ -1919,6 +1919,10 @@ pub(crate) fn request_pr_review_in_tx(
         .filter(|t| t.deleted_at.is_none())
         .with_context(|| format!("unknown task: {work_item_id}"))?;
 
+    if crate::parking::is_parked(conn, work_item_id)? {
+        bail!("cannot review {work_item_id}: item is parked; un-park it first");
+    }
+
     if task.status.is_terminal() {
         bail!(
             "cannot review {work_item_id}: task is `{}` — terminal work items have no open PR to review",

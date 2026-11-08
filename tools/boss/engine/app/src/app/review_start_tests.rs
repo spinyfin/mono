@@ -1,4 +1,29 @@
 use super::*;
+
+#[tokio::test]
+async fn parking_during_metadata_fetch_prevents_review_admission() {
+    let (state, _dir) = state(true);
+    let id = seed(&state, "example/repo", 42);
+    let db = &state.work_db;
+    let result = boss_engine_completion::review_admission::admit_review(
+        db,
+        &id,
+        Some("https://github.com/example/repo/pull/42"),
+        Some(16),
+        &OpenPr,
+        |_| async {
+            db.park_work_item_as_actor(&id, true, None, "human").unwrap();
+            Ok(metadata("head"))
+        },
+    )
+    .await;
+    let Err(error) = result else {
+        panic!("parking must refuse admission")
+    };
+    assert!(error.to_string().contains("parked"), "{error}");
+    assert!(db.list_executions(Some(&id)).unwrap().is_empty());
+    assert!(db.review_batches_for_cycle_root(&id).unwrap().is_empty());
+}
 use boss_engine_runtime::test_support::{create_test_chore_manual, create_test_product_with_repo};
 use boss_protocol::{
     ProposalKind, ReviewBatch, ReviewBatchMemberRole, ReviewBatchPhase, ReviewBatchStatus, WorkExecution,

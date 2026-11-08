@@ -430,3 +430,74 @@ async fn the_unpark_hook_traces_the_database_steps_before_the_job_runs() {
         "the job closes with its own progress event"
     );
 }
+
+#[tokio::test]
+async fn quota_deferral_still_rearms_an_exhausted_ci_budget() {
+    let f = Fixture::with_budget(ScriptedBudget::script(vec![Some(0)]));
+    let id = f.chore_in_review("quota-exhausted", "https://github.com/foo/bar/pull/7410");
+    f.db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'blocked', blocked_reason = 'ci_failure_exhausted',
+         ci_attempts_used = 3 WHERE id = ?1",
+            [&id],
+        )
+        .unwrap();
+    f.park(&id);
+    let report = f.unpark(&id);
+    let summary = UnparkReconciler::new(fast_limits())
+        .run(&f.env, UnparkJob::for_report(&id, &report))
+        .await;
+    assert_eq!(summary.deferred_for_quota, 1);
+    assert_eq!(f.db.get_ci_attempts_used(&id).unwrap(), 0);
+    assert_eq!(f.task(&id).status, TaskStatus::InReview);
+    assert_eq!(f.task(&id).blocked_reason, None);
+}
+
+#[tokio::test]
+async fn parking_again_after_begin_prevents_all_upkeep() {
+    let f = Fixture::new();
+    let id = f.chore_in_review("park-again", "https://github.com/foo/bar/pull/7411");
+    f.db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'blocked', blocked_reason = 'ci_failure_exhausted',
+         ci_attempts_used = 3 WHERE id = ?1",
+            [&id],
+        )
+        .unwrap();
+    f.park(&id);
+    let report = f.unpark(&id);
+    let reconciler = Arc::new(UnparkReconciler::new(fast_limits()));
+    // Hold the job queue so begin has returned but the item cannot run.
+    let turn = reconciler.hold_queue().await;
+    let handle = reconciler.begin(&f.env, HUMAN, &id, report).await;
+    f.park(&id);
+    drop(turn);
+    let summary = handle.await.unwrap();
+    assert_eq!(summary.outcomes[0].records.len(), 1);
+    assert_eq!(summary.outcomes[0].records[0].code, "re_parked");
+    assert_eq!(f.db.get_ci_attempts_used(&id).unwrap(), 3);
+    assert_eq!(f.task(&id).blocked_reason.as_deref(), Some("ci_failure_exhausted"));
+    assert!(f.executions(&id).is_empty());
+    assert_eq!(f.db.progression_grace_waived_at(&id).unwrap(), None);
+}
+
+#[tokio::test]
+async fn oscillating_quota_waits_only_once_per_job() {
+    let f = Fixture::with_budget(ScriptedBudget::script(vec![
+        Some(0),
+        Some(4_000),
+        Some(4_000),
+        Some(4_000),
+        Some(0),
+    ]));
+    let (project, _) = f.project_with_open_prs(3);
+    f.park(&project);
+    let report = f.unpark(&project);
+    let summary = UnparkReconciler::new(fast_limits())
+        .run(&f.env, UnparkJob::for_report(&project, &report))
+        .await;
+    assert_eq!(summary.deferred_for_quota, 1);
+    assert_eq!(rate_limit_phases(&f, &project).await, vec!["waiting", "deferred"]);
+}
