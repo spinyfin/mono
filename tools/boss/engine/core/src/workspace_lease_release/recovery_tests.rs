@@ -726,7 +726,7 @@ async fn only_an_unstarted_unrecorded_execution_is_never_positioned() {
         .unwrap();
     assert!(never_positioned(&db, &execution));
     // A failure report from an earlier attempt does not change that: dispatch
-    // no longer writes recovery names that such an attempt could leave behind.
+    // writes no recovery names that such an attempt could leave behind.
     crate::execution_bookmark_recovery::report_failure(&db, &execution, "bookmark write failed");
     assert!(never_positioned(&db, &execution));
     db.record_execution_bookmark(&execution_bookmark::ExecutionBookmark {

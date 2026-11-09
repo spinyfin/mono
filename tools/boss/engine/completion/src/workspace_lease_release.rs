@@ -61,7 +61,7 @@ impl WorkspaceOccupancy for OwningHostOccupancy {
 }
 
 /// Teardown preservation on the execution's owning host. The outcome is
-/// reported to the operator and never decides whether the lease is released.
+/// A failure raises a `preserved_work_needs_inspection` attention item and never decides whether the lease is released.
 #[async_trait::async_trait]
 pub trait Preservation: Send + Sync {
     async fn preserve(&self, execution: &WorkExecution, cause: TerminalCause) -> Result<()>;
@@ -124,8 +124,8 @@ impl Preservation for CubePreservation<'_> {
     }
 }
 
-/// Inferred death requires an owning-host registry check. A failed check is
-/// reported to the operator and does not hold the lease. The workspace is read
+/// Inferred death requires an owning-host registry check. A failed check
+/// raises an inspection attention item and does not hold the lease. The workspace is read
 /// live only with positive ownership evidence: it still holds this execution's
 /// lease, or it is free again and cube's claim counter equals the one recorded
 /// for this lease, so no other lease was ever claimed on it. Anything else
@@ -562,6 +562,28 @@ fn report_preservation_failure(db: &WorkDb, execution: &WorkExecution, lease_id:
             id = execution.id
         ),
     };
+    // An open inspection item keeps its earlier evidence; the failure is
+    // appended so the lease and error are not lost.
+    let kind = boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND;
+    let open = db.list_attention_items(&execution.id).ok().and_then(|items| {
+        items
+            .into_iter()
+            .find(|item| item.kind == kind && item.status == "open")
+    });
+    if let Some(open) = open {
+        if open.body_markdown.contains(&inspect.reason) {
+            return;
+        }
+        let body = format!("{}\n- {}", open.body_markdown, inspect.reason);
+        if let Err(err) = db.upsert_execution_attention(&execution.id, kind, &open.title, &body) {
+            tracing::error!(
+                execution_id = %execution.id,
+                error = %format!("{err:#}"),
+                "could not append the preservation failure to the open inspection item",
+            );
+        }
+        return;
+    }
     raise_inspect_attention(db, execution, inspect);
 }
 

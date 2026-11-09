@@ -2171,11 +2171,11 @@ impl ExecutionCoordinator {
         adapter: &Arc<dyn HostAdapter>,
     ) -> Result<CubeWorkspaceLease> {
         // A previous pre-start attempt may still hold a lease (its cube
-        // release failed). Try to free it. A never-started release is not
-        // held by any gate today, but if one ever keeps it, detach it from
-        // this execution so it does not block every retry: the workspace
-        // stays leased in cube and cube's TTL is the backstop. Recovery
-        // follows the shared-store bookmarks, not the detached checkout. If
+        // release failed). Try to free it. A never-started release has no
+        // pane or occupancy gate; a Kept outcome is handled defensively by
+        // detaching the lease from this execution so it does not block every
+        // retry: the workspace stays leased in cube and cube's TTL is the
+        // backstop. If
         // only cube's own call failed, the lease stays recorded and this
         // attempt fails so the sweep and the next retry keep trying to return
         // it.

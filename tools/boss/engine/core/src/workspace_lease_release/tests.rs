@@ -245,6 +245,41 @@ async fn failed_preservation_warns_and_still_releases_the_lease() {
 }
 
 #[tokio::test]
+async fn failed_preservation_folds_into_an_open_inspection_item() {
+    let (_dir, db) = open_db();
+    let execution = seed_terminal(&db, ExecutionStatus::Completed, "lease-second");
+    let kind = boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND;
+    db.upsert_execution_attention(
+        &execution.id,
+        kind,
+        "Preserved work needs inspection",
+        "Earlier evidence: existing preserved commit `abc123`.",
+    )
+    .unwrap();
+    let outcome = apply_release(
+        &db,
+        &execution,
+        "lease-second",
+        ReleaseEvidence {
+            cause: TerminalCause::ProvenCompleted,
+            pane: PaneStatus::Gone,
+            occupancy: &FixedOccupancy(Occupancy::Empty),
+            preservation: &FixedPreservation(Err("second bookmark write failed")),
+        },
+        async { Ok(()) },
+    )
+    .await;
+    assert_eq!(outcome, LeaseReleaseOutcome::Released);
+    let items = db.list_attention_items(&execution.id).unwrap();
+    let open: Vec<_> = items.iter().filter(|i| i.kind == kind && i.status == "open").collect();
+    assert_eq!(open.len(), 1, "the failure folds into the open item");
+    let body = &open[0].body_markdown;
+    assert!(body.contains("Earlier evidence: existing preserved commit `abc123`."));
+    assert!(body.contains("second bookmark write failed"));
+    assert!(body.contains("lease-second"));
+}
+
+#[tokio::test]
 async fn preservation_does_not_run_while_a_gate_keeps_the_lease() {
     let (_dir, db) = open_db();
     let execution = seed_terminal(&db, ExecutionStatus::Orphaned, "lease-occupied");
