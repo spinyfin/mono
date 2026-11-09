@@ -1010,7 +1010,7 @@ pub fn reconcile_revision_execution(
     // `blocked_detail` written below names that path.
     if let Some(attempt) = retired_spawning_attempt(conn, task)? {
         let now = now_string();
-        abandon_pending_executions(pending, conn, &task.id, &now)?;
+        abandon_pending_item_work_executions(pending, conn, &task.id, &now)?;
         if query_live_execution_for_work_item(conn, &task.id)?.is_none() {
             let attempt_status = attempt.status.clone();
             let attempt_succeeded = attempt_status.as_str() == "succeeded";

@@ -265,26 +265,57 @@ pub(crate) fn abandon_pending_executions(
     work_item_id: &str,
     now: &str,
 ) -> Result<usize> {
+    abandon_pending_executions_filtered(pending, conn, work_item_id, now, true)
+}
+
+/// Like [`abandon_pending_executions`] but leaves queued `progression` runs
+/// alone. Gates about the item's *own* work (a retired spawning attempt) must
+/// not withdraw the run the sweep minted to unstick that very item: the run is
+/// not an attempt at the item's work, and abandoning it would feed the
+/// progression infrastructure-failure cap without an agent ever running.
+pub(crate) fn abandon_pending_item_work_executions(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    work_item_id: &str,
+    now: &str,
+) -> Result<usize> {
+    abandon_pending_executions_filtered(pending, conn, work_item_id, now, false)
+}
+
+fn abandon_pending_executions_filtered(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    work_item_id: &str,
+    now: &str,
+    include_progression: bool,
+) -> Result<usize> {
+    let kind_filter = if include_progression {
+        ""
+    } else {
+        " AND kind <> 'progression'"
+    };
     // Capture the ids/statuses of the rows about to be abandoned so the
     // canonical terminalization trace (see `WorkDb::mark_execution_orphaned`
     // in executions_runs.rs) can name each one individually, rather than
     // leaving this bulk transition untraced.
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT id, status FROM work_executions
          WHERE work_item_id = ?1
-           AND status IN ('queued', 'ready', 'waiting_dependency', 'claimed')",
-    )?;
+           AND status IN ('queued', 'ready', 'waiting_dependency', 'claimed'){kind_filter}"
+    ))?;
     let doomed: Vec<(String, String)> = stmt
         .query_map(params![work_item_id], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     drop(stmt);
 
     let abandoned = conn.execute(
-        "UPDATE work_executions
-         SET status = 'abandoned',
-             finished_at = COALESCE(finished_at, ?2)
-         WHERE work_item_id = ?1
-           AND status IN ('queued', 'ready', 'waiting_dependency', 'claimed')",
+        &format!(
+            "UPDATE work_executions
+             SET status = 'abandoned',
+                 finished_at = COALESCE(finished_at, ?2)
+             WHERE work_item_id = ?1
+               AND status IN ('queued', 'ready', 'waiting_dependency', 'claimed'){kind_filter}"
+        ),
         params![work_item_id, now],
     )?;
     for (execution_id, from_status) in &doomed {

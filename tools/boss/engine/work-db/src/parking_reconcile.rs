@@ -34,9 +34,10 @@
 //!   guard.
 //! - **Step 7, the progression grace stamp.** `tasks.progression_grace_waived_at`
 //!   marks an item whose stuck-age grace period the progression sweep must skip
-//!   once. Nothing reads this stamp yet: it is meant for the progression
-//!   sweep described in Part 2 of the design, and is inert until that sweep
-//!   consumes it.
+//!   once. The progression candidate views read it (clause 5) and the sweep
+//!   consumes it when it mints a run. It is stamped only by the background
+//!   job, after steps 3 to 6 have refreshed the item's state, never by the
+//!   un-park transaction itself.
 //! - **The churn floor.** [`WorkDb::last_unparked_at`] is the time of the item's
 //!   last un-park, read from the task status ledger. The orphan sweep's churn
 //!   guard counts only executions created at or after it, so evidence from
@@ -282,8 +283,7 @@ impl WorkDb {
             params![work_item_id, now_string()],
         )?;
         if updated == 0 {
-            // The un-park transaction stamps eagerly; an item the reconcile then
-            // finished (its PR merged while parked) must not keep the stamp.
+            // An item the reconcile finished (its PR merged while parked) must not keep the stamp.
             conn.execute(
                 "UPDATE tasks SET progression_grace_waived_at = NULL
                  WHERE id = ?1 AND status IN ('done', 'archived')",

@@ -811,17 +811,6 @@ fn set_task_parked(
            AND deleted_at IS NULL AND status NOT IN ('done', 'archived')",
         params![id, now, PARKED_VIA_DIRECT],
     )?;
-    // An item that is still stuck once it is un-parked is diagnosed straight
-    // away, not after the normal progression grace period (design section 1.5,
-    // step 7). Only open rows are stamped: a finished item has nothing for
-    // progression to look at. Parking again clears the stamp (see `stamp_task`).
-    crate::progression_candidates::waive_grace(tx, id)?;
-    tx.execute(
-        "UPDATE tasks SET progression_grace_waived_at = strftime('%s','now')
-         WHERE parent_task_id = ?1 AND kind = 'revision'
-           AND deleted_at IS NULL AND parked_at IS NULL AND status NOT IN ('done', 'archived')",
-        [id],
-    )?;
     Ok(report)
 }
 

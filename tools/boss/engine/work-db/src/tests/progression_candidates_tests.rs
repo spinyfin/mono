@@ -940,8 +940,8 @@ fn clause_5_declared_blockers_and_a_fresh_unpark_are_admitted_before_the_grace()
     assert!(!f.clauses(&churned).grace_waived);
     f.assert_candidate(&churned, false);
 
-    // Un-parking an item that is still stuck waives the grace, so it is
-    // diagnosed straight away.
+    // Un-parking an item that is still stuck waives the grace (step 7), so it
+    // is diagnosed straight away.
     // The failure stamp is written after the park, so the un-park reconcile
     // keeps it as current evidence (an older stamp is cleared as stale).
     let unparked = f.chore("Parked then released");
@@ -956,6 +956,11 @@ fn clause_5_declared_blockers_and_a_fresh_unpark_are_admitted_before_the_grace()
     );
     f.assert_candidate(&unparked, false);
     f.db.park_work_item_as_actor(&unparked, false, None, "human").unwrap();
+    // The un-park transaction itself does not stamp: the background job stamps
+    // after it has refreshed the item (step 7), so the sweep cannot nominate a
+    // half-reconciled item.
+    assert!(!f.clauses(&unparked).grace_waived);
+    assert!(f.db.stamp_progression_grace_waived(&unparked).unwrap());
     assert!(f.clauses(&unparked).grace_waived);
     f.assert_candidate(&unparked, true);
 }
@@ -1589,4 +1594,96 @@ fn a_batch_mint_gives_one_run_per_pr_family_to_the_oldest_stuck_item() {
     // `ready` run is the progression activity the report exposes.
     assert_eq!(bucket(&f.db, &fixer), None);
     assert_eq!(bucket(&f.db, &newer_share), None);
+}
+
+// ── A progression run survives the reconciler's gates about the item's work ─
+
+#[test]
+fn reconcile_leaves_a_run_minted_for_a_retired_attempt_revision_alone() {
+    let f = fixture();
+    let parent = f.chore("Parent");
+    f.sql(&format!(
+        "UPDATE tasks SET status = 'in_review', pr_url = 'https://github.com/o/r/pull/7' WHERE id = '{parent}'"
+    ));
+    let revision = f.revision_of(&parent, "Conflict fix");
+    let attempt = f.insert_conflict_attempt(&parent, "sha-1");
+    f.sql(&format!(
+        "UPDATE conflict_resolutions SET status = 'failed' WHERE id = '{attempt}';
+         UPDATE tasks SET created_via = '{prefix}{attempt}' WHERE id = '{revision}';",
+        prefix = CREATED_VIA_MERGE_CONFLICT_PREFIX
+    ));
+    f.stick(
+        &revision,
+        "status = 'blocked', blocked_reason = 'spawning_attempt_retired_unsuccessfully'",
+        3,
+    );
+    assert_eq!(f.clauses(&revision).stuck_kind.as_deref(), Some("S10_retired_attempt"));
+
+    let run =
+        f.db.mint_progression_execution(&revision)
+            .unwrap()
+            .expect("the S10 revision is a candidate");
+    // The reconciler runs on every structural mutation; twice, a cooldown apart.
+    for _ in 0..2 {
+        f.db.reconcile_product_executions(&f.product).unwrap();
+        let status: String =
+            f.db.connect()
+                .unwrap()
+                .query_row("SELECT status FROM work_executions WHERE id = ?1", [&run.id], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+        assert_eq!(status, "ready", "the retired-attempt gate must not withdraw the run");
+    }
+    let clauses = f.clauses(&revision);
+    assert!(
+        clauses.progression_live && !clauses.infrastructure_failing,
+        "{clauses:?}"
+    );
+}
+
+#[test]
+fn a_run_the_engine_withdrew_before_it_started_is_not_a_failure_or_a_cooldown() {
+    let f = fixture();
+    let id = f.stuck_chore("Withdrawn twice");
+    for ago in [30 * HOUR, 20 * HOUR] {
+        finished_progression_run(&f, &id, ExecutionStatus::Abandoned, ago);
+    }
+    let clauses = f.clauses(&id);
+    assert!(!clauses.infrastructure_failing && !clauses.in_cooldown, "{clauses:?}");
+    f.assert_candidate(&id, true);
+    // Once a withdrawn run had started, it is a dead run like any other.
+    f.sql("UPDATE work_executions SET started_at = created_at");
+    assert!(f.clauses(&id).infrastructure_failing);
+}
+
+#[test]
+fn a_run_that_died_before_it_started_still_counts_as_an_infrastructure_failure() {
+    // A spawn that fails before start (`failed`) or loses its worker (`orphaned`)
+    // is a real infrastructure failure even with no `started_at`: only the
+    // engine's own withdrawal (`abandoned`) is exempt. Not counting these would
+    // let the sweep re-nominate the item on every tick.
+    for status in [ExecutionStatus::Failed, ExecutionStatus::Orphaned] {
+        let f = fixture();
+        let id = f.stuck_chore("Died before start");
+        finished_progression_run(&f, &id, status.clone(), 20 * HOUR);
+        assert!(!f.clauses(&id).infrastructure_failing, "one failure is retried");
+        finished_progression_run(&f, &id, status.clone(), 30 * HOUR);
+        let clauses = f.clauses(&id);
+        assert!(clauses.infrastructure_failing, "{status:?}: {clauses:?}");
+        f.assert_candidate(&id, false);
+    }
+}
+
+#[test]
+fn the_report_shows_a_dead_run_as_stuck_not_as_being_handled() {
+    let f = fixture();
+    let id = f.stuck_chore("Run died");
+    let run = finished_progression_run(&f, &id, ExecutionStatus::Failed, 0);
+    assert!(f.clauses(&id).in_cooldown, "the cooldown still throttles nomination");
+    assert_eq!(bucket(&f.db, &id), Some(StuckBucket::EngineStuck));
+    f.sql(&format!(
+        "UPDATE work_executions SET status = 'completed' WHERE id = '{run}'"
+    ));
+    assert_eq!(bucket(&f.db, &id), Some(StuckBucket::ProgressionInFlight));
 }
