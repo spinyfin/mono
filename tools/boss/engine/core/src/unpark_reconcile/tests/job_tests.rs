@@ -452,6 +452,18 @@ async fn quota_deferral_still_rearms_an_exhausted_ci_budget() {
     assert_eq!(f.db.get_ci_attempts_used(&id).unwrap(), 0);
     assert_eq!(f.task(&id).status, TaskStatus::InReview);
     assert_eq!(f.task(&id).blocked_reason, None);
+    let ci = summary.outcomes[0]
+        .records
+        .iter()
+        .find(|r| r.step == Step::CiProbe)
+        .expect("ci_probe is traced");
+    assert_eq!(ci.code, "budget_reset_probe_deferred");
+    assert!(
+        ci.detail.contains("re-armed from ci_failure_exhausted"),
+        "{}",
+        ci.detail
+    );
+    assert!(ci.detail.contains("attempts used reset from 3"), "{}", ci.detail);
 }
 
 #[tokio::test]

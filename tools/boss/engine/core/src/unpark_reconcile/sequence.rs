@@ -292,7 +292,7 @@ pub async fn reconcile_unparked_item(env: &UnparkEnv, work_item_id: &str, github
             return outcome;
         }
     };
-    if stop_if_reparked(env, &mut outcome).await {
+    if stop_if_reparked(env, &mut outcome, Step::RefreshPr).await {
         return outcome;
     }
     if task.deleted_at.is_some() || task.status.is_terminal() {
@@ -318,7 +318,7 @@ pub async fn reconcile_unparked_item(env: &UnparkEnv, work_item_id: &str, github
             _ => None,
         })
         .unwrap_or(task);
-    if stop_if_reparked(env, &mut outcome).await {
+    if stop_if_reparked(env, &mut outcome, Step::ReconcileExecution).await {
         return outcome;
     }
     let record = reconcile_execution_step(env, &task).await;
@@ -332,7 +332,7 @@ pub async fn reconcile_unparked_item(env: &UnparkEnv, work_item_id: &str, github
     outcome
 }
 
-async fn stop_if_reparked(env: &UnparkEnv, outcome: &mut ItemOutcome) -> bool {
+async fn stop_if_reparked(env: &UnparkEnv, outcome: &mut ItemOutcome, next_step: Step) -> bool {
     if !env
         .work_db
         .is_parked_or_assume_not(&outcome.work_item_id, "unpark reconciliation")
@@ -342,11 +342,7 @@ async fn stop_if_reparked(env: &UnparkEnv, outcome: &mut ItemOutcome) -> bool {
     push(
         env,
         outcome,
-        StepRecord::skipped(
-            Step::RefreshPr,
-            "re_parked",
-            "item was parked again; reconciliation stops",
-        ),
+        StepRecord::skipped(next_step, "re_parked", "item was parked again; reconciliation stops"),
     )
     .await;
     true
@@ -389,13 +385,22 @@ async fn pr_steps(env: &UnparkEnv, task: &Task, github: GithubAccess, outcome: &
             "no_open_pr_lifecycle",
             format!("item is {status}; it has no review-phase PR to refresh"),
         )),
-        (_, Some(_), _, GithubAccess::Deferred { remaining, reserve }) => Some(skip(
-            "rate_limited",
-            format!(
+        (_, Some(_), _, GithubAccess::Deferred { remaining, reserve }) => {
+            let detail = format!(
                 "GitHub quota is low ({remaining} points left, below the {reserve} this job leaves for the \
                  engine's other callers); deferred to the merge poller's ordinary sweep"
-            ),
-        )),
+            );
+            let mut records = skip("rate_limited", detail.clone());
+            if !budget.is_empty() {
+                // The budget reset is a state change; the trace must say it happened.
+                records[2] = StepRecord::ok(
+                    Step::CiProbe,
+                    "budget_reset_probe_deferred",
+                    format!("CI budget: {budget}; the probe itself is deferred ({detail})"),
+                );
+            }
+            Some(records)
+        }
         _ => None,
     };
     if let Some(records) = skipped {
@@ -546,7 +551,8 @@ fn prepare_ci_budget(env: &UnparkEnv, task: &Task, pr_url: &str) -> String {
         }
     }
     match env.work_db.reset_ci_attempts_used(&task.id) {
-        Ok(()) => parts.push(format!("attempts used reset from {used}")),
+        Ok(()) if used > 0 => parts.push(format!("attempts used reset from {used}")),
+        Ok(()) => {}
         Err(err) => {
             tracing::warn!(work_item_id = %task.id, ?err, "unpark: could not reset the CI attempt budget");
             parts.push("attempt budget reset failed".to_owned());
