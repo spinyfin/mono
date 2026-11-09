@@ -213,7 +213,14 @@ fn real_leases_continue_during_collection_and_exclusivity_is_retryable() {
     };
     release(&first);
 
-    let gate = JjGate::exclusive(&JjGate::path(f._dir.path()), Duration::ZERO).unwrap();
+    // The release above closed its last shared hold an instant ago; see
+    // `EXCLUSIVE_GATE_WAIT` for why a zero wait here is a race against every
+    // other test's process spawns.
+    let gate = JjGate::exclusive(
+        &JjGate::path(f._dir.path()),
+        crate::app::tests::support::EXCLUSIVE_GATE_WAIT,
+    )
+    .unwrap();
     let started = Instant::now();
     let error = run_with_dependencies(
         Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "gc contention"]),

@@ -19,6 +19,19 @@ use crate::app::gc;
 /// that reads it must hold this lock too, not just the ones that write it.
 pub(super) static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// How long a test waits to take the jj maintenance gate exclusively.
+///
+/// Never try the gate with a zero wait right after this process released
+/// it. A child that another test thread is spawning holds a copy of every
+/// open descriptor from the spawn until its exec, including a gate this
+/// thread has already closed, and the kernel keeps the flock until that last
+/// copy goes away. A zero-wait try-lock in that window reports the gate
+/// busy although no holder remains; under the test binary's parallelism
+/// the window is hit regularly, and the failure then poisons `ENV_MUTEX`
+/// for every environment-dependent test. The wait is a ceiling, not a
+/// delay: the lock is retried every 25ms and taken as soon as it is free.
+pub(super) const EXCLUSIVE_GATE_WAIT: Duration = Duration::from_secs(30);
+
 /// A fresh database whose daily pool-GC pass counts as having just run.
 /// A test of leasing is a test of leasing: the periodic pass would
 /// otherwise run on the first lease of every test, against the test's
