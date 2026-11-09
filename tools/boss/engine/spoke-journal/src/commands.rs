@@ -131,7 +131,9 @@ impl Journal {
             "negotiated limit cannot fit command result identity"
         );
         records::insert(&tx, &mut record, Admission::Lifecycle, self.limits)?;
-        // Release the command payload and its durable recovery snapshot.
+        // Release the command payload. The `recovery` column is no longer
+        // written, but a command received before it was retired may still
+        // carry a snapshot whose bytes were counted into `queued_bytes`.
         tx.execute("UPDATE identity SET queued_bytes=queued_bytes-?1", [payload_bytes])?;
         tx.execute(
             "UPDATE commands SET applied=1,bytes=zeroblob(0),recovery=NULL WHERE sequence=?1",

@@ -14,7 +14,7 @@ Legacy names still found in the store:
 
 The `execution_bookmarks` row for the execution records the shared store path, the host, and the baseline commit id (`base_commit`) recorded at dispatch from `work_executions.pr_head_before` (bound PR) or the commit the workspace was positioned on (normally trunk, or an open task PR's head when recovery positioned there), captured as the working copy's parent right after positioning, or returned by the engine's own fresh positioning, and carried to pointer creation so a trunk that advances in between cannot move the floor. `trunk()` resolved at pointer creation is only the last resort when no positioned commit could be captured; the positioned commit is captured after every positioning (a fresh change's parent, or the PR head / target commit a goto landed on), even when the pre-pointer snapshot recorded no `pr_head_before`; a failed capture is retried as a pre-start failure rather than recording that later floor. Recovery reads that commit id as the floor of the execution's work; it never reads the `boss-base/` bookmark. A baseline commit that was rewritten or abandoned still exists in the store and still works as a floor; a row with no usable `base_commit` uses the bound PR's `pr_head_before`, then trunk.
 
-Recovery is an optimisation. If pointer integrity checks cannot establish safe recovery, the engine archives the preserved commits and starts fresh. Transport failures retry through the ordinary positioning-failure path without retiring the recovery source. Redoing work is preferable to leaving an item unable to progress.
+Recovery is an optimisation. If pointer integrity checks cannot establish safe recovery, the engine archives the preserved commits and starts fresh. Transport failures retry through the ordinary positioning-failure path without retiring the recovery source. Redoing work is preferable to leaving an item unable to progress, and a recovery problem never keeps a workspace leased (see Lease release and teardown preservation below).
 
 Recovery resumes a later execution from the unpublished range above the recorded floor (`::head ~ ::floor`). Lineage between the pointers and the floor is not an integrity invariant: two heads on different lines are both resumed. Genuine integrity failures (conflicted or missing heads, a foreign store) archive and start fresh.
 
@@ -106,6 +106,12 @@ A failed archive write is a storage/host bug, not a containment decision. It lea
 Migration `20261102_2105_recovery_fresh_start` re-enables existing items parked specifically for `execution_recovery_failed`, including containment failures. Human decisions, other blocked reasons and deleted items remain unchanged. Legacy recovery-chain cards are resolved.
 
 Archive only heads containing unpublished, non-empty work beyond the baseline, trunk and remote history. Empty runs and already published commits need no permanent archive.
+
+## Lease release and teardown preservation
+
+When a run ends, the engine returns the cube workspace lease after one best-effort preservation step (`apply_release` in [completion/src/workspace_lease_release.rs](../engine/completion/src/workspace_lease_release.rs)). The pane and occupancy verdicts come first, because preserving snapshots the working copy and must not race a worker that may still be running jj there; only if they allow the release does the engine preserve (writing `preserved/<execution id>` when unpublished work exists) and then release.
+
+Preservation never decides whether the lease is released. If it fails (the recovery record or workspace path is missing, the owning host or cube registry cannot be reached, jj fails), the engine logs it, files one `preserved_work_needs_inspection` attention item on the execution that names the error and the lease, and releases the lease anyway. Nothing is deleted: the worker's last working-copy commit stays in the shared jj store, findable with `jj op log`, but it is not bookmarked. An execution that never started and was never positioned (no recovery record) holds only what cube placed in the workspace and skips preservation silently. Only an unconfirmed pane or occupancy verdict (a live pane, a process in the workspace, an occupancy scan that could not complete) keeps a lease.
 
 ### Startup entry points and checks
 

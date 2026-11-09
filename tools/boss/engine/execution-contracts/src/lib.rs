@@ -2,9 +2,7 @@
 //! Concrete host operations remain in the host executor and upper adapters.
 
 mod lease_release;
-pub use lease_release::{
-    BookmarkStatus, KeepReason, LeaseReleaseDecision, LeaseReleaseOutcome, PaneStatus, PreStartStage, TerminalCause,
-};
+pub use lease_release::{KeepReason, LeaseReleaseDecision, LeaseReleaseOutcome, PaneStatus, TerminalCause};
 mod host_selection;
 pub use host_selection::{
     ChoreRequirements, DRIVERS_PROBED_CAPABILITY, Eligibility, HostSlot, IneligibilityReason, REVIEW_GUIDE_DRIVER,

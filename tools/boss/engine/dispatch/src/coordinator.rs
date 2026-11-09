@@ -19,8 +19,8 @@ use boss_engine_storage_values::attention_kinds::{
 };
 use boss_execution_contracts::{
     ChoreRequirements, Eligibility, FailureEffect, HostSlot, IneligibilityReason, LeaseReleaseOutcome,
-    LifecycleServices, LiveWorkerLiveness, PidStatus, PreStartStage, PreStartStreakTracker, TeardownReason,
-    TerminalCause, WorkerPaneReleaser, driver_capability, select_host,
+    LifecycleServices, LiveWorkerLiveness, PidStatus, PreStartStreakTracker, TeardownReason, TerminalCause,
+    WorkerPaneReleaser, driver_capability, select_host,
 };
 
 use crate::conflict_diagnosis;

@@ -49,7 +49,7 @@ async fn teardown_preserves_workspace_even_when_legacy_pointers_are_missing() {
             cause: TerminalCause::ProvenCompleted,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &DbBookmarkGate::new(&db, None),
+            preservation: &DbPreservation::new(&db, None),
         },
         async { Ok(()) },
     )
@@ -89,7 +89,7 @@ async fn teardown_overwrites_a_stale_preserved_tip_with_later_unpublished_work()
             cause: TerminalCause::ProvenNeverStarted,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &DbBookmarkGate::new(&db, None),
+            preservation: &DbPreservation::new(&db, None),
         },
         async { Ok(()) },
     )
@@ -117,7 +117,7 @@ async fn teardown_overwrites_a_stale_preserved_tip_with_later_unpublished_work()
             cause: TerminalCause::ProvenCompleted,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &DbBookmarkGate::new(&db, None),
+            preservation: &DbPreservation::new(&db, None),
         },
         async { Ok(()) },
     )
@@ -151,10 +151,10 @@ async fn failed_legacy_backup_does_not_prevent_teardown_preservation() {
     let execution = fixture(&db, &repo.worker).await;
     crate::execution_bookmark_recovery::report_failure(&db, &execution, "legacy backup failed");
     std::fs::write(repo.worker.join("work.txt"), "preserve independently of backup").unwrap();
-    assert_eq!(
-        DbBookmarkGate::new(&db, None).status(&execution).await,
-        BookmarkStatus::Confirmed
-    );
+    DbPreservation::new(&db, None)
+        .preserve(&execution, TerminalCause::ProvenCompleted)
+        .await
+        .unwrap();
     assert!(db.preserved_tip(&execution.id).unwrap().is_some());
 }
 
@@ -166,12 +166,12 @@ crate::stub_cube_client! { UnavailableRegistry {
 } }
 
 #[tokio::test]
-async fn inferred_registry_failure_keeps_lease_but_proven_stop_preserves_live_work() {
+async fn inferred_registry_failure_warns_and_releases_but_proven_stop_preserves_live_work() {
     let (dir, db) = open_db();
     let repo = boss_engine_test_git::jj::JjRepo::new(dir.path());
     let execution = fixture(&db, &repo.worker).await;
     std::fs::write(repo.worker.join("work"), "latest unsnapshotted edits").unwrap();
-    let gate = DbBookmarkGate::new(&db, None).with_cube(&UnavailableRegistry);
+    let preservation = DbPreservation::new(&db, None).with_cube(&UnavailableRegistry);
     let outcome = apply_release(
         &db,
         &execution,
@@ -180,22 +180,24 @@ async fn inferred_registry_failure_keeps_lease_but_proven_stop_preserves_live_wo
             cause: TerminalCause::Inferred,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &gate,
+            preservation: &preservation,
         },
-        async { panic!("unconfirmed ownership must not release") },
+        async { Ok(()) },
     )
     .await;
-    assert_eq!(
-        outcome,
-        LeaseReleaseOutcome::Kept {
-            reason: KeepReason::BookmarkUnconfirmed
-        }
-    );
+    // Unconfirmed ownership means the working copy is never read, but a
+    // recovery problem does not keep the workspace leased.
+    assert_eq!(outcome, LeaseReleaseOutcome::Released);
     assert!(db.preserved_tip(&execution.id).unwrap().is_none());
-    assert_eq!(
-        gate.status_for_cause(&execution, TerminalCause::ProvenStopped).await,
-        BookmarkStatus::Confirmed
+    assert!(
+        open_kinds(&db, &execution.id).contains(&"preserved_work_needs_inspection".to_owned()),
+        "{:?}",
+        open_kinds(&db, &execution.id)
     );
+    preservation
+        .preserve(&execution, TerminalCause::ProvenStopped)
+        .await
+        .unwrap();
     assert!(db.preserved_tip(&execution.id).unwrap().is_some());
 }
 
@@ -209,11 +211,11 @@ async fn unresolved_first_teardown_raises_inspection_without_prior_record() {
             db.confirm_workspace_lease(&execution.id, "lease", boundary).unwrap();
         }
         assert!(db.preserved_tip(&execution.id).unwrap().is_none());
-        let gate = DbBookmarkGate::new(&db, None).with_cube(&OkCube);
-        assert_eq!(
-            gate.status_for_cause(&execution, TerminalCause::Inferred).await,
-            BookmarkStatus::Confirmed
-        );
+        DbPreservation::new(&db, None)
+            .with_cube(&OkCube)
+            .preserve(&execution, TerminalCause::Inferred)
+            .await
+            .unwrap();
         let items = db.list_attention_items(&execution.id).unwrap();
         assert!(items.iter().any(|item| item.kind == "preserved_work_needs_inspection"));
     }
@@ -649,7 +651,7 @@ async fn sweep_retries_a_pidless_row_only_after_a_gated_cube_failure() {
             cause: TerminalCause::ProvenStopped,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &DbBookmarkGate::new(&db, None),
+            preservation: &DbPreservation::new(&db, None),
         },
         async { anyhow::bail!("cube temporarily unavailable") },
     )
@@ -690,7 +692,7 @@ async fn sweep_retries_a_never_started_row_without_a_bookmark() {
             cause: TerminalCause::ProvenNeverStarted,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &NeverPositioned,
+            preservation: &NoPreservation,
         },
         async { anyhow::bail!("cube temporarily unavailable") },
     )
@@ -704,10 +706,11 @@ async fn sweep_retries_a_never_started_row_without_a_bookmark() {
     assert!(db.get_execution(&execution.id).unwrap().cube_lease_id.is_none());
 }
 
-/// A retained lease with an open bookmark creation or backup failure keeps its
-/// bookmark gate even though no bookmark row was ever recorded.
+/// Only an execution that neither started nor recorded a recovery row is
+/// skipped by teardown preservation; any recorded row or run means work may
+/// exist that the lease release must not strand.
 #[tokio::test]
-async fn open_bookmark_failure_keeps_the_gate_for_a_retained_lease() {
+async fn only_an_unstarted_unrecorded_execution_is_never_positioned() {
     let (_dir, db) = open_db();
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, product.id, "retained");
@@ -721,36 +724,27 @@ async fn open_bookmark_failure_keeps_the_gate_for_a_retained_lease() {
                 .build(),
         )
         .unwrap();
-    assert!(never_positioned(
-        &db,
-        &execution.id,
-        PreStartStage::BeforeRecoveryBookmark
-    ));
-    assert!(!never_positioned(
-        &db,
-        &execution.id,
-        PreStartStage::AtOrAfterRecoveryBookmark
-    ));
+    assert!(never_positioned(&db, &execution));
+    // A failure report from an earlier attempt does not change that: dispatch
+    // no longer writes recovery names that such an attempt could leave behind.
     crate::execution_bookmark_recovery::report_failure(&db, &execution, "bookmark write failed");
-    assert!(!never_positioned(
-        &db,
-        &execution.id,
-        PreStartStage::BeforeRecoveryBookmark
-    ));
-    // A later attempt's own success resolves the failure, so it no longer gates.
-    db.resolve_attention_kind_for_execution(&execution.id, crate::execution_bookmark_recovery::RECOVERY_FAILED)
-        .unwrap();
-    assert!(never_positioned(
-        &db,
-        &execution.id,
-        PreStartStage::BeforeRecoveryBookmark
-    ));
+    assert!(never_positioned(&db, &execution));
+    db.record_execution_bookmark(&execution_bookmark::ExecutionBookmark {
+        execution_id: execution.id.clone(),
+        repo_path: PathBuf::from("/tmp/repo"),
+        host_id: "local".to_owned(),
+        base_commit: None,
+        pr_head_before: None,
+        has_recovery_head: None,
+    })
+    .unwrap();
+    assert!(!never_positioned(&db, &execution));
 }
 
-/// Pane and occupancy verdicts come before bookmark confirmation, which
-/// would otherwise advance the recovery head under a possibly-live worker.
+/// Pane and occupancy verdicts come before preservation, which snapshots the
+/// working copy under a possibly-live worker.
 #[tokio::test]
-async fn occupied_workspace_does_not_advance_the_recovery_head() {
+async fn occupied_workspace_is_not_preserved() {
     let (dir, db) = open_db();
     let repo = boss_engine_test_git::jj::JjRepo::new(dir.path());
     let execution = fixture(&db, &repo.worker).await;
@@ -781,7 +775,7 @@ async fn occupied_workspace_does_not_advance_the_recovery_head() {
                 cwds: vec![(std::process::id() + 1, repo.worker.canonicalize().unwrap())],
                 complete: true,
             },
-            bookmark: &DbBookmarkGate::new(&db, None),
+            preservation: &DbPreservation::new(&db, None),
         },
         async { panic!("an occupied workspace is not released") },
     )
@@ -793,6 +787,7 @@ async fn occupied_workspace_does_not_advance_the_recovery_head() {
         }
     );
     assert_eq!(head_at().await, before, "the recovery head must not move");
+    assert!(db.preserved_tip(&execution.id).unwrap().is_none());
     assert!(open_kinds(&db, &execution.id).is_empty());
 }
 
@@ -827,7 +822,7 @@ async fn successful_release_resolves_both_lease_attention_kinds() {
     let (dir, db) = open_db();
     let repo = boss_engine_test_git::jj::JjRepo::new(dir.path());
     let execution = fixture(&db, &repo.worker).await;
-    raise_unreleased_attention(&db, &execution, "held", "held");
+    raise_attention(&db, &execution, LEASE_UNRELEASED_ATTENTION_KIND, "held", "held");
     raise_attention(&db, &execution, LEASE_RELEASE_FAILED_ATTENTION_KIND, "failed", "failed");
     assert_eq!(open_kinds(&db, &execution.id).len(), 2);
     let outcome = apply_release(
@@ -838,7 +833,7 @@ async fn successful_release_resolves_both_lease_attention_kinds() {
             cause: TerminalCause::ProvenCompleted,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &DbBookmarkGate::new(&db, None),
+            preservation: &DbPreservation::new(&db, None),
         },
         async { Ok(()) },
     )

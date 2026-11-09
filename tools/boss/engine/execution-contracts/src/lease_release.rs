@@ -32,18 +32,9 @@ pub enum PaneStatus {
     Present,
 }
 
-/// Whether the recovery bookmark is confirmed written, when the run had work.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BookmarkStatus {
-    NotRequired,
-    Confirmed,
-    Unconfirmed(String),
-}
-
 /// Why lease-release policy kept the lease.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeepReason {
-    BookmarkUnconfirmed,
     PaneStillPresent,
     ProcessInWorkspace,
     OccupancyUnconfirmed,
@@ -52,7 +43,6 @@ pub enum KeepReason {
 impl KeepReason {
     pub fn label(self) -> &'static str {
         match self {
-            Self::BookmarkUnconfirmed => "bookmark_unconfirmed",
             Self::PaneStillPresent => "pane_still_present",
             Self::ProcessInWorkspace => "process_in_workspace",
             Self::OccupancyUnconfirmed => "occupancy_unconfirmed",
@@ -74,15 +64,4 @@ pub enum LeaseReleaseOutcome {
     NoLease,
     Kept { reason: KeepReason },
     CubeFailed { error: String },
-}
-
-/// How far dispatch got before a pre-start failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreStartStage {
-    /// The execution's recovery bookmark has not been written. The workspace
-    /// holds only what cube placed there, so there is no worker work to lose.
-    BeforeRecoveryBookmark,
-    /// Bookmark creation was attempted or has run; its pointers must be
-    /// confirmed before the workspace is returned.
-    AtOrAfterRecoveryBookmark,
 }

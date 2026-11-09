@@ -2,8 +2,7 @@
 //! Production implementations live in engine core.
 
 use crate::{
-    CubeClient, ExecutionPublisher, HostAdapter, HostAdapterProvider, LeaseReleaseOutcome, PaneStatus, PreStartStage,
-    TerminalCause,
+    CubeClient, ExecutionPublisher, HostAdapter, HostAdapterProvider, LeaseReleaseOutcome, PaneStatus, TerminalCause,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -223,8 +222,8 @@ pub trait LiveWorkerLiveness: Send + Sync {
 #[async_trait]
 pub trait LifecycleServices: Send + Sync {
     /// Proven-death cube release used by the coordinator's spawn/completion
-    /// paths: empty occupancy, DB bookmark gate on `adapter`, then
-    /// `release_workspace_with_reset`.
+    /// paths: empty occupancy, best-effort teardown preservation on `adapter`,
+    /// then `release_workspace_with_reset`.
     async fn apply_proven_workspace_release(
         &self,
         execution: &WorkExecution,
@@ -238,7 +237,6 @@ pub trait LifecycleServices: Send + Sync {
         execution: &WorkExecution,
         lease_id: &str,
         adapter: &dyn HostAdapter,
-        stage: PreStartStage,
     ) -> LeaseReleaseOutcome;
 
     async fn release_refused_workspace(

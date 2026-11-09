@@ -6,7 +6,7 @@ use boss_engine_test_git::jj::JjRepo;
 
 #[tokio::test]
 async fn fresh_dispatch_preserves_and_reports_work_without_legacy_bookmark_failures() {
-    use crate::workspace_lease_release::{BookmarkGate, BookmarkStatus, DbBookmarkGate};
+    use crate::workspace_lease_release::{DbPreservation, Preservation, TerminalCause};
     use boss_engine_recovery::execution_bookmark::{create_from, preserved_name};
     for has_work in [false, true] {
         let dir = tempdir().unwrap();
@@ -50,10 +50,10 @@ async fn fresh_dispatch_preserves_and_reports_work_without_legacy_bookmark_failu
                 .is_none()
         );
         assert!(db.list_attention_items(&execution.id).unwrap().is_empty());
-        assert_eq!(
-            DbBookmarkGate { db: &db, adapter: None }.status(&execution).await,
-            BookmarkStatus::Confirmed
-        );
+        DbPreservation { db: &db, adapter: None }
+            .preserve(&execution, TerminalCause::ProvenCompleted)
+            .await
+            .unwrap();
         assert_eq!(db.preserved_tip(&execution.id).unwrap().is_some(), has_work);
         db.mark_execution_orphaned(&execution.id, "worker terminated").unwrap();
         db.connect()
@@ -153,16 +153,17 @@ async fn bookmark_creation_failure_is_recorded_before_a_worker_can_start() {
         "a missing recovery ref must prevent spawn"
     );
     assert_eq!(cube.bookmark_calls.lock().await.as_slice(), [id.as_str()]);
-    assert!(
-        cube.release_calls.lock().await.is_empty(),
-        "failed recovery creation must retain the lease"
+    assert_eq!(
+        cube.release_calls.lock().await.as_slice(),
+        ["lease-1"],
+        "a recovery failure never keeps the workspace reserved: nothing ran in it"
     );
-    assert_eq!(db.get_execution(&id).unwrap().cube_lease_id.as_deref(), Some("lease-1"));
+    assert_eq!(db.get_execution(&id).unwrap().cube_lease_id.as_deref(), None);
     let attention = db.list_attention_items(&id).unwrap();
     assert!(
         attention
             .iter()
-            .any(|a| a.kind == crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND)
+            .all(|a| a.kind != crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND)
     );
     assert!(
         attention

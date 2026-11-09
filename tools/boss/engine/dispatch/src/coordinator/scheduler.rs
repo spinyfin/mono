@@ -2747,12 +2747,7 @@ impl ExecutionCoordinator {
         };
         if let Some(lease_id) = current.cube_lease_id.clone() {
             self.lifecycle
-                .release_lease_after_proven_never_started(
-                    &current,
-                    &lease_id,
-                    self.host_adapter().as_ref(),
-                    PreStartStage::AtOrAfterRecoveryBookmark,
-                )
+                .release_lease_after_proven_never_started(&current, &lease_id, self.host_adapter().as_ref())
                 .await;
         }
         if current.status != ExecutionStatus::Claimed {

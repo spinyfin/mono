@@ -1144,7 +1144,7 @@ mod tests {
     /// row reaped without this release leaks its lease forever. This is the
     /// "leases leak durably" half of the false-reap incident.
     #[tokio::test]
-    async fn run_one_pass_reaps_but_holds_a_lease_without_recovery_proof() {
+    async fn run_one_pass_reaps_and_releases_a_lease_without_recovery_proof() {
         let (_d, db) = open_db();
         let product = create_product(&db);
         let automation = create_automation(&db, &product);
@@ -1164,16 +1164,16 @@ mod tests {
         let outcome = run_one_pass(db.as_ref(), coordinator, &sink, &convergence, &cube).await;
 
         assert_eq!(outcome.reaped, 1);
-        assert!(cube.force_release_calls().is_empty());
-        assert_eq!(
-            db.get_execution(&exec.id).unwrap().cube_lease_id.as_deref(),
-            Some("lease-1")
-        );
+        assert_eq!(cube.force_release_calls(), ["lease-1"]);
+        assert_eq!(db.get_execution(&exec.id).unwrap().cube_lease_id.as_deref(), None);
+        // Nothing was recorded to preserve from, which is reported rather than
+        // a reason to keep the workspace leased.
+        let items = db.list_attention_items(&exec.id).unwrap();
+        assert!(items.iter().any(|item| item.kind == "preserved_work_needs_inspection"));
         assert!(
-            db.list_attention_items(&exec.id)
-                .unwrap()
+            items
                 .iter()
-                .any(|item| item.kind == crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND)
+                .all(|item| item.kind != crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND)
         );
     }
 

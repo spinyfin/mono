@@ -1600,17 +1600,16 @@ async fn two_hour_idle_tmux_worker_is_auto_reaped() {
     );
     assert_eq!(outcome.auto_reap_aborted, 0);
     // Teardown is proven, but this fixture has no recovery pointer or
-    // inspectable workspace. Its lease must survive the inferred-death reap.
-    assert!(cube.force_release_calls().is_empty());
-    assert_eq!(
-        db.get_execution(&execution_id).unwrap().cube_lease_id.as_deref(),
-        Some("lease-1")
-    );
+    // inspectable workspace: nothing can be preserved, which is reported, and
+    // the lease is still returned by the inferred-death reap.
+    assert_eq!(cube.force_release_calls(), ["lease-1"]);
+    assert_eq!(db.get_execution(&execution_id).unwrap().cube_lease_id.as_deref(), None);
+    let items = db.list_attention_items(&execution_id).unwrap();
+    assert!(items.iter().any(|item| item.kind == "preserved_work_needs_inspection"));
     assert!(
-        db.list_attention_items(&execution_id)
-            .unwrap()
+        items
             .iter()
-            .any(|item| item.kind == crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND)
+            .all(|item| item.kind != crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND)
     );
 
     let exec = db.get_execution(&execution_id).unwrap();
