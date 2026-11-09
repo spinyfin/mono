@@ -50,12 +50,9 @@ mod archive_tests;
 /// baseline commit id is a floor, never something the heads must descend from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PointerIntegrityKind {
-    /// Not produced: pointer reconciliation no longer exists. Nothing decodes
-    /// it from a peer; the only remaining mention is a test that lists every
-    /// variant, and both go together in the follow-on cleanup.
+    /// Never produced by this crate; handled like [`Self::Other`] if seen.
     NotContained,
-    /// Not produced: PR bookmarks are no longer refreshed from GitHub. Removed
-    /// together with [`Self::NotContained`].
+    /// Never produced by this crate; handled like [`Self::Other`] if seen.
     PrHeadUnavailable,
     /// A resumed head descends from work that teardown quarantined as possibly
     /// belonging to a later holder. Nothing was moved or restaged.
@@ -328,39 +325,18 @@ pub(crate) async fn resolve_bookmark_targets(
     repo: &Path,
     bookmarks: &[String],
 ) -> Result<std::collections::HashMap<String, Vec<String>>> {
-    let mut targets: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     if bookmarks.is_empty() {
-        return Ok(targets);
+        return Ok(std::collections::HashMap::new());
     }
     let revset = bookmarks
         .iter()
         .map(|name| revision(name))
         .collect::<Vec<_>>()
         .join(" | ");
-    let output = jj
-        .run(
-            repo,
-            &[
-                "--ignore-working-copy",
-                "log",
-                "--no-graph",
-                "-r",
-                &revset,
-                "-T",
-                "commit_id ++ \"\\t\" ++ local_bookmarks.map(|b| b.name()).join(\"\\t\") ++ \"\\n\"",
-            ],
-        )
-        .await?;
-    for line in output.lines().filter(|line| !line.is_empty()) {
-        let mut fields = line.split('\t');
-        let Some(commit) = fields.next().filter(|commit| !commit.is_empty()) else {
-            continue;
-        };
-        for name in fields.filter(|name| bookmarks.iter().any(|wanted| wanted == name)) {
-            targets.entry(name.to_owned()).or_default().push(commit.to_owned());
-        }
-    }
-    Ok(targets)
+    Ok(bookmark_targets_in(
+        &commits_with_bookmarks(jj, repo, &revset).await?,
+        bookmarks,
+    ))
 }
 
 /// Resolve a bookmark to the single commit it targets. Commit ids, unlike
@@ -675,8 +651,6 @@ pub(crate) async fn reject_quarantined_heads(jj: &dyn Jj, record: &ExecutionBook
     Ok(())
 }
 
-/// Compatibility fixtures for the pre-migration three-bookmark layout, used only by this
-/// crate's own tests. Other crates use `boss_engine_recovery_fixtures`.
 /// The report a restore hands to the successor worker's prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
@@ -747,6 +721,8 @@ impl RestoreReport {
     }
 }
 
+/// Compatibility fixtures for the pre-migration three-bookmark layout, used only by this
+/// crate's own tests. Other crates use `boss_engine_recovery_fixtures`.
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
