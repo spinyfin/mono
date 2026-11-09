@@ -703,6 +703,7 @@ mod floor_tests {
         execution_bookmarks::migrate_has_recovery_head(&expected).unwrap();
         super::super::spoke_hub::migrate_host_commands_run_idx(&expected).unwrap();
         super::super::parking_reconcile::migrate(&expected).unwrap();
+        super::super::parking_reconcile::migrate_cancel_provenance(&expected).unwrap();
         let before = capture(&expected);
         drop(expected);
         for version in 32..=60 {
