@@ -137,6 +137,7 @@ pub(super) struct FakeCubeClient {
     /// The `inherited_base` each bookmark creation was handed, in call order.
     pub(super) bookmark_inherited_bases: Mutex<Vec<Option<String>>>,
     pub(super) fail_goto: bool,
+    pub(super) goto_cube_error: Option<String>,
     /// Fail the first N `goto_workspace` calls, then succeed.
     pub(super) fail_first_n_goto: usize,
     /// Fail the first N `release_workspace` calls, then succeed.
@@ -370,6 +371,11 @@ crate::stub_cube_client! { FakeCubeClient {
     }
 
     async fn goto_workspace(&self, workspace_path: &std::path::Path, pr: u64) -> Result<()> {
+        if let Some(stderr) = &self.goto_cube_error {
+            return Err(crate::cube_commands::CubeCliError {
+                host: "local".into(), exit_code: Some(1), stderr: stderr.clone(), stdout: String::new(),
+            }.into());
+        }
         let call_index = {
             let mut calls = self.goto_calls.lock().await;
             calls.push((workspace_path.display().to_string(), pr));

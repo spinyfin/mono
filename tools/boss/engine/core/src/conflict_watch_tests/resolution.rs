@@ -420,7 +420,7 @@ async fn retrying_a_failed_attempt_clears_lockfile_regeneration_attention() {
         .expect("attempt");
     db.mark_conflict_resolution_failed(&attempt.id, "lockfile_regeneration_failed: Cargo.lock")
         .unwrap();
-    file_lockfile_attention(&db, &chore);
+    assert_eq!(db.list_attention_items_for_work_item(&chore).unwrap().len(), 1);
     assert_eq!(open_lockfile_attention_count(&db, &chore), 1);
 
     db.retry_conflict_resolution(&attempt.id)

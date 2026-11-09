@@ -3,8 +3,8 @@
 //! Rung 1 leases a workspace and runs an engine-direct rebase. Cube can
 //! collapse replay-only conflicts when it proves that the final tree is
 //! unchanged. A clean pushed result retires without dispatching a worker.
-//! Recovery pointers are saved before positioning and restored afterward;
-//! baseline maintenance cannot override the published resolution outcome.
+//! Live writers defer workspace work so the engine cannot rewrite history
+//! underneath an active worker.
 //!
 //! Rung 0 applies deterministic resolvers to residual conflicts. Every
 //! file must resolve and the result must push before the attempt retires.
@@ -155,6 +155,10 @@ pub(crate) enum LadderOutcome {
     /// [`Self::MechanicalRungsUnavailable`]); the live writer owns the branch
     /// until it finishes, and a conflict it leaves behind is picked up then.
     DeferredForLiveWriter,
+    /// Cube refused workspace preparation. The failed attempt and its error
+    /// remain visible while the background queue checks for recovery; no
+    /// worker revision can fix a workspace it cannot enter.
+    WorkspacePreparationFailed,
     /// Every residual conflicted file was a generated lockfile, but its
     /// regeneration failed operationally (tool missing from `PATH`, no
     /// network, the tool itself erroring, the lockfile absent on the base).
@@ -355,6 +359,10 @@ pub(crate) async fn try_mechanical_rungs_with(
                 "conflict_ladder: could not lease a workspace for rung 1 after retry; mechanical rungs \
                  unavailable this attempt",
             );
+            if err.is::<boss_host_execution::cube::CubeCliError>() {
+                halt_workspace_failure(work_db, publisher, candidate, attempt, &err).await;
+                return LadderOutcome::WorkspacePreparationFailed;
+            }
             log_routing_verdict(
                 &candidate.work_item_id,
                 Some(pr_number),
@@ -485,6 +493,10 @@ pub(crate) async fn run_rung1_in_lease_with(
 ) -> LadderOutcome {
     let lease = workspace.lease;
     if let Err(err) = cube_client.goto_workspace(&lease.workspace_path, pr_number).await {
+        if err.is::<boss_host_execution::cube::CubeCliError>() || crate::work::conflict_workspace_failed(attempt) {
+            halt_workspace_failure(work_db, publisher, candidate, attempt, &err).await;
+            return LadderOutcome::WorkspacePreparationFailed;
+        }
         tracing::warn!(
             work_item_id = %candidate.work_item_id,
             pr = pr_number,
@@ -663,6 +675,31 @@ pub(crate) async fn run_rung1_in_lease_with(
     LadderOutcome::FellThrough {
         residual_conflict_files: Some(residual_conflict_files),
         reason: rung0_fallthrough_reason,
+    }
+}
+
+async fn halt_workspace_failure(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    attempt: &ConflictResolution,
+    error: &anyhow::Error,
+) {
+    tracing::warn!(attempt_id = %attempt.id, error = %format!("{error:#}"), "conflict_ladder: workspace preparation refused; no worker spawned");
+    match work_db.fail_conflict_workspace(&attempt.id, &format!("{error:#}")) {
+        Ok(Some(_)) => {
+            publisher
+                .publish_work_item_changed(
+                    &candidate.product_id,
+                    &candidate.work_item_id,
+                    "conflict_workspace_failed",
+                )
+                .await
+        }
+        Ok(None) => {}
+        Err(err) => {
+            tracing::error!(attempt_id = %attempt.id, ?err, "conflict_ladder: failed to persist workspace refusal")
+        }
     }
 }
 

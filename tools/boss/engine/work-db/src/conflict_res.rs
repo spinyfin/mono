@@ -244,9 +244,8 @@ impl WorkDb {
             tx.commit()?;
             return Ok(None);
         }
-        // Only stamp the parent's `blocked_attempt_id` for live
-        // attempts; an immediately-abandoned churn-guard row would
-        // mis-point the kanban at a dead attempt.
+        // Live attempts point the card at ongoing work. A churn stop is
+        // stamped with its full explanation by surface_conflict_stop below.
         if !churn_tripped {
             tx.execute(
                 "UPDATE tasks
@@ -261,6 +260,9 @@ impl WorkDb {
         }
         let inserted = query_conflict_resolution(&tx, &id)?
             .with_context(|| format!("unknown conflict_resolution after insert: {id}"))?;
+        if churn_tripped {
+            conflict_stop::surface_conflict_stop(&tx, &id)?;
+        }
         tx.commit()?;
         Ok(Some(inserted))
     }
@@ -442,6 +444,9 @@ impl WorkDb {
                 AND status IN ('pending', 'running')",
             params![attempt_id, reason, now],
         )?;
+        if rows > 0 {
+            conflict_stop::surface_conflict_stop(&tx, attempt_id)?;
+        }
         finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
 
@@ -485,7 +490,8 @@ impl WorkDb {
                     resolved_by_rung          = COALESCE(resolved_by_rung, ?4),
                     mechanical_rung_in_flight = NULL
               WHERE id = ?1
-                AND status IN ('pending', 'running')",
+                AND (status IN ('pending', 'running')
+                     OR (status = 'failed' AND failure_reason LIKE 'workspace_preparation_failed: %'))",
             params![attempt_id, head_sha_after, now, rung],
         )?;
         finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
@@ -731,6 +737,9 @@ impl WorkDb {
                 AND status IN ('pending', 'running')",
             params![attempt_id, reason, now],
         )?;
+        if rows > 0 && reason != "superseded_stale_head" {
+            conflict_stop::surface_conflict_stop(&tx, attempt_id)?;
+        }
         finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
 
@@ -1003,6 +1012,15 @@ impl WorkDb {
             &tx,
             &reset.work_item_id,
             crate::LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND,
+        )?;
+        dispatch_helpers::resolve_attention_kind_in_tx(
+            &tx,
+            &reset.work_item_id,
+            CONFLICT_REMEDIATION_STOPPED_ATTENTION_KIND,
+        )?;
+        tx.execute(
+            "UPDATE tasks SET blocked_detail = NULL WHERE id = ?1 AND blocked_reason = 'merge_conflict'",
+            [&reset.work_item_id],
         )?;
         tx.commit()?;
         Ok(Some(reset))

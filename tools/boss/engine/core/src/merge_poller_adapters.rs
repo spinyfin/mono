@@ -71,7 +71,8 @@ impl ConflictHandling for CoreSweepHost {
         probe: &PrLifecycleProbe,
     ) -> bool {
         let mode = match (response.ladder_enabled, self.remediation.as_ref(), response.cube_client) {
-            (false, _, _) => ConflictRemediationMode::Disabled,
+            (false, Some(queue), _) => ConflictRemediationMode::WorkerOnly(queue),
+            (false, None, _) => ConflictRemediationMode::Disabled,
             (true, Some(queue), _) => ConflictRemediationMode::Deferred(queue),
             // No background remediator (tests, or a host built with
             // `with_remediation(None)`): run the ladder inline on the sweep task

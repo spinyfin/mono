@@ -53,20 +53,29 @@ async fn churn_guard_pre_abandons_fourth_attempt_in_window() {
         "pre-abandoned attempt must carry finished_at so it's terminal",
     );
 
-    // Parent's `blocked_attempt_id` must still point at the
-    // most-recent live attempt (a3), not the dead a4.
+    // The blocked card points at the terminal attempt explaining why
+    // remediation stopped, rather than an earlier pending attempt.
     match db.get_work_item(&chore).unwrap() {
         crate::work::WorkItem::Chore(t) => {
             assert_eq!(
                 t.blocked_attempt_id.as_deref(),
-                Some(a3.id.as_str()),
-                "blocked_attempt_id must not retarget at the pre-abandoned row",
+                Some(a4.id.as_str()),
+                "blocked_attempt_id must identify the surfaced terminal reason",
             );
             assert_eq!(t.status, TaskStatus::Blocked);
             assert_eq!(t.blocked_reason.as_deref(), Some("merge_conflict"));
+            assert!(
+                t.blocked_detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("repeated unsuccessful attempts")
+            );
         }
         other => panic!("expected chore, got {other:?}"),
     }
+    let attention = db.list_attention_items_for_work_item(&chore).unwrap();
+    assert_eq!(attention.len(), 1);
+    assert!(attention[0].body_markdown.contains("repeated unsuccessful attempts"));
 }
 
 #[tokio::test]

@@ -149,6 +149,11 @@ const fn entry(kind: &'static str, cleared_by: ClearedBy, rationale: &'static st
 /// `every_registered_kind_is_declared_once` below pins the table itself.
 pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     entry(
+        CONFLICT_REMEDIATION_STOPPED_ATTENTION_KIND,
+        ClearedBy::ProducerReconciles,
+        "Conflict remediation clears the signal after workspace preparation succeeds, a retry resumes, or the PR becomes clean.",
+    ),
+    entry(
         REVISION_CHAIN_RECOVERY_BLOCKED_ATTENTION_KIND,
         ClearedBy::WorkResumed,
         "Legacy recovery blockers are rearmed by the fresh-start migration; a successful start clears the obsolete failure.",

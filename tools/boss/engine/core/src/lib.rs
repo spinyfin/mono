@@ -61,6 +61,7 @@ pub use boss_conflict_diagnosis as conflict_diagnosis;
 pub mod conflict_ladder;
 pub mod conflict_remediation;
 pub mod conflict_watch;
+mod conflict_workspace;
 pub mod coordinator_guidance;
 pub mod coordinator_handoff;
 pub mod coordinator_tmux;
