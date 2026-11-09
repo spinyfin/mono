@@ -17,6 +17,9 @@ use crate::work::ExecutionStatus;
 #[path = "worker_death_regression_tests.rs"]
 mod worker_death_regression_tests;
 
+#[path = "stale_worker_progression_timeout_tests.rs"]
+mod progression_timeout_tests;
+
 // A staleness threshold whose cutoff lands in the *future*, so any
 // `last_event_at` stamped "now" by `apply_event` compares as stale.
 // This lets us exercise the staleness branch deterministically

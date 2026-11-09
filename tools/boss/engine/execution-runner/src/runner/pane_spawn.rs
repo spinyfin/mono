@@ -865,10 +865,18 @@ impl ExecutionRunner for PaneSpawnRunner {
             None
         };
 
-        let lease_id = execution
-            .cube_lease_id
-            .clone()
-            .context("execution missing cube_lease_id; coordinator must lease before spawn")?;
+        // A kind that holds no cube lease (`progression`) runs in an
+        // engine-owned scratch directory and spawns with an empty
+        // `BOSS_LEASE_ID`; every other kind must have been leased by the
+        // coordinator before the spawn.
+        let lease_id = if execution.kind.holds_cube_lease() {
+            execution
+                .cube_lease_id
+                .clone()
+                .context("execution missing cube_lease_id; coordinator must lease before spawn")?
+        } else {
+            String::new()
+        };
 
         // The coordinator already claimed a slot via WorkerPool —
         // `worker_id` is `worker-{N}` (main pool), `auto-worker-{N}`
@@ -1132,6 +1140,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 crate::worker_setup::WorkerKind::Triage => crate::driver::WorkerKind::Triage,
                 crate::worker_setup::WorkerKind::AnswerAgent => crate::driver::WorkerKind::AnswerAgent,
                 crate::worker_setup::WorkerKind::ReviewGuide => crate::driver::WorkerKind::ReviewGuide,
+                crate::worker_setup::WorkerKind::Progression => crate::driver::WorkerKind::Progression,
             },
             workspace_path: workspace_path.to_path_buf(),
             events_socket_path: self.events_socket_path(),

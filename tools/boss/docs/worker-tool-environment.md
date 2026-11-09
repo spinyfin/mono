@@ -87,6 +87,33 @@ to explicit toolchain manifests, locale and SDK selection, and
 credential-variable inheritance. Those policies should be specified
 independently of this fix.
 
+## The progression agent: no workspace
+
+A `progression` run (the agent that diagnoses one stuck work item) holds no
+code checkout and no cube lease. It is spawned through the same local path as
+every other worker, but its working directory is an engine-owned scratch
+directory, `<system temp>/boss-progression-scratch/<execution id>`, outside every
+repository, created before the spawn and removed when the run is torn down.
+The spawn machinery needs a directory to write the agent-rules file, the settings
+pointer and the initial-input script, and nothing else lives there.
+
+What it can run is an allowlist under `--permission-mode dontAsk`, which the
+dispatcher forces so it cannot be downgraded: `Read`, `Grep` and `Glob`;
+`boss propose`, read-only `boss task show|list` and `boss pr status` (in both
+the bare `boss` and `"$BOSS_BIN"` spellings); and `gh pr view|checks`. Everything
+else is denied: file writes, all of `jj`, `git` and `cube`, mutating `gh` verbs
+and `gh api` with a mutating method or field flag. The ordinary worker denylist
+still applies on top. Codex runs it with `--sandbox read-only` and Grok with the
+read-only sandbox profile, never the Standard posture.
+
+The PATH and launcher environment described above applies unchanged: the boss
+and cube launchers are materialized in the worker tool directory and the sealed
+`BOSS_WORKER_TOOL_PATH` is exported. Because the scratch directory has no
+`REPOBIN.toml`, it gets no checkleft launcher, and `BOSS_LEASE_ID` is empty.
+The pane's pid is registered at the confined progression tier of the worker RPC
+surface (with its neighbourhood captured first), on a fresh spawn and again when
+the pane is re-adopted after an engine restart.
+
 ## Validation
 
 The worker-bin Bazel tests put a stale checkleft ahead of the composed PATH

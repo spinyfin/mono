@@ -504,6 +504,7 @@ fn prompt_addendum_to_prepend(kind: &ExecutionKind, addendum: Option<&'static st
         crate::worker_setup::WorkerKind::Reviewer
         | crate::worker_setup::WorkerKind::Triage
         | crate::worker_setup::WorkerKind::AnswerAgent
+        | crate::worker_setup::WorkerKind::Progression
         | crate::worker_setup::WorkerKind::ReviewGuide => None,
     }
 }
@@ -561,6 +562,7 @@ pub async fn compose_worker_spawn(
         crate::worker_setup::WorkerKind::Reviewer
         | crate::worker_setup::WorkerKind::ReviewGuide
         | crate::worker_setup::WorkerKind::Triage
+        | crate::worker_setup::WorkerKind::Progression
         | crate::worker_setup::WorkerKind::AnswerAgent => None,
     };
     let WorkerSpawnOpts {

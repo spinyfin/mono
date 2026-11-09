@@ -495,6 +495,14 @@ pub trait WorkerSpawner: Send + Sync {
 
     fn worker_registry(&self) -> &WorkerRegistry;
 
+    /// The work database, used to capture a progression pane's neighbourhood
+    /// when its pid is registered ([`WorkerRegistry::register_for_run`]).
+    /// `None` in tests that never spawn a progression run; a progression
+    /// spawn without it is registered confined with no scope.
+    fn work_db(&self) -> Option<&crate::work::WorkDb> {
+        None
+    }
+
     /// Engine's live per-slot state registry. Implementations return
     /// `None` from in-process tests that don't care about the live
     /// state surface; the spawn flow then skips the registration
@@ -892,7 +900,12 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
     spawner
         .worker_registry()
         .register_tmux_run_slot(input.run_id.clone(), slot_id, tmux_host.session_name());
-    spawner.worker_registry().register(shell_pid, input.run_id.clone());
+    spawner.worker_registry().register_for_run(
+        shell_pid,
+        &input.run_id,
+        input.worker_kind == crate::worker_setup::WorkerKind::Progression,
+        spawner.work_db(),
+    );
 
     // 4. Stamp the initial LiveWorkerState so bossctl/UI immediately
     //    see "Spawning" with the launch-default model — no more
@@ -2619,6 +2632,66 @@ mod tests {
         assert!(!keys.contains(&"RANDOM_KEY"));
         // Allowlisted key still made it through.
         assert!(keys.contains(&"BOSS_TASK_ID"));
+    }
+
+    /// Delegates to [`StubSpawner`] but also exposes a work database, the way
+    /// the production spawner does.
+    struct DbSpawner {
+        inner: StubSpawner,
+        db: Arc<crate::work::WorkDb>,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkerSpawner for DbSpawner {
+        async fn send_to_app_request(
+            &self,
+            request: EngineToAppRequest,
+            timeout: Duration,
+        ) -> Result<EngineToAppResponse, SendToAppError> {
+            self.inner.send_to_app_request(request, timeout).await
+        }
+
+        fn worker_registry(&self) -> &WorkerRegistry {
+            self.inner.worker_registry()
+        }
+
+        fn work_db(&self) -> Option<&crate::work::WorkDb> {
+            Some(&self.db)
+        }
+    }
+
+    /// A freshly spawned progression pane is registered at the confined tier and
+    /// its neighbourhood is captured before the registration; an ordinary worker
+    /// is not.
+    #[tokio::test]
+    async fn a_fresh_progression_spawn_registers_the_pane_at_the_confined_tier() {
+        use crate::test_support::{create_test_chore_manual, create_test_product_named, open_db_arc};
+        let (_dir, db) = open_db_arc();
+        let product = create_test_product_named(&db, "p");
+        let chore = create_test_chore_manual(&db, product.id.clone(), "stuck");
+        let execution = db
+            .create_execution(
+                boss_protocol::CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(boss_protocol::ExecutionKind::Progression)
+                    .status(boss_protocol::ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        for (kind, expected_tier) in [(WorkerKind::Progression, true), (WorkerKind::Standard, false)] {
+            let workspace = TempDir::new().unwrap();
+            let spawner = DbSpawner {
+                inner: ok_spawner_capturing(),
+                db: db.clone(),
+            };
+            let mut input = sample_input(&workspace, spawner.inner.tmux_runner.clone());
+            input.run_id = execution.id.clone();
+            input.worker_kind = kind;
+            start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
+            assert_eq!(spawner.inner.registry.registered_tier(4242), Some(expected_tier));
+        }
+        db.check_progression_scope(&execution.id, &chore.id)
+            .expect("the progression spawn captured its neighbourhood");
     }
 
     #[tokio::test]

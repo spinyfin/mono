@@ -301,6 +301,10 @@ impl boss_engine_runtime::spawn_flow::WorkerSpawner for ServerState {
         &self.worker_registry
     }
 
+    fn work_db(&self) -> Option<&WorkDb> {
+        Some(&self.work_db)
+    }
+
     async fn reap_worker_pane(&self, run_id: &str) {
         // Delegate to the inherent reaper, discarding the outcome — the
         // spawn-completion path already knows the worker came up (it just
@@ -1772,6 +1776,11 @@ impl ServerState {
             execution_coordinator_inner.set_automation_pool(automation_pool);
             execution_coordinator_inner.set_review_pool(review_pool);
             execution_coordinator_inner.set_progression_pool(progression_pool);
+            // The engine can start a checkout-free progression agent, so lift
+            // the dispatcher's hold on `progression` rows. The real guard is the
+            // default-off `progression_agents` feature flag: the sweep mints no
+            // `progression` row unless it is on.
+            execution_coordinator_inner.set_progression_spawn_enabled(true);
             // Wire the SHA-delta gate's run-start snapshot: when an
             // execution transitions to `running`, the completion
             // handler captures the bound chore PR's head SHA into

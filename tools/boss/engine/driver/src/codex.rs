@@ -617,6 +617,11 @@ pub fn codex_sandbox_for_worker_kind(worker_kind: WorkerKind, sandbox_enforced: 
         // (render_review_guide_config), not a CLI override — see
         // codex_sandbox_extra_args's doc comment for why.
         WorkerKind::ReviewGuide => None,
+        // The progression agent holds no checkout and never writes files, so it
+        // gets Codex's most restrictive filesystem sandbox regardless of the
+        // enforcement flag — never the Standard `workspace-write` /
+        // `danger-full-access` posture.
+        WorkerKind::Progression => Some("read-only"),
         WorkerKind::Standard | WorkerKind::Triage | WorkerKind::AnswerAgent => {
             if sandbox_enforced {
                 Some("workspace-write")

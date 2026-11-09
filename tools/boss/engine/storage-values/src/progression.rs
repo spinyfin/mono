@@ -38,6 +38,10 @@ pub const METADATA_KEY_MAX_CREATES_PER_ITEM_WINDOW: &str = "progression.max_crea
 /// `metadata` key holding the published rolling window the create budget counts over.
 pub const METADATA_KEY_MAX_CREATES_WINDOW_SECS: &str = "progression.max_creates_window_secs";
 
+/// `metadata` key holding the published `progression.run_timeout`. The
+/// stale-worker sweep reads it to reap a progression run that outlives it.
+pub const METADATA_KEY_RUN_TIMEOUT_SECS: &str = "progression.run_timeout_secs";
+
 /// A run that ended `no_changes_needed` judged the item not stuck in any way a
 /// verb addresses, so the item is re-nominated only after the cooldown times
 /// this factor (design 2.5, "`no_action` is not an escalation").
@@ -82,9 +86,11 @@ pub struct ProgressionSettings {
     /// seconds. Placeholder 7 days.
     #[builder(default = DEFAULT_MAX_CREATES_WINDOW_SECS)]
     pub max_creates_window_secs: i64,
-    /// `progression.run_timeout`, in seconds. Placeholder 30 minutes. The value is
-    /// declared and parsed but nothing enforces it yet: a progression run is
-    /// bounded only by the stale-worker reaper's ordinary rules.
+    /// `progression.run_timeout`, in seconds. Placeholder 30 minutes. The
+    /// stale-worker sweep reaps a progression run older than this through its
+    /// ordinary reap path and records it `orphaned`, which the candidate view's
+    /// infrastructure-failure clause counts (two in a row stops nominations).
+    /// The engine publishes it as `progression.run_timeout_secs` metadata.
     #[builder(default = DEFAULT_RUN_TIMEOUT_SECS)]
     pub run_timeout_secs: u64,
     /// `progression.expected_questions_per_week`: an alarm threshold on the

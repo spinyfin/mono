@@ -886,6 +886,32 @@ pub async fn run_one_pass_with_terminal_and_grace(
             continue;
         }
 
+        // A `progression` run is bounded by its own wall-clock timeout, not by
+        // the semantic-staleness ladder: that ladder raises `stale_worker`
+        // attention and appends audit text on the *work item*, and a progression
+        // run's item is the stuck item it is inspecting, which this sweep must
+        // not touch. Reaped past the timeout through the ordinary reaper; until
+        // then left alone.
+        if execution.kind == boss_protocol::ExecutionKind::Progression {
+            if reap_timed_out_progression(
+                ProgressionReapContext {
+                    work_db,
+                    live_states,
+                    coordinator: coordinator.clone(),
+                    dispatch_events,
+                    reaper,
+                },
+                &state,
+                &execution,
+                now_epoch_secs,
+            )
+            .await
+            {
+                outcome.reaped += 1;
+            }
+            continue;
+        }
+
         // Tmux is consulted for exact identity and death only — never for a
         // health verdict (see the module doc's "Two authorities" section).
         let identity = match terminal_inspector {
@@ -1127,6 +1153,102 @@ pub async fn run_one_pass_with_terminal_and_grace(
     }
 
     outcome
+}
+
+/// Collaborators for [`reap_timed_out_progression`].
+struct ProgressionReapContext<'a> {
+    work_db: &'a WorkDb,
+    live_states: &'a LiveWorkerStateRegistry,
+    coordinator: Arc<ExecutionCoordinator>,
+    dispatch_events: &'a dyn DispatchEventSink,
+    reaper: &'a dyn StaleWorkerReaper,
+}
+
+/// The published `progression.run_timeout`, in seconds. Falls back to the
+/// placeholder default when the engine has not published one (or it is
+/// unreadable), the same convention the candidate views use for their limits.
+fn progression_run_timeout_secs(work_db: &WorkDb) -> i64 {
+    use boss_engine_storage_values::progression::{DEFAULT_RUN_TIMEOUT_SECS, METADATA_KEY_RUN_TIMEOUT_SECS};
+    work_db
+        .get_metadata(METADATA_KEY_RUN_TIMEOUT_SECS)
+        .ok()
+        .flatten()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(i64::try_from(DEFAULT_RUN_TIMEOUT_SECS).unwrap_or(i64::MAX))
+}
+
+/// Reap a `progression` run that has outlived `progression.run_timeout`.
+/// Returns `true` when it was reaped.
+///
+/// Goes through the sweep's ordinary reap path (`StaleWorkerReaper`, the same
+/// teardown `bossctl agents stop` performs) and records the execution
+/// `orphaned`, a status the candidate view's infrastructure-failure clause
+/// counts, so two timeouts in a row stop the sweep nominating the item. Unlike
+/// the worker reap paths it appends no audit line and resolves no attention on
+/// the work item, takes no recovery backup (the run has no bookmark) and
+/// releases no lease (it holds none).
+async fn reap_timed_out_progression(
+    ctx: ProgressionReapContext<'_>,
+    state: &boss_protocol::LiveWorkerState,
+    execution: &boss_protocol::WorkExecution,
+    now_epoch_secs: i64,
+) -> bool {
+    let ProgressionReapContext {
+        work_db,
+        live_states,
+        coordinator,
+        dispatch_events,
+        reaper,
+    } = ctx;
+    let Some(started_epoch) = execution.started_epoch() else {
+        return false;
+    };
+    let timeout_secs = progression_run_timeout_secs(work_db);
+    if now_epoch_secs.saturating_sub(started_epoch) <= timeout_secs {
+        return false;
+    }
+    let execution_id = &state.run_id;
+    let reason = format!(
+        "progression-run-timeout: the run was still going {}s after it started (limit {timeout_secs}s); reaped",
+        now_epoch_secs.saturating_sub(started_epoch)
+    );
+    tracing::warn!(
+        execution_id,
+        work_item_id = %execution.work_item_id,
+        timeout_secs,
+        "stale-worker sweep: progression run exceeded its timeout; reaping",
+    );
+    if let Err(err) = work_db.mark_execution_orphaned(execution_id, &reason) {
+        tracing::warn!(
+            execution_id,
+            ?err,
+            "stale-worker sweep: failed to mark timed-out progression run orphaned"
+        );
+        return false;
+    }
+    // Removes the scratch directory along with any driver-owned state.
+    crate::driver_teardown::teardown_driver_workspace(
+        work_db,
+        execution_id,
+        execution.workspace_path.as_deref().map(std::path::Path::new),
+        crate::driver_teardown::TeardownReason::StaleWorkerReconcile,
+    )
+    .await;
+    reaper.reap_worker(execution_id).await;
+    crate::dead_pid_sweep::release_reaped_execution(live_states, &coordinator, state).await;
+    dispatch_events
+        .emit(
+            DispatchEvent::new(Stage::StaleWorkerReconcile, Outcome::Ok, execution_id)
+                .with_work_item(&execution.work_item_id)
+                .with_details(serde_json::json!({
+                    "slot_id": state.slot_id,
+                    "progression_run_timeout": true,
+                    "timeout_secs": timeout_secs,
+                })),
+        )
+        .await;
+    true
 }
 
 /// Tmux identity evidence available for a slot whose terminal inspector did

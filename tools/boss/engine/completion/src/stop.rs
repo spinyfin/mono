@@ -647,6 +647,13 @@ impl WorkerCompletionHandler {
                 .await;
         }
 
+        // A `progression` execution holds no checkout and never opens a PR. Its
+        // Stop only finalizes the run; the stuck item it was sent to diagnose
+        // must not enter PR detection or the nudge loop, and is left untouched.
+        if execution.kind == ExecutionKind::Progression {
+            return self.finalize_progression(&execution).await;
+        }
+
         // Maint task 6: an `automation_triage` execution never opens a PR.
         // Its Stop is resolved by the marker-protocol outcome detector
         // (`automation: task <id>` / `automation: skip — …`), not by PR

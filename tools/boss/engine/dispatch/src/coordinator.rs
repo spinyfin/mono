@@ -835,6 +835,7 @@ mod dispatch_admission;
 mod execution;
 mod lease_limiter;
 mod preserved_work;
+mod progression_spawn;
 mod run;
 mod scheduler;
 

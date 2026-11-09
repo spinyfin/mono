@@ -1348,6 +1348,14 @@ fn standard_worker_sandbox_defaults_to_danger_full_access() {
         codex_sandbox_for_worker_kind(WorkerKind::AnswerAgent, false),
         Some("danger-full-access")
     );
+    // A progression agent holds no checkout and writes nothing: read-only
+    // whatever the enforcement flag says, never the Standard posture.
+    for enforced in [false, true] {
+        assert_eq!(
+            codex_sandbox_for_worker_kind(WorkerKind::Progression, enforced),
+            Some("read-only")
+        );
+    }
     // codex_sandbox_enforced=true restores the OS-enforced fence.
     assert_eq!(
         codex_sandbox_for_worker_kind(WorkerKind::Standard, true),

@@ -102,6 +102,7 @@ pub async fn teardown_driver_workspace(
 
     let started = Instant::now();
     let (outcome, driver_slug) = resolve_and_teardown(work_db, execution_id, workspace_path).await;
+    remove_progression_scratch(work_db, execution_id);
     tracing::info!(
         execution_id,
         reason = reason.as_str(),
@@ -111,6 +112,25 @@ pub async fn teardown_driver_workspace(
         elapsed_ms = started.elapsed().as_millis(),
         "driver workspace teardown: completed",
     );
+}
+
+/// A `progression` run's working directory is an engine-owned scratch
+/// directory, not a checkout, and nothing else cleans it up: remove it once
+/// the run is torn down. The path is derived from the execution id, never read
+/// back from the row. A no-op for every other kind and for an unreadable row.
+fn remove_progression_scratch(work_db: &WorkDb, execution_id: &str) {
+    match work_db.get_execution(execution_id) {
+        Ok(execution) if !execution.kind.holds_cube_lease() => {
+            if let Err(err) = boss_execution_contracts::progression_scratch::remove_scratch_dir(execution_id) {
+                tracing::warn!(
+                    execution_id,
+                    error = %format!("{err:#}"),
+                    "driver workspace teardown: failed to remove progression scratch dir (non-fatal)",
+                );
+            }
+        }
+        Ok(_) | Err(_) => {}
+    }
 }
 
 /// Body of [`teardown_driver_workspace`], split out so the completion trace

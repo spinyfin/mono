@@ -1045,6 +1045,8 @@ pub(crate) async fn sweep_pending_pr(handler: &dyn CompletionRequests, execution
         // P3b: an answer_agent outcome only comes from the on-Stop
         // finalizer, never from a PR-detection recheck.
         | StopOutcome::AnswerAgent { .. }
+        // A progression outcome only comes from the on-Stop finalizer.
+        | StopOutcome::Progression
         // A review-guide outcome only comes from the on-Stop finalizer,
         // never from a PR-detection recheck (review-guide executions never
         // produce a PR at all).
@@ -1162,6 +1164,8 @@ pub(crate) async fn sweep_late_pr(
         // P3b: an answer_agent outcome only comes from the on-Stop
         // finalizer, never from a late-PR recheck.
         | StopOutcome::AnswerAgent { .. }
+        // A progression outcome only comes from the on-Stop finalizer.
+        | StopOutcome::Progression
         // A review-guide outcome only comes from the on-Stop finalizer,
         // never from a late-PR recheck (review-guide executions never
         // produce a PR at all).

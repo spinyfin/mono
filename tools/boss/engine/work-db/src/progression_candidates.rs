@@ -113,8 +113,8 @@ use boss_engine_storage_values::dispatch_wait::{
 use boss_engine_storage_values::progression::{
     CREATED_VIA_PROGRESSION_SWEEP, DEFAULT_COOLDOWN_SECS, DEFAULT_MAX_CREATES_PER_ITEM_WINDOW,
     DEFAULT_MAX_CREATES_WINDOW_SECS, DEFAULT_STUCK_AFTER_SECS, INFRASTRUCTURE_FAILURE_CAP, METADATA_KEY_COOLDOWN_SECS,
-    METADATA_KEY_MAX_CREATES_PER_ITEM_WINDOW, METADATA_KEY_MAX_CREATES_WINDOW_SECS, METADATA_KEY_STUCK_AFTER_SECS,
-    NO_ACTION_COOLDOWN_MULTIPLIER, ProgressionSettings,
+    METADATA_KEY_MAX_CREATES_PER_ITEM_WINDOW, METADATA_KEY_MAX_CREATES_WINDOW_SECS, METADATA_KEY_RUN_TIMEOUT_SECS,
+    METADATA_KEY_STUCK_AFTER_SECS, NO_ACTION_COOLDOWN_MULTIPLIER, ProgressionSettings,
 };
 
 pub(super) const GRACE_COLUMN_MIGRATION_ID: &str = "20261106_1200_progression_grace_waived_at";
@@ -867,6 +867,12 @@ impl WorkDb {
                 i64::from(settings.max_creates_per_item_window),
             ),
             (METADATA_KEY_MAX_CREATES_WINDOW_SECS, settings.max_creates_window_secs),
+            // Not read by the candidate views: the stale-worker sweep applies it
+            // to a live progression run.
+            (
+                METADATA_KEY_RUN_TIMEOUT_SECS,
+                i64::try_from(settings.run_timeout_secs).unwrap_or(i64::MAX),
+            ),
         ] {
             tx.execute(
                 "INSERT INTO metadata (key, value) VALUES (?1, ?2)

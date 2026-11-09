@@ -594,3 +594,12 @@ fn real_process_table_verifies_the_live_process() {
     reg.inner.lock().unwrap().pid_to_run.get_mut(&self_pid).unwrap().start = Some(snapshot.start + 1);
     assert_eq!(reg.lookup_with_ancestor_walk(self_pid), None);
 }
+
+#[test]
+fn register_for_run_fails_closed_for_a_progression_with_no_work_db() {
+    let reg = WorkerRegistry::new();
+    reg.register_for_run(10, "run-p", true, None);
+    reg.register_for_run(11, "run-w", false, None);
+    assert_eq!(reg.registered_tier(10), Some(true), "no scope still means confined");
+    assert_eq!(reg.registered_tier(11), Some(false));
+}

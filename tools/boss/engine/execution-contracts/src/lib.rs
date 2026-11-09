@@ -12,6 +12,7 @@ mod spawn_confirmation;
 pub use spawn_confirmation::{
     SpawnConfirmationError, composer_not_ready_error, spawn_confirmation_error, turn_did_not_start_error,
 };
+pub mod progression_scratch;
 mod worker_kind;
 pub use worker_kind::{WorkerKind, worker_kind_for_execution};
 mod pre_start_streak;

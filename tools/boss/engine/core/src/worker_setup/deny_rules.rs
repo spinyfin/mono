@@ -147,6 +147,72 @@ pub fn answer_agent_deny_rules() -> Vec<String> {
     read_only_worker_deny_rules()
 }
 
+/// The `permissions.allow` allowlist for [`WorkerKind::Progression`].
+///
+/// Under the forced `dontAsk` mode this is the ENTIRE set of non-read-only
+/// actions the progression agent can take. It holds the read-only inspection
+/// tools, the declaration command (`propose`, in both the bare `boss` and the
+/// `"$BOSS_BIN"` spelling workers are taught), read-only task/PR status
+/// queries, and read-only `gh pr` inspection. There is deliberately no
+/// `Edit`, no `jj`/`git`/`cube`, and no mutating `gh`/`boss` verb.
+///
+/// Every entry MUST be read-only or a declaration. Adding a mutating entry is a
+/// capability escalation and must be reviewed as such.
+pub fn progression_allow_rules() -> Vec<String> {
+    let mut rules = vec!["Read".to_owned(), "Grep".to_owned(), "Glob".to_owned()];
+    for bin in ["boss", r#""$BOSS_BIN""#] {
+        for sub in ["propose", "task show", "task list", "pr status"] {
+            rules.push(format!("Bash({bin} {sub}:*)"));
+        }
+    }
+    rules.push("Bash(gh pr view:*)".to_owned());
+    rules.push("Bash(gh pr checks:*)".to_owned());
+    rules
+}
+
+/// Defense-in-depth `permissions.deny` belt for [`WorkerKind::Progression`].
+///
+/// The primary enforcement is the `dontAsk` allowlist
+/// ([`progression_allow_rules`]); deny always wins over allow. On top of the
+/// read-only worker set (file writes, publish verbs, all of `cube`) it denies
+/// every `jj` and `git` invocation (the agent holds no checkout), the mutating
+/// `gh pr` / `gh issue` verbs beyond the publish set, and `gh api` with a
+/// mutating method or field flag (`-f`/`-F` imply POST).
+pub fn progression_deny_rules() -> Vec<String> {
+    let mut rules = read_only_worker_deny_rules();
+    for vcs in ["jj", "git"] {
+        rules.push(format!("Bash({vcs})"));
+        rules.push(format!("Bash({vcs}:*)"));
+    }
+    for verb in [
+        "pr ready",
+        "pr reopen",
+        "pr lock",
+        "pr unlock",
+        "issue reopen",
+        "issue delete",
+        "issue transfer",
+        "issue pin",
+        "issue unpin",
+        "issue lock",
+        "issue unlock",
+    ] {
+        rules.push(format!("Bash(gh {verb}:*)"));
+    }
+    // `gh api` defaults to GET; a method flag naming a write verb, or any field
+    // flag (which makes `gh api` default to POST), is a mutation.
+    for flag in ["-X", "--method"] {
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            rules.push(format!("Bash(gh api * {flag} {method}*)"));
+            rules.push(format!("Bash(gh api * {flag}={method}*)"));
+        }
+    }
+    for flag in ["-f", "-F", "--field", "--raw-field", "--input"] {
+        rules.push(format!("Bash(gh api * {flag} *)"));
+    }
+    rules
+}
+
 /// Review-guide workers inspect pinned source and submit one result. The shared
 /// hook narrows Bash to literal reads and immutable git-object inspection.
 pub fn review_guide_allow_rules() -> Vec<String> {

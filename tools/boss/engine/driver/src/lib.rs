@@ -93,6 +93,9 @@ pub enum WorkerKind {
     /// allowlisted mutating command at all. Runs exclusively on the Codex
     /// driver's fixed `gpt-6-astra`/`high` profile.
     ReviewGuide,
+    /// Checkout-free progression agent for a stuck work item: allowlist-only
+    /// (`dontAsk`), no file edits, no VCS, no GitHub writes.
+    Progression,
 }
 
 /// All inputs Boss provides to a driver for its [`Capability::PermissionPolicy`]:

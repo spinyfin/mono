@@ -321,3 +321,79 @@ async fn turn_end_during_an_in_flight_finalize_waits_and_sees_the_terminal_state
         "released exactly once"
     );
 }
+
+#[tokio::test]
+async fn on_stop_finalizes_a_progression_run_without_touching_the_stuck_item() {
+    // A progression run holds no lease and no checkout. Its Stop must finalize
+    // the execution and release the pane only: no PR detection, no nudge, no
+    // cube call, and — above all — no change to the item it was sent to inspect.
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = db
+        .create_product(
+            CreateProductInput::builder()
+                .name("Boss")
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .build(),
+        )
+        .unwrap();
+    let chore = crate::test_support::create_test_chore_manual(&db, product.id.clone(), "stuck item");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'todo', autostart = 1, dispatch_failed_reason = 'cube_workspace_lease_failed',
+                    dispatch_failed_error = 'lease boom', dispatch_failed_at = '2026-11-01T00:00:00Z'
+             WHERE id = ?1",
+            [&chore.id],
+        )
+        .unwrap();
+    let snapshot = |db: &WorkDb| -> Vec<Option<String>> {
+        db.connect()
+            .unwrap()
+            .query_row(
+                "SELECT status, CAST(autostart AS TEXT), dispatch_failed_reason, dispatch_failed_error,
+                        dispatch_failed_at, updated_at, description, pr_url FROM tasks WHERE id = ?1",
+                [&chore.id],
+                |row| (0..8).map(|i| row.get::<_, Option<String>>(i)).collect(),
+            )
+            .unwrap()
+    };
+    let execution = db
+        .create_execution(
+            boss_protocol::CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(boss_protocol::ExecutionKind::Progression)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.start_progression_run_on_local_host(
+        &execution.id,
+        "progression-1",
+        "/tmp/boss-progression-scratch/t17",
+        true,
+    )
+    .unwrap();
+    let before = snapshot(&db);
+
+    // A detector that would bind a PR if the progression run reached PR detection.
+    let TestHarness {
+        handler, cube, pane, ..
+    } = TestHarness::new(
+        db.clone(),
+        StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/1")),
+    );
+    let outcome = handler.on_stop(&execution.id).await;
+
+    assert!(matches!(outcome, StopOutcome::Progression), "got {outcome:?}");
+    assert_eq!(
+        db.get_execution(&execution.id).unwrap().status,
+        ExecutionStatus::Completed
+    );
+    assert_eq!(pane.calls.lock().await.as_slice(), [execution.id.as_str()]);
+    assert!(
+        cube.release_calls.lock().await.is_empty(),
+        "no lease was held, so none is released"
+    );
+    assert_eq!(snapshot(&db), before, "the stuck item is untouched by the run ending");
+}
