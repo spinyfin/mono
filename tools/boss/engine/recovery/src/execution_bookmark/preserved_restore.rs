@@ -18,9 +18,24 @@ async fn recorded_candidates(jj: &dyn Jj, record: &ExecutionBookmark, recorded: 
     }
 }
 
+/// Select the tip, then refuse it when it is a content evolution of the
+/// recorded tip, whichever path selected it.
+pub(super) async fn select_tip(
+    jj: &dyn Jj,
+    record: &ExecutionBookmark,
+    base: &str,
+    recorded: Option<&PreservedTip>,
+) -> Result<Option<(String, Vec<String>)>> {
+    let selected = select_variant(jj, record, base, recorded).await?;
+    if let (Some((tip, _)), Some(recorded)) = (selected.as_ref(), recorded) {
+        super::preserved::reject_content_evolution(jj, record, tip, recorded).await?;
+    }
+    Ok(selected)
+}
+
 /// Prefer a variant in the PR history, then the newest visible variant in
 /// jj's evolution log and operation journal. Unrelated changes are undecidable.
-pub(super) async fn select_tip(
+async fn select_variant(
     jj: &dyn Jj,
     record: &ExecutionBookmark,
     base: &str,

@@ -2,8 +2,8 @@
 use super::*;
 #[path = "preserved_safety.rs"]
 mod safety;
-pub(super) use safety::safe_candidates;
 use safety::{finalize_tip, quarantine, reject_unsafe_outcome};
+pub(super) use safety::{reject_content_evolution, safe_candidates};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreservedTip {

@@ -20,6 +20,8 @@ const EMPTY_SETUP_CHANGES: &str = r#"(empty() & description(exact:"")) ~ (merges
 
 mod preserved;
 #[cfg(test)]
+mod preserved_quarantine_tests;
+#[cfg(test)]
 mod preserved_retry_tests;
 #[cfg(test)]
 mod preserved_safety_tests;
@@ -76,6 +78,9 @@ pub enum PointerIntegrityKind {
     NotContained,
     /// The disposable PR bookmark is missing or conflicted; refresh it from GitHub.
     PrHeadUnavailable,
+    /// A resumed head descends from work that teardown quarantined as possibly
+    /// belonging to a later holder. Nothing was moved or restaged.
+    Quarantined,
     /// Ambiguous execution bookmark or wrong store.
     Other,
 }
@@ -525,7 +530,27 @@ pub(crate) fn heads_revset(heads: &[String]) -> String {
 
 pub(crate) async fn resume_heads_of(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<Vec<String>> {
     let pointers = resolve_pointers(jj, record).await?;
-    resume_heads(jj, record, &pointers).await
+    let heads = resume_heads(jj, record, &pointers).await?;
+    reject_quarantined_heads(jj, record, &heads).await?;
+    Ok(heads)
+}
+
+/// Legacy heads follow the working-copy change, so a later holder's snapshot
+/// can move them onto edits teardown quarantined. Restaging such a head would
+/// adopt those edits, so it is refused the same way `preserved/<exec>` is.
+pub(crate) async fn reject_quarantined_heads(jj: &dyn Jj, record: &ExecutionBookmark, heads: &[String]) -> Result<()> {
+    let revisions: Vec<String> = heads.iter().map(|head| revision(head)).collect();
+    let safe = preserved::safe_candidates(jj, record, revisions.clone()).await?;
+    if safe.len() != revisions.len() {
+        return Err(pointer_integrity_error_of(
+            PointerIntegrityKind::Quarantined,
+            format!(
+                "recovery head of {} descends from work quarantined as possibly belonging to a later holder; not restaging it",
+                record.execution_id
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Compatibility fixtures for the pre-migration three-bookmark layout, used only by this
@@ -720,6 +745,11 @@ pub async fn release_heads(
     Ok(archived)
 }
 
+/// Deliberately unguarded by the quarantine: `backup_execution_patch` exports
+/// quarantined heads so their content is kept, and nothing here restages them.
+/// Any caller that restages must go through `unpublished_diff` or
+/// `resume_heads_of`, which call `reject_quarantined_heads`.
+///
 /// Diff for each resumed head, concatenated, from the newest common ancestor
 /// of the head with the floor or trunk. Bounding by trunk keeps upstream
 /// changes a rebase pulled in out of the patch.
@@ -815,12 +845,11 @@ pub async fn unpublished_diff(jj: &dyn Jj, record: &ExecutionBookmark) -> Result
         return Ok(patch);
     }
     let pointers = resolve_pointers(jj, record).await?;
+    let heads = resume_heads(jj, record, &pointers).await?;
+    reject_quarantined_heads(jj, record, &heads).await?;
     let range = format!(
         "({} ~ ::remote_bookmarks()) & ~empty()",
-        above_floor(
-            &pointers.base,
-            &heads_revset(&resume_heads(jj, record, &pointers).await?)
-        )
+        above_floor(&pointers.base, &heads_revset(&heads))
     );
     let unpublished = jj
         .run(
