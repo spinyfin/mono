@@ -32,7 +32,6 @@ boss-engine-planner-validation = { path = "../planner-validation" }
 boss-pr-template = { path = "../pr-template" }
 boss-protocol = { path = "../../protocol" }
 boss-review-guide = { path = "../review-guide" }
-boss-ssh-transport = { path = "../ssh-transport" }
 boss-tmux = { path = "../../tmux" }
 boss-work-db = { path = "../work-db" }
 git-utils = { path = "../../../../lib/rust/git_utils" }

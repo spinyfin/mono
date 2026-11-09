@@ -1313,7 +1313,6 @@ dependencies = [
  "boss-prose-vocabulary",
  "boss-protocol",
  "boss-review-guide",
- "boss-ssh-transport",
  "boss-tmux",
  "boss-work-db",
  "chrono",
