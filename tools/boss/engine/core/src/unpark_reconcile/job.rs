@@ -10,9 +10,10 @@ use boss_work_db::parking_reconcile::UnparkReport;
 use tokio::time::Instant;
 
 use super::sequence::{
-    GithubAccess, ItemOutcome, StepKind, UnparkEnv, emit, reconcile_unparked_item, record_released_rows,
+    GithubAccess, ItemOutcome, StepKind, UnparkEnv, emit, polled_for_pr_refresh, reconcile_unparked_item,
+    record_released_rows,
 };
-use crate::work::{TaskKind, WorkItem};
+use crate::work::WorkItem;
 
 /// How long consecutive GitHub-touching items are spaced apart.
 const DEFAULT_CHILD_SPACING: Duration = Duration::from_secs(1);
@@ -29,7 +30,7 @@ const DEFAULT_PROGRESS_EVERY: usize = 10;
 /// The job's pacing limits.
 ///
 /// **How these were chosen, and what they were not.** They come from arithmetic
-/// on known per-call costs, not from measured traffic; retune them from measured un-park spend. A child that touches GitHub costs at
+/// on known per-call costs, not from measured traffic. A child that touches GitHub costs at
 /// most three GraphQL points: the targeted reconcile's one batched probe and its
 /// one merge-queue dequeue query are each billed `max(1, nodes / 100)`, which is
 /// 1 for a single PR, and the optional review-metadata fetch is one more. Even
@@ -37,10 +38,10 @@ const DEFAULT_PROGRESS_EVERY: usize = 10;
 /// window allows. The merge poller starts stretching its own cadence when fewer
 /// than 1,500 remain (`RATE_LIMIT_LOW_WATER`); the reserve here sits 500 above
 /// that, so this job backs off before the poller must. The spacing keeps a
-/// project of that size under a thousand probes an hour regardless of quota. The
-/// largest real project's child count, and the points one un-park actually spent,
-/// are for the "set limits from measured traffic" step to record and, if
-/// needed, retune.
+/// project of that size under a thousand probes an hour regardless of quota.
+/// Replace these estimates with measured values: the child count of the largest
+/// real project and the GraphQL points one un-park actually spends (attributed to
+/// the `unpark_reconcile` GitHub caller).
 ///
 /// **When a limit fires.** Spacing only delays. The quota reserve makes the job
 /// wait up to `quota_max_wait` — once per job — for the window to recover, then
@@ -164,6 +165,12 @@ impl UnparkReconciler {
     /// Run `job` to completion (after any job already running), one item at a
     /// time. Never fails: every problem is recorded on the item it concerns.
     pub async fn run(&self, env: &UnparkEnv, job: UnparkJob) -> JobSummary {
+        // The spawned job does not inherit its spawner's task-locals, so the
+        // attribution is set where the job's own GitHub calls begin.
+        boss_gh_telemetry::scope(boss_gh_telemetry::callers::UNPARK_RECONCILE, self.run_job(env, job)).await
+    }
+
+    async fn run_job(&self, env: &UnparkEnv, job: UnparkJob) -> JobSummary {
         let _turn = self.one_job_at_a_time.lock().await;
         let total = job.items.len();
         let mut summary = JobSummary {
@@ -221,17 +228,10 @@ impl UnparkReconciler {
 }
 
 /// Whether reconciling `item_id` will reach for GitHub: a non-revision item
-/// with a bound PR in a review-phase status.
+/// with a bound PR that the merge poller lists for a refresh.
 fn touches_github(env: &UnparkEnv, item_id: &str) -> bool {
     match env.work_db.get_work_item(item_id) {
-        Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => {
-            task.kind != TaskKind::Revision
-                && task.pr_url.as_deref().is_some_and(|url| !url.is_empty())
-                && matches!(
-                    task.status,
-                    crate::work::TaskStatus::InReview | crate::work::TaskStatus::Blocked
-                )
-        }
+        Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => polled_for_pr_refresh(env, &task),
         _ => false,
     }
 }

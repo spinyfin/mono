@@ -6,9 +6,12 @@ use super::*;
 /// pipeline on demand, using the same batch admission as automatic review
 /// when fanout is enabled, and the unchanged legacy path otherwise.
 pub(super) async fn handle_trigger_pr_review(ctx: Dispatch, req: FrontendRequest) {
-    handle_trigger_pr_review_with(ctx, req, &GhPrStateChecker, |url| async move {
-        boss_github::pr_files::fetch_pr_view_json(&url, "state,baseRefOid,headRefOid,files,additions,deletions").await
-    })
+    handle_trigger_pr_review_with(
+        ctx,
+        req,
+        &GhPrStateChecker,
+        boss_engine_completion::review_admission::fetch_review_admission_metadata,
+    )
     .await;
 }
 

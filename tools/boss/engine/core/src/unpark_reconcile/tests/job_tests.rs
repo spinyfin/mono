@@ -513,3 +513,98 @@ async fn oscillating_quota_waits_only_once_per_job() {
     assert_eq!(summary.deferred_for_quota, 1);
     assert_eq!(rate_limit_phases(&f, &project).await, vec!["waiting", "deferred"]);
 }
+
+// ── a finished parent's revisions ──────────────────────────────────────────
+
+#[tokio::test]
+async fn a_revision_of_a_parent_that_merged_while_parked_is_still_reconciled() {
+    let f = Fixture::new();
+    let chore = f.chore_in_review("merged-parent", "https://github.com/foo/bar/pull/7240");
+    let revision =
+        f.db.create_revision(
+            boss_protocol::CreateRevisionInput::builder()
+                .parent_task_id(chore.clone())
+                .description("Address a finding")
+                .build(),
+            &crate::work::FakePrStateChecker::always(crate::work::PrOpenState::Open),
+        )
+        .unwrap();
+    assert_eq!(f.task(&revision.id).status, TaskStatus::Todo, "setup: an open revision");
+    f.park(&chore);
+    assert_eq!(
+        f.task(&revision.id).status,
+        TaskStatus::Todo,
+        "setup: parked with its parent"
+    );
+    f.db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET status = 'done' WHERE id = ?1", [&chore])
+        .unwrap();
+    let report = f.unpark(&chore);
+    assert!(
+        report.rows.iter().any(|row| row.id == revision.id),
+        "setup: released with its parent"
+    );
+    assert_eq!(
+        f.task(&revision.id).status,
+        TaskStatus::Todo,
+        "setup: still open before the job"
+    );
+
+    let summary = UnparkReconciler::new(fast_limits())
+        .run(&f.env, UnparkJob::for_report(&chore, &report))
+        .await;
+
+    assert_eq!(summary.with_errors, 0, "{summary:?}");
+    let revision_steps = f.event_steps(&revision.id).await;
+    assert!(
+        revision_steps.iter().any(|step| step == "reconcile_execution"),
+        "step 5 ran for the revision: {revision_steps:?}"
+    );
+    // The reconcile retires a revision whose parent finished; without step 5
+    // it would have been left open and dispatchable.
+    assert_eq!(f.task(&revision.id).status, TaskStatus::Archived);
+}
+
+// ── GitHub attribution ─────────────────────────────────────────────────────
+
+/// A probe that records the GitHub caller attribution in force when it is asked.
+struct CallerRecordingProbe {
+    inner: Arc<StubProbe>,
+    seen: std::sync::Mutex<Vec<&'static str>>,
+}
+
+#[async_trait]
+impl MergeProbe for CallerRecordingProbe {
+    async fn probe(&self, pr_url: &str) -> Result<PrLifecycleProbe> {
+        self.seen.lock().unwrap().push(boss_gh_telemetry::current_caller());
+        self.inner.probe(pr_url).await
+    }
+}
+
+#[tokio::test]
+async fn the_jobs_github_calls_are_attributed_to_the_unpark_caller() {
+    let f = Fixture::new();
+    let pr = "https://github.com/foo/bar/pull/7241";
+    let chore = f.chore_in_review("attributed", pr);
+    f.park(&chore);
+    let report = f.unpark(&chore);
+    let probe = Arc::new(CallerRecordingProbe {
+        inner: f.probe.clone(),
+        seen: std::sync::Mutex::default(),
+    });
+    let mut env = f.env.clone();
+    env.probe = probe.clone();
+
+    // Through `begin`, which spawns the job: task-locals do not cross a spawn.
+    let reconciler = Arc::new(UnparkReconciler::new(fast_limits()));
+    reconciler.begin(&env, HUMAN, &chore, report).await.await.unwrap();
+
+    let seen = probe.seen.lock().unwrap().clone();
+    assert!(!seen.is_empty(), "the job probed the PR");
+    assert!(
+        seen.iter()
+            .all(|caller| *caller == boss_gh_telemetry::callers::UNPARK_RECONCILE),
+        "{seen:?}"
+    );
+}

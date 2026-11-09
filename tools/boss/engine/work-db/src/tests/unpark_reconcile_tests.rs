@@ -663,3 +663,62 @@ fn consecutive_unproductive_streak_stops_at_the_floor() {
         .unwrap();
     assert!(none.is_empty());
 }
+
+// A CI fix that was running when the item was parked finishes normally: its
+// green report returns the parent to `in_review` through the shared clear.
+// Only the un-park re-arm refuses a parked item.
+#[test]
+fn a_parked_item_still_returns_to_in_review_when_its_running_ci_fix_goes_green() {
+    let db = open();
+    let product = create_test_product_named(&db, "ci-fix-green").id;
+    let chore = create_test_chore_manual(&db, &product, "ci fix running").id;
+    let pr = "https://github.com/foo/bar/pull/9100";
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'blocked', blocked_reason = 'ci_failure', pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![chore, pr],
+        )
+        .unwrap();
+    park(&db, &chore);
+
+    let cleared = db.clear_chore_blocked_ci_failure(&chore, pr).unwrap();
+
+    assert!(cleared.is_some(), "the in-flight fix's completion proceeds");
+    assert_eq!(task(&db, &chore).status, boss_protocol::TaskStatus::InReview);
+}
+
+#[test]
+fn the_rearm_refuses_a_parked_item_and_touches_only_the_exhausted_reason() {
+    let db = open();
+    let product = create_test_product_named(&db, "rearm").id;
+    let chore = create_test_chore_manual(&db, &product, "exhausted").id;
+    let pr = "https://github.com/foo/bar/pull/9101";
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'blocked', blocked_reason = 'ci_failure_exhausted', pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![chore, pr],
+        )
+        .unwrap();
+    park(&db, &chore);
+    assert!(db.rearm_exhausted_ci_block_unless_parked(&chore, pr).unwrap().is_none());
+    assert_eq!(
+        task(&db, &chore).blocked_reason.as_deref(),
+        Some("ci_failure_exhausted")
+    );
+
+    unpark(&db, &chore);
+    assert!(db.rearm_exhausted_ci_block_unless_parked(&chore, pr).unwrap().is_some());
+    assert_eq!(task(&db, &chore).status, boss_protocol::TaskStatus::InReview);
+
+    // A live (not exhausted) CI block is left to its fix.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'blocked', blocked_reason = 'ci_failure' WHERE id = ?1",
+            [&chore],
+        )
+        .unwrap();
+    assert!(db.rearm_exhausted_ci_block_unless_parked(&chore, pr).unwrap().is_none());
+}

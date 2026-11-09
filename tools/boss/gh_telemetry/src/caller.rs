@@ -145,6 +145,8 @@ pub mod callers {
     pub const PR_STATE_CHECK: &str = "pr_state_check";
     /// Immutable source-packet collection for PR review guides.
     pub const REVIEW_GUIDE_SOURCE_CAPTURE: &str = "review_guide_source_capture";
+    /// The background job that refreshes an un-parked item's PRs.
+    pub const UNPARK_RECONCILE: &str = "unpark_reconcile";
 }
 
 #[cfg(test)]

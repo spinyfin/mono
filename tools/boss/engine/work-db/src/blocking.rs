@@ -668,9 +668,27 @@ impl WorkDb {
     /// the matching `task_blocked_signals` rows as `cleared_at`.
     /// Idempotent — returns `Ok(None)` on WHERE-guard miss.
     pub fn clear_chore_blocked_ci_failure(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
+        self.clear_blocked_ci_failure(work_item_id, pr_url, false)
+    }
+
+    /// The un-park reconciliation's re-arm: flip a `blocked: ci_failure_exhausted`
+    /// item back to `in_review` so its refreshed attempt budget can be spent.
+    ///
+    /// Unlike [`Self::clear_chore_blocked_ci_failure`], this touches only the
+    /// exhausted reason and refuses a parked item, both checked in the same
+    /// Immediate transaction as the write, so a re-park that lands between the
+    /// reconciliation's own parked check and this write cannot be undone by it.
+    /// The shared clear has no parking guard: a CI fix that was already running
+    /// when the item was parked finishes normally, including its return to
+    /// `in_review`. Idempotent — returns `Ok(None)` on a guard miss.
+    pub fn rearm_exhausted_ci_block_unless_parked(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
+        self.clear_blocked_ci_failure(work_item_id, pr_url, true)
+    }
+
+    fn clear_blocked_ci_failure(&self, work_item_id: &str, pr_url: &str, rearm_only: bool) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if crate::parking::is_parked(&tx, work_item_id)? {
+        if rearm_only && crate::parking::is_parked(&tx, work_item_id)? {
             return Ok(None);
         }
         let now = now_string();
@@ -687,9 +705,10 @@ impl WorkDb {
               WHERE id = ?1
                 AND status = 'blocked'
                 AND blocked_reason IN ('ci_failure', 'ci_failure_exhausted')
+                AND (?4 = 0 OR blocked_reason = 'ci_failure_exhausted')
                 AND pr_url = ?2
                 AND deleted_at IS NULL",
-            params![work_item_id, pr_url, now],
+            params![work_item_id, pr_url, now, rearm_only],
         )?;
         if rows == 0 {
             tx.commit()?;

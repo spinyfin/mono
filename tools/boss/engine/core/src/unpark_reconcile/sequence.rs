@@ -303,6 +303,15 @@ pub async fn reconcile_unparked_item(env: &UnparkEnv, work_item_id: &str, github
         );
         leave_trace(env, work_item_id, &record).await;
         outcome.records.push(record);
+        // A finished parent can still have open revisions released with it
+        // (a project un-park releases done children too). The job leaves them
+        // to the parent's pass, so they get step 6 and their grace stamp here.
+        if task.kind != TaskKind::Revision {
+            let record = revisions_step(env, &task).await;
+            if record.code != "no_revisions" {
+                push(env, &mut outcome, record).await;
+            }
+        }
         return outcome;
     }
 
@@ -358,22 +367,54 @@ async fn leave_trace_best_effort(env: &UnparkEnv, work_item_id: &str, record: &S
     leave_trace(env, work_item_id, record).await;
 }
 
+/// Whether the merge poller lists `task` as a candidate for a PR refresh, which
+/// is what the targeted reconcile steps 3 and 4 run through. A non-revision
+/// `in_review` item is; a `blocked` one is only when its reason is one the
+/// poller's candidate lists carry (`merge_conflict`, `ci_failure`,
+/// `ci_failure_exhausted`, `dependency`, `review_feedback`) or it is a stranded
+/// remediation row with no reason at all. Every other hold (`worker_failed`,
+/// `awaiting_operator_answer`, `execution_recovery_failed`, `deletion_signoff`,
+/// …) is on no list: the reconcile makes no GitHub call for it, and the hold is
+/// not the PR's to resolve.
+pub(super) fn polled_for_pr_refresh(env: &UnparkEnv, task: &Task) -> bool {
+    if task.kind == TaskKind::Revision || task.pr_url.as_deref().is_none_or(str::is_empty) {
+        return false;
+    }
+    match task.status {
+        TaskStatus::InReview => true,
+        TaskStatus::Blocked => match task.blocked_reason.as_deref() {
+            Some("merge_conflict" | "ci_failure" | "ci_failure_exhausted" | "dependency" | "review_feedback") => true,
+            Some(_) => false,
+            None => env
+                .work_db
+                .list_chores_stranded_blocked_remediation()
+                .map(|rows| rows.iter().any(|row| row.work_item_id == task.id))
+                .unwrap_or(false),
+        },
+        _ => false,
+    }
+}
+
 /// Steps 3 and 4. Only a non-revision item with a bound PR in `in_review` or
-/// `blocked` has an open-PR lifecycle to refresh; a revision follows its
-/// parent's PR and the parent's own pass covers it.
+/// in a `blocked` state the merge poller watches has an open-PR lifecycle to
+/// refresh; a revision follows its parent's PR and the parent's own pass covers
+/// it.
 async fn pr_steps(env: &UnparkEnv, task: &Task, github: GithubAccess, outcome: &mut ItemOutcome) {
     let pr_url = task.pr_url.as_deref().filter(|url| !url.is_empty());
     let skip = |code: &'static str, detail: String| {
         [Step::RefreshPr, Step::ConflictProbe, Step::CiProbe, Step::AiReview]
             .map(|step| StepRecord::skipped(step, code, detail.clone()))
     };
-    let budget = if task.kind != TaskKind::Revision
-        && matches!(task.status, TaskStatus::InReview | TaskStatus::Blocked)
-        && let Some(pr_url) = pr_url
-    {
-        prepare_ci_budget(env, task, pr_url)
-    } else {
+    let polled = polled_for_pr_refresh(env, task);
+    let budget = match pr_url {
+        Some(pr_url) if polled => prepare_ci_budget(env, task, pr_url),
+        _ => String::new(),
+    };
+    // The CI budget clause, for whichever CiProbe record is written.
+    let budget_note = if budget.is_empty() {
         String::new()
+    } else {
+        format!("; CI budget: {budget}")
     };
     let skipped = match (task.kind == TaskKind::Revision, pr_url, task.status.clone(), github) {
         (true, ..) => Some(skip(
@@ -385,6 +426,16 @@ async fn pr_steps(env: &UnparkEnv, task: &Task, github: GithubAccess, outcome: &
             "no_open_pr_lifecycle",
             format!("item is {status}; it has no review-phase PR to refresh"),
         )),
+        (_, Some(_), TaskStatus::Blocked, _) if !polled => {
+            let reason = task.blocked_reason.as_deref().unwrap_or("no reason recorded");
+            Some(skip(
+                "held",
+                format!(
+                    "item is blocked ({reason}); the merge poller does not refresh the PR of that hold, so there is \
+                     nothing to probe and its CI attempt budget is left as it is"
+                ),
+            ))
+        }
         (_, Some(_), _, GithubAccess::Deferred { remaining, reserve }) => {
             let detail = format!(
                 "GitHub quota is low ({remaining} points left, below the {reserve} this job leaves for the \
@@ -448,7 +499,16 @@ async fn pr_steps(env: &UnparkEnv, task: &Task, github: GithubAccess, outcome: &
     push(env, outcome, refresh).await;
     if !open {
         for step in [Step::ConflictProbe, Step::CiProbe, Step::AiReview] {
-            let record = StepRecord::skipped(step, "pr_not_open", "the PR is not open, so there is nothing to probe");
+            let note = if step == Step::CiProbe {
+                budget_note.as_str()
+            } else {
+                ""
+            };
+            let record = StepRecord::skipped(
+                step,
+                "pr_not_open",
+                format!("the PR is not open, so there is nothing to probe{note}"),
+            );
             push(env, outcome, record).await;
         }
         return;
@@ -488,25 +548,25 @@ async fn pr_steps(env: &UnparkEnv, task: &Task, github: GithubAccess, outcome: &
         StepRecord::skipped(
             Step::CiProbe,
             "conflict_first",
-            "the PR conflicts with its base; conflict resolution runs before CI is examined",
+            format!("the PR conflicts with its base; conflict resolution runs before CI is examined{budget_note}"),
         )
     } else if ci_red && ci_before {
         StepRecord::ok(
             Step::CiProbe,
             "ci_in_flight",
-            format!("required checks are red and a CI-fix attempt is already running for the PR ({budget})"),
+            format!("required checks are red and a CI-fix attempt is already running for the PR{budget_note}"),
         )
     } else if ci_red {
         StepRecord::ok(
             Step::CiProbe,
             "ci_remediation_routed",
-            format!("required checks are red; they entered CI remediation with a fresh attempt budget ({budget})"),
+            format!("required checks are red; they entered CI remediation with a fresh attempt budget{budget_note}"),
         )
     } else {
         StepRecord::ok(
             Step::CiProbe,
             "clear",
-            format!("required checks are not red ({budget})"),
+            format!("required checks are not red{budget_note}"),
         )
     };
     push(env, outcome, conflict).await;
@@ -544,7 +604,7 @@ fn prepare_ci_budget(env: &UnparkEnv, task: &Task, pr_url: &str) -> String {
     let used = env.work_db.get_ci_attempts_used(&task.id).unwrap_or(0);
     let mut parts = Vec::new();
     if task.status == TaskStatus::Blocked && task.blocked_reason.as_deref() == Some("ci_failure_exhausted") {
-        match env.work_db.clear_chore_blocked_ci_failure(&task.id, pr_url) {
+        match env.work_db.rearm_exhausted_ci_block_unless_parked(&task.id, pr_url) {
             Ok(Some(_)) => parts.push("re-armed from ci_failure_exhausted".to_owned()),
             Ok(None) => {}
             Err(err) => tracing::warn!(work_item_id = %task.id, ?err, "unpark: could not re-arm exhausted CI block"),
@@ -629,21 +689,28 @@ async fn ai_review_step(env: &UnparkEnv, task: &Task, pr_url: &str) -> StepRecor
             ),
         );
     }
-    use boss_engine_completion::review_admission::{ReviewAdmission, admit_review};
+    use boss_engine_completion::review_admission::{ReviewAdmission, admit_review, fetch_review_admission_metadata};
     let pool = env
         .completion
         .review_batch_fanout_enabled()
         .then_some(env.completion.review_pool_size());
+    // Parking does not stop a reviewer that was already running. The legacy
+    // admission refuses to start a second execution on the item, which would
+    // read as a failed step; batch admission reports this case itself.
+    if pool.is_none() && matches!(env.work_db.get_live_execution_for_work_item(&task.id, ""), Ok(Some(_))) {
+        return StepRecord::ok(
+            Step::AiReview,
+            "in_flight",
+            "a worker is already running for this item, so no second review is started",
+        );
+    }
     match admit_review(
         &env.work_db,
         &task.id,
         Some(pr_url),
         pool,
         &StaticPrStateChecker(PrOpenState::Open),
-        |url| async move {
-            boss_github::pr_files::fetch_pr_view_json(&url, "state,baseRefOid,headRefOid,files,additions,deletions")
-                .await
-        },
+        fetch_review_admission_metadata,
     )
     .await
     {

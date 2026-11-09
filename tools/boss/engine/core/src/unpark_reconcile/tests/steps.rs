@@ -287,7 +287,12 @@ async fn a_clean_open_pr_is_left_alone_and_gets_an_ai_review_it_missed() {
 
     assert_eq!(outcome.get(Step::RefreshPr).unwrap().code, "open");
     assert_eq!(outcome.get(Step::ConflictProbe).unwrap().code, "clear");
-    assert_eq!(outcome.get(Step::CiProbe).unwrap().code, "clear");
+    let ci = outcome.get(Step::CiProbe).unwrap();
+    assert_eq!(ci.code, "clear");
+    assert_eq!(
+        ci.detail, "required checks are not red",
+        "nothing was reset, so there is no budget clause"
+    );
     let review = outcome.get(Step::AiReview).unwrap();
     assert_eq!((review.kind, review.code), (StepKind::Ok, "scheduled"), "{review:?}");
     let reviews: Vec<_> =
@@ -788,4 +793,149 @@ async fn step_7_stamps_the_grace_waiver_on_every_open_item() {
     let record = outcome.get(Step::ProgressionGrace).unwrap();
     assert_eq!((record.kind, record.code), (StepKind::Ok, "stamped"));
     assert!(f.db.progression_grace_waived_at(&chore).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn an_unobserved_pr_still_records_the_ci_budget_it_reset() {
+    let f = Fixture::new();
+    let pr = "https://github.com/foo/bar/pull/7212";
+    let chore = f.chore_in_review("budget-unobserved", pr);
+    f.db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'blocked', blocked_reason = 'ci_failure_exhausted',
+             ci_attempts_used = 3 WHERE id = ?1",
+            [&chore],
+        )
+        .unwrap();
+    f.park(&chore);
+    f.probe.set_err(pr, "gh: HTTP 502");
+
+    let outcome = f.unpark_and_reconcile(&chore).await;
+
+    let ci = outcome.get(Step::CiProbe).unwrap();
+    assert_eq!(ci.code, "pr_not_open", "{ci:?}");
+    assert!(
+        ci.detail.contains("re-armed from ci_failure_exhausted") && ci.detail.contains("attempts used reset from 3"),
+        "{}",
+        ci.detail
+    );
+}
+
+#[tokio::test]
+async fn a_conflicting_pr_still_records_the_ci_budget_it_reset() {
+    let f = Fixture::new();
+    let pr = "https://github.com/foo/bar/pull/7213";
+    let chore = f.chore_in_review("budget-conflict", pr);
+    f.db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET ci_attempts_used = 2 WHERE id = ?1", [&chore])
+        .unwrap();
+    f.park(&chore);
+    f.probe.set_with_base_head(pr, open_conflicting(), "base-1", "head-1");
+
+    let outcome = f.unpark_and_reconcile(&chore).await;
+
+    let ci = outcome.get(Step::CiProbe).unwrap();
+    assert_eq!(ci.code, "conflict_first", "{ci:?}");
+    assert!(ci.detail.contains("attempts used reset from 2"), "{}", ci.detail);
+}
+
+// ── holds the merge poller does not watch ──────────────────────────────────
+
+/// A chore with a PR bound that rests in `blocked: <reason>`, with part of its
+/// CI budget spent.
+fn pr_bound_hold(f: &Fixture, reason: &str, pr: &str) -> String {
+    let id = f.chore_in_review(&format!("hold-{reason}"), pr);
+    f.db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'blocked', blocked_reason = ?2, ci_attempts_used = 2 WHERE id = ?1",
+            rusqlite::params![id, reason],
+        )
+        .unwrap();
+    id
+}
+
+const UNWATCHED_HOLDS: [&str; 3] = ["worker_failed", "awaiting_operator_answer", "execution_recovery_failed"];
+
+#[tokio::test]
+async fn a_pr_bound_hold_the_poller_does_not_watch_is_not_refreshed_or_reported_as_an_error() {
+    for (n, reason) in UNWATCHED_HOLDS.into_iter().enumerate() {
+        let f = Fixture::new();
+        let chore = pr_bound_hold(&f, reason, &format!("https://github.com/foo/bar/pull/{}", 7220 + n));
+        f.park(&chore);
+
+        let outcome = f.unpark_and_reconcile(&chore).await;
+
+        assert!(!outcome.has_error(), "{reason}: {outcome:?}");
+        for step in [Step::RefreshPr, Step::ConflictProbe, Step::CiProbe, Step::AiReview] {
+            let record = outcome.get(step).unwrap();
+            assert_eq!(
+                (record.kind, record.code),
+                (StepKind::Skipped, "held"),
+                "{reason} {step:?}"
+            );
+        }
+        assert_eq!(
+            f.db.get_ci_attempts_used(&chore).unwrap(),
+            2,
+            "{reason}: budget untouched"
+        );
+        assert_eq!(f.task(&chore).blocked_reason.as_deref(), Some(reason));
+    }
+}
+
+#[tokio::test]
+async fn a_job_over_an_unwatched_hold_makes_no_github_call_and_spends_no_pacing() {
+    let f = Fixture::with_budget(ScriptedBudget::script(vec![Some(0)]));
+    let chore = pr_bound_hold(&f, "awaiting_operator_answer", "https://github.com/foo/bar/pull/7230");
+    f.park(&chore);
+    let report = f.unpark(&chore);
+
+    let summary = UnparkReconciler::new(UnparkLimits::builder().child_spacing(Duration::from_secs(3600)).build())
+        .run(&f.env, UnparkJob::for_report(&chore, &report))
+        .await;
+
+    assert_eq!(summary.with_errors, 0);
+    assert_eq!(summary.deferred_for_quota, 0, "the quota gate is not consulted");
+    assert_eq!(f.budget.reads(), 0);
+    assert_eq!(f.db.get_ci_attempts_used(&chore).unwrap(), 2);
+}
+
+// ── step 4: a reviewer that was running when the item was parked ───────────
+
+#[tokio::test]
+async fn a_reviewer_still_running_at_un_park_is_recorded_as_in_flight() {
+    let f = Fixture::new();
+    let pr = "https://github.com/foo/bar/pull/7231";
+    let chore = f.chore_in_review("reviewer-running", pr);
+    f.probe
+        .set_with_base_head(pr, PrLifecycleState::Open(OpenPrStatus::clean()), "base-1", "head-1");
+    let execution =
+        f.db.create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.clone())
+                .kind(boss_protocol::ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .repo_remote_url("git@github.com:foo/bar.git")
+                .build(),
+        )
+        .unwrap();
+    f.db.start_execution_run(
+        &execution.id,
+        "agent-1",
+        "repo-1",
+        "lease-1",
+        "ws-1",
+        "/workspaces/ws-1",
+    )
+    .unwrap();
+    f.park(&chore);
+
+    let outcome = f.unpark_and_reconcile(&chore).await;
+
+    let review = outcome.get(Step::AiReview).unwrap();
+    assert_eq!((review.kind, review.code), (StepKind::Ok, "in_flight"), "{review:?}");
+    assert!(!outcome.has_error(), "{outcome:?}");
 }
