@@ -113,9 +113,9 @@ async fn actual_daemon_journals_capacity_before_welcome_and_replays_offline_back
     let mut hub = Fixture::new().await;
     let daemon = hub.start();
     let first = hub.connection().await;
-    // Capacity is admitted on a 5s interval with MissedTickBehavior::Skip.
-    // The first tick is immediate; a late second tick is deferred to the next
-    // 5s boundary (10s), so 5.2s is not enough on a loaded host.
+    // The daemon journals capacity every 5s from its start (first tick
+    // immediate). Wait well past the second tick so a slow sample/append on a
+    // loaded host still lands before the daemon is stopped.
     tokio::time::sleep(std::time::Duration::from_secs(12)).await;
     drop(daemon);
     drop(first);
