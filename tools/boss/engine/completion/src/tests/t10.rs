@@ -549,6 +549,55 @@ async fn expired_worker_wait_resumes_normal_nudging() {
     assert_eq!(probes.snapshot().len(), 1);
 }
 
+/// An accepted wait pauses existing strikes; it cannot forgive them. Once
+/// the bounded grant expires, a quiet no-PR worker still fails on the next
+/// eligible sweep, with no fourth probe or new Stop needed.
+#[tokio::test]
+async fn expired_wait_with_three_prior_nudges_trips_on_the_next_sweep() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    let TestHarness {
+        handler, probes, cube, ..
+    } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let waits = Arc::new(crate::wait_registry::WaitRegistry::new());
+    let breaker = Arc::new(crate::nudge_breaker::NudgeBreaker::new());
+    let handler = handler
+        .with_wait_registry(waits.clone())
+        .with_nudge_breaker(breaker.clone());
+    for count in 1..=3 {
+        assert!(matches!(
+            handler.on_stop(&execution_id).await,
+            StopOutcome::AwaitingInput
+        ));
+        assert_eq!(breaker.counts(&execution_id), Some((count, count)));
+    }
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    waits
+        .declare(&execution_id, "job running".into(), None, 60, now)
+        .unwrap();
+    assert!(matches!(
+        handler.on_stop(&execution_id).await,
+        StopOutcome::WorkerWaitPending { .. }
+    ));
+    assert!(matches!(
+        handler.recheck_background_nudge(&execution_id).await,
+        Some(StopOutcome::WorkerWaitPending { .. })
+    ));
+    assert_eq!(breaker.counts(&execution_id), Some((3, 3)));
+
+    // Model the deadline passing without a wall-clock sleep.
+    waits
+        .declare(&execution_id, "job running".into(), None, 60, now - 61)
+        .unwrap();
+    assert!(matches!(
+        handler.recheck_background_nudge(&execution_id).await,
+        Some(StopOutcome::NudgeBreakerParked { .. })
+    ));
+    assert_eq!(probes.snapshot().len(), 3, "the trip must not send a fourth nudge");
+    assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Failed);
+    assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+}
+
 /// A worker that declares a wait and then ends its turn emits no further
 /// Stop, so only the recurring sweep can act. While the wait is unexpired
 /// the sweep must hold without probing or counting; once it lapses the sweep
