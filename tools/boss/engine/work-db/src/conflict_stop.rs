@@ -1,6 +1,16 @@
 //! Durable reasons for conflict remediation that has no working fix vehicle.
 use super::*;
 
+pub const CONFLICT_WORKSPACE_FAILURE: &str = "workspace_preparation_failed: ";
+
+pub fn conflict_workspace_failed(attempt: &ConflictResolution) -> bool {
+    attempt.status == "failed"
+        && attempt
+            .failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with(CONFLICT_WORKSPACE_FAILURE))
+}
+
 /// Record why a failed or abandoned conflict attempt stopped.
 ///
 /// The parent task's `blocked_detail` and `blocked_attempt_id` name the
@@ -94,25 +104,34 @@ fn conflict_stop_missing(conn: &rusqlite::Connection, attempt_id: &str) -> Resul
     )?)
 }
 
+/// Most recent resolution attempt that says what remediation last did.
+/// Prediction telemetry and deferral records (`deferred` rows and the
+/// `superseded` rows they become) are ledger notes, not attempts, and cannot
+/// hide a stopped remediation episode.
+pub(crate) fn latest_actionable_conflict_resolution_on(
+    conn: &rusqlite::Connection,
+    work_item_id: &str,
+) -> Result<Option<ConflictResolution>> {
+    let id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM conflict_resolutions
+              WHERE work_item_id = ?1 AND event_source != 'speculative_predicted'
+                AND status != ?2 AND deferral_end_reason IS NULL
+              ORDER BY created_at DESC, id DESC LIMIT 1",
+            params![work_item_id, crate::conflict_deferral::CONFLICT_STATUS_DEFERRED],
+            |row| row.get(0),
+        )
+        .optional()?;
+    id.map(|id| query_conflict_resolution(conn, &id))
+        .transpose()
+        .map(Option::flatten)
+}
+
 #[work_db_boundary::instrument]
 impl WorkDb {
-    /// The newest attempt that is not telemetry: speculative predictions and
-    /// deferral records cannot hide a stopped remediation episode.
+    /// See [`latest_actionable_conflict_resolution_on`].
     pub fn latest_actionable_conflict_resolution(&self, work_item_id: &str) -> Result<Option<ConflictResolution>> {
-        let conn = self.connect()?;
-        let id: Option<String> = conn
-            .query_row(
-                "SELECT id FROM conflict_resolutions
-                  WHERE work_item_id = ?1 AND event_source != 'speculative_predicted'
-                    AND status != 'deferred' AND deferral_end_reason IS NULL
-                  ORDER BY created_at DESC, id DESC LIMIT 1",
-                [work_item_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        id.map(|id| query_conflict_resolution(&conn, &id))
-            .transpose()
-            .map(Option::flatten)
+        latest_actionable_conflict_resolution_on(&*self.connect()?, work_item_id)
     }
 
     /// Repair older terminal rows that predate durable blocked details. This
@@ -132,5 +151,117 @@ impl WorkDb {
         }
         tx.commit()?;
         Ok(missing)
+    }
+
+    /// Before structured pre-start failures were attached to the attempt,
+    /// dispatch retained the preparation stage and full error on the revision.
+    /// Use that persisted stage, never text matching on Cube's diagnostic.
+    pub fn retain_conflict_revision_workspace_failure(&self, attempt_id: &str) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let error: Option<(String, String)> = tx
+            .query_row(
+                "SELECT t.dispatch_failed_error, t.id FROM conflict_resolutions current
+             JOIN conflict_resolutions prior ON prior.work_item_id = current.work_item_id
+             JOIN tasks t ON t.id = prior.revision_task_id
+             WHERE current.id = ?1
+               AND ((current.status IN ('pending', 'running') AND prior.id = current.id)
+                 OR (current.status = 'abandoned' AND current.failure_reason = 'churn_threshold_exceeded'
+                     AND prior.head_sha_before IS current.head_sha_before))
+               AND t.dispatch_failed_reason IN ('cube_workspace_positioning_failed', 'cube_workspace_lease_failed')
+               AND t.dispatch_failed_error IS NOT NULL
+             ORDER BY prior.created_at DESC, prior.id DESC LIMIT 1",
+                [attempt_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((error, revision)) = error else {
+            return Ok(false);
+        };
+        tx.execute(
+            "UPDATE conflict_resolutions SET status = 'failed', failure_reason = ?2,
+            finished_at = COALESCE(finished_at, ?3), resolved_by_rung = NULL, revision_task_id = ?4 WHERE id = ?1",
+            params![
+                attempt_id,
+                format!("{CONFLICT_WORKSPACE_FAILURE}{error}"),
+                now_string(),
+                revision
+            ],
+        )?;
+        surface_conflict_stop(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Preserve Cube's full diagnostic, independent of worker liveness. Repeated
+    /// observations of the same failed attempt do not mint another terminal state.
+    pub fn fail_conflict_workspace(&self, attempt_id: &str, error: &str) -> Result<Option<ConflictResolution>> {
+        self.mark_conflict_resolution_failed(attempt_id, &format!("{CONFLICT_WORKSPACE_FAILURE}{error}"))
+    }
+
+    pub fn conflict_resolution_for_revision(&self, revision_id: &str) -> Result<Option<ConflictResolution>> {
+        let conn = self.connect()?;
+        let id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM conflict_resolutions WHERE revision_task_id = ?1
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+                [revision_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        id.map(|id| query_conflict_resolution(&conn, &id))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    /// Called only after Cube has successfully prepared the workspace again.
+    /// Keep the old revision and its failure records until that positive evidence
+    /// exists; then retire it and reuse the attempt without consuming the churn cap.
+    pub fn resume_conflict_workspace(
+        &self,
+        attempt_id: &str,
+        head: Option<&str>,
+        base: Option<&str>,
+    ) -> Result<Option<ConflictResolution>> {
+        let Some(attempt) = self
+            .get_conflict_resolution(attempt_id)?
+            .filter(conflict_workspace_failed)
+        else {
+            return Ok(None);
+        };
+        if let Some(revision) = &attempt.revision_task_id {
+            if self.is_conflict_revision_running_or_queued(revision)? {
+                return Ok(None);
+            }
+            self.close_moot_revision_task(
+                revision,
+                ArchiveProvenance::new(
+                    ARCHIVE_MECHANISM_CONFLICT_WATCH_SUPERSESSION,
+                    "workspace preparation recovered",
+                ),
+            )?;
+        }
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let rows = tx.execute(
+            "UPDATE conflict_resolutions SET status = 'pending', failure_reason = NULL,
+                 finished_at = NULL, revision_task_id = NULL,
+                 head_sha_before = COALESCE(?3, head_sha_before), base_sha_at_trigger = COALESCE(?4, base_sha_at_trigger)
+             WHERE id = ?1 AND status = 'failed' AND failure_reason = ?2",
+            params![attempt_id, attempt.failure_reason, head, base],
+        )?;
+        if rows == 0 {
+            return Ok(None);
+        }
+        tx.execute("UPDATE tasks SET blocked_detail = NULL WHERE id = ?1 AND blocked_attempt_id = ?2 AND blocked_reason = 'merge_conflict'",
+            params![attempt.work_item_id, attempt_id])?;
+        dispatch_helpers::resolve_attention_kind_in_tx(
+            &tx,
+            &attempt.work_item_id,
+            CONFLICT_REMEDIATION_STOPPED_ATTENTION_KIND,
+        )?;
+        let resumed = query_conflict_resolution(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(resumed)
     }
 }

@@ -40,7 +40,8 @@
 //!   deliberately leaves its attempt `pending` for a later tick to retry —
 //!   [`LadderOutcome::MechanicalRungsUnavailable`], i.e. a rung-1 lease
 //!   failure — holds its slot for [`DEFAULT_REMEDIATION_COOLDOWN`] so the
-//!   retry doesn't become a storm. Every other exit
+//!   retry doesn't become a storm. Failed workspace preparation uses the
+//!   same cooldown for preparation-only recovery probes. Every other exit
 //!   ([`RemediationDisposition::Settled`]) releases the slot immediately: a
 //!   *new* conflict on the same PR must never be declined because an
 //!   unrelated, already-concluded remediation happened to finish seconds ago.
@@ -100,11 +101,12 @@ pub const MAX_CONCURRENT_CONFLICT_REMEDIATIONS: usize = 2;
 /// How long a PR is held out of the queue after a ladder run that
 /// **deliberately left its attempt `pending` for a later tick to retry** —
 /// [`LadderOutcome::MechanicalRungsUnavailable`], the rung-1 lease failure.
+/// Failed workspace preparation also uses this interval for recovery probes.
 /// Without it, every adaptive per-PR reconcile — 40 s apart on a hot PR —
 /// would queue another full ladder run against a PR whose last one failed
 /// seconds ago.
 ///
-/// Deliberately **not** applied to any other exit. A run that concluded —
+/// Deliberately **not** applied to exits with no recovery probe owed. A run that concluded —
 /// retired the conflict, halted for sign-off, spawned a worker revision, or
 /// aborted because the attempt/PR moved on — has nothing outstanding, so
 /// holding its PR for another three minutes only delays remediation of a
@@ -144,7 +146,8 @@ pub enum RemediationDisposition {
     /// `revision_task_id` for a later detection tick to retry
     /// ([`LadderOutcome::MechanicalRungsUnavailable`]). This is the retry
     /// storm [`DEFAULT_REMEDIATION_COOLDOWN`] exists for, and the only
-    /// outcome that pays it.
+    /// outcome that pays it. A terminal workspace failure also owes a
+    /// preparation-only recovery probe and uses this disposition.
     RetryAfterCooldown,
 }
 
@@ -228,10 +231,11 @@ impl LadderRemediationJob {
     fn abort_reason(&self, candidate: &PendingMergeCheck, attempt: &ConflictResolution) -> Option<String> {
         match self.work_db.get_conflict_resolution(&attempt.id) {
             Ok(Some(current)) => {
-                if !matches!(current.status.as_str(), "pending" | "running") {
+                let workspace_failed = crate::work::conflict_workspace_failed(&current);
+                if !matches!(current.status.as_str(), "pending" | "running") && !workspace_failed {
                     return Some(format!("attempt is now `{}`, no longer live", current.status));
                 }
-                if current.revision_task_id.is_some() {
+                if current.revision_task_id.is_some() && !workspace_failed {
                     return Some("attempt already has a revision task; another vehicle owns the fix".to_owned());
                 }
             }
@@ -290,6 +294,22 @@ impl ConflictRemediationJob for LadderRemediationJob {
             );
             return RemediationDisposition::Settled;
         }
+        if crate::work::conflict_workspace_failed(&attempt) {
+            return if crate::conflict_workspace::recover(
+                &self.work_db,
+                self.publisher.as_ref(),
+                self.cube_client.as_ref(),
+                &candidate,
+                &attempt,
+                &probe,
+            )
+            .await
+            {
+                RemediationDisposition::Settled
+            } else {
+                RemediationDisposition::RetryAfterCooldown
+            };
+        }
         let outcome = conflict_ladder::try_mechanical_rungs(
             self.work_db.as_ref(),
             self.publisher.as_ref(),
@@ -330,6 +350,7 @@ impl ConflictRemediationJob for LadderRemediationJob {
                 );
                 RemediationDisposition::Settled
             }
+            LadderOutcome::WorkspacePreparationFailed => RemediationDisposition::RetryAfterCooldown,
             LadderOutcome::MechanicalRungsUnavailable => {
                 // Same contract as the inline path: spawn nothing, leave the
                 // attempt `pending` with no `revision_task_id` so a later

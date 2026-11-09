@@ -2571,7 +2571,27 @@ impl ExecutionCoordinator {
             .downcast_ref::<boss_host_execution::cube::CubeCliError>()
             .and_then(|error| error.refusal_message())
             .unwrap_or_else(|| error_text.clone());
-        let retry_delays: &[std::time::Duration] = if positioning_refused {
+        // A typed Cube failure during preparation cannot be repaired by
+        // replacing the conflict revision. Preserve it on the owning attempt
+        // before the watcher can mistake this execution for a stale worker.
+        // A structured positioning refusal is not such a failure: its
+        // attention kind was replaced above, so it keeps the durable
+        // positioning-refused hold and that hold's own recheck sweep.
+        let conflict_workspace = if matches!(
+            attention_kind,
+            "cube_workspace_positioning_failed" | "cube_workspace_lease_failed"
+        ) && error.is::<crate::cube_commands::CubeCliError>()
+        {
+            self.work_db
+                .conflict_resolution_for_revision(&execution.work_item_id)?
+                .filter(|attempt| {
+                    matches!(attempt.status.as_str(), "pending" | "running")
+                        || boss_work_db::conflict_workspace_failed(attempt)
+                })
+        } else {
+            None
+        };
+        let retry_delays: &[std::time::Duration] = if positioning_refused || conflict_workspace.is_some() {
             &[]
         } else {
             &self.pre_start_retry_delays
@@ -2607,6 +2627,21 @@ impl ExecutionCoordinator {
                 return Err(bookkeeping_error.context(PreStartFailureReported));
             }
         };
+
+        if let Some(attempt) = &conflict_workspace {
+            self.work_db.fail_conflict_workspace(&attempt.id, &error_text)?;
+            self.work_db.update_work_item_as_actor(
+                &execution.work_item_id,
+                boss_work_db::WorkItemPatch {
+                    status: Some("blocked".into()),
+                    blocked_reason: Some("merge_conflict".into()),
+                    blocked_detail: Some(error_text.clone()),
+                    autostart: Some(false),
+                    ..Default::default()
+                },
+                "engine",
+            )?;
+        }
 
         // The tracing log alone is not enough: `bossctl dispatch diagnose`
         // and the stage-stalled detector read the dispatch event stream, and
@@ -2662,6 +2697,31 @@ impl ExecutionCoordinator {
                 });
             }
             PreStartFailureOutcome::PermanentFail => {
+                if let Some(attempt) = conflict_workspace {
+                    self.publisher
+                        .publish_work_item_changed(
+                            &attempt.product_id,
+                            &attempt.work_item_id,
+                            "conflict_workspace_failed",
+                        )
+                        .await;
+                    self.publisher
+                        .publish_work_item_changed(
+                            &attempt.product_id,
+                            &execution.work_item_id,
+                            "conflict_workspace_failed",
+                        )
+                        .await;
+                    self.publisher
+                        .publish(
+                            &execution.id,
+                            &execution.work_item_id,
+                            execution.status.as_str(),
+                            "execution_start_failed",
+                        )
+                        .await;
+                    return Ok(());
+                }
                 self.surface_permanent_start_failure(PermanentStartFailure {
                     execution: &execution,
                     run: run.as_ref(),

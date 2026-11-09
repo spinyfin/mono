@@ -91,13 +91,16 @@ pub(crate) fn clear_resolved_signal_in_tx(
     } else {
         None
     };
-    let conflict = if !ci {
-        ids.first()
-            .map(|id| query_conflict_resolution(conn, id))
-            .transpose()?
-            .flatten()
-    } else {
+    // A workspace-failed attempt is terminal, but no revision could be
+    // prepared for it and it still owns the episode: a mergeable PR retires
+    // it exactly like a live attempt.
+    let conflict = if ci {
         None
+    } else if let Some(id) = ids.first() {
+        query_conflict_resolution(conn, id)?
+    } else {
+        crate::conflict_stop::latest_actionable_conflict_resolution_on(conn, item)?
+            .filter(crate::conflict_stop::conflict_workspace_failed)
     };
     let queue = attempt
         .as_ref()
@@ -149,14 +152,18 @@ pub(crate) fn clear_resolved_signal_in_tx(
     };
     let retire_conflict = conflict
         .as_ref()
-        .is_some_and(|a| a.status == "running" || task_transitioned || a.revision_task_id.is_some());
+        .is_some_and(|a| {
+            a.status == "running"
+                || task_transitioned
+                || a.revision_task_id.is_some()
+                || crate::conflict_stop::conflict_workspace_failed(a)
+        });
     let retire = if ci { attempt.is_some() } else { retire_conflict };
     if retire {
-        let id = &ids[0];
-        if ci {
-            mark_ci_remediation_succeeded_in_tx(conn, id, None)?;
+        if let Some(conflict) = &conflict {
+            mark_conflict_resolution_succeeded_at_rung_in_tx(conn, &conflict.id, None, RUNG_FULL_WORKER)?;
         } else {
-            mark_conflict_resolution_succeeded_at_rung_in_tx(conn, id, None, RUNG_FULL_WORKER)?;
+            mark_ci_remediation_succeeded_in_tx(conn, &ids[0], None)?;
         }
         let revision = attempt
             .as_ref()
@@ -239,10 +246,9 @@ pub(crate) fn clear_resolved_signal_in_tx(
         } else {
             None
         },
-        conflict_attempt: if retire && !ci {
-            query_conflict_resolution(conn, &ids[0])?
-        } else {
-            None
+        conflict_attempt: match &conflict {
+            Some(conflict) if retire => query_conflict_resolution(conn, &conflict.id)?,
+            _ => None,
         },
     })))
 }

@@ -14,6 +14,9 @@ use crate::work::{
 use boss_execution_contracts::RebaseOutcome;
 use boss_host_execution::types::{CubeRepoHandle, CubeWorkspaceLease};
 
+#[path = "conflict_workspace_tests.rs"]
+mod workspace_tests;
+
 /// What the scripted cube double's `rebase_workspace` returns.
 #[derive(Clone)]
 enum Script {
@@ -22,6 +25,7 @@ enum Script {
     Conflicts(Vec<String>),
     EnsureRepoErrors,
     RebaseErrors,
+    GotoDivergence,
 }
 
 /// Configurable [`CubeClient`] double for the rung-1 harness. Records the
@@ -141,6 +145,12 @@ crate::stub_cube_client! { ScriptCube {
     }
     async fn goto_workspace(&self, _workspace_path: &std::path::Path, pr: u64) -> Result<()> {
         self.gotos.lock().await.push(pr);
+        if matches!(self.script, Script::GotoDivergence) {
+            return Err(boss_host_execution::cube::CubeCliError {
+                host: "local".into(), exit_code: Some(1), stdout: String::new(),
+                stderr: "cube will not pick a side with unique content; inspect with jj log; resolve with jj bookmark set pr/42 -r head --allow-backwards".into(),
+            }.into());
+        }
         Ok(())
     }
     async fn rebase_workspace(&self, _workspace_path: &std::path::Path, pr: u64) -> Result<RebaseOutcome> {
@@ -160,6 +170,7 @@ crate::stub_cube_client! { ScriptCube {
                 Ok(RebaseOutcome { clean: false, pushed: false, conflicted_files: files.clone(), linearized_commits: 0, linearize_decline: None })
             }
             Script::RebaseErrors => anyhow::bail!("rebase boom"),
+            Script::GotoDivergence => unreachable!("goto must refuse before rebase"),
             Script::EnsureRepoErrors => unreachable!("ensure_repo already errored"),
         }
     }
