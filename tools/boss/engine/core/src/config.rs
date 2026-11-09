@@ -1118,4 +1118,66 @@ mod tests {
         let socket = tmux_socket_path_beside_db(Path::new("/tmp/x/state.db")).unwrap();
         assert_eq!(socket, Path::new("/tmp/x/tmux.sock"));
     }
+
+    fn progression_with(
+        vars: &[(&str, &str)],
+    ) -> anyhow::Result<boss_engine_storage_values::progression::ProgressionSettings> {
+        let vars: Vec<(String, String)> = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        super::load_progression_settings(&|name: &str| {
+            vars.iter().find(|(k, _)| k == name).map(|(_, v)| OsString::from(v))
+        })
+    }
+
+    #[test]
+    fn progression_settings_default_to_the_placeholders_and_accept_each_override() {
+        use boss_engine_storage_values::progression::ProgressionSettings;
+        assert_eq!(progression_with(&[]).unwrap(), ProgressionSettings::default());
+
+        let settings = progression_with(&[
+            ("BOSS_PROGRESSION_POOL_SIZE", "2"),
+            ("BOSS_PROGRESSION_SWEEP_INTERVAL_SECS", "11"),
+            ("BOSS_PROGRESSION_STUCK_AFTER_SECS", "22"),
+            ("BOSS_PROGRESSION_COOLDOWN_SECS", "33"),
+            ("BOSS_PROGRESSION_MAX_CREATES_PER_ITEM_WINDOW", "4"),
+            ("BOSS_PROGRESSION_MAX_CREATES_WINDOW_SECS", "55"),
+            ("BOSS_PROGRESSION_RUN_TIMEOUT_SECS", "66"),
+        ])
+        .unwrap();
+        assert_eq!(settings.pool_size, 2);
+        assert_eq!(settings.sweep_interval_secs, 11);
+        assert_eq!(settings.stuck_after_secs, 22);
+        assert_eq!(settings.cooldown_secs, 33);
+        assert_eq!(settings.max_creates_per_item_window, 4);
+        assert_eq!(settings.max_creates_window_secs, 55);
+        assert_eq!(settings.run_timeout_secs, 66);
+    }
+
+    #[test]
+    fn progression_settings_reject_zero_unparsable_and_out_of_range_values() {
+        for name in [
+            "BOSS_PROGRESSION_POOL_SIZE",
+            "BOSS_PROGRESSION_SWEEP_INTERVAL_SECS",
+            "BOSS_PROGRESSION_STUCK_AFTER_SECS",
+            "BOSS_PROGRESSION_COOLDOWN_SECS",
+            "BOSS_PROGRESSION_MAX_CREATES_PER_ITEM_WINDOW",
+            "BOSS_PROGRESSION_MAX_CREATES_WINDOW_SECS",
+            "BOSS_PROGRESSION_RUN_TIMEOUT_SECS",
+        ] {
+            let zero = progression_with(&[(name, "0")]).unwrap_err().to_string();
+            assert!(zero.contains(name) && zero.contains("greater than zero"), "{zero}");
+            let junk = progression_with(&[(name, "soon")]).unwrap_err().to_string();
+            assert!(junk.contains(name), "{junk}");
+        }
+        let too_big = progression_with(&[("BOSS_PROGRESSION_MAX_CREATES_PER_ITEM_WINDOW", "4294967296")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            too_big.contains("BOSS_PROGRESSION_MAX_CREATES_PER_ITEM_WINDOW"),
+            "{too_big}"
+        );
+        let huge_secs = progression_with(&[("BOSS_PROGRESSION_COOLDOWN_SECS", "18446744073709551615")])
+            .unwrap_err()
+            .to_string();
+        assert!(huge_secs.contains("BOSS_PROGRESSION_COOLDOWN_SECS"), "{huge_secs}");
+    }
 }

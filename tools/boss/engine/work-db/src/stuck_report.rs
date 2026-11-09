@@ -72,6 +72,9 @@ pub(super) fn build(
     // The progression footprint of every item, read once: a per-item read would
     // evaluate the view once for each stuck item in the report.
     let progression_runs = super::progression_candidates::run_states(conn)?;
+    // Likewise the dependency rule: one pass over the view, not one per item.
+    let shared = super::progression_candidates::shared_clauses(conn)?;
+    let progressing_prerequisite = |id: &str| shared.get(id).is_some_and(|clauses| clauses.dependency_held);
     let mut rows = Vec::new();
     let mut unconverted = 0;
     for id in ids {
@@ -136,7 +139,9 @@ pub(super) fn build(
         if let Some(parked_at) = parked_holder.as_ref().and_then(|holder| holder.parked_at) {
             (changed_at, legacy) = (parked_at, false);
         }
-        let human = human_hold(conn, &task, failure_basis.as_deref(), now)?;
+        // Clause 1 of the progression predicate is the one definition of a
+        // human hold; a parked item is already handled by `parked_holder`.
+        let human = parked_holder.is_none() && shared.get(&id).is_some_and(|clauses| !clauses.eligible);
         if declared && !human && parked_holder.is_none() {
             unconverted += 1;
         }
@@ -163,7 +168,7 @@ pub(super) fn build(
             .any(|reason| boss_engine_storage_values::dispatch_wait::is_capacity_wait_reason(reason));
         let progression = progression_runs.get(&id).copied().unwrap_or_default();
         let classification = classification(conn, &task, wait.as_deref())?;
-        let dependency = task.blocked_reason.as_deref() == Some("dependency") && progressing_prerequisite(conn, &id)?;
+        let dependency = task.blocked_reason.as_deref() == Some("dependency") && progressing_prerequisite(&id);
         let bucket = if parked_holder.is_some() {
             StuckBucket::Parked
         } else if human || matches!(classification.as_str(), "S18_pr_behind" | "awaiting_merge") {
@@ -183,14 +188,13 @@ pub(super) fn build(
             // infrastructure failure, so the sweep no longer nominates it. The
             // engine has admitted defeat; this counts as waiting on a human.
             StuckBucket::ProgressionFailing
-        } else if progression.live || progression.in_cooldown {
-            // An agent is working the item, or has just been and the item is
-            // inside the cooldown that follows a run (four times as long after a
+        } else if progression.live || progression.in_completed_cooldown {
+            // An agent is working the item, or has just finished and the item is
+            // inside the cooldown that follows a completed run (four times as long after a
             // run that judged the item not stuck).
             StuckBucket::ProgressionInFlight
         } else if super::stuck_activity::has_pending_execution(conn, &id)?
-            || (super::stuck_activity::has_waiting_dependency_execution(conn, &id)?
-                && progressing_prerequisite(conn, &id)?)
+            || (super::stuck_activity::has_waiting_dependency_execution(conn, &id)? && progressing_prerequisite(&id))
         {
             // Queued/ready dispatch is active work, including chain-serialization
             // holds. A waiting_dependency row is active only while its gate is
@@ -308,53 +312,6 @@ pub(super) fn latest_basis(conn: &Connection, id: &str, property: &str) -> Resul
         .optional()?)
 }
 
-fn human_hold(conn: &Connection, task: &Task, failure_basis: Option<&str>, now: i64) -> Result<bool> {
-    let open_question: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM operator_questions WHERE work_item_id = ?1 AND status = 'open')",
-        [&task.id],
-        |r| r.get(0),
-    )?;
-    let autostart_actor: String = conn.query_row(
-        "SELECT actor FROM task_status_audit WHERE work_item_id = ?1 AND property = 'autostart' ORDER BY id DESC LIMIT 1",
-        [&task.id], |r| r.get(0),
-    ).optional()?.unwrap_or_else(|| task.last_status_actor.clone());
-    let human_autostart = !autostart_actor
-        .parse::<boss_protocol::StatusActor>()
-        .ok()
-        .is_some_and(boss_protocol::StatusActor::is_engine_cascade);
-    let execution = query_latest_execution_for_work_item(conn, &task.id)?;
-    let queued_wait = super::queued_wait::for_execution(conn, execution.as_ref(), now)?
-        .reason
-        .is_some();
-    let actor: String = conn
-        .query_row(
-            "SELECT actor FROM task_status_audit
-             WHERE work_item_id = ?1 AND property = 'status' ORDER BY id DESC LIMIT 1",
-            [&task.id],
-            |r| r.get(0),
-        )
-        .optional()?
-        .unwrap_or_else(|| task.last_status_actor.clone());
-    let manual_block = !actor
-        .parse::<boss_protocol::StatusActor>()
-        .ok()
-        .is_some_and(boss_protocol::StatusActor::is_engine_cascade);
-    Ok(open_question
-        || query_live_execution_for_work_item(conn, &task.id)?
-            .is_some_and(|e| e.status == ExecutionStatus::WaitingHuman)
-        || task.blocked_reason.as_deref() == Some("deletion_signoff")
-        || (task.status == TaskStatus::Blocked && task.blocked_reason.is_none() && manual_block)
-        || task.deferred
-        || (task.human_driven && !task.status.is_terminal())
-        || (task.blocked_reason.as_deref() == Some("worker_failed") && failure_basis == Some("operator_no"))
-        || (task.status == TaskStatus::Todo
-            && !task.autostart
-            && human_autostart
-            && !queued_wait
-            && task.dispatch_failed_reason.is_none()
-            && task.blocked_reason.is_none()))
-}
-
 /// `true` when a gating prerequisite of `id`, or transitively of one of those,
 /// is parked. The walk is over unsatisfied `blocks` edges only, so it stops at
 /// finished work; `seen` bounds it against a dependency cycle.
@@ -368,15 +325,6 @@ fn has_parked_prerequisite(conn: &Connection, id: &str, seen: &mut BTreeSet<Stri
         }
     }
     Ok(false)
-}
-
-/// Whether progress is going through a prerequisite of `id` rather than through
-/// `id` itself: an open prerequisite is live, parked, or a progression
-/// candidate. This reads `progression_candidate_clauses` so the report, the
-/// sweep and `bossctl dispatch diagnose` share one definition (design 2.1
-/// clause 4).
-fn progressing_prerequisite(conn: &Connection, id: &str) -> Result<bool> {
-    super::progression_candidates::dependency_held(conn, id)
 }
 
 /// Classify durable reasons before applying an owned host liveness observation.

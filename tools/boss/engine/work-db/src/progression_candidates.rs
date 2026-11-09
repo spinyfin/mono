@@ -121,16 +121,6 @@ pub(super) const GRACE_COLUMN_MIGRATION_ID: &str = "20261106_1200_progression_gr
 pub(super) const EXECUTION_PROVENANCE_MIGRATION_ID: &str = "20261106_1205_execution_created_via";
 pub(super) const VIEWS_MIGRATION_ID: &str = "20261106_1210_progression_candidate_views";
 
-/// Add `tasks.progression_grace_waived_at`: epoch seconds, set when a producer
-/// waives the `progression.stuck_after` grace for an item (a worker-declared
-/// blocker, an un-park) and cleared when the sweep consumes it.
-pub(super) fn migrate_grace_column(conn: &Connection) -> Result<()> {
-    if !crate::schema_init::table_has_column(conn, "tasks", "progression_grace_waived_at")? {
-        conn.execute_batch("ALTER TABLE tasks ADD COLUMN progression_grace_waived_at TEXT")?;
-    }
-    Ok(())
-}
-
 /// Add `work_executions.created_via`: which producer minted the execution. Only
 /// the `progression_sweep` sets it today; a NULL value means an execution minted
 /// by the ordinary reconcile and request paths.
@@ -165,11 +155,10 @@ const DROP_VIEWS: &str = "DROP VIEW IF EXISTS progression_candidates;
          DROP VIEW IF EXISTS progression_chain_roots;
          DROP VIEW IF EXISTS progression_prereq_task_edges;";
 
-/// Drop the views. The views read the task status ledger, and SQLite re-parses
-/// every view when an `ALTER TABLE` runs, so a test that simulates an older
-/// database by dropping the ledger drops these first; reopening the database
-/// recreates them from [`views_sql`] during [`WorkDb::init`].
-#[cfg(test)]
+/// Drop the views. SQLite re-parses every view when an `ALTER TABLE` runs, so
+/// [`WorkDb::init`] drops them before the migration runner and recreates them
+/// from [`views_sql`] afterwards; a test that simulates an older database by
+/// dropping a table they read drops them first too.
 pub(crate) fn drop_views(conn: &Connection) -> Result<()> {
     conn.execute_batch(DROP_VIEWS)?;
     Ok(())
@@ -197,9 +186,8 @@ fn open_attention_sql(a: &str, kind_predicate: &str) -> String {
     )
 }
 
-/// The stuck report's "waiting on a human" holds, in SQL. Mirrors
-/// `stuck_report::human_hold`; the test module checks the two against the same
-/// fixtures.
+/// The "waiting on a human" holds, in SQL. This is the one definition: the stuck
+/// report reads clause 1 from the clause view rather than keeping a Rust copy.
 fn human_held_sql(a: &str) -> String {
     // COALESCE: a NULL `blocked_reason` makes several terms NULL, and a NULL hold
     // must read as "not held", not poison the clause that negates it.
@@ -513,26 +501,44 @@ fn real_candidates_view_sql() -> String {
 /// minted for this item inside the rolling window, identified by
 /// `created_via LIKE 'progression:%'` (design 2.4).
 fn create_budget_exhausted_sql(a: &str, max_creates: &str, window: &str) -> String {
+    // Two indexed arms (children by parent, precursors by dependent) rather than
+    // one scan of every task with an OR across both relations.
     format!(
-        "(SELECT COUNT(*) FROM tasks created
-          WHERE created.created_via LIKE 'progression:%'
-            AND created.deleted_at IS NULL
-            AND CAST(created.created_at AS INTEGER) > {NOW} - ({window})
-            AND (created.parent_task_id = {a}.id
-                 OR EXISTS (SELECT 1 FROM work_item_dependencies d
-                            WHERE d.dependent_id = {a}.id AND d.prerequisite_id = created.id)))
+        "(SELECT COUNT(*) FROM (
+              SELECT created.id FROM tasks created
+              WHERE created.parent_task_id = {a}.id
+                AND created.created_via LIKE 'progression:%'
+                AND created.deleted_at IS NULL
+                AND CAST(created.created_at AS INTEGER) > {NOW} - ({window})
+              UNION
+              SELECT created.id FROM work_item_dependencies d
+              JOIN tasks created ON created.id = d.prerequisite_id
+              WHERE d.dependent_id = {a}.id
+                AND created.created_via LIKE 'progression:%'
+                AND created.deleted_at IS NULL
+                AND CAST(created.created_at AS INTEGER) > {NOW} - ({window})))
          >= ({max_creates})"
     )
 }
 
 /// Whether the item is inside the cooldown after a progression run. The cooldown
 /// is measured from the end of the run (its creation while it has not ended), a
-/// run that was cancelled before it started does not start one, and a run that
-/// judged the item not stuck (`no_changes_needed`) earns the longer cooldown.
-fn in_cooldown_sql(a: &str, cooldown: &str) -> String {
+/// run that was cancelled before it started does not start one, a run the engine
+/// withdrew before it ever started (`abandoned` with no `started_at`) is not an
+/// attempt at all, and a run that judged the item not stuck
+/// (`no_changes_needed`) earns the longer cooldown. `completed_only` restricts
+/// the runs to ones that reached `completed`: the cooldown the stuck report
+/// treats as "being handled" (design 3.2), as opposed to the broader one that
+/// only throttles nomination.
+fn in_cooldown_sql(a: &str, cooldown: &str, completed_only: bool) -> String {
+    let status_filter = if completed_only {
+        "px.status = 'completed'"
+    } else {
+        "px.status <> 'cancelled' AND NOT (px.status = 'abandoned' AND px.started_at IS NULL)"
+    };
     format!(
         "EXISTS (SELECT 1 FROM work_executions px
-                 WHERE px.work_item_id = {a}.id AND px.kind = 'progression' AND px.status <> 'cancelled'
+                 WHERE px.work_item_id = {a}.id AND px.kind = 'progression' AND {status_filter}
                    AND COALESCE(CAST(px.finished_at AS INTEGER), CAST(px.created_at AS INTEGER))
                        + ({cooldown}) * (CASE WHEN px.run_done_outcome = 'no_changes_needed'
                                               THEN {NO_ACTION_COOLDOWN_MULTIPLIER} ELSE 1 END) > {NOW})"
@@ -547,6 +553,7 @@ fn infrastructure_failing_sql(a: &str) -> String {
             format!(
                 "COALESCE((SELECT fx.status FROM work_executions fx
                            WHERE fx.work_item_id = {a}.id AND fx.kind = 'progression' AND fx.status <> 'cancelled'
+                             AND NOT (fx.status = 'abandoned' AND fx.started_at IS NULL)
                            ORDER BY fx.created_at DESC, fx.id DESC LIMIT 1 OFFSET {offset})
                           IN {INFRASTRUCTURE_FAILED}, 0)"
             )
@@ -560,13 +567,15 @@ fn infrastructure_failing_sql(a: &str) -> String {
 /// runs all died. They depend only on the item's own progression executions, so
 /// the stuck report reads them from their own cheap view.
 fn run_state_select(cooldown: &str) -> String {
-    let in_cooldown = in_cooldown_sql("t", cooldown);
+    let in_cooldown = in_cooldown_sql("t", cooldown, false);
+    let in_completed_cooldown = in_cooldown_sql("t", cooldown, true);
     let infrastructure_failing = infrastructure_failing_sql("t");
     format!(
         "EXISTS (SELECT 1 FROM work_executions lx
                  WHERE lx.work_item_id = t.id AND lx.kind = 'progression'
                    AND lx.status IN {LIVE_OR_PENDING}) AS progression_live,
          {in_cooldown} AS in_cooldown,
+         {in_completed_cooldown} AS in_completed_cooldown,
          ({infrastructure_failing}) AS infrastructure_failing"
     )
 }
@@ -952,17 +961,6 @@ impl WorkDb {
         tx.commit()?;
         Ok(mint)
     }
-
-    /// Waive the `progression.stuck_after` grace for `work_item_id` once: the
-    /// sweep nominates it as soon as it is otherwise a candidate, and consumes
-    /// the stamp when it does. Used when an owner un-parks an item. Stamps with
-    /// the database clock so the stamp can never read as older than the ledger
-    /// row written in the same statement.
-    pub fn waive_progression_grace(&self, work_item_id: &str) -> Result<()> {
-        let conn = self.connect()?;
-        waive_grace(&conn, work_item_id)?;
-        Ok(())
-    }
 }
 
 /// What one [`WorkDb::mint_progression_executions`] pass did.
@@ -1007,16 +1005,6 @@ fn insert_progression_execution(conn: &Connection, work_item_id: &str) -> Result
     Ok(execution)
 }
 
-/// Stamp `tasks.progression_grace_waived_at`. A stamp older than the item's
-/// current stuck state is ignored by the views, so a stale one is harmless.
-pub(crate) fn waive_grace(conn: &Connection, work_item_id: &str) -> rusqlite::Result<usize> {
-    conn.execute(
-        "UPDATE tasks SET progression_grace_waived_at = strftime('%s','now')
-         WHERE id = ?1 AND deleted_at IS NULL AND parked_at IS NULL AND status NOT IN ('done', 'archived')",
-        [work_item_id],
-    )
-}
-
 /// A progression run's footprint on one item; see `progression_run_state`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct RunState {
@@ -1024,6 +1012,9 @@ pub(crate) struct RunState {
     pub live: bool,
     /// The item is inside the cooldown after a progression run.
     pub in_cooldown: bool,
+    /// The item is inside the cooldown after a progression run that completed;
+    /// a run that died leaves this false (it only throttles nomination).
+    pub in_completed_cooldown: bool,
     /// The last progression runs all ended in infrastructure failure.
     pub infrastructure_failing: bool,
 }
@@ -1031,9 +1022,9 @@ pub(crate) struct RunState {
 /// The run state of every open item that has any progression footprint.
 pub(crate) fn run_states(conn: &Connection) -> Result<std::collections::HashMap<String, RunState>> {
     let mut stmt = conn.prepare(
-        "SELECT work_item_id, progression_live, in_cooldown, infrastructure_failing
+        "SELECT work_item_id, progression_live, in_cooldown, in_completed_cooldown, infrastructure_failing
          FROM progression_run_state
-         WHERE progression_live OR in_cooldown OR infrastructure_failing",
+         WHERE progression_live OR in_cooldown OR in_completed_cooldown OR infrastructure_failing",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -1041,25 +1032,42 @@ pub(crate) fn run_states(conn: &Connection) -> Result<std::collections::HashMap<
             RunState {
                 live: row.get(1)?,
                 in_cooldown: row.get(2)?,
-                infrastructure_failing: row.get(3)?,
+                in_completed_cooldown: row.get(3)?,
+                infrastructure_failing: row.get(4)?,
             },
         ))
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// Whether an open prerequisite of `work_item_id` is live, parked, or a
-/// progression candidate (clause 4's raw test, without the item's own
-/// `blocked_reason` guard). `false` for an item that is not an open task.
-pub(crate) fn dependency_held(conn: &Connection, work_item_id: &str) -> Result<bool> {
-    Ok(conn
-        .query_row(
-            "SELECT dependency_held FROM progression_candidate_clauses WHERE work_item_id = ?1",
-            [work_item_id],
-            |row| row.get(0),
-        )
-        .optional()?
-        .unwrap_or(false))
+/// Two clause facts the stuck report shares with the sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SharedClauses {
+    /// Clause 1: the item is neither parked nor waiting on a human.
+    pub eligible: bool,
+    /// An open prerequisite is live, parked, or a progression candidate
+    /// (clause 4's raw test, without the item's own `blocked_reason` guard).
+    pub dependency_held: bool,
+}
+
+/// [`SharedClauses`] for every open item, read in one pass over the clause view.
+/// The stuck report consults them per item; reading them once replaces a
+/// re-evaluation of the whole candidate graph per item, and means the report and
+/// the sweep share one definition of a human hold. An item absent from the map is
+/// not an open task.
+pub(crate) fn shared_clauses(conn: &Connection) -> Result<std::collections::HashMap<String, SharedClauses>> {
+    let mut stmt =
+        conn.prepare("SELECT work_item_id, c1_eligible, dependency_held FROM progression_candidate_clauses")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            SharedClauses {
+                eligible: row.get(1)?,
+                dependency_held: row.get(2)?,
+            },
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 pub(crate) fn read_clauses(conn: &Connection, work_item_id: &str) -> Result<Option<ProgressionClauses>> {

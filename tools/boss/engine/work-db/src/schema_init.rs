@@ -74,6 +74,12 @@ impl WorkDb {
             )?;
             Some(SCHEMA_COMPATIBILITY_FLOOR.1)
         };
+        // SQLite re-parses every view when a table is altered, dropped or
+        // renamed, so a migration that rebuilds a table the candidate views
+        // read would fail with "error in view progression_...". Drop them
+        // before the migration runner so migrations never see them; they are
+        // recreated below, after migrations, on every open.
+        super::progression_candidates::drop_views(&tx)?;
         let known = registry::all();
         migrations::apply(&tx, &known, version)?;
         // Required runtime data, not a historical migration. Capability
@@ -705,7 +711,7 @@ mod floor_tests {
         preserved_work::migrate_lease_boundary(&expected).unwrap();
         preserved_work::migrate_lease_generation(&expected).unwrap();
         super::super::parking::migrate(&expected).unwrap();
-        super::super::progression_candidates::migrate_grace_column(&expected).unwrap();
+        super::super::parking_reconcile::migrate(&expected).unwrap();
         super::super::progression_candidates::migrate_execution_provenance(&expected).unwrap();
         super::super::progression_candidates::migrate_views(&expected).unwrap();
         super::super::spoke_hub::migrate(&expected).unwrap();

@@ -73,17 +73,18 @@ pub struct ProgressionSettings {
     #[builder(default = DEFAULT_COOLDOWN_SECS)]
     pub cooldown_secs: i64,
     /// `progression.max_creates_per_item_window`: revisions plus precursors a
-    /// progression run may create for one item per window. Placeholder 3. Read
-    /// by the verb layer: exhaustion is a refusal and the agent must ask.
+    /// progression run may create for one item per window. Placeholder 3. The
+    /// candidate views read it (an exhausted budget stops the sweep nominating
+    /// the item); no verb layer enforces it on a running agent yet.
     #[builder(default = DEFAULT_MAX_CREATES_PER_ITEM_WINDOW)]
     pub max_creates_per_item_window: u32,
     /// The rolling window `max_creates_per_item_window` counts over, in
     /// seconds. Placeholder 7 days.
     #[builder(default = DEFAULT_MAX_CREATES_WINDOW_SECS)]
     pub max_creates_window_secs: i64,
-    /// `progression.run_timeout`, in seconds: after it the stale-worker reaper's
-    /// ordinary rules apply and the run counts as an infrastructure failure.
-    /// Placeholder 30 minutes.
+    /// `progression.run_timeout`, in seconds. Placeholder 30 minutes. The value is
+    /// declared and parsed but nothing enforces it yet: a progression run is
+    /// bounded only by the stale-worker reaper's ordinary rules.
     #[builder(default = DEFAULT_RUN_TIMEOUT_SECS)]
     pub run_timeout_secs: u64,
     /// `progression.expected_questions_per_week`: an alarm threshold on the
