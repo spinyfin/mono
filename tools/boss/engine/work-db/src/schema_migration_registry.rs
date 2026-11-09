@@ -14,6 +14,11 @@ pub(super) fn all() -> Vec<Migration> {
         .collect();
     migrations.extend([
         Migration {
+            id: "20261109_0451_explicit_launch_focus".into(),
+            legacy_version: None,
+            apply: dispatch_focus::migrate_explicit_launch,
+        },
+        Migration {
             id: "20261104_1700_workspace_lease_boundary".into(),
             legacy_version: None,
             apply: preserved_work::migrate_lease_boundary,

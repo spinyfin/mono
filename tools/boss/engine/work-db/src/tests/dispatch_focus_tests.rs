@@ -90,6 +90,133 @@ fn ready_execution(db: &WorkDb, work_item_id: &str, kind: ExecutionKind) -> Work
 }
 
 #[test]
+fn explicit_launch_admits_only_its_lineage_after_database_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("boss.db");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let focused = project(&db, &product.id, "Focused", false);
+    let focus = focus_on_project(&focused.id);
+    db.save_dispatch_focus(&focus).unwrap();
+    let launched = create_test_chore_manual(&db, &product.id, "Explicitly launched");
+    let sibling = create_test_chore_manual(&db, &product.id, "Unlaunched sibling");
+    let request = |id: &str, force| RequestExecutionInput::builder().work_item_id(id).force(force).build();
+    let queued = db.request_execution(request(&launched.id, false)).unwrap();
+    assert!(!in_focus(&db, &launched.id, &focus));
+    let reused = db.request_execution(request(&launched.id, true)).unwrap();
+    assert_eq!(queued.id, reused.id, "an existing ready row also records launch intent");
+    db.request_execution(request(&sibling.id, false)).unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = 'https://github.com/org/repo/pull/' || short_id WHERE id IN (?1, ?2)",
+            params![launched.id, sibling.id],
+        )
+        .unwrap();
+
+    let mut admitted = Vec::new();
+    let mut held = Vec::new();
+    for (root, executions) in [(&launched, &mut admitted), (&sibling, &mut held)] {
+        executions.push(ready_execution(&db, &root.id, ExecutionKind::PrReview));
+        let (_, comparison) = crate::test_support::seed_review_guide_series_for_pr(
+            &db,
+            &root.id,
+            &format!("https://github.com/org/repo/pull/{}", root.short_id.unwrap()),
+            "base",
+            "head",
+        );
+        executions.push(db.create_pr_review_guide_execution(&comparison, "org/repo").unwrap());
+        for reason in ["pr_review:pre_merge:test", "ci-fix:test", "merge-conflict:test"] {
+            let revision = insert_revision_row(&db, &product.id, &root.id);
+            db.connect()
+                .unwrap()
+                .execute(
+                    "UPDATE tasks SET created_via = ?2 WHERE id = ?1",
+                    params![revision, reason],
+                )
+                .unwrap();
+            executions.push(ready_execution(&db, &revision, ExecutionKind::RevisionImplementation));
+        }
+        let followup = followup_of(&db, &product.id, root, &format!("pr_review:post_merge:{}", root.id));
+        executions.push(ready_execution(&db, &followup.id, ExecutionKind::ChoreImplementation));
+        let revision = insert_revision_row(&db, &product.id, &followup.id);
+        executions.push(ready_execution(&db, &revision, ExecutionKind::RevisionImplementation));
+    }
+    // Completing the implementation and closing its root must not consume
+    // the exemption: post-merge work still needs it after a restart.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'done' WHERE id IN (?1, ?2)",
+            params![launched.id, sibling.id],
+        )
+        .unwrap();
+    drop(db);
+    let db = WorkDb::open(path).unwrap();
+    let restored_focus = db.load_dispatch_focus().unwrap();
+    assert_eq!(restored_focus, focus);
+    let expected: HashSet<_> = held.iter().map(|execution| execution.id.clone()).collect();
+    admitted.extend(held);
+    assert_eq!(
+        db.executions_outside_dispatch_focus(&admitted, &restored_focus)
+            .unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn launching_an_intermediate_revision_admits_descendants_but_not_its_root_or_siblings() {
+    let db = WorkDb::open(temp_db_path("focus-launched-revision")).unwrap();
+    let product = create_test_product(&db);
+    let focus = focus_on_project("proj_elsewhere");
+    let root = merged_origin(&db, &product.id, None, "Unlaunched root");
+    let launched = insert_revision_row(&db, &product.id, &root.id);
+    let descendant = insert_revision_row(&db, &product.id, &launched);
+    let sibling = insert_revision_row(&db, &product.id, &root.id);
+    db.request_execution(
+        RequestExecutionInput::builder()
+            .work_item_id(&launched)
+            .force(true)
+            .build(),
+    )
+    .unwrap();
+    assert!(in_focus(&db, &launched, &focus));
+    assert!(in_focus(&db, &descendant, &focus));
+    assert!(!in_focus(&db, &root.id, &focus));
+    assert!(!in_focus(&db, &sibling, &focus));
+}
+
+#[test]
+fn a_refused_launch_and_a_pause_only_override_do_not_grant_focus_admission() {
+    let db = WorkDb::open(temp_db_path("focus-launch-refusal")).unwrap();
+    let product = create_test_product(&db);
+    let focus = focus_on_project("proj_elsewhere");
+    let task = create_test_chore_manual(&db, &product.id, "Pause override");
+    db.request_execution(
+        RequestExecutionInput::builder()
+            .work_item_id(&task.id)
+            .bypass_dispatch_pause(true)
+            .build(),
+    )
+    .unwrap();
+    assert!(!in_focus(&db, &task.id, &focus));
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET status = 'done' WHERE id = ?1", [&task.id])
+        .unwrap();
+    let error = db
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(&task.id)
+                .force(true)
+                .build(),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("terminal"), "{error}");
+    assert!(!in_focus(&db, &task.id, &focus));
+}
+
+#[test]
 fn an_empty_focus_set_contains_everything() {
     let db = WorkDb::open(temp_db_path("focus-empty")).unwrap();
     let product = create_test_product(&db);

@@ -4,8 +4,9 @@
 //! verdict is applied.
 //!
 //! Focus is an admission gate and nothing else. Nothing here writes to a
-//! work item: scope is *derived* from the row's existing project, product and
-//! lineage columns, so clearing the focus set leaves every row as it was.
+//! work item while resolving scope: scope is derived from project, product,
+//! lineage and the durable explicit-launch flag. Clearing focus leaves every
+//! row as it was.
 //!
 //! # The scope rule
 //!
@@ -14,9 +15,10 @@
 //! 1. its `project_id` is a focused project (a project's design seed task is
 //!    an ordinary task with `project_id` set, so it counts as the project);
 //! 2. its `product_id` is a focused product (any project, or none);
-//! 3. its lineage roots in an in-scope item. A `revision` (including the
+//! 3. it was explicitly requested with `bossctl agents launch`;
+//! 4. its lineage roots in an in-scope item. A `revision` (including the
 //!    review, CI-fix and merge-conflict revisions the engine mints) resolves
-//!    through its chain root; a `followup` (including a post-merge review
+//!    through its parent chain; a `followup` (including a post-merge review
 //!    followup) resolves through `origin_task_short_id` to the task it
 //!    followed up. Both steps repeat, so a revision of a followup of an
 //!    in-scope root is in scope.
@@ -35,6 +37,13 @@ use super::*;
 
 /// Metadata KV key holding the JSON-encoded [`DispatchFocus`].
 const METADATA_KEY_DISPATCH_FOCUS: &str = "dispatch_focus";
+
+pub(super) fn migrate_explicit_launch(conn: &Connection) -> Result<()> {
+    if !super::schema_init::table_has_column(conn, "tasks", "explicitly_launched")? {
+        conn.execute_batch("ALTER TABLE tasks ADD COLUMN explicitly_launched INTEGER NOT NULL DEFAULT 0")?;
+    }
+    Ok(())
+}
 
 /// Resolves scope for a batch of work items against one focus set, memoising
 /// per work item so a drain pass pays for each distinct item once.
@@ -154,7 +163,13 @@ impl<'a> ScopeResolver<'a> {
         let Some(task) = query_task(self.conn, task_id)? else {
             return Ok(false);
         };
-        if self.focus.product_ids.contains(&task.product_id)
+        let explicitly_launched: bool = self.conn.query_row(
+            "SELECT explicitly_launched FROM tasks WHERE id = ?1",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        if explicitly_launched
+            || self.focus.product_ids.contains(&task.product_id)
             || task
                 .project_id
                 .as_deref()
@@ -162,11 +177,14 @@ impl<'a> ScopeResolver<'a> {
         {
             return Ok(true);
         }
-        if task.kind == TaskKind::Revision {
-            let root = chain_root(self.conn, task_id)?;
-            if root != task_id && self.resolve(&root, depth + 1)? {
-                return Ok(true);
-            }
+        // Walk each parent so an explicitly launched intermediate revision
+        // also admits its descendants without admitting its unlaunched root.
+        if task.kind == TaskKind::Revision
+            && let Some(parent) = task.parent_task_id.as_deref()
+            && parent != task_id
+            && self.resolve(parent, depth + 1)?
+        {
+            return Ok(true);
         }
         if let Some(origin_short_id) = task.origin_task_short_id {
             let origin: Option<String> = self

@@ -603,7 +603,10 @@ enum DispatchAction {
     /// or its project/product is added. Nothing is rewritten: it is only an
     /// admission gate. The global pause still overrides it, `bossctl agents
     /// launch` still bypasses it, and the concurrency cap still applies.
-    /// Persisted across engine restarts.
+    /// An explicit launch also admits that item's engine-minted revisions
+    /// and followups through focus for the item's lifetime, including review,
+    /// CI-fix, merge-conflict and post-merge review. This launch intent and
+    /// the focus set persist across engine restarts.
     Focus {
         #[command(subcommand)]
         action: focus::FocusAction,

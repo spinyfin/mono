@@ -28,6 +28,8 @@ use boss_protocol::{
     OperatorAnswer, PauseReason, Project, ReviewBatchPhase, ReviewClassification, ReviewLanguageBucket, ReviewProfile,
 };
 
+mod explicit_launch;
+
 struct Harness {
     _dir: tempfile::TempDir,
     db: Arc<WorkDb>,
