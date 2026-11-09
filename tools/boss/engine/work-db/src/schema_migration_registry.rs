@@ -356,7 +356,7 @@ pub(super) fn all() -> Vec<Migration> {
         Migration {
             id: progression_candidates::VIEWS_MIGRATION_ID.into(),
             legacy_version: None,
-            apply: progression_candidates::migrate_views,
+            apply: progression_candidates::migrate_views_noop,
         },
         Migration {
             id: spoke_hub::MIGRATION_ID.into(),

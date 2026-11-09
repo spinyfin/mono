@@ -1658,6 +1658,24 @@ fn a_run_the_engine_withdrew_before_it_started_is_not_a_failure_or_a_cooldown() 
 }
 
 #[test]
+fn a_run_that_died_before_it_started_still_counts_as_an_infrastructure_failure() {
+    // A spawn that fails before start (`failed`) or loses its worker (`orphaned`)
+    // is a real infrastructure failure even with no `started_at`: only the
+    // engine's own withdrawal (`abandoned`) is exempt. Not counting these would
+    // let the sweep re-nominate the item on every tick.
+    for status in [ExecutionStatus::Failed, ExecutionStatus::Orphaned] {
+        let f = fixture();
+        let id = f.stuck_chore("Died before start");
+        finished_progression_run(&f, &id, status.clone(), 20 * HOUR);
+        assert!(!f.clauses(&id).infrastructure_failing, "one failure is retried");
+        finished_progression_run(&f, &id, status.clone(), 30 * HOUR);
+        let clauses = f.clauses(&id);
+        assert!(clauses.infrastructure_failing, "{status:?}: {clauses:?}");
+        f.assert_candidate(&id, false);
+    }
+}
+
+#[test]
 fn the_report_shows_a_dead_run_as_stuck_not_as_being_handled() {
     let f = fixture();
     let id = f.stuck_chore("Run died");

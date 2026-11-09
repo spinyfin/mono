@@ -77,8 +77,9 @@ impl WorkDb {
         // SQLite re-parses every view when a table is altered, dropped or
         // renamed, so a migration that rebuilds a table the candidate views
         // read would fail with "error in view progression_...". Drop them
-        // before the migration runner so migrations never see them; they are
-        // recreated below, after migrations, on every open.
+        // before the migration runner and no registry entry creates them, so no
+        // migration ever runs while they exist; they are created below, after
+        // migrations, on every open.
         super::progression_candidates::drop_views(&tx)?;
         let known = registry::all();
         migrations::apply(&tx, &known, version)?;
@@ -272,6 +273,47 @@ impl WorkDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn view_count(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'view' AND name LIKE 'progression_%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn record_view_count_probe(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE view_probe AS SELECT count(*) AS n FROM sqlite_master
+             WHERE type = 'view' AND name LIKE 'progression_%'",
+        )?;
+        Ok(())
+    }
+
+    /// The candidate views must not exist while any registered migration runs,
+    /// so a later migration may rebuild a table they read. A probe registered
+    /// right after the shipped views entry observes the state mid-sequence.
+    #[test]
+    fn candidate_views_do_not_exist_while_migrations_run() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(baseline::SQL).unwrap();
+        let tx = conn.transaction().unwrap();
+        let mut known = registry::all();
+        let after_views = format!("{}~probe", crate::progression_candidates::VIEWS_MIGRATION_ID);
+        known.push(migrations::Migration {
+            id: after_views,
+            legacy_version: None,
+            apply: record_view_count_probe,
+        });
+        migrations::apply(&tx, &known, Some(SCHEMA_COMPATIBILITY_FLOOR.1)).unwrap();
+        let seen: i64 = tx.query_row("SELECT n FROM view_probe", [], |row| row.get(0)).unwrap();
+        assert_eq!(seen, 0, "a migration ran while progression_* views existed");
+        assert_eq!(view_count(&tx), 0, "no registry entry may create the views");
+
+        let db = WorkDb::open_in_memory().unwrap();
+        assert!(view_count(&db.connect().unwrap()) > 0, "init recreates the views");
+    }
 
     #[test]
     fn fresh_database_produces_current_schema() {

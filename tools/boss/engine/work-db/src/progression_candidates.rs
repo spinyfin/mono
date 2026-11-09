@@ -131,11 +131,20 @@ pub(super) fn migrate_execution_provenance(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// (Re)create the candidate views. Idempotent drop-then-create. The named
-/// migration installs them on first upgrade; [`WorkDb::init`] also calls this
-/// after migrations on every open so an existing database evaluates the
-/// predicate this binary ships (the helpers interpolated into [`views_sql`]
-/// are live Rust, not frozen SQL).
+/// Apply function of the shipped `20261106_1210` registry entry. The id stays so
+/// databases that recorded it keep a consistent history, but the entry creates
+/// nothing: the views are not schema owned by the migration sequence. If it
+/// created them, they would exist while every later migration runs, and a
+/// migration that rebuilds a table they read would fail with "error in view
+/// progression_...". [`WorkDb::init`] creates them after the runner instead.
+pub(super) fn migrate_views_noop(_conn: &Connection) -> Result<()> {
+    Ok(())
+}
+
+/// (Re)create the candidate views. Idempotent drop-then-create.
+/// [`WorkDb::init`] calls this after migrations on every open so a database
+/// evaluates the predicate this binary ships (the helpers interpolated into
+/// [`views_sql`] are live Rust, not frozen SQL).
 pub(super) fn migrate_views(conn: &Connection) -> Result<()> {
     conn.execute_batch(&views_sql())?;
     Ok(())
@@ -525,8 +534,10 @@ fn create_budget_exhausted_sql(a: &str, max_creates: &str, window: &str) -> Stri
 /// is measured from the end of the run (its creation while it has not ended), a
 /// run that was cancelled before it started does not start one, a run the engine
 /// withdrew before it ever started (`abandoned` with no `started_at`) is not an
-/// attempt at all, and a run that judged the item not stuck
-/// (`no_changes_needed`) earns the longer cooldown. `completed_only` restricts
+/// attempt at all, while a never-started `failed` or `orphaned` run still counts
+/// (a spawn that fails before start is a genuine infrastructure failure, and not
+/// counting it would let the sweep re-nominate the item every tick), and a
+/// run that judged the item not stuck (`no_changes_needed`) earns the longer cooldown. `completed_only` restricts
 /// the runs to ones that reached `completed`: the cooldown the stuck report
 /// treats as "being handled" (design 3.2), as opposed to the broader one that
 /// only throttles nomination.
