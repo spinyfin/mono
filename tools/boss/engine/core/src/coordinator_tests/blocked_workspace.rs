@@ -31,6 +31,11 @@ pub(super) fn blocked_pair(path: &std::path::Path) -> (Arc<WorkDb>, WorkExecutio
         )
         .unwrap();
     db.record_worker_failure(&prior.id, "needs a decision").unwrap();
+    // Teardown returned the run's cube lease. Dispatch holds a successor while
+    // its recovery predecessor still records one, so a finished predecessor
+    // must not. Only the lease is cleared: the workspace columns stay, as
+    // they do while a release is still finishing, for tests that read them.
+    assert!(db.claim_execution_workspace_release(&prior.id, "lease-old").unwrap());
     let prior = db.get_execution(&prior.id).unwrap();
     let next = db
         .create_execution(
@@ -838,6 +843,9 @@ pub(super) async fn chain_harness(chain_root_pr: bool, origin: bool, conflict: b
     std::fs::write(repo.worker.join(file), text).unwrap();
     JjRepo::run(&repo.worker, &["status"]);
     super::recovery::preserve_work(&db, &prior.id, &repo.worker).await;
+    // Preserving the work is followed by returning the orphaned run's lease;
+    // dispatch holds the resume until that has happened.
+    release_finished_execution_lease(&db, &prior.id);
     if conflict {
         JjRepo::run(&repo.repo, &["new", "main", "-m", "Conflicting main"]);
         std::fs::write(repo.repo.join("base.txt"), "main change\n").unwrap();
@@ -1017,6 +1025,8 @@ async fn rewritten_pr_dispatch_preserves_successor_work_through_second_recovery(
 
     super::recovery::preserve_work(&db, &h.next.id, &h.repo.replacement).await;
     db.mark_execution_orphaned(&h.next.id, "second crash").unwrap();
+    // The second crash's lease is returned once its work is preserved, as for the first.
+    release_finished_execution_lease(&db, &h.next.id);
     h.next = db.request_resume_execution(&h.next.id, 1, 0, "test").unwrap();
     *h.cube.next_workspace_id.lock().await = Some("replacement".into());
     // A fresh coordinator models the restart and gives dispatch a fresh pool.

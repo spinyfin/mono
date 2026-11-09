@@ -442,10 +442,13 @@ impl boss_engine_runtime::transient_recovery::TransientRecoveryReaper for Server
     /// confirmed-teardown path every other retire uses. `release_slot`
     /// used to call `release_worker_and_kick` without ever asking the
     /// app to tear the pane down, so the next dispatch claimed a slot
-    /// the app still hosted and died `SlotBusy`.
-    async fn reap_worker(&self, execution_id: &str) {
-        if ServerState::release_worker_pane(self, execution_id).await != PaneReleaseOutcome::Reaped {
-            return;
+    /// the app still hosted and died `SlotBusy`. Reports the teardown's
+    /// outcome: the caller preserves the run's work and returns its cube
+    /// lease only on `Reaped`.
+    async fn reap_worker(&self, execution_id: &str) -> PaneReleaseOutcome {
+        let outcome = ServerState::release_worker_pane(self, execution_id).await;
+        if outcome != PaneReleaseOutcome::Reaped {
+            return outcome;
         }
         // A successfully reaped worker may have lost its run-to-slot mapping
         // before teardown. Clear any remaining live-state entry so the pool
@@ -459,6 +462,7 @@ impl boss_engine_runtime::transient_recovery::TransientRecoveryReaper for Server
                  held claim",
             );
         }
+        outcome
     }
 }
 

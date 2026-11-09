@@ -502,6 +502,7 @@ async fn answering_a_question_on_an_in_scope_row_redispatches_it_automatically()
         crate::work::insert_question(&h.db.connect().unwrap(), &execution.id, "proposal", &question).unwrap();
         h.db.record_worker_awaiting_operator_answer(&execution.id, "needs a decision", &question)
             .unwrap();
+        release_finished_execution_lease(&h.db, &execution.id);
         let outcome =
             h.db.answer_operator_question(task, OperatorAnswer::YesNo { value: false })
                 .unwrap();

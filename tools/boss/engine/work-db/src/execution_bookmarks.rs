@@ -1,4 +1,5 @@
 use super::*;
+use crate::executions_runs::TERMINAL_LEASE_RELEASE_WINDOW_SECS;
 use crate::schema_init::table_has_column;
 use boss_engine_recovery::execution_bookmark::ExecutionBookmark;
 use rusqlite::Connection;
@@ -201,6 +202,39 @@ impl WorkDb {
             execution: source,
             has_preserved_tip,
         }))
+    }
+
+    /// The recovery predecessor whose preserved work a dispatch of `execution`
+    /// would restore, when that predecessor still holds its cube workspace
+    /// lease. Its unpublished work is preserved only as its lease is released
+    /// (preservation precedes the release, and the release clears the lease
+    /// columns), so while the lease is recorded the dispatch cannot tell "no
+    /// work to restore" from "work not yet preserved". Dispatch holds the row
+    /// instead of guessing, and starting it from trunk would strand whatever
+    /// the predecessor left unpublished.
+    ///
+    /// `None` when `execution` recovers from its own record (a retry) or has no
+    /// predecessor, or when the predecessor's lease is gone. A lease recorded
+    /// for longer than [`TERMINAL_LEASE_RELEASE_WINDOW_SECS`] is ignored: cube
+    /// expired it and the ended-run lease sweep no longer retries it, so
+    /// holding for it would never end.
+    pub fn recovery_predecessor_holding_lease(&self, execution: &WorkExecution) -> Result<Option<WorkExecution>> {
+        let Some(source) = self.recovery_source(execution)? else {
+            return Ok(None);
+        };
+        let predecessor = source.execution;
+        if predecessor.id == execution.id {
+            return Ok(None);
+        }
+        let holds_lease = predecessor
+            .cube_lease_id
+            .as_deref()
+            .is_some_and(|lease| !lease.is_empty());
+        let ended = predecessor.finished_epoch().or_else(|| predecessor.created_epoch());
+        let within_window = ended.is_none_or(|ended| {
+            ended >= boss_engine_utils::epoch_time::now_epoch_secs() - TERMINAL_LEASE_RELEASE_WINDOW_SECS
+        });
+        Ok((holds_lease && within_window).then_some(predecessor))
     }
 
     /// Resolve the predecessor by recorded execution identity alone. Workspace

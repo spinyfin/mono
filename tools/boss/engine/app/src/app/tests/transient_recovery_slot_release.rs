@@ -117,6 +117,7 @@ async fn run_recovery(server: &Arc<ServerState>) -> boss_engine_runtime::transie
         policy: &policy,
         nudger: &NoopWorkerNudger,
         reaper: server.as_ref(),
+        cube_client: server.cube_client.as_ref(),
     };
     run_one_pass(
         &cx,

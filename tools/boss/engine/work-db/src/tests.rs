@@ -559,6 +559,7 @@ mod claimed_dispatch_tests;
 mod latest_local_execution_tests;
 mod list_runs_filters;
 mod metrics_store_tests;
+mod predecessor_lease_hold_tests;
 mod t01;
 mod t02;
 mod t03;

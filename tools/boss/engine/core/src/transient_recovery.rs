@@ -22,10 +22,10 @@
 //! its prompt. For this alive-but-idle case the cheap first recovery is
 //! a runtime nudge ("your previous turn ended on a transient API error;
 //! please retry the last step") injected via the same channel as
-//! `bossctl agents send`. Full orphan+respawn (spawn a fresh `claude`
-//! process on the same workspace) is reserved for cases where the
-//! worker is actually dead, the nudge did not clear the error by the
-//! next sweep, or the error is permanent.
+//! `bossctl agents send`. Full orphan+respawn (a fresh `claude` process
+//! that continues the work from what the stalled run left unpublished) is
+//! reserved for cases where the worker is actually dead, the nudge did not
+//! clear the error by the next sweep, or the error is permanent.
 //!
 //! Each pass, for every non-actively-working worker slot whose backing
 //! execution is old enough ([`RECOVERY_GRACE_SECS`]):
@@ -48,21 +48,28 @@
 //!      On the next sweep if the error is still the last entry,
 //!      increment the attempt counter and proceed to orphan+respawn.
 //!   4. **Resume** (transient, under the cap, not nudgeable): orphan the
-//!      dead execution and insert a fresh `ready` one that prefers the
-//!      same cube workspace with `allow_dirty = true` (so `--prefer
-//!      --allow-dirty` re-leases the exact workspace *without* cube
-//!      resetting it, and the in-progress jj branch is not lost),
-//!      carrying an incremented `transient_failure_count` and a
-//!      `dispatch_not_before` backoff. The runner's existing
-//!      startup-recovery prompt then directs the new worker to resume
-//!      the prior branch. `allow_dirty` also hardens the workspace-lease
-//!      fallback (`crate::coordinator`'s `lease_workspace_with_fallback`):
-//!      a failed lease on the preferred workspace fails the dispatch
-//!      outright instead of silently landing on a different, clean
-//!      workspace, which would strand the uncommitted work. The stalled
-//!      worker's pane is torn down through
-//!      `boss_engine::app::ServerState::release_worker_pane`; the pool claim
-//!      is handed back only when that teardown is confirmed.
+//!      dead execution and insert a fresh `ready` one carrying an
+//!      incremented `transient_failure_count` and a `dispatch_not_before`
+//!      backoff, in one transaction (so no other sweep sees an orphan with no
+//!      successor and mints a second one). The stalled worker's pane is then
+//!      torn down through `boss_engine::app::ServerState::release_worker_pane`;
+//!      the pool claim is handed back only when that teardown is confirmed.
+//!      Once the pane is confirmed gone this path **preserves the stalled
+//!      run's unpublished work and returns its cube workspace lease itself**,
+//!      through the same inferred-death release the other reaping sweeps use
+//!      ([`crate::workspace_lease_release::release_lease_after_inferred_death`]):
+//!      it records the work as a `preserved/<execution>` tip, which is how the
+//!      successor gets it back. The successor leases any free workspace (never
+//!      the stalled run's) and restores that tip; there is no same-workspace
+//!      contract. Dispatch holds the successor
+//!      ([`crate::work::WorkDb::recovery_predecessor_holding_lease`]) while the
+//!      stalled run still holds its lease, so the order of this release and
+//!      the successor's dispatch cannot decide whether the work survives. A
+//!      preservation failure never holds the lease (a recovery problem must
+//!      not strand a workspace): the release goes ahead and an inspection
+//!      attention item carries the error. If a process still occupies the
+//!      workspace, or occupancy cannot be confirmed, the lease stays recorded
+//!      and the successor stays held until a later sweep finishes the release.
 //!   5. **Escalate** (permanent / unrecognised / retry cap reached):
 //!      raise a `WorkAttentionItem` and stop. The orphan-active sweep
 //!      excludes work items with an open recovery attention item
@@ -117,7 +124,8 @@ use async_trait::async_trait;
 use boss_event_bus::Event;
 use serde_json::Value;
 
-use boss_protocol::{LiveWorkerState, WorkerActivity};
+use boss_execution_contracts::{CubeClient, PaneReleaseOutcome};
+use boss_protocol::{LiveWorkerState, WorkExecution, WorkerActivity};
 
 use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
@@ -127,6 +135,7 @@ use crate::transient_error::{
     ErrorClass, EscalateReason, RecoveryDecision, RecoveryPolicy, extract_worker_error, transcript_shows_no_activity,
 };
 use crate::work::{ATTENTION_KIND_RECOVERY_EXHAUSTED, ATTENTION_KIND_RECOVERY_PERMANENT, WorkDb};
+use crate::workspace_lease_release::{LeaseReleaseOutcome, PaneStatus, release_lease_after_inferred_death};
 
 /// How often the sweep runs.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
@@ -184,13 +193,23 @@ pub trait TransientRecoveryReaper: Send + Sync {
     /// Tear down the worker's tmux pane (if any) for `execution_id` and
     /// release resources only once that teardown is confirmed. Idempotent:
     /// a slot with no pane is a no-op.
-    async fn reap_worker(&self, execution_id: &str);
+    ///
+    /// Reports whether the worker is confirmed gone. Only
+    /// [`PaneReleaseOutcome::Reaped`] lets the caller preserve the run's
+    /// work and return its cube workspace lease; on
+    /// [`PaneReleaseOutcome::NoLiveWorker`] (nothing was mapped to reap, which
+    /// includes a worker still mid-spawn) the lease must stay put.
+    async fn reap_worker(&self, execution_id: &str) -> PaneReleaseOutcome;
 }
 
-/// Live-worker collaborators used by the transient-recovery loop.
+/// Collaborators of the transient-recovery loop that reach live workers and
+/// the cube workspaces they hold.
 pub struct RecoveryWorkers {
     pub nudger: Arc<dyn WorkerNudger>,
     pub reaper: Arc<dyn TransientRecoveryReaper>,
+    /// Cube registry and lease operations, used to preserve a resumed run's
+    /// work and return its workspace lease once its pane is gone.
+    pub cube_client: Arc<dyn CubeClient>,
 }
 
 /// No-op nudger used in tests and contexts without an app session.
@@ -237,6 +256,7 @@ pub struct RecoveryContext<'a> {
     pub policy: &'a RecoveryPolicy,
     pub nudger: &'a dyn WorkerNudger,
     pub reaper: &'a dyn TransientRecoveryReaper,
+    pub cube_client: &'a dyn CubeClient,
 }
 
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`,
@@ -277,6 +297,7 @@ pub fn spawn_loop(
                 policy: &policy,
                 nudger: workers.nudger.as_ref(),
                 reaper: workers.reaper.as_ref(),
+                cube_client: workers.cube_client.as_ref(),
             };
             let outcome = run_one_pass(&cx, &mut nudged_executions, now).await;
             if outcome.has_activity() {
@@ -309,6 +330,7 @@ pub fn spawn_loop(
                                     policy: &policy,
                                     nudger: workers.nudger.as_ref(),
                                     reaper: workers.reaper.as_ref(),
+                                    cube_client: workers.cube_client.as_ref(),
                                 };
                                 let outcome = run_for_execution(&cx, &mut nudged_executions, now, &execution_id).await;
                                 if outcome.has_activity() {
@@ -402,6 +424,7 @@ async fn process_state(
         policy,
         nudger,
         reaper,
+        cube_client,
         ..
     } = cx;
     let coordinator = cx.coordinator.clone();
@@ -574,6 +597,13 @@ async fn process_state(
             }
 
             // --- Orphan+respawn path ---
+            //
+            // The successor row is inserted in the same transaction that
+            // orphans the stalled run, so no other sweep can see an orphan
+            // with no successor and mint a second one. It cannot dispatch
+            // ahead of the stalled run's work: dispatch holds it while that
+            // run still holds its cube lease, and this path returns the lease
+            // (preserving first) as soon as the pane is confirmed gone.
             let dispatch_not_before = now_epoch_secs + backoff.as_secs() as i64;
             let reason = format!(
                 "{stall_reason} (auto-resume attempt {attempt}/{max}): {clipped}",
@@ -597,9 +627,25 @@ async fn process_state(
                 backoff_secs = backoff.as_secs(),
                 error = %clipped,
                 stall_reason,
-                "transient-recovery: worker stalled; auto-resuming on same workspace",
+                "transient-recovery: worker stalled; resuming in a new execution on any free workspace \
+                 (the stalled run's unpublished work is preserved and restored)",
             );
-            release_slot(reaper, &execution_id).await;
+            let reaped = release_slot(reaper, &execution_id).await;
+            let predecessor_lease = if reaped == PaneReleaseOutcome::Reaped {
+                release_predecessor_lease(work_db, cube_client, &execution).await
+            } else {
+                // The worker is not confirmed gone (nothing mapped to reap, or
+                // still mid-spawn), so its workspace may still be in use:
+                // leave the lease alone. The successor stays held until a
+                // later sweep sees the run dead and releases it.
+                tracing::warn!(
+                    execution_id,
+                    work_item_id = %work_item_id,
+                    "transient-recovery: worker not confirmed gone; leaving its cube lease for the \
+                     lease-release sweeps (the resume execution stays held until it is released)",
+                );
+                PredecessorLease::NotAttempted
+            };
             crate::reconcile_audit::append_reconcile_audit_best_effort(
                 work_db,
                 &work_item_id,
@@ -620,6 +666,7 @@ async fn process_state(
                             "backoff_secs": backoff.as_secs(),
                             "class": stall_reason,
                             "error": clipped,
+                            "predecessor_lease": predecessor_lease.label(),
                         })),
                 )
                 .await;
@@ -790,8 +837,100 @@ fn should_inspect(activity: WorkerActivity) -> bool {
 /// `pool_claim_sweep` cannot rescue an already-released claim; holding
 /// it on unconfirmed teardown is the only way the next dispatch stays
 /// off the still-hosted pane.
-async fn release_slot(reaper: &dyn TransientRecoveryReaper, execution_id: &str) {
-    reaper.reap_worker(execution_id).await;
+async fn release_slot(reaper: &dyn TransientRecoveryReaper, execution_id: &str) -> PaneReleaseOutcome {
+    reaper.reap_worker(execution_id).await
+}
+
+/// What the resume path did with the stalled run's cube workspace lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PredecessorLease {
+    /// Nothing to do: the run held no lease, or another sweep had already
+    /// released it (preserving its work first).
+    None,
+    /// The run's work was preserved and its lease returned to cube.
+    Released,
+    /// The release gates kept the lease (a process still in the workspace,
+    /// or occupancy that could not be confirmed).
+    Kept,
+    /// The gates passed but the cube release itself failed.
+    CubeFailed,
+    /// The worker was not confirmed gone, so no release was attempted.
+    NotAttempted,
+}
+
+impl PredecessorLease {
+    fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Released => "released",
+            Self::Kept => "kept",
+            Self::CubeFailed => "cube_failed",
+            Self::NotAttempted => "not_attempted",
+        }
+    }
+}
+
+/// Preserve the stalled run's unpublished work and return its cube workspace
+/// lease, through the same inferred-death release every other reaping sweep
+/// uses ([`release_lease_after_inferred_death`]): it records the work as the
+/// run's `preserved/<execution>` tip before it lets go of the lease. When the
+/// work cannot be preserved the lease is still returned, and an inspection
+/// attention item carries the error. The pane is already confirmed gone, so
+/// what remains for the gates to decide is whether a stray process still
+/// occupies the workspace.
+///
+/// Never retries or waits for the outcome: a lease that is kept stays
+/// recorded, the resume execution stays held behind it (see
+/// [`crate::work::WorkDb::recovery_predecessor_holding_lease`]), and the
+/// leftover-lease sweep keeps retrying the release.
+async fn release_predecessor_lease(
+    work_db: &WorkDb,
+    cube_client: &dyn CubeClient,
+    execution: &WorkExecution,
+) -> PredecessorLease {
+    let Some(lease_id) = execution.cube_lease_id.as_deref() else {
+        return PredecessorLease::None;
+    };
+    let outcome = release_lease_after_inferred_death(
+        work_db,
+        execution,
+        PaneStatus::Gone,
+        None,
+        Some(cube_client),
+        cube_client.force_release_lease(lease_id, Some("transient-recovery: stalled worker auto-resumed")),
+    )
+    .await;
+    match outcome {
+        LeaseReleaseOutcome::Released => {
+            tracing::info!(
+                execution_id = %execution.id,
+                lease_id,
+                "transient-recovery: preserved the stalled run's work and released its cube lease",
+            );
+            PredecessorLease::Released
+        }
+        LeaseReleaseOutcome::NoLease => PredecessorLease::None,
+        LeaseReleaseOutcome::Kept { reason } => {
+            tracing::warn!(
+                execution_id = %execution.id,
+                lease_id,
+                keep_reason = reason.label(),
+                "transient-recovery: the stalled run's cube lease was kept; the resume execution \
+                 stays held until a later sweep releases it",
+            );
+            PredecessorLease::Kept
+        }
+        LeaseReleaseOutcome::CubeFailed { error } => {
+            tracing::warn!(
+                execution_id = %execution.id,
+                lease_id,
+                error = %error,
+                "transient-recovery: cube refused to release the stalled run's lease; the resume \
+                 execution stays held until a later sweep releases it",
+            );
+            PredecessorLease::CubeFailed
+        }
+    }
 }
 
 /// Read the last `max_bytes` of a transcript file and parse the
@@ -903,12 +1042,20 @@ mod tests {
     /// confirmed-teardown path.
     struct RecordingReaper {
         reaped: tokio::sync::Mutex<Vec<String>>,
+        outcome: PaneReleaseOutcome,
     }
 
     impl RecordingReaper {
         fn new() -> Self {
+            Self::reporting(PaneReleaseOutcome::Reaped)
+        }
+
+        /// A reaper whose teardown reports `outcome` (the app-backed one
+        /// reports `NoLiveWorker` when it could not confirm the worker gone).
+        fn reporting(outcome: PaneReleaseOutcome) -> Self {
             Self {
                 reaped: tokio::sync::Mutex::new(Vec::new()),
+                outcome,
             }
         }
 
@@ -919,10 +1066,28 @@ mod tests {
 
     #[async_trait]
     impl TransientRecoveryReaper for RecordingReaper {
-        async fn reap_worker(&self, execution_id: &str) {
+        async fn reap_worker(&self, execution_id: &str) -> PaneReleaseOutcome {
             self.reaped.lock().await.push(execution_id.to_owned());
+            self.outcome
         }
     }
+
+    /// Cube registry double: reports no workspaces (so no run is confirmed to
+    /// own one) and records every forced lease release.
+    #[derive(Default)]
+    struct RecordingCube {
+        force_released: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    crate::stub_cube_client! { RecordingCube {
+        async fn force_release_lease(&self, lease_id: &str, _reason: Option<&str>) -> Result<()> {
+            self.force_released.lock().await.push(lease_id.to_owned());
+            Ok(())
+        }
+        async fn list_workspaces(&self) -> Result<Vec<boss_host_execution::types::CubeWorkspaceStatus>> {
+            Ok(Vec::new())
+        }
+    } }
 
     // ─── helpers ──────────────────────────────────────────────────────
 
@@ -1019,6 +1184,7 @@ mod tests {
     ) -> (TransientRecoveryOutcome, Arc<RecordingDispatchEventSink>, Vec<String>) {
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let reaper = RecordingReaper::new();
+        let cube = RecordingCube::default();
         let cx = RecoveryContext {
             work_db: db,
             live_states: live,
@@ -1027,6 +1193,7 @@ mod tests {
             policy: &RecoveryPolicy::default(),
             nudger,
             reaper: &reaper,
+            cube_client: &cube,
         };
         let outcome = run_one_pass(&cx, nudged, now()).await;
         let reaped = reaper.reaped_ids().await;
@@ -1134,11 +1301,14 @@ mod tests {
             .iter()
             .find(|e| e.id != exec_id && e.status == ExecutionStatus::Ready)
             .expect("expected a fresh ready execution");
-        assert_eq!(fresh.preferred_workspace_id.as_deref(), Some("mono-agent-007"));
+        assert_eq!(
+            fresh.preferred_workspace_id, None,
+            "the resume leases any free workspace; it must not name the stalled run's"
+        );
         assert_eq!(fresh.transient_failure_count, 1);
         assert!(
-            fresh.allow_dirty,
-            "resume execution must force allow_dirty so cube doesn't wipe the recovered workspace"
+            !fresh.allow_dirty,
+            "nothing reads allow_dirty on a resume row, and the successor never reclaims a dirty workspace"
         );
 
         let events = sink.events().await;
@@ -1147,7 +1317,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transient_error_resumes_on_same_workspace() {
+    async fn transient_error_resumes_in_a_new_execution() {
         // NoopWorkerNudger always fails → falls through to orphan+respawn.
         // Exercises the pre-nudge behaviour for contexts where nudge is unavailable.
         let (dir, db) = open_db();
@@ -1177,7 +1347,7 @@ mod tests {
             .iter()
             .find(|e| e.id != dead_id && e.status == ExecutionStatus::Ready)
             .expect("expected a fresh ready execution");
-        assert_eq!(fresh.preferred_workspace_id.as_deref(), Some("mono-agent-007"));
+        assert_eq!(fresh.preferred_workspace_id, None);
         assert_eq!(fresh.transient_failure_count, 1);
         assert!(
             fresh.dispatch_not_before.is_some(),
@@ -1188,6 +1358,127 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].stage, "transient_recovery");
         assert_eq!(events[0].outcome, "ok");
+    }
+
+    /// The state left by [`resume_with_teardown`].
+    struct ResumeRun {
+        /// Keeps the on-disk DB alive while `db` is used.
+        _dir: TempDir,
+        db: Arc<WorkDb>,
+        dead_id: String,
+        sink: Arc<RecordingDispatchEventSink>,
+        /// Lease ids the resume asked cube to release.
+        released: Vec<String>,
+    }
+
+    /// Runs one pass for a worker stalled on a socket error whose pane
+    /// teardown reports `teardown`. The run holds `lease-1` but has no
+    /// recorded store location, so its work cannot be preserved.
+    async fn resume_with_teardown(teardown: PaneReleaseOutcome) -> ResumeRun {
+        let (dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let transcript = write_transcript(&dir, "t.jsonl", &[NORMAL_LINE, SOCKET_ERROR_LINE]);
+        let db = Arc::new(db);
+        let dead_id = create_running_execution(&db, &work_item_id, &transcript, 0);
+
+        let live = Arc::new(LiveWorkerStateRegistry::new());
+        let coordinator = make_coordinator(db.clone(), 2);
+        let worker_id = coordinator.worker_pool().claim_worker(&dead_id, None).await.unwrap();
+        let slot_id = boss_execution_contracts::slot_id_from_worker_id(&worker_id).unwrap();
+        register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let reaper = RecordingReaper::reporting(teardown);
+        let cube = RecordingCube::default();
+        let cx = RecoveryContext {
+            work_db: &db,
+            live_states: &live,
+            coordinator: coordinator.clone(),
+            dispatch_events: sink.as_ref(),
+            policy: &RecoveryPolicy::default(),
+            nudger: &NoopWorkerNudger,
+            reaper: &reaper,
+            cube_client: &cube,
+        };
+        let outcome = run_one_pass(&cx, &mut HashSet::new(), now()).await;
+        assert_eq!(outcome.resumed, 1);
+        let released = cube.force_released.lock().await.clone();
+        ResumeRun {
+            _dir: dir,
+            db,
+            dead_id,
+            sink,
+            released,
+        }
+    }
+
+    /// The race this closes: the successor used to be left to start from
+    /// trunk whenever it dispatched before a later sweep preserved the
+    /// stalled run's work. Reaping an unconfirmed worker must not release the
+    /// lease out from under it.
+    #[tokio::test]
+    async fn resume_leaves_the_lease_alone_when_the_worker_is_not_confirmed_gone() {
+        let ResumeRun {
+            db,
+            dead_id,
+            sink,
+            released,
+            ..
+        } = resume_with_teardown(PaneReleaseOutcome::NoLiveWorker).await;
+
+        assert!(released.is_empty(), "no lease may be released: {released:?}");
+        let dead = db.get_execution(&dead_id).unwrap();
+        assert_eq!(dead.status, ExecutionStatus::Orphaned);
+        assert_eq!(dead.cube_lease_id.as_deref(), Some("lease-1"));
+        assert!(db.list_attention_items(&dead_id).unwrap().is_empty());
+        let events = sink.events().await;
+        assert_eq!(events[0].details["predecessor_lease"], "not_attempted");
+        // The resume row is held behind that lease rather than starting fresh.
+        let fresh = db
+            .list_executions(Some(&dead.work_item_id))
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id != dead_id && e.status == ExecutionStatus::Ready)
+            .expect("the resume row exists");
+        assert_eq!(
+            db.recovery_predecessor_holding_lease(&fresh).unwrap().map(|e| e.id),
+            Some(dead_id)
+        );
+    }
+
+    /// A worker confirmed gone whose work cannot be preserved still returns
+    /// its lease (a recovery problem never strands a workspace), and the
+    /// failure is loud: an attention item carries the error and names the lease.
+    #[tokio::test]
+    async fn resume_that_cannot_preserve_still_returns_the_lease_and_raises_the_error() {
+        let ResumeRun {
+            db,
+            dead_id,
+            sink,
+            released,
+            ..
+        } = resume_with_teardown(PaneReleaseOutcome::Reaped).await;
+
+        assert_eq!(released, vec!["lease-1".to_owned()]);
+        assert!(db.get_execution(&dead_id).unwrap().cube_lease_id.is_none());
+        let items = db.list_attention_items(&dead_id).unwrap();
+        let item = items
+            .iter()
+            .find(|item| {
+                item.kind == boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND
+            })
+            .unwrap_or_else(|| panic!("expected an inspection attention item, got {items:?}"));
+        assert_eq!(item.status, "open");
+        assert!(
+            item.body_markdown
+                .contains("workspace recovery store location is unavailable for preservation"),
+            "{}",
+            item.body_markdown
+        );
+        assert!(item.body_markdown.contains("lease-1"), "{}", item.body_markdown);
+        let events = sink.events().await;
+        assert_eq!(events[0].details["predecessor_lease"], "released");
     }
 
     #[tokio::test]
@@ -1447,7 +1738,7 @@ mod tests {
             fresh.transient_failure_count, 2,
             "the attempt counter must be consumed (1 prior + this verified-failed retry)"
         );
-        assert!(fresh.allow_dirty);
+        assert!(!fresh.allow_dirty);
 
         let events = sink.events().await;
         assert_eq!(events.len(), 1);
@@ -1770,6 +2061,7 @@ mod tests {
         let policy = RecoveryPolicy::default();
         let nudger = RecordingNudger::new();
         let reaper = RecordingReaper::new();
+        let cube = RecordingCube::default();
         let cx = RecoveryContext {
             work_db: &db,
             live_states: &live,
@@ -1778,6 +2070,7 @@ mod tests {
             policy: &policy,
             nudger: &nudger,
             reaper: &reaper,
+            cube_client: &cube,
         };
         let mut nudged = HashSet::new();
 
@@ -1803,6 +2096,7 @@ mod tests {
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let policy = RecoveryPolicy::default();
         let reaper = RecordingReaper::new();
+        let cube = RecordingCube::default();
         let cx = RecoveryContext {
             work_db: &db,
             live_states: &live,
@@ -1811,6 +2105,7 @@ mod tests {
             policy: &policy,
             nudger: &NoopWorkerNudger,
             reaper: &reaper,
+            cube_client: &cube,
         };
         let mut nudged = HashSet::new();
 
@@ -1845,6 +2140,7 @@ mod tests {
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let policy = RecoveryPolicy::default();
         let reaper = RecordingReaper::new();
+        let cube = RecordingCube::default();
         let cx = RecoveryContext {
             work_db: &db,
             live_states: &live,
@@ -1856,6 +2152,7 @@ mod tests {
             // execution in one call.
             nudger: &NoopWorkerNudger,
             reaper: &reaper,
+            cube_client: &cube,
         };
         let mut nudged = HashSet::new();
 

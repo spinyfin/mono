@@ -47,6 +47,34 @@ Successful release, including an already-absent lease, clears the remaining
 workspace metadata. The leftover sweep checks at most 100 recent local
 executions per pass and does not infer teardown from terminal status alone.
 
+**A successor waits for that release.** A finished run's unpublished work is
+preserved as its lease is released, so while the lease is still recorded
+dispatch cannot tell "no work to restore" from "work not yet preserved". A
+`ready` execution whose recovery predecessor (the latest earlier execution of
+the same work item and kind that ran) is terminal but still records a cube
+lease is therefore held with the dispatch wait reason
+`awaiting_predecessor_preservation`; it never starts from trunk in the
+meantime. This applies to the drain and to `bossctl agents launch` alike, and
+to a lookup that fails. The hold ends when the predecessor's lease is released
+(the cleared lease columns are what dispatch reads), or after cube's 24-hour
+lease TTL, which is also how far back the leftover sweep retries. What keeps a
+lease recorded is a pane or process still in the workspace, occupancy that
+cannot be confirmed, or a cube failure; the leftover sweep keeps retrying and
+the successor stays held behind it rather than abandoning the work. A
+preservation failure does not hold the lease: the release goes ahead and a
+`preserved_work_needs_inspection` attention item on the predecessor carries the
+error and the lease id, so a successor that then starts without that work does
+so with the loss on record.
+
+The transient-recovery auto-resume is the one orphaning path that used to
+leave that release to a later sweep. It now preserves the stalled run's work
+and releases its lease itself, through the same inferred-death release the
+dead-pid, stale-worker and spawn-ack sweeps use, as soon as the pane is
+confirmed gone. The successor row is inserted in the same transaction that
+orphans the stalled run (so no other sweep mints a second one), carries no
+workspace preference, and leases any free workspace; the work reaches it
+through the preserved tip, never through the stalled run's workspace.
+
 ## How orphans get detected
 
 ### Automatic detection at engine startup
