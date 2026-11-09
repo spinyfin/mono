@@ -1,6 +1,16 @@
 //! Shared explicit and un-park review admission.
 use boss_work_db::{PrStateChecker, ReviewBatchDispatch, WorkDb, WorkExecution};
 
+/// The `gh pr view` fields admission reads: `state` for the open check, and the
+/// rest as the input of `review_batch_input_from_metadata`. Every caller of
+/// [`admit_review`] fetches exactly these.
+const REVIEW_ADMISSION_FIELDS: &str = "state,baseRefOid,headRefOid,files,additions,deletions";
+
+/// Fetch the PR metadata [`admit_review`] needs for `url`.
+pub async fn fetch_review_admission_metadata(url: String) -> anyhow::Result<serde_json::Value> {
+    boss_github::pr_files::fetch_pr_view_json(&url, REVIEW_ADMISSION_FIELDS).await
+}
+
 /// Admission preserves the batch outcome so each caller can report it in its
 /// own interface. Database admission rechecks parking in its write transaction.
 pub enum ReviewAdmission {

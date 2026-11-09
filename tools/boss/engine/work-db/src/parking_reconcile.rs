@@ -34,8 +34,9 @@
 //!   guard.
 //! - **Step 7, the progression grace stamp.** `tasks.progression_grace_waived_at`
 //!   marks an item whose stuck-age grace period the progression sweep must skip
-//!   once. This entry only writes it; the sweep that consumes it is a later
-//!   entry of the same design, so the stamp is inert until then.
+//!   once. Nothing reads this stamp yet: it is meant for the progression
+//!   sweep described in Part 2 of the design, and is inert until that sweep
+//!   consumes it.
 //! - **The churn floor.** [`WorkDb::last_unparked_at`] is the time of the item's
 //!   last un-park, read from the task status ledger. The orphan sweep's churn
 //!   guard counts only executions created at or after it, so evidence from
