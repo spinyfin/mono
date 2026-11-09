@@ -228,19 +228,26 @@ async fn rung1_defers_while_a_worker_is_live_and_leaves_the_store_untouched() {
     let fx = fixture().await;
     let (commit_before, change_before) = pr_tip(&fx.repo);
     // The live worker rewrites its own history in its workspace (rebasing the
-    // PR branch onto upstream) as the ladder is invoked: the overlap that used
-    // to leave conflicted bookmarks. Both sides wait on the barrier so the
-    // rewrite starts as the ladder call begins.
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    // PR branch onto upstream) and is still mid-edit when the ladder is
+    // invoked: the overlap that used to leave conflicted bookmarks. A two-way
+    // handshake pins the order. The worker signals once its rewrite has landed
+    // in the shared store and then waits; the ladder runs in that window; only
+    // then is the worker released to finish its edit.
+    let (rewritten_tx, rewritten_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let worker = fx.repo.worker.clone();
-    let worker_barrier = barrier.clone();
     let worker_rebase = std::thread::spawn(move || {
-        worker_barrier.wait();
         JjRepo::run(&worker, &["rebase", "-b", PR_BRANCH, "-d", "upstream"]);
+        rewritten_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
         std::fs::write(worker.join("more.txt"), "more live work").unwrap();
         JjRepo::run(&worker, &["status"]);
     });
-    barrier.wait();
+    rewritten_rx.recv().unwrap();
+    // The rewrite is already in the store before the ladder is called.
+    let (commit_mid, change_mid) = pr_tip(&fx.repo);
+    assert_ne!(commit_before, commit_mid, "the worker's rebase rewrote nothing");
+    assert_eq!(change_before, change_mid);
     let during = try_mechanical_rungs(
         &fx.db,
         &RecordingPublisher::default(),
@@ -249,6 +256,10 @@ async fn rung1_defers_while_a_worker_is_live_and_leaves_the_store_untouched() {
         &fx.attempt,
     )
     .await;
+    // The ladder returned while the worker was still mid-edit, and left the
+    // rewritten tip exactly as the worker made it.
+    assert_eq!(pr_tip(&fx.repo), (commit_mid.clone(), change_mid));
+    release_tx.send(()).unwrap();
     worker_rebase.join().unwrap();
     // And again once the worker's rewrite has landed.
     let after = try_mechanical_rungs(
@@ -260,10 +271,8 @@ async fn rung1_defers_while_a_worker_is_live_and_leaves_the_store_untouched() {
     )
     .await;
 
-    // The worker really rewrote the PR commit: new commit id, same change.
-    let (commit_after, change_after) = pr_tip(&fx.repo);
-    assert_ne!(commit_before, commit_after, "the worker's rebase rewrote nothing");
-    assert_eq!(change_before, change_after);
+    // Neither ladder call moved the PR tip the worker produced.
+    assert_eq!(pr_tip(&fx.repo).0, commit_mid);
 
     assert_eq!(during, LadderOutcome::DeferredForLiveWriter);
     assert_eq!(after, LadderOutcome::DeferredForLiveWriter);
@@ -360,15 +369,10 @@ async fn claimed_and_waiting_human_writers_defer_too() {
     }
 }
 
-/// The conflict-watch caller treats the deferral like an unavailable rung: it
-/// spawns no conflict revision alongside the live writer and leaves the
-/// attempt for a later tick.
-#[tokio::test]
-async fn conflict_watch_spawns_no_revision_while_a_worker_is_live() {
+async fn detect_conflict(fx: &Fixture) {
     use crate::conflict_watch::on_conflict_detected;
     use crate::merge_poller::{OpenPrStatus, PrLifecycleProbe, PrLifecycleState};
 
-    let fx = fixture().await;
     let probe = PrLifecycleProbe::builder()
         .url(fx.candidate.pr_url.clone())
         .state(PrLifecycleState::Open(OpenPrStatus::conflict_only()))
@@ -376,7 +380,6 @@ async fn conflict_watch_spawns_no_revision_while_a_worker_is_live() {
         .labels(Vec::new())
         .review(crate::merge_poller::PrReviewState::Unknown)
         .build();
-
     on_conflict_detected(
         &fx.db,
         &RecordingPublisher::default(),
@@ -386,6 +389,28 @@ async fn conflict_watch_spawns_no_revision_while_a_worker_is_live() {
         &probe,
     )
     .await;
+}
+
+/// Control for the deferral test below: the identical detection with no live
+/// writer does reach the ladder, so the deferral test's empty cube log comes
+/// from the deferral and not from an earlier return.
+#[tokio::test]
+async fn conflict_watch_reaches_the_ladder_when_no_worker_is_live() {
+    let fx = fixture().await;
+    fx.db.mark_execution_redundant(&fx.live_execution_id).unwrap();
+    detect_conflict(&fx).await;
+    let calls = fx.cube.calls.lock().unwrap().clone();
+    assert_eq!(calls.first().copied(), Some("ensure_repo"), "{calls:?}");
+    assert_eq!(fx.cube.rebases.load(Ordering::SeqCst), 1);
+}
+
+/// The conflict-watch caller treats the deferral like an unavailable rung: it
+/// spawns no conflict revision alongside the live writer and leaves the
+/// attempt for a later tick.
+#[tokio::test]
+async fn conflict_watch_spawns_no_revision_while_a_worker_is_live() {
+    let fx = fixture().await;
+    detect_conflict(&fx).await;
 
     assert!(
         fx.cube.calls.lock().unwrap().is_empty(),
