@@ -1,4 +1,5 @@
 use super::helpers::*;
+use super::recovery_restage::bookmark_targets;
 
 pub(super) fn blocked_pair(path: &std::path::Path) -> (Arc<WorkDb>, WorkExecution, WorkExecution) {
     let db = Arc::new(WorkDb::open(path.to_path_buf()).unwrap());

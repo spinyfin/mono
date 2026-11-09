@@ -54,45 +54,175 @@ fn status_json_carries_the_stored_run_and_execution_errors() {
     assert!(absent["run_error_text"].is_null() && absent["execution_last_error"].is_null());
 }
 
-#[test]
-fn failed_hosted_pane_shows_stored_errors() {
+/// What the fake engine knows about; every request a status read makes is
+/// answered from it, over a real socket and `BossClient`.
+#[derive(Clone)]
+struct FakeEngine {
+    panes: Vec<HostedPaneStatus>,
+    execution: WorkExecution,
+    runs: Vec<WorkRun>,
+    task: Task,
+}
+
+impl FakeEngine {
+    fn answer(&self, request: FrontendRequest) -> FrontendEvent {
+        match request {
+            FrontendRequest::ListHostedPaneStatuses => FrontendEvent::HostedPaneStatusList {
+                panes: self.panes.clone(),
+            },
+            FrontendRequest::GetExecution { id } if id == self.execution.id => FrontendEvent::ExecutionResult {
+                execution: self.execution.clone(),
+            },
+            FrontendRequest::ListRuns { execution_id } => FrontendEvent::RunsList {
+                execution_id,
+                runs: self.runs.clone(),
+            },
+            FrontendRequest::GetWorkItem { .. } => FrontendEvent::WorkItemResult {
+                item: WorkItem::Task(self.task.clone()),
+            },
+            FrontendRequest::GetTaskRuntime { work_item_id } => FrontendEvent::TaskRuntimeResult {
+                runtime: boss_protocol::TaskRuntime::builder()
+                    .work_item_id(work_item_id)
+                    .execution_id(self.execution.id.clone())
+                    .build(),
+            },
+            FrontendRequest::ListAttentionItemsForWorkItem { work_item_id } => {
+                FrontendEvent::AttentionItemsForWorkItemList {
+                    work_item_id,
+                    items: Vec::new(),
+                }
+            }
+            other => FrontendEvent::Error {
+                message: format!("fake engine does not answer {other:?}"),
+            },
+        }
+    }
+
+    /// Serve one connection on a private socket and report `reference`'s
+    /// status against it.
+    async fn status(&self, json: bool, reference: &str, states: &[LiveWorkerState]) -> String {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let socket = std::env::temp_dir().join(format!("agents-status-{}.sock", uuid_like()));
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind fake engine socket");
+        let engine = self.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            while let Some(line) = lines.next_line().await.expect("read request") {
+                let request: boss_protocol::FrontendRequestEnvelope = serde_json::from_str(&line).expect("request");
+                let reply =
+                    boss_protocol::FrontendEventEnvelope::response(request.request_id, engine.answer(request.payload));
+                let mut bytes = serde_json::to_vec(&reply).expect("reply");
+                bytes.push(b'\n');
+                writer.write_all(&bytes).await.expect("write reply");
+            }
+        });
+        let mut client = BossClient::connect_socket(socket.to_str().expect("utf-8 socket path"))
+            .await
+            .expect("connect to fake engine");
+        let report = status_report_for_reference(&mut client, json, reference, states)
+            .await
+            .expect("status read succeeds")
+            .expect("reference resolves");
+        drop(client);
+        server.abort();
+        let _ = std::fs::remove_file(&socket);
+        report
+    }
+}
+
+fn uuid_like() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!("{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+fn fake_engine(pane: Option<HostedPaneStatus>) -> FakeEngine {
     let (run, execution) = failed_run_and_execution();
-    let panes = [hosted_pane(
+    FakeEngine {
+        panes: pane.into_iter().collect(),
+        execution,
+        runs: vec![run],
+        task: task("task_1", TaskKind::Chore),
+    }
+}
+
+const RUN_ERROR: &str = "pre-start failed: cube workspace goto failed";
+const EXECUTION_ERROR: &str = "could not restage preserved work: base unresolvable";
+
+fn assert_shows_both_errors(report: &str, json: bool) {
+    if json {
+        let value: serde_json::Value = serde_json::from_str(report.trim()).expect("one JSON document");
+        assert_eq!(value["errors"]["run_error_text"], RUN_ERROR, "{report}");
+        assert_eq!(value["errors"]["execution_last_error"], EXECUTION_ERROR, "{report}");
+    } else {
+        assert!(
+            report.contains(RUN_ERROR) && report.contains(EXECUTION_ERROR),
+            "{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn live_registry_match_shows_stored_errors() {
+    let engine = fake_engine(None);
+    let states = [worker(1, "exec_1", "Data")];
+    for json in [false, true] {
+        let report = engine.status(json, "exec_1", &states).await;
+        assert_shows_both_errors(&report, json);
+    }
+    // The live fields stay where they were, next to the new `errors`.
+    let report = engine.status(true, "data", &states).await;
+    let value: serde_json::Value = serde_json::from_str(report.trim()).expect("json");
+    assert_eq!(value["run_id"], "exec_1");
+    assert_eq!(value["slot_id"], 1);
+}
+
+#[tokio::test]
+async fn work_item_with_a_live_entry_shows_stored_errors() {
+    let engine = fake_engine(None);
+    let mut state = worker(1, "exec_1", "Data");
+    state.work_item_id = Some("task_1".to_owned());
+    let states = [state];
+    for json in [false, true] {
+        let report = engine.status(json, "task_1", &states).await;
+        assert_shows_both_errors(&report, json);
+    }
+}
+
+#[tokio::test]
+async fn hosted_pane_resolved_by_name_slot_and_execution_shows_stored_errors() {
+    let engine = fake_engine(Some(hosted_pane(
         2,
         "exec_1",
         "Data",
         HostedPaneState::DurableOccupantNoRegistry {
             status: "failed".to_owned(),
         },
-    )];
+    )));
     for reference in ["data", "2", "exec_1"] {
-        let pane = resolve_hosted_pane_ref(reference, &panes)
-            .expect("no ambiguity")
-            .expect("reference should resolve");
-        let json = hosted_pane_status_json(pane, Some(&run), Some(&execution));
-        assert_eq!(
-            json["errors"]["run_error_text"],
-            "pre-start failed: cube workspace goto failed"
-        );
-        assert_eq!(
-            json["errors"]["execution_last_error"],
-            "could not restage preserved work: base unresolvable"
-        );
+        for json in [false, true] {
+            let report = engine.status(json, reference, &[]).await;
+            assert_shows_both_errors(&report, json);
+        }
     }
-    // An error stored only on the run is shown without an execution error.
-    let mut run_only = execution.clone();
-    run_only.last_error = None;
-    let json = hosted_pane_status_json(&panes[0], Some(&run), Some(&run_only));
-    assert_eq!(
-        json["errors"]["run_error_text"],
-        "pre-start failed: cube workspace goto failed"
-    );
-    assert!(json["errors"]["execution_last_error"].is_null());
-    let lines = stored_error_lines(Some(&run), Some(&run_only)).join("\n");
-    assert!(
-        lines.contains("pre-start failed") && !lines.contains("last error"),
-        "{lines}"
-    );
+}
+
+#[tokio::test]
+async fn parked_work_item_shows_an_error_stored_only_on_its_latest_run() {
+    let mut engine = fake_engine(None);
+    engine.execution.last_error = None;
+    for json in [false, true] {
+        let report = engine.status(json, "task_1", &[]).await;
+        if json {
+            let value: serde_json::Value = serde_json::from_str(report.trim()).expect("json");
+            assert_eq!(value["errors"]["run_error_text"], RUN_ERROR, "{report}");
+            assert!(value["errors"]["execution_last_error"].is_null(), "{report}");
+        } else {
+            assert!(report.contains(RUN_ERROR) && !report.contains("last error"), "{report}");
+        }
+    }
 }
 
 #[test]
@@ -776,8 +906,7 @@ fn parse_transcript_tail_events_falls_back_to_the_grok_driver_for_acp_records() 
         boss_engine::transcript_markdown::parse_transcript_checked(jsonl).is_err(),
         "raw ACP content must not match the Claude/Codex schema directly"
     );
-    let events =
-        parse_transcript_tail_events(jsonl, Some("grok"), "/tmp/t.jsonl").expect("grok driver must normalize");
+    let events = parse_transcript_tail_events(jsonl, Some("grok"), "/tmp/t.jsonl").expect("grok driver must normalize");
     assert!(
         assistant_texts(&events)
             .iter()

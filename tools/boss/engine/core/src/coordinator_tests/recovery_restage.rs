@@ -390,3 +390,32 @@ async fn rewritten_baseline_and_lost_bookmark_need_no_checkpoint() {
             .is_empty()
     );
 }
+
+/// Where each of a record's three legacy bookmarks points now, as sorted commit
+/// ids joined by commas (`None` when absent). Tests compare it before and after
+/// an operation to prove the bookmarks did not move.
+pub(super) fn bookmark_targets(
+    record: &boss_engine_recovery::execution_bookmark::ExecutionBookmark,
+) -> Vec<(String, Option<String>)> {
+    [record.base(), record.head(), record.publication()]
+        .into_iter()
+        .map(|name| {
+            let out = JjRepo::run(
+                &record.repo_path,
+                &[
+                    "--ignore-working-copy",
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    &format!("bookmarks(exact:\"{name}\")"),
+                    "-T",
+                    "commit_id ++ \"\\n\"",
+                ],
+            );
+            let mut ids: Vec<&str> = out.lines().filter(|line| !line.is_empty()).collect();
+            ids.sort_unstable();
+            let target = (!ids.is_empty()).then(|| ids.join(","));
+            (name, target)
+        })
+        .collect()
+}
