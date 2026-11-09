@@ -704,6 +704,7 @@ mod floor_tests {
         super::super::spoke_hub::migrate_host_commands_run_idx(&expected).unwrap();
         super::super::parking_reconcile::migrate(&expected).unwrap();
         super::super::parking_reconcile::migrate_cancel_provenance(&expected).unwrap();
+        super::super::dispatch_focus::migrate_explicit_launch(&expected).unwrap();
         let before = capture(&expected);
         drop(expected);
         for version in 32..=60 {

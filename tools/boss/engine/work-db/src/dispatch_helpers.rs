@@ -1310,11 +1310,9 @@ pub fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         work_item_id,
         priority,
         preferred_workspace_id,
-        // `force` is purely a dispatcher hint (handled by
-        // `ExecutionCoordinator::force_dispatch`); the DB layer just
-        // creates / refreshes a `ready` row the same way for both
-        // forced and queued requests.
-        force: _,
+        // Explicit launch grants durable focus admission to this work item
+        // and its descendants; pool growth remains a dispatcher concern.
+        force,
         // The pause-only override intent, its provenance, and the
         // observed pause generation are all resolved entirely above this
         // layer, by `ExecutionCoordinator::dispatch_with_pause_bypass`
@@ -1592,6 +1590,16 @@ pub fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
     if resolved_repo.is_none() {
         let label = repo_unresolved_kind_label(conn, &work_item_id)?;
         bail!("{}", repo_unresolved_attention_body(&work_item_id, label));
+    }
+
+    // Keep the owner's launch intent for the lifetime of this item, including
+    // review and repair work after its implementation execution completes.
+    // This write shares the request transaction, so refusals roll it back.
+    if force {
+        conn.execute(
+            "UPDATE tasks SET explicitly_launched = 1 WHERE id = ?1",
+            [&work_item_id],
+        )?;
     }
 
     // Idempotency / re-dispatch-storm guard.
