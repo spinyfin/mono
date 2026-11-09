@@ -646,10 +646,70 @@ mod floor_tests {
 
     #[test]
     fn supported_databases_apply_post_floor_migrations_without_losing_data() {
+        // The independent expected schema is identical for every supported version.
+        let expected = Connection::open_in_memory().unwrap();
+        seed_released_schema(&expected);
+        project_postmortem::migrate_project_postmortem_signals(&expected).unwrap();
+        pr_flow::migrate_operator_questions(&expected).unwrap();
+        expected.execute_batch("CREATE TABLE execution_restore_reports (execution_id TEXT PRIMARY KEY REFERENCES work_executions(id) ON DELETE CASCADE, report TEXT NOT NULL)").unwrap();
+        personas::migrate(&expected).unwrap();
+        expected.execute_batch("CREATE TABLE sentinel (value TEXT)").unwrap();
+        expected
+            .execute_batch("ALTER TABLE work_executions ADD COLUMN dispatch_wait_blocker_id TEXT")
+            .unwrap();
+        expected
+            .execute_batch("ALTER TABLE ci_remediations ADD COLUMN queue_base_sha TEXT")
+            .unwrap();
+        expected
+            .execute_batch("ALTER TABLE ci_remediations ADD COLUMN requeue_enqueued_at INTEGER")
+            .unwrap();
+        review_guide_jobs::guide_updates::migrate(&expected).unwrap();
+        expected.execute_batch(EXECUTION_BOOKMARK_COLUMNS_43).unwrap();
+        expected.execute_batch(TASKS_PR_URL_INDEX_SQL).unwrap();
+        expected.execute_batch(TASKS_PR_UPDATED_AT_45).unwrap();
+        expected.execute_batch(TASKS_CRITICAL_PROVENANCE_46).unwrap();
+        expected.execute_batch(IN_FLIGHT_WORKSPACES_INDEX_SQL).unwrap();
+        expected.execute_batch(ATTENTION_OPEN_KIND_INDEX_SQL).unwrap();
+        expected.execute_batch(BOARD_RUNTIME_EPOCH_49).unwrap();
+        expected.execute_batch(WORK_RUNS_SEMANTIC_TURN_CONDITION_50).unwrap();
+        ci_failure_identity::migrate(&expected).unwrap();
+        expected
+            .execute_batch("ALTER TABLE work_executions ADD COLUMN progression_neighbourhood TEXT")
+            .unwrap();
+        expected.execute_batch(BOARD_REVIEW_EPOCH_53).unwrap();
+        expected.execute_batch(TASKS_PARENT_KIND_INDEX_54).unwrap();
+        expected.execute_batch(VERDICT_REVISION_INDEX_55).unwrap();
+        super::super::board_projection_schema::migrate(&expected).unwrap();
+        expected.execute_batch(EXECUTION_BOOKMARK_PRUNE_COLUMNS_60).unwrap();
+        expected.execute_batch(migrations::CREATE_LEDGER).unwrap();
+        driver_allocation::sol_selection::migrate(&expected).unwrap();
+        task_status_audit::migrate(&expected).unwrap();
+        super::super::critical_requests::migrate(&expected).unwrap();
+        expected
+            .execute_batch(WORK_EXECUTIONS_ITEM_KIND_STATUS_FINISHED_INDEX)
+            .unwrap();
+        pr_flow::migrate_operator_question_stuck_classification(&expected).unwrap();
+        stuck_report::migrate_wait_history(&expected).unwrap();
+        super::super::conflict_mismatch::migrate(&expected).unwrap();
+        preserved_work::migrate(&expected).unwrap();
+        execution_wait_history::migrate(&expected).unwrap();
+        stuck_snapshot::migrate(&expected).unwrap();
+        super::super::conflict_mismatch::migrate_operator_forced_admission(&expected).unwrap();
+        preserved_work::migrate_lease_boundary(&expected).unwrap();
+        preserved_work::migrate_lease_generation(&expected).unwrap();
+        super::super::parking::migrate(&expected).unwrap();
+        super::super::spoke_hub::migrate(&expected).unwrap();
+        super::super::parking::migrate_membership(&expected).unwrap();
+        execution_bookmarks::migrate_has_recovery_head(&expected).unwrap();
+        super::super::spoke_hub::migrate_host_commands_run_idx(&expected).unwrap();
+        let before = capture(&expected);
+        drop(expected);
         for version in 32..=60 {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("supported.db");
             let conn = Connection::open(&path).unwrap();
+            // Preparing historical input is fixture work, not the upgrade under test.
+            conn.execute_batch("BEGIN").unwrap();
             // Construct an existing DB from the independent released-chain
             // golden, rather than opening through the implementation under test.
             seed_released_schema(&conn);
@@ -744,62 +804,7 @@ mod floor_tests {
             .unwrap();
             conn.execute_batch("CREATE TABLE sentinel (value TEXT); INSERT INTO sentinel VALUES ('keep me');")
                 .unwrap();
-            let expected = Connection::open_in_memory().unwrap();
-            seed_released_schema(&expected);
-            project_postmortem::migrate_project_postmortem_signals(&expected).unwrap();
-            pr_flow::migrate_operator_questions(&expected).unwrap();
-            expected.execute_batch("CREATE TABLE execution_restore_reports (execution_id TEXT PRIMARY KEY REFERENCES work_executions(id) ON DELETE CASCADE, report TEXT NOT NULL)").unwrap();
-            personas::migrate(&expected).unwrap();
-            expected.execute_batch("CREATE TABLE sentinel (value TEXT)").unwrap();
-            expected
-                .execute_batch("ALTER TABLE work_executions ADD COLUMN dispatch_wait_blocker_id TEXT")
-                .unwrap();
-            expected
-                .execute_batch("ALTER TABLE ci_remediations ADD COLUMN queue_base_sha TEXT")
-                .unwrap();
-            expected
-                .execute_batch("ALTER TABLE ci_remediations ADD COLUMN requeue_enqueued_at INTEGER")
-                .unwrap();
-            review_guide_jobs::guide_updates::migrate(&expected).unwrap();
-            expected.execute_batch(EXECUTION_BOOKMARK_COLUMNS_43).unwrap();
-            expected.execute_batch(TASKS_PR_URL_INDEX_SQL).unwrap();
-            expected.execute_batch(TASKS_PR_UPDATED_AT_45).unwrap();
-            expected.execute_batch(TASKS_CRITICAL_PROVENANCE_46).unwrap();
-            expected.execute_batch(IN_FLIGHT_WORKSPACES_INDEX_SQL).unwrap();
-            expected.execute_batch(ATTENTION_OPEN_KIND_INDEX_SQL).unwrap();
-            expected.execute_batch(BOARD_RUNTIME_EPOCH_49).unwrap();
-            expected.execute_batch(WORK_RUNS_SEMANTIC_TURN_CONDITION_50).unwrap();
-            ci_failure_identity::migrate(&expected).unwrap();
-            expected
-                .execute_batch("ALTER TABLE work_executions ADD COLUMN progression_neighbourhood TEXT")
-                .unwrap();
-            expected.execute_batch(BOARD_REVIEW_EPOCH_53).unwrap();
-            expected.execute_batch(TASKS_PARENT_KIND_INDEX_54).unwrap();
-            expected.execute_batch(VERDICT_REVISION_INDEX_55).unwrap();
-            super::super::board_projection_schema::migrate(&expected).unwrap();
-            expected.execute_batch(EXECUTION_BOOKMARK_PRUNE_COLUMNS_60).unwrap();
-            expected.execute_batch(migrations::CREATE_LEDGER).unwrap();
-            driver_allocation::sol_selection::migrate(&expected).unwrap();
-            task_status_audit::migrate(&expected).unwrap();
-            super::super::critical_requests::migrate(&expected).unwrap();
-            expected
-                .execute_batch(WORK_EXECUTIONS_ITEM_KIND_STATUS_FINISHED_INDEX)
-                .unwrap();
-            pr_flow::migrate_operator_question_stuck_classification(&expected).unwrap();
-            stuck_report::migrate_wait_history(&expected).unwrap();
-            super::super::conflict_mismatch::migrate(&expected).unwrap();
-            preserved_work::migrate(&expected).unwrap();
-            execution_wait_history::migrate(&expected).unwrap();
-            stuck_snapshot::migrate(&expected).unwrap();
-            super::super::conflict_mismatch::migrate_operator_forced_admission(&expected).unwrap();
-            preserved_work::migrate_lease_boundary(&expected).unwrap();
-            preserved_work::migrate_lease_generation(&expected).unwrap();
-            super::super::parking::migrate(&expected).unwrap();
-            super::super::spoke_hub::migrate(&expected).unwrap();
-            super::super::parking::migrate_membership(&expected).unwrap();
-            execution_bookmarks::migrate_has_recovery_head(&expected).unwrap();
-            super::super::spoke_hub::migrate_host_commands_run_idx(&expected).unwrap();
-            let before = capture(&expected);
+            conn.execute_batch("COMMIT").unwrap();
             drop(conn);
             for _ in 0..2 {
                 let db = WorkDb::open(path.clone()).unwrap();
