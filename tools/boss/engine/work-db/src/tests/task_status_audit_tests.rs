@@ -385,6 +385,7 @@ fn upgrading_existing_tasks_backfills_once_and_preserves_known_dispatch_age() {
             ))
             .unwrap();
         }
+        crate::progression_candidates::drop_views(&conn).unwrap();
         conn.execute_batch("DROP TABLE task_status_audit; DROP TABLE task_status_audit_context;")
             .unwrap();
         if let Some(version) = version {

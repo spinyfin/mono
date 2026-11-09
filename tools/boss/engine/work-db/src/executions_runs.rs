@@ -687,13 +687,19 @@ impl WorkDb {
     /// Ahead of every key above: a row whose work item is at the human-only
     /// `critical` priority (`work/critical_priority.rs`) sorts first,
     /// regardless of dispatch class, execution priority, or age — oldest
-    /// critical first among themselves. The drain also exempts those rows
-    /// from the interactive concurrency cap and an operator pause; see
-    /// [`Self::list_critical_ready_execution_ids`].
+    /// critical first among themselves — except `progression` rows, which stay
+    /// ordered by stuck age (`created_at`) inside the progression pool. The
+    /// drain also exempts those critical rows from the interactive concurrency
+    /// cap and an operator pause; see [`Self::list_critical_ready_execution_ids`].
     pub fn list_ready_executions(&self) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
+        // A progression run is ranked by how long its item has been stuck (the
+        // sweep mints oldest-stuck first, and `created_at` then `id` keep that
+        // order), not by the class of the item it is bound to: it competes only
+        // with other progression runs, for the progression pool's own slots.
         let class_case = format!(
             "CASE \
+               WHEN we.kind = 'progression' THEN 5 \
                WHEN t.kind = 'revision' AND t.created_via GLOB '{merge_conflict}*' THEN 1 \
                WHEN t.kind = 'revision' AND t.created_via GLOB '{ci_fix}*' THEN 2 \
                WHEN t.kind = 'revision' AND t.created_via GLOB '{pr_review}*' THEN 3 \
@@ -711,8 +717,8 @@ impl WorkDb {
              WHERE we.status = 'ready' \
                AND (we.dispatch_not_before IS NULL \
                     OR CAST(we.dispatch_not_before AS INTEGER) <= CAST(strftime('%s', 'now') AS INTEGER)) \
-             ORDER BY CASE WHEN t.priority = '{critical}' THEN 0 ELSE 1 END ASC, \
-                      CASE WHEN t.priority = '{critical}' THEN we.created_at END ASC, \
+             ORDER BY CASE WHEN t.priority = '{critical}' AND we.kind <> 'progression' THEN 0 ELSE 1 END ASC, \
+                      CASE WHEN t.priority = '{critical}' AND we.kind <> 'progression' THEN we.created_at END ASC, \
                       {class_case} ASC, we.priority DESC, we.created_at ASC, we.id ASC",
             critical = super::critical_priority::PRIORITY_CRITICAL,
             EXECUTION_COLUMNS = EXECUTION_COLUMNS,

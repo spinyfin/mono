@@ -1,5 +1,6 @@
 //! Daily stuck-work measurements: one persisted report per UTC day, exported
-//! as gauges. Runs independently of any progression dispatch.
+//! as gauges. Runs independently of any progression dispatch; the two
+//! progression buckets are read from the same report as every other.
 use crate::metrics::Registry;
 use crate::work::WorkDb;
 use boss_protocol::{StuckBucket, StuckReport};
@@ -20,6 +21,16 @@ crate::register_gauge!(
     STUCK_DEPENDENCY,
     "task_stuck.waiting_on_dependency",
     "Daily count of items waiting on a progressing prerequisite."
+);
+crate::register_gauge!(
+    STUCK_PROGRESSION_IN_FLIGHT,
+    "task_stuck.progression_in_flight",
+    "Daily count of items a progression agent is handling or has just handled."
+);
+crate::register_gauge!(
+    STUCK_PROGRESSION_FAILING,
+    "task_stuck.progression_failing",
+    "Daily count of items progression could not unstick."
 );
 crate::register_gauge!(
     STUCK_ENGINE,
@@ -53,6 +64,8 @@ pub fn register_metrics(registry: &Registry) {
         &STUCK_HUMAN,
         &STUCK_CAPACITY,
         &STUCK_DEPENDENCY,
+        &STUCK_PROGRESSION_IN_FLIGHT,
+        &STUCK_PROGRESSION_FAILING,
         &STUCK_ENGINE,
         &STUCK_MAX_AGE,
         &STUCK_PARKED,
@@ -89,6 +102,8 @@ pub(crate) fn record(registry: &Registry, report: &StuckReport) {
         (StuckBucket::WaitingOnHuman, &STUCK_HUMAN),
         (StuckBucket::WaitingOnCapacity, &STUCK_CAPACITY),
         (StuckBucket::WaitingOnDependency, &STUCK_DEPENDENCY),
+        (StuckBucket::ProgressionInFlight, &STUCK_PROGRESSION_IN_FLIGHT),
+        (StuckBucket::ProgressionFailing, &STUCK_PROGRESSION_FAILING),
         (StuckBucket::EngineStuck, &STUCK_ENGINE),
         (StuckBucket::Parked, &STUCK_PARKED),
         (StuckBucket::ParkedUpstream, &STUCK_PARKED_UPSTREAM),
@@ -141,6 +156,9 @@ mod tests {
                 row(StuckBucket::EngineStuck, 40),
                 row(StuckBucket::EngineStuck, 90),
                 row(StuckBucket::WaitingOnDependency, 7),
+                row(StuckBucket::ProgressionInFlight, 3),
+                row(StuckBucket::ProgressionInFlight, 4),
+                row(StuckBucket::ProgressionFailing, 8),
             ])
             .questions_filed(0)
             .unconverted_declared_blockers(0)
@@ -149,6 +167,8 @@ mod tests {
         assert_eq!(registry.gauge_value("task_stuck.waiting_on_human"), Some(1));
         assert_eq!(registry.gauge_value("task_stuck.waiting_on_capacity"), Some(0));
         assert_eq!(registry.gauge_value("task_stuck.waiting_on_dependency"), Some(1));
+        assert_eq!(registry.gauge_value("task_stuck.progression_in_flight"), Some(2));
+        assert_eq!(registry.gauge_value("task_stuck.progression_failing"), Some(1));
         assert_eq!(registry.gauge_value("task_stuck.engine_stuck"), Some(2));
         assert_eq!(registry.gauge_value("task_stuck.parked"), Some(1));
         assert_eq!(registry.gauge_value("task_stuck.parked_upstream"), Some(1));

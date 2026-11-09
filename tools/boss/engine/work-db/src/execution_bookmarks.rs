@@ -192,8 +192,12 @@ impl WorkDb {
     /// `execution` itself when it already has a preserved tip or a live
     /// record (a retry), otherwise its recovery predecessor. Both dispatch
     /// recovery and host placement start from this one lookup.
+    ///
+    /// Kinds that [`boss_protocol::ExecutionKind::never_writes_pr_branch`]
+    /// have no recovery source: they inherit neither a predecessor's record
+    /// nor their own, matching [`Self::recovery_predecessor`].
     pub fn recovery_source(&self, execution: &WorkExecution) -> Result<Option<RecoverySource>> {
-        if execution.kind.is_read_only_review() {
+        if execution.kind.never_writes_pr_branch() {
             return Ok(None);
         }
         let own_tip = self.preserved_tip(&execution.id)?.is_some();
@@ -214,7 +218,7 @@ impl WorkDb {
     /// Resolve the predecessor by recorded execution identity alone. Workspace
     /// preferences, lease ownership, and filesystem existence are irrelevant.
     ///
-    /// A read-only review kind ([`boss_protocol::ExecutionKind::is_read_only_review`]) never
+    /// A read-only review kind ([`boss_protocol::ExecutionKind::never_writes_pr_branch`]) never
     /// has a recovery predecessor. A reviewer never writes to the PR branch,
     /// so an earlier reviewer of the same item has no unpublished work for it
     /// to inherit; the only effects inheriting that record could have are to
@@ -226,7 +230,7 @@ impl WorkDb {
     /// Its own record, when a self-retry has one, is still consulted by
     /// dispatch; only inheritance is ruled out here.
     pub fn recovery_predecessor(&self, execution: &WorkExecution) -> Result<Option<WorkExecution>> {
-        if execution.kind.is_read_only_review() {
+        if execution.kind.never_writes_pr_branch() {
             return Ok(None);
         }
         let conn = self.connect()?;

@@ -31,11 +31,12 @@ pub mod semantic_progress;
 pub use never_started_reap::NeverStartedReapCommit;
 
 /// Attributed worker-pool label for a live run (`"main"`, `"automation"`,
-/// or `"review"`). Matches
+/// `"review"`, or `"progression"`). Matches
 /// [`crate::coordinator::ExecutionCoordinator::attributed_pool_label`]:
-/// PR reviews and review guides always report `"review"`, automation triage and other
-/// automation-sourced work report `"automation"`, everything else
-/// reports `"main"`. Independent of which physical slot the run
+/// progression runs always report `"progression"` (whatever produced the stuck
+/// item they are bound to), PR reviews and review guides always report
+/// `"review"`, automation triage and other automation-sourced work report
+/// `"automation"`, everything else reports `"main"`. Independent of which physical slot the run
 /// occupies (automation can spill into a main-pool Lower Decks slot).
 ///
 /// Used at spawn registration to stamp [`LiveWorkerState::pool`] so
@@ -43,6 +44,7 @@ pub use never_started_reap::NeverStartedReapCommit;
 /// table or re-deriving attribution.
 pub fn attributed_pool_label(kind: ExecutionKind, has_source_automation: bool) -> &'static str {
     match kind {
+        ExecutionKind::Progression => "progression",
         ExecutionKind::PrReview | ExecutionKind::PrReviewGuide => "review",
         ExecutionKind::AutomationTriage => "automation",
         _ if has_source_automation => "automation",

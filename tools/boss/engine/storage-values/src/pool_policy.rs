@@ -32,6 +32,20 @@ pub const AUTOMATION_WORKER_ID_PREFIX: &str = "auto-worker-";
 /// `pool_for_worker_id` can route releases to the review pool.
 pub const REVIEW_WORKER_ID_PREFIX: &str = "review-";
 
+/// Worker ID prefix for progression-pool slots. Distinct from the main,
+/// automation, and review prefixes so `pool_for_worker_id` routes a release to
+/// the progression pool and a progression slot is never mistaken for
+/// interactive capacity.
+pub const PROGRESSION_WORKER_ID_PREFIX: &str = "progression-";
+
+/// Hard cap on the progression worker pool. This bounds the slot namespace
+/// (progression slots follow the review range), not the operating size: the
+/// operating size is `progression.pool_size`
+/// ([`crate::progression::ProgressionSettings::pool_size`]), which the runtime
+/// clamps to this ceiling. Progression agents run on a laptop that is already
+/// constrained on concurrent work, so the ceiling is deliberately small.
+pub const MAX_PROGRESSION_POOL_SIZE: usize = 4;
+
 /// Driver slug the review/automation pools dispatch on, independent of
 /// whatever `tasks.driver` the reviewed/automated row itself carries. Named
 /// so the reason is legible at every call site: reviews stay on Opus, and
@@ -126,6 +140,10 @@ pub fn kind_always_dispatches_on_pool_driver(kind: &ExecutionKind) -> bool {
         | ExecutionKind::ProjectDesign
         | ExecutionKind::RevisionImplementation
         | ExecutionKind::TaskImplementation => false,
+        // Pool-bound (the progression pool) but not driver-pinned: a
+        // progression agent runs on the product's default driver and model, so
+        // traffic allocation keeps deciding it like any other kind.
+        ExecutionKind::Progression => false,
     }
 }
 

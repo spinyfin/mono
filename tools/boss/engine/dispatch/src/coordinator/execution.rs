@@ -414,7 +414,7 @@ impl ExecutionCoordinator {
             );
         }
         let required_driver = self.resolve_spawn_driver(execution, worker_id)?;
-        let preferred = if execution.kind.is_read_only_review() {
+        let preferred = if execution.kind.never_writes_pr_branch() {
             None
         } else {
             self.recovery_source_host(execution)?
@@ -510,6 +510,31 @@ impl ExecutionCoordinator {
         worker_id: &str,
         admission: DispatchAdmission,
     ) -> Result<()> {
+        // A `progression` row has no agent to run until the engine has a
+        // progression worker kind. The drain holds it before claiming a slot;
+        // this is the chokepoint backstop for `force_dispatch`, so the row
+        // cannot start as an ordinary coding worker with a repo checkout. Not a
+        // spawn failure: the claim is handed back.
+        if self.execution_targets_progression_pool(execution) && !self.progression_spawn_enabled {
+            tracing::warn!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                worker_id = %worker_id,
+                "spawn_attempt refused: the engine cannot spawn a progression agent yet",
+            );
+            if let Err(err) = self.work_db.release_dispatch_claim(&execution.id) {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "failed to release dispatch claim after progression-unavailable hold"
+                );
+            }
+            return Err(anyhow!(
+                "execution {} is a progression run and the engine cannot spawn progression agents yet; \
+                 it stays `ready`",
+                execution.id
+            ));
+        }
         // Global pause gate. `drain_ready_queue` short-circuits before ever
         // claiming a slot, so in the ordinary case this is never reached
         // while paused — but a pause can land in the window between that
@@ -1580,7 +1605,7 @@ impl ExecutionCoordinator {
                 return Err(err);
             }
         };
-        let recovered_blocked = !execution.kind.is_read_only_review()
+        let recovered_blocked = !execution.kind.never_writes_pr_branch()
             && (recovered.as_ref().is_some_and(|recovered| recovered.has_work)
                 || self.work_db.execution_restore_report(&execution.id)?.is_some());
         let goto_target = match (pr_for_goto, immutable_target_sha.as_deref()) {
@@ -1878,7 +1903,7 @@ impl ExecutionCoordinator {
             }
             if self.work_db.execution_bookmark_optional(&execution.id)?.is_none() {
                 let execution_for_pointer = self.work_db.get_execution(&execution.id)?;
-                let report = if execution.kind.is_read_only_review() {
+                let report = if execution.kind.never_writes_pr_branch() {
                     None
                 } else {
                     self.work_db.execution_restore_report(&execution.id)?

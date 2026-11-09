@@ -54,6 +54,8 @@ impl ExecutionCoordinator {
             worker_pool,
             automation_pool: WorkerPool::new_automation(MAX_AUTOMATION_POOL_SIZE),
             review_pool: WorkerPool::new_review(DEFAULT_REVIEW_POOL_SIZE),
+            progression_pool: WorkerPool::new_progression(boss_engine_storage_values::progression::DEFAULT_POOL_SIZE),
+            progression_spawn_enabled: false,
             host_adapter,
             host_adapter_provider,
             remote_pane_releaser: None,
@@ -105,6 +107,25 @@ impl ExecutionCoordinator {
     /// from `BOSS_AUTOMATION_POOL_SIZE`; tests may supply a smaller pool.
     pub fn set_automation_pool(&mut self, pool: WorkerPool) {
         self.automation_pool = pool;
+    }
+
+    /// Override the progression pool. `app.rs` calls this with a pool sized from
+    /// `progression.pool_size`; tests may supply a smaller one.
+    pub fn set_progression_pool(&mut self, pool: WorkerPool) {
+        self.progression_pool = pool;
+    }
+
+    /// Declare that a `progression` agent can actually be spawned (see the
+    /// `progression_spawn_enabled` field). Until a progression worker kind is
+    /// registered this stays false, so `progression` executions are held `ready`
+    /// and never reach a worker slot, a cube lease, or a pane.
+    pub fn set_progression_spawn_enabled(&mut self, enabled: bool) {
+        self.progression_spawn_enabled = enabled;
+    }
+
+    /// Whether a minted `progression` execution may be spawned at all.
+    pub fn progression_spawn_enabled(&self) -> bool {
+        self.progression_spawn_enabled
     }
 
     /// Test-only views of coordinator internals the integration suite drives
@@ -388,8 +409,14 @@ impl ExecutionCoordinator {
         self.review_pool.clone()
     }
 
+    /// Return a clone of the progression worker pool handle, for the
+    /// Agents-tab pool state and the pool-claim reconciler.
+    pub fn progression_worker_pool(&self) -> WorkerPool {
+        self.progression_pool.clone()
+    }
+
     /// Return the union of execution ids currently claimed across ALL
-    /// worker pools (main, automation, and review).
+    /// worker pools (main, automation, review, and progression).
     ///
     /// The orphan-active sweep uses this as its liveness oracle so that
     /// executions claimed in the review or automation pools are correctly
@@ -401,6 +428,7 @@ impl ExecutionCoordinator {
         let mut claimed = self.worker_pool.claimed_execution_ids().await;
         claimed.extend(self.automation_pool.claimed_execution_ids().await);
         claimed.extend(self.review_pool.claimed_execution_ids().await);
+        claimed.extend(self.progression_pool.claimed_execution_ids().await);
         claimed
     }
 
@@ -421,7 +449,12 @@ impl ExecutionCoordinator {
     /// to a different execution), which the caller treats as "the row's status
     /// is the only re-dispatch protection".
     pub async fn reclaim_slot(&self, worker_id: &str, execution_id: &str) -> bool {
-        for pool in [&self.worker_pool, &self.automation_pool, &self.review_pool] {
+        for pool in [
+            &self.worker_pool,
+            &self.automation_pool,
+            &self.review_pool,
+            &self.progression_pool,
+        ] {
             if pool.reclaim_slot(worker_id, execution_id).await {
                 return true;
             }
@@ -430,7 +463,7 @@ impl ExecutionCoordinator {
     }
 
     /// Execution currently claiming `worker_id` in the pool that owns that
-    /// id (main, automation, or review), or `None` if the slot is free.
+    /// id (main, automation, review, or progression), or `None` if the slot is free.
     ///
     /// Routes through [`Self::pool_for_worker_id`] so a `review-N` or
     /// `auto-worker-N` id is not silently treated as unclaimed just because
@@ -796,7 +829,10 @@ impl ExecutionCoordinator {
     ///   `boss_engine::pr_review_recovery`'s churn guard, which parks the item
     ///   and leaves an open PR permanently unreviewed. It is also what makes
     ///   `reviews: held` true — a breaker pause that spent reviews as
-    ///   canaries was not holding them.
+    ///   canaries was not holding them. A `progression` row is likewise
+    ///   never a canary: it does not exercise the coding-worker spawn path
+    ///   being probed, and a failed canary would be recorded against the
+    ///   stuck item it was meant to help.
     /// - [`DispatchAdmission::PauseBypassOverride`] — allowed **only** under
     ///   an Operator-origin pause with the default scope
     ///   ([`DispatchPause::accepts_pause_bypass`]); a Breaker-origin pause or
@@ -840,6 +876,15 @@ impl ExecutionCoordinator {
                         "dispatch is breaker-paused ({reason}) and a `pr_review` execution is never \
                          eligible as a recovery canary — a failed canary counts against the review \
                          churn guard and would park the work item with an unreviewed open PR",
+                        reason = pause.reason,
+                    ));
+                }
+                if self.execution_targets_progression_pool(execution) {
+                    return hold(format!(
+                        "dispatch is breaker-paused ({reason}) and a progression execution is never \
+                         eligible as a recovery canary — it does not exercise the coding-worker spawn \
+                         path being probed, and a failed canary would be recorded against the stuck \
+                         work item it was meant to help",
                         reason = pause.reason,
                     ));
                 }
@@ -1084,6 +1129,9 @@ impl ExecutionCoordinator {
 
     /// Return the pool that should handle `execution`.
     ///
+    /// `progression` executions always route to the progression pool, checked
+    /// before everything else: the run is bound to a stuck work item that may
+    /// itself be review- or automation-produced, but the run is neither.
     /// `pr_review` and `pr_review_guide` executions always route to the
     /// review pool — this is checked first so a reviewer (or guide) of an
     /// automation-produced task still lands in the review pool, not the
@@ -1095,6 +1143,7 @@ impl ExecutionCoordinator {
         match self.dispatch_pool_for(execution) {
             boss_protocol::DispatchPool::Review => &self.review_pool,
             boss_protocol::DispatchPool::Automation => &self.automation_pool,
+            boss_protocol::DispatchPool::Progression => &self.progression_pool,
             boss_protocol::DispatchPool::Main => &self.worker_pool,
         }
     }
@@ -1115,11 +1164,24 @@ impl ExecutionCoordinator {
         execution.kind == ExecutionKind::PrReview || execution.kind == ExecutionKind::PrReviewGuide
     }
 
+    /// `true` when `execution` is a `progression` administrative agent run. It
+    /// routes to its own pool by kind alone, whatever the stuck item it is
+    /// bound to is (a progression run on an automation-produced item is still
+    /// a progression run, never an automation one).
+    pub fn execution_targets_progression_pool(&self, execution: &WorkExecution) -> bool {
+        execution.kind == ExecutionKind::Progression
+    }
+
     /// `true` when `execution` targets the automation pool. `pr_review_guide`
     /// is deliberately excluded — see [`Self::execution_targets_review_pool`]
     /// — so it is never held by [`Self::is_automation_paused`] and never
     /// counted as automation-originated by [`Self::attributed_pool_label`].
+    /// `progression` is excluded for the same reason: the item it is bound to
+    /// may have been produced by an automation, but the run is not one.
     pub(super) fn execution_targets_automation_pool(&self, execution: &WorkExecution) -> bool {
+        if self.execution_targets_progression_pool(execution) {
+            return false;
+        }
         if execution.kind == ExecutionKind::AutomationTriage {
             return true;
         }
@@ -1132,7 +1194,9 @@ impl ExecutionCoordinator {
     /// The pool `drain_ready_queue` routes `execution` to. Review is checked
     /// first, so a reviewer of an automation-produced task counts as review.
     pub fn dispatch_pool_for(&self, execution: &WorkExecution) -> boss_protocol::DispatchPool {
-        if self.execution_targets_review_pool(execution) {
+        if self.execution_targets_progression_pool(execution) {
+            boss_protocol::DispatchPool::Progression
+        } else if self.execution_targets_review_pool(execution) {
             boss_protocol::DispatchPool::Review
         } else if self.execution_targets_automation_pool(execution) {
             boss_protocol::DispatchPool::Automation
@@ -1142,10 +1206,13 @@ impl ExecutionCoordinator {
     }
 
     /// Return the pool that owns `worker_id`. Automation-pool slots carry the
-    /// `"auto-worker-"` prefix and review-pool slots the `"review-"` prefix,
-    /// both stamped at construction time; everything else is the main pool.
+    /// `"auto-worker-"` prefix, review-pool slots the `"review-"` prefix and
+    /// progression-pool slots the `"progression-"` prefix, all stamped at
+    /// construction time; everything else is the main pool.
     pub(super) fn pool_for_worker_id<'a>(&'a self, worker_id: &str) -> &'a WorkerPool {
-        if worker_id.starts_with(REVIEW_WORKER_ID_PREFIX) {
+        if worker_id.starts_with(PROGRESSION_WORKER_ID_PREFIX) {
+            &self.progression_pool
+        } else if worker_id.starts_with(REVIEW_WORKER_ID_PREFIX) {
             &self.review_pool
         } else if worker_id.starts_with(AUTOMATION_WORKER_ID_PREFIX) {
             &self.automation_pool

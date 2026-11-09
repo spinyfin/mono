@@ -222,7 +222,7 @@ impl DbBookmarkGate<'_> {
         cube: Option<&dyn CubeClient>,
     ) -> BookmarkStatus {
         // Read-only reviews never preserve or inherit implementation work.
-        if execution.kind.is_read_only_review() {
+        if execution.kind.never_writes_pr_branch() {
             return BookmarkStatus::NotRequired;
         }
         let result: Result<()> = async {

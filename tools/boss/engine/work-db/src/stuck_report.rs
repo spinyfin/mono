@@ -64,11 +64,14 @@ pub(super) fn build(
     let mut stmt = conn.prepare(
         "SELECT id FROM tasks t WHERE deleted_at IS NULL AND status NOT IN ('done','archived')
          AND NOT EXISTS (SELECT 1 FROM work_executions e WHERE e.work_item_id = t.id
-                         AND e.status IN ('claimed','running')) ORDER BY id",
+                         AND e.kind <> 'progression' AND e.status IN ('claimed','running')) ORDER BY id",
     )?;
     let ids = stmt
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    // The progression footprint of every item, read once: a per-item read would
+    // evaluate the view once for each stuck item in the report.
+    let progression_runs = super::progression_candidates::run_states(conn)?;
     let mut rows = Vec::new();
     let mut unconverted = 0;
     for id in ids {
@@ -141,12 +144,26 @@ pub(super) fn build(
         if age < minimum_age_secs {
             continue;
         }
+        // A progression run is not an attempt at the item's work, so the latest
+        // execution above skips it. A progression run that is queued behind a
+        // pause or a full pool still explains why nothing is moving, though.
+        let progression_wait: Option<String> = conn
+            .query_row(
+                "SELECT dispatch_wait_reason FROM work_executions
+                 WHERE work_item_id = ?1 AND kind = 'progression' AND status IN ('queued', 'ready')
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+                [&id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
         let capacity = wait
-            .as_deref()
-            .is_some_and(boss_engine_storage_values::dispatch_wait::is_capacity_wait_reason);
+            .iter()
+            .chain(progression_wait.iter())
+            .any(|reason| boss_engine_storage_values::dispatch_wait::is_capacity_wait_reason(reason));
+        let progression = progression_runs.get(&id).copied().unwrap_or_default();
         let classification = classification(conn, &task, wait.as_deref())?;
-        let dependency =
-            task.blocked_reason.as_deref() == Some("dependency") && progressing_prerequisite(conn, &id, now)?;
+        let dependency = task.blocked_reason.as_deref() == Some("dependency") && progressing_prerequisite(conn, &id)?;
         let bucket = if parked_holder.is_some() {
             StuckBucket::Parked
         } else if human || matches!(classification.as_str(), "S18_pr_behind" | "awaiting_merge") {
@@ -161,9 +178,19 @@ pub(super) fn build(
             StuckBucket::WaitingOnCapacity
         } else if dependency {
             StuckBucket::WaitingOnDependency
+        } else if progression.infrastructure_failing {
+            // Progression could not unstick the item: its last runs ended in
+            // infrastructure failure, so the sweep no longer nominates it. The
+            // engine has admitted defeat; this counts as waiting on a human.
+            StuckBucket::ProgressionFailing
+        } else if progression.live || progression.in_cooldown {
+            // An agent is working the item, or has just been and the item is
+            // inside the cooldown that follows a run (four times as long after a
+            // run that judged the item not stuck).
+            StuckBucket::ProgressionInFlight
         } else if super::stuck_activity::has_pending_execution(conn, &id)?
             || (super::stuck_activity::has_waiting_dependency_execution(conn, &id)?
-                && progressing_prerequisite(conn, &id, now)?)
+                && progressing_prerequisite(conn, &id)?)
         {
             // Queued/ready dispatch is active work, including chain-serialization
             // holds. A waiting_dependency row is active only while its gate is
@@ -343,36 +370,13 @@ fn has_parked_prerequisite(conn: &Connection, id: &str, seen: &mut BTreeSet<Stri
     Ok(false)
 }
 
-fn progressing_prerequisite(conn: &Connection, id: &str, now: i64) -> Result<bool> {
-    for prereq in deps::gating_prereqs_for(conn, id)? {
-        if let Some(project) = query_project(conn, &prereq)?
-            && !matches!(project.status, ProjectStatus::Done | ProjectStatus::Archived)
-        {
-            return Ok(true);
-        }
-        if let Some(task) = query_task(conn, &prereq)?
-            && task.deleted_at.is_none()
-            && !task.status.is_terminal()
-        {
-            let live: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM work_executions WHERE work_item_id = ?1
-                 AND status IN ('queued','ready','waiting_dependency','claimed','running','waiting_human'))",
-                [&prereq],
-                |r| r.get(0),
-            )?;
-            if live
-                || !human_hold(
-                    conn,
-                    &task,
-                    latest_basis(conn, &prereq, "blocked_reason")?.as_deref(),
-                    now,
-                )?
-            {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
+/// Whether progress is going through a prerequisite of `id` rather than through
+/// `id` itself: an open prerequisite is live, parked, or a progression
+/// candidate. This reads `progression_candidate_clauses` so the report, the
+/// sweep and `bossctl dispatch diagnose` share one definition (design 2.1
+/// clause 4).
+fn progressing_prerequisite(conn: &Connection, id: &str) -> Result<bool> {
+    super::progression_candidates::dependency_held(conn, id)
 }
 
 /// Classify durable reasons before applying an owned host liveness observation.

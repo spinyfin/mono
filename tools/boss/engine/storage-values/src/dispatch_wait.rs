@@ -12,6 +12,12 @@ pub const DISPATCH_WAIT_REASON_DISPATCH_PAUSED: &str = "dispatch_paused";
 /// Automation pause is holding this automation-pool row.
 pub const DISPATCH_WAIT_REASON_AUTOMATION_PAUSED: &str = "automation_paused";
 
+/// A `progression` row is held `ready` because the engine cannot yet spawn a
+/// progression agent (no worker kind of its own). Not a capacity wait: nothing
+/// is short of slots, so it is deliberately absent from
+/// [`is_capacity_wait_reason`].
+pub const DISPATCH_WAIT_REASON_PROGRESSION_UNAVAILABLE: &str = "progression_unavailable";
+
 /// Dispatch focus is holding an out-of-scope ready row.
 pub use boss_protocol::DISPATCH_WAIT_REASON_FOCUS_MODE;
 
@@ -54,7 +60,12 @@ mod tests {
         ] {
             assert!(is_capacity_wait_reason(&reason), "{reason}");
         }
-        for reason in ["interactive_concurrency_cap", "slot_busy", "waiting_dependency"] {
+        for reason in [
+            "interactive_concurrency_cap",
+            "slot_busy",
+            "waiting_dependency",
+            DISPATCH_WAIT_REASON_PROGRESSION_UNAVAILABLE,
+        ] {
             assert!(!is_capacity_wait_reason(reason), "{reason}");
         }
     }

@@ -8,6 +8,9 @@ pub enum DispatchPool {
     Main,
     Review,
     Automation,
+    /// Administrative `progression` agents: their own small pool, invisible to
+    /// the interactive cap and to Lower Decks spillover.
+    Progression,
 }
 
 impl DispatchPool {
@@ -17,6 +20,7 @@ impl DispatchPool {
             Self::Main => "main",
             Self::Review => "review",
             Self::Automation => "automation",
+            Self::Progression => "progression",
         }
     }
 }

@@ -325,6 +325,24 @@ fn seed_waiting_writer(db: &WorkDb, product: &str) -> String {
 // ── The registry ───────────────────────────────────────────────────────────
 
 const PRODUCERS: &[Producer] = &[
+    Producer {
+        name: "stuck-item progression (list_progression_candidates)",
+        stance: Stance::Excludes,
+        seed: |db, product| {
+            let id = chore(db, product, "stuck progression candidate");
+            set_row(
+                db,
+                &id,
+                "status = 'blocked', blocked_reason = 'merge_conflict', progression_grace_waived_at = strftime('%s','now')",
+            );
+            id
+        },
+        nominated: |db| {
+            ids(db.list_progression_candidates(None).unwrap(), |c| {
+                c.work_item_id.clone()
+            })
+        },
+    },
     // Re-dispatch of work the engine lost track of.
     Producer {
         name: "orphan re-dispatch (list_orphan_active_candidates)",

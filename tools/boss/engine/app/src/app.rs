@@ -1416,6 +1416,7 @@ impl ServerState {
         let worker_pool = WorkerPool::new(cfg.work.worker_pool_size);
         let automation_pool = WorkerPool::new_automation(cfg.work.automation_pool_size);
         let review_pool = WorkerPool::new_review(cfg.work.review_pool_size);
+        let progression_pool = WorkerPool::new_progression(cfg.work.progression.effective_pool_size());
         // Capture clamped pool sizes before they move into the coordinator so
         // we can embed them into ServerState and push EnginePoolConfig to the
         // macOS app on every RegisterAppSession.
@@ -1752,6 +1753,7 @@ impl ServerState {
             execution_coordinator_inner.set_enable_dispatch_ready_bus(cfg.work.enable_dispatch_ready_bus);
             execution_coordinator_inner.set_automation_pool(automation_pool);
             execution_coordinator_inner.set_review_pool(review_pool);
+            execution_coordinator_inner.set_progression_pool(progression_pool);
             // Wire the SHA-delta gate's run-start snapshot: when an
             // execution transitions to `running`, the completion
             // handler captures the bound chore PR's head SHA into

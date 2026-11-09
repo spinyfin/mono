@@ -281,6 +281,15 @@ impl WorkDb {
              WHERE id = ?1 AND deleted_at IS NULL AND parked_at IS NULL AND status NOT IN ('done', 'archived')",
             params![work_item_id, now_string()],
         )?;
+        if updated == 0 {
+            // The un-park transaction stamps eagerly; an item the reconcile then
+            // finished (its PR merged while parked) must not keep the stamp.
+            conn.execute(
+                "UPDATE tasks SET progression_grace_waived_at = NULL
+                 WHERE id = ?1 AND status IN ('done', 'archived')",
+                [work_item_id],
+            )?;
+        }
         Ok(updated > 0)
     }
 

@@ -2,8 +2,9 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
+use boss_engine_storage_values::progression::ProgressionSettings;
 use boss_engine_utility_model::{self as utility_model, UtilityModel};
 
 use boss_execution_contracts::{DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE};
@@ -253,6 +254,13 @@ pub struct WorkConfig {
     /// `BOSS_ENABLE_DISPATCH_READY_BUS`.
     #[builder(default = DEFAULT_ENABLE_DISPATCH_READY_BUS)]
     pub enable_dispatch_ready_bus: bool,
+    /// The limits that bound progression agents (design section 2.6): pool size,
+    /// sweep interval, stuck-after grace, cooldown, create budget, run timeout.
+    /// Each is configured via a `BOSS_PROGRESSION_*` variable and defaults to the
+    /// design's placeholder; they are not yet tuned from measured traffic. See
+    /// [`ProgressionSettings`].
+    #[builder(default)]
+    pub progression: ProgressionSettings,
     /// Model slug the Boss coordinator session launches with, pushed to the
     /// macOS app as `EnginePoolConfig.coordinator_model` on every
     /// `RegisterAppSession`. Configured via `BOSS_COORDINATOR_MODEL`;
@@ -311,6 +319,7 @@ impl WorkConfig {
             .unwrap_or(DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER);
         let enable_dispatch_ready_bus =
             lookup_bool(&lookup, "BOSS_ENABLE_DISPATCH_READY_BUS")?.unwrap_or(DEFAULT_ENABLE_DISPATCH_READY_BUS);
+        let progression = load_progression_settings(&lookup)?;
         let coordinator_model = lookup_string(&lookup, "BOSS_COORDINATOR_MODEL")
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
@@ -331,6 +340,7 @@ impl WorkConfig {
             .merge_order_stagger_secs(merge_order_stagger_secs)
             .enable_spawn_capability_breaker(enable_spawn_capability_breaker)
             .enable_dispatch_ready_bus(enable_dispatch_ready_bus)
+            .progression(progression)
             .coordinator_model(coordinator_model)
             .build())
     }
@@ -370,6 +380,46 @@ pub fn tmux_socket_path_beside_db(db_path: &Path) -> Result<PathBuf> {
              relying on this fallback."
         ),
     }
+}
+
+/// Read the progression limits from `BOSS_PROGRESSION_*`. Absent variables keep
+/// the design's placeholders; a zero or unparsable value is an error, since a
+/// zero grace, cooldown or interval would make the sweep fire on every item at
+/// once.
+fn load_progression_settings(lookup: &impl Fn(&str) -> Option<OsString>) -> Result<ProgressionSettings> {
+    let defaults = ProgressionSettings::default();
+    let positive = |name: &str| -> Result<Option<u64>> {
+        match lookup_u64(lookup, name)? {
+            Some(0) => bail!("{name} must be greater than zero"),
+            other => Ok(other),
+        }
+    };
+    let secs = |name: &str, default: i64| -> Result<i64> {
+        positive(name)?.map_or(Ok(default), |value| {
+            i64::try_from(value).map_err(|_| anyhow!("{name} is too large: {value}"))
+        })
+    };
+    let pool_size = lookup_usize(lookup, "BOSS_PROGRESSION_POOL_SIZE")?.unwrap_or(defaults.pool_size);
+    if pool_size == 0 {
+        bail!("BOSS_PROGRESSION_POOL_SIZE must be greater than zero");
+    }
+    Ok(ProgressionSettings::builder()
+        .pool_size(pool_size)
+        .sweep_interval_secs(positive("BOSS_PROGRESSION_SWEEP_INTERVAL_SECS")?.unwrap_or(defaults.sweep_interval_secs))
+        .stuck_after_secs(secs("BOSS_PROGRESSION_STUCK_AFTER_SECS", defaults.stuck_after_secs)?)
+        .cooldown_secs(secs("BOSS_PROGRESSION_COOLDOWN_SECS", defaults.cooldown_secs)?)
+        .max_creates_per_item_window(positive("BOSS_PROGRESSION_MAX_CREATES_PER_ITEM_WINDOW")?.map_or(
+            Ok(defaults.max_creates_per_item_window),
+            |value| {
+                u32::try_from(value).map_err(|_| anyhow!("BOSS_PROGRESSION_MAX_CREATES_PER_ITEM_WINDOW is too large"))
+            },
+        )?)
+        .max_creates_window_secs(secs(
+            "BOSS_PROGRESSION_MAX_CREATES_WINDOW_SECS",
+            defaults.max_creates_window_secs,
+        )?)
+        .run_timeout_secs(positive("BOSS_PROGRESSION_RUN_TIMEOUT_SECS")?.unwrap_or(defaults.run_timeout_secs))
+        .build())
 }
 
 fn lookup_usize(lookup: impl Fn(&str) -> Option<OsString>, name: &str) -> Result<Option<usize>> {

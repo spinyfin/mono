@@ -83,6 +83,26 @@ fn project_prerequisite_is_progressing_until_terminal_or_missing() {
             .build(),
     )
     .unwrap();
+    // An open project with no live or stuck member holds nothing: the dependent
+    // is the item to progress.
+    assert_eq!(row(&db, &task.id).bucket, StuckBucket::EngineStuck);
+    // A member task of the project that is being worked makes it live.
+    let member = create_test_chore_manual(&db, &product.id, "Project member");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET project_id = ?2 WHERE id = ?1",
+            params![member.id, project.id],
+        )
+        .unwrap();
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(&member.id)
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::Running)
+            .build(),
+    )
+    .unwrap();
     assert_eq!(row(&db, &task.id).bucket, StuckBucket::WaitingOnDependency);
     db.connect()
         .unwrap()
@@ -479,14 +499,10 @@ fn human_only_gates_do_not_count_as_progressing_prerequisites() {
                 .build(),
         )
         .unwrap();
-        assert_eq!(
-            row(&db, &dependent.id).bucket,
-            if expected == StuckBucket::WaitingOnHuman {
-                StuckBucket::EngineStuck
-            } else {
-                StuckBucket::WaitingOnDependency
-            }
-        );
+        // None of these prerequisites is live, parked or a progression
+        // candidate, so progress cannot go through them: the dependent is the
+        // item to progress.
+        assert_eq!(row(&db, &dependent.id).bucket, StuckBucket::EngineStuck);
     }
 }
 

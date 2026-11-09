@@ -390,6 +390,15 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
                 "Expected outcome for this run:\n- read what you need to answer the question accurately,\n- post exactly one comprehensive reply to the comment thread,\n- take no other action — you are read-only.\n",
             );
         }
+        ExecutionKind::Progression => {
+            // Administrative agent bound to a stuck item: it holds no checkout
+            // and delivers no PR. (The diagnosis packet is composed by the
+            // progression brief composer; this arm keeps the generic composer
+            // sane and PR-free if reached.)
+            prompt.push_str(
+                "Expected outcome for this run:\n- diagnose why this work item is stuck from what the engine has recorded,\n- take no repository action: you hold no checkout and open no PR,\n- end the run with a `\"$BOSS_BIN\" propose done` declaration.\n",
+            );
+        }
         ExecutionKind::PrReviewGuide => {
             // Enforced read-only review-guide generator: a pinned read-only
             // workspace, no PR. (The full review-guide prompt with the

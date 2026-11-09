@@ -2417,6 +2417,21 @@ async fn serve_scoped(
         server_state.feature_flags.clone(),
     );
 
+    // Progression sweep (task-persistence-parking-and-autonomous-progression.md,
+    // section 2.2): queue an administrative `progression` run for every
+    // non-parked work item that is stuck with nothing working it. Publishes the
+    // limits the `progression_candidates` view reads at spawn, whatever the
+    // flag says, so the stuck report and `bossctl dispatch diagnose` apply this
+    // engine's numbers; minting is gated by the `progression_agents` flag
+    // (default off), re-checked every pass.
+    let coord_for_progression = server_state.execution_coordinator.clone();
+    let _progression_sweep_handle = boss_engine_runtime::progression_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        cfg.work.progression,
+        Arc::new(move || coord_for_progression.kick()),
+        server_state.feature_flags.clone(),
+    );
+
     // Automation scheduler (maintenance-tasks.md, Maint task 5): each tick,
     // for every enabled `schedule` automation that is due, compute its
     // cron/timezone occurrence, enforce the open-task gate, apply catch-up /

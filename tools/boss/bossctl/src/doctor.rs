@@ -1969,6 +1969,15 @@ pub fn run_diagnose(
             .ok()
     });
 
+    // Whether the engine would spend a progression agent on this item is a fact
+    // about the item, not a dispatch event, so diagnose reads it from state.db
+    // too: it names the clause that says no when the answer is no.
+    let progression_diagnosis = db.zip(scope.work_item_id.as_deref()).and_then(|(work_db, item_id)| {
+        crate::progression::ProgressionDiagnosis::load(work_db, item_id)
+            .map_err(|err| eprintln!("warning: progression lookup skipped: {err:#}"))
+            .ok()
+    });
+
     let mut findings = match_dispatch_signatures(&events, now_ms, Some(&fleet), Some(&db_facts), &scope_execs);
 
     match load_scope_trace_records(root, &scope_execs, &scope_items) {
@@ -2054,6 +2063,9 @@ pub fn run_diagnose(
         if let Some(focus) = &focus_diagnosis {
             payload.insert("focus".into(), focus.to_json());
         }
+        if let Some(progression) = &progression_diagnosis {
+            payload.insert("progression".into(), progression.to_json());
+        }
         println!("{}", Value::Object(payload));
         return Ok(());
     }
@@ -2086,6 +2098,12 @@ pub fn run_diagnose(
 
     if let Some(focus) = focus_diagnosis.as_ref().filter(|f| f.focus.is_active()) {
         for line in focus.lines() {
+            println!("{line}");
+        }
+    }
+
+    if let Some(progression) = &progression_diagnosis {
+        for line in progression.lines(i64::try_from(now_ms / 1000).unwrap_or(i64::MAX)) {
             println!("{line}");
         }
     }

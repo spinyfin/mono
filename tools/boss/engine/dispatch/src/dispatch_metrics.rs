@@ -32,6 +32,11 @@ boss_metrics::register_gauge!(
     "Number of `ready` executions targeting the review pool, sampled at the start of the most recent drain pass.",
 );
 boss_metrics::register_gauge!(
+    DISPATCH_QUEUE_DEPTH_PROGRESSION,
+    "dispatch.queue_depth.progression",
+    "Number of `ready` executions targeting the progression pool, sampled at the start of the most recent drain pass.",
+);
+boss_metrics::register_gauge!(
     DISPATCH_QUEUE_OLDEST_WAIT_SECONDS_MAIN,
     "dispatch.queue_oldest_wait_seconds.main",
     "Age in seconds (by created_at) of the oldest ready main-pool execution, sampled at the start of the most recent drain pass.",
@@ -45,6 +50,11 @@ boss_metrics::register_gauge!(
     DISPATCH_QUEUE_OLDEST_WAIT_SECONDS_REVIEW,
     "dispatch.queue_oldest_wait_seconds.review",
     "Age in seconds (by created_at) of the oldest ready review-pool execution, sampled at the start of the most recent drain pass.",
+);
+boss_metrics::register_gauge!(
+    DISPATCH_QUEUE_OLDEST_WAIT_SECONDS_PROGRESSION,
+    "dispatch.queue_oldest_wait_seconds.progression",
+    "Age in seconds (by created_at) of the oldest ready progression-pool execution, sampled at the start of the most recent drain pass.",
 );
 boss_metrics::register_counter!(
     DISPATCH_COMPLETED,
@@ -63,9 +73,11 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_gauge(&DISPATCH_QUEUE_DEPTH_MAIN);
     registry.register_gauge(&DISPATCH_QUEUE_DEPTH_AUTOMATION);
     registry.register_gauge(&DISPATCH_QUEUE_DEPTH_REVIEW);
+    registry.register_gauge(&DISPATCH_QUEUE_DEPTH_PROGRESSION);
     registry.register_gauge(&DISPATCH_QUEUE_OLDEST_WAIT_SECONDS_MAIN);
     registry.register_gauge(&DISPATCH_QUEUE_OLDEST_WAIT_SECONDS_AUTOMATION);
     registry.register_gauge(&DISPATCH_QUEUE_OLDEST_WAIT_SECONDS_REVIEW);
+    registry.register_gauge(&DISPATCH_QUEUE_OLDEST_WAIT_SECONDS_PROGRESSION);
     registry.register_counter(&DISPATCH_COMPLETED);
     registry.register_gauge(&DISPATCH_DRAIN_PASS_DURATION_MS);
 }
@@ -79,12 +91,16 @@ pub struct PoolQueueSample {
     pub oldest_wait_secs: i64,
 }
 
-/// Snapshot of all three pools' queue state for one drain pass.
+/// Snapshot of every pool's queue state for one drain pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QueueSnapshot {
     pub main: PoolQueueSample,
     pub automation: PoolQueueSample,
     pub review: PoolQueueSample,
+    /// Candidates waiting for a progression slot. This is what shows the pool
+    /// limit firing: when `progression.pool_size` is smaller than the stream of
+    /// candidates, they queue here, oldest first, rather than being dropped.
+    pub progression: PoolQueueSample,
 }
 
 /// Push a [`QueueSnapshot`] into the registry's gauges.
@@ -95,6 +111,8 @@ pub fn record_queue_snapshot(registry: &Registry, snapshot: QueueSnapshot) {
     DISPATCH_QUEUE_OLDEST_WAIT_SECONDS_AUTOMATION.set(registry, snapshot.automation.oldest_wait_secs);
     DISPATCH_QUEUE_DEPTH_REVIEW.set(registry, snapshot.review.depth);
     DISPATCH_QUEUE_OLDEST_WAIT_SECONDS_REVIEW.set(registry, snapshot.review.oldest_wait_secs);
+    DISPATCH_QUEUE_DEPTH_PROGRESSION.set(registry, snapshot.progression.depth);
+    DISPATCH_QUEUE_OLDEST_WAIT_SECONDS_PROGRESSION.set(registry, snapshot.progression.oldest_wait_secs);
 }
 
 /// Record one successfully completed dispatch (a worker slot claimed).
@@ -112,7 +130,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn record_queue_snapshot_sets_all_six_gauges() {
+    fn record_queue_snapshot_sets_every_pool_gauge() {
         let registry = Registry::new();
         register_metrics(&registry);
 
@@ -131,6 +149,10 @@ mod tests {
                     depth: 0,
                     oldest_wait_secs: 0,
                 },
+                progression: PoolQueueSample {
+                    depth: 2,
+                    oldest_wait_secs: 900,
+                },
             },
         );
 
@@ -148,6 +170,11 @@ mod tests {
         assert_eq!(
             registry.gauge_value("dispatch.queue_oldest_wait_seconds.review"),
             Some(0)
+        );
+        assert_eq!(registry.gauge_value("dispatch.queue_depth.progression"), Some(2));
+        assert_eq!(
+            registry.gauge_value("dispatch.queue_oldest_wait_seconds.progression"),
+            Some(900)
         );
     }
 

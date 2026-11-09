@@ -465,6 +465,11 @@ pub(crate) fn query_latest_run(conn: &Connection, execution_id: &str) -> Result<
     .map_err(Into::into)
 }
 
+/// A `progression` run is bound to the stuck item it is unsticking, but it is
+/// not an attempt at the item's work. It is skipped here so that a finished
+/// progression run is never the "latest execution" the reconcile and request
+/// paths compare against: left in, it would read as an execution of a different
+/// kind and stop them minting the item's next implementation execution.
 pub(crate) fn query_latest_execution_for_work_item(
     conn: &Connection,
     work_item_id: &str,
@@ -475,7 +480,7 @@ pub(crate) fn query_latest_execution_for_work_item(
                 created_at, started_at, finished_at,
                 pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
          FROM work_executions
-         WHERE work_item_id = ?1
+         WHERE work_item_id = ?1 AND kind <> 'progression'
          ORDER BY created_at DESC, id DESC
          LIMIT 1",
     )?
@@ -535,6 +540,7 @@ pub(crate) fn query_last_non_abandoned_execution_for_work_item(
          FROM work_executions
          WHERE work_item_id = ?1
            AND status != 'abandoned'
+           AND kind <> 'progression'
          ORDER BY created_at DESC, id DESC
          LIMIT 1",
     )?

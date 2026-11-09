@@ -102,6 +102,14 @@ pub fn worker_kind_for_execution(kind: &ExecutionKind) -> WorkerKind {
         ExecutionKind::AutomationTriage => WorkerKind::Triage,
         ExecutionKind::AnswerAgent => WorkerKind::AnswerAgent,
         ExecutionKind::PrReviewGuide => WorkerKind::ReviewGuide,
+        // Interim posture: the engine cannot spawn a progression agent yet (the
+        // dispatcher holds every `progression` row `ready`; see
+        // `ExecutionCoordinator::progression_spawn_enabled`). Should one ever
+        // reach a spawn path anyway, it gets the most restricted surface that
+        // exists today — the answer agent's deny-by-default allowlist, with no
+        // write access to a repo — and never `Standard`'s full write and push
+        // access.
+        ExecutionKind::Progression => WorkerKind::AnswerAgent,
         ExecutionKind::ChoreImplementation
         | ExecutionKind::CiRemediation
         | ExecutionKind::ConflictResolution

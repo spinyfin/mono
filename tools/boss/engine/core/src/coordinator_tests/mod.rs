@@ -23,6 +23,7 @@ mod pool_contract;
 mod post_merge_review_dispatch;
 mod pre_start_streak;
 mod preserved_work;
+mod progression_pool;
 mod recovery;
 mod recovery_fresh_start;
 mod recovery_restage;

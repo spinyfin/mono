@@ -11,7 +11,7 @@ fn has_writer(conn: &Connection, task_id: &str) -> Result<bool> {
     let kinds = stmt.query_map([task_id], |row| row.get::<_, String>(0))?;
     for kind in kinds {
         let kind: ExecutionKind = kind?.parse().map_err(anyhow::Error::msg)?;
-        if !kind.is_read_only_review() {
+        if !kind.never_writes_pr_branch() {
             return Ok(true);
         }
     }

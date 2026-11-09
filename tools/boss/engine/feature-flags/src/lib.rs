@@ -414,6 +414,25 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         default_enabled: false,
         capability_id: None,
     },
+    FeatureFlagSpec {
+        name: "progression_agents",
+        description: "Let the engine spend an administrative `progression` agent on any non-parked work item \
+             that is stuck, has no live work, and is not waiting on a human (design: \
+             task-persistence-parking-and-autonomous-progression.md, section 2). When on, the \
+             `progression_sweep` reads the `progression_candidates` view every \
+             `progression.sweep_interval` and mints one `progression` execution per candidate, oldest stuck \
+             first, into the progression pool (`progression.pool_size` slots, invisible to the interactive \
+             cap and to Lower Decks spillover, held by both the operator and the breaker pause). A \
+             progression agent never writes to a repository; it diagnoses, then creates work for coding \
+             agents or asks the owner one question. DEFAULT OFF, and inert until the progression worker \
+             kind lands: until then a minted row is held `ready` with wait reason `progression_unavailable` \
+             and cannot spawn. The stuck report and `bossctl dispatch diagnose` read the same candidate view \
+             whether or not this flag is on. Kill switch: set false to stop minting; rows already minted \
+             stay `ready` until they are cancelled.",
+        category: "progression",
+        default_enabled: false,
+        capability_id: None,
+    },
 ];
 
 /// Snapshot of one flag's current state for the wire / debug pane.

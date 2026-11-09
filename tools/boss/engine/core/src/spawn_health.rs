@@ -729,10 +729,14 @@ pub async fn maybe_admit_recovery_probe(
     // Reviews are ineligible (see the module-level rationale above); the
     // coordinator's gate would refuse them anyway, and filtering here means
     // a queue whose tail happens to be reviews still gets a canary from the
-    // rows behind them.
+    // rows behind them. So are progression runs: they are the least urgent
+    // rows in the queue, which is exactly where this probe looks, but a run
+    // bound to a stuck item proves nothing about the coding-worker spawn path
+    // the breaker is probing, and a failed canary would be recorded against
+    // the very item it is meant to help.
     let eligible: Vec<&WorkExecution> = ready
         .iter()
-        .filter(|e| !coordinator.execution_targets_review_pool(e))
+        .filter(|e| !coordinator.execution_targets_review_pool(e) && !coordinator.execution_targets_progression_pool(e))
         .collect();
     let skipped_reviews = total_ready - eligible.len();
     // Dispatch focus mode holds out-of-scope rows from every automatic path,

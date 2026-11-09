@@ -390,7 +390,7 @@ async fn legacy_conflicts_remain_untouched_and_never_prevent_start() {
             0,
             "{kind:?}"
         );
-        if kind.is_read_only_review() {
+        if kind.never_writes_pr_branch() {
             assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
             assert_eq!(
                 pointer_integrity_kind(&diff(&LocalJj, &record).await.unwrap_err()),

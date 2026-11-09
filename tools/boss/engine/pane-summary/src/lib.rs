@@ -297,6 +297,15 @@ pub fn answer_agent_summary() -> Option<String> {
     Some("answering a doc comment".to_owned())
 }
 
+/// Pane summary for `progression` agents — same rationale as
+/// [`ci_remediation_summary`]: the run's `work_item_id` is the stuck item
+/// itself, so the cached implementer gerund must not be read or overwritten.
+/// Reads as `"<Name> is unsticking <task-name>"`, or the shorter `"unsticking
+/// work"` when the task name is empty.
+pub fn progression_summary(task_name: &str) -> Option<String> {
+    Some(derived_task_phrase("unsticking", "unsticking work", task_name, 3))
+}
+
 /// Fixed phrase for [`ExecutionKind::PrReviewGuide`], mirroring
 /// [`answer_agent_summary`]: this kind's synthetic row is keyed by a source
 /// comparison id, not a real task, so there is no `work_item_id` cache slot
@@ -344,6 +353,10 @@ pub fn derived_title_summary(
         | ExecutionKind::ProjectDesign
         | ExecutionKind::RevisionImplementation
         | ExecutionKind::TaskImplementation => None,
+        // A progression run is bound to the stuck item itself, so its row title
+        // is that item's own title: routing it through `get_or_generate` would
+        // read and overwrite the implementer's cached summary, flapping both.
+        ExecutionKind::Progression => Some(progression_summary(task_name)),
     }
 }
 
@@ -760,6 +773,18 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("answering a doc comment"),
+        );
+        assert_eq!(
+            derived_title_summary(&ExecutionKind::Progression, None, "Fix flaky test")
+                .unwrap()
+                .as_deref(),
+            Some("unsticking Fix flaky test"),
+        );
+        assert_eq!(
+            derived_title_summary(&ExecutionKind::Progression, None, "")
+                .unwrap()
+                .as_deref(),
+            Some("unsticking work"),
         );
     }
 
