@@ -1,6 +1,100 @@
 use super::*;
 use boss_protocol::{Product, Project, ProjectStatus, Task, TaskKind, TaskStatus};
 
+fn failed_run_and_execution() -> (WorkRun, WorkExecution) {
+    let run = WorkRun::builder()
+        .id("run_1")
+        .agent_id("agent_1")
+        .execution_id("exec_1")
+        .created_at("1747000000")
+        .status("failed")
+        .error_text("pre-start failed: cube workspace goto failed")
+        .build();
+    let execution = WorkExecution::builder()
+        .id("exec_1")
+        .work_item_id("task_1")
+        .kind(boss_protocol::ExecutionKind::ChoreImplementation)
+        .status(boss_protocol::ExecutionStatus::Failed)
+        .repo_remote_url("git@example.com:foo.git")
+        .created_at("1747000000")
+        .last_error("could not restage preserved work: base unresolvable")
+        .build();
+    (run, execution)
+}
+
+#[test]
+fn status_text_shows_the_stored_run_and_execution_errors() {
+    let (run, execution) = failed_run_and_execution();
+    let lines = stored_error_lines(Some(&run), Some(&execution)).join("\n");
+    assert!(
+        lines.contains("pre-start failed: cube workspace goto failed"),
+        "{lines}"
+    );
+    assert!(
+        lines.contains("could not restage preserved work: base unresolvable"),
+        "{lines}"
+    );
+    // Neither error stored: nothing is printed.
+    let (mut quiet_run, mut quiet_execution) = failed_run_and_execution();
+    quiet_run.error_text = None;
+    quiet_execution.last_error = None;
+    assert!(stored_error_lines(Some(&quiet_run), Some(&quiet_execution)).is_empty());
+}
+
+#[test]
+fn status_json_carries_the_stored_run_and_execution_errors() {
+    let (run, execution) = failed_run_and_execution();
+    let errors = stored_errors_json(Some(&run), Some(&execution));
+    assert_eq!(errors["run_error_text"], "pre-start failed: cube workspace goto failed");
+    assert_eq!(
+        errors["execution_last_error"],
+        "could not restage preserved work: base unresolvable"
+    );
+    let absent = stored_errors_json(None, None);
+    assert!(absent["run_error_text"].is_null() && absent["execution_last_error"].is_null());
+}
+
+#[test]
+fn failed_hosted_pane_shows_stored_errors() {
+    let (run, execution) = failed_run_and_execution();
+    let panes = [hosted_pane(
+        2,
+        "exec_1",
+        "Data",
+        HostedPaneState::DurableOccupantNoRegistry {
+            status: "failed".to_owned(),
+        },
+    )];
+    for reference in ["data", "2", "exec_1"] {
+        let pane = resolve_hosted_pane_ref(reference, &panes)
+            .expect("no ambiguity")
+            .expect("reference should resolve");
+        let json = hosted_pane_status_json(pane, Some(&run), Some(&execution));
+        assert_eq!(
+            json["errors"]["run_error_text"],
+            "pre-start failed: cube workspace goto failed"
+        );
+        assert_eq!(
+            json["errors"]["execution_last_error"],
+            "could not restage preserved work: base unresolvable"
+        );
+    }
+    // An error stored only on the run is shown without an execution error.
+    let mut run_only = execution.clone();
+    run_only.last_error = None;
+    let json = hosted_pane_status_json(&panes[0], Some(&run), Some(&run_only));
+    assert_eq!(
+        json["errors"]["run_error_text"],
+        "pre-start failed: cube workspace goto failed"
+    );
+    assert!(json["errors"]["execution_last_error"].is_null());
+    let lines = stored_error_lines(Some(&run), Some(&run_only)).join("\n");
+    assert!(
+        lines.contains("pre-start failed") && !lines.contains("last error"),
+        "{lines}"
+    );
+}
+
 #[test]
 fn tmux_adoption_state_label_marks_not_tmux_hosted_as_remote_detached() {
     assert_eq!(
@@ -682,7 +776,8 @@ fn parse_transcript_tail_events_falls_back_to_the_grok_driver_for_acp_records() 
         boss_engine::transcript_markdown::parse_transcript_checked(jsonl).is_err(),
         "raw ACP content must not match the Claude/Codex schema directly"
     );
-    let events = parse_transcript_tail_events(jsonl, Some("grok"), "/tmp/t.jsonl").expect("grok driver must normalize");
+    let events =
+        parse_transcript_tail_events(jsonl, Some("grok"), "/tmp/t.jsonl").expect("grok driver must normalize");
     assert!(
         assistant_texts(&events)
             .iter()
