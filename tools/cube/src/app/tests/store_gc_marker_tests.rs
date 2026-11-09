@@ -7,7 +7,7 @@ use super::store_gc_tests::{
     abandon_command, index_command, mono_record, op_log, op_log_command, pr_ref_commands, ps_command, seed_store_files,
     source_of,
 };
-use super::support::{ExpectedCommand, FakeRunner, seed_mono_repo, with_database_path};
+use super::support::{EXCLUSIVE_GATE_WAIT, ExpectedCommand, FakeRunner, seed_mono_repo, with_database_path};
 use crate::app::errors::CubeError;
 use crate::app::store_gc::{Collection, DEFAULT_KEEP, gc_repo_store};
 use crate::command_runner::JjGate;
@@ -100,7 +100,7 @@ fn a_pass_neither_replaces_nor_clears_another_stores_marker() {
     );
     // Even a pass that already holds the exclusive gate, having finished its
     // reads before the marker appeared, can neither replace nor clear it.
-    let gate = JjGate::exclusive(&JjGate::path(database.parent().unwrap()), Duration::ZERO).unwrap();
+    let gate = JjGate::exclusive(&JjGate::path(database.parent().unwrap()), EXCLUSIVE_GATE_WAIT).unwrap();
     assert!(gate.quarantine(&source).is_err());
     assert!(gate.clear_quarantine(&source).is_err());
     drop(gate);
@@ -204,7 +204,7 @@ fn empty_marker_requires_explicit_verified_recovery() {
     let error = JjGate::shared_with_runner(&lock, Duration::ZERO, &fake).err().unwrap();
     assert_eq!(error.exit_code(), std::process::ExitCode::from(75));
     assert!(error.to_string().contains("unknown owner"));
-    let gate = JjGate::exclusive(&lock, Duration::ZERO).unwrap();
+    let gate = JjGate::exclusive(&lock, EXCLUSIVE_GATE_WAIT).unwrap();
     assert!(gate.quarantine(Path::new("/store/owner")).is_err());
     assert_eq!(std::fs::read_to_string(marker_path(&database)).unwrap(), "");
 }

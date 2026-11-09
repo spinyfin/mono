@@ -40,6 +40,8 @@ mod workspace_ops;
 pub(crate) mod workspace_status;
 
 #[cfg(test)]
+mod test_fs;
+#[cfg(test)]
 mod tests;
 
 pub use dispatch::run;

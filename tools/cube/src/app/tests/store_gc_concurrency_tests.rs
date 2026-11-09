@@ -14,6 +14,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+#[path = "store_gc_fixture.rs"]
+mod fixture;
+
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
 struct Runner {
@@ -37,6 +40,7 @@ impl CommandRunner for Runner {
         if invocation.program == "ps" {
             return Ok(String::new());
         }
+        let reported_program = invocation.program.clone();
         let mut invocation = invocation.clone();
         if invocation.program == "jj" {
             if invocation.args.iter().any(|arg| arg == "gc")
@@ -72,20 +76,41 @@ impl CommandRunner for Runner {
             start.elapsed(),
             output.is_ok()
         );
+        // Report failures under the production program name. Cube recognises
+        // jj's stale-working-copy and diverged-operation errors by it, so the
+        // concurrent leases below recover from a racing sibling workspace the
+        // way they do against `jj` on PATH instead of failing outright.
+        let output = output.map_err(|error| match error {
+            CubeError::CommandFailed {
+                program: _,
+                args,
+                status,
+                stderr,
+            } => CubeError::CommandFailed {
+                program: reported_program.clone(),
+                args,
+                status,
+                stderr,
+            },
+            other => other,
+        });
         let output = output?;
-        if invocation.args.iter().any(|arg| arg == "log")
+        if invocation
+            .args
+            .iter()
+            .any(|arg| arg == crate::app::store_gc::OP_LOG_TEMPLATE)
             && let Some(cut) = &self.cut
         {
-            // Keep the real DAG, but put the selected cut outside the keep
-            // window without sleeping three days to age a scratch fixture.
+            // Keep the real DAG and age only the selected cut. Cached fixture
+            // timestamps may be months old; retained operations must still be
+            // inside the keep window when this test runs again.
+            let now = crate::app::util::current_epoch_s().unwrap();
             return Ok(output
                 .lines()
                 .map(|line| {
-                    if line.starts_with(cut) {
-                        format!("{cut} 1")
-                    } else {
-                        line.to_owned()
-                    }
+                    let (id, _) = line.split_once(' ').expect("operation id and timestamp");
+                    let ended = if id == cut { 1 } else { now };
+                    format!("{id} {ended}")
                 })
                 .collect::<Vec<_>>()
                 .join("\n"));
@@ -108,6 +133,20 @@ fn real_leases_continue_during_collection_and_exclusivity_is_retryable() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let f = Fixture::with_ws_path("pool/mono-agent-001");
+    // Exercise a neglected operation store's file count and deletion I/O.
+    // Contents of unreachable views are never decoded by the collector, and
+    // sparse files keep their count and logical size without writing a
+    // gigabyte of zeros. Creating that many files is bound by filesystem
+    // metadata latency, so they are staged beside the store while the
+    // small-store phases below run, then swapped in once the history is installed.
+    let staged_views = f._dir.path().join("unreachable-views");
+    let unreachable_views = std::thread::spawn({
+        let staged_views = staged_views.clone();
+        move || {
+            std::fs::create_dir(&staged_views)?;
+            crate::app::test_fs::create_sparse_files(&staged_views, 137_000, 8192)
+        }
+    });
     let database = f._dir.path().join("state.db");
     let record = RepoRecord {
         repo: "mono".into(),
@@ -174,7 +213,14 @@ fn real_leases_continue_during_collection_and_exclusivity_is_retryable() {
     };
     release(&first);
 
-    let gate = JjGate::exclusive(&JjGate::path(f._dir.path()), Duration::ZERO).unwrap();
+    // The release above closed its last shared hold an instant ago; see
+    // `EXCLUSIVE_GATE_WAIT` for why a zero wait here is a race against every
+    // other test's process spawns.
+    let gate = JjGate::exclusive(
+        &JjGate::path(f._dir.path()),
+        crate::app::tests::support::EXCLUSIVE_GATE_WAIT,
+    )
+    .unwrap();
     let started = Instant::now();
     let error = run_with_dependencies(
         Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "gc contention"]),
@@ -189,56 +235,25 @@ fn real_leases_continue_during_collection_and_exclusivity_is_retryable() {
     assert!(busy < Duration::from_secs(4), "{busy:?}");
     drop(gate);
 
-    let cut = f.jj(&f.root, &["op", "log", "--no-graph", "--limit", "1", "-T", "id"]);
-    // Eight independent bookmark writers in a secondary workspace model a
-    // busy pool without racing exports to the primary Git index, and avoid
-    // serial process-startup overhead. Wait for every writer, including on
-    // failure; every operation comes from the declared real jj binary.
-    let script = r#"
-set -eu
-pids=""
-for worker in 0 1 2 3 4 5 6 7; do
-    (
-        i=0
-        while [ "$i" -lt 2100 ]; do
-            if [ "$((i % 2))" -eq 0 ]; then rev=main; else rev=feat; fi
-            "$1" --quiet --ignore-working-copy -R "$2" bookmark set "gc-scale-$worker" --allow-backwards -r "$rev"
-            i=$((i + 1))
-        done
-    ) &
-    pids="$pids $!"
-done
-status=0
-for pid in $pids; do wait "$pid" || status=1; done
-exit "$status"
-"#;
-    let mut seed = RealCommandRunner::invocation(
-        &f.root,
-        "sh",
-        &[
-            "-c",
-            script,
-            "seed-operations",
-            f.runner.binary.to_str().unwrap(),
-            f.ws.to_str().unwrap(),
-        ],
-    );
-    seed.env
-        .push(("JJ_CONFIG".into(), f.runner.config.display().to_string()));
-    RealCommandRunner
-        .run_with_timeout(&seed, Duration::from_secs(600))
-        .unwrap();
-    f.jj(
-        &f.root,
-        &["--ignore-working-copy", "log", "-r", "main", "-T", "commit_id"],
-    );
-    // Exercise a neglected operation store's file count and deletion I/O.
-    // Contents of unreachable views are never decoded by the collector.
+    // Installing the cached history and placing the unreachable views touch
+    // only private paths and run jj by its declared absolute path, so
+    // environment-dependent tests can proceed meanwhile. Reacquire before the
+    // leases below spawn anything by bare name again.
+    drop(_env);
+    let cut = fixture::install(&f);
+    unreachable_views.join().unwrap().unwrap();
+    // The staged directory becomes the store's view directory: the history's
+    // real views move in, then the directories trade places.
     let views = f.root.join(".jj/repo/op_store/views");
-    let unreachable_view = vec![0_u8; 8192];
-    for n in 1..=137_000_u64 {
-        std::fs::write(views.join(format!("{n:0128x}")), &unreachable_view).unwrap();
+    for entry in std::fs::read_dir(&views).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::rename(entry.path(), staged_views.join(entry.file_name())).unwrap();
     }
+    std::fs::remove_dir(&views).unwrap();
+    std::fs::rename(&staged_views, &views).unwrap();
+    let _env = crate::app::tests::support::ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let (scale_baseline, before_gc) = lease();
     release(&before_gc);
     eprintln!("lease baseline: small store={baseline:?}, populated store={scale_baseline:?}");
@@ -325,4 +340,10 @@ exit "$status"
         report.exclusive_ms, report.collection_ms
     );
     f.jj(&f.ws, &["status"]);
+    // Tens of thousands of rewritten operation and index files remain. Their
+    // removal is not part of what this test measures, and as the binary's
+    // longest test it would otherwise end the whole run seconds later, so it
+    // proceeds alongside the remaining tests; the test runner's private temp
+    // root is removed in full after the binary exits regardless.
+    std::thread::spawn(move || drop(f));
 }
