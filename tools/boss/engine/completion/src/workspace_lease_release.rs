@@ -315,6 +315,21 @@ pub async fn apply_release(
     evidence: ReleaseEvidence<'_>,
     do_release: impl Future<Output = Result<()>>,
 ) -> LeaseReleaseOutcome {
+    apply_release_choosing(db, execution, lease_id, evidence, |_| do_release).await
+}
+
+/// [`apply_release`] for callers that can release with cube's
+/// `--force-reset`, which skips cube's own unpushed-work guard and salvage.
+/// `release` receives whether teardown preservation succeeded and must use the
+/// forced reset only when it did; after a failed preservation it must use the
+/// plain release so cube keeps or salvages a dirty tree.
+pub async fn apply_release_choosing<Fut: Future<Output = Result<()>>>(
+    db: &WorkDb,
+    execution: &WorkExecution,
+    lease_id: &str,
+    evidence: ReleaseEvidence<'_>,
+    release: impl FnOnce(bool) -> Fut,
+) -> LeaseReleaseOutcome {
     let current = match db.get_execution(&execution.id) {
         Ok(row) if row.cube_lease_id.as_deref() == Some(lease_id) => row,
         Ok(row) => {
@@ -362,9 +377,8 @@ pub async fn apply_release(
             // store, which must not race a worker that may still be running
             // jj in this workspace. A failure is reported and the lease is
             // returned regardless: recovery trouble never strands a workspace.
-            if let Err(err) = preservation.preserve(execution, cause).await {
-                report_preservation_failure(db, execution, lease_id, &err);
-            }
+            // The failure is reported once the release outcome is known.
+            let preserve_error = preservation.preserve(execution, cause).await.err();
             match db.claim_execution_workspace_release(&execution.id, lease_id) {
                 Ok(true) => {}
                 Ok(false) => return LeaseReleaseOutcome::NoLease,
@@ -374,7 +388,7 @@ pub async fn apply_release(
                     };
                 }
             }
-            let result = match do_release.await {
+            let result = match release(preserve_error.is_none()).await {
                 Ok(()) => {
                     tracing::info!(
                         execution_id = %execution.id,
@@ -428,6 +442,9 @@ pub async fn apply_release(
                     LeaseReleaseOutcome::CubeFailed { error }
                 }
             };
+            if let Some(err) = &preserve_error {
+                report_preservation_failure(db, execution, lease_id, err, &result);
+            }
             if result == LeaseReleaseOutcome::Released {
                 if let Err(err) = db.finish_execution_workspace_release(execution) {
                     tracing::error!(error = %err, "failed to clear released workspace metadata");
@@ -542,24 +559,40 @@ fn raise_inspect_attention(
     }
 }
 
-/// Teardown could not preserve the workspace's edits. The lease is released
-/// anyway, so this is the one durable pointer to the unbookmarked work.
-fn report_preservation_failure(db: &WorkDb, execution: &WorkExecution, lease_id: &str, err: &anyhow::Error) {
+/// Teardown could not preserve the workspace's edits. This is the one durable
+/// pointer to the unbookmarked work, worded from what the release actually did.
+fn report_preservation_failure(
+    db: &WorkDb,
+    execution: &WorkExecution,
+    lease_id: &str,
+    err: &anyhow::Error,
+    outcome: &LeaseReleaseOutcome,
+) {
     tracing::warn!(
         execution_id = %execution.id,
         lease_id,
         error = %format!("{err:#}"),
-        "teardown could not preserve the workspace; releasing the lease anyway",
+        "teardown could not preserve the workspace",
     );
+    let what_happened = match outcome {
+        LeaseReleaseOutcome::Released => format!(
+            "lease `{lease_id}` was released without cube's forced reset, so cube's own unpushed-work guard keeps or \
+             salvages a dirty tree"
+        ),
+        LeaseReleaseOutcome::CubeFailed { .. } => format!(
+            "lease `{lease_id}` is still held because cube's release failed, and the leftover-lease sweep retries it"
+        ),
+        _ => format!("lease `{lease_id}` is no longer held for this run"),
+    };
     let inspect = boss_engine_recovery::execution_bookmark::PreserveInspect {
         existing_commit_id: None,
         workspace_change_id: None,
         workspace_commit_id: None,
         workspace_count: None,
         reason: format!(
-            "Teardown could not preserve this run's workspace edits ({err:#}); lease `{lease_id}` was released \
-             anyway. The worker's last working-copy commit is not bookmarked as `preserved/{id}`; locate it in the \
-             shared jj store (for example with `jj op log`)",
+            "Teardown could not preserve this run's workspace edits ({err:#}); {what_happened}. The worker's last \
+             working-copy commit is not bookmarked as `preserved/{id}`; locate it in the shared jj store (for \
+             example with `jj op log`)",
             id = execution.id
         ),
     };

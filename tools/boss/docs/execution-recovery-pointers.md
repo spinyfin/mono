@@ -4,12 +4,12 @@ Dispatch creates no bookmarks. It records the baseline commit on the `execution_
 
 - The worker creates the publication branch `boss/<execution id>` (`jj bookmark set boss/<execution id> -r @`) immediately before `cube pr create`. The worker does not advance any recovery bookmark.
 - At teardown, when the workspace holds unpublished work, the engine writes one `preserved/<execution id>` bookmark at its tip and records that tip on the execution row. Nothing is written when there is nothing to preserve. The preserved tip is the source for later edits.
-- A transitional `boss-recovery/<execution id>` head exists only when a positioned lease already carries unpublished commits (work restored from a preserved tip). A `boss-base/<execution id>` bookmark exists only for legacy executions that were in flight before this layout; recovery never reads it.
+- Dispatch writes no `boss-recovery/<execution id>` head: restoring a preserved tip positions `@` on it and records no bookmark. Only legacy executions carry a `boss-recovery/` head. A `boss-base/<execution id>` bookmark exists only for legacy executions that were in flight before this layout; recovery never reads it.
 
 Legacy names still found in the store:
 
 - `boss-base/<execution id>`: leftover baseline bookmark from earlier engines. The floor is the row's `base_commit`.
-- `boss-recovery/<execution id>`: recovery head, transitional as described above.
+- `boss-recovery/<execution id>`: legacy recovery head from earlier engines; dispatch no longer writes it.
 - `boss/<execution id>`: the publication head the worker creates before opening a PR, then pushes.
 
 The `execution_bookmarks` row for the execution records the shared store path, the host, and the baseline commit id (`base_commit`) recorded at dispatch from `work_executions.pr_head_before` (bound PR) or the commit the workspace was positioned on (normally trunk, or an open task PR's head when recovery positioned there), captured as the working copy's parent right after positioning, or returned by the engine's own fresh positioning, and carried to pointer creation so a trunk that advances in between cannot move the floor. `trunk()` resolved at pointer creation is only the last resort when no positioned commit could be captured; the positioned commit is captured after every positioning (a fresh change's parent, or the PR head / target commit a goto landed on), even when the pre-pointer snapshot recorded no `pr_head_before`; a failed capture is retried as a pre-start failure rather than recording that later floor. Recovery reads that commit id as the floor of the execution's work; it never reads the `boss-base/` bookmark. A baseline commit that was rewritten or abandoned still exists in the store and still works as a floor; a row with no usable `base_commit` uses the bound PR's `pr_head_before`, then trunk.
@@ -33,8 +33,8 @@ Every consumer, by pointer (paths are repo-relative):
 
 **`boss-recovery/<exec>`**
 
-- Written by: `create_from` on `@` only when the positioned lease already carries unpublished commits. The worker does not advance it. Teardown preservation is the source for later edits.
-- Read by: `resolve_pointers`, `restore`, `restore_for_retry` and `diff` (all in `execution_bookmark.rs`); the coordinator's blocked-workspace recovery (`create_or_start_fresh` and `recover_from_record` in `coordinator/blocked_workspace.rs`); the abandoned-bookmark sweep (`core/src/abandoned_execution_bookmarks.rs`); prune (`prune.rs`).
+- Written by: leftover from earlier engines only. Dispatch `create_from` writes no recovery bookmark (it sets `has_recovery_head = Some(false)`), and the worker does not advance one. Teardown preservation (`preserved/<exec>`) is the source for later edits.
+- Read by: `resolve_pointers`, `restore`, `restore_for_retry` and `diff` (all in `execution_bookmark.rs`); the abandoned-bookmark sweep (`core/src/abandoned_execution_bookmarks.rs`); prune (`prune.rs`).
 - What is actually needed: the tip of unpublished work that was already on the lease at dispatch, including work that was never pushed. Needed until the work is proven published or teardown has preserved it, then never.
 
 **`boss/<exec>`**
@@ -45,15 +45,15 @@ Every consumer, by pointer (paths are repo-relative):
 
 **`pr/<n>`**
 
-- Written by: cube's bound-PR checkout (`cube workspace goto`) when positioning on a PR (`recover_from_record` in `blocked_workspace.rs`).
+- Written by: cube's bound-PR checkout (`cube workspace goto`) when positioning on a PR.
 - Read by: the positioned workspace itself (the engine does not read `pr/<n>`); forgotten by cube's sweep once no workspace is positioned on it.
 - What is actually needed: the PR head for the duration of one positioning. Already bounded (7 local bookmarks on the dev Mac); what lingered were 656 `refs/heads/pr/<n>` git refs that an older jj left behind after the bookmark was forgotten, which the store upkeep below removes.
 
-**The minimal set.** During an execution's life the remaining names encode different things, and two of them legitimately diverge: the worker pushes `boss/` (which cube may then move to the remote head) while a transitional `boss-recovery/` or a teardown `preserved/` tip keeps tracking local unpushed work, and the baseline is the recorded commit id. What is not needed is any of them **after** the PR that carried the work is merged or closed, and that is where all of the growth was: the count was 3 × executions ever run. Empty initialization writes no bookmarks; a recovery head exists only for unpublished work already on the lease; `boss/` exists between the worker's first push and merge; `pr/<n>` only during a positioning.
+**The minimal set.** During an execution's life the remaining names encode different things, and two of them legitimately diverge: the worker pushes `boss/` (which cube may then move to the remote head) while a teardown `preserved/` tip (or, for a legacy execution, its `boss-recovery/` head) keeps tracking local unpushed work, and the baseline is the recorded commit id. What is not needed is any of them **after** the PR that carried the work is merged or closed, and that is where all of the growth was: the count was 3 × executions ever run. Empty initialization writes no bookmarks; no recovery head is written at dispatch; `boss/` exists between the worker's first push and merge; `pr/<n>` only during a positioning.
 
 ## Lifecycle: how the pointers are retired
 
-Empty initialization records the starting commit and performs no jj store operation. Restored unpublished work creates one transitional recovery head on `@`. The worker creates the publication bookmark immediately before opening a PR. From then on an empty `bookmark forget` runs nothing, because an operation that changes no bookmark still writes a full view.
+Empty initialization records the starting commit and performs no jj store operation. Restored unpublished work positions `@` on the preserved tip and writes no bookmark. The worker creates the publication bookmark immediately before opening a PR. From then on an empty `bookmark forget` runs nothing, because an operation that changes no bookmark still writes a full view.
 
 **The prune sweep** (`engine/core/src/execution_bookmark_prune.rs`) runs in the abandoned-branch sweep loop, every five minutes, over at most 100 live local records of terminal executions per pass (`list_prune_candidates`). A record whose chain root is still open is stamped `pr_open` and looked at again in six hours. For the rest it asks the recovery crate to prove the work published (`recovery/src/execution_bookmark/prune.rs`), with these vouchers in order:
 
@@ -128,7 +128,7 @@ Implementation execution kinds enter `ExecutionCoordinator::recover_execution_bo
 | Host selection                                                | Prefer the recovery source host when it is eligible; if it cannot admit work, select another eligible host and archive through the source adapter. No wait or backpressure on a full source. |
 | Resume / same-execution pre-start retry                       | Its own record is inspected first; fallback archives all old targets before releasing names and creating new pointers.                                                                       |
 
-Pointer initialization is a second boundary: `create_from` checks that an inherited baseline belongs to the same store and, when it must create a recovery head, refuses an existing recovery-head name. Leftover baseline or publication names from a partial legacy initialization are ignored. `create_or_start_fresh` in the coordinator archives and releases partially initialized current-run pointers, retries adoption of a valid predecessor, and only then archives the source before positioning fresh and creating the new record. This also handles a crash between writing refs and persisting their database row. Immutable review targets remain immutable during this fallback.
+Pointer initialization is a second boundary: `create_from` checks that an inherited baseline belongs to the same store and writes no bookmark. Leftover baseline, recovery or publication names from a legacy initialization are ignored. A crash between positioning and persisting the execution row leaves no pointer to clean up. Immutable review targets remain immutable during this fallback.
 
 The low-level checks are `resolve_pointers`, `resume_heads` and `restore_for_retry` in [execution_bookmark.rs](../engine/recovery/src/execution_bookmark.rs). Their failures are handled by the common coordinator fallback rather than a blocking-card policy. Host placement honours explicit constraints; the source adapter archives work on its owning host if fresh dispatch uses another host.
 

@@ -1,5 +1,5 @@
 //! Lease hand-back across pre-start retries: a lease kept or failed by one
-//! attempt must neither be released without recovery proof nor wedge the
+//! attempt must neither be released ahead of the pane and occupancy gates nor wedge the
 //! next attempt. Shared fixtures live in [`super::helpers`].
 
 use super::helpers::*;

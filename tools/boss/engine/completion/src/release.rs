@@ -145,7 +145,9 @@ impl WorkerCompletionHandler {
         let Some(lease_id) = execution.cube_lease_id.clone() else {
             return ForceReleaseOutcome::NoLeaseHeld;
         };
-        match crate::workspace_lease_release::apply_release(
+        let lease_ref = lease_id.as_str();
+        let cube_client = &self.cube_client;
+        match crate::workspace_lease_release::apply_release_choosing(
             &self.work_db,
             execution,
             &lease_id,
@@ -155,7 +157,13 @@ impl WorkerCompletionHandler {
                 occupancy: &crate::workspace_lease_release::EmptyOccupancy,
                 preservation: &crate::workspace_lease_release::DbPreservation::new(&self.work_db, None),
             },
-            self.cube_client.release_workspace_with_reset(&lease_id),
+            |preserved| async move {
+                if preserved {
+                    cube_client.release_workspace_with_reset(lease_ref).await
+                } else {
+                    cube_client.release_workspace(lease_ref).await
+                }
+            },
         )
         .await
         {

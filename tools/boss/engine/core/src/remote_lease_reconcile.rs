@@ -362,11 +362,12 @@ async fn reap_dead_remote_execution(
 
     // Release the leaked lease on the REMOTE cube (the correct one — the
     // heartbeat/lost-workspace sweeps would target the LOCAL cube). A dead
-    // pid is inferred death: the lease is returned only once the recovery
-    // bookmark is confirmed on the owning host and no process there has its
-    // cwd in the workspace. Otherwise it stays recorded for a later pass
-    // (`release_terminal_remote_resources`), with attention filed for a
-    // failed gate; cube's own TTL is the backstop.
+    // pid is inferred death: the lease is returned only once the owning
+    // host confirms no process there has its cwd in the workspace. Otherwise
+    // it stays recorded for a later pass (`release_terminal_remote_resources`);
+    // cube's own TTL is the backstop. Preserving unpushed edits is best effort:
+    // a failure is reported through `preserved_work_needs_inspection` and does
+    // not hold the lease.
     let lease_outcome = release_dead_remote_lease(
         work_db,
         adapter,
@@ -394,8 +395,8 @@ async fn reap_dead_remote_execution(
         "Execution `{exec_id}` was dispatched to host `{host}` and its worker process (pid {remote_pid}) is gone \
          without ever reporting completion.\n\n\
          The execution has been reaped, so the work item can be re-dispatched. Its cube lease is released once the \
-         run's recovery bookmark and the workspace's occupancy are confirmed; if that cannot be confirmed the lease \
-         stays held and a separate attention item says why.\n\n\
+         owning host confirms the workspace is unoccupied; a failure to preserve unpushed edits is reported in a \
+         separate inspection item and does not hold the lease.\n\n\
          **Last worker output** (`{worker_log_path}` on `{host}`):\n\n```\n{log}\n```\n\n\
          If that output shows a host-level problem — expired agent credentials, a missing binary — every dispatch \
          to `{host}` will fail the same way until it is fixed.",

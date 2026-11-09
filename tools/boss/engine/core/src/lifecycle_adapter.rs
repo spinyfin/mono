@@ -117,7 +117,7 @@ impl LifecycleServices for CoreLifecycleServices {
         cause: TerminalCause,
         adapter: &dyn HostAdapter,
     ) -> LeaseReleaseOutcome {
-        crate::workspace_lease_release::apply_release(
+        crate::workspace_lease_release::apply_release_choosing(
             &self.work_db,
             execution,
             lease_id,
@@ -127,7 +127,13 @@ impl LifecycleServices for CoreLifecycleServices {
                 occupancy: &crate::workspace_lease_release::EmptyOccupancy,
                 preservation: &crate::workspace_lease_release::DbPreservation::new(&self.work_db, Some(adapter)),
             },
-            adapter.release_workspace_with_reset(lease_id),
+            move |preserved| async move {
+                if preserved {
+                    adapter.release_workspace_with_reset(lease_id).await
+                } else {
+                    adapter.release_workspace(lease_id).await
+                }
+            },
         )
         .await
     }

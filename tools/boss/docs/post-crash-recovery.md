@@ -37,9 +37,10 @@ Compared to the other terminal statuses:
 `preserved/<execution>` bookmark in the shared jj store (or, for a legacy
 execution, its `boss-recovery/<execution>` head), not from the originating
 workspace. After an orphan is recorded, the engine releases the cube lease
-once teardown has preserved the current workspace commit (or found nothing
-unpublished to preserve), the pane is confirmed gone, and no process has its cwd
-inside the workspace. Inconclusive probes keep the lease held, with cube's
+once the pane is confirmed gone and no process has its cwd inside the
+workspace. Teardown preservation of the current workspace commit is best
+effort and runs first; a failure is reported through a
+`preserved_work_needs_inspection` item and never holds the lease. Inconclusive probes keep the lease held, with cube's
 24-hour TTL as the backstop. A release attempt atomically claims
 `cube_lease_id` before calling cube; a genuine failure restores the claim.
 Successful release, including an already-absent lease, clears the remaining

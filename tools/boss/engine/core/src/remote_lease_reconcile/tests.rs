@@ -684,8 +684,8 @@ async fn known_safe_input_retries_without_a_pid_and_stale_clear_preserves_marker
 }
 
 /// A dead recorded pid is only inferred death: the owning host must also
-/// report an empty workspace and a confirmed recovery pointer before the
-/// lease goes back.
+/// report an empty workspace before the lease goes back; a missing
+/// recovery pointer does not hold it.
 #[tokio::test]
 async fn dead_pid_keeps_the_lease_unless_occupancy_is_confirmed() {
     use crate::workspace_lease_release::{LEASE_UNRELEASED_ATTENTION_KIND, Occupancy};

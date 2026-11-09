@@ -391,8 +391,9 @@ pub mod cube {
     }
 
     /// End-of-run release: skip cube's dirty-preservation probe so the
-    /// workspace returns to the pool. Safe only after the recovery bookmark
-    /// is confirmed; the shared store keeps the commits.
+    /// workspace returns to the pool. Use it only after teardown preservation
+    /// succeeded; after a failed preservation use [`release_workspace`] so
+    /// cube's guard keeps or salvages a dirty tree.
     pub async fn release_workspace_with_reset<T: CubeJsonTransport + ?Sized>(
         transport: &T,
         lease_id: &str,
