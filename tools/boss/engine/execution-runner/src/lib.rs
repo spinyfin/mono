@@ -102,7 +102,6 @@ use boss_feature_flags as feature_flags;
 use boss_pane_summary as pane_summary;
 use boss_pr_review as pr_review;
 use boss_pr_template as pr_template;
-use boss_ssh_transport as ssh_transport;
 use boss_work_db as work;
 #[cfg(test)]
 use boss_work_db::test_support;

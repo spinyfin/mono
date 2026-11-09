@@ -29,7 +29,6 @@ RUNNER_DEPS = [
     "//tools/boss/engine/pr-template",
     "//tools/boss/protocol",
     "//tools/boss/engine/review-guide",
-    "//tools/boss/engine/ssh-transport",
     "//tools/boss/tmux",
     "//tools/boss/engine/work-db",
     "//lib/rust/git_utils",
