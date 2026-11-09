@@ -50,10 +50,6 @@ mod archive_tests;
 /// baseline commit id is a floor, never something the heads must descend from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PointerIntegrityKind {
-    /// Never produced by this crate; handled like [`Self::Other`] if seen.
-    NotContained,
-    /// Never produced by this crate; handled like [`Self::Other`] if seen.
-    PrHeadUnavailable,
     /// A resumed head descends from work that teardown quarantined as possibly
     /// belonging to a later holder. Nothing was moved or restaged.
     Quarantined,

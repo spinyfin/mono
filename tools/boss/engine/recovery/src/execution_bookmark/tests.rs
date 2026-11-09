@@ -781,3 +781,92 @@ async fn shallow_history_below_trunk_does_not_affect_baseline_creation() {
         .unwrap();
     assert_eq!(next.base_commit.as_deref(), Some(advanced.as_str()));
 }
+
+fn files_at(repo: &Path, revset: &str) -> Vec<String> {
+    boss_engine_test_git::jj::JjRepo::run(repo, &["--ignore-working-copy", "file", "list", "-r", revset])
+        .lines()
+        .map(|f| Path::new(f).file_name().unwrap().to_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn rewritten_baseline_keeps_working_without_ancestry_repair() {
+    use boss_engine_test_git::jj::JjRepo;
+    use test_support::{bookmark, one, revision_on_pr_head};
+    // The PR head (the recorded baseline) is rebased onto newer main together
+    // with the work above it, so the heads no longer descend from the row's
+    // commit id. That is ordinary jj history, not damage.
+    let s = revision_on_pr_head("exec_rewritten_base").await;
+    let repo = &s.repo.repo;
+    let original = s.record.base_commit.clone().unwrap();
+    JjRepo::run(&s.repo.worker, &["rebase", "-b", "boss/root", "-d", "main"]);
+    let rewritten = one(repo, &revision(&s.record.base()));
+    assert_ne!(rewritten, original, "the baseline bookmark followed the rewrite");
+    // Move the bookmark somewhere unrelated, then delete it: neither matters.
+    JjRepo::run(repo, &["new", "root()", "-m", "Another line"]);
+    bookmark(repo, &s.record.base(), &one(repo, "@"));
+    JjRepo::run(repo, &["bookmark", "delete", &s.record.base()]);
+    let patch = diff(&LocalJj, &s.record).await.unwrap();
+    assert!(patch.contains("revision.txt"), "{patch}");
+    assert!(
+        !patch.contains("toolchain.txt"),
+        "upstream changes must not leak into the patch: {patch}"
+    );
+    assert!(!unpublished_diff(&LocalJj, &s.record).await.unwrap().is_empty());
+    assert!(
+        restore_for_retry(&LocalJj, &s.record, &s.repo.replacement, true)
+            .await
+            .unwrap()
+    );
+    let restored = files_at(&s.repo.replacement, "@");
+    assert!(restored.contains(&"revision.txt".to_owned()), "{restored:?}");
+}
+
+#[tokio::test]
+async fn a_foreign_head_is_preserved_work_not_an_integrity_failure() {
+    use boss_engine_test_git::jj::JjRepo;
+    use test_support::{bookmark, one, revision_on_pr_head};
+    let s = revision_on_pr_head("exec_foreign").await;
+    let repo = &s.repo.repo;
+    JjRepo::run(repo, &["new", "root()", "-m", "Someone else's history"]);
+    std::fs::write(repo.join("foreign.txt"), "not ours\n").unwrap();
+    JjRepo::run(repo, &["status"]);
+    let foreign = one(repo, "@");
+    bookmark(repo, &s.record.head(), &foreign);
+    bookmark(repo, &s.record.publication(), &foreign);
+    let patch = diff(&LocalJj, &s.record).await.unwrap();
+    assert!(patch.contains("foreign.txt"), "{patch}");
+    assert!(!unpublished_diff(&LocalJj, &s.record).await.unwrap().is_empty());
+    assert_eq!(one(repo, &revision(&s.record.head())), foreign, "nothing moved");
+}
+
+#[tokio::test]
+async fn retry_reuses_its_own_empty_positioning_change() {
+    use boss_engine_test_git::jj::JjRepo;
+    let log = |repo: &Path, revset: &str, template: &str| {
+        JjRepo::run(repo, &["log", "--no-graph", "-r", revset, "-T", template])
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = JjRepo::with_origin(dir.path());
+    let record = test_support::create_legacy_three_bookmark_fixture(&LocalJj, &repo.worker, "exec_retry", "local")
+        .await
+        .unwrap();
+    let original = log(&repo.worker, "@", "commit_id");
+    assert!(
+        !restore_for_retry(&LocalJj, &record, &repo.replacement, true)
+            .await
+            .unwrap()
+    );
+    assert_eq!(log(&repo.replacement, "@", "commit_id"), original);
+    std::fs::write(repo.replacement.join("fix"), "retry fix\n").unwrap();
+    JjRepo::run(&repo.replacement, &["describe", "-m", "Fix after retry"]);
+    assert!(
+        log(
+            &repo.replacement,
+            "(main..@) & empty() & description(exact:\"\")",
+            "commit_id"
+        )
+        .is_empty()
+    );
+    assert!(diff(&LocalJj, &record).await.unwrap().contains("retry fix"));
+}

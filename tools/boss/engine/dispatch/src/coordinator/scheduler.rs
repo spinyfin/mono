@@ -706,13 +706,23 @@ impl ExecutionCoordinator {
     /// which is the overwhelmingly common case (a quiet queue, or a backlog
     /// draining faster than any single dispatch takes).
     fn inflight_chain_siblings(&self, execution: &WorkExecution) -> Result<Vec<WorkExecution>> {
+        let mut siblings = Vec::new();
+        // An engine rebase of the chain (conflict ladder, speculative probe)
+        // rewrites the PR branch in the shared jj store, so no worker may
+        // start on the chain until it finishes. The engine holds the chain
+        // for the whole rebase, which a database-liveness check cannot see.
+        if let Some(rebased_item_id) = self.work_db.engine_rebase_in_progress(&execution.work_item_id)? {
+            siblings.push(engine_rebase_pseudo_sibling(execution, &rebased_item_id));
+        }
         if self.inflight_dispatches.is_empty() {
-            return Ok(Vec::new());
+            return Ok(siblings);
         }
         let member_ids = self.work_db.chain_member_ids(&execution.work_item_id)?;
-        Ok(self
-            .inflight_dispatches
-            .chain_siblings(&member_ids, &execution.work_item_id, &execution.id))
+        siblings.extend(
+            self.inflight_dispatches
+                .chain_siblings(&member_ids, &execution.work_item_id, &execution.id),
+        );
+        Ok(siblings)
     }
 
     /// Resolve the per-PR single-writer chain check for `execution`,
@@ -2793,6 +2803,20 @@ fn union_with_inflight(mut db_siblings: Vec<WorkExecution>, inflight: &[WorkExec
         .collect();
     db_siblings.extend(extra);
     db_siblings
+}
+
+/// Stands in for the live sibling an engine rebase would otherwise be: it is
+/// not a worker, but it blocks the chain the same way and names the work item
+/// whose PR is being rebased in the wait reason.
+fn engine_rebase_pseudo_sibling(execution: &WorkExecution, rebased_item_id: &str) -> WorkExecution {
+    WorkExecution::builder()
+        .id(format!("engine-rebase:{rebased_item_id}"))
+        .work_item_id(rebased_item_id)
+        .kind(ExecutionKind::ConflictResolution)
+        .status(ExecutionStatus::Running)
+        .repo_remote_url(execution.repo_remote_url.clone())
+        .created_at(execution.created_at.clone())
+        .build()
 }
 
 /// RAII claim on a `ready` execution for the duration of one drain-loop

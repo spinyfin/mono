@@ -68,9 +68,7 @@ mod commands {
             let observed = stamp()?;
             let result = match &command.body {
                 Some(command::Body::Workspace(_)) => {
-                    executor
-                        .try_execute(&command, interrupted, observed.wall_unix_ms)
-                        .await?
+                    executor.execute(&command, interrupted, observed.wall_unix_ms).await
                 }
                 Some(
                     command::Body::Spawn(_)

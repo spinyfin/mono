@@ -255,23 +255,29 @@ pub(crate) async fn try_mechanical_rungs_with(
     // rewrites from its own workspace at the same time. Concurrent operations
     // on one branch are what produce divergence, so prevent the overlap
     // instead of repairing it afterwards: with a live writer, do nothing now.
-    if let Some(writers) = live_writers_blocking_rebase(work_db, &candidate.work_item_id) {
-        tracing::info!(
-            work_item_id = %candidate.work_item_id,
-            pr = pr_number,
-            attempt_id = %attempt.id,
-            live_writers = %writers,
-            "conflict_ladder: a worker is live on this PR's chain; deferring the engine rebase",
-        );
-        log_routing_verdict(
-            &candidate.work_item_id,
-            Some(pr_number),
-            &[],
-            "skip",
-            "a worker is live on this PR's chain; engine rebase deferred until it finishes",
-        );
-        return LadderOutcome::DeferredForLiveWriter;
-    }
+    // The hold also keeps dispatch from starting a worker on this chain while
+    // the lease, rebase and push below are running, and is released when this
+    // function returns on any path.
+    let _chain_hold = match hold_chain_for_engine_rebase(work_db, &candidate.work_item_id) {
+        Ok(hold) => hold,
+        Err(writers) => {
+            tracing::info!(
+                work_item_id = %candidate.work_item_id,
+                pr = pr_number,
+                attempt_id = %attempt.id,
+                live_writers = %writers,
+                "conflict_ladder: a worker is live on this PR's chain; deferring the engine rebase",
+            );
+            log_routing_verdict(
+                &candidate.work_item_id,
+                Some(pr_number),
+                &[],
+                "skip",
+                "a worker is live on this PR's chain; engine rebase deferred until it finishes",
+            );
+            return LadderOutcome::DeferredForLiveWriter;
+        }
+    };
 
     // One INFO line at ladder entry so "was any mechanical rung invoked for
     // this conflict?" is answerable from the engine trace (mono#1398/#1764:
@@ -735,28 +741,18 @@ pub(crate) async fn halt_attempt_for_lockfile_failure(
         .await;
 }
 
-/// Describe the live writers on the PR's chain, or `None` when no worker can
-/// be writing the PR branch. A failed lookup also defers: rewriting a branch a
-/// worker may be on, because the check could not run, is the unsafe direction.
-pub(crate) fn live_writers_blocking_rebase(work_db: &WorkDb, chain_item_id: &str) -> Option<String> {
-    match work_db.live_writers_in_chain(chain_item_id) {
-        Ok(writers) if writers.is_empty() => None,
-        Ok(writers) => Some(
-            writers
-                .iter()
-                .map(|execution| format!("{} ({})", execution.id, execution.status))
-                .collect::<Vec<_>>()
-                .join(", "),
-        ),
-        Err(err) => {
-            tracing::warn!(
-                work_item_id = %chain_item_id,
-                ?err,
-                "conflict_ladder: could not list live writers; deferring the engine rebase",
-            );
-            Some("lookup failed".to_owned())
-        }
-    }
+/// Claim the PR's chain for an engine rebase, or describe what stands in the
+/// way: live writers on the chain, a failed lookup, or another engine rebase.
+/// A failed lookup also refuses: rewriting a branch a worker may be on,
+/// because the check could not run, is the unsafe direction. The returned hold
+/// is visible to the dispatch chain guard until it is dropped.
+pub(crate) fn hold_chain_for_engine_rebase(
+    work_db: &WorkDb,
+    chain_item_id: &str,
+) -> Result<crate::work::EngineRebaseHold, String> {
+    work_db
+        .try_hold_chain_for_engine_rebase(chain_item_id)
+        .map_err(|blocker| blocker.to_string())
 }
 
 /// Rung 0: feed rung-1's residual conflicted files to the deterministic-

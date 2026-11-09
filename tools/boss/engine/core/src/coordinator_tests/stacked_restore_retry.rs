@@ -256,11 +256,7 @@ async fn restore_transport_failure_retries_on_the_same_stacked_base() {
 async fn every_integrity_verdict_retains_saved_work_and_allows_fresh_dispatch() {
     use boss_engine_recovery::execution_bookmark::PointerIntegrityKind;
     use boss_engine_test_git::jj::JjRepo;
-    for kind in [
-        PointerIntegrityKind::Other,
-        PointerIntegrityKind::NotContained,
-        PointerIntegrityKind::PrHeadUnavailable,
-    ] {
+    for kind in [PointerIntegrityKind::Other, PointerIntegrityKind::Quarantined] {
         let h = chain_harness(true, true, false).await;
         let adapter: Arc<dyn HostAdapter> = Arc::new(FlakyRestoreAdapter {
             inner: h.coordinator.host_adapter().clone(),

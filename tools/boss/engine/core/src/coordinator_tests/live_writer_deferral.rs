@@ -229,7 +229,8 @@ async fn rung1_defers_while_a_worker_is_live_and_leaves_the_store_untouched() {
     let (commit_before, change_before) = pr_tip(&fx.repo);
     // The live worker rewrites its own history in its workspace (rebasing the
     // PR branch onto upstream) and is still mid-edit when the ladder is
-    // invoked: the overlap that used to leave conflicted bookmarks. A two-way
+    // invoked: the overlap that leaves conflicted bookmarks when an engine rebase
+    // runs alongside a live writer. A two-way
     // handshake pins the order. The worker signals once its rewrite has landed
     // in the shared store and then waits; the ladder runs in that window; only
     // then is the worker released to finish its edit.

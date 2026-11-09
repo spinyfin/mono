@@ -94,18 +94,6 @@ impl WorkDb {
         Ok(())
     }
 
-    pub fn bookmark_reconciliation_note(&self, execution_id: &str) -> Result<Option<String>> {
-        Ok(self
-            .connect()?
-            .query_row(
-                "SELECT reconciliation_note FROM execution_bookmarks WHERE execution_id = ?1",
-                [execution_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .flatten())
-    }
-
     /// Mark a record as retired: its pointers are no longer a recovery
     /// source (reads treat it as absent) and the abandoned-bookmark sweep
     /// leaves it alone. The row stays so the decision is auditable.

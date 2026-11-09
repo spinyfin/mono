@@ -151,15 +151,17 @@ pub async fn run_speculative_pass(
         if checked >= MAX_CHECKS_PER_PASS {
             break;
         }
-        // A live writer owns the PR branch. Checked here, immediately before
-        // this candidate's rebase, because earlier candidates' checks take
-        // long enough for a writer to have started since the sweep began.
-        // Skip without marking the PR checked, so it is rechecked on the
-        // next pass once the writer is gone rather than waiting out a whole
-        // recheck interval; a skip does not consume the per-pass cap.
-        if crate::conflict_ladder::live_writers_blocking_rebase(work_db, &candidate.work_item_id).is_some() {
+        // A live writer owns the PR branch, and dispatch must not start one
+        // while this candidate's rebase is running. Taken here, immediately
+        // before this candidate's rebase, because earlier candidates' checks
+        // take long enough for a writer to have started since the sweep
+        // began. Skip without marking the PR checked, so it is rechecked on
+        // the next pass once the writer is gone rather than waiting out a
+        // whole recheck interval; a skip does not consume the per-pass cap.
+        let Ok(_chain_hold) = crate::conflict_ladder::hold_chain_for_engine_rebase(work_db, &candidate.work_item_id)
+        else {
             continue;
-        }
+        };
         schedule.mark_checked(&candidate.work_item_id, now);
         check_one(work_db, cube_client, metrics, candidate).await;
         checked += 1;

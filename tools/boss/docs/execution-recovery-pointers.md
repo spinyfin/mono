@@ -46,14 +46,14 @@ Every consumer, by pointer (paths are repo-relative):
 **`pr/<n>`**
 
 - Written by: cube's bound-PR checkout (`cube workspace goto`) when positioning on a PR (`recover_from_record` in `blocked_workspace.rs`).
-- Read by: reconciliation rung 1, the PR head (`reconcile.rs`), and the positioned workspace itself; forgotten by cube's sweep once no workspace is positioned on it.
+- Read by: the positioned workspace itself (the engine does not read `pr/<n>`); forgotten by cube's sweep once no workspace is positioned on it.
 - What is actually needed: the PR head for the duration of one positioning. Already bounded (7 local bookmarks on the dev Mac); what lingered were 656 `refs/heads/pr/<n>` git refs that an older jj left behind after the bookmark was forgotten, which the store upkeep below removes.
 
 **The minimal set.** During an execution's life the remaining names encode different things, and two of them legitimately diverge: the worker pushes `boss/` (which cube may then move to the remote head) while a transitional `boss-recovery/` or a teardown `preserved/` tip keeps tracking local unpushed work, and the baseline is the recorded commit id. What is not needed is any of them **after** the PR that carried the work is merged or closed, and that is where all of the growth was: the count was 3 × executions ever run. Empty initialization writes no bookmarks; a recovery head exists only for unpublished work already on the lease; `boss/` exists between the worker's first push and merge; `pr/<n>` only during a positioning.
 
 ## Lifecycle: how the pointers are retired
 
-Empty initialization records the starting commit and performs no jj store operation. Restored unpublished work creates one transitional recovery head on `@`. The worker creates the publication bookmark immediately before opening a PR. From then on no engine path moves a pointer that already points where it is being set: `set_bookmarks` and `restore_pointers` skip unchanged bookmarks, and an empty `bookmark forget` runs nothing, because an operation that changes no bookmark still writes a full view.
+Empty initialization records the starting commit and performs no jj store operation. Restored unpublished work creates one transitional recovery head on `@`. The worker creates the publication bookmark immediately before opening a PR. From then on an empty `bookmark forget` runs nothing, because an operation that changes no bookmark still writes a full view.
 
 **The prune sweep** (`engine/core/src/execution_bookmark_prune.rs`) runs in the abandoned-branch sweep loop, every five minutes, over at most 100 live local records of terminal executions per pass (`list_prune_candidates`). A record whose chain root is still open is stamped `pr_open` and looked at again in six hours. For the rest it asks the recovery crate to prove the work published (`recovery/src/execution_bookmark/prune.rs`), with these vouchers in order:
 
@@ -92,7 +92,7 @@ There is no reconciliation. The conflict ladder and the speculative pass do not 
 
 ## What happens to the item
 
-Every pointer-integrity verdict (Other, NotContained and PrHeadUnavailable) that cannot be reconciled uses the same archive-and-start-fresh path. Transport failures such as unavailable SSH, GitHub or cube commands propagate to the ordinary retry path without archiving. For integrity failures, dispatch does the following:
+Every pointer-integrity verdict (`Other`, `Quarantined`) uses the same archive-and-start-fresh path. Transport failures such as unavailable SSH, GitHub or cube commands propagate to the ordinary retry path without archiving. For integrity failures, dispatch does the following:
 
 1. Resolve **all** targets of the baseline, recovery and publication bookmarks, including every side of a conflicted bookmark and any surviving recorded baseline commit.
 2. Write durable local bookmarks named `preserved-archive/<execution id>/<commit id>` for targets with unpublished non-empty work beyond the baseline and published history. The `preserved/<execution id>` name is reserved for the teardown-time tip of unpublished work, and git cannot hold both `preserved/<exec>` and `preserved/<exec>/<commit>` as refs. Every archive must succeed before any original pointer is released. Separate commit suffixes retain both diverged heads and repeated attempts. These bookmarks are never published or included in execution-pointer pruning.

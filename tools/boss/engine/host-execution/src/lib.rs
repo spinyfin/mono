@@ -1533,17 +1533,6 @@ pub mod workspace {
 
     impl<T: CubeJsonTransport> Executor<T> {
         pub async fn execute(&self, command: &Command, interrupted: bool, now_ms: i64) -> CommandResult {
-            self.try_execute(command, interrupted, now_ms)
-                .await
-                .unwrap_or_else(|error| CommandResult {
-                    command_id: command.command_id.clone(),
-                    code: ResultCode::OutcomeUncertain.into(),
-                    reason: format!("{error:#}"),
-                    value: None,
-                })
-        }
-
-        pub async fn try_execute(&self, command: &Command, interrupted: bool, now_ms: i64) -> Result<CommandResult> {
             let mut result = CommandResult {
                 command_id: command.command_id.clone(),
                 ..Default::default()
@@ -1559,13 +1548,13 @@ pub mod workspace {
                 Err(error) => {
                     result.code = ResultCode::Rejected.into();
                     result.reason = error.to_string();
-                    return Ok(result);
+                    return result;
                 }
             };
             if !interrupted && command.not_after_unix_ms <= now_ms {
                 result.code = ResultCode::Rejected.into();
                 result.reason = "command expired".into();
-                return Ok(result);
+                return result;
             }
             // Only reads and acquisition reconciliation may run after an uncertain
             // effect. In particular, replaying a heartbeat would extend a relative
@@ -1584,7 +1573,7 @@ pub mod workspace {
             {
                 result.code = ResultCode::OutcomeUncertain.into();
                 result.reason = "workspace operation interrupted; hub reconciliation required".into();
-                return Ok(result);
+                return result;
             }
             let mut phase = Phase::Authorizing;
             let outcome = tokio::time::timeout(
@@ -1616,7 +1605,7 @@ pub mod workspace {
             }
             // Keep failure diagnostics bounded too; never truncate a success payload.
             result.reason = boss_engine_utils::string_clip::clip_to_bytes_with_suffix(&result.reason, 4096, "…");
-            Ok(result)
+            result
         }
 
         async fn repo(&self, id: &str) -> Result<CubeRepoSummary> {
