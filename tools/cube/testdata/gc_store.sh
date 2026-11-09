@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# All repositories belong to this build action. The test copies them before
-# changing anything, so the history is built once per declared jj version.
-jj_binary="$PWD/$1"
-fixture_dir="$PWD/$2"
+# The maintainer archive script supplies the pinned jj and a private directory.
+# Relative paths also work when reproducing the original Bazel-built fixture.
+case "$1" in /*) jj_binary="$1" ;; *) jj_binary="$PWD/$1" ;; esac
+case "$2" in /*) fixture_dir="$2" ;; *) fixture_dir="$PWD/$2" ;; esac
 root="$fixture_dir/root"
 workspace="$fixture_dir/pool/mono-agent-001"
 upstream="$fixture_dir/upstream"
@@ -35,7 +35,7 @@ jj_at "$workspace" new main
 jj_at "$root" op log --no-graph --limit 1 -T id > "$fixture_dir/cut"
 
 # Retain the real concurrent writers and full history: only their repeated
-# construction moves out of the test action and into Bazel's action cache.
+# construction moves out of the test action and into the published archive.
 pids=()
 for worker in 0 1 2 3 4 5 6 7; do
     (

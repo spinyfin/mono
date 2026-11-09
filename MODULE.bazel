@@ -350,6 +350,9 @@ test_runtime_repository(
 # Rebuild procedure: tools/boss/docs/runbooks/update-ghostty-prebuilt.md
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
+gc_store_repositories = use_extension("//tools/cube:testdata/gc_store_repository.bzl", "gc_store_repositories")
+use_repo(gc_store_repositories, "cube_gc_store_tree")
+
 # Codex runtime compatibility tests must use the deployed CLI version, not
 # whatever happens to be installed on the CI host. Keep all platforms in
 # sync, and keep this in lockstep with PINNED_CODEX_CLI_VERSION — the actual

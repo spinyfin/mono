@@ -789,6 +789,28 @@
         }
       }
     },
+    "//tools/cube:testdata/gc_store_repository.bzl%gc_store_repositories": {
+      "general": {
+        "bzlTransitiveDigest": "Kn5gp+X9rXUzTx1xPhMmhugf/gX/l7YdWeCXgcRdBiM=",
+        "usagesDigest": "ehV9gQvVHHXkma6jRzvcQljCruWXOi/ninpSfWjyN5M=",
+        "recordedInputs": [
+          "REPO_MAPPING:,bazel_tools bazel_tools",
+          "FILE:@@//tools/cube/testdata/gc_store.json c44df8a739980c1a6767bfa951e8574cd6d555ba052c965373594c20d1e3fc43"
+        ],
+        "generatedRepoSpecs": {
+          "cube_gc_store_tree": {
+            "repoRuleId": "@@bazel_tools//tools/build_defs/repo:http.bzl%http_archive",
+            "attributes": {
+              "build_file_content": "exports_files([\"cut\"], visibility = [\"@@//tools/cube:__pkg__\"])\n\nfilegroup(\n    name = \"store\",\n    srcs = glob([\"root/**\", \"upstream/**\", \"pool/**\"]) + [\"cut\"],\n    visibility = [\"@@//tools/cube:__pkg__\"],\n)\n",
+              "sha256": "f064c52d42e977c8e59cff3f5e658f3911cbd0b9ea51167486e5217021605fdf",
+              "urls": [
+                "https://github.com/spinyfin/mono/releases/download/cube-test-data-gc-store-v1/gc-store.tar.gz"
+              ]
+            }
+          }
+        }
+      }
+    },
     "@@buildifier_prebuilt+//:defs.bzl%buildifier_prebuilt_deps_extension": {
       "general": {
         "bzlTransitiveDigest": "3SXpv/oaemUJfW9RAoTqenEgHJE2pkdbrrkPif6Vk00=",
