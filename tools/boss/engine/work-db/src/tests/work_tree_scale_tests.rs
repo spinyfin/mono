@@ -1,13 +1,39 @@
 //! Deterministic, production-cardinality fixture; never reads operator state.
 use super::*;
 use boss_metrics::population_timing::{PopulationTrace, segment};
-use std::time::Instant;
+use std::{sync::LazyLock, time::Instant};
 
-pub(super) fn seed(conn: &Connection) {
-    // Fixture load is not the thing under measurement. Skip durable commit
-    // cost so ~70k inserts finish well inside the test budget.
-    conn.execute_batch("PRAGMA synchronous = OFF; PRAGMA journal_mode = MEMORY; PRAGMA temp_store = MEMORY;")
-        .unwrap();
+// Fixture load is not the thing under measurement. Skip durable commit
+// cost so ~70k inserts finish well inside the test budget.
+const FIXTURE_PRAGMAS: &str = "PRAGMA synchronous = OFF; PRAGMA journal_mode = MEMORY; PRAGMA temp_store = MEMORY;";
+
+/// The seeded database, built once per test process: a cold open plus ~70k
+/// inserts that every scale test would otherwise repeat before its first
+/// assertion. Tests take a private copy from [`open_seeded`] and never write
+/// to this file.
+static SEEDED: LazyLock<(tempfile::TempDir, PathBuf)> = LazyLock::new(|| {
+    let (dir, path) = disk_db_path("scale-fixture");
+    let db = WorkDb::open(path.clone()).unwrap();
+    seed(&db.connect().unwrap());
+    // The in-memory journal leaves nothing beside the database file, and
+    // closing the only connection means no page is still unwritten.
+    drop(db);
+    (dir, path)
+});
+
+/// A writable copy of the seeded fixture, on a connection configured the way
+/// the seeding connection was. It attaches without `init`, so the schema and
+/// planner statistics are exactly the ones the seeded file was built with.
+pub(super) fn open_seeded(label: &str) -> (tempfile::TempDir, WorkDb) {
+    let (dir, path) = disk_db_path(label);
+    std::fs::copy(&SEEDED.1, &path).unwrap();
+    let db = WorkDb::open_existing(path).unwrap();
+    db.connect().unwrap().execute_batch(FIXTURE_PRAGMAS).unwrap();
+    (dir, db)
+}
+
+fn seed(conn: &Connection) {
+    conn.execute_batch(FIXTURE_PRAGMAS).unwrap();
     conn.execute_batch("BEGIN").unwrap();
     {
         let mut insert_product = conn
@@ -178,10 +204,8 @@ pub(super) fn seed(conn: &Connection) {
 
 #[test]
 fn work_tree_production_scale_measurement() {
-    let (_dir, path) = disk_db_path("scale");
-    let db = WorkDb::open(path).unwrap();
+    let (_dir, db) = open_seeded("scale");
     let conn = db.connect().unwrap();
-    seed(&conn);
     for (table, expected) in [
         ("tasks", 10030),
         ("projects", 131),
@@ -279,10 +303,38 @@ fn measure(db: &WorkDb, product: &str, expected: Option<usize>) {
         totals[p50], totals[p95], reviews[p50], reviews[p95]
     );
     if expected.is_some() {
+        measure_probes(db, product, samples);
+    }
+}
+
+/// The probes that follow the full-tree samples on the seeded fixture. Each
+/// writing probe changes different rows and compares only against trees it
+/// assembles itself, so none depends on what another wrote: each gets a
+/// private copy of the fixture. An ordinary run only checks their invariants
+/// and runs them side by side, which bounds the test by its longest probe
+/// rather than their sum. A benchmark run (`BOSS_BENCH_SAMPLES`) keeps them
+/// back to back so no probe's timings include another's load.
+fn measure_probes(db: &WorkDb, product: &str, samples: usize) {
+    fn on_private_copy(label: &str, probe: impl FnOnce(&WorkDb)) {
+        let (_dir, db) = open_seeded(label);
+        probe(&db);
+    }
+    let deltas = || on_private_copy("scale-deltas", |db| measure_deltas(db, product));
+    let runtimes = || on_private_copy("scale-runtimes", |db| measure_cached_runtimes(db, product, samples));
+    let reviews = || on_private_copy("scale-reviews", |db| measure_cached_reviews(db, product, samples));
+    if std::env::var_os("BOSS_BENCH_SAMPLES").is_some() {
         measure_runtime_patches(db, product);
-        measure_deltas(db, product);
-        measure_cached_runtimes(db, product, samples);
-        measure_cached_reviews(db, product, samples);
+        deltas();
+        runtimes();
+        reviews();
+    } else {
+        std::thread::scope(|scope| {
+            scope.spawn(deltas);
+            scope.spawn(runtimes);
+            scope.spawn(reviews);
+            // On the caller's copy, which no spawned probe opens.
+            measure_runtime_patches(db, product);
+        });
     }
 }
 

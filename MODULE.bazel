@@ -261,12 +261,28 @@ crate.annotation(
     # connections/threads in the process — under parallel `cargo test`/`bazel
     # test` load with many WorkDb instances this mutex, not the underlying
     # work, was most of the wall time (see
-    # tools/boss/docs/investigations, WorkDb reconnect profiling). OPT_LEVEL=3
-    # optimizes the bundled sqlite3.c even in a fastbuild/dbg Rust compile,
-    # since `cc`'s build-script probe (libsqlite3-sys build.rs) otherwise
-    # infers -O0 from Bazel's compilation mode.
+    # tools/boss/docs/investigations, WorkDb reconnect profiling).
+    #
+    # -USQLITE_ENABLE_MEMORY_MANAGEMENT undoes a define libsqlite3-sys's
+    # build.rs always passes for the bundled build. With it, SQLite keeps one
+    # page cache for the whole process behind one static mutex, so every page
+    # fetch and unpin on every connection, to any database, takes the same
+    # lock: a sampled `work_db_test` run spent over half of all thread time
+    # waiting on it, and a preempted holder stalls every other connection.
+    # Without it each connection owns its cache and the page path takes no
+    # process-wide lock. The only thing given up is `sqlite3_release_memory()`
+    # and the soft-heap-limit retry, which nothing here calls (and which
+    # MEMSTATUS=0 already disables). SQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS
+    # removes the other static mutex on that path, taken on every page
+    # allocation and free only to maintain `sqlite3_status()` counters.
+    # `sqlite_build_has_no_process_wide_page_cache_lock` in work-db pins all
+    # three options against the compiled library.
+    #
+    # OPT_LEVEL=3 optimizes the bundled sqlite3.c even in a fastbuild/dbg Rust
+    # compile, since `cc`'s build-script probe (libsqlite3-sys build.rs)
+    # otherwise infers -O0 from Bazel's compilation mode.
     build_script_env = {
-        "LIBSQLITE3_FLAGS": "SQLITE_DEFAULT_MEMSTATUS=0",
+        "LIBSQLITE3_FLAGS": "SQLITE_DEFAULT_MEMSTATUS=0 -USQLITE_ENABLE_MEMORY_MANAGEMENT SQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS",
         "OPT_LEVEL": "3",
     },
     crate = "libsqlite3-sys",
