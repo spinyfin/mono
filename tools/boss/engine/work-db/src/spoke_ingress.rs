@@ -238,7 +238,23 @@ impl WorkDb {
         }
         if commit.sequence <= pruned_through as u64 {
             // Already received and since pruned: the original bytes are gone,
-            // so the duplicate cannot be compared, but it also changes nothing.
+            // so the duplicate cannot be compared. A result can still be
+            // verified against the settled command, so it is acknowledged only
+            // if that exact result is already durable; anything else would
+            // report a result the hub never persisted.
+            if let Some(result) = commit.result {
+                let settled: Option<Vec<u8>> = tx
+                    .query_row(
+                        "SELECT result FROM host_commands WHERE host_id = ?1 AND command_id = ?2",
+                        params![commit.host_id, result.command_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                if settled.as_deref() != Some(result.bytes) {
+                    return Err(fault(HostOutboxFault::Denied));
+                }
+            }
             tx.commit()?;
             return Ok(received);
         }
@@ -673,5 +689,57 @@ mod tests {
         // A reconnect after pruning still resumes at the receipt.
         let again = db.open_spoke_journal("host-a", "journal", 4, 1).unwrap();
         assert_eq!(again.received, 4);
+    }
+
+    #[test]
+    fn a_result_at_a_pruned_sequence_is_not_accepted_unless_already_settled() {
+        let db = db();
+        db.set_host_transport("host-a", HostTransport::SpokeReady).unwrap();
+        let owned = db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
+        let run = key(&owned);
+        db.append_host_command("host-a", "c1", Some(&run), RunAdmission::Start, b"req", &|seq| {
+            seq.to_be_bytes().to_vec()
+        })
+        .unwrap();
+        let admission = db.open_spoke_journal("host-a", "journal", 0, 1).unwrap();
+        db.commit_spoke_record(commit("host-a", &admission, 1, b"capacity", &[], None))
+            .unwrap();
+        db.prune_spoke_ingress("host-a", 1).unwrap();
+        let result = || SpokeIngressResult {
+            command_id: "c1",
+            run: Some(&run),
+            bytes: b"ok",
+        };
+        let replay = |result| {
+            db.commit_spoke_record(commit(
+                "host-a",
+                &admission,
+                1,
+                b"fabricated",
+                std::slice::from_ref(&run),
+                Some(result),
+            ))
+        };
+        assert_eq!(fault_of(&replay(result()).unwrap_err()), Some(HostOutboxFault::Denied));
+        assert!(db.host_command_result("host-a", "c1").unwrap().is_none());
+        assert_eq!(db.spoke_journal("host-a").unwrap().unwrap().received, 1);
+        // Once the result is genuinely durable, a retransmission is acknowledged.
+        db.commit_spoke_record(commit(
+            "host-a",
+            &admission,
+            2,
+            b"real",
+            std::slice::from_ref(&run),
+            Some(result()),
+        ))
+        .unwrap();
+        db.prune_spoke_ingress("host-a", 2).unwrap();
+        assert_eq!(replay(result()).unwrap(), 2);
+        let other = SpokeIngressResult {
+            command_id: "c1",
+            run: Some(&run),
+            bytes: b"different",
+        };
+        assert_eq!(fault_of(&replay(other).unwrap_err()), Some(HostOutboxFault::Denied));
     }
 }
