@@ -43,7 +43,7 @@ impl Fixture {
             .await
             .unwrap();
         std::fs::write(self.worker.join("second.txt"), "second change\n").unwrap();
-        LocalJj.run(&self.worker, &["status"]).await.unwrap();
+        LocalJj.run(&self.worker, &["debug", "snapshot"]).await.unwrap();
     }
 }
 
@@ -204,44 +204,63 @@ async fn restored_dispatch_creates_no_bookmarks_and_uses_the_recorded_floor() {
     );
 }
 
-#[tokio::test]
-async fn terminated_run_survives_released_removed_reused_and_foreign_leased_workspace() {
-    for state in ["released", "removed", "reused", "leased_elsewhere"] {
-        let f = Fixture::new().await;
-        let record = f.record("exec_terminated").await;
-        f.edit(&record).await;
-        match state {
-            "removed" => {
-                LocalJj.run(&f.repo, &["workspace", "forget", "worker"]).await.unwrap();
-                std::fs::remove_dir_all(&f.worker).unwrap();
-            }
-            "reused" | "leased_elsewhere" => {
-                LocalJj
-                    .run(&f.worker, &["new", "root()", "-m", "Unrelated lease"])
-                    .await
-                    .unwrap();
-                std::fs::write(f.worker.join("foreign.txt"), "someone else's work\n").unwrap();
-            }
-            _ => {}
+/// The worker's lease ended in `state`; its recorded work is still exported
+/// and restored, and nothing a later holder put in the workspace leaks in.
+async fn terminated_run_survives_workspace(state: &str) {
+    let f = Fixture::new().await;
+    let record = f.record("exec_terminated").await;
+    f.edit(&record).await;
+    match state {
+        "removed" => {
+            LocalJj.run(&f.repo, &["workspace", "forget", "worker"]).await.unwrap();
+            std::fs::remove_dir_all(&f.worker).unwrap();
         }
-        let patch = diff(&LocalJj, &record).await.unwrap();
-        assert!(
-            patch.contains("work.txt") && patch.contains("second.txt"),
-            "{state}: {patch}"
-        );
-        assert!(!patch.contains("foreign.txt"), "{state}: {patch}");
-        assert!(restore(&LocalJj, &record, &f.replacement).await.unwrap());
-        assert_eq!(
-            std::fs::read_to_string(f.replacement.join("second.txt")).unwrap(),
-            "second change\n"
-        );
-        if state == "leased_elsewhere" {
-            assert_eq!(
-                std::fs::read_to_string(f.worker.join("foreign.txt")).unwrap(),
-                "someone else's work\n"
-            );
+        "reused" | "leased_elsewhere" => {
+            LocalJj
+                .run(&f.worker, &["new", "root()", "-m", "Unrelated lease"])
+                .await
+                .unwrap();
+            std::fs::write(f.worker.join("foreign.txt"), "someone else's work\n").unwrap();
         }
+        _ => {}
     }
+    let patch = diff(&LocalJj, &record).await.unwrap();
+    assert!(
+        patch.contains("work.txt") && patch.contains("second.txt"),
+        "{state}: {patch}"
+    );
+    assert!(!patch.contains("foreign.txt"), "{state}: {patch}");
+    assert!(restore(&LocalJj, &record, &f.replacement).await.unwrap());
+    assert_eq!(
+        std::fs::read_to_string(f.replacement.join("second.txt")).unwrap(),
+        "second change\n"
+    );
+    if state == "leased_elsewhere" {
+        assert_eq!(
+            std::fs::read_to_string(f.worker.join("foreign.txt")).unwrap(),
+            "someone else's work\n"
+        );
+    }
+}
+
+#[tokio::test]
+async fn terminated_run_survives_a_released_workspace() {
+    terminated_run_survives_workspace("released").await;
+}
+
+#[tokio::test]
+async fn terminated_run_survives_a_removed_workspace() {
+    terminated_run_survives_workspace("removed").await;
+}
+
+#[tokio::test]
+async fn terminated_run_survives_a_reused_workspace() {
+    terminated_run_survives_workspace("reused").await;
+}
+
+#[tokio::test]
+async fn terminated_run_survives_a_foreign_leased_workspace() {
+    terminated_run_survives_workspace("leased_elsewhere").await;
 }
 
 #[tokio::test]
@@ -532,7 +551,7 @@ async fn only_missing_heads_fail_without_lineage_or_baseline_bookmark_checks() {
     let f = Fixture::new().await;
     let record = f.record("exec_integrity").await;
     std::fs::write(f.worker.join("recovery-line.txt"), "recovery line\n").unwrap();
-    LocalJj.run(&f.worker, &["status"]).await.unwrap();
+    LocalJj.run(&f.worker, &["debug", "snapshot"]).await.unwrap();
     LocalJj
         .run(&f.worker, &["new", "@-", "-m", "Divergent publication"])
         .await

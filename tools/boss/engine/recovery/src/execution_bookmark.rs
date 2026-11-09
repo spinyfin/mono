@@ -432,28 +432,87 @@ pub(crate) struct Pointers {
     pub(crate) heads: Heads,
 }
 
-pub(crate) async fn resolve_heads(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<Heads> {
-    let recovery = resolve_optional(jj, &record.repo_path, &record.head()).await?;
-    let publication = resolve_optional(jj, &record.repo_path, &record.publication()).await?;
-    if recovery.is_none() && publication.is_none() {
-        return Err(missing_heads_error(record));
-    }
-    Ok(Heads { recovery, publication })
+/// What one `jj` invocation reads for a record: the commits its two head
+/// bookmarks target and which of its recorded floor commits exist in the
+/// store, visible or not. Every resolver below derives its answer from this,
+/// so resolving heads, floor or both costs one child process.
+struct PointerQuery {
+    targets: std::collections::HashMap<String, Vec<String>>,
+    present: std::collections::HashSet<String>,
 }
 
-/// The floor of the execution's work: the commit id recorded on its row. A
-/// rewritten or abandoned baseline commit still exists in the store, so it
-/// keeps working as a floor. A record with no usable `base_commit` (legacy, or
-/// collected from the store) uses the bound PR's `pr_head_before`, then trunk.
-/// Neither is an error.
+/// The recorded floor candidates that can be commit ids, in precedence order.
+fn floor_candidates(record: &ExecutionBookmark) -> impl Iterator<Item = &str> {
+    [record.base_commit.as_deref(), record.pr_head_before.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter(|commit| !commit.is_empty() && commit.bytes().all(|c| c.is_ascii_hexdigit()))
+}
+
+async fn query_pointers(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<PointerQuery> {
+    let names = [record.head(), record.publication()];
+    let mut revset: Vec<String> = names.iter().map(|name| revision(name)).collect();
+    // `present()` turns a commit that is not in the store into an empty set
+    // instead of a resolution error; a hidden commit named by id is listed.
+    revset.extend(floor_candidates(record).map(|commit| format!("present({commit})")));
+    let commits = snapshot::commits_with_bookmarks(jj, &record.repo_path, &revset.join(" | ")).await?;
+    Ok(PointerQuery {
+        targets: snapshot::bookmark_targets_in(&commits, &names),
+        present: commits.into_iter().map(|(commit, _)| commit).collect(),
+    })
+}
+
+impl PointerQuery {
+    /// The single commit `bookmark` targets. A conflicted bookmark resolves to
+    /// several commits and is a real pointer-integrity error.
+    fn single(&self, bookmark: &str) -> Result<Option<String>> {
+        match self.targets.get(bookmark).map(Vec::as_slice) {
+            None | Some([]) => Ok(None),
+            Some([commit]) => Ok(Some(commit.clone())),
+            Some(commits) => Err(pointer_integrity_error(format!(
+                "recovery bookmark {bookmark} {UNRESOLVED_MESSAGE}; found {}",
+                commits.len()
+            ))),
+        }
+    }
+
+    fn heads(&self, record: &ExecutionBookmark) -> Result<Heads> {
+        let recovery = self.single(&record.head())?;
+        let publication = self.single(&record.publication())?;
+        if recovery.is_none() && publication.is_none() {
+            return Err(missing_heads_error(record));
+        }
+        Ok(Heads { recovery, publication })
+    }
+
+    /// The floor of the execution's work: the commit id recorded on its row. A
+    /// rewritten or abandoned baseline commit still exists in the store, so it
+    /// keeps working as a floor. A record with no usable `base_commit` (legacy,
+    /// or collected from the store) uses the bound PR's `pr_head_before`, then
+    /// trunk. Neither is an error. A recorded id is used only when the store
+    /// returned exactly it, never a commit it merely prefixes.
+    fn base(&self, record: &ExecutionBookmark) -> String {
+        floor_candidates(record)
+            .find(|commit| self.present.contains(*commit))
+            .map_or_else(|| "trunk()".to_owned(), str::to_owned)
+    }
+}
+
+pub(crate) async fn resolve_heads(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<Heads> {
+    query_pointers(jj, record).await?.heads(record)
+}
+
+/// See [`PointerQuery::base`]. Works for a record whose heads are gone.
 pub(crate) async fn resolve_base(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
-    if let Some(commit) = usable_commit(jj, &record.repo_path, record.base_commit.as_deref()).await? {
-        return Ok(commit);
-    }
-    if let Some(commit) = usable_commit(jj, &record.repo_path, record.pr_head_before.as_deref()).await? {
-        return Ok(commit);
-    }
-    Ok("trunk()".to_owned())
+    Ok(query_pointers(jj, record).await?.base(record))
+}
+
+pub(crate) async fn resolve_pointers(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<Pointers> {
+    let query = query_pointers(jj, record).await?;
+    Ok(Pointers {
+        base: query.base(record),
+        heads: query.heads(record)?,
+    })
 }
 
 async fn usable_commit(jj: &dyn Jj, repo: &Path, commit: Option<&str>) -> Result<Option<String>> {
@@ -461,12 +520,6 @@ async fn usable_commit(jj: &dyn Jj, repo: &Path, commit: Option<&str>) -> Result
         Some(commit) if commit_exists(jj, repo, commit).await? => Ok(Some(commit.to_owned())),
         _ => Ok(None),
     }
-}
-
-pub(crate) async fn resolve_pointers(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<Pointers> {
-    let heads = resolve_heads(jj, record).await?;
-    let base = resolve_base(jj, record).await?;
-    Ok(Pointers { base, heads })
 }
 
 /// Work above the floor: everything the head reaches that the floor's own
@@ -526,13 +579,6 @@ pub(crate) fn heads_revset(heads: &[String]) -> String {
         "({})",
         heads.iter().map(|head| revision(head)).collect::<Vec<_>>().join(" | ")
     )
-}
-
-pub(crate) async fn resume_heads_of(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<Vec<String>> {
-    let pointers = resolve_pointers(jj, record).await?;
-    let heads = resume_heads(jj, record, &pointers).await?;
-    reject_quarantined_heads(jj, record, &heads).await?;
-    Ok(heads)
 }
 
 /// Legacy heads follow the working-copy change, so a later holder's snapshot
@@ -747,8 +793,8 @@ pub async fn release_heads(
 
 /// Deliberately unguarded by the quarantine: `backup_execution_patch` exports
 /// quarantined heads so their content is kept, and nothing here restages them.
-/// Any caller that restages must go through `unpublished_diff` or
-/// `resume_heads_of`, which call `reject_quarantined_heads`.
+/// Any caller that restages must go through `unpublished_diff` or call
+/// `reject_quarantined_heads` on the heads it resolved itself.
 ///
 /// Diff for each resumed head, concatenated, from the newest common ancestor
 /// of the head with the floor or trunk. Bounding by trunk keeps upstream
@@ -758,9 +804,15 @@ pub async fn release_heads(
 /// conflicted references and unavailable jj are errors, never empty results.
 pub async fn diff(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
     let pointers = resolve_pointers(jj, record).await?;
+    let heads = resume_heads(jj, record, &pointers).await?;
+    diff_of(jj, record, &pointers, &heads).await
+}
+
+/// [`diff`] for pointers and resumed heads the caller already resolved.
+async fn diff_of(jj: &dyn Jj, record: &ExecutionBookmark, pointers: &Pointers, heads: &[String]) -> Result<String> {
     let mut patches = String::new();
-    for head in resume_heads(jj, record, &pointers).await? {
-        let head = revision(&head);
+    for head in heads {
+        let head = revision(head);
         let patch = jj
             .run(
                 &record.repo_path,
@@ -800,11 +852,16 @@ pub async fn restore_for_retry(
         jj.shared_repo(workspace).await? == record.repo_path,
         "recovery destination belongs to a different shared repository"
     );
-    let has_work = !unpublished_diff(jj, record).await?.trim().is_empty();
+    let pointers = resolve_pointers(jj, record).await?;
+    let heads = resume_heads(jj, record, &pointers).await?;
+    let has_work = !unpublished_diff_of(jj, record, &pointers, &heads)
+        .await?
+        .trim()
+        .is_empty();
     if !has_work && !self_retry {
         return Ok(false);
     }
-    let heads = resume_heads_of(jj, record).await?;
+    reject_quarantined_heads(jj, record, &heads).await?;
     let head = heads_revset(&heads);
     if self_retry && heads.len() == 1 {
         let empty_setup = jj
@@ -840,16 +897,27 @@ pub async fn restore_for_retry(
 /// Ignore work already reachable from a remote bookmark, including an empty
 /// working-copy child left after publishing. Still validate both local refs.
 pub async fn unpublished_diff(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
-    let patch = diff(jj, record).await?;
+    let pointers = resolve_pointers(jj, record).await?;
+    let heads = resume_heads(jj, record, &pointers).await?;
+    unpublished_diff_of(jj, record, &pointers, &heads).await
+}
+
+/// [`unpublished_diff`] for pointers and resumed heads the caller already
+/// resolved, so one operation resolves them once.
+pub(crate) async fn unpublished_diff_of(
+    jj: &dyn Jj,
+    record: &ExecutionBookmark,
+    pointers: &Pointers,
+    heads: &[String],
+) -> Result<String> {
+    let patch = diff_of(jj, record, pointers, heads).await?;
     if patch.trim().is_empty() {
         return Ok(patch);
     }
-    let pointers = resolve_pointers(jj, record).await?;
-    let heads = resume_heads(jj, record, &pointers).await?;
-    reject_quarantined_heads(jj, record, &heads).await?;
+    reject_quarantined_heads(jj, record, heads).await?;
     let range = format!(
         "({} ~ ::remote_bookmarks()) & ~empty()",
-        above_floor(&pointers.base, &heads_revset(&heads))
+        above_floor(&pointers.base, &heads_revset(heads))
     );
     let unpublished = jj
         .run(

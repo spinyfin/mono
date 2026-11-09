@@ -408,8 +408,7 @@ pub async fn adopt_pushed_head(
     pushed_head: &str,
     trunk: &str,
 ) -> Result<Anchor> {
-    let heads = resolve_heads(jj, record).await?;
-    let base = resolve_base(jj, record).await?;
+    let Pointers { base, heads } = resolve_pointers(jj, record).await?;
     let named = heads.named(record);
     let superseded = superseded_pointers(jj, record, &named, Some(&base), pushed_head, trunk).await?;
     if superseded.iter().any(|pointer| !pointer.containment.is_contained()) {

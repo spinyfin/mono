@@ -260,7 +260,7 @@ async fn publication_ahead_of_recovery(execution_id: &str) -> (super::reconcile_
     let work = one(repo, &revision(&s.record.head()));
     JjRepo::run(repo, &["new", &work, "-m", "Pushed follow-up"]);
     std::fs::write(repo.join("follow-up.txt"), "follow-up\n").unwrap();
-    JjRepo::run(repo, &["status"]);
+    JjRepo::snapshot(repo);
     let ahead = one(repo, "@");
     bookmark(repo, &s.record.publication(), &ahead);
     (s, work, ahead)
@@ -319,7 +319,7 @@ async fn diverged_heads_keep_the_one_with_unpublished_work_and_a_retry_with_its_
     // The publication head moved sideways onto a sibling of the preserved work.
     JjRepo::run(repo, &["new", &pr_head, "-m", "Sibling work"]);
     std::fs::write(repo.join("sibling.txt"), "sibling\n").unwrap();
-    JjRepo::run(repo, &["status"]);
+    JjRepo::snapshot(repo);
     let sibling = one(repo, "@");
     bookmark(repo, &s.record.publication(), &sibling);
     // The first look only knows a head carrying the recovery work.

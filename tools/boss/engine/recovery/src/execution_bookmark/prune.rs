@@ -225,8 +225,8 @@ pub async fn prune(jj: &dyn Jj, record: &ExecutionBookmark, vouchers: &[Voucher]
     let repo = &record.repo_path;
     let base_name = record.base();
     let base_bookmarked = resolve_optional(jj, repo, &base_name).await?.is_some();
-    let heads = match resolve_heads(jj, record).await {
-        Ok(heads) => heads,
+    let pointers = match resolve_pointers(jj, record).await {
+        Ok(pointers) => pointers,
         Err(err) if is_missing_pointer_error(&err) => {
             let forgotten = if base_bookmarked { vec![base_name] } else { Vec::new() };
             forget(jj, repo, &forgotten).await?;
@@ -234,15 +234,19 @@ pub async fn prune(jj: &dyn Jj, record: &ExecutionBookmark, vouchers: &[Voucher]
         }
         Err(err) => return Err(err),
     };
-    let base = resolve_base(jj, record).await?;
-    let named = heads.named(record);
+    let base = pointers.base.clone();
+    let named = pointers.heads.named(record);
     let mut tried = Vec::new();
     // The cheapest proof needs no voucher at all: when every non-empty
     // preserved change is already reachable from a remote bookmark, the
     // pushed branch itself vouches, whichever branch that was. The
     // colocated store's `@git` twins are not remote bookmarks, so a local
     // bookmark can never vouch for itself here.
-    match unpublished_diff(jj, record).await {
+    let published = async {
+        let heads = resume_heads(jj, record, &pointers).await?;
+        unpublished_diff_of(jj, record, &pointers, &heads).await
+    };
+    match published.await {
         Ok(patch) if patch.trim().is_empty() => {
             let commit = named.first().map(|(_, commit)| commit.clone()).unwrap_or_default();
             let mut forgotten = Vec::new();

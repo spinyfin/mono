@@ -25,7 +25,9 @@ rust_test(
     name = "test-git_test",
     size = "small",
     crate = ":test-git",
+    data = ["@jj_test_tools//:jj"],
     edition = "2024",
+    env = {"BOSS_JJ_BIN": "$(rootpath @jj_test_tools//:jj)"},
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
