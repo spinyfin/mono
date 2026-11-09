@@ -73,7 +73,7 @@ async fn work_carried_by_the_pr_head_by_ancestry_forgets_every_pointer() {
     for name in [s.record.base(), s.record.head(), s.record.publication()] {
         assert!(!bookmark_exists(repo, &name), "{name} survived");
     }
-    let err = resolve_pointers(&LocalJj, &s.record).await.unwrap_err();
+    let err = resolve_heads(&LocalJj, &s.record).await.unwrap_err();
     assert!(is_missing_pointer_error(&err), "{err:#}");
     // The commits themselves stay in the store: only the references went.
     assert_eq!(one(repo, &head), head);
