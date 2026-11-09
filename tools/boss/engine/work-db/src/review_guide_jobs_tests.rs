@@ -92,6 +92,42 @@ fn list_executions_for_task_includes_its_review_guide_runs() {
     assert!(db.list_executions(Some(&other_root)).unwrap().is_empty());
 }
 
+#[test]
+fn launch_target_for_review_item_is_its_pending_execution() {
+    let (_dir, db) = open_db();
+    let (root, _series_id, comparison_id) = seeded_series(&db);
+
+    // Nothing pending yet: refuse, naming the review item, and create nothing.
+    let err = db.pending_review_guide_launch_target(&comparison_id).unwrap_err();
+    assert!(err.to_string().contains("no pending review execution"), "{err}");
+
+    let execution = db
+        .create_pr_review_guide_execution(&comparison_id, "acme/widget")
+        .unwrap();
+
+    // The review item id resolves to the existing pending execution.
+    let target = db.pending_review_guide_launch_target(&comparison_id).unwrap().unwrap();
+    assert_eq!(target.id, execution.id);
+    // An execution id of that run maps to the same execution.
+    let by_exec = db.pending_review_guide_launch_target(&execution.id).unwrap().unwrap();
+    assert_eq!(by_exec.id, execution.id);
+    // No second execution was created.
+    assert_eq!(db.list_executions(Some(&root)).unwrap().len(), 1);
+    // A task id is not a review target.
+    assert!(db.pending_review_guide_launch_target(&root).unwrap().is_none());
+}
+
+#[test]
+fn launch_target_rejects_non_review_execution_id_naming_work_item() {
+    let (_dir, db) = open_db();
+    let (root, _series_id, _comparison_id) = seeded_series(&db);
+    let execution = db
+        .request_execution(RequestExecutionInput::builder().work_item_id(root.clone()).build())
+        .unwrap();
+    let err = db.pending_review_guide_launch_target(&execution.id).unwrap_err();
+    assert!(err.to_string().contains(&root), "{err}");
+}
+
 /// A `PrReviewGuide` execution's `work_item_id` is a comparison id
 /// (`prgc_…`), not a task/project/product/comment id. Every reconciliation
 /// path that classifies a bound `work_item_id` must recognise that shape
