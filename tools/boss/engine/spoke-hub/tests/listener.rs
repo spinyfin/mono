@@ -4,7 +4,10 @@ use std::sync::Arc;
 use boss_host_enrollment::{HostCredentials, pem_encode};
 use boss_protocol_spoke::v1::enrollment_client::EnrollmentClient;
 use boss_protocol_spoke::v1::spoke_hub_client::SpokeHubClient;
-use boss_protocol_spoke::v1::{self, EnrollRequest, spoke_frame};
+use boss_protocol_spoke::v1::{self, CommandResult, EnrollRequest, ResultCode, record, spoke_frame};
+use boss_spoke_hub::HubStream;
+use boss_spoke_stream::CommandOutcome;
+use boss_spoke_stream::store::CommandAdmission;
 use boss_work_db::WorkDb;
 use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
 use tokio::sync::mpsc;
@@ -40,6 +43,7 @@ struct Running {
     addr: SocketAddr,
     pki: ServerPki,
     task: tokio::task::JoinHandle<()>,
+    stream: HubStream,
 }
 
 impl Running {
@@ -56,10 +60,16 @@ async fn start(db: WorkDb, credentials: Arc<HostCredentials>) -> Running {
     let addr = listener.local_addr().expect("addr");
     let identity = pki.identity();
     let stream = hub_stream(db, credentials);
+    let serving = stream.clone();
     let task = tokio::spawn(async move {
-        let _ = stream.serve(listener, identity).await;
+        let _ = serving.serve(listener, identity).await;
     });
-    Running { addr, pki, task }
+    Running {
+        addr,
+        pki,
+        task,
+        stream,
+    }
 }
 
 async fn dial(hub: &Running, identity: Option<Identity>) -> Result<Channel, tonic::transport::Error> {
@@ -304,6 +314,84 @@ async fn first_contact_with_a_populated_journal_replays_from_the_start() {
         }
     }
     assert_eq!(db.spoke_journal("edge-1").unwrap().unwrap().received, 3);
+
+    hub.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_result_at_a_pruned_sequence_does_not_resolve_the_waiter_or_fabricate_a_receipt() {
+    let fx = Credentials::new();
+    let (_dir, db) = work_db();
+    spoke_ready(&db, "edge-1");
+    let owned = db.reserve_spoke_assignment("exec_1", "edge-1").unwrap();
+    let run = proto_run(&run_key(&owned));
+    let hub = start(db.clone(), fx.credentials.clone()).await;
+    let (spoke, cert) = enroll_edge(&hub, &fx.credentials).await;
+    let mut peer = connect(
+        dial(&hub, Some(identity_of(&spoke, &cert))).await.expect("dial"),
+        hello("edge-1"),
+    )
+    .await
+    .expect("connect");
+    match peer.next().await {
+        Some(v1::hub_frame::Body::Welcome(_)) => {}
+        other => panic!("expected welcome, got {other:?}"),
+    }
+
+    peer.tx
+        .send(v1::SpokeFrame {
+            body: Some(spoke_frame::Body::Record(capacity(1))),
+        })
+        .await
+        .unwrap();
+    match peer.next().await {
+        Some(v1::hub_frame::Body::RecordReceipt(cursor)) => assert_eq!(cursor.through, 1),
+        other => panic!("expected receipt, got {other:?}"),
+    }
+    assert_eq!(db.prune_spoke_ingress("edge-1", 1).unwrap(), 1);
+    assert!(db.spoke_ingress_frame("edge-1", 1).unwrap().is_none());
+
+    let manager = hub.stream.manager().clone();
+    let waiting = tokio::spawn({
+        let command = stop_command("c1", run.clone());
+        async move { manager.command("edge-1", CommandAdmission::Start, command, STEP).await }
+    });
+    match peer.next().await {
+        Some(v1::hub_frame::Body::Command(command)) => assert_eq!(command.command_id, "c1"),
+        other => panic!("expected command, got {other:?}"),
+    }
+
+    let result = CommandResult {
+        command_id: "c1".into(),
+        code: ResultCode::Ok.into(),
+        ..Default::default()
+    };
+    peer.tx
+        .send(v1::SpokeFrame {
+            body: Some(spoke_frame::Body::Record(v1::Record {
+                sequence: 1,
+                observed: Some(stamp()),
+                run: Some(run),
+                body: Some(record::Body::Result(result)),
+            })),
+        })
+        .await
+        .unwrap();
+    match peer.next().await {
+        Some(v1::hub_frame::Body::RecordReceipt(_)) => {
+            panic!("pruned fabricated result must not mint a receipt")
+        }
+        Some(other) => panic!("unexpected hub frame after pruned result, got {other:?}"),
+        None => {}
+    }
+    let outcome = waiting.await.expect("command task");
+    assert_eq!(
+        outcome,
+        Err(CommandOutcome::OutcomeUncertain),
+        "waiter must not resolve with success"
+    );
+    assert!(db.host_command_result("edge-1", "c1").unwrap().is_none());
+    assert_eq!(db.spoke_journal("edge-1").unwrap().unwrap().received, 1);
 
     hub.stop().await;
 }

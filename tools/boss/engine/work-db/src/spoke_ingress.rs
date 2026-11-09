@@ -238,22 +238,24 @@ impl WorkDb {
         }
         if commit.sequence <= pruned_through as u64 {
             // Already received and since pruned: the original bytes are gone,
-            // so the duplicate cannot be compared. A result can still be
-            // verified against the settled command, so it is acknowledged only
-            // if that exact result is already durable; anything else would
-            // report a result the hub never persisted.
+            // so the duplicate cannot be compared. A result is acknowledged
+            // only when that command already holds a durable result whose run
+            // and bytes both match; otherwise the hub would report a result it
+            // never persisted, or bind a pending command to a vanished frame.
             if let Some(result) = commit.result {
-                let settled: Option<Vec<u8>> = tx
+                let settled: bool = tx
                     .query_row(
-                        "SELECT result FROM host_commands WHERE host_id = ?1 AND command_id = ?2",
+                        "SELECT result IS NOT NULL FROM host_commands
+                          WHERE host_id = ?1 AND command_id = ?2",
                         params![commit.host_id, result.command_id],
                         |row| row.get(0),
                     )
                     .optional()?
-                    .flatten();
-                if settled.as_deref() != Some(result.bytes) {
+                    .unwrap_or(false);
+                if !settled {
                     return Err(fault(HostOutboxFault::Denied));
                 }
+                settle_host_command_in_tx(&tx, commit.host_id, result.command_id, result.run, result.bytes)?;
             }
             tx.commit()?;
             return Ok(received);
@@ -741,5 +743,17 @@ mod tests {
             bytes: b"different",
         };
         assert_eq!(fault_of(&replay(other).unwrap_err()), Some(HostOutboxFault::Denied));
+        let mut forged = run.clone();
+        forged.spawn_token = "forged".into();
+        let wrong_run = SpokeIngressResult {
+            command_id: "c1",
+            run: Some(&forged),
+            bytes: b"ok",
+        };
+        assert_eq!(fault_of(&replay(wrong_run).unwrap_err()), Some(HostOutboxFault::Denied));
+        assert_eq!(
+            db.host_command_result("host-a", "c1").unwrap().as_deref(),
+            Some(&b"ok"[..])
+        );
     }
 }
