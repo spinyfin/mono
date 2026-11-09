@@ -1299,6 +1299,42 @@ impl WorkDb {
         Ok(all_executions)
     }
 
+    /// Resolve a manual-start target (`bossctl agents launch` / `work start`)
+    /// that names a PR review guide item rather than a task.
+    ///
+    /// A review guide item (`prgc_…`) is dispatched by the automatic review
+    /// path, which already stamped the repo on its execution; it is not a
+    /// task, so the task-shaped request path (repo resolution, bound-PR
+    /// refusal) does not apply. Returns `Ok(None)` for any other id so the
+    /// caller falls through to the ordinary path. For a `prgc_` id returns
+    /// the latest non-terminal review guide execution (never creating one),
+    /// or an error when none is pending. An execution id of a review guide
+    /// run maps to that run's item; any other execution id is refused with
+    /// a message naming the work item id to use instead.
+    pub fn pending_review_guide_launch_target(&self, id: &str) -> Result<Option<WorkExecution>> {
+        let work_item_id = if id.starts_with("exec_") {
+            let execution = self.get_execution(id)?;
+            if execution.kind != ExecutionKind::PrReviewGuide {
+                bail!(
+                    "{id} is an execution id, not a work item id; launch its work item {} instead",
+                    execution.work_item_id
+                );
+            }
+            execution.work_item_id
+        } else if id.starts_with("prgc_") {
+            id.to_owned()
+        } else {
+            return Ok(None);
+        };
+        let conn = self.connect()?;
+        let pending = query_latest_execution_for_work_item(&conn, &work_item_id)?
+            .filter(|e| e.kind == ExecutionKind::PrReviewGuide && !e.status.is_terminal());
+        match pending {
+            Some(execution) => Ok(Some(execution)),
+            None => bail!("review item {work_item_id} has no pending review execution to launch"),
+        }
+    }
+
     /// An absent execution is distinct from a failed database read.
     pub fn find_execution(&self, id: &str) -> Result<Option<WorkExecution>> {
         let conn = self.connect()?;
