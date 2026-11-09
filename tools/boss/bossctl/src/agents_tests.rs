@@ -414,8 +414,8 @@ fn no_match_with_no_live_workers() {
 /// of — the shape whose `LiveWorkerState` was cleared while its process
 /// kept running. An `exec_…` selector that misses the live list is the
 /// signal that lets `agents_stop` forward it to the engine anyway rather
-/// than reporting `no live worker matches` and leaving the operator to
-/// `kill` by pid.
+/// than reporting `no live worker matches` and leaving `kill <pid>` as
+/// the only way to stop it.
 #[test]
 fn execution_ids_are_recognised_for_the_untracked_stop_fallback() {
     assert!(looks_like_execution_id("exec_18c6a6add38b5fe0_97"));
@@ -480,9 +480,9 @@ fn hosted_pane(slot_id: u8, run_id: &str, crew_name: &str, state: HostedPaneStat
     }
 }
 
-/// The exact incident shape: a crew name the operator can see in the
-/// app, backing a run the live registry has dropped entirely, must
-/// still resolve — by name, by slot, and by run id.
+/// A crew name the app still displays, backing a run the live registry
+/// has dropped entirely, must still resolve — by name, by slot, and by
+/// run id.
 #[test]
 fn resolves_terminal_entry_live_process_pane_by_name_slot_and_run_id() {
     let panes = [hosted_pane(
@@ -697,10 +697,9 @@ fn parse_transcript_tail_events_errors_when_driver_resolves_but_cannot_normalize
     // content (e.g. a Grok tail window landing entirely on a
     // `session_update` variant `parse_acp_envelope` maps to `Unknown`,
     // or any other non-empty content the driver silently drops) must
-    // not swallow the original schema error into an empty transcript —
-    // the doc comment on `parse_transcript_tail_events` promises the
-    // opposite, and this is the exact "renders nothing" symptom this
-    // module set out to fix.
+    // not swallow the original schema error into an empty transcript:
+    // `parse_transcript_tail_events` documents that content it cannot
+    // normalize is an error, never an empty render.
     let jsonl = concat!(
         r#"{"method":"session/update","params":{"sessionId":"s1","update":{"#,
         r#""sessionUpdate":"totally_unknown_variant","foo":"bar"}}}"#,
@@ -732,9 +731,8 @@ fn parse_transcript_tail_events_grok_joins_tool_call_and_surfaces_hook_events() 
     // `normalize_transcript_entry`) would instead see the update in
     // isolation, fail the `toolCallId` correlation, and emit an
     // extra `{"type":"system"}` filler event with no subtype. A
-    // `hook_execution` record must also surface as a system event,
-    // per the brief's requirement that hook events render alongside
-    // assistant text and tool calls/results.
+    // `hook_execution` record must also surface as a system event so
+    // hook events render alongside assistant text and tool calls/results.
     let jsonl = concat!(
         r#"{"method":"session/update","params":{"sessionId":"s1","update":{"#,
         r#""sessionUpdate":"tool_call","toolCallId":"call-1","title":"run_terminal_command","rawInput":{"command":"echo hi"}}}}"#,
