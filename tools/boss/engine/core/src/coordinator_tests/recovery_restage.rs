@@ -26,7 +26,6 @@ async fn task_and_chore_recovery_keeps_verified_pr_files_without_persisting_a_ba
         std::fs::write(repo.worker.join("pr-only.txt"), "published implementation").unwrap();
         JjRepo::run(&repo.worker, &["describe", "-m", "Published implementation"]);
         JjRepo::run(&repo.worker, &["bookmark", "set", "pr/99", "-r", "@"]);
-        JjRepo::run(&repo.repo, &["bookmark", "delete", &record.base()]);
         super::recovery::preserve_work(&db, &prior.id, &repo.worker).await;
         let cube = Arc::new(FakeCubeClient {
             workspace_root: Some(dir.path().to_path_buf()),
@@ -69,8 +68,6 @@ async fn task_and_chore_recovery_keeps_verified_pr_files_without_persisting_a_ba
             std::fs::read_to_string(repo.replacement.join("pr-only.txt")).unwrap(),
             "published implementation"
         );
-        let patch = recovery::diff(&LocalJj, &reloaded).await.unwrap();
-        assert!(patch.contains("pr-only.txt"), "{patch}");
         assert!(
             db.record_execution_bookmark(&reloaded).is_err(),
             "live duplicates must fail"
@@ -93,11 +90,21 @@ async fn checkout_of_predecessor_publication_cannot_hide_unpublished_work() {
     std::fs::write(repo.worker.join("published.txt"), "published").unwrap();
     JjRepo::run(&repo.worker, &["describe", "-m", "Published"]);
     JjRepo::run(&repo.worker, &["bookmark", "set", "pr/99", "-r", "@"]);
-    JjRepo::run(&repo.repo, &["new", &record.base(), "-m", "Unpublished publication"]);
+    // A worker names its publication branch itself before it publishes.
+    let publication = format!("boss/{}", prior.id);
+    JjRepo::run(
+        &repo.repo,
+        &[
+            "new",
+            record.base_commit.as_deref().unwrap(),
+            "-m",
+            "Unpublished publication",
+        ],
+    );
     std::fs::write(repo.repo.join("unpublished.txt"), "unique work").unwrap();
     JjRepo::run(
         &repo.repo,
-        &["bookmark", "set", &record.publication(), "-r", "@", "--allow-backwards"],
+        &["bookmark", "set", &publication, "-r", "@", "--allow-backwards"],
     );
     super::recovery::preserve_work(&db, &prior.id, &repo.repo).await;
     let before = bookmark_targets(&record);
@@ -105,7 +112,7 @@ async fn checkout_of_predecessor_publication_cannot_hide_unpublished_work() {
         workspace_root: Some(dir.path().to_path_buf()),
         real_bookmarks: true,
         position_real_workspace: true,
-        goto_reset_bookmark: Some(record.publication()),
+        goto_reset_bookmark: Some(publication.clone()),
         ..Default::default()
     });
     let coordinator = ExecutionCoordinator::new(db, WorkerPool::new(1), cube, Arc::new(FakeExecutionRunner::default()));
@@ -128,9 +135,6 @@ async fn checkout_of_predecessor_publication_cannot_hide_unpublished_work() {
     );
     for (name, commit) in before {
         if let Some(commit) = commit {
-            if name == record.base() {
-                continue;
-            }
             assert_eq!(
                 JjRepo::run(
                     &repo.replacement,
@@ -171,17 +175,27 @@ async fn read_only_review_ignores_a_damaged_predecessor_record() {
     std::fs::write(repo.worker.join("published.txt"), "published").unwrap();
     JjRepo::run(&repo.worker, &["describe", "-m", "Published"]);
     JjRepo::run(&repo.worker, &["bookmark", "set", "pr/99", "-r", "@"]);
-    JjRepo::run(&repo.repo, &["new", &record.base(), "-m", "Unpublished publication"]);
+    // A worker names its publication branch itself before it publishes.
+    let publication = format!("boss/{}", prior.id);
+    JjRepo::run(
+        &repo.repo,
+        &[
+            "new",
+            record.base_commit.as_deref().unwrap(),
+            "-m",
+            "Unpublished publication",
+        ],
+    );
     std::fs::write(repo.repo.join("unpublished.txt"), "unique work").unwrap();
     JjRepo::run(
         &repo.repo,
-        &["bookmark", "set", &record.publication(), "-r", "@", "--allow-backwards"],
+        &["bookmark", "set", &publication, "-r", "@", "--allow-backwards"],
     );
     let before = bookmark_targets(&record);
     let cube = Arc::new(FakeCubeClient {
         workspace_root: Some(dir.path().to_path_buf()),
         real_bookmarks: true,
-        goto_reset_bookmark: Some(record.publication()),
+        goto_reset_bookmark: Some(publication.clone()),
         ..Default::default()
     });
     let coordinator = ExecutionCoordinator::new(
@@ -212,7 +226,7 @@ async fn read_only_review_ignores_a_damaged_predecessor_record() {
 
     let head = JjRepo::run(
         &repo.repo,
-        &["log", "--no-graph", "-r", &record.head(), "-T", "commit_id"],
+        &["log", "--no-graph", "-r", &publication, "-T", "commit_id"],
     );
     let operation = JjRepo::run(&repo.repo, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
     for message in ["left rewrite", "right rewrite"] {
@@ -221,8 +235,6 @@ async fn read_only_review_ignores_a_damaged_predecessor_record() {
             &["--at-op", operation.trim(), "describe", head.trim(), "-m", message],
         );
     }
-    let error = recovery::diff(&LocalJj, &record).await.unwrap_err();
-    assert!(error.to_string().contains("exactly one"), "{error:#}");
     let operation = JjRepo::run(&repo.repo, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
 
     // An unreadable store makes any attempted lineage inspection fail. Cover
@@ -285,7 +297,6 @@ async fn closed_pr_with_a_missing_baseline_recovers_against_trunk_without_retiri
         .unwrap();
     record.base_commit = None;
     db.record_execution_bookmark(&record).unwrap();
-    JjRepo::run(&repo.repo, &["bookmark", "delete", &record.base()]);
     let cube = Arc::new(FakeCubeClient {
         workspace_root: Some(dir.path().to_path_buf()),
         real_bookmarks: true,
@@ -325,11 +336,10 @@ async fn abandoned_recorded_baseline_does_not_retire_the_record() {
         .await
         .unwrap();
     // The record names cube's empty positioning commit as its baseline, which
-    // is then abandoned with its bookmark: no successor, no PR to vouch.
-    JjRepo::run(&repo.repo, &["new", &record.base()]);
+    // is then abandoned: no successor, no PR to vouch.
+    JjRepo::run(&repo.repo, &["new", record.base_commit.as_deref().unwrap()]);
     let empty = JjRepo::run(&repo.repo, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
     JjRepo::run(&repo.repo, &["abandon", "@"]);
-    JjRepo::run(&repo.repo, &["bookmark", "delete", &record.base()]);
     record.base_commit = Some(empty);
     db.record_execution_bookmark(&record).unwrap();
     let cube = Arc::new(FakeCubeClient {
@@ -357,7 +367,7 @@ async fn abandoned_recorded_baseline_does_not_retire_the_record() {
 }
 
 #[tokio::test]
-async fn rewritten_baseline_and_lost_bookmark_need_no_checkpoint() {
+async fn rewritten_history_needs_no_checkpoint() {
     let dir = tempdir().unwrap();
     let (db, prior, _) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
     let repo = JjRepo::new(dir.path());
@@ -374,48 +384,42 @@ async fn rewritten_baseline_and_lost_bookmark_need_no_checkpoint() {
     JjRepo::run(&repo.repo, &["new", "main", "-m", "New upstream"]);
     std::fs::write(repo.repo.join("upstream.txt"), "upstream").unwrap();
     JjRepo::run(&repo.repo, &["bookmark", "set", "new-upstream", "-r", "@"]);
-    JjRepo::run(&repo.worker, &["rebase", "-b", &record.head(), "-d", "new-upstream"]);
+    JjRepo::run(&repo.worker, &["rebase", "-b", "@", "-d", "new-upstream"]);
     let reloaded = db.execution_bookmark(&prior.id).unwrap();
     assert_eq!(
         reloaded.base_commit, record.base_commit,
         "no checkpoint rewrites the row"
     );
-    JjRepo::run(&repo.repo, &["bookmark", "delete", &record.base()]);
-    let patch = recovery::diff(&LocalJj, &reloaded).await.unwrap();
-    assert!(patch.contains("revision.txt"));
-    assert!(
-        !recovery::unpublished_diff(&LocalJj, &reloaded)
-            .await
-            .unwrap()
-            .is_empty()
-    );
 }
 
-/// Where each of a record's three legacy bookmarks points now, as sorted commit
-/// ids joined by commas (`None` when absent). Tests compare it before and after
-/// an operation to prove the bookmarks did not move.
+/// Where a record's worker-created publication branch and its preserved tip
+/// point now, as sorted commit ids joined by commas (`None` when absent). Tests
+/// compare it before and after an operation to prove the bookmarks did not move.
 pub(super) fn bookmark_targets(
     record: &boss_engine_recovery::execution_bookmark::ExecutionBookmark,
 ) -> Vec<(String, Option<String>)> {
-    [record.base(), record.head(), record.publication()]
-        .into_iter()
-        .map(|name| {
-            let out = JjRepo::run(
-                &record.repo_path,
-                &[
-                    "--ignore-working-copy",
-                    "log",
-                    "--no-graph",
-                    "-r",
-                    &format!("bookmarks(exact:\"{name}\")"),
-                    "-T",
-                    "commit_id ++ \"\\n\"",
-                ],
-            );
-            let mut ids: Vec<&str> = out.lines().filter(|line| !line.is_empty()).collect();
-            ids.sort_unstable();
-            let target = (!ids.is_empty()).then(|| ids.join(","));
-            (name, target)
-        })
-        .collect()
+    [
+        format!("boss/{}", record.execution_id),
+        recovery::preserved_name(&record.execution_id),
+    ]
+    .into_iter()
+    .map(|name| {
+        let out = JjRepo::run(
+            &record.repo_path,
+            &[
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-r",
+                &format!("bookmarks(exact:\"{name}\")"),
+                "-T",
+                "commit_id ++ \"\\n\"",
+            ],
+        );
+        let mut ids: Vec<&str> = out.lines().filter(|line| !line.is_empty()).collect();
+        ids.sort_unstable();
+        let target = (!ids.is_empty()).then(|| ids.join(","));
+        (name, target)
+    })
+    .collect()
 }

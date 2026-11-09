@@ -1,12 +1,6 @@
-//! Crash reporting reads execution references from the shared store. A failed
-//! probe is recorded on the work item, never classified as empty.
-use std::path::PathBuf;
-
-use anyhow::Result;
-use boss_engine_recovery::execution_bookmark::LocalJj;
-use boss_engine_recovery::recovery_backup::{backup_execution_patch, default_recovery_dir};
-
+//! Recovery failures recorded on the work item, never classified as empty.
 use crate::work::{CreateAttentionItemInput, WorkDb, WorkExecution};
+use anyhow::Result;
 
 #[cfg(test)]
 pub(crate) use boss_engine_storage_values::attention_kinds::EXECUTION_BOOKMARK_CREATE_FAILED_ATTENTION_KIND as CREATE_FAILED;
@@ -60,34 +54,6 @@ pub(crate) fn report_chain_block(db: &WorkDb, execution: &WorkExecution, reason:
         ),
     )?;
     Ok(())
-}
-
-pub async fn backup_dead_execution(db: &WorkDb, execution: &WorkExecution) -> Option<PathBuf> {
-    execution.started_at.as_ref()?;
-    let result: Result<Option<PathBuf>> = async {
-        let record = db.execution_bookmark(&execution.id)?;
-        anyhow::ensure!(
-            record.host_id == "local",
-            "recovery store is on host {}; local crash backup cannot inspect it",
-            record.host_id
-        );
-        let dir = default_recovery_dir().ok_or_else(|| anyhow::anyhow!("recovery directory unavailable"))?;
-        backup_execution_patch(&dir, &LocalJj, &record).await
-    }
-    .await;
-    match result {
-        Ok(path) => path,
-        Err(err) if boss_engine_recovery::execution_bookmark::is_missing_pointer_error(&err) => {
-            // Fresh executions have no legacy head. Lease teardown preserves
-            // the workspace directly, including edits after the last jj new.
-            tracing::debug!(execution_id = %execution.id, "no legacy bookmark to export; teardown preserves workspace work");
-            None
-        }
-        Err(err) => {
-            report_failure(db, execution, &format!("{err:#}"));
-            None
-        }
-    }
 }
 
 pub(crate) fn report_failure(db: &WorkDb, execution: &WorkExecution, reason: &str) {

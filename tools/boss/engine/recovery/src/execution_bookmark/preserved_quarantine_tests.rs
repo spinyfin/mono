@@ -1,5 +1,4 @@
-//! The quarantine applies to every path that can restage work, not only
-//! `preserved/<exec>` as selected from the recorded tip.
+//! The quarantine keeps a later holder's edits out of restaged work.
 use super::preserved_tests::fixture;
 use super::*;
 use boss_engine_test_git::jj::JjRepo;
@@ -17,42 +16,6 @@ async fn boundary_now(ownership: BoundaryOwnership) -> WorkspaceTipSource {
         .as_millis() as i64;
     tokio::time::sleep(Duration::from_millis(20)).await;
     WorkspaceTipSource::LeaseBoundary { unix_millis, ownership }
-}
-
-#[tokio::test]
-async fn legacy_heads_that_follow_a_quarantined_change_are_never_restaged() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = fixture(dir.path());
-    let record = create(&LocalJj, &repo.worker, "exec_legacy_quarantine", "local")
-        .await
-        .unwrap();
-    std::fs::write(repo.worker.join("ours"), "first holder").unwrap();
-    JjRepo::run(&repo.worker, &["status"]);
-    let source = boundary_now(BoundaryOwnership::Reassigned).await;
-    std::fs::write(repo.worker.join("theirs"), "later holder").unwrap();
-    let outcome = preserve_from(&LocalJj, &record, &repo.worker, None, None, source)
-        .await
-        .unwrap();
-    assert!(outcome.tip.is_none(), "{outcome:?}");
-    // A claim snapshots the later holder's edits into the change the legacy
-    // heads track before resetting the workspace.
-    JjRepo::run(&repo.worker, &["git", "fetch"]);
-    JjRepo::run(&repo.worker, &["new", "main"]);
-    let names = JjRepo::run(&repo.repo, &["bookmark", "list", "-T", "name ++ \"\\n\""]);
-    let patch = unpublished_diff(&LocalJj, &record).await;
-    let err = patch.expect_err(&format!("bookmarks: {names}"));
-    assert_eq!(
-        pointer_integrity_kind(&err),
-        Some(PointerIntegrityKind::Quarantined),
-        "{err:#}"
-    );
-    let err = restore(&LocalJj, &record, &repo.replacement).await.unwrap_err();
-    assert_eq!(
-        pointer_integrity_kind(&err),
-        Some(PointerIntegrityKind::Quarantined),
-        "{err:#}"
-    );
-    assert!(!repo.replacement.join("theirs").exists());
 }
 
 #[tokio::test]

@@ -675,13 +675,8 @@ async fn reap_dead_execution(
     )
     .await;
 
-    // Export supplementary patch evidence from the recorded shared-store ref.
-    // Inspection failures raise attention; they never read the old workspace.
-    let recovery_patch = crate::execution_bookmark_recovery::backup_dead_execution(work_db, execution).await;
-
     // Append [engine-reconcile] audit line to the task description
-    // so a human inspecting the chore can see why it was reset (and
-    // where to find the recovery patch, if one was captured).
+    // so a human inspecting the chore can see why it was reset.
     let detection_source = evidence.audit_source();
     if let Some(work_item_id) = &state.work_item_id
         && let Err(err) = crate::reconcile_audit::append_reconcile_audit(
@@ -691,7 +686,6 @@ async fn reap_dead_execution(
             &format!(
                 "dead worker (exec {execution_id}) detected via {detection_source}; chore reset to todo for redispatch"
             ),
-            recovery_patch.as_deref(),
         )
     {
         tracing::warn!(
@@ -744,9 +738,6 @@ async fn reap_dead_execution(
         "dead_pid": state.shell_pid,
         "slot_id": state.slot_id,
         "detection_source": evidence.as_str(),
-        "recovery_patch": recovery_patch
-            .as_deref()
-            .map(|p| p.display().to_string()),
     });
     if let Some(observation) = probe_observation
         && let Some(obj) = details.as_object_mut()

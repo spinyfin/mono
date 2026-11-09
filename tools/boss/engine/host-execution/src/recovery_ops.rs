@@ -1,8 +1,8 @@
 //! Recovery workspace operations whose arguments are the recovery crate's own
 //! value types: the commit a workspace was positioned on, a fresh start from
 //! trunk, confirming that unpublished work is preserved, restoring it, checking
-//! whether it is still unpublished, and pruning a finished execution's
-//! bookmarks once it is proven published.
+//! whether it is still unpublished, and forgetting an execution's preserved
+//! references once they are finished with.
 //!
 //! The wire carries those arguments as the bounded JSON of
 //! [`HostRecoveryRequest`] (`WorkspaceOp.request_json`) and returns the recovery
@@ -10,15 +10,13 @@
 //! structs. Nothing here accepts a path, an argv or a revset from the peer.
 use anyhow::{Context, Result, ensure};
 use boss_engine_recovery::execution_bookmark::{
-    self as recovery, ExecutionBookmark, HostRecoveryRequest, LocalJj, Voucher, WorkspaceTipSource,
+    self as recovery, ExecutionBookmark, HostRecoveryRequest, LocalJj, WorkspaceTipSource,
 };
 use serde_json::Value;
 use std::path::Path;
 
 /// Largest request payload a host will decode.
 pub const MAX_REQUEST_BYTES: usize = 16 * 1024;
-/// Most vouchers one prune request may carry.
-pub const MAX_VOUCHERS: usize = 16;
 
 /// Decode and bound a request payload. An empty payload is the defaults.
 pub fn parse_request(bytes: &[u8]) -> Result<HostRecoveryRequest> {
@@ -87,26 +85,12 @@ pub async fn preserved_unpublished(record: &ExecutionBookmark, request: &HostRec
     ))
 }
 
-/// The request's vouchers as the recovery crate's own, bounded and validated.
-pub fn vouchers(request: &HostRecoveryRequest) -> Result<Vec<Voucher>> {
-    ensure!(
-        request.vouchers.len() <= MAX_VOUCHERS,
-        "prune request carries more than {MAX_VOUCHERS} vouchers"
-    );
-    request
-        .vouchers
-        .iter()
-        .cloned()
-        .map(recovery::HostVoucher::into_voucher)
-        .collect()
-}
-
-/// Forget a finished execution's pointers once a voucher proves the preserved
-/// work is published. `trunk` is the repository's main branch.
-pub async fn prune(record: &ExecutionBookmark, request: &HostRecoveryRequest, trunk: &str) -> Result<Value> {
-    let vouchers = vouchers(request)?;
+/// Forget the preserved references of the record's execution in one
+/// operation: the tip, and with the archive scope its inspection archives.
+/// The result is the list of names that were forgotten.
+pub async fn forget_preserved(record: &ExecutionBookmark, request: &HostRecoveryRequest) -> Result<Value> {
     Ok(serde_json::to_value(
-        recovery::prune(&LocalJj, record, &vouchers, trunk).await?,
+        recovery::forget_preserved_references(&LocalJj, record, request.scope).await?,
     )?)
 }
 
@@ -145,16 +129,7 @@ mod tests {
             }),
             since_unix: Some(1_700_000_000),
             tip_source: Some(WorkspaceTipSource::Live),
-            vouchers: vec![
-                recovery::HostVoucher::Commit {
-                    label: "PR #1 head".into(),
-                    commit_id: commit.clone(),
-                },
-                recovery::HostVoucher::RemoteBookmark {
-                    name: "boss/exec_1".into(),
-                    remote: "origin".into(),
-                },
-            ],
+            scope: recovery::PreservedScope::TipAndArchives,
         };
         let request_json = serde_json::json!({
             "recorded": {
@@ -164,10 +139,7 @@ mod tests {
             },
             "since_unix": 1_700_000_000,
             "tip_source": "Live",
-            "vouchers": [
-                {"Commit": {"label": "PR #1 head", "commit_id": commit.as_str()}},
-                {"RemoteBookmark": {"name": "boss/exec_1", "remote": "origin"}}
-            ]
+            "scope": "TipAndArchives"
         });
         assert_eq!(serde_json::to_value(&request).unwrap(), request_json);
         assert_eq!(
@@ -207,65 +179,8 @@ mod tests {
             preserve
         );
 
-        let published = recovery::PruneOutcome::Published {
-            vouched_by: "PR #1 head".into(),
-            commit: commit.clone(),
-            forgotten: vec!["boss-base/exec_1".into(), "boss/exec_1".into()],
-            rewritten: 0,
-        };
-        let unproven = recovery::PruneOutcome::Unproven {
-            kept: vec!["boss-recovery/exec_1".into()],
-            missing: vec![recovery::MissingChange {
-                change_id: change.clone(),
-                commit: commit.clone(),
-                description: "work".into(),
-            }],
-            forgotten: vec!["boss-base/exec_1".into()],
-            tried: vec!["remote bookmarks: unpublished changes remain".into()],
-        };
-        let gone = recovery::PruneOutcome::AlreadyGone {
-            forgotten: vec!["boss-base/exec_1".into()],
-        };
-        assert_eq!(
-            serde_json::to_value(&published).unwrap(),
-            serde_json::json!({
-                "Published": {
-                    "vouched_by": "PR #1 head",
-                    "commit": commit.as_str(),
-                    "forgotten": ["boss-base/exec_1", "boss/exec_1"],
-                    "rewritten": 0
-                }
-            })
-        );
-        assert_eq!(
-            serde_json::to_value(&unproven).unwrap(),
-            serde_json::json!({
-                "Unproven": {
-                    "kept": ["boss-recovery/exec_1"],
-                    "missing": [{
-                        "change_id": change.as_str(),
-                        "commit": commit.as_str(),
-                        "description": "work"
-                    }],
-                    "forgotten": ["boss-base/exec_1"],
-                    "tried": ["remote bookmarks: unpublished changes remain"]
-                }
-            })
-        );
-        assert_eq!(
-            serde_json::to_value(&gone).unwrap(),
-            serde_json::json!({"AlreadyGone": {"forgotten": ["boss-base/exec_1"]}})
-        );
-        for outcome in [published, unproven, gone] {
-            let value = serde_json::to_value(&outcome).unwrap();
-            assert_eq!(
-                serde_json::from_value::<recovery::PruneOutcome>(value).unwrap(),
-                outcome
-            );
-        }
-
         let restore = recovery::RestoreReport::builder()
-            .pointer("boss-recovery/exec_1")
+            .pointer("preserved/exec_1")
             .commits("aaa")
             .base_sha(commit.clone())
             .conflicts("")
@@ -276,7 +191,7 @@ mod tests {
             .unrestaged_unpublished("ccc")
             .build();
         let restore_json = serde_json::json!({
-            "pointer": "boss-recovery/exec_1",
+            "pointer": "preserved/exec_1",
             "commits": "aaa",
             "base_sha": commit.as_str(),
             "conflicts": "",
@@ -368,8 +283,6 @@ mod tests {
         let checked = executor.execute(&command(interrupted_check), true, 1).await;
         assert_eq!(checked.code, v1::ResultCode::Ok as i32, "{}", checked.reason);
 
-        let bookmark = created.bookmark.as_ref().unwrap();
-        boss_engine_test_git::jj::JjRepo::run(&repo.worker, &["bookmark", "set", &bookmark.head, "-r", "@"]);
         let fresh = executor.execute(&command(op(Kind::StartFresh)), false, 1).await;
         assert_eq!(fresh.code, v1::ResultCode::Ok as i32, "{}", fresh.reason);
         let Some(command_result::Value::Workspace(fresh)) = fresh.value else {
@@ -387,27 +300,38 @@ mod tests {
             "the fresh workspace sits directly on trunk"
         );
 
-        // No voucher is supplied, so pruning must not retire the work as published.
-        let mut prune = op(Kind::PruneBookmark);
-        prune.bookmark = created.bookmark.clone();
-        (prune.workspace_id, prune.lease_id) = Default::default();
-        prune.trunk = "main".into();
-        prune.request_json = payload(&HostRecoveryRequest::default());
-        let pruned = executor.execute(&command(prune), false, 1).await;
-        assert_eq!(pruned.code, v1::ResultCode::Ok as i32, "{}", pruned.reason);
-        let Some(command_result::Value::Workspace(pruned)) = pruned.value else {
-            panic!("missing prune outcome")
-        };
-        let outcome: recovery::PruneOutcome = serde_json::from_slice(&pruned.cube_result_json).unwrap();
-        // Nothing vouched for the work, so it is never reported as published.
-        assert!(
-            !matches!(outcome, recovery::PruneOutcome::Published { .. }),
-            "{outcome:?}"
+        // The tip teardown preserved goes in one operation, and a repeat is a no-op.
+        let tip_name = recovery::preserved_name(&run().execution_id);
+        for expected in [vec![tip_name.clone()], Vec::new()] {
+            let mut forget = op(Kind::ForgetPreserved);
+            forget.bookmark = created.bookmark.clone();
+            (forget.workspace_id, forget.lease_id) = Default::default();
+            forget.request_json = payload(&HostRecoveryRequest::default());
+            let forgotten = executor.execute(&command(forget), false, 1).await;
+            assert_eq!(forgotten.code, v1::ResultCode::Ok as i32, "{}", forgotten.reason);
+            let Some(command_result::Value::Workspace(forgotten)) = forgotten.value else {
+                panic!("missing forget result")
+            };
+            assert_eq!(
+                serde_json::from_slice::<Vec<String>>(&forgotten.cube_result_json).unwrap(),
+                expected
+            );
+        }
+        let listed = boss_engine_test_git::jj::JjRepo::run(
+            &repo.repo,
+            &[
+                "bookmark",
+                "list",
+                "-T",
+                "name ++ \"\\n\"",
+                &format!("exact:{tip_name}"),
+            ],
         );
+        assert!(listed.trim().is_empty(), "the preserved tip survived: {listed}");
     }
 
     #[tokio::test]
-    async fn executor_prunes_as_published_when_a_remote_bookmark_voucher_carries_the_work() {
+    async fn executor_forgets_archives_only_when_the_archive_scope_asks() {
         let root = tempfile::tempdir().unwrap();
         let repo = boss_engine_test_git::jj::JjRepo::new(root.path());
         let cube = Cube::new(root.path());
@@ -421,65 +345,33 @@ mod tests {
         let Some(command_result::Value::Workspace(created)) = created.value else {
             panic!("missing bookmark")
         };
-        let bookmark = created.bookmark.as_ref().unwrap();
-        std::fs::write(repo.worker.join("published.txt"), "on the branch").unwrap();
-        let mut confirm = op(Kind::ConfirmRecovery);
-        confirm.bookmark = created.bookmark.clone();
-        confirm.request_json = payload(&HostRecoveryRequest {
-            tip_source: Some(WorkspaceTipSource::Live),
-            ..Default::default()
-        });
-        let confirmed = executor.execute(&command(confirm), false, 1).await;
-        assert_eq!(confirmed.code, v1::ResultCode::Ok as i32, "{}", confirmed.reason);
-        boss_engine_test_git::jj::JjRepo::run(&repo.worker, &["bookmark", "set", &bookmark.head, "-r", "@"]);
-        boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["git", "export"]);
-        let git_store = repo.repo.join(".jj/repo/store/git");
-        boss_engine_test_git::jj::JjRepo::run(
-            &repo.repo,
-            &["git", "remote", "add", "origin", git_store.to_str().unwrap()],
-        );
-        boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["git", "fetch"]);
-        let present: Vec<String> = [&bookmark.base, &bookmark.recovery, &bookmark.head]
-            .into_iter()
-            .filter(|name| {
-                boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["bookmark", "list", "-T", "name ++ \"\\n\"", name])
-                    .lines()
-                    .any(|line| line == *name)
-            })
-            .cloned()
-            .collect();
-        assert!(!present.is_empty(), "expected pointers to forget");
-
-        let mut prune = op(Kind::PruneBookmark);
-        prune.bookmark = created.bookmark.clone();
-        (prune.workspace_id, prune.lease_id) = Default::default();
-        prune.trunk = "main".into();
-        prune.request_json = payload(&HostRecoveryRequest {
-            vouchers: vec![recovery::HostVoucher::RemoteBookmark {
-                name: bookmark.head.clone(),
-                remote: "origin".into(),
-            }],
-            ..Default::default()
-        });
-        let pruned = executor.execute(&command(prune), false, 1).await;
-        assert_eq!(pruned.code, v1::ResultCode::Ok as i32, "{}", pruned.reason);
-        let Some(command_result::Value::Workspace(pruned)) = pruned.value else {
-            panic!("missing prune outcome")
-        };
-        let outcome: recovery::PruneOutcome = serde_json::from_slice(&pruned.cube_result_json).unwrap();
-        match outcome {
-            recovery::PruneOutcome::Published { forgotten, .. } => {
-                for name in &present {
-                    assert!(forgotten.contains(name), "{name} not forgotten: {forgotten:?}");
-                    let listed = boss_engine_test_git::jj::JjRepo::run(
-                        &repo.repo,
-                        &["bookmark", "list", "-T", "name ++ \"\\n\"", name],
-                    );
-                    assert!(!listed.lines().any(|line| line == name), "{name} survived: {listed}");
-                }
-            }
-            other => panic!("expected published: {other:?}"),
+        let execution = run().execution_id;
+        let tip = recovery::preserved_name(&execution);
+        let archive = recovery::preserved_archive_name(&execution, "aaaa");
+        for name in [&tip, &archive] {
+            boss_engine_test_git::jj::JjRepo::run(&repo.worker, &["bookmark", "create", name, "-r", "@"]);
         }
+        let forget = |scope| {
+            let mut forget = op(Kind::ForgetPreserved);
+            forget.bookmark = created.bookmark.clone();
+            (forget.workspace_id, forget.lease_id) = Default::default();
+            forget.request_json = payload(&HostRecoveryRequest {
+                scope,
+                ..Default::default()
+            });
+            command(forget)
+        };
+        let names =
+            || boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["bookmark", "list", "-T", "name ++ \"\\n\""]);
+        let result = executor.execute(&forget(recovery::PreservedScope::Tip), false, 1).await;
+        assert_eq!(result.code, v1::ResultCode::Ok as i32, "{}", result.reason);
+        assert!(!names().lines().any(|name| name == tip), "{}", names());
+        assert!(names().lines().any(|name| name == archive), "{}", names());
+        let result = executor
+            .execute(&forget(recovery::PreservedScope::TipAndArchives), false, 1)
+            .await;
+        assert_eq!(result.code, v1::ResultCode::Ok as i32, "{}", result.reason);
+        assert!(!names().lines().any(|name| name == archive), "{}", names());
     }
 
     #[tokio::test]
@@ -503,37 +395,17 @@ mod tests {
         garbage.request_json = b"not json".to_vec();
         let mut stray = op(Kind::PositionedParent);
         stray.request_json = b"{}".to_vec();
-        // A check needs the recorded tip; a prune needs a bounded voucher list and a trunk.
+        // A check needs the recorded tip; a forget needs its payload, and the scope must be one it knows.
         let mut unrecorded = op(Kind::CheckPreservedUnpublished);
         unrecorded.bookmark = created.bookmark.clone();
         (unrecorded.workspace_id, unrecorded.lease_id) = Default::default();
         unrecorded.request_json = b"{}".to_vec();
-        let mut flooded = op(Kind::PruneBookmark);
-        flooded.bookmark = created.bookmark.clone();
-        (flooded.workspace_id, flooded.lease_id) = Default::default();
-        flooded.trunk = "main".into();
-        flooded.request_json = payload(&HostRecoveryRequest {
-            vouchers: vec![
-                recovery::HostVoucher::RemoteBookmark {
-                    name: "b".into(),
-                    remote: "origin".into()
-                };
-                MAX_VOUCHERS + 1
-            ],
-            ..Default::default()
-        });
-        let mut unsafe_voucher = flooded.clone();
-        unsafe_voucher.request_json = payload(&HostRecoveryRequest {
-            vouchers: vec![recovery::HostVoucher::Commit {
-                label: "head".into(),
-                commit_id: "not-a-commit".into(),
-            }],
-            ..Default::default()
-        });
-        let mut no_trunk = flooded.clone();
-        no_trunk.trunk = "--all".into();
-        no_trunk.request_json = b"{}".to_vec();
-        for request in [missing, garbage, stray, unrecorded, flooded, unsafe_voucher, no_trunk] {
+        let mut unscoped = op(Kind::ForgetPreserved);
+        unscoped.bookmark = created.bookmark.clone();
+        (unscoped.workspace_id, unscoped.lease_id) = Default::default();
+        let mut unknown_scope = unscoped.clone();
+        unknown_scope.request_json = b"{\"scope\": \"Everything\"}".to_vec();
+        for request in [missing, garbage, stray, unrecorded, unscoped, unknown_scope] {
             let result = executor.execute(&command(request), false, 1).await;
             assert_eq!(result.code, v1::ResultCode::Rejected as i32, "{}", result.reason);
         }
@@ -543,7 +415,7 @@ mod tests {
             Kind::ConfirmRecovery,
             Kind::RestorePreserved,
             Kind::CheckPreservedUnpublished,
-            Kind::PruneBookmark,
+            Kind::ForgetPreserved,
         ] {
             for (commit, change) in [
                 ("a".into(), "k".repeat(32)),
@@ -556,9 +428,6 @@ mod tests {
                 request.bookmark = created.bookmark.clone();
                 if crate::validation::store_operation(kind) {
                     (request.workspace_id, request.lease_id) = Default::default();
-                }
-                if kind == Kind::PruneBookmark {
-                    request.trunk = "main".into();
                 }
                 request.request_json = payload(&HostRecoveryRequest {
                     recorded: Some(recovery::PreservedTip {
@@ -582,9 +451,6 @@ mod tests {
         let mut foreign = op(Kind::ConfirmRecovery);
         foreign.bookmark = created.bookmark.clone().map(|mut bookmark| {
             bookmark.execution_id = "exec_other".into();
-            bookmark.head = "boss/exec_other".into();
-            bookmark.recovery = "boss-recovery/exec_other".into();
-            bookmark.base = "boss-base/exec_other".into();
             bookmark
         });
         foreign.request_json = b"{}".to_vec();

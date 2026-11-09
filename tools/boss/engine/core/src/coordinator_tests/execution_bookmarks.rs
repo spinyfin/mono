@@ -44,11 +44,6 @@ async fn fresh_dispatch_preserves_and_reports_work_without_legacy_bookmark_failu
             JjRepo::run(&repo.worker, &["new", "-m", "Second edit"]);
             std::fs::write(repo.worker.join("second.txt"), "unpublished second edit").unwrap();
         }
-        assert!(
-            crate::execution_bookmark_recovery::backup_dead_execution(&db, &execution)
-                .await
-                .is_none()
-        );
         assert!(db.list_attention_items(&execution.id).unwrap().is_empty());
         DbPreservation { db: &db, adapter: None }
             .preserve(&execution, TerminalCause::ProvenCompleted)
@@ -189,7 +184,6 @@ struct BoundPrFixture {
     dir: tempfile::TempDir,
     db: Arc<WorkDb>,
     id: String,
-    repo: JjRepo,
     head: String,
 }
 
@@ -252,13 +246,7 @@ async fn bound_pr_fixture(revision: bool) -> BoundPrFixture {
         .await
         .unwrap();
     assert_ne!(ancestry.base_commit.as_deref(), Some(head.as_str()));
-    BoundPrFixture {
-        dir,
-        db,
-        id,
-        repo,
-        head,
-    }
+    BoundPrFixture { dir, db, id, head }
 }
 
 async fn bound_pr_snapshot_dispatch(revision: bool, fail_first: bool) {
@@ -551,6 +539,7 @@ async fn sweep_reports_real_unpushed_revisions_independent_of_original_workspace
             if has_work {
                 std::fs::write(repo.worker.join("revision.txt"), "unpushed revision").unwrap();
                 JjRepo::run(&repo.worker, &["describe", "-m", "Unpushed revision"]);
+                super::recovery::preserve_work(&db, &prior.id, &repo.worker).await;
             }
             db.mark_execution_orphaned(&prior.id, "worker terminated").unwrap();
             rusqlite::Connection::open(&path)
@@ -586,7 +575,11 @@ async fn sweep_reports_real_unpushed_revisions_independent_of_original_workspace
                     attentions[0].kind,
                     crate::abandoned_execution_bookmarks::RECOVERABLE_WORK
                 );
-                assert!(attentions[0].body_markdown.contains(&record.head()));
+                assert!(
+                    attentions[0]
+                        .body_markdown
+                        .contains(&boss_engine_recovery::execution_bookmark::preserved_name(&prior.id))
+                );
                 crate::abandoned_execution_bookmarks::run_one_pass(&db, &coordinator)
                     .await
                     .unwrap();
@@ -608,16 +601,15 @@ async fn sweep_reports_real_unpushed_revisions_independent_of_original_workspace
     }
 }
 
-/// The abandoned-bookmark sweep is the loudness path that still fails a
-/// missing pointer: dispatch and resume must not, but the sweep still
-/// raises `execution_bookmark_recovery_failed` attention.
+/// A run that was never preserved has nothing for the abandoned-work sweep to
+/// report, and not having a recorded store is not a recovery failure.
 #[tokio::test]
-async fn missing_pointer_is_reported_instead_of_skipped_by_the_sweep() {
+async fn an_execution_without_a_preserved_tip_is_not_reported_or_failed_by_the_sweep() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("boss.db");
     let db = Arc::new(WorkDb::open(path.clone()).unwrap());
     let product = create_test_product(&db);
-    let chore = create_test_chore_manual(&db, product.id, "Missing pointer");
+    let chore = create_test_chore_manual(&db, product.id, "Never preserved");
     let prior = db
         .create_execution(
             CreateExecutionInput::builder()
@@ -643,47 +635,41 @@ async fn missing_pointer_is_reported_instead_of_skipped_by_the_sweep() {
         Arc::new(FakeCubeClient::default()),
         Arc::new(FakeExecutionRunner::default()),
     );
-    let failure = crate::abandoned_execution_bookmarks::run_one_pass(&db, &coordinator)
+    let reported = crate::abandoned_execution_bookmarks::run_one_pass(&db, &coordinator)
         .await
-        .unwrap_err();
-    assert!(failure.to_string().contains("no engine-created recovery bookmark"));
-    let attentions = db.list_attention_items(&prior.id).unwrap();
-    assert_eq!(attentions.len(), 1);
-    assert_eq!(attentions[0].kind, crate::execution_bookmark_recovery::RECOVERY_FAILED);
-    assert!(
-        attentions[0]
-            .body_markdown
-            .contains("no engine-created recovery bookmark")
-    );
+        .unwrap();
+    assert_eq!(reported, 0);
+    assert!(db.list_attention_items(&prior.id).unwrap().is_empty());
 }
 
-/// The engine's prune sweep and its candidate query.
-mod prune_sweep {
+/// The sweep that forgets the preserved references an execution no longer needs.
+mod preserved_cleanup_sweep {
     use super::super::helpers::*;
-    use crate::execution_bookmark_prune::{BATCH_SIZE, GH_LOOKUPS_PER_PASS, UNPROVEN, run_one_pass};
-    use crate::work::{PrOpenState, PrStateChecker, prune_outcome};
-    use boss_engine_recovery::execution_bookmark::{ExecutionBookmark, LocalJj};
+    use crate::preserved_cleanup_sweep::{Backoff, CleanupReport, run_one_pass};
+    use crate::work::CreateAttentionItemInput;
+    use boss_engine_recovery::execution_bookmark::{LocalJj, preserved_archive_name, preserved_name};
     use boss_engine_recovery_fixtures::create;
+    use boss_engine_storage_values::attention_kinds::{
+        PRESERVED_WORK_ARCHIVED_ATTENTION_KIND, PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND,
+    };
     use boss_engine_test_git::jj::JjRepo;
-    use std::sync::atomic::AtomicUsize;
 
-    const PR_URL: &str = "https://github.com/spinyfin/mono/pull/7";
-    const LONG_AGO: i64 = 24 * 60 * 60;
+    const DAY: i64 = 24 * 60 * 60;
 
     struct Fixture {
         _dir: tempfile::TempDir,
         db: Arc<WorkDb>,
         repo: JjRepo,
         coordinator: ExecutionCoordinator,
-        product_id: String,
+        backoff: Backoff,
     }
 
     fn fixture() -> Fixture {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("boss.db");
-        let db = Arc::new(WorkDb::open(path.clone()).unwrap());
-        let product = create_test_product(&db);
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let repo = JjRepo::new(dir.path());
+        super::super::recovery::configure_recovery_origin(&repo.repo);
+        JjRepo::run(&repo.repo, &["git", "fetch", "--remote", "origin", "--branch", "main"]);
         let coordinator = ExecutionCoordinator::new(
             db.clone(),
             WorkerPool::new(1),
@@ -695,29 +681,22 @@ mod prune_sweep {
             db,
             repo,
             coordinator,
-            product_id: product.id,
+            backoff: Backoff::default(),
         }
     }
 
     impl Fixture {
         fn sql(&self, sql: &str, params: impl rusqlite::Params) {
-            rusqlite::Connection::open(self._dir.path().join("boss.db"))
-                .unwrap()
-                .execute(sql, params)
-                .unwrap();
+            self.db.connect().unwrap().execute(sql, params).unwrap();
         }
 
-        /// A finished local execution (orphaned `finished_secs_ago` seconds ago)
-        /// with a live recovery record whose pointers sit on the worker's `@`.
-        /// Returns the chore id, the execution id and the record.
-        async fn execution(&self, name: &str, finished_secs_ago: i64) -> (String, String, ExecutionBookmark) {
-            let chore = create_test_chore_manual(&self.db, self.product_id.clone(), name);
+        fn execution(&self, work_item_id: &str) -> String {
             let execution = self
                 .db
                 .create_execution(
                     CreateExecutionInput::builder()
-                        .work_item_id(chore.id.clone())
-                        .kind(boss_protocol::ExecutionKind::RevisionImplementation)
+                        .work_item_id(work_item_id)
+                        .kind(ExecutionKind::ChoreImplementation)
                         .status(ExecutionStatus::Ready)
                         .build(),
                 )
@@ -725,702 +704,222 @@ mod prune_sweep {
             self.db
                 .start_execution_run(&execution.id, "worker", "mono", "lease", "workspace", "/workspace")
                 .unwrap();
-            let record = create(&LocalJj, &self.repo.worker, &execution.id, "local")
-                .await
-                .unwrap();
+            execution.id
+        }
+
+        /// A finished execution whose unpublished edit teardown preserved under a
+        /// real `preserved/<execution>` bookmark in the shared store.
+        async fn preserved(&self, work_item_id: &str, file: &str) -> String {
+            let id = self.execution(work_item_id);
+            let record = create(&LocalJj, &self.repo.worker, &id, "local").await.unwrap();
             self.db.record_execution_bookmark(&record).unwrap();
-            self.db
-                .mark_execution_orphaned(&execution.id, "worker terminated")
-                .unwrap();
+            std::fs::write(self.repo.worker.join(file), "unpublished").unwrap();
+            JjRepo::run(&self.repo.worker, &["describe", "-m", file]);
+            super::super::recovery::preserve_work(&self.db, &id, &self.repo.worker).await;
+            JjRepo::run(&self.repo.worker, &["new", "main"]);
+            assert!(self.db.preserved_tip(&id).unwrap().is_some());
+            self.db.mark_execution_orphaned(&id, "worker terminated").unwrap();
+            id
+        }
+
+        fn chore(&self, name: &str) -> String {
+            let product = create_test_product(&self.db);
+            create_test_chore_manual(&self.db, product.id, name).id
+        }
+
+        fn close_chain(&self, chore_id: &str, closed_secs_ago: i64) {
             self.sql(
-                "UPDATE work_executions SET finished_at = CAST(unixepoch('now') - ?2 AS TEXT) WHERE id = ?1",
-                rusqlite::params![execution.id, finished_secs_ago],
+                "UPDATE tasks SET status = 'done', completed_at = CAST(unixepoch('now') - ?2 AS TEXT) WHERE id = ?1",
+                rusqlite::params![chore_id, closed_secs_ago],
             );
-            (chore.id, execution.id, record)
         }
 
-        /// Give every pointer a real unpushed change and return its commit.
-        fn write_unpushed_work(&self, record: &ExecutionBookmark) -> String {
-            std::fs::write(self.repo.worker.join("revision.txt"), "unpushed revision").unwrap();
-            JjRepo::run(&self.repo.worker, &["describe", "-m", "Unpushed revision"]);
-            self.commit_of(&record.head())
-        }
-
-        fn commit_of(&self, bookmark: &str) -> String {
-            JjRepo::run(
-                &self.repo.worker,
-                &[
-                    "--ignore-working-copy",
-                    "log",
-                    "--no-graph",
-                    "-r",
-                    &format!("bookmarks(exact:\"{bookmark}\")"),
-                    "-T",
-                    "commit_id",
-                ],
-            )
-            .trim()
-            .to_owned()
-        }
-
-        fn bookmark_exists(&self, name: &str) -> bool {
+        fn exists(&self, name: &str) -> bool {
             !JjRepo::run(
-                &self.repo.worker,
-                &[
-                    "--ignore-working-copy",
-                    "bookmark",
-                    "list",
-                    "-T",
-                    "name ++ \"\\n\"",
-                    name,
-                ],
+                &self.repo.repo,
+                &["bookmark", "list", "-T", "name ++ \"\\n\"", &format!("exact:{name}")],
             )
             .trim()
             .is_empty()
         }
 
-        fn close_chain(&self, chore_id: &str, pr_url: Option<&str>, observed_head: Option<&str>) {
-            self.sql(
-                "UPDATE tasks SET status = 'done', pr_url = ?2, pr_head_sha = ?3 WHERE id = ?1",
-                rusqlite::params![chore_id, pr_url, observed_head],
-            );
-        }
-
-        fn outcome(&self, execution_id: &str) -> Option<String> {
-            self.db.execution_bookmark_prune_outcome(execution_id).unwrap()
-        }
-
-        fn retired(&self, execution_id: &str) -> bool {
-            self.db
-                .execution_bookmark_retired_reason(execution_id)
+        async fn pass(&mut self) -> CleanupReport {
+            run_one_pass(&self.db, &self.coordinator, &mut self.backoff)
+                .await
                 .unwrap()
-                .is_some()
         }
+    }
 
-        fn unproven_items(&self, execution_id: &str) -> usize {
-            self.db
-                .list_attention_items(execution_id)
+    #[tokio::test]
+    async fn a_published_successor_releases_its_predecessors_tip_in_one_pass() {
+        let mut f = fixture();
+        let chore = f.chore("Restaged then published");
+        let prior = f.preserved(&chore, "prior.txt").await;
+        let successor = f.execution(&chore);
+        let record = create(&LocalJj, &f.repo.worker, &successor, "local").await.unwrap();
+        f.db.record_execution_bookmark(&record).unwrap();
+        f.db.record_bookmark_recovery(&successor, &prior, true).unwrap();
+        f.db.create_attention_item(CreateAttentionItemInput {
+            execution_id: Some(prior.clone()),
+            work_item_id: None,
+            kind: crate::abandoned_execution_bookmarks::RECOVERABLE_WORK.to_owned(),
+            status: None,
+            title: "Unpublished execution work is recoverable".into(),
+            body_markdown: "body".into(),
+            resolved_at: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            f.pass().await,
+            CleanupReport::default(),
+            "the successor has not published"
+        );
+        assert!(f.exists(&preserved_name(&prior)));
+
+        f.sql(
+            "UPDATE work_executions SET pr_head_after = ?2 WHERE id = ?1",
+            rusqlite::params![successor, "b".repeat(40)],
+        );
+        let report = f.pass().await;
+        assert_eq!(report.superseded, 1, "{report:?}");
+        assert_eq!(report.references_forgotten, 1);
+        assert!(!f.exists(&preserved_name(&prior)));
+        assert!(f.db.preserved_tip(&prior).unwrap().is_none());
+        assert!(
+            f.db.list_attention_items(&prior)
                 .unwrap()
                 .iter()
-                .filter(|item| item.kind == UNPROVEN)
-                .count()
-        }
-
-        fn uncheck(&self, execution_id: &str) {
-            self.sql(
-                "UPDATE execution_bookmarks SET prune_checked_at = NULL WHERE execution_id = ?1",
-                [execution_id],
-            );
-        }
-
-        async fn pass(&self, pr_state: Arc<dyn PrStateChecker>) -> crate::execution_bookmark_prune::PruneReport {
-            run_one_pass(&self.db, &self.coordinator, pr_state).await.unwrap()
-        }
-    }
-
-    /// Counts `inspect` calls and answers with a preset head or an error.
-    struct CountingChecker {
-        head_sha: Option<String>,
-        fail: bool,
-        calls: AtomicUsize,
-    }
-
-    impl CountingChecker {
-        fn new(head_sha: Option<&str>, fail: bool) -> Arc<Self> {
-            Arc::new(Self {
-                head_sha: head_sha.map(str::to_owned),
-                fail,
-                calls: AtomicUsize::new(0),
-            })
-        }
-
-        fn calls(&self) -> usize {
-            self.calls.load(Ordering::SeqCst)
-        }
-    }
-
-    impl PrStateChecker for CountingChecker {
-        fn check(&self, _pr_url: &str) -> Result<PrOpenState> {
-            Ok(PrOpenState::Merged)
-        }
-
-        fn inspect(&self, pr_url: &str) -> Result<crate::work::PrInspect> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            if self.fail {
-                anyhow::bail!("gh unavailable for {pr_url}");
-            }
-            Ok(crate::work::PrInspect {
-                open_state: PrOpenState::Merged,
-                head_sha: self.head_sha.clone(),
-            })
-        }
-    }
-
-    fn no_github() -> Arc<CountingChecker> {
-        CountingChecker::new(None, false)
-    }
-
-    // ── list_prune_candidates ───────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn candidates_are_terminal_local_live_records_past_the_grace_window() {
-        let f = fixture();
-        let grace = 15 * 60;
-        let (_, old, _) = f.execution("Old", LONG_AGO).await;
-        let (_, fresh, _) = f.execution("Fresh", 1).await;
-        let (_, remote, _) = f.execution("Remote", LONG_AGO).await;
-        f.sql(
-            "UPDATE execution_bookmarks SET host_id = 'zakalwe' WHERE execution_id = ?1",
-            [&remote],
+                .all(|item| item.status == "resolved"),
+            "the recoverable-work item described a tip that is gone"
         );
-        let (_, retired, _) = f.execution("Retired", LONG_AGO).await;
-        f.db.retire_execution_bookmark(&retired, "test").unwrap();
-        let (_, running, _) = f.execution("Running", LONG_AGO).await;
-        f.sql(
-            "UPDATE work_executions SET status = 'running' WHERE id = ?1",
-            [&running],
-        );
-        let ids: Vec<String> =
-            f.db.list_prune_candidates(grace, 3600, 3600, 100)
-                .unwrap()
-                .into_iter()
-                .map(|c| c.execution.id)
-                .collect();
         assert_eq!(
-            ids,
-            vec![old.clone()],
-            "fresh/remote/retired/running rows must be skipped: {fresh} {remote}"
+            f.pass().await,
+            CleanupReport::default(),
+            "a second pass has nothing to do"
         );
     }
 
     #[tokio::test]
-    async fn recheck_intervals_depend_on_the_last_outcome_and_unchecked_rows_come_first() {
-        let f = fixture();
-        let (_, checked, _) = f.execution("Checked", 3 * LONG_AGO).await;
-        let (_, never, _) = f.execution("Never checked", LONG_AGO).await;
-        let stamp = |id: &str, outcome: &str, age: i64| {
-            f.sql(
-            "UPDATE execution_bookmarks SET prune_outcome = ?2, prune_checked_at = unixepoch('now') - ?3 WHERE execution_id = ?1",
-            rusqlite::params![id, outcome, age],
+    async fn a_superseded_tip_leaves_inspection_archives_for_a_human() {
+        let mut f = fixture();
+        let chore = f.chore("Archived variants");
+        let prior = f.preserved(&chore, "prior.txt").await;
+        let archive = preserved_archive_name(&prior, "aaaa");
+        JjRepo::run(
+            &f.repo.repo,
+            &["bookmark", "create", &archive, "-r", &preserved_name(&prior)],
         );
-        };
-        let listed = |open: i64, unproven: i64| -> Vec<String> {
-            f.db.list_prune_candidates(0, open, unproven, 100)
-                .unwrap()
-                .into_iter()
-                .map(|c| c.execution.id)
-                .collect()
-        };
-        // Open-chain rows wait the open interval; unproven and errored rows the
-        // longer unproven one.
-        stamp(&checked, prune_outcome::PR_OPEN, 100);
-        assert_eq!(listed(1000, 10), vec![never.clone()]);
-        assert_eq!(listed(50, 10_000), vec![never.clone(), checked.clone()]);
-        stamp(&checked, prune_outcome::UNPROVEN, 100);
-        assert_eq!(listed(10_000, 1000), vec![never.clone()]);
-        assert_eq!(listed(10_000, 50), vec![never.clone(), checked.clone()]);
-        stamp(&checked, prune_outcome::ERROR, 100);
-        assert_eq!(listed(10_000, 1000), vec![never.clone()]);
-        // Never-checked rows lead even though the checked one finished earlier,
-        // and the batch limit cuts the checked row off first.
-        let limited = f.db.list_prune_candidates(0, 10_000, 50, 1).unwrap();
-        assert_eq!(limited.len(), 1);
-        assert_eq!(limited[0].execution.id, never);
-    }
-
-    #[tokio::test]
-    async fn candidates_carry_the_chain_state_and_deduplicated_pr_heads() {
-        let f = fixture();
-        let (chore, execution, _) = f.execution("Chain", LONG_AGO).await;
-        let (open_chore, open_execution, _) = f.execution("Open chain", LONG_AGO).await;
-        let head_a = "a".repeat(40);
-        let head_b = "b".repeat(40);
-        f.db.set_execution_pr_head_before(&execution, &head_a).unwrap();
+        let successor = f.execution(&chore);
+        let record = create(&LocalJj, &f.repo.worker, &successor, "local").await.unwrap();
+        f.db.record_execution_bookmark(&record).unwrap();
+        f.db.record_bookmark_recovery(&successor, &prior, true).unwrap();
         f.sql(
             "UPDATE work_executions SET pr_head_after = ?2 WHERE id = ?1",
-            rusqlite::params![execution, head_a],
+            rusqlite::params![successor, "b".repeat(40)],
         );
-        // A later execution on the same chain that records the next head.
-        let second =
-            f.db.create_execution(
-                CreateExecutionInput::builder()
-                    .work_item_id(chore.clone())
-                    .kind(boss_protocol::ExecutionKind::RevisionImplementation)
-                    .status(ExecutionStatus::Ready)
-                    .build(),
-            )
-            .unwrap()
-            .id;
-        f.sql(
-            "UPDATE work_executions SET pr_head_after = ?2 WHERE id = ?1",
-            rusqlite::params![second, head_b],
+        assert_eq!(f.pass().await.superseded, 1);
+        assert!(!f.exists(&preserved_name(&prior)));
+        assert!(
+            f.exists(&archive),
+            "unselected variants wait for a human or the retention period"
         );
-        f.close_chain(&chore, Some(PR_URL), Some(&head_b));
-        let candidates = f.db.list_prune_candidates(0, 0, 0, 100).unwrap();
-        let closed = candidates.iter().find(|c| c.execution.id == execution).unwrap();
-        assert!(closed.chain_closed);
-        assert_eq!(closed.pr_url.as_deref(), Some(PR_URL));
-        assert_eq!(closed.observed_pr_head.as_deref(), Some(head_b.as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_chain_closed_past_the_retention_period_forgets_its_tip_and_archives() {
+        let mut f = fixture();
+        let open = f.chore("Still open");
+        let closed = f.chore("Closed long ago");
+        let recent = f.chore("Closed yesterday");
+        let kept = f.preserved(&open, "open.txt").await;
+        let old = f.preserved(&closed, "old.txt").await;
+        let fresh = f.preserved(&recent, "recent.txt").await;
+        let archive = preserved_archive_name(&old, "aaaa");
+        JjRepo::run(
+            &f.repo.repo,
+            &["bookmark", "create", &archive, "-r", &preserved_name(&old)],
+        );
+        f.db.upsert_execution_attention(&old, PRESERVED_WORK_ARCHIVED_ATTENTION_KIND, "Archived", "body")
+            .unwrap();
+        f.close_chain(&closed, 30 * DAY);
+        f.close_chain(&recent, DAY);
+
+        let report = f.pass().await;
+        assert_eq!(report.closed_chain, 1, "{report:?}");
+        assert_eq!(report.references_forgotten, 2);
+        assert!(!f.exists(&preserved_name(&old)) && !f.exists(&archive));
+        assert!(f.db.preserved_tip(&old).unwrap().is_none());
         assert_eq!(
-            closed.recorded_pr_heads,
-            vec![head_a, head_b],
-            "the same head recorded before and after is listed once, oldest first"
+            f.db.list_attention_items(&old).unwrap()[0].status,
+            "resolved",
+            "the archived-variants item described references that are gone"
         );
-        let open = candidates.iter().find(|c| c.execution.id == open_execution).unwrap();
-        assert!(
-            !open.chain_closed,
-            "a chain whose root is not done/archived stays open: {open_chore}"
-        );
-        assert_eq!(open.pr_url, None);
-    }
-
-    // ── the sweep pass ──────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn an_open_chain_is_stamped_and_left_alone() {
-        let f = fixture();
-        let (_, id, record) = f.execution("Open", LONG_AGO).await;
-        f.write_unpushed_work(&record);
-        let report = f.pass(no_github()).await;
-        assert_eq!((report.examined, report.pr_open), (1, 1));
-        assert_eq!(f.outcome(&id).as_deref(), Some(prune_outcome::PR_OPEN));
-        assert!(!f.retired(&id));
-        assert!(f.bookmark_exists(&record.head()) && f.bookmark_exists(&record.publication()));
-        // Stamped just now: the next pass does not look again.
-        assert_eq!(f.pass(no_github()).await.examined, 0);
-    }
-
-    #[tokio::test]
-    async fn a_finished_execution_inside_the_grace_window_is_not_examined() {
-        let f = fixture();
-        let (chore, id, _) = f.execution("Just finished", 1).await;
-        f.close_chain(&chore, None, None);
-        assert_eq!(f.pass(no_github()).await.examined, 0);
-        assert_eq!(f.outcome(&id), None);
-    }
-
-    #[tokio::test]
-    async fn work_carried_by_the_observed_pr_head_is_published_and_retired() {
-        let f = fixture();
-        let (chore, id, record) = f.execution("Published", LONG_AGO).await;
-        let work = f.write_unpushed_work(&record);
-        f.close_chain(&chore, Some(PR_URL), Some(&work));
-        let github = no_github();
-        let report = f.pass(github.clone()).await;
-        assert_eq!((report.examined, report.published, report.unproven), (1, 1, 0));
-        assert_eq!(github.calls(), 0, "a recorded head needs no GitHub lookup");
-        assert_eq!(f.outcome(&id).as_deref(), Some(prune_outcome::PUBLISHED));
-        assert!(f.retired(&id));
-        for name in [record.base(), record.head(), record.publication()] {
-            assert!(!f.bookmark_exists(&name), "{name} survived");
+        for survivor in [&kept, &fresh] {
+            assert!(f.exists(&preserved_name(survivor)), "{survivor}");
+            assert!(f.db.preserved_tip(survivor).unwrap().is_some());
         }
     }
 
     #[tokio::test]
-    async fn pointers_that_are_already_gone_retire_the_record() {
-        let f = fixture();
-        let (chore, id, record) = f.execution("Gone", LONG_AGO).await;
-        f.close_chain(&chore, Some(PR_URL), None);
+    async fn an_open_inspection_request_keeps_the_archives_when_the_tip_goes() {
+        let mut f = fixture();
+        let closed = f.chore("Closed with unsafe work set aside");
+        let id = f.preserved(&closed, "old.txt").await;
+        let archive = format!(
+            "{}unsafe/change/commit",
+            boss_engine_recovery::execution_bookmark::preserved_archive_prefix(&id)
+        );
         JjRepo::run(
-            &f.repo.worker,
-            &["bookmark", "forget", &record.head(), &record.publication()],
+            &f.repo.repo,
+            &["bookmark", "create", &archive, "-r", &preserved_name(&id)],
         );
-        let report = f.pass(no_github()).await;
-        assert_eq!((report.examined, report.already_gone), (1, 1));
-        assert_eq!(f.outcome(&id).as_deref(), Some(prune_outcome::ALREADY_GONE));
-        assert!(f.retired(&id));
-        assert!(!f.bookmark_exists(&record.base()));
+        f.db.upsert_execution_attention(&id, PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND, "Inspect", "body")
+            .unwrap();
+        f.close_chain(&closed, 30 * DAY);
+        assert_eq!(f.pass().await.closed_chain, 1);
+        assert!(!f.exists(&preserved_name(&id)));
+        assert!(f.exists(&archive), "work a human was asked to inspect is not deleted");
+        assert_eq!(f.db.list_attention_items(&id).unwrap()[0].status, "open");
     }
 
     #[tokio::test]
-    async fn unproven_work_keeps_its_pointers_and_raises_one_attention_item() {
-        let f = fixture();
-        let (chore, id, record) = f.execution("Unproven", LONG_AGO).await;
-        f.write_unpushed_work(&record);
-        f.close_chain(&chore, None, None);
-        let report = f.pass(no_github()).await;
-        assert_eq!((report.examined, report.unproven, report.gh_lookups), (1, 1, 0));
-        assert_eq!(f.outcome(&id).as_deref(), Some(prune_outcome::UNPROVEN));
-        assert!(!f.retired(&id));
-        assert!(f.bookmark_exists(&record.head()) && f.bookmark_exists(&record.publication()));
-        assert!(
-            !f.bookmark_exists(&record.base()),
-            "the baseline is rebuilt from the record"
-        );
-        assert_eq!(f.unproven_items(&id), 1);
-        let body =
-            f.db.list_attention_items(&id)
-                .unwrap()
-                .into_iter()
-                .find(|item| item.kind == UNPROVEN)
-                .unwrap()
-                .body_markdown;
-        assert!(
-            body.contains("so the pointers were kept"),
-            "two kept heads read plural: {body}"
-        );
-        assert!(
-            body.contains("The baseline `boss-base/") && body.contains("rebuilt from the record"),
-            "the baseline is named apart: {body}"
-        );
-        assert!(
-            !body.contains("carried by a voucher and forgotten"),
-            "no voucher carried the baseline: {body}"
-        );
-        // The daily re-check finds the same thing and does not stack a second item.
+    async fn an_unreachable_store_keeps_the_tip_and_is_not_retried_every_pass() {
+        let mut f = fixture();
+        let closed = f.chore("Store on a host that is gone");
+        let id = f.preserved(&closed, "old.txt").await;
         f.sql(
-            "UPDATE execution_bookmarks SET prune_checked_at = prune_checked_at - ?2 WHERE execution_id = ?1",
-            rusqlite::params![id, 2 * LONG_AGO],
+            "UPDATE execution_bookmarks SET host_id = 'gone' WHERE execution_id = ?1",
+            [&id],
         );
-        assert_eq!(f.pass(no_github()).await.unproven, 1);
-        assert_eq!(f.unproven_items(&id), 1, "the open item is re-raised, not duplicated");
-    }
-
-    #[tokio::test]
-    async fn github_head_lookup_publishes_work_no_recorded_head_carries() {
-        let f = fixture();
-        let (chore, id, record) = f.execution("GitHub voucher", LONG_AGO).await;
-        let work = f.write_unpushed_work(&record);
-        f.close_chain(&chore, Some(PR_URL), None);
-        let github = CountingChecker::new(Some(&work), false);
-        let report = f.pass(github.clone()).await;
-        assert_eq!((report.published, report.gh_lookups), (1, 1));
-        assert_eq!(github.calls(), 1);
-        assert_eq!(f.outcome(&id).as_deref(), Some(prune_outcome::PUBLISHED));
-        assert!(f.retired(&id));
-        assert!(!f.bookmark_exists(&record.head()));
-    }
-
-    #[tokio::test]
-    async fn a_publication_head_ahead_of_recovery_survives_until_github_vouches_for_it() {
-        let f = fixture();
-        let (chore, id, record) = f.execution("Ahead", LONG_AGO).await;
-        let work = f.write_unpushed_work(&record);
-        // The worker pushed one more commit: only the publication head has it.
-        JjRepo::run(&f.repo.worker, &["new", "-m", "Pushed follow-up"]);
-        std::fs::write(f.repo.worker.join("follow-up.txt"), "follow-up").unwrap();
-        JjRepo::run(&f.repo.worker, &["status"]);
-        let ahead = JjRepo::run(
-            &f.repo.worker,
-            &[
-                "--ignore-working-copy",
-                "log",
-                "--no-graph",
-                "-r",
-                "@",
-                "-T",
-                "commit_id",
-            ],
-        )
-        .trim()
-        .to_owned();
-        JjRepo::run(
-            &f.repo.worker,
-            &[
-                "bookmark",
-                "set",
-                &record.publication(),
-                "-r",
-                &ahead,
-                "--allow-backwards",
-            ],
-        );
-        // The merge poller saw only the older head, and GitHub cannot be asked.
-        f.close_chain(&chore, Some(PR_URL), Some(&work));
-        let report = f.pass(CountingChecker::new(None, true)).await;
-        assert_eq!((report.unproven, report.gh_lookups, report.errors), (1, 1, 0));
+        f.close_chain(&closed, 30 * DAY);
+        let first = f.pass().await;
+        assert_eq!((first.failed, first.closed_chain), (1, 0), "{first:?}");
         assert!(
-            f.bookmark_exists(&record.publication()),
-            "the head with unpublished work must stay"
+            f.db.preserved_tip(&id).unwrap().is_some(),
+            "a failure keeps the reference"
         );
-        assert_eq!(f.commit_of(&record.publication()), ahead);
-        assert!(!f.retired(&id));
-        // The retry, with GitHub reporting the head that carries the follow-up.
-        f.uncheck(&id);
-        let report = f.pass(CountingChecker::new(Some(&ahead), false)).await;
-        assert_eq!((report.published, report.gh_lookups), (1, 1));
-        assert!(f.retired(&id));
-        assert!(!f.bookmark_exists(&record.publication()));
+        assert!(f.exists(&preserved_name(&id)));
+        let second = f.pass().await;
+        assert_eq!((second.failed, second.deferred), (0, 1), "{second:?}");
     }
 
     #[tokio::test]
-    async fn failed_github_lookups_leave_the_pointers_in_place() {
-        let f = fixture();
-        let (chore, id, record) = f.execution("Lookup fails", LONG_AGO).await;
-        f.write_unpushed_work(&record);
-        f.close_chain(&chore, Some(PR_URL), None);
-        let report = f.pass(CountingChecker::new(None, true)).await;
-        assert_eq!((report.unproven, report.gh_lookups, report.errors), (1, 1, 0));
-        assert_eq!(f.outcome(&id).as_deref(), Some(prune_outcome::UNPROVEN));
-        assert!(f.bookmark_exists(&record.head()) && f.bookmark_exists(&record.publication()));
-    }
-
-    #[tokio::test]
-    async fn github_lookups_are_budgeted_per_pass() {
-        let f = fixture();
-        let total = GH_LOOKUPS_PER_PASS + 2;
-        assert!(total <= BATCH_SIZE);
-        let mut ids = Vec::new();
-        let mut last_record = None;
-        for n in 0..total {
-            let (chore, id, record) = f.execution(&format!("Budget {n}"), LONG_AGO).await;
-            f.close_chain(&chore, Some(PR_URL), None);
-            ids.push(id);
-            last_record = Some(record);
-        }
-        f.write_unpushed_work(&last_record.unwrap());
-        let github = CountingChecker::new(None, false);
-        let report = f.pass(github.clone()).await;
-        assert_eq!(report.examined, total);
-        assert_eq!(report.unproven, total);
-        assert_eq!(report.gh_lookups, GH_LOOKUPS_PER_PASS);
-        assert_eq!(github.calls(), GH_LOOKUPS_PER_PASS);
-    }
-
-    #[tokio::test]
-    async fn a_record_whose_store_cannot_be_read_is_stamped_error_without_stopping_the_pass() {
-        let f = fixture();
-        let (broken_chore, broken, broken_record) = f.execution("Broken store", 3 * LONG_AGO).await;
-        f.close_chain(&broken_chore, Some(PR_URL), None);
+    async fn a_repository_that_no_longer_exists_has_nothing_to_forget() {
+        let mut f = fixture();
+        let closed = f.chore("Repository deleted");
+        let id = f.preserved(&closed, "old.txt").await;
         f.sql(
-            "UPDATE execution_bookmarks SET repo_path = '/nonexistent/boss-prune-test' WHERE execution_id = ?1",
-            [&broken],
+            "UPDATE execution_bookmarks SET repo_path = '/nonexistent/boss-cleanup-test' WHERE execution_id = ?1",
+            [&id],
         );
-        let (chore, healthy, record) = f.execution("Healthy", LONG_AGO).await;
-        let work = f.write_unpushed_work(&record);
-        f.close_chain(&chore, Some(PR_URL), Some(&work));
-        let report = f.pass(no_github()).await;
-        assert_eq!((report.examined, report.errors, report.published), (2, 1, 1));
-        assert_eq!(f.outcome(&broken).as_deref(), Some(prune_outcome::ERROR));
-        assert!(!f.retired(&broken));
-        assert_eq!(f.outcome(&healthy).as_deref(), Some(prune_outcome::PUBLISHED));
-        assert!(
-            f.bookmark_exists(&broken_record.head()),
-            "an unreadable record's pointers are untouched"
+        f.close_chain(&closed, 30 * DAY);
+        let report = f.pass().await;
+        assert_eq!(
+            (report.closed_chain, report.failed, report.references_forgotten),
+            (1, 0, 0),
+            "{report:?}"
         );
+        assert!(f.db.preserved_tip(&id).unwrap().is_none());
     }
-}
-
-/// Dispatch a bound-PR revision through a coordinator with `retry_delays`
-/// and the given cube double, with `verifier` answering PR head lookups.
-fn bound_pr_coordinator(
-    fx: &BoundPrFixture,
-    cube: Arc<FakeCubeClient>,
-    verifier: &Arc<crate::completion::tests::StubBranchVerifier>,
-    retry_delays: Vec<Duration>,
-    sink: Arc<crate::dispatch_events::RecordingDispatchEventSink>,
-) -> (Arc<ExecutionCoordinator>, Arc<FakeExecutionRunner>) {
-    let handler = crate::completion::integration_handler(fx.db.clone(), "https://github.com/foo/bar/pull/99")
-        .with_branch_verifier(verifier.clone());
-    let runner = Arc::new(FakeExecutionRunner {
-        pending: true,
-        ..Default::default()
-    });
-    let mut coordinator = ExecutionCoordinator::new(fx.db.clone(), WorkerPool::new(1), cube, runner.clone())
-        .with_pre_start_retry_delays(retry_delays)
-        .with_dispatch_events(sink);
-    coordinator.set_execution_started_hook(Arc::new(handler));
-    (Arc::new(coordinator), runner)
-}
-
-fn bound_pr_cube(fx: &BoundPrFixture, failing_bookmark_creates: usize) -> Arc<FakeCubeClient> {
-    Arc::new(
-        FakeCubeClient {
-            workspace_root: Some(fx.dir.path().to_path_buf()),
-            real_bookmarks: true,
-            position_real_workspace: true,
-            fail_first_n_bookmark_creates: failing_bookmark_creates,
-            ..Default::default()
-        }
-        .with_next_workspace_id("worker"),
-    )
-}
-
-/// Move the bound PR forward by one commit and return the new head.
-fn advance_bound_pr(fx: &BoundPrFixture) -> String {
-    JjRepo::run(&fx.repo.worker, &["new", "pr/99", "-m", "PR head moved"]);
-    std::fs::write(fx.repo.worker.join("moved"), "pushed by someone else").unwrap();
-    JjRepo::run(&fx.repo.worker, &["bookmark", "set", "pr/99", "-r", "@"]);
-    let moved = JjRepo::run(
-        &fx.repo.worker,
-        &["log", "--no-graph", "-r", "pr/99", "-T", "commit_id"],
-    );
-    JjRepo::run(&fx.repo.worker, &["new", "pr/99", "-m", "PR checkout"]);
-    moved
-}
-
-#[tokio::test]
-async fn retry_after_a_post_snapshot_failure_uses_the_head_at_the_retry() {
-    let fx = bound_pr_fixture(true).await;
-    let cube = bound_pr_cube(&fx, 1);
-    let verifier = crate::completion::tests::StubBranchVerifier::ok("pr/99");
-    verifier.set_head_oid(Ok(fx.head.clone())).await;
-    let sink = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
-    let (coordinator, runner) = bound_pr_coordinator(&fx, cube, &verifier, vec![Duration::from_secs(1)], sink.clone());
-    coordinator.kick();
-
-    let events = wait_for_stage(&sink, &fx.id, "pre_start_failure").await;
-    let failure = events.iter().find(|e| e.stage == "pre_start_failure").unwrap();
-    assert_eq!(failure.details["will_retry"], true);
-    assert!(
-        failure
-            .error_message
-            .as_deref()
-            .unwrap()
-            .contains("jj bookmark create failed")
-    );
-    assert_eq!(
-        fx.db.get_execution(&fx.id).unwrap().pr_head_before.as_deref(),
-        Some(fx.head.as_str()),
-        "the failed attempt had already taken its snapshot"
-    );
-    assert!(fx.db.execution_bookmark_optional(&fx.id).unwrap().is_none());
-    assert!(runner.calls.lock().await.is_empty());
-
-    let moved = advance_bound_pr(&fx);
-    assert_ne!(moved, fx.head);
-    verifier.set_head_oid(Ok(moved.clone())).await;
-    wait_for_execution_status(&fx.db, &fx.id, ExecutionStatus::Running).await;
-    assert_eq!(
-        fx.db.get_execution(&fx.id).unwrap().pr_head_before.as_deref(),
-        Some(moved.as_str())
-    );
-    assert_eq!(
-        fx.db.execution_bookmark(&fx.id).unwrap().base_commit.as_deref(),
-        Some(moved.as_str()),
-        "the pointer floor must be the head at the attempt that created it"
-    );
-}
-
-#[tokio::test]
-async fn spent_retry_budget_creates_the_pointer_without_a_head_but_earlier_attempts_still_retry() {
-    let fx = bound_pr_fixture(true).await;
-    let cube = bound_pr_cube(&fx, 0);
-    let verifier = crate::completion::tests::StubBranchVerifier::ok("pr/99");
-    verifier.set_head_oid(Err("github unavailable".into())).await;
-    let sink = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
-    // One retry delay: the first attempt (no failures yet) returns the error,
-    // the second (one failure == the retry budget) falls back.
-    let (coordinator, _runner) = bound_pr_coordinator(&fx, cube, &verifier, vec![Duration::from_secs(1)], sink.clone());
-    coordinator.kick();
-
-    let events = wait_for_stage(&sink, &fx.id, "pre_start_failure").await;
-    let failure = events.iter().find(|e| e.stage == "pre_start_failure").unwrap();
-    assert_eq!(failure.details["will_retry"], true);
-    assert!(failure.error_message.as_deref().unwrap().contains("github unavailable"));
-    assert!(fx.db.execution_bookmark_optional(&fx.id).unwrap().is_none());
-
-    wait_for_execution_status(&fx.db, &fx.id, ExecutionStatus::Running).await;
-    assert_eq!(fx.db.get_execution(&fx.id).unwrap().pr_head_before, None);
-    let record = fx.db.execution_bookmark(&fx.id).unwrap();
-    assert_eq!(
-        record.base_commit.as_deref(),
-        Some(fx.head.as_str()),
-        "without a snapshot the floor is the PR head the workspace was positioned on, not trunk"
-    );
-}
-
-#[tokio::test]
-async fn fallback_after_a_stale_snapshot_does_not_reuse_the_earlier_head_as_the_floor() {
-    let fx = bound_pr_fixture(true).await;
-    let cube = bound_pr_cube(&fx, 1);
-    let verifier = crate::completion::tests::StubBranchVerifier::ok("pr/99");
-    verifier.set_head_oid(Ok(fx.head.clone())).await;
-    let sink = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
-    let (coordinator, _runner) = bound_pr_coordinator(&fx, cube, &verifier, vec![Duration::from_secs(1)], sink.clone());
-    coordinator.kick();
-
-    wait_for_stage(&sink, &fx.id, "pre_start_failure").await;
-    assert_eq!(
-        fx.db.get_execution(&fx.id).unwrap().pr_head_before.as_deref(),
-        Some(fx.head.as_str())
-    );
-
-    // The PR moves and GitHub is unreachable for the retry, which has spent
-    // its budget: the stale head must not survive as this run's floor.
-    advance_bound_pr(&fx);
-    verifier.set_head_oid(Err("github unavailable".into())).await;
-    wait_for_execution_status(&fx.db, &fx.id, ExecutionStatus::Running).await;
-    assert_eq!(fx.db.get_execution(&fx.id).unwrap().pr_head_before, None);
-    assert_ne!(
-        fx.db.execution_bookmark(&fx.id).unwrap().base_commit.as_deref(),
-        Some(fx.head.as_str())
-    );
-}
-
-#[tokio::test]
-async fn a_non_rate_limit_http_403_does_not_consume_a_pre_start_retry() {
-    let fx = bound_pr_fixture(true).await;
-    let cube = bound_pr_cube(&fx, 0);
-    let verifier = crate::completion::tests::StubBranchVerifier::ok("pr/99");
-    verifier
-        .set_head_oid(Err("Resource not accessible by integration (HTTP 403)".into()))
-        .await;
-    let sink = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
-    let (coordinator, _runner) = bound_pr_coordinator(&fx, cube, &verifier, vec![Duration::from_secs(1)], sink.clone());
-    coordinator.kick();
-
-    wait_for_execution_status(&fx.db, &fx.id, ExecutionStatus::Running).await;
-    assert_eq!(fx.db.get_execution(&fx.id).unwrap().pr_head_before, None);
-    assert_eq!(fx.db.get_execution(&fx.id).unwrap().pre_start_failure_count, 0);
-    assert!(fx.db.execution_bookmark_optional(&fx.id).unwrap().is_some());
-    assert!(
-        sink.events_for(&fx.id)
-            .await
-            .iter()
-            .all(|event| event.stage != "pre_start_failure"),
-        "a classified 403 must not consume a pre-start retry"
-    );
-}
-
-#[tokio::test]
-async fn retry_after_a_run_start_failure_refreshes_the_head_even_when_the_pointer_exists() {
-    let fx = bound_pr_fixture(true).await;
-    let db_path = fx.dir.path().join("boss.db");
-    rusqlite::Connection::open(&db_path)
-        .unwrap()
-        .execute_batch(
-            "CREATE TRIGGER fail_first_run_start BEFORE INSERT ON work_runs
-             BEGIN
-               SELECT RAISE(ABORT, 'injected run start failure');
-             END;",
-        )
-        .unwrap();
-    let cube = bound_pr_cube(&fx, 0);
-    let verifier = crate::completion::tests::StubBranchVerifier::ok("pr/99");
-    verifier.set_head_oid(Ok(fx.head.clone())).await;
-    let sink = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
-    let (coordinator, runner) = bound_pr_coordinator(&fx, cube, &verifier, vec![Duration::from_secs(1)], sink.clone());
-    coordinator.kick();
-
-    let events = wait_for_stage(&sink, &fx.id, "pre_start_failure").await;
-    let failure = events.iter().find(|e| e.stage == "pre_start_failure").unwrap();
-    assert_eq!(failure.details["will_retry"], true);
-    assert!(
-        failure
-            .error_message
-            .as_deref()
-            .unwrap()
-            .contains("injected run start failure")
-    );
-    assert!(fx.db.execution_bookmark_optional(&fx.id).unwrap().is_some());
-    assert_eq!(
-        fx.db.get_execution(&fx.id).unwrap().pr_head_before.as_deref(),
-        Some(fx.head.as_str())
-    );
-    assert!(runner.calls.lock().await.is_empty());
-
-    rusqlite::Connection::open(&db_path)
-        .unwrap()
-        .execute("DROP TRIGGER fail_first_run_start", [])
-        .unwrap();
-    let moved = advance_bound_pr(&fx);
-    assert_ne!(moved, fx.head);
-    verifier.set_head_oid(Ok(moved.clone())).await;
-    wait_for_execution_status(&fx.db, &fx.id, ExecutionStatus::Running).await;
-    assert_eq!(
-        fx.db.get_execution(&fx.id).unwrap().pr_head_before.as_deref(),
-        Some(moved.as_str()),
-        "a retry after the pointer exists must still snapshot the head at that attempt"
-    );
 }

@@ -1549,9 +1549,15 @@ pub trait HostAdapter: Send + Sync {
         bail!("preserved work inspection is not supported by this host adapter")
     }
 
-    async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {
-        let _ = record;
-        bail!("execution bookmark inspection is not supported by this host adapter")
+    /// Forget the preserved references `scope` names for `record`'s execution
+    /// in one jj operation; returns the names forgotten.
+    async fn forget_preserved_references(
+        &self,
+        record: &ExecutionBookmark,
+        scope: execution_bookmark::PreservedScope,
+    ) -> Result<Vec<String>> {
+        let _ = (record, scope);
+        bail!("preserved reference cleanup is not supported by this host adapter")
     }
 
     /// Position a fresh child of the repository's configured trunk, resolved
@@ -1584,17 +1590,6 @@ pub trait HostAdapter: Send + Sync {
             Err(err) if execution_bookmark::is_base_unresolvable_error(&err) => Ok(true),
             Err(err) => Err(err),
         }
-    }
-    /// Forget a finished execution's pointers once a voucher proves its
-    /// preserved work is published; unproven work keeps its recovery head.
-    async fn prune_execution_bookmark(
-        &self,
-        record: &ExecutionBookmark,
-        vouchers: &[execution_bookmark::Voucher],
-        trunk: &str,
-    ) -> Result<execution_bookmark::PruneOutcome> {
-        let _ = (record, vouchers, trunk);
-        bail!("execution bookmark pruning is not supported by this host adapter")
     }
     /// Stable host identifier (e.g. `"local"`, `"zakalwe"`).
     fn host_id(&self) -> &str;

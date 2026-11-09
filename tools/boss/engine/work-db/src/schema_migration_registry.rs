@@ -388,6 +388,11 @@ pub(super) fn all() -> Vec<Migration> {
             legacy_version: None,
             apply: parking_reconcile::migrate_cancel_provenance,
         },
+        Migration {
+            id: execution_bookmarks::RETIRE_PRUNE_STATE_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: execution_bookmarks::migrate_retire_prune_state,
+        },
     ]);
     migrations
 }

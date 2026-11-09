@@ -201,7 +201,7 @@ async fn blocked_recovery_missing_bookmark_yields_none_and_dispatch_proceeds() {
 async fn predecessor_record_without_heads_is_an_empty_run_not_a_recovery_failure() {
     let dir = tempdir().unwrap();
     let (db, prior, next) = blocked_pair(&dir.path().join("boss.db"));
-    let repo = record_then_delete_heads(&db, dir.path(), &prior.id).await;
+    let repo = record_without_bookmarks(&db, dir.path(), &prior.id).await;
     let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
     let coordinator = Arc::new(
         ExecutionCoordinator::new(
@@ -242,9 +242,24 @@ async fn predecessor_record_without_heads_is_an_empty_run_not_a_recovery_failure
     assert!(!events.contains("pointers_retired"), "{events}");
 }
 
-/// Records `execution_id`'s pointers in `db`, then deletes both heads so only
-/// the baseline survives. Returns the repo holding them.
-async fn record_then_delete_heads(
+/// Dispatch creates no `boss*` bookmark for an execution.
+fn assert_no_execution_bookmarks(repo: &std::path::Path, execution_id: &str) {
+    let listed = boss_engine_test_git::jj::JjRepo::run(
+        repo,
+        &[
+            "bookmark",
+            "list",
+            "-T",
+            "name ++ \"\\n\"",
+            &format!("glob:boss*{execution_id}"),
+        ],
+    );
+    assert!(listed.trim().is_empty(), "dispatch created bookmarks: {listed}");
+}
+
+/// Records `execution_id`'s starting commit in `db` and creates no bookmark, as
+/// dispatch does. Returns the repo holding it.
+async fn record_without_bookmarks(
     db: &WorkDb,
     dir: &std::path::Path,
     execution_id: &str,
@@ -255,10 +270,6 @@ async fn record_then_delete_heads(
     let repo = JjRepo::new(dir);
     let record = create(&LocalJj, &repo.worker, execution_id, "local").await.unwrap();
     db.record_execution_bookmark(&record).unwrap();
-    JjRepo::run(
-        &repo.repo,
-        &["bookmark", "delete", &record.head(), &record.publication()],
-    );
     repo
 }
 
@@ -272,10 +283,10 @@ fn recovery_coordinator_for(db: Arc<WorkDb>) -> Arc<ExecutionCoordinator> {
 }
 
 #[tokio::test]
-async fn self_retry_with_deleted_own_heads_leaves_the_record_and_continues() {
+async fn self_retry_without_bookmarks_leaves_the_record_and_continues() {
     let dir = tempdir().unwrap();
     let (db, _prior, next) = blocked_pair(&dir.path().join("boss.db"));
-    let repo = record_then_delete_heads(&db, dir.path(), &next.id).await;
+    let repo = record_without_bookmarks(&db, dir.path(), &next.id).await;
     let coordinator = Arc::new(ExecutionCoordinator::new(
         db.clone(),
         WorkerPool::new(1),
@@ -317,24 +328,7 @@ async fn self_retry_with_deleted_own_heads_leaves_the_record_and_continues() {
             .as_str()
         )
     );
-    assert!(
-        boss_engine_test_git::jj::JjRepo::run(
-            &repo.repo,
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                &format!(
-                    "bookmarks(exact:{}) | bookmarks(exact:{})",
-                    fresh.head(),
-                    fresh.publication()
-                ),
-                "-T",
-                "commit_id"
-            ]
-        )
-        .is_empty()
-    );
+    assert_no_execution_bookmarks(&repo.repo, &fresh.execution_id);
 }
 
 /// A row recorded by dispatch for a run that preserved nothing has a baseline
@@ -387,7 +381,7 @@ async fn redispatch_of_a_fresh_empty_execution_raises_no_recovery_note() {
 }
 
 #[tokio::test]
-async fn self_retry_with_deleted_own_heads_and_stale_report_still_positions_on_the_bound_pr() {
+async fn self_retry_without_bookmarks_and_stale_report_still_positions_on_the_bound_pr() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("boss.db");
     let (db, _prior, next) = blocked_pair(&path);
@@ -402,7 +396,7 @@ async fn self_retry_with_deleted_own_heads_and_stale_report_still_positions_on_t
     let next = db.get_execution(&next.id).unwrap();
     use boss_engine_recovery::execution_bookmark::RestoreReport;
     use boss_engine_test_git::jj::JjRepo;
-    let repo = record_then_delete_heads(&db, dir.path(), &next.id).await;
+    let repo = record_without_bookmarks(&db, dir.path(), &next.id).await;
     let original = db.execution_bookmark(&next.id).unwrap();
     super::recovery::configure_recovery_origin(&repo.repo);
     JjRepo::run(&repo.repo, &["bookmark", "set", "pr/99", "-r", "main"]);
@@ -453,28 +447,11 @@ async fn self_retry_with_deleted_own_heads_and_stale_report_still_positions_on_t
     );
     let fresh = db.execution_bookmark(&next.id).unwrap();
     assert_eq!(fresh, original, "legacy metadata is not repaired during dispatch");
-    assert!(
-        boss_engine_test_git::jj::JjRepo::run(
-            &repo.repo,
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                &format!(
-                    "bookmarks(exact:{}) | bookmarks(exact:{})",
-                    fresh.head(),
-                    fresh.publication()
-                ),
-                "-T",
-                "commit_id"
-            ]
-        )
-        .is_empty()
-    );
+    assert_no_execution_bookmarks(&repo.repo, &fresh.execution_id);
 }
 
 #[tokio::test]
-async fn read_only_review_leaves_deleted_predecessor_heads_uninspected() {
+async fn read_only_review_leaves_predecessor_records_uninspected() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("boss.db");
     let (db, prior, next) = blocked_pair(&path);
@@ -484,7 +461,7 @@ async fn read_only_review_leaves_deleted_predecessor_heads_uninspected() {
         .unwrap();
     let next = db.get_execution(&next.id).unwrap();
     assert_eq!(next.kind, ExecutionKind::PrReview);
-    let repo = record_then_delete_heads(&db, dir.path(), &prior.id).await;
+    let repo = record_without_bookmarks(&db, dir.path(), &prior.id).await;
     let coordinator = recovery_coordinator_for(db.clone());
     let lease = CubeWorkspaceLease {
         lease_id: "lease-new".into(),
@@ -575,7 +552,7 @@ async fn blocked_revision_dispatch_restores_bookmark_with_or_without_original_wo
         super::recovery::configure_recovery_origin(&repo.repo);
         JjRepo::run(&repo.repo, &["bookmark", "set", "pr/99", "-r", "main"]);
         let record = if recovered {
-            let record = boss_engine_recovery::execution_bookmark::create_from(
+            boss_engine_recovery::execution_bookmark::create_from(
                 &LocalJj,
                 &repo.worker,
                 &prior.id,
@@ -584,9 +561,7 @@ async fn blocked_revision_dispatch_restores_bookmark_with_or_without_original_wo
                 None,
             )
             .await
-            .unwrap();
-            assert_eq!(record.has_recovery_head, Some(false));
-            record
+            .unwrap()
         } else {
             create(&LocalJj, &repo.worker, &prior.id, "local").await.unwrap()
         };
@@ -594,7 +569,11 @@ async fn blocked_revision_dispatch_restores_bookmark_with_or_without_original_wo
         std::fs::write(repo.worker.join("revision.txt"), "unpushed revision").unwrap();
         JjRepo::run(&repo.worker, &["status"]);
         if recovered {
-            JjRepo::run(&repo.worker, &["bookmark", "set", &record.publication(), "-r", "@"]);
+            // A worker names its publication branch itself before publishing.
+            JjRepo::run(
+                &repo.worker,
+                &["bookmark", "set", &format!("boss/{}", prior.id), "-r", "@"],
+            );
         }
         super::recovery::preserve_work(&db, &prior.id, &repo.worker).await;
         if !recovered {
@@ -640,10 +619,7 @@ async fn blocked_revision_dispatch_restores_bookmark_with_or_without_original_wo
             .expect("restore report recorded");
         assert!(report.pointer.starts_with("preserved/"), "{}", report.pointer);
         assert!(report.conflicts.is_empty());
-        assert_eq!(
-            db.execution_bookmark(&next.id).unwrap().head(),
-            format!("boss-recovery/{}", next.id)
-        );
+        assert_no_execution_bookmarks(&repo.repo, &next.id);
         assert!(JjRepo::run(&repo.replacement, &["diff", "--git", "--from", "main"]).contains("revision.txt"));
         assert!(cube.create_calls.lock().await.is_empty());
         assert!(cube.lease_calls.lock().await[0].1.starts_with(&format!("{} ", next.id)));
@@ -686,14 +662,12 @@ async fn blocked_revision_dispatch_restages_a_record_without_a_baseline() {
                 "log",
                 "--no-graph",
                 "-r",
-                &format!("bookmarks(exact:\"boss-recovery/{}\")", prior.id),
+                &format!("bookmarks(exact:\"preserved/{}\")", prior.id),
                 "-T",
                 "commit_id",
             ],
         );
-        // A record from before the baseline commit was recorded, whose
-        // bookmark a worker's `jj abandon` took with it.
-        JjRepo::run(&repo.repo, &["bookmark", "delete", &record.base()]);
+        // A record from before the baseline commit was recorded.
         rusqlite::Connection::open(&path)
             .unwrap()
             .execute(
@@ -957,10 +931,9 @@ async fn rewritten_pr_dispatch_preserves_successor_work_through_second_recovery(
     let mut h = chain_harness(true, true, false).await;
     let db = h.coordinator.work_db().clone();
     let prior = db.recovery_predecessor(&h.next).unwrap().unwrap();
-    let record = db.execution_bookmark(&prior.id).unwrap();
     JjRepo::run(&h.repo.repo, &["new", "main", "-m", "Old published PR"]);
     std::fs::write(h.repo.repo.join("stale-pr"), "old published").unwrap();
-    JjRepo::run(&h.repo.repo, &["bookmark", "set", "pr/99", &record.base(), "-r", "@"]);
+    JjRepo::run(&h.repo.repo, &["bookmark", "set", "pr/99", "-r", "@"]);
     // Dispatch recorded this PR head as the execution's baseline commit.
     let old_pr = JjRepo::run(&h.repo.repo, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
     assert_eq!(
@@ -1133,17 +1106,12 @@ async fn positioning_transport_failure_retries_without_archiving() {
 }
 
 #[tokio::test]
-async fn orphaned_predecessor_with_no_head_bookmarks_dispatches_cleanly() {
+async fn orphaned_predecessor_without_a_preserved_tip_dispatches_cleanly() {
     use boss_engine_test_git::jj::JjRepo;
     let h = chain_harness(true, true, false).await;
     let db = &h.coordinator.work_db();
     let prior = db.recovery_predecessor(&h.next).unwrap().unwrap();
-    let record = db.execution_bookmark(&prior.id).unwrap();
     db.clear_preserved_tip(&prior.id).unwrap();
-    JjRepo::run(
-        &h.repo.repo,
-        &["bookmark", "delete", &record.head(), &record.publication()],
-    );
     h.dispatch().await.unwrap();
     let (WorkItem::Task(item) | WorkItem::Chore(item)) = db.get_work_item(&h.next.work_item_id).unwrap() else {
         panic!("expected implementation item")
@@ -1155,13 +1123,7 @@ async fn orphaned_predecessor_with_no_head_bookmarks_dispatches_cleanly() {
     assert!(!h.repo.replacement.join("revision.txt").exists());
     let successor = db.execution_bookmark(&h.next.id).unwrap();
     assert!(successor.base_commit.is_some());
-    assert!(
-        JjRepo::run(
-            &h.repo.repo,
-            &["bookmark", "list", &successor.base(), &successor.publication()]
-        )
-        .is_empty()
-    );
+    assert_no_execution_bookmarks(&h.repo.repo, &successor.execution_id);
     assert!(JjRepo::run(&h.repo.replacement, &["diff", "--git", "--from", "pr/99"]).is_empty());
     assert_eq!(h.cube.goto_calls.lock().await.len(), 1);
 }
@@ -1258,14 +1220,7 @@ async fn revision_start_retry_keeps_its_own_pointers_on_the_staged_history() {
         let restored_patch = || JjRepo::run(&h.repo.replacement, &["diff", "--git", "--from", "pr/99"]);
         assert_eq!(restored_patch(), patch);
         assert!(h.repo.replacement.join("later").exists());
-        assert!(
-            JjRepo::run(
-                &h.repo.repo,
-                &["bookmark", "list", &record.base(), &record.publication()]
-            )
-            .is_empty()
-        );
-        assert!(JjRepo::run(&h.repo.repo, &["bookmark", "list", &record.head()]).is_empty());
+        assert_no_execution_bookmarks(&h.repo.repo, &record.execution_id);
         assert_eq!(restored_patch(), patch);
         // The retry restaged the recorded preserved tip, so it records a restore report.
         assert!(db.execution_restore_report(&h.next.id).unwrap().is_some());
@@ -1426,7 +1381,6 @@ async fn unpreservable_pre_start_lease_does_not_block_redispatch() {
         host_id: "local".to_owned(),
         base_commit: None,
         pr_head_before: None,
-        has_recovery_head: None,
     })
     .unwrap();
     let cube = Arc::new(FakeCubeClient::default());

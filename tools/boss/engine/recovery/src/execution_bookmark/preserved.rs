@@ -47,9 +47,9 @@ pub struct HostRecoveryRequest {
     /// `None` reads the live workspace.
     #[serde(default)]
     pub tip_source: Option<WorkspaceTipSource>,
-    /// Vouchers a bookmark prune may use to prove preserved work is published.
+    /// Which preserved references a forget removes; the tip alone by default.
     #[serde(default)]
-    pub vouchers: Vec<HostVoucher>,
+    pub scope: PreservedScope,
 }
 
 pub fn preserved_name(execution_id: &str) -> String {

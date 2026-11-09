@@ -171,12 +171,7 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     entry(
         ABANDONED_EXECUTION_BOOKMARK_ATTENTION_KIND,
         ClearedBy::ProducerReconciles,
-        "The bookmark sweep resolves this signal when the execution has no remaining unpublished work.",
-    ),
-    entry(
-        EXECUTION_BOOKMARK_PRUNE_UNPROVEN_ATTENTION_KIND,
-        ClearedBy::ProducerReconciles,
-        "The prune sweep resolves this signal once a later pass proves the preserved work published, or a human retires the record after inspecting the commits it names.",
+        "The bookmark sweep resolves this signal when the execution has no remaining unpublished work, and the preserved-reference cleanup resolves it when it forgets the tip.",
     ),
     entry(
         EXECUTION_BOOKMARK_RECOVERY_RETIRED_ATTENTION_KIND,
@@ -191,7 +186,7 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     entry(
         PRESERVED_WORK_ARCHIVED_ATTENTION_KIND,
         ClearedBy::HumanDecision,
-        "Restore restaged the selected tip and archived unpublished unselected variants. A later restage of that selected tip does not recover the archived work, so this signal stays open for inspection.",
+        "Restore restaged the selected tip and archived unpublished unselected variants. A later restage of that selected tip does not recover the archived work, so this signal stays open for inspection until a human resolves it or the preserved-reference cleanup forgets the archives of an item whose chain has been closed for the retention period.",
     ),
     entry(
         PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND,

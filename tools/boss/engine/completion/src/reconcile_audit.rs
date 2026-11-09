@@ -9,30 +9,21 @@
 //! storage's [`WorkDb::append_work_item_description_line`]. Each call site
 //! supplies only its caller-specific reason.
 
-use std::path::Path;
-
 use crate::work::WorkDb;
 
 /// Append an `[engine-reconcile]` audit line to `work_item_id`'s description.
 ///
 /// The emitted line is:
-/// `\n[engine-reconcile] epoch {now_epoch_secs}: {reason}.{recovery_note}`
-/// where `recovery_note` is ` Uncommitted work backed up to {path}.` when
-/// `recovery_patch` is `Some`, and empty otherwise. The caller formats only
-/// `reason` (without the trailing period); this helper owns the fetch,
-/// description extraction, recovery-note construction, and update.
+/// `\n[engine-reconcile] epoch {now_epoch_secs}: {reason}.`
+/// The caller formats only `reason` (without the trailing period); this helper
+/// owns the fetch, description extraction, and update.
 pub fn append_reconcile_audit(
     work_db: &WorkDb,
     work_item_id: &str,
     now_epoch_secs: i64,
     reason: &str,
-    recovery_patch: Option<&Path>,
 ) -> anyhow::Result<()> {
-    let recovery_note = match recovery_patch {
-        Some(path) => format!(" Uncommitted work backed up to {}.", path.display()),
-        None => String::new(),
-    };
-    let audit_line = format!("\n{ENGINE_RECONCILE_MARKER} epoch {now_epoch_secs}: {reason}.{recovery_note}");
+    let audit_line = format!("\n{ENGINE_RECONCILE_MARKER} epoch {now_epoch_secs}: {reason}.");
     append_description_line(work_db, work_item_id, &audit_line)
 }
 
@@ -70,12 +61,12 @@ pub fn append_description_line(work_db: &WorkDb, work_item_id: &str, line: &str)
     work_db.append_work_item_description_line(work_item_id, line)
 }
 
-/// Best-effort variant of [`append_reconcile_audit`] with no recovery note:
+/// Best-effort variant of [`append_reconcile_audit`]:
 /// a lookup/update failure is logged via `tracing::warn!` and swallowed,
 /// never propagated. Used by transient-recovery where the audit line is a
 /// courtesy on top of the resume and must never block it.
 pub fn append_reconcile_audit_best_effort(work_db: &WorkDb, work_item_id: &str, now_epoch_secs: i64, reason: &str) {
-    if let Err(err) = append_reconcile_audit(work_db, work_item_id, now_epoch_secs, reason, None) {
+    if let Err(err) = append_reconcile_audit(work_db, work_item_id, now_epoch_secs, reason) {
         tracing::warn!(
             work_item_id,
             ?err,
@@ -129,28 +120,11 @@ mod tests {
         let chore = create_active_chore(&db, &product.id, "reap me");
         set_description(&db, &chore, "original body");
 
-        append_reconcile_audit(&db, &chore, EPOCH, "worker pid 123 exited", None).unwrap();
+        append_reconcile_audit(&db, &chore, EPOCH, "worker pid 123 exited").unwrap();
 
         assert_eq!(
             description_of(&db, &chore),
             "original body\n[engine-reconcile] epoch 1700000000: worker pid 123 exited.",
-        );
-    }
-
-    #[test]
-    fn includes_recovery_note_when_patch_present() {
-        let (_dir, db) = open_db();
-        let product = create_test_product(&db);
-        let chore = create_active_chore(&db, &product.id, "recover me");
-        set_description(&db, &chore, "before");
-
-        let patch = Path::new("/var/tmp/backup-abc.patch");
-        append_reconcile_audit(&db, &chore, EPOCH, "resumed after transient error", Some(patch)).unwrap();
-
-        assert_eq!(
-            description_of(&db, &chore),
-            "before\n[engine-reconcile] epoch 1700000000: resumed after transient error. \
-             Uncommitted work backed up to /var/tmp/backup-abc.patch.",
         );
     }
 
@@ -163,8 +137,8 @@ mod tests {
 
         // Two successive appends must both survive, in order, on top of the
         // original body — nothing is overwritten.
-        append_reconcile_audit(&db, &chore, EPOCH, "first reason", None).unwrap();
-        append_reconcile_audit(&db, &chore, EPOCH + 1, "second reason", None).unwrap();
+        append_reconcile_audit(&db, &chore, EPOCH, "first reason").unwrap();
+        append_reconcile_audit(&db, &chore, EPOCH + 1, "second reason").unwrap();
 
         assert_eq!(
             description_of(&db, &chore),
@@ -180,7 +154,7 @@ mod tests {
         let product = create_test_product(&db);
         set_description(&db, &product.id, "product notes");
 
-        append_reconcile_audit(&db, &product.id, EPOCH, "product reason", None).unwrap();
+        append_reconcile_audit(&db, &product.id, EPOCH, "product reason").unwrap();
 
         assert_eq!(
             description_of(&db, &product.id),
@@ -203,7 +177,7 @@ mod tests {
             )
             .unwrap();
 
-        append_reconcile_audit(&db, &project.id, EPOCH, "project reason", None).unwrap();
+        append_reconcile_audit(&db, &project.id, EPOCH, "project reason").unwrap();
 
         assert_eq!(
             description_of(&db, &project.id),
@@ -240,7 +214,7 @@ mod tests {
         // Sanity: the strict helper propagates the lookup failure for an
         // unknown id, so the best-effort variant has something real to
         // swallow.
-        assert!(append_reconcile_audit(&db, missing, EPOCH, "no such item", None).is_err());
+        assert!(append_reconcile_audit(&db, missing, EPOCH, "no such item").is_err());
 
         // Must not panic and must not propagate — a courtesy audit line
         // never blocks the resume it rides on.

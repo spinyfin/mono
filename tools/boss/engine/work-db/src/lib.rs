@@ -927,7 +927,7 @@ pub use critical_priority::{
     PRIORITY_CRITICAL, authorize_priority_write, critical_refusal, inherited_priority, is_critical,
     refuse_worker_critical_raise,
 };
-pub use execution_bookmarks::{PruneCandidate, RecoverySource, prune_outcome};
+pub use execution_bookmarks::RecoverySource;
 pub use output_types::AutomationDedupSuppression;
 pub use output_types::AutomationSiblingTask;
 pub use output_types::HostBoundExecution;
@@ -963,6 +963,7 @@ pub use pr_state::PrStateChecker;
 pub use pr_state::RevisionGateError;
 pub use pr_state::StaticPrStateChecker;
 pub use pr_state::classify_pr_merge_state;
+pub use preserved_cleanup::{CLOSED_CHAIN_RETENTION_SECS, PreservedCleanup, PreservedCleanupReason};
 pub use proposals::SubmitWorkerProposalInput;
 pub use proposals::SubmitWorkerProposalOutcome;
 pub use review_verdicts::{
@@ -979,5 +980,6 @@ pub use spoke_hub::{
 };
 pub use trunk_merge_intents::{ActiveTrunkMergeIntent, TrunkMergeIntent, TrunkMergeIntentInsertInput};
 
+mod preserved_cleanup;
 mod preserved_work;
 mod teardown_preservation_attention;

@@ -2,7 +2,7 @@ use super::blocked_workspace::chain_harness;
 use super::helpers::*;
 use crate::coordinator::{CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus};
 use crate::host_adapter::HostAdapter;
-use boss_engine_recovery::execution_bookmark::{ExecutionBookmark, RestoreReport};
+use boss_engine_recovery::execution_bookmark::{ExecutionBookmark, RestoreReport, preserved_name};
 
 /// Delegates to a real adapter, but fails the first
 /// `restore_preserved_work` with an ordinary (transient) error and
@@ -41,10 +41,6 @@ impl HostAdapter for FlakyRestoreAdapter {
 
     async fn recovery_pr_base(&self, origin: &str, pr: u64) -> Result<String> {
         self.inner.recovery_pr_base(origin, pr).await
-    }
-
-    async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {
-        self.inner.execution_bookmark_diff(record).await
     }
 
     fn host_id(&self) -> &str {
@@ -171,10 +167,16 @@ async fn restore_transport_failure_retries_on_the_same_stacked_base() {
     });
     let adapter: Arc<dyn HostAdapter> = flaky.clone();
     let source = h.coordinator.work_db().recovery_predecessor(&h.next).unwrap().unwrap();
-    let record = h.coordinator.work_db().execution_bookmark(&source.id).unwrap();
     let preserved = JjRepo::run(
         &h.repo.repo,
-        &["log", "-r", &record.head(), "--no-graph", "-T", "commit_id"],
+        &[
+            "log",
+            "-r",
+            &preserved_name(&source.id),
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ],
     );
 
     let error = h
@@ -200,7 +202,14 @@ async fn restore_transport_failure_retries_on_the_same_stacked_base() {
     assert_eq!(
         JjRepo::run(
             &h.repo.repo,
-            &["log", "-r", &record.head(), "--no-graph", "-T", "commit_id"]
+            &[
+                "log",
+                "-r",
+                &preserved_name(&source.id),
+                "--no-graph",
+                "-T",
+                "commit_id"
+            ]
         ),
         preserved
     );
@@ -288,7 +297,6 @@ async fn every_integrity_verdict_retains_saved_work_and_allows_fresh_dispatch() 
 
 #[tokio::test]
 async fn legacy_conflicts_remain_untouched_and_never_prevent_start() {
-    use boss_engine_recovery::execution_bookmark::{LocalJj, PointerIntegrityKind, diff, pointer_integrity_kind};
     use boss_engine_test_git::jj::JjRepo;
     for kind in [
         ExecutionKind::AnswerAgent,
@@ -317,11 +325,11 @@ async fn legacy_conflicts_remain_untouched_and_never_prevent_start() {
             )
             .unwrap();
         h.next = db.get_execution(&h.next.id).unwrap();
-        let record = db.execution_bookmark(&prior.id).unwrap();
-        let head = JjRepo::run(
-            &h.repo.repo,
-            &["log", "-r", &record.head(), "--no-graph", "-T", "commit_id"],
-        );
+        // A bookmark an earlier engine created, left conflicted by two concurrent
+        // rewrites. Nothing reads it, so it can neither block nor be touched.
+        let legacy = format!("boss-recovery/{}", prior.id);
+        JjRepo::run(&h.repo.worker, &["bookmark", "create", &legacy, "-r", "@"]);
+        let head = JjRepo::run(&h.repo.repo, &["log", "-r", &legacy, "--no-graph", "-T", "commit_id"]);
         let op = JjRepo::run(&h.repo.repo, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
         for description in ["left recovery", "right recovery"] {
             JjRepo::run(
@@ -334,15 +342,13 @@ async fn legacy_conflicts_remain_untouched_and_never_prevent_start() {
             &[
                 "log",
                 "-r",
-                &format!("bookmarks(exact:{})", record.head()),
+                &format!("bookmarks(exact:{legacy})"),
                 "--no-graph",
                 "-T",
                 "commit_id ++ \"\\n\"",
             ],
         );
         assert_eq!(twins.lines().count(), 2);
-        let error = diff(&LocalJj, &record).await.unwrap_err();
-        assert_eq!(pointer_integrity_kind(&error), Some(PointerIntegrityKind::Other));
         if kind == ExecutionKind::RevisionImplementation {
             h.dispatch().await.unwrap();
             assert_eq!(db.get_execution(&h.next.id).unwrap().status, ExecutionStatus::Running);
@@ -376,10 +382,6 @@ async fn legacy_conflicts_remain_untouched_and_never_prevent_start() {
         );
         if kind.never_writes_pr_branch() {
             assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
-            assert_eq!(
-                pointer_integrity_kind(&diff(&LocalJj, &record).await.unwrap_err()),
-                Some(PointerIntegrityKind::Other)
-            );
             continue;
         }
         assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
@@ -394,7 +396,7 @@ async fn legacy_conflicts_remain_untouched_and_never_prevent_start() {
                 &[
                     "log",
                     "-r",
-                    &format!("bookmarks(exact:{})", record.head()),
+                    &format!("bookmarks(exact:{legacy})"),
                     "--no-graph",
                     "-T",
                     "commit_id ++ \"\\n\""

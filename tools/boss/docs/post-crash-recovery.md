@@ -34,9 +34,8 @@ Compared to the other terminal statuses:
   has signal that it does.
 
 **Lease handling:** resume reads preserved work from the
-`preserved/<execution>` bookmark in the shared jj store (or, for a legacy
-execution, its `boss-recovery/<execution>` head), not from the originating
-workspace. After an orphan is recorded, the engine releases the cube lease
+`preserved/<execution>` bookmark in the shared jj store, not from the
+originating workspace. After an orphan is recorded, the engine releases the cube lease
 once the pane is confirmed gone and no process has its cwd inside the
 workspace. Teardown preservation of the current workspace commit is best
 effort and runs first; a failure is reported through a
@@ -227,55 +226,20 @@ on the worker's next hook, and submitting its guide minutes later — is
 covered by `restart_during_spawn_reopens_the_attempt_with_the_readopted_execution_and_publishes_the_guide`
 in `tools/boss/engine/work-db/src/review_guide_jobs_tests.rs`.
 
-## Automatic workspace patch backup
+## Workspace patch backup (retired)
 
-Preserving the lease keeps the in-flight work _reachable_ only as long as
-the workspace's dirty working copy survives — it is still lost the moment
-that workspace is re-leased and reset, or if cube cannot reclaim it. As a
-precaution, every path that transitions a live execution to `orphaned`
-now also snapshots the workspace's uncommitted work to a durable patch
-**at death-detection time**, independent of whether the workspace can
-later be reclaimed.
+The engine no longer exports a patch when it records a death. A worker's
+unpublished work is preserved once, at teardown, under the
+`preserved/<execution>` bookmark in the shared jj store (see
+[execution-recovery-pointers.md](execution-recovery-pointers.md)), which is
+what resume restages from. The death-detection hooks (`dead_pid_sweep`,
+`dead_pane_sweep`, `lost_workspace_sweep`, `stale_worker_sweep`,
+`spawn_ack_sweep` and the startup reaper) write no patch, and their
+`[engine-reconcile]` audit lines and dispatch events carry no `recovery_patch`.
 
-The capture is implemented in
-`tools/boss/engine/src/recovery_backup.rs` and invoked from all three
-at-death hooks:
-
-- `dead_pid_sweep` — worker PID probe reports the process is gone.
-- `stale_worker_sweep` — worker is wedged past the staleness threshold.
-- the startup reaper in `app.rs` — cube probe verdict `Dead` across an
-  engine/UI restart.
-
-Each hook runs `jj diff --git` against the dead worker's leased workspace
-(equivalent to `jj diff --git -R <ws>`) and, if the working copy is
-dirty, writes the git-format patch to:
-
-```
-$HOME/Library/Application Support/Boss/recovery/<exec-id>.patch
-```
-
-(overridable via the `BOSS_RECOVERY_DIR` env var). The path is recorded
-in two places so a human or a resuming worker can find it: the
-`[engine-reconcile]` audit line appended to the work item's description
-(`Uncommitted work backed up to <path>.`), and the `recovery_patch`
-field of the `dead_pid_reconcile` / `stale_worker_reconcile` dispatch
-event.
-
-The capture is **best-effort and non-fatal**: a missing workspace path,
-an unavailable `jj`, or an empty diff is logged and swallowed, and the
-reap proceeds regardless.
-
-Boss's own bookkeeping (`.boss/`, notably the `events-pending.jsonl`
-hook spool) is filtered out of the capture. Patch size is not a signal
-of value: three of the four patches taken at 14:42 PDT on 2026-07-23
-were 203 KB / 197 KB / 38 KB of nothing but that spool, and only an
-11 KB patch held real code.
-
-**Scope:** the patch captures _uncommitted_ working-copy changes only.
-Local commits the worker already `jj describe`d into ancestors of `@`
-are not captured (capturing `trunk..@` is a possible future
-enhancement), and branches already pushed to origin are already durable
-there.
+Patches written by earlier engines stay in the engine's `recovery/` directory
+(`<exec-id>.patch`, overridable with `BOSS_RECOVERY_DIR`) and are still
+replayed, and retained, by the section below.
 
 ## Automatic recovery: cube first, patch second
 

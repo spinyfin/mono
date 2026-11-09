@@ -119,7 +119,7 @@ pub fn spawn_group_leader_sleeper() -> std::process::Child {
     }
 }
 
-/// Give a local completion fixture the same durable recovery references as a
+/// Give a local completion fixture the same durable recovery record as a
 /// dispatched worker. Uses the fixture's existing directory and real jj.
 pub fn preserve_test_workspace(db: &WorkDb, execution_id: &str) {
     use boss_engine_recovery::execution_bookmark::ExecutionBookmark;
@@ -152,13 +152,7 @@ pub fn preserve_test_workspace(db: &WorkDb, execution_id: &str) {
         host_id: "local".to_owned(),
         base_commit: None,
         pr_head_before: None,
-        has_recovery_head: None,
     };
-    JjRepo::run(workspace, &["bookmark", "set", &record.base(), "-r", "@-"]);
-    JjRepo::run(
-        workspace,
-        &["bookmark", "set", &record.head(), &record.publication(), "-r", "@"],
-    );
     db.record_execution_bookmark(&record).unwrap();
 }
 
@@ -172,7 +166,6 @@ pub fn record_remote_test_recovery(db: &WorkDb, execution_id: &str, host: &str) 
         host_id: host.to_owned(),
         base_commit: None,
         pr_head_before: None,
-        has_recovery_head: None,
     })
     .unwrap();
 }

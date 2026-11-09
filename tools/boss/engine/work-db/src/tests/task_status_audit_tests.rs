@@ -390,11 +390,14 @@ fn upgrading_existing_tasks_backfills_once_and_preserves_known_dispatch_age() {
             .unwrap();
         if let Some(version) = version {
             if version < 60 {
-                conn.execute_batch(
-                    "ALTER TABLE execution_bookmarks DROP COLUMN prune_checked_at;
-                     ALTER TABLE execution_bookmarks DROP COLUMN prune_outcome;",
-                )
-                .unwrap();
+                // Schema 60's columns were dropped by a later migration, so an
+                // upgraded database no longer has them to remove.
+                for column in ["prune_checked_at", "prune_outcome"] {
+                    if crate::schema_init::table_has_column(&conn, "execution_bookmarks", column).unwrap() {
+                        conn.execute_batch(&format!("ALTER TABLE execution_bookmarks DROP COLUMN {column}"))
+                            .unwrap();
+                    }
+                }
             }
             conn.execute_batch("DROP TABLE schema_migrations").unwrap();
             conn.execute(

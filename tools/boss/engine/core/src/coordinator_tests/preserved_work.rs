@@ -35,16 +35,6 @@ async fn dispatch_prefers_preserved_work_over_retired_legacy_pointers() {
     db.record_preserved_tip(&prior.id, &tip).unwrap();
     db.retire_execution_bookmark(&prior.id, "legacy pointers retired")
         .unwrap();
-    JjRepo::run(
-        &repo.repo,
-        &[
-            "bookmark",
-            "delete",
-            &record.head(),
-            &record.base(),
-            &record.publication(),
-        ],
-    );
     // The poller's recorded head is stale relative to the PR; positioning must
     // not trust it.
     db.connect()
@@ -128,16 +118,6 @@ async fn restage_keeps_newer_published_commit_when_recorded_head_lags() {
     db.record_preserved_tip(&prior.id, &tip).unwrap();
     db.retire_execution_bookmark(&prior.id, "legacy pointers retired")
         .unwrap();
-    JjRepo::run(
-        &repo.repo,
-        &[
-            "bookmark",
-            "delete",
-            &record.head(),
-            &record.base(),
-            &record.publication(),
-        ],
-    );
     let (coordinator, cube) = coordinator_for(db.clone());
     let lease = CubeWorkspaceLease {
         workspace_id: "replacement".into(),
@@ -328,16 +308,6 @@ async fn self_retry_restages_preserved_work_when_legacy_pointers_are_retired() {
     db.record_preserved_tip(&execution.id, &tip).unwrap();
     db.retire_execution_bookmark(&execution.id, "legacy pointers retired")
         .unwrap();
-    JjRepo::run(
-        &repo.repo,
-        &[
-            "bookmark",
-            "delete",
-            &record.head(),
-            &record.base(),
-            &record.publication(),
-        ],
-    );
     let (coordinator, _) = coordinator_for(db.clone());
     let lease = CubeWorkspaceLease {
         workspace_id: "retry".into(),

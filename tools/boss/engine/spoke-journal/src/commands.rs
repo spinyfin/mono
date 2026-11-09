@@ -113,7 +113,7 @@ impl Journal {
         if record.encoded_len() + 16 > limit {
             let read_only = matches!(&command.body, Some(command::Body::Workspace(op))
                 if matches!(WorkspaceKind::try_from(op.kind),
-                    Ok(WorkspaceKind::ListRepos | WorkspaceKind::ListWorkspaces | WorkspaceKind::Status | WorkspaceKind::DiffBookmark)));
+                    Ok(WorkspaceKind::ListRepos | WorkspaceKind::ListWorkspaces | WorkspaceKind::Status)));
             record.body = Some(record::Body::Result(CommandResult {
                 command_id: command.command_id.clone(),
                 code: if read_only || was_rejected {

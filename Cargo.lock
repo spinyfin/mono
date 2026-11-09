@@ -1045,7 +1045,6 @@ dependencies = [
  "async-trait",
  "bon",
  "boss-engine-test-git",
- "boss-log-files",
  "serde",
  "serde_json",
  "tempfile",
