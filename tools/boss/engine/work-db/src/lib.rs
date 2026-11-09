@@ -809,6 +809,7 @@ use schema_init::table_has_column;
 mod execution_wait_history;
 mod semantic_progress;
 mod spoke_hub;
+mod spoke_ingress;
 mod stuck_activity;
 mod stuck_report;
 mod stuck_snapshot;
@@ -977,6 +978,9 @@ pub use spoke_hub::{
     AmbiguousSpokeAssignment, HostOutboxFault, HostTransport, MAX_UNSETTLED_HOST_COMMAND_BYTES,
     MAX_UNSETTLED_HOST_COMMANDS, MIN_RETAINED_SETTLED_HOST_COMMANDS, RunAdmission, SETTLED_HOST_COMMAND_RETENTION_MS,
     SpokeAssignment, SpokeHeldByOtherHost, SpokeHostInUse, SpokeRunKey, StoredHostCommand,
+};
+pub use spoke_ingress::{
+    MAX_HOST_INGRESS_BYTES, MAX_HOST_INGRESS_RECORDS, SpokeIngressCommit, SpokeIngressResult, SpokeJournalAdmission,
 };
 pub use trunk_merge_intents::{ActiveTrunkMergeIntent, TrunkMergeIntent, TrunkMergeIntentInsertInput};
 

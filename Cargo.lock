@@ -1653,6 +1653,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-spoke-hub"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "boss-host-enrollment",
+ "boss-protocol-spoke",
+ "boss-spoke-stream",
+ "boss-work-db",
+ "prost",
+ "rcgen",
+ "rustls",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
 name = "boss-spoke-journal"
 version = "0.1.0"
 dependencies = [

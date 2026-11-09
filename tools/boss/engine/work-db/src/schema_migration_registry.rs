@@ -394,6 +394,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: execution_bookmarks::migrate_retire_prune_state,
         },
         Migration {
+            id: spoke_ingress::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: spoke_ingress::migrate,
+        },
+        Migration {
             id: "20261109_1930_preserved_archive_cleanup".into(),
             legacy_version: None,
             apply: preserved_cleanup::migrate_archive_cleanup,

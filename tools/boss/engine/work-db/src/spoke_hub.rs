@@ -881,48 +881,62 @@ impl WorkDb {
     ) -> Result<()> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        type Stored = (
-            Option<String>,
-            Option<i64>,
-            Option<String>,
-            Option<String>,
-            Option<Vec<u8>>,
-        );
-        let stored: Option<Stored> = tx
-            .query_row(
-                "SELECT run_execution_id, run_generation, run_id, spawn_token, result
-                 FROM host_commands WHERE host_id = ?1 AND command_id = ?2",
-                params![host_id, command_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-            )
-            .optional()?;
-        let Some((execution_id, generation, run_id, token, settled)) = stored else {
-            return Err(fault(HostOutboxFault::Denied));
-        };
-        let stored_run = match (execution_id, generation, run_id, token) {
-            (Some(execution_id), Some(generation), Some(run_id), Some(spawn_token)) => Some(SpokeRunKey {
-                execution_id,
-                assignment_generation: generation as u64,
-                run_id,
-                spawn_token,
-            }),
-            _ => None,
-        };
-        if stored_run.as_ref() != run {
-            return Err(fault(HostOutboxFault::Denied));
-        }
-        match settled {
-            Some(previous) if previous == result => return Ok(()),
-            Some(_) => return Err(fault(HostOutboxFault::Denied)),
-            None => {}
-        }
-        tx.execute(
-            "UPDATE host_commands SET result = ?3, settled_at_ms = ?4 WHERE host_id = ?1 AND command_id = ?2",
-            params![host_id, command_id, result, now_ms()],
-        )?;
+        settle_host_command_in_tx(&tx, host_id, command_id, run, result)?;
         tx.commit()?;
         Ok(())
     }
+}
+
+/// Persist a terminal result inside an already-open transaction. Ingress
+/// commits the observation receipt in the same transaction so a crash cannot
+/// acknowledge a result the outbox cannot later query.
+pub(crate) fn settle_host_command_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    host_id: &str,
+    command_id: &str,
+    run: Option<&SpokeRunKey>,
+    result: &[u8],
+) -> Result<()> {
+    type Stored = (
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<Vec<u8>>,
+    );
+    let stored: Option<Stored> = tx
+        .query_row(
+            "SELECT run_execution_id, run_generation, run_id, spawn_token, result
+             FROM host_commands WHERE host_id = ?1 AND command_id = ?2",
+            params![host_id, command_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()?;
+    let Some((execution_id, generation, run_id, token, settled)) = stored else {
+        return Err(fault(HostOutboxFault::Denied));
+    };
+    let stored_run = match (execution_id, generation, run_id, token) {
+        (Some(execution_id), Some(generation), Some(run_id), Some(spawn_token)) => Some(SpokeRunKey {
+            execution_id,
+            assignment_generation: generation as u64,
+            run_id,
+            spawn_token,
+        }),
+        _ => None,
+    };
+    if stored_run.as_ref() != run {
+        return Err(fault(HostOutboxFault::Denied));
+    }
+    match settled {
+        Some(previous) if previous == result => return Ok(()),
+        Some(_) => return Err(fault(HostOutboxFault::Denied)),
+        None => {}
+    }
+    tx.execute(
+        "UPDATE host_commands SET result = ?3, settled_at_ms = ?4 WHERE host_id = ?1 AND command_id = ?2",
+        params![host_id, command_id, result, now_ms()],
+    )?;
+    Ok(())
 }
 
 fn unique_open_assignment(
