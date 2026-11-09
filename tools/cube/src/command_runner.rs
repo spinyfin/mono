@@ -44,6 +44,16 @@ pub trait CommandRunner {
         self.lock_pr_bookmarks(cwd)
     }
 
+    /// Shared-store critical section for adding or removing a git remote.
+    ///
+    /// jj rewrites the store's git config for each remote change under a
+    /// fail-fast config lock, so two cube processes adding their temporary
+    /// fetch remotes at once make one of them fail instead of waiting. Held
+    /// only around the config write, never around a fetch.
+    fn lock_git_remotes(&self, cwd: &Path) -> Result<crate::lock::RepoLock, CubeError> {
+        crate::lock::RepoLock::for_git_remotes(cwd)
+    }
+
     fn run(&self, invocation: &CommandInvocation) -> Result<String, CubeError>;
 
     /// Cleanup runs in an isolated group and retains both output streams.

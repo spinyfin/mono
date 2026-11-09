@@ -25,6 +25,10 @@ impl CommandRunner for PublishFixture<'_> {
         crate::lock::RepoLock::for_workspace(self.worker)
     }
 
+    fn lock_git_remotes(&self, _cwd: &Path) -> Result<crate::lock::RepoLock> {
+        crate::lock::RepoLock::for_git_remotes(self.worker)
+    }
+
     fn run(&self, invocation: &crate::command_runner::CommandInvocation) -> Result<String> {
         if invocation.program == "gh" {
             if invocation.args == ["api", "repos/test/repo/pulls/42"] {
@@ -392,52 +396,162 @@ fn divergent_sibling_with_authored_ancestor_is_refused() {
     exercise_siblings(Some("extra-parent"), false, false);
 }
 
+// Newer trunk siblings: every authored commit is checked, with and without a
+// recorded head, across the same three shapes as the base-only cases above.
+
 #[test]
-fn newer_trunk_siblings_check_every_authored_commit_even_with_recorded_head() {
-    for recorded in [false, true] {
-        for extra in [None, Some("extra-head"), Some("extra-parent")] {
-            exercise_siblings(extra, true, recorded);
-        }
-    }
+fn newer_trunk_base_only_sibling_resolves_to_published_head() {
+    exercise_siblings(None, true, false);
 }
 
 #[test]
-fn recorded_head_does_not_authorize_clean_unpublished_siblings() {
-    for extra in [None, Some("extra-head"), Some("extra-parent")] {
-        exercise_siblings(extra, false, true);
-    }
+fn newer_trunk_sibling_with_authored_content_is_refused() {
+    exercise_siblings(Some("extra-head"), true, false);
+}
+
+#[test]
+fn newer_trunk_sibling_with_authored_ancestor_is_refused() {
+    exercise_siblings(Some("extra-parent"), true, false);
+}
+
+#[test]
+fn newer_trunk_base_only_sibling_resolves_with_recorded_head() {
+    exercise_siblings(None, true, true);
+}
+
+#[test]
+fn newer_trunk_sibling_with_authored_content_is_refused_despite_recorded_head() {
+    exercise_siblings(Some("extra-head"), true, true);
+}
+
+#[test]
+fn newer_trunk_sibling_with_authored_ancestor_is_refused_despite_recorded_head() {
+    exercise_siblings(Some("extra-parent"), true, true);
+}
+
+// A recorded head does not authorize clean but unpublished siblings.
+
+#[test]
+fn recorded_head_still_resolves_base_only_sibling() {
+    exercise_siblings(None, false, true);
+}
+
+#[test]
+fn recorded_head_does_not_authorize_sibling_with_authored_content() {
+    exercise_siblings(Some("extra-head"), false, true);
+}
+
+#[test]
+fn recorded_head_does_not_authorize_sibling_with_authored_ancestor() {
+    exercise_siblings(Some("extra-parent"), false, true);
+}
+
+/// The history every sibling scenario starts from: `base` → `parent` →
+/// `head` (bookmarked `original`), an `upstream` rewrite of `base`, and a
+/// trunk of more commits than the authored-history safety limit ending at
+/// `main`. Building it takes over a hundred jj invocations, so it is built
+/// once per test binary and each scenario works on a private copy.
+struct SiblingsHistory {
+    _dir: tempfile::TempDir,
+    repo: std::path::PathBuf,
+    commits: SiblingsCommits,
+}
+
+/// Commit ids of the shared history a scenario refers to.
+struct SiblingsCommits {
+    parent: String,
+    original: String,
+    upstream: String,
+    latest: String,
+}
+
+fn siblings_history() -> &'static SiblingsHistory {
+    static HISTORY: std::sync::OnceLock<SiblingsHistory> = std::sync::OnceLock::new();
+    HISTORY.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let jj = |args: &[&str]| TestJj.run(&RealCommandRunner::invocation(&repo, "jj", args)).unwrap();
+        jj(&["git", "init", "--colocate"]);
+        jj(&["config", "set", "--repo", "user.name", "Test"]);
+        jj(&["config", "set", "--repo", "user.email", "test@example.com"]);
+        std::fs::write(repo.join("base"), "base\n").unwrap();
+        jj(&["commit", "-m", "base"]);
+        let base = jj_commit_id(&TestJj, &repo, "@-").unwrap();
+        std::fs::write(repo.join("parent"), "parent\n").unwrap();
+        jj(&["commit", "-m", "parent"]);
+        let parent = jj_commit_id(&TestJj, &repo, "@-").unwrap();
+        std::fs::write(repo.join("head"), "head\n").unwrap();
+        jj(&["describe", "-m", "head"]);
+        let original = jj_commit_id(&TestJj, &repo, "@").unwrap();
+        jj(&["bookmark", "set", "original", "-r", &original]);
+        jj(&["new", &base, "-m", "upstream"]);
+        std::fs::write(repo.join("base"), "new base\n").unwrap();
+        let upstream = jj_commit_id(&TestJj, &repo, "@").unwrap();
+        // A linear trunk of more commits than the authored-history safety
+        // limit. Each `duplicate` round re-inserts the trunk so far below the
+        // working copy, doubling its length for one jj invocation instead of
+        // one per commit; the trunk ends at 101 commits.
+        for i in 0..13 {
+            jj(&["new", "-m", &format!("trunk {i}")]);
+        }
+        for _ in 0..3 {
+            jj(&[
+                "duplicate",
+                "-r",
+                r#"description(glob:"trunk *") ~ @"#,
+                "--insert-before",
+                "@",
+            ]);
+        }
+        for i in 13..17 {
+            jj(&["new", "-m", &format!("trunk {i}")]);
+        }
+        assert_eq!(
+            jj(&[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"description(glob:"trunk *")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ])
+            .lines()
+            .count(),
+            101
+        );
+        std::fs::write(repo.join("base"), "latest base\n").unwrap();
+        let latest = jj_commit_id(&TestJj, &repo, "@").unwrap();
+        jj(&["bookmark", "set", "main", "-r", &latest]);
+        SiblingsHistory {
+            _dir: dir,
+            repo,
+            commits: SiblingsCommits {
+                parent,
+                original,
+                upstream,
+                latest,
+            },
+        }
+    })
 }
 
 fn exercise_siblings(extra: Option<&str>, newer_side: bool, recorded: bool) {
+    let history = siblings_history();
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path();
+    crate::app::test_fs::copy_tree(&history.repo, repo).unwrap();
+    let SiblingsCommits {
+        parent,
+        original,
+        upstream,
+        latest,
+    } = &history.commits;
+    let (parent, original, upstream, latest) = (parent.as_str(), original.as_str(), upstream.as_str(), latest.as_str());
     let jj = |args: &[&str]| TestJj.run(&RealCommandRunner::invocation(repo, "jj", args)).unwrap();
-    jj(&["git", "init", "--colocate"]);
-    jj(&["config", "set", "--repo", "user.name", "Test"]);
-    jj(&["config", "set", "--repo", "user.email", "test@example.com"]);
-    std::fs::write(repo.join("base"), "base\n").unwrap();
-    jj(&["commit", "-m", "base"]);
-    let base = jj_commit_id(&TestJj, repo, "@-").unwrap();
-    std::fs::write(repo.join("parent"), "parent\n").unwrap();
-    jj(&["commit", "-m", "parent"]);
-    let parent = jj_commit_id(&TestJj, repo, "@-").unwrap();
-    std::fs::write(repo.join("head"), "head\n").unwrap();
-    jj(&["describe", "-m", "head"]);
-    let original = jj_commit_id(&TestJj, repo, "@").unwrap();
-    jj(&["bookmark", "set", "original", "-r", &original]);
     if recorded {
-        crate::app::pr_bookmarks::record_head(repo, 42, &original).unwrap();
+        crate::app::pr_bookmarks::record_head(repo, 42, original).unwrap();
     }
-    jj(&["new", &base, "-m", "upstream"]);
-    std::fs::write(repo.join("base"), "new base\n").unwrap();
-    let upstream = jj_commit_id(&TestJj, repo, "@").unwrap();
-    // More trunk commits than the authored-history safety limit.
-    for i in 0..101 {
-        jj(&["new", "-m", &format!("trunk {i}")]);
-    }
-    std::fs::write(repo.join("base"), "latest base\n").unwrap();
-    let latest = jj_commit_id(&TestJj, repo, "@").unwrap();
-    jj(&["bookmark", "set", "main", "-r", &latest]);
     let remote_dir = tempfile::tempdir().unwrap();
     let remote = remote_dir.path().join("remote");
     std::fs::create_dir(&remote).unwrap();
@@ -452,13 +566,7 @@ fn exercise_siblings(extra: Option<&str>, newer_side: bool, recorded: bool) {
         remote.join(".jj/repo/store/git").to_str().unwrap(),
     ]);
     jj(&["git", "push", "-b", "main", "--allow-new"]);
-    jj(&[
-        "rebase",
-        "-s",
-        &parent,
-        "-d",
-        if newer_side { &latest } else { &upstream },
-    ]);
+    jj(&["rebase", "-s", parent, "-d", if newer_side { latest } else { upstream }]);
     let side = jj_commit_id(&TestJj, repo, "original").unwrap();
     jj(&["bookmark", "set", "saved-side", "-r", &side]);
     if let Some(file) = extra {
@@ -474,15 +582,9 @@ fn exercise_siblings(extra: Option<&str>, newer_side: bool, recorded: bool) {
         jj(&["status"]);
     }
     let side = jj_commit_id(&TestJj, repo, "saved-side").unwrap();
-    jj(&["edit", &original]);
+    jj(&["edit", original]);
     jj(&["describe", "-m", "independent published sibling"]);
-    jj(&[
-        "rebase",
-        "-s",
-        &parent,
-        "-d",
-        if newer_side { &upstream } else { &latest },
-    ]);
+    jj(&["rebase", "-s", parent, "-d", if newer_side { upstream } else { latest }]);
     let head = jj_commit_id(&TestJj, repo, "@").unwrap();
     jj(&["bookmark", "set", "pr/42", "-r", &side]);
     let operation = jj(&["op", "log", "--no-graph", "--limit", "1", "-T", "id"]);

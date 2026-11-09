@@ -40,6 +40,16 @@ impl RepoLock {
         crate::lock::RepoLock::acquire(&shared_repo_dir(cwd)?.join("cube-pr-bookmarks.lock"))
     }
 
+    /// Serialize git remote additions and removals across the processes
+    /// sharing the store `cwd` belongs to. jj rewrites the store's git config
+    /// for each remote change under a fail-fast lock, so unserialized
+    /// concurrent changes make one side fail. Separate from
+    /// [`Self::for_workspace`]: a fetch never runs under this lock, and a
+    /// holder of the PR-bookmark lock may take it.
+    pub fn for_git_remotes(cwd: &Path) -> Result<Self, CubeError> {
+        crate::lock::RepoLock::acquire(&shared_repo_dir(cwd)?.join("cube-git-remotes.lock"))
+    }
+
     pub fn acquire(lock_path: &Path) -> Result<Self, CubeError> {
         Self::open_and_lock(lock_path, true)?.ok_or_else(|| unreachable!("a blocking lock always acquires"))
     }

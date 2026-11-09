@@ -678,10 +678,30 @@ pub(super) fn prune_stale_temp_remotes(runner: &dyn CommandRunner, database_path
         if !stale {
             continue;
         }
-        if let Err(error) = run(runner, database_path, cwd, &["git", "remote", "remove", name]) {
+        if let Err(error) = remove_remote(runner, database_path, cwd, name) {
             eprintln!("warning: cube could not remove stale temporary remote {name}: {error}");
         }
     }
+}
+
+/// Add `remote` at `url` to the shared store under its remote-change lock, so
+/// concurrent cube processes queue instead of tripping jj's fail-fast git
+/// config lock.
+fn add_remote(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    cwd: &Path,
+    remote: &str,
+    url: &str,
+) -> Result<()> {
+    let _remotes = runner.lock_git_remotes(cwd)?;
+    run(runner, database_path, cwd, &["git", "remote", "add", remote, url]).map(|_| ())
+}
+
+/// Remove `remote` from the shared store under its remote-change lock.
+fn remove_remote(runner: &dyn CommandRunner, database_path: Option<&Path>, cwd: &Path, remote: &str) -> Result<()> {
+    let _remotes = runner.lock_git_remotes(cwd)?;
+    run(runner, database_path, cwd, &["git", "remote", "remove", remote]).map(|_| ())
 }
 
 /// URL of the matching GitHub repository, ignoring local mirrors and other
@@ -725,7 +745,7 @@ fn fetch_pull_ref(
     let git_dir = store_git_dir(cwd)?;
     prune_stale_temp_remotes(runner, database_path, cwd);
     let remote = temp_remote_name(number);
-    run(runner, database_path, cwd, &["git", "remote", "add", &remote, &url])?;
+    add_remote(runner, database_path, cwd, &remote, &url)?;
     let refspec = format!("+refs/pull/{number}/head:refs/remotes/{remote}/pull-{number}");
     let fetched = run_jj_network_within(
         runner,
@@ -746,7 +766,7 @@ fn fetch_pull_ref(
         deadline,
     );
     let imported = fetched.and_then(|_| import_git_refs(runner, database_path, cwd));
-    let _ = run(runner, database_path, cwd, &["git", "remote", "remove", &remote]);
+    let _ = remove_remote(runner, database_path, cwd, &remote);
     imported
 }
 
@@ -770,8 +790,7 @@ fn fetch_head_from_head_repo(
         .ok_or_else(|| CubeError::InvalidArgument(format!("PR {number} reports no head repository")))?;
     prune_stale_temp_remotes(runner, database_path, cwd);
     let remote = temp_remote_name(number);
-    let jj = |args: &[&str]| run_jj(runner, database_path, &RealCommandRunner::invocation(cwd, "jj", args));
-    jj(&["git", "remote", "add", &remote, &url])?;
+    add_remote(runner, database_path, cwd, &remote, &url)?;
     let fetched = run_jj_network_within(
         runner,
         database_path,
@@ -780,7 +799,7 @@ fn fetch_head_from_head_repo(
     );
     // Remove the temporary remote whether or not the fetch worked. The fetched
     // commits stay in the store.
-    let _ = jj(&["git", "remote", "remove", &remote]);
+    let _ = remove_remote(runner, database_path, cwd, &remote);
     fetched.map(|_| ())
 }
 

@@ -1,26 +1,8 @@
 //! Install a private copy of the Bazel-built large operation history.
 use super::Fixture;
+use crate::app::test_fs::copy_tree;
 use std::fs;
 use std::path::Path;
-
-fn copy_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(destination)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let target = destination.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_tree(&entry.path(), &target)?;
-        } else {
-            assert!(
-                entry.file_type()?.is_file(),
-                "fixture must contain only directories and files"
-            );
-            // Bazel artifacts are read-only; fresh files must be writable by jj.
-            fs::write(target, fs::read(entry.path())?)?;
-        }
-    }
-    Ok(())
-}
 
 pub(super) fn install(f: &Fixture) -> String {
     let source = std::env::var("CUBE_GC_STORE_FIXTURE").expect("Bazel must declare the GC fixture");

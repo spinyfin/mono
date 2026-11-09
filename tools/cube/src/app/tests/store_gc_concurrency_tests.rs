@@ -40,6 +40,7 @@ impl CommandRunner for Runner {
         if invocation.program == "ps" {
             return Ok(String::new());
         }
+        let reported_program = invocation.program.clone();
         let mut invocation = invocation.clone();
         if invocation.program == "jj" {
             if invocation.args.iter().any(|arg| arg == "gc")
@@ -75,6 +76,24 @@ impl CommandRunner for Runner {
             start.elapsed(),
             output.is_ok()
         );
+        // Report failures under the production program name. Cube recognises
+        // jj's stale-working-copy and diverged-operation errors by it, so the
+        // concurrent leases below recover from a racing sibling workspace the
+        // way they do against `jj` on PATH instead of failing outright.
+        let output = output.map_err(|error| match error {
+            CubeError::CommandFailed {
+                program: _,
+                args,
+                status,
+                stderr,
+            } => CubeError::CommandFailed {
+                program: reported_program.clone(),
+                args,
+                status,
+                stderr,
+            },
+            other => other,
+        });
         let output = output?;
         if invocation
             .args
@@ -114,6 +133,20 @@ fn real_leases_continue_during_collection_and_exclusivity_is_retryable() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let f = Fixture::with_ws_path("pool/mono-agent-001");
+    // Exercise a neglected operation store's file count and deletion I/O.
+    // Contents of unreachable views are never decoded by the collector, and
+    // sparse files keep their count and logical size without writing a
+    // gigabyte of zeros. Creating that many files is bound by filesystem
+    // metadata latency, so they are staged beside the store while the
+    // small-store phases below run, then swapped in once the history is installed.
+    let staged_views = f._dir.path().join("unreachable-views");
+    let unreachable_views = std::thread::spawn({
+        let staged_views = staged_views.clone();
+        move || {
+            std::fs::create_dir(&staged_views)?;
+            crate::app::test_fs::create_sparse_files(&staged_views, 137_000, 8192)
+        }
+    });
     let database = f._dir.path().join("state.db");
     let record = RepoRecord {
         repo: "mono".into(),
@@ -195,20 +228,22 @@ fn real_leases_continue_during_collection_and_exclusivity_is_retryable() {
     assert!(busy < Duration::from_secs(4), "{busy:?}");
     drop(gate);
 
-    let cut = fixture::install(&f);
-    // This phase uses only private paths, so environment-dependent tests can
-    // run while we populate the unreachable views. Reacquire before spawning jj.
+    // Installing the cached history and placing the unreachable views touch
+    // only private paths and run jj by its declared absolute path, so
+    // environment-dependent tests can proceed meanwhile. Reacquire before the
+    // leases below spawn anything by bare name again.
     drop(_env);
-    // Exercise a neglected operation store's file count and deletion I/O.
-    // Contents of unreachable views are never decoded by the collector. Sparse
-    // files retain their count and logical size without writing a gigabyte of zeros.
+    let cut = fixture::install(&f);
+    unreachable_views.join().unwrap().unwrap();
+    // The staged directory becomes the store's view directory: the history's
+    // real views move in, then the directories trade places.
     let views = f.root.join(".jj/repo/op_store/views");
-    for n in 1..=137_000_u64 {
-        std::fs::File::create(views.join(format!("{n:0128x}")))
-            .unwrap()
-            .set_len(8192)
-            .unwrap();
+    for entry in std::fs::read_dir(&views).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::rename(entry.path(), staged_views.join(entry.file_name())).unwrap();
     }
+    std::fs::remove_dir(&views).unwrap();
+    std::fs::rename(&staged_views, &views).unwrap();
     let _env = crate::app::tests::support::ENV_MUTEX
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -298,4 +333,10 @@ fn real_leases_continue_during_collection_and_exclusivity_is_retryable() {
         report.exclusive_ms, report.collection_ms
     );
     f.jj(&f.ws, &["status"]);
+    // Tens of thousands of rewritten operation and index files remain. Their
+    // removal is not part of what this test measures, and as the binary's
+    // longest test it would otherwise end the whole run seconds later, so it
+    // proceeds alongside the remaining tests; the test runner's private temp
+    // root is removed in full after the binary exits regardless.
+    std::thread::spawn(move || drop(f));
 }

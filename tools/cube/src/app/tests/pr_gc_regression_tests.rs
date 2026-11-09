@@ -1,23 +1,58 @@
 use super::*;
 
+/// Two processes bringing the same fork head in at once each add their own
+/// temporary remote, fetch while the other's remote exists, and leave none
+/// behind. The remote additions themselves are serialized by the store's
+/// remote-change lock (unserialized, jj's fail-fast git config lock makes one
+/// of them fail), so the two sides meet once both fetches are about to start.
 #[test]
 fn concurrent_fork_fetches_use_distinct_remotes() {
+    /// A two-party meeting point with a bound: a side whose partner never
+    /// arrives fails the test instead of hanging the binary.
+    struct Rendezvous {
+        arrived: std::sync::Mutex<usize>,
+        complete: std::sync::Condvar,
+    }
+    impl Rendezvous {
+        fn wait(&self) {
+            let mut arrived = self.arrived.lock().unwrap();
+            *arrived += 1;
+            if *arrived >= 2 {
+                self.complete.notify_all();
+                return;
+            }
+            let (_arrived, result) = self
+                .complete
+                .wait_timeout_while(arrived, std::time::Duration::from_secs(30), |arrived| *arrived < 2)
+                .unwrap();
+            assert!(
+                !result.timed_out(),
+                "the other fetch never reached its temporary remote"
+            );
+        }
+    }
     struct ConcurrentFetch<'a> {
         jj: &'a DeclaredJj,
         added: std::sync::Mutex<Vec<String>>,
-        barrier: std::sync::Barrier,
+        both_fetching: Rendezvous,
     }
     impl CommandRunner for ConcurrentFetch<'_> {
         fn run(&self, invocation: &CommandInvocation) -> Result<String> {
-            let result = self.jj.run(invocation);
             if invocation
                 .args
                 .starts_with(&["git".into(), "remote".into(), "add".into()])
             {
                 self.added.lock().unwrap().push(invocation.args[3].clone());
-                self.barrier.wait();
             }
-            result
+            if invocation
+                .args
+                .starts_with(&["git".into(), "fetch".into(), "--remote".into()])
+            {
+                // Both temporary remotes exist from here until the first
+                // fetch finishes and removes its own.
+                self.both_fetching.wait();
+            }
+            self.jj.run(invocation)
         }
     }
     let f = Fixture::new();
@@ -26,7 +61,10 @@ fn concurrent_fork_fetches_use_distinct_remotes() {
     let runner = ConcurrentFetch {
         jj: &f.runner,
         added: Default::default(),
-        barrier: std::sync::Barrier::new(2),
+        both_fetching: Rendezvous {
+            arrived: std::sync::Mutex::new(0),
+            complete: std::sync::Condvar::new(),
+        },
     };
     std::thread::scope(|scope| {
         let resolve = || {

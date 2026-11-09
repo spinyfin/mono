@@ -401,6 +401,12 @@ impl CommandRunner for FakeRunner {
         crate::lock::RepoLock::acquire(&dir.path().join("bookmarks.lock"))
     }
 
+    fn lock_git_remotes(&self, _cwd: &std::path::Path) -> Result<crate::lock::RepoLock> {
+        // As above: nothing contends a scripted runner's remote changes.
+        let dir = tempfile::tempdir().unwrap();
+        crate::lock::RepoLock::acquire(&dir.path().join("remotes.lock"))
+    }
+
     fn run(&self, invocation: &CommandInvocation) -> Result<String> {
         self.next_expectation(invocation).result
     }
