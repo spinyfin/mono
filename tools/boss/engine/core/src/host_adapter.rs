@@ -274,34 +274,11 @@ impl HostAdapter for LocalHostAdapter {
         execution_bookmark::unpublished_diff(&LocalJj, record).await
     }
 
-    async fn discard_orphaned_execution_baseline(&self, record: &ExecutionBookmark) -> Result<()> {
-        if record.host_id != "local" {
-            return Err(execution_bookmark::pointer_integrity_error(format!(
-                "recovery bookmark belongs to host {}",
-                record.host_id
-            )));
-        }
-        execution_bookmark::discard_orphaned_baseline(&LocalJj, record).await
-    }
-
     async fn positioned_parent(&self, workspace: &Path) -> Result<String> {
         self.cube_client.positioned_parent(workspace).await
     }
     async fn start_fresh_workspace(&self, workspace: &Path) -> Result<String> {
         execution_bookmark::start_fresh(&LocalJj, workspace).await
-    }
-    async fn release_execution_bookmark_heads(
-        &self,
-        record: &ExecutionBookmark,
-        release_names: bool,
-    ) -> Result<Vec<(String, String)>> {
-        if record.host_id != "local" {
-            return Err(execution_bookmark::pointer_integrity_error(format!(
-                "recovery bookmark belongs to host {}",
-                record.host_id
-            )));
-        }
-        execution_bookmark::release_heads(&LocalJj, record, release_names).await
     }
     async fn prune_execution_bookmark(
         &self,
@@ -865,35 +842,12 @@ impl HostAdapter for SshHostAdapter {
         execution_bookmark::unpublished_diff(self, record).await
     }
 
-    async fn discard_orphaned_execution_baseline(&self, record: &ExecutionBookmark) -> Result<()> {
-        if record.host_id != self.host_id() {
-            return Err(execution_bookmark::pointer_integrity_error(format!(
-                "recovery bookmark belongs to host {}",
-                record.host_id
-            )));
-        }
-        execution_bookmark::discard_orphaned_baseline(self, record).await
-    }
-
     async fn positioned_parent(&self, workspace: &Path) -> Result<String> {
         execution_bookmark::positioned_parent(self, workspace).await
     }
     async fn start_fresh_workspace(&self, workspace: &Path) -> Result<String> {
         execution_bookmark::start_fresh(self, workspace).await
     }
-    async fn release_execution_bookmark_heads(
-        &self,
-        record: &ExecutionBookmark,
-        release_names: bool,
-    ) -> Result<Vec<(String, String)>> {
-        if record.host_id != self.host_id() {
-            return Err(execution_bookmark::pointer_integrity_error(
-                "recovery store belongs to another host",
-            ));
-        }
-        execution_bookmark::release_heads(self, record, release_names).await
-    }
-
     fn host_id(&self) -> &str {
         &self.transport.host_id
     }

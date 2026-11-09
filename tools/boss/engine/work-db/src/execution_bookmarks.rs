@@ -388,8 +388,8 @@ impl WorkDb {
     }
 
     /// File a preserved-work inspection verdict for `execution_id`, or fold it
-    /// into the open item: earlier commit references are kept and only commits
-    /// the body does not yet name are appended.
+    /// into the open item: earlier evidence is kept and only commits and a
+    /// reason the body does not yet carry are appended.
     pub fn raise_preserved_work_inspect_attention(
         &self,
         execution_id: &str,
@@ -418,6 +418,9 @@ impl WorkDb {
         {
             body.push('\n');
             body.push_str(&line);
+        }
+        if !inspect.reason.is_empty() && !body.contains(&inspect.reason) {
+            body.push_str(&format!("\n- {}", inspect.reason));
         }
         self.upsert_execution_attention(execution_id, kind, title, &body)
     }
@@ -574,4 +577,50 @@ fn inspect_body(inspect: &boss_engine_recovery::execution_bookmark::PreserveInsp
         body.push_str(" New workspace tip: unavailable.");
     }
     body
+}
+
+#[cfg(test)]
+mod inspect_attention_tests {
+    use super::*;
+    use crate::test_support::{create_ready_chore_execution, create_test_chore_manual, create_test_product};
+    use boss_engine_recovery::execution_bookmark::PreserveInspect;
+    use std::path::PathBuf;
+
+    fn inspect(reason: &str) -> PreserveInspect {
+        PreserveInspect {
+            existing_commit_id: None,
+            workspace_change_id: None,
+            workspace_commit_id: None,
+            workspace_count: None,
+            reason: reason.into(),
+        }
+    }
+
+    #[test]
+    fn a_later_reason_is_appended_to_the_open_item_once() {
+        let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+        let product = create_test_product(&db);
+        let chore = create_test_chore_manual(&db, product.id, "inspect");
+        let execution = create_ready_chore_execution(&db, chore.id);
+        let kind = boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND;
+
+        db.raise_preserved_work_inspect_attention(&execution.id, &inspect("first reason"))
+            .unwrap();
+        db.raise_preserved_work_inspect_attention(&execution.id, &inspect("second reason"))
+            .unwrap();
+        db.raise_preserved_work_inspect_attention(&execution.id, &inspect("second reason"))
+            .unwrap();
+
+        let open: Vec<_> = db
+            .list_attention_items(&execution.id)
+            .unwrap()
+            .into_iter()
+            .filter(|item| item.kind == kind && item.status == "open")
+            .collect();
+        assert_eq!(open.len(), 1, "one open item");
+        let body = &open[0].body_markdown;
+        assert!(body.contains("first reason"), "{body}");
+        assert_eq!(body.matches("second reason").count(), 1, "{body}");
+        assert!(body.ends_with("\n- second reason"), "{body}");
+    }
 }

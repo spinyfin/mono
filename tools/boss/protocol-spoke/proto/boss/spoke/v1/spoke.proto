@@ -248,12 +248,10 @@ enum WorkspaceKind {
   CREATE_BOOKMARK = 12;
   DIFF_BOOKMARK = 13;
   RESTORE_BOOKMARK = 14;
-  DISCARD_BASELINE = 15;
   RESTORE_REBASED = 16;
   CHECKPOINT_BASELINE = 17;
   PREPARE_RECOVERY_PR = 18;
   RECONCILE_BOOKMARK = 19;
-  RELEASE_HEADS = 20;
   // The commit the workspace was positioned on (its working copy's parent);
   // the result is a JSON string in cube_result_json.
   POSITIONED_PARENT = 21;
@@ -276,10 +274,10 @@ enum WorkspaceKind {
   // repository's main branch, and the result is the prune outcome as JSON.
   // A store operation: it needs no lease.
   PRUNE_BOOKMARK = 26;
-  // Release recovery heads with request_json.release_names controlling whether
-  // publication names are released (default true). Older peers reject this
-  // kind rather than silently ignoring publication-preserving options.
-  RELEASE_HEADS_CONFIGURED = 27;
+  // 15 (DISCARD_BASELINE), 20 (RELEASE_HEADS) and 27 (RELEASE_HEADS_CONFIGURED)
+  // were retired with the per-execution baseline and recovery pointers.
+  reserved 15, 20, 27;
+  reserved "DISCARD_BASELINE", "RELEASE_HEADS", "RELEASE_HEADS_CONFIGURED";
 }
 // A discriminated, typed operation, not an argv tunnel: kind selects which
 // fields are required and which are forbidden. Paths from a peer are display
@@ -307,7 +305,7 @@ message WorkspaceOp {
   // A bounded JSON compatibility payload for the recovery kinds whose
   // arguments are the recovery crate's own value types. Required for
   // CONFIRM_RECOVERY, RESTORE_PRESERVED, CHECK_PRESERVED_UNPUBLISHED,
-  // PRUNE_BOOKMARK and RELEASE_HEADS_CONFIGURED, and forbidden for every other
+  // PRUNE_BOOKMARK, and forbidden for every other
   // kind. It names no path, argv or revset. It carries no version marker: new
   // semantics always need a new WorkspaceKind so older hosts reject the
   // operation rather than silently dropping unknown fields.

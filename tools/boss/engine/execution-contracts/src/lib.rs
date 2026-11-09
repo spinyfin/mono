@@ -1554,13 +1554,6 @@ pub trait HostAdapter: Send + Sync {
         bail!("execution bookmark inspection is not supported by this host adapter")
     }
 
-    /// Drop the baseline left behind when both of an execution's heads are
-    /// gone, so a self-retry can create fresh pointers.
-    async fn discard_orphaned_execution_baseline(&self, record: &ExecutionBookmark) -> Result<()> {
-        let _ = record;
-        bail!("execution bookmark cleanup is not supported by this host adapter")
-    }
-
     /// Position a fresh child of the repository's configured trunk, resolved
     /// once, and return the commit it was positioned on so the recovery
     /// pointer's floor is that commit rather than a later re-resolution.
@@ -1575,16 +1568,6 @@ pub trait HostAdapter: Send + Sync {
     async fn positioned_parent(&self, workspace: &Path) -> Result<String> {
         let _ = workspace;
         bail!("workspace parent resolution is not supported by this host adapter")
-    }
-    /// Archive unpublished targets before optionally releasing names that the
-    /// current execution must reuse. Predecessor publication names stay tracked.
-    async fn release_execution_bookmark_heads(
-        &self,
-        record: &ExecutionBookmark,
-        release_names: bool,
-    ) -> Result<Vec<(String, String)>> {
-        let _ = (record, release_names);
-        bail!("execution bookmark release is not supported by this host adapter")
     }
     /// Structured PR lookup before cube positioning: true when the PR is open,
     /// false when it is closed or merged. An unresolvable base still counts as

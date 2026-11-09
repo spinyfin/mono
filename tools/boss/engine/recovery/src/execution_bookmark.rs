@@ -41,9 +41,6 @@ pub use prune::{HostVoucher, MissingChange, PruneOutcome, RewrittenChange, Vouch
 #[cfg(test)]
 mod prune_tests;
 
-#[cfg(test)]
-mod archive_tests;
-
 /// Which invariant a damaged pointer broke. Lineage between the pointers and
 /// the baseline is deliberately not an invariant: jj rewrites commits and
 /// merges concurrent operations as a matter of course, so the recorded
@@ -316,6 +313,7 @@ fn revision(bookmark: &str) -> String {
 /// bookmark lists more than one; an absent bookmark is missing from the
 /// map). Bookmark names are matched by the template's `name()`, never the
 /// decorated `name*` / `name??` rendering.
+#[cfg(test)]
 pub(crate) async fn resolve_bookmark_targets(
     jj: &dyn Jj,
     repo: &Path,
@@ -828,83 +826,6 @@ pub async fn start_fresh(jj: &dyn Jj, workspace: &Path) -> Result<String> {
     let trunk = one_commit(jj, workspace, "trunk()").await?;
     jj.run(workspace, &["new", &trunk, "-m", "Fresh execution"]).await?;
     Ok(trunk)
-}
-
-/// Clean reinitialisation for a self-retry whose own heads are both gone: drop
-/// the surviving baseline so fresh pointers can be created for the same
-/// execution. Refuses unless both heads are confirmed absent, so it can never
-/// discard provenance that a live pointer still depends on.
-pub async fn discard_orphaned_baseline(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<()> {
-    for head in [record.head(), record.publication()] {
-        ensure!(
-            resolve_optional(jj, &record.repo_path, &head).await?.is_none(),
-            "refusing to discard baseline {}: pointer {head} still exists",
-            record.base()
-        );
-    }
-    if resolve_optional(jj, &record.repo_path, &record.base()).await?.is_some() {
-        jj.run(&record.repo_path, &["bookmark", "delete", &record.base()])
-            .await?;
-    }
-    Ok(())
-}
-
-/// Archive unpublished work before releasing private recovery and baseline names.
-/// Release the publication name too only when this execution must reuse it.
-/// Baseline, trunk, remote history and empty-only ranges need no archive. Conflicted bookmarks can have several targets; retain them all.
-/// Archive names include the commit identity so repeated fallbacks never
-/// overwrite earlier preserved work. Pruning only touches the three run names.
-pub async fn release_heads(
-    jj: &dyn Jj,
-    record: &ExecutionBookmark,
-    release_names: bool,
-) -> Result<Vec<(String, String)>> {
-    let names = [record.base(), record.head(), record.publication()];
-    let targets = resolve_bookmark_targets(jj, &record.repo_path, &names).await?;
-    let mut commits: std::collections::BTreeSet<String> = targets.values().flatten().cloned().collect();
-    if let Some(base) = &record.base_commit
-        && commit_exists(jj, &record.repo_path, base).await?
-    {
-        commits.insert(base.clone());
-    }
-    let mut archived = Vec::new();
-    let baseline = record.base_commit.as_deref();
-    for commit in commits {
-        let base = format!("present({})", baseline.unwrap_or("root()"));
-        let unpublished = jj
-            .run(
-                &record.repo_path,
-                &[
-                    "log",
-                    "--no-graph",
-                    "-r",
-                    &format!("({base}..{commit}) ~ (::remote_bookmarks() | ::trunk() | empty())"),
-                    "-T",
-                    "commit_id",
-                ],
-            )
-            .await?;
-        if unpublished.trim().is_empty() {
-            continue;
-        }
-        let archive = preserved_archive_name(&record.execution_id, &commit);
-        jj.run(&record.repo_path, &["bookmark", "set", &archive, "-r", &commit])
-            .await?;
-        archived.push((archive, commit));
-    }
-    // Preserve predecessor publication names, which may still be tracked PR branches.
-    // Delete retains remote tracking; forget would untrack a pushed PR branch.
-    let mut args = vec!["bookmark", "delete"];
-    args.extend(
-        names
-            .iter()
-            .filter(|name| targets.contains_key(*name) && (release_names || **name != record.publication()))
-            .map(String::as_str),
-    );
-    if args.len() > 2 {
-        jj.run(&record.repo_path, &args).await?;
-    }
-    Ok(archived)
 }
 
 /// Deliberately unguarded by the quarantine: `backup_execution_patch` exports
