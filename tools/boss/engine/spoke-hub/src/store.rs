@@ -2,10 +2,11 @@
 
 use boss_protocol_spoke::{
     negotiate::Selection,
-    v1::{Command, CommandResult, Cursor, Hello, Record, ResultCode, Run, WorkspaceKind, command, record},
+    v1::{Command, CommandResult, Cursor, Hello, Record, ResultCode, Run, record},
 };
 use boss_spoke_stream::store::{
-    Admission, CommandJournal, CommandOutbox, PendingCommand, Session, SpokeObservationSink, StoreError,
+    Admission, CommandAdmission, CommandJournal, CommandOutbox, PendingCommand, Session, SpokeObservationSink,
+    StoreError,
 };
 use boss_work_db::{HostOutboxFault, RunAdmission, SpokeIngressCommit, SpokeIngressResult, SpokeRunKey, WorkDb};
 use prost::Message;
@@ -89,33 +90,10 @@ fn observed_at_ms(record: &Record) -> i64 {
     record.observed.as_ref().map(|stamp| stamp.wall_unix_ms).unwrap_or(0)
 }
 
-/// Workspace kinds that remain addressable after the assignment resolves.
-fn is_recovery_kind(kind: WorkspaceKind) -> bool {
-    matches!(
-        kind,
-        WorkspaceKind::RestoreBookmark
-            | WorkspaceKind::DiscardBaseline
-            | WorkspaceKind::RestoreRebased
-            | WorkspaceKind::CheckpointBaseline
-            | WorkspaceKind::PrepareRecoveryPr
-            | WorkspaceKind::ReconcileBookmark
-            | WorkspaceKind::ReleaseHeads
-            | WorkspaceKind::PositionedParent
-            | WorkspaceKind::ConfirmRecovery
-            | WorkspaceKind::RestorePreserved
-            | WorkspaceKind::CheckPreservedUnpublished
-            | WorkspaceKind::PruneBookmark
-            | WorkspaceKind::ReleaseHeadsConfigured
-    )
-}
-
-fn admission_for(command: &Command) -> RunAdmission {
-    match &command.body {
-        Some(command::Body::Workspace(op)) => match WorkspaceKind::try_from(op.kind) {
-            Ok(kind) if is_recovery_kind(kind) => RunAdmission::Recovery,
-            _ => RunAdmission::Start,
-        },
-        _ => RunAdmission::Start,
+fn run_admission(admission: CommandAdmission) -> RunAdmission {
+    match admission {
+        CommandAdmission::Start => RunAdmission::Start,
+        CommandAdmission::Recovery => RunAdmission::Recovery,
     }
 }
 
@@ -210,7 +188,7 @@ impl CommandOutbox for WorkDbOutbox {
         .await
     }
 
-    async fn append(&self, host: &str, command: Command) -> Result<Command, StoreError> {
+    async fn append(&self, host: &str, admission: CommandAdmission, command: Command) -> Result<Command, StoreError> {
         let host = host.to_owned();
         blocking(&self.db, move |db| {
             if host.is_empty() || command.command_id.is_empty() {
@@ -220,7 +198,7 @@ impl CommandOutbox for WorkDbOutbox {
             request.sequence = 0;
             let request = request.encode_to_vec();
             let run = command.run.as_ref().map(run_key);
-            let admission = admission_for(&command);
+            let admission = run_admission(admission);
             let stored = db
                 .append_host_command(
                     &host,

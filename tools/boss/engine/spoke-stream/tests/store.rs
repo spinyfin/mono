@@ -146,7 +146,7 @@ impl CommandOutbox for Memory {
             received: state.received,
         })
     }
-    async fn append(&self, _: &str, mut command: Command) -> Result<Command, StoreError> {
+    async fn append(&self, _: &str, _: CommandAdmission, mut command: Command) -> Result<Command, StoreError> {
         let pause = { self.pauses.append.lock().unwrap().clone() };
         if let Some(pause) = pause {
             pause.entered.notify_one();

@@ -10,10 +10,22 @@ use crate::*;
 
 pub(crate) const MIGRATION_ID: &str = "20261109_1800_spoke_ingress_journal";
 
-/// Most encoded observation bytes one host may retain on the hub.
+/// Most encoded observation bytes one host may hold unpruned on the hub.
 pub const MAX_HOST_INGRESS_BYTES: i64 = 512 * 1024 * 1024;
-/// Most observation frames one host may retain on the hub.
+/// Most observation frames one host may hold unpruned on the hub.
 pub const MAX_HOST_INGRESS_RECORDS: i64 = 1_048_576;
+
+/// Per-host bound on retained (not yet pruned) ingress.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IngressQuota {
+    pub records: i64,
+    pub bytes: i64,
+}
+
+const DEFAULT_QUOTA: IngressQuota = IngressQuota {
+    records: MAX_HOST_INGRESS_RECORDS,
+    bytes: MAX_HOST_INGRESS_BYTES,
+};
 
 /// The durable journal cursor advertised on Welcome and record receipts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,7 +73,10 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             host_id    TEXT PRIMARY KEY,
             journal_id TEXT NOT NULL,
             generation INTEGER NOT NULL DEFAULT 0,
-            received   INTEGER NOT NULL DEFAULT 0
+            received   INTEGER NOT NULL DEFAULT 0,
+            record_count   INTEGER NOT NULL DEFAULT 0,
+            byte_count     INTEGER NOT NULL DEFAULT 0,
+            pruned_through INTEGER NOT NULL DEFAULT 0
          );
          CREATE TABLE IF NOT EXISTS spoke_ingress (
             host_id        TEXT NOT NULL,
@@ -72,9 +87,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             features       TEXT NOT NULL,
             observed_at_ms INTEGER NOT NULL,
             PRIMARY KEY (host_id, journal_id, sequence)
-         );
-         CREATE INDEX IF NOT EXISTS spoke_ingress_host_idx
-            ON spoke_ingress(host_id);",
+         );",
     )?;
     Ok(())
 }
@@ -99,11 +112,13 @@ fn host_owns_run(tx: &rusqlite::Transaction<'_>, host_id: &str, run: &SpokeRunKe
 impl WorkDb {
     /// Claim the next durable connection generation for `host_id`.
     ///
-    /// A host with no journal is admitted on first contact with an empty
-    /// history: that host is already authenticated, which is the authorization
-    /// a new journal needs. A later Hello that names a different journal, or
-    /// that cannot cover the hub's receipt, is a replay gap. Failure does not
-    /// increment the generation.
+    /// A host with no journal is admitted on first contact when its journal
+    /// still retains sequence 1: that host is already authenticated, which is
+    /// the authorization a new journal needs, and the hub simply has received
+    /// nothing yet, so the whole prefix replays. A first Hello whose journal
+    /// has compacted past sequence 1 is a replay gap. A later Hello that names
+    /// a different journal, or that cannot cover the hub's receipt, is also a
+    /// replay gap. Failure does not increment the generation.
     pub fn open_spoke_journal(
         &self,
         host_id: &str,
@@ -125,7 +140,7 @@ impl WorkDb {
             .optional()?;
         let admission = match stored {
             None => {
-                if last_record > 0 || first_retained > 1 {
+                if first_retained > 1 {
                     return Err(fault(HostOutboxFault::ReplayGap));
                 }
                 tx.execute(
@@ -166,19 +181,37 @@ impl WorkDb {
     /// durable receipt in the same transaction. A result is settled here so a
     /// crash after receipt still answers `host_command_result`.
     pub fn commit_spoke_record(&self, commit: SpokeIngressCommit<'_>) -> Result<u64> {
+        self.commit_spoke_record_within(commit, DEFAULT_QUOTA)
+    }
+
+    pub(crate) fn commit_spoke_record_within(
+        &self,
+        commit: SpokeIngressCommit<'_>,
+        quota: IngressQuota,
+    ) -> Result<u64> {
         if commit.sequence == 0 || commit.frame.is_empty() {
             return Err(fault(HostOutboxFault::Denied));
         }
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let stored: Option<(String, i64, i64)> = tx
+        let stored: Option<(String, i64, i64, i64, i64, i64)> = tx
             .query_row(
-                "SELECT journal_id, generation, received FROM spoke_journals WHERE host_id = ?1",
+                "SELECT journal_id, generation, received, record_count, byte_count, pruned_through
+                   FROM spoke_journals WHERE host_id = ?1",
                 [commit.host_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((journal_id, generation, received)) = stored else {
+        let Some((journal_id, generation, received, record_count, byte_count, pruned_through)) = stored else {
             return Err(fault(HostOutboxFault::Denied));
         };
         if journal_id != commit.journal_id || generation as u64 != commit.generation {
@@ -203,6 +236,12 @@ impl WorkDb {
             tx.commit()?;
             return Ok(received);
         }
+        if commit.sequence <= pruned_through as u64 {
+            // Already received and since pruned: the original bytes are gone,
+            // so the duplicate cannot be compared, but it also changes nothing.
+            tx.commit()?;
+            return Ok(received);
+        }
         if commit.sequence != received + 1 {
             return Err(fault(HostOutboxFault::ReplayGap));
         }
@@ -211,12 +250,8 @@ impl WorkDb {
                 return Err(fault(HostOutboxFault::Denied));
             }
         }
-        let (count, bytes): (i64, i64) = tx.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(LENGTH(frame)), 0) FROM spoke_ingress WHERE host_id = ?1",
-            [commit.host_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        if count >= MAX_HOST_INGRESS_RECORDS || bytes + commit.frame.len() as i64 > MAX_HOST_INGRESS_BYTES {
+        let frame_len = commit.frame.len() as i64;
+        if record_count >= quota.records || byte_count + frame_len > quota.bytes {
             return Err(fault(HostOutboxFault::Full));
         }
         if let Some(result) = commit.result {
@@ -241,11 +276,54 @@ impl WorkDb {
             ],
         )?;
         tx.execute(
-            "UPDATE spoke_journals SET received = ?2 WHERE host_id = ?1",
-            params![commit.host_id, commit.sequence as i64],
+            "UPDATE spoke_journals
+                SET received = ?2, record_count = record_count + 1, byte_count = byte_count + ?3
+              WHERE host_id = ?1",
+            params![commit.host_id, commit.sequence as i64, frame_len],
         )?;
         tx.commit()?;
         Ok(commit.sequence)
+    }
+
+    /// Drop stored frames at or below `through` once a consumer no longer
+    /// needs them, releasing their share of the host's quota. Only frames the
+    /// hub has already received can be pruned; the receipt never moves. Returns
+    /// the number of frames removed.
+    pub fn prune_spoke_ingress(&self, host_id: &str, through: u64) -> Result<u64> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stored: Option<(String, i64, i64)> = tx
+            .query_row(
+                "SELECT journal_id, received, pruned_through FROM spoke_journals WHERE host_id = ?1",
+                [host_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((journal_id, received, pruned_through)) = stored else {
+            return Err(fault(HostOutboxFault::Denied));
+        };
+        let through = through.min(received as u64) as i64;
+        if through <= pruned_through {
+            return Ok(0);
+        }
+        let (count, bytes): (i64, i64) = tx.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(frame)), 0) FROM spoke_ingress
+              WHERE host_id = ?1 AND journal_id = ?2 AND sequence <= ?3",
+            params![host_id, journal_id, through],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        tx.execute(
+            "DELETE FROM spoke_ingress WHERE host_id = ?1 AND journal_id = ?2 AND sequence <= ?3",
+            params![host_id, journal_id, through],
+        )?;
+        tx.execute(
+            "UPDATE spoke_journals
+                SET record_count = record_count - ?2, byte_count = byte_count - ?3, pruned_through = ?4
+              WHERE host_id = ?1",
+            params![host_id, count, bytes, through],
+        )?;
+        tx.commit()?;
+        Ok(count as u64)
     }
 
     /// The durable journal a host last admitted, if any.
@@ -371,13 +449,28 @@ mod tests {
     }
 
     #[test]
-    fn a_new_journal_with_history_the_hub_does_not_hold_is_a_replay_gap() {
+    fn a_new_journal_that_compacted_past_the_first_record_is_a_replay_gap() {
         let db = db();
         assert_eq!(
-            fault_of(&db.open_spoke_journal("host-a", "journal", 4, 1).unwrap_err()),
+            fault_of(&db.open_spoke_journal("host-a", "journal", 4, 2).unwrap_err()),
             Some(HostOutboxFault::ReplayGap)
         );
         assert!(db.spoke_journal("host-a").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_new_journal_that_still_retains_its_first_record_replays_from_the_start() {
+        let db = db();
+        let admission = db.open_spoke_journal("host-a", "journal", 4, 1).unwrap();
+        assert_eq!(admission.generation, 1);
+        assert_eq!(admission.received, 0);
+        for sequence in 1..=4 {
+            assert_eq!(
+                db.commit_spoke_record(commit("host-a", &admission, sequence, b"frame", &[], None))
+                    .unwrap(),
+                sequence
+            );
+        }
     }
 
     #[test]
@@ -536,5 +629,49 @@ mod tests {
         );
         assert!(db.spoke_ingress_frame("host-a", 1).unwrap().is_none());
         assert_eq!(db.spoke_journal("host-a").unwrap().unwrap().received, 0);
+    }
+
+    #[test]
+    fn quota_is_o1_exact_at_the_boundary_and_ignores_duplicates() {
+        let db = db();
+        let quota = IngressQuota { records: 2, bytes: 10 };
+        let admission = db.open_spoke_journal("host-a", "journal", 0, 1).unwrap();
+        let put = |sequence: u64, frame: &[u8]| {
+            db.commit_spoke_record_within(commit("host-a", &admission, sequence, frame, &[], None), quota)
+        };
+        assert_eq!(put(1, b"aaaa").unwrap(), 1);
+        // An identical duplicate stores nothing and consumes no quota.
+        assert_eq!(put(1, b"aaaa").unwrap(), 1);
+        assert_eq!(put(1, b"aaaa").unwrap(), 1);
+        assert_eq!(put(2, b"bbbbbb").unwrap(), 2); // exactly 10 bytes
+        assert_eq!(fault_of(&put(3, b"c").unwrap_err()), Some(HostOutboxFault::Full));
+        assert_eq!(db.spoke_journal("host-a").unwrap().unwrap().received, 2);
+    }
+
+    #[test]
+    fn a_host_at_its_quota_recovers_after_pruning() {
+        let db = db();
+        let quota = IngressQuota { records: 2, bytes: 100 };
+        let admission = db.open_spoke_journal("host-a", "journal", 0, 1).unwrap();
+        let put = |sequence: u64| {
+            db.commit_spoke_record_within(commit("host-a", &admission, sequence, b"frame", &[], None), quota)
+        };
+        put(1).unwrap();
+        put(2).unwrap();
+        assert_eq!(fault_of(&put(3).unwrap_err()), Some(HostOutboxFault::Full));
+        assert_eq!(db.prune_spoke_ingress("host-a", 1).unwrap(), 1);
+        // Pruning past the receipt clamps to it; repeating is a no-op.
+        assert_eq!(db.prune_spoke_ingress("host-a", 1).unwrap(), 0);
+        assert_eq!(put(3).unwrap(), 3);
+        assert_eq!(fault_of(&put(4).unwrap_err()), Some(HostOutboxFault::Full));
+        assert_eq!(db.prune_spoke_ingress("host-a", 99).unwrap(), 2);
+        assert_eq!(put(4).unwrap(), 4);
+        // A retransmission of a pruned frame is acknowledged without storing it.
+        assert_eq!(put(1).unwrap(), 4);
+        assert!(db.spoke_ingress_frame("host-a", 1).unwrap().is_none());
+        assert_eq!(db.spoke_journal("host-a").unwrap().unwrap().received, 4);
+        // A reconnect after pruning still resumes at the receipt.
+        let again = db.open_spoke_journal("host-a", "journal", 4, 1).unwrap();
+        assert_eq!(again.received, 4);
     }
 }

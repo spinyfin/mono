@@ -268,3 +268,42 @@ async fn reconnect_replays_receipt_and_fences_the_old_generation() {
 
     hub.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn first_contact_with_a_populated_journal_replays_from_the_start() {
+    let fx = Credentials::new();
+    let (_dir, db) = work_db();
+    let hub = start(db.clone(), fx.credentials.clone()).await;
+    let (spoke, cert) = enroll_edge(&hub, &fx.credentials).await;
+
+    // The spoke produced records before it ever reached this hub.
+    let mut populated = hello("edge-1");
+    populated.last_record = 3;
+    populated.first_retained = 1;
+    let mut peer = connect(
+        dial(&hub, Some(identity_of(&spoke, &cert))).await.expect("dial"),
+        populated,
+    )
+    .await
+    .expect("connect");
+    let welcome = match peer.next().await {
+        Some(v1::hub_frame::Body::Welcome(welcome)) => welcome,
+        other => panic!("expected welcome, got {other:?}"),
+    };
+    assert_eq!(welcome.received_records.unwrap().through, 0);
+    for sequence in 1..=3 {
+        peer.tx
+            .send(v1::SpokeFrame {
+                body: Some(spoke_frame::Body::Record(capacity(sequence))),
+            })
+            .await
+            .unwrap();
+        match peer.next().await {
+            Some(v1::hub_frame::Body::RecordReceipt(cursor)) => assert_eq!(cursor.through, sequence),
+            other => panic!("expected receipt, got {other:?}"),
+        }
+    }
+    assert_eq!(db.spoke_journal("edge-1").unwrap().unwrap().received, 3);
+
+    hub.stop().await;
+}

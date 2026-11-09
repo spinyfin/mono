@@ -2,6 +2,7 @@ use super::support::Peer;
 use super::{command, record, support::*};
 use boss_protocol_spoke::v1::*;
 use boss_spoke_stream::CommandOutcome;
+use boss_spoke_stream::store::CommandAdmission;
 use std::time::Duration;
 
 #[tokio::test]
@@ -22,7 +23,7 @@ async fn spawn_cannot_require_an_unnegotiated_feature() {
         ..Default::default()
     }));
     assert_eq!(
-        fx.manager.command("host", spawn, STEP).await,
+        fx.manager.command("host", CommandAdmission::Start, spawn, STEP).await,
         Err(CommandOutcome::Invalid)
     );
     assert!(fx.store.outbox.lock().unwrap().commands.is_empty());
@@ -36,7 +37,11 @@ async fn revocation_closes_response_while_command_storage_is_busy() {
     let pause = std::sync::Arc::new(super::store::Pause::default());
     *fx.store.pauses.append.lock().unwrap() = Some(pause.clone());
     let manager = fx.manager.clone();
-    let waiting = tokio::spawn(async move { manager.command("host", command("stop"), STEP).await });
+    let waiting = tokio::spawn(async move {
+        manager
+            .command("host", CommandAdmission::Start, command("stop"), STEP)
+            .await
+    });
     tokio::time::timeout(STEP, pause.entered.notified()).await.unwrap();
     *fx.auth.revoked.lock().unwrap() = true;
     fx.auth
@@ -56,7 +61,12 @@ async fn receipt_is_not_success_timeout_is_uncertain_and_late_result_is_queryabl
     let manager = fx.manager.clone();
     let waiting = tokio::spawn(async move {
         manager
-            .command("host", command("stop"), Duration::from_millis(200))
+            .command(
+                "host",
+                CommandAdmission::Start,
+                command("stop"),
+                Duration::from_millis(200),
+            )
             .await
     });
     let sent = match peer.next().await {
@@ -80,7 +90,13 @@ async fn receipt_is_not_success_timeout_is_uncertain_and_late_result_is_queryabl
     completed.body = Some(record::Body::Result(result.clone()));
     peer.send(spoke_frame::Body::Record(completed)).await;
     assert!(matches!(peer.next().await, Some(hub_frame::Body::RecordReceipt(c)) if c.through == 1));
-    assert_eq!(fx.manager.command("host", command("stop"), STEP).await.unwrap(), result);
+    assert_eq!(
+        fx.manager
+            .command("host", CommandAdmission::Start, command("stop"), STEP)
+            .await
+            .unwrap(),
+        result
+    );
     assert_eq!(fx.store.outbox.lock().unwrap().commands.len(), 1);
 }
 
@@ -90,13 +106,19 @@ async fn reconnect_replays_same_command_and_fences_old_waiter() {
     let mut old = fx.connect(hello()).await.unwrap();
     old.welcome().await;
     let manager = fx.manager.clone();
-    let waiting = tokio::spawn(async move { manager.command("host", command("stop"), STEP).await });
+    let waiting = tokio::spawn(async move {
+        manager
+            .command("host", CommandAdmission::Start, command("stop"), STEP)
+            .await
+    });
     let first = match old.next().await {
         Some(hub_frame::Body::Command(c)) => c,
         other => panic!("{other:?}"),
     };
     assert_eq!(
-        fx.manager.command("host", command("other"), STEP).await,
+        fx.manager
+            .command("host", CommandAdmission::Start, command("other"), STEP)
+            .await,
         Err(CommandOutcome::Busy)
     );
     let mut new = fx.connect(hello()).await.unwrap();
@@ -109,7 +131,11 @@ async fn reconnect_replays_same_command_and_fences_old_waiter() {
     };
     assert_eq!(first, replay);
     let manager = fx.manager.clone();
-    let retry = tokio::spawn(async move { manager.command("host", command("stop"), STEP).await });
+    let retry = tokio::spawn(async move {
+        manager
+            .command("host", CommandAdmission::Start, command("stop"), STEP)
+            .await
+    });
     let mut result = record(1);
     result.body = Some(record::Body::Result(CommandResult {
         command_id: "stop".into(),
@@ -128,7 +154,11 @@ async fn forged_result_or_receipt_cannot_complete_or_advance_a_command() {
         let mut peer = fx.connect(hello()).await.unwrap();
         peer.welcome().await;
         let manager = fx.manager.clone();
-        let waiting = tokio::spawn(async move { manager.command("host", command("stop"), STEP).await });
+        let waiting = tokio::spawn(async move {
+            manager
+                .command("host", CommandAdmission::Start, command("stop"), STEP)
+                .await
+        });
         assert!(matches!(peer.next().await, Some(hub_frame::Body::Command(_))));
         if result_case {
             let mut forged = record(1);
@@ -166,7 +196,10 @@ async fn command_replay_preserves_unknown_fields_from_durable_bytes() {
         command: Vec<u8>,
     }
     let fx = Fixture::new().await;
-    fx.store.append("host", command("stop")).await.unwrap();
+    fx.store
+        .append("host", CommandAdmission::Start, command("stop"))
+        .await
+        .unwrap();
     let expected = {
         let mut outbox = fx.store.outbox.lock().unwrap();
         let bytes = outbox.encoded.get_mut(&1).unwrap();
@@ -239,9 +272,18 @@ async fn unreplayable_command_is_durably_rejected_and_the_wire_sequence_stays_co
     use boss_spoke_stream::store::CommandOutbox;
     let fx = Fixture::new().await;
     let capture = capture_command();
-    fx.store.append("host", capture.clone()).await.unwrap();
-    fx.store.append("host", command("stop")).await.unwrap();
-    fx.store.append("host", command("later")).await.unwrap();
+    fx.store
+        .append("host", CommandAdmission::Start, capture.clone())
+        .await
+        .unwrap();
+    fx.store
+        .append("host", CommandAdmission::Start, command("stop"))
+        .await
+        .unwrap();
+    fx.store
+        .append("host", CommandAdmission::Start, command("later"))
+        .await
+        .unwrap();
     // The reconnecting spoke no longer offers pane capture.
     let mut reconnect = hello();
     reconnect.features.retain(|f| f.name != feature::PANE_CAPTURE);
@@ -256,7 +298,11 @@ async fn unreplayable_command_is_durably_rejected_and_the_wire_sequence_stays_co
     // The stream is still admitting records.
     peer.send(spoke_frame::Body::Record(record(1))).await;
     assert!(matches!(peer.next().await, Some(hub_frame::Body::RecordReceipt(c)) if c.through == 1));
-    let rejected = fx.manager.command("host", capture.clone(), STEP).await.unwrap();
+    let rejected = fx
+        .manager
+        .command("host", CommandAdmission::Start, capture.clone(), STEP)
+        .await
+        .unwrap();
     assert_eq!(rejected.code, ResultCode::Rejected as i32);
     assert_eq!(rejected.command_id, "capture");
     assert_eq!(fx.store.completed("host", "capture").await.unwrap(), Some(rejected));
@@ -264,13 +310,13 @@ async fn unreplayable_command_is_durably_rejected_and_the_wire_sequence_stays_co
     let mut changed = capture.clone();
     changed.run.as_mut().unwrap().run_id = "other".into();
     assert_eq!(
-        fx.manager.command("host", changed, STEP).await,
+        fx.manager.command("host", CommandAdmission::Start, changed, STEP).await,
         Err(CommandOutcome::Invalid)
     );
     let mut changed = command("capture");
     changed.not_after_unix_ms += 1;
     assert_eq!(
-        fx.manager.command("host", changed, STEP).await,
+        fx.manager.command("host", CommandAdmission::Start, changed, STEP).await,
         Err(CommandOutcome::Invalid)
     );
     // Across a reconnect the receipt is still a contiguous prefix and nothing replays.
@@ -283,7 +329,11 @@ async fn unreplayable_command_is_durably_rejected_and_the_wire_sequence_stays_co
     let mut again = fx.connect(reconnect).await.unwrap();
     again.welcome().await;
     let manager = fx.manager.clone();
-    let waiting = tokio::spawn(async move { manager.command("host", command("final"), STEP).await });
+    let waiting = tokio::spawn(async move {
+        manager
+            .command("host", CommandAdmission::Start, command("final"), STEP)
+            .await
+    });
     expect_command(&mut again, "final", 3).await;
     receipt(&again, 3).await;
     waiting.abort();
@@ -295,8 +345,14 @@ async fn undecodable_or_invalid_stored_commands_settle_under_their_real_id() {
     use prost::Message;
     for undecodable in [false, true] {
         let fx = Fixture::new().await;
-        fx.store.append("host", command("broken")).await.unwrap();
-        fx.store.append("host", command("stop")).await.unwrap();
+        fx.store
+            .append("host", CommandAdmission::Start, command("broken"))
+            .await
+            .unwrap();
+        fx.store
+            .append("host", CommandAdmission::Start, command("stop"))
+            .await
+            .unwrap();
         {
             let mut outbox = fx.store.outbox.lock().unwrap();
             let bytes = if undecodable {
@@ -316,7 +372,10 @@ async fn undecodable_or_invalid_stored_commands_settle_under_their_real_id() {
         assert_eq!(rejected.code, ResultCode::Rejected as i32);
         assert_eq!(rejected.command_id, "broken");
         assert_eq!(
-            fx.manager.command("host", command("broken"), STEP).await.unwrap(),
+            fx.manager
+                .command("host", CommandAdmission::Start, command("broken"), STEP)
+                .await
+                .unwrap(),
             rejected
         );
     }
@@ -330,7 +389,11 @@ async fn rejecting_notifies_a_matching_waiter_with_the_real_id() {
     fx.store
         .strip_appended_body
         .store(true, std::sync::atomic::Ordering::Release);
-    let result = fx.manager.command("host", command("unknown-body"), STEP).await.unwrap();
+    let result = fx
+        .manager
+        .command("host", CommandAdmission::Start, command("unknown-body"), STEP)
+        .await
+        .unwrap();
     assert_eq!(
         (result.command_id.as_str(), result.code),
         ("unknown-body", ResultCode::Rejected as i32)
@@ -340,7 +403,11 @@ async fn rejecting_notifies_a_matching_waiter_with_the_real_id() {
         .store(false, std::sync::atomic::Ordering::Release);
     // The freed slot is reused by the next command.
     let manager = fx.manager.clone();
-    let waiting = tokio::spawn(async move { manager.command("host", command("stop"), STEP).await });
+    let waiting = tokio::spawn(async move {
+        manager
+            .command("host", CommandAdmission::Start, command("stop"), STEP)
+            .await
+    });
     expect_command(&mut peer, "stop", 1).await;
     waiting.abort();
 }
@@ -349,7 +416,10 @@ async fn rejecting_notifies_a_matching_waiter_with_the_real_id() {
 async fn outbox_ordering_violations_fail_the_stream_and_settle_nothing() {
     use boss_spoke_stream::store::CommandOutbox;
     let fx = Fixture::new().await;
-    fx.store.append("host", command("stop")).await.unwrap();
+    fx.store
+        .append("host", CommandAdmission::Start, command("stop"))
+        .await
+        .unwrap();
     {
         // A duplicated/out-of-order embedded sequence: the outbox broke its contract.
         use prost::Message;
