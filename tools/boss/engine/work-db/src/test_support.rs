@@ -4,7 +4,7 @@ use boss_protocol::QueueCiEvidence;
 
 #[path = "test_db_template.rs"]
 mod db_template;
-pub(crate) use db_template::open_memory_db;
+pub(crate) use db_template::{open_memory_db, seed_new_file_db};
 
 /// Run a synchronization callback while holding the database connection.
 /// The callback must not call another operation on this database.

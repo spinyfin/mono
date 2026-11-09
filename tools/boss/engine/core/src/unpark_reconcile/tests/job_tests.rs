@@ -187,7 +187,11 @@ async fn children_without_a_pr_are_neither_paced_nor_counted_against_the_quota()
     let limits = UnparkLimits::builder()
         .child_spacing(Duration::from_millis(500))
         .build();
-    let started = std::time::Instant::now();
+    // Measured on the paused runtime clock, which only a timer can move: a
+    // single pacing wait still spends a whole spacing and fails the bound
+    // below, and a starved host, which spends none, cannot.
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
 
     let summary = UnparkReconciler::new(limits)
         .run(

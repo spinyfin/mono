@@ -1995,7 +1995,13 @@ async fn mismatched_guide_head_fails_attempt_without_spawning() {
     assert!(failed.error.unwrap().contains(&packet.head_sha));
 }
 
-#[tokio::test]
+// The confirming-spawn tests below run on the paused runtime clock. Their
+// confirmation windows are tens of milliseconds, and on the wall clock a
+// starved host can spend a whole window inside the first evidence read,
+// before the pane is ever probed. Paused, only the confirmation timers move
+// the clock, so each window ends exactly when the code under test stops
+// finding work to do.
+#[tokio::test(start_paused = true)]
 async fn spawn_confirmation_timeout_reaps_the_pane_and_fails_the_spawn() {
     let workspace = TempDir::new().unwrap();
     let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
@@ -2026,7 +2032,7 @@ async fn spawn_confirmation_timeout_reaps_the_pane_and_fails_the_spawn() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn spawn_confirmation_ready_chrome_without_a_hook_fails_turn_start_and_reaps() {
     let workspace = TempDir::new().unwrap();
     let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
@@ -2058,7 +2064,7 @@ async fn spawn_confirmation_ready_chrome_without_a_hook_fails_turn_start_and_rea
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn spawn_confirmation_passes_when_transcript_path_is_set_without_a_registry_signal() {
     let workspace = TempDir::new().unwrap();
     let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
@@ -2101,7 +2107,7 @@ async fn spawn_confirmation_passes_when_transcript_path_is_set_without_a_registr
     assert!(spawner.reaped_run_ids().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn spawn_confirmation_passes_when_driver_chrome_and_hook_arrive() {
     let workspace = TempDir::new().unwrap();
     let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
@@ -2130,7 +2136,7 @@ async fn spawn_confirmation_passes_when_driver_chrome_and_hook_arrive() {
     assert!(spawner.reaped_run_ids().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn spawn_confirmation_passes_when_hook_arrives_without_chrome() {
     let workspace = TempDir::new().unwrap();
     let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
@@ -2159,7 +2165,7 @@ async fn spawn_confirmation_passes_when_hook_arrives_without_chrome() {
     assert!(spawner.reaped_run_ids().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn run_execution_reaps_and_signals_when_cancelled_during_confirmation() {
     let workspace = TempDir::new().unwrap();
     let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
@@ -2245,7 +2251,7 @@ async fn confirm_with_history_only(history: &str) -> (Result<RunOutcome>, Arc<Ca
     (result, spawner)
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn spawn_confirmation_finds_banner_that_only_exists_in_scrollback() {
     // Composer readiness is satisfied by history alone; with no hook the
     // failure is therefore the turn-start one, not "composer never ready".
@@ -2262,7 +2268,7 @@ async fn spawn_confirmation_finds_banner_that_only_exists_in_scrollback() {
     assert_eq!(&log[..2], [false, true], "visible read must miss, then history is read");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn spawn_confirmation_scrollback_without_a_marker_still_fails() {
     let (result, spawner) = confirm_with_history_only("bash: exec: claude: not found\nlogin: \n❯ \n").await;
     let msg = result
@@ -2275,7 +2281,7 @@ async fn spawn_confirmation_scrollback_without_a_marker_still_fails() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn spawn_confirmation_passes_on_a_hook_delivered_before_registration() {
     let workspace = TempDir::new().unwrap();
     let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);

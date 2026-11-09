@@ -63,7 +63,7 @@ mod tests {
 
     #[test]
     fn unknown_stored_level_defaults_off() {
-        let db = WorkDb::open_in_memory().unwrap();
+        let db = WorkDb::open(":memory:".into()).unwrap();
         db.set_metadata(SETTING_KEY, "unknown").unwrap();
         assert!(!enabled(&db).unwrap());
         assert!(!snapshot(&db).unwrap().enabled);

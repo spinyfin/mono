@@ -473,7 +473,7 @@ mod tests {
     async fn a_successful_read_populates_the_cache() {
         let source = ScriptedSource::serving(SHA_OLD, "# rules v1\n");
         let service = Arc::new(DesignDocsService::with_source(source));
-        let db = WorkDb::open_in_memory().unwrap();
+        let db = WorkDb::open(":memory:".into()).unwrap();
         assert_eq!(db.load_coordinator_guidance_cache("prod_boss").unwrap(), None);
 
         let view = read_at(&service, &db, NOW, Duration::from_secs(5)).await;
@@ -498,7 +498,7 @@ mod tests {
     async fn a_failed_fetch_with_a_cache_serves_it_labelled_with_the_error() {
         let source = ScriptedSource::serving(SHA_OLD, "# rules v1\n");
         let service = Arc::new(DesignDocsService::with_source(source.clone()));
-        let db = WorkDb::open_in_memory().unwrap();
+        let db = WorkDb::open(":memory:".into()).unwrap();
         read_at(&service, &db, NOW, Duration::from_secs(5)).await;
 
         source.go_offline();
@@ -552,7 +552,7 @@ mod tests {
         let source = ScriptedSource::serving(SHA_OLD, "# rules v1\n");
         source.go_offline();
         let service = Arc::new(DesignDocsService::with_source(source));
-        let db = WorkDb::open_in_memory().unwrap();
+        let db = WorkDb::open(":memory:".into()).unwrap();
 
         let view = read_at(&service, &db, NOW, Duration::from_secs(5)).await;
 
@@ -573,7 +573,7 @@ mod tests {
     async fn a_newer_successful_read_replaces_the_cache_entry() {
         let source = ScriptedSource::serving(SHA_OLD, "# rules v1\n");
         let service = Arc::new(DesignDocsService::with_source(source.clone()));
-        let db = WorkDb::open_in_memory().unwrap();
+        let db = WorkDb::open(":memory:".into()).unwrap();
         read_at(&service, &db, NOW, Duration::from_secs(5)).await;
 
         source.serve(SHA_NEW, "# rules v2\n");
@@ -600,7 +600,7 @@ mod tests {
             message: "HTTP 404".to_owned(),
         });
         let service = Arc::new(DesignDocsService::with_source(source.clone()));
-        let db = WorkDb::open_in_memory().unwrap();
+        let db = WorkDb::open(":memory:".into()).unwrap();
         let first = read_at(&service, &db, NOW, Duration::from_secs(5)).await;
         assert!(
             matches!(first.state, CoordinatorGuidanceState::Missing { .. }),
@@ -625,7 +625,7 @@ mod tests {
     async fn a_budget_overrun_falls_back_to_the_cache_and_names_the_overrun() {
         let source = ScriptedSource::serving(SHA_OLD, "# rules v1\n");
         let service = Arc::new(DesignDocsService::with_source(source));
-        let db = WorkDb::open_in_memory().unwrap();
+        let db = WorkDb::open(":memory:".into()).unwrap();
         read_at(&service, &db, NOW, Duration::from_secs(5)).await;
 
         // A different service whose blob read hangs: nothing fresh arrives
@@ -645,7 +645,7 @@ mod tests {
     async fn a_cache_from_another_repo_is_never_served() {
         let source = ScriptedSource::serving(SHA_OLD, "# rules v1\n");
         let service = Arc::new(DesignDocsService::with_source(source.clone()));
-        let db = WorkDb::open_in_memory().unwrap();
+        let db = WorkDb::open(":memory:".into()).unwrap();
         read_at(&service, &db, NOW, Duration::from_secs(5)).await;
 
         // The product is repointed at a different repo, which is unreachable.
@@ -672,7 +672,7 @@ mod tests {
             product("prod_b", "Beta", None),
             product("prod_c", "Gamma", Some("https://gitlab.com/acme/gamma.git")),
         ];
-        let db = WorkDb::open_in_memory().unwrap();
+        let db = WorkDb::open(":memory:".into()).unwrap();
         let views = load_product_guidance(&service, &db, &products, Duration::from_millis(50), NOW).await;
         assert_eq!(views.len(), 3, "one entry per product, no omissions");
         assert_eq!(views[0].product_id, "prod_a");

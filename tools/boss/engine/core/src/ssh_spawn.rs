@@ -1237,7 +1237,7 @@ mod tests {
 
     #[tokio::test]
     async fn failure_after_staging_removes_the_run_directory_and_clears_the_marker() {
-        let db = crate::work::WorkDb::open_in_memory().unwrap();
+        let db = crate::work::WorkDb::open(":memory:".into()).unwrap();
         let exec = FakeExec::new(0, "");
         let result = crate::remote_input_lifecycle::with_input_lifecycle(
             &exec,
@@ -1256,7 +1256,7 @@ mod tests {
 
     #[tokio::test]
     async fn immediate_worker_death_removes_the_run_directory() {
-        let db = crate::work::WorkDb::open_in_memory().unwrap();
+        let db = crate::work::WorkDb::open(":memory:".into()).unwrap();
         let exec = FakeExec::new(0, "boss-remote-run: starting run_id=run-1 version=eng-x pid=4242\n")
             .with_liveness(LivenessStub::Dead);
         let outcome = crate::remote_input_lifecycle::with_input_lifecycle(
@@ -1283,7 +1283,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_removal_and_interrupted_launch_keep_a_pending_marker() {
-        let db = crate::work::WorkDb::open_in_memory().unwrap();
+        let db = crate::work::WorkDb::open(":memory:".into()).unwrap();
         let exec = FakeExec::new(0, "").with_failing_cleanup();
         let _ = crate::remote_input_lifecycle::with_input_lifecycle(
             &exec,
@@ -1323,7 +1323,7 @@ mod tests {
     #[tokio::test]
     async fn uncertain_wrapper_exits_keep_input_and_marker() {
         for status in [255, -1, 83, 123] {
-            let db = crate::work::WorkDb::open_in_memory().unwrap();
+            let db = crate::work::WorkDb::open(":memory:".into()).unwrap();
             let exec = FakeExec::new(status, "");
             let outcome = crate::remote_input_lifecycle::with_input_lifecycle(
                 &exec,
