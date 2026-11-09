@@ -54,10 +54,11 @@ mod archive_tests;
 /// baseline commit id is a floor, never something the heads must descend from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PointerIntegrityKind {
-    /// Reconciliation was attempted and the preserved work is not carried by
-    /// anything the engine can vouch for. Nothing was moved.
+    /// Not produced: pointer reconciliation no longer exists. Kept so callers
+    /// that enumerate every verdict still compile; handled like [`Self::Other`].
     NotContained,
-    /// The disposable PR bookmark is missing or conflicted; refresh it from GitHub.
+    /// Not produced: PR bookmarks are no longer refreshed from GitHub. Kept
+    /// for the same reason as [`Self::NotContained`]; handled like [`Self::Other`].
     PrHeadUnavailable,
     /// A resumed head descends from work that teardown quarantined as possibly
     /// belonging to a later holder. Nothing was moved or restaged.

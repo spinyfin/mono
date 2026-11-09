@@ -391,7 +391,8 @@ pub(crate) async fn agents_status(socket_path: &Option<String>, json: bool, agen
             // timeout).
             let hosted = fetch_hosted_pane_statuses(&mut client).await?;
             if let Some(pane) = resolve_hosted_pane_ref(&agent, &hosted)? {
-                print_hosted_pane_status(json, pane);
+                let (run, execution) = fetch_pane_stored_records(&mut client, &pane.run_id).await;
+                print_hosted_pane_status(json, pane, run.as_ref(), execution.as_ref());
                 return Ok(());
             }
             if looks_like_name_or_slot(&agent) {
@@ -506,6 +507,10 @@ async fn print_parked_work_item_status(client: &mut BossClient, json: bool, work
         },
         None => None,
     };
+    let latest_run = match execution.as_ref() {
+        Some(execution) => fetch_latest_run(client, &execution.id).await,
+        None => None,
+    };
     let attention_items = match client
         .send_request(&FrontendRequest::ListAttentionItemsForWorkItem {
             work_item_id: primary_id.clone(),
@@ -529,7 +534,7 @@ async fn print_parked_work_item_status(client: &mut BossClient, json: bool, work
                 "live_worker_state": serde_json::Value::Null,
                 "task_runtime": runtime,
                 "execution": execution,
-                "errors": stored_errors_json(None, execution.as_ref()),
+                "errors": stored_errors_json(latest_run.as_ref(), execution.as_ref()),
                 "open_attention_items": open_attention_items,
             })
         );
@@ -562,7 +567,7 @@ async fn print_parked_work_item_status(client: &mut BossClient, json: bool, work
                 .unwrap_or_else(|| "-".to_owned())
         );
     }
-    for line in stored_error_lines(None, execution.as_ref()) {
+    for line in stored_error_lines(latest_run.as_ref(), execution.as_ref()) {
         println!("{line}");
     }
     if open_attention_items.is_empty() {
@@ -576,10 +581,39 @@ async fn print_parked_work_item_status(client: &mut BossClient, json: bool, work
     Ok(())
 }
 
-/// Failure text the engine stored for a run (`work_runs.error_text`) and for
-/// its execution (`work_executions.last_error`). A pre-start failure is
-/// recorded here and nowhere the status output used to show, so a worker that
-/// never started read as a bare `failed` with no cause.
+/// The most recent run of an execution; best-effort, so a missing run never
+/// fails a status read.
+async fn fetch_latest_run(client: &mut BossClient, execution_id: &str) -> Option<WorkRun> {
+    match client
+        .send_request(&FrontendRequest::ListRuns {
+            execution_id: execution_id.to_owned(),
+        })
+        .await
+    {
+        Ok(FrontendEvent::RunsList { runs, .. }) => runs.into_iter().max_by(|a, b| a.created_at.cmp(&b.created_at)),
+        _ => None,
+    }
+}
+
+/// The stored latest run and execution behind a hosted pane; its `run_id` is
+/// the execution id. Best-effort, like [`fetch_latest_run`].
+async fn fetch_pane_stored_records(
+    client: &mut BossClient,
+    execution_id: &str,
+) -> (Option<WorkRun>, Option<WorkExecution>) {
+    let request = FrontendRequest::GetExecution {
+        id: execution_id.to_owned(),
+    };
+    let execution = match client.send_request(&request).await {
+        Ok(FrontendEvent::ExecutionResult { execution }) => Some(execution),
+        _ => None,
+    };
+    (fetch_latest_run(client, execution_id).await, execution)
+}
+
+/// Failure text stored for a run (`work_runs.error_text`) and its execution
+/// (`work_executions.last_error`). A pre-start failure is recorded only here,
+/// so it may be present even when no worker process ever started.
 fn stored_errors_json(run: Option<&WorkRun>, execution: Option<&WorkExecution>) -> serde_json::Value {
     serde_json::json!({
         "run_error_text": run.and_then(|run| run.error_text.as_deref()),
@@ -1915,19 +1949,14 @@ fn durable_occupant_detail_lines(pane: &HostedPaneStatus, status: &str) -> Strin
 /// (see [`agents_status`]), so this covers exactly the case the live
 /// `LiveWorkerState` detail (model, activity, current tool) isn't
 /// available for.
-fn print_hosted_pane_status(json: bool, pane: &HostedPaneStatus) {
+fn print_hosted_pane_status(
+    json: bool,
+    pane: &HostedPaneStatus,
+    run: Option<&WorkRun>,
+    execution: Option<&WorkExecution>,
+) {
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "slot_id": pane.slot_id,
-                "run_id": pane.run_id,
-                "crew_name": pane.crew_name,
-                "state": pane.state,
-                "summary": pane.summary,
-                "task_title": pane.task_title,
-            })
-        );
+        println!("{}", hosted_pane_status_json(pane, run, execution));
         return;
     }
     println!("slot {} ({}) — run {}", pane.slot_id, pane.crew_name, pane.run_id);
@@ -1968,6 +1997,25 @@ fn print_hosted_pane_status(json: bool, pane: &HostedPaneStatus) {
     if let Some(summary) = &pane.summary {
         println!("  summary:       {summary}");
     }
+    for line in stored_error_lines(run, execution) {
+        println!("{line}");
+    }
+}
+
+fn hosted_pane_status_json(
+    pane: &HostedPaneStatus,
+    run: Option<&WorkRun>,
+    execution: Option<&WorkExecution>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "slot_id": pane.slot_id,
+        "run_id": pane.run_id,
+        "crew_name": pane.crew_name,
+        "state": pane.state,
+        "summary": pane.summary,
+        "task_title": pane.task_title,
+        "errors": stored_errors_json(run, execution),
+    })
 }
 
 /// One-line `agents list` row for a live worker. Pure so tests can pin

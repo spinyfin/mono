@@ -94,15 +94,6 @@ impl WorkDb {
         Ok(())
     }
 
-    pub fn update_execution_bookmark_base(&self, execution_id: &str, commit: &str) -> Result<()> {
-        let changed = self.connect()?.execute(
-            "UPDATE execution_bookmarks SET base_commit = ?2 WHERE execution_id = ?1 AND retired_at IS NULL",
-            params![execution_id, commit],
-        )?;
-        anyhow::ensure!(changed == 1, "live execution bookmark record missing");
-        Ok(())
-    }
-
     pub fn bookmark_reconciliation_note(&self, execution_id: &str) -> Result<Option<String>> {
         Ok(self
             .connect()?

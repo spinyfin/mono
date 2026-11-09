@@ -951,7 +951,16 @@ async fn rewritten_pr_dispatch_preserves_successor_work_through_second_recovery(
     JjRepo::run(&h.repo.repo, &["bookmark", "set", "pr/99", &record.base(), "-r", "@"]);
     // Dispatch recorded this PR head as the execution's baseline commit.
     let old_pr = JjRepo::run(&h.repo.repo, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
-    db.update_execution_bookmark_base(&prior.id, &old_pr).unwrap();
+    assert_eq!(
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE execution_bookmarks SET base_commit = ?2 WHERE execution_id = ?1 AND retired_at IS NULL",
+                rusqlite::params![prior.id, old_pr],
+            )
+            .unwrap(),
+        1
+    );
     JjRepo::run(&h.repo.repo, &["git", "export"]);
     JjRepo::run(
         &h.repo.repo,

@@ -4,8 +4,8 @@
 //! live worker's, the ladder's leased scratch workspace and the main one. A
 //! rebase from one workspace while another has the same branch checked out is
 //! how bookmarks end up conflicted or changes end up divergent.
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use super::helpers::*;
 use crate::conflict_ladder::{LadderOutcome, try_mechanical_rungs};
@@ -205,18 +205,43 @@ fn divergent_changes(repo: &JjRepo) -> String {
     .to_owned()
 }
 
+/// `(commit_id, change_id)` of the PR branch tip.
+fn pr_tip(repo: &JjRepo) -> (String, String) {
+    let out = JjRepo::run(
+        &repo.repo,
+        &[
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            PR_BRANCH,
+            "-T",
+            "commit_id ++ \" \" ++ change_id",
+        ],
+    );
+    let (commit, change) = out.trim().split_once(' ').expect("commit and change id");
+    (commit.to_owned(), change.to_owned())
+}
+
 #[tokio::test]
 async fn rung1_defers_while_a_worker_is_live_and_leaves_the_store_untouched() {
     let fx = fixture().await;
-    // The live worker rewrites its own history in its workspace while the
-    // ladder is invoked: the overlap that used to leave conflicted bookmarks.
+    let (commit_before, change_before) = pr_tip(&fx.repo);
+    // The live worker rewrites its own history in its workspace (rebasing the
+    // PR branch onto upstream) as the ladder is invoked: the overlap that used
+    // to leave conflicted bookmarks. Both sides wait on the barrier so the
+    // rewrite starts as the ladder call begins.
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
     let worker = fx.repo.worker.clone();
+    let worker_barrier = barrier.clone();
     let worker_rebase = std::thread::spawn(move || {
-        JjRepo::run(&worker, &["rebase", "-b", PR_BRANCH, "-d", "main"]);
+        worker_barrier.wait();
+        JjRepo::run(&worker, &["rebase", "-b", PR_BRANCH, "-d", "upstream"]);
         std::fs::write(worker.join("more.txt"), "more live work").unwrap();
         JjRepo::run(&worker, &["status"]);
     });
-    let outcome = try_mechanical_rungs(
+    barrier.wait();
+    let during = try_mechanical_rungs(
         &fx.db,
         &RecordingPublisher::default(),
         &fx.cube,
@@ -225,8 +250,23 @@ async fn rung1_defers_while_a_worker_is_live_and_leaves_the_store_untouched() {
     )
     .await;
     worker_rebase.join().unwrap();
+    // And again once the worker's rewrite has landed.
+    let after = try_mechanical_rungs(
+        &fx.db,
+        &RecordingPublisher::default(),
+        &fx.cube,
+        &fx.candidate,
+        &fx.attempt,
+    )
+    .await;
 
-    assert_eq!(outcome, LadderOutcome::DeferredForLiveWriter);
+    // The worker really rewrote the PR commit: new commit id, same change.
+    let (commit_after, change_after) = pr_tip(&fx.repo);
+    assert_ne!(commit_before, commit_after, "the worker's rebase rewrote nothing");
+    assert_eq!(change_before, change_after);
+
+    assert_eq!(during, LadderOutcome::DeferredForLiveWriter);
+    assert_eq!(after, LadderOutcome::DeferredForLiveWriter);
     assert!(
         fx.cube.calls.lock().unwrap().is_empty(),
         "the ladder touched cube while a worker was live: {:?}",
@@ -318,4 +358,86 @@ async fn claimed_and_waiting_human_writers_defer_too() {
         assert_eq!(writers.len(), 1, "{status}");
         assert_eq!(writers[0].id, fx.live_execution_id);
     }
+}
+
+/// The conflict-watch caller treats the deferral like an unavailable rung: it
+/// spawns no conflict revision alongside the live writer and leaves the
+/// attempt for a later tick.
+#[tokio::test]
+async fn conflict_watch_spawns_no_revision_while_a_worker_is_live() {
+    use crate::conflict_watch::on_conflict_detected;
+    use crate::merge_poller::{OpenPrStatus, PrLifecycleProbe, PrLifecycleState};
+
+    let fx = fixture().await;
+    let probe = PrLifecycleProbe::builder()
+        .url(fx.candidate.pr_url.clone())
+        .state(PrLifecycleState::Open(OpenPrStatus::conflict_only()))
+        .base_ref_oid("abc123")
+        .labels(Vec::new())
+        .review(crate::merge_poller::PrReviewState::Unknown)
+        .build();
+
+    on_conflict_detected(
+        &fx.db,
+        &RecordingPublisher::default(),
+        Some(&fx.cube),
+        &FakePrStateChecker::always(PrOpenState::Open),
+        &fx.candidate,
+        &probe,
+    )
+    .await;
+
+    assert!(
+        fx.cube.calls.lock().unwrap().is_empty(),
+        "the ladder touched cube while a worker was live: {:?}",
+        fx.cube.calls.lock().unwrap()
+    );
+    let latest = fx
+        .db
+        .latest_conflict_resolution_for_work_item(&fx.candidate.work_item_id)
+        .unwrap()
+        .expect("detection records an attempt");
+    assert_eq!(latest.status, "pending", "{latest:?}");
+    assert!(latest.resolved_by_rung.is_none());
+    assert!(
+        latest.revision_task_id.is_none(),
+        "no conflict revision may start alongside the live writer"
+    );
+    assert_eq!(conflicted_bookmarks(&fx.repo), "");
+}
+
+/// The queued remediation path reports the deferral as a retry owed after the
+/// cooldown, not as a settled attempt.
+#[tokio::test]
+async fn queued_remediation_retries_after_cooldown_while_a_worker_is_live() {
+    use crate::conflict_remediation::{ConflictRemediationJob, LadderRemediationJob, RemediationDisposition};
+    use crate::merge_poller::{OpenPrStatus, PrLifecycleProbe, PrLifecycleState, PrReviewState};
+
+    let fx = fixture().await;
+    let cube_calls = Arc::new(SharedStoreCube {
+        store: fx.repo.repo.clone(),
+        scratch: fx.repo.replacement.clone(),
+        calls: Mutex::new(Vec::new()),
+        rebases: AtomicUsize::new(0),
+    });
+    let job = LadderRemediationJob::new(
+        Arc::new(fx.db.clone()),
+        Arc::new(RecordingPublisher::default()),
+        cube_calls.clone(),
+    )
+    .with_pr_checker(Arc::new(FakePrStateChecker::always(PrOpenState::Open)));
+    let probe = PrLifecycleProbe::builder()
+        .url(fx.candidate.pr_url.clone())
+        .state(PrLifecycleState::Open(OpenPrStatus::conflict_only()))
+        .labels(Vec::new())
+        .review(PrReviewState::Unknown)
+        .build();
+
+    let disposition = job.run(fx.candidate.clone(), fx.attempt.clone(), probe).await;
+
+    assert_eq!(disposition, RemediationDisposition::RetryAfterCooldown);
+    assert!(cube_calls.calls.lock().unwrap().is_empty());
+    let current = fx.db.get_conflict_resolution(&fx.attempt.id).unwrap().unwrap();
+    assert_eq!(current.status, "pending");
+    assert!(current.revision_task_id.is_none());
 }
