@@ -1,7 +1,7 @@
 //! Release a cube workspace lease when a run has provably ended, driven from
 //! the engine host: the leftover-lease sweep and the host process scan that
 //! supplies its occupancy evidence. The release policy itself (`decide`,
-//! `apply_release` and the bookmark/occupancy gates) lives in
+//! `apply_release`, the occupancy gate and teardown preservation) lives in
 //! `boss_engine_completion::workspace_lease_release` and is re-exported here.
 //!
 //! Resume reads preserved work from `preserved/<execution>` bookmarks
@@ -83,13 +83,12 @@ pub async fn release_lease_after_inferred_death_with(
             &snapshot
         }
     };
-    let plain_gate = DbBookmarkGate::new(work_db, adapter);
-    let cube_gate = cube.map(|cube| DbBookmarkGate::new(work_db, adapter).with_cube(cube));
-    let db_gate: &dyn BookmarkGate = match cube_gate.as_ref() {
-        Some(gate) => gate,
-        None => &plain_gate,
+    let plain = DbPreservation::new(work_db, adapter);
+    let with_cube = cube.map(|cube| DbPreservation::new(work_db, adapter).with_cube(cube));
+    let preservation: &dyn Preservation = match with_cube.as_ref() {
+        Some(preservation) => preservation,
+        None => &plain,
     };
-    let bookmark = sweep_bookmark_gate(work_db, execution, db_gate);
     apply_release(
         work_db,
         execution,
@@ -98,7 +97,7 @@ pub async fn release_lease_after_inferred_death_with(
             cause: TerminalCause::Inferred,
             pane,
             occupancy,
-            bookmark,
+            preservation,
         },
         do_release,
     )
@@ -316,8 +315,7 @@ fn sweep_pane_status(db: &WorkDb, live: &LiveWorkerStateRegistry, execution: &Wo
         // that failed before its pane) is retried only after an earlier
         // release attempt got past every gate and then failed in cube. That
         // attempt ran after the spawn had settled, so it is the durable proof
-        // that nothing is mid-spawn; the occupancy scan and bookmark gate
-        // still run again here.
+        // that nothing is mid-spawn; the occupancy scan still runs again here.
         Ok(None) if release_previously_failed_in_cube(db, &execution.id) => PaneStatus::Gone,
         _ => PaneStatus::Present,
     }
@@ -329,21 +327,6 @@ fn release_previously_failed_in_cube(db: &WorkDb, execution_id: &str) -> bool {
             .iter()
             .any(|item| item.kind == LEASE_RELEASE_FAILED_ATTENTION_KIND && item.status == "open")
     })
-}
-
-/// A row that never started a run holds only what cube placed in the
-/// workspace, so an absent bookmark is not a gap; every other row must
-/// confirm its recovery pointers.
-pub(crate) fn sweep_bookmark_gate<'a>(
-    db: &WorkDb,
-    execution: &WorkExecution,
-    confirming: &'a dyn BookmarkGate,
-) -> &'a dyn BookmarkGate {
-    if execution.started_at.is_none() && never_positioned(db, &execution.id, PreStartStage::BeforeRecoveryBookmark) {
-        &NeverPositioned
-    } else {
-        confirming
-    }
 }
 
 /// Counts from one leftover-lease pass.
@@ -388,7 +371,7 @@ pub fn spawn_loop(
 }
 
 /// Release every terminal execution that still holds a cube lease, subject
-/// to the bookmark / pane / occupancy gates.
+/// to the pane / occupancy gates.
 pub async fn run_one_pass(
     work_db: &WorkDb,
     cube_client: &dyn CubeClient,
@@ -428,7 +411,6 @@ async fn run_one_pass_with_occupancy<O: WorkspaceOccupancy, Fut: Future<Output =
             occupancy = Some(capture.take().expect("one scan per pass")().await);
         }
         let occupancy = occupancy.as_ref().expect("scanned above");
-        let db_gate = DbBookmarkGate::new(work_db, None).with_cube(cube_client);
         let result = apply_release(
             work_db,
             &execution,
@@ -437,7 +419,7 @@ async fn run_one_pass_with_occupancy<O: WorkspaceOccupancy, Fut: Future<Output =
                 cause: TerminalCause::Inferred,
                 pane,
                 occupancy,
-                bookmark: sweep_bookmark_gate(work_db, &execution, &db_gate),
+                preservation: &DbPreservation::new(work_db, None).with_cube(cube_client),
             },
             cube_client.release_workspace(&lease_id),
         )

@@ -372,7 +372,7 @@ async fn self_retry_restages_preserved_work_when_legacy_pointers_are_retired() {
 #[tokio::test]
 async fn pre_start_teardown_then_retry_preserves_later_unpublished_edits() {
     use crate::workspace_lease_release::{
-        DbBookmarkGate, EmptyOccupancy, LeaseReleaseOutcome, PaneStatus, ReleaseEvidence, TerminalCause, apply_release,
+        DbPreservation, EmptyOccupancy, LeaseReleaseOutcome, PaneStatus, ReleaseEvidence, TerminalCause, apply_release,
     };
     let dir = tempdir().unwrap();
     let repo = JjRepo::new(dir.path());
@@ -432,7 +432,7 @@ async fn pre_start_teardown_then_retry_preserves_later_unpublished_edits() {
             cause: TerminalCause::ProvenNeverStarted,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &DbBookmarkGate { db: &db, adapter: None },
+            preservation: &DbPreservation { db: &db, adapter: None },
         },
         async { Ok(()) },
     )
@@ -493,7 +493,7 @@ async fn pre_start_teardown_then_retry_preserves_later_unpublished_edits() {
             cause: TerminalCause::ProvenCompleted,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &DbBookmarkGate { db: &db, adapter: None },
+            preservation: &DbPreservation { db: &db, adapter: None },
         },
         async { Ok(()) },
     )

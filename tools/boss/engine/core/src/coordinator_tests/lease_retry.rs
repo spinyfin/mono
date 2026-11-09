@@ -163,11 +163,12 @@ async fn post_lease_chain_sibling_refusal_releases_lease_and_redispatch_succeeds
     wait_for_runner_calls(&runner, 1).await;
 }
 
-/// A bookmark write fails before any row is recorded. The retry must not hand
-/// the workspace back on the strength of the missing row, and once a later
-/// attempt writes its own bookmark the stale failure no longer blocks it.
+/// A bookmark write fails before any row is recorded. Nothing ran in the
+/// workspace, so the failed attempt hands it straight back instead of holding
+/// it for the retry, and once a later attempt succeeds the stale failure no
+/// longer shows.
 #[tokio::test]
-async fn bookmark_failure_retry_does_not_release_without_recovery_proof() {
+async fn bookmark_failure_retry_releases_the_workspace_and_spawns() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     seed_local_claude_driver(&db);
@@ -195,21 +196,19 @@ async fn bookmark_failure_retry_does_not_release_without_recovery_proof() {
         sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(runner.calls.lock().await.len(), 1, "the retry spawns");
-    assert!(
-        cube.release_calls.lock().await.is_empty(),
-        "the lease retained after the bookmark failure is never released without recovery proof"
+    assert_eq!(
+        cube.release_calls.lock().await.len(),
+        1,
+        "the failed attempt's workspace goes back to cube at once: a recovery failure never keeps it reserved"
     );
     let open = open_kinds(&db, &id);
     assert!(
         !open
             .iter()
             .any(|kind| kind == crate::execution_bookmark_recovery::CREATE_FAILED
-                || kind == crate::execution_bookmark_recovery::RECOVERY_FAILED),
+                || kind == crate::execution_bookmark_recovery::RECOVERY_FAILED
+                || kind == LEASE_UNRELEASED_ATTENTION_KIND),
         "the successful attempt supersedes the earlier failure: {open:?}"
-    );
-    assert!(
-        open.iter().any(|kind| kind == LEASE_UNRELEASED_ATTENTION_KIND),
-        "{open:?}"
     );
 }
 

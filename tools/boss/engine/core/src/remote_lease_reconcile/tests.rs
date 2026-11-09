@@ -687,20 +687,21 @@ async fn known_safe_input_retries_without_a_pid_and_stale_clear_preserves_marker
 /// report an empty workspace and a confirmed recovery pointer before the
 /// lease goes back.
 #[tokio::test]
-async fn dead_pid_keeps_the_lease_unless_occupancy_and_recovery_are_confirmed() {
+async fn dead_pid_keeps_the_lease_unless_occupancy_is_confirmed() {
     use crate::workspace_lease_release::{LEASE_UNRELEASED_ATTENTION_KIND, Occupancy};
     for (occupancy, drop_recovery, released) in [
         (Some(Occupancy::Empty), false, true),
         (Some(Occupancy::Occupied), false, false),
         (Some(Occupancy::Unknown), false, false),
         (None, false, false),
-        (Some(Occupancy::Empty), true, false),
+        // A recovery record that cannot be used is reported, never a reason to keep the lease.
+        (Some(Occupancy::Empty), true, true),
     ] {
         let (_d, db) = open_db_arc();
         db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
         let id = start_remote_run(&db, &create_chore(&db), "anaplian", "lease", Some(4242));
         if drop_recovery {
-            // A recovery record that names another store cannot be confirmed.
+            // A recovery record that names another store cannot be used.
             db.connect()
                 .unwrap()
                 .execute(
@@ -724,12 +725,9 @@ async fn dead_pid_keeps_the_lease_unless_occupancy_and_recovery_are_confirmed() 
             "{occupancy:?} {drop_recovery}"
         );
         if drop_recovery {
-            assert!(
-                db.list_attention_items(&id)
-                    .unwrap()
-                    .iter()
-                    .any(|item| item.kind == LEASE_UNRELEASED_ATTENTION_KIND)
-            );
+            let items = db.list_attention_items(&id).unwrap();
+            assert!(items.iter().any(|item| item.kind == "preserved_work_needs_inspection"));
+            assert!(items.iter().all(|item| item.kind != LEASE_UNRELEASED_ATTENTION_KIND));
         }
     }
 }

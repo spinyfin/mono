@@ -1389,11 +1389,12 @@ async fn pr_review_self_retry_with_a_record_still_positions_via_goto() {
     assert_eq!(h.cube.goto_calls.lock().await.len(), 1, "must run cube workspace goto");
 }
 
-/// A pre-start lease whose release gates keep it (unconfirmed recovery
-/// pointers) must not wedge every later dispatch of the same execution: it is
-/// detached and a fresh workspace is leased.
+/// A pre-start lease whose recovery record cannot be used (its store is gone)
+/// must not wedge every later dispatch of the same execution: preservation
+/// fails without holding the lease, which is released, and a fresh workspace
+/// is leased.
 #[tokio::test]
-async fn kept_pre_start_lease_does_not_block_redispatch() {
+async fn unpreservable_pre_start_lease_does_not_block_redispatch() {
     let dir = tempdir().unwrap();
     let (db, _prior, next) = blocked_pair(&dir.path().join("boss.db"));
     db.restore_execution_workspace(
@@ -1432,12 +1433,20 @@ async fn kept_pre_start_lease_does_not_block_redispatch() {
     let lease = coordinator
         .lease_workspace_with_fallback_for_test(&next, "worker", &repo, "task", &coordinator.host_adapter())
         .await
-        .expect("a kept lease must not block leasing a fresh workspace");
+        .expect("an unpreservable lease must not block leasing a fresh workspace");
     assert_ne!(lease.lease_id, "kept-lease");
-    assert!(
-        cube.release_calls.lock().await.is_empty(),
-        "the kept lease is not released"
+    assert_eq!(
+        cube.release_calls.lock().await.as_slice(),
+        ["kept-lease"],
+        "the lease goes back to cube even though its workspace could not be preserved"
     );
     let after = db.get_execution(&next.id).unwrap();
     assert_ne!(after.cube_lease_id.as_deref(), Some("kept-lease"));
+    assert!(
+        db.list_attention_items(&next.id)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == "preserved_work_needs_inspection" && item.status == "open"),
+        "the unpreserved workspace is reported, not silently released"
+    );
 }

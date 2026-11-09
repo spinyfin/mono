@@ -1502,8 +1502,7 @@ impl ExecutionCoordinator {
                 // so the row returns to `ready` (the deferral path) and
                 // `recover_failed_dispatch` does not count this serialization
                 // as a spawn failure.
-                self.release_pre_start_workspace(execution, &lease, &adapter, PreStartStage::BeforeRecoveryBookmark)
-                    .await;
+                self.release_pre_start_workspace(execution, &lease, &adapter).await;
                 if let Err(err) = self.work_db.release_dispatch_claim(&execution.id) {
                     tracing::error!(
                         execution_id = %execution.id,
@@ -1586,8 +1585,7 @@ impl ExecutionCoordinator {
         {
             Ok(recovered) => recovered,
             Err(err) => {
-                self.release_pre_start_workspace(execution, &lease, &adapter, PreStartStage::BeforeRecoveryBookmark)
-                    .await;
+                self.release_pre_start_workspace(execution, &lease, &adapter).await;
                 // Report the failed recovery operation without guessing its cause.
                 let attention = (
                     "cube_workspace_positioning_failed",
@@ -1733,13 +1731,7 @@ impl ExecutionCoordinator {
                             );
                         }
                     } else {
-                        self.release_pre_start_workspace(
-                            execution,
-                            &lease,
-                            &adapter,
-                            PreStartStage::BeforeRecoveryBookmark,
-                        )
-                        .await;
+                        self.release_pre_start_workspace(execution, &lease, &adapter).await;
                         let failure_label = match target {
                             GotoTarget::Pr(_) => "Cube `workspace goto` positioning failed",
                             GotoTarget::Revision(_) => "Cube `workspace goto --revision` positioning failed",
@@ -1804,13 +1796,7 @@ impl ExecutionCoordinator {
                     Some(change)
                 }
                 Err(err) => {
-                    self.release_pre_start_workspace(
-                        execution,
-                        &lease,
-                        &adapter,
-                        PreStartStage::BeforeRecoveryBookmark,
-                    )
-                    .await;
+                    self.release_pre_start_workspace(execution, &lease, &adapter).await;
                     self.dispatch_events
                         .emit(
                             DispatchEvent::new(Stage::CubeChangeCreated, DispatchOutcome::Error, &execution.id)
@@ -1854,13 +1840,7 @@ impl ExecutionCoordinator {
             match adapter.positioned_parent(&lease.workspace_path).await {
                 Ok(commit) => Some(commit),
                 Err(err) => {
-                    self.release_pre_start_workspace(
-                        execution,
-                        &lease,
-                        &adapter,
-                        PreStartStage::BeforeRecoveryBookmark,
-                    )
-                    .await;
+                    self.release_pre_start_workspace(execution, &lease, &adapter).await;
                     if had_requested_host {
                         self.cancel_requested_host_pre_start_failure(execution, "positioned commit capture", &err)
                             .await;
@@ -1930,8 +1910,7 @@ impl ExecutionCoordinator {
         .await;
         if let Err(err) = bookmark_result {
             self.lifecycle.report_bookmark_failure(execution, &format!("{err:#}"));
-            self.release_pre_start_workspace(execution, &lease, &adapter, PreStartStage::AtOrAfterRecoveryBookmark)
-                .await;
+            self.release_pre_start_workspace(execution, &lease, &adapter).await;
             self.record_start_failure(
                 Arc::clone(self),
                 execution,
@@ -1946,9 +1925,8 @@ impl ExecutionCoordinator {
         // This attempt recorded its recovery metadata in a freshly leased workspace.
         // Creation or backup failures filed by an earlier attempt describe a
         // lease that is no longer this execution's (a retained one was
-        // released or detached before this lease), and would otherwise keep
-        // this lease held at completion. Failures raised from here on belong
-        // to this lease and stay open for the release gate.
+        // released or detached before this lease), so this attempt's success
+        // supersedes them. Failures raised from here on belong to this lease.
         for kind in [CREATE_FAILED, RECOVERY_FAILED] {
             if let Err(err) = self.work_db.resolve_attention_kind_for_execution(&execution.id, kind) {
                 tracing::warn!(execution_id = %execution.id, kind, ?err, "could not resolve superseded bookmark failure");
@@ -2069,8 +2047,7 @@ impl ExecutionCoordinator {
                 Ok(())
             }
             Err(err) => {
-                self.release_pre_start_workspace(execution, &lease, &adapter, PreStartStage::AtOrAfterRecoveryBookmark)
-                    .await;
+                self.release_pre_start_workspace(execution, &lease, &adapter).await;
                 self.dispatch_events
                     .emit(
                         DispatchEvent::new(Stage::RunStarted, DispatchOutcome::Error, &execution.id)
@@ -2193,25 +2170,19 @@ impl ExecutionCoordinator {
         task: &str,
         adapter: &Arc<dyn HostAdapter>,
     ) -> Result<CubeWorkspaceLease> {
-        // A previous pre-start attempt may still hold a lease (cube release
-        // failed, or its recovery bookmark could not be confirmed). Try to
-        // free it. If the gates keep it, detach it from this execution so it
-        // does not block every retry: the workspace stays leased in cube, its
-        // unreleased-lease attention is already filed, and cube's TTL is the
-        // backstop. Recovery follows the shared-store bookmarks, not the
-        // detached checkout. If only cube's own call failed, the lease stays
-        // recorded and this attempt fails so the sweep and the next retry
-        // keep trying to return it. A lease retained after a bookmark
-        // failure keeps its bookmark gate (see `never_positioned`).
+        // A previous pre-start attempt may still hold a lease (its cube
+        // release failed). Try to free it. A never-started release has no
+        // pane or occupancy gate; a Kept outcome is handled defensively by
+        // detaching the lease from this execution so it does not block every
+        // retry: the workspace stays leased in cube and cube's TTL is the
+        // backstop. If
+        // only cube's own call failed, the lease stays recorded and this
+        // attempt fails so the sweep and the next retry keep trying to return
+        // it.
         if let Some(existing_lease) = execution.cube_lease_id.as_deref() {
             let outcome = self
                 .lifecycle
-                .release_lease_after_proven_never_started(
-                    execution,
-                    existing_lease,
-                    adapter.as_ref(),
-                    PreStartStage::BeforeRecoveryBookmark,
-                )
+                .release_lease_after_proven_never_started(execution, existing_lease, adapter.as_ref())
                 .await;
             match outcome {
                 LeaseReleaseOutcome::Released | LeaseReleaseOutcome::NoLease => {}
@@ -2534,10 +2505,9 @@ impl ExecutionCoordinator {
         execution: &WorkExecution,
         lease: &CubeWorkspaceLease,
         adapter: &Arc<dyn HostAdapter>,
-        stage: PreStartStage,
     ) {
         self.lifecycle
-            .release_lease_after_proven_never_started(execution, &lease.lease_id, adapter.as_ref(), stage)
+            .release_lease_after_proven_never_started(execution, &lease.lease_id, adapter.as_ref())
             .await;
     }
 

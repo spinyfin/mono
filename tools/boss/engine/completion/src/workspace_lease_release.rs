@@ -1,13 +1,16 @@
 //! Release a cube workspace lease when a run has provably ended.
 //!
-//! Cube's 24-hour lease TTL is the backstop for two cases this module must
-//! still honour: a recovery bookmark that did not write, and an inferred
-//! death whose pane or process occupancy cannot be confirmed. Every other
-//! terminal path releases the lease as soon as those gates pass, so a
-//! finished run does not hold a 10–20 GiB workspace until TTL.
+//! Cube's 24-hour lease TTL is the backstop for an inferred death whose pane
+//! or process occupancy cannot be confirmed. Every other terminal path
+//! releases the lease as soon as those gates pass, so a finished run does not
+//! hold a 10–20 GiB workspace until TTL.
 //!
-//! Resume prefers `preserved/<execution>` bookmarks over legacy recovery names
-//! in the shared jj store, never from the originating working copy.
+//! Teardown preserves the workspace's unpublished edits as
+//! `preserved/<execution>` in the shared jj store immediately before the
+//! release. That step is best effort: a failure raises an inspection warning
+//! naming the lease and never keeps the lease held, so a recovery problem
+//! cannot strand a workspace. Resume reads those bookmarks, never the
+//! originating working copy.
 //!
 //! This is the release policy shared by completion's teardown and the engine's
 //! lease sweeps. Scanning the host for occupying processes, and the sweep that
@@ -29,8 +32,7 @@ use boss_engine_recovery::execution_bookmark::{BoundaryOwnership, WorkspaceTipSo
 use boss_execution_contracts::{CubeClient, HostAdapter};
 
 pub use boss_execution_contracts::{
-    BookmarkStatus, KeepReason, LeaseReleaseDecision, LeaseReleaseOutcome, Occupancy, PaneStatus, PreStartStage,
-    TerminalCause,
+    KeepReason, LeaseReleaseDecision, LeaseReleaseOutcome, Occupancy, PaneStatus, TerminalCause,
 };
 
 /// Workspace occupancy probe. Production walks process cwds; tests inject.
@@ -58,26 +60,16 @@ impl WorkspaceOccupancy for OwningHostOccupancy {
     }
 }
 
-/// Teardown preservation on the execution's owning host.
+/// Teardown preservation on the execution's owning host. Its outcome never
+/// decides whether the lease is released; a failure raises a
+/// `preserved_work_needs_inspection` attention item.
 #[async_trait::async_trait]
-pub trait BookmarkGate: Send + Sync {
-    async fn status(&self, execution: &WorkExecution) -> BookmarkStatus;
-
-    async fn status_for_cause(&self, execution: &WorkExecution, _cause: TerminalCause) -> BookmarkStatus {
-        self.status(execution).await
-    }
+pub trait Preservation: Send + Sync {
+    async fn preserve(&self, execution: &WorkExecution, cause: TerminalCause) -> Result<()>;
 }
 
 /// Pure policy. Callers still have to perform the cube release and DB clear.
-pub fn decide(
-    cause: TerminalCause,
-    bookmark: &BookmarkStatus,
-    pane: PaneStatus,
-    occupancy: Occupancy,
-) -> LeaseReleaseDecision {
-    if matches!(bookmark, BookmarkStatus::Unconfirmed(_)) {
-        return LeaseReleaseDecision::Keep(KeepReason::BookmarkUnconfirmed);
-    }
+pub fn decide(cause: TerminalCause, pane: PaneStatus, occupancy: Occupancy) -> LeaseReleaseDecision {
     if pane == PaneStatus::Present {
         return LeaseReleaseDecision::Keep(KeepReason::PaneStillPresent);
     }
@@ -94,60 +86,54 @@ pub fn decide(
 }
 
 /// Preserve unpublished work through jj on the owning host. A missing record
-/// is never evidence of an empty workspace.
-pub struct DbBookmarkGate<'a> {
+/// is never evidence of an empty workspace, except for an execution that never
+/// started and was never positioned: cube placed everything in that workspace.
+pub struct DbPreservation<'a> {
     pub db: &'a WorkDb,
     pub adapter: Option<&'a dyn HostAdapter>,
 }
 
-/// A [`DbBookmarkGate`] that asks the owning cube's registry whether this
+/// A [`DbPreservation`] that asks the owning cube's registry whether this
 /// execution still holds its workspace before inferred-death teardown reads
 /// the working copy; proven releases skip the registry check.
-pub struct CubeBookmarkGate<'a> {
-    gate: DbBookmarkGate<'a>,
+pub struct CubePreservation<'a> {
+    inner: DbPreservation<'a>,
     cube: &'a dyn CubeClient,
 }
 
-impl<'a> DbBookmarkGate<'a> {
+impl<'a> DbPreservation<'a> {
     pub fn new(db: &'a WorkDb, adapter: Option<&'a dyn HostAdapter>) -> Self {
         Self { db, adapter }
     }
 
-    pub fn with_cube(self, cube: &'a dyn CubeClient) -> CubeBookmarkGate<'a> {
-        CubeBookmarkGate { gate: self, cube }
+    pub fn with_cube(self, cube: &'a dyn CubeClient) -> CubePreservation<'a> {
+        CubePreservation { inner: self, cube }
     }
 }
 
 #[async_trait::async_trait]
-impl BookmarkGate for DbBookmarkGate<'_> {
-    async fn status(&self, execution: &WorkExecution) -> BookmarkStatus {
-        self.status_for_cause(execution, TerminalCause::ProvenCompleted).await
-    }
-
-    async fn status_for_cause(&self, execution: &WorkExecution, cause: TerminalCause) -> BookmarkStatus {
-        self.preserve_status(execution, cause, None).await
+impl Preservation for DbPreservation<'_> {
+    async fn preserve(&self, execution: &WorkExecution, cause: TerminalCause) -> Result<()> {
+        self.preserve_workspace(execution, cause, None).await
     }
 }
 
 #[async_trait::async_trait]
-impl BookmarkGate for CubeBookmarkGate<'_> {
-    async fn status(&self, execution: &WorkExecution) -> BookmarkStatus {
-        self.status_for_cause(execution, TerminalCause::ProvenCompleted).await
-    }
-
-    async fn status_for_cause(&self, execution: &WorkExecution, cause: TerminalCause) -> BookmarkStatus {
-        self.gate.preserve_status(execution, cause, Some(self.cube)).await
+impl Preservation for CubePreservation<'_> {
+    async fn preserve(&self, execution: &WorkExecution, cause: TerminalCause) -> Result<()> {
+        self.inner.preserve_workspace(execution, cause, Some(self.cube)).await
     }
 }
 
-/// Inferred death requires an owning-host registry check. Failure keeps the
-/// lease for retry. The workspace is read live only with positive ownership
-/// evidence: it still holds this execution's lease, or it is free again and
-/// cube's claim counter equals the one recorded for this lease, so no other
-/// lease was ever claimed on it. Anything else resolves only at this lease's
-/// boundary and never adopts later changes; a free workspace whose counter
-/// moved is never snapshotted and unrelated work is never reported. Rewrites
-/// of this execution's boundary change are still reported for inspection.
+/// Inferred death requires an owning-host registry check. A failed check
+/// raises an inspection attention item and does not hold the lease. The workspace is read
+/// live only with positive ownership evidence: it still holds this execution's
+/// lease, or it is free again and cube's claim counter equals the one recorded
+/// for this lease, so no other lease was ever claimed on it. Anything else
+/// resolves only at this lease's boundary and never adopts later changes; a
+/// free workspace whose counter moved is never snapshotted and unrelated work
+/// is never reported. Rewrites of this execution's boundary change are still
+/// reported for inspection.
 async fn workspace_tip_source(
     execution: &WorkExecution,
     boundary: Option<i64>,
@@ -214,58 +200,48 @@ async fn workspace_tip_source(
     ))
 }
 
-impl DbBookmarkGate<'_> {
-    async fn preserve_status(
+impl DbPreservation<'_> {
+    async fn preserve_workspace(
         &self,
         execution: &WorkExecution,
         cause: TerminalCause,
         cube: Option<&dyn CubeClient>,
-    ) -> BookmarkStatus {
+    ) -> Result<()> {
         // Read-only reviews never preserve or inherit implementation work.
         if execution.kind.never_writes_pr_branch() {
-            return BookmarkStatus::NotRequired;
+            return Ok(());
         }
-        let result: Result<()> = async {
-            // An open legacy creation/backup failure must not skip preserve().
-            // The row's source is what teardown needs; the failure item is
-            // about a previous attempt's bookmark write, not this run's work.
-            let record = self
-                .db
-                .preservation_source(&execution.id)?
-                .ok_or_else(|| anyhow::anyhow!("workspace recovery store location is unavailable for preservation"))?;
-            let workspace = execution
-                .workspace_path
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("workspace path unavailable for preservation"))?;
-            let recorded = self.db.preserved_tip(&execution.id)?;
-            let since_unix = execution.started_epoch().or_else(|| execution.created_epoch());
-            let (tip_source, ownership) = if matches!(cause, TerminalCause::Inferred) {
-                workspace_tip_source(
-                    execution,
-                    self.db.workspace_lease_boundary(&execution.id)?,
-                    self.db.workspace_lease_generation(&execution.id)?,
-                    cube,
-                    self.adapter,
-                )
-                .await?
-            } else {
-                (WorkspaceTipSource::Live, String::new())
-            };
-            let mut outcome = if let Some(adapter) = self.adapter {
-                adapter
-                    .confirm_workspace_recovery_from(
-                        &record,
-                        Path::new(workspace),
-                        recorded.as_ref(),
-                        since_unix,
-                        tip_source,
-                    )
-                    .await?
-            } else if record.host_id != "local" {
-                anyhow::bail!("owning host adapter is unavailable for remote preservation");
-            } else {
-                boss_engine_recovery::execution_bookmark::preserve_from(
-                    &boss_engine_recovery::execution_bookmark::LocalJj,
+        // An execution that never started and was never positioned holds only
+        // what cube placed in the workspace: there is no worker work to lose.
+        if never_positioned(self.db, execution) {
+            return Ok(());
+        }
+        // The row's source is what teardown needs.
+        let record = self
+            .db
+            .preservation_source(&execution.id)?
+            .ok_or_else(|| anyhow::anyhow!("workspace recovery store location is unavailable for preservation"))?;
+        let workspace = execution
+            .workspace_path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("workspace path unavailable for preservation"))?;
+        let recorded = self.db.preserved_tip(&execution.id)?;
+        let since_unix = execution.started_epoch().or_else(|| execution.created_epoch());
+        let (tip_source, ownership) = if matches!(cause, TerminalCause::Inferred) {
+            workspace_tip_source(
+                execution,
+                self.db.workspace_lease_boundary(&execution.id)?,
+                self.db.workspace_lease_generation(&execution.id)?,
+                cube,
+                self.adapter,
+            )
+            .await?
+        } else {
+            (WorkspaceTipSource::Live, String::new())
+        };
+        let mut outcome = if let Some(adapter) = self.adapter {
+            adapter
+                .confirm_workspace_recovery_from(
                     &record,
                     Path::new(workspace),
                     recorded.as_ref(),
@@ -273,42 +249,37 @@ impl DbBookmarkGate<'_> {
                     tip_source,
                 )
                 .await?
-            };
-            if let Some(inspect) = outcome.inspect.as_mut() {
-                inspect.reason.push_str(&format!("; {ownership}"));
-            }
-            match &outcome.tip {
-                Some(tip) => self.db.record_preserved_tip(&execution.id, tip)?,
-                None => self.db.clear_preserved_tip(&execution.id)?,
-            }
-            if let Some(inspect) = outcome.inspect {
-                raise_inspect_attention(self.db, execution, inspect);
-            }
-            Ok(())
+        } else if record.host_id != "local" {
+            anyhow::bail!("owning host adapter is unavailable for remote preservation");
+        } else {
+            boss_engine_recovery::execution_bookmark::preserve_from(
+                &boss_engine_recovery::execution_bookmark::LocalJj,
+                &record,
+                Path::new(workspace),
+                recorded.as_ref(),
+                since_unix,
+                tip_source,
+            )
+            .await?
+        };
+        if let Some(inspect) = outcome.inspect.as_mut() {
+            inspect.reason.push_str(&format!("; {ownership}"));
         }
-        .await;
-        match result {
-            Ok(()) => BookmarkStatus::Confirmed,
-            Err(err) => BookmarkStatus::Unconfirmed(format!("{err:#}")),
+        match &outcome.tip {
+            Some(tip) => self.db.record_preserved_tip(&execution.id, tip)?,
+            None => self.db.clear_preserved_tip(&execution.id)?,
         }
+        if let Some(inspect) = outcome.inspect {
+            raise_inspect_attention(self.db, execution, inspect);
+        }
+        Ok(())
     }
 }
 
-/// An open recovery creation or backup failure for this execution. Dispatch
-/// resolves it once a later attempt writes its own bookmark, so an open one
-/// always belongs to the attempt whose lease is being released. Unreadable
-/// attention state counts as a failure: it is never evidence of a clean run.
-pub fn has_open_bookmark_failure(db: &WorkDb, execution_id: &str) -> bool {
-    db.list_attention_items(execution_id).map_or(true, |items| {
-        items.iter().any(|item| {
-            item.status == "open"
-                && matches!(
-                    item.kind.as_str(),
-                    boss_engine_storage_values::attention_kinds::EXECUTION_BOOKMARK_RECOVERY_FAILED_ATTENTION_KIND
-                        | boss_engine_storage_values::attention_kinds::EXECUTION_BOOKMARK_CREATE_FAILED_ATTENTION_KIND
-                )
-        })
-    })
+/// The execution never ran a worker and no recovery record was written for
+/// it, so its workspace holds nothing that cube did not place there.
+pub fn never_positioned(db: &WorkDb, execution: &WorkExecution) -> bool {
+    execution.started_at.is_none() && matches!(db.preservation_source(&execution.id), Ok(None))
 }
 
 /// The directory is positively known not to exist (not merely unreadable).
@@ -321,7 +292,7 @@ pub struct ReleaseEvidence<'a> {
     pub cause: TerminalCause,
     pub pane: PaneStatus,
     pub occupancy: &'a dyn WorkspaceOccupancy,
-    pub bookmark: &'a dyn BookmarkGate,
+    pub preservation: &'a dyn Preservation,
 }
 
 /// Always-empty occupancy, for proven-death paths that do not scan.
@@ -333,9 +304,10 @@ impl WorkspaceOccupancy for EmptyOccupancy {
     }
 }
 
-/// Release `lease_id` for `execution` when [`decide`] says so. Cube is
-/// claimed with a compare-and-clear before cube is called. Only the claim
-/// owner may restore the lease after a genuine release failure.
+/// Release `lease_id` for `execution` when [`decide`] says so, after one
+/// best-effort teardown preservation. Cube is claimed with a compare-and-clear
+/// before cube is called. Only the claim owner may restore the lease after a
+/// genuine release failure.
 pub async fn apply_release(
     db: &WorkDb,
     execution: &WorkExecution,
@@ -362,7 +334,7 @@ pub async fn apply_release(
         cause,
         pane,
         occupancy,
-        bookmark,
+        preservation,
     } = evidence;
     let local = matches!(db.execution_host_id(&execution.id), Ok(None))
         || matches!(db.execution_host_id(&execution.id), Ok(Some(host)) if host == "local");
@@ -374,35 +346,8 @@ pub async fn apply_release(
         },
         _ => Occupancy::Empty,
     };
-    // Pane and occupancy verdicts come first. Confirming the bookmark
-    // snapshots the working copy and may create a preserved bookmark in the
-    // shared store, which must not race a worker that may still be running
-    // jj in this workspace.
-    let bookmark_status = if matches!(
-        decide(cause, &BookmarkStatus::NotRequired, pane, occupancy_status),
-        LeaseReleaseDecision::Release
-    ) {
-        bookmark.status_for_cause(execution, cause).await
-    } else {
-        BookmarkStatus::NotRequired
-    };
-    match decide(cause, &bookmark_status, pane, occupancy_status) {
+    match decide(cause, pane, occupancy_status) {
         LeaseReleaseDecision::Keep(reason) => {
-            if matches!(reason, KeepReason::BookmarkUnconfirmed) {
-                let detail = match &bookmark_status {
-                    BookmarkStatus::Unconfirmed(msg) => msg.clone(),
-                    _ => reason.label().to_owned(),
-                };
-                raise_unreleased_attention(
-                    db,
-                    execution,
-                    "Workspace lease held: recovery bookmark unconfirmed",
-                    &format!(
-                        "The cube workspace lease `{lease_id}` was not released because the recovery bookmark \
-                         for this run could not be confirmed. The lease stays held until cube's TTL. {detail}"
-                    ),
-                );
-            }
             tracing::info!(
                 execution_id = %execution.id,
                 lease_id,
@@ -412,6 +357,14 @@ pub async fn apply_release(
             LeaseReleaseOutcome::Kept { reason }
         }
         LeaseReleaseDecision::Release => {
+            // Pane and occupancy verdicts come first. Preserving snapshots the
+            // working copy and may create a preserved bookmark in the shared
+            // store, which must not race a worker that may still be running
+            // jj in this workspace. A failure is reported and the lease is
+            // returned regardless: recovery trouble never strands a workspace.
+            if let Err(err) = preservation.preserve(execution, cause).await {
+                report_preservation_failure(db, execution, lease_id, &err);
+            }
             match db.claim_execution_workspace_release(&execution.id, lease_id) {
                 Ok(true) => {}
                 Ok(false) => return LeaseReleaseOutcome::NoLease,
@@ -502,30 +455,20 @@ pub async fn release_refused_workspace(
             cause: TerminalCause::ProvenNeverStarted,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &NeverPositioned,
+            preservation: &NoPreservation,
         },
         adapter.force_release_lease(lease_id, Some("refused occupied workspace; preserve checkout")),
     )
     .await
 }
 
-/// Only a failure that precedes any bookmark row may skip confirmation: a row
-/// means pointers exist that the release must not strand, and an open
-/// creation or backup failure means the bookmark write itself may have left
-/// work behind that no row records. A lease retained from a previous attempt
-/// therefore keeps its bookmark gate whatever stage the caller assumes.
-pub fn never_positioned(db: &WorkDb, execution_id: &str, stage: PreStartStage) -> bool {
-    stage == PreStartStage::BeforeRecoveryBookmark
-        && matches!(db.execution_bookmark_optional(execution_id), Ok(None))
-        && !has_open_bookmark_failure(db, execution_id)
-}
-
-pub struct NeverPositioned;
+/// Preserves nothing: for a workspace this execution never positioned.
+pub struct NoPreservation;
 
 #[async_trait::async_trait]
-impl BookmarkGate for NeverPositioned {
-    async fn status(&self, _: &WorkExecution) -> BookmarkStatus {
-        BookmarkStatus::NotRequired
+impl Preservation for NoPreservation {
+    async fn preserve(&self, _: &WorkExecution, _: TerminalCause) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -535,7 +478,6 @@ pub async fn release_lease_after_proven_never_started(
     execution: &WorkExecution,
     lease_id: &str,
     adapter: &dyn boss_execution_contracts::HostAdapter,
-    stage: PreStartStage,
 ) -> LeaseReleaseOutcome {
     let current = match work_db.get_execution(&execution.id) {
         Ok(row) if row.cube_lease_id.as_deref() == Some(lease_id) => row,
@@ -571,12 +513,6 @@ pub async fn release_lease_after_proven_never_started(
             },
         };
     }
-    let db_gate = DbBookmarkGate::new(work_db, Some(adapter));
-    let bookmark: &dyn BookmarkGate = if never_positioned(work_db, &execution.id, stage) {
-        &NeverPositioned
-    } else {
-        &db_gate
-    };
     apply_release(
         work_db,
         execution,
@@ -585,7 +521,7 @@ pub async fn release_lease_after_proven_never_started(
             cause: TerminalCause::ProvenNeverStarted,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark,
+            preservation: &DbPreservation::new(work_db, Some(adapter)),
         },
         adapter.release_workspace(lease_id),
     )
@@ -606,8 +542,28 @@ fn raise_inspect_attention(
     }
 }
 
-pub fn raise_unreleased_attention(db: &WorkDb, execution: &WorkExecution, title: &str, body: &str) {
-    raise_attention(db, execution, LEASE_UNRELEASED_ATTENTION_KIND, title, body);
+/// Teardown could not preserve the workspace's edits. The lease is released
+/// anyway, so this is the one durable pointer to the unbookmarked work.
+fn report_preservation_failure(db: &WorkDb, execution: &WorkExecution, lease_id: &str, err: &anyhow::Error) {
+    tracing::warn!(
+        execution_id = %execution.id,
+        lease_id,
+        error = %format!("{err:#}"),
+        "teardown could not preserve the workspace; releasing the lease anyway",
+    );
+    let inspect = boss_engine_recovery::execution_bookmark::PreserveInspect {
+        existing_commit_id: None,
+        workspace_change_id: None,
+        workspace_commit_id: None,
+        workspace_count: None,
+        reason: format!(
+            "Teardown could not preserve this run's workspace edits ({err:#}); lease `{lease_id}` was released \
+             anyway. The worker's last working-copy commit is not bookmarked as `preserved/{id}`; locate it in the \
+             shared jj store (for example with `jj op log`)",
+            id = execution.id
+        ),
+    };
+    raise_inspect_attention(db, execution, inspect);
 }
 
 pub fn raise_attention(db: &WorkDb, execution: &WorkExecution, kind: &str, title: &str, body: &str) {
@@ -659,10 +615,11 @@ pub fn resolve_unreleased_attention(db: &WorkDb, execution_id: &str) {
 /// Release a remote worker's lease through the claimed release policy, for
 /// every path that releases on the strength of a recorded pid or a finished
 /// turn rather than a confirmed stop. The remote worker cannot be stopped by
-/// this engine, so the owning host's recovery bookmark and workspace
-/// occupancy (both probed through `host`) must confirm; an inconclusive
-/// probe keeps the lease. `release` performs the cube call for the lease id
-/// it is handed. Returns what actually happened.
+/// this engine, so the owning host's workspace occupancy (probed through
+/// `host`) must confirm; an inconclusive probe keeps the lease. Teardown
+/// preservation runs on that host first and never holds the lease. `release`
+/// performs the cube call for the lease id it is handed. Returns what
+/// actually happened.
 pub async fn release_remote_lease<Fut: std::future::Future<Output = anyhow::Result<()>>>(
     work_db: &WorkDb,
     host: &dyn boss_execution_contracts::HostAdapter,
@@ -700,7 +657,7 @@ pub async fn release_remote_lease<Fut: std::future::Future<Output = anyhow::Resu
             cause: TerminalCause::Inferred,
             pane,
             occupancy: &OwningHostOccupancy(occupancy),
-            bookmark: &DbBookmarkGate::new(work_db, Some(host)),
+            preservation: &DbPreservation::new(work_db, Some(host)),
         },
         release(lease_id.clone()),
     )

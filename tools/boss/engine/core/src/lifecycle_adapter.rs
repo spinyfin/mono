@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use boss_dispatch_events::DispatchEventSink;
 use boss_execution_contracts::{
     CubeClient, ExecutionPublisher, ExecutionRunner, HostAdapter, HostAdapterProvider, LeaseReleaseOutcome,
-    LifecycleServices, LiveWorkerLiveness, NoopExecutionPublisher, PaneStatus, PidStatus, PreStartStage,
-    ReattachSummary, RemoteLeaseReconcileOutcome, TeardownReason, TerminalCause, WorkerPaneReleaser, WorkerPool,
+    LifecycleServices, LiveWorkerLiveness, NoopExecutionPublisher, PaneStatus, PidStatus, ReattachSummary,
+    RemoteLeaseReconcileOutcome, TeardownReason, TerminalCause, WorkerPaneReleaser, WorkerPool,
 };
 use boss_protocol::WorkExecution;
 
@@ -125,7 +125,7 @@ impl LifecycleServices for CoreLifecycleServices {
                 cause,
                 pane: PaneStatus::Gone,
                 occupancy: &crate::workspace_lease_release::EmptyOccupancy,
-                bookmark: &crate::workspace_lease_release::DbBookmarkGate::new(&self.work_db, Some(adapter)),
+                preservation: &crate::workspace_lease_release::DbPreservation::new(&self.work_db, Some(adapter)),
             },
             adapter.release_workspace_with_reset(lease_id),
         )
@@ -137,14 +137,12 @@ impl LifecycleServices for CoreLifecycleServices {
         execution: &WorkExecution,
         lease_id: &str,
         adapter: &dyn HostAdapter,
-        stage: PreStartStage,
     ) -> LeaseReleaseOutcome {
         crate::workspace_lease_release::release_lease_after_proven_never_started(
             &self.work_db,
             execution,
             lease_id,
             adapter,
-            stage,
         )
         .await
     }

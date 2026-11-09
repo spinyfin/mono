@@ -1212,13 +1212,7 @@ mod validation {
     pub(crate) fn store_operation(kind: Kind) -> bool {
         matches!(
             kind,
-            Kind::DiffBookmark
-                | Kind::DiscardBaseline
-                | Kind::CheckpointBaseline
-                | Kind::ReleaseHeads
-                | Kind::ReleaseHeadsConfigured
-                | Kind::CheckPreservedUnpublished
-                | Kind::PruneBookmark
+            Kind::DiffBookmark | Kind::CheckpointBaseline | Kind::CheckPreservedUnpublished | Kind::PruneBookmark
         )
     }
 
@@ -1430,31 +1424,18 @@ mod validation {
                 }
                 allowed.request_json.clone_from(&op.request_json);
             }
-            Kind::ReleaseHeadsConfigured => {
-                ensure!(
-                    !op.request_json.is_empty(),
-                    "configured release requires its request payload"
-                );
-                crate::recovery_ops::parse_request(&op.request_json)?;
-                allowed.request_json.clone_from(&op.request_json);
-            }
-            Kind::ReleaseHeads
-            | Kind::Release
+            Kind::Release
             | Kind::Status
             | Kind::ListWorkspaces
             | Kind::ListRepos
             | Kind::DiffBookmark
-            | Kind::DiscardBaseline
             | Kind::CheckpointBaseline => {}
         }
         if matches!(
             kind,
             Kind::DiffBookmark
                 | Kind::RestoreBookmark
-                | Kind::DiscardBaseline
                 | Kind::CheckpointBaseline
-                | Kind::ReleaseHeads
-                | Kind::ReleaseHeadsConfigured
                 | Kind::ConfirmRecovery
                 | Kind::RestorePreserved
                 | Kind::CheckPreservedUnpublished
@@ -1853,25 +1834,9 @@ pub mod workspace {
                                     *phase = Phase::Effect;
                                     json!(recovery::restore_for_retry(&LocalJj, &record, &path, op.self_retry).await?)
                                 }
-                                Kind::DiscardBaseline => {
-                                    *phase = Phase::Effect;
-                                    recovery::discard_orphaned_baseline(&LocalJj, &record).await?;
-                                    json!({})
-                                }
                                 Kind::CheckpointBaseline => {
                                     *phase = Phase::Effect;
                                     json!(record.base_commit.clone().unwrap_or_default())
-                                }
-                                Kind::ReleaseHeads | Kind::ReleaseHeadsConfigured => {
-                                    *phase = Phase::Effect;
-                                    let release_names = if kind == Kind::ReleaseHeadsConfigured {
-                                        crate::recovery_ops::parse_request(&op.request_json)?
-                                            .release_names
-                                            .unwrap_or(true)
-                                    } else {
-                                        true
-                                    };
-                                    json!(recovery::release_heads(&LocalJj, &record, release_names).await?)
                                 }
                                 Kind::ConfirmRecovery => {
                                     *phase = Phase::Effect;
@@ -2177,7 +2142,10 @@ mod tests {
             pr_head_before: String::new(),
         };
         for number in 1..=27 {
-            let kind = Kind::try_from(number).unwrap();
+            // Retired kinds have their numbers reserved in the schema.
+            let Ok(kind) = Kind::try_from(number) else {
+                continue;
+            };
             let mut request = op(kind);
             if crate::validation::retired_operation(kind) {
                 let error = validate_workspace(&request, Some(&assignment)).unwrap_err();
@@ -2205,9 +2173,7 @@ mod tests {
                     request.trunk = "main".into();
                     request.request_json = b"{}".to_vec();
                 }
-                Kind::ConfirmRecovery | Kind::RestorePreserved | Kind::ReleaseHeadsConfigured => {
-                    request.request_json = b"{}".to_vec()
-                }
+                Kind::ConfirmRecovery | Kind::RestorePreserved => request.request_json = b"{}".to_vec(),
                 Kind::CheckPreservedUnpublished => {
                     request.request_json = serde_json::to_vec(
                         &serde_json::json!({"recorded": {"commit_id": "a".repeat(40), "change_id": "k".repeat(32), "count": 1}}),

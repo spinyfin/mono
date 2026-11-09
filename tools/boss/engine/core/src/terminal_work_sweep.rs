@@ -1395,15 +1395,17 @@ mod tests {
             "execution must be marked orphaned since deletion never tore it down",
         );
 
-        // Reaping alone is insufficient: no recovery pointer was recorded
-        // for this fixture, so the lease must remain held with attention.
-        assert!(cube.force_released.lock().unwrap().is_empty());
-        assert_eq!(execution.cube_lease_id.as_deref(), Some(lease_id));
+        // Reaping releases the lease too. No recovery pointer was recorded
+        // for this fixture, so teardown cannot preserve anything: it says so
+        // in an inspection warning and still returns the workspace.
+        assert_eq!(cube.force_released.lock().unwrap().len(), 1);
+        assert_eq!(execution.cube_lease_id.as_deref(), None);
+        let items = db.list_attention_items(&execution_id).unwrap();
+        assert!(items.iter().any(|item| item.kind == "preserved_work_needs_inspection"));
         assert!(
-            db.list_attention_items(&execution_id)
-                .unwrap()
+            items
                 .iter()
-                .any(|item| item.kind == crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND)
+                .all(|item| item.kind != crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND)
         );
 
         let events = sink.events().await;

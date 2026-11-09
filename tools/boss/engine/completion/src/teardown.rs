@@ -294,7 +294,7 @@ impl WorkerCompletionHandler {
                                 cause: crate::workspace_lease_release::TerminalCause::ProvenCompleted,
                                 pane: pane_status,
                                 occupancy: &crate::workspace_lease_release::EmptyOccupancy,
-                                bookmark: &crate::workspace_lease_release::DbBookmarkGate::new(&self.work_db, None),
+                                preservation: &crate::workspace_lease_release::DbPreservation::new(&self.work_db, None),
                             },
                             timed,
                         )

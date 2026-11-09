@@ -43,14 +43,6 @@ impl HostAdapter for FlakyRestoreAdapter {
         self.inner.recovery_pr_base(origin, pr).await
     }
 
-    async fn release_execution_bookmark_heads(
-        &self,
-        record: &ExecutionBookmark,
-        release_names: bool,
-    ) -> Result<Vec<(String, String)>> {
-        self.inner.release_execution_bookmark_heads(record, release_names).await
-    }
-
     async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {
         self.inner.execution_bookmark_diff(record).await
     }
@@ -118,10 +110,6 @@ impl HostAdapter for FlakyRestoreAdapter {
         self.inner
             .create_execution_bookmark(workspace, execution_id, predecessor, inherited_base)
             .await
-    }
-
-    async fn discard_orphaned_execution_baseline(&self, record: &ExecutionBookmark) -> Result<()> {
-        self.inner.discard_orphaned_execution_baseline(record).await
     }
 
     async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus> {

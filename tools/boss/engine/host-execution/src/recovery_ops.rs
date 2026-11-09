@@ -130,7 +130,7 @@ mod tests {
         assert!(parse_request(b"{\"tip_source\": \"Nowhere\"}").is_err());
         // Unknown fields are ignored: new semantics always use a new WorkspaceKind,
         // so an extra JSON field must not change this kind's meaning.
-        assert!(parse_request(b"{\"release_names\": false, \"future\": 1}").is_ok());
+        assert!(parse_request(b"{\"future\": 1}").is_ok());
     }
 
     #[test]
@@ -145,7 +145,6 @@ mod tests {
             }),
             since_unix: Some(1_700_000_000),
             tip_source: Some(WorkspaceTipSource::Live),
-            release_names: Some(false),
             vouchers: vec![
                 recovery::HostVoucher::Commit {
                     label: "PR #1 head".into(),
@@ -165,7 +164,6 @@ mod tests {
             },
             "since_unix": 1_700_000_000,
             "tip_source": "Live",
-            "release_names": false,
             "vouchers": [
                 {"Commit": {"label": "PR #1 head", "commit_id": commit.as_str()}},
                 {"RemoteBookmark": {"name": "boss/exec_1", "remote": "origin"}}
@@ -372,30 +370,6 @@ mod tests {
 
         let bookmark = created.bookmark.as_ref().unwrap();
         boss_engine_test_git::jj::JjRepo::run(&repo.worker, &["bookmark", "set", &bookmark.head, "-r", "@"]);
-        // The old kind must reject the new payload rather than delete names.
-        let mut old_release = op(Kind::ReleaseHeads);
-        old_release.bookmark = created.bookmark.clone();
-        (old_release.workspace_id, old_release.lease_id) = Default::default();
-        old_release.request_json = payload(&HostRecoveryRequest {
-            release_names: Some(false),
-            ..Default::default()
-        });
-        let rejected = executor.execute(&command(old_release), false, 1).await;
-        assert_eq!(rejected.code, v1::ResultCode::Rejected as i32, "{}", rejected.reason);
-
-        let mut release = op(Kind::ReleaseHeadsConfigured);
-        release.request_json = payload(&HostRecoveryRequest {
-            release_names: Some(false),
-            ..Default::default()
-        });
-        release.bookmark = created.bookmark.clone();
-        (release.workspace_id, release.lease_id) = Default::default();
-        let released = executor.execute(&command(release), false, 1).await;
-        assert_eq!(released.code, v1::ResultCode::Ok as i32, "{}", released.reason);
-        let bookmark = created.bookmark.as_ref().unwrap();
-        let names = boss_engine_test_git::jj::JjRepo::run(&repo.worker, &["bookmark", "list", &bookmark.head]);
-        assert!(names.contains(&bookmark.head), "publication bookmark retained: {names}");
-
         let fresh = executor.execute(&command(op(Kind::StartFresh)), false, 1).await;
         assert_eq!(fresh.code, v1::ResultCode::Ok as i32, "{}", fresh.reason);
         let Some(command_result::Value::Workspace(fresh)) = fresh.value else {

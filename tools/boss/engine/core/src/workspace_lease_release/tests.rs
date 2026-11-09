@@ -17,16 +17,17 @@ impl WorkspaceOccupancy for FixedOccupancy {
     }
 }
 
-struct FixedBookmark(BookmarkStatus);
+/// A preservation outcome fixed by the test.
+struct FixedPreservation(std::result::Result<(), &'static str>);
 #[async_trait::async_trait]
-impl BookmarkGate for FixedBookmark {
-    async fn status(&self, _: &WorkExecution) -> BookmarkStatus {
-        self.0.clone()
+impl Preservation for FixedPreservation {
+    async fn preserve(&self, _: &WorkExecution, _: TerminalCause) -> Result<()> {
+        self.0.map_err(|message| anyhow::anyhow!(message))
     }
 }
 
 fn decide_release(cause: TerminalCause) -> LeaseReleaseDecision {
-    decide(cause, &BookmarkStatus::NotRequired, PaneStatus::Gone, Occupancy::Empty)
+    decide(cause, PaneStatus::Gone, Occupancy::Empty)
 }
 
 #[test]
@@ -56,12 +57,7 @@ fn proven_stopped_releases_when_pane_gone() {
 #[test]
 fn proven_stopped_keeps_when_pane_present() {
     assert_eq!(
-        decide(
-            TerminalCause::ProvenStopped,
-            &BookmarkStatus::NotRequired,
-            PaneStatus::Present,
-            Occupancy::Empty,
-        ),
+        decide(TerminalCause::ProvenStopped, PaneStatus::Present, Occupancy::Empty),
         LeaseReleaseDecision::Keep(KeepReason::PaneStillPresent)
     );
 }
@@ -74,12 +70,7 @@ fn inferred_releases_when_pane_gone_and_empty() {
 #[test]
 fn inferred_keeps_when_a_process_is_in_the_workspace() {
     assert_eq!(
-        decide(
-            TerminalCause::Inferred,
-            &BookmarkStatus::NotRequired,
-            PaneStatus::Gone,
-            Occupancy::Occupied,
-        ),
+        decide(TerminalCause::Inferred, PaneStatus::Gone, Occupancy::Occupied),
         LeaseReleaseDecision::Keep(KeepReason::ProcessInWorkspace)
     );
 }
@@ -87,26 +78,8 @@ fn inferred_keeps_when_a_process_is_in_the_workspace() {
 #[test]
 fn inferred_keeps_when_occupancy_is_unknown() {
     assert_eq!(
-        decide(
-            TerminalCause::Inferred,
-            &BookmarkStatus::NotRequired,
-            PaneStatus::Gone,
-            Occupancy::Unknown,
-        ),
+        decide(TerminalCause::Inferred, PaneStatus::Gone, Occupancy::Unknown),
         LeaseReleaseDecision::Keep(KeepReason::OccupancyUnconfirmed)
-    );
-}
-
-#[test]
-fn bookmark_unconfirmed_keeps_even_for_proven_completion() {
-    assert_eq!(
-        decide(
-            TerminalCause::ProvenCompleted,
-            &BookmarkStatus::Unconfirmed("jj bookmark missing".into()),
-            PaneStatus::Gone,
-            Occupancy::Empty,
-        ),
-        LeaseReleaseDecision::Keep(KeepReason::BookmarkUnconfirmed)
     );
 }
 
@@ -131,7 +104,7 @@ async fn apply_with(
     execution: &WorkExecution,
     cause: TerminalCause,
     occupancy: Occupancy,
-    bookmark: BookmarkStatus,
+    preservation: std::result::Result<(), &'static str>,
     release: Result<()>,
 ) -> LeaseReleaseOutcome {
     let lease = execution.cube_lease_id.clone().unwrap();
@@ -143,7 +116,7 @@ async fn apply_with(
             cause,
             pane: PaneStatus::Gone,
             occupancy: &FixedOccupancy(occupancy),
-            bookmark: &FixedBookmark(bookmark),
+            preservation: &FixedPreservation(preservation),
         },
         async { release },
     )
@@ -159,7 +132,7 @@ async fn apply_releases_completed_and_clears_columns() {
         &execution,
         TerminalCause::ProvenCompleted,
         Occupancy::Empty,
-        BookmarkStatus::Confirmed,
+        Ok(()),
         Ok(()),
     )
     .await;
@@ -178,7 +151,7 @@ async fn apply_releases_never_started_failure() {
         &execution,
         TerminalCause::ProvenNeverStarted,
         Occupancy::Occupied,
-        BookmarkStatus::NotRequired,
+        Ok(()),
         Ok(()),
     )
     .await;
@@ -195,7 +168,7 @@ async fn apply_releases_cancelled_when_pane_gone() {
         &execution,
         TerminalCause::ProvenStopped,
         Occupancy::Empty,
-        BookmarkStatus::NotRequired,
+        Ok(()),
         Ok(()),
     )
     .await;
@@ -211,7 +184,7 @@ async fn apply_keeps_inferred_when_a_process_is_in_the_workspace() {
         &execution,
         TerminalCause::Inferred,
         Occupancy::Occupied,
-        BookmarkStatus::NotRequired,
+        Ok(()),
         Ok(()),
     )
     .await;
@@ -228,7 +201,7 @@ async fn apply_keeps_inferred_when_a_process_is_in_the_workspace() {
 }
 
 #[tokio::test]
-async fn apply_keeps_and_files_attention_when_bookmark_is_unconfirmed() {
+async fn failed_preservation_warns_and_still_releases_the_lease() {
     let (_dir, db) = open_db();
     let execution = seed_terminal(&db, ExecutionStatus::Completed, "lease-bm");
     let released = Arc::new(Mutex::new(false));
@@ -241,7 +214,7 @@ async fn apply_keeps_and_files_attention_when_bookmark_is_unconfirmed() {
             cause: TerminalCause::ProvenCompleted,
             pane: PaneStatus::Gone,
             occupancy: &FixedOccupancy(Occupancy::Empty),
-            bookmark: &FixedBookmark(BookmarkStatus::Unconfirmed("bookmark write failed".into())),
+            preservation: &FixedPreservation(Err("preserved bookmark write failed")),
         },
         async move {
             *flag.lock().unwrap() = true;
@@ -249,25 +222,85 @@ async fn apply_keeps_and_files_attention_when_bookmark_is_unconfirmed() {
         },
     )
     .await;
+    assert_eq!(outcome, LeaseReleaseOutcome::Released);
+    assert!(
+        *released.lock().unwrap(),
+        "an unpreserved workspace must not keep the lease held"
+    );
+    assert_eq!(db.get_execution(&execution.id).unwrap().cube_lease_id.as_deref(), None);
+    let items = db.list_attention_items(&execution.id).unwrap();
+    let warning = items
+        .iter()
+        .find(|item| {
+            item.kind == boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND
+                && item.status == "open"
+        })
+        .expect("an inspection warning names the unpreserved work");
+    assert!(warning.body_markdown.contains("preserved bookmark write failed"));
+    assert!(warning.body_markdown.contains("lease-bm"));
+    assert!(
+        items.iter().all(|item| item.kind != LEASE_UNRELEASED_ATTENTION_KIND),
+        "no lease is held, so no unreleased-lease item is filed"
+    );
+}
+
+#[tokio::test]
+async fn failed_preservation_folds_into_an_open_inspection_item() {
+    let (_dir, db) = open_db();
+    let execution = seed_terminal(&db, ExecutionStatus::Completed, "lease-second");
+    let kind = boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND;
+    db.upsert_execution_attention(
+        &execution.id,
+        kind,
+        "Preserved work needs inspection",
+        "Earlier evidence: existing preserved commit `abc123`.",
+    )
+    .unwrap();
+    let outcome = apply_release(
+        &db,
+        &execution,
+        "lease-second",
+        ReleaseEvidence {
+            cause: TerminalCause::ProvenCompleted,
+            pane: PaneStatus::Gone,
+            occupancy: &FixedOccupancy(Occupancy::Empty),
+            preservation: &FixedPreservation(Err("second bookmark write failed")),
+        },
+        async { Ok(()) },
+    )
+    .await;
+    assert_eq!(outcome, LeaseReleaseOutcome::Released);
+    let items = db.list_attention_items(&execution.id).unwrap();
+    let open: Vec<_> = items.iter().filter(|i| i.kind == kind && i.status == "open").collect();
+    assert_eq!(open.len(), 1, "the failure folds into the open item");
+    let body = &open[0].body_markdown;
+    assert!(body.contains("Earlier evidence: existing preserved commit `abc123`."));
+    assert!(body.contains("second bookmark write failed"));
+    assert!(body.contains("lease-second"));
+}
+
+#[tokio::test]
+async fn preservation_does_not_run_while_a_gate_keeps_the_lease() {
+    let (_dir, db) = open_db();
+    let execution = seed_terminal(&db, ExecutionStatus::Orphaned, "lease-occupied");
+    let outcome = apply_with(
+        &db,
+        &execution,
+        TerminalCause::Inferred,
+        Occupancy::Occupied,
+        Err("must not be attempted"),
+        Ok(()),
+    )
+    .await;
     assert_eq!(
         outcome,
         LeaseReleaseOutcome::Kept {
-            reason: KeepReason::BookmarkUnconfirmed
+            reason: KeepReason::ProcessInWorkspace
         }
     );
     assert!(
-        !*released.lock().unwrap(),
-        "cube must not be called when the bookmark is unconfirmed"
-    );
-    assert_eq!(
-        db.get_execution(&execution.id).unwrap().cube_lease_id.as_deref(),
-        Some("lease-bm")
-    );
-    let items = db.list_attention_items(&execution.id).unwrap();
-    assert!(
-        items
-            .iter()
-            .any(|item| item.kind == LEASE_UNRELEASED_ATTENTION_KIND && item.status == "open")
+        db.list_attention_items(&execution.id).unwrap().is_empty(),
+        "preservation snapshots the working copy, so it waits for the pane and occupancy verdicts"
     );
 }
 
@@ -280,7 +313,7 @@ async fn apply_keeps_lease_and_files_attention_when_cube_release_fails() {
         &execution,
         TerminalCause::ProvenCompleted,
         Occupancy::Empty,
-        BookmarkStatus::NotRequired,
+        Ok(()),
         Err(anyhow::anyhow!("cube unavailable")),
     )
     .await;
@@ -311,7 +344,7 @@ async fn stale_keep_cannot_resurrect_a_released_lease() {
             cause: TerminalCause::ProvenCompleted,
             pane: PaneStatus::Gone,
             occupancy: &FixedOccupancy(Occupancy::Empty),
-            bookmark: &FixedBookmark(BookmarkStatus::Unconfirmed("bookmark write failed".into())),
+            preservation: &FixedPreservation(Err("preserved bookmark write failed")),
         },
         async { Ok(()) },
     )
@@ -335,7 +368,7 @@ async fn stale_failure_cannot_resurrect_a_released_lease() {
             cause: TerminalCause::ProvenCompleted,
             pane: PaneStatus::Gone,
             occupancy: &FixedOccupancy(Occupancy::Empty),
-            bookmark: &FixedBookmark(BookmarkStatus::NotRequired),
+            preservation: &FixedPreservation(Ok(())),
         },
         async { Err(anyhow::anyhow!("cube timeout")) },
     )
@@ -394,7 +427,7 @@ async fn sweep_keeps_orphaned_row_when_occupancy_is_occupied() {
 }
 
 #[tokio::test]
-async fn db_bookmark_gate_rejects_a_record_without_a_pointer() {
+async fn db_preservation_errors_for_a_record_without_a_pointer() {
     let (_dir, db) = open_db();
     let execution = seed_terminal(&db, ExecutionStatus::Completed, "lease-rec");
     db.record_execution_bookmark(&ExecutionBookmark {
@@ -406,20 +439,48 @@ async fn db_bookmark_gate_rejects_a_record_without_a_pointer() {
         has_recovery_head: None,
     })
     .unwrap();
-    assert!(matches!(
-        DbBookmarkGate { db: &db, adapter: None }.status(&execution).await,
-        BookmarkStatus::Unconfirmed(_)
-    ));
+    assert!(
+        DbPreservation { db: &db, adapter: None }
+            .preserve(&execution, TerminalCause::ProvenCompleted)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
-async fn db_bookmark_gate_rejects_a_failed_or_missing_write() {
+async fn db_preservation_skips_a_workspace_this_execution_never_positioned() {
     let (_dir, db) = open_db();
     let execution = seed_terminal(&db, ExecutionStatus::Failed, "lease-none");
-    assert!(matches!(
-        DbBookmarkGate { db: &db, adapter: None }.status(&execution).await,
-        BookmarkStatus::Unconfirmed(_)
-    ));
+    assert!(execution.started_at.is_none());
+    DbPreservation { db: &db, adapter: None }
+        .preserve(&execution, TerminalCause::ProvenNeverStarted)
+        .await
+        .expect("cube placed everything in a workspace that was never positioned");
+}
+
+#[tokio::test]
+async fn db_preservation_errors_for_a_started_execution_without_a_record() {
+    let (_dir, db) = open_db();
+    let execution = seed_terminal(&db, ExecutionStatus::Ready, "lease-started");
+    db.start_execution_run(
+        &execution.id,
+        "worker",
+        "repo",
+        "lease-started",
+        "ws-1",
+        "/tmp/ws-started",
+    )
+    .unwrap();
+    db.cancel_execution(&execution.id).unwrap();
+    let execution = db.get_execution(&execution.id).unwrap();
+    assert!(execution.started_at.is_some());
+    assert!(
+        DbPreservation { db: &db, adapter: None }
+            .preserve(&execution, TerminalCause::ProvenStopped)
+            .await
+            .is_err(),
+        "a missing record is never evidence of an empty workspace"
+    );
 }
 
 #[test]
@@ -492,12 +553,7 @@ fn inconclusive_cwd_and_path_probes_keep_the_lease() {
     let occupancy = snapshot.occupancy(dir.path());
     assert_eq!(occupancy, Occupancy::Unknown);
     assert_eq!(
-        decide(
-            TerminalCause::Inferred,
-            &BookmarkStatus::Confirmed,
-            PaneStatus::Gone,
-            occupancy
-        ),
+        decide(TerminalCause::Inferred, PaneStatus::Gone, occupancy),
         LeaseReleaseDecision::Keep(KeepReason::OccupancyUnconfirmed)
     );
 }
@@ -545,7 +601,7 @@ async fn lease_not_found_is_success_without_attention() {
             &execution,
             TerminalCause::ProvenCompleted,
             Occupancy::Empty,
-            BookmarkStatus::Confirmed,
+            Ok(()),
             Err(error.into())
         )
         .await,
@@ -559,7 +615,7 @@ async fn lease_not_found_is_success_without_attention() {
 async fn concurrent_release_calls_cube_once() {
     let (_dir, db) = open_db();
     let execution = seed_terminal(&db, ExecutionStatus::Completed, "concurrent");
-    let bookmark = FixedBookmark(BookmarkStatus::Confirmed);
+    let preservation = FixedPreservation(Ok(()));
     let first = apply_release(
         &db,
         &execution,
@@ -568,7 +624,7 @@ async fn concurrent_release_calls_cube_once() {
             cause: TerminalCause::ProvenCompleted,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &bookmark,
+            preservation: &preservation,
         },
         async {
             assert_eq!(
@@ -580,7 +636,7 @@ async fn concurrent_release_calls_cube_once() {
                         cause: TerminalCause::ProvenCompleted,
                         pane: PaneStatus::Gone,
                         occupancy: &EmptyOccupancy,
-                        bookmark: &bookmark,
+                        preservation: &preservation,
                     },
                     async { panic!("duplicate cube release") }
                 )
@@ -608,7 +664,7 @@ async fn old_release_cannot_clear_or_restore_over_a_new_lease() {
                 cause: TerminalCause::ProvenCompleted,
                 pane: PaneStatus::Gone,
                 occupancy: &EmptyOccupancy,
-                bookmark: &FixedBookmark(BookmarkStatus::Confirmed),
+                preservation: &FixedPreservation(Ok(())),
             },
             async {
                 db.restore_execution_workspace(&execution.id, "new", Some("new-workspace"), Some("/tmp/new-workspace"))

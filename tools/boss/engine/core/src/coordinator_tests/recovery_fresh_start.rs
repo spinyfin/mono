@@ -1013,15 +1013,6 @@ impl crate::host_adapter::HostAdapter for ScratchDestination {
     async fn start_fresh_workspace(&self, workspace: &Path) -> Result<String> {
         self.inner.start_fresh_workspace(workspace).await
     }
-    async fn release_execution_bookmark_heads(
-        &self,
-        record: &recovery::ExecutionBookmark,
-        release_names: bool,
-    ) -> Result<Vec<(String, String)>> {
-        self.inner
-            .release_execution_bookmark_heads(&self.on_inner_store(record), release_names)
-            .await
-    }
     async fn create_execution_bookmark(
         &self,
         workspace: &Path,
@@ -1062,12 +1053,6 @@ impl crate::host_adapter::HostAdapter for ScratchDestination {
     ) -> Result<recovery::PreserveOutcome> {
         self.inner
             .confirm_workspace_recovery(&self.on_inner_store(record), workspace, recorded, since_unix)
-            .await
-    }
-
-    async fn discard_orphaned_execution_baseline(&self, record: &recovery::ExecutionBookmark) -> Result<()> {
-        self.inner
-            .discard_orphaned_execution_baseline(&self.on_inner_store(record))
             .await
     }
 

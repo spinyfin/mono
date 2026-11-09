@@ -2031,7 +2031,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn driver_start_timeout_holds_a_started_lease_without_a_preservation_source() {
+    async fn driver_start_timeout_releases_a_started_lease_and_reports_the_missing_preservation_source() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
@@ -2044,13 +2044,18 @@ mod tests {
         let cube = RecordingCube::default();
         let (outcome, _) = run_pass(&db, &live_states, &coordinator, &cube).await;
         assert_eq!(outcome.driver_start_reaped, 1);
-        assert!(
-            cube.released_lease_ids().is_empty(),
-            "a started run without a preservation source must keep the lease"
-        );
         assert_eq!(
-            db.get_execution(&execution_id).unwrap().cube_lease_id.as_deref(),
-            Some("lease-1")
+            cube.released_lease_ids(),
+            vec!["lease-1".to_owned()],
+            "a missing preservation source never keeps the lease"
+        );
+        assert!(db.get_execution(&execution_id).unwrap().cube_lease_id.is_none());
+        assert!(
+            db.list_attention_items(&execution_id)
+                .unwrap()
+                .iter()
+                .any(|item| item.kind == "preserved_work_needs_inspection"),
+            "a started run that could not be preserved is reported"
         );
     }
 
