@@ -101,48 +101,34 @@ async fn handle_trigger_pr_review_with<F, Fut>(
                 return;
             }
         };
-        // An explicit review does not override a park: a parked row is skipped
-        // by every automatic path, so a reviewer started here would only strand.
-        // The same typed "un-park it first" refusal `RequestExecution` gives.
-        if let Err(err) = work_db.refuse_if_parked(&owner.id) {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
-            return;
-        }
-        let result = if server_state.feature_flags.is_enabled("review_batch_fanout") {
-            async {
-                let pr_url = owner.pr_url.as_deref().ok_or_else(|| anyhow::anyhow!("task has no PR URL"))?;
-                let metadata = fetch_metadata(pr_url.to_owned()).await
-                    .map_err(|err| anyhow::anyhow!("cannot start review batch: PR metadata unavailable: {err}"))?;
-                match metadata.get("state").and_then(serde_json::Value::as_str) {
-                    Some("OPEN") => {}
-                    Some(state) => anyhow::bail!("cannot start review batch: PR is {state}"),
-                    None => anyhow::bail!("cannot start review batch: PR metadata omitted open state"),
+        let pool = server_state
+            .feature_flags
+            .is_enabled("review_batch_fanout")
+            .then_some(usize::from(server_state.review_pool_size));
+        let result = boss_engine_completion::review_admission::admit_review(
+            &work_db,
+            &owner.id,
+            owner.pr_url.as_deref(),
+            pool,
+            pr_checker,
+            fetch_metadata,
+        )
+        .await
+        .and_then(|admission| {
+            use boss_engine_completion::review_admission::ReviewAdmission;
+            match admission {
+                ReviewAdmission::Legacy(execution) => Ok(ReviewStartOutcome::Legacy(execution)),
+                ReviewAdmission::Batch(boss_work_db::ReviewBatchDispatch::Created { batch, executions }) => {
+                    BatchOutcome::new(batch, executions, false).map(ReviewStartOutcome::Batch)
                 }
-                let input = boss_engine_completion::review_batch_input_from_metadata(&work_db, &owner.id, pr_url, metadata)?;
-                match work_db.request_pre_merge_review_batch_for_pool(input, usize::from(server_state.review_pool_size))? {
-                    boss_work_db::ReviewBatchDispatch::Created { batch, executions } => {
-                        tracing::info!(batch_id = %batch.id, generation = batch.generation, "review start: admitted review batch");
-                        BatchOutcome::new(batch, executions, false)
-                    }
-                    boss_work_db::ReviewBatchDispatch::ExistingBatch { batch, executions } => {
-                        tracing::info!(batch_id = %batch.id, generation = batch.generation, "review start: reused active review batch");
-                        BatchOutcome::new(batch, executions, true)
-                    }
-                    other => anyhow::bail!("cannot start review batch: unexpected admission outcome {other:?}"),
+                ReviewAdmission::Batch(boss_work_db::ReviewBatchDispatch::ExistingBatch { batch, executions }) => {
+                    BatchOutcome::new(batch, executions, true).map(ReviewStartOutcome::Batch)
                 }
-            }.await
-            .map(ReviewStartOutcome::Batch)
-        } else {
-            work_db
-                .request_pr_review(&owner.id, pr_checker)
-                .map(ReviewStartOutcome::Legacy)
-        };
+                ReviewAdmission::Batch(other) => {
+                    anyhow::bail!("cannot start review batch: unexpected admission outcome {other:?}")
+                }
+            }
+        });
         match result {
             Ok(outcome) => {
                 let execution = outcome.execution();

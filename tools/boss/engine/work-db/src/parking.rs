@@ -46,11 +46,16 @@
 //!   names it. A task parked directly before or during the project's park
 //!   stays parked.
 //!
-//! Un-park only clears the columns and writes the ledger row; it does not
-//! refresh the PR, route conflicts or red CI, or re-mint executions.
-//! Section 1.5 of
+//! Un-park clears the columns and writes the ledger row (step 1 of the
+//! reconciliation sequence), and in the same transaction clears the stale halt
+//! stamps that predate the park (step 2, [`crate::parking_reconcile`]). It
+//! reports the rows it released ([`UnparkReport`]) and does nothing that needs
+//! GitHub: refreshing the PR, routing conflicts and red CI, scheduling the AI
+//! review, re-minting executions and flagging the item for progression are the
+//! background steps 3 to 7, run by `engine/core/src/unpark_reconcile.rs` from
+//! that report. Section 1.5 of
 //! `tools/boss/docs/designs/task-persistence-parking-and-autonomous-progression.md`
-//! specifies that sequence.
+//! specifies the whole sequence.
 //!
 //! ## Atrophy: who consults the predicate
 //!
@@ -147,6 +152,7 @@
 
 use super::*;
 use crate::executions_runs::CancelExecutionOpts;
+use crate::parking_reconcile::{self, UnparkReport};
 use boss_protocol::{LAST_STATUS_ACTOR_BOSS, LAST_STATUS_ACTOR_HUMAN, PARKED_VIA_DIRECT, parked_via_project};
 
 pub(super) const MIGRATION_ID: &str = "20261104_0145_task_parking";
@@ -609,34 +615,64 @@ impl WorkDb {
         reason: Option<&str>,
         actor: &str,
     ) -> Result<WorkItem> {
+        self.park_work_item_reporting(id, parked, reason, actor)
+            .map(|(item, _report)| item)
+    }
+
+    /// [`Self::park_work_item_as_actor`] that also reports every row an un-park
+    /// released and what step 2 of the reconciliation sequence did to each (the
+    /// report is empty for a park). The caller schedules the sequence's
+    /// background steps from it: see `engine/core/src/unpark_reconcile.rs`.
+    pub fn park_work_item_reporting(
+        &self,
+        id: &str,
+        parked: bool,
+        reason: Option<&str>,
+        actor: &str,
+    ) -> Result<(WorkItem, UnparkReport)> {
         authorize_actor(actor)?;
         let reason = reason.map(str::trim).filter(|reason| !reason.is_empty());
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut pending = PendingEvents::new();
         let now = now_string();
-        let item = match classify_id(id)? {
+        let (item, report) = match classify_id(id)? {
             ItemKind::Task => {
-                set_task_parked(&tx, &mut pending, id, parked, reason, actor, &now)?;
+                let report = set_task_parked(&tx, &mut pending, id, parked, reason, actor, &now)?;
                 let mut task = query_task(&tx, id).require("task", id)?;
                 project_for_work_item_updated(&tx, &mut task, "park_work_item");
-                task_to_item(task)
+                (task_to_item(task), report)
             }
             ItemKind::Project => {
-                set_project_parked(&tx, &mut pending, id, parked, reason, actor, &now)?;
-                WorkItem::Project(query_project(&tx, id).require("project", id)?)
+                let report = set_project_parked(&tx, &mut pending, id, parked, reason, actor, &now)?;
+                (
+                    WorkItem::Project(query_project(&tx, id).require("project", id)?),
+                    report,
+                )
             }
             ItemKind::Product => bail!("cannot park product {id}: parking applies to tasks, chores and projects"),
             ItemKind::Comment | ItemKind::Comparison => bail!("{id} is not a task, chore or project"),
         };
         commit_and_publish(tx, pending, self.event_bus())?;
-        Ok(item)
+        Ok((item, report))
     }
 
     /// `UpdateWorkItem` with `parked` set. A parking patch carries nothing else:
     /// park and un-park are their own request, so they cannot ride along with —
     /// or half-apply beside — an unrelated edit.
     pub(crate) fn apply_parking_patch(&self, id: &str, patch: &WorkItemPatch, actor: &str) -> Result<WorkItem> {
+        self.apply_parking_patch_reporting(id, patch, actor)
+            .map(|(item, _report)| item)
+    }
+
+    /// [`Self::apply_parking_patch`] with the un-park report, for the request
+    /// handler that schedules the reconciliation sequence.
+    pub fn apply_parking_patch_reporting(
+        &self,
+        id: &str,
+        patch: &WorkItemPatch,
+        actor: &str,
+    ) -> Result<(WorkItem, UnparkReport)> {
         anyhow::ensure!(
             patch.is_parking_only(),
             "`parked` cannot be combined with other fields in one update: send park and un-park as their own request"
@@ -644,7 +680,7 @@ impl WorkDb {
         let Some(parked) = patch.parked else {
             bail!("`parked_reason` needs `parked`: pass `parked = true` to park with a reason");
         };
-        self.park_work_item_as_actor(id, parked, patch.parked_reason.as_deref(), actor)
+        self.park_work_item_reporting(id, parked, patch.parked_reason.as_deref(), actor)
     }
 
     /// See [`is_parked`].
@@ -693,6 +729,8 @@ impl WorkDb {
     }
 }
 
+/// Park or un-park one task. An un-park returns the rows it released (the
+/// task and the revisions that inherited its stamp); a park returns none.
 fn set_task_parked(
     tx: &Connection,
     pending: &mut PendingEvents,
@@ -701,7 +739,7 @@ fn set_task_parked(
     reason: Option<&str>,
     actor: &str,
     now: &str,
-) -> Result<()> {
+) -> Result<UnparkReport> {
     let task = query_task(tx, id).require("task", id)?;
     let verb = if parked { "park" } else { "un-park" };
     if task.deleted_at.is_some() {
@@ -731,14 +769,14 @@ fn set_task_parked(
                 )?;
             }
             inherit_park_stamp_onto_open_revisions(tx, pending, id, actor, now, BASIS_PARKED)?;
-            return Ok(());
+            return Ok(UnparkReport::default());
         }
         stamp_task(tx, id, actor, reason, PARKED_VIA_DIRECT, now, BASIS_PARKED)?;
         inherit_park_stamp_onto_open_revisions(tx, pending, id, actor, now, BASIS_PARKED)?;
-        return Ok(());
+        return Ok(UnparkReport::default());
     }
     if task.parked_at.is_none() {
-        return Ok(());
+        return Ok(UnparkReport::default());
     }
     if let Some(project_id) = task.project_id.as_deref()
         && open_parked_project(tx, project_id)?.is_some()
@@ -747,6 +785,14 @@ fn set_task_parked(
             "cannot un-park {id}: it is parked because project {project_id} is parked — \
              run `boss project unpark {project_id}`. Rows the owner parked directly stay parked when the project is un-parked"
         );
+    }
+    // Step 2 of the reconciliation sequence reads each row as it was parked,
+    // so it runs before the park columns are cleared.
+    let revisions = parking_reconcile::directly_parked_revisions(tx, id)?;
+    let mut report = UnparkReport::default();
+    report.rows.push(parking_reconcile::release_row(tx, &task, actor)?);
+    for revision in &revisions {
+        report.rows.push(parking_reconcile::release_row(tx, revision, actor)?);
     }
     crate::task_status_audit::execute(
         tx,
@@ -765,7 +811,7 @@ fn set_task_parked(
            AND deleted_at IS NULL AND status NOT IN ('done', 'archived')",
         params![id, now, PARKED_VIA_DIRECT],
     )?;
-    Ok(())
+    Ok(report)
 }
 
 fn stamp_task(
@@ -828,7 +874,7 @@ fn inherit_park_stamp_onto_open_revisions(
     Ok(())
 }
 
-fn open_revision_ids(tx: &Connection, parent_id: &str) -> Result<Vec<String>> {
+pub(crate) fn open_revision_ids(tx: &Connection, parent_id: &str) -> Result<Vec<String>> {
     Ok(tx
         .prepare(
             "SELECT id FROM tasks
@@ -840,6 +886,8 @@ fn open_revision_ids(tx: &Connection, parent_id: &str) -> Result<Vec<String>> {
         .collect::<rusqlite::Result<_>>()?)
 }
 
+/// Park or un-park a project and, for an un-park, report the cascaded rows it
+/// released (with `project_id` set).
 fn set_project_parked(
     tx: &Connection,
     pending: &mut PendingEvents,
@@ -848,7 +896,7 @@ fn set_project_parked(
     reason: Option<&str>,
     actor: &str,
     now: &str,
-) -> Result<()> {
+) -> Result<UnparkReport> {
     let project = query_project(tx, id).require("project", id)?;
     let via = parked_via_project(id);
     if parked {
@@ -865,7 +913,7 @@ fn set_project_parked(
                     params![id, reason, now],
                 )?;
             }
-            return Ok(());
+            return Ok(UnparkReport::default());
         }
         tx.execute(
             "UPDATE projects SET parked_at = ?2, parked_by = ?3, parked_reason = ?4, parked_via = ?5, updated_at = ?2
@@ -895,7 +943,7 @@ fn set_project_parked(
         for child in &children {
             cancel_pending_executions(tx, pending, child)?;
         }
-        return Ok(());
+        return Ok(UnparkReport::default());
     }
     if project.parked_at.is_some() {
         tx.execute(
@@ -907,6 +955,14 @@ fn set_project_parked(
     }
     // Always clear the cascaded rows, even when the project was already
     // un-parked: a stale stamp naming it would otherwise strand a hidden row.
+    // Step 2 of the reconciliation sequence reads each as it was parked.
+    let mut report = UnparkReport {
+        project_id: Some(id.to_owned()),
+        rows: Vec::new(),
+    };
+    for task in parking_reconcile::project_cascaded_tasks(tx, &via)? {
+        report.rows.push(parking_reconcile::release_row(tx, &task, actor)?);
+    }
     crate::task_status_audit::execute(
         tx,
         BASIS_PROJECT_UNPARK_CASCADE,
@@ -915,7 +971,7 @@ fn set_project_parked(
          WHERE parked_via = ?1",
         params![via, now],
     )?;
-    Ok(())
+    Ok(report)
 }
 
 /// Cancel `work_item_id`'s never-started executions. A `claimed` row is
@@ -935,6 +991,10 @@ pub(crate) fn cancel_pending_executions(
         .query_map([work_item_id], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     for execution_id in &ids {
+        tx.execute(
+            "INSERT OR IGNORE INTO parking_cancelled_executions (execution_id) VALUES (?1)",
+            [execution_id],
+        )?;
         crate::executions_runs::cancel_execution_in_tx(
             tx,
             pending,

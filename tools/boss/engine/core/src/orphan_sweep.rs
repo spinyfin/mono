@@ -89,6 +89,10 @@
 //!    resolves on its own — only an explicit `bossctl work start` / kanban
 //!    drag-to-Doing clears it, the same gesture that already resolves the
 //!    park's own attention item.
+//!    Both halves count only executions created at or after the item's last
+//!    un-park ([`crate::work::WorkDb::last_unparked_at`]): un-parking is the
+//!    owner deciding to try again, so what died before it is not evidence
+//!    against the first attempt after it (`crate::unpark_reconcile`).
 //! 7. Checks dispatch pause and worker capacity, then calls [`WorkDb::request_execution_with_live_check`] (the same
 //!    path `bossctl work start` uses) to mark the stale execution
 //!    `abandoned` and insert a fresh `ready` execution, then kicks
@@ -514,7 +518,21 @@ async fn run_one_pass_filtered(
         // failure banner while its previous worker is still editing the
         // workspace, and `autostart = 0` means the engine would never pick
         // it back up on its own.
-        let recent_terminal = match work_db.count_recent_terminal_executions(&work_item_id, churn_cutoff, None) {
+        // An un-park is the owner deciding to try again, so executions that
+        // ended before it are stale evidence: both halves count from the item's
+        // last un-park at the earliest (`unpark_reconcile`, design section 1.5
+        // step 5). A failed ledger read falls back to the whole history, which
+        // is the guard's ordinary, stricter behaviour.
+        let unpark_floor = work_db.last_unparked_at(&work_item_id).unwrap_or_else(|err| {
+            tracing::warn!(
+                work_item_id = %work_item_id,
+                ?err,
+                "orphan sweep: could not read the last un-park time; counting the whole execution history",
+            );
+            None
+        });
+        let item_churn_cutoff = unpark_floor.map_or(churn_cutoff, |floor| floor.max(churn_cutoff));
+        let recent_terminal = match work_db.count_recent_terminal_executions(&work_item_id, item_churn_cutoff, None) {
             Ok(n) => n,
             Err(err) => {
                 tracing::warn!(
@@ -536,18 +554,18 @@ async fn run_one_pass_filtered(
         // window — so the guard has a second, time-independent half: the
         // unbroken streak of unproductive terminal executions since the
         // row last completed a run. Either half tripping parks the row.
-        let consecutive_terminal_ids = match work_db.list_consecutive_unproductive_terminal_execution_ids(&work_item_id)
-        {
-            Ok(ids) => ids,
-            Err(err) => {
-                tracing::warn!(
-                    work_item_id = %work_item_id,
-                    ?err,
-                    "orphan sweep: failed to count consecutive terminal executions; skipping item",
-                );
-                continue;
-            }
-        };
+        let consecutive_terminal_ids =
+            match work_db.list_consecutive_unproductive_terminal_execution_ids_since(&work_item_id, unpark_floor) {
+                Ok(ids) => ids,
+                Err(err) => {
+                    tracing::warn!(
+                        work_item_id = %work_item_id,
+                        ?err,
+                        "orphan sweep: failed to count consecutive terminal executions; skipping item",
+                    );
+                    continue;
+                }
+            };
         let consecutive_terminal = consecutive_terminal_ids.len() as i64;
         let window_tripped = recent_terminal >= ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD;
         let consecutive_tripped = consecutive_terminal >= ORPHAN_REDISPATCH_CHURN_GUARD_CONSECUTIVE_THRESHOLD;
@@ -789,7 +807,7 @@ async fn run_one_pass_filtered(
                     ChurnTrip::Window => (
                         recent_terminal,
                         work_db
-                            .list_recent_terminal_execution_ids(&work_item_id, churn_cutoff, None)
+                            .list_recent_terminal_execution_ids(&work_item_id, item_churn_cutoff, None)
                             .unwrap_or_default(),
                     ),
                     ChurnTrip::Consecutive => (consecutive_terminal, consecutive_terminal_ids),

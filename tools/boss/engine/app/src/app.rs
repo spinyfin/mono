@@ -139,6 +139,7 @@ mod tmux_teardown;
 mod transcript_persist;
 mod trunk_auth;
 mod trust;
+mod unpark;
 mod viewer_reconcile;
 mod work_items;
 mod worker_events;
@@ -1167,6 +1168,19 @@ struct ServerState {
     /// `new_arc` return and the first `spawn_merge_poller` call in
     /// `serve` — that window is < 1 ms in production.
     pr_reconciler_kick: Arc<Notify>,
+    /// The merge poller's host: conflict remediation (behind its bounded
+    /// background queue and per-PR cooldown), design-doc pointer upkeep and
+    /// project population. Built once here and handed to the poller loop in
+    /// `serve`, so work the un-park reconciliation routes into conflict
+    /// resolution shares the poller's queue instead of opening a second one.
+    sweep_host: Arc<boss_engine_runtime::merge_poller_adapters::CoreSweepHost>,
+    /// Runs the background steps of the un-park reconciliation (see
+    /// `boss_engine_runtime::unpark_reconcile`). One per engine, so two
+    /// un-parks never run their GitHub steps at the same time.
+    unpark_reconciler: Arc<boss_engine_runtime::unpark_reconcile::UnparkReconciler>,
+    /// The engine's `max_review_cycles`, which the un-park reconciliation's AI
+    /// review step honours.
+    max_review_cycles: usize,
     /// Secret token written to the control-token file at startup. A
     /// frontend `Shutdown { token }` RPC must match this value to
     /// trigger graceful exit. `None` only in tests / in-process
@@ -1681,6 +1695,11 @@ impl ServerState {
         };
         let cube_client_for_state = cube_client.clone();
         let publisher_for_state = publisher.clone();
+        let sweep_host_for_state = Arc::new(boss_engine_runtime::merge_poller_adapters::CoreSweepHost::new(
+            work_db.clone(),
+            publisher.clone(),
+            cube_client.clone(),
+        ));
 
         // The evidence blob store lands under the same root, next to
         // `state.db`, so an install's data is one directory.
@@ -1856,6 +1875,11 @@ impl ServerState {
                 .settings(settings_for_state)
                 .metrics(metrics_for_state)
                 .pr_reconciler_kick(pr_reconciler_kick_for_state)
+                .sweep_host(sweep_host_for_state)
+                .unpark_reconciler(Arc::new(boss_engine_runtime::unpark_reconcile::UnparkReconciler::new(
+                    boss_engine_runtime::unpark_reconcile::UnparkLimits::default(),
+                )))
+                .max_review_cycles(cfg.work.max_review_cycles)
                 .tracker_registry(tracker_registry_for_state)
                 .github_auth(github_auth_for_state)
                 .trunk_token_store(trunk_token_store_for_state)

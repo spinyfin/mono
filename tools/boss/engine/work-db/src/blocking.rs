@@ -670,6 +670,9 @@ impl WorkDb {
     pub fn clear_chore_blocked_ci_failure(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if crate::parking::is_parked(&tx, work_item_id)? {
+            return Ok(None);
+        }
         let now = now_string();
         let rows = crate::task_status_audit::execute(
             &tx,
@@ -934,7 +937,7 @@ impl WorkDb {
             "UPDATE tasks
                 SET ci_attempts_used = 0
               WHERE id = ?1
-                AND deleted_at IS NULL",
+                AND deleted_at IS NULL AND parked_at IS NULL",
             params![work_item_id],
         )?;
         Ok(())

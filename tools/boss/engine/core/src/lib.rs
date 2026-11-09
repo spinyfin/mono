@@ -220,6 +220,7 @@ pub mod tmux_health;
 pub mod tmux_preflight;
 pub mod transcript_liveness;
 pub mod transient_recovery;
+pub mod unpark_reconcile;
 pub use boss_engine_utility_model as utility_model;
 pub use boss_work_db as work;
 pub use work::work_dependencies;
