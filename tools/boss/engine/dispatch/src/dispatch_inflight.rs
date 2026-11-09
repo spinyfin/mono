@@ -19,7 +19,7 @@
 //! rows on the same chain would each look up a DB that shows no live sibling —
 //! because neither has started yet — and both would dispatch, putting two
 //! writers on the one shared jj backing store cube gives every same-PR
-//! workspace. That is precisely the T1577/T1815 two-writer corruption the chain
+//! workspace. That is precisely the two-writer corruption the chain
 //! guard exists to prevent, and `schedule_execution`'s post-lease TOCTOU
 //! assertion does not catch it: both tasks can pass that check before either
 //! goes live.

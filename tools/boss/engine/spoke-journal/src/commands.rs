@@ -16,31 +16,6 @@ pub(crate) fn result_identity_bound(command: &Command) -> usize {
 }
 
 impl Journal {
-    pub fn recovery_snapshot(&self, sequence: u64) -> Result<Option<Vec<u8>>> {
-        Ok(self.db.query_row(
-            "SELECT recovery FROM commands WHERE sequence=?1 AND attempting=1 AND applied=0",
-            [sequence],
-            |r| r.get(0),
-        )?)
-    }
-
-    /// FULL-sync commit before any operation that may move recovery pointers.
-    pub fn save_recovery_snapshot(&mut self, sequence: u64, bytes: &[u8]) -> Result<()> {
-        let tx = self.db.transaction()?;
-        records::admit(&tx, bytes.len() as u64, Admission::Lifecycle, self.limits)?;
-        let changed = tx.execute(
-            "UPDATE commands SET recovery=?1 WHERE sequence=?2 AND attempting=1 AND applied=0 AND recovery IS NULL",
-            params![bytes, sequence],
-        )?;
-        ensure!(
-            changed == 1,
-            "recovery snapshot already saved or command is not attempting"
-        );
-        tx.execute("UPDATE identity SET queued_bytes=queued_bytes+?1", [bytes.len() as u64])?;
-        tx.commit()?;
-        Ok(())
-    }
-
     /// Raw bytes are retained, including fields unknown to this binary.
     /// No receipt may be sent until this method returns successfully.
     pub fn receive_command(&mut self, bytes: &[u8]) -> Result<u64> {

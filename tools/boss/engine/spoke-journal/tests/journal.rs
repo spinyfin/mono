@@ -237,22 +237,8 @@ fn attempting_survives_restart_and_result_commits_once() {
     let (pending, interrupted) = journal.begin_pending().unwrap().unwrap();
     assert!(!interrupted);
     assert_eq!(journal.applied_commands().unwrap(), 0);
-    let before = journal.bytes().unwrap();
-    journal
-        .save_recovery_snapshot(pending.sequence, b"saved pointers")
-        .unwrap();
-    assert_eq!(journal.bytes().unwrap(), before + 14);
     drop(journal);
     let mut journal = open(&root);
-    assert_eq!(
-        journal.recovery_snapshot(pending.sequence).unwrap().unwrap(),
-        b"saved pointers"
-    );
-    assert!(
-        journal
-            .save_recovery_snapshot(pending.sequence, b"replacement")
-            .is_err()
-    );
     let (recovered, interrupted) = journal.begin_pending().unwrap().unwrap();
     assert!(interrupted);
     assert_eq!(recovered, pending);

@@ -262,7 +262,7 @@ pub(crate) async fn fetch_tmux_worker_statuses(client: &mut BossClient) -> Resul
 /// durable-occupant-no-registry / OccupancyInconclusive / husk) — see
 /// [`HostedPaneState`]. This is the durable-state fallback
 /// every `agents` verb consults once a plain live-registry lookup misses,
-/// so a crew name or slot id the operator can see in the app still
+/// so a crew name or slot id shown in the app still
 /// resolves after the engine drops the live registry entry.
 pub(crate) async fn fetch_hosted_pane_statuses(client: &mut BossClient) -> Result<Vec<HostedPaneStatus>> {
     match client
@@ -348,7 +348,7 @@ fn pane_state_label(state: &HostedPaneState) -> &'static str {
 
 /// Build the "no worker matches" error for a reference that resolved in
 /// neither the live registry nor the durable/hosted-pane roster, listing
-/// both so the operator can see what was actually searched — not just the
+/// both so the caller can see what was actually searched — not just the
 /// live crew (mirrors what `live_candidates_summary` alone used to show).
 fn no_worker_matches_error(reference: &str, states: &[LiveWorkerState], hosted: &[HostedPaneStatus]) -> anyhow::Error {
     let live = live_candidates_summary(states);
@@ -450,8 +450,8 @@ async fn status_report_for_reference(
     match resolve_agent_ref(agent, states) {
         Ok(state) => return Ok(Some(live_state_report(client, json, state).await)),
         Err(_) => {
-            // Durable-state fallback: a crew name or slot id the operator can
-            // see in the app must resolve even after the engine has dropped
+            // Durable-state fallback: a crew name or slot id shown in the
+            // app must resolve even after the engine has dropped
             // the live registry entry (crash, terminal-fail path, spawn-ack
             // timeout).
             let hosted = fetch_hosted_pane_statuses(client).await?;

@@ -625,6 +625,11 @@ pub struct WorkDb {
     /// cloned freely across the engine, and an arm on one handle must be
     /// visible to the mutation that runs through another.
     boothby_action: Arc<Mutex<Option<boothby::BoothbyActionContext>>>,
+    /// PR chains the engine is rebasing in the shared jj store right now.
+    /// Shared across clones so the conflict ladder's hold is visible to the
+    /// dispatch chain guard; see [`EngineRebaseHold`].
+    #[builder(default)]
+    engine_rebase_holds: Arc<Mutex<engine_rebase_hold::EngineRebaseHolds>>,
     /// The engine event bus this `WorkDb` (and every clone of it) publishes
     /// state-transition events onto — see `crate::event_publish`. Defaults
     /// to a private bus with no subscribers when `WorkDb` is opened
@@ -649,6 +654,7 @@ impl Clone for WorkDb {
             memory: self.memory.clone(),
             conn: Arc::clone(&self.conn),
             boothby_action: Arc::clone(&self.boothby_action),
+            engine_rebase_holds: Arc::clone(&self.engine_rebase_holds),
             event_bus: Arc::clone(&self.event_bus),
             persona_metrics: Arc::clone(&self.persona_metrics),
             token_generator: Arc::clone(&self.token_generator),
@@ -722,6 +728,7 @@ mod dispatch_helpers;
 mod driver_allocation;
 mod driver_lookup;
 mod editorial;
+mod engine_rebase_hold;
 pub mod event_publish;
 mod exec_status_helpers;
 mod exec_tail;
@@ -837,6 +844,7 @@ pub use dep_helpers::*;
 pub use dispatch_class::DispatchClass;
 pub use dispatch_helpers::*;
 pub use driver_allocation::*;
+pub use engine_rebase_hold::{EngineRebaseBlocker, EngineRebaseHold};
 pub use exec_status_helpers::*;
 pub use exec_tail::content_checksum;
 use ideas::list_ideas_in_tx;

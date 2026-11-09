@@ -113,7 +113,10 @@ async fn actual_daemon_journals_capacity_before_welcome_and_replays_offline_back
     let mut hub = Fixture::new().await;
     let daemon = hub.start();
     let first = hub.connection().await;
-    tokio::time::sleep(std::time::Duration::from_millis(5200)).await;
+    // The daemon journals capacity every 5s from its start (first tick
+    // immediate). Wait well past the second tick so a slow sample/append on a
+    // loaded host still lands before the daemon is stopped.
+    tokio::time::sleep(std::time::Duration::from_secs(12)).await;
     drop(daemon);
     drop(first);
     let journal = Journal::open(&hub.root(), "host", Limits::default()).unwrap();
