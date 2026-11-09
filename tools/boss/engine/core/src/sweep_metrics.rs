@@ -36,7 +36,6 @@ pub fn register_metrics(registry: &Registry) {
         ticker.register(registry);
     }
     registry.register_counter(&AGENT_JSONL_STREAM_ROOT_REVALIDATIONS);
-    crate::work::execution_bookmark_metrics::register_metrics(registry);
 }
 
 pub(crate) static ENVELOPE_WATCH: SweepTicker = SweepTicker::new(
@@ -92,7 +91,6 @@ mod tests {
             "envelope_watch.pass_duration_ms",
             "terminal_work_sweep.items_per_pass",
             "agent_jsonl_stream.items_per_pass",
-            "execution_bookmark_pointers.pass_duration_ms",
         ] {
             assert_eq!(registry.gauge_value(name), Some(0), "{name}");
         }
@@ -101,8 +99,6 @@ mod tests {
             "terminal_work_sweep.passes",
             "agent_jsonl_stream.passes",
             "agent_jsonl_stream.root_revalidations",
-            "execution_bookmark_pointers.passes",
-            "execution_bookmark_pointers.jj_spawns",
         ] {
             assert_eq!(registry.counter_value(name), Some(0), "{name}");
         }

@@ -146,6 +146,15 @@ pub(crate) enum LadderOutcome {
     /// [`Self::LockfileRegenerationFailed`] instead, so it cannot retry
     /// silently forever.
     MechanicalRungsUnavailable,
+    /// A worker is live on this PR's chain (the root or any revision, in
+    /// `claimed`, `running` or `waiting_human`; reviews excluded), so the
+    /// engine must not rewrite the PR branch's commits in the shared jj store
+    /// underneath it. Checked before any repo access or lease, so nothing was
+    /// leased, positioned or rebased. The caller spawns nothing and leaves the
+    /// attempt `pending` (retried on a later tick, like
+    /// [`Self::MechanicalRungsUnavailable`]); the live writer owns the branch
+    /// until it finishes, and a conflict it leaves behind is picked up then.
+    DeferredForLiveWriter,
     /// Every residual conflicted file was a generated lockfile, but its
     /// regeneration failed operationally (tool missing from `PATH`, no
     /// network, the tool itself erroring, the lockfile absent on the base).
@@ -241,10 +250,33 @@ pub(crate) async fn try_mechanical_rungs_with(
     };
     let pr_number = pr_number as u64;
 
+    // The engine's rebase and push rewrite the PR branch's history in the
+    // shared jj store, and a live worker on the same chain follows those
+    // rewrites from its own workspace at the same time. Concurrent operations
+    // on one branch are what produce divergence, so prevent the overlap
+    // instead of repairing it afterwards: with a live writer, do nothing now.
+    if let Some(writers) = live_writers_blocking_rebase(work_db, &candidate.work_item_id) {
+        tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr = pr_number,
+            attempt_id = %attempt.id,
+            live_writers = %writers,
+            "conflict_ladder: a worker is live on this PR's chain; deferring the engine rebase",
+        );
+        log_routing_verdict(
+            &candidate.work_item_id,
+            Some(pr_number),
+            &[],
+            "skip",
+            "a worker is live on this PR's chain; engine rebase deferred until it finishes",
+        );
+        return LadderOutcome::DeferredForLiveWriter;
+    }
+
     // One INFO line at ladder entry so "was any mechanical rung invoked for
     // this conflict?" is answerable from the engine trace (mono#1398/#1764:
     // the ladder was running silently / never reached). Escalation and
-    // outcome lines follow from `run_rung1_in_lease` / `attempt_rung0`.
+    // outcome lines follow from `run_rung1_in_lease_with` / `attempt_rung0`.
     tracing::info!(
         work_item_id = %candidate.work_item_id,
         pr = pr_number,
@@ -436,33 +468,6 @@ async fn lease_rung1_workspace(
 /// Position the leased workspace on the PR head, run the engine-direct
 /// rebase, and act on the outcome. Split out so the caller can release the
 /// lease unconditionally regardless of which branch this returns from.
-#[cfg(test)]
-pub(crate) async fn run_rung1_in_lease(
-    work_db: &WorkDb,
-    publisher: &dyn ExecutionPublisher,
-    cube_client: &dyn CubeClient,
-    candidate: &PendingMergeCheck,
-    attempt: &ConflictResolution,
-    pr_number: u64,
-    lease: &boss_host_execution::types::CubeWorkspaceLease,
-) -> LadderOutcome {
-    let workspace = RungWorkspace {
-        lease,
-        resolvers: &builtin_resolvers,
-    };
-    run_rung1_in_lease_with(
-        work_db,
-        publisher,
-        cube_client,
-        candidate,
-        attempt,
-        pr_number,
-        &workspace,
-    )
-    .await
-}
-
-/// [`run_rung1_in_lease`] with an injectable rung-0 resolver registry.
 pub(crate) async fn run_rung1_in_lease_with(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -473,9 +478,7 @@ pub(crate) async fn run_rung1_in_lease_with(
     workspace: &RungWorkspace<'_>,
 ) -> LadderOutcome {
     let lease = workspace.lease;
-    let saved = work_db.snapshot_rebase_pointers(&candidate.work_item_id).await;
     if let Err(err) = cube_client.goto_workspace(&lease.workspace_path, pr_number).await {
-        work_db.restore_rebase_pointers(&saved).await;
         tracing::warn!(
             work_item_id = %candidate.work_item_id,
             pr = pr_number,
@@ -493,7 +496,6 @@ pub(crate) async fn run_rung1_in_lease_with(
     let rebase = match cube_client.rebase_workspace(&lease.workspace_path, pr_number).await {
         Ok(outcome) => outcome,
         Err(err) => {
-            work_db.restore_rebase_pointers(&saved).await;
             tracing::warn!(
                 work_item_id = %candidate.work_item_id,
                 pr = pr_number,
@@ -510,8 +512,6 @@ pub(crate) async fn run_rung1_in_lease_with(
     };
 
     if rebase.clean {
-        // A clean push is the whole operation: adopt the pushed PR head.
-        finish_rebase_pointers(work_db, &saved, attempt, rebase.pushed).await;
         if rebase.pushed {
             // Vet rung 1's pushed resolution against the
             // both-parents deletion tripwire before auto-retiring.
@@ -613,15 +613,11 @@ pub(crate) async fn run_rung1_in_lease_with(
         // "did not resolve every residual file" message previously
         // misdiagnosed a resolved-but-push-rejected result as an unresolved
         // one.
-        // Only a retired or signoff-held resolution was pushed.
-        let pushed = matches!(rung0_outcome, LadderOutcome::Retired | LadderOutcome::HaltedForSignoff);
-        finish_rebase_pointers(work_db, &saved, attempt, pushed).await;
         match rung0_outcome {
             LadderOutcome::FellThrough { reason, .. } => reason,
             other => return other,
         }
     } else {
-        finish_rebase_pointers(work_db, &saved, attempt, false).await;
         // Rung 0 is compile-time gated off (see `RUNG0_APPLY_LIVE`). Emit one
         // line so the engine trace records *why* the deterministic resolvers
         // show zero activity — a config fact, not a dispatch/logging bug
@@ -739,22 +735,28 @@ pub(crate) async fn halt_attempt_for_lockfile_failure(
         .await;
 }
 
-/// Close the pointer-protection window opened before cube's goto/rebase:
-/// restore the saved recovery pointers and, when the operation pushed a PR
-/// head, adopt it for every record whose work it already carries.
-async fn finish_rebase_pointers(
-    work_db: &WorkDb,
-    saved: &[(
-        boss_engine_recovery::execution_bookmark::ExecutionBookmark,
-        boss_engine_recovery::execution_bookmark::PointerSnapshot,
-    )],
-    attempt: &ConflictResolution,
-    pushed: bool,
-) {
-    let branch = pushed.then_some(attempt.head_branch.as_str());
-    work_db
-        .finish_rebase_pointers(saved, branch, &attempt.base_branch)
-        .await;
+/// Describe the live writers on the PR's chain, or `None` when no worker can
+/// be writing the PR branch. A failed lookup also defers: rewriting a branch a
+/// worker may be on, because the check could not run, is the unsafe direction.
+pub(crate) fn live_writers_blocking_rebase(work_db: &WorkDb, chain_item_id: &str) -> Option<String> {
+    match work_db.live_writers_in_chain(chain_item_id) {
+        Ok(writers) if writers.is_empty() => None,
+        Ok(writers) => Some(
+            writers
+                .iter()
+                .map(|execution| format!("{} ({})", execution.id, execution.status))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %chain_item_id,
+                ?err,
+                "conflict_ladder: could not list live writers; deferring the engine rebase",
+            );
+            Some("lookup failed".to_owned())
+        }
+    }
 }
 
 /// Rung 0: feed rung-1's residual conflicted files to the deterministic-
@@ -766,7 +768,7 @@ async fn finish_rebase_pointers(
 /// so the caller's existing rung-3 fallback takes over exactly as it does
 /// today.
 ///
-/// A free function (rather than inlined into [`run_rung1_in_lease`]) so
+/// A free function (rather than inlined into [`run_rung1_in_lease_with`]) so
 /// this rung's actual mechanics are unit-testable in isolation from the
 /// [`RUNG0_APPLY_LIVE`] gate at its one live call site.
 ///

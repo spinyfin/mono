@@ -256,7 +256,7 @@ pub(super) async fn reject_unsafe_outcome(
 /// (`jj squash`, `jj absorb`, `jj diffedit`). Only a pure rebase, which leaves
 /// the added and removed lines untouched, may move `preserved/<exec>` off the
 /// commit teardown recorded; any other evolution may carry foreign edits.
-/// Content is compared with `reconcile::same_change_content` (an `interdiff`,
+/// Content is compared with `prune::same_change_content` (an `interdiff`,
 /// so paths, modes and binary changes count), for every commit of the recorded
 /// ancestry including empty ones: a later holder can squash text into an empty
 /// boundary. A rebase onto a moved base compares equal even when it leaves
@@ -317,7 +317,7 @@ pub(in super::super) async fn reject_content_evolution(
         let mut unchanged = true;
         for candidate in moved.lines().filter(|id| !id.is_empty()) {
             unchanged &= candidate == original
-                || super::reconcile::same_change_content(jj, &record.repo_path, original, candidate).await?;
+                || super::prune::same_change_content(jj, &record.repo_path, original, candidate).await?;
         }
         if !unchanged {
             return Err(pointer_integrity_error(format!(

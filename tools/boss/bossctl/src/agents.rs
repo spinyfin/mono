@@ -15,6 +15,14 @@ use super::*;
 
 use boss_engine::work::dispatch_halt_headline;
 
+/// `println!` into a `String`, so a report can be built and asserted on.
+macro_rules! outln {
+    ($out:expr, $($arg:tt)*) => {{
+        use std::fmt::Write as _;
+        let _ = writeln!($out, $($arg)*);
+    }};
+}
+
 /// Resolve a positional `agent` argument to a live worker entry.
 ///
 /// Tries, in order: (a) exact match on `run_id`, (b) exact match on
@@ -379,44 +387,9 @@ pub(crate) async fn agents_status(socket_path: &Option<String>, json: bool, agen
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
 
-    match resolve_agent_ref(&agent, &states) {
-        Ok(state) => {
-            print_live_state(json, state);
-            return Ok(());
-        }
-        Err(_) => {
-            // Durable-state fallback: a crew name or slot id the operator can
-            // see in the app must resolve even after the engine has dropped
-            // the live registry entry (crash, terminal-fail path, spawn-ack
-            // timeout).
-            let hosted = fetch_hosted_pane_statuses(&mut client).await?;
-            if let Some(pane) = resolve_hosted_pane_ref(&agent, &hosted)? {
-                print_hosted_pane_status(json, pane);
-                return Ok(());
-            }
-            if looks_like_name_or_slot(&agent) {
-                return Err(no_worker_matches_error(&agent, &states, &hosted));
-            }
-        }
-    }
-
-    // Not a live worker. If the reference resolves to a work item (a typed
-    // short id or a primary task_/proj_/prod_ id), report on it directly. This
-    // is the only path available for a work item the engine has *parked*
-    // rather than dispatched — e.g. the orphan-sweep / pr_review-recovery
-    // churn guard: there is no live worker and (if it never got far enough
-    // to spawn one) no `work_runs` row either, so the `GetRun` fallback
-    // below would just error with "no such run".
-    if let Some(work_item) = resolve_work_item_ref(&mut client, &agent).await? {
-        let primary_id = work_item.primary_id().to_owned();
-        if let Some(state) = states
-            .iter()
-            .find(|s| s.work_item_id.as_deref() == Some(primary_id.as_str()))
-        {
-            print_live_state(json, state);
-            return Ok(());
-        }
-        return print_parked_work_item_status(&mut client, json, &work_item).await;
+    if let Some(text) = status_report_for_reference(&mut client, json, &agent, &states).await? {
+        print!("{text}");
+        return Ok(());
     }
 
     // No live entry and the reference doesn't look like a name or
@@ -464,6 +437,68 @@ pub(crate) async fn agents_status(socket_path: &Option<String>, json: bool, agen
     Ok(())
 }
 
+/// Render the status of a live worker, a durably tracked hosted pane, or a
+/// work item with no worker, each with the stored run and execution failure
+/// text. `None` means the reference matches none of them, so the caller falls
+/// back to a historical run lookup.
+async fn status_report_for_reference(
+    client: &mut BossClient,
+    json: bool,
+    agent: &str,
+    states: &[LiveWorkerState],
+) -> Result<Option<String>> {
+    match resolve_agent_ref(agent, states) {
+        Ok(state) => return Ok(Some(live_state_report(client, json, state).await)),
+        Err(_) => {
+            // Durable-state fallback: a crew name or slot id the operator can
+            // see in the app must resolve even after the engine has dropped
+            // the live registry entry (crash, terminal-fail path, spawn-ack
+            // timeout).
+            let hosted = fetch_hosted_pane_statuses(client).await?;
+            if let Some(pane) = resolve_hosted_pane_ref(agent, &hosted)? {
+                let (run, execution) = fetch_pane_stored_records(client, &pane.run_id).await;
+                return Ok(Some(hosted_pane_status_text(
+                    json,
+                    pane,
+                    run.as_ref(),
+                    execution.as_ref(),
+                )));
+            }
+            if looks_like_name_or_slot(agent) {
+                return Err(no_worker_matches_error(agent, states, &hosted));
+            }
+        }
+    }
+
+    // Not a live worker. If the reference resolves to a work item (a typed
+    // short id or a primary task_/proj_/prod_ id), report on it directly. This
+    // is the only path available for a work item the engine has *parked*
+    // rather than dispatched — e.g. the orphan-sweep / pr_review-recovery
+    // churn guard: there is no live worker and (if it never got far enough
+    // to spawn one) no `work_runs` row either, so the `GetRun` fallback
+    // would just error with "no such run".
+    if let Some(work_item) = resolve_work_item_ref(client, agent).await? {
+        let primary_id = work_item.primary_id().to_owned();
+        if let Some(state) = states
+            .iter()
+            .find(|s| s.work_item_id.as_deref() == Some(primary_id.as_str()))
+        {
+            return Ok(Some(live_state_report(client, json, state).await));
+        }
+        return Ok(Some(parked_work_item_status(client, json, &work_item).await?));
+    }
+    Ok(None)
+}
+
+/// A live worker's report with the stored errors of its latest run and
+/// execution. The registry entry can outlive a failed start, and the failure
+/// text is recorded only on those rows.
+async fn live_state_report(client: &mut BossClient, json: bool, state: &LiveWorkerState) -> String {
+    let execution_id = state.execution_id.as_deref().unwrap_or(&state.run_id);
+    let (run, execution) = fetch_pane_stored_records(client, execution_id).await;
+    live_state_text(json, state, run.as_ref(), execution.as_ref())
+}
+
 /// Report on a work item that resolved from `bossctl agents status`'s
 /// argument but has no live worker backing it — the case a bare `GetRun`
 /// lookup can't handle because the item may never have gotten far enough
@@ -482,7 +517,8 @@ pub(crate) async fn agents_status(socket_path: &Option<String>, json: bool, agen
 /// `cli/src/output.rs`. Without the latter, a churn-parked task/chore would
 /// print `status: todo` followed by "(no open attention items)" with no clue
 /// why — the same read-surface gap `boss task/chore show` already closed.
-async fn print_parked_work_item_status(client: &mut BossClient, json: bool, work_item: &WorkItem) -> Result<()> {
+async fn parked_work_item_status(client: &mut BossClient, json: bool, work_item: &WorkItem) -> Result<String> {
+    let mut out = String::new();
     let primary_id = work_item.primary_id().to_owned();
 
     let runtime = match client
@@ -494,6 +530,21 @@ async fn print_parked_work_item_status(client: &mut BossClient, json: bool, work
     {
         FrontendEvent::TaskRuntimeResult { runtime } => Some(runtime),
         _ => None,
+    };
+    let execution = match runtime.as_ref().and_then(|runtime| runtime.execution_id.clone()) {
+        Some(id) => match client
+            .send_request(&FrontendRequest::GetExecution { id })
+            .await
+            .context("sending GetExecution")?
+        {
+            FrontendEvent::ExecutionResult { execution } => Some(execution),
+            _ => None,
+        },
+        None => None,
+    };
+    let latest_run = match execution.as_ref() {
+        Some(execution) => fetch_latest_run(client, &execution.id).await,
+        None => None,
     };
     let attention_items = match client
         .send_request(&FrontendRequest::ListAttentionItemsForWorkItem {
@@ -511,16 +562,19 @@ async fn print_parked_work_item_status(client: &mut BossClient, json: bool, work
         .collect();
 
     if json {
-        println!(
+        outln!(
+            out,
             "{}",
             serde_json::json!({
                 "work_item": work_item,
                 "live_worker_state": serde_json::Value::Null,
                 "task_runtime": runtime,
+                "execution": execution,
+                "errors": stored_errors_json(latest_run.as_ref(), execution.as_ref()),
                 "open_attention_items": open_attention_items,
             })
         );
-        return Ok(());
+        return Ok(out);
     }
 
     let (status, name) = match work_item {
@@ -528,18 +582,19 @@ async fn print_parked_work_item_status(client: &mut BossClient, json: bool, work
         WorkItem::Project(p) => (p.status.as_str().to_owned(), p.name.as_str()),
         WorkItem::Product(p) => (p.status.clone(), p.name.as_str()),
     };
-    println!("{primary_id} \"{name}\" — no live worker");
-    println!("  status: {status}");
+    outln!(out, "{primary_id} \"{name}\" — no live worker");
+    outln!(out, "  status: {status}");
     if let WorkItem::Task(t) | WorkItem::Chore(t) = work_item
         && let Some(reason) = t.dispatch_failed_reason.as_deref()
     {
-        println!("  {}", dispatch_halt_headline(reason));
+        outln!(out, "  {}", dispatch_halt_headline(reason));
         if let Some(error) = t.dispatch_failed_error.as_deref() {
-            println!("    {error}");
+            outln!(out, "    {error}");
         }
     }
     if let Some(runtime) = &runtime {
-        println!(
+        outln!(
+            out,
             "  current_execution: {} [{}]",
             runtime.execution_id.as_deref().unwrap_or("-"),
             runtime
@@ -549,15 +604,73 @@ async fn print_parked_work_item_status(client: &mut BossClient, json: bool, work
                 .unwrap_or_else(|| "-".to_owned())
         );
     }
+    for line in stored_error_lines(latest_run.as_ref(), execution.as_ref()) {
+        outln!(out, "{line}");
+    }
     if open_attention_items.is_empty() {
-        println!("  (no open attention items)");
+        outln!(out, "  (no open attention items)");
     } else {
-        println!("  open attention items:");
+        outln!(out, "  open attention items:");
         for item in &open_attention_items {
-            println!("    [{}] {} (since {})", item.kind, item.title, item.created_at);
+            outln!(out, "    [{}] {} (since {})", item.kind, item.title, item.created_at);
         }
     }
-    Ok(())
+    Ok(out)
+}
+
+/// The most recent run of an execution; best-effort, so a missing run never
+/// fails a status read.
+async fn fetch_latest_run(client: &mut BossClient, execution_id: &str) -> Option<WorkRun> {
+    match client
+        .send_request(&FrontendRequest::ListRuns {
+            execution_id: execution_id.to_owned(),
+        })
+        .await
+    {
+        Ok(FrontendEvent::RunsList { runs, .. }) => runs.into_iter().max_by(|a, b| a.created_at.cmp(&b.created_at)),
+        _ => None,
+    }
+}
+
+/// The stored latest run and execution behind a hosted pane; its `run_id` is
+/// the execution id. Best-effort, like [`fetch_latest_run`].
+async fn fetch_pane_stored_records(
+    client: &mut BossClient,
+    execution_id: &str,
+) -> (Option<WorkRun>, Option<WorkExecution>) {
+    let request = FrontendRequest::GetExecution {
+        id: execution_id.to_owned(),
+    };
+    let execution = match client.send_request(&request).await {
+        Ok(FrontendEvent::ExecutionResult { execution }) => Some(execution),
+        _ => None,
+    };
+    (fetch_latest_run(client, execution_id).await, execution)
+}
+
+/// Failure text stored for a run (`work_runs.error_text`) and its execution
+/// (`work_executions.last_error`). A pre-start failure is recorded only here,
+/// so it may be present even when no worker process ever started.
+fn stored_errors_json(run: Option<&WorkRun>, execution: Option<&WorkExecution>) -> serde_json::Value {
+    serde_json::json!({
+        "run_error_text": run.and_then(|run| run.error_text.as_deref()),
+        "execution_last_error": execution.and_then(|execution| execution.last_error.as_deref()),
+    })
+}
+
+/// Text-mode lines for the stored failure text; empty when neither is set.
+fn stored_error_lines(run: Option<&WorkRun>, execution: Option<&WorkExecution>) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(error) = run.and_then(|run| run.error_text.as_deref()).filter(|e| !e.is_empty()) {
+        lines.push(format!("  run error:     {error}"));
+    }
+    if let Some(error) = execution
+        .and_then(|execution| execution.last_error.as_deref())
+        .filter(|e| !e.is_empty())
+    {
+        lines.push(format!("  last error:    {error}"));
+    }
+    lines
 }
 
 /// Renders a historical `GetRun` lookup alongside the worker's actual
@@ -581,6 +694,7 @@ fn print_run_lifecycle(json: bool, run: &WorkRun, live: Option<&LiveWorkerState>
                          lifecycle. Use live_worker_state (if present) or execution for that.",
                 "live_worker_state": live,
                 "execution": execution,
+                "errors": stored_errors_json(Some(run), execution),
             })
         );
         return;
@@ -594,6 +708,9 @@ fn print_run_lifecycle(json: bool, run: &WorkRun, live: Option<&LiveWorkerState>
     }
     if let Some(f) = &run.finished_at {
         println!("  spawn finished:{f}");
+    }
+    for line in stored_error_lines(Some(run), None) {
+        println!("{line}");
     }
 
     match live {
@@ -612,6 +729,9 @@ fn print_run_lifecycle(json: bool, run: &WorkRun, live: Option<&LiveWorkerState>
                 }
                 if let Some(f) = &exec.finished_at {
                     println!("  finished: {f}");
+                }
+                for line in stored_error_lines(None, Some(exec)) {
+                    println!("{line}");
                 }
             }
             None => {
@@ -1748,65 +1868,86 @@ pub(crate) async fn agents_pools(socket_path: &Option<String>, json: bool) -> Re
 }
 
 fn print_live_state(json: bool, state: &LiveWorkerState) {
+    print!("{}", live_state_text(json, state, None, None));
+}
+
+/// The live-state report, followed by the stored failure text of the
+/// worker's latest run and execution. In JSON the live fields stay at the top
+/// level and an `errors` object is added next to them.
+fn live_state_text(
+    json: bool,
+    state: &LiveWorkerState,
+    run: Option<&WorkRun>,
+    execution: Option<&WorkExecution>,
+) -> String {
+    let mut out = String::new();
     if json {
-        println!("{}", serde_json::to_string(state).expect("LiveWorkerState serializes"));
-        return;
+        let mut value = serde_json::to_value(state).expect("LiveWorkerState serializes");
+        if let Some(object) = value.as_object_mut() {
+            object.insert("errors".to_owned(), stored_errors_json(run, execution));
+        }
+        outln!(out, "{value}");
+        return out;
     }
-    println!("slot {} ({})", state.slot_id, state.name);
-    println!("  run:           {}", state.run_id);
-    println!("  model:         {}", state.model);
-    println!("  activity:      {}", state.activity.as_str());
-    println!("  shell_pid:     {}", state.shell_pid);
+    outln!(out, "slot {} ({})", state.slot_id, state.name);
+    outln!(out, "  run:           {}", state.run_id);
+    outln!(out, "  model:         {}", state.model);
+    outln!(out, "  activity:      {}", state.activity.as_str());
+    outln!(out, "  shell_pid:     {}", state.shell_pid);
     if state.held {
-        println!("  held:          true (exempt from idle-park/auto-reap sweeps)");
+        outln!(out, "  held:          true (exempt from idle-park/auto-reap sweeps)");
     }
     if let Some(reason) = &state.wait_reason {
         let expiry = state.wait_expires_at.as_deref().unwrap_or("unknown");
-        println!("  wait:          {reason} (expires {expiry})");
+        outln!(out, "  wait:          {reason} (expires {expiry})");
     }
     if let Some(recovery) = &state.recovery_status {
-        println!("  recovery:      {recovery}");
+        outln!(out, "  recovery:      {recovery}");
     }
     if let Some(id) = &state.work_item_id {
-        println!("  work_item:     {id}");
+        outln!(out, "  work_item:     {id}");
     }
     if let Some(name) = &state.work_item_name {
-        println!("  work_item_name:{name}");
+        outln!(out, "  work_item_name:{name}");
     }
     if let Some(id) = &state.execution_id {
-        println!("  execution:     {id}");
+        outln!(out, "  execution:     {id}");
     }
     // Attributed pool + execution kind (stamped at spawn). Shown so
     // `agents status`/`list` can diagnose pool routing without joining
     // the execution table — independent of physical slot occupancy
     // (spilled automation still reports pool=automation).
     if let Some(pool) = &state.pool {
-        println!("  pool:          {pool}");
+        outln!(out, "  pool:          {pool}");
     }
     if let Some(kind) = &state.kind {
-        println!("  kind:          {kind}");
+        outln!(out, "  kind:          {kind}");
     }
     if let Some(agent_type) = &state.agent_type {
-        println!("  type:          {agent_type}");
+        outln!(out, "  type:          {agent_type}");
     }
     if let Some(project) = project_status_label(state) {
-        println!("  project:       {project}");
+        outln!(out, "  project:       {project}");
     }
     if let Some(host) = &state.host_id {
-        println!("  host:          {host}");
+        outln!(out, "  host:          {host}");
     }
     if let Some(ts) = &state.started_at {
-        println!("  started_at:    {ts}");
+        outln!(out, "  started_at:    {ts}");
     }
     if let Some(tool) = &state.current_tool {
-        println!("  current_tool:  {tool}");
+        outln!(out, "  current_tool:  {tool}");
     }
     if let Some(ts) = &state.last_event_at {
-        println!("  last_event_at: {ts}");
+        outln!(out, "  last_event_at: {ts}");
     }
     if let Some(ts) = &state.last_tool_ended_at {
-        println!("  last_tool_end: {ts}");
+        outln!(out, "  last_tool_end: {ts}");
     }
+    for line in stored_error_lines(run, execution) {
+        outln!(out, "{line}");
+    }
+    out
 }
 
 /// `agents status` project line. An absent project means the work is
@@ -1866,59 +2007,88 @@ fn durable_occupant_detail_lines(pane: &HostedPaneStatus, status: &str) -> Strin
 /// (see [`agents_status`]), so this covers exactly the case the live
 /// `LiveWorkerState` detail (model, activity, current tool) isn't
 /// available for.
-fn print_hosted_pane_status(json: bool, pane: &HostedPaneStatus) {
+fn hosted_pane_status_text(
+    json: bool,
+    pane: &HostedPaneStatus,
+    run: Option<&WorkRun>,
+    execution: Option<&WorkExecution>,
+) -> String {
+    let mut out = String::new();
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "slot_id": pane.slot_id,
-                "run_id": pane.run_id,
-                "crew_name": pane.crew_name,
-                "state": pane.state,
-                "summary": pane.summary,
-                "task_title": pane.task_title,
-            })
-        );
-        return;
+        outln!(out, "{}", hosted_pane_status_json(pane, run, execution));
+        return out;
     }
-    println!("slot {} ({}) — run {}", pane.slot_id, pane.crew_name, pane.run_id);
+    outln!(out, "slot {} ({}) — run {}", pane.slot_id, pane.crew_name, pane.run_id);
     match &pane.state {
         HostedPaneState::Live => {
             // Reachable only if the worker went live in the gap between the
             // `ListWorkerLiveStates` and `ListHostedPaneStatuses` round
             // trips — vanishingly rare, and harmless: the caller just
             // re-runs the command a moment later for full live detail.
-            println!("  state: live (just resolved via durable state; re-run for full live detail)");
+            outln!(
+                out,
+                "  state: live (just resolved via durable state; re-run for full live detail)"
+            );
         }
         HostedPaneState::LiveProcessNoRegistry { evidence } => {
-            println!("  state: terminal entry, live process ({evidence})");
-            println!("  the engine has no live run tracked for this worker, but its process is still running.");
-            println!(
+            outln!(out, "  state: terminal entry, live process ({evidence})");
+            outln!(
+                out,
+                "  the engine has no live run tracked for this worker, but its process is still running."
+            );
+            outln!(
+                out,
                 "  `bossctl agents stop {}` or `bossctl agents retire-pane {}` will reap it.",
-                pane.run_id, pane.slot_id
+                pane.run_id,
+                pane.slot_id
             );
         }
         HostedPaneState::DurableOccupantNoRegistry { status } => {
-            println!("{}", durable_occupant_detail_lines(pane, status));
+            outln!(out, "{}", durable_occupant_detail_lines(pane, status));
         }
         HostedPaneState::OccupancyInconclusive { evidence } => {
-            println!("  state: occupancy inconclusive ({evidence})");
-            println!(
+            outln!(out, "  state: occupancy inconclusive ({evidence})");
+            outln!(
+                out,
                 "  resolve the probe failure, or run `bossctl agents stop {}` then `bossctl agents retire-pane {}`.",
-                pane.run_id, pane.slot_id
+                pane.run_id,
+                pane.slot_id
             );
         }
         HostedPaneState::Husk => {
-            println!("  state: husk (app viewer only, no engine-tracked run, no live process)");
-            println!("  retire with `bossctl agents retire-pane {}`", pane.slot_id);
+            outln!(
+                out,
+                "  state: husk (app viewer only, no engine-tracked run, no live process)"
+            );
+            outln!(out, "  retire with `bossctl agents retire-pane {}`", pane.slot_id);
         }
     }
     if let Some(title) = &pane.task_title {
-        println!("  work_item:     {title}");
+        outln!(out, "  work_item:     {title}");
     }
     if let Some(summary) = &pane.summary {
-        println!("  summary:       {summary}");
+        outln!(out, "  summary:       {summary}");
     }
+    for line in stored_error_lines(run, execution) {
+        outln!(out, "{line}");
+    }
+    out
+}
+
+fn hosted_pane_status_json(
+    pane: &HostedPaneStatus,
+    run: Option<&WorkRun>,
+    execution: Option<&WorkExecution>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "slot_id": pane.slot_id,
+        "run_id": pane.run_id,
+        "crew_name": pane.crew_name,
+        "state": pane.state,
+        "summary": pane.summary,
+        "task_title": pane.task_title,
+        "errors": stored_errors_json(run, execution),
+    })
 }
 
 /// One-line `agents list` row for a live worker. Pure so tests can pin

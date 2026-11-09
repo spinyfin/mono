@@ -255,7 +255,7 @@ pub(super) fn all() -> Vec<Migration> {
             apply: |conn| {
                 execution_recovery_rearm::migrate(
                     conn,
-                    boss_engine_recovery::execution_bookmark::is_legacy_pr_anchor_blocker,
+                    execution_recovery_rearm::is_legacy_pr_anchor_blocker,
                 )?;
                 Ok(())
             },

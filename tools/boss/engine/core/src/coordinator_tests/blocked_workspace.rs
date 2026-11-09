@@ -1,4 +1,5 @@
 use super::helpers::*;
+use super::recovery_restage::bookmark_targets;
 
 pub(super) fn blocked_pair(path: &std::path::Path) -> (Arc<WorkDb>, WorkExecution, WorkExecution) {
     let db = Arc::new(WorkDb::open(path.to_path_buf()).unwrap());
@@ -951,7 +952,16 @@ async fn rewritten_pr_dispatch_preserves_successor_work_through_second_recovery(
     JjRepo::run(&h.repo.repo, &["bookmark", "set", "pr/99", &record.base(), "-r", "@"]);
     // Dispatch recorded this PR head as the execution's baseline commit.
     let old_pr = JjRepo::run(&h.repo.repo, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
-    db.update_execution_bookmark_base(&prior.id, &old_pr).unwrap();
+    assert_eq!(
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE execution_bookmarks SET base_commit = ?2 WHERE execution_id = ?1 AND retired_at IS NULL",
+                rusqlite::params![prior.id, old_pr],
+            )
+            .unwrap(),
+        1
+    );
     JjRepo::run(&h.repo.repo, &["git", "export"]);
     JjRepo::run(
         &h.repo.repo,
@@ -1078,12 +1088,7 @@ async fn positioning_transport_failure_retries_without_archiving() {
         _ => panic!("expected implementation item"),
     };
     let record = db.execution_bookmark(&prior.id).unwrap();
-    let pointers = boss_engine_recovery::execution_bookmark::snapshot_pointers(
-        &boss_engine_recovery::execution_bookmark::LocalJj,
-        &record,
-    )
-    .await
-    .unwrap();
+    let pointers = bookmark_targets(&record);
     let error = h.dispatch().await.unwrap_err();
     assert!(format!("{error:#}").contains("cube workspace goto failed"), "{error:#}");
     assert!(!boss_engine_recovery::execution_bookmark::is_pointer_integrity_error(
@@ -1101,15 +1106,7 @@ async fn positioning_transport_failure_retries_without_archiving() {
     assert_eq!(item.autostart, autostart);
     assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
     assert!(db.execution_bookmark_retired_reason(&prior.id).unwrap().is_none());
-    assert_eq!(
-        boss_engine_recovery::execution_bookmark::snapshot_pointers(
-            &boss_engine_recovery::execution_bookmark::LocalJj,
-            &record,
-        )
-        .await
-        .unwrap(),
-        pointers
-    );
+    assert_eq!(bookmark_targets(&record), pointers);
     assert!(
         JjRepo::run(
             &h.repo.repo,

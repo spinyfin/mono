@@ -11,7 +11,7 @@
 //!
 //! The proof is either [`unpublished_diff`] coming back empty (every
 //! non-empty preserved change is already reachable from a remote bookmark)
-//! or the same containment check reconciliation uses ([`containment`]):
+//! or a containment check ([`containment`]):
 //! each head must be the vouching commit or one of its ancestors, or every
 //! non-empty preserved change must have a content-equivalent variant (same
 //! change id, empty bookkeeping-filtered interdiff) in the vouching
@@ -28,8 +28,185 @@
 //! both stay. Because only proven heads are ever forgotten, a later call with
 //! a better voucher (the PR head GitHub reports) sees every head that still
 //! needs proof.
-use super::reconcile::containment;
 use super::*;
+
+/// One rewritten change: the preserved commit and the vouching history's
+/// commit that carries the same change id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RewrittenChange {
+    pub change_id: String,
+    pub preserved: String,
+    pub published: String,
+}
+
+/// A non-empty preserved change with no variant anywhere in the vouching
+/// history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissingChange {
+    pub change_id: String,
+    pub commit: String,
+    pub description: String,
+}
+
+/// How a preserved head relates to the commit that is to vouch for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Containment {
+    /// The head is that commit or one of its ancestors.
+    Ancestor,
+    /// Every non-empty change in `base..head` that is not itself in the
+    /// vouching history has a content-equivalent variant with the same change id there.
+    Rewritten { matched: Vec<RewrittenChange> },
+    /// Changes the vouching history does not carry in any form.
+    Missing { missing: Vec<MissingChange> },
+}
+
+impl Containment {
+    pub fn is_contained(&self) -> bool {
+        !matches!(self, Containment::Missing { .. })
+    }
+}
+
+fn change_commit_lines(output: &str) -> impl Iterator<Item = (&str, &str, &str)> {
+    output.lines().filter(|line| !line.is_empty()).map(|line| {
+        let mut parts = line.splitn(3, ' ');
+        let change = parts.next().unwrap_or_default();
+        let commit = parts.next().unwrap_or_default();
+        let description = parts.next().unwrap_or_default();
+        (change, commit, description)
+    })
+}
+
+/// `(change id, commit id)` of every commit in `revset`, in log order.
+async fn changes(jj: &dyn Jj, repo: &Path, revset: &str) -> Result<Vec<(String, String)>> {
+    let output = jj
+        .run(
+            repo,
+            &[
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-r",
+                revset,
+                "-T",
+                "change_id ++ \" \" ++ commit_id ++ \"\\n\"",
+            ],
+        )
+        .await?;
+    Ok(change_commit_lines(&output)
+        .map(|(change, commit, _)| (change.to_owned(), commit.to_owned()))
+        .collect())
+}
+
+/// Change id -> commit id of every commit in `revset`.
+async fn changes_by_id(jj: &dyn Jj, repo: &Path, revset: &str) -> Result<std::collections::HashMap<String, String>> {
+    Ok(changes(jj, repo, revset).await?.into_iter().collect())
+}
+
+/// Does `variant` (a rewrite of `commit` sharing its change id) carry the same
+/// content? An empty interdiff, ignoring bookkeeping paths, proves it.
+pub(super) async fn same_change_content(jj: &dyn Jj, repo: &Path, commit: &str, variant: &str) -> Result<bool> {
+    let interdiff = jj
+        .run(
+            repo,
+            &[
+                "--ignore-working-copy",
+                "interdiff",
+                "--from",
+                commit,
+                "--to",
+                variant,
+                "--git",
+            ],
+        )
+        .await?;
+    Ok(crate::recovery_apply::filter_bookkeeping(&interdiff)
+        .text
+        .trim()
+        .is_empty())
+}
+
+fn upstream(trunk: &str) -> String {
+    format!(
+        "::remote_bookmarks(exact:{})",
+        serde_json::to_string(trunk).expect("string serializes")
+    )
+}
+
+/// The range of preserved work: everything above `base` when one is known,
+/// otherwise the head's whole lineage. Upstream commits (anything a remote
+/// `trunk` bookmark already carries) are never preserved work.
+fn preserved_range(base: Option<&str>, head: &str, trunk: &str) -> String {
+    match base {
+        Some(base) => format!("((::({head}) ~ ::({base})) ~ {})", upstream(trunk)),
+        None => format!("(::({head}) ~ {})", upstream(trunk)),
+    }
+}
+
+/// The history that may vouch for preserved work: everything above the
+/// baseline's parents, so the baseline's own rewritten variant counts too
+/// (a stranded baseline is exactly that variant sitting under the head).
+fn vouching_range(base: &str, vouching: &str, trunk: &str) -> String {
+    format!("((::({vouching}) ~ ::(({base})-)) ~ {})", upstream(trunk))
+}
+
+/// Is the preserved work of `head` already carried by `vouching`? Ancestry
+/// first; otherwise every non-empty preserved commit that is not an
+/// ancestor of `vouching` must have a visible commit with the same change
+/// id and an equivalent patch in the vouching history. An empty interdiff
+/// proves equivalence across rebases; identity alone cannot vouch for an
+/// unpublished amendment. Without a base only ancestry counts.
+pub(super) async fn containment(
+    jj: &dyn Jj,
+    repo: &Path,
+    base: Option<&str>,
+    head: &str,
+    vouching: &str,
+    trunk: &str,
+) -> Result<Containment> {
+    if descends(jj, repo, head, vouching).await? {
+        return Ok(Containment::Ancestor);
+    }
+    let range = preserved_range(base, head, trunk);
+    let outside = jj
+        .run(
+            repo,
+            &[
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-r",
+                &format!("({range} ~ ::({vouching})) ~ empty()"),
+                "-T",
+                "change_id ++ \" \" ++ commit_id ++ \" \" ++ description.first_line() ++ \"\\n\"",
+            ],
+        )
+        .await?;
+    let published = match base {
+        Some(base) => changes_by_id(jj, repo, &vouching_range(base, vouching, trunk)).await?,
+        None => Default::default(),
+    };
+    let mut matched = Vec::new();
+    let mut missing = Vec::new();
+    for (change, commit, description) in change_commit_lines(&outside) {
+        match published.get(change) {
+            Some(variant) if same_change_content(jj, repo, commit, variant).await? => matched.push(RewrittenChange {
+                change_id: change.to_owned(),
+                preserved: commit.to_owned(),
+                published: variant.clone(),
+            }),
+            _ => missing.push(MissingChange {
+                change_id: change.to_owned(),
+                commit: commit.to_owned(),
+                description: description.to_owned(),
+            }),
+        }
+    }
+    Ok(if missing.is_empty() {
+        Containment::Rewritten { matched }
+    } else {
+        Containment::Missing { missing }
+    })
+}
 
 fn short(id: &str) -> &str {
     &id[..12.min(id.len())]

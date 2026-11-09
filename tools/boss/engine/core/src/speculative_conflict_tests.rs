@@ -305,6 +305,43 @@ async fn pass_caps_checks_per_sweep() {
     );
 }
 
+#[tokio::test]
+async fn live_writer_on_the_chain_skips_the_candidate_without_marking_it_checked() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, _product_id, work_item_id) = in_review_candidate(&db, "SpecLiveWriter");
+    let execution = db
+        .create_execution(
+            crate::work::CreateExecutionInput::builder()
+                .work_item_id(&work_item_id)
+                .kind(boss_protocol::ExecutionKind::ChoreImplementation)
+                .status(boss_protocol::ExecutionStatus::Running)
+                .build(),
+        )
+        .unwrap();
+    let cube = ScriptCube::new(Script::Clean);
+    let registry = registry_with_counters();
+    let mut schedule = SpeculativeCheckSchedule::default();
+
+    run_speculative_pass(&db, &cube, &registry, &mut schedule, std::slice::from_ref(&candidate)).await;
+
+    assert_eq!(
+        *cube.leases.lock().await,
+        0,
+        "no workspace may be leased under a live writer"
+    );
+    assert!(cube.rebases.lock().await.is_empty());
+    assert!(
+        schedule.due(&candidate.work_item_id, Instant::now()),
+        "a skipped candidate must stay due so it is rechecked once the writer is gone"
+    );
+
+    // Once the writer is gone the very next pass checks it.
+    db.mark_execution_redundant(&execution.id).unwrap();
+    run_speculative_pass(&db, &cube, &registry, &mut schedule, &[candidate]).await;
+    assert_eq!(*cube.rebases.lock().await, vec![42]);
+}
+
 #[test]
 fn schedule_due_respects_recheck_interval_then_becomes_due_again() {
     let mut schedule = SpeculativeCheckSchedule::default();

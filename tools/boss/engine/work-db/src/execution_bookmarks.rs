@@ -1,8 +1,6 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use super::*;
 use crate::schema_init::table_has_column;
-use boss_engine_recovery::execution_bookmark::{ExecutionBookmark, Jj, LocalJj, PointerSnapshot};
+use boss_engine_recovery::execution_bookmark::ExecutionBookmark;
 use rusqlite::Connection;
 
 pub(crate) const HAS_RECOVERY_HEAD_MIGRATION_ID: &str = "20261107_0815_execution_bookmark_has_recovery_head";
@@ -14,160 +12,8 @@ pub(crate) fn migrate_has_recovery_head(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// [`LocalJj`] with a child-process count, so a pointer snapshot / restore
-/// pass can publish how many `jj` processes it spawned
-/// (`execution_bookmark_pointers.jj_spawns`). Spawns are the whole cost of
-/// these passes; the count is what makes a regression visible.
-struct CountingJj {
-    spawns: AtomicU64,
-}
-
-impl CountingJj {
-    fn new() -> Self {
-        Self {
-            spawns: AtomicU64::new(0),
-        }
-    }
-
-    fn spawns(&self) -> u64 {
-        self.spawns.load(Ordering::Relaxed)
-    }
-}
-
-#[async_trait::async_trait]
-impl Jj for CountingJj {
-    async fn run(&self, repo: &std::path::Path, args: &[&str]) -> Result<String> {
-        self.spawns.fetch_add(1, Ordering::Relaxed);
-        LocalJj.run(repo, args).await
-    }
-
-    async fn shared_repo(&self, workspace: &std::path::Path) -> Result<std::path::PathBuf> {
-        LocalJj.shared_repo(workspace).await
-    }
-}
-
 #[work_db_boundary::instrument]
 impl WorkDb {
-    /// Live local recovery records of the PR-owning chain: the root item and
-    /// every revision share the PR branch in the shared store, so an engine
-    /// rebase moves all of their pointers. Executions with a live worker are
-    /// left out: the rebase also rewrites that worker's working copy, and jj's
-    /// own rewrite-following keeps its bookmarks consistent with it. Restoring
-    /// them to pre-rebase commits would strand them on a divergent twin.
-    fn chain_bookmark_records(&self, chain_root_id: &str) -> Vec<ExecutionBookmark> {
-        let executions = match self.list_executions_for_chain(chain_root_id) {
-            Ok(executions) => executions,
-            Err(err) => {
-                tracing::warn!(
-                    ?err,
-                    chain_root_id,
-                    "cannot list chain executions for recovery pointers"
-                );
-                return Vec::new();
-            }
-        };
-        let mut seen = std::collections::HashSet::new();
-        let mut records = Vec::new();
-        for execution in executions {
-            if !seen.insert(execution.id.clone()) || execution.status.is_live() {
-                continue;
-            }
-            match self.execution_bookmark_optional(&execution.id) {
-                Ok(Some(record)) if record.host_id == "local" => records.push(record),
-                Ok(_) => {}
-                Err(err) => {
-                    tracing::warn!(execution_id = %execution.id, ?err, "cannot read recovery bookmark record");
-                }
-            }
-        }
-        records
-    }
-
-    /// Preserve recovery identities across cube's shared-store pointer
-    /// rewrites. Best-effort per record: one damaged historical record is
-    /// logged and left out so it cannot disable the rebase for the others.
-    pub async fn snapshot_rebase_pointers(&self, chain_root_id: &str) -> Vec<(ExecutionBookmark, PointerSnapshot)> {
-        use boss_engine_recovery::execution_bookmark::snapshot_pointers;
-        let registry = self.metrics_registry();
-        let timer = crate::execution_bookmark_metrics::EXECUTION_BOOKMARK_POINTERS.begin();
-        let jj = CountingJj::new();
-        let records = self.chain_bookmark_records(chain_root_id);
-        let items = records.len();
-        let mut saved = Vec::new();
-        for record in records {
-            match snapshot_pointers(&jj, &record).await {
-                Ok(pointers) => saved.push((record, pointers)),
-                Err(err) => {
-                    tracing::warn!(execution_id = %record.execution_id, ?err, "cannot snapshot recovery pointers; leaving this record unprotected");
-                }
-            }
-        }
-        crate::execution_bookmark_metrics::EXECUTION_BOOKMARK_POINTERS_JJ_SPAWNS.inc_by(registry, jj.spawns());
-        timer.finish(registry, items);
-        saved
-    }
-
-    /// Attempt every restore even if one repository is unavailable. A published
-    /// rebase must still pass the deletion gate when maintenance fails.
-    pub async fn restore_rebase_pointers(&self, saved: &[(ExecutionBookmark, PointerSnapshot)]) -> bool {
-        use boss_engine_recovery::execution_bookmark::restore_pointers;
-        let registry = self.metrics_registry();
-        let timer = crate::execution_bookmark_metrics::EXECUTION_BOOKMARK_POINTERS.begin();
-        let jj = CountingJj::new();
-        let mut restored = true;
-        for (record, pointers) in saved {
-            if let Err(err) = restore_pointers(&jj, record, pointers).await {
-                restored = false;
-                tracing::error!(execution_id = %record.execution_id, ?err, "could not restore recovery pointers after cube rebase");
-            }
-        }
-        crate::execution_bookmark_metrics::EXECUTION_BOOKMARK_POINTERS_JJ_SPAWNS.inc_by(registry, jj.spawns());
-        timer.finish(registry, saved.len());
-        restored
-    }
-
-    /// End of a mechanical rebase operation: put every saved pointer back, then,
-    /// when the operation pushed a new PR head (`pushed_branch`), move each
-    /// record whose preserved work that head already carries onto it as one set
-    /// and persist the baseline. Records with unpublished work keep their saved
-    /// identities. Never fails the caller; maintenance problems are logged.
-    pub async fn finish_rebase_pointers(
-        &self,
-        saved: &[(ExecutionBookmark, PointerSnapshot)],
-        pushed_branch: Option<&str>,
-        trunk: &str,
-    ) -> bool {
-        use boss_engine_recovery::execution_bookmark::{adopt_pushed_head, resolve_bookmark_commit};
-        // The branch moved with the rebase, so read it before restoring.
-        let mut pushed = Vec::new();
-        if let Some(branch) = pushed_branch {
-            for (record, _) in saved {
-                match resolve_bookmark_commit(&LocalJj, record, branch).await {
-                    Ok(Some(commit)) => pushed.push((record, commit)),
-                    Ok(None) => {}
-                    Err(err) => {
-                        tracing::warn!(execution_id = %record.execution_id, ?err, "cannot resolve pushed PR head; keeping saved pointers");
-                    }
-                }
-            }
-        }
-        let restored = self.restore_rebase_pointers(saved).await;
-        if !restored {
-            return false;
-        }
-        for (record, commit) in pushed {
-            let result: Result<()> = async {
-                adopt_pushed_head(&LocalJj, record, &commit, trunk).await?;
-                self.update_execution_bookmark_base(&record.execution_id, &commit)
-            }
-            .await;
-            if let Err(err) = result {
-                tracing::warn!(execution_id = %record.execution_id, ?err, "recovery pointers not moved onto the pushed PR head; keeping saved pointers");
-            }
-        }
-        true
-    }
-
     pub fn record_execution_restore_report(
         &self,
         execution_id: &str,
@@ -245,15 +91,6 @@ impl WorkDb {
             ],
         )?;
         anyhow::ensure!(changed == 1, "execution bookmark record already exists and is live");
-        Ok(())
-    }
-
-    pub fn update_execution_bookmark_base(&self, execution_id: &str, commit: &str) -> Result<()> {
-        let changed = self.connect()?.execute(
-            "UPDATE execution_bookmarks SET base_commit = ?2 WHERE execution_id = ?1 AND retired_at IS NULL",
-            params![execution_id, commit],
-        )?;
-        anyhow::ensure!(changed == 1, "live execution bookmark record missing");
         Ok(())
     }
 

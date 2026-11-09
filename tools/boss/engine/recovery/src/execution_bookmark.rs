@@ -35,19 +35,8 @@ pub use preserved::{
 mod preserved_restore;
 pub use preserved_restore::restore_preserved;
 
-mod pr_anchor;
-pub use pr_anchor::is_legacy_pr_anchor_blocker;
-#[cfg(test)]
-mod pr_anchor_tests;
-
-mod snapshot;
-pub use snapshot::{PointerSnapshot, restore_pointers, snapshot_pointers};
-
-mod redispatch;
-pub use redispatch::{RestoreReport, restore_rebased};
-
 mod prune;
-pub use prune::{HostVoucher, PruneOutcome, Voucher, prune};
+pub use prune::{HostVoucher, MissingChange, PruneOutcome, RewrittenChange, Voucher, prune};
 
 #[cfg(test)]
 mod prune_tests;
@@ -55,28 +44,15 @@ mod prune_tests;
 #[cfg(test)]
 mod archive_tests;
 
-#[cfg(test)]
-mod redispatch_tests;
-
-mod reconcile;
-pub use reconcile::{
-    Anchor, Containment, MissingChange, Reconciliation, RewrittenChange, SupersededPointer, adopt_pushed_head,
-    reconcile, resolve_bookmark_commit,
-};
-
-#[cfg(test)]
-mod reconcile_tests;
-
 /// Which invariant a damaged pointer broke. Lineage between the pointers and
 /// the baseline is deliberately not an invariant: jj rewrites commits and
 /// merges concurrent operations as a matter of course, so the recorded
 /// baseline commit id is a floor, never something the heads must descend from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PointerIntegrityKind {
-    /// Reconciliation was attempted and the preserved work is not carried by
-    /// anything the engine can vouch for. Nothing was moved.
+    /// Never produced by this crate; handled like [`Self::Other`] if seen.
     NotContained,
-    /// The disposable PR bookmark is missing or conflicted; refresh it from GitHub.
+    /// Never produced by this crate; handled like [`Self::Other`] if seen.
     PrHeadUnavailable,
     /// A resumed head descends from work that teardown quarantined as possibly
     /// belonging to a later holder. Nothing was moved or restaged.
@@ -338,6 +314,31 @@ fn revision(bookmark: &str) -> String {
     )
 }
 
+/// Resolve several bookmarks of one repository in a single `jj` invocation.
+///
+/// Returns every visible commit each named bookmark points at (a conflicted
+/// bookmark lists more than one; an absent bookmark is missing from the
+/// map). Bookmark names are matched by the template's `name()`, never the
+/// decorated `name*` / `name??` rendering.
+pub(crate) async fn resolve_bookmark_targets(
+    jj: &dyn Jj,
+    repo: &Path,
+    bookmarks: &[String],
+) -> Result<std::collections::HashMap<String, Vec<String>>> {
+    if bookmarks.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let revset = bookmarks
+        .iter()
+        .map(|name| revision(name))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Ok(bookmark_targets_in(
+        &commits_with_bookmarks(jj, repo, &revset).await?,
+        bookmarks,
+    ))
+}
+
 /// Resolve a bookmark to the single commit it targets. Commit ids, unlike
 /// change ids, stay unique when a change is divergent (two visible commits
 /// sharing one change id), so ancestry checks built on them cannot match a
@@ -449,15 +450,65 @@ fn floor_candidates(record: &ExecutionBookmark) -> impl Iterator<Item = &str> {
         .filter(|commit| !commit.is_empty() && commit.bytes().all(|c| c.is_ascii_hexdigit()))
 }
 
+/// Every commit `revset` names, with the local bookmarks it carries, in one
+/// `jj` invocation. Hidden commits named explicitly are listed too.
+pub(crate) async fn commits_with_bookmarks(
+    jj: &dyn Jj,
+    repo: &Path,
+    revset: &str,
+) -> Result<Vec<(String, Vec<String>)>> {
+    let output = jj
+        .run(
+            repo,
+            &[
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-r",
+                revset,
+                "-T",
+                "commit_id ++ \"\\t\" ++ local_bookmarks.map(|b| b.name()).join(\"\\t\") ++ \"\\n\"",
+            ],
+        )
+        .await?;
+    Ok(output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let commit = fields.next().filter(|commit| !commit.is_empty())?;
+            Some((
+                commit.to_owned(),
+                fields.filter(|name| !name.is_empty()).map(str::to_owned).collect(),
+            ))
+        })
+        .collect())
+}
+
+/// The commits each of `bookmarks` targets among `commits`: a conflicted
+/// bookmark lists more than one, an absent bookmark is missing from the map.
+pub(crate) fn bookmark_targets_in(
+    commits: &[(String, Vec<String>)],
+    bookmarks: &[String],
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut targets: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for (commit, names) in commits {
+        for name in names.iter().filter(|name| bookmarks.contains(name)) {
+            targets.entry(name.clone()).or_default().push(commit.clone());
+        }
+    }
+    targets
+}
+
 async fn query_pointers(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<PointerQuery> {
     let names = [record.head(), record.publication()];
     let mut revset: Vec<String> = names.iter().map(|name| revision(name)).collect();
     // `present()` turns a commit that is not in the store into an empty set
     // instead of a resolution error; a hidden commit named by id is listed.
     revset.extend(floor_candidates(record).map(|commit| format!("present({commit})")));
-    let commits = snapshot::commits_with_bookmarks(jj, &record.repo_path, &revset.join(" | ")).await?;
+    let commits = commits_with_bookmarks(jj, &record.repo_path, &revset.join(" | ")).await?;
     Ok(PointerQuery {
-        targets: snapshot::bookmark_targets_in(&commits, &names),
+        targets: bookmark_targets_in(&commits, &names),
         present: commits.into_iter().map(|(commit, _)| commit).collect(),
     })
 }
@@ -498,6 +549,7 @@ impl PointerQuery {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn resolve_heads(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<Heads> {
     query_pointers(jj, record).await?.heads(record)
 }
@@ -599,14 +651,82 @@ pub(crate) async fn reject_quarantined_heads(jj: &dyn Jj, record: &ExecutionBook
     Ok(())
 }
 
+/// The report a restore hands to the successor worker's prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct RestoreReport {
+    pub pointer: String,
+    pub commits: String,
+    pub base_sha: String,
+    pub conflicts: String,
+    /// Baseline of staged history; predecessor provenance stays untouched.
+    #[serde(default)]
+    pub inherited_base: Option<String>,
+    /// True when a PR head bookmark was restaged (a revision), so the PR must be
+    /// rewritten through `cube pr update`.
+    #[serde(default)]
+    #[builder(default)]
+    pub pr_bound: bool,
+    /// Set when the PR's own base could not be used and history was restaged
+    /// onto a substitute branch; records the requested base, the branch used
+    /// and why.
+    #[serde(default)]
+    pub base_fallback: Option<String>,
+    /// Commit ids of conflicted preserved variants that were not selected.
+    #[serde(default)]
+    #[builder(default)]
+    pub discarded_tips: String,
+    /// Unpublished unselected variants that still have a named archive
+    /// reference. Dispatch raises attention when this is non-empty.
+    #[serde(default)]
+    #[builder(default)]
+    pub unrestaged_unpublished: String,
+}
+
+impl RestoreReport {
+    pub fn instructions(&self) -> String {
+        let conflict_task = if self.conflicts.is_empty() {
+            "The rebase completed without conflicts.".to_owned()
+        } else {
+            format!(
+                "FIRST TASK: resolve the following rebase conflicts, preserving both sides and all inherited commits, before continuing the implementation. Inspect each listed commit with `jj resolve --list -r <commit>`; conflicts may be in ancestors of `@`.\n{}",
+                self.conflicts
+            )
+        };
+        let pr_rewrite = if !self.pr_bound {
+            String::new()
+        } else {
+            let base = match &self.base_fallback {
+                Some(note) => format!(
+                    "WARNING: the PR's own base branch could not be used ({note}). History was restaged onto that substitute branch instead, so if the PR is stacked, its unmerged parent's commits may now appear among the inherited commits: inspect them and drop any that belong to the parent PR before publishing. "
+                ),
+                None => "For a revision, the PR history was restaged onto its current base branch (including a stacked PR base). ".to_owned(),
+            };
+            format!(
+                "{base}The PR head-branch bookmark still points at the original head: publishing requires moving that bookmark to the completed history with `jj bookmark set --allow-backwards` and rewriting the existing PR through `cube pr update`.\n\n"
+            )
+        };
+        let discarded = if self.discarded_tips.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nConflicted preserved variants not selected:\n```text\n{}```\n",
+                self.discarded_tips
+            )
+        };
+        format!(
+            "## EXECUTION BOOKMARK RECOVERY\n\nRestored pointer: `{}`. After fetching the upstream, the engine restaged this history onto base SHA `{}`.\n\nOriginal commits (before rebasing):\n```text\n{}```\n{discarded}\n{conflict_task}\n\n{pr_rewrite}Stay at `@` and inspect the inherited history. The old workspace was not used: re-run the required build and tests in your own leased workspace before publishing; earlier validation does not satisfy this run's gate.\n\n",
+            self.pointer, self.base_sha, self.commits
+        )
+    }
+}
+
 /// Compatibility fixtures for the pre-migration three-bookmark layout, used only by this
 /// crate's own tests. Other crates use `boss_engine_recovery_fixtures`.
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
-pub(crate) use test_support::{
-    create_legacy_three_bookmark_fixture as create, create_legacy_three_bookmark_fixture_from,
-};
+pub(crate) use test_support::create_legacy_three_bookmark_fixture as create;
 
 /// Baseline recording failed after identifying the shared store.
 #[derive(Debug)]
@@ -744,7 +864,7 @@ pub async fn release_heads(
     release_names: bool,
 ) -> Result<Vec<(String, String)>> {
     let names = [record.base(), record.head(), record.publication()];
-    let targets = snapshot::resolve_bookmark_targets(jj, &record.repo_path, &names).await?;
+    let targets = resolve_bookmark_targets(jj, &record.repo_path, &names).await?;
     let mut commits: std::collections::BTreeSet<String> = targets.values().flatten().cloned().collect();
     if let Some(base) = &record.base_commit
         && commit_exists(jj, &record.repo_path, base).await?

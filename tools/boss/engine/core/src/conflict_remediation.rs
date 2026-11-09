@@ -346,6 +346,21 @@ impl ConflictRemediationJob for LadderRemediationJob {
                 );
                 RemediationDisposition::RetryAfterCooldown
             }
+            LadderOutcome::DeferredForLiveWriter => {
+                // A worker is live on this PR's chain; the engine does not
+                // rebase under it. Nothing was leased or changed, so retry
+                // later: the cooldown holds the slot as for an unavailable
+                // rung.
+                tracing::info!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    attempt_id = %attempt.id,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "conflict_remediation: a worker is live on this PR's chain; engine rebase deferred, \
+                     no worker spawned, ladder will retry on a later tick",
+                );
+                RemediationDisposition::RetryAfterCooldown
+            }
             LadderOutcome::FellThrough {
                 residual_conflict_files,
                 ..
