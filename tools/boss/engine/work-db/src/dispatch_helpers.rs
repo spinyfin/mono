@@ -1,6 +1,7 @@
 use super::dispatch_admission::{
     primary_pr_awaits_review, revision_implementation_completed, work_item_is_deliberately_parked,
 };
+use super::queued_wait::ReviewNaming;
 use super::*;
 
 /// Shared per-product short-id read-modify-write. Reads the current
@@ -272,29 +273,115 @@ pub(crate) fn collect_product_dependencies(conn: &Connection, product_id: &str) 
     collect_rows(rows)
 }
 
+/// Where one board assembly's runtime pass spent its statements and time.
+/// The phases partition `statements`: the epoch read, the execution point
+/// queries each computed card reports (1-4, see [`compute_task_runtime`]),
+/// and every statement of the annotation.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) struct RuntimePassCost {
+    pub statements: u64,
+    /// The epoch read and the cache probe; absent on the uncached path.
+    pub cache: Option<RuntimeCacheCost>,
+    /// The execution projection of every card the cache could not serve.
+    pub computed: RuntimePhaseCost,
+    /// Naming the wait of every card with nothing pending, by branch.
+    pub annotation: super::unscheduled_wait::ClassifyCost,
+}
+
+impl RuntimePassCost {
+    /// Record each phase as a sub-segment of `db.task_runtimes`, so a slow
+    /// runtime pass names the phase and the annotation branch that took it.
+    pub(crate) fn record(&self, trace: &mut boss_metrics::population_timing::PopulationTrace) {
+        use boss_metrics::population_timing::segment;
+        if let Some(cache) = &self.cache {
+            trace.record_cache_probe(
+                segment::DB_TASK_RUNTIMES_CACHE,
+                cache.millis,
+                cache.statements,
+                cache.hits,
+                cache.misses,
+            );
+        }
+        trace.record_nplus1(
+            segment::DB_TASK_RUNTIMES_COMPUTE,
+            self.computed.millis,
+            self.computed.cards,
+            self.computed.statements,
+        );
+        let annotation = &self.annotation;
+        trace.record_nplus1(
+            segment::DB_TASK_RUNTIMES_ANNOTATION,
+            annotation.millis(),
+            annotation.cards(),
+            annotation.statements(),
+        );
+        for (name, branch) in [
+            (segment::DB_TASK_RUNTIMES_ANNOTATION_QUEUED, &annotation.queued),
+            (
+                segment::DB_TASK_RUNTIMES_ANNOTATION_IDLE_ACTIVE,
+                &annotation.idle_active,
+            ),
+            (segment::DB_TASK_RUNTIMES_ANNOTATION_REVIEW, &annotation.review),
+        ] {
+            trace.record_nplus1(name, branch.millis, branch.cards, branch.statements);
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) struct RuntimeCacheCost {
+    pub hits: usize,
+    pub misses: usize,
+    pub statements: u64,
+    pub millis: f64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) struct RuntimePhaseCost {
+    pub cards: usize,
+    pub statements: u64,
+    pub millis: f64,
+}
+
 /// Hydrate the per-item runtime for every task and chore. This is the
 /// primary N+1 on the `get_work_tree` path: one call per work item, each
-/// running execution point queries plus task-derived wait annotation. Returns
-/// the runtimes alongside the total number of SQL statements executed, so
-/// `boss_engine::population_timing` can attribute the per-row subquery fan-out.
+/// running execution point queries. The wait of every card with nothing
+/// pending is then named for all of them together, with statements that do
+/// not grow with the board. Returns the runtimes alongside what the pass
+/// cost, so `boss_engine::population_timing` can attribute the per-row
+/// subquery fan-out.
 pub(crate) fn collect_task_runtimes(
     conn: &Connection,
     tasks: &[Task],
     chores: &[Task],
     now: i64,
-) -> Result<(Vec<TaskRuntime>, u64)> {
+) -> Result<(Vec<TaskRuntime>, RuntimePassCost)> {
+    let started = std::time::Instant::now();
     let mut runtimes = Vec::with_capacity(tasks.len() + chores.len());
     let mut queries = 0u64;
     for task in tasks.iter().chain(chores.iter()) {
-        let mut runtime = compute_task_runtime(conn, &task.id, &mut queries, now)?.runtime;
-        let (annotation, statements) = super::db_diagnostics::count_statements(conn, || {
-            super::queued_wait::annotate_unscheduled(conn, task, &mut runtime)
-        });
-        queries += statements;
-        annotation?;
-        runtimes.push(runtime);
+        runtimes.push(compute_task_runtime(conn, &task.id, &mut queries, now, ReviewNaming::Deferred)?.runtime);
     }
-    Ok((runtimes, queries))
+    let computed = RuntimePhaseCost {
+        cards: runtimes.len(),
+        statements: queries,
+        millis: started.elapsed().as_secs_f64() * 1000.0,
+    };
+    let annotation = {
+        let counter = super::db_diagnostics::StatementCounter::install(conn);
+        super::queued_wait::annotate_unscheduled_many(
+            conn,
+            tasks.iter().chain(chores.iter()).zip(runtimes.iter_mut()),
+            Some(&counter),
+        )?
+    };
+    let cost = RuntimePassCost {
+        statements: computed.statements + annotation.statements(),
+        cache: None,
+        computed,
+        annotation,
+    };
+    Ok((runtimes, cost))
 }
 
 /// Runtime snapshot for a single work item. `queries` is incremented by the
@@ -305,7 +392,7 @@ pub(crate) fn collect_task_runtimes(
 /// annotation statements are counted as well.
 pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str, queries: &mut u64) -> Result<TaskRuntime> {
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
-    let mut runtime = compute_task_runtime(conn, work_item_id, queries, now)?.runtime;
+    let mut runtime = compute_task_runtime(conn, work_item_id, queries, now, ReviewNaming::Inline)?.runtime;
     // A card queued with no execution is explained from its task row, which
     // the execution-keyed projection above never reads.
     if runtime.dispatch_wait_reason.is_none() {
@@ -347,9 +434,11 @@ pub struct ComputedRuntime {
 ///   versioned, `cacheable` is false.
 ///
 /// The item's own task row is not an input here. A card queued with no
-/// execution is explained from that row by `queued_wait::annotate_unscheduled`,
-/// which callers holding the row apply after this projection (and after any
-/// cache hit).
+/// execution is explained from that row by
+/// `queued_wait::annotate_unscheduled_many`, which callers holding the rows
+/// apply after this projection (and after any cache hit). Such a caller
+/// passes [`ReviewNaming::Deferred`], because that pass also names a run
+/// parked waiting for review.
 ///
 /// A new input must be added to one of those four mechanisms, or the cache
 /// will serve it stale; `every_runtime_input_write_invalidates_exactly_its_item`
@@ -360,6 +449,7 @@ pub(crate) fn compute_task_runtime(
     work_item_id: &str,
     queries: &mut u64,
     now: i64,
+    review: ReviewNaming,
 ) -> Result<ComputedRuntime> {
     let latest = query_latest_execution_for_work_item(conn, work_item_id)?;
     *queries += 1;
@@ -399,7 +489,7 @@ pub(crate) fn compute_task_runtime(
             None => latest,
         }
     };
-    let wait = super::queued_wait::for_execution(conn, execution.as_ref(), now)?;
+    let wait = super::queued_wait::for_execution_naming(conn, execution.as_ref(), now, review)?;
     let (execution_status, run_status, execution_id, current_run_id, dispatch_retry_at, dispatch_wait_since) =
         if let Some(execution) = execution {
             *queries += 1;

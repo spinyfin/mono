@@ -1225,12 +1225,13 @@ impl WorkDb {
         trace.set_items(tasks.len() + chores.len());
 
         // Primary N+1: one runtime lookup per task and chore, each running
-        // 1-4 point queries (on the cached path, only for misses).
-        // `runtime_queries` is the aggregate statement count, which makes the
-        // per-row fan-out visible in the log.
+        // 1-4 point queries (on the cached path, only for misses), then one
+        // set-based pass naming the wait of every card with nothing pending.
+        // The aggregate statement count makes the per-row fan-out visible in
+        // the log; the sub-segments say which phase it came from.
         trace.enter_stage(segment::DB_TASK_RUNTIMES);
         let t = Instant::now();
-        let (task_runtimes, runtime_queries) = match runtime_cache {
+        let (task_runtimes, runtime_cost) = match runtime_cache {
             Some(cache) => collect_task_runtimes_cached(conn, product_id, &tasks, &chores, cache, now, validity)?,
             None => collect_task_runtimes(conn, &tasks, &chores, now)?,
         };
@@ -1238,8 +1239,9 @@ impl WorkDb {
             segment::DB_TASK_RUNTIMES,
             elapsed_ms(t),
             tasks.len() + chores.len(),
-            runtime_queries,
+            runtime_cost.statements,
         );
+        runtime_cost.record(trace);
 
         trace.enter_stage(segment::DB_DEPENDENCIES);
         let t = Instant::now();

@@ -11,19 +11,12 @@
 //! no named condition holds the answer is
 //! [`DISPATCH_WAIT_REASON_UNCLASSIFIED`], which is reported as an anomaly
 //! rather than shown as a reason.
+use super::unscheduled_wait::{self, Candidate, ClassifyCost};
 use super::*;
 use boss_engine_storage_values::dispatch_wait::{
-    DISPATCH_WAIT_REASON_AUTOSTART_OFF, DISPATCH_WAIT_REASON_AWAITING_DISPATCH,
-    DISPATCH_WAIT_REASON_AWAITING_PARENT_PR, DISPATCH_WAIT_REASON_AWAITING_REDISPATCH,
-    DISPATCH_WAIT_REASON_AWAITING_REVIEW, DISPATCH_WAIT_REASON_DEFERRED, DISPATCH_WAIT_REASON_DISPATCH_FAILED,
-    DISPATCH_WAIT_REASON_HUMAN_DRIVEN, DISPATCH_WAIT_REASON_NOT_BEFORE, DISPATCH_WAIT_REASON_PARKED,
-    DISPATCH_WAIT_REASON_PR_OPEN, DISPATCH_WAIT_REASON_PROJECT_ORDER, DISPATCH_WAIT_REASON_RECOVERY_ATTENTION,
-    DISPATCH_WAIT_REASON_REPO_UNRESOLVED, DISPATCH_WAIT_REASON_RUN_ENDED, DISPATCH_WAIT_REASON_UNCLASSIFIED,
+    DISPATCH_WAIT_REASON_AUTOSTART_OFF, DISPATCH_WAIT_REASON_AWAITING_DISPATCH, DISPATCH_WAIT_REASON_AWAITING_MERGE,
+    DISPATCH_WAIT_REASON_NOT_BEFORE, DISPATCH_WAIT_REASON_PROJECT_ORDER, DISPATCH_WAIT_REASON_UNCLASSIFIED,
     DISPATCH_WAIT_REASON_WAITING_DEPENDENCY, UnexplainedWait, dispatch_wait_phrase, is_unlabelled_wait_code,
-};
-use boss_engine_storage_values::dispatch_wait::{
-    DISPATCH_WAIT_REASON_AWAITING_MERGE, DISPATCH_WAIT_REASON_DELIBERATE_PARK, DISPATCH_WAIT_REASON_DISPATCH_PAUSED,
-    DISPATCH_WAIT_REASON_REVIEW_BATCH, DISPATCH_WAIT_REASON_REVIEW_RESERVATION,
 };
 use boss_protocol::DispatchWaitBlocker;
 
@@ -42,7 +35,7 @@ pub(super) struct DispatchWait {
 }
 
 impl DispatchWait {
-    fn named(code: &str) -> Self {
+    pub(super) fn named(code: &str) -> Self {
         Self {
             reason: Some(code.to_owned()),
             label: Some(dispatch_wait_phrase(code)),
@@ -80,16 +73,40 @@ fn blocker_short_label(blocker: &DispatchWaitBlocker) -> Option<String> {
     blocker.short_id.map(|n| format!("{prefix}{n}"))
 }
 
+/// Who names the wait of a run parked waiting for review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReviewNaming {
+    /// The execution projection, by classifying the run's item now.
+    Inline,
+    /// The caller, which classifies every item with nothing pending as a set
+    /// afterwards ([`annotate_unscheduled_many`]). That pass names a parked
+    /// run from the same item row, so naming it here as well would only
+    /// repeat the work once per card.
+    Deferred,
+}
+
 /// Classify a pending execution. Only pending state is projected: an old hold
 /// is never leaked onto a claimed, live or finished run, which is not waiting
 /// on dispatch at all.
 pub(super) fn for_execution(conn: &Connection, execution: Option<&WorkExecution>, now: i64) -> Result<DispatchWait> {
+    for_execution_naming(conn, execution, now, ReviewNaming::Inline)
+}
+
+/// [`for_execution`] with the naming of a review-parked run chosen by the
+/// caller.
+pub(super) fn for_execution_naming(
+    conn: &Connection,
+    execution: Option<&WorkExecution>,
+    now: i64,
+    review: ReviewNaming,
+) -> Result<DispatchWait> {
     let Some(execution) = execution else {
         return Ok(DispatchWait::default());
     };
     match execution.status {
         ExecutionStatus::WaitingDependency => for_gated(conn, execution),
         ExecutionStatus::Ready | ExecutionStatus::Queued => for_ready(conn, execution, now),
+        ExecutionStatus::WaitingReview if review == ReviewNaming::Deferred => Ok(DispatchWait::default()),
         ExecutionStatus::WaitingReview => review_wait(conn, &execution.work_item_id),
         ExecutionStatus::WaitingMerge => Ok(DispatchWait::named(DISPATCH_WAIT_REASON_AWAITING_MERGE)),
         _ => Ok(DispatchWait::default()),
@@ -262,241 +279,72 @@ pub(super) fn for_item(
 }
 
 /// Classify an item with nothing pending for it: a card the board lists as
-/// queued (`todo` with automatic start on), or an `active` item with no run
-/// pending or live. `latest` is the item's most recent execution. Returns
-/// `None` when the item is in neither state.
+/// queued (`todo` with automatic start on), an `active` item with no run
+/// pending or live, or an item in review. `latest` is the status of the
+/// item's most recent execution. Returns `None` when the item is in none of
+/// those states.
 ///
-/// For a queued card the named reasons are the reconciler's own refusals to
-/// mint an execution, in its order (`reconcile_work_item_execution` /
-/// `reconcile_revision_execution`). When none of them applies the reconciler
-/// would have minted one, so its absence is unclassified.
+/// This is [`unscheduled_wait::classify`] for one item; a caller holding many
+/// items passes them all to [`annotate_unscheduled_many`] instead, which
+/// costs the same statements as one.
 pub(super) fn for_unscheduled(
     conn: &Connection,
     task: &Task,
     latest: Option<&ExecutionStatus>,
 ) -> Result<Option<DispatchWait>> {
-    if task.deleted_at.is_none() {
-        match latest {
-            Some(ExecutionStatus::WaitingReview) => return review_wait(conn, &task.id).map(Some),
-            Some(ExecutionStatus::WaitingMerge) => {
-                return Ok(Some(DispatchWait::named(DISPATCH_WAIT_REASON_AWAITING_MERGE)));
-            }
-            _ => {}
-        }
-    }
-    if task.deleted_at.is_some() || latest.is_some_and(|status| !status.is_terminal()) {
-        return Ok(None);
-    }
-    match task.status {
-        TaskStatus::Todo if task.autostart => for_queued_card(conn, task, latest).map(Some),
-        TaskStatus::Active => for_idle_active(conn, task).map(Some),
-        TaskStatus::InReview => review_wait(conn, &task.id).map(Some),
-        _ => Ok(None),
-    }
+    let (mut waits, _) = unscheduled_wait::classify(conn, &[Candidate { task, latest }], None)?;
+    Ok(waits.remove(&task.id))
 }
 
-/// Holds shared by idle cards and review handling, including inherited holds.
-fn item_hold(conn: &Connection, task: &Task) -> Result<Option<&'static str>> {
-    Ok(if task.human_driven || work_item_is_human_driven(conn, &task.id)? {
-        Some(DISPATCH_WAIT_REASON_HUMAN_DRIVEN)
-    } else if task.is_parked() || !parking::upkeep_eligible(conn, &task.id)? {
-        Some(DISPATCH_WAIT_REASON_PARKED)
-    } else {
-        None
-    })
-}
-
+/// The wait of a run parked waiting for review, named from its item's row.
 fn review_wait(conn: &Connection, id: &str) -> Result<DispatchWait> {
-    use boss_engine_storage_values::dispatch_wait::{
-        DISPATCH_WAIT_REASON_HUMAN_REVIEW, DISPATCH_WAIT_REASON_REVIEW_COMPLETE, DISPATCH_WAIT_REASON_REVISION_PENDING,
-    };
-    let Some(task) = query_task(conn, id)? else {
-        return Ok(DispatchWait::named(DISPATCH_WAIT_REASON_UNCLASSIFIED));
-    };
-    if let Some(code) = item_hold(conn, &task)? {
-        return Ok(DispatchWait::named(code));
+    match query_task(conn, id)? {
+        Some(task) => unscheduled_wait::review_wait(conn, &task),
+        None => Ok(DispatchWait::named(DISPATCH_WAIT_REASON_UNCLASSIFIED)),
     }
-    let root = chain_root(conn, id)?;
-    let owner = if root == id {
-        task.clone()
-    } else {
-        query_task(conn, &root)?.unwrap_or_else(|| task.clone())
-    };
-    let human_review = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM work_attention_items
-         WHERE work_item_id IN (?1, ?2) AND kind = 'pr_review_cycle_bound' AND status = 'open')",
-        params![id, root],
-        |row| row.get::<_, bool>(0),
-    )?;
-    // Reuse the resolved owner instead of walking the card's chain again.
-    let reviews = super::review_badge::fetch_current_heads(
-        conn,
-        std::slice::from_ref(&root),
-        super::review_badge::ReviewKey::Owner,
-    )?;
-    let review = reviews.get(&root);
-    let revision_pending = review
-        .and_then(|review| review.findings_revision_id.as_deref())
-        .map(|id| query_task(conn, id))
-        .transpose()?
-        .flatten()
-        .is_some_and(|revision| {
-            revision.deleted_at.is_none()
-                && matches!(
-                    revision.status,
-                    TaskStatus::Todo | TaskStatus::Active | TaskStatus::Blocked
-                )
-        });
-    let code = if human_review {
-        DISPATCH_WAIT_REASON_HUMAN_REVIEW
-    } else if super::dispatch::live_pre_merge_batch_holds(conn, id)? {
-        DISPATCH_WAIT_REASON_REVIEW_BATCH
-    } else if revision_pending {
-        DISPATCH_WAIT_REASON_REVISION_PENDING
-    } else if task.review_required_state.as_deref() == Some("changes_requested")
-        || review.is_some_and(|review| review.state == AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS)
-    {
-        DISPATCH_WAIT_REASON_HUMAN_REVIEW
-    } else if review.is_some_and(|review| {
-        matches!(
-            review.state,
-            AI_REVIEW_STATE_REVIEWED_CLEAN_PENDING | AI_REVIEW_STATE_REVIEWED_ALL_CLEAR
-        )
-    }) {
-        DISPATCH_WAIT_REASON_REVIEW_COMPLETE
-    } else if !WorkDb::pre_merge_review_admission_candidates_in(conn, Some(id))?.is_empty() {
-        DISPATCH_WAIT_REASON_REVIEW_RESERVATION
-    } else if task.review_required_state.as_deref() == Some("approved") {
-        DISPATCH_WAIT_REASON_AWAITING_MERGE
-    } else if matches!(
-        task.review_required_state.as_deref(),
-        Some("required" | "review_required")
-    ) {
-        DISPATCH_WAIT_REASON_HUMAN_REVIEW
-    } else if owner.pr_url.as_deref().is_some_and(|url| !url.trim().is_empty())
-        && matches!(owner.review_required_state.as_deref(), None | Some("unknown"))
-        && (task_kind_excluded_from_ai_review(&owner.kind)
-            || review.is_some_and(|review| review.state == AI_REVIEW_STATE_NOT_REVIEWED))
-    {
-        // Inspect the family only after the cheap fallback gates pass.
-        // Name outstanding work even when there is no AI verdict.
-        let (revision, reviewer) = conn.query_row(
-            &format!(
-                "{} SELECT
-                 EXISTS(SELECT 1 FROM family f JOIN tasks t ON t.id = f.id
-                     WHERE t.deleted_at IS NULL AND t.kind = 'revision'
-                         AND t.status IN ('todo', 'active', 'blocked')),
-                 EXISTS(SELECT 1 FROM family f JOIN tasks t ON t.id = f.id
-                     JOIN work_executions e ON e.work_item_id = t.id
-                     WHERE t.deleted_at IS NULL AND e.kind = 'pr_review'
-                         AND e.status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned'))",
-                super::review_badge::review_family_cte("?1", super::review_badge::ReviewKey::Card)
-            ),
-            [id],
-            |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
-        )?;
-        if revision {
-            DISPATCH_WAIT_REASON_REVISION_PENDING
-        } else if reviewer {
-            DISPATCH_WAIT_REASON_REVIEW_BATCH
-        } else {
-            DISPATCH_WAIT_REASON_AWAITING_MERGE
-        }
-    } else {
-        DISPATCH_WAIT_REASON_UNCLASSIFIED
-    };
-    Ok(DispatchWait::named(code))
 }
 
-/// An `active` item with no run pending or live. The orphan sweep is what
-/// starts a replacement run, so the sweep's own candidate predicate names the
-/// ordinary state; the holds it leaves alone are named in turn. Anything
-/// else is the anomaly [`DISPATCH_WAIT_REASON_UNCLASSIFIED`].
-fn for_idle_active(conn: &Connection, task: &Task) -> Result<DispatchWait> {
-    let code = if let Some(code) = item_hold(conn, task)? {
-        code
-    } else if task.dispatch_failed_reason.is_some() {
-        DISPATCH_WAIT_REASON_DISPATCH_FAILED
-    } else if conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM work_attention_items
-         WHERE work_item_id = ?1 AND status = 'open' AND kind IN (?2, ?3))",
-        params![
-            task.id,
-            ATTENTION_KIND_RECOVERY_PERMANENT,
-            ATTENTION_KIND_RECOVERY_EXHAUSTED
-        ],
-        |row| row.get::<_, bool>(0),
-    )? {
-        DISPATCH_WAIT_REASON_RECOVERY_ATTENTION
-    } else if super::dispatch_admission::work_item_is_deliberately_parked(conn, &task.id)? {
-        DISPATCH_WAIT_REASON_DELIBERATE_PARK
-    } else if !super::dispatch::orphan_active_candidates(conn, i64::MAX, Some(&task.id))?.is_empty() {
-        if super::dispatch_admission::pause_holds_on(conn, &task.id)? {
-            DISPATCH_WAIT_REASON_DISPATCH_PAUSED
-        } else {
-            DISPATCH_WAIT_REASON_AWAITING_REDISPATCH
-        }
-    } else if super::dispatch_admission::primary_pr_awaits_review(conn, &task.id)?
-        || super::dispatch_admission::revision_implementation_completed(conn, &task.id)?
-        || super::dispatch::live_pre_merge_batch_holds(conn, &task.id)?
-        || conn.query_row(
-            &format!("SELECT {}", super::dispatch::review_recovery_holds_sql("?1")),
-            [&task.id],
-            |row| row.get::<_, bool>(0),
-        )?
-    {
-        // The sweep leaves these to review handling: a delivered pull request,
-        // a completed revision, a live review batch or a review pass that
-        // review recovery owns.
-        DISPATCH_WAIT_REASON_AWAITING_REVIEW
-    } else {
-        DISPATCH_WAIT_REASON_UNCLASSIFIED
-    };
-    Ok(DispatchWait::named(code))
+/// Write [`for_unscheduled`]'s answer onto `runtime`, for a caller that holds
+/// one task row.
+pub(super) fn annotate_unscheduled(conn: &Connection, task: &Task, runtime: &mut TaskRuntime) -> Result<()> {
+    annotate_unscheduled_many(conn, [(task, runtime)], None).map(|_| ())
 }
 
-/// A `todo` card with automatic start on, nothing pending for it and no live
-/// run.
-fn for_queued_card(conn: &Connection, task: &Task, latest: Option<&ExecutionStatus>) -> Result<DispatchWait> {
-    let code = if let Some(code) = item_hold(conn, task)? {
-        code
-    } else if task.deferred || work_item_is_deferred(conn, &task.id)? {
-        DISPATCH_WAIT_REASON_DEFERRED
-    } else if latest.is_some() {
-        // The reconciler never mints a replacement after a finished run.
-        DISPATCH_WAIT_REASON_RUN_ENDED
-    } else if task.kind == TaskKind::Revision {
-        match get_chain_root_task(conn, &task.id)? {
-            Some(root) if root.pr_url.as_deref().is_none_or(|url| url.trim().is_empty()) => {
-                DISPATCH_WAIT_REASON_AWAITING_PARENT_PR
-            }
-            _ => DISPATCH_WAIT_REASON_UNCLASSIFIED,
-        }
-    } else if task.pr_url.as_deref().is_some_and(|url| !url.trim().is_empty()) {
-        DISPATCH_WAIT_REASON_PR_OPEN
-    } else if resolve_repo_for_work_item(conn, &task.id)?.is_none() {
-        DISPATCH_WAIT_REASON_REPO_UNRESOLVED
-    } else {
-        DISPATCH_WAIT_REASON_UNCLASSIFIED
-    };
-    Ok(DispatchWait::named(code))
-}
-
-/// Write [`for_unscheduled`]'s answer onto `runtime`, for callers that hold
-/// the task row. Applied after the execution-keyed projection and after any
-/// board runtime cache hit, because the answer comes from the task row, which
-/// that cache does not version.
+/// Write [`for_unscheduled`]'s answer onto every card's runtime with a number
+/// of statements that does not depend on how many cards there are. Applied
+/// after the execution-keyed projection and after any board runtime cache
+/// hit, because the answer comes from the task row, which that cache does not
+/// version.
 ///
 /// Inputs include the task and parent chain, executions, project/product,
 /// recovery attention, deliberate parks, pause metadata and review batches.
 /// The board journal invalidates these inputs, including cycle-root holds;
 /// this annotation is recomputed after every execution-cache hit.
-pub(super) fn annotate_unscheduled(conn: &Connection, task: &Task, runtime: &mut TaskRuntime) -> Result<()> {
-    if let Some(wait) = for_unscheduled(conn, task, runtime.execution_status.as_ref())? {
-        runtime.dispatch_wait_reason = wait.reason;
-        runtime.dispatch_wait_label = wait.label;
+///
+/// `counter`, when given, attributes statements to the returned branch costs.
+pub(super) fn annotate_unscheduled_many<'a>(
+    conn: &Connection,
+    cards: impl IntoIterator<Item = (&'a Task, &'a mut TaskRuntime)>,
+    counter: Option<&super::db_diagnostics::StatementCounter<'_>>,
+) -> Result<ClassifyCost> {
+    let mut cards: Vec<(&Task, &mut TaskRuntime)> = cards.into_iter().collect();
+    let (mut waits, cost) = {
+        let candidates: Vec<Candidate<'_>> = cards
+            .iter()
+            .map(|(task, runtime)| Candidate {
+                task,
+                latest: runtime.execution_status.as_ref(),
+            })
+            .collect();
+        unscheduled_wait::classify(conn, &candidates, counter)?
+    };
+    for (task, runtime) in &mut cards {
+        if let Some(wait) = waits.remove(&task.id) {
+            runtime.dispatch_wait_reason = wait.reason;
+            runtime.dispatch_wait_label = wait.label;
+        }
     }
-    Ok(())
+    Ok(cost)
 }
 
 /// Whether a recorded chain-hold blocker still holds the chain: running, waiting on a human,
@@ -528,6 +376,20 @@ fn blocker_for(conn: &Connection, id: &str) -> Result<Option<DispatchWaitBlocker
     }))
 }
 
+/// What one [`WorkDb::list_unexplained_dispatch_waits`] pass read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct UnexplainedWaitCost {
+    /// Pending executions projected one by one.
+    pub pending_executions: usize,
+    /// Queued, idle `active` and in-review items listed for classification.
+    pub unscheduled_items: usize,
+    /// The set-based classification of those items, by branch.
+    pub classified: ClassifyCost,
+    /// Every statement the pass ran.
+    pub statements: u64,
+    pub millis: f64,
+}
+
 #[work_db_boundary::instrument]
 impl WorkDb {
     /// Every wait the engine has not explained, for the scheduler heartbeat.
@@ -542,28 +404,76 @@ impl WorkDb {
     ///
     /// A `waiting_dependency` row only counts while its task is one the board
     /// shows as waiting (`active`, or `todo` with automatic start on).
+    ///
+    /// The read holds the engine's one database connection, so what it costs
+    /// is what every other writer waits behind on each beat. Items with
+    /// nothing pending are classified as sets: the statements this runs do
+    /// not grow with the number of queued, idle or in-review items, and only
+    /// a pending execution still costs its own projection. Each pass logs
+    /// its cost at `debug`.
     pub fn list_unexplained_dispatch_waits(&self) -> Result<Vec<UnexplainedWait>> {
+        let (waits, cost) = self.list_unexplained_dispatch_waits_measured()?;
+        tracing::debug!(
+            duration_ms = cost.millis,
+            statements = cost.statements,
+            pending_executions = cost.pending_executions,
+            unscheduled_items = cost.unscheduled_items,
+            classify_statements = cost.classified.statements(),
+            queued = cost.classified.queued.cards,
+            idle_active = cost.classified.idle_active.cards,
+            review = cost.classified.review.cards,
+            unexplained = waits.len(),
+            "unexplained dispatch waits: pass complete",
+        );
+        Ok(waits)
+    }
+
+    /// [`Self::list_unexplained_dispatch_waits`] with what the pass cost.
+    pub(crate) fn list_unexplained_dispatch_waits_measured(
+        &self,
+    ) -> Result<(Vec<UnexplainedWait>, UnexplainedWaitCost)> {
         let conn = self.connect()?;
+        let started = std::time::Instant::now();
+        let counter = super::db_diagnostics::StatementCounter::install(&conn);
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
         let mut waits = Vec::new();
 
-        let pending: Vec<String> = conn
-            .prepare(
-                "SELECT id FROM work_executions
-                 WHERE status IN ('queued', 'ready', 'waiting_dependency', 'waiting_review', 'waiting_merge')
-                 ORDER BY created_at ASC, id ASC",
-            )?
-            .query_map([], |row| row.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        for id in pending {
-            let Some(execution) = query_execution(&conn, &id)? else {
+        let pending: Vec<WorkExecution> = {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {} FROM work_executions we
+                 WHERE we.status IN ('queued', 'ready', 'waiting_dependency', 'waiting_review', 'waiting_merge')
+                 ORDER BY we.created_at ASC, we.id ASC",
+                super::executions_runs::EXECUTION_COLUMNS
+            ))?;
+            let rows = stmt.query_map([], map_execution)?;
+            collect_rows(rows)?
+        };
+        // Runs parked for review are named from their items' rows, together.
+        let mut parked: Vec<&str> = pending
+            .iter()
+            .filter(|execution| execution.status == ExecutionStatus::WaitingReview)
+            .map(|execution| execution.work_item_id.as_str())
+            .collect();
+        parked.sort_unstable();
+        parked.dedup();
+        let parked_tasks = query_tasks(&conn, &parked)?;
+        let parked_waits = unscheduled_wait::review_waits(&conn, &parked_tasks.iter().collect::<Vec<_>>())?;
+        let pending_count = pending.len();
+        for execution in pending {
+            let reason = if execution.status == ExecutionStatus::WaitingReview {
+                // A run whose item no longer exists has nothing to name it.
+                parked_waits
+                    .get(&execution.work_item_id)
+                    .is_none_or(DispatchWait::is_unclassified)
+                    .then(|| DISPATCH_WAIT_REASON_UNCLASSIFIED.to_owned())
+            } else {
+                let wait = for_execution(&conn, Some(&execution), now)?;
+                let awaiting = wait.reason.as_deref() == Some(DISPATCH_WAIT_REASON_AWAITING_DISPATCH);
+                (wait.is_unclassified() || awaiting).then(|| wait.reason.unwrap_or_default())
+            };
+            let Some(reason) = reason else {
                 continue;
             };
-            let wait = for_execution(&conn, Some(&execution), now)?;
-            let awaiting = wait.reason.as_deref() == Some(DISPATCH_WAIT_REASON_AWAITING_DISPATCH);
-            if !wait.is_unclassified() && !awaiting {
-                continue;
-            }
             let task = query_task(&conn, &execution.work_item_id)?;
             let board_waiting = task.as_ref().is_none_or(|task| {
                 task.deleted_at.is_none()
@@ -574,74 +484,77 @@ impl WorkDb {
             }
             waits.push(UnexplainedWait {
                 work_item_id: execution.work_item_id.clone(),
-                reason: wait.reason.unwrap_or_default(),
+                reason,
                 task_status: task.map(|task| task.status.as_str().to_owned()),
                 execution: Some(execution),
             });
         }
 
-        // Rows whose own columns already name the hold (deferred, human-driven,
-        // parked) are skipped in SQL: this runs on every heartbeat and a
-        // product can carry many of them. The classifier decides the rest.
-        let unscheduled: Vec<String> = conn
-            .prepare(
-                "SELECT t.id FROM tasks t
-                 WHERE t.status = 'todo' AND t.autostart = 1 AND t.deleted_at IS NULL
-                   AND COALESCE(t.deferred, 0) = 0 AND COALESCE(t.human_driven, 0) = 0
-                   AND t.parked_at IS NULL
+        // Every item with nothing pending, with its row and the status of its
+        // latest run, in one read: queued cards first, then `active` and
+        // in-review items, each by id. Queued rows whose own columns already
+        // name the hold (deferred, human-driven, parked) are skipped in SQL:
+        // this runs on every heartbeat and a product can carry many of them.
+        // Most idle `active` items are `awaiting_redispatch`, because the
+        // orphan sweep starts a replacement. The classifier decides them all
+        // together; any it cannot name is reported.
+        let unscheduled: Vec<(Task, Option<ExecutionStatus>)> = {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {columns},
+                        (SELECT e.status FROM work_executions e
+                         WHERE e.work_item_id = tasks.id AND e.kind <> 'progression'
+                         ORDER BY e.created_at DESC, e.id DESC
+                         LIMIT 1)
+                 FROM tasks
+                 WHERE deleted_at IS NULL
+                   AND ((status = 'todo' AND autostart = 1
+                         AND COALESCE(deferred, 0) = 0 AND COALESCE(human_driven, 0) = 0
+                         AND parked_at IS NULL)
+                        OR status IN ('active', 'in_review'))
                    AND NOT EXISTS (
                        SELECT 1 FROM work_executions we
-                       WHERE we.work_item_id = t.id
+                       WHERE we.work_item_id = tasks.id
                          AND we.status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned'))
-                 ORDER BY t.id ASC",
-            )?
-            .query_map([], |row| row.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        for id in unscheduled {
-            let Some(task) = query_task(&conn, &id)? else {
-                continue;
-            };
-            let latest = query_latest_execution_for_work_item(&conn, &id)?.map(|execution| execution.status);
-            if for_unscheduled(&conn, &task, latest.as_ref())?.is_some_and(|wait| wait.is_unclassified()) {
+                 ORDER BY status = 'todo' DESC, id ASC",
+                columns = super::query_ensure::TASK_COLUMNS
+            ))?;
+            let rows = stmt.query_map([], |row| {
+                let task = map_task_with_parent_provenance_and_archived_reason(row)?;
+                let column = row.as_ref().column_count() - 1;
+                let latest: Option<String> = row.get(column)?;
+                let latest = latest
+                    .map(|raw| parse_text_column::<ExecutionStatus>(column, &raw))
+                    .transpose()?;
+                Ok((task, latest))
+            })?;
+            collect_rows(rows)?
+        };
+        let candidates: Vec<Candidate<'_>> = unscheduled
+            .iter()
+            .map(|(task, latest)| Candidate {
+                task,
+                latest: latest.as_ref(),
+            })
+            .collect();
+        let (classified, cost) = unscheduled_wait::classify(&conn, &candidates, Some(&counter))?;
+        for (task, _) in &unscheduled {
+            if classified.get(&task.id).is_some_and(DispatchWait::is_unclassified) {
                 waits.push(UnexplainedWait {
-                    work_item_id: id,
+                    work_item_id: task.id.clone(),
                     execution: None,
                     reason: DISPATCH_WAIT_REASON_UNCLASSIFIED.to_owned(),
                     task_status: Some(task.status.as_str().to_owned()),
                 });
             }
         }
-
-        // Active items with no run pending or live: the orphan sweep starts a
-        // replacement, so most are `awaiting_redispatch`; any the classifier
-        // cannot name is reported.
-        let idle_active: Vec<String> = conn
-            .prepare(
-                "SELECT t.id FROM tasks t
-                 WHERE t.status IN ('active', 'in_review') AND t.deleted_at IS NULL
-                   AND NOT EXISTS (
-                       SELECT 1 FROM work_executions we
-                       WHERE we.work_item_id = t.id
-                         AND we.status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned'))
-                 ORDER BY t.id ASC",
-            )?
-            .query_map([], |row| row.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        for id in idle_active {
-            let Some(task) = query_task(&conn, &id)? else {
-                continue;
-            };
-            let latest = query_latest_execution_for_work_item(&conn, &id)?.map(|execution| execution.status);
-            if for_unscheduled(&conn, &task, latest.as_ref())?.is_some_and(|wait| wait.is_unclassified()) {
-                waits.push(UnexplainedWait {
-                    work_item_id: id,
-                    execution: None,
-                    reason: DISPATCH_WAIT_REASON_UNCLASSIFIED.to_owned(),
-                    task_status: Some(task.status.as_str().to_owned()),
-                });
-            }
-        }
-        Ok(waits)
+        let cost = UnexplainedWaitCost {
+            pending_executions: pending_count,
+            unscheduled_items: unscheduled.len(),
+            classified: cost,
+            statements: counter.total(),
+            millis: started.elapsed().as_secs_f64() * 1000.0,
+        };
+        Ok((waits, cost))
     }
 
     /// Reclassify a `ready` row that scheduler passes have left unexplained as

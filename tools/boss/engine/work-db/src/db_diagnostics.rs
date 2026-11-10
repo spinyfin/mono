@@ -9,40 +9,67 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Count statements in a synchronous projection, including nested helper queries.
-/// Installs a temporary SQLite statement trace callback and removes it on exit.
-/// Assumes no other trace callback is installed on this connection.
-pub(super) fn count_statements<T>(conn: &rusqlite::Connection, work: impl FnOnce() -> T) -> (T, u64) {
-    use std::ffi::{c_int, c_uint, c_void};
-    unsafe extern "C" fn count(_: c_uint, context: *mut c_void, _: *mut c_void, _: *mut c_void) -> c_int {
-        // SAFETY: the counter lives until the trace is removed below. SQLite
-        // invokes this callback synchronously on the connection's thread.
-        unsafe { *context.cast::<u64>() += 1 };
-        0
-    }
-    struct TraceGuard(*mut rusqlite::ffi::sqlite3);
-    impl Drop for TraceGuard {
-        fn drop(&mut self) {
-            // SAFETY: the borrowed connection outlives this guard, including
-            // during unwinding; no callback retains the stack counter.
-            unsafe { rusqlite::ffi::sqlite3_trace_v2(self.0, 0, None, std::ptr::null_mut()) };
+/// Counts the statements a connection runs while this is alive, including
+/// nested helper queries, through a temporary SQLite statement trace callback
+/// that is removed on drop.
+///
+/// Install one per projection and read [`Self::total`] at the points of
+/// interest: a connection has a single trace callback, so a second counter on
+/// the same connection would replace this one and remove it when dropped.
+pub(super) struct StatementCounter<'conn> {
+    conn: &'conn rusqlite::Connection,
+    // Boxed so the address SQLite holds stays put when the counter moves.
+    statements: Box<std::cell::Cell<u64>>,
+}
+
+impl<'conn> StatementCounter<'conn> {
+    pub(super) fn install(conn: &'conn rusqlite::Connection) -> Self {
+        use std::ffi::{c_int, c_uint, c_void};
+        unsafe extern "C" fn count(_: c_uint, context: *mut c_void, _: *mut c_void, _: *mut c_void) -> c_int {
+            // SAFETY: the cell lives until the trace is removed in `drop`.
+            // SQLite invokes this callback synchronously on the connection's
+            // thread, never while `total` is reading the cell.
+            let statements = unsafe { &*context.cast::<std::cell::Cell<u64>>() };
+            statements.set(statements.get() + 1);
+            0
         }
+        let statements = Box::new(std::cell::Cell::new(0u64));
+        // SAFETY: exclusive synchronous use of the connection's trace hook;
+        // `drop` removes it before the cell or the connection can go away.
+        unsafe {
+            rusqlite::ffi::sqlite3_trace_v2(
+                conn.handle(),
+                rusqlite::ffi::SQLITE_TRACE_STMT as c_uint,
+                Some(count),
+                std::ptr::from_ref::<std::cell::Cell<u64>>(&statements)
+                    .cast_mut()
+                    .cast(),
+            );
+        }
+        Self { conn, statements }
     }
-    let mut statements = 0u64;
-    // SAFETY: exclusive synchronous use of the connection's trace hook; the
-    // guard removes it before the stack counter or connection can be dropped.
-    let guard = unsafe {
-        let db = conn.handle();
-        rusqlite::ffi::sqlite3_trace_v2(
-            db,
-            rusqlite::ffi::SQLITE_TRACE_STMT as c_uint,
-            Some(count),
-            (&mut statements as *mut u64).cast(),
-        );
-        TraceGuard(db)
-    };
+
+    /// Statements run on the connection since this counter was installed.
+    pub(super) fn total(&self) -> u64 {
+        self.statements.get()
+    }
+}
+
+impl Drop for StatementCounter<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the borrowed connection outlives this counter, including
+        // during unwinding; after this no callback refers to the cell.
+        unsafe { rusqlite::ffi::sqlite3_trace_v2(self.conn.handle(), 0, None, std::ptr::null_mut()) };
+    }
+}
+
+/// Count the statements `work` runs on `conn`. See [`StatementCounter`] for
+/// the one-callback-per-connection limit: `work` must not count on `conn`
+/// itself.
+pub(super) fn count_statements<T>(conn: &rusqlite::Connection, work: impl FnOnce() -> T) -> (T, u64) {
+    let counter = StatementCounter::install(conn);
     let result = work();
-    drop(guard);
+    let statements = counter.total();
     (result, statements)
 }
 

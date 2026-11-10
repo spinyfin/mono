@@ -18,6 +18,10 @@
 //!   db.tasks
 //!   db.chores
 //!   db.task_runtimes N+1 hydration — carries db_queries (statements run)
+//!     .cache         epoch read + runtime-cache probe (cache_hits / cache_misses)
+//!     .compute       execution projection of the cards the cache missed
+//!     .annotation    naming the wait of cards with nothing pending, and
+//!       .queued / .idle_active / .review   its three branches (rows = cards)
 //!   db.dependencies
 //!   db.ai_reviewing
 //!   db.ai_review_state
@@ -96,6 +100,21 @@ pub mod segment {
     /// Per-item runtime hydration — the primary N+1. `db_queries` exposes
     /// the per-row subquery fan-out.
     pub const DB_TASK_RUNTIMES: &str = "db.task_runtimes";
+    /// Within `db.task_runtimes`: the epoch read and the runtime-cache probe.
+    /// Carries `cache_hits` / `cache_misses`; absent when no cache is in use.
+    pub const DB_TASK_RUNTIMES_CACHE: &str = "db.task_runtimes.cache";
+    /// Within `db.task_runtimes`: the execution projection of every card the
+    /// cache could not serve. `rows` is those cards.
+    pub const DB_TASK_RUNTIMES_COMPUTE: &str = "db.task_runtimes.compute";
+    /// Within `db.task_runtimes`: naming the wait of every card with nothing
+    /// pending. `rows` is the cards named; `db_queries` must not grow with it.
+    pub const DB_TASK_RUNTIMES_ANNOTATION: &str = "db.task_runtimes.annotation";
+    /// Within the annotation: `todo` cards with automatic start on.
+    pub const DB_TASK_RUNTIMES_ANNOTATION_QUEUED: &str = "db.task_runtimes.annotation.queued";
+    /// Within the annotation: `active` cards with no run pending or live.
+    pub const DB_TASK_RUNTIMES_ANNOTATION_IDLE_ACTIVE: &str = "db.task_runtimes.annotation.idle_active";
+    /// Within the annotation: cards in review.
+    pub const DB_TASK_RUNTIMES_ANNOTATION_REVIEW: &str = "db.task_runtimes.annotation.review";
     /// `SELECT` for the product's cross-item dependencies.
     pub const DB_DEPENDENCIES: &str = "db.dependencies";
     /// Batched `IN (...)` query for the "AI reviewing" badge.
@@ -166,10 +185,11 @@ pub struct EnginePopulationRecord {
     /// app-side `items` field).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub items: Option<i64>,
-    /// Review-cache hits for `db.ai_review_state` (owners served from cache).
+    /// Entries a cache served: owners for `db.ai_review_state`, cards for
+    /// `db.task_runtimes.cache`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_hits: Option<i64>,
-    /// Review-cache misses for `db.ai_review_state` (owners recomputed).
+    /// Entries a cache could not serve and the segment's owner recomputed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_misses: Option<i64>,
     /// Distinct PR owners resolved in `db.ai_review_state`.
@@ -335,6 +355,32 @@ impl PopulationTrace {
                 .cache_hits(cache_hits as i64)
                 .cache_misses(cache_misses as i64)
                 .owners(owners as i64)
+                .build(),
+        );
+    }
+
+    /// Record a cache probe over `cache_hits + cache_misses` entries that
+    /// ran `db_queries` statements.
+    pub fn record_cache_probe(
+        &mut self,
+        segment: &'static str,
+        duration_ms: f64,
+        db_queries: u64,
+        cache_hits: usize,
+        cache_misses: usize,
+    ) {
+        if !self.is_enabled() {
+            return;
+        }
+        self.segments.push(
+            PendingSegment::builder()
+                .ts_epoch_ms(boss_engine_day_rotated_log::now_ms())
+                .segment(segment)
+                .duration_ms(duration_ms)
+                .rows((cache_hits + cache_misses) as i64)
+                .db_queries(db_queries as i64)
+                .cache_hits(cache_hits as i64)
+                .cache_misses(cache_misses as i64)
                 .build(),
         );
     }

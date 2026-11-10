@@ -1,17 +1,25 @@
 use super::board_runtime_cache::{BoardRuntimeCache, CachedRuntime};
-use super::dispatch_helpers::compute_task_runtime;
+use super::db_diagnostics::StatementCounter;
+use super::dispatch_helpers::{RuntimeCacheCost, RuntimePassCost, RuntimePhaseCost, compute_task_runtime};
+use super::queued_wait::ReviewNaming;
 use super::*;
+use std::time::Instant;
 
 /// [`collect_task_runtimes`] backed by the engine-wide [`BoardRuntimeCache`].
 /// Epochs are read in the same snapshot as the fallback computation, so a hit
 /// is exactly the value the uncached path would compute from that snapshot;
 /// only misses (changed, expired, never seen, or consulting other items) run
-/// execution point queries. Task-derived wait annotation runs on hits too.
-/// The returned statement count includes those annotation statements, cache
-/// misses and the epoch query. Annotation remains linear in card count,
-/// including cache hits and heartbeat reads: each review card resolves its
-/// holds, owner, current head and admission independently. The family query
-/// runs only after the cheap merge-fallback conditions pass.
+/// execution point queries.
+///
+/// Task-derived wait annotation runs on hits too, because no epoch versions
+/// the task row it reads. It names every card with nothing pending in one
+/// set-based pass, so its statements do not grow with the board: a warm pass
+/// over a settled board costs the epoch read plus that fixed handful.
+///
+/// The returned cost splits the pass by phase. Statements are counted as the
+/// segment always has: the epoch read, the execution point queries each miss
+/// reports, and every statement of the annotation, which one SQLite trace
+/// hook counts for the whole pass rather than one per card.
 pub(crate) fn collect_task_runtimes_cached(
     conn: &Connection,
     product_id: &str,
@@ -20,55 +28,74 @@ pub(crate) fn collect_task_runtimes_cached(
     cache: &BoardRuntimeCache,
     now: i64,
     mut validity: Option<&mut HashMap<String, (bool, Option<i64>)>>,
-) -> Result<(Vec<TaskRuntime>, u64)> {
+) -> Result<(Vec<TaskRuntime>, RuntimePassCost)> {
+    let started = Instant::now();
     let epochs = query_runtime_epochs(conn, product_id)?;
-    let mut queries = 1u64;
     let items: Vec<(&str, i64)> = tasks
         .iter()
         .chain(chores)
         .map(|task| (task.id.as_str(), epochs.get(&task.id).copied().unwrap_or(0)))
         .collect();
     let lookup = cache.lookup(product_id, &items, now);
+    let hits = lookup.hits.iter().filter(|hit| hit.is_some()).count();
+    let cache_cost = RuntimeCacheCost {
+        hits,
+        misses: items.len() - hits,
+        statements: 1,
+        millis: started.elapsed().as_secs_f64() * 1000.0,
+    };
+
     let mut runtimes = Vec::with_capacity(items.len());
     let mut fresh = Vec::new();
-    for ((((id, epoch), hit), expires_at), task) in items
-        .iter()
-        .zip(lookup.hits)
-        .zip(lookup.expiries)
-        .zip(tasks.iter().chain(chores))
-    {
-        let (mut runtime, cacheable, expires_at) = match hit {
+    let mut computed = RuntimePhaseCost {
+        cards: cache_cost.misses,
+        ..RuntimePhaseCost::default()
+    };
+    for (((id, epoch), hit), expires_at) in items.iter().zip(lookup.hits).zip(lookup.expiries) {
+        let (runtime, cacheable, expires_at) = match hit {
             Some(runtime) => (runtime, true, expires_at),
             None => {
-                let computed = compute_task_runtime(conn, id, &mut queries, now)?;
-                if computed.cacheable {
+                let miss = Instant::now();
+                let result = compute_task_runtime(conn, id, &mut computed.statements, now, ReviewNaming::Deferred)?;
+                computed.millis += miss.elapsed().as_secs_f64() * 1000.0;
+                if result.cacheable {
                     fresh.push((
                         (*id).to_owned(),
                         CachedRuntime {
                             epoch: *epoch,
-                            expires_at: computed.expires_at,
-                            runtime: computed.runtime.clone(),
+                            expires_at: result.expires_at,
+                            runtime: result.runtime.clone(),
                         },
                     ));
                 }
-                (computed.runtime, computed.cacheable, computed.expires_at)
+                (result.runtime, result.cacheable, result.expires_at)
             }
         };
-        // Applied to hits as well as misses: the cache holds the
-        // execution-derived runtime, and why a card with no execution is
-        // queued comes from its task row, which no epoch versions.
-        let (annotation, statements) = super::db_diagnostics::count_statements(conn, || {
-            super::queued_wait::annotate_unscheduled(conn, task, &mut runtime)
-        });
-        queries += statements;
-        annotation?;
         if let Some(validity) = validity.as_mut() {
             validity.insert((*id).to_owned(), (cacheable, expires_at));
         }
         runtimes.push(runtime);
     }
+
+    // Applied to hits as well as misses: the cache holds the
+    // execution-derived runtime, and why a card with no execution is
+    // queued comes from its task row, which no epoch versions.
+    let annotation = {
+        let counter = StatementCounter::install(conn);
+        super::queued_wait::annotate_unscheduled_many(
+            conn,
+            tasks.iter().chain(chores).zip(runtimes.iter_mut()),
+            Some(&counter),
+        )?
+    };
     cache.complete(product_id, lookup.pass, fresh);
-    Ok((runtimes, queries))
+    let cost = RuntimePassCost {
+        statements: cache_cost.statements + computed.statements + annotation.statements(),
+        cache: Some(cache_cost),
+        computed,
+        annotation,
+    };
+    Ok((runtimes, cost))
 }
 
 /// Current `board_runtime_epoch` for every item of `product_id` that has one;

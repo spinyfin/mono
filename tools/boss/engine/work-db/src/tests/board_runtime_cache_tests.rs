@@ -87,21 +87,32 @@ impl Board {
         self.db.connect().unwrap().execute(sql, params).unwrap();
     }
 
+    /// Statements the set-based wait annotation runs for this board.
     fn annotation_statements(&self) -> i64 {
         let tree = self.db.get_work_tree(&self.product_id).unwrap();
         let conn = self.db.connect().unwrap();
-        let (_, statements) = crate::db_diagnostics::count_statements(&conn, || {
-            for task in tree.tasks.iter().chain(&tree.chores) {
-                let mut runtime = tree
+        let mut cards: Vec<(&Task, TaskRuntime)> = tree
+            .tasks
+            .iter()
+            .chain(&tree.chores)
+            .map(|task| {
+                let runtime = tree
                     .task_runtimes
                     .iter()
                     .find(|r| r.work_item_id == task.id)
                     .unwrap()
                     .clone();
-                crate::queued_wait::annotate_unscheduled(&conn, task, &mut runtime).unwrap();
-            }
-        });
-        statements as i64
+                (task, runtime)
+            })
+            .collect();
+        let counter = crate::db_diagnostics::StatementCounter::install(&conn);
+        crate::queued_wait::annotate_unscheduled_many(
+            &conn,
+            cards.iter_mut().map(|(task, runtime)| (*task, runtime)),
+            Some(&counter),
+        )
+        .unwrap();
+        counter.total() as i64
     }
 
     /// Assemble through the cache and without it, assert the trees are equal,

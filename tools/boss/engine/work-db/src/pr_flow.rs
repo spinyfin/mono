@@ -1017,31 +1017,67 @@ impl WorkDb {
     /// replaces), so it needs neither marker nor inertia cutoff.
     pub fn list_tasks_awaiting_pre_merge_review_admission(&self) -> Result<Vec<DeferredReviewAdmissionCandidate>> {
         let conn = self.connect()?;
-        Self::pre_merge_review_admission_candidates_in(&conn, None)
+        Self::pre_merge_review_admission_candidates_in::<&str>(&conn, None)
     }
 
-    pub(super) fn pre_merge_review_admission_candidates_in(
+    /// `only` restricts the candidates to the named items.
+    pub(super) fn pre_merge_review_admission_candidates_in<S: AsRef<str>>(
         conn: &Connection,
-        only: Option<&str>,
+        only: Option<&[S]>,
     ) -> Result<Vec<DeferredReviewAdmissionCandidate>> {
         let inertia_cutoff = (boss_engine_utils::epoch_time::now_epoch_secs() as u64)
             .saturating_sub(super::REVIEW_BATCH_STALE_SECS)
             .to_string();
-        // Match chain_root's MAX_CHAIN_DEPTH - 1 recursive bound. When ?2
-        // names one item, bound the seed before walking its ancestors. With
-        // no requested item, admit all eligible active/in_review PR rows;
-        // the outer WHERE narrows them to marker and readmission cases.
+        let mut stmt = conn.prepare(&Self::pre_merge_review_admission_candidates_sql(only.is_some()))?;
+        let map = |row: &Row<'_>| {
+            Ok(DeferredReviewAdmissionCandidate {
+                task_id: row.get(0)?,
+                product_id: row.get(1)?,
+                pr_url: row.get(2)?,
+                repo_remote_url: row.get(3)?,
+                cycle_root_id: row.get(4)?,
+            })
+        };
+        let rows = match only {
+            Some(ids) => stmt.query_map(params![inertia_cutoff, id_array(ids)], map)?,
+            None => stmt.query_map(params![inertia_cutoff], map)?,
+        };
+        collect_rows(rows)
+    }
+
+    /// Production SQL for [`Self::pre_merge_review_admission_candidates_in`]:
+    /// `?1` is the inertia cutoff and, when `scoped`, `?2` the JSON array of
+    /// item ids. Exposed so the query-plan test can `EXPLAIN` it.
+    pub(crate) fn pre_merge_review_admission_candidates_sql(scoped: bool) -> String {
+        // Match chain_root's MAX_CHAIN_DEPTH - 1 recursive bound. A named set
+        // bounds the seed before walking its ancestors, as an `IN` over the
+        // ids so each row is sought by primary key. Folded into one statement
+        // with `?2 IS NULL OR ...` the seed had no usable term and visited
+        // every PR-bearing task; the unary `+` keeps the planner from still
+        // preferring the `pr_url` index over the ids. With no named set,
+        // admit all eligible active/in_review PR rows; the outer WHERE
+        // narrows them to marker and readmission cases.
+        let seed = if scoped {
+            "AND +t.pr_url IS NOT NULL
+                 AND +t.pr_url != ''
+                 AND t.id IN (SELECT value FROM json_each(?2))"
+        } else {
+            "AND t.pr_url IS NOT NULL
+                 AND t.pr_url != ''"
+        };
         let upkeep = super::parking::upkeep_eligible_task_sql("t");
         let walk = super::cycle_root_walk_cte(&format!(
             "t.status IN ('active', 'in_review')
-                 AND t.pr_url IS NOT NULL
-                 AND t.pr_url != ''
+                 {seed}
                  AND t.deleted_at IS NULL
-                 AND (?2 IS NULL OR t.id = ?2)
                  AND {upkeep}",
         ));
         let needs_readmission = super::review_batches::pre_merge_review_needs_readmission_sql("roots.cycle_root_id");
-        let sql = format!(
+        // `CROSS JOIN` fixes the join order: from the walked rows to their
+        // task and product by primary key. Left to choose, the planner
+        // starts from `products` once the database has statistics and
+        // visits every task of each product to probe the walk.
+        format!(
             "{walk}
              SELECT t.id, t.product_id, t.pr_url,
                     COALESCE(
@@ -1058,9 +1094,9 @@ impl WorkDb {
                       ''
                     ) AS repo_remote_url,
                     roots.cycle_root_id
-             FROM tasks t
-             JOIN products p ON p.id = t.product_id
-             JOIN roots ON roots.task_id = t.id
+             FROM roots
+             CROSS JOIN tasks t ON t.id = roots.task_id
+             CROSS JOIN products p ON p.id = t.product_id
              WHERE (
                      t.status = 'active'
                      OR EXISTS (
@@ -1099,22 +1135,10 @@ impl WorkDb {
                      OR t.updated_at < ?1
                      OR ({needs_readmission} AND t.id = roots.cycle_root_id)
                    )
-               AND (?2 IS NULL OR t.id = ?2)
              ORDER BY t.updated_at ASC",
             walk = walk,
             needs_readmission = needs_readmission,
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![inertia_cutoff, only], |row| {
-            Ok(DeferredReviewAdmissionCandidate {
-                task_id: row.get(0)?,
-                product_id: row.get(1)?,
-                pr_url: row.get(2)?,
-                repo_remote_url: row.get(3)?,
-                cycle_root_id: row.get(4)?,
-            })
-        })?;
-        collect_rows(rows)
+        )
     }
 
     /// Advance a task from `active` to `in_review` as the reviewer-fallback,
