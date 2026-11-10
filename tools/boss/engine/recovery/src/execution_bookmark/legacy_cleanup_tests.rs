@@ -113,7 +113,7 @@ async fn forgets_what_holds_nothing_unpublished_and_archives_what_does() {
         .await
         .unwrap();
 
-    let archive = format!("preserved-archive/exec_b/{lost}");
+    let archive = format!("preserved-archive/exec_b/legacy/{lost}");
     assert_eq!(report.found, 8);
     assert_eq!(report.forgotten, 6, "{report:?}");
     assert_eq!(
@@ -219,7 +219,7 @@ async fn a_conflicted_bookmark_with_one_unpublished_side_is_archived_whole() {
     expected.sort();
     assert_eq!(archived, expected, "every side is kept");
     for commit in [&published, &lost] {
-        assert!(s.has(&format!("preserved-archive/exec_c/{commit}")));
+        assert!(s.has(&format!("preserved-archive/exec_c/legacy/{commit}")));
     }
     assert!(!s.has("boss-recovery/exec_c"));
 }
@@ -240,7 +240,7 @@ async fn only_exact_commit_ids_vouch_for_work() {
     let report = cleanup_legacy_store(&LocalJj, &s.repo.repo, &vouchers).await.unwrap();
     assert_eq!(report.archived.len(), 1, "{report:?}");
     assert_eq!(report.forgotten, 1);
-    assert!(s.has(&format!("preserved-archive/exec_d/{lost}")));
+    assert!(s.has(&format!("preserved-archive/exec_d/legacy/{lost}")));
 }
 
 #[tokio::test]
@@ -381,4 +381,38 @@ async fn a_move_after_the_last_recheck_survives_the_forget_operation_merge() {
     assert_eq!(report.forgotten, 0, "{report:?}");
     assert_eq!(report.kept, vec!["boss-recovery/exec_f".to_owned()]);
     assert_eq!(s.commit_of("bookmarks(exact:\"boss-recovery/exec_f\")"), work);
+    assert_eq!(
+        s.run(&[
+            "log",
+            "--no-graph",
+            "-r",
+            "bookmarks(exact:\"boss-recovery/exec_f\")",
+            "-T",
+            "if(conflict, \"conflict\", \"clean\")"
+        ]),
+        "clean",
+        "the merge of a forget and a concurrent move must not leave a conflicted name"
+    );
+    let listing = s.run(&["bookmark", "list", "exec_f", "boss-recovery/exec_f"]);
+    assert!(!listing.contains("conflicted"), "{listing}");
+}
+
+#[tokio::test]
+async fn an_archive_the_restore_path_made_is_not_reported_as_legacy_work() {
+    let s = Store::new();
+    let lost = s.work("main", "lost.txt");
+    // Created by dispatch's normal restore, not by this cleanup.
+    s.bookmark(&[&format!("preserved-archive/exec_normal/{lost}")], &lost);
+    s.bookmark(&["boss-recovery/exec_legacy"], &lost);
+    let report = cleanup_legacy_store(&LocalJj, &s.repo.repo, &[]).await.unwrap();
+    assert_eq!(report.archived.len(), 1, "{report:?}");
+    assert_eq!(report.archived[0].execution_id, "exec_legacy");
+    // A retry reports only the legacy archive, once.
+    let again = cleanup_legacy_store(&LocalJj, &s.repo.repo, &[]).await.unwrap();
+    assert_eq!(again.archived.len(), 1, "{again:?}");
+    assert_eq!(
+        again.archived[0].archive,
+        format!("preserved-archive/exec_legacy/legacy/{lost}")
+    );
+    assert!(s.has(&format!("preserved-archive/exec_normal/{lost}")));
 }

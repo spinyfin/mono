@@ -153,7 +153,13 @@ async fn forget_one(db: &WorkDb, coordinator: &ExecutionCoordinator, cleanup: &P
     let record = db
         .preservation_source(&execution.id)?
         .ok_or_else(|| anyhow!("no store location recorded for execution {}", execution.id))?;
-    let scope = cleanup.scope;
+    // The scope was chosen when the list was read. A legacy store cleanup may
+    // have created archives, or an inspection item been filed, since then.
+    let scope = if cleanup.scope == PreservedScope::TipAndArchives && db.preserved_archives_protected(&execution.id)? {
+        PreservedScope::Tip
+    } else {
+        cleanup.scope
+    };
     // A repository that no longer exists on this machine holds nothing to forget.
     let forgotten = if record.host_id == "local" && !record.repo_path.exists() {
         Vec::new()

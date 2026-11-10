@@ -182,12 +182,7 @@ impl WorkDb {
             if closed_at_epoch > cutoff {
                 continue;
             }
-            let keep_inspection_archives: bool = conn.query_row(
-                "SELECT EXISTS (SELECT 1 FROM work_attention_items
-                                WHERE execution_id = ?1 AND kind = ?2 AND status = 'open')",
-                params![id, PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND],
-                |row| row.get(0),
-            )?;
+            let keep_inspection_archives = archives_protected(&conn, &id)?;
             let has_tip: bool = conn.query_row(
                 "SELECT preserved_commit_id IS NOT NULL FROM work_executions WHERE id = ?1",
                 [&id],
@@ -207,6 +202,15 @@ impl WorkDb {
             });
         }
         Ok(cleanups)
+    }
+
+    /// Whether `execution_id`'s inspection archives must be kept right now: an
+    /// inspection item is open, or the legacy cleanup of the execution's store
+    /// has not completed and may still be creating archives. Callers recheck
+    /// this immediately before forgetting, since the list they chose from may
+    /// be stale.
+    pub fn preserved_archives_protected(&self, execution_id: &str) -> Result<bool> {
+        archives_protected(&*self.connect()?, execution_id)
     }
 
     /// Record that `execution_id`'s preserved references were forgotten: its
@@ -265,4 +269,20 @@ pub(crate) fn migrate_archive_cleanup(conn: &rusqlite::Connection) -> Result<()>
         )?;
     }
     Ok(())
+}
+
+/// An open inspection item protects an execution's archives. So does an
+/// unfinished legacy cleanup of its store: that cleanup creates archives of
+/// unpublished work and files their inspection items only when it completes,
+/// and the sweep must not forget an archive in between.
+fn archives_protected(conn: &Connection, execution_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM work_attention_items
+                        WHERE execution_id = ?1 AND kind = ?2 AND status = 'open')
+             OR EXISTS (SELECT 1 FROM execution_bookmarks eb
+                        JOIN legacy_store_cleanups l ON l.host_id = eb.host_id AND l.repo_path = eb.repo_path
+                        WHERE eb.execution_id = ?1 AND l.completed_at IS NULL)",
+        params![execution_id, PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND],
+        |row| row.get(0),
+    )?)
 }

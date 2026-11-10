@@ -202,6 +202,28 @@ async fn nothing_forgotten_means_nothing_to_collect() {
 }
 
 #[tokio::test]
+async fn a_pass_that_only_wrote_operations_still_collects() {
+    let (_dir, db) = open_db();
+    let tmp = tempfile::tempdir().unwrap();
+    pend(&db, "local", tmp.path().to_str().unwrap(), Some("mono"));
+    let cleaner = FakeCleaner {
+        report: LegacyCleanupReport {
+            found: 3,
+            operations: 2,
+            ..LegacyCleanupReport::default()
+        },
+        ..FakeCleaner::default()
+    };
+    run_one_pass(&db, &cleaner).await.unwrap();
+    assert_eq!(
+        cleaner.calls().last().unwrap(),
+        "gc local mono",
+        "{:?}",
+        cleaner.calls()
+    );
+}
+
+#[tokio::test]
 async fn a_local_store_that_is_gone_is_complete_without_asking_jj() {
     let (_dir, db) = open_db();
     pend(&db, "local", "/does/not/exist/anywhere", Some("mono"));
@@ -280,6 +302,6 @@ async fn recorded_pushed_heads_keep_squash_merged_work_out_of_the_archives() {
     let names = run(&["bookmark", "list", "-T", "name ++ \"\\n\""]);
     assert_eq!(
         names.lines().filter(|n| *n != "main").collect::<Vec<_>>(),
-        vec![format!("preserved-archive/exec_abandoned/{abandoned}").as_str()]
+        vec![format!("preserved-archive/exec_abandoned/legacy/{abandoned}").as_str()]
     );
 }

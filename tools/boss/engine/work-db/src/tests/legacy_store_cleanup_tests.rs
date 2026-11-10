@@ -281,3 +281,44 @@ fn new_archives_on_an_old_closed_chain_survive_until_inspected() {
         "human inspection releases the archives"
     );
 }
+
+#[test]
+fn archives_are_protected_for_as_long_as_the_store_cleanup_is_unfinished() {
+    let db = WorkDb::open(temp_db_path("legacy-archives-protected")).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore_manual(&db, product.id, "old closed chain");
+    let execution = recorded_execution(&db, &chore.id, "local", "/stores/mono", "mono");
+    sql(
+        &db,
+        "UPDATE tasks SET status = 'done', completed_at = '1', updated_at = '1' WHERE id = ?1",
+        [&chore.id],
+    );
+    sql(
+        &db,
+        "UPDATE execution_bookmarks SET archive_cleanup_pending = 1 WHERE execution_id = ?1",
+        [&execution],
+    );
+    sql(
+        &db,
+        "INSERT INTO legacy_store_cleanups (host_id, repo_path) VALUES ('local', '/stores/mono')",
+        [],
+    );
+    // The cleanup is creating archives and has filed nothing yet: a sweep that
+    // selected this long-closed execution earlier must not forget them.
+    assert!(db.preserved_archives_protected(&execution).unwrap());
+    assert!(
+        db.list_closed_chain_preserved(CLOSED_CHAIN_RETENTION_SECS, 100, &[])
+            .unwrap()
+            .is_empty()
+    );
+    // Completing files the inspection item in the same transaction.
+    db.finish_legacy_store_cleanup("local", Path::new("/stores/mono"), &report(&[&execution], 1, 0))
+        .unwrap();
+    assert!(db.preserved_archives_protected(&execution).unwrap());
+    sql(
+        &db,
+        "UPDATE work_attention_items SET status = 'resolved' WHERE execution_id = ?1",
+        [&execution],
+    );
+    assert!(!db.preserved_archives_protected(&execution).unwrap());
+}

@@ -11,7 +11,8 @@
 //!    non-empty work, then forgets every legacy name that holds none, in a
 //!    handful of jj operations. A name that holds such work is never forgotten.
 //! 2. The store is marked completed and never visited again.
-//! 3. `cube repo gc` runs on the host, because forgetting bookmarks only
+//! 3. `cube repo gc` runs on the host whenever the pass wrote operations, because
+//!    forgetting bookmarks or hiding heads only
 //!    shrinks the view of operations from now on: the old operations, each with
 //!    its multi-megabyte view, are collected by cube.
 //!
@@ -194,7 +195,7 @@ async fn clean_one(
     // Forgetting bookmarks only shrinks the view of later operations; cube
     // collects the old operations. Its failure never undoes the cleanup:
     // cube's own daily pass collects the store as well.
-    let gc_error = if report.forgotten == 0 {
+    let gc_error = if report.operations == 0 {
         None
     } else if let Some(repo_id) = &store.cube_repo_id {
         cleaner.collect(&store.host_id, repo_id).await.err().map(|err| {
