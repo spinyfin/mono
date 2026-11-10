@@ -35,6 +35,11 @@ pub async fn run(cli: Cli) -> Result<()> {
     // `$HOME`. Workers inherit this as `BOSS_SOCKET_PATH` so a driver that
     // scopes `$HOME` (Grok) still reaches this engine.
     work.frontend_socket_path = Some(socket_path.clone());
+    work.hub = work.hub.isolate_for_fixture(
+        isolation.is_test_fixture,
+        isolation.scoped_path("hub-credentials"),
+        &boss_engine_runtime::hub::HubProductionPaths::current(),
+    );
     let cfg = Arc::new(boss_engine_runtime::config::RuntimeConfig::from_parts(work, None));
 
     run_server(cli, cfg, isolation).await
@@ -511,6 +516,20 @@ async fn serve_scoped(
     } else {
         cfg
     };
+    // Fixture engines inherit the pane's hub env. Refuse production listen,
+    // CA and TLS identity here so both `run` and in-process `serve` isolate
+    // before the listener binds. Production sockets are unchanged.
+    let isolation = IsolationPaths::derive(&socket_path.to_string_lossy());
+    let isolated_hub = cfg.work.hub.clone().isolate_for_fixture(
+        isolation.is_test_fixture,
+        isolation.scoped_path("hub-credentials"),
+        &boss_engine_runtime::hub::HubProductionPaths::current(),
+    );
+    let cfg = {
+        let mut work = cfg.work.clone();
+        work.hub = isolated_hub;
+        Arc::new(cfg.with_work(work))
+    };
 
     // Refuse to proceed at all if a live process already holds the events
     // socket path — before the control-token file or the frontend socket
@@ -602,6 +621,22 @@ async fn serve_scoped(
         },
     )?;
     pre_bind.mark("server_state");
+    if let Some(bound) = boss_engine_runtime::hub::bind_hub_listener(&cfg.work.hub, (*server_state.work_db).clone())
+        .await
+        .context("starting hub listener")?
+    {
+        server_state.set_hub_stream(bound.stream.clone());
+        tracing::info!(
+            addr = %bound.local_addr,
+            handle = server_state.hub_stream().is_some(),
+            "hub listener serving"
+        );
+        boss_task_scope::spawn(async move {
+            if let Err(err) = bound.serve().await {
+                tracing::error!(error = %err, "hub listener ended");
+            }
+        });
+    }
     super::panic_hook::install(&server_state);
 
     // Local host capability discovery (`uname`, `gh auth status`, one login

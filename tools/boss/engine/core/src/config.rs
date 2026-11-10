@@ -269,6 +269,12 @@ pub struct WorkConfig {
     /// higher tier without a code change.
     #[builder(default = DEFAULT_COORDINATOR_MODEL.to_owned())]
     pub coordinator_model: String,
+    /// Hub listener, host credentials and server TLS identity. Inert until
+    /// listen, credentials directory and TLS cert/key are all set. Test
+    /// fixtures isolate this via [`crate::hub::HubConfig::isolate_for_fixture`]
+    /// before startup binds a socket.
+    #[builder(default)]
+    pub hub: crate::hub::HubConfig,
 }
 
 impl WorkConfig {
@@ -342,6 +348,7 @@ impl WorkConfig {
             .enable_dispatch_ready_bus(enable_dispatch_ready_bus)
             .progression(progression)
             .coordinator_model(coordinator_model)
+            .hub(crate::hub::HubConfig::load_from(&lookup)?)
             .build())
     }
 
@@ -1117,6 +1124,30 @@ mod tests {
     fn tmux_socket_path_beside_db_resolves_next_to_the_db_file() {
         let socket = tmux_socket_path_beside_db(Path::new("/tmp/x/state.db")).unwrap();
         assert_eq!(socket, Path::new("/tmp/x/tmux.sock"));
+    }
+
+    #[test]
+    fn work_config_hub_is_inert_by_default_and_loads_from_env() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("state.db");
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path)),
+            _ => None,
+        })
+        .unwrap();
+        assert!(config.hub.listener_plan().unwrap().is_none());
+
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path)),
+            crate::hub::LISTEN_ENV => Some(OsString::from("127.0.0.1:8443")),
+            crate::hub::CREDENTIALS_DIR_ENV => Some(OsString::from("/tmp/hub-credentials")),
+            crate::hub::TLS_CERT_ENV => Some(OsString::from("/tmp/hub.crt")),
+            crate::hub::TLS_KEY_ENV => Some(OsString::from("/tmp/hub.key")),
+            _ => None,
+        })
+        .unwrap();
+        let plan = config.hub.listener_plan().unwrap().unwrap();
+        assert_eq!(plan.listen, "127.0.0.1:8443".parse().unwrap());
     }
 
     fn progression_with(

@@ -22,6 +22,8 @@ TEST_ALIASES = {
     "//tools/boss/engine/observation-contracts:observation_contracts_test_support": "boss_observation_contracts",
     "//tools/boss/engine/work-db:work-db": "boss_work_db_production",
     "//tools/boss/engine/work-db:work_db_test_support": "boss_work_db",
+    "//tools/boss/engine/spoke-hub": "boss_spoke_hub_production",
+    "//tools/boss/engine/spoke-hub:spoke_hub_test_support": "boss_spoke_hub",
 }
 
 TEST_SWAPS = [
@@ -32,6 +34,7 @@ TEST_SWAPS = [
     "//tools/boss/engine/live-worker-state",
     "//tools/boss/engine/merge-poller",
     "//tools/boss/engine/observation-contracts",
+    "//tools/boss/engine/spoke-hub",
     "//tools/boss/engine/work-db",
 ]
 
@@ -43,6 +46,7 @@ TEST_DEPS = [
     "//tools/boss/engine/live-worker-state:live_worker_state_test_support",
     "//tools/boss/engine/merge-poller:merge_poller_test_support",
     "//tools/boss/engine/observation-contracts:observation_contracts_test_support",
+    "//tools/boss/engine/spoke-hub:spoke_hub_test_support",
     "//tools/boss/engine/work-db:work_db_test_support",
 ]
 
@@ -150,6 +154,7 @@ def runtime_libraries():
             "//tools/boss/engine/event-bus",
             "//tools/boss/engine/feature-flags",
             "//tools/boss/engine/gh-invocation",
+            "//tools/boss/engine/host-enrollment",
             "//tools/boss/engine/live-worker-state",
             "//tools/boss/engine/grok-home-retention",
             "//tools/boss/engine/live-status-redact",
@@ -162,6 +167,7 @@ def runtime_libraries():
             "//tools/boss/engine/pr-template",
             "//tools/boss/engine/recovery",
             "//tools/boss/engine/review-guide",
+            "//tools/boss/engine/spoke-hub",
             "//tools/boss/engine/ssh-transport",
             "//tools/boss/engine/stdout-progress",
             "//tools/boss/engine/storage-values",
@@ -180,6 +186,7 @@ def runtime_libraries():
             "//tools/boss/github_tracker",
             "//tools/boss/log-files",
             "//tools/boss/protocol",
+            "//tools/boss/protocol-spoke",
             "//tools/boss/tmux",
         ] + all_crate_deps(package_name = "tools/boss/engine/core/runtime", normal = True),
     )

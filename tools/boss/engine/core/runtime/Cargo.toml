@@ -26,6 +26,8 @@ boss-observation-contracts = { path = "../../observation-contracts" }
 boss-engine-storage-values = { path = "../../storage-values" }
 boss-work-db = { path = "../../work-db" }
 boss-host-execution = { path = "../../host-execution" }
+boss-host-enrollment = { path = "../../host-enrollment" }
+boss-spoke-hub = { path = "../../spoke-hub" }
 boss-task-scope = { path = "../../task-scope" }
 anyhow = { workspace = true }
 boss-ci-log-reader = { path = "../../ci-log-reader" }
@@ -71,6 +73,7 @@ boss-pr-template = { path = "../../pr-template" }
 boss-review-guide = { path = "../../review-guide" }
 boss-engine-recovery = { path = "../../recovery" }
 boss-protocol = { path = "../../../protocol" }
+boss-protocol-spoke = { path = "../../../protocol-spoke" }
 boss-ssh-transport = { path = "../../ssh-transport" }
 boss-timer-wheel = { path = "../../timer-wheel" }
 boss-engine-day-rotated-log = { path = "../../day-rotated-log" }
@@ -88,6 +91,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+tonic = { workspace = true }
 tracing = { workspace = true }
 shlex = { workspace = true }
 rusqlite = { workspace = true }
@@ -111,7 +115,9 @@ boss-work-db = { path = "../../work-db", features = ["test-support"] }
 boss-prose-vocabulary = { path = "../../prose-vocabulary" }
 boss-engine-recovery-fixtures = { path = "../../recovery-fixtures" }
 boss-engine-test-git = { path = "../../test-git" }
+rcgen = { workspace = true }
 tempfile = { workspace = true }
+tokio-stream = { workspace = true }
 wiremock = { workspace = true }
 # test-util enables tokio's virtual-time controls (time::pause / advance,
 # #[tokio::test(start_paused = true)]) used by the sweep_loop tests to

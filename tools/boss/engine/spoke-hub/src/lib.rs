@@ -2,8 +2,9 @@
 //! command outbox, composed with host enrollment on one optional-client-auth
 //! mTLS listener.
 //!
-//! This crate does not install a host adapter and does not start a listener
-//! from engine configuration. New work stays on SSH (`HostTransport::LegacySsh`)
+//! Engine startup binds this listener from configuration when listen,
+//! credentials and TLS identity are all set. This crate still does not
+//! install a host adapter; new work stays on SSH (`HostTransport::LegacySsh`)
 //! until a later composition proves host readiness and wires
 //! [`HubStream::manager`] into dispatch.
 
@@ -36,6 +37,26 @@ impl HubStream {
         let outbox = Arc::new(WorkDbOutbox::new(db));
         let manager = StreamManager::new(config, credentials.clone(), sink, outbox);
         Self { manager, credentials }
+    }
+
+    /// Compose with the hub identity strings engine configuration carries.
+    /// Stream limits keep the crate defaults.
+    pub fn with_identity(
+        hub_id: impl Into<String>,
+        authority_generation: impl Into<String>,
+        build_fingerprint: impl Into<String>,
+        credentials: Arc<HostCredentials>,
+        db: WorkDb,
+    ) -> Self {
+        Self::new(
+            Config::builder()
+                .hub_id(hub_id)
+                .authority_generation(authority_generation)
+                .build_fingerprint(build_fingerprint)
+                .build(),
+            credentials,
+            db,
+        )
     }
 
     /// The stream manager later adapter composition submits commands through.
