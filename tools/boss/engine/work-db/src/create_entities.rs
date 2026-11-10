@@ -69,25 +69,28 @@ impl WorkDb {
                 .with_context(|| format!("failed to create work db directory {}", parent.display()))?;
         }
 
+        // A fixture database that does not exist yet starts as a copy of the
+        // migrated schema, like ":memory:" above, instead of replaying every
+        // migration. A file that is already there always gets real startup.
+        #[cfg(any(test, feature = "test-support"))]
+        if super::test_support::seed_new_file_db(&path) {
+            return Self::open_writer(path);
+        }
+        Self::open_and_migrate(path)
+    }
+
+    /// Startup proper: open the writer connection, then bring the schema up
+    /// to date. [`Self::open`] is this for every database file in a
+    /// production build.
+    pub(crate) fn open_and_migrate(path: PathBuf) -> Result<Self> {
         // Timed in two halves so "opening the connection" (file open, WAL
         // recovery, PRAGMAs) is separable from "bringing the schema up to
         // date" (`init`) in the startup ledger — the two have different
         // fixes when slow.
         let started = std::time::Instant::now();
         tracing::info!(path = %path.display(), "work db: opening");
-        let conn = Self::open_raw_connection(&path, None)?;
+        let db = Self::open_writer(path)?;
         let connect_elapsed = started.elapsed();
-        let db = Self {
-            path,
-            memory: None,
-            conn: Arc::new(Mutex::new(conn)),
-            boothby_action: Arc::default(),
-            engine_rebase_holds: Arc::default(),
-            event_bus: Arc::new(EventBus::new()),
-            persona_metrics: personas::new_metrics_registry(),
-            engine_build_identity: None,
-            token_generator: super::default_token_generator(),
-        };
         let init_started = std::time::Instant::now();
         db.init()?;
         tracing::info!(
@@ -98,6 +101,22 @@ impl WorkDb {
             "work db: open complete",
         );
         Ok(db)
+    }
+
+    /// The writer handle startup uses, with no schema work done through it.
+    fn open_writer(path: PathBuf) -> Result<Self> {
+        let conn = Self::open_raw_connection(&path, None)?;
+        Ok(Self {
+            path,
+            memory: None,
+            conn: Arc::new(Mutex::new(conn)),
+            boothby_action: Arc::default(),
+            engine_rebase_holds: Arc::default(),
+            event_bus: Arc::new(EventBus::new()),
+            persona_metrics: personas::new_metrics_registry(),
+            engine_build_identity: None,
+            token_generator: super::default_token_generator(),
+        })
     }
 
     /// Create a per-call named shared-cache in-memory database. Each call

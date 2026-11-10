@@ -606,7 +606,7 @@ mod tests {
         // intact. Driven through a local channel rather than the global
         // sink, so it cannot capture (or be perturbed by) `gh` calls made
         // by other tests running concurrently in this binary.
-        let db = Arc::new(WorkDb::open_in_memory().expect("open db"));
+        let db = Arc::new(WorkDb::open(":memory:".into()).expect("open db"));
         let (tx, rx) = unbounded_channel::<GhCallSample>();
         let handle = spawn_writer(db.clone(), rx);
 
@@ -648,7 +648,7 @@ mod tests {
     async fn writer_task_commits_what_it_holds_when_the_sender_drops() {
         // A partial batch must not be lost on shutdown: when every sender
         // is gone the writer commits what it has before returning.
-        let db = Arc::new(WorkDb::open_in_memory().expect("open db"));
+        let db = Arc::new(WorkDb::open(":memory:".into()).expect("open db"));
         let (tx, rx) = unbounded_channel::<GhCallSample>();
         let handle = spawn_writer(db.clone(), rx);
 

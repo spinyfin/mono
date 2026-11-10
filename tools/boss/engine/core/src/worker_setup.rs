@@ -1804,7 +1804,11 @@ fn prune_unreferenced_guard_dirs(dir: &Path, kind: &str, filename: &str, keep_di
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let referenced = referenced_guard_dir_names(dir);
+    // Read on first use. Finding what the settings files reference means
+    // reading every one of them, and this runs for each guard on every worker
+    // spawn; a directory holding only this build's guards has nothing to
+    // prune, so the common spawn reads none.
+    let mut referenced: Option<Vec<String>> = None;
     let now = SystemTime::now();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -1817,15 +1821,19 @@ fn prune_unreferenced_guard_dirs(dir: &Path, kind: &str, filename: &str, keep_di
         if !is_content_addressed_guard_dir_name(name, kind) {
             continue;
         }
-        if referenced.iter().any(|r| r == name) {
-            continue;
-        }
         let script = path.join(filename);
         let mtime = std::fs::metadata(&script)
             .and_then(|m| m.modified())
             .or_else(|_| std::fs::metadata(&path).and_then(|m| m.modified()));
         if let Ok(mtime) = mtime
             && now.duration_since(mtime).unwrap_or(Duration::ZERO) < GUARD_SCRIPT_PRUNE_GRACE
+        {
+            continue;
+        }
+        if referenced
+            .get_or_insert_with(|| referenced_guard_dir_names(dir))
+            .iter()
+            .any(|r| r == name)
         {
             continue;
         }
@@ -1850,11 +1858,12 @@ fn prune_unreferenced_guard_dirs(dir: &Path, kind: &str, filename: &str, keep_di
 }
 
 fn is_content_addressed_guard_dir_name(name: &str, kind: &str) -> bool {
-    let prefix = format!("{kind}-");
-    let Some(hash) = name.strip_prefix(&prefix) else {
+    // Allocation-free: a prune that does scan asks this of every token in
+    // every settings file under the directory.
+    let Some(hash) = name.strip_prefix(kind).and_then(|rest| rest.strip_prefix('-')) else {
         return false;
     };
-    hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit())
+    hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Directory names (`path-guard-<sha256>`, …) mentioned by any `*.json`

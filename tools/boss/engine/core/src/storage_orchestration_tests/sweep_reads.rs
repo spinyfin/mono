@@ -26,34 +26,43 @@ fn set_effort(db: &WorkDb, id: &str, effort: EffortLevel) {
     .unwrap();
 }
 
+/// The columns of `table`, in declaration order.
+fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
+    conn.prepare(&format!("PRAGMA table_info({table})"))
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
 /// Copy one `tasks` / `work_executions` row into a new row with a few
 /// columns overridden — the fixture builder for the baseline below. Going
 /// through the create/update APIs for hundreds of rows is itself quadratic
 /// (every update republishes the full projection), which would make the
 /// fixture, not the reads, the thing being timed.
-fn clone_row(conn: &Connection, table: &str, template_id: &str, overrides: &[(&str, &str)]) {
-    let columns: Vec<String> = conn
-        .prepare(&format!("PRAGMA table_info({table})"))
-        .unwrap()
-        .query_map([], |row| row.get::<_, String>(1))
-        .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap();
+///
+/// The overrides are bound rather than spliced in as literals, so the
+/// statement text depends only on which columns are overridden and each
+/// shape is planned once for the thousands of rows it inserts. `columns` is
+/// [`table_columns`] for `table`, read once by the caller for the same reason.
+fn clone_row(conn: &Connection, table: &str, columns: &[String], template_id: &str, overrides: &[(&str, &str)]) {
     let select: Vec<String> = columns
         .iter()
-        .map(|column| match overrides.iter().find(|(name, _)| name == column) {
-            Some((_, value)) => format!("'{}'", value.replace('\'', "''")),
+        .map(|column| match overrides.iter().position(|(name, _)| name == column) {
+            Some(index) => format!("?{}", index + 2),
             None => column.clone(),
         })
         .collect();
-    conn.execute(
-        &format!(
-            "INSERT INTO {table} ({}) SELECT {} FROM {table} WHERE id = ?1",
-            columns.join(", "),
-            select.join(", ")
-        ),
-        params![template_id],
-    )
+    conn.prepare_cached(&format!(
+        "INSERT INTO {table} ({}) SELECT {} FROM {table} WHERE id = ?1",
+        columns.join(", "),
+        select.join(", ")
+    ))
+    .unwrap()
+    .execute(rusqlite::params_from_iter(
+        std::iter::once(template_id).chain(overrides.iter().map(|(_, value)| *value)),
+    ))
     .unwrap();
 }
 
@@ -82,7 +91,14 @@ fn sweep_cost_baseline_full_projection_vs_narrow_reads() {
     let fixture_started = Instant::now();
     let mut roots = Vec::with_capacity(ROOTS);
     {
-        let conn = raw(&db);
+        let mut conn = raw(&db);
+        let task_columns = table_columns(&conn, "tasks");
+        let execution_columns = table_columns(&conn, "work_executions");
+        // One transaction for the whole seed: committing each of the
+        // thousands of rows separately costs more than inserting them.
+        let conn = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
         for i in 0..ROOTS {
             let root = format!("task_root{i:04}");
             let pr_url = format!("https://github.com/o/r/pull/{i}");
@@ -90,6 +106,7 @@ fn sweep_cost_baseline_full_projection_vs_narrow_reads() {
             clone_row(
                 &conn,
                 "tasks",
+                &task_columns,
                 &template,
                 &[
                     ("id", &root),
@@ -106,6 +123,7 @@ fn sweep_cost_baseline_full_projection_vs_narrow_reads() {
                 clone_row(
                     &conn,
                     "tasks",
+                    &task_columns,
                     &template,
                     &[
                         ("id", &revision),
@@ -120,27 +138,30 @@ fn sweep_cost_baseline_full_projection_vs_narrow_reads() {
                 clone_row(
                     &conn,
                     "work_executions",
+                    &execution_columns,
                     &template_execution.id,
                     &[("id", &execution), ("work_item_id", &revision), ("status", "completed")],
                 );
-                conn.execute(
+                conn.prepare_cached(
                     "INSERT INTO pr_review_verdicts (id, execution_id, work_item_id, head_sha, findings_count,
                         revision_warranted, gate_outcome, revision_task_id, created_at)
                      VALUES (?1, ?2, ?3, ?4, 2, 1, 'completed_with_findings', ?5, ?6)",
-                    params![
-                        format!("prv_{i}_{r}"),
-                        execution,
-                        root,
-                        head,
-                        revision,
-                        format!("{}", 1_700_000_000 + i * 10 + r),
-                    ],
                 )
+                .unwrap()
+                .execute(params![
+                    format!("prv_{i}_{r}"),
+                    execution,
+                    root,
+                    head,
+                    revision,
+                    format!("{}", 1_700_000_000 + i * 10 + r),
+                ])
                 .unwrap();
                 parent = revision;
             }
             roots.push(root);
         }
+        conn.commit().unwrap();
     }
     eprintln!("sweep_cost_baseline: fixture built in {:?}", fixture_started.elapsed());
     let states = crate::live_worker_state::LiveWorkerStateRegistry::new();
