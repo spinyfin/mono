@@ -30,15 +30,6 @@ pub struct CancelExecutionOpts {
 /// Column list `map_execution` reads, qualified with the `we` alias.
 const EXECUTION_COLUMNS: &str = "we.id, we.work_item_id, we.kind, we.status, we.repo_remote_url, we.cube_repo_id, we.cube_lease_id, we.cube_workspace_id, we.workspace_path, we.priority, we.preferred_workspace_id, we.created_at, we.started_at, we.finished_at, we.pre_start_failure_count, we.dispatch_not_before, we.pr_url, we.pr_head_before, we.prefer_is_soft, we.worker_branch_prefix, we.transient_failure_count, we.allow_dirty, we.branch_naming, we.dispatch_wait_reason, we.dispatch_wait_since, we.driver_runtime_state, we.driver, we.model, we.effort_level, we.pr_head_after, we.last_error";
 
-/// How long after a run ends its still-recorded cube lease remains worth
-/// acting on. Cube's own lease TTL is 24 hours, and the ended-run lease sweep
-/// ([`WorkDb::list_terminal_executions_holding_lease`]) stops considering a
-/// terminal row after that long, so a lease recorded longer ago no longer
-/// holds a workspace that anything will release or preserve. Dispatch's
-/// hold on a predecessor's lease ([`WorkDb::recovery_predecessor_holding_lease`])
-/// uses the same bound, so it can never outlive the sweep that clears it.
-pub const TERMINAL_LEASE_RELEASE_WINDOW_SECS: i64 = 86_400;
-
 #[work_db_boundary::instrument]
 impl WorkDb {
     /// Mark an execution `cancelled` and stamp `finished_at`. Errors
@@ -475,8 +466,8 @@ impl WorkDb {
     /// lease is released, so a successor can never start from trunk in the
     /// window between the two.
     ///
-    /// Returns the new `ready` execution. The caller reaps the worker pane,
-    /// releases the predecessor's lease and emits the dispatch event. Because
+    /// Returns the new `ready` execution. The caller confirms worker teardown
+    /// and preserves and releases its lease before calling this method. Because
     /// the work item now has a `ready` execution, the orphan-active sweep
     /// skips it (no double dispatch).
     pub fn request_resume_execution(
@@ -508,6 +499,24 @@ impl WorkDb {
                    AND finished_at IS NULL",
                 params![dead_execution_id, now.as_str(), reason],
             )?;
+        }
+
+        // Another reconciler can settle the run while teardown is in flight.
+        // Reuse its successor under the insertion transaction rather than
+        // minting a duplicate after the asynchronous preservation step.
+        let successor: Option<String> = tx
+            .query_row(
+                "SELECT id FROM work_executions WHERE work_item_id = ?1 AND kind = ?2
+             AND rowid > (SELECT rowid FROM work_executions WHERE id = ?3)
+             ORDER BY rowid ASC LIMIT 1",
+                params![dead.work_item_id, dead.kind.as_str(), dead_execution_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(id) = successor {
+            let successor = query_execution(&tx, &id)?.context("resume successor disappeared")?;
+            tx.commit()?;
+            return Ok(successor);
         }
 
         let new_id = next_id("exec");
@@ -877,8 +886,8 @@ impl WorkDb {
         collect_rows(rows)
     }
 
-    /// Bounded recent local leftovers. Older leases have reached cube's TTL;
-    /// remote leases belong to the owning host's reconciler.
+    /// Local leftovers, including leases older than cube's TTL: expiry does
+    /// not prove that work was preserved. Remote leases belong to their host.
     pub fn list_terminal_executions_holding_lease(&self) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
@@ -893,13 +902,9 @@ impl WorkDb {
                AND COALESCE((SELECT r.host_id FROM work_runs r
                              WHERE r.execution_id = work_executions.id
                              ORDER BY r.created_at DESC, r.id DESC LIMIT 1), 'local') = 'local'
-               AND CAST(COALESCE(finished_at, created_at) AS INTEGER) >= ?1
              ORDER BY created_at DESC, id DESC LIMIT 100",
         )?;
-        let rows = stmt.query_map(
-            [boss_engine_utils::epoch_time::now_epoch_secs() - TERMINAL_LEASE_RELEASE_WINDOW_SECS],
-            map_execution,
-        )?;
+        let rows = stmt.query_map([], map_execution)?;
         collect_rows(rows)
     }
 

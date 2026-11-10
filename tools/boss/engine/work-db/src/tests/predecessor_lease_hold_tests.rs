@@ -1,5 +1,4 @@
 use super::*;
-use crate::executions_runs::TERMINAL_LEASE_RELEASE_WINDOW_SECS;
 use boss_engine_recovery::execution_bookmark::PreservedTip;
 
 /// A finished predecessor that still records the cube lease it ran under, and
@@ -35,10 +34,10 @@ fn successor_waits_while_a_finished_predecessor_still_records_its_lease() {
 }
 
 #[test]
-fn a_lease_the_release_sweep_no_longer_retries_cannot_hold_a_successor_forever() {
+fn an_old_lease_still_holds_the_successor_and_is_retried_by_the_release_sweep() {
     let db = WorkDb::open(temp_db_path("predecessor-lease-window")).unwrap();
     let (prior, next) = finished_predecessor_and_successor(&db, "stale");
-    let ended = boss_engine_utils::epoch_time::now_epoch_secs() - TERMINAL_LEASE_RELEASE_WINDOW_SECS - 60;
+    let ended = boss_engine_utils::epoch_time::now_epoch_secs() - 86_400 - 60;
     db.connect()
         .unwrap()
         .execute(
@@ -51,10 +50,10 @@ fn a_lease_the_release_sweep_no_longer_retries_cannot_hold_a_successor_forever()
         db.list_terminal_executions_holding_lease()
             .unwrap()
             .iter()
-            .all(|e| e.id != prior.id),
-        "the sweep that would clear the lease no longer looks at this row"
+            .any(|e| e.id == prior.id),
+        "the sweep must still preserve and release this lease"
     );
-    assert!(db.recovery_predecessor_holding_lease(&next).unwrap().is_none());
+    assert!(db.recovery_predecessor_holding_lease(&next).unwrap().is_some());
 }
 
 #[test]
@@ -129,4 +128,13 @@ fn a_resume_row_names_no_workspace() {
     // it, and that is what the successor waits for.
     let held = db.recovery_predecessor_holding_lease(&resumed).unwrap();
     assert_eq!(held.map(|e| e.id), Some(id));
+}
+
+#[test]
+fn resume_reuses_a_successor_inserted_during_teardown() {
+    let db = WorkDb::open(temp_db_path("resume-insertion-race")).unwrap();
+    let (prior, next) = finished_predecessor_and_successor(&db, "concurrent resume");
+    let resumed = db.request_resume_execution(&prior.id, 1, 0, "retry").unwrap();
+    assert_eq!(resumed.id, next.id);
+    assert_eq!(db.list_executions(Some(&prior.work_item_id)).unwrap().len(), 2);
 }

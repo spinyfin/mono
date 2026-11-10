@@ -1,5 +1,4 @@
 use super::*;
-use crate::executions_runs::TERMINAL_LEASE_RELEASE_WINDOW_SECS;
 use crate::schema_init::table_has_column;
 use boss_engine_recovery::execution_bookmark::ExecutionBookmark;
 use rusqlite::Connection;
@@ -214,10 +213,8 @@ impl WorkDb {
     /// the predecessor left unpublished.
     ///
     /// `None` when `execution` recovers from its own record (a retry) or has no
-    /// predecessor, or when the predecessor's lease is gone. A lease recorded
-    /// for longer than [`TERMINAL_LEASE_RELEASE_WINDOW_SECS`] is ignored: cube
-    /// expired it and the ended-run lease sweep no longer retries it, so
-    /// holding for it would never end.
+    /// predecessor, or when the predecessor's lease is gone. Lease age does not
+    /// prove that unpublished work has been preserved.
     pub fn recovery_predecessor_holding_lease(&self, execution: &WorkExecution) -> Result<Option<WorkExecution>> {
         let Some(source) = self.recovery_source(execution)? else {
             return Ok(None);
@@ -230,11 +227,7 @@ impl WorkDb {
             .cube_lease_id
             .as_deref()
             .is_some_and(|lease| !lease.is_empty());
-        let ended = predecessor.finished_epoch().or_else(|| predecessor.created_epoch());
-        let within_window = ended.is_none_or(|ended| {
-            ended >= boss_engine_utils::epoch_time::now_epoch_secs() - TERMINAL_LEASE_RELEASE_WINDOW_SECS
-        });
-        Ok((holds_lease && within_window).then_some(predecessor))
+        Ok(holds_lease.then_some(predecessor))
     }
 
     /// Resolve the predecessor by recorded execution identity alone. Workspace

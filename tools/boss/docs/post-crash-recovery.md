@@ -40,8 +40,9 @@ workspace. After an orphan is recorded, the engine releases the cube lease
 once the pane is confirmed gone and no process has its cwd inside the
 workspace. Teardown preservation of the current workspace commit is best
 effort and runs first; a failure is reported through a
-`preserved_work_needs_inspection` item and never holds the lease. Inconclusive probes keep the lease held, with cube's
-24-hour TTL as the backstop. A release attempt atomically claims
+`preserved_work_needs_inspection` item and never holds the lease. Inconclusive
+probes keep the lease held; cube's 24-hour TTL does not prove work was preserved.
+A release attempt atomically claims
 `cube_lease_id` before calling cube; a genuine failure restores the claim.
 Successful release, including an already-absent lease, clears the remaining
 workspace metadata. The leftover sweep checks at most 100 recent local
@@ -55,9 +56,10 @@ the same work item and kind that ran) is terminal but still records a cube
 lease is therefore held with the dispatch wait reason
 `awaiting_predecessor_preservation`; it never starts from trunk in the
 meantime. This applies to the drain and to `bossctl agents launch` alike, and
-to a lookup that fails. The hold ends when the predecessor's lease is released
-(the cleared lease columns are what dispatch reads), or after cube's 24-hour
-lease TTL, which is also how far back the leftover sweep retries. What keeps a
+to a lookup that fails, including after inline liveness reconciliation. The
+hold ends when the predecessor's lease is released (the cleared lease columns
+are what dispatch reads). The leftover sweep also retries leases older than
+cube's TTL. What keeps a
 lease recorded is a pane or process still in the workspace, occupancy that
 cannot be confirmed, or a cube failure; the leftover sweep keeps retrying and
 the successor stays held behind it rather than abandoning the work. A
@@ -66,14 +68,14 @@ preservation failure does not hold the lease: the release goes ahead and a
 error and the lease id, so a successor that then starts without that work does
 so with the loss on record.
 
-The transient-recovery auto-resume is the one orphaning path that used to
-leave that release to a later sweep. It now preserves the stalled run's work
-and releases its lease itself, through the same inferred-death release the
-dead-pid, stale-worker and spawn-ack sweeps use, as soon as the pane is
-confirmed gone. The successor row is inserted in the same transaction that
-orphans the stalled run (so no other sweep mints a second one), carries no
-workspace preference, and leases any free workspace; the work reaches it
-through the preserved tip, never through the stalled run's workspace.
+Transient recovery confirms pane teardown, preserves the stalled run's work,
+and releases its lease through the same inferred-death release the dead-pid,
+stale-worker and spawn-ack sweeps use before inserting a successor. Unconfirmed
+teardown or incomplete release leaves the execution live for reconciliation
+and retry. After release, one transaction orphans the stalled run and inserts
+its successor, reusing an existing successor if a concurrent reconciler
+created one. The successor carries no workspace preference and leases any
+free workspace; the work reaches it through the preserved tip.
 
 ## How orphans get detected
 

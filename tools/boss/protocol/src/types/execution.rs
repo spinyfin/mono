@@ -750,7 +750,7 @@ pub struct WorkExecution {
     pub effort_level: Option<super::common::EffortLevel>,
     /// Recorded when the row is created on the orphan recovery re-dispatch
     /// path (when the predecessor execution was `orphaned`) and for
-    /// merge-cancelled review followups. Dispatch no longer reads it: it
+    /// merge-cancelled review followups. Dispatch does not read it: it
     /// always leases a clean workspace (never `--allow-dirty`) and recovers
     /// the predecessor's work through its preserved tip. The transient-recovery
     /// auto-resume path (`WorkDb::request_resume_execution`) does not set it.

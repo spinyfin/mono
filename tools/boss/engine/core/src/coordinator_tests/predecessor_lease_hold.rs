@@ -308,14 +308,35 @@ async fn resume_preserves_the_stalled_runs_work_and_returns_its_lease_before_the
 async fn successor_is_held_until_a_later_sweep_releases_the_lease_then_restores_the_work() {
     let s = Stalled::new(true).await;
 
-    // The pane teardown is not confirmed, so the resume leaves the lease to
-    // the sweeps, which here run only after the successor is ready.
-    let (outcome, sink) = s.resume(PaneReleaseOutcome::NoLiveWorker).await;
-    assert_eq!(outcome.resumed, 1);
-    assert_eq!(sink.events().await[0].details["predecessor_lease"], "not_attempted");
-    assert!(s.stalled().cube_lease_id.is_some());
-    assert!(s.db().preserved_tip(&s.stalled_id).unwrap().is_none());
+    // A predecessor orphaned while the engine was offline still needs
+    // preservation even after cube's 24-hour lease TTL.
+    s.db().mark_execution_orphaned(&s.stalled_id, "worker gone").unwrap();
+    s.db()
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET finished_at = ?2 WHERE id = ?1",
+            rusqlite::params![
+                s.stalled_id,
+                (boss_engine_utils::epoch_time::now_epoch_secs() - 90_000).to_string()
+            ],
+        )
+        .unwrap();
+    s.db()
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(s.stalled().work_item_id)
+                .build(),
+        )
+        .unwrap();
     let successor = s.successor();
+    assert!(
+        s.db()
+            .list_terminal_executions_holding_lease()
+            .unwrap()
+            .iter()
+            .any(|e| e.id == s.stalled_id)
+    );
     assert!(s.db().recovery_predecessor_holding_lease(&successor).unwrap().is_some());
 
     // The drain holds it with the named reason and touches neither a slot nor
@@ -398,5 +419,71 @@ async fn failed_preservation_raises_an_attention_item_carrying_the_error_before_
             .iter()
             .any(|item| item.kind == "preserved_work_needs_inspection" && item.status == "open"),
         "starting does not quietly clear the warning"
+    );
+}
+
+#[tokio::test]
+async fn inline_reconcile_keeps_successor_held_until_preservation_finishes() {
+    let s = Stalled::new(true).await;
+    // A missing recorded path makes occupancy unconfirmable. The durable
+    // start time and absent pane pid still prove the pane never attached.
+    s.db()
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET started_at = ?2 WHERE execution_id = ?1",
+            rusqlite::params![
+                s.stalled_id,
+                (boss_engine_utils::epoch_time::now_epoch_secs() - 600).to_string()
+            ],
+        )
+        .unwrap();
+    s.db()
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET workspace_path = NULL WHERE id = ?1",
+            [&s.stalled_id],
+        )
+        .unwrap();
+    let next = s
+        .db()
+        .create_execution(
+            boss_protocol::CreateExecutionInput::builder()
+                .work_item_id(s.stalled().work_item_id)
+                .kind(s.stalled().kind)
+                .status(ExecutionStatus::Ready)
+                .repo_remote_url(s.stalled().repo_remote_url)
+                .build(),
+        )
+        .unwrap();
+    assert!(s.db().recovery_predecessor_holding_lease(&next).unwrap().is_none());
+    let err = s
+        .coordinator
+        .force_dispatch(&next.id, DispatchAdmission::OperatorForced)
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains(HOLD_REASON), "{err:#}");
+    assert!(s.stalled().status.is_terminal());
+    assert_eq!(s.stalled().cube_lease_id.as_deref(), Some("lease-old"));
+    assert!(s.db().preserved_tip(&s.stalled_id).unwrap().is_none());
+    assert_eq!(s.db().get_execution(&next.id).unwrap().status, ExecutionStatus::Ready);
+    assert_eq!(s.wait_reason(&next.id).as_deref(), Some(HOLD_REASON));
+    assert!(s.cube.lease_calls.lock().await.is_empty());
+
+    s.db()
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET workspace_path = ?2 WHERE id = ?1",
+            rusqlite::params![s.stalled_id, s.repo.worker.to_str().unwrap()],
+        )
+        .unwrap();
+    assert_eq!(s.release_like_a_later_sweep().await, LeaseReleaseOutcome::Released);
+    s.coordinator.drain_ready_queue_for_test().await;
+    wait_for_execution_status(s.db(), &next.id, ExecutionStatus::Running).await;
+    assert_eq!(
+        std::fs::read_to_string(s.repo.replacement.join("fix")).unwrap(),
+        "unpublished fix"
     );
 }
