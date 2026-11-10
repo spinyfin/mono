@@ -183,22 +183,7 @@ pub(crate) fn classify_review_signal(leaves: &[serde_json::Value]) -> ReviewSign
     }
 }
 
-/// Verdict bucket a single rollup leaf contributes to. Produced by
-/// [`normalize_leaf`] so the two GraphQL leaf shapes
-/// (`CheckRun` and `StatusContext`) feed the same downstream branches
-/// in [`classify_ci`].
-pub(crate) enum LeafVerdict {
-    /// Leaf is in a non-terminal state (queued / running / expected /
-    /// briefly post-completion with empty conclusion).
-    InFlight,
-    /// Leaf reached a successful terminal state (`SUCCESS` /
-    /// `NEUTRAL` / `SKIPPED`).
-    Pass,
-    /// Leaf reached a failing terminal state. `conclusion` is the
-    /// uppercased token kept verbatim for the worker prompt /
-    /// `ci_remediations.failed_checks` JSON.
-    Fail { conclusion: String },
-}
+pub(crate) use boss_github::LeafVerdict;
 
 /// Normalize one rollup leaf into a [`LeafVerdict`]. `gh pr view
 /// --json statusCheckRollup` returns a heterogeneous array containing
@@ -220,56 +205,7 @@ pub(crate) enum LeafVerdict {
 /// merge-queue rebounce path uses when reading REST `/commits/{sha}/status`
 /// — so the two "did CI fail" answers cannot drift apart.
 pub(crate) fn normalize_leaf(leaf: &serde_json::Value) -> LeafVerdict {
-    let typename = leaf.get("__typename").and_then(|v| v.as_str()).unwrap_or("");
-
-    // StatusContext: `state` carries the verdict. Dispatch on
-    // `__typename` when present; fall back to "has `state` but no
-    // `conclusion`" so older fixtures (and any future leaf shape that
-    // mirrors StatusContext) classify correctly.
-    let has_status_context_shape = typename.eq_ignore_ascii_case("StatusContext")
-        || (leaf.get("state").is_some() && leaf.get("conclusion").is_none());
-    if has_status_context_shape {
-        let state = leaf.get("state").and_then(|v| v.as_str()).unwrap_or("");
-        return match boss_github::classify_status_context_state(state) {
-            boss_github::StatusContextVerdict::Pass => LeafVerdict::Pass,
-            boss_github::StatusContextVerdict::Fail { conclusion } => LeafVerdict::Fail { conclusion },
-            boss_github::StatusContextVerdict::InFlight => LeafVerdict::InFlight,
-        };
-    }
-
-    // CheckRun (and unknown typenames that still carry CheckRun-shaped
-    // fields): combine `status` and `conclusion`. A leaf is in-flight
-    // when its status is one of GitHub's pending-shape values OR when
-    // the conclusion is still empty (briefly, post-completion).
-    let status = leaf
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_ascii_uppercase();
-    let conclusion = leaf
-        .get("conclusion")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_ascii_uppercase();
-    let status_in_flight = matches!(
-        status.as_str(),
-        "IN_PROGRESS" | "QUEUED" | "PENDING" | "WAITING" | "REQUESTED" | ""
-    );
-    if conclusion.is_empty() {
-        return LeafVerdict::InFlight;
-    }
-    if is_failure_conclusion(&conclusion) {
-        return LeafVerdict::Fail { conclusion };
-    }
-    if is_pass_conclusion(&conclusion) {
-        return LeafVerdict::Pass;
-    }
-    if status_in_flight {
-        return LeafVerdict::InFlight;
-    }
-    // Unknown conclusion shape — treat as in-flight rather than
-    // misclassifying it as a failure.
-    LeafVerdict::InFlight
+    boss_github::classify_rollup_leaf(leaf)
 }
 
 fn leaf_timestamp(leaf: &serde_json::Value) -> &str {

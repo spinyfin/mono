@@ -19,7 +19,7 @@ pub trait EvidenceProvider {
         &self,
         base: &str,
         head: &str,
-        pr_url: &str,
+        remote: &str,
     ) -> impl std::future::Future<Output = Result<String>> + Send;
     fn log(&self, check: &Value) -> impl std::future::Future<Output = Result<String>> + Send;
 }
@@ -75,8 +75,7 @@ impl EvidenceProvider for EngineEvidence<'_> {
         Ok(value)
     }
 
-    async fn conflict(&self, base: &str, head: &str, pr_url: &str) -> Result<String> {
-        let repo_url = pr_url.split_once("/pull/").context("invalid PR URL")?.0;
+    async fn conflict(&self, base: &str, head: &str, remote: &str) -> Result<String> {
         // The probe's object store lives in its own temporary directory beside
         // (not inside) the agent's working directory, and is removed when the
         // probe ends, including when the probe is dropped on timeout.
@@ -87,7 +86,7 @@ impl EvidenceProvider for EngineEvidence<'_> {
             None => builder.tempdir()?,
         };
         Ok(serde_json::to_string(
-            &boss_conflict_diagnosis::collect_remote(scratch.path(), &format!("{repo_url}.git"), base, head).await?,
+            &boss_conflict_diagnosis::collect_remote(scratch.path(), remote, base, head).await?,
         )?)
     }
 
@@ -114,36 +113,24 @@ fn check_url(check: &Value) -> Option<&str> {
 }
 
 fn verdict(check: &Value) -> &str {
-    check["conclusion"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .or_else(|| check["state"].as_str())
-        .unwrap_or("UNKNOWN")
+    boss_github::leaf_verdict_token(check).unwrap_or("UNKNOWN")
 }
 
-/// Mirrors the merge poller's closed failure set (`is_failure_conclusion` in
-/// `merge-poller/src/schedule.rs`), including `CANCELLED` and `STALE`, so a PR
-/// stuck on those checks is probed like any other failure.
 fn failed(check: &Value) -> bool {
-    matches!(
-        verdict(check).to_ascii_uppercase().as_str(),
-        "FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "STARTUP_FAILURE" | "ACTION_REQUIRED" | "STALE"
-    )
+    boss_github::leaf_is_failure(check)
 }
 
 fn passed(check: &Value) -> bool {
-    matches!(
-        verdict(check).to_ascii_uppercase().as_str(),
-        "SUCCESS" | "NEUTRAL" | "SKIPPED"
-    )
+    boss_github::leaf_is_pass(check)
 }
 
 /// Upper bounds for one engine probe. The spawn waits on these inline, so each
 /// must be finite; a probe that exceeds its bound is rendered as `probe timed
 /// out` and the agent treats that evidence as unknown. They are generous
 /// ceilings, not measured typical costs (a `gh` call normally returns in
-/// seconds), and a partial fetch of two commits normally completes well inside
-/// the conflict bound.
+/// seconds), and the conflict fetch is blob-less but still downloads every ancestor
+/// commit and tree of the two SHAs, so its cost grows with history and the
+/// bound is deliberately the largest.
 #[derive(Debug, Clone, Copy)]
 pub struct ProbeLimits {
     pub gh: Duration,
@@ -162,6 +149,16 @@ async fn bounded<T>(limit: Duration, probe: impl Future<Output = Result<T>>) -> 
         Ok(result) => result,
         Err(_) => bail!("probe timed out after {limit:?}"),
     }
+}
+
+/// The product's configured remote, when it has one; otherwise the PR's own
+/// repository over HTTPS.
+pub(crate) fn conflict_remote(packet: &ProgressionBriefPacket, pr_url: &str) -> Result<String> {
+    if let Some(remote) = packet.repo_remote_url.as_deref() {
+        return Ok(remote.to_owned());
+    }
+    let repo_url = pr_url.split_once("/pull/").context("invalid PR URL")?.0;
+    Ok(format!("{repo_url}.git"))
 }
 
 fn current_diagnosis(packet: &ProgressionBriefPacket, base: &str, head: &str) -> Option<String> {
@@ -248,7 +245,10 @@ pub async fn gather_evidence_with(
         if let Ok(base) = &live_base {
             let diagnosis = match current_diagnosis(packet, base, head) {
                 Some(stored) => Ok(stored),
-                None => bounded(limits.conflict, provider.conflict(base, head, url)).await,
+                None => match conflict_remote(packet, url) {
+                    Ok(remote) => bounded(limits.conflict, provider.conflict(base, head, &remote)).await,
+                    Err(error) => Err(error),
+                },
             };
             match diagnosis {
                 Ok(json) => out.push_str(&format!(

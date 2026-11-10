@@ -215,55 +215,6 @@ async fn pr_reconcile_requests_arm_reconciles_once_and_parks_after_close() {
     );
 }
 
-/// `is_failure_conclusion` / `is_pass_conclusion` partition GitHub's
-/// conclusion tokens into the gating buckets. Each is a closed set:
-/// the failure set is FAILURE/ERROR/TIMED_OUT/CANCELLED/STARTUP_FAILURE/
-/// ACTION_REQUIRED/STALE; the pass set is SUCCESS/NEUTRAL/SKIPPED.
-/// Matching is case-insensitive, and an unknown token is in neither set
-/// (so the caller keeps waiting rather than mis-routing remediation).
-#[test]
-fn conclusion_predicates_partition_closed_sets() {
-    let failures = [
-        "FAILURE",
-        "ERROR",
-        "TIMED_OUT",
-        "CANCELLED",
-        "STARTUP_FAILURE",
-        "ACTION_REQUIRED",
-        "STALE",
-    ];
-    for c in failures {
-        assert!(super::is_failure_conclusion(c), "{c} should be a failure");
-        assert!(!super::is_pass_conclusion(c), "{c} must not also be a pass",);
-        // Case-insensitive: the lowercase form classifies identically.
-        let lower = c.to_ascii_lowercase();
-        assert!(
-            super::is_failure_conclusion(&lower),
-            "{lower} (lowercase) should be a failure",
-        );
-    }
-
-    let passes = ["SUCCESS", "NEUTRAL", "SKIPPED"];
-    for c in passes {
-        assert!(super::is_pass_conclusion(c), "{c} should be a pass");
-        assert!(!super::is_failure_conclusion(c), "{c} must not also be a failure",);
-        let lower = c.to_ascii_lowercase();
-        assert!(
-            super::is_pass_conclusion(&lower),
-            "{lower} (lowercase) should be a pass",
-        );
-    }
-
-    // An unknown conclusion is in neither set.
-    for unknown in ["", "WAT", "in_progress", "queued"] {
-        assert!(
-            !super::is_failure_conclusion(unknown),
-            "{unknown:?} must not be a failure",
-        );
-        assert!(!super::is_pass_conclusion(unknown), "{unknown:?} must not be a pass",);
-    }
-}
-
 // ── Pass budget ────────────────────────────────────────────────────────
 //
 // A detection pass that runs past its own cadence used to be completely

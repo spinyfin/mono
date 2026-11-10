@@ -11,12 +11,19 @@ use boss_protocol::{
     FinishExecutionRunInput, WorkItemPatch,
 };
 use boss_work_db::{
-    CiRemediationInsertInput, ConflictResolutionInsertInput, PrPollStateInput, WorkDb, WorkerFailureBasis,
+    CiRemediationInsertInput, ConflictResolutionInsertInput, PrPollStateInput,
+    REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS, ReviewVerdictInput, WorkDb, WorkerFailureBasis,
     test_support::{create_test_chore_manual, create_test_product_named, open_db},
 };
 use regex::Regex;
 
-use crate::compose_progression_brief;
+use crate::{gather_progression_brief, render_progression_brief};
+
+/// The stored-state half of the prompt, as production renders it after the
+/// episode write; engine probes are covered in `evidence_tests`.
+fn compose_progression_brief(db: &WorkDb, id: &str) -> anyhow::Result<String> {
+    Ok(render_progression_brief(&gather_progression_brief(db, id)?))
+}
 use crate::golden;
 
 const REQUIRED_SECTIONS: &[&str] = &[
@@ -703,6 +710,139 @@ fn chain_evidence_on_the_parent_reaches_a_stuck_revision() {
 }
 
 #[test]
+fn s6_green_sibling_is_evidence_the_failure_is_specific_to_this_pr() {
+    let f = fixture();
+    let id = f.chore("Red alone");
+    f.bind_pr(&id, 62);
+    let green = f.chore("Green sibling");
+    f.bind_pr(&green, 63);
+    let pending = f.chore("Pending sibling");
+    f.bind_pr(&pending, 64);
+    let other_fail = f.chore("Different failure");
+    f.bind_pr(&other_fail, 65);
+    f.poll(&id, "deadbeef", &poller_detail(&[("bazel-test", "FAILURE")]));
+    f.poll(&other_fail, "feedface", &poller_detail(&[("checkleft", "FAILURE")]));
+    f.db.update_task_pr_poll_state(
+        &green,
+        PrPollStateInput {
+            ci_required_state: "success",
+            review_required_state: "",
+            ci_required_detail: None,
+            pr_mergeable_state: "MERGEABLE",
+            pr_head_sha: Some("cafebabe"),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    f.stick(&id, "status = 'blocked', blocked_reason = 'ci_failure_exhausted'");
+    let text = f.brief(&id);
+    assert!(
+        text.contains("no other PR shows it failing (not failing on 2 other PRs with stored state, unobserved on 1) → more likely specific to this PR"),
+        "{text}"
+    );
+}
+
+#[test]
+fn pr_section_carries_the_ai_review_verdict() {
+    let f = fixture();
+    let id = f.chore("Reviewed");
+    f.bind_pr(&id, 66);
+    f.poll(&id, "deadbeef", "[]");
+    f.stick(&id, "status = 'in_review', review_cycle = 2");
+    let text = f.brief(&id);
+    assert!(text.contains("### AI review"), "{text}");
+    assert!(text.contains("- review_cycle: 2"), "{text}");
+    assert!(
+        text.contains("latest verdict: (none recorded; unknown, not clean)"),
+        "{text}"
+    );
+}
+
+impl Fixture {
+    /// Record a `pr_review` verdict row for `item` the way a completed review
+    /// pass leaves it.
+    fn review_verdict(&self, item: &str, head: Option<&str>, warranted: bool, revision_task: Option<&str>) {
+        let execution = self
+            .db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(item)
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Completed)
+                    .build(),
+            )
+            .unwrap();
+        WorkDb::insert_review_verdict_in_tx(
+            &self.db.connect().unwrap(),
+            &execution.id,
+            item,
+            &ReviewVerdictInput {
+                head_sha: head.map(str::to_owned),
+                findings_count: 3,
+                revision_warranted: warranted,
+                gate_outcome: REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS,
+            },
+        )
+        .unwrap();
+        if let Some(revision_task) = revision_task {
+            self.db
+                .set_review_verdict_revision_task_id(&execution.id, revision_task)
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn ai_review_verdict_reports_head_freshness() {
+    for (reviewed, expect) in [
+        (Some("cafe01"), "matches_current_head=true"),
+        (Some("old000"), "matches_current_head=false"),
+        (None, "matches_current_head=unknown"),
+    ] {
+        let f = fixture();
+        let id = f.chore("Reviewed");
+        f.bind_pr(&id, 67);
+        f.poll(&id, "cafe01", "[]");
+        f.stick(&id, "status = 'in_review'");
+        f.review_verdict(&id, reviewed, true, Some("rev-task-1"));
+        let text = f.brief(&id);
+        assert!(
+            text.contains(&format!(
+                "gate_outcome=completed_with_findings revision_warranted=true findings=3 revision_task=rev-task-1 reviewed_head={} {expect}",
+                reviewed.unwrap_or("(unrecorded)")
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("latest verdict: (none recorded"), "{text}");
+    }
+}
+
+#[test]
+fn stuck_revision_reads_the_chain_roots_review_verdict() {
+    let f = fixture();
+    let parent = f.chore("Reviewed parent");
+    f.bind_pr(&parent, 68);
+    f.poll(&parent, "beef68", "[]");
+    f.stick(&parent, "status = 'in_review'");
+    f.review_verdict(&parent, Some("beef68"), false, None);
+    let revision = f.chore("Stuck revision");
+    f.sql(&format!(
+        "UPDATE tasks SET kind = 'revision', parent_task_id = '{parent}',
+                status = 'blocked', blocked_reason = 'worker_failed'
+         WHERE id = '{revision}'"
+    ));
+    f.review_verdict(&revision, Some("other00"), true, Some("not-this-one"));
+    let text = f.brief(&revision);
+    assert!(
+        text.contains(
+            "revision_warranted=false findings=3 revision_task=(none) reviewed_head=beef68 matches_current_head=true"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("not-this-one"), "{text}");
+}
+
+#[test]
 fn s6_failing_only_here_is_attributed_unknown_not_this_pr() {
     let f = fixture();
     let id = f.chore("Red alone");
@@ -713,7 +853,7 @@ fn s6_failing_only_here_is_attributed_unknown_not_this_pr() {
     f.stick(&id, "status = 'blocked', blocked_reason = 'ci_failure_exhausted'");
     let text = f.brief(&id);
     assert!(
-        text.contains("`bazel-test` failed on this PR; no other PR with stored detail shows it failing (1 other PRs have no stored detail), main not in stored snapshot → attribution unknown until engine probe."),
+        text.contains("`bazel-test` failed on this PR; no other PR shows it failing (not failing on 0 other PRs with stored state, unobserved on 1) → main not in stored snapshot → attribution unknown until engine probe."),
         "{text}"
     );
     assert!(!text.contains("likely this PR's change"), "{text}");

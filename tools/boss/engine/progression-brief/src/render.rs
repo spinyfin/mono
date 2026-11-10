@@ -1,6 +1,8 @@
 //! Markdown rendering of a [`ProgressionBriefPacket`].
 
 use crate::catalogue::{render_question_criteria, render_verb_catalogue};
+use boss_work_db::ProductPrCiSnapshot;
+
 use crate::packet::{Neighbour, ProgressionBriefPacket};
 
 /// Render the diagnosis packet as the progression worker's prompt body.
@@ -203,9 +205,46 @@ fn render_pr(out: &mut String, packet: &ProgressionBriefPacket) {
         packet.review_required_state.as_deref().unwrap_or("(unobserved)"),
     );
     out.push('\n');
+    render_ai_review(out, packet);
     render_conflict_attempts(out, packet);
     render_ci_attempts(out, packet);
     render_check_history(out, packet);
+}
+
+fn render_ai_review(out: &mut String, packet: &ProgressionBriefPacket) {
+    out.push_str("### AI review\n\n");
+    line(
+        out,
+        "ai_review_state",
+        packet.ai_review_state.as_deref().unwrap_or("(none)"),
+    );
+    if let Some(stage) = packet.ai_review_stage.as_deref() {
+        line(out, "ai_review_stage", stage);
+    }
+    line(out, "review_cycle", &packet.review_cycle.to_string());
+    match packet.latest_review.as_ref() {
+        None => line(out, "latest verdict", "(none recorded; unknown, not clean)"),
+        Some(verdict) => {
+            let reviewed = verdict.head_sha.as_deref();
+            let matches = match (reviewed, packet.pr_head_sha.as_deref()) {
+                (Some(reviewed), Some(current)) => (reviewed == current).to_string(),
+                _ => "unknown".to_owned(),
+            };
+            line(
+                out,
+                "latest verdict",
+                &format!(
+                    "gate_outcome={} revision_warranted={} findings={} revision_task={} reviewed_head={} matches_current_head={matches}",
+                    verdict.gate_outcome,
+                    verdict.revision_warranted,
+                    verdict.findings_count,
+                    verdict.revision_task_id.as_deref().unwrap_or("(none)"),
+                    reviewed.unwrap_or("(unrecorded)"),
+                ),
+            );
+        }
+    }
+    out.push('\n');
 }
 
 fn render_conflict_attempts(out: &mut String, packet: &ProgressionBriefPacket) {
@@ -243,6 +282,12 @@ fn render_conflict_diagnosis(out: &mut String, json: &str, current_head: Option<
     {
         out.push_str(&format!(
             "  STALE: stored for head {stored}; the PR head is now {current}\n"
+        ));
+    }
+    if let Some(base) = value.get("base_sha").and_then(|v| v.as_str()) {
+        out.push_str(&format!(
+            "  base at trigger: {base} (the PR's recorded base then, not the live target tip; \
+             see Engine evidence probes for the current-tip result)\n"
         ));
     }
     if let Some(error) = value.get("error").and_then(|v| v.as_str()) {
@@ -303,38 +348,63 @@ fn render_check_history(out: &mut String, packet: &ProgressionBriefPacket) {
         out.push_str("(no failing required checks recorded on this item)\n\n");
         return;
     }
-    let unobserved = packet
-        .other_pr_ci
-        .iter()
-        .filter(|snap| snap.ci_required_detail.is_none())
-        .count();
     for check in &failing_here {
-        let others: Vec<&str> = packet
-            .other_pr_ci
-            .iter()
-            .filter(|snap| check_failed_on(&snap.ci_required_detail, check))
-            .map(|snap| snap.name.as_str())
-            .collect();
-        if others.is_empty() {
+        let (mut failing, mut passing, mut unobserved) = (Vec::new(), 0usize, 0usize);
+        for snap in &packet.other_pr_ci {
+            match sibling_outcome(snap, check) {
+                Sibling::Failing => failing.push(snap.name.as_str()),
+                Sibling::NotFailing => passing += 1,
+                Sibling::Unobserved => unobserved += 1,
+            }
+        }
+        if failing.is_empty() {
+            let verdict = if passing > 0 {
+                "more likely specific to this PR (main still unobserved until engine probe)"
+            } else {
+                "main not in stored snapshot → attribution unknown until engine probe"
+            };
             out.push_str(&format!(
-                "- `{check}` failed on this PR; no other PR with stored detail shows it failing \
-                 ({unobserved} other PRs have no stored detail), main not in stored snapshot → attribution unknown until engine probe.\n"
+                "- `{check}` failed on this PR; no other PR shows it failing (not failing on {passing} other PRs with stored state, \
+                 unobserved on {unobserved}) → {verdict}.\n"
             ));
         } else {
             out.push_str(&format!(
-                "- `{check}` failed on this PR and on {} other open/recent PRs ({}) → likely unrelated or flaky.\n",
-                others.len(),
-                others.join(", ")
+                "- `{check}` failed on this PR and on {} other open/recent PRs ({}) → likely unrelated or flaky. \
+                 Not failing on {passing} other PRs; unobserved on {unobserved}.\n",
+                failing.len(),
+                failing.join(", ")
             ));
         }
     }
     out.push('\n');
 }
 
+enum Sibling {
+    Failing,
+    NotFailing,
+    Unobserved,
+}
+
+/// The merge poller stores detail only while required checks fail, so a green
+/// sibling has `state = success` and no detail: that is evidence, not a gap.
+fn sibling_outcome(snap: &ProductPrCiSnapshot, check: &str) -> Sibling {
+    match snap.ci_required_state.as_deref() {
+        Some("success") => Sibling::NotFailing,
+        Some("fail") if snap.ci_required_detail.is_some() => {
+            if check_failed_on(&snap.ci_required_detail, check) {
+                Sibling::Failing
+            } else {
+                Sibling::NotFailing
+            }
+        }
+        _ => Sibling::Unobserved,
+    }
+}
+
 /// Names of the checks in a stored `ci_required_detail`. The merge poller
 /// stores only failing required checks, with GitHub's uppercase conclusion
 /// (`FAILURE`, `TIMED_OUT`, `ERROR`, `STARTUP_FAILURE`, …), so a check counts as
-/// failing unless its conclusion is one of the pass values.
+/// failing when its conclusion is in the shared failure set.
 fn failing_check_names(detail: Option<&str>) -> Vec<String> {
     let Some(detail) = detail else {
         return Vec::new();
@@ -349,12 +419,7 @@ fn failing_check_names(detail: Option<&str>) -> Vec<String> {
         .iter()
         .filter_map(|item| {
             let name = item.get("name")?.as_str()?;
-            let conclusion = item.get("conclusion").and_then(|v| v.as_str()).unwrap_or("");
-            let passing = matches!(
-                conclusion.to_ascii_uppercase().as_str(),
-                "SUCCESS" | "NEUTRAL" | "SKIPPED"
-            );
-            (!passing).then(|| name.to_owned())
+            boss_github::leaf_is_failure(item).then(|| name.to_owned())
         })
         .collect()
 }

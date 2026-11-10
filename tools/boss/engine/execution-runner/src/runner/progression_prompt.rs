@@ -14,10 +14,21 @@ pub(super) async fn compose_progression_prompt(
 ) -> String {
     match boss_progression_brief::gather_progression_brief(work_db, &execution.work_item_id) {
         Ok(packet) => {
+            // The fingerprint is already in the rendered packet, so a failed
+            // write must not cost the agent its diagnosis. Compose runs once
+            // per spawn and nothing retries here: a failed write drops this
+            // episode from later repeat-attempt comparison (it reads the
+            // persisted per-execution keys) unless this execution is composed
+            // again.
             if let Err(error) =
                 work_db.record_progression_episode(&execution.id, &packet.fingerprint, &packet.stuck_kind)
             {
-                return fallback_prompt(&execution.id, &execution.work_item_id, &error);
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    %error,
+                    "progression brief: failed to record the episode; continuing with the full packet"
+                );
             }
             let evidence =
                 boss_progression_brief::gather_evidence(&packet, &boss_progression_brief::EngineEvidence { workspace })

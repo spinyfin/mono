@@ -31,6 +31,8 @@ struct Probe {
     hang_conflict: bool,
     #[builder(default)]
     conflict_bases: std::sync::Mutex<Vec<String>>,
+    #[builder(default)]
+    conflict_remotes: std::sync::Mutex<Vec<String>>,
 }
 
 impl EvidenceProvider for Probe {
@@ -53,8 +55,9 @@ impl EvidenceProvider for Probe {
     async fn main_checks(&self, _: &str) -> Result<Value> {
         Ok(self.main.clone())
     }
-    async fn conflict(&self, base: &str, head: &str, _: &str) -> Result<String> {
+    async fn conflict(&self, base: &str, head: &str, remote: &str) -> Result<String> {
         self.conflicts.fetch_add(1, Ordering::SeqCst);
+        self.conflict_remotes.lock().unwrap().push(remote.to_owned());
         if self.hang_conflict {
             std::future::pending::<()>().await;
         }
@@ -358,4 +361,63 @@ async fn hung_conflict_probe_is_reported_and_later_probes_still_run() {
         "{text}"
     );
     assert!(text.contains("fresh failing log"), "{text}");
+}
+
+#[tokio::test]
+async fn conflict_probe_uses_the_recorded_remote_else_the_pr_repository() {
+    let (_dir, _db, mut packet) = packet();
+    packet.repo_remote_url = None;
+    let provider = probe("FAILURE");
+    gather_evidence(&packet, &provider).await;
+    assert_eq!(
+        *provider.conflict_remotes.lock().unwrap(),
+        ["https://github.com/o/r.git"]
+    );
+
+    packet.repo_remote_url = Some("git@example.com:team/mirror.git".into());
+    let provider = probe("FAILURE");
+    gather_evidence(&packet, &provider).await;
+    assert_eq!(
+        *provider.conflict_remotes.lock().unwrap(),
+        ["git@example.com:team/mirror.git"]
+    );
+}
+
+#[test]
+fn conflict_remote_rejects_a_pr_url_without_a_pull_segment() {
+    let (_dir, _db, mut packet) = packet();
+    packet.repo_remote_url = None;
+    let err = crate::evidence::conflict_remote(&packet, "https://github.com/o/r/issues/1").unwrap_err();
+    assert!(err.to_string().contains("invalid PR URL"), "{err}");
+}
+
+#[test]
+fn gather_resolves_remote_from_item_then_product_and_drops_blank() {
+    let (_dir, db, packet) = packet();
+    let id = packet.item.id.clone();
+    let product_id = packet.item.product_id.clone();
+    let quote = |value: Option<&str>| value.map_or("NULL".to_owned(), |v| format!("'{v}'"));
+    let set = |item: Option<&str>, product: Option<&str>| {
+        db.connect()
+            .unwrap()
+            .execute_batch(&format!(
+                "UPDATE tasks SET repo_remote_url = {} WHERE id = '{id}';
+                 UPDATE products SET repo_remote_url = {} WHERE id = '{product_id}';",
+                quote(item),
+                quote(product),
+            ))
+            .unwrap();
+        gather_progression_brief(&db, &id).unwrap().repo_remote_url
+    };
+    assert_eq!(
+        set(Some("item-remote"), Some("product-remote")).as_deref(),
+        Some("item-remote")
+    );
+    assert_eq!(set(None, Some("product-remote")).as_deref(), Some("product-remote"));
+    assert_eq!(set(None, Some("   ")), None);
+    assert_eq!(set(Some("  "), None), None);
+    assert_eq!(
+        set(Some("  "), Some("product-remote")).as_deref(),
+        Some("product-remote")
+    );
 }
