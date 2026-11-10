@@ -54,8 +54,8 @@ fn restaged(db: &WorkDb, successor: &str, predecessor: &str) {
 fn publish(db: &WorkDb, execution_id: &str) {
     sql(
         db,
-        "UPDATE work_executions SET pr_head_after = ?2 WHERE id = ?1",
-        params![execution_id, "b".repeat(40)],
+        "UPDATE work_executions SET pr_head_before = ?3, pr_head_after = ?2 WHERE id = ?1",
+        params![execution_id, "b".repeat(40), "a".repeat(40)],
     );
 }
 
@@ -346,20 +346,71 @@ fn a_metadata_only_successor_keeps_its_predecessors_tip() {
 }
 
 #[test]
-fn archive_cleanup_migration_is_idempotent_and_preserves_archive_only_records() {
+fn a_successor_without_a_head_baseline_does_not_count_as_published() {
+    let db = WorkDb::open(temp_db_path("null-baseline-preserved")).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore_manual(&db, product.id, "no baseline");
+    let prior = preserved_execution(&db, &chore.id, DAY);
+    let successor = preserved_execution(&db, &chore.id, 1);
+    restaged(&db, &successor, &prior);
+    sql(
+        &db,
+        "UPDATE work_executions SET pr_head_before = NULL, pr_head_after = 'new-head' WHERE id = ?1",
+        [&successor],
+    );
+    assert!(db.list_superseded_preserved(10, &[]).unwrap().is_empty());
+    assert!(db.preserved_tip(&prior).unwrap().is_some());
+}
+
+#[test]
+fn superseded_listing_resumes_after_the_cursor() {
+    let db = WorkDb::open(temp_db_path("superseded-cursor")).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore_manual(&db, product.id, "cursor");
+    let first = preserved_execution(&db, &chore.id, 10);
+    let second = preserved_execution(&db, &chore.id, 9);
+    let third = preserved_execution(&db, &chore.id, 8);
+    restaged(&db, &second, &first);
+    restaged(&db, &third, &second);
+    publish(&db, &third);
+    let page = db.list_superseded_preserved_after(1, &[], None).unwrap();
+    assert_eq!(ids(&page), vec![first.clone()]);
+    let page = db.list_superseded_preserved_after(1, &[], Some(&first)).unwrap();
+    assert_eq!(ids(&page), vec![second.clone()]);
+    assert!(
+        db.list_superseded_preserved_after(1, &[], Some(&second))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn archive_cleanup_migration_is_idempotent_and_flags_only_records_that_may_hold_references() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute_batch("CREATE TABLE execution_bookmarks (execution_id TEXT PRIMARY KEY); INSERT INTO execution_bookmarks VALUES ('old');").unwrap();
+    conn.execute_batch(
+        "CREATE TABLE execution_bookmarks (execution_id TEXT PRIMARY KEY);
+         CREATE TABLE work_executions (id TEXT PRIMARY KEY, preserved_commit_id TEXT);
+         CREATE TABLE work_attention_items (id TEXT PRIMARY KEY, execution_id TEXT, kind TEXT);
+         INSERT INTO execution_bookmarks VALUES ('tip'), ('archived'), ('inspect'), ('plain');
+         INSERT INTO work_executions VALUES ('tip', 'abc'), ('archived', NULL), ('inspect', NULL), ('plain', NULL);
+         INSERT INTO work_attention_items VALUES
+            ('a1', 'archived', 'preserved_work_archived'),
+            ('a2', 'inspect', 'preserved_work_needs_inspection'),
+            ('a3', 'plain', 'something_else');",
+    )
+    .unwrap();
     for _ in 0..2 {
         crate::preserved_cleanup::migrate_archive_cleanup(&conn).unwrap();
     }
     conn.execute("INSERT INTO execution_bookmarks (execution_id) VALUES ('new')", [])
         .unwrap();
-    let pending: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM execution_bookmarks WHERE archive_cleanup_pending = 1",
-            [],
-            |row| row.get(0),
-        )
+    let mut stmt = conn
+        .prepare("SELECT execution_id FROM execution_bookmarks WHERE archive_cleanup_pending = 1 ORDER BY 1")
         .unwrap();
-    assert_eq!(pending, 2);
+    let pending: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(pending, ["archived", "inspect", "tip"]);
 }

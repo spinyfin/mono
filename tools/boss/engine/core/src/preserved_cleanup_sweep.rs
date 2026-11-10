@@ -15,7 +15,9 @@
 //!
 //! Each pass forgets a bounded batch, one jj operation per execution. A host
 //! that cannot be reached is retried after [`RETRY_AFTER`] rather than on every
-//! pass, so a few unreachable records cannot starve the rest.
+//! pass, and each list is walked with a cursor that moves past every attempted
+//! record and wraps only after the whole list has been traversed, so failing
+//! records cannot starve the rest however many there are.
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -38,6 +40,8 @@ pub(crate) const RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
 #[derive(Debug, Default)]
 pub(crate) struct Backoff {
     failed_at: HashMap<String, Instant>,
+    superseded_cursor: Option<String>,
+    closed_chain_cursor: Option<String>,
 }
 
 impl Backoff {
@@ -70,15 +74,40 @@ pub(crate) async fn run_one_pass(
     coordinator: &ExecutionCoordinator,
     backoff: &mut Backoff,
 ) -> Result<CleanupReport> {
-    let now = Instant::now();
+    run_one_pass_with(db, coordinator, backoff, Instant::now(), BATCH_SIZE).await
+}
+
+/// [`run_one_pass`] with an injectable clock and batch size.
+pub(crate) async fn run_one_pass_with(
+    db: &WorkDb,
+    coordinator: &ExecutionCoordinator,
+    backoff: &mut Backoff,
+    now: Instant,
+    batch_size: usize,
+) -> Result<CleanupReport> {
     let excluded: Vec<_> = backoff
         .failed_at
         .keys()
         .filter(|id| !backoff.due(id, now))
         .cloned()
         .collect();
-    let mut cleanups = db.list_superseded_preserved(BATCH_SIZE, &excluded)?;
-    cleanups.extend(db.list_closed_chain_preserved(CLOSED_CHAIN_RETENTION_SECS, BATCH_SIZE, &excluded)?);
+    let superseded = db.list_superseded_preserved_after(batch_size, &excluded, backoff.superseded_cursor.as_deref())?;
+    // A full batch means more may follow: resume after it. A short one reached
+    // the end of the list, so the next pass starts over from the beginning.
+    backoff.superseded_cursor = (superseded.len() >= batch_size)
+        .then(|| superseded.last().map(|c| c.execution.id.clone()))
+        .flatten();
+    let closed = db.list_closed_chain_preserved_after(
+        CLOSED_CHAIN_RETENTION_SECS,
+        batch_size,
+        &excluded,
+        backoff.closed_chain_cursor.as_deref(),
+    )?;
+    backoff.closed_chain_cursor = (closed.len() >= batch_size)
+        .then(|| closed.last().map(|c| c.execution.id.clone()))
+        .flatten();
+    let mut cleanups = superseded;
+    cleanups.extend(closed);
     let mut report = CleanupReport::default();
     let mut seen = HashSet::new();
     report.deferred = excluded.len();

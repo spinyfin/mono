@@ -50,6 +50,17 @@ impl WorkDb {
     /// Executions whose preserved tip a later, published execution carried,
     /// with the published execution that vouches for each. At most `limit`.
     pub fn list_superseded_preserved(&self, limit: usize, excluded: &[String]) -> Result<Vec<PreservedCleanup>> {
+        self.list_superseded_preserved_after(limit, excluded, None)
+    }
+
+    /// As [`Self::list_superseded_preserved`], but only executions whose id sorts
+    /// after `after`, so a sweep can walk the whole set in fair batches.
+    pub fn list_superseded_preserved_after(
+        &self,
+        limit: usize,
+        excluded: &[String],
+        after: Option<&str>,
+    ) -> Result<Vec<PreservedCleanup>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "WITH RECURSIVE lineage(published, ancestor, depth) AS (
@@ -58,7 +69,8 @@ impl WorkDb {
                  JOIN work_executions we ON we.id = eb.execution_id
                  WHERE eb.recovered_from IS NOT NULL
                    AND we.pr_head_after IS NOT NULL AND we.pr_head_after != ''
-                   AND we.pr_head_after IS NOT we.pr_head_before
+                   AND we.pr_head_before IS NOT NULL AND we.pr_head_before != ''
+                   AND we.pr_head_after != we.pr_head_before
                  UNION
                  SELECT l.published, eb.recovered_from, l.depth + 1
                  FROM lineage l
@@ -71,13 +83,19 @@ impl WorkDb {
              JOIN execution_bookmarks pe ON pe.execution_id = p.id
              WHERE p.preserved_commit_id IS NOT NULL AND p.id != l.published
                AND p.id NOT IN (SELECT value FROM json_each(?3))
+               AND p.id > ?4
              GROUP BY p.id
              ORDER BY p.id
              LIMIT ?1",
         )?;
         let pairs = stmt
             .query_map(
-                params![limit as i64, MAX_LINEAGE_DEPTH, serde_json::to_string(excluded)?],
+                params![
+                    limit as i64,
+                    MAX_LINEAGE_DEPTH,
+                    serde_json::to_string(excluded)?,
+                    after.unwrap_or_default()
+                ],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -94,14 +112,26 @@ impl WorkDb {
         Ok(cleanups)
     }
 
-    /// Terminal executions still holding a preserved tip whose PR chain has
-    /// been closed for at least `retention_secs`. At most `limit`, oldest
-    /// finished first.
+    /// Terminal executions that may still hold a preserved tip or archives
+    /// whose PR chain has been closed for at least `retention_secs`. At most
+    /// `limit`, in id order.
     pub fn list_closed_chain_preserved(
         &self,
         retention_secs: i64,
         limit: usize,
         excluded: &[String],
+    ) -> Result<Vec<PreservedCleanup>> {
+        self.list_closed_chain_preserved_after(retention_secs, limit, excluded, None)
+    }
+
+    /// As [`Self::list_closed_chain_preserved`], but only executions whose id
+    /// sorts after `after`, so a sweep can walk the whole set in fair batches.
+    pub fn list_closed_chain_preserved_after(
+        &self,
+        retention_secs: i64,
+        limit: usize,
+        excluded: &[String],
+        after: Option<&str>,
     ) -> Result<Vec<PreservedCleanup>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
@@ -109,14 +139,18 @@ impl WorkDb {
              JOIN execution_bookmarks eb ON eb.execution_id = we.id
              WHERE (we.preserved_commit_id IS NOT NULL OR eb.archive_cleanup_pending = 1)
                AND we.id NOT IN (SELECT value FROM json_each(?1))
+               AND we.id > ?2
                AND NOT EXISTS (SELECT 1 FROM work_attention_items a
                    WHERE a.execution_id = we.id AND a.status = 'open'
                      AND a.kind IN ('preserved_work_not_restaged', 'abandoned_execution_bookmark'))
                AND we.status IN ('completed', 'failed', 'cancelled', 'orphaned', 'abandoned')
-             ORDER BY CAST(we.finished_at AS INTEGER) ASC, we.id ASC",
+             ORDER BY we.id ASC",
         )?;
         let ids = stmt
-            .query_map([serde_json::to_string(excluded)?], |row| row.get::<_, String>(0))?
+            .query_map(
+                params![serde_json::to_string(excluded)?, after.unwrap_or_default()],
+                |row| row.get::<_, String>(0),
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
         let cutoff = boss_engine_utils::epoch_time::now_epoch_secs() - retention_secs;
@@ -210,12 +244,24 @@ impl WorkDb {
     }
 }
 
-/// Store records may hold archives even when their restageable tip is gone.
-/// Keep a pending archive scan independently until closed-chain cleanup finishes it.
+/// `archive_cleanup_pending` means preserved-archive references may exist for
+/// the execution, whether or not its restageable tip is still recorded. It is
+/// set when archives or an inspection item are filed (see
+/// `upsert_execution_attention`) and cleared when closed-chain cleanup has
+/// forgotten them. Existing rows are backfilled where a tip or archive or
+/// inspection attention history shows references may exist.
 pub(crate) fn migrate_archive_cleanup(conn: &rusqlite::Connection) -> Result<()> {
     if !crate::schema_init::table_has_column(conn, "execution_bookmarks", "archive_cleanup_pending")? {
         conn.execute_batch(
-            "ALTER TABLE execution_bookmarks ADD COLUMN archive_cleanup_pending INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE execution_bookmarks ADD COLUMN archive_cleanup_pending INTEGER NOT NULL DEFAULT 0;
+             UPDATE execution_bookmarks SET archive_cleanup_pending = 1
+             WHERE execution_id IN (
+                 SELECT id FROM work_executions WHERE preserved_commit_id IS NOT NULL
+                 UNION
+                 SELECT execution_id FROM work_attention_items
+                 WHERE execution_id IS NOT NULL
+                   AND kind IN ('preserved_work_archived', 'preserved_work_needs_inspection')
+             );",
         )?;
     }
     Ok(())

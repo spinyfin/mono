@@ -778,8 +778,8 @@ mod preserved_cleanup_sweep {
         assert!(f.exists(&preserved_name(&prior)));
 
         f.sql(
-            "UPDATE work_executions SET pr_head_after = ?2 WHERE id = ?1",
-            rusqlite::params![successor, "b".repeat(40)],
+            "UPDATE work_executions SET pr_head_before = ?3, pr_head_after = ?2 WHERE id = ?1",
+            rusqlite::params![successor, "b".repeat(40), "a".repeat(40)],
         );
         let report = f.pass().await;
         assert_eq!(report.superseded, 1, "{report:?}");
@@ -810,13 +810,15 @@ mod preserved_cleanup_sweep {
             &f.repo.repo,
             &["bookmark", "create", &archive, "-r", &preserved_name(&prior)],
         );
+        f.db.upsert_execution_attention(&prior, PRESERVED_WORK_ARCHIVED_ATTENTION_KIND, "Archived", "body")
+            .unwrap();
         let successor = f.execution(&chore);
         let record = create(&LocalJj, &f.repo.worker, &successor, "local").await.unwrap();
         f.db.record_execution_bookmark(&record).unwrap();
         f.db.record_bookmark_recovery(&successor, &prior, true).unwrap();
         f.sql(
-            "UPDATE work_executions SET pr_head_after = ?2 WHERE id = ?1",
-            rusqlite::params![successor, "b".repeat(40)],
+            "UPDATE work_executions SET pr_head_before = ?3, pr_head_after = ?2 WHERE id = ?1",
+            rusqlite::params![successor, "b".repeat(40), "a".repeat(40)],
         );
         assert_eq!(f.pass().await.superseded, 1);
         assert!(!f.exists(&preserved_name(&prior)));
@@ -917,14 +919,19 @@ mod preserved_cleanup_sweep {
     }
 
     #[tokio::test]
-    async fn more_than_a_batch_of_failed_stores_cannot_starve_a_healthy_store() {
-        use crate::preserved_cleanup_sweep::BATCH_SIZE;
+    async fn a_failing_prefix_longer_than_the_retry_window_cannot_starve_a_healthy_store() {
+        use crate::preserved_cleanup_sweep::{RETRY_AFTER, run_one_pass_with};
+        use std::time::{Duration, Instant};
+        const BATCH: usize = 2;
+        const INTERVAL: Duration = Duration::from_secs(5 * 60);
+        // More failing records than one retry window's worth of batches.
+        let failing_count = BATCH * (RETRY_AFTER.as_secs() / INTERVAL.as_secs()) as usize + BATCH;
         let mut f = fixture();
         let chore = f.chore("Many unreachable stores");
         let template = f.preserved(&chore, "template.txt").await;
         let record = f.db.preservation_source(&template).unwrap().unwrap();
         let tip = f.db.preserved_tip(&template).unwrap().unwrap();
-        for _ in 0..=BATCH_SIZE {
+        for _ in 0..failing_count {
             let id = f.execution(&chore);
             let mut record = record.clone();
             record.execution_id = id.clone();
@@ -934,12 +941,19 @@ mod preserved_cleanup_sweep {
             f.db.mark_execution_orphaned(&id, "terminated").unwrap();
             f.sql("UPDATE work_executions SET finished_at = '1' WHERE id = ?1", [&id]);
         }
+        let healthy = f.preserved(&chore, "healthy.txt").await;
         f.close_chain(&chore, 30 * DAY);
-        assert_eq!(f.pass().await.failed, BATCH_SIZE);
-        assert!(f.exists(&preserved_name(&template)));
-        let report = f.pass().await;
-        assert_eq!((report.failed, report.closed_chain), (1, 1), "{report:?}");
-        assert!(!f.exists(&preserved_name(&template)));
+        let start = Instant::now();
+        let mut passes = 0;
+        while f.exists(&preserved_name(&healthy)) {
+            assert!(passes < 4 * failing_count, "the healthy store was never reached");
+            let now = start + INTERVAL * passes as u32;
+            run_one_pass_with(&f.db, &f.coordinator, &mut f.backoff, now, BATCH)
+                .await
+                .unwrap();
+            passes += 1;
+        }
+        assert!(f.db.preserved_tip(&healthy).unwrap().is_none());
     }
 
     #[tokio::test]
