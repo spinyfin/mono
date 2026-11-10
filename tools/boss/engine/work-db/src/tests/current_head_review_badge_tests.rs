@@ -363,6 +363,18 @@ fn current_head_review_badge_findings_revision_delivered_without_head_change_is_
             .iter()
             .any(|wait| wait.work_item_id == root)
     );
+    // Revision rows inherit the PR rather than carrying their own URL.
+    assert!(
+        query_task(&db.connect().unwrap(), &revision)
+            .unwrap()
+            .unwrap()
+            .pr_url
+            .is_none()
+    );
+    assert_eq!(
+        db.get_task_runtime(&revision).unwrap().dispatch_wait_reason.as_deref(),
+        Some(boss_engine_storage_values::dispatch_wait::DISPATCH_WAIT_REASON_AWAITING_MERGE)
+    );
     let delivered = card(&db, &product, &root);
     assert_eq!(delivered.ai_review_state.as_deref(), Some("not_reviewed"));
     assert!(delivered.ai_review_findings_revision_id.is_none());

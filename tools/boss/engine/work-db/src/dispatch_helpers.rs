@@ -274,9 +274,9 @@ pub(crate) fn collect_product_dependencies(conn: &Connection, product_id: &str) 
 
 /// Hydrate the per-item runtime for every task and chore. This is the
 /// primary N+1 on the `get_work_tree` path: one call per work item, each
-/// running execution point queries plus task-derived wait annotation. Returns the runtimes alongside the total
-/// number of SQL statements executed, so `boss_engine::population_timing` can
-/// attribute the per-row subquery fan-out.
+/// running execution point queries plus task-derived wait annotation. Returns
+/// the runtimes alongside the total number of SQL statements executed, so
+/// `boss_engine::population_timing` can attribute the per-row subquery fan-out.
 pub(crate) fn collect_task_runtimes(
     conn: &Connection,
     tasks: &[Task],

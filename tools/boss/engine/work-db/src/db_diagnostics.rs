@@ -10,8 +10,8 @@ use std::{
 };
 
 /// Count statements in a synchronous projection, including nested helper queries.
-/// This connection has no SQL trace installed; the call observer used below is
-/// independent of SQLite's statement trace.
+/// Installs a temporary SQLite statement trace callback and removes it on exit.
+/// Assumes no other trace callback is installed on this connection.
 pub(super) fn count_statements<T>(conn: &rusqlite::Connection, work: impl FnOnce() -> T) -> (T, u64) {
     use std::ffi::{c_int, c_uint, c_void};
     unsafe extern "C" fn count(_: c_uint, context: *mut c_void, _: *mut c_void, _: *mut c_void) -> c_int {

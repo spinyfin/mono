@@ -66,8 +66,8 @@ pub const DISPATCH_WAIT_REASON_INTERACTIVE_CAP: &str = "interactive_concurrency_
 pub const DISPATCH_WAIT_REASON_WAITING_DEPENDENCY: &str = "waiting_dependency";
 
 /// The row is a later task of a project whose earlier task has not yet reached
-/// review or completion: the reconciler holds every project task but the first incomplete
-/// one in `waiting_dependency`.
+/// review or completion: the reconciler holds every project task but the first
+/// incomplete one in `waiting_dependency`.
 pub const DISPATCH_WAIT_REASON_PROJECT_ORDER: &str = "project_order";
 
 /// The row is `ready` but its `dispatch_not_before` deadline is still ahead.

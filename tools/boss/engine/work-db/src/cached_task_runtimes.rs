@@ -8,7 +8,10 @@ use super::*;
 /// only misses (changed, expired, never seen, or consulting other items) run
 /// execution point queries. Task-derived wait annotation runs on hits too.
 /// The returned statement count includes those annotation statements, cache
-/// misses and the epoch query.
+/// misses and the epoch query. Annotation remains linear in card count,
+/// including cache hits and heartbeat reads: each review card resolves its
+/// holds, owner, current head and admission independently. The family query
+/// runs only after the cheap merge-fallback conditions pass.
 pub(crate) fn collect_task_runtimes_cached(
     conn: &Connection,
     product_id: &str,

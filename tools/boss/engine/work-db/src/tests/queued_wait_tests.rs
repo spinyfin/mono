@@ -1160,7 +1160,7 @@ fn excluded_review_kinds_wait_for_merge_without_false_attention() {
         pending(&db, &item.id, ExecutionKind::PrReview, ExecutionStatus::WaitingReview);
         assert_eq!(
             db.get_task_runtime(&item.id).unwrap().dispatch_wait_reason.as_deref(),
-            Some(DISPATCH_WAIT_REASON_UNCLASSIFIED)
+            Some(DISPATCH_WAIT_REASON_REVIEW_BATCH)
         );
     }
 }
@@ -1170,6 +1170,10 @@ fn merge_only_wait_requires_the_whole_revision_family_to_be_idle() {
     let db = db();
     let product = create_test_product(&db);
     let root = make_in_review_chore(&db, &product.id, "https://github.com/test/repo/pull/8");
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET kind = 'design' WHERE id = ?1", [&root])
+        .unwrap();
     let child = create_test_chore(&db, &product.id, "pending revision");
     db.connect()
         .unwrap()
@@ -1178,14 +1182,24 @@ fn merge_only_wait_requires_the_whole_revision_family_to_be_idle() {
             params![child.id, root],
         )
         .unwrap();
-    assert_eq!(
-        db.get_task_runtime(&root).unwrap().dispatch_wait_reason.as_deref(),
-        Some(DISPATCH_WAIT_REASON_UNCLASSIFIED)
-    );
+    for status in ["todo", "active", "blocked"] {
+        set_status(&db, &child.id, status);
+        assert_eq!(
+            db.get_task_runtime(&root).unwrap().dispatch_wait_reason.as_deref(),
+            Some(DISPATCH_WAIT_REASON_REVISION_PENDING),
+            "{status}"
+        );
+        assert!(
+            !db.list_unexplained_dispatch_waits()
+                .unwrap()
+                .iter()
+                .any(|wait| wait.work_item_id == root)
+        );
+    }
     set_status(&db, &child.id, "in_review");
     pending(&db, &child.id, ExecutionKind::PrReview, ExecutionStatus::Running);
     assert_eq!(
         db.get_task_runtime(&root).unwrap().dispatch_wait_reason.as_deref(),
-        Some(DISPATCH_WAIT_REASON_UNCLASSIFIED)
+        Some(DISPATCH_WAIT_REASON_REVIEW_BATCH)
     );
 }
