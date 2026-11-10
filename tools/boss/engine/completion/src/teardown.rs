@@ -231,20 +231,24 @@ impl WorkerCompletionHandler {
                 PaneReleaseOutcome::Reaped => crate::workspace_lease_release::PaneStatus::Gone,
                 PaneReleaseOutcome::NoLiveWorker => crate::workspace_lease_release::PaneStatus::Present,
             };
-            let release = async {
-                match owning_cube {
-                    Ok(resolved) if resolved.is_local() => {
-                        self.cube_client.release_workspace_with_reset(lease_id).await
+            let timed_out_flag = &mut cube_timed_out;
+            let timed = move |preserved: bool| async move {
+                let release = async {
+                    match owning_cube {
+                        // The forced reset skips cube's unpushed-work guard, so
+                        // it is used only once preservation succeeded.
+                        Ok(resolved) if resolved.is_local() && preserved => {
+                            self.cube_client.release_workspace_with_reset(lease_id).await
+                        }
+                        Ok(resolved) if resolved.is_local() => self.cube_client.release_workspace(lease_id).await,
+                        Ok(resolved) => resolved.cube.force_release_lease(lease_id, Some(path)).await,
+                        Err(err) => Err(err),
                     }
-                    Ok(resolved) => resolved.cube.force_release_lease(lease_id, Some(path)).await,
-                    Err(err) => Err(err),
-                }
-            };
-            let timed = async {
+                };
                 match tokio::time::timeout(CUBE_RELEASE_TIMEOUT, release).await {
                     Ok(result) => result,
                     Err(_elapsed) => {
-                        cube_timed_out = true;
+                        *timed_out_flag = true;
                         Err(anyhow::anyhow!(
                             "cube workspace release timed out after {}s",
                             CUBE_RELEASE_TIMEOUT.as_secs()
@@ -286,7 +290,7 @@ impl WorkerCompletionHandler {
                             },
                         }
                     } else {
-                        crate::workspace_lease_release::apply_release(
+                        crate::workspace_lease_release::apply_release_choosing(
                             &self.work_db,
                             &execution,
                             lease_id,

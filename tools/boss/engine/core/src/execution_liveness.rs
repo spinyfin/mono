@@ -229,8 +229,9 @@ pub fn finalize_dead_automation_triage_run(work_db: &WorkDb, execution: &WorkExe
 ///
 /// - `reason` is recorded on the orphan (`mark_execution_orphaned`, which
 ///   keeps the cube lease + workspace *columns* on the row until
-///   [`crate::workspace_lease_release`] confirms the recovery bookmark and
-///   that no process still has its cwd in the workspace). Callers whose
+///   [`crate::workspace_lease_release`] confirms the pane is gone and
+///   that no process still has its cwd in the workspace; preserving unpushed
+///   edits is best effort and never holds the lease). Callers whose
 ///   recovery path creates a fresh execution — never reclaiming that lease
 ///   in place — follow up with that gated release so the workspace returns
 ///   to the pool.

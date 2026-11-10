@@ -4,6 +4,8 @@ use boss_engine_recovery::execution_bookmark::ExecutionBookmark;
 use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus};
 use std::sync::Mutex;
 
+mod preservation_retry;
+
 struct SweepCube;
 crate::stub_cube_client! { SweepCube {
     async fn release_workspace(&self, _: &str) -> Result<()> { Ok(()) }
@@ -242,6 +244,65 @@ async fn failed_preservation_warns_and_still_releases_the_lease() {
         items.iter().all(|item| item.kind != LEASE_UNRELEASED_ATTENTION_KIND),
         "no lease is held, so no unreleased-lease item is filed"
     );
+}
+
+/// The forced reset skips cube's unpushed-work guard, so it is chosen only
+/// when preservation succeeded.
+#[tokio::test]
+async fn forced_reset_is_chosen_only_after_successful_preservation() {
+    for (preservation, expect_forced) in [(Ok(()), true), (Err("preserved bookmark write failed"), false)] {
+        let (_dir, db) = open_db();
+        let execution = seed_terminal(&db, ExecutionStatus::Completed, "lease-choose");
+        let forced = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&forced);
+        let outcome = apply_release_choosing(
+            &db,
+            &execution,
+            "lease-choose",
+            ReleaseEvidence {
+                cause: TerminalCause::ProvenCompleted,
+                pane: PaneStatus::Gone,
+                occupancy: &FixedOccupancy(Occupancy::Empty),
+                preservation: &FixedPreservation(preservation),
+            },
+            |preserved| async move {
+                *seen.lock().unwrap() = Some(preserved);
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(outcome, LeaseReleaseOutcome::Released);
+        assert_eq!(*forced.lock().unwrap(), Some(expect_forced));
+    }
+}
+
+#[tokio::test]
+async fn failed_preservation_then_failed_release_says_the_lease_is_still_held() {
+    let (_dir, db) = open_db();
+    let execution = seed_terminal(&db, ExecutionStatus::Completed, "lease-held");
+    let outcome = apply_release(
+        &db,
+        &execution,
+        "lease-held",
+        ReleaseEvidence {
+            cause: TerminalCause::ProvenCompleted,
+            pane: PaneStatus::Gone,
+            occupancy: &FixedOccupancy(Occupancy::Empty),
+            preservation: &FixedPreservation(Err("preserved bookmark write failed")),
+        },
+        async { Err(anyhow::anyhow!("cube exploded")) },
+    )
+    .await;
+    assert!(matches!(outcome, LeaseReleaseOutcome::CubeFailed { .. }));
+    let items = db.list_attention_items(&execution.id).unwrap();
+    let warning = items
+        .iter()
+        .find(|item| {
+            item.kind == boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND
+        })
+        .expect("an inspection warning is filed");
+    assert!(warning.body_markdown.contains("still held"));
+    assert!(!warning.body_markdown.contains("was released"));
 }
 
 #[tokio::test]

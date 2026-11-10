@@ -223,7 +223,8 @@ pub trait LiveWorkerLiveness: Send + Sync {
 pub trait LifecycleServices: Send + Sync {
     /// Proven-death cube release used by the coordinator's spawn/completion
     /// paths: empty occupancy, best-effort teardown preservation on `adapter`,
-    /// then `release_workspace_with_reset`.
+    /// then `release_workspace_with_reset` only if preservation succeeded.
+    /// Otherwise use `release_workspace` so cube's unpushed-work guard runs.
     async fn apply_proven_workspace_release(
         &self,
         execution: &WorkExecution,

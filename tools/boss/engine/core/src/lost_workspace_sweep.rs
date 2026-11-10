@@ -460,8 +460,8 @@ fn release_reconciled_persona(work_db: &WorkDb, execution: &WorkExecution) {
 
 /// Gated cube lease release after a successful lost-workspace /
 /// never-attached reconcile. The workspace is gone or the pane never came
-/// up; occupancy and the recovery bookmark still have to pass before the
-/// lease is actually dropped.
+/// up; pane and occupancy verdicts still have to pass before the lease is
+/// actually dropped; preservation is best effort and never holds it.
 async fn maybe_force_release_reconciled_lease(
     work_db: &WorkDb,
     execution: &WorkExecution,

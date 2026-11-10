@@ -2172,13 +2172,9 @@ impl ExecutionCoordinator {
     ) -> Result<CubeWorkspaceLease> {
         // A previous pre-start attempt may still hold a lease (its cube
         // release failed). Try to free it. A never-started release has no
-        // pane or occupancy gate; a Kept outcome is handled defensively by
-        // detaching the lease from this execution so it does not block every
-        // retry: the workspace stays leased in cube and cube's TTL is the
-        // backstop. If
-        // only cube's own call failed, the lease stays recorded and this
-        // attempt fails so the sweep and the next retry keep trying to return
-        // it.
+        // pane or occupancy gate, so it either releases or cube's own call
+        // fails; on failure the lease stays recorded and this attempt fails so
+        // the sweep and the next retry keep trying to return it.
         if let Some(existing_lease) = execution.cube_lease_id.as_deref() {
             let outcome = self
                 .lifecycle
@@ -2186,36 +2182,21 @@ impl ExecutionCoordinator {
                 .await;
             match outcome {
                 LeaseReleaseOutcome::Released | LeaseReleaseOutcome::NoLease => {}
-                // Every gate passed and cube itself failed. The lease stays
-                // recorded on this execution so the leftover-lease sweep keeps
-                // retrying it; leasing a fresh workspace would overwrite it.
+                // Cube itself failed. The lease stays recorded on this
+                // execution so the leftover-lease sweep keeps retrying it;
+                // leasing a fresh workspace would overwrite it.
                 LeaseReleaseOutcome::CubeFailed { error } => {
                     return Err(anyhow!(
                         "previous cube workspace lease {existing_lease} could not be released yet: {error}"
                     ));
                 }
-                LeaseReleaseOutcome::Kept { .. } => {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        lease_id = existing_lease,
-                        ?outcome,
-                        "previous pre-start lease kept by its release gates; detaching it and leasing a fresh workspace",
-                    );
-                    match self
-                        .work_db
-                        .claim_execution_workspace_release(&execution.id, existing_lease)
-                    {
-                        Ok(_) => {
-                            if let Err(err) = self.work_db.finish_execution_workspace_release(execution) {
-                                tracing::error!(execution_id = %execution.id, ?err, "failed to detach kept lease metadata");
-                            }
-                        }
-                        Err(err) => {
-                            return Err(anyhow!(
-                                "previous cube workspace lease {existing_lease} is still held and could not be detached: {err:#}"
-                            ));
-                        }
-                    }
+                // A never-started release has no gate that can keep the lease,
+                // so this is unexpected; treat it like a failed release.
+                LeaseReleaseOutcome::Kept { reason } => {
+                    return Err(anyhow!(
+                        "previous cube workspace lease {existing_lease} was unexpectedly kept ({})",
+                        reason.label()
+                    ));
                 }
             }
         }

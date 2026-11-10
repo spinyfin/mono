@@ -106,10 +106,11 @@ impl WorkDb {
     ///
     /// The workspace lease columns (`cube_lease_id`,
     /// `cube_workspace_id`, `workspace_path`) are intentionally left
-    /// intact. Resume reads preserved work from `boss-recovery/<execution>`
-    /// bookmarks, not this working copy; `boss_engine::workspace_lease_release`
-    /// releases the lease once the bookmark is confirmed and no process
-    /// still has its cwd inside the workspace. If those gates fail the
+    /// intact. Resume reads preserved work from the `preserved/<execution>`
+    /// bookmark, not this working copy; `boss_engine::workspace_lease_release`
+    /// releases the lease once the pane is gone and no process still has its
+    /// cwd inside the workspace. Preservation is best effort and a failure
+    /// is reported through `preserved_work_needs_inspection`. If those gates fail the
     /// columns stay so a later pass can retry; cube's TTL is the backstop.
     ///
     /// Any non-terminal `work_runs` rows attached to the execution are
