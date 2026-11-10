@@ -795,7 +795,7 @@
         "usagesDigest": "ehV9gQvVHHXkma6jRzvcQljCruWXOi/ninpSfWjyN5M=",
         "recordedInputs": [
           "REPO_MAPPING:,bazel_tools bazel_tools",
-          "FILE:@@//tools/cube/testdata/gc_store.json c44df8a739980c1a6767bfa951e8574cd6d555ba052c965373594c20d1e3fc43"
+          "FILE:@@//tools/cube/testdata/gc_store.json f958974f31e3ec9455917536cf28d90060b4a0b2464b42a2f165fcabd9cd54a4"
         ],
         "generatedRepoSpecs": {
           "cube_gc_store_tree": {

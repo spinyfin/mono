@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# The maintainer archive script supplies the pinned jj and a private directory.
-# Relative paths also work when reproducing the original Bazel-built fixture.
+# Usage: gc_store.sh <jj-binary> <output-dir>. Relative paths resolve against the current directory.
 case "$1" in /*) jj_binary="$1" ;; *) jj_binary="$PWD/$1" ;; esac
 case "$2" in /*) fixture_dir="$2" ;; *) fixture_dir="$PWD/$2" ;; esac
 root="$fixture_dir/root"
@@ -34,8 +33,7 @@ jj_at "$root" git remote add origin "$upstream"
 jj_at "$workspace" new main
 jj_at "$root" op log --no-graph --limit 1 -T id > "$fixture_dir/cut"
 
-# Retain the real concurrent writers and full history: only their repeated
-# construction moves out of the test action and into the published archive.
+# Keep the real concurrent writers and full history; the published archive stores the result so tests never rebuild it.
 pids=()
 for worker in 0 1 2 3 4 5 6 7; do
     (

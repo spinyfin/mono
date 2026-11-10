@@ -5,11 +5,11 @@ use std::fs;
 use std::path::Path;
 
 pub(super) fn install(f: &Fixture) -> String {
-    let source = std::env::var("CUBE_GC_STORE_FIXTURE").expect("Bazel must declare the GC fixture");
-    let source = Path::new(&source).parent().expect("fixture directory containing cut");
+    let cut = std::env::var("CUBE_GC_STORE_CUT").expect("Bazel must declare the GC store cut file");
+    let source = Path::new(&cut).parent().expect("fixture directory containing cut");
     // Keep the small-store lease/release baseline and its database. Replace
     // only the scratch repositories at the registered paths with the large
-    // history, just as the old per-run bookmark loop populated those paths.
+    // history from the published fixture.
     for relative in ["root", "upstream", "pool/mono-agent-001"] {
         let target = f._dir.path().join(relative);
         fs::remove_dir_all(&target).unwrap();
