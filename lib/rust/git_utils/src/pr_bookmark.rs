@@ -1,17 +1,12 @@
-//! Reserved `pr/<n>` namespace — local-only bookmarks that cube manages as
-//! convenience pointers from a PR number to its head commit within a workspace.
+//! Reserved `pr/<n>` namespace — legacy local-only bookmarks. Cube no longer
+//! creates or maintains these pointers.
 //!
 //! These bookmarks are NEVER pushed to any remote. Every push path in cube
 //! calls [`assert_not_pr_bookmark`] before executing `jj git push` to enforce
 //! this invariant.
 
-/// Text of cube's deterministic refusal to repair a conflicted `pr/<n>` whose
-/// other side holds unique content. Callers outside cube (the Boss engine)
-/// match on it to tell this refusal from a transient failure.
-pub const UNSAFE_REPAIR_PHRASE: &str = "cube will not pick a side";
-
 /// Text of cube's error when GitHub's PR response carries no head SHA, so
-/// there is nothing to point the alias at.
+/// there is no authoritative commit to fetch.
 pub const NO_PR_HEAD_PHRASE: &str = "returned no head.sha";
 
 /// Returns `true` if `name` matches the reserved `pr/<digits>` pattern.

@@ -364,23 +364,6 @@ pub enum WorkspaceCommand {
         #[arg(long, conflicts_with_all = ["bookmark", "pr"])]
         revision: Option<String>,
     },
-    /// Repair the shared `pr/<n>` alias from GitHub's current head for PR N.
-    ///
-    /// Recreates a missing alias, or repairs a conflicted one, through the
-    /// same guarded writer `goto --pr` uses: the store-wide PR-bookmark lock,
-    /// the refusal to pick a side of a conflict that holds unique content, and
-    /// the git import/export. A fork-headed PR is fetched from its head
-    /// repository. Never moves any working copy. Fails loudly when the alias
-    /// cannot be repaired.
-    RepairPrBookmark {
-        /// Absolute path of a workspace or the shared source checkout. If
-        /// omitted, uses the current directory.
-        #[arg(long)]
-        workspace: Option<String>,
-        /// PR number whose alias to repair.
-        #[arg(long)]
-        pr: u64,
-    },
     /// Fetch the PR's actual GitHub base (or an explicit base before PR creation)
     /// and rebase preserved work locally.
     /// Never publishes, collapses commits, or repositions the working copy.
@@ -649,7 +632,7 @@ pub enum PrCommand {
     Ensure(PrCreateArgs),
     /// Advance an existing PR by pushing the current commit to its head branch.
     ///
-    /// Advances both the remote head branch and the local `pr/<n>` bookmark to
+    /// Advances the local and remote head branch to
     /// `@` (fast-forward only by default) and pushes to GitHub. Idempotent: a
     /// re-run with nothing new to land is a no-op. Refuses non-descendants,
     /// merged/closed PRs, and empty commits (unless already pushed).
@@ -662,12 +645,12 @@ pub enum PrCommand {
 
 #[derive(Debug, Args)]
 pub struct PrPushArgs {
-    /// PR number to advance. If omitted, inferred from the nearest `pr/<n>`
-    /// bookmark in `@`'s ancestry.
+    /// PR number to advance. If omitted, looked up on GitHub using the supplied
+    /// branch or the nearest local branch bookmark in `@`'s ancestry.
     #[arg(long)]
     pub pr: Option<u64>,
-    /// Head branch name to push. If omitted, inferred from the co-located
-    /// non-`pr/*` bookmark on the same commit as the `pr/<n>` ancestor.
+    /// Head branch name to push. If omitted with --pr, uses GitHub's head.ref;
+    /// otherwise uses the nearest local branch bookmark in `@`'s ancestry.
     #[arg(long)]
     pub branch: Option<String>,
     /// Force-push with lease semantics: verifies that GitHub's head has not
@@ -1295,29 +1278,6 @@ mod tests {
             }
             _ => panic!("expected workspace reconcile command"),
         }
-    }
-
-    #[test]
-    fn workspace_repair_pr_bookmark_requires_a_pr_and_accepts_a_workspace() {
-        let cli = Cli::parse_from([
-            "cube",
-            "workspace",
-            "repair-pr-bookmark",
-            "--workspace",
-            "/store",
-            "--pr",
-            "139",
-        ]);
-        match cli.command {
-            Command::Workspace {
-                command: WorkspaceCommand::RepairPrBookmark { workspace, pr },
-            } => {
-                assert_eq!(workspace.as_deref(), Some("/store"));
-                assert_eq!(pr, 139);
-            }
-            _ => panic!("expected workspace repair-pr-bookmark command"),
-        }
-        assert!(Cli::try_parse_from(["cube", "workspace", "repair-pr-bookmark"]).is_err());
     }
 
     #[test]

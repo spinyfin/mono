@@ -45,11 +45,11 @@ Every consumer, by pointer (paths are repo-relative):
 
 **`pr/<n>`**
 
-- Written by: cube's bound-PR checkout (`cube workspace goto`) when positioning on a PR.
-- Read by: the positioned workspace itself (the engine does not read `pr/<n>`); forgotten by cube's sweep once no workspace is positioned on it.
-- What is actually needed: the PR head for the duration of one positioning. Already bounded (7 local bookmarks on the dev Mac); what lingered were 656 `refs/heads/pr/<n>` git refs that an older jj left behind after the bookmark was forgotten, which the store upkeep below removes.
+- Written by: nothing. Cube no longer writes, reads or sweeps `pr/<n>`: `cube workspace goto` positions on the PR head without creating an alias, and the bookmark sweep only handles execution bookmarks.
+- Read by: nothing. The engine never read `pr/<n>`. Legacy aliases created by earlier cube versions remain until the dependent one-shot archival cleanup removes them, and a jj rebase may still carry a legacy alias along with the commits it names.
+- What is actually needed: nothing. The PR head is recorded by GitHub and by the engine's `pr_head_*` columns. `cube repo gc` still removes orphaned `refs/heads/pr/<n>` git refs left behind by earlier jj versions (`tools/cube/src/app/store_gc.rs`).
 
-**The minimal set.** During an execution's life the remaining names encode different things, and two of them legitimately diverge: the worker pushes `boss/` (which cube may then move to the remote head) while a teardown `preserved/` tip keeps tracking local unpushed work, and the baseline is the recorded commit id. What is not needed is any of them **after** the PR that carried the work is merged or closed, and that is where all of the growth was: the count was 3 × executions ever run. Empty initialization writes no bookmarks; no recovery head is written at dispatch; `boss/` exists between the worker's first push and merge; `pr/<n>` only during a positioning.
+**The minimal set.** During an execution's life the remaining names encode different things, and two of them legitimately diverge: the worker pushes `boss/` (which cube may then move to the remote head) while a teardown `preserved/` tip keeps tracking local unpushed work, and the baseline is the recorded commit id. What is not needed is any of them **after** the PR that carried the work is merged or closed, and that is where all of the growth was: the count was 3 × executions ever run. Empty initialization writes no bookmarks; no recovery head is written at dispatch; `boss/` exists between the worker's first push and merge; `pr/<n>` is no longer maintained at all.
 
 ## Cleanup of preserved references
 

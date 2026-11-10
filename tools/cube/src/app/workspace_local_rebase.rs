@@ -62,8 +62,7 @@ pub(super) fn rebase_at(
     )?;
     // Quote symbols so branch names are never interpreted as revset operators.
     let destination = format!("{}@{}", serde_json::to_string(base)?, serde_json::to_string(&remote)?);
-    let rebase_output =
-        super::pr_rebase::rebase_preserving_pr_bookmarks(runner, database_path, cwd, "@", &destination)?;
+    let rebase_output = super::jj::rebase_branch_onto(runner, database_path, cwd, "@", &destination)?;
     let conflicts = run_jj(
         runner,
         database_path,

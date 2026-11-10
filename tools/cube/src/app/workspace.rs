@@ -30,9 +30,7 @@ use crate::app::excludes::ensure_boss_infra_excluded;
 use crate::app::gc::{
     gc_aged_unhealthy_workspaces, gc_workspace_bookmarks, maybe_trigger_pool_gc, reclaim_quarantined_workspace,
 };
-use crate::app::health::{
-    WorkspaceHealthOutcome, check_workspace_health_within, read_head_status, repair_conflicted_bookmarks,
-};
+use crate::app::health::{WorkspaceHealthOutcome, check_workspace_health_within, read_head_status};
 use crate::app::jj::{cleanup_workspace_logs, current_workspace_commit, workspace_path_exists};
 use crate::app::lease_reclaim::{
     ProvisionPath, ProvisioningContext, ReclaimLimits, ReclaimUndo, ScanProbes, reclaim_unhealthy_workspace_for_lease,
@@ -52,7 +50,7 @@ use crate::app::reset::{
 };
 use crate::app::salvage::list_salvage_records;
 use crate::app::util::{current_epoch_s, holder_identity, repo_lock_path, resolve_release_lease};
-use crate::app::workspace_ops::{workspace_goto, workspace_push, workspace_rebase, workspace_repair_pr_bookmark};
+use crate::app::workspace_ops::{workspace_goto, workspace_push, workspace_rebase};
 
 /// Default lease TTL: 24 hours from acquisition.
 ///
@@ -506,8 +504,6 @@ pub(super) fn run_workspace(
             // Before claiming any workspace, inspect a *bounded* set of free
             // candidates:
             //   - Clean → use immediately (update DB if stale-dirty)
-            //   - ConflictedBookmarks → save as first repairable candidate
-            //     (keep looking for a clean one; repair before claim)
             //   - DirtyWorkingCopy → skip and mark in the store so
             //     `cube workspace list` surfaces it
             //
@@ -641,8 +637,6 @@ pub(super) fn run_workspace(
             let mut scan_truncated: Option<&'static str> = None;
             // first clean workspace found
             let mut clean_candidate: Option<String> = None;
-            // first conflicted-but-repairable workspace found
-            let mut conflicted_candidate: Option<(String, Vec<String>)> = None;
             // Free workspaces whose directory exists but has neither .jj/ nor
             // .git/ — husks holding no recoverable work. Collected as
             // (workspace_id, path) so the lease path can GC them and reuse the
@@ -808,9 +802,6 @@ pub(super) fn run_workspace(
                                     Ok(other) => {
                                         let reason = match &other {
                                             WorkspaceHealthOutcome::DirtyWorkingCopy => "dirty_after_stale_recovery",
-                                            WorkspaceHealthOutcome::ConflictedBookmarks(_) => {
-                                                "conflicted_after_stale_recovery"
-                                            }
                                             WorkspaceHealthOutcome::StaleWorkingCopy(_) => "still_stale_after_recovery",
                                             WorkspaceHealthOutcome::BrokenEmpty => "broken_empty_after_stale_recovery",
                                             WorkspaceHealthOutcome::Clean => unreachable!(),
@@ -869,21 +860,6 @@ pub(super) fn run_workspace(
                             }
                         }
                     }
-                    WorkspaceHealthOutcome::ConflictedBookmarks(ref bookmarks) => {
-                        health_checks.push(json!({
-                            "workspace_id": ws_id,
-                            "health": "conflicted",
-                            "bookmarks": bookmarks,
-                            "skipped": conflicted_candidate.is_some(),
-                        }));
-                        store.update_workspace_health(&repo, ws_id, WorkspaceHealth::Conflicted)?;
-                        scan_probes.insert(ws_id.clone(), Some(bookmarks.clone()));
-                        if conflicted_candidate.is_none() {
-                            conflicted_candidate = Some((ws_id.clone(), bookmarks.clone()));
-                        }
-                        // Keep looking for a clean one before falling back
-                        // to repairing the conflicted one.
-                    }
                     WorkspaceHealthOutcome::DirtyWorkingCopy => {
                         health_checks.push(json!({
                             "workspace_id": ws_id,
@@ -892,7 +868,7 @@ pub(super) fn run_workspace(
                             "reason": "dirty_working_copy",
                         }));
                         store.update_workspace_health(&repo, ws_id, WorkspaceHealth::Dirty)?;
-                        scan_probes.insert(ws_id.clone(), None);
+                        scan_probes.insert(ws_id.clone());
                         audit!(
                             database_path,
                             "workspace.health_check_skipped",
@@ -943,13 +919,7 @@ pub(super) fn run_workspace(
             // per lease rather than one per free workspace, which is what
             // turned the audit log into 18k rows of the same fact.
             let scan_elapsed_ms = scan_started.elapsed().as_millis() as u64;
-            let scan_outcome = if clean_candidate.is_some() {
-                "clean"
-            } else if conflicted_candidate.is_some() {
-                "conflicted_repairable"
-            } else {
-                "none"
-            };
+            let scan_outcome = if clean_candidate.is_some() { "clean" } else { "none" };
             audit!(
                 database_path,
                 "workspace.health_scan",
@@ -981,12 +951,11 @@ pub(super) fn run_workspace(
                 "outcome": scan_outcome,
             });
 
-            // Decide which workspace to use: prefer clean, fall back to the
-            // first repairable conflicted workspace, then to a quarantined one
+            // Decide which workspace to use: prefer clean, then a quarantined one
             // that can be verifiably reclaimed, otherwise auto-create a fresh
             // one. No pool state (dirty, husk, occupied) is ever a hard stop —
             // cube always provisions new capacity for a reachable repo.
-            let mut chosen_id = clean_candidate.or_else(|| conflicted_candidate.as_ref().map(|(id, _)| id.clone()));
+            let mut chosen_id = clean_candidate;
 
             // Growing the pool is the last resort, not the first: a quarantined
             // workspace nobody is working in is perfectly good capacity, and
@@ -1026,7 +995,6 @@ pub(super) fn run_workspace(
             // salvaged first; a candidate that cannot be salvaged is left
             // exactly as it was. Workspaces whose lease expired in this very
             // call are not candidates: the reset guard below refuses them.
-            let mut lease_reclaim_bookmarks: Vec<String> = Vec::new();
             let mut lease_reclaim_report = None;
             let mut lease_reclaim_undo: Option<ReclaimUndo> = None;
             if chosen_id.is_none() {
@@ -1050,9 +1018,7 @@ pub(super) fn run_workspace(
                                 "workspace_id": reclaimed.workspace_id,
                                 "health": "unhealthy_reclaimed",
                                 "skipped": false,
-                                "conflicted_bookmarks": reclaimed.conflicted_bookmarks,
                             }));
-                            lease_reclaim_bookmarks = reclaimed.conflicted_bookmarks;
                             lease_reclaim_undo = Some(reclaimed.undo);
                             chosen_id = Some(reclaimed.workspace_id);
                         }
@@ -1085,12 +1051,8 @@ pub(super) fn run_workspace(
             {
                 undo.roll_back(&store, database_path, "claim_refused");
             }
-            let (mut workspace, mut was_auto_created, repair_bookmarks) = if let Some((ws, ws_id)) = claimed_chosen {
-                let bookmarks = conflicted_candidate
-                    .filter(|(id, _)| *id == ws_id)
-                    .map(|(_, b)| b)
-                    .unwrap_or(lease_reclaim_bookmarks);
-                (ws, false, bookmarks)
+            let (mut workspace, mut was_auto_created) = if let Some((ws, _ws_id)) = claimed_chosen {
+                (ws, false)
             } else {
                 // No clean or repairable workspace. Self-heal any broken-empty
                 // husks first: a directory with neither .jj/ nor .git/ holds no
@@ -1152,7 +1114,7 @@ pub(super) fn run_workspace(
                         lease_expires_at,
                     )?
                     .ok_or_else(|| CubeError::NoAvailableWorkspace(repo.clone()))?;
-                (ws, true, vec![])
+                (ws, true)
             };
 
             if !workspace_path_exists(&workspace) {
@@ -1189,61 +1151,6 @@ pub(super) fn run_workspace(
             // the lock across `jj git fetch` is exactly what let one stalled
             // workspace wedge every other lease/release for the repo.
             drop(_lock);
-
-            // If the workspace had conflicted bookmarks, repair them before
-            // the reset. `jj new main` would succeed with conflicts present,
-            // but the conflicts would still appear in `jj status` for the
-            // new worker — better to clean them up now so the workspace is
-            // truly pristine.
-            if !repair_bookmarks.is_empty() {
-                let repair = match repair_conflicted_bookmarks(
-                    runner,
-                    database_path,
-                    &workspace.workspace_path,
-                    &repair_bookmarks,
-                ) {
-                    Ok(repair) => repair,
-                    Err(error) => {
-                        let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
-                        if let Some(undo) = &lease_reclaim_undo {
-                            undo.roll_back(&store, database_path, "bookmark_repair_failed");
-                        }
-                        return Err(error);
-                    }
-                };
-                // Bookmarks live in the repo's shared jj store, not in any
-                // one workspace, so `jj status` reported this same conflict
-                // from every free workspace the scan probed and each of them
-                // was cached `conflicted`. When the repair removed the conflict
-                // for all of them at once, let the cache say so. A bookmark
-                // that was left conflicted is still conflicted everywhere, so
-                // the cache stays accurate and is not cleared.
-                let cache_result = if repair.failures.is_empty() {
-                    store.clear_cached_conflicted_health(&workspace.repo)
-                } else {
-                    Ok(0)
-                };
-                match cache_result {
-                    Ok(cleared) if cleared > 0 => {
-                        audit!(
-                            database_path,
-                            "workspace.conflicted_cache_cleared",
-                            repo = workspace.repo,
-                            repaired_in = workspace.workspace_id,
-                            bookmarks = repair_bookmarks,
-                            cleared = cleared,
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        eprintln!(
-                            "warning: cube repaired conflicted bookmarks in {} but could not clear the \
-                             cached `conflicted` health of its sibling workspaces: {error}",
-                            workspace.workspace_id,
-                        );
-                    }
-                }
-            }
 
             // If the workspace we just claimed was reclaimed-from-expired
             // in this lease call, guard the reset: a destructive
@@ -2288,9 +2195,6 @@ pub(super) fn run_workspace(
             pr,
             revision,
         } => workspace_goto(database_path, runner, workspace, bookmark, pr, revision),
-        WorkspaceCommand::RepairPrBookmark { workspace, pr } => {
-            workspace_repair_pr_bookmark(database_path, runner, workspace, pr)
-        }
         WorkspaceCommand::LocalRebase { pr, base } => {
             super::workspace_local_rebase::local_rebase(database_path, runner, pr, base.as_deref())
         }

@@ -16,7 +16,6 @@ mod lease_tests;
 mod list_status_tests;
 mod pr_bookmarks_tests;
 mod pr_push_tests;
-mod pr_rebase_tests;
 mod pr_tests;
 mod push_collapse_tests;
 mod push_tests;
@@ -32,11 +31,5 @@ mod setup_tests;
 mod store_gc_marker_tests;
 mod store_gc_tests;
 mod support;
-
-pub(super) fn with_checkleft_fixture<T>(run: impl FnOnce() -> T) -> T {
-    let _lock = support::ENV_MUTEX.lock().unwrap();
-    let _env = checkleft_tests::CheckleftEnvGuard::with_gate_disabled();
-    run()
-}
 
 mod cleanup_source_tests;

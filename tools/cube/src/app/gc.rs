@@ -1,11 +1,9 @@
-//! Garbage collection: consumed bookmarks, closed-PR bookmarks, aged
+//! Garbage collection: consumed bookmarks, aged
 //! unhealthy workspaces, stale logs, and the background pool GC trigger.
 
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
-
-use git_utils::pr_bookmark;
 
 use crate::command_runner::{CommandRunner, RealCommandRunner};
 use crate::metadata::{WorkspaceHealth, WorkspaceRecord, WorkspaceState};
@@ -17,7 +15,7 @@ use crate::app::disk::human_bytes;
 use crate::app::errors::Result;
 use crate::app::health::probe_workspace_reuse;
 use crate::app::jj::{self, run_jj, run_jj_network, workspace_path_exists};
-use crate::app::pr_bookmarks;
+use crate::app::pr_head;
 use crate::app::reclaim::{compact_free_workspaces, has_free_workspace_surplus, trim_free_workspaces_to_mark};
 use crate::app::reconcile::reconcile_free_workspace_health;
 use crate::app::reset::reset_workspace_after_fetch_within;
@@ -89,24 +87,23 @@ pub(super) const POOL_GC_TRIM_PROGRESS_KEY: &str = "last_pool_gc_trim_made_progr
 /// the throttle at [`POOL_GC_BACKLOG_RETRY_SECS`].
 pub(super) const POOL_GC_CLEANUP_PROGRESS_KEY: &str = "last_pool_gc_cleanup_made_progress";
 
-/// List and optionally forget consumed `boss/exec_*` bookmarks and
-/// unreferenced `pr/<n>` bookmarks in a workspace.
+/// List and optionally forget consumed `boss/exec_*` bookmarks.
 ///
 /// A `boss/exec_*` bookmark is "consumed" when its tip is reachable from `main`
-/// (`bookmarks(glob:"boss/exec_*") & ::main`). A `pr/<n>` bookmark is eligible
-/// for GC when every side is protected by a remote or a confirmed PR head and
-/// no workspace in the shared store is positioned on any side (see
-/// [`collect_unreferenced_pr_bookmarks`]). Retained stale refs are resolved
-/// against GitHub before repair, outside the lock.
+/// (`bookmarks(glob:"boss/exec_*") & ::main`). A bookmark that is *conflicted*
+/// has one tip per side, and `jj bookmark forget` drops every side at once, so
+/// a name is forgotten only when no side holds unpublished non-empty work: a
+/// side that is merged, published to a remote, or an empty commit over such
+/// history loses nothing, but a side with unpushed work keeps the whole
+/// bookmark (the merged side included) in place. Other bookmark namespaces,
+/// and conflicts in them, are never touched here.
 ///
 /// If `do_fetch` is true, runs `jj git fetch` first so `::main` reflects the
 /// latest merged PRs. If `dry_run` is true, lists what would be forgotten
 /// without acting.
 ///
 /// Returns the names of bookmarks forgotten (or that would be forgotten on
-/// dry-run). Local failures propagate; unavailable GitHub heads are reported
-/// with a warning and retained. Neither half of the local sweep may
-/// degrade to "found nothing": pruning is the only thing that bounds these
+/// dry-run). Errors propagate: the sweep is the only thing that bounds these
 /// bookmark sets, so a sweep that cannot decide has to say so loudly rather
 /// than report an empty result that reads identically to a clean pool. See
 /// the caller in `workspace::release` for how that surfaces.
@@ -117,11 +114,6 @@ pub(super) fn gc_workspace_bookmarks(
     do_fetch: bool,
     dry_run: bool,
 ) -> Result<Vec<String>> {
-    // Fetch before taking the store-wide PR-bookmark lock: every `goto --pr`,
-    // `pr create/update/push` and lease repair in the repo waits on that lock
-    // with no timeout, so it must never be held across the network. Anything
-    // the fetch imports after this point is picked up by the next sweep; the
-    // eligibility reads below all happen under the lock.
     if do_fetch {
         run_jj_network(
             runner,
@@ -129,55 +121,40 @@ pub(super) fn gc_workspace_bookmarks(
             &RealCommandRunner::invocation(workspace_path, "jj", &["git", "fetch"]),
         )?;
     }
-    let mut lock = runner.lock_pr_bookmarks(workspace_path)?;
-
-    // A stale `refs/heads/pr/<n>` left in the colocated git repo by an older
-    // cube's `forget` only becomes visible to the sweep once imported; do that
-    // first so those leftovers are found and removed rather than lingering
-    // until some unrelated command at the colocated root happens to import
-    // them. A dry run must not write, so it sees only what jj already knows.
     if !dry_run {
-        pr_bookmarks::prune_stale_temp_remotes(runner, database_path, workspace_path);
-        pr_bookmarks::import_git_refs(runner, database_path, workspace_path)?;
+        pr_head::prune_stale_temp_remotes(runner, database_path, workspace_path);
     }
 
-    let mut exec_bookmarks = collect_consumed_exec_bookmarks(runner, database_path, workspace_path)?;
-
-    // Also sweep pr/<n> bookmarks no workspace is positioned on any more.
-    let names = list_unreferenced_pr_bookmarks(runner, database_path, workspace_path)?;
-    let mut pr_candidates = super::pr_gc::eligible(runner, database_path, workspace_path, &names)?;
-    let retained: Vec<_> = names.into_iter().filter(|name| !pr_candidates.contains(name)).collect();
-    if !dry_run && !retained.is_empty() {
-        drop(lock);
-        let resolved = super::pr_gc::resolve_retained(runner, database_path, workspace_path, &retained);
-        lock = runner.lock_pr_bookmarks(workspace_path)?;
-        pr_bookmarks::import_git_refs(runner, database_path, workspace_path)?;
-        exec_bookmarks = collect_consumed_exec_bookmarks(runner, database_path, workspace_path)?;
-        let keep = super::pr_gc::repair_retained(runner, database_path, workspace_path, &resolved);
-        pr_candidates = collect_unreferenced_pr_bookmarks(runner, database_path, workspace_path)?;
-        pr_candidates.retain(|name| !keep.contains(name));
-    }
-    let _lock = lock;
-
-    let mut bookmarks = exec_bookmarks.clone();
-    bookmarks.extend(pr_candidates.iter().cloned());
-    if bookmarks.is_empty() || dry_run {
-        return Ok(bookmarks);
+    let exec_bookmarks = collect_consumed_exec_bookmarks(runner, database_path, workspace_path).map_err(|error| {
+        crate::app::errors::CubeError::InvalidArgument(format!(
+            "cannot sweep consumed bookmarks in {}: {error}",
+            workspace_path.display()
+        ))
+    })?;
+    if exec_bookmarks.is_empty() || dry_run {
+        return Ok(exec_bookmarks);
     }
 
-    if !exec_bookmarks.is_empty() {
-        let mut args: Vec<&str> = vec!["bookmark", "forget"];
-        args.extend(exec_bookmarks.iter().map(String::as_str));
-        run_jj(
-            runner,
-            database_path,
-            &RealCommandRunner::invocation(workspace_path, "jj", &args),
-        )?;
-    }
-    // `delete`, not `forget`, and exported: see `crate::app::pr_bookmarks`.
-    pr_bookmarks::delete_pr_bookmarks(runner, database_path, workspace_path, &pr_candidates)?;
+    let mut args: Vec<&str> = vec!["bookmark", "forget"];
+    args.extend(exec_bookmarks.iter().map(String::as_str));
+    run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(workspace_path, "jj", &args),
+    )?;
 
-    Ok(bookmarks)
+    Ok(exec_bookmarks)
+}
+
+/// Tips of `boss/exec_*` bookmark sides that main does not contain.
+const UNMERGED_EXEC_TIPS: &str = r#"bookmarks(glob:"boss/exec_*") ~ ::main"#;
+
+/// Unmerged tips whose history holds a non-empty commit that neither main nor
+/// any remote bookmark contains: the unpublished work a forget would orphan.
+pub(super) fn unpublished_exec_tips() -> String {
+    format!(
+        "({UNMERGED_EXEC_TIPS}) & descendants((::({UNMERGED_EXEC_TIPS}) ~ ::main ~ ::remote_bookmarks()) ~ empty())"
+    )
 }
 
 fn collect_consumed_exec_bookmarks(
@@ -185,37 +162,36 @@ fn collect_consumed_exec_bookmarks(
     database_path: Option<&Path>,
     workspace_path: &Path,
 ) -> Result<Vec<String>> {
-    let output = run_jj(
-        runner,
-        database_path,
-        &RealCommandRunner::invocation(
-            workspace_path,
-            "jj",
-            &[
-                "log",
-                "-r",
-                "bookmarks(glob:\"boss/exec_*\") & ::main",
-                "--no-graph",
-                "-T",
-                BOOKMARK_NAMES_TEMPLATE,
-            ],
-        ),
-    )?;
-
-    Ok(dedup_bookmark_names(&output, |s| s.starts_with("boss/exec_")))
+    let names_of = |revset: &str| -> Result<Vec<String>> {
+        let output = run_jj(
+            runner,
+            database_path,
+            &RealCommandRunner::invocation(
+                workspace_path,
+                "jj",
+                &["log", "-r", revset, "--no-graph", "-T", BOOKMARK_NAMES_TEMPLATE],
+            ),
+        )?;
+        Ok(dedup_bookmark_names(&output, |s| s.starts_with("boss/exec_")))
+    };
+    let consumed = names_of(r#"bookmarks(glob:"boss/exec_*") & ::main"#)?;
+    if consumed.is_empty() {
+        return Ok(consumed);
+    }
+    let holding_work = names_of(&unpublished_exec_tips())?;
+    Ok(consumed
+        .into_iter()
+        .filter(|name| !holding_work.contains(name))
+        .collect())
 }
 
 /// Render bookmark names from a `jj log` template without jj's sync-status
 /// markers.
 ///
 /// The bare `bookmarks` keyword decorates a name that is not synced with its
-/// remote counterpart — `pr/1648` renders as `pr/1648*`. The sweep used to
-/// read that keyword and split on whitespace, so a decorated name failed
-/// [`pr_bookmark::is_pr_bookmark`]'s all-digits check and was dropped from the
-/// candidate set entirely: six of the sixty `pr/*` bookmarks in the live
-/// `mono` store were permanently unforgettable for that reason alone. Mapping
-/// over `.name()` yields the undecorated name, which is both what the filters
-/// expect and what `jj bookmark forget` will accept.
+/// remote counterpart (`name*`). Mapping over `.name()` yields the undecorated
+/// name, which is both what the filters expect and what `jj bookmark forget`
+/// will accept.
 pub(super) const BOOKMARK_NAMES_TEMPLATE: &str = r#"bookmarks.map(|b| b.name()).join("\n") ++ "\n""#;
 
 /// Parse [`BOOKMARK_NAMES_TEMPLATE`] output into a de-duplicated list of the
@@ -230,54 +206,6 @@ fn dedup_bookmark_names(output: &str, keep: impl Fn(&str) -> bool) -> Vec<String
         .filter(|s| seen.insert(s.to_string()))
         .map(str::to_string)
         .collect()
-}
-
-/// Revset for `pr/<n>` bookmarks no workspace is positioned on any more: every
-/// `pr/*` bookmark, minus those reachable from some workspace's working copy.
-///
-/// `working_copies()` resolves the `@` of *every* workspace registered in the
-/// shared store, which is the right scope precisely because the store is
-/// shared — see [`collect_unreferenced_pr_bookmarks`].
-pub(super) const UNREFERENCED_PR_BOOKMARKS_REVSET: &str = r#"bookmarks(glob:"pr/*") ~ ::(working_copies())"#;
-
-/// Collect local `pr/<n>` bookmarks that no workspace in the shared store is
-/// positioned on any more, and whose sides all have publication protection.
-///
-/// Published heads remain protection after squash merging and branch deletion.
-/// All candidates are checked together; unique or in-use work is retained.
-/// Errors propagate instead of masquerading as an empty candidate set.
-pub(super) fn collect_unreferenced_pr_bookmarks(
-    runner: &dyn CommandRunner,
-    database_path: Option<&Path>,
-    workspace_path: &Path,
-) -> Result<Vec<String>> {
-    let names = list_unreferenced_pr_bookmarks(runner, database_path, workspace_path)?;
-    super::pr_gc::eligible(runner, database_path, workspace_path, &names)
-}
-
-fn list_unreferenced_pr_bookmarks(
-    runner: &dyn CommandRunner,
-    database_path: Option<&Path>,
-    workspace_path: &Path,
-) -> Result<Vec<String>> {
-    let output = run_jj(
-        runner,
-        database_path,
-        &RealCommandRunner::invocation(
-            workspace_path,
-            "jj",
-            &[
-                "log",
-                "-r",
-                UNREFERENCED_PR_BOOKMARKS_REVSET,
-                "--no-graph",
-                "-T",
-                BOOKMARK_NAMES_TEMPLATE,
-            ],
-        ),
-    )?;
-
-    Ok(dedup_bookmark_names(&output, pr_bookmark::is_pr_bookmark))
 }
 
 /// Cheap, read-only check for whether any aged-unhealthy candidate currently

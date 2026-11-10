@@ -28,12 +28,11 @@
 //!    prior cached health restored, so the next lease neither re-probes a
 //!    healthy-looking row nor writes a duplicate record of the same stack.
 //!
-//! A cached-`conflicted` workspace is the cheap case. `jj status` reports
-//! every conflicted bookmark in the repo, and pool workspaces share one jj
-//! store, so a single conflicted `pr/<n>` bookmark marks every free workspace
-//! the scan happens to probe. Those trees are empty and on main; repairing
-//! the bookmarks (which the lease already does for the one conflicted
-//! candidate it picks) is all they need.
+//! A cached-`conflicted` row is a leftover from when a conflicted bookmark
+//! anywhere in the shared store marked every probed workspace. Bookmarks
+//! belong to the repository, not to a workspace, so cube no longer reads that
+//! as damage; such a row reclaims like any other (its tree is empty and on
+//! main) and no bookmark is touched.
 //!
 //! ## Who is not a candidate
 //!
@@ -58,7 +57,7 @@
 //! unsalvageable rows soak up every lease's attempts, so the starting point
 //! rotates across leases through a persisted per-repo cursor.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -99,10 +98,9 @@ pub(super) fn lease_reclaim_cursor_key(repo: &str) -> String {
     format!("lease_reclaim_cursor:{repo}")
 }
 
-/// What the scan already learned about a workspace in this same lease call,
-/// so the reclaim does not re-run `jj status` for it: `Some(bookmarks)` when
-/// the scan found it conflicted, `None` when it found it dirty.
-pub(super) type ScanProbes = HashMap<String, Option<Vec<String>>>;
+/// Workspaces this same lease call's scan already found dirty, so the reclaim
+/// does not re-run `jj status` for them.
+pub(super) type ScanProbes = HashSet<String>;
 
 /// Everything needed to put a reclaimed workspace back as it was if the lease
 /// fails before the reset completes.
@@ -157,8 +155,6 @@ impl ReclaimUndo {
 #[derive(Debug)]
 pub(super) struct ReclaimedForLease {
     pub(super) workspace_id: String,
-    /// Conflicted bookmarks to repair before the reset, if any.
-    pub(super) conflicted_bookmarks: Vec<String>,
     pub(super) undo: ReclaimUndo,
 }
 
@@ -201,7 +197,7 @@ impl LeaseReclaimReport {
 }
 
 /// Order candidates so the cheapest, most clearly abandoned ones go first:
-/// `conflicted` (empty tree, bookmark repair only) ahead of `dirty`, then by
+/// legacy `conflicted` rows (empty tree) ahead of `dirty`, then by
 /// how long each has been unhealthy, oldest first, then by id for stability.
 pub(super) fn order_reclaim_candidates(records: &mut [WorkspaceRecord]) {
     records.sort_by(|a, b| {
@@ -352,15 +348,14 @@ pub(super) fn reclaim_unhealthy_workspace_for_lease(
             .map(|since| now_epoch_s.saturating_sub(since))
             .unwrap_or(0);
 
-        // 1. Conflicted bookmarks to repair, from this lease's scan when it
-        //    already looked, otherwise from one `jj status` now (bounded by
-        //    the same deadline). A tree the reset cannot make clean (stale,
-        //    husk) is skipped before any network or salvage work is done.
-        let conflicted_bookmarks = match scan_probes.get(ws_id) {
-            Some(probed) => probed.clone().unwrap_or_default(),
-            None => match check_workspace_health_within(runner, database_path, &record.workspace_path, deadline) {
-                Ok(WorkspaceHealthOutcome::Clean) | Ok(WorkspaceHealthOutcome::DirtyWorkingCopy) => Vec::new(),
-                Ok(WorkspaceHealthOutcome::ConflictedBookmarks(bookmarks)) => bookmarks,
+        // 1. A tree the reset cannot make clean (stale, husk) is skipped before
+        //    any network or salvage work is done. The scan's own probe is
+        //    reused when it already looked, otherwise one `jj status` runs now
+        //    (bounded by the same deadline). Bookmark conflicts are not
+        //    examined: bookmarks belong to the shared store, not this tree.
+        if !scan_probes.contains(ws_id) {
+            match check_workspace_health_within(runner, database_path, &record.workspace_path, deadline) {
+                Ok(WorkspaceHealthOutcome::Clean) | Ok(WorkspaceHealthOutcome::DirtyWorkingCopy) => {}
                 Ok(WorkspaceHealthOutcome::StaleWorkingCopy(_)) => {
                     record_skip(
                         database_path,
@@ -402,8 +397,8 @@ pub(super) fn reclaim_unhealthy_workspace_for_lease(
                     );
                     continue;
                 }
-            },
-        };
+            }
+        }
 
         // 2. Probe, then salvage anything no remote has. Only a complete
         //    salvage licenses the reset; a failed one leaves the workspace
@@ -473,7 +468,7 @@ pub(super) fn reclaim_unhealthy_workspace_for_lease(
         }
 
         // 3. Hand it back to the pool. The caller claims it by id and runs the
-        //    ordinary fetch-and-reset (plus bookmark repair) as for any other
+        //    ordinary fetch-and-reset as for any other
         //    candidate; `undo` lets it put everything back if that fails.
         if !store.gc_clear_workspace_unhealthy_state(repo, ws_id)? {
             if let Some(path) = &salvaged_to {
@@ -501,7 +496,6 @@ pub(super) fn reclaim_unhealthy_workspace_for_lease(
             head_change_id = status.head_change_id(),
             unpushed_commits = status.unpushed_summary(),
             salvaged_to = salvaged_str.as_deref(),
-            conflicted_bookmarks = conflicted_bookmarks,
         );
         eprintln!(
             "cube: lease reclaim: reusing {ws_id} ({prior_health} for {age_secs}s{}) instead of provisioning",
@@ -513,7 +507,6 @@ pub(super) fn reclaim_unhealthy_workspace_for_lease(
         report.reclaimed = Some(ws_id.to_string());
         reclaimed = Some(ReclaimedForLease {
             workspace_id: ws_id.to_string(),
-            conflicted_bookmarks,
             undo: ReclaimUndo {
                 repo: repo.to_string(),
                 workspace_id: ws_id.to_string(),

@@ -1,29 +1,26 @@
-//! Pre-lease health checks on a free workspace: dirty, conflicted, broken, or
+//! Pre-lease health checks on a free workspace: dirty, broken, or
 //! stale working copies, and the reuse verdict for its `@`.
 
 use std::path::Path;
 use std::time::Instant;
-
-use git_utils::pr_bookmark;
 
 use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
 use crate::{audit, reuse_guard};
 
 use crate::app::errors::{CubeError, Result};
 use crate::app::jj::{
-    budgeted_timeout, jj_needs_colocate_init, jj_update_stale_recovery_kind, network_cmd_timeout, run_jj,
+    budgeted_timeout, jj_needs_colocate_init, jj_update_stale_recovery_kind, network_cmd_timeout,
     run_jj_network_within, run_jj_within,
 };
-use crate::app::pr_bookmarks;
 
 /// Outcome of a pre-lease health check on a free workspace.
 #[derive(Debug, Clone)]
 pub(super) enum WorkspaceHealthOutcome {
-    /// Working copy is clean and no bookmarks are conflicted. Ready to use as-is.
+    /// Working copy is clean. Ready to use as-is. Bookmark conflicts in the
+    /// shared store are deliberately not part of this verdict: bookmarks belong
+    /// to the repository, not to any one workspace, so every workspace of a
+    /// repository reports the same conflict and none of them is damaged by it.
     Clean,
-    /// Working copy is clean, but one or more bookmarks are conflicted.
-    /// Forget other namespaces before resetting; best-effort repair pr/* to the GitHub head.
-    ConflictedBookmarks(Vec<String>),
     /// Working copy has uncommitted changes from a prior worker session.
     /// Not safe to auto-repair — skip this workspace.
     DirtyWorkingCopy,
@@ -145,283 +142,7 @@ pub(super) fn check_workspace_health_within(
         return Ok(WorkspaceHealthOutcome::DirtyWorkingCopy);
     }
 
-    let conflicted = parse_conflicted_bookmarks_from_status(&output);
-    if !conflicted.is_empty() {
-        return Ok(WorkspaceHealthOutcome::ConflictedBookmarks(conflicted));
-    }
-
     Ok(WorkspaceHealthOutcome::Clean)
-}
-
-/// Extract conflicted bookmark names from `jj status` output.
-///
-/// `jj status` includes a section like:
-/// ```text
-/// These bookmarks have conflicts:
-///   fix-spawn-worker-pane-burst-crash
-///   Use `jj bookmark list` to see details. ...
-/// ```
-/// The bookmark names are the indented lines before the "Use …" hint.
-fn parse_conflicted_bookmarks_from_status(status: &str) -> Vec<String> {
-    let mut in_section = false;
-    let mut bookmarks = Vec::new();
-    for line in status.lines() {
-        if line.contains("These bookmarks have conflicts:") {
-            in_section = true;
-            continue;
-        }
-        if in_section {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || !line.starts_with(' ') {
-                break; // end of section
-            }
-            // Skip the advisory "Use `jj bookmark list`…" line.
-            if trimmed.starts_with("Use `jj bookmark") {
-                continue;
-            }
-            bookmarks.push(trimmed.to_string());
-        }
-    }
-    bookmarks
-}
-
-/// End-to-end wall-clock budget for one PR-bookmark repair: remote discovery,
-/// the store-wide fetch, GitHub lookups, head resolution, the lock wait and
-/// every guarded write. Every `jj` call in the repair runs under this deadline
-/// (see [`crate::app::jj::scope_deadline`]), so cube terminates itself well
-/// inside the engine's 120s transport budget and a caller that gives up and
-/// restores its own pointers never races a surviving cube process.
-const PR_REPAIR_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// Share of the repair that the opportunistic store-wide `jj git fetch` may
-/// use, so a wedged remote cannot starve the GitHub lookups.
-const PR_REPAIR_FETCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// Longest the locked write phase waits for the store-wide PR-bookmark lock
-/// (further capped by what remains of [`PR_REPAIR_TOTAL_BUDGET`]).
-const PR_REPAIR_LOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// Engine-owned pointer namespaces: per-execution recovery and base
-/// bookmarks, teardown-preserved tips, and archived unpublished heads.
-/// These are not stacked-PR boundaries.
-pub(super) const ENGINE_POINTER_BOOKMARK_PREFIXES: [&str; 4] =
-    ["boss-recovery/", "boss-base/", "preserved/", "preserved-archive/"];
-
-/// Bookmark namespaces that are shared, repo-global pointers owned by the PR
-/// flow or the Boss engine rather than by the workspace being repaired:
-/// `pr/<n>` aliases, the per-execution publication bookmark, and the
-/// engine-owned pointer namespaces. Bookmarks live in the shared jj store,
-/// so forgetting one here would also drop it for every other lease that
-/// depends on it. (`pr/<n>` aliases never reach the forget path:
-/// [`repair_conflicted_bookmarks`] repairs them in place instead.)
-const PUBLICATION_POINTER_BOOKMARK_PREFIXES: [&str; 2] = ["pr/", "boss/"];
-
-fn is_shared_pointer_bookmark(bookmark: &str) -> bool {
-    PUBLICATION_POINTER_BOOKMARK_PREFIXES
-        .iter()
-        .chain(ENGINE_POINTER_BOOKMARK_PREFIXES.iter())
-        .any(|prefix| bookmark.starts_with(prefix))
-}
-
-/// Result of [`repair_conflicted_bookmarks`]: the bookmarks it could not
-/// repair and deliberately left conflicted and untouched.
-#[derive(Debug, Default)]
-pub(super) struct BookmarkRepair {
-    /// Each unrepaired bookmark with the reason it was left untouched.
-    pub(super) failures: Vec<(String, String)>,
-}
-
-impl BookmarkRepair {
-    /// Names of the bookmarks left untouched.
-    #[cfg(test)]
-    pub(super) fn unrepaired(&self) -> Vec<&str> {
-        self.failures.iter().map(|(name, _)| name.as_str()).collect()
-    }
-}
-
-/// Repair each conflicted bookmark so the workspace no longer reports
-/// bookmark conflicts. Shared pointer bookmarks (see
-/// [`is_shared_pointer_bookmark`]) are left alone and audited as skipped. Called at lease time when the health check finds
-/// `ConflictedBookmarks` and the workspace is otherwise clean (working
-/// copy empty).
-///
-/// Non-PR bookmarks are forgotten (except shared pointers, which are skipped); a failure to forget one fails the lease.
-///
-/// `pr/<n>` bookmarks are repaired **best-effort, one at a time**: the PR's
-/// authoritative head is its `head.sha`, used directly when the store has it
-/// (so a deleted source branch or a fork-headed PR does not matter), and the
-/// repair goes through the same guarded writer as `goto --pr`. A head missing
-/// from the store is fetched from the head repository first. A bookmark whose
-/// head cannot be resolved, or which the writer refuses (the other side holds
-/// unique content), is left conflicted and untouched, with a warning and an
-/// audit event naming the reason and the commits it currently resolves to. Such a bookmark never fails the lease:
-/// `pr/*` bookmarks live in the shared store, so failing here would fail every
-/// later lease of the repo until someone fixed it by hand. `goto --pr` for
-/// that PR still fails loudly.
-///
-/// All network work (`jj git fetch`, `gh api`) happens before the store-wide
-/// PR-bookmark lock is taken; the lock covers only the local writes.
-pub(super) fn repair_conflicted_bookmarks(
-    runner: &dyn CommandRunner,
-    database_path: Option<&Path>,
-    workspace_path: &Path,
-    bookmarks: &[String],
-) -> Result<BookmarkRepair> {
-    let (pr_bookmarks, others): (Vec<String>, Vec<String>) =
-        bookmarks.iter().cloned().partition(|b| pr_bookmark::is_pr_bookmark(b));
-    for bookmark in &others {
-        if is_shared_pointer_bookmark(bookmark) {
-            audit!(
-                database_path,
-                "workspace.bookmark_forget_skipped",
-                workspace_path = workspace_path.display().to_string(),
-                bookmark = bookmark,
-            );
-            continue;
-        }
-        audit!(
-            database_path,
-            "workspace.bookmark_forgotten",
-            workspace_path = workspace_path.display().to_string(),
-            bookmark = bookmark,
-        );
-        run_jj(
-            runner,
-            database_path,
-            &CommandInvocation {
-                cwd: workspace_path.to_path_buf(),
-                program: "jj".to_string(),
-                args: vec!["bookmark".to_string(), "forget".to_string(), bookmark.clone()],
-                env: vec![],
-            },
-        )?;
-    }
-    repair_pr_bookmarks(runner, database_path, workspace_path, &pr_bookmarks)
-}
-
-/// Point each `pr/<n>` bookmark in `names` (missing, conflicted or
-/// stale) at its PR's authoritative GitHub head through the guarded writer
-/// shared with `goto --pr`: the store-wide PR-bookmark lock, the
-/// conflicted-side policy and the git import/export. Best-effort per
-/// bookmark; every bookmark left untouched is reported in the result with
-/// its reason. Network work runs before the lock is taken.
-pub(super) fn repair_pr_bookmarks(
-    runner: &dyn CommandRunner,
-    database_path: Option<&Path>,
-    workspace_path: &Path,
-    names: &[String],
-) -> Result<BookmarkRepair> {
-    let mut outcome = BookmarkRepair::default();
-    if names.is_empty() {
-        return Ok(outcome);
-    }
-
-    let skip = |outcome: &mut BookmarkRepair, bookmark: &str, why: &str| {
-        let sides = pr_bookmarks::bookmark_commits_best_effort(runner, database_path, workspace_path, bookmark);
-        eprintln!("warning: cube left PR bookmark `{bookmark}` (commits: {sides}) untouched: {why}");
-        audit!(
-            database_path,
-            "workspace.pr_bookmark_repair_skipped",
-            workspace_path = workspace_path.display().to_string(),
-            bookmark = bookmark,
-            commits = sides,
-            reason = why,
-        );
-        outcome.failures.push((bookmark.to_string(), why.to_string()));
-    };
-
-    let overall = Instant::now() + PR_REPAIR_TOTAL_BUDGET;
-    let _deadline_scope = crate::app::jj::scope_deadline(overall);
-
-    // Phase 1, no lock: everything that talks to the network.
-    let mut heads: Vec<(String, u64, String)> = Vec::new();
-    match crate::app::reset::resolve_github_remote_for_workspace(runner, database_path, workspace_path) {
-        Err(error) => {
-            for bookmark in names {
-                skip(
-                    &mut outcome,
-                    bookmark,
-                    &format!("cannot resolve the GitHub remote: {error}"),
-                );
-            }
-        }
-        Ok((remote, repo)) => {
-            let deadline = overall;
-            if let Err(error) = run_jj_network_within(
-                runner,
-                database_path,
-                &RealCommandRunner::invocation(workspace_path, "jj", &["git", "fetch", "--remote", &remote]),
-                Some((Instant::now() + PR_REPAIR_FETCH_BUDGET).min(overall)),
-            ) {
-                // Not fatal: the head commit may already be in the shared store.
-                eprintln!("warning: cube could not fetch `{remote}` before repairing PR bookmarks: {error}");
-            }
-            for bookmark in names {
-                match resolve_lease_pr_head(runner, database_path, workspace_path, &repo, bookmark, deadline) {
-                    Ok((number, sha)) => heads.push((bookmark.clone(), number, sha)),
-                    Err(error) => skip(&mut outcome, bookmark, &error.to_string()),
-                }
-            }
-        }
-    }
-
-    // Phase 2, locked: local writes only.
-    if !heads.is_empty() {
-        let lock_budget = PR_REPAIR_LOCK_BUDGET.min(overall.saturating_duration_since(Instant::now()));
-        let _lock = match runner.lock_pr_bookmarks_within(workspace_path, lock_budget) {
-            Ok(lock) => lock,
-            Err(error) => {
-                // Best-effort: contention must not fail a lease. The engine
-                // path turns a non-empty `failures` into a retryable error.
-                for (bookmark, _, _) in &heads {
-                    skip(
-                        &mut outcome,
-                        bookmark,
-                        &format!("could not take the PR-bookmark lock: {error}"),
-                    );
-                }
-                return Ok(outcome);
-            }
-        };
-        for (bookmark, number, sha) in &heads {
-            pr_bookmarks::record_published_head(workspace_path, *number, sha);
-            if let Err(error) = pr_bookmarks::point_pr_bookmark(runner, database_path, workspace_path, *number, sha) {
-                skip(&mut outcome, bookmark, &error.to_string());
-            }
-        }
-    }
-    Ok(outcome)
-}
-
-/// The PR number and authoritative head commit of the missing, conflicted or
-/// stale `pr/<n>` alias `bookmark`, from GitHub's `head.sha` through the
-/// resolver `goto --pr` uses. The source branch name is not consulted, so a
-/// deleted branch does not matter. The GitHub lookup shares `deadline` with
-/// the head fetches.
-fn resolve_lease_pr_head(
-    runner: &dyn CommandRunner,
-    database_path: Option<&Path>,
-    workspace_path: &Path,
-    repo: &str,
-    bookmark: &str,
-    deadline: Instant,
-) -> Result<(u64, String)> {
-    let number: u64 = bookmark[3..]
-        .parse()
-        .map_err(|_| CubeError::InvalidArgument(format!("invalid PR bookmark {bookmark}")))?;
-    let timeout = crate::app::jj::budgeted_timeout(Some(deadline), crate::app::jj::network_cmd_timeout())
-        .ok_or_else(|| CubeError::InvalidArgument(format!("no time left to look up PR {number} on GitHub")))?;
-    let info = crate::app::gh_pr::fetch_pr_json_with_timeout(runner, workspace_path, repo, number, timeout)?;
-    let head = pr_bookmarks::resolve_pr_head(
-        runner,
-        database_path,
-        workspace_path,
-        repo,
-        number,
-        &info,
-        Some(deadline),
-    )?;
-    Ok((number, head.sha))
 }
 
 /// Audit one of cube's own `jj` invocations against a leased
@@ -594,26 +315,4 @@ pub(super) fn probe_workspace_reuse(
         deadline,
     )?;
     read_head_status_within(runner, database_path, workspace_path, main_branch, deadline)
-}
-
-#[cfg(test)]
-mod shared_pointer_tests {
-    use super::is_shared_pointer_bookmark;
-
-    #[test]
-    fn only_shared_pointer_namespaces_are_protected() {
-        for shared in [
-            "pr/42",
-            "boss/exec_1",
-            "boss-recovery/exec_1",
-            "boss-base/exec_1",
-            "preserved/exec_1",
-            "preserved-archive/exec_1/abc",
-        ] {
-            assert!(is_shared_pointer_bookmark(shared), "{shared}");
-        }
-        for owned in ["fix-burst", "feature/pr/42", "boss-ish"] {
-            assert!(!is_shared_pointer_bookmark(owned), "{owned}");
-        }
-    }
 }
