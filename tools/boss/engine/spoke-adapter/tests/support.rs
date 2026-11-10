@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
-use boss_engine_recovery::execution_bookmark::{ExecutionBookmark, PreservedTip, PruneOutcome, Voucher};
+use boss_engine_recovery::execution_bookmark::{ExecutionBookmark, PreservedScope, PreservedTip};
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_execution_contracts::{
     CollectOutcome, CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
@@ -272,15 +272,14 @@ impl HostAdapter for LegacyAdapter {
             .record(&format!("preserved_work_unpublished:{}", record.execution_id));
         Ok(true)
     }
-    async fn prune_execution_bookmark(
+    async fn forget_preserved_references(
         &self,
         record: &ExecutionBookmark,
-        _: &[Voucher],
-        _: &str,
-    ) -> anyhow::Result<PruneOutcome> {
+        _: PreservedScope,
+    ) -> anyhow::Result<Vec<String>> {
         self.legacy
-            .record(&format!("prune_execution_bookmark:{}", record.execution_id));
-        Ok(PruneOutcome::AlreadyGone { forgotten: vec![] })
+            .record(&format!("forget_preserved_references:{}", record.execution_id));
+        Ok(vec![])
     }
 }
 

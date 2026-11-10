@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use boss_engine_recovery::execution_bookmark::{ExecutionBookmark, HostRecoveryRequest, WorkspaceTipSource};
+use boss_engine_recovery::execution_bookmark::{
+    ExecutionBookmark, HostRecoveryRequest, PreservedScope, WorkspaceTipSource,
+};
 use boss_execution_contracts::{
     ControlOutcome, HostAdapter, HostAdapterProvider, RunWaitState, SpawnOutcomeUncertain, WorkerInputKind, WorkerLife,
 };
@@ -124,7 +126,15 @@ async fn a_command_naming_a_run_the_hub_does_not_hold_is_never_stored_or_sent() 
     let peer = fx.spoke(Box::new(standard), None, 0).await;
     let mut forged = peer_command("forged");
     forged.run.as_mut().unwrap().spawn_token = "not-the-token".into();
-    let outcome = fx.manager.command(HOST, forged, Duration::from_secs(2)).await;
+    let outcome = fx
+        .manager
+        .command(
+            HOST,
+            boss_spoke_stream::store::CommandAdmission::Recovery,
+            forged,
+            Duration::from_secs(2),
+        )
+        .await;
     assert_eq!(outcome, Err(boss_spoke_stream::CommandOutcome::OutcomeUncertain));
     assert!(fx.db.host_command_wire(HOST, "forged").unwrap().is_none());
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -136,7 +146,15 @@ async fn a_command_naming_a_run_the_hub_does_not_hold_is_never_stored_or_sent() 
     let mut genuine = genuine;
     genuine.run.as_mut().unwrap().spawn_token = held.spawn_token;
     genuine.run.as_mut().unwrap().run_id = held.run_id;
-    let stored = fx.manager.command(HOST, genuine, Duration::from_millis(300)).await;
+    let stored = fx
+        .manager
+        .command(
+            HOST,
+            boss_spoke_stream::store::CommandAdmission::Recovery,
+            genuine,
+            Duration::from_millis(300),
+        )
+        .await;
     assert_eq!(
         stored,
         Err(boss_spoke_stream::CommandOutcome::OutcomeUncertain),
@@ -449,9 +467,6 @@ async fn recovery_operations_are_typed_workspace_commands() {
                         created.bookmark = Some(Bookmark {
                             repo_id: "repo".into(),
                             execution_id: "exec_1".into(),
-                            head: "boss/exec_1".into(),
-                            recovery: "boss-recovery/exec_1".into(),
-                            base: "boss-base/exec_1".into(),
                             anchor_commit: script_commit.clone(),
                             pr_head_before: String::new(),
                         });
@@ -462,7 +477,7 @@ async fn recovery_operations_are_typed_workspace_commands() {
                         json!({"tip": {"change_id": "c", "commit_id": "d", "count": 2}, "inspect": null}),
                     ),
                     Kind::RestorePreserved => workspace(c, json!(null)),
-                    Kind::DiffBookmark => workspace(c, json!("diff --git")),
+                    Kind::ForgetPreserved => workspace(c, json!(["preserved/exec_1"])),
                     _ => return standard(c),
                 };
                 Some(ok(c, Some(value)))
@@ -497,14 +512,25 @@ async fn recovery_operations_are_typed_workspace_commands() {
 
     // Recovery that needs no working copy outlives the lease.
     adapter.release_workspace("lease-1").await.unwrap();
-    assert_eq!(adapter.execution_bookmark_diff(&record).await.unwrap(), "diff --git");
+    assert_eq!(
+        adapter
+            .forget_preserved_references(&record, PreservedScope::Tip)
+            .await
+            .unwrap(),
+        ["preserved/exec_1"]
+    );
 
     // A record from another host is refused before anything is sent.
     let foreign = ExecutionBookmark {
         host_id: "elsewhere".into(),
         ..record.clone()
     };
-    assert!(adapter.execution_bookmark_diff(&foreign).await.is_err());
+    assert!(
+        adapter
+            .forget_preserved_references(&foreign, PreservedScope::Tip)
+            .await
+            .is_err()
+    );
 
     let sent = peer.commands();
     let op_of = |kind: Kind| {
@@ -526,7 +552,7 @@ async fn recovery_operations_are_typed_workspace_commands() {
         (Some(7), Some(WorkspaceTipSource::Live))
     );
     // A store operation names neither workspace nor lease, only the bookmark.
-    let diff = op_of(Kind::DiffBookmark);
+    let diff = op_of(Kind::ForgetPreserved);
     assert!(diff.workspace_id.is_empty() && diff.lease_id.is_empty() && diff.bookmark.is_some());
 }
 

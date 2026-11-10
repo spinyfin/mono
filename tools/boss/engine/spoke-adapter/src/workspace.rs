@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail, ensure};
 use boss_engine_recovery::execution_bookmark::{
-    ExecutionBookmark, HostRecoveryRequest, PreserveOutcome, PreservedTip, PruneOutcome, RestoreReport, Voucher,
+    ExecutionBookmark, HostRecoveryRequest, PreserveOutcome, PreservedScope, PreservedTip, RestoreReport,
     WorkspaceTipSource,
 };
 use boss_execution_contracts::{
@@ -401,9 +401,6 @@ impl SpokeHostAdapter {
                 .clone()
                 .context("the assignment has not leased in a repository")?,
             execution_id: record.execution_id.clone(),
-            head: record.publication(),
-            recovery: record.head(),
-            base: record.base(),
             anchor_commit: record.base_commit.clone().unwrap_or_default(),
             pr_head_before: record.pr_head_before.clone().unwrap_or_default(),
         })
@@ -419,9 +416,6 @@ impl SpokeHostAdapter {
             host_id: self.host_name().to_owned(),
             base_commit: non_empty(&bookmark.anchor_commit),
             pr_head_before: non_empty(&bookmark.pr_head_before),
-            // The wire does not say whether the host wrote a recovery head;
-            // `None` makes a reader inspect the host's store.
-            has_recovery_head: None,
         }
     }
 
@@ -472,13 +466,6 @@ impl SpokeHostAdapter {
         let result = self.send("create_bookmark", assignment, op, None).await?;
         let bookmark = result.bookmark.context("host created no recovery bookmark")?;
         Ok(self.record_from(assignment, &bookmark))
-    }
-
-    pub(crate) async fn rec_diff(&self, assignment: &SpokeAssignment, record: &ExecutionBookmark) -> Result<String> {
-        let result = self
-            .recovery_op("diff_bookmark", assignment, record, Kind::DiffBookmark, false, |_| {})
-            .await?;
-        json(&result, "bookmark diff")
     }
 
     /// Operations whose whole answer is one commit id.
@@ -573,27 +560,29 @@ impl SpokeHostAdapter {
         json(&result, "preserved-work check")
     }
 
-    /// Forget a finished execution's pointers once a voucher proves its
-    /// preserved work is published. The vouchers cross the wire as plain values;
-    /// the host validates them and builds its own revsets.
-    pub(crate) async fn rec_prune(
+    pub(crate) async fn rec_forget_preserved(
         &self,
         assignment: &SpokeAssignment,
         record: &ExecutionBookmark,
-        vouchers: &[Voucher],
-        trunk: &str,
-    ) -> Result<PruneOutcome> {
+        scope: PreservedScope,
+    ) -> Result<Vec<String>> {
         let request = serde_json::to_vec(&HostRecoveryRequest {
-            vouchers: vouchers.iter().map(Voucher::to_host).collect(),
+            scope,
             ..Default::default()
         })?;
         let result = self
-            .recovery_op("prune_bookmark", assignment, record, Kind::PruneBookmark, false, |op| {
-                op.trunk = trunk.to_owned();
-                op.request_json = request;
-            })
+            .recovery_op(
+                "forget_preserved",
+                assignment,
+                record,
+                Kind::ForgetPreserved,
+                false,
+                |op| {
+                    op.request_json = request;
+                },
+            )
             .await?;
-        json(&result, "bookmark prune")
+        json(&result, "preserved reference cleanup")
     }
 }
 

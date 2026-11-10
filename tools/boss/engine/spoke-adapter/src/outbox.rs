@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use boss_protocol_spoke::v1::{Command, CommandResult, Cursor, ResultCode};
-use boss_spoke_stream::store::{CommandJournal, CommandOutbox, PendingCommand, StoreError};
+use boss_spoke_stream::store::{CommandAdmission, CommandJournal, CommandOutbox, PendingCommand, StoreError};
 use boss_work_db::{HostOutboxFault, RunAdmission, SpokeRunKey, WorkDb};
 use prost::Message;
 
@@ -64,6 +64,14 @@ pub(crate) fn run_key(run: Option<&boss_protocol_spoke::v1::Run>) -> Option<Spok
 /// Whether a command starts new work on its run. Only a lease or a spawn does;
 /// teardown and recovery stay addressable on a resolved assignment, so the
 /// database admits the others without checking that it is still open.
+pub(crate) fn command_admission(command: &Command) -> CommandAdmission {
+    if starts_new_work(command) {
+        CommandAdmission::Start
+    } else {
+        CommandAdmission::Recovery
+    }
+}
+
 fn starts_new_work(command: &Command) -> bool {
     use boss_protocol_spoke::v1::{WorkspaceKind, command::Body};
     match &command.body {
@@ -91,7 +99,7 @@ impl CommandOutbox for WorkDbOutbox {
         Ok(CommandJournal { journal_id, received })
     }
 
-    async fn append(&self, host: &str, command: Command) -> Result<Command, StoreError> {
+    async fn append(&self, host: &str, admission: CommandAdmission, command: Command) -> Result<Command, StoreError> {
         let host = host.to_owned();
         self.blocking(move |db| {
             let request = command.encode_to_vec();
@@ -100,10 +108,9 @@ impl CommandOutbox for WorkDbOutbox {
                 stamped.sequence = sequence;
                 stamped.encode_to_vec()
             };
-            let admission = if starts_new_work(&command) {
-                RunAdmission::Start
-            } else {
-                RunAdmission::Recovery
+            let admission = match admission {
+                CommandAdmission::Start => RunAdmission::Start,
+                CommandAdmission::Recovery => RunAdmission::Recovery,
             };
             let stored = db.append_host_command(
                 &host,

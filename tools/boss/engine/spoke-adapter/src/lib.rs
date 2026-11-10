@@ -36,7 +36,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use boss_engine_recovery::execution_bookmark::{
-    ExecutionBookmark, PreserveOutcome, PreservedTip, PruneOutcome, RestoreReport, Voucher, WorkspaceTipSource,
+    ExecutionBookmark, PreserveOutcome, PreservedScope, PreservedTip, RestoreReport, WorkspaceTipSource,
 };
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_execution_contracts::{
@@ -333,7 +333,11 @@ impl Hub {
         deadline: Duration,
     ) -> Result<CommandResult, HostCallError> {
         let command_id = command.command_id.clone();
-        match self.streams.command(host_id, command, deadline).await {
+        match self
+            .streams
+            .command(host_id, outbox::command_admission(&command), command, deadline)
+            .await
+        {
             Ok(result) => Ok(result),
             Err(CommandOutcome::OutcomeUncertain) => Err(HostCallError::Uncertain {
                 host_id: host_id.to_owned(),
@@ -760,13 +764,6 @@ impl HostAdapter for SpokeHostAdapter {
         }
     }
 
-    async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {
-        match self.route_execution(&record.execution_id).await? {
-            Route::Spoke(assignment) => self.rec_diff(&assignment, record).await,
-            Route::Legacy(legacy) => legacy.execution_bookmark_diff(record).await,
-        }
-    }
-
     async fn start_fresh_workspace(&self, workspace: &Path) -> Result<String> {
         match self.route_path(workspace).await? {
             Route::Spoke(assignment) => {
@@ -839,15 +836,14 @@ impl HostAdapter for SpokeHostAdapter {
         }
     }
 
-    async fn prune_execution_bookmark(
+    async fn forget_preserved_references(
         &self,
         record: &ExecutionBookmark,
-        vouchers: &[Voucher],
-        trunk: &str,
-    ) -> Result<PruneOutcome> {
+        scope: PreservedScope,
+    ) -> Result<Vec<String>> {
         match self.route_execution(&record.execution_id).await? {
-            Route::Spoke(assignment) => self.rec_prune(&assignment, record, vouchers, trunk).await,
-            Route::Legacy(legacy) => legacy.prune_execution_bookmark(record, vouchers, trunk).await,
+            Route::Spoke(assignment) => self.rec_forget_preserved(&assignment, record, scope).await,
+            Route::Legacy(legacy) => legacy.forget_preserved_references(record, scope).await,
         }
     }
 

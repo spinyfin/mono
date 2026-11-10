@@ -6,9 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use boss_engine_recovery::execution_bookmark::{
-    ExecutionBookmark, HostRecoveryRequest, HostVoucher, PreservedTip, Voucher,
-};
+use boss_engine_recovery::execution_bookmark::{ExecutionBookmark, HostRecoveryRequest, PreservedScope, PreservedTip};
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_execution_contracts::{CollectOutcome, ControlOutcome, Occupancy};
 use boss_protocol_spoke::v1::{Command, PaneLife, ResultCode, WorkspaceKind as Kind, command};
@@ -204,7 +202,12 @@ async fn a_resolved_assignment_admits_no_new_work_but_stays_open_to_recovery() {
         let id = refused.command_id.clone();
         assert!(
             fx.manager
-                .command(HOST, refused, Duration::from_millis(300))
+                .command(
+                    HOST,
+                    boss_spoke_stream::store::CommandAdmission::Start,
+                    refused,
+                    Duration::from_millis(300)
+                )
                 .await
                 .is_err()
         );
@@ -214,12 +217,20 @@ async fn a_resolved_assignment_admits_no_new_work_but_stays_open_to_recovery() {
     let diff = command_for(
         "recovery-diff",
         command::Body::Workspace(boss_protocol_spoke::v1::WorkspaceOp {
-            kind: Kind::DiffBookmark.into(),
+            kind: Kind::ForgetPreserved.into(),
             repo_id: "repo".into(),
             ..Default::default()
         }),
     );
-    let _ = fx.manager.command(HOST, diff, Duration::from_millis(300)).await;
+    let _ = fx
+        .manager
+        .command(
+            HOST,
+            boss_spoke_stream::store::CommandAdmission::Recovery,
+            diff,
+            Duration::from_millis(300),
+        )
+        .await;
     assert!(fx.db.host_command_wire(HOST, "recovery-diff").unwrap().is_some());
     assert!(peer.commands().iter().all(|c| c.command_id != "late-lease"));
 }
@@ -326,7 +337,10 @@ async fn operations_without_a_wire_form_follow_the_run_that_owns_them() {
         count: 1,
     };
     assert!(unbound.preserved_work_unpublished(&other, &tip).await.unwrap());
-    unbound.prune_execution_bookmark(&other, &[], "main").await.unwrap();
+    unbound
+        .forget_preserved_references(&other, PreservedScope::Tip)
+        .await
+        .unwrap();
     assert_eq!(
         fx.legacy_calls(),
         [
@@ -339,7 +353,7 @@ async fn operations_without_a_wire_form_follow_the_run_that_owns_them() {
             "read_transcript_tail_bytes",
             "collect_structured_output:exec_other",
             "preserved_work_unpublished:exec_other",
-            "prune_execution_bookmark:exec_other",
+            "forget_preserved_references:exec_other",
         ]
     );
 
@@ -391,7 +405,7 @@ async fn operations_without_a_wire_form_follow_the_run_that_owns_them() {
 }
 
 #[tokio::test]
-async fn preserved_work_check_and_prune_cross_the_wire_as_typed_operations() {
+async fn preserved_work_check_and_cleanup_cross_the_wire_as_typed_operations() {
     let fx = Fixture::new().await;
     fx.ready(HOST);
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
@@ -400,10 +414,7 @@ async fn preserved_work_check_and_prune_cross_the_wire_as_typed_operations() {
             Box::new(|c| {
                 let value = match workspace_kind(c)? {
                     Kind::CheckPreservedUnpublished => workspace(c, json!(true)),
-                    Kind::PruneBookmark => workspace(
-                        c,
-                        json!({"Published": {"vouched_by": "PR #1 head", "commit": "b", "forgotten": ["boss/exec_1"], "rewritten": 0}}),
-                    ),
+                    Kind::ForgetPreserved => workspace(c, json!(["preserved/exec_1"])),
                     _ => return standard(c),
                 };
                 Some(ok(c, Some(value)))
@@ -425,18 +436,11 @@ async fn preserved_work_check_and_prune_cross_the_wire_as_typed_operations() {
         count: 2,
     };
     assert!(adapter.preserved_work_unpublished(&record, &tip).await.unwrap());
-    let vouchers = [
-        Voucher::commit("PR #1 head", &"b".repeat(40)).unwrap(),
-        Voucher::remote_bookmark("boss/exec_1", "origin"),
-    ];
-    let outcome = adapter
-        .prune_execution_bookmark(&record, &vouchers, "main")
+    let forgotten = adapter
+        .forget_preserved_references(&record, PreservedScope::TipAndArchives)
         .await
         .unwrap();
-    assert!(matches!(
-        outcome,
-        boss_engine_recovery::execution_bookmark::PruneOutcome::Published { .. }
-    ));
+    assert_eq!(forgotten, ["preserved/exec_1"]);
 
     let sent = peer.commands();
     let op_of = |kind: Kind| {
@@ -452,22 +456,10 @@ async fn preserved_work_check_and_prune_cross_the_wire_as_typed_operations() {
     assert!(check.workspace_id.is_empty() && check.lease_id.is_empty());
     let request: HostRecoveryRequest = serde_json::from_slice(&check.request_json).unwrap();
     assert_eq!(request.recorded, Some(tip));
-    let prune = op_of(Kind::PruneBookmark);
-    assert_eq!(prune.trunk, "main");
-    let request: HostRecoveryRequest = serde_json::from_slice(&prune.request_json).unwrap();
-    assert_eq!(
-        request.vouchers,
-        [
-            HostVoucher::Commit {
-                label: "PR #1 head".into(),
-                commit_id: "b".repeat(40)
-            },
-            HostVoucher::RemoteBookmark {
-                name: "boss/exec_1".into(),
-                remote: "origin".into()
-            },
-        ]
-    );
+    let cleanup = op_of(Kind::ForgetPreserved);
+    assert!(cleanup.workspace_id.is_empty() && cleanup.lease_id.is_empty());
+    let request: HostRecoveryRequest = serde_json::from_slice(&cleanup.request_json).unwrap();
+    assert_eq!(request.scope, PreservedScope::TipAndArchives);
 }
 
 #[tokio::test]
@@ -874,7 +866,7 @@ async fn recovery_on_the_old_spoke_host_crosses_the_stream_after_a_legacy_handof
     let peer = fx
         .spoke(
             Box::new(|c| match workspace_kind(c) {
-                Some(Kind::DiffBookmark) => Some(ok(c, Some(workspace(c, json!("diff --git"))))),
+                Some(Kind::ForgetPreserved) => Some(ok(c, Some(workspace(c, json!(["preserved/exec_1"]))))),
                 _ => standard(c),
             }),
             None,
@@ -896,11 +888,17 @@ async fn recovery_on_the_old_spoke_host_crosses_the_stream_after_a_legacy_handof
         .repo_path("/spoke/repo".into())
         .host_id(HOST)
         .build();
-    assert_eq!(fresh.execution_bookmark_diff(&record).await.unwrap(), "diff --git");
+    assert_eq!(
+        fresh
+            .forget_preserved_references(&record, PreservedScope::Tip)
+            .await
+            .unwrap(),
+        ["preserved/exec_1"]
+    );
     assert!(
         peer.commands()
             .iter()
-            .any(|c| workspace_kind(c) == Some(Kind::DiffBookmark))
+            .any(|c| workspace_kind(c) == Some(Kind::ForgetPreserved))
     );
     // New work is still fenced.
     assert!(adapter.lease_workspace("repo", "task", None, false, &[]).await.is_err());
@@ -1015,7 +1013,7 @@ async fn recovery_for_a_resolved_spoke_run_crosses_the_stream_after_the_host_ret
     let peer = fx
         .spoke(
             Box::new(|c| match workspace_kind(c) {
-                Some(Kind::DiffBookmark) => Some(ok(c, Some(workspace(c, json!("diff --git"))))),
+                Some(Kind::ForgetPreserved) => Some(ok(c, Some(workspace(c, json!(["preserved/exec_1"]))))),
                 _ => standard(c),
             }),
             None,
@@ -1032,11 +1030,17 @@ async fn recovery_for_a_resolved_spoke_run_crosses_the_stream_after_the_host_ret
         .repo_path("/spoke/repo".into())
         .host_id(HOST)
         .build();
-    assert_eq!(fresh.execution_bookmark_diff(&record).await.unwrap(), "diff --git");
+    assert_eq!(
+        fresh
+            .forget_preserved_references(&record, PreservedScope::Tip)
+            .await
+            .unwrap(),
+        ["preserved/exec_1"]
+    );
     assert!(
         peer.commands()
             .iter()
-            .any(|c| workspace_kind(c) == Some(Kind::DiffBookmark))
+            .any(|c| workspace_kind(c) == Some(Kind::ForgetPreserved))
     );
     assert!(fx.legacy_calls().is_empty(), "{:?}", fx.legacy_calls());
 }
