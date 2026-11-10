@@ -40,16 +40,24 @@
 //!    keeps. If the post-abandon polling never finds a quiet instant, the
 //!    pass falls back to the two-week default. Either way it collects only
 //!    when the head re-check found a single head.
+//!    Collection uses a private, freshly rebuilt index over the shared store.
+//!    Inherited indexes are not trusted: newer jj versions can omit legacy
+//!    predecessors that jj 0.26 still needs when rebuilding. Fresh validation
+//!    also runs before abandon (preserving the live cache on failure), and
+//!    again after collection. Any validation failure fails the upkeep and
+//!    records a failed audit event; a successful cached read is insufficient.
 //!
 //! The abandon holds the exclusive host-wide [`JjGate`] from before the
-//! abandon through the head check and read-only commit-index warm-up. Every
+//! abandon through the head check. Every
 //! `jj` command cube starts
 //! (lease, goto, push, fetch; see `command_runner`) holds the gate shared for
 //! its run, so none of those can load the pre-rewrite head; cube commands
 //! wait at most two seconds, then return a retryable maintenance error.
-//! Abandon has a two-minute deadline and index warm-up has a separate 20s
-//! deadline: at most 140s of subprocess work excludes readers. Warm-up failure
-//! is non-fatal; the next reader builds the index. Interrupted rewrites are
+//! Abandon has a two-minute deadline. Read-only index warm-up runs afterward
+//! under a shared gate with its own five-minute deadline, pinned to the verified
+//! operation so it cannot merge a racing head. Warm-up failure is audited and
+//! non-fatal: independent fresh-index verification still gates collection.
+//! Interrupted rewrites are
 //! checked before releasing exclusivity. A durable, atomically published
 //! marker rejects readers until recovery observes no jj processes and one
 //! head under the exclusive gate. Readers attempt this recovery immediately,
@@ -95,6 +103,7 @@ use crate::store::Store;
 
 use crate::app::errors::{CubeError, Result};
 use crate::app::jj::run_jj;
+use crate::app::store_gc_integrity::{GcIndex, collector_version};
 
 /// Operations newer than this are never abandoned. Three days of history
 /// keeps `jj op undo` useful while the log stays bounded.
@@ -113,9 +122,9 @@ const QUIESCENCE_POLL: Duration = Duration::from_millis(250);
 /// Timeout kills and reaps the child; heads are checked even on failure.
 /// The scale regression exercises 16,800 retained operations.
 const EXCLUSIVE_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
-/// Best-effort warm-up keeps combined exclusive subprocess work to 140s.
-/// Leave the rewrite bound large enough for the measured retained DAG.
-const INDEX_WARMUP_TIMEOUT: Duration = Duration::from_secs(20);
+/// A full rebuild of mono's 18 GiB operation store took 148s. Allow roughly
+/// twice that measured time without extending host-wide reader exclusion.
+const INDEX_WARMUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Template the cut-point selection reads: one `<operation id> <end epoch>`
 /// line per operation, newest first.
 pub(super) const OP_LOG_TEMPLATE: &str = r#"id ++ " " ++ time.end().format("%s") ++ "\n""#;
@@ -337,24 +346,32 @@ pub(super) fn jj_processes(ps_output: &str) -> Vec<String> {
 /// Number of operation heads in the store at `source`. One means every
 /// workspace's operations descend from a single head.
 pub(crate) fn count_op_heads(source: &Path) -> Result<usize> {
-    let heads = source.join(".jj/repo/op_heads/heads");
-    let mut entries = std::fs::read_dir(&heads).map_err(CubeError::Io)?;
-    entries.try_fold(0, |count, entry| entry.map(|_| count + 1).map_err(CubeError::Io))
+    Ok(op_heads(source)?.len())
+}
+
+/// The operation head ids in the store at `source`, one directory entry each.
+fn op_heads(source: &Path) -> Result<Vec<String>> {
+    std::fs::read_dir(source.join(".jj/repo/op_heads/heads"))
+        .map_err(CubeError::Io)?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<_>>()
+        .map_err(CubeError::Io)
 }
 
 /// Stop the pass unless the store holds exactly one operation head. A second
 /// head means a jj command raced the abandon: the next jj command merges the
 /// heads against an empty base, so nothing may be collected.
-fn require_single_op_head(record: &RepoRecord, source: &Path, when: &str) -> Result<()> {
-    let heads = count_op_heads(source)?;
-    if heads == 1 {
-        return Ok(());
+fn require_single_op_head(record: &RepoRecord, source: &Path, when: &str) -> Result<String> {
+    let mut heads = op_heads(source)?;
+    if heads.len() == 1 {
+        return Ok(heads.remove(0));
     }
     Err(CubeError::InvalidArgument(format!(
-        "repo `{}`: the store holds {heads} operation heads {when} (expected 1); \
+        "repo `{}`: the store holds {} operation heads {when} (expected 1); \
          the rewrite is unsafe, so nothing was collected. Repair the operation heads in {} \
          before allowing commands to merge abandoned ancestry",
         record.repo,
+        heads.len(),
         source.display()
     )))
 }
@@ -521,15 +538,50 @@ pub(super) fn gc_repo_store(
     quiescence: Duration,
     dry_run: bool,
 ) -> Result<StoreGcReport> {
-    gc_repo_store_with_deadline(
-        runner,
-        database_path,
-        record,
-        keep,
-        quiescence,
-        EXCLUSIVE_COMMAND_TIMEOUT,
-        dry_run,
-    )
+    let started = Instant::now();
+    let mut collector_jj = None;
+    let probe = match (dry_run, record.source.as_deref()) {
+        (false, Some(source)) if source.join(".jj/repo").is_dir() => {
+            collector_version(runner, source).map(|version| collector_jj = Some(version))
+        }
+        _ => Ok(()),
+    };
+    probe
+        .and_then(|()| {
+            gc_repo_store_with_deadline(
+                runner,
+                database_path,
+                record,
+                keep,
+                quiescence,
+                Collector {
+                    exclusive_timeout: EXCLUSIVE_COMMAND_TIMEOUT,
+                    jj_version: collector_jj.as_deref(),
+                },
+                dry_run,
+            )
+        })
+        .inspect_err(|error| {
+            audit!(
+                database_path,
+                "repo.store_gc",
+                repo = record.repo,
+                source = record.source,
+                dry_run = dry_run,
+                outcome = "failed",
+                collector_jj_version = collector_jj,
+                duration_ms = started.elapsed().as_millis() as u64,
+                error = error.to_string()
+            );
+        })
+}
+
+/// How a pass drives `jj`: the bound on each command run under the exclusive
+/// gate (production always uses [`EXCLUSIVE_COMMAND_TIMEOUT`]) and the
+/// version of the `jj` that collects, recorded in the audit rows.
+pub(super) struct Collector<'a> {
+    pub(super) exclusive_timeout: Duration,
+    pub(super) jj_version: Option<&'a str>,
 }
 
 /// [`gc_repo_store`] with the bound on each command run under the exclusive
@@ -540,9 +592,13 @@ pub(super) fn gc_repo_store_with_deadline(
     record: &RepoRecord,
     keep: Duration,
     quiescence: Duration,
-    exclusive_timeout: Duration,
+    collector: Collector<'_>,
     dry_run: bool,
 ) -> Result<StoreGcReport> {
+    let Collector {
+        exclusive_timeout,
+        jj_version: collector_jj,
+    } = collector;
     let started = Instant::now();
     let source = record.source.clone().ok_or_else(|| {
         CubeError::InvalidArgument(format!(
@@ -600,7 +656,17 @@ pub(super) fn gc_repo_store_with_deadline(
     let mut collection_ms = 0;
     let mut abandoned_through = abandoned_through;
     if !dry_run {
-        // Held through the head check and commit-index warm-up:
+        // Validate before rewriting operations: a damaged store can still
+        // load from its live cached index, which must remain usable on error.
+        let index = {
+            let _reader = JjGate::shared_for_database(database_path)?;
+            let index = GcIndex::new(&source)?;
+            let head = require_single_op_head(record, &source, "before the abandon")?;
+            index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "before abandon", &head)?;
+            index
+        };
+        let mut rewritten_head = None;
+        // Held through the rewrite and head check:
         // cube-started jj commands wait on it, so
         // none of them can load the pre-rewrite head in between.
         let mut gate = None;
@@ -636,35 +702,9 @@ pub(super) fn gc_repo_store_with_deadline(
                     &gated_jj_invocation(&source, &["--ignore-working-copy", "op", "abandon", &range]),
                     exclusive_timeout,
                 );
-                require_single_op_head(record, &source, "after the abandon")?;
+                rewritten_head = Some(require_single_op_head(record, &source, "after the abandon")?);
                 active_gate.clear_quarantine(&source)?;
                 abandon?;
-                // Rewritten operation IDs invalidate jj's commit-index lookup.
-                // Build that read-only index before readers resume, rather than
-                // making the first lease pay for it while holding the registry
-                // lock. It has its own deadline, and failing it is not fatal:
-                // the rewrite is verified, and the first reader rebuilds the
-                // index instead.
-                if let Err(error) = runner.run_with_timeout(
-                    &gated_jj_invocation(
-                        &source,
-                        &[
-                            "--ignore-working-copy",
-                            "log",
-                            "-r",
-                            "root()",
-                            "--no-graph",
-                            "-T",
-                            "commit_id",
-                        ],
-                    ),
-                    INDEX_WARMUP_TIMEOUT.min(exclusive_timeout),
-                ) {
-                    eprintln!(
-                        "cube: store gc: {}: commit-index warm-up failed after a verified abandon: {error}",
-                        record.repo
-                    );
-                }
             } else {
                 gate = None;
                 abandoned_through = None;
@@ -675,16 +715,71 @@ pub(super) fn gc_repo_store_with_deadline(
             // The observation that makes `--expire now` safe has to come
             // after the abandon: it is the commands that loaded the store
             // before the rewrite that must have finished.
-            let mut gc_args = vec!["--ignore-working-copy", "util", "gc"];
+            let mut gc_args = vec!["util", "gc"];
             exclusive_ms = exclusive_started.map_or(0, |start| start.elapsed().as_millis());
             drop(gate);
             let _reader = JjGate::shared_for_database(database_path)?;
+            if let Some(ref head) = rewritten_head {
+                // Rewritten operation IDs invalidate jj's commit-index lookup.
+                // Populate it without excluding readers across every repo for
+                // a large rebuild. Pin the checked head: a read at the current
+                // operation could silently merge a concurrent second head.
+                // Fresh-index verification below remains mandatory even when
+                // this best-effort optimization fails.
+                let warmup_started = Instant::now();
+                let warmup_timeout = INDEX_WARMUP_TIMEOUT;
+                let warmup = runner.run_with_timeout(
+                    &gated_jj_invocation(
+                        &source,
+                        &[
+                            "--ignore-working-copy",
+                            "--at-operation",
+                            head,
+                            "log",
+                            "-r",
+                            "root()",
+                            "--no-graph",
+                            "-T",
+                            "commit_id",
+                        ],
+                    ),
+                    warmup_timeout,
+                );
+                audit!(
+                    database_path,
+                    "repo.store_gc.index_warmup",
+                    repo = record.repo,
+                    collector_jj_version = collector_jj,
+                    outcome = if warmup.is_ok() { "succeeded" } else { "failed" },
+                    duration_ms = warmup_started.elapsed().as_millis() as u64,
+                    timeout_ms = warmup_timeout.as_millis() as u64,
+                    error = warmup.as_ref().err().map(ToString::to_string),
+                );
+                if let Err(error) = warmup {
+                    eprintln!(
+                        "cube: store gc: {}: commit-index warm-up failed after a verified abandon: {error}",
+                        record.repo
+                    );
+                }
+            }
+            // The fresh-index rebuild can take minutes, so it runs first and
+            // pinned to the checked head: a head published meanwhile cannot
+            // be merged into it. The quiet observation and the head check
+            // come after it, immediately before `util gc`, so neither goes
+            // stale.
+            let collection_started = Instant::now();
+            let head = require_single_op_head(record, &source, "before the collection rebuild")?;
+            if let Some(ref rewritten) = rewritten_head {
+                super::store_gc_integrity::require_safe_progress(runner, &source, rewritten, &head)?;
+            }
+            index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "before collection", &head)?;
             let quiet = wait_for_jj_quiescence(runner, &source, quiescence, QUIESCENCE_POLL)?;
-            // A command that started during the abandon loaded the old head
-            // and may have committed on it since; its head only shows up
-            // now, so the heads are counted again after the wait and before
-            // any collection, on both the immediate and the deferred path.
-            require_single_op_head(record, &source, "before the collection")?;
+            // A command that started during the abandon or the rebuild
+            // loaded an older head and may have committed on it since; that
+            // head only shows up now, on both the immediate and deferred
+            // paths.
+            let current = require_single_op_head(record, &source, "before the collection")?;
+            super::store_gc_integrity::require_safe_progress(runner, &source, &head, &current)?;
             if quiet {
                 gc_args.extend(["--expire", "now"]);
                 collection = Collection::Immediate;
@@ -693,8 +788,10 @@ pub(super) fn gc_repo_store_with_deadline(
             }
             // Collection is a reader: leases proceed, but another rewrite
             // cannot invalidate the head this collector loaded.
-            let collection_started = Instant::now();
-            runner.run_with_timeout(&gated_jj_invocation(&source, &gc_args), MAINTENANCE_CMD_TIMEOUT)?;
+            index.run(runner, &gc_args, MAINTENANCE_CMD_TIMEOUT)?;
+            let collected = require_single_op_head(record, &source, "after the collection")?;
+            super::store_gc_integrity::require_safe_progress(runner, &source, &current, &collected)?;
+            index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "after collection", &collected)?;
             collection_ms = collection_started.elapsed().as_millis();
         }
     }
@@ -766,6 +863,8 @@ pub(super) fn gc_repo_store_with_deadline(
         duration_ms = report.duration_ms as u64,
         exclusive_ms = report.exclusive_ms as u64,
         collection_ms = report.collection_ms as u64,
+        collector_jj_version = collector_jj,
+        fresh_index_verified = matches!(report.collection, Collection::Immediate | Collection::Deferred),
     );
     Ok(report)
 }

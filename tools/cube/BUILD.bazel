@@ -65,12 +65,14 @@ rust_test(
         ":cube",
         "@cube_gc_store_tree//:cut",
         "@cube_gc_store_tree//:store",
+        "@cube_jj_newer//:jj",
         "@jj_test_tools//:jj",
     ],
     env = {
         "BOSS_JJ_BIN": "$(rootpath @jj_test_tools//:jj)",
         # Path to the fixture's `cut` file; its parent directory is the store root.
         "CUBE_GC_STORE_CUT": "$(rootpath @cube_gc_store_tree//:cut)",
+        "CUBE_NEWER_JJ_BIN": "$(rootpath @cube_jj_newer//:jj)",
         "CUBE_TEST_BIN": "$(rootpath :cube)",
     },
     proc_macro_deps = all_crate_deps(

@@ -726,11 +726,13 @@ checkout and not aware of anything above jj:
    anything but exactly one operation head. Every `jj` command cube itself
    starts holds a host-wide shared gate (`locks/jj-maintenance.lock`) for
    its run, and the pass holds the gate exclusive from before the abandon
-   through the immediate head check and commit-index warm-up, so no cube-started command
+   through the immediate head check, so no cube-started command
    can load the pre-rewrite head. The rewrite has a two-minute safety deadline
-   to accommodate large kept-operation DAGs; read-only index warm-up has its own
-   20-second deadline, bounding their combined exclusive subprocess work at
-   140 seconds. Warm-up failure is non-fatal: the next reader builds the index. A timed-out child is killed and
+   to accommodate large kept-operation DAGs. Read-only index warm-up then runs
+   under a shared gate with a five-minute deadline. It is pinned to the checked
+   operation, so it cannot merge a second head that appears while rebuilding.
+   Warm-up failure is audited and non-fatal; the independent fresh-index checks
+   still gate collection. A timed-out child is killed and
    reaped, and heads are checked before releasing the gate even on failure.
    A durable, atomically published `locks/jj-maintenance.blocked` marker prevents cube readers
    from resuming after an unverified rewrite. Readers immediately attempt recovery
@@ -763,10 +765,40 @@ checkout and not aware of anything above jj:
    back to the two-week threshold. Collection holds the gate shared, so leases can
    proceed throughout it. Reports and audit events include `exclusive_ms`
    and `collection_ms` to distinguish rewrite contention from collection cost.
+   Cube reconstructs a private commit index before abandoning operations and
+   again before collection, uses that index for GC, and verifies a fresh rebuild
+   afterward. This protects predecessor commits required by the active jj
+   version even when an inherited index omits them. A verification failure
+   returns an error and writes a failed `repo.store_gc` audit row; preflight
+   preserves the live cached index on an already-damaged store. See
+   [missing-predecessor recovery](store-gc-recovery.md) for the tested recovery
+   procedure and shared-client version requirements.
+   The pre-collection rebuild is pinned to the checked operation head, and the
+   quiet observation and single-head check follow it immediately before
+   `util gc`; a second head published during the rebuild stops the pass.
+   Pinned parent checks before and after collection accept concurrent merges
+   only when every branch reaches the previously checked head. A merge that
+   restores abandoned ancestry fails the pass and writes a failed audit row,
+   including when it appears during `util gc`. The ancestry walk is bounded
+   to 4,096 operations and 60 seconds and refuses unverified history.
+   The collector
+   must also be the oldest client sharing the store: a newer `jj` omits legacy
+   predecessors from its index, prunes them, and still passes its own
+   verifications. The `jj` on `PATH` is therefore refused when newer than 0.26
+   (override with `CUBE_OLDEST_JJ_CLIENT=<major.minor>` once every client is
+   upgraded), and its `jj --version` is recorded on the `repo.store_gc` and
+   `repo.store_gc.index_warmup` audit rows. Neither jj 0.26 nor 0.32's `util gc` prunes
+   the default index store, so skipping the live `.jj/repo/index` loses no
+   reclamation.
    Working-copy health checks can also be expensive after the operation IDs
    change: jj rebuilds its commit index by walking operation ancestry, so
-   maintenance warms that index before releasing exclusivity. A large-store experiment measured 23 seconds in `jj status` before
-   collection even started. Lease health probes and stale recovery share a
+   maintenance warms that index without holding the host-wide exclusive gate.
+   Rebuilding an isolated copy of mono's 18 GiB operation store indexed 66,490
+   commits in 148 seconds, so the warm-up deadline is five minutes: roughly
+   twice that measured time, while
+   allowing readers of other stores to proceed. A reader of the same store
+   can still need to build its own index before warm-up finishes.
+   Lease health probes and stale recovery share a
    two-second per-workspace deadline within the five-second scan budget.
    A timeout never authorizes reuse; cube tries another candidate or provisions
    fresh capacity, preserving the existing dirty-workspace checks.
@@ -798,9 +830,12 @@ the child holds a dedicated `locks/<repo>.store-gc.lock` for its whole run
 (`try_acquire`; a second run is refused). It deliberately does not take the
 per-repo lease lock: a collection runs for minutes and every `cube workspace
 lease` waits on that lock, while jj itself tolerates the workspaces'
-concurrent commands. Each jj call is bounded at thirty minutes. The outcome
-is recorded as a `repo.store_gc` audit event with before/after operation,
-view and byte counts.
+concurrent commands. Listing, independent index verification, and collection
+have thirty-minute command deadlines. Completed passes record before/after
+operation, view and byte counts in `repo.store_gc`; failures record the error,
+source path, dry-run flag, and elapsed time. `repo.store_gc.index_warmup` records
+each warm-up's outcome, elapsed time, deadline, and error when it fails, even
+if a later head check supplies the terminal collection error.
 
 ## PR Model
 

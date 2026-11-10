@@ -97,6 +97,10 @@ jj_test_repository = use_repo_rule("//tools/boss/engine/recovery:jj_repository.b
 
 jj_test_repository(name = "jj_test_tools")
 
+jj_newer_repository = use_repo_rule("//tools/cube:testdata/jj_newer_repository.bzl", "jj_newer_repository")
+
+jj_newer_repository(name = "cube_jj_newer")
+
 worker_zsh_repository = use_repo_rule(
     "//tools/boss/engine/worker-bin:host_shell.bzl",
     "worker_zsh_repository",
