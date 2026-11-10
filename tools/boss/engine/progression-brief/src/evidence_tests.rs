@@ -416,4 +416,8 @@ fn gather_resolves_remote_from_item_then_product_and_drops_blank() {
     assert_eq!(set(None, Some("product-remote")).as_deref(), Some("product-remote"));
     assert_eq!(set(None, Some("   ")), None);
     assert_eq!(set(Some("  "), None), None);
+    assert_eq!(
+        set(Some("  "), Some("product-remote")).as_deref(),
+        Some("product-remote")
+    );
 }

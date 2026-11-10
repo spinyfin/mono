@@ -127,15 +127,19 @@ async fn git_version() -> Option<(u32, u32, u32)> {
 /// invocation (e.g. new-syntax `merge-tree` treats exit 1 as a conflict
 /// signal rather than a failure).
 async fn run_git(args: &[&str], workspace_path: &Path, git_dir: &Path) -> std::io::Result<Output> {
-    Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(workspace_path)
         .env("GIT_DIR", git_dir)
         // A probe must fail fast on missing credentials, never wait on a prompt.
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .kill_on_drop(true)
-        .output()
-        .await
+        .env("GIT_TERMINAL_PROMPT", "0");
+    // ssh prompts (host key, key passphrase) go via /dev/tty, which
+    // GIT_TERMINAL_PROMPT does not cover; keep any operator-configured command.
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+        command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    }
+    command.kill_on_drop(true).output().await
 }
 
 /// Resolve the jj repo directory (the dir that directly contains

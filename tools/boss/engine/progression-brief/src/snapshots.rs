@@ -11,7 +11,8 @@ use boss_protocol::{
     FinishExecutionRunInput, WorkItemPatch,
 };
 use boss_work_db::{
-    CiRemediationInsertInput, ConflictResolutionInsertInput, PrPollStateInput, WorkDb, WorkerFailureBasis,
+    CiRemediationInsertInput, ConflictResolutionInsertInput, PrPollStateInput,
+    REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS, ReviewVerdictInput, WorkDb, WorkerFailureBasis,
     test_support::{create_test_chore_manual, create_test_product_named, open_db},
 };
 use regex::Regex;
@@ -766,21 +767,28 @@ impl Fixture {
             .create_execution(
                 CreateExecutionInput::builder()
                     .work_item_id(item)
-                    .kind(ExecutionKind::ChoreImplementation)
-                    .status(ExecutionStatus::Ready)
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Completed)
                     .build(),
             )
             .unwrap();
-        let head = head.map_or("NULL".to_owned(), |h| format!("'{h}'"));
-        let revision = revision_task.map_or("NULL".to_owned(), |r| format!("'{r}'"));
-        self.sql(&format!(
-            "INSERT INTO pr_review_verdicts (id, execution_id, work_item_id, head_sha, findings_count,
-                 revision_warranted, gate_outcome, revision_task_id, created_at)
-             VALUES ('rvv-{id}', '{id}', '{item}', {head}, 3, {w}, 'revision_created', {revision},
-                 '2026-01-01T00:00:00Z')",
-            id = execution.id,
-            w = warranted as i64,
-        ));
+        WorkDb::insert_review_verdict_in_tx(
+            &self.db.connect().unwrap(),
+            &execution.id,
+            item,
+            &ReviewVerdictInput {
+                head_sha: head.map(str::to_owned),
+                findings_count: 3,
+                revision_warranted: warranted,
+                gate_outcome: REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS,
+            },
+        )
+        .unwrap();
+        if let Some(revision_task) = revision_task {
+            self.db
+                .set_review_verdict_revision_task_id(&execution.id, revision_task)
+                .unwrap();
+        }
     }
 }
 
@@ -800,7 +808,7 @@ fn ai_review_verdict_reports_head_freshness() {
         let text = f.brief(&id);
         assert!(
             text.contains(&format!(
-                "gate_outcome=revision_created revision_warranted=true findings=3 revision_task=rev-task-1 reviewed_head={} {expect}",
+                "gate_outcome=completed_with_findings revision_warranted=true findings=3 revision_task=rev-task-1 reviewed_head={} {expect}",
                 reviewed.unwrap_or("(unrecorded)")
             )),
             "{text}"

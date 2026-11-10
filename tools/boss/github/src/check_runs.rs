@@ -11,7 +11,7 @@ use crate::gh_runner::gh_output;
 /// parser ([`parse_commit_statuses_for_failures`]) so the two paths
 /// cannot drift on which states count as failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StatusContextVerdict {
+pub enum LeafVerdict {
     /// Terminal success (`SUCCESS`).
     Pass,
     /// Terminal failure. `conclusion` is the uppercased state token
@@ -29,15 +29,15 @@ pub enum StatusContextVerdict {
 ///
 /// Values per GitHub's commit-status API: SUCCESS / FAILURE / ERROR /
 /// PENDING / EXPECTED. Only `FAILURE` and `ERROR` are terminal fails.
-pub fn classify_status_context_state(state: &str) -> StatusContextVerdict {
+pub fn classify_status_context_state(state: &str) -> LeafVerdict {
     let upper = state.to_ascii_uppercase();
     match upper.as_str() {
-        "SUCCESS" => StatusContextVerdict::Pass,
-        "FAILURE" | "ERROR" => StatusContextVerdict::Fail { conclusion: upper },
+        "SUCCESS" => LeafVerdict::Pass,
+        "FAILURE" | "ERROR" => LeafVerdict::Fail { conclusion: upper },
         // PENDING (running), EXPECTED (branch protection lists the
         // context but no run has reported yet), empty, or anything
         // else GitHub may add later → wait for a terminal verdict.
-        _ => StatusContextVerdict::InFlight,
+        _ => LeafVerdict::InFlight,
     }
 }
 
@@ -76,7 +76,7 @@ pub fn leaf_verdict_token(leaf: &serde_json::Value) -> Option<&str> {
 /// `conclusion`") carry the verdict in `state`. `CheckRun` leaves use
 /// `conclusion`; an empty or missing conclusion, or an unknown one, is
 /// in-flight rather than a guessed failure.
-pub fn classify_rollup_leaf(leaf: &serde_json::Value) -> StatusContextVerdict {
+pub fn classify_rollup_leaf(leaf: &serde_json::Value) -> LeafVerdict {
     let typename = leaf.get("__typename").and_then(|v| v.as_str()).unwrap_or("");
     let has_status_context_shape = typename.eq_ignore_ascii_case("StatusContext")
         || (leaf.get("state").is_some() && leaf.get("conclusion").is_none());
@@ -90,28 +90,28 @@ pub fn classify_rollup_leaf(leaf: &serde_json::Value) -> StatusContextVerdict {
         .unwrap_or("")
         .to_ascii_uppercase();
     if conclusion.is_empty() {
-        StatusContextVerdict::InFlight
+        LeafVerdict::InFlight
     } else if is_failure_conclusion(&conclusion) {
-        StatusContextVerdict::Fail { conclusion }
+        LeafVerdict::Fail { conclusion }
     } else {
         // Pass, or an unknown conclusion shape (treated as in-flight rather
         // than misclassified as a failure).
         if is_pass_conclusion(&conclusion) {
-            StatusContextVerdict::Pass
+            LeafVerdict::Pass
         } else {
-            StatusContextVerdict::InFlight
+            LeafVerdict::InFlight
         }
     }
 }
 
 /// True when a `CheckRun` or `StatusContext` leaf is a terminal failure.
 pub fn leaf_is_failure(leaf: &serde_json::Value) -> bool {
-    matches!(classify_rollup_leaf(leaf), StatusContextVerdict::Fail { .. })
+    matches!(classify_rollup_leaf(leaf), LeafVerdict::Fail { .. })
 }
 
 /// True when a `CheckRun` or `StatusContext` leaf is a terminal pass.
 pub fn leaf_is_pass(leaf: &serde_json::Value) -> bool {
-    matches!(classify_rollup_leaf(leaf), StatusContextVerdict::Pass)
+    matches!(classify_rollup_leaf(leaf), LeafVerdict::Pass)
 }
 
 /// CI provider inferred from a check's `targetUrl` host. The CI-watch
@@ -364,8 +364,8 @@ pub fn parse_commit_statuses_for_failures(body: &[u8]) -> Vec<RequiredCheckFailu
     for status in statuses {
         let state = status["state"].as_str().unwrap_or("");
         let conclusion = match classify_status_context_state(state) {
-            StatusContextVerdict::Fail { conclusion } => conclusion,
-            StatusContextVerdict::Pass | StatusContextVerdict::InFlight => continue,
+            LeafVerdict::Fail { conclusion } => conclusion,
+            LeafVerdict::Pass | LeafVerdict::InFlight => continue,
         };
         let name = status["context"].as_str().unwrap_or_default().to_owned();
         if name.is_empty() {
@@ -434,12 +434,12 @@ mod tests {
         assert_eq!(leaf_verdict_token(&ctx_fail), Some("ERROR"));
         assert_eq!(leaf_verdict_token(&empty_run), None);
         let null_run = serde_json::json!({"__typename": "CheckRun", "status": "COMPLETED", "conclusion": null});
-        assert_eq!(classify_rollup_leaf(&null_run), StatusContextVerdict::InFlight);
-        assert_eq!(classify_rollup_leaf(&empty_run), StatusContextVerdict::InFlight);
+        assert_eq!(classify_rollup_leaf(&null_run), LeafVerdict::InFlight);
+        assert_eq!(classify_rollup_leaf(&empty_run), LeafVerdict::InFlight);
         let typed_ctx = serde_json::json!({"__typename": "StatusContext", "state": "FAILURE"});
         assert_eq!(
             classify_rollup_leaf(&typed_ctx),
-            StatusContextVerdict::Fail {
+            LeafVerdict::Fail {
                 conclusion: "FAILURE".into()
             }
         );
@@ -576,11 +576,11 @@ mod tests {
     /// SUCCESS passes; everything else waits.
     #[test]
     fn classify_status_context_state_matches_rollup_rules() {
-        assert_eq!(classify_status_context_state("SUCCESS"), StatusContextVerdict::Pass);
-        assert_eq!(classify_status_context_state("success"), StatusContextVerdict::Pass);
+        assert_eq!(classify_status_context_state("SUCCESS"), LeafVerdict::Pass);
+        assert_eq!(classify_status_context_state("success"), LeafVerdict::Pass);
         assert_eq!(
             classify_status_context_state("FAILURE"),
-            StatusContextVerdict::Fail {
+            LeafVerdict::Fail {
                 conclusion: "FAILURE".into()
             }
         );
@@ -588,22 +588,19 @@ mod tests {
         // to match the GraphQL rollup path's spelling.
         assert_eq!(
             classify_status_context_state("failure"),
-            StatusContextVerdict::Fail {
+            LeafVerdict::Fail {
                 conclusion: "FAILURE".into()
             }
         );
         assert_eq!(
             classify_status_context_state("error"),
-            StatusContextVerdict::Fail {
+            LeafVerdict::Fail {
                 conclusion: "ERROR".into()
             }
         );
-        assert_eq!(classify_status_context_state("PENDING"), StatusContextVerdict::InFlight);
-        assert_eq!(
-            classify_status_context_state("EXPECTED"),
-            StatusContextVerdict::InFlight
-        );
-        assert_eq!(classify_status_context_state(""), StatusContextVerdict::InFlight);
+        assert_eq!(classify_status_context_state("PENDING"), LeafVerdict::InFlight);
+        assert_eq!(classify_status_context_state("EXPECTED"), LeafVerdict::InFlight);
+        assert_eq!(classify_status_context_state(""), LeafVerdict::InFlight);
     }
 
     /// Regression (mono merge-queue ejections): Buildkite posts legacy

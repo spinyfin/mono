@@ -21,11 +21,13 @@ pub fn gather_progression_brief(db: &WorkDb, work_item_id: &str) -> Result<Progr
         .as_ref()
         .map(|product| product.name.clone())
         .unwrap_or_else(|| item.product_id.clone());
-    let repo_remote_url = item
-        .repo_remote_url
-        .clone()
-        .or_else(|| product.as_ref().and_then(|product| product.repo_remote_url.clone()))
-        .filter(|url| !url.trim().is_empty());
+    let non_blank = |url: &String| !url.trim().is_empty();
+    let repo_remote_url = item.repo_remote_url.clone().filter(non_blank).or_else(|| {
+        product
+            .as_ref()
+            .and_then(|product| product.repo_remote_url.clone())
+            .filter(non_blank)
+    });
     let project_name = match item.project_id.as_deref() {
         Some(project_id) => Some(db.get_project(project_id).context("load project")?.name),
         None => None,

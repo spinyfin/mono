@@ -183,22 +183,7 @@ pub(crate) fn classify_review_signal(leaves: &[serde_json::Value]) -> ReviewSign
     }
 }
 
-/// Verdict bucket a single rollup leaf contributes to. Produced by
-/// [`normalize_leaf`] so the two GraphQL leaf shapes
-/// (`CheckRun` and `StatusContext`) feed the same downstream branches
-/// in [`classify_ci`].
-pub(crate) enum LeafVerdict {
-    /// Leaf is in a non-terminal state (queued / running / expected /
-    /// briefly post-completion with empty conclusion).
-    InFlight,
-    /// Leaf reached a successful terminal state (`SUCCESS` /
-    /// `NEUTRAL` / `SKIPPED`).
-    Pass,
-    /// Leaf reached a failing terminal state. `conclusion` is the
-    /// uppercased token kept verbatim for the worker prompt /
-    /// `ci_remediations.failed_checks` JSON.
-    Fail { conclusion: String },
-}
+pub(crate) use boss_github::LeafVerdict;
 
 /// Normalize one rollup leaf into a [`LeafVerdict`]. `gh pr view
 /// --json statusCheckRollup` returns a heterogeneous array containing
@@ -220,11 +205,7 @@ pub(crate) enum LeafVerdict {
 /// merge-queue rebounce path uses when reading REST `/commits/{sha}/status`
 /// — so the two "did CI fail" answers cannot drift apart.
 pub(crate) fn normalize_leaf(leaf: &serde_json::Value) -> LeafVerdict {
-    match boss_github::classify_rollup_leaf(leaf) {
-        boss_github::StatusContextVerdict::Pass => LeafVerdict::Pass,
-        boss_github::StatusContextVerdict::Fail { conclusion } => LeafVerdict::Fail { conclusion },
-        boss_github::StatusContextVerdict::InFlight => LeafVerdict::InFlight,
-    }
+    boss_github::classify_rollup_leaf(leaf)
 }
 
 fn leaf_timestamp(leaf: &serde_json::Value) -> &str {
