@@ -781,7 +781,7 @@ checkout and not aware of anything above jj:
    verifications. The `jj` on `PATH` is therefore refused when newer than 0.26
    (override with `CUBE_OLDEST_JJ_CLIENT=<major.minor>` once every client is
    upgraded), and its `jj --version` is recorded on the `repo.store_gc` and
-   `repo.store_gc.index_warmup` audit rows. jj 0.26's `util gc` does not prune
+   `repo.store_gc.index_warmup` audit rows. Neither jj 0.26 nor 0.32's `util gc` prunes
    the default index store, so skipping the live `.jj/repo/index` loses no
    reclamation.
    Working-copy health checks can also be expensive after the operation IDs

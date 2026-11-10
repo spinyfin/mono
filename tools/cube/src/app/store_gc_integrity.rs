@@ -12,9 +12,10 @@
 //! audit rows.
 //!
 //! Collection also never touches the live `.jj/repo/index`. That is
-//! deliberate and costs nothing: jj 0.26's `util gc` does not prune the
-//! default index store (verified against a repo with abandoned operations:
-//! the `index/operations` links and segments are identical before and after),
+//! deliberate and costs nothing: neither jj 0.26 nor 0.32's `util gc` prunes the
+//! default index store (tested against repos with abandoned operations:
+//! the `index/operations` links and segments are identical before and after;
+//! see `store_gc_default_index_retention_for_both_client_versions`),
 //! so running it against the private scratch index leaves the live index
 //! exactly as growth-prone as it already was. A rewrite itself orphans the
 //! old operation links; reclaiming them is a `jj debug reindex` of the live
@@ -160,4 +161,52 @@ impl Drop for GcIndex {
             );
         }
     }
+}
+
+/// Follow only single-parent operations back to the checked head. Unknown
+/// debug output fails closed, so it cannot authorize collection.
+pub(super) fn require_linear_progress(
+    runner: &dyn CommandRunner,
+    source: &Path,
+    ancestor: &str,
+    head: &str,
+) -> Result<()> {
+    let mut current = head.to_owned();
+    let mut seen = std::collections::HashSet::new();
+    while current != ancestor && seen.insert(current.clone()) {
+        let output = runner.run_with_timeout(
+            &RealCommandRunner::invocation(
+                source,
+                "jj",
+                &[
+                    "--ignore-working-copy",
+                    "--at-operation",
+                    &current,
+                    "debug",
+                    "operation",
+                    "--display",
+                    "operation",
+                    &current,
+                ],
+            ),
+            Duration::from_secs(60),
+        )?;
+        let parents = output
+            .split_once("parents: [")
+            .and_then(|(_, rest)| rest.split_once(']'));
+        let ids: Vec<_> = parents
+            .map(|(text, _)| text.split('"').skip(1).step_by(2).collect())
+            .unwrap_or_default();
+        if ids.len() != 1 || ids[0].len() != 128 || !ids[0].bytes().all(|b| b.is_ascii_hexdigit()) {
+            break;
+        }
+        current = ids[0].to_owned();
+    }
+    if current == ancestor {
+        return Ok(());
+    }
+    Err(CubeError::InvalidArgument(format!(
+        "unsafe operation heads in {}: {head} does not descend linearly from {ancestor}; a merge or abandoned ancestry was found; nothing was collected",
+        source.display()
+    )))
 }

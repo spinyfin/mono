@@ -719,7 +719,7 @@ pub(super) fn gc_repo_store_with_deadline(
             exclusive_ms = exclusive_started.map_or(0, |start| start.elapsed().as_millis());
             drop(gate);
             let _reader = JjGate::shared_for_database(database_path)?;
-            if let Some(head) = rewritten_head {
+            if let Some(ref head) = rewritten_head {
                 // Rewritten operation IDs invalidate jj's commit-index lookup.
                 // Populate it without excluding readers across every repo for
                 // a large rebuild. Pin the checked head: a read at the current
@@ -734,7 +734,7 @@ pub(super) fn gc_repo_store_with_deadline(
                         &[
                             "--ignore-working-copy",
                             "--at-operation",
-                            &head,
+                            head,
                             "log",
                             "-r",
                             "root()",
@@ -769,6 +769,9 @@ pub(super) fn gc_repo_store_with_deadline(
             // stale.
             let collection_started = Instant::now();
             let head = require_single_op_head(record, &source, "before the collection rebuild")?;
+            if let Some(ref rewritten) = rewritten_head {
+                super::store_gc_integrity::require_linear_progress(runner, &source, rewritten, &head)?;
+            }
             index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "before collection", &head)?;
             let quiet = wait_for_jj_quiescence(runner, &source, quiescence, QUIESCENCE_POLL)?;
             // A command that started during the abandon or the rebuild
@@ -776,13 +779,7 @@ pub(super) fn gc_repo_store_with_deadline(
             // head only shows up now, on both the immediate and deferred
             // paths.
             let current = require_single_op_head(record, &source, "before the collection")?;
-            if current != head {
-                return Err(CubeError::InvalidArgument(format!(
-                    "repo `{}`: the operation head moved during the pre-collection rebuild \
-                     ({head} -> {current}); nothing was collected",
-                    record.repo
-                )));
-            }
+            super::store_gc_integrity::require_linear_progress(runner, &source, &head, &current)?;
             if quiet {
                 gc_args.extend(["--expire", "now"]);
                 collection = Collection::Immediate;
@@ -792,7 +789,8 @@ pub(super) fn gc_repo_store_with_deadline(
             // Collection is a reader: leases proceed, but another rewrite
             // cannot invalidate the head this collector loaded.
             index.run(runner, &gc_args, MAINTENANCE_CMD_TIMEOUT)?;
-            index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "after collection", &current)?;
+            let collected = require_single_op_head(record, &source, "after the collection")?;
+            index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "after collection", &collected)?;
             collection_ms = collection_started.elapsed().as_millis();
         }
     }
