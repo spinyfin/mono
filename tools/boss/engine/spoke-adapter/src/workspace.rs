@@ -481,19 +481,6 @@ impl SpokeHostAdapter {
         json(&result, "bookmark diff")
     }
 
-    pub(crate) async fn rec_discard(&self, assignment: &SpokeAssignment, record: &ExecutionBookmark) -> Result<()> {
-        self.recovery_op(
-            "discard_baseline",
-            assignment,
-            record,
-            Kind::DiscardBaseline,
-            false,
-            |_| {},
-        )
-        .await?;
-        Ok(())
-    }
-
     /// Operations whose whole answer is one commit id.
     pub(crate) async fn rec_commit(
         &self,
@@ -557,35 +544,6 @@ impl SpokeHostAdapter {
             )
             .await?;
         json(&result, "preserved-work restore")
-    }
-
-    pub(crate) async fn rec_release_heads(
-        &self,
-        assignment: &SpokeAssignment,
-        record: &ExecutionBookmark,
-        release_names: bool,
-    ) -> Result<Vec<(String, String)>> {
-        // The original kind releases the names unconditionally and takes no
-        // payload. A request that must keep the publication names uses the
-        // configured kind, which an older peer rejects rather than silently
-        // deleting the names.
-        let (kind, request) = if release_names {
-            (Kind::ReleaseHeads, Vec::new())
-        } else {
-            (
-                Kind::ReleaseHeadsConfigured,
-                serde_json::to_vec(&HostRecoveryRequest {
-                    release_names: Some(false),
-                    ..Default::default()
-                })?,
-            )
-        };
-        let result = self
-            .recovery_op("release_heads", assignment, record, kind, false, |op| {
-                op.request_json = request;
-            })
-            .await?;
-        json(&result, "head release")
     }
 
     /// Whether the preserved tip still holds changes no remote bookmark

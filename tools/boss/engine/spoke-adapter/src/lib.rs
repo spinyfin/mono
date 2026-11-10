@@ -767,13 +767,6 @@ impl HostAdapter for SpokeHostAdapter {
         }
     }
 
-    async fn discard_orphaned_execution_baseline(&self, record: &ExecutionBookmark) -> Result<()> {
-        match self.route_execution(&record.execution_id).await? {
-            Route::Spoke(assignment) => self.rec_discard(&assignment, record).await,
-            Route::Legacy(legacy) => legacy.discard_orphaned_execution_baseline(record).await,
-        }
-    }
-
     async fn start_fresh_workspace(&self, workspace: &Path) -> Result<String> {
         match self.route_path(workspace).await? {
             Route::Spoke(assignment) => {
@@ -791,17 +784,6 @@ impl HostAdapter for SpokeHostAdapter {
                     .await
             }
             Route::Legacy(legacy) => legacy.positioned_parent(workspace).await,
-        }
-    }
-
-    async fn release_execution_bookmark_heads(
-        &self,
-        record: &ExecutionBookmark,
-        release_names: bool,
-    ) -> Result<Vec<(String, String)>> {
-        match self.route_execution(&record.execution_id).await? {
-            Route::Spoke(assignment) => self.rec_release_heads(&assignment, record, release_names).await,
-            Route::Legacy(legacy) => legacy.release_execution_bookmark_heads(record, release_names).await,
         }
     }
 

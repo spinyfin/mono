@@ -463,7 +463,6 @@ async fn recovery_operations_are_typed_workspace_commands() {
                     ),
                     Kind::RestorePreserved => workspace(c, json!(null)),
                     Kind::DiffBookmark => workspace(c, json!("diff --git")),
-                    Kind::ReleaseHeads | Kind::ReleaseHeadsConfigured => workspace(c, json!([["boss/exec_1", "abc"]])),
                     _ => return standard(c),
                 };
                 Some(ok(c, Some(value)))
@@ -499,14 +498,6 @@ async fn recovery_operations_are_typed_workspace_commands() {
     // Recovery that needs no working copy outlives the lease.
     adapter.release_workspace("lease-1").await.unwrap();
     assert_eq!(adapter.execution_bookmark_diff(&record).await.unwrap(), "diff --git");
-    assert_eq!(
-        adapter
-            .release_execution_bookmark_heads(&record, false)
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
 
     // A record from another host is refused before anything is sent.
     let foreign = ExecutionBookmark {
@@ -537,15 +528,6 @@ async fn recovery_operations_are_typed_workspace_commands() {
     // A store operation names neither workspace nor lease, only the bookmark.
     let diff = op_of(Kind::DiffBookmark);
     assert!(diff.workspace_id.is_empty() && diff.lease_id.is_empty() && diff.bookmark.is_some());
-    // Keeping the publication names needs the configured kind; the original
-    // kind carries no payload and an older peer would reject the new one.
-    let release: HostRecoveryRequest =
-        serde_json::from_slice(&op_of(Kind::ReleaseHeadsConfigured).request_json).unwrap();
-    assert_eq!(release.release_names, Some(false));
-    assert!(sent.iter().all(|c| !matches!(
-        &c.body,
-        Some(command::Body::Workspace(op)) if op.kind == Kind::ReleaseHeads as i32
-    )));
 }
 
 #[test]
