@@ -305,16 +305,23 @@ async fn a_second_run_changes_nothing() {
 /// Moves a legacy bookmark after the first evaluation, as a still-running
 /// worker of an earlier engine would.
 struct MovesBookmark {
-    inner: LocalJj,
     repo: PathBuf,
     target: String,
     listings: Mutex<usize>,
     on_forget: bool,
+    second_target: Option<String>,
 }
 
 #[async_trait]
 impl Jj for MovesBookmark {
     async fn run(&self, repo: &Path, args: &[&str]) -> Result<String> {
+        if args.contains(&"set")
+            && let Some(target) = &self.second_target
+        {
+            LocalJj
+                .run(&self.repo, &["bookmark", "set", "boss-recovery/exec_f", "-r", target])
+                .await?;
+        }
         if args.contains(&"--all-remotes") || (self.on_forget && args.contains(&"forget")) {
             let listing = {
                 let mut listings = self.listings.lock().unwrap();
@@ -322,7 +329,7 @@ impl Jj for MovesBookmark {
                 *listings
             };
             if (!self.on_forget && listing == 2) || (self.on_forget && args.contains(&"forget")) {
-                self.inner
+                LocalJj
                     .run(
                         &self.repo,
                         &[
@@ -337,11 +344,11 @@ impl Jj for MovesBookmark {
                     .await?;
             }
         }
-        self.inner.run(repo, args).await
+        LocalJj.run(repo, args).await
     }
 
     async fn shared_repo(&self, workspace: &Path) -> Result<PathBuf> {
-        self.inner.shared_repo(workspace).await
+        LocalJj.shared_repo(workspace).await
     }
 }
 
@@ -352,11 +359,11 @@ async fn a_name_that_moved_during_the_cleanup_is_left_in_place() {
     let new_work = s.work("main", "new.txt");
     s.bookmark(&["boss-recovery/exec_f"], &main);
     let jj = MovesBookmark {
-        inner: LocalJj,
         repo: s.repo.repo.clone(),
         target: new_work.clone(),
         listings: Mutex::new(0),
         on_forget: false,
+        second_target: None,
     };
     let report = cleanup_legacy_store(&jj, &s.repo.repo, &[]).await.unwrap();
     assert_eq!(report.forgotten, 0, "{report:?}");
@@ -371,11 +378,11 @@ async fn a_move_after_the_last_recheck_survives_the_forget_operation_merge() {
     let work = s.work("main", "concurrent.txt");
     s.bookmark(&["boss-recovery/exec_f"], &main);
     let jj = MovesBookmark {
-        inner: LocalJj,
         repo: s.repo.repo.clone(),
         target: work.clone(),
         listings: Mutex::new(0),
         on_forget: true,
+        second_target: None,
     };
     let report = cleanup_legacy_store(&jj, &s.repo.repo, &[]).await.unwrap();
     assert_eq!(report.forgotten, 0, "{report:?}");
@@ -415,4 +422,24 @@ async fn an_archive_the_restore_path_made_is_not_reported_as_legacy_work() {
         format!("preserved-archive/exec_legacy/legacy/{lost}")
     );
     assert!(s.has(&format!("preserved-archive/exec_normal/{lost}")));
+}
+
+#[tokio::test]
+async fn a_second_move_immediately_before_conflict_repair_is_not_rolled_back() {
+    let s = Store::new();
+    let main = s.commit_of("main");
+    let first = s.work("main", "first.txt");
+    let latest = s.work(&first, "latest.txt");
+    s.bookmark(&["boss-recovery/exec_f"], &main);
+    let jj = MovesBookmark {
+        repo: s.repo.repo.clone(),
+        target: first,
+        listings: Mutex::new(0),
+        on_forget: true,
+        second_target: Some(latest.clone()),
+    };
+    cleanup_legacy_store(&jj, &s.repo.repo, &[]).await.unwrap();
+    assert_eq!(s.commit_of("bookmarks(exact:\"boss-recovery/exec_f\")"), latest);
+    let listing = s.run(&["bookmark", "list", "boss-recovery/exec_f"]);
+    assert!(!listing.contains("conflicted"), "{listing}");
 }

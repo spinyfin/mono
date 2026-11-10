@@ -25,7 +25,7 @@
 //!
 //! The names are listed once, evaluated in bulk, and forgotten in batches, so a
 //! store with thousands of names takes a handful of operations rather than
-//! thousands. Archives are written as one Git ref transaction and imported by
+//! thousands. Archives are written in byte-bounded Git ref transactions and imported by
 //! one operation, whatever number of distinct commits they point at.
 use super::*;
 use std::collections::{BTreeMap, HashSet};
@@ -61,6 +61,7 @@ struct Legacy {
     execution_id: Option<String>,
     /// One commit per side; several when the bookmark is conflicted.
     targets: Vec<String>,
+    conflicted: bool,
 }
 
 fn classify(name: &str) -> Option<(Family, Option<String>)> {
@@ -142,7 +143,7 @@ async fn list_legacy(jj: &dyn Jj, repo: &Path) -> Result<(Vec<Legacy>, HashSet<S
                 "glob:boss/exec_*",
                 "glob:pr/*",
                 "-T",
-                r#"name ++ "\t" ++ remote ++ "\t" ++ added_targets.map(|c| c.commit_id()).join(",") ++ "\n""#,
+                r#"name ++ "\t" ++ remote ++ "\t" ++ added_targets.map(|c| c.commit_id()).join(",") ++ "\t" ++ conflict ++ "\n""#,
             ],
         )
         .await?;
@@ -150,7 +151,7 @@ async fn list_legacy(jj: &dyn Jj, repo: &Path) -> Result<(Vec<Legacy>, HashSet<S
     let mut twins = HashSet::new();
     let mut exported = BTreeMap::new();
     for line in out.lines() {
-        let mut fields = line.splitn(3, '\t');
+        let mut fields = line.splitn(4, '\t');
         let (Some(name), Some(remote), Some(targets)) = (fields.next(), fields.next(), fields.next()) else {
             continue;
         };
@@ -181,6 +182,7 @@ async fn list_legacy(jj: &dyn Jj, repo: &Path) -> Result<(Vec<Legacy>, HashSet<S
             family,
             execution_id,
             targets,
+            conflicted: fields.next() == Some("true"),
         });
     }
     legacy.sort_by(|a, b| a.name.cmp(&b.name));
@@ -305,33 +307,29 @@ async fn forget_planned(
         args.extend(patterns.iter().map(String::as_str));
         pinned.run(repo, &args).await?;
         report.operations += 1;
-        let (remaining, _, _) = list_legacy(jj, repo).await?;
-        let remaining: BTreeMap<_, _> = remaining.into_iter().map(|e| (e.name, e.targets)).collect();
+        let repair_op = operation(jj, repo).await?;
+        let repair = AtOperation {
+            jj,
+            operation: &repair_op,
+        };
+        let (remaining, _, _) = list_legacy(&repair, repo).await?;
+        let remaining: BTreeMap<_, _> = remaining.into_iter().map(|e| (e.name.clone(), e)).collect();
         for pattern in patterns {
             let name = pattern.trim_start_matches("exact:");
             match remaining.get(name) {
                 None => report.forgotten += 1,
-                Some(targets) => {
+                Some(entry) => {
                     // A writer moved the name while the forget ran, and jj's
                     // operation merge left it conflicted between "removed" and
                     // "moved". The move wins: a live publication branch must
                     // stay pushable, so resolve it to its new target.
-                    if let [target] = targets.as_slice()
-                        && targets != &planned[name]
+                    if entry.conflicted
+                        && let [target] = entry.targets.as_slice()
+                        && entry.targets != planned[name]
                     {
-                        jj.run(
-                            repo,
-                            &[
-                                "--ignore-working-copy",
-                                "bookmark",
-                                "set",
-                                name,
-                                "-r",
-                                target,
-                                "--allow-backwards",
-                            ],
-                        )
-                        .await?;
+                        repair
+                            .run(repo, &["--ignore-working-copy", "bookmark", "set", name, "-r", target])
+                            .await?;
                         report.operations += 1;
                     }
                     report.kept.push(name.to_owned());
@@ -359,7 +357,7 @@ async fn remove_exported_refs(jj: &dyn Jj, repo: &Path, refs: &[(&str, &str)]) -
         .context("removing exported legacy Git refs atomically")
 }
 
-/// Write every archive as a new Git branch in one transaction. One
+/// Write archives as new Git branches in byte-bounded transactions. One
 /// `jj bookmark create` per distinct target would write a full view for each.
 async fn create_archive_refs(jj: &dyn Jj, repo: &Path, creates: &[(String, String)]) -> Result<()> {
     let mut edits = String::new();
@@ -381,6 +379,25 @@ async fn git_ref_transaction(jj: &dyn Jj, repo: &Path, updates: &str) -> Result<
     if updates.is_empty() {
         return Ok(());
     }
+    // Payload crosses jj and SSH argv before reaching stdin. Leave ample
+    // space for shell quoting and repository paths below the 128 KiB limit.
+    const TRANSACTION_BYTES: usize = 24 * 1024;
+    let mut batch = String::new();
+    for line in updates.split_inclusive('\n') {
+        ensure!(
+            line.len() <= TRANSACTION_BYTES,
+            "Git ref update exceeds transport budget"
+        );
+        if batch.len() + line.len() > TRANSACTION_BYTES {
+            run_ref_transaction(jj, repo, &batch).await?;
+            batch.clear();
+        }
+        batch.push_str(line);
+    }
+    run_ref_transaction(jj, repo, &batch).await
+}
+
+async fn run_ref_transaction(jj: &dyn Jj, repo: &Path, updates: &str) -> Result<()> {
     let edits = format!("start\n{updates}prepare\ncommit\n");
     let shared = jj.shared_repo(repo).await?;
     let git = shared.join(".jj/repo/store/git_target");

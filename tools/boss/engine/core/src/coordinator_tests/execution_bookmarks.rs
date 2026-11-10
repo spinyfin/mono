@@ -644,6 +644,8 @@ async fn an_execution_without_a_preserved_tip_is_not_reported_or_failed_by_the_s
 
 /// The sweep that forgets the preserved references an execution no longer needs.
 mod preserved_cleanup_sweep {
+    #[path = "legacy_archive_race_tests.rs"]
+    mod legacy_archive_race_tests;
     use super::super::helpers::*;
     use crate::preserved_cleanup_sweep::{Backoff, CleanupReport, run_one_pass};
     use crate::work::CreateAttentionItemInput;
@@ -780,6 +782,11 @@ mod preserved_cleanup_sweep {
         f.sql(
             "UPDATE work_executions SET pr_head_before = ?3, pr_head_after = ?2 WHERE id = ?1",
             rusqlite::params![successor, "b".repeat(40), "a".repeat(40)],
+        );
+        let source = f.db.preserved_tip(&prior).unwrap().unwrap().commit_id;
+        assert!(
+            f.db.pushed_pr_heads().unwrap().contains(&source),
+            "restaged source is publication evidence across change identities"
         );
         let report = f.pass().await;
         assert_eq!(report.superseded, 1, "{report:?}");

@@ -109,11 +109,20 @@ impl WorkDb {
         let heads = stmt
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        drop(conn);
         let mut heads: Vec<String> = heads
             .into_iter()
             .map(|head| head.to_ascii_lowercase())
             .filter(|head| is_pushed_head(head))
             .collect();
+        // Restaging duplicates across change identities. A recorded later push
+        // proves the preserved source was carried; reuse the cleanup lineage.
+        for cleanup in self.list_superseded_preserved(i32::MAX as usize, &[])? {
+            if let Some(tip) = self.preserved_tip(&cleanup.execution.id)? {
+                heads.push(tip.commit_id);
+            }
+        }
         heads.sort();
         heads.dedup();
         Ok(heads)

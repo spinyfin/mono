@@ -39,7 +39,7 @@ pub use preserved_cleanup::{PreservedScope, forget_preserved_references};
 mod preserved_cleanup_tests;
 
 mod legacy_cleanup;
-pub use legacy_cleanup::{LegacyArchive, LegacyCleanupReport, cleanup_legacy_store};
+pub use legacy_cleanup::{LegacyArchive, LegacyCleanupReport, cleanup_legacy_store, legacy_archive_name};
 #[cfg(test)]
 mod legacy_cleanup_tests;
 

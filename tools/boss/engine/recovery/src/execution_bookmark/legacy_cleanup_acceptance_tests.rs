@@ -217,7 +217,7 @@ async fn evolution_predecessor_is_published_but_a_successor_edit_is_not() {
 }
 
 #[tokio::test]
-async fn a_published_duplicate_vouches_for_its_predecessor_across_change_identities() {
+async fn a_recorded_restaged_source_is_published_across_change_identities() {
     let s = Store::new();
     let original = s.work("main", "original.txt");
     s.run(&["duplicate", &original]);
@@ -237,7 +237,9 @@ async fn a_published_duplicate_vouches_for_its_predecessor_across_change_identit
     // would follow the rewrite to `later`, which is deliberately unpublished.
     s.bookmark(&["boss-recovery/exec_original"], &original);
     s.bookmark(&["boss-recovery/exec_later"], &later);
-    let report = cleanup_legacy_store(&LocalJj, &s.repo.repo, &[published])
+    // The database's published recovery lineage supplies the source tip;
+    // evolution reads no longer scan unrelated published change identities.
+    let report = cleanup_legacy_store(&LocalJj, &s.repo.repo, &[published, original.clone()])
         .await
         .unwrap();
     assert_eq!(report.archived.len(), 1, "{report:?}");
@@ -310,45 +312,86 @@ fn commit_stream(reference: &str, parent: &str, n: usize) -> String {
 }
 
 #[tokio::test]
-async fn hundreds_of_distinct_unpublished_targets_take_a_constant_number_of_operations() {
+async fn two_thousand_archives_use_bounded_transport_arguments_and_one_import() {
     let dir = tempfile::tempdir().unwrap();
     let repo = JjRepo::colocated(dir.path());
     let s = Store { _dir: dir, repo };
     let main = s.commit_of("main");
-    let stream: String = (0..300)
-        .map(|n| commit_stream(&format!("refs/heads/boss-recovery/exec_distinct{n}"), &main, n))
+    let stream: String = (0..2000)
+        .map(|n| {
+            commit_stream(
+                &format!("refs/heads/boss-recovery/exec_18e699d3123f8030_distinct_unpublished_{n}"),
+                &main,
+                n,
+            )
+        })
         .collect();
     fast_import(&s, &stream);
     s.run(&["git", "import"]);
     let before = s.operations();
-    let report = cleanup_legacy_store(&LocalJj, &s.repo.repo, &[]).await.unwrap();
-    assert_eq!(report.archived.len(), 300, "{report:?}");
-    assert_eq!(report.forgotten, 300, "{report:?}");
-    assert!(report.operations <= 4, "constant, not one per target: {report:?}");
-    assert!(s.operations() - before <= 4);
-    assert_eq!(names_in(&s.names(), "preserved-archive/").len(), 300);
+    let jj = CountsEvologs::default();
+    let report = cleanup_legacy_store(&jj, &s.repo.repo, &[]).await.unwrap();
+    assert_eq!(report.archived.len(), 2000, "{report:?}");
+    assert_eq!(report.forgotten, 2000, "{report:?}");
+    assert!(
+        report.operations <= 8,
+        "bounded batches, not one per target: {report:?}"
+    );
+    assert!(s.operations() - before <= 8);
+    assert_eq!(names_in(&s.names(), "preserved-archive/").len(), 2000);
     assert!(names_in(&s.names(), "boss-recovery/").is_empty());
+    assert!(jj.max_argv.load(std::sync::atomic::Ordering::SeqCst) < 32 * 1024);
+    assert_eq!(
+        jj.imports.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "initial reconcile, one archive import, final reconcile"
+    );
+    println!(
+        "2000 archives: {} operations, maximum argv {} bytes",
+        report.operations,
+        jj.max_argv.load(std::sync::atomic::Ordering::SeqCst)
+    );
+    let actual = s.run(&[
+        "bookmark",
+        "list",
+        "glob:preserved-archive/*",
+        "-T",
+        r#"name ++ " " ++ normal_target.commit_id() ++ "\n""#,
+    ]);
+    let actual: std::collections::BTreeMap<_, _> = actual.lines().map(|l| l.split_once(' ').unwrap()).collect();
     for archive in &report.archived {
-        assert_eq!(
-            s.commit_of(&format!("bookmarks(exact:\"{}\")", archive.archive)),
-            archive.commit_id
-        );
+        assert_eq!(actual[archive.archive.as_str()], archive.commit_id);
     }
 }
 
 /// Counts the evolution logs read.
-struct CountsEvologs(std::sync::atomic::AtomicUsize);
+#[derive(Default)]
+struct CountsEvologs {
+    evologs: std::sync::atomic::AtomicUsize,
+    calls: std::sync::atomic::AtomicUsize,
+    max_argv: std::sync::atomic::AtomicUsize,
+    imports: std::sync::atomic::AtomicUsize,
+}
 
 #[async_trait]
 impl Jj for CountsEvologs {
     async fn run(&self, repo: &Path, args: &[&str]) -> Result<String> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.max_argv.fetch_max(
+            args.iter().map(|a| a.len() + 3).sum(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         if args.contains(&"evolog") {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.evologs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        if args.contains(&"import") {
+            self.imports.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         LocalJj.run(repo, args).await
     }
 
     async fn shared_repo(&self, workspace: &Path) -> Result<PathBuf> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         LocalJj.shared_repo(workspace).await
     }
 }
@@ -381,11 +424,49 @@ async fn deep_published_history_with_unrelated_unpublished_work_reads_a_bounded_
     // candidate set from ever emptying.
     let busy = s.work("main", "busy.txt");
     s.bookmark(&["boss-recovery/exec_busy"], &busy);
-    let jj = CountsEvologs(Default::default());
-    let report = cleanup_legacy_store(&jj, &s.repo.repo, &[]).await.unwrap();
+    // Hundreds of recorded off-trunk heads, each with a three-commit stack.
+    let main = s.commit_of("main");
+    let mut branches = String::new();
+    for n in 400..1300 {
+        let parent = if n % 3 == 1 { main.clone() } else { format!(":{n}") };
+        branches.push_str(&commit_stream(&format!("refs/heads/pr/{}", (n - 400) / 3), &parent, n));
+    }
+    fast_import(&s, &branches);
+    s.run(&["git", "import"]);
+    let heads: Vec<_> = s
+        .run(&[
+            "log",
+            "--no-graph",
+            "-r",
+            "bookmarks(glob:\"pr/*\")",
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ])
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(heads.len(), 300);
+    let jj = CountsEvologs::default();
+    let before = s.operations();
+    let report = cleanup_legacy_store(&jj, &s.repo.repo, &heads).await.unwrap();
+    assert!(jj.calls.load(std::sync::atomic::Ordering::SeqCst) <= 60);
+    assert!(report.operations <= 8, "{report:?}");
+    assert!(s.operations() - before <= 8);
+    assert_eq!(
+        s.commit_of(&format!(
+            "bookmarks(exact:\"preserved-archive/exec_busy/legacy/{busy}\")"
+        )),
+        busy
+    );
     assert_eq!(report.archived.len(), 1, "{report:?}");
-    let evologs = jj.0.load(std::sync::atomic::Ordering::SeqCst);
+    let evologs = jj.evologs.load(std::sync::atomic::Ordering::SeqCst);
     assert!(evologs <= 5, "trunk history is not walked commit by commit: {evologs}");
+    assert!(jj.max_argv.load(std::sync::atomic::Ordering::SeqCst) < 96 * 1024);
+    println!(
+        "400 trunk commits and 300 three-commit branches: {evologs} evologs, {} transport calls, {} operations",
+        jj.calls.load(std::sync::atomic::Ordering::SeqCst),
+        report.operations
+    );
 }
 
 /// Creates a child of the commit about to be abandoned, as a worker starting

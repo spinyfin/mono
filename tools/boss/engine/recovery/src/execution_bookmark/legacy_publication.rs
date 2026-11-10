@@ -2,8 +2,8 @@
 use super::*;
 
 /// Commit ids named by one abandon, with its revset repeated for the safety
-/// predicate: both copies stay well below a remote shell's 128 KiB limit.
-const ABANDON_BATCH: usize = 800;
+/// predicate: all three copies stay well below a remote shell's 128 KiB limit.
+const ABANDON_BATCH: usize = 500;
 
 /// Publication evidence is fixed at the initial snapshot. Later commits are
 /// conservatively unpublished, so refreshing the visible heads never requires
@@ -26,18 +26,9 @@ fn rows(text: &str) -> Vec<(&str, &str)> {
     text.lines().filter_map(|r| r.split_once(' ')).collect()
 }
 
-/// Include evolution predecessors even across change identities (`duplicate`
-/// records such edges). A successor edit never becomes published merely by
-/// sharing a published change's identity.
-///
-/// The walk is bounded: one `jj evolog` per published commit that is not on
-/// trunk (remote branches and recorded pushed heads, the commits this engine's
-/// workers could have rewritten before pushing), plus trunk commits sharing a
-/// change identity with an unpublished candidate. Trunk history arrives by
-/// fetch and has no local predecessors, so walking all of it would cost
-/// thousands of processes and prove nothing. A commit already seen as a
-/// predecessor is skipped, since its evolution is part of the one that listed
-/// it. The walk stops as soon as no candidate remains.
+/// Walk evolution only for published commits sharing a candidate change identity.
+/// Recorded restaged sources arrive in `heads` from the database because
+/// duplicates cross change identities. Successor edits remain unpublished.
 pub(super) async fn evidence(jj: &dyn Jj, repo: &Path, heads: &[String]) -> Result<Publication> {
     let template = "commit_id ++ \" \" ++ change_id ++ \"\\n\"";
     let log = super::super::preserved::log;
@@ -70,7 +61,8 @@ pub(super) async fn evidence(jj: &dyn Jj, repo: &Path, heads: &[String]) -> Resu
         .collect();
     let targets = off_trunk
         .iter()
-        .chain(trunk.iter().filter(|(_, change)| changes.contains(change)))
+        .chain(trunk.iter())
+        .filter(|(_, change)| changes.contains(change))
         .map(|(id, _)| *id);
     let mut seen = HashSet::new();
     for id in targets {

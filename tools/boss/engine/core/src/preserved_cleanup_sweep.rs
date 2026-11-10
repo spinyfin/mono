@@ -148,7 +148,11 @@ pub(crate) async fn run_one_pass_with(
 
 /// Forget one execution's references and record that they are gone. Returns how
 /// many references were forgotten.
-async fn forget_one(db: &WorkDb, coordinator: &ExecutionCoordinator, cleanup: &PreservedCleanup) -> Result<usize> {
+pub(crate) async fn forget_one(
+    db: &WorkDb,
+    coordinator: &ExecutionCoordinator,
+    cleanup: &PreservedCleanup,
+) -> Result<usize> {
     let execution = &cleanup.execution;
     let record = db
         .preservation_source(&execution.id)?
