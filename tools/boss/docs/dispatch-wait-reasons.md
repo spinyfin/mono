@@ -7,8 +7,8 @@ Every work item that is waiting rather than running carries a named reason. The 
 `engine/work-db/src/queued_wait.rs` classifies a wait. It is the only place that decides why an item is waiting:
 
 - `for_item` is the item-level entry point every surface calls. It classifies a pending latest execution with `for_execution`, and otherwise the item itself with `for_unscheduled`.
-- `for_execution` classifies a pending execution (`ready`, `waiting_dependency`, or the legacy `queued`).
-- `for_unscheduled` classifies an item with nothing pending: a card the board queues (`todo` with automatic start on), or an `active` item with no run pending or live.
+- `for_execution` classifies a pending execution (`ready`, `waiting_dependency`, `waiting_review`, `waiting_merge`, or the legacy `queued`).
+- `for_unscheduled` classifies an item with nothing pending: a card the board queues (`todo` with automatic start on), an `active` item with no run pending or live, or an `in_review` item.
 
 The result travels on `TaskRuntime` as `dispatch_wait_reason` (a wait code, or the scheduler's own sentence for one hold) and `dispatch_wait_label` (the phrase to show). The vocabulary and its phrases live in `engine/storage-values/src/dispatch_wait.rs`.
 
@@ -58,12 +58,16 @@ An `active` item with no run pending or live. The orphan sweep's own candidate p
 | --------------------- | ----------------------------------------------------------------------------- |
 | `human_driven`        | No agent ever starts for it.                                                  |
 | `parked`              | It, its project or its parent is parked.                                      |
-| `dispatch_failed`     | A dispatch failure (the churn guard, a deliberate park) holds it.             |
+| `dispatch_failed`     | A recorded dispatch failure, such as the churn guard, holds it.               |
 | `recovery_attention`  | Worker recovery gave up and raised an attention item for a person.            |
 | `awaiting_redispatch` | Its worker ended. The orphan sweep starts a replacement.                      |
 | `awaiting_review`     | Its pull request is with review and merge handling, which owns the next step. |
 
-Items in review (`in_review`) are not classified by this function yet.
+Review and merge waits use `review_reservation` before reviewer admission, `review_batch` while a matching pre-merge batch is live, and `awaiting_merge` when merge handling owns the next step. An in-review item without a pull request or an explaining execution is `unclassified`.
+
+Before promising `awaiting_redispatch`, the classifier applies admission's shared pause exemptions and deliberate-park predicate. `dispatch_paused` names a pause that holds the item; `deliberate_park` means its worker stopped for a person. Critical main-pool work and reviews retain admission's operator-pause exemptions.
+
+Board projection triggers invalidate review-batch and pause changes. Attention writes already invalidate the projection; parking writes update the task/project rows already journaled. Wait annotation is recomputed even on runtime-cache hits.
 
 ## When the engine cannot name a wait
 

@@ -415,6 +415,41 @@ fn every_waiting_state_yields_a_named_reason() {
         DISPATCH_WAIT_REASON_AWAITING_REVIEW,
     ));
 
+    for (status, reason) in [
+        (ExecutionStatus::WaitingReview, DISPATCH_WAIT_REASON_REVIEW_RESERVATION),
+        (ExecutionStatus::WaitingMerge, DISPATCH_WAIT_REASON_AWAITING_MERGE),
+    ] {
+        let item = idle(reason);
+        pending(&db, &item.id, ExecutionKind::ChoreImplementation, status);
+        covered.insert(assert_named(reason, &wait_of(&db, pid, &item.id), reason));
+    }
+    let batch = batch_held_item(&db, pid);
+    set_status(&db, &batch.id, "in_review");
+    covered.insert(assert_named(
+        "review batch",
+        &wait_of(&db, pid, &batch.id),
+        DISPATCH_WAIT_REASON_REVIEW_BATCH,
+    ));
+    let parked = idle("worker deliberately stopped");
+    let run = pending(
+        &db,
+        &parked.id,
+        ExecutionKind::ChoreImplementation,
+        ExecutionStatus::Abandoned,
+    );
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET run_done_outcome = 'blocked' WHERE id = ?1",
+            [&run.id],
+        )
+        .unwrap();
+    covered.insert(assert_named(
+        "deliberate park",
+        &wait_of(&db, pid, &parked.id),
+        DISPATCH_WAIT_REASON_DELIBERATE_PARK,
+    ));
+
     // Every reason in the vocabulary is reachable from a state above, so a
     // reason cannot be added without a state that produces it.
     let vocabulary: BTreeSet<String> = DISPATCH_WAIT_REASON_CODES
@@ -573,11 +608,9 @@ fn insert_recovery_attention(db: &WorkDb, work_item_id: &str) {
         .unwrap();
 }
 
-/// An `active` item held only by a live pre-merge review batch whose head
-/// matches the producer's, with no pull request and no review pass of its
-/// own: no named condition explains why it is waiting.
-fn active_item_nothing_explains(db: &WorkDb, product_id: &str) -> Task {
-    let chore = create_test_chore(db, product_id, "active, held by a batch nothing names");
+/// A producer held by a live review batch at its current head.
+fn batch_held_item(db: &WorkDb, product_id: &str) -> Task {
+    let chore = create_test_chore(db, product_id, "active, held by a review batch");
     set_status(db, &chore.id, "active");
     let run = pending(
         db,
@@ -601,36 +634,16 @@ fn active_item_nothing_explains(db: &WorkDb, product_id: &str) -> Task {
 }
 
 #[test]
-fn an_active_item_nothing_explains_is_unclassified_and_reported() {
+fn a_batch_held_active_item_is_named_and_not_reported() {
     let db = db();
     let product = create_test_product(&db);
-    let chore = active_item_nothing_explains(&db, &product.id);
-
-    let runtime = wait_of(&db, &product.id, &chore.id);
-    assert_eq!(
-        runtime.dispatch_wait_reason.as_deref(),
-        Some(DISPATCH_WAIT_REASON_UNCLASSIFIED)
+    let chore = batch_held_item(&db, &product.id);
+    assert_named(
+        "batch hold",
+        &wait_of(&db, &product.id, &chore.id),
+        DISPATCH_WAIT_REASON_AWAITING_REVIEW,
     );
-    assert!(
-        runtime
-            .dispatch_wait_label
-            .unwrap()
-            .starts_with(&dispatch_wait_phrase(DISPATCH_WAIT_REASON_UNCLASSIFIED))
-    );
-    let reported: Vec<_> = db
-        .list_unexplained_dispatch_waits()
-        .unwrap()
-        .into_iter()
-        .map(|wait| (wait.work_item_id, wait.reason, wait.task_status))
-        .collect();
-    assert_eq!(
-        reported,
-        vec![(
-            chore.id.clone(),
-            DISPATCH_WAIT_REASON_UNCLASSIFIED.to_owned(),
-            Some("active".to_owned())
-        )]
-    );
+    assert!(db.list_unexplained_dispatch_waits().unwrap().is_empty());
 }
 
 #[test]
@@ -679,7 +692,7 @@ fn the_stuck_report_names_the_boards_reason_for_items_with_nothing_pending() {
         )
         .unwrap();
 
-    let unclassified = active_item_nothing_explains(&db, pid);
+    let batch_held = batch_held_item(&db, pid);
     let redispatch = create_test_chore(&db, pid, "active, worker ended");
     set_status(&db, &redispatch.id, "active");
 
@@ -689,7 +702,7 @@ fn the_stuck_report_names_the_boards_reason_for_items_with_nothing_pending() {
         (&deferred, pid, DISPATCH_WAIT_REASON_DEFERRED),
         (&ended, pid, DISPATCH_WAIT_REASON_RUN_ENDED),
         (&unresolved, repoless.id.as_str(), DISPATCH_WAIT_REASON_REPO_UNRESOLVED),
-        (&unclassified, pid, DISPATCH_WAIT_REASON_UNCLASSIFIED),
+        (&batch_held, pid, DISPATCH_WAIT_REASON_AWAITING_REVIEW),
         (&redispatch, pid, DISPATCH_WAIT_REASON_AWAITING_REDISPATCH),
     ] {
         let on_board = wait_of(&db, product_id, &item.id);
@@ -866,5 +879,100 @@ fn the_project_chain_still_holds_a_task_nobody_started() {
     assert_eq!(
         db.get_task_runtime(&third.id).unwrap().dispatch_wait_reason.as_deref(),
         Some(DISPATCH_WAIT_REASON_WAITING_DEPENDENCY)
+    );
+}
+
+#[test]
+fn idle_admission_holds_and_review_waits_agree_across_surfaces() {
+    let db = db();
+    let product = create_test_product(&db);
+    let ordinary = create_test_chore(&db, &product.id, "paused");
+    let critical = create_test_chore(&db, &product.id, "critical");
+    for item in [&ordinary, &critical] {
+        set_status(&db, &item.id, "active");
+    }
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET priority = 'critical' WHERE id = ?1", [&critical.id])
+        .unwrap();
+    db.connect().unwrap().execute_batch(
+        "INSERT OR REPLACE INTO metadata(key,value) VALUES ('dispatch_paused','1'),('dispatch_paused_origin','operator');").unwrap();
+    let parked = create_test_chore(&db, &product.id, "deliberate park");
+    set_status(&db, &parked.id, "active");
+    let run = pending(
+        &db,
+        &parked.id,
+        ExecutionKind::ChoreImplementation,
+        ExecutionStatus::Abandoned,
+    );
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET run_done_outcome = 'blocked' WHERE id = ?1",
+            [&run.id],
+        )
+        .unwrap();
+    let mut cases = vec![
+        (ordinary, DISPATCH_WAIT_REASON_DISPATCH_PAUSED),
+        (critical, DISPATCH_WAIT_REASON_AWAITING_REDISPATCH),
+        (parked, DISPATCH_WAIT_REASON_DELIBERATE_PARK),
+    ];
+    for (status, reason) in [
+        (ExecutionStatus::WaitingReview, DISPATCH_WAIT_REASON_REVIEW_RESERVATION),
+        (ExecutionStatus::WaitingMerge, DISPATCH_WAIT_REASON_AWAITING_MERGE),
+    ] {
+        let item = create_test_chore(&db, &product.id, reason);
+        set_status(&db, &item.id, "in_review");
+        pending(&db, &item.id, ExecutionKind::ChoreImplementation, status);
+        cases.push((item, reason));
+    }
+    let unexplained = create_test_chore(&db, &product.id, "review without a PR");
+    set_status(&db, &unexplained.id, "in_review");
+    cases.push((unexplained.clone(), DISPATCH_WAIT_REASON_UNCLASSIFIED));
+    let batch = batch_held_item(&db, &product.id);
+    set_status(&db, &batch.id, "in_review");
+    cases.push((batch, DISPATCH_WAIT_REASON_REVIEW_BATCH));
+    let report = db
+        .stuck_report(0, boss_engine_utils::epoch_time::now_epoch_secs(), &|_| false)
+        .unwrap();
+    for (item, reason) in cases {
+        let runtime = wait_of(&db, &product.id, &item.id);
+        assert_eq!(runtime.dispatch_wait_reason.as_deref(), Some(reason), "{}", item.name);
+        let row = report.rows.iter().find(|row| row.work_item_id == item.id).unwrap();
+        assert_eq!(row.wait_reason, runtime.dispatch_wait_reason);
+        assert_eq!(row.wait_label, runtime.dispatch_wait_label);
+    }
+    assert!(
+        db.list_unexplained_dispatch_waits()
+            .unwrap()
+            .iter()
+            .any(|wait| wait.work_item_id == unexplained.id && wait.reason == DISPATCH_WAIT_REASON_UNCLASSIFIED)
+    );
+}
+
+#[test]
+fn an_idle_active_item_outside_the_sweeps_clock_is_an_anomaly() {
+    let db = db();
+    let product = create_test_product(&db);
+    let item = create_test_chore(&db, &product.id, "invalid update clock");
+    set_status(&db, &item.id, "active");
+    // No legitimate hold explains this row: its invalid timestamp excludes
+    // it even from the candidate walk with the broadest possible cutoff.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET updated_at = '9223372036854775807' WHERE id = ?1",
+            [&item.id],
+        )
+        .unwrap();
+    assert_eq!(
+        wait_of(&db, &product.id, &item.id).dispatch_wait_reason.as_deref(),
+        Some(DISPATCH_WAIT_REASON_UNCLASSIFIED)
+    );
+    assert!(
+        db.list_unexplained_dispatch_waits()
+            .unwrap()
+            .iter()
+            .any(|wait| wait.work_item_id == item.id && wait.reason == DISPATCH_WAIT_REASON_UNCLASSIFIED)
     );
 }

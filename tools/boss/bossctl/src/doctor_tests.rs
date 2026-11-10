@@ -1061,7 +1061,23 @@ fn diagnose_wait_line_reports_the_engines_reason() {
         )
         .unwrap()
     };
-    let line = |work_item_id: &str| dispatch_wait_line(&db.get_task_runtime(work_item_id).unwrap());
+    let root = trace_root("wait-pipeline", "");
+    let line = |work_item_id: &str| {
+        let runtime = db.get_task_runtime(work_item_id).unwrap();
+        let report = diagnose_report(&root, work_item_id, true, false, 1000, Some(&db))
+            .unwrap()
+            .unwrap();
+        assert_eq!(report["wait"], dispatch_wait_json(&runtime));
+        dispatch_wait_line(&runtime)
+    };
+    for (status, reason) in [
+        (ExecutionStatus::WaitingReview, "review_reservation"),
+        (ExecutionStatus::WaitingMerge, "awaiting_merge"),
+    ] {
+        let item = chore(reason);
+        execution(&item.id, status);
+        assert!(line(&item.id).starts_with(&format!("waiting: {reason} — ")));
+    }
 
     // A hold the scheduler recorded.
     let held = chore("held by a full pool");
@@ -1128,4 +1144,45 @@ fn diagnose_wait_line_reports_the_engines_reason() {
     let json = dispatch_wait_json(&db.get_task_runtime(&gated.id).unwrap());
     assert_eq!(json["reason"], "waiting_dependency");
     assert_eq!(json["blocker"]["work_item_id"], prerequisite.id.as_str());
+}
+
+#[test]
+fn diagnose_resolves_items_without_execution_or_event_history() {
+    use boss_protocol::{CreateChoreInput, CreateProductInput};
+    let db = boss_engine::work::WorkDb::open(":memory:".into()).unwrap();
+    let product = db
+        .create_product(
+            CreateProductInput::builder()
+                .name("No history")
+                .repo_remote_url("https://github.com/test/repo")
+                .build(),
+        )
+        .unwrap();
+    let root = trace_root("no-history", "");
+    for (status, deferred, expected) in [
+        ("todo", 1, "deferred"),
+        ("active", 0, "awaiting_redispatch"),
+        ("in_review", 0, "unclassified"),
+    ] {
+        let item = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name(expected)
+                    .build(),
+            )
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = ?2, deferred = ?3 WHERE id = ?1",
+                (&item.id, status, deferred),
+            )
+            .unwrap();
+        let report = diagnose_report(&root, &item.id, true, false, 1000, Some(&db))
+            .unwrap()
+            .unwrap();
+        assert_eq!(report["wait"]["reason"], expected, "{report}");
+        assert!(report["timelines"].as_object().unwrap().is_empty(), "{report}");
+    }
 }

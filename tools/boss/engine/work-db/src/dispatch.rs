@@ -1990,6 +1990,23 @@ pub(crate) fn parent_review_command(conn: &Connection, root: &str, pr_url: Optio
     Ok(format!("bossctl agents launch {root}"))
 }
 
+/// Whether a live review batch still covers this producer head.
+pub(crate) fn live_pre_merge_batch_holds(conn: &Connection, id: &str) -> Result<bool> {
+    let root = chain_root(conn, id)?;
+    Ok(conn.query_row(
+        r#"SELECT EXISTS (
+            SELECT 1 FROM pr_review_batches b
+            WHERE b.cycle_root_id = ?2 AND b.phase = 'pre_merge'
+              AND b.status NOT IN ('completed', 'failed')
+              AND (SELECT COALESCE(NULLIF(we.pr_head_after, ''), b.target_sha)
+                   FROM work_executions we WHERE we.work_item_id = ?1 AND we.kind != 'pr_review'
+                   ORDER BY we.finished_at DESC, we.id DESC LIMIT 1) = b.target_sha
+        )"#,
+        params![id, root],
+        |row| row.get(0),
+    )?)
+}
+
 /// The orphan sweep's candidate walk: `active` items older than `cutoff`
 /// (epoch seconds) with no run pending or live, minus the holds the sweep
 /// leaves alone. `only` restricts the walk to one item. See
@@ -2056,20 +2073,7 @@ pub(crate) fn orphan_active_candidates(conn: &Connection, cutoff: i64, only: Opt
                             OR (we2.created_at = we.created_at AND we2.id > we.id))
                  )
            )
-           AND NOT EXISTS (
-               SELECT 1 FROM pr_review_batches b
-               WHERE b.cycle_root_id = roots.cycle_root_id
-                 AND b.phase = 'pre_merge'
-                 AND b.status NOT IN ('completed', 'failed')
-                 AND (
-                       SELECT COALESCE(NULLIF(we.pr_head_after, ''), b.target_sha)
-                       FROM work_executions we
-                       WHERE we.work_item_id = t.id
-                         AND we.kind != 'pr_review'
-                       ORDER BY we.finished_at DESC, we.id DESC
-                       LIMIT 1
-                     ) = b.target_sha
-           )
+
          ORDER BY t.updated_at ASC, t.id ASC",
         walk = walk,
         upkeep = upkeep,
@@ -2083,7 +2087,10 @@ pub(crate) fn orphan_active_candidates(conn: &Connection, cutoff: i64, only: Opt
         let id = row?;
         // A completed producer waiting for review admission is not
         // an orphan. Review recovery owns it, even without a batch.
-        if !primary_pr_awaits_review(conn, &id)? && !revision_implementation_completed(conn, &id)? {
+        if !primary_pr_awaits_review(conn, &id)?
+            && !revision_implementation_completed(conn, &id)?
+            && !live_pre_merge_batch_holds(conn, &id)?
+        {
             out.push(id);
         }
     }

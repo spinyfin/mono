@@ -21,6 +21,10 @@ use boss_engine_storage_values::dispatch_wait::{
     DISPATCH_WAIT_REASON_REPO_UNRESOLVED, DISPATCH_WAIT_REASON_RUN_ENDED, DISPATCH_WAIT_REASON_UNCLASSIFIED,
     DISPATCH_WAIT_REASON_WAITING_DEPENDENCY, UnexplainedWait, dispatch_wait_phrase, is_unlabelled_wait_code,
 };
+use boss_engine_storage_values::dispatch_wait::{
+    DISPATCH_WAIT_REASON_AWAITING_MERGE, DISPATCH_WAIT_REASON_DELIBERATE_PARK, DISPATCH_WAIT_REASON_DISPATCH_PAUSED,
+    DISPATCH_WAIT_REASON_REVIEW_BATCH, DISPATCH_WAIT_REASON_REVIEW_RESERVATION,
+};
 use boss_protocol::DispatchWaitBlocker;
 
 #[derive(Default)]
@@ -86,6 +90,8 @@ pub(super) fn for_execution(conn: &Connection, execution: Option<&WorkExecution>
     match execution.status {
         ExecutionStatus::WaitingDependency => for_gated(conn, execution),
         ExecutionStatus::Ready | ExecutionStatus::Queued => for_ready(conn, execution, now),
+        ExecutionStatus::WaitingReview => review_wait(conn, &execution.work_item_id),
+        ExecutionStatus::WaitingMerge => Ok(DispatchWait::named(DISPATCH_WAIT_REASON_AWAITING_MERGE)),
         _ => Ok(DispatchWait::default()),
     }
 }
@@ -243,7 +249,11 @@ pub(super) fn for_item(
     if latest.is_some_and(|execution| {
         matches!(
             execution.status,
-            ExecutionStatus::WaitingDependency | ExecutionStatus::Ready | ExecutionStatus::Queued
+            ExecutionStatus::WaitingDependency
+                | ExecutionStatus::Ready
+                | ExecutionStatus::Queued
+                | ExecutionStatus::WaitingReview
+                | ExecutionStatus::WaitingMerge
         )
     }) {
         return for_execution(conn, latest, now);
@@ -265,14 +275,45 @@ pub(super) fn for_unscheduled(
     task: &Task,
     latest: Option<&ExecutionStatus>,
 ) -> Result<Option<DispatchWait>> {
+    if task.deleted_at.is_none() {
+        match latest {
+            Some(ExecutionStatus::WaitingReview) => return review_wait(conn, &task.id).map(Some),
+            Some(ExecutionStatus::WaitingMerge) => {
+                return Ok(Some(DispatchWait::named(DISPATCH_WAIT_REASON_AWAITING_MERGE)));
+            }
+            _ => {}
+        }
+    }
     if task.deleted_at.is_some() || latest.is_some_and(|status| !status.is_terminal()) {
         return Ok(None);
     }
     match task.status {
         TaskStatus::Todo if task.autostart => for_queued_card(conn, task, latest).map(Some),
         TaskStatus::Active => for_idle_active(conn, task).map(Some),
+        TaskStatus::InReview => {
+            let code = if super::dispatch::live_pre_merge_batch_holds(conn, &task.id)? {
+                DISPATCH_WAIT_REASON_REVIEW_BATCH
+            } else if task.pr_url.as_deref().is_none_or(|url| url.trim().is_empty()) {
+                DISPATCH_WAIT_REASON_UNCLASSIFIED
+            } else if task.review_required_state.as_deref() == Some("approved") {
+                DISPATCH_WAIT_REASON_AWAITING_MERGE
+            } else {
+                DISPATCH_WAIT_REASON_REVIEW_RESERVATION
+            };
+            Ok(Some(DispatchWait::named(code)))
+        }
         _ => Ok(None),
     }
+}
+
+fn review_wait(conn: &Connection, id: &str) -> Result<DispatchWait> {
+    Ok(DispatchWait::named(
+        if super::dispatch::live_pre_merge_batch_holds(conn, id)? {
+            DISPATCH_WAIT_REASON_REVIEW_BATCH
+        } else {
+            DISPATCH_WAIT_REASON_REVIEW_RESERVATION
+        },
+    ))
 }
 
 /// An `active` item with no run pending or live. The orphan sweep is what
@@ -297,10 +338,17 @@ fn for_idle_active(conn: &Connection, task: &Task) -> Result<DispatchWait> {
         |row| row.get::<_, bool>(0),
     )? {
         DISPATCH_WAIT_REASON_RECOVERY_ATTENTION
+    } else if super::dispatch_admission::work_item_is_deliberately_parked(conn, &task.id)? {
+        DISPATCH_WAIT_REASON_DELIBERATE_PARK
     } else if !super::dispatch::orphan_active_candidates(conn, i64::MAX, Some(&task.id))?.is_empty() {
-        DISPATCH_WAIT_REASON_AWAITING_REDISPATCH
+        if super::dispatch_admission::pause_holds_on(conn, &task.id)? {
+            DISPATCH_WAIT_REASON_DISPATCH_PAUSED
+        } else {
+            DISPATCH_WAIT_REASON_AWAITING_REDISPATCH
+        }
     } else if super::dispatch_admission::primary_pr_awaits_review(conn, &task.id)?
         || super::dispatch_admission::revision_implementation_completed(conn, &task.id)?
+        || super::dispatch::live_pre_merge_batch_holds(conn, &task.id)?
         || conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM work_executions WHERE work_item_id = ?1 AND kind = 'pr_review')",
             [&task.id],
@@ -361,10 +409,10 @@ fn for_queued_card(conn: &Connection, task: &Task, latest: Option<&ExecutionStat
 /// board runtime cache hit, because the answer comes from the task row, which
 /// that cache does not version.
 ///
-/// The answer reads only what the incremental board projection already
-/// re-reads a card for: the card's own row and executions, the rows of its
-/// parent chain (a revision's parent pull request), and its project and
-/// product. So it adds nothing a refresh has to recompute unprompted.
+/// Inputs include the task and parent chain, executions, project/product,
+/// recovery attention, deliberate parks, pause metadata and review batches.
+/// The board journal invalidates these inputs, including cycle-root holds;
+/// this annotation is recomputed after every execution-cache hit.
 pub(super) fn annotate_unscheduled(conn: &Connection, task: &Task, runtime: &mut TaskRuntime) -> Result<()> {
     if let Some(wait) = for_unscheduled(conn, task, runtime.execution_status.as_ref())? {
         runtime.dispatch_wait_reason = wait.reason;
@@ -424,7 +472,7 @@ impl WorkDb {
         let pending: Vec<String> = conn
             .prepare(
                 "SELECT id FROM work_executions
-                 WHERE status IN ('queued', 'ready', 'waiting_dependency')
+                 WHERE status IN ('queued', 'ready', 'waiting_dependency', 'waiting_review', 'waiting_merge')
                  ORDER BY created_at ASC, id ASC",
             )?
             .query_map([], |row| row.get(0))?
@@ -492,7 +540,7 @@ impl WorkDb {
         let idle_active: Vec<String> = conn
             .prepare(
                 "SELECT t.id FROM tasks t
-                 WHERE t.status = 'active' AND t.deleted_at IS NULL
+                 WHERE t.status IN ('active', 'in_review') AND t.deleted_at IS NULL
                    AND NOT EXISTS (
                        SELECT 1 FROM work_executions we
                        WHERE we.work_item_id = t.id

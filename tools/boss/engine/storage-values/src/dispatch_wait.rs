@@ -119,6 +119,15 @@ pub const DISPATCH_WAIT_REASON_AWAITING_REDISPATCH: &str = "awaiting_redispatch"
 /// is with review and merge handling, which owns the next step.
 pub const DISPATCH_WAIT_REASON_AWAITING_REVIEW: &str = "awaiting_review";
 
+/// The review admission pass has not reserved reviewers yet.
+pub const DISPATCH_WAIT_REASON_REVIEW_RESERVATION: &str = "review_reservation";
+/// A review batch is collecting or applying its verdicts.
+pub const DISPATCH_WAIT_REASON_REVIEW_BATCH: &str = "review_batch";
+/// Review is complete and merge handling owns the next step.
+pub const DISPATCH_WAIT_REASON_AWAITING_MERGE: &str = "awaiting_merge";
+/// A worker deliberately stopped for a person to decide the next step.
+pub const DISPATCH_WAIT_REASON_DELIBERATE_PARK: &str = "deliberate_park";
+
 /// The item is `active` with no run pending or live because a dispatch
 /// failure (the churn guard, a deliberate park) is holding it.
 pub const DISPATCH_WAIT_REASON_DISPATCH_FAILED: &str = "dispatch_failed";
@@ -138,6 +147,19 @@ pub use boss_protocol::DISPATCH_WAIT_REASON_UNCLASSIFIED;
 /// reported as [`DISPATCH_WAIT_REASON_UNCLASSIFIED`], so a new hold cannot
 /// reach a card as a bare identifier.
 pub const DISPATCH_WAIT_REASON_CODES: &[(&str, &str)] = &[
+    (
+        DISPATCH_WAIT_REASON_REVIEW_RESERVATION,
+        "waiting for a review reservation",
+    ),
+    (DISPATCH_WAIT_REASON_REVIEW_BATCH, "a review batch is in progress"),
+    (
+        DISPATCH_WAIT_REASON_AWAITING_MERGE,
+        "waiting for its pull request to merge",
+    ),
+    (
+        DISPATCH_WAIT_REASON_DELIBERATE_PARK,
+        "its worker stopped; waiting for a person",
+    ),
     (DISPATCH_WAIT_REASON_POOL_EXHAUSTED, "worker pool full"),
     (DISPATCH_WAIT_REASON_DISPATCH_PAUSED, "dispatch paused"),
     (DISPATCH_WAIT_REASON_AUTOMATION_PAUSED, "automation paused"),

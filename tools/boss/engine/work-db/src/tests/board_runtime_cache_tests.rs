@@ -152,6 +152,7 @@ type Step = (&'static str, Box<dyn Fn(&Board)>, u64);
 fn every_runtime_input_write_invalidates_exactly_its_item() {
     let board = board();
     let target = board.chore("target");
+    board.sql("UPDATE tasks SET status = 'active' WHERE id = ?1", &[&target]);
     let bystander = board.chore("bystander");
     board.execution(&bystander, ExecutionStatus::Running);
     board.assert_equivalent();
@@ -279,6 +280,74 @@ fn every_runtime_input_write_invalidates_exactly_its_item() {
                 }
             }),
             1,
+        ),
+        // These non-execution inputs are re-annotated on cache hits; parity
+        // must change without rebuilding either execution-derived runtime.
+        (
+            "recovery attention opened",
+            Box::new({
+                let target = target.clone();
+                move |b| {
+                    b.sql("INSERT INTO work_attention_items(id,work_item_id,kind,status,title,body_markdown,created_at) VALUES ('cache-attention',?1,'worker_recovery_exhausted','open','recovery','body','1')", &[&target])
+                }
+            }),
+            0,
+        ),
+        (
+            "recovery attention resolved",
+            Box::new({
+                let target = target.clone();
+                move |b| {
+                    b.sql(
+                        "UPDATE work_attention_items SET status = 'resolved' WHERE work_item_id = ?1",
+                        &[&target],
+                    )
+                }
+            }),
+            0,
+        ),
+        (
+            "parking changed",
+            Box::new({
+                let target = target.clone();
+                move |b| {
+                    b.sql("UPDATE tasks SET parked_at = '1', parked_by = 'human', parked_reason = 'hold', parked_via = 'direct' WHERE id = ?1", &[&target])
+                }
+            }),
+            0,
+        ),
+        (
+            "parking cleared",
+            Box::new({
+                let target = target.clone();
+                move |b| {
+                    b.sql("UPDATE tasks SET parked_at = NULL, parked_by = NULL, parked_reason = NULL, parked_via = NULL WHERE id = ?1", &[&target])
+                }
+            }),
+            0,
+        ),
+        (
+            "review batch opened",
+            Box::new({
+                let target = target.clone();
+                move |b| {
+                    b.sql("INSERT INTO pr_review_batches(id,cycle_root_id,base_sha,classification_json,created_at,phase,pr_number,pr_url,status,target_sha,updated_at) VALUES ('cache-batch',?1,'base','{}','1','pre_merge',7,'https://github.com/test/repo/pull/7','collecting','head','1')", &[&target])
+                }
+            }),
+            0,
+        ),
+        (
+            "review batch ended",
+            Box::new({
+                let target = target.clone();
+                move |b| {
+                    b.sql(
+                        "UPDATE pr_review_batches SET status = 'completed' WHERE cycle_root_id = ?1",
+                        &[&target],
+                    )
+                }
+            }),
+            0,
         ),
         (
             "execution reassigned",

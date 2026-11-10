@@ -233,6 +233,42 @@ final class QueuedWaitTests: XCTestCase {
         ), "Unexpected state — the engine sent no reason for this wait")
     }
 
+    func testIdleActiveReasonsReachResolveWithTerminalOrAbsentExecution() {
+        for status: String? in ["completed", "cancelled", nil] {
+            for (reason, lead) in [("awaiting_redispatch", "Waiting"), ("unclassified", "Unexpected state")] {
+                let pending = runtime(reason: reason, label: "engine phrase", status: status)
+                XCTAssertEqual(WorkCardLiveStatus.resolve(
+                    task: task(status: "active"), column: .doing, runtime: pending, liveState: nil
+                ), "\(lead) — engine phrase")
+            }
+        }
+    }
+
+    func testReviewAndMergeReasonsReachReviewColumn() {
+        for (status, reason) in [("waiting_review", "review_reservation"),
+                                 ("waiting_merge", "awaiting_merge"),
+                                 ("completed", "review_batch")] {
+            XCTAssertEqual(WorkCardLiveStatus.resolve(
+                task: task(status: "in_review"), column: .review,
+                runtime: runtime(reason: reason, label: "engine phrase", status: status), liveState: nil
+            ), "Waiting — engine phrase")
+        }
+    }
+
+    func testEngineWaitDoesNotOverrideLiveOrHumanWork() {
+        for status in ["claimed", "running", "waiting_human"] {
+            XCTAssertFalse(WorkCardLiveStatus.isQueued(
+                task: task(status: "active"),
+                runtime: runtime(reason: "awaiting_redispatch", label: "stale", status: status)))
+        }
+        var human = task(status: "active")
+        human.humanDriven = true
+        XCTAssertEqual(WorkCardLiveStatus.resolve(
+            task: human, column: .doing,
+            runtime: runtime(reason: "awaiting_redispatch", label: "stale", status: "completed"), liveState: nil
+        ), "Human-driven — waiting on you")
+    }
+
     private func snapshot(_ model: ChatViewModel, _ task: WorkTask) -> WorkCardSnapshot {
         model.workCardSnapshot(for: task, column: .doing, isSelected: false,
                                isFrontierHighlighted: false, boardStyle: .elevated, liveState: nil)
@@ -240,7 +276,7 @@ final class QueuedWaitTests: XCTestCase {
 
     /// `label` is the phrase the engine sends with `reason`.
     private func runtime(
-        reason: String?, label: String?, status: String = "ready", blocker: DispatchWaitBlocker? = nil
+        reason: String?, label: String?, status: String? = "ready", blocker: DispatchWaitBlocker? = nil
     ) -> WorkTaskRuntime {
         WorkTaskRuntime(workItemID: "task_waiting", executionStatus: status, runStatus: nil,
                         executionID: "exec_waiting", dispatchRetryAt: nil, dispatchWaitReason: reason,

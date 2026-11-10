@@ -224,7 +224,11 @@ impl ExecutionCoordinator {
             }
         }
         let mut pause = self.dispatch_pause_snapshot();
-        if (facts.exempt_from_operator_pause || (facts.targets_main_pool && facts.is_critical)) && pause.overridable {
+        if boss_engine_storage_values::dispatch_pause::exempts_work(
+            pause.overridable,
+            facts.exempt_from_operator_pause,
+            facts.targets_main_pool && facts.is_critical,
+        ) {
             // Reviews and critical main-pool work are exempt from operator
             // new-work pauses in the drain; neither needs a one-shot forced override.
             pause = DispatchPauseSnapshot::default();

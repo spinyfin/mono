@@ -65,6 +65,7 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         "attention_groups",
         "attentions",
         "planner_runs",
+        "pr_review_batches",
     ] {
         for operation in ["INSERT", "UPDATE", "DELETE"] {
             conn.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS board_changes_{table}_{operation} AFTER {operation} ON {table} BEGIN INSERT INTO board_changes(source) VALUES ('{table}'); END;"))?;
@@ -128,12 +129,13 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         }
     }
     // Board review badges consult this migration watermark. Scheduler and
-    // coordinator metadata do not affect the board and must not force scans.
+    // coordinator metadata other than dispatch pause do not affect the board.
     let key = super::review_verdicts::PR_REVIEW_VERDICTS_SINCE_METADATA_KEY;
+    let keys = format!("('{key}', 'dispatch_paused', 'dispatch_paused_origin', 'dispatch_paused_scope')");
     for (operation, condition) in [
-        ("INSERT", format!("NEW.key = '{key}'")),
-        ("UPDATE", format!("OLD.key = '{key}' OR NEW.key = '{key}'")),
-        ("DELETE", format!("OLD.key = '{key}'")),
+        ("INSERT", format!("NEW.key IN {keys}")),
+        ("UPDATE", format!("OLD.key IN {keys} OR NEW.key IN {keys}")),
+        ("DELETE", format!("OLD.key IN {keys}")),
     ] {
         conn.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS board_changes_metadata_{operation} AFTER {operation} ON metadata WHEN {condition} BEGIN INSERT INTO board_changes(source) VALUES ('metadata'); END;"))?;
     }

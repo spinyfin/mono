@@ -319,7 +319,8 @@ fn board_projection_review_evidence_and_metadata_sequences_match_complete_projec
     check(&db, &product, &mut model, 100);
     db.connect().unwrap().execute("INSERT INTO pr_review_batches(id,cycle_root_id,base_sha,classification_json,created_at,phase,pr_number,pr_url,status,target_sha,updated_at) VALUES ('projection-batch',?1,'base','{}','1','pre_merge',7,'https://github.com/spinyfin/mono/pull/7','collecting','head','1')", [&root]).unwrap();
     db.connect().unwrap().execute("INSERT INTO pr_review_batch_members(id,batch_id,attempt,created_at,provider_effort,requested_driver,resolved_model,role,status,updated_at,execution_id) VALUES ('projection-member','projection-batch',1,'1','medium','claude','synthetic','supervisor','pending','1',?1)", [&execution.id]).unwrap();
-    assert!(matches!(check(&db, &product, &mut model, 100), Refresh::Incremental(_)));
+    // Batch creation changes wait classification throughout its cycle family.
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Snapshot("broad_input"));
     assert_eq!(
         model
             .as_ref()
@@ -642,4 +643,54 @@ fn board_projection_upgrade_replaces_broad_triggers_and_preserves_watermark() {
         )
         .unwrap();
     assert_eq!(item, root);
+}
+
+#[test]
+fn wait_inputs_refresh_the_board_after_attention_pause_parking_and_batch_writes() {
+    let db = WorkDb::open(temp_db_path("projection-waits")).unwrap();
+    let product = make_revision_product(&db, "waits");
+    let item = create_test_chore_manual(&db, product.clone(), "idle").id;
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET status = 'active' WHERE id = ?1", [&item])
+        .unwrap();
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(item.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    let mut model = None;
+    check(&db, &product, &mut model, 100);
+    for sql in [
+        "INSERT INTO work_attention_items(id,work_item_id,kind,status,title,body_markdown,created_at) VALUES ('wait-alert',?1,'worker_recovery_exhausted','open','recovery','body','1')",
+        "UPDATE work_attention_items SET status = 'resolved' WHERE work_item_id = ?1",
+        "UPDATE tasks SET parked_at = '1', parked_by = 'human', parked_reason = 'hold', parked_via = 'direct' WHERE id = ?1",
+        "UPDATE tasks SET parked_at = NULL, parked_by = NULL, parked_reason = NULL, parked_via = NULL WHERE id = ?1",
+        "INSERT INTO pr_review_batches(id,cycle_root_id,base_sha,classification_json,created_at,phase,pr_number,pr_url,status,target_sha,updated_at) VALUES ('wait-batch',?1,'base','{}','1','pre_merge',7,'https://github.com/test/repo/pull/7','collecting','head','1')",
+        "UPDATE pr_review_batches SET status = 'completed' WHERE cycle_root_id = ?1",
+        "DELETE FROM pr_review_batches WHERE cycle_root_id = ?1",
+    ] {
+        db.connect().unwrap().execute(sql, [&item]).unwrap();
+        assert_ne!(check(&db, &product, &mut model, 100), Refresh::Incremental(0), "{sql}");
+    }
+    for sql in [
+        "INSERT OR REPLACE INTO metadata(key,value) VALUES ('dispatch_paused','1')",
+        "UPDATE metadata SET value = '0' WHERE key = 'dispatch_paused'",
+        "DELETE FROM metadata WHERE key = 'dispatch_paused'",
+    ] {
+        db.connect().unwrap().execute_batch(sql).unwrap();
+        assert_eq!(check(&db, &product, &mut model, 100), Refresh::Snapshot("broad_input"));
+    }
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'abandoned', run_done_outcome = 'blocked' WHERE id = ?1",
+            [&execution.id],
+        )
+        .unwrap();
+    check(&db, &product, &mut model, 100);
 }

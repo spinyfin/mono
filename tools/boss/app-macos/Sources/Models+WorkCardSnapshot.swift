@@ -512,7 +512,7 @@ enum WorkCardLiveStatus {
         isNextUp: Bool = false,
         now: Date = Date()
     ) -> String? {
-        guard column == .doing else { return nil }
+        guard column == .doing || (column == .review && isQueued(task: task, runtime: runtime)) else { return nil }
 
         // Human-driven rows occupy Doing without a worker — never paint
         // them as "Waiting for a slot" / stalled agent work.
@@ -530,7 +530,8 @@ enum WorkCardLiveStatus {
         if isQueued(task: task, runtime: runtime) {
             return isNextUp
                 ? nextUpLabel(runtime: runtime, now: now)
-                : queuedLabel(runtime: runtime, now: now)
+                : queuedLabel(runtime: runtime, now: now,
+                              lead: task.status != "todo" && !isPendingExecution(runtime) ? "Waiting" : "Queued")
         }
         // A declared job wait names what the worker is waiting on, so it
         // is shown even for conflict / CI-remediation runs.

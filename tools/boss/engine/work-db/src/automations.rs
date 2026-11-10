@@ -873,14 +873,7 @@ impl WorkDb {
     /// id is not found in `tasks` (e.g. it references a project or product).
     pub fn source_automation_id_for_work_item(&self, work_item_id: &str) -> Result<Option<String>> {
         let conn = self.connect()?;
-        conn.query_row(
-            "SELECT source_automation_id FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
-            [work_item_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()
-        .map(|opt| opt.flatten())
-        .map_err(Into::into)
+        source_automation_id_on(&conn, work_item_id)
     }
 
     /// Create a `ready` `automation_triage` work_execution bound to an
@@ -1439,6 +1432,17 @@ fn collapse_automation_run_retries(runs: Vec<boss_protocol::AutomationRun>) -> V
         collapsed.push(run);
     }
     collapsed
+}
+
+pub(crate) fn source_automation_id_on(conn: &Connection, work_item_id: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT source_automation_id FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+        [work_item_id],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .map(|opt| opt.flatten())
+    .map_err(Into::into)
 }
 
 #[cfg(test)]

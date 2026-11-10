@@ -7,19 +7,21 @@ extension WorkCardLiveStatus {
 
     static func isQueued(task: WorkTask, runtime: WorkTaskRuntime?) -> Bool {
         if task.humanDriven && task.status == "active" { return false }
-        if ["claimed", "running", "waiting_human", "waiting_review", "waiting_merge"].contains(runtime?.executionStatus ?? "") {
+        if ["claimed", "running", "waiting_human"].contains(runtime?.executionStatus ?? "") {
             return false
         }
+        let hasWait = !(runtime?.dispatchWaitReason?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
         return isPendingExecution(runtime) || (task.status == "todo" && task.autostart)
+            || (["active", "in_review"].contains(task.status) && hasWait)
     }
 
     /// The grey status line of a queued card: why it is waiting, as the
     /// engine's wait classifier reports it. This view never decides a reason
     /// of its own; it formats the two deadlines the engine sends and renders
     /// the engine's phrase for everything else.
-    static func queuedLabel(runtime: WorkTaskRuntime?, now: Date) -> String {
+    static func queuedLabel(runtime: WorkTaskRuntime?, now: Date, lead: String = "Queued") -> String {
         let status = queuedStatus(runtime: runtime, now: now)
-        return "\(status.lead) — \(status.detail)"
+        return "\(status.lead == queuedLead ? lead : status.lead) — \(status.detail)"
     }
 
     /// The first runnable main-pool card. A hold it still carries (a full

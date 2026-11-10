@@ -1533,7 +1533,7 @@ pub fn resolve_diagnose_scope(
                 work_item_id: resolved.work_item_id,
             });
         }
-        if !resolved.execution_ids.is_empty() {
+        if resolved.work_item_id.is_some() {
             return Ok(DiagnoseScope {
                 input_id: id.to_owned(),
                 resolved_as: ResolvedAs::WorkItem,
@@ -1902,6 +1902,20 @@ pub fn run_diagnose(
     now_ms: u128,
     db: Option<&boss_engine::work::WorkDb>,
 ) -> Result<()> {
+    if let Some(payload) = diagnose_report(root, id, json, signatures_only, now_ms, db)? {
+        println!("{payload}");
+    }
+    Ok(())
+}
+
+fn diagnose_report(
+    root: &Path,
+    id: &str,
+    json: bool,
+    signatures_only: bool,
+    now_ms: u128,
+    db: Option<&boss_engine::work::WorkDb>,
+) -> Result<Option<Value>> {
     let db_resolution = db.and_then(|work_db| {
         if let Ok(exec) = work_db.get_execution(id) {
             return Some(WorkItemResolution {
@@ -1910,8 +1924,8 @@ pub fn run_diagnose(
                 execution_ids: vec![id.to_owned()],
             });
         }
-        if let Ok(list) = work_db.list_executions(Some(id))
-            && !list.is_empty()
+        if work_db.get_work_item(id).is_ok()
+            && let Ok(list) = work_db.list_executions(Some(id))
         {
             return Some(WorkItemResolution {
                 as_execution: false,
@@ -2113,8 +2127,7 @@ pub fn run_diagnose(
         if let Some(wait) = &wait_diagnosis {
             payload.insert("wait".into(), dispatch_wait_json(wait));
         }
-        println!("{}", Value::Object(payload));
-        return Ok(());
+        return Ok(Some(Value::Object(payload)));
     }
 
     match scope.resolved_as {
@@ -2169,7 +2182,7 @@ pub fn run_diagnose(
             println!("  {}", crate::stream_integrity::NO_EVENTS_CAVEAT);
         }
         integrity.print_footer();
-        return Ok(());
+        return Ok(None);
     }
 
     if !signatures_only {
@@ -2191,7 +2204,7 @@ pub fn run_diagnose(
     println!();
     print!("{}", render_findings(&findings, &integrity));
     integrity.print_footer();
-    Ok(())
+    Ok(None)
 }
 
 /// Render one execution's timeline with its unreadable regions marked in place.
