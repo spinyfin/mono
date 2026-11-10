@@ -359,10 +359,9 @@ pub(crate) async fn try_mechanical_rungs_with(
                 "conflict_ladder: could not lease a workspace for rung 1 after retry; mechanical rungs \
                  unavailable this attempt",
             );
-            if err.is::<boss_host_execution::cube::CubeCliError>() {
-                halt_workspace_failure(work_db, publisher, candidate, attempt, &err).await;
-                return LadderOutcome::WorkspacePreparationFailed;
-            }
+            // A lease-stage error (unreachable remote, clone or fetch failure)
+            // is not a deterministic refusal of this PR's branch; the lease was
+            // already retried once, and the next conflict_watch tick tries again.
             log_routing_verdict(
                 &candidate.work_item_id,
                 Some(pr_number),

@@ -71,7 +71,7 @@
 //! again blinding merge detection for the length of a rebase.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -81,7 +81,7 @@ use crate::conflict_ladder::{self, LadderOutcome};
 use crate::conflict_watch;
 use crate::merge_poller::PrLifecycleProbe;
 use crate::work::{ConflictResolution, GhPrStateChecker, PendingMergeCheck, PrOpenState, PrStateChecker, WorkDb};
-use boss_execution_contracts::{CubeClient, ExecutionPublisher};
+use boss_execution_contracts::{CubeClient, ExecutionPublisher, HostAdapterProvider};
 
 /// How many conflict remediations may run at once.
 ///
@@ -171,6 +171,10 @@ pub struct LadderRemediationJob {
     work_db: Arc<WorkDb>,
     publisher: Arc<dyn ExecutionPublisher>,
     cube_client: Arc<dyn CubeClient>,
+    /// Late-bound: the host adapters exist only once the execution
+    /// coordinator is built, after this job. A failed workspace on a remote
+    /// host is probed through its adapter, never this engine's own Cube.
+    host_adapters: Arc<OnceLock<Arc<dyn HostAdapterProvider>>>,
     /// Checked immediately before the fall-through revision spawn.
     /// Deliberately the **live** checker rather than the detection pass's
     /// `StaticPrStateChecker(Open)` snapshot: minutes elapse between the
@@ -187,8 +191,21 @@ impl LadderRemediationJob {
             work_db,
             publisher,
             cube_client,
+            host_adapters: Arc::new(OnceLock::new()),
             pr_checker: Arc::new(GhPrStateChecker),
         }
+    }
+
+    /// Share the slot the production wiring fills with the host adapters.
+    pub fn host_adapter_slot(&self) -> Arc<OnceLock<Arc<dyn HostAdapterProvider>>> {
+        Arc::clone(&self.host_adapters)
+    }
+
+    /// Install the host adapters used to probe a remote host's refusal.
+    #[cfg(test)]
+    pub fn with_host_adapters(self, provider: Arc<dyn HostAdapterProvider>) -> Self {
+        let _ = self.host_adapters.set(provider);
+        self
     }
 
     /// Swap the live `gh` checker for a double. Test seam only — production
@@ -299,6 +316,7 @@ impl ConflictRemediationJob for LadderRemediationJob {
                 &self.work_db,
                 self.publisher.as_ref(),
                 self.cube_client.as_ref(),
+                self.host_adapters.get().map(|hosts| hosts.as_ref()),
                 &candidate,
                 &attempt,
                 &probe,

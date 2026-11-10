@@ -3,6 +3,34 @@ use super::*;
 
 pub const CONFLICT_WORKSPACE_FAILURE: &str = "workspace_preparation_failed: ";
 
+pub(super) const MIGRATION_ID: &str = "20261109_1500_conflict_workspace_recovery";
+
+/// Per-attempt recovery bookkeeping for a failed conflict workspace: how many
+/// times a recovery probe resumed it, the host whose refusal failed it
+/// (`NULL` for a local or mechanical-rung failure), and the failure text that
+/// was current at the last resume.
+pub(super) fn migrate(conn: &Connection) -> Result<()> {
+    for (column, ddl) in [
+        (
+            "workspace_resumes",
+            "ALTER TABLE conflict_resolutions ADD COLUMN workspace_resumes INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "workspace_failure_host",
+            "ALTER TABLE conflict_resolutions ADD COLUMN workspace_failure_host TEXT",
+        ),
+        (
+            "workspace_resume_failure",
+            "ALTER TABLE conflict_resolutions ADD COLUMN workspace_resume_failure TEXT",
+        ),
+    ] {
+        if !super::schema_init::table_has_column(conn, "conflict_resolutions", column)? {
+            conn.execute_batch(ddl)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn conflict_workspace_failed(attempt: &ConflictResolution) -> bool {
     attempt.status == "failed"
         && attempt
@@ -80,6 +108,11 @@ pub(crate) fn surface_conflict_stop(conn: &rusqlite::Transaction<'_>, attempt_id
 /// state until the head or base moves.
 pub const MAX_UNCHANGED_WORKSPACE_RESUMES: i64 = 3;
 
+/// Once the unchanged-context resume budget is spent, a recovery probe that
+/// succeeds still resumes the attempt, but at most this often. This is how a
+/// repaired bookmark or repository on the failing host is picked up.
+pub const PAUSED_WORKSPACE_RETRY_SECS: i64 = 3600;
+
 pub(crate) const WORKSPACE_RECOVERED_ARCHIVE_REASON: &str = "workspace preparation recovered";
 
 fn conflict_stop_missing(conn: &rusqlite::Connection, attempt_id: &str) -> Result<bool> {
@@ -117,8 +150,9 @@ fn workspace_failure_candidate(conn: &rusqlite::Connection, attempt_id: &str) ->
              JOIN tasks t ON t.id = prior.revision_task_id
              WHERE current.id = ?1
                AND t.dispatch_failed_reason IN ('cube_workspace_positioning_failed', 'cube_workspace_lease_failed')
-               AND t.dispatch_failed_error IS NOT NULL",
-            [attempt_id],
+               AND t.dispatch_failed_error IS NOT NULL
+               AND t.archived_reason IS NOT ?2",
+            params![attempt_id, WORKSPACE_RECOVERED_ARCHIVE_REASON],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?)
@@ -190,7 +224,40 @@ impl WorkDb {
     /// Preserve Cube's full diagnostic, independent of worker liveness. Repeated
     /// observations of the same failed attempt do not mint another terminal state.
     pub fn fail_conflict_workspace(&self, attempt_id: &str, error: &str) -> Result<Option<ConflictResolution>> {
-        self.mark_conflict_resolution_failed(attempt_id, &format!("{CONFLICT_WORKSPACE_FAILURE}{error}"))
+        self.fail_conflict_workspace_on_host(attempt_id, error, None)
+    }
+
+    /// As [`Self::fail_conflict_workspace`], recording the host whose refusal
+    /// failed the attempt so a recovery probe asks that host and not this
+    /// engine's own Cube. `None` and the local host id mean "local".
+    pub fn fail_conflict_workspace_on_host(
+        &self,
+        attempt_id: &str,
+        error: &str,
+        host_id: Option<&str>,
+    ) -> Result<Option<ConflictResolution>> {
+        let failed =
+            self.mark_conflict_resolution_failed(attempt_id, &format!("{CONFLICT_WORKSPACE_FAILURE}{error}"))?;
+        let remote = host_id.filter(|host| *host != boss_protocol::LOCAL_HOST_ID);
+        self.connect()?.execute(
+            "UPDATE conflict_resolutions SET workspace_failure_host = ?2
+             WHERE id = ?1 AND status = 'failed' AND failure_reason LIKE ?3 || '%'",
+            params![attempt_id, remote, CONFLICT_WORKSPACE_FAILURE],
+        )?;
+        Ok(failed)
+    }
+
+    /// The remote host whose refusal failed this attempt, if any.
+    pub fn conflict_workspace_failure_host(&self, attempt_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .connect()?
+            .query_row(
+                "SELECT workspace_failure_host FROM conflict_resolutions WHERE id = ?1",
+                [attempt_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     pub fn conflict_resolution_for_revision(&self, revision_id: &str) -> Result<Option<ConflictResolution>> {
@@ -208,23 +275,26 @@ impl WorkDb {
             .map(Option::flatten)
     }
 
-    /// Revisions retired because a recovery probe resumed their attempt.
-    fn workspace_resumes(&self, work_item_id: &str) -> Result<i64> {
+    /// Resumes already spent on the attempt's current failure episode, and the
+    /// failure text that was current at the last resume.
+    fn workspace_resume_state(&self, attempt_id: &str) -> Result<(i64, Option<String>)> {
         Ok(self.connect()?.query_row(
-            "SELECT COUNT(*) FROM tasks WHERE parent_task_id = ?1 AND kind = 'revision'
-               AND created_via LIKE ?2 || '%' AND archived_reason = ?3",
-            params![
-                work_item_id,
-                CREATED_VIA_MERGE_CONFLICT_PREFIX,
-                WORKSPACE_RECOVERED_ARCHIVE_REASON
-            ],
-            |row| row.get(0),
+            "SELECT workspace_resumes, workspace_resume_failure FROM conflict_resolutions WHERE id = ?1",
+            [attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?)
     }
 
-    /// Called only after Cube has successfully prepared the workspace again.
-    /// Keep the old revision and its failure records until that positive evidence
-    /// exists; then retire it and reuse the attempt without consuming the churn cap.
+    /// Called only after Cube has successfully prepared the workspace again on
+    /// the host that failed. Keep the old revision and its failure records
+    /// until that positive evidence exists; then retire it and reuse the
+    /// attempt without consuming the churn cap.
+    ///
+    /// The resume budget lives on the attempt and is spent atomically by every
+    /// resume, with or without a revision. A moved head or base, or a failure
+    /// that differs from the one the last resume saw, reopens it. Once spent,
+    /// the attempt stays surfaced as paused and is only retried once per
+    /// [`PAUSED_WORKSPACE_RETRY_SECS`].
     pub fn resume_conflict_workspace(
         &self,
         attempt_id: &str,
@@ -237,12 +307,21 @@ impl WorkDb {
         else {
             return Ok(None);
         };
-        let unchanged = head.is_none_or(|h| attempt.head_sha_before.as_deref() == Some(h))
-            && base.is_none_or(|b| attempt.base_sha_at_trigger.as_deref() == Some(b));
-        if unchanged && self.workspace_resumes(&attempt.work_item_id)? >= MAX_UNCHANGED_WORKSPACE_RESUMES {
-            // Bounded: stay in the surfaced failed state until the head or
-            // base actually changes.
-            return Ok(None);
+        let context_moved = head.is_some_and(|h| attempt.head_sha_before.as_deref() != Some(h))
+            || base.is_some_and(|b| attempt.base_sha_at_trigger.as_deref() != Some(b));
+        let (spent, last_failure) = self.workspace_resume_state(attempt_id)?;
+        let new_failure = last_failure.is_some() && last_failure != attempt.failure_reason;
+        let spent = if context_moved || new_failure { 0 } else { spent };
+        if spent >= MAX_UNCHANGED_WORKSPACE_RESUMES {
+            let finished: i64 = attempt
+                .finished_at
+                .as_deref()
+                .and_then(|at| at.parse().ok())
+                .unwrap_or(0);
+            if boss_engine_utils::epoch_time::now_epoch_secs() - finished < PAUSED_WORKSPACE_RETRY_SECS {
+                self.note_workspace_recovery_paused(&attempt)?;
+                return Ok(None);
+            }
         }
         if let Some(revision) = &attempt.revision_task_id {
             if self.is_conflict_revision_running_or_queued(revision)? {
@@ -260,10 +339,11 @@ impl WorkDb {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let rows = tx.execute(
             "UPDATE conflict_resolutions SET status = 'pending', failure_reason = NULL,
-                 finished_at = NULL, revision_task_id = NULL,
+                 finished_at = NULL, revision_task_id = NULL, workspace_failure_host = NULL,
+                 workspace_resumes = ?5 + 1, workspace_resume_failure = ?2,
                  head_sha_before = COALESCE(?3, head_sha_before), base_sha_at_trigger = COALESCE(?4, base_sha_at_trigger)
              WHERE id = ?1 AND status = 'failed' AND failure_reason = ?2",
-            params![attempt_id, attempt.failure_reason, head, base],
+            params![attempt_id, attempt.failure_reason, head, base, spent],
         )?;
         if rows == 0 {
             return Ok(None);
@@ -278,5 +358,49 @@ impl WorkDb {
         let resumed = query_conflict_resolution(&tx, attempt_id)?;
         tx.commit()?;
         Ok(resumed)
+    }
+
+    /// Tell whoever follows the surfaced advice that automatic recovery is
+    /// paused and what lifts the pause, on both the attention and the card.
+    fn note_workspace_recovery_paused(&self, attempt: &ConflictResolution) -> Result<()> {
+        self.note_workspace_recovery(
+            &attempt.id,
+            &format!(
+                "Automatic recovery is paused after {MAX_UNCHANGED_WORKSPACE_RESUMES} unsuccessful resumes. It resumes \
+                 when the PR head or base moves, when the failure changes, or on the next check after {} minutes.",
+                PAUSED_WORKSPACE_RETRY_SECS / 60
+            ),
+        )
+    }
+
+    /// Append `note` (why recovery is not happening right now) to the surfaced
+    /// stop. Idempotent: repeated identical notes write nothing.
+    pub fn note_workspace_recovery(&self, attempt_id: &str, note: &str) -> Result<()> {
+        let Some(attempt) = self
+            .get_conflict_resolution(attempt_id)?
+            .filter(conflict_workspace_failed)
+        else {
+            return Ok(());
+        };
+        let reason = attempt.failure_reason.as_deref().unwrap_or_default();
+        let detail = format!("Conflict remediation stopped: {reason}\n\n{note}");
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE tasks SET blocked_detail = ?2 WHERE id = ?1 AND blocked_attempt_id = ?3
+               AND blocked_reason = 'merge_conflict' AND blocked_detail IS NOT ?2",
+            params![attempt.work_item_id, detail, attempt.id],
+        )?;
+        tx.execute(
+            "UPDATE work_attention_items SET body_markdown = ?3 WHERE work_item_id = ?1 AND status = 'open'
+               AND kind = ?2 AND body_markdown IS NOT ?3",
+            params![
+                attempt.work_item_id,
+                CONFLICT_REMEDIATION_STOPPED_ATTENTION_KIND,
+                format!("PR {}\n\n{detail}", attempt.pr_url)
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 }

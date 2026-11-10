@@ -2582,12 +2582,23 @@ impl ExecutionCoordinator {
         } else {
             None
         };
-        // Fail the attempt first so no detection pass can observe the dead
-        // revision while its attempt still looks live.
-        if let Some(attempt) = &conflict_workspace {
-            self.work_db.fail_conflict_workspace(&attempt.id, &error_text)?;
+        // A goto/positioning refusal is deterministic, so it fails the attempt
+        // at once. A lease-stage Cube error can be transient (unreachable
+        // remote, clone or fetch failure), so it follows the ordinary retry
+        // schedule and fails the attempt only on the final failure. Either way
+        // the attempt fails before the execution failure commits, so no
+        // detection pass can observe the dead revision while its attempt still
+        // looks live.
+        let positioning = attention_kind == "cube_workspace_positioning_failed";
+        let final_failure = execution.pre_start_failure_count >= self.pre_start_retry_delays.len() as i64;
+        if let Some(attempt) = &conflict_workspace
+            && (positioning || final_failure)
+        {
+            let host = self.work_db.execution_host_id(&execution.id).ok().flatten();
+            self.work_db
+                .fail_conflict_workspace_on_host(&attempt.id, &error_text, host.as_deref())?;
         }
-        let retry_delays = if conflict_workspace.is_some() {
+        let retry_delays = if conflict_workspace.is_some() && positioning {
             &[][..]
         } else {
             &self.pre_start_retry_delays[..]

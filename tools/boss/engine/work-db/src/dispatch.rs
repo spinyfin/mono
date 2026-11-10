@@ -470,9 +470,18 @@ impl WorkDb {
                AND t.dispatch_failed_at IS NOT NULL
                AND CAST(t.dispatch_failed_at AS INTEGER) < ?1
                AND {upkeep}
+               -- A conflict revision whose attempt failed in workspace
+               -- preparation is recovered only by the conflict-workspace
+               -- probe; respawning it here would repeat the same refusal.
+               AND NOT EXISTS (
+                   SELECT 1 FROM conflict_resolutions cr
+                    WHERE cr.revision_task_id = t.id AND cr.status = 'failed'
+                      AND cr.failure_reason LIKE ?2 || '%')
              ORDER BY CAST(t.dispatch_failed_at AS INTEGER) ASC, t.id ASC",
         ))?;
-        let rows = stmt.query_map([cutoff], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![cutoff, crate::CONFLICT_WORKSPACE_FAILURE], |row| {
+            row.get::<_, String>(0)
+        })?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);

@@ -147,8 +147,16 @@ struct WorkCardPopoverView: View {
                 }
             }
 
+            // A stopped conflict remediation is shown here as well as in the
+            // blocked detail: a higher-priority blocker (dependency, review
+            // feedback) owns the blocked detail, so the attention is the only
+            // card-visible place the stop reason reaches in that case.
             ForEach((model.attentionItemsByWorkItemID[task.id] ?? []).filter {
-                $0.kind == "execution_bookmark_recovery_retired"
+                [
+                    "execution_bookmark_recovery_retired",
+                    "conflict_remediation_stopped",
+                    "lockfile_regeneration_failed",
+                ].contains($0.kind) && $0.resolvedAt == nil
             }) { note in
                 DisclosureGroup(note.title) {
                     Text(note.bodyMarkdown)

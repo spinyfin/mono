@@ -265,7 +265,7 @@ pub async fn on_conflict_detected_with(
                 queue.try_enqueue(candidate, &attempt, probe) == EnqueueOutcome::Enqueued
             }
             ConflictRemediationMode::Inline(cube) => {
-                crate::conflict_workspace::recover(work_db, publisher, cube, candidate, &attempt, probe).await
+                crate::conflict_workspace::recover(work_db, publisher, cube, None, candidate, &attempt, probe).await
             }
             ConflictRemediationMode::Disabled => false,
         };
