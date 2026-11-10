@@ -444,46 +444,58 @@ impl WorkDb {
     ///
     ///   1. If `dead_execution_id` is still non-terminal, mark it
     ///      `orphaned` (and stamp any still-active runs `orphaned` with
-    ///      `reason`). Orphaned — not abandoned — so the coordinator's
-    ///      recovery path ([`Self::get_prior_orphaned_execution`]) can find
-    ///      it and replay its saved recovery patch (or re-lease its
-    ///      workspace dirty for in-place recovery) into the new execution.
-    ///   2. Insert a fresh `ready` execution for the same work item that
-    ///      **prefers the same cube workspace with `allow_dirty = true`**
-    ///      (so cube's `--prefer --allow-dirty` re-leases the exact
-    ///      workspace *without* resetting it, and in-progress work in the
-    ///      jj workspace is not lost), carries `transient_failure_count =
-    ///      new_count`, and is deferred until `dispatch_not_before_epoch`
-    ///      (the backoff window — same `dispatch_not_before` gate the
-    ///      pre-start retry path uses, honoured by
-    ///      [`Self::list_ready_executions`]).
+    ///      `reason`). Orphaned — not abandoned — so the successor's
+    ///      dispatch can find it as its recovery predecessor
+    ///      ([`Self::recovery_predecessor`]) and restore the unpublished work
+    ///      preserved when its workspace lease is released.
+    ///   2. Reuse the live successor if one exists, else insert a fresh
+    ///      `ready` execution for the same work item, carrying
+    ///      `transient_failure_count = new_count` and deferred until
+    ///      `dispatch_not_before_epoch` (the backoff window — the same
+    ///      `dispatch_not_before` gate the pre-start retry path uses,
+    ///      honoured by [`Self::list_ready_executions`]).
     ///
-    ///      `allow_dirty` is always forced `true` here, regardless of
-    ///      what the dead execution carried: this function exists
-    ///      specifically to reclaim a workspace that has uncommitted
-    ///      in-flight work, so a plain carry-forward (which defaults to
-    ///      `false` for an ordinary first dispatch) would let cube's
-    ///      normal clean-reset silently discard that work even on a
-    ///      successful same-workspace lease. Forcing it `true` also
-    ///      hardens `boss_engine::coordinator`'s `lease_workspace_with_fallback`:
-    ///      a failed lease on the preferred workspace becomes a hard
-    ///      failure instead of a silent fallback to a different, clean
-    ///      workspace.
+    /// The successor states no workspace preference. Dispatch leases any free
+    /// workspace, never the predecessor's, and brings the predecessor's work
+    /// across through the preserved tip recorded when its lease is released;
+    /// so the row carries no `preferred_workspace_id` and no `allow_dirty`,
+    /// which nothing on that path would read. What it does depend on is that
+    /// the predecessor's work is preserved and its lease released. The caller
+    /// confirms worker teardown and attempts that release first; if the lease
+    /// is kept, this method still runs, and dispatch holds the successor
+    /// ([`Self::recovery_predecessor_holding_lease`]) until the now-terminal
+    /// predecessor's lease is released by the leftover-lease sweep, so the
+    /// successor never starts from trunk.
     ///
-    /// Returns the new `ready` execution. The caller releases the worker
-    /// pool slot and emits the dispatch event. Because the work item now
-    /// has a `ready` execution, the orphan-active sweep skips it (no
-    /// double dispatch).
+    /// If another reconciler already created the live successor (the next
+    /// execution of the work item and kind, non-terminal, of a kind that
+    /// recovers from its predecessor), that row is reused instead of inserting
+    /// a duplicate, with its `transient_failure_count` and `dispatch_not_before`
+    /// raised to at least the requested values. Otherwise a fresh `ready`
+    /// execution is inserted.
+    ///
+    /// Returns the successor, new or reused. Because the work item now has a
+    /// live execution, the orphan-active sweep skips it (no double dispatch).
+    ///
+    /// Returns `None`, changing nothing, when the predecessor was settled by
+    /// someone else while the caller was preserving its work: it is already
+    /// `cancelled`, `completed`, `failed` or `abandoned`. A resume there would
+    /// restart cancelled work or duplicate finished work. Only an `orphaned`
+    /// predecessor (another recovery path got there first) still resumes.
     pub fn request_resume_execution(
         &self,
         dead_execution_id: &str,
         new_count: i64,
         dispatch_not_before_epoch: i64,
         reason: &str,
-    ) -> Result<WorkExecution> {
+    ) -> Result<Option<WorkExecution>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let dead = query_execution(&tx, dead_execution_id).require("execution", dead_execution_id)?;
+
+        if dead.status.is_terminal() && dead.status != ExecutionStatus::Orphaned {
+            return Ok(None);
+        }
 
         let now = now_string();
         if !dead.status.is_terminal() {
@@ -505,14 +517,44 @@ impl WorkDb {
             )?;
         }
 
-        // Prefer the workspace the dead worker was actually leased into;
-        // fall back to its recorded preference if the lease metadata was
-        // never stamped. Hard prefer (prefer_is_soft carried from the
-        // dead row) so the resume lands on the same jj checkout.
-        let preferred_workspace_id = dead
-            .cube_workspace_id
-            .clone()
-            .or_else(|| dead.preferred_workspace_id.clone());
+        // Another reconciler can settle the run while teardown is in flight.
+        // Adopt the successor it created, but only the row that is genuinely
+        // this execution's resume: the next execution of the work item and
+        // kind, still live, and of a kind that recovers from its predecessor.
+        // Read-only kinds (PR review batch members share one work item) have
+        // no recovery predecessor, so a later row there is a sibling, never a
+        // resume. A terminal row is finished work, not a successor.
+        if !dead.kind.never_writes_pr_branch() {
+            let next: Option<String> = tx
+                .query_row(
+                    "SELECT id FROM work_executions WHERE work_item_id = ?1 AND kind = ?2
+                 AND rowid > (SELECT rowid FROM work_executions WHERE id = ?3)
+                 ORDER BY rowid ASC LIMIT 1",
+                    params![dead.work_item_id, dead.kind.as_str(), dead_execution_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(id) = next {
+                let candidate = query_execution(&tx, &id)?.context("resume successor disappeared")?;
+                if !candidate.status.is_terminal() {
+                    // The retry budget and backoff still apply to the adopted
+                    // row: raise, never lower, what the other reconciler set.
+                    tx.execute(
+                        "UPDATE work_executions
+                         SET transient_failure_count = MAX(transient_failure_count, ?2),
+                             dispatch_not_before = CASE
+                                 WHEN dispatch_not_before IS NULL
+                                      OR CAST(dispatch_not_before AS INTEGER) < ?3
+                                 THEN ?3 ELSE dispatch_not_before END
+                         WHERE id = ?1",
+                        params![id, new_count, dispatch_not_before_epoch.to_string()],
+                    )?;
+                    let successor = query_execution(&tx, &id)?.context("resume successor disappeared")?;
+                    tx.commit()?;
+                    return Ok(Some(successor));
+                }
+            }
+        }
 
         let new_id = next_id("exec");
         let dispatch_not_before = dispatch_not_before_epoch.to_string();
@@ -520,10 +562,10 @@ impl WorkDb {
         tx.execute(
             "INSERT INTO work_executions (
                 id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
-                cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                cube_workspace_id, workspace_path, priority,
                 created_at, started_at, finished_at, prefer_is_soft,
-                transient_failure_count, dispatch_not_before, allow_dirty, branch_naming
-             ) VALUES (?1, ?2, ?3, 'ready', ?4, ?5, NULL, NULL, NULL, ?6, ?7, ?8, NULL, NULL, ?9, ?10, ?11, ?12, ?13)",
+                transient_failure_count, dispatch_not_before, branch_naming
+             ) VALUES (?1, ?2, ?3, 'ready', ?4, ?5, NULL, NULL, NULL, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11)",
             params![
                 new_id,
                 dead.work_item_id,
@@ -531,16 +573,10 @@ impl WorkDb {
                 dead.repo_remote_url,
                 dead.cube_repo_id,
                 dead.priority,
-                preferred_workspace_id,
                 now,
                 dead.prefer_is_soft as i64,
                 new_count,
                 dispatch_not_before,
-                // Always true: this row exists to reclaim a workspace
-                // with uncommitted in-flight work (see the doc comment
-                // above) — never carry forward the dead execution's
-                // (typically `false`) value.
-                true as i64,
                 branch_naming_json,
             ],
         )?;
@@ -548,7 +584,7 @@ impl WorkDb {
         let new_execution = query_execution(&tx, &new_id)?
             .with_context(|| format!("missing execution after resume insert: {new_id}"))?;
         tx.commit()?;
-        Ok(new_execution)
+        Ok(Some(new_execution))
     }
 
     /// Path of the most recent run's transcript for `execution_id`, or
@@ -887,8 +923,8 @@ impl WorkDb {
         collect_rows(rows)
     }
 
-    /// Bounded recent local leftovers. Older leases have reached cube's TTL;
-    /// remote leases belong to the owning host's reconciler.
+    /// Local leftovers, including leases older than cube's TTL: expiry does
+    /// not prove that work was preserved. Remote leases belong to their host.
     pub fn list_terminal_executions_holding_lease(&self) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
@@ -903,13 +939,9 @@ impl WorkDb {
                AND COALESCE((SELECT r.host_id FROM work_runs r
                              WHERE r.execution_id = work_executions.id
                              ORDER BY r.created_at DESC, r.id DESC LIMIT 1), 'local') = 'local'
-               AND CAST(COALESCE(finished_at, created_at) AS INTEGER) >= ?1
              ORDER BY created_at DESC, id DESC LIMIT 100",
         )?;
-        let rows = stmt.query_map(
-            [boss_engine_utils::epoch_time::now_epoch_secs() - 86_400],
-            map_execution,
-        )?;
+        let rows = stmt.query_map([], map_execution)?;
         collect_rows(rows)
     }
 

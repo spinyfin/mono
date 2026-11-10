@@ -34,7 +34,7 @@ struct SeededWorker {
 /// error, a pool claim, a worker-registry mapping, and an Idle live-state
 /// entry — the shape transient-recovery inspects.
 async fn seed_stalled_worker(error_line: &str, register_session: bool) -> SeededWorker {
-    let (server, dir) = test_server_state();
+    let (server, dir) = test_server_state_with_fakes();
     let db = server.work_db.as_ref();
     let product_id = create_product(db);
     let work_item_id = create_active_chore(db, &product_id, "stalled chore");
@@ -109,6 +109,7 @@ async fn seed_stalled_worker_without_slot_mapping(error_line: &str) -> SeededWor
 async fn run_recovery(server: &Arc<ServerState>) -> boss_engine_runtime::transient_recovery::TransientRecoveryOutcome {
     let sink = Arc::new(RecordingDispatchEventSink::new());
     let policy = RecoveryPolicy::default();
+    let hosts = server.execution_coordinator.host_adapter_provider();
     let cx = RecoveryContext {
         work_db: server.work_db.as_ref(),
         live_states: &server.live_worker_states,
@@ -117,6 +118,8 @@ async fn run_recovery(server: &Arc<ServerState>) -> boss_engine_runtime::transie
         policy: &policy,
         nudger: &NoopWorkerNudger,
         reaper: server.as_ref(),
+        cube_client: server.cube_client.as_ref(),
+        host_adapters: hosts.as_ref(),
     };
     run_one_pass(
         &cx,
@@ -149,10 +152,8 @@ async fn confirm_next_pane_release(server: Arc<ServerState>, sink: Arc<SessionSi
         .await;
 }
 
-/// Regression: an unconfirmed orphan+respawn must **hold** the pool claim.
-/// Against the previous `release_slot` this fails — it freed the slot
-/// unconditionally, so the next `claim_worker` succeeded and the subsequent
-/// `AttachWorkerPane` died `SlotBusy`.
+/// A reaped tmux worker can resume after preservation, while an unconfirmed
+/// viewer detach still holds the pool claim to prevent a slot collision.
 #[tokio::test(start_paused = true)]
 async fn unconfirmed_orphan_respawn_holds_the_pool_claim() {
     let seeded = seed_stalled_worker(SOCKET_ERROR_LINE, true).await;
@@ -161,6 +162,7 @@ async fn unconfirmed_orphan_respawn_holds_the_pool_claim() {
     let outcome = run_recovery(&seeded.server).await;
     assert_eq!(outcome.resumed, 1, "socket error with no nudger must orphan+respawn");
     assert_eq!(outcome.escalated, 0);
+    assert_resume_follows_lease_release(&seeded);
 
     assert_eq!(
         pool.idle_count().await,
@@ -205,12 +207,27 @@ async fn absent_app_session_is_unconfirmed_and_holds_the_claim() {
 
     let outcome = run_recovery(&seeded.server).await;
     assert_eq!(outcome.resumed, 1);
+    assert_resume_follows_lease_release(&seeded);
     assert_eq!(
         pool.idle_count().await,
         0,
         "no app session must not be treated as confirmation the pane is gone",
     );
     assert!(pool.claim_worker("exec-fresh", None).await.is_none());
+}
+
+fn assert_resume_follows_lease_release(seeded: &SeededWorker) {
+    let db = seeded.server.work_db.as_ref();
+    let execution = db.get_execution(&seeded.exec_id).unwrap();
+    assert_eq!(execution.status, boss_protocol::ExecutionStatus::Orphaned);
+    assert!(execution.cube_lease_id.is_none());
+    let executions = db.list_executions(Some(&execution.work_item_id)).unwrap();
+    assert_eq!(executions.len(), 2, "one successor after confirmed tmux teardown");
+    assert!(
+        executions
+            .iter()
+            .any(|e| e.id != execution.id && e.status == boss_protocol::ExecutionStatus::Ready)
+    );
 }
 
 #[tokio::test]

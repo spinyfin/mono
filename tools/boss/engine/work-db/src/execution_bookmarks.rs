@@ -203,6 +203,33 @@ impl WorkDb {
         }))
     }
 
+    /// The recovery predecessor whose preserved work a dispatch of `execution`
+    /// would restore, when that predecessor still holds its cube workspace
+    /// lease. Its unpublished work is preserved only as its lease is released
+    /// (preservation precedes the release, and the release clears the lease
+    /// columns), so while the lease is recorded the dispatch cannot tell "no
+    /// work to restore" from "work not yet preserved". Dispatch holds the row
+    /// instead of guessing, and starting it from trunk would strand whatever
+    /// the predecessor left unpublished.
+    ///
+    /// `None` when `execution` recovers from its own record (a retry) or has no
+    /// predecessor, or when the predecessor's lease is gone. Lease age does not
+    /// prove that unpublished work has been preserved.
+    pub fn recovery_predecessor_holding_lease(&self, execution: &WorkExecution) -> Result<Option<WorkExecution>> {
+        let Some(source) = self.recovery_source(execution)? else {
+            return Ok(None);
+        };
+        let predecessor = source.execution;
+        if predecessor.id == execution.id {
+            return Ok(None);
+        }
+        let holds_lease = predecessor
+            .cube_lease_id
+            .as_deref()
+            .is_some_and(|lease| !lease.is_empty());
+        Ok(holds_lease.then_some(predecessor))
+    }
+
     /// Resolve the predecessor by recorded execution identity alone. Workspace
     /// preferences, lease ownership, and filesystem existence are irrelevant.
     ///

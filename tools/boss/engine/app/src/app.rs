@@ -442,10 +442,17 @@ impl boss_engine_runtime::transient_recovery::TransientRecoveryReaper for Server
     /// confirmed-teardown path every other retire uses. `release_slot`
     /// used to call `release_worker_and_kick` without ever asking the
     /// app to tear the pane down, so the next dispatch claimed a slot
-    /// the app still hosted and died `SlotBusy`.
-    async fn reap_worker(&self, execution_id: &str) {
-        if ServerState::release_worker_pane(self, execution_id).await != PaneReleaseOutcome::Reaped {
-            return;
+    /// the app still hosted and died `SlotBusy`. Reports the teardown's
+    /// outcome: the caller preserves the run's work and returns its cube
+    /// lease only on `Reaped`.
+    async fn reap_worker(&self, execution_id: &str) -> PaneReleaseOutcome {
+        // Resume insertion terminalizes the run only after preservation.
+        // Keep an unacknowledged viewer's pool claim during that interval.
+        let outcome = self
+            .release_worker_pane_with_teardown_policy(execution_id, false, true)
+            .await;
+        if outcome != PaneReleaseOutcome::Reaped {
+            return outcome;
         }
         // A successfully reaped worker may have lost its run-to-slot mapping
         // before teardown. Clear any remaining live-state entry so the pool
@@ -459,6 +466,7 @@ impl boss_engine_runtime::transient_recovery::TransientRecoveryReaper for Server
                  held claim",
             );
         }
+        outcome
     }
 }
 
@@ -505,7 +513,9 @@ impl WorkerPaneReleaser for ServerStatePaneReleaser {
         let Some(server) = self.server.get().and_then(Weak::upgrade) else {
             return PaneReleaseOutcome::NoLiveWorker;
         };
-        server.release_worker_pane_with_remote_proof(run_id, true).await
+        server
+            .release_worker_pane_with_teardown_policy(run_id, true, false)
+            .await
     }
 }
 
@@ -2062,13 +2072,15 @@ impl ServerState {
     /// or unavailable tmux evidence preserves the worker for rollback/drain.
     /// A verified teardown also clears live-state and detaches its app viewer.
     pub async fn release_worker_pane(&self, run_id: &str) -> PaneReleaseOutcome {
-        self.release_worker_pane_with_remote_proof(run_id, false).await
+        self.release_worker_pane_with_teardown_policy(run_id, false, false)
+            .await
     }
 
-    async fn release_worker_pane_with_remote_proof(
+    async fn release_worker_pane_with_teardown_policy(
         &self,
         run_id: &str,
         remote_proven_dead: bool,
+        hold_unconfirmed_claim: bool,
     ) -> PaneReleaseOutcome {
         // Terminal status alone does not prove a remote worker has stopped.
         if self.execution_is_terminal(run_id)
@@ -2205,10 +2217,13 @@ impl ServerState {
         };
         // Preserve the existing viewer-slot acknowledgement contract: terminal
         // claims with an unconfirmed detach are handed back by pool_claim_sweep.
-        // Nonterminal claims must be released here because that sweep only
-        // considers terminal rows. The tmux process has already been reaped.
+        // Transient recovery terminalizes after preservation, so it explicitly
+        // retains unconfirmed claims until then. Other nonterminal callers
+        // release here because the sweep only considers terminal rows.
+        // The tmux process has already been reaped.
         let worker_id = boss_execution_contracts::worker_id_for_slot(slot_id);
-        let sweep_owns_handback = !pane_confirmed_released && self.execution_is_terminal(run_id);
+        let sweep_owns_handback =
+            !pane_confirmed_released && (hold_unconfirmed_claim || self.execution_is_terminal(run_id));
         if sweep_owns_handback {
             tracing::warn!(
                 run_id,

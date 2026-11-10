@@ -18,6 +18,15 @@ pub const DISPATCH_WAIT_REASON_AUTOMATION_PAUSED: &str = "automation_paused";
 /// [`is_capacity_wait_reason`].
 pub const DISPATCH_WAIT_REASON_PROGRESSION_UNAVAILABLE: &str = "progression_unavailable";
 
+/// A resume or successor row is held `ready` because the execution it recovers
+/// from is finished but still holds its cube workspace lease, so that run's
+/// unpublished work has not been preserved yet. Dispatching now would start
+/// the row from trunk and strand the work. Not a capacity wait: nothing is
+/// short of slots or workspaces, and the row stays held until the lease is
+/// released (which preserves first), so it is deliberately absent from
+/// [`is_capacity_wait_reason`].
+pub const DISPATCH_WAIT_REASON_AWAITING_PREDECESSOR_PRESERVATION: &str = "awaiting_predecessor_preservation";
+
 /// Dispatch focus is holding an out-of-scope ready row.
 pub use boss_protocol::DISPATCH_WAIT_REASON_FOCUS_MODE;
 
@@ -65,6 +74,7 @@ mod tests {
             "slot_busy",
             "waiting_dependency",
             DISPATCH_WAIT_REASON_PROGRESSION_UNAVAILABLE,
+            DISPATCH_WAIT_REASON_AWAITING_PREDECESSOR_PRESERVATION,
         ] {
             assert!(!is_capacity_wait_reason(reason), "{reason}");
         }

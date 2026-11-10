@@ -1044,6 +1044,9 @@ async fn preempted_automation_work_redispatches_once_capacity_frees() {
         sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(preemptor.calls().await.len(), 1, "the spilled automation was preempted");
+    // The production preemptor also returns the victim's cube lease (which
+    // `FakePreemptor` does not model); the requeued run waits behind it.
+    release_finished_execution_lease(&db, &spilled_execution_id);
 
     // Free the automation pool's own slot, as a finishing automation
     // worker would, and kick. The requeued work must dispatch onto it.

@@ -748,15 +748,13 @@ pub struct WorkExecution {
     /// unclassified; `None` with no driver is a pre-recording execution.
     #[serde(default)]
     pub effort_level: Option<super::common::EffortLevel>,
-    /// When `true`, the cube lease call for this execution will include
-    /// `--allow-dirty`, causing cube to reclaim the named preferred workspace
-    /// with its uncommitted working copy intact rather than resetting it.
-    /// Set on the orphan recovery re-dispatch path (when the predecessor
-    /// execution was `orphaned`), merge-cancelled review followups, and by the
-    /// transient-recovery auto-resume path (`WorkDb::request_resume_execution`
-    /// in `boss-engine`) so the recovering worker lands on the exact dirty
-    /// workspace its predecessor left behind instead of cube silently
-    /// wiping it. Normal first-time dispatches leave this `false`.
+    /// Recorded when the row is created on the orphan recovery re-dispatch
+    /// path (when the predecessor execution was `orphaned`) and for
+    /// merge-cancelled review followups. Dispatch does not read it: it
+    /// always leases a clean workspace (never `--allow-dirty`) and recovers
+    /// the predecessor's work through its preserved tip. The transient-recovery
+    /// auto-resume path (`WorkDb::request_resume_execution`) does not set it.
+    /// Normal first-time dispatches leave this `false`.
     #[serde(default)]
     #[builder(default)]
     pub allow_dirty: bool,

@@ -277,9 +277,12 @@ pub enum Stage {
     DispatchDecision,
     /// The transient-recovery sweep detected a worker that stalled or
     /// died with a *transient* Claude API error as the last entry in
-    /// its transcript and auto-resumed it on the same workspace. The
+    /// its transcript and auto-resumed it in a new execution (on any free
+    /// workspace, carrying over the stalled run's preserved work). The
     /// `details` object carries `attempt`, `max_attempts`, the error
-    /// `class`, and a clipped `error` string so `bossctl dispatch tail`
+    /// `class`, a clipped `error` string, and `predecessor_lease` (what
+    /// became of the stalled run's cube lease: `released`, `kept`,
+    /// `cube_failed`, `not_attempted` or `none`) so `bossctl dispatch tail`
     /// shows "recovering, attempt 2/3" without a log dive.
     TransientRecovery,
     /// The transient-recovery sweep stopped retrying a worker and

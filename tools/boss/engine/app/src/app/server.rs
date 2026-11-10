@@ -2208,7 +2208,8 @@ async fn serve_scoped(
     // Periodic transient-recovery reconciler: detects workers wedged by
     // a transient Claude API error (the interactive `claude` session
     // printed the error, ended its turn, and sits Idle while the chore
-    // is unfinished) and auto-resumes them on the same workspace with
+    // is unfinished) and auto-resumes them in a new execution on any free
+    // workspace, carrying over the stalled run's preserved work, with
     // bounded retries + backoff, escalating non-retryable / cap-reached
     // failures for human attention. Runs every 60s and fires on boot;
     // also subscribes to `TransientErrorIdle` (published by
@@ -2228,6 +2229,8 @@ async fn serve_scoped(
             nudger: Arc::clone(&server_state) as Arc<dyn boss_engine_runtime::transient_recovery::WorkerNudger>,
             reaper: Arc::clone(&server_state)
                 as Arc<dyn boss_engine_runtime::transient_recovery::TransientRecoveryReaper>,
+            cube_client: server_state.cube_client.clone(),
+            host_adapters: server_state.execution_coordinator.host_adapter_provider(),
         },
         boss_engine_runtime::transient_recovery::DEFAULT_INTERVAL,
         transient_error_idle,

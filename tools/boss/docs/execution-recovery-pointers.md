@@ -3,7 +3,7 @@
 Dispatch creates no bookmarks. It records the baseline commit on the `execution_bookmarks` row, and the rest of the lifecycle is:
 
 - The worker creates the publication branch `boss/<execution id>` (`jj bookmark set boss/<execution id> -r @`) immediately before `cube pr create`. The worker does not advance any recovery bookmark.
-- At teardown, when the workspace holds unpublished work, the engine writes one `preserved/<execution id>` bookmark at its tip and records that tip on the execution row. Nothing is written when there is nothing to preserve. The preserved tip is the source for later edits.
+- At teardown, when the workspace holds unpublished work, the engine writes one `preserved/<execution id>` bookmark at its tip and records that tip on the execution row. Nothing is written when there is nothing to preserve. The preserved tip is the source for later edits. Preservation happens as the cube lease is released, so dispatch holds a successor (wait reason `awaiting_predecessor_preservation`) while its recovery predecessor still records a lease; see [post-crash recovery](post-crash-recovery.md).
 - Dispatch writes no `boss-recovery/<execution id>` head: restoring a preserved tip positions `@` on it and records no bookmark. Only legacy executions carry a `boss-recovery/` head. A `boss-base/<execution id>` bookmark exists only for legacy executions that were in flight before this layout; recovery never reads it.
 
 Legacy names still found in the store:

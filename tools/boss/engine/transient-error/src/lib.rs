@@ -368,9 +368,9 @@ impl EscalateReason {
 /// transcript entry was an API error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryDecision {
-    /// Auto-resume on the same workspace. `attempt` is 1-based (the
-    /// attempt number this resume represents) and `backoff` is how long
-    /// to defer the resume dispatch.
+    /// Auto-resume in a new execution that continues from the stalled run's
+    /// preserved work. `attempt` is 1-based (the attempt number this resume
+    /// represents) and `backoff` is how long to defer the resume dispatch.
     Resume { attempt: u32, backoff: Duration },
     /// Stop retrying and surface for human attention.
     Escalate { reason: EscalateReason },

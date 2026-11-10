@@ -57,6 +57,19 @@ pub use boss_engine_completion::test_support::{
 };
 pub use boss_execution_contracts::test_doubles::{NoopCube, RecordingPublisher};
 
+/// Leave `execution_id` as teardown leaves a finished run once it has
+/// preserved the run's work: its cube workspace lease returned and the lease
+/// columns cleared. Dispatch holds a successor while its recovery predecessor
+/// still records a lease, so a fixture that models a finished predecessor
+/// must not leave one behind. A no-op for a row that holds no lease.
+pub fn release_finished_execution_lease(db: &WorkDb, execution_id: &str) {
+    let execution = db.get_execution(execution_id).unwrap();
+    if let Some(lease_id) = execution.cube_lease_id.clone() {
+        assert!(db.claim_execution_workspace_release(execution_id, &lease_id).unwrap());
+        db.finish_execution_workspace_release(&execution).unwrap();
+    }
+}
+
 /// An [`ExecutionRunner`] test double whose `run_execution` panics with
 /// `unimplemented!()`. The sweep and recovery test modules
 /// (`dead_pid_sweep`, `orphan_sweep`, `pool_claim_sweep`,

@@ -6,7 +6,9 @@ use super::*;
 use crate::app::work_items::handle_operator_question;
 use async_trait::async_trait;
 use boss_engine_dispatch::coordinator::DispatchPauseOrigin;
-use boss_engine_runtime::test_support::{create_test_chore_manual, create_test_product, insert_host_capability};
+use boss_engine_runtime::test_support::{
+    create_test_chore_manual, create_test_product, insert_host_capability, release_finished_execution_lease,
+};
 use boss_execution_contracts::{
     CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus, ExecutionRunner,
     RunOutcome, RunWaitState,
@@ -240,6 +242,8 @@ fn parked_mismatch() -> Parked {
     db.record_worker_awaiting_operator_answer(&execution_id, "worker declared blocked", &question)
         .unwrap()
         .expect("live execution parks the revision");
+    // Parking the run tears its worker down and returns its workspace lease.
+    release_finished_execution_lease(db, &execution_id);
     Parked {
         _dir: dir,
         state,
