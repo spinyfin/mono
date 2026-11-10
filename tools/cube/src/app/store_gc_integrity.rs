@@ -11,10 +11,15 @@
 //! [`OLDEST_SHARED_CLIENT_JJ`] before anything runs, and recorded in the
 //! audit rows.
 //!
+//! A pinned 200-operation mono sample contained 11 two-parent merges. Parent
+//! checks therefore walk the DAG: concurrent merges are safe only when every
+//! branch reaches the checked head, without reaching abandoned history.
+//!
 //! Collection also never touches the live `.jj/repo/index`. That is
 //! deliberate and costs nothing: neither jj 0.26 nor 0.32's `util gc` prunes the
 //! default index store (tested against repos with abandoned operations:
-//! the `index/operations` links and segments are identical before and after;
+//! all index file paths and contents, including operation links and segments,
+//! are identical before and after;
 //! see `store_gc_default_index_retention_for_both_client_versions`),
 //! so running it against the private scratch index leaves the live index
 //! exactly as growth-prone as it already was. A rewrite itself orphans the
@@ -163,17 +168,27 @@ impl Drop for GcIndex {
     }
 }
 
-/// Follow only single-parent operations back to the checked head. Unknown
-/// debug output fails closed, so it cannot authorize collection.
-pub(super) fn require_linear_progress(
+/// Require every parent branch to reach the checked head, accepting benign
+/// concurrent merges but refusing abandoned ancestry. Bound both work and time;
+/// unknown debug output fails closed, so it cannot authorize collection.
+pub(super) fn require_safe_progress(
     runner: &dyn CommandRunner,
     source: &Path,
     ancestor: &str,
     head: &str,
 ) -> Result<()> {
-    let mut current = head.to_owned();
+    let mut pending = vec![head.to_owned()];
     let mut seen = std::collections::HashSet::new();
-    while current != ancestor && seen.insert(current.clone()) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut unsafe_history = false;
+    while let Some(current) = pending.pop() {
+        if current == ancestor || !seen.insert(current.clone()) {
+            continue;
+        }
+        if seen.len() > 4096 || std::time::Instant::now() >= deadline {
+            unsafe_history = true;
+            break;
+        }
         let output = runner.run_with_timeout(
             &RealCommandRunner::invocation(
                 source,
@@ -189,7 +204,7 @@ pub(super) fn require_linear_progress(
                     &current,
                 ],
             ),
-            Duration::from_secs(60),
+            deadline.saturating_duration_since(std::time::Instant::now()),
         )?;
         let parents = output
             .split_once("parents: [")
@@ -197,16 +212,21 @@ pub(super) fn require_linear_progress(
         let ids: Vec<_> = parents
             .map(|(text, _)| text.split('"').skip(1).step_by(2).collect())
             .unwrap_or_default();
-        if ids.len() != 1 || ids[0].len() != 128 || !ids[0].bytes().all(|b| b.is_ascii_hexdigit()) {
+        if ids.is_empty()
+            || ids
+                .iter()
+                .any(|id| id.len() != 128 || !id.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            unsafe_history = true;
             break;
         }
-        current = ids[0].to_owned();
+        pending.extend(ids.into_iter().map(str::to_owned));
     }
-    if current == ancestor {
+    if !unsafe_history {
         return Ok(());
     }
     Err(CubeError::InvalidArgument(format!(
-        "unsafe operation heads in {}: {head} does not descend linearly from {ancestor}; a merge or abandoned ancestry was found; nothing was collected",
+        "unsafe operation heads in {}: {head} does not descend safely from {ancestor}; abandoned or unverified ancestry was found",
         source.display()
     )))
 }

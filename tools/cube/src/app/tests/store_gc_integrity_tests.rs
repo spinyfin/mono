@@ -239,88 +239,111 @@ fn a_head_published_during_the_pre_collection_rebuild_stops_both_collection_path
 }
 
 #[test]
-fn linear_operations_during_rebuild_and_collection_are_verified_at_the_new_head() {
-    use super::support::ExpectedCommand;
-    use crate::command_runner::{CommandInvocation, CommandRunner};
-    use std::cell::Cell;
+fn collection_checks_linear_progress_and_refuses_a_merge_with_abandoned_history() {
+    for stale_merge in [false, true] {
+        use super::support::ExpectedCommand;
+        use crate::command_runner::{CommandInvocation, CommandRunner};
+        use std::cell::Cell;
 
-    let (tempdir, database) = with_database_path();
-    seed_mono_repo(&tempdir.path().join("workspaces"), &database);
-    let source = seed_store_files(&source_of(&database));
-    std::fs::remove_dir(source.join(".git")).unwrap();
-    let heads = source.join(".jj/repo/op_heads/heads");
-    let original = "b".repeat(128);
-    let forward = "c".repeat(128);
-    let collected = "d".repeat(128);
-    std::fs::rename(heads.join("head"), heads.join(&original)).unwrap();
-    let verify = |head: &str| gc_index_command(&source, &["--at-operation", head, "debug", "reindex"]);
-    let parents = |head: &str, parent: &str| {
-        ExpectedCommand::ok(
-            source.clone(),
-            "jj",
-            &[
-                "--ignore-working-copy",
-                "--at-operation",
-                head,
-                "debug",
-                "operation",
-                "--display",
-                "operation",
-                head,
-            ],
-            &format!("Operation {{ parents: [OperationId(\"{parent}\")], metadata: {{}} }}"),
-        )
-    };
-    let now = crate::app::util::current_epoch_s().unwrap();
-    let fake = FakeRunner::new(vec![
-        op_log_command(&source, &format!("{original} {now}\n")),
-        verify(&original),
-        verify(&original),
-        ps_command(&source, ""),
-        parents(&forward, &original),
-        gc_index_command(&source, &["util", "gc", "--expire", "now"]),
-        verify(&collected),
-    ]);
-    struct Forward<'a> {
-        fake: &'a FakeRunner,
-        heads: std::path::PathBuf,
-        ids: [&'a str; 3],
-        reindexes: Cell<usize>,
-    }
-    impl CommandRunner for Forward<'_> {
-        fn run(&self, invocation: &CommandInvocation) -> crate::app::errors::Result<String> {
-            let result = self.fake.run(invocation)?;
-            let transition = if invocation.args.iter().any(|arg| arg == "reindex") {
-                self.reindexes.set(self.reindexes.get() + 1);
-                (self.reindexes.get() == 2).then_some(0)
-            } else if invocation.args.iter().any(|arg| arg == "gc") {
-                Some(1)
-            } else {
-                None
-            };
-            if let Some(i) = transition {
-                std::fs::rename(self.heads.join(self.ids[i]), self.heads.join(self.ids[i + 1])).unwrap();
+        let (tempdir, database) = with_database_path();
+        seed_mono_repo(&tempdir.path().join("workspaces"), &database);
+        let source = seed_store_files(&source_of(&database));
+        std::fs::remove_dir(source.join(".git")).unwrap();
+        let heads = source.join(".jj/repo/op_heads/heads");
+        let original = "b".repeat(128);
+        let forward = "c".repeat(128);
+        let collected = "d".repeat(128);
+        std::fs::rename(heads.join("head"), heads.join(&original)).unwrap();
+        let verify = |head: &str| gc_index_command(&source, &["--at-operation", head, "debug", "reindex"]);
+        let parents = |head: &str, parent: &str| {
+            ExpectedCommand::ok(
+                source.clone(),
+                "jj",
+                &[
+                    "--ignore-working-copy",
+                    "--at-operation",
+                    head,
+                    "debug",
+                    "operation",
+                    "--display",
+                    "operation",
+                    head,
+                ],
+                &format!("Operation {{ parents: [OperationId(\"{parent}\")], metadata: {{}} }}"),
+            )
+        };
+        let now = crate::app::util::current_epoch_s().unwrap();
+        let mut expected = vec![
+            op_log_command(&source, &format!("{original} {now}\n")),
+            verify(&original),
+            verify(&original),
+            ps_command(&source, ""),
+            parents(&forward, &original),
+            gc_index_command(&source, &["util", "gc", "--expire", "now"]),
+        ];
+        if stale_merge {
+            let root = "0".repeat(128);
+            let mut merged = parents(&collected, &forward);
+            merged.result = Ok(format!(
+                "Operation {{ parents: [OperationId(\"{forward}\"), OperationId(\"{root}\")], metadata: {{}} }}"
+            ));
+            let mut root_op = parents(&root, &root);
+            root_op.result = Ok("Operation { parents: [], metadata: {} }".into());
+            expected.extend([merged, root_op]);
+        } else {
+            expected.extend([parents(&collected, &forward), verify(&collected)]);
+        }
+        let fake = FakeRunner::new(expected);
+        struct Forward<'a> {
+            fake: &'a FakeRunner,
+            heads: std::path::PathBuf,
+            ids: [&'a str; 3],
+            reindexes: Cell<usize>,
+        }
+        impl CommandRunner for Forward<'_> {
+            fn run(&self, invocation: &CommandInvocation) -> crate::app::errors::Result<String> {
+                let result = self.fake.run(invocation)?;
+                let transition = if invocation.args.iter().any(|arg| arg == "reindex") {
+                    self.reindexes.set(self.reindexes.get() + 1);
+                    (self.reindexes.get() == 2).then_some(0)
+                } else if invocation.args.iter().any(|arg| arg == "gc") {
+                    Some(1)
+                } else {
+                    None
+                };
+                if let Some(i) = transition {
+                    std::fs::rename(self.heads.join(self.ids[i]), self.heads.join(self.ids[i + 1])).unwrap();
+                }
+                Ok(result)
             }
-            Ok(result)
+        }
+        let runner = Forward {
+            fake: &fake,
+            heads,
+            ids: [&original, &forward, &collected],
+            reindexes: Cell::new(0),
+        };
+        let report = crate::app::store_gc::gc_repo_store(
+            &runner,
+            Some(&database),
+            &mono_record(&database),
+            crate::app::store_gc::DEFAULT_KEEP,
+            std::time::Duration::from_millis(200),
+            false,
+        );
+        fake.assert_exhausted();
+        if stale_merge {
+            assert!(report.unwrap_err().to_string().contains("does not descend safely"));
+            let events: Vec<_> = audit_events(&tempdir)
+                .into_iter()
+                .filter(|row| row["event"] == "repo.store_gc")
+                .collect();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["outcome"], "failed");
+        } else {
+            assert_eq!(report.unwrap().collection, crate::app::store_gc::Collection::Immediate);
         }
     }
-    let runner = Forward {
-        fake: &fake,
-        heads,
-        ids: [&original, &forward, &collected],
-        reindexes: Cell::new(0),
-    };
-    let report = crate::app::store_gc::gc_repo_store(
-        &runner,
-        Some(&database),
-        &mono_record(&database),
-        crate::app::store_gc::DEFAULT_KEEP,
-        std::time::Duration::from_millis(200),
-        false,
-    )
-    .unwrap();
-    fake.assert_exhausted();
-    assert_eq!(report.collection, crate::app::store_gc::Collection::Immediate);
 }
 
 #[test]

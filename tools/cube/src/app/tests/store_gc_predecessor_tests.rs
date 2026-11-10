@@ -97,7 +97,7 @@ fn collect_with_runner(
     )
 }
 
-fn race_with_head(during_rebuild: bool, busy: bool, merge: bool) {
+fn race_with_head(phase: u8, busy: bool, merge: bool) {
     let f = fixture();
     let original_head = f.jj(
         &f.root,
@@ -115,7 +115,7 @@ fn race_with_head(during_rebuild: bool, busy: bool, merge: bool) {
     struct RacingHead<'a> {
         fixture: &'a Fixture,
         original_head: String,
-        during_rebuild: bool,
+        phase: u8,
         reindexes: std::cell::Cell<usize>,
         busy: bool,
         merge: bool,
@@ -140,18 +140,19 @@ fn race_with_head(during_rebuild: bool, busy: bool, merge: bool) {
             }
             // The second reindex is the pre-collection rebuild: pinned to the
             // checked head, it must not merge the head published under it.
-            let publish = if self.during_rebuild {
-                reindex && self.reindexes.get() == 2
-            } else {
-                invocation.args.iter().any(|arg| arg == "root()")
+            let publish = match self.phase {
+                2 => invocation.args.iter().any(|arg| arg == "gc"),
+                1 => reindex && self.reindexes.get() == 2,
+                _ => invocation.args.iter().any(|arg| arg == "root()"),
             };
             if publish {
-                let head = invocation
-                    .args
-                    .windows(2)
-                    .find(|args| args[0] == "--at-operation")
-                    .unwrap();
-                self.rewritten.replace(head[1].clone());
+                let head = std::fs::read_dir(self.fixture.root.join(".jj/repo/op_heads/heads"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .file_name();
+                self.rewritten.replace(head.to_str().unwrap().to_owned());
                 // A writer loaded the old head before abandon and publishes
                 // it while the warm-up is starting. An unpinned read would
                 // merge it, hiding the race from the collector's head check.
@@ -188,7 +189,7 @@ fn race_with_head(during_rebuild: bool, busy: bool, merge: bool) {
     let runner = RacingHead {
         fixture: &f,
         original_head: original_head.clone(),
-        during_rebuild,
+        phase,
         reindexes: Default::default(),
         busy,
         merge,
@@ -196,9 +197,9 @@ fn race_with_head(during_rebuild: bool, busy: bool, merge: bool) {
         rewritten: Default::default(),
     };
     let error = collect_with_runner(&f, Duration::ZERO, &runner).unwrap_err();
-    assert_eq!(runner.gc_calls.get(), 0);
+    assert_eq!(runner.gc_calls.get(), usize::from(phase == 2));
     if merge {
-        assert!(error.to_string().contains("does not descend linearly"), "{error}");
+        assert!(error.to_string().contains("does not descend safely"), "{error}");
     } else {
         assert!(
             error.to_string().contains("2 operation heads before the collection"),
@@ -223,15 +224,90 @@ fn race_with_head(during_rebuild: bool, busy: bool, merge: bool) {
 
 #[test]
 fn store_gc_predecessor_warmup_does_not_merge_a_racing_head() {
-    race_with_head(false, false, false);
-    race_with_head(false, false, true);
+    race_with_head(0, false, false);
+    race_with_head(0, false, true);
 }
 
 #[test]
 fn store_gc_predecessor_pre_collection_rebuild_does_not_merge_a_racing_head() {
     for busy in [false, true] {
-        race_with_head(true, busy, false);
+        race_with_head(1, busy, false);
     }
+}
+
+#[test]
+fn store_gc_predecessor_merge_during_collection_is_audited_as_failed() {
+    for busy in [false, true] {
+        race_with_head(2, busy, true);
+    }
+}
+
+#[test]
+fn store_gc_accepts_concurrent_describes_descending_from_the_checked_head() {
+    let f = fixture();
+    let ancestor = f.jj(
+        &f.root,
+        &[
+            "--ignore-working-copy",
+            "op",
+            "log",
+            "--limit",
+            "1",
+            "--no-graph",
+            "-T",
+            "id",
+        ],
+    );
+    std::thread::scope(|scope| {
+        let describe = |message| {
+            f.jj(
+                &f.root,
+                &[
+                    "--ignore-working-copy",
+                    "--at-operation",
+                    &ancestor,
+                    "describe",
+                    "-m",
+                    message,
+                ],
+            );
+        };
+        let first = scope.spawn(move || describe("concurrent first"));
+        let second = scope.spawn(move || describe("concurrent second"));
+        first.join().unwrap();
+        second.join().unwrap();
+    });
+    assert_eq!(crate::app::store_gc::count_op_heads(&f.root).unwrap(), 2);
+    cached_read(&f);
+    let head = f.jj(
+        &f.root,
+        &[
+            "--ignore-working-copy",
+            "op",
+            "log",
+            "--limit",
+            "1",
+            "--no-graph",
+            "-T",
+            "id",
+        ],
+    );
+    let operation = f.jj(
+        &f.root,
+        &[
+            "--ignore-working-copy",
+            "--at-operation",
+            &head,
+            "debug",
+            "operation",
+            "--display",
+            "operation",
+            &head,
+        ],
+    );
+    let parents = operation.split_once("parents: [").unwrap().1.split_once(']').unwrap().0;
+    assert_eq!(parents.matches("OperationId(").count(), 2);
+    crate::app::store_gc_integrity::require_safe_progress(&f.runner, &f.root, &ancestor, &head).unwrap();
 }
 
 fn cached_read(f: &Fixture) {
@@ -272,26 +348,31 @@ fn store_gc_default_index_retention_for_both_client_versions() {
         cached_read(&f);
         let snapshot = || {
             let index = f.root.join(".jj/repo/index");
-            let names = |path: &std::path::Path| {
-                let mut entries = std::fs::read_dir(path)
-                    .unwrap()
-                    .map(|e| e.unwrap().file_name())
-                    .collect::<Vec<_>>();
-                entries.sort();
-                entries
-            };
-            (names(&index.join("operations")), names(&index))
+            fn files(root: &std::path::Path, path: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+                let mut result = Vec::new();
+                for entry in std::fs::read_dir(path).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        result.extend(files(root, &path));
+                    } else {
+                        result.push((
+                            path.strip_prefix(root).unwrap().to_owned(),
+                            std::fs::read(&path).unwrap(),
+                        ));
+                    }
+                }
+                result.sort();
+                result
+            }
+            files(&index, &index)
         };
         let before = snapshot();
         unsafe_collect(&f);
         let after = snapshot();
         eprintln!(
-            "{}: operation links {}, index entries {}; after GC {}, {}",
+            "{}: {} index files and their contents retained",
             f.jj(&f.root, &["--version"]),
-            before.0.len(),
-            before.1.len(),
-            after.0.len(),
-            after.1.len()
+            before.len()
         );
         assert_eq!(before, after);
     }
@@ -330,7 +411,7 @@ fn store_gc_linear_progress_after_abandon_is_accepted() {
                 }
                 let head = std::fs::read_dir(&heads).unwrap().next().unwrap().unwrap().file_name();
                 let start = std::time::Instant::now();
-                crate::app::store_gc_integrity::require_linear_progress(
+                crate::app::store_gc_integrity::require_safe_progress(
                     &self.f.runner,
                     &self.f.root,
                     ancestor.to_str().unwrap(),

@@ -775,7 +775,13 @@ checkout and not aware of anything above jj:
    procedure and shared-client version requirements.
    The pre-collection rebuild is pinned to the checked operation head, and the
    quiet observation and single-head check follow it immediately before
-   `util gc`; a head published during the rebuild stops the pass. The collector
+   `util gc`; a second head published during the rebuild stops the pass.
+   Pinned parent checks before and after collection accept concurrent merges
+   only when every branch reaches the previously checked head. A merge that
+   restores abandoned ancestry fails the pass and writes a failed audit row,
+   including when it appears during `util gc`. The ancestry walk is bounded
+   to 4,096 operations and 60 seconds and refuses unverified history.
+   The collector
    must also be the oldest client sharing the store: a newer `jj` omits legacy
    predecessors from its index, prunes them, and still passes its own
    verifications. The `jj` on `PATH` is therefore refused when newer than 0.26

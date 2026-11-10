@@ -770,7 +770,7 @@ pub(super) fn gc_repo_store_with_deadline(
             let collection_started = Instant::now();
             let head = require_single_op_head(record, &source, "before the collection rebuild")?;
             if let Some(ref rewritten) = rewritten_head {
-                super::store_gc_integrity::require_linear_progress(runner, &source, rewritten, &head)?;
+                super::store_gc_integrity::require_safe_progress(runner, &source, rewritten, &head)?;
             }
             index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "before collection", &head)?;
             let quiet = wait_for_jj_quiescence(runner, &source, quiescence, QUIESCENCE_POLL)?;
@@ -779,7 +779,7 @@ pub(super) fn gc_repo_store_with_deadline(
             // head only shows up now, on both the immediate and deferred
             // paths.
             let current = require_single_op_head(record, &source, "before the collection")?;
-            super::store_gc_integrity::require_linear_progress(runner, &source, &head, &current)?;
+            super::store_gc_integrity::require_safe_progress(runner, &source, &head, &current)?;
             if quiet {
                 gc_args.extend(["--expire", "now"]);
                 collection = Collection::Immediate;
@@ -790,6 +790,7 @@ pub(super) fn gc_repo_store_with_deadline(
             // cannot invalidate the head this collector loaded.
             index.run(runner, &gc_args, MAINTENANCE_CMD_TIMEOUT)?;
             let collected = require_single_op_head(record, &source, "after the collection")?;
+            super::store_gc_integrity::require_safe_progress(runner, &source, &current, &collected)?;
             index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "after collection", &collected)?;
             collection_ms = collection_started.elapsed().as_millis();
         }
