@@ -744,7 +744,9 @@ pub mod parking;
 pub mod parking_reconcile;
 pub mod personas;
 mod progression_candidates;
+mod progression_done;
 mod progression_scope;
+mod progression_verbs;
 mod project_postmortem;
 #[cfg(test)]
 use boss_prose_vocabulary as prose_vocabulary;
@@ -882,6 +884,7 @@ pub use pr_flow::insert_question;
 #[cfg(test)]
 pub use products_design::resolve_task_doc_pointer;
 pub use progression_candidates::{ProgressionCandidate, ProgressionClauses, ProgressionMint};
+pub use progression_verbs::ProgressionVerbRefusal;
 pub use proposal_apply::*;
 pub use query_ensure::*;
 pub use review_batches::{

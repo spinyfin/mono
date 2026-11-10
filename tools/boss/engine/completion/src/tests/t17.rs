@@ -376,10 +376,13 @@ fn stuck_item_with_started_progression(dir: &Path) -> (Arc<WorkDb>, String, crat
 }
 
 #[tokio::test]
-async fn on_stop_finalizes_a_progression_run_without_touching_the_stuck_item() {
+async fn a_progression_stop_without_a_declaration_fails_the_run_as_no_disposition_and_leaves_the_item_alone() {
     // A progression run holds no lease and no checkout. Its Stop must finalize
     // the execution and release the pane only: no PR detection, no nudge, no
     // cube call, and — above all — no change to the item it was sent to inspect.
+    // A run that ended its turn without declaring how it ended has no disposition,
+    // so it is a failed run (counted toward the infrastructure-failure cap), not a
+    // completed one.
     let dir = tempdir().unwrap();
     let (db, chore_id, execution) = stuck_item_with_started_progression(dir.path());
     // The item's pre-existing stale-worker evidence must survive the Stop's
@@ -398,10 +401,19 @@ async fn on_stop_finalizes_a_progression_run_without_touching_the_stuck_item() {
     let outcome = handler.on_stop(&execution.id).await;
 
     assert!(matches!(outcome, StopOutcome::Progression), "got {outcome:?}");
-    assert_eq!(
-        db.get_execution(&execution.id).unwrap().status,
-        ExecutionStatus::Completed
-    );
+    assert_eq!(db.get_execution(&execution.id).unwrap().status, ExecutionStatus::Failed);
+    let (run_status, error_text): (String, Option<String>) = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, error_text FROM work_runs WHERE execution_id = ?1",
+            [&execution.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(run_status, "failed");
+    assert_eq!(error_text.as_deref(), Some("no disposition"));
+    assert_eq!(db.progression_disposition(&execution.id).unwrap(), None);
     assert_eq!(pane.calls.lock().await.as_slice(), [execution.id.as_str()]);
     assert!(
         cube.release_calls.lock().await.is_empty(),
@@ -419,6 +431,142 @@ async fn on_stop_finalizes_a_progression_run_without_touching_the_stuck_item() {
             .any(|item| item.kind == "stale_worker" && item.status == "open"),
         "the item's stale_worker attention stays open"
     );
+}
+
+/// Declare `done` for a progression run through the real submission path (the
+/// proposal row, the disposition), as `boss propose done` does.
+fn declare_progression_done(
+    db: &WorkDb,
+    execution_id: &str,
+    payload: serde_json::Value,
+) -> boss_protocol::WorkerProposal {
+    use boss_engine_proposal_validation::{derive_idempotency_key, validate_payload};
+    let execution = db.get_execution(execution_id).unwrap();
+    let kind = boss_protocol::ProposalKind::RunDone;
+    let validated = validate_payload(kind, &payload).expect("done payload validates");
+    let key = derive_idempotency_key(execution_id, kind, &validated.canonical_json);
+    db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+        execution_id,
+        work_item_id: &execution.work_item_id,
+        kind,
+        payload_json: &validated.canonical_json,
+        idempotency_key: &key,
+    })
+    .unwrap()
+    .expect("done submission accepted")
+    .proposal
+}
+
+#[tokio::test]
+async fn a_declared_progression_run_completes_at_submission_and_never_looks_for_a_pr() {
+    // `delivered` and `no-changes-needed` both finish the run when the declaration
+    // lands (a no-op is not deferred to the driver's Stop, which has no command
+    // evidence to add for a run that holds no checkout), with the disposition the
+    // declaration earned and no PR resolution.
+    for (outcome, disposition) in [
+        ("delivered", boss_protocol::ProgressionDisposition::Progressed),
+        ("no_changes_needed", boss_protocol::ProgressionDisposition::NoAction),
+    ] {
+        let dir = tempdir().unwrap();
+        let (db, chore_id, execution) = stuck_item_with_started_progression(dir.path());
+        let before = item_snapshot(&db, &chore_id);
+        let proposal = declare_progression_done(
+            &db,
+            &execution.id,
+            serde_json::json!({"outcome": outcome, "summary": "Looked at it."}),
+        );
+        assert_eq!(proposal.state, boss_protocol::ProposalState::Applied);
+        let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/1"));
+        let TestHarness { handler, pane, .. } = TestHarness::new(db.clone(), detector.clone());
+
+        let run_outcome = handler
+            .finalize_declared_run_done(
+                &execution.id,
+                if outcome == "delivered" {
+                    boss_protocol::RunDoneOutcome::Delivered
+                } else {
+                    boss_protocol::RunDoneOutcome::NoChangesNeeded
+                },
+            )
+            .await;
+
+        assert!(
+            matches!(run_outcome, StopOutcome::Progression),
+            "{outcome}: {run_outcome:?}"
+        );
+        assert_eq!(
+            db.get_execution(&execution.id).unwrap().status,
+            ExecutionStatus::Completed,
+            "{outcome}"
+        );
+        assert_eq!(
+            db.progression_disposition(&execution.id).unwrap(),
+            Some(disposition),
+            "{outcome}"
+        );
+        assert!(
+            detector.calls.lock().unwrap().is_empty(),
+            "{outcome}: no PR lookup for a run with no branch"
+        );
+        assert_eq!(
+            item_snapshot(&db, &chore_id),
+            before,
+            "{outcome}: the item is untouched"
+        );
+        assert_eq!(pane.calls.lock().await.as_slice(), [execution.id.as_str()]);
+        // A late Stop finds a finished run.
+        assert!(matches!(
+            handler
+                .finalize_declared_run_done(&execution.id, boss_protocol::RunDoneOutcome::Delivered)
+                .await,
+            StopOutcome::AlreadyTerminal
+        ));
+    }
+}
+
+#[tokio::test]
+async fn an_asking_progression_run_parks_the_item_on_its_question_and_completes_as_asked() {
+    let dir = tempdir().unwrap();
+    let (db, chore_id, execution) = stuck_item_with_started_progression(dir.path());
+    let proposal = declare_progression_done(
+        &db,
+        &execution.id,
+        serde_json::json!({
+            "outcome": "blocked", "summary": "Needs the owner", "criterion": "3",
+            "question": {
+                "text": "Should the old importer be removed?",
+                "answer_type": {"kind": "yes_no"},
+                "explanation": "Context:\nThe brief and the code disagree.\nYes:\nRemove it.\nNo:\nKeep it.\nRecommendation:\nI recommend Yes because it has no callers."
+            }
+        }),
+    );
+    assert_eq!(proposal.state, boss_protocol::ProposalState::Applied);
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+
+    let outcome = handler
+        .finalize_declared_run_done(&execution.id, boss_protocol::RunDoneOutcome::Blocked)
+        .await;
+
+    assert!(matches!(outcome, StopOutcome::Progression), "{outcome:?}");
+    assert_eq!(
+        db.get_execution(&execution.id).unwrap().status,
+        ExecutionStatus::Completed
+    );
+    assert_eq!(
+        db.progression_disposition(&execution.id).unwrap(),
+        Some(boss_protocol::ProgressionDisposition::Asked)
+    );
+    let task = task_row(&db, &chore_id);
+    assert_eq!(task.status, boss_protocol::TaskStatus::Blocked);
+    assert_eq!(task.blocked_reason.as_deref(), Some("awaiting_operator_answer"));
+    assert_eq!(
+        task.dispatch_failed_reason, None,
+        "the question supersedes the halt stamp"
+    );
+    let questions = db.list_operator_questions(&chore_id).unwrap();
+    assert_eq!(questions.len(), 1);
+    assert_eq!(questions[0].status, boss_protocol::OperatorQuestionStatus::Open);
+    assert_eq!(questions[0].question.execution_id, execution.id);
 }
 
 #[tokio::test]

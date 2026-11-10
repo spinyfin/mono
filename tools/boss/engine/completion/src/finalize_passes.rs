@@ -45,6 +45,9 @@ impl PureRebaseGateOutcome {
 /// [`WorkerCompletionHandler::finalize_automation_triage`] to record.
 type AutomationTriageDecision = (&'static str, Option<String>, Option<String>);
 
+/// The `error_text` of a progression run that ended without declaring `done`.
+pub(super) const PROGRESSION_NO_DISPOSITION: &str = "no disposition";
+
 impl WorkerCompletionHandler {
     /// Proposal acknowledgement is the delivery boundary; no transcript is read.
     pub async fn finalize_submitted_review_guide(&self, execution_id: &str) -> StopOutcome {
@@ -679,28 +682,54 @@ impl WorkerCompletionHandler {
         StopOutcome::AnswerAgent { replied }
     }
 
-    /// Finalize a `progression` execution at its Stop boundary: complete the
-    /// execution and run rows and release the pane. It holds no cube lease, so
-    /// no workspace release is attempted (its scratch directory is removed by
-    /// the driver teardown), and it never touches the work item it inspected —
-    /// no PR detection, no nudge, no status change. A `driver_error` (the
-    /// driver reported the turn boundary as a fatal error) is recorded on the
-    /// run as a failure, never as an attention or status change on the item.
+    /// Finalize a `progression` execution at its Stop boundary. It holds no cube
+    /// lease, so no workspace release is attempted (its scratch directory is
+    /// removed by the driver teardown), and it never enters PR detection, the
+    /// nudge loop or a PR-resolving finalizer. A `driver_error` (the driver
+    /// reported the turn boundary as a fatal error) is recorded on the run as a
+    /// failure, never as an attention or status change on the item.
+    ///
+    /// The run's outcome is its declaration: a run that declared `done` is
+    /// completed with its recorded disposition, and one that ended its turn
+    /// without declaring anything is `failed` with `error_text = 'no
+    /// disposition'`, which the candidate view counts toward the
+    /// infrastructure-failure cap.
     pub(super) async fn finalize_progression(
         &self,
         execution: &crate::work::WorkExecution,
         driver_error: Option<&str>,
     ) -> StopOutcome {
+        self.finalize_progression_run(execution, driver_error, false).await
+    }
+
+    /// [`Self::finalize_progression`], also reached at declaration time
+    /// (`declared`). A declaration's finalize reports a database failure as
+    /// [`StopOutcome::DbError`] before tearing anything down, so the pending
+    /// finalize retries with the declaration still stamped; the Stop path keeps
+    /// finalizing the pane whatever the write did.
+    pub(super) async fn finalize_progression_run(
+        &self,
+        execution: &crate::work::WorkExecution,
+        driver_error: Option<&str>,
+        declared: bool,
+    ) -> StopOutcome {
         let workspace_path = execution.workspace_path.clone();
         let teardown = self.begin_teardown(&execution.id);
-        let finished = match driver_error {
-            Some(detail) => self
-                .work_db
-                .fail_progression_execution(&execution.id, &format!("progression: driver error: {detail}")),
-            None => {
+        let (finished, failed) = match driver_error {
+            Some(detail) => (
                 self.work_db
-                    .complete_pane_parked_execution(&execution.id, "completed", Some("progression: run ended"))
-            }
+                    .fail_progression_execution(&execution.id, &format!("progression: driver error: {detail}")),
+                true,
+            ),
+            None => match self.work_db.progression_disposition(&execution.id) {
+                Ok(Some(_)) => (self.work_db.finish_progression_declared(&execution.id), false),
+                Ok(None) => (
+                    self.work_db
+                        .fail_progression_execution(&execution.id, PROGRESSION_NO_DISPOSITION),
+                    true,
+                ),
+                Err(err) => (Err(err), false),
+            },
         };
         match finished {
             Ok(Some(_)) => {}
@@ -708,11 +737,16 @@ impl WorkerCompletionHandler {
                 execution_id = %execution.id,
                 "progression finalise: execution already terminal; nothing to do",
             ),
-            Err(err) => tracing::error!(
-                execution_id = %execution.id,
-                ?err,
-                "failed to finalise progression execution row",
-            ),
+            Err(err) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "failed to finalise progression execution row",
+                );
+                if declared {
+                    return StopOutcome::DbError;
+                }
+            }
         }
         self.finish_worker_teardown(
             &execution.id,
@@ -727,18 +761,25 @@ impl WorkerCompletionHandler {
             .publish(
                 &execution.id,
                 &execution.work_item_id,
-                if driver_error.is_some() { "failed" } else { "completed" },
-                if driver_error.is_some() {
+                if failed { "failed" } else { "completed" },
+                if failed {
                     "progression_failed"
                 } else {
                     "progression_completed"
                 },
             )
             .await;
+        // An `asked` run parked the item on its question; refresh the board.
+        if !failed && let Ok(item) = self.work_db.get_work_item(&execution.work_item_id) {
+            self.publisher
+                .publish_work_item_changed(item.product_id(), &execution.work_item_id, "progression_completed")
+                .await;
+        }
         tracing::info!(
             execution_id = %execution.id,
             work_item_id = %execution.work_item_id,
-            "progression execution finalised (work item untouched)",
+            failed,
+            "progression execution finalised",
         );
         StopOutcome::Progression
     }

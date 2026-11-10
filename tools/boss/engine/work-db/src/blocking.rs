@@ -407,48 +407,9 @@ impl WorkDb {
     pub fn clear_chore_blocked_merge_conflict(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let now = now_string();
-        let rows = crate::task_status_audit::execute(
-            &tx,
-            "clear_chore_blocked_merge_conflict",
-            "engine",
-            "UPDATE tasks
-                SET status             = 'in_review',
-                    blocked_reason     = NULL,
-                    blocked_attempt_id = NULL,
-                    last_status_actor  = 'engine',
-                    updated_at         = ?3
-              WHERE id = ?1
-                AND status = 'blocked'
-                AND blocked_reason = 'merge_conflict'
-                AND pr_url = ?2
-                AND deleted_at IS NULL",
-            params![work_item_id, pr_url, now],
-        )?;
-        if rows == 0 {
-            tx.commit()?;
-            return Ok(None);
-        }
-        // Phase 10 #31: mark the matching side-table row(s) cleared so
-        // the polymorphic clear dispatch doesn't re-fire on the next
-        // probe. Mirrors `clear_chore_blocked_ci_failure`.
-        tx.execute(
-            "UPDATE task_blocked_signals
-                SET cleared_at = ?2
-              WHERE work_item_id = ?1
-                AND reason = 'merge_conflict'
-                AND cleared_at IS NULL",
-            params![work_item_id, now],
-        )?;
-        let updated = query_task(&tx, work_item_id)?
-            .with_context(|| format!("unknown task after merge_conflict clear: {work_item_id}"))?;
-        super::dispatch_helpers::resolve_attention_kind_in_tx(
-            &tx,
-            work_item_id,
-            crate::LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND,
-        )?;
+        let cleared = clear_blocked_merge_conflict_in_tx(&tx, work_item_id, pr_url, "engine")?;
         tx.commit()?;
-        Ok(Some(updated))
+        Ok(cleared)
     }
 
     /// Stricter variant of [`Self::clear_chore_blocked_merge_conflict`]
@@ -688,44 +649,9 @@ impl WorkDb {
     fn clear_blocked_ci_failure(&self, work_item_id: &str, pr_url: &str, rearm_only: bool) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if rearm_only && crate::parking::is_parked(&tx, work_item_id)? {
-            return Ok(None);
-        }
-        let now = now_string();
-        let rows = crate::task_status_audit::execute(
-            &tx,
-            "clear_chore_blocked_ci_failure",
-            "engine",
-            "UPDATE tasks
-                SET status             = 'in_review',
-                    blocked_reason     = NULL,
-                    blocked_attempt_id = NULL,
-                    last_status_actor  = 'engine',
-                    updated_at         = ?3
-              WHERE id = ?1
-                AND status = 'blocked'
-                AND blocked_reason IN ('ci_failure', 'ci_failure_exhausted')
-                AND (?4 = 0 OR blocked_reason = 'ci_failure_exhausted')
-                AND pr_url = ?2
-                AND deleted_at IS NULL",
-            params![work_item_id, pr_url, now, rearm_only],
-        )?;
-        if rows == 0 {
-            tx.commit()?;
-            return Ok(None);
-        }
-        tx.execute(
-            "UPDATE task_blocked_signals
-                SET cleared_at = ?2
-              WHERE work_item_id = ?1
-                AND reason IN ('ci_failure', 'ci_failure_exhausted', 'ci_flaky_retriggered')
-                AND cleared_at IS NULL",
-            params![work_item_id, now],
-        )?;
-        let updated = query_task(&tx, work_item_id)?
-            .with_context(|| format!("unknown task after ci_failure clear: {work_item_id}"))?;
+        let cleared = clear_blocked_ci_failure_in_tx(&tx, work_item_id, pr_url, rearm_only, "engine")?;
         tx.commit()?;
-        Ok(Some(updated))
+        Ok(cleared)
     }
 
     /// CI analogue of [`Self::record_merge_conflict_in_flight`]. Upsert the
@@ -2208,6 +2134,107 @@ impl WorkDb {
 // ordering and the `deleted_at` guard on the attempts-used writers. This
 // module is intentionally narrow: it holds only the unknown-work-item
 // fallbacks for those same methods, which none of the external tests cover.
+/// The `blocked: merge_conflict` -> `in_review` retire write, on the caller's
+/// transaction, recording `actor` as the writer. The engine's merge poller
+/// passes `"engine"`; a progression run clearing a signal whose probe is clear
+/// passes `"progression"`, so the row reads as that agent's decision.
+pub(crate) fn clear_blocked_merge_conflict_in_tx(
+    conn: &Connection,
+    work_item_id: &str,
+    pr_url: &str,
+    actor: &str,
+) -> Result<Option<Task>> {
+    let now = now_string();
+    let rows = crate::task_status_audit::execute(
+        conn,
+        "clear_chore_blocked_merge_conflict",
+        actor,
+        "UPDATE tasks
+            SET status             = 'in_review',
+                blocked_reason     = NULL,
+                blocked_attempt_id = NULL,
+                last_status_actor  = ?4,
+                updated_at         = ?3
+          WHERE id = ?1
+            AND status = 'blocked'
+            AND blocked_reason = 'merge_conflict'
+            AND pr_url = ?2
+            AND deleted_at IS NULL",
+        params![work_item_id, pr_url, now, actor],
+    )?;
+    if rows == 0 {
+        return Ok(None);
+    }
+    // Phase 10 #31: mark the matching side-table row(s) cleared so
+    // the polymorphic clear dispatch doesn't re-fire on the next
+    // probe. Mirrors `clear_chore_blocked_ci_failure`.
+    conn.execute(
+        "UPDATE task_blocked_signals
+            SET cleared_at = ?2
+          WHERE work_item_id = ?1
+            AND reason = 'merge_conflict'
+            AND cleared_at IS NULL",
+        params![work_item_id, now],
+    )?;
+    let updated = query_task(conn, work_item_id)?
+        .with_context(|| format!("unknown task after merge_conflict clear: {work_item_id}"))?;
+    super::dispatch_helpers::resolve_attention_kind_in_tx(
+        conn,
+        work_item_id,
+        crate::LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND,
+    )?;
+    Ok(Some(updated))
+}
+
+/// The `blocked: ci_failure[_exhausted]` -> `in_review` retire write, on the
+/// caller's transaction, recording `actor` as the writer (see
+/// [`clear_blocked_merge_conflict_in_tx`]). `rearm_only` limits it to the
+/// exhausted reason and refuses a parked item.
+pub(crate) fn clear_blocked_ci_failure_in_tx(
+    conn: &Connection,
+    work_item_id: &str,
+    pr_url: &str,
+    rearm_only: bool,
+    actor: &str,
+) -> Result<Option<Task>> {
+    if rearm_only && crate::parking::is_parked(conn, work_item_id)? {
+        return Ok(None);
+    }
+    let now = now_string();
+    let rows = crate::task_status_audit::execute(
+        conn,
+        "clear_chore_blocked_ci_failure",
+        actor,
+        "UPDATE tasks
+            SET status             = 'in_review',
+                blocked_reason     = NULL,
+                blocked_attempt_id = NULL,
+                last_status_actor  = ?5,
+                updated_at         = ?3
+          WHERE id = ?1
+            AND status = 'blocked'
+            AND blocked_reason IN ('ci_failure', 'ci_failure_exhausted')
+            AND (?4 = 0 OR blocked_reason = 'ci_failure_exhausted')
+            AND pr_url = ?2
+            AND deleted_at IS NULL",
+        params![work_item_id, pr_url, now, rearm_only, actor],
+    )?;
+    if rows == 0 {
+        return Ok(None);
+    }
+    conn.execute(
+        "UPDATE task_blocked_signals
+            SET cleared_at = ?2
+          WHERE work_item_id = ?1
+            AND reason IN ('ci_failure', 'ci_failure_exhausted', 'ci_flaky_retriggered')
+            AND cleared_at IS NULL",
+        params![work_item_id, now],
+    )?;
+    let updated = query_task(conn, work_item_id)?
+        .with_context(|| format!("unknown task after ci_failure clear: {work_item_id}"))?;
+    Ok(Some(updated))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

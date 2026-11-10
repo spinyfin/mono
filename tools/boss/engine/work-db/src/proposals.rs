@@ -123,7 +123,7 @@ pub(super) fn map_worker_proposal(row: &Row<'_>) -> rusqlite::Result<WorkerPropo
 }
 
 /// Fetch the row for `(execution_id, idempotency_key)` — the replay lookup.
-fn find_by_idempotency_key(
+pub(super) fn find_by_idempotency_key(
     conn: &Connection,
     execution_id: &str,
     idempotency_key: &str,
@@ -283,6 +283,13 @@ impl WorkDb {
             input.kind != ProposalKind::ReviewGuide || guide.is_some(),
             "a review-guide submission must be validated before it reaches storage"
         );
+        // Progression verbs mutate the taxonomy, so they have their own scoped,
+        // transactional path; none may arrive through the generic pipeline.
+        anyhow::ensure!(
+            !input.kind.is_progression_verb(),
+            "`{}` is a progression verb; submit it through `submit_progression_verb`",
+            input.kind
+        );
         // The transaction-holding half. Scoped to a block so the `conn`
         // guard (a lock over `WorkDb`'s single shared connection — see
         // `WorkDb::connect`'s docs) is dropped before the post-commit
@@ -366,6 +373,8 @@ impl WorkDb {
                     question_worker.as_ref(),
                 )?),
                 ProposalApplyPolicy::Gated => None,
+                // Refused above before the transaction opened.
+                ProposalApplyPolicy::Scoped => anyhow::bail!("`{}` is a progression verb", input.kind),
             };
             // A review guide is accepted atomically or not at all. Its
             // refusals are state judgements (the attempt is not running, the
@@ -699,7 +708,11 @@ const IN_FLIGHT_ONLY_PROPOSAL_KINDS: [ProposalKind; 2] = [ProposalKind::EffortEs
 /// *submit*, so a proposal that was later rejected or expired still consumed
 /// a slot. Anything else would let a loop that keeps getting rejected keep
 /// proposing forever — exactly the runaway the cap exists to bound.
-fn count_proposals_in_tx(conn: &Connection, execution_id: &str, kind: ProposalKind) -> Result<ProposalCounts> {
+pub(super) fn count_proposals_in_tx(
+    conn: &Connection,
+    execution_id: &str,
+    kind: ProposalKind,
+) -> Result<ProposalCounts> {
     let (total, for_kind): (i64, i64) = conn.query_row(
         "SELECT COUNT(*), COALESCE(SUM(kind = ?2), 0)
          FROM worker_proposals WHERE execution_id = ?1",
@@ -974,6 +987,15 @@ mod tests {
             }
             ProposalKind::RunDone => format!(r#"{{"outcome":"delivered","summary":"S{i}"}}"#),
             ProposalKind::Wait => format!(r#"{{"reason":"wait {i}","duration_secs":60}}"#),
+            // Applied by `submit_progression_verb`, which has its own tests.
+            ProposalKind::Revise
+            | ProposalKind::Precursor
+            | ProposalKind::Depend
+            | ProposalKind::Undepend
+            | ProposalKind::Redispatch
+            | ProposalKind::ClearSignal
+            | ProposalKind::ArchiveRevision
+            | ProposalKind::Unblock => unreachable!("progression verbs do not use the generic pipeline"),
         }
     }
 
@@ -1478,7 +1500,7 @@ mod tests {
 
         // Spread across kinds so the per-kind cap never fires first.
         let mut submitted = 0usize;
-        for &kind in ProposalKind::ALL {
+        for &kind in ProposalKind::ALL.iter().filter(|kind| !kind.is_progression_verb()) {
             let room = PROPOSAL_CAP_TOTAL_PER_EXECUTION - submitted;
             let take = room.min(PROPOSAL_CAP_PER_KIND_PER_EXECUTION);
             fill(&db, &execution_id, &chore_id, kind, take);

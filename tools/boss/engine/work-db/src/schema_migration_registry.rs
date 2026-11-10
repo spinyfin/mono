@@ -418,6 +418,11 @@ pub(super) fn all() -> Vec<Migration> {
             legacy_version: None,
             apply: legacy_store_cleanup::migrate,
         },
+        Migration {
+            id: progression_verbs::ACTIONS_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: progression_verbs::migrate_actions,
+        },
     ]);
     migrations
 }

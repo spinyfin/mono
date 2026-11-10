@@ -32,11 +32,14 @@ use std::collections::BTreeSet;
 use std::str::FromStr;
 
 use boss_protocol::{
-    AttentionProposalPayload, AutomationOutcomeProposalPayload, BlockedProposalPayload, DeferredScopeProposalPayload,
+    ArchiveRevisionProposalPayload, AttentionProposalPayload, AutomationOutcomeProposalPayload, BlockedProposalPayload,
+    CLEARABLE_BLOCK_REASONS, ClearSignalProposalPayload, DeferredScopeProposalPayload, DependProposalPayload,
     EffortEscalationProposalPayload, FollowupTaskProposalPayload, PROPOSAL_CAP_PER_KIND_PER_EXECUTION,
-    PROPOSAL_CAP_TOTAL_PER_EXECUTION, PrCreatedProposalPayload, ProposalErrorCode, ProposalFieldError, ProposalKind,
-    ProposalSubmissionError, ReviewReportProposalPayload, ReviewVerdictProposalPayload, RunDoneOutcome,
-    RunDoneProposalPayload, WAIT_MAX_DURATION_SECS, WaitProposalPayload,
+    PROPOSAL_CAP_TOTAL_PER_EXECUTION, PrCreatedProposalPayload, PrecursorProposalPayload, ProgressionQuestionCriterion,
+    ProposalErrorCode, ProposalFieldError, ProposalKind, ProposalSubmissionError, RedispatchProposalPayload,
+    ReviewReportProposalPayload, ReviewVerdictProposalPayload, ReviseProposalPayload, RunDoneOutcome,
+    RunDoneProposalPayload, UnblockProposalPayload, UndependProposalPayload, WAIT_MAX_DURATION_SECS,
+    WaitProposalPayload,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -278,6 +281,14 @@ pub fn validate_payload(kind: ProposalKind, payload: &Value) -> Result<Validated
             let outcome = reader.required_enum::<RunDoneOutcome>("outcome");
             let summary = reader.required_text("summary", MAX_SHORT_FIELD_CHARS);
             let question = reader.operator_question(outcome);
+            let criterion = reader.optional_enum::<ProgressionQuestionCriterion>("criterion");
+            if criterion.is_some() && question.is_none() {
+                reader.error(
+                    "criterion",
+                    "a criterion only accompanies a question: it says which of the numbered reasons for \
+                     asking the owner this question meets",
+                );
+            }
             let queue_ci_evidence = reader.raw("queue_ci_evidence").and_then(|value| {
                 match serde_json::from_value::<boss_protocol::QueueCiEvidence>(value.clone()) {
                     Ok(evidence) => Some(evidence),
@@ -288,12 +299,13 @@ pub fn validate_payload(kind: ProposalKind, payload: &Value) -> Result<Validated
                 }
             });
             reader.finish()?;
-            to_json(&RunDoneProposalPayload {
+            let canonical = to_json(&RunDoneProposalPayload {
                 outcome: outcome.unwrap_or(RunDoneOutcome::Blocked),
                 summary: summary.unwrap_or_default(),
                 question,
                 queue_ci_evidence,
-            })
+            });
+            with_criterion(canonical, criterion)
         }
         ProposalKind::Wait => {
             let duration_secs = reader.required_u64("duration_secs", 1, WAIT_MAX_DURATION_SECS);
@@ -305,6 +317,66 @@ pub fn validate_payload(kind: ProposalKind, payload: &Value) -> Result<Validated
                 reason: reason.unwrap_or_default(),
                 waiting_on,
             })
+        }
+        ProposalKind::Revise => {
+            let brief = reader.required_text("brief", MAX_LONG_FIELD_CHARS);
+            reader.finish()?;
+            to_json(&ReviseProposalPayload {
+                brief: brief.unwrap_or_default(),
+            })
+        }
+        ProposalKind::Precursor => {
+            let name = reader.required_text("name", MAX_PREREQUISITE_NAME_CHARS);
+            if let Some(name) = name.as_deref()
+                && name.contains(['\n', '\r'])
+            {
+                reader.error("name", "must be a single line");
+            }
+            let brief = reader.required_text("brief", MAX_LONG_FIELD_CHARS);
+            reader.finish()?;
+            to_json(&PrecursorProposalPayload {
+                name: name.unwrap_or_default(),
+                brief: brief.unwrap_or_default(),
+            })
+        }
+        ProposalKind::Depend => {
+            let on = reader.required_work_item_ref("on");
+            reader.finish()?;
+            to_json(&DependProposalPayload {
+                on: on.unwrap_or_default(),
+            })
+        }
+        ProposalKind::Undepend => {
+            let on = reader.required_work_item_ref("on");
+            reader.finish()?;
+            to_json(&UndependProposalPayload {
+                on: on.unwrap_or_default(),
+            })
+        }
+        ProposalKind::Redispatch => {
+            let brief_addendum = reader.optional_text("brief_addendum", MAX_LONG_FIELD_CHARS);
+            reader.finish()?;
+            to_json(&RedispatchProposalPayload { brief_addendum })
+        }
+        ProposalKind::ClearSignal => {
+            let reason = reader.required_one_of("reason", CLEARABLE_BLOCK_REASONS);
+            reader.finish()?;
+            to_json(&ClearSignalProposalPayload {
+                reason: reason.unwrap_or_default(),
+            })
+        }
+        ProposalKind::ArchiveRevision => {
+            let revision = reader.required_work_item_ref("revision");
+            let reason = reader.required_text("reason", MAX_SHORT_FIELD_CHARS);
+            reader.finish()?;
+            to_json(&ArchiveRevisionProposalPayload {
+                revision: revision.unwrap_or_default(),
+                reason: reason.unwrap_or_default(),
+            })
+        }
+        ProposalKind::Unblock => {
+            reader.finish()?;
+            to_json(&UnblockProposalPayload {})
         }
     };
 
@@ -481,6 +553,24 @@ fn json_type_name(value: &Value) -> &'static str {
 /// keeps the signature total rather than panicking inside an RPC handler.
 fn to_json<T: serde::Serialize>(payload: &T) -> String {
     serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_owned())
+}
+
+/// Add the progression question `criterion` to a canonical `run_done` payload.
+/// It rides beside the typed payload (see
+/// [`boss_protocol::run_done_question_criterion`]) and, being part of the
+/// canonical form, is part of the idempotency hash: re-asking the same question
+/// under a different criterion is a different submission.
+fn with_criterion(canonical: String, criterion: Option<ProgressionQuestionCriterion>) -> String {
+    let Some(criterion) = criterion else {
+        return canonical;
+    };
+    match serde_json::from_str::<Value>(&canonical) {
+        Ok(Value::Object(mut object)) => {
+            object.insert("criterion".to_owned(), Value::String(criterion.as_str().to_owned()));
+            Value::Object(object).to_string()
+        }
+        _ => canonical,
+    }
 }
 
 /// Read `automation_outcome`'s tag-dependent field set.
@@ -754,6 +844,24 @@ impl<'a> PayloadReader<'a> {
             format!("unknown value `{text}`; expected one of: {}", allowed.join(", ")),
         );
         None
+    }
+
+    /// Read `field` as a work-item reference: a `task_…` id or a short `T<n>` id.
+    /// Shape only; the engine resolves it and checks it against the run's
+    /// neighbourhood.
+    fn required_work_item_ref(&mut self, field: &'static str) -> Option<String> {
+        let text = self.required_text(field, MAX_SHORT_FIELD_CHARS)?;
+        let short = text
+            .strip_prefix(['T', 't'])
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()));
+        if !(text.starts_with("task_") || short) || text.contains(char::is_whitespace) {
+            self.error(
+                field,
+                format!("`{text}` is not a work-item id; expected a `task_…` id or a short `T<n>` id"),
+            );
+            return None;
+        }
+        Some(text)
     }
 
     /// Read `field` as a canonical GitHub PR URL.

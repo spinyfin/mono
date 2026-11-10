@@ -1822,8 +1822,27 @@ async fn every_kind_can_be_submitted() {
             }),
             ProposalKind::RunDone => json!({"outcome": "delivered", "summary": "S"}),
             ProposalKind::Wait => json!({"reason": "bazel test", "duration_secs": 60}),
+            ProposalKind::Revise => json!({"brief": "Fix it"}),
+            ProposalKind::Precursor => json!({"name": "Fix it on main", "brief": "Stand-alone."}),
+            ProposalKind::Depend | ProposalKind::Undepend => json!({"on": "task_x"}),
+            ProposalKind::Redispatch | ProposalKind::Unblock => json!({}),
+            ProposalKind::ClearSignal => json!({"reason": "merge_conflict"}),
+            ProposalKind::ArchiveRevision => json!({"revision": "task_x", "reason": "dead"}),
         };
         let response = submit(&fx, kind, payload).await;
+        if kind.is_progression_verb() {
+            // The progression verbs are valid payloads the engine judges: a
+            // plain worker run is not a progression run, so each is refused and
+            // stores nothing, whether or not the worker tier is enforced.
+            let error = rejected(response);
+            assert_eq!(error.code, ProposalErrorCode::NotAccepted, "{kind}");
+            assert!(
+                error.message.contains("only a live progression run"),
+                "{kind}: {}",
+                error.message
+            );
+            continue;
+        }
         if kind == ProposalKind::ReviewGuide {
             // The fixture is a plain chore run with no review-guide attempt,
             // and a guide is accepted atomically or refused without a row:

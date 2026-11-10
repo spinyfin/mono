@@ -114,6 +114,46 @@ boss_metrics::register_counter!(
     "SubmitProposal accepted a proposal of kind `wait` — a worker declared a time-bounded wait.",
 );
 boss_metrics::register_counter!(
+    PROPOSAL_SUBMITTED_REVISE,
+    "worker_proposals.submitted.revise",
+    "SubmitProposal accepted a progression verb of kind `revise`.",
+);
+boss_metrics::register_counter!(
+    PROPOSAL_SUBMITTED_PRECURSOR,
+    "worker_proposals.submitted.precursor",
+    "SubmitProposal accepted a progression verb of kind `precursor`.",
+);
+boss_metrics::register_counter!(
+    PROPOSAL_SUBMITTED_DEPEND,
+    "worker_proposals.submitted.depend",
+    "SubmitProposal accepted a progression verb of kind `depend`.",
+);
+boss_metrics::register_counter!(
+    PROPOSAL_SUBMITTED_UNDEPEND,
+    "worker_proposals.submitted.undepend",
+    "SubmitProposal accepted a progression verb of kind `undepend`.",
+);
+boss_metrics::register_counter!(
+    PROPOSAL_SUBMITTED_REDISPATCH,
+    "worker_proposals.submitted.redispatch",
+    "SubmitProposal accepted a progression verb of kind `redispatch`.",
+);
+boss_metrics::register_counter!(
+    PROPOSAL_SUBMITTED_CLEAR_SIGNAL,
+    "worker_proposals.submitted.clear_signal",
+    "SubmitProposal accepted a progression verb of kind `clear_signal`.",
+);
+boss_metrics::register_counter!(
+    PROPOSAL_SUBMITTED_ARCHIVE_REVISION,
+    "worker_proposals.submitted.archive_revision",
+    "SubmitProposal accepted a progression verb of kind `archive_revision`.",
+);
+boss_metrics::register_counter!(
+    PROPOSAL_SUBMITTED_UNBLOCK,
+    "worker_proposals.submitted.unblock",
+    "SubmitProposal accepted a progression verb of kind `unblock`.",
+);
+boss_metrics::register_counter!(
     PROPOSAL_VALIDATION_FAILED,
     "worker_proposals.validation_failed",
     "SubmitProposal rejected a submission for ProposalErrorCode::ValidationFailed (payload schema).",
@@ -145,6 +185,14 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&PROPOSAL_SUBMITTED_REVIEW_VERDICT);
     registry.register_counter(&PROPOSAL_SUBMITTED_RUN_DONE);
     registry.register_counter(&PROPOSAL_SUBMITTED_WAIT);
+    registry.register_counter(&PROPOSAL_SUBMITTED_REVISE);
+    registry.register_counter(&PROPOSAL_SUBMITTED_PRECURSOR);
+    registry.register_counter(&PROPOSAL_SUBMITTED_DEPEND);
+    registry.register_counter(&PROPOSAL_SUBMITTED_UNDEPEND);
+    registry.register_counter(&PROPOSAL_SUBMITTED_REDISPATCH);
+    registry.register_counter(&PROPOSAL_SUBMITTED_CLEAR_SIGNAL);
+    registry.register_counter(&PROPOSAL_SUBMITTED_ARCHIVE_REVISION);
+    registry.register_counter(&PROPOSAL_SUBMITTED_UNBLOCK);
     registry.register_counter(&PROPOSAL_VALIDATION_FAILED);
     registry.register_counter(&PROPOSAL_RATE_LIMITED);
 }
@@ -164,6 +212,14 @@ fn record_proposal_submitted(metrics: &Registry, kind: ProposalKind) {
         ProposalKind::ReviewVerdict => PROPOSAL_SUBMITTED_REVIEW_VERDICT.inc(metrics),
         ProposalKind::RunDone => PROPOSAL_SUBMITTED_RUN_DONE.inc(metrics),
         ProposalKind::Wait => PROPOSAL_SUBMITTED_WAIT.inc(metrics),
+        ProposalKind::Revise => PROPOSAL_SUBMITTED_REVISE.inc(metrics),
+        ProposalKind::Precursor => PROPOSAL_SUBMITTED_PRECURSOR.inc(metrics),
+        ProposalKind::Depend => PROPOSAL_SUBMITTED_DEPEND.inc(metrics),
+        ProposalKind::Undepend => PROPOSAL_SUBMITTED_UNDEPEND.inc(metrics),
+        ProposalKind::Redispatch => PROPOSAL_SUBMITTED_REDISPATCH.inc(metrics),
+        ProposalKind::ClearSignal => PROPOSAL_SUBMITTED_CLEAR_SIGNAL.inc(metrics),
+        ProposalKind::ArchiveRevision => PROPOSAL_SUBMITTED_ARCHIVE_REVISION.inc(metrics),
+        ProposalKind::Unblock => PROPOSAL_SUBMITTED_UNBLOCK.inc(metrics),
     }
 }
 
@@ -543,16 +599,22 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
         None
     };
 
-    let outcome = boss_engine_runtime::review_guide_validation::submit_worker_proposal(
-        &work_db,
-        SubmitWorkerProposalInput {
-            execution_id: &caller.execution_id,
-            work_item_id: &caller.work_item_id,
-            kind,
-            payload_json: &validated.canonical_json,
-            idempotency_key: &idempotency_key,
-        },
-    );
+    let submission = SubmitWorkerProposalInput {
+        execution_id: &caller.execution_id,
+        work_item_id: &caller.work_item_id,
+        kind,
+        payload_json: &validated.canonical_json,
+        idempotency_key: &idempotency_key,
+    };
+    // A progression verb mutates the taxonomy, so it never takes the generic
+    // auto-apply route: it is scope-checked and applied in its own transaction,
+    // and only a live progression run may submit one (a worker's identical
+    // submission is refused there, whether or not the worker tier is enforced).
+    let outcome = if kind.is_progression_verb() {
+        work_db.submit_progression_verb(submission, server_state.pr_state_checker.as_ref())
+    } else {
+        boss_engine_runtime::review_guide_validation::submit_worker_proposal(&work_db, submission)
+    };
 
     match outcome {
         Ok(Ok(SubmitWorkerProposalOutcome {
@@ -562,6 +624,10 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
             review_batch_quorum_outcome,
         })) => {
             record_proposal_submitted(&server_state.metrics, kind);
+            if kind.is_progression_verb() && !already_submitted {
+                // A revision, a precursor or a restart may have minted a ready execution.
+                server_state.publisher.kick_scheduler();
+            }
             if let Some(payload) = wait_payload
                 && !already_submitted
             {

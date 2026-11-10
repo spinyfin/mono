@@ -166,6 +166,145 @@ pub(crate) enum ProposeCommand {
     /// Example: `boss propose wait --reason "bazel test //tools/boss/engine/...
     /// still compiling" --duration 30m --waiting-on task_abc`
     Wait(WaitArgs),
+    /// Progression agents only: create a revision on this item's own open PR,
+    /// with a diagnosis-bearing brief. Counts against the item's create budget;
+    /// at most one open progression revision per PR; refused if the PR is closed.
+    ///
+    /// Example: `boss propose revise --brief-file brief.md`
+    Revise(ReviseArgs),
+    /// Progression agents only: create a chore and make this item depend on it
+    /// (a red check that belongs on `main`, a missing prerequisite). Counts
+    /// against the create budget; at most one open precursor per item.
+    ///
+    /// Example: `boss propose precursor --name "Fix the flaky fixture on main"
+    /// --brief-file brief.md`
+    Precursor(PrecursorArgs),
+    /// Progression agents only: add a dependency edge from this item to another
+    /// item in its neighbourhood.
+    ///
+    /// Example: `boss propose depend --on task_0123abcd`
+    Depend(DependencyEdgeArgs),
+    /// Progression agents only: drop the edge from this item to a prerequisite
+    /// that is finished, archived, missing, or a dead revision of a green PR.
+    ///
+    /// Example: `boss propose undepend --on task_0123abcd`
+    Undepend(DependencyEdgeArgs),
+    /// Progression agents only: explicitly restart this item. Clears the churn
+    /// guard, a worker's deliberate park and its attention, and a non-refusal
+    /// `worker_failed` block. At most once per stuck kind until a work run
+    /// completes. The addendum is appended to the item's brief.
+    ///
+    /// Example: `boss propose redispatch --brief-addendum-file note.md`
+    Redispatch(RedispatchArgs),
+    /// Progression agents only: clear a `blocked_reason` whose probe is already
+    /// clear (`merge_conflict` while the PR is MERGEABLE, `ci_failure` while
+    /// required checks pass). Refused when the stored probe disagrees.
+    ///
+    /// Example: `boss propose clear-signal --reason merge_conflict`
+    ClearSignal(ClearSignalArgs),
+    /// Progression agents only: archive a dead revision of this item's PR chain
+    /// that has no live execution, when the parent PR is green. Never the item
+    /// itself.
+    ///
+    /// Example: `boss propose archive-revision task_0123abcd --reason "dead; parent is green"`
+    ArchiveRevision(ArchiveRevisionArgs),
+    /// Progression agents only: move this item `blocked -> todo` once its block
+    /// reason is cleared.
+    ///
+    /// Example: `boss propose unblock`
+    Unblock(UnblockArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ReviseArgs {
+    /// The brief of the revision, inline. Exactly one of `--brief` /
+    /// `--brief-file` is required; prefer `--brief-file`.
+    #[arg(long, conflicts_with = "brief_file")]
+    brief: Option<String>,
+
+    /// Path to a file containing the revision's brief.
+    #[arg(long = "brief-file", value_name = "PATH", conflicts_with = "brief")]
+    brief_file: Option<PathBuf>,
+
+    #[command(flatten)]
+    common: IdempotencyArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct PrecursorArgs {
+    /// One-line name of the precursor chore.
+    #[arg(long)]
+    name: String,
+
+    /// The precursor's brief, inline. Exactly one of `--brief` / `--brief-file`
+    /// is required; the precursor's worker sees nothing else, so make it stand
+    /// alone.
+    #[arg(long, conflicts_with = "brief_file")]
+    brief: Option<String>,
+
+    /// Path to a file containing the precursor's brief.
+    #[arg(long = "brief-file", value_name = "PATH", conflicts_with = "brief")]
+    brief_file: Option<PathBuf>,
+
+    #[command(flatten)]
+    common: IdempotencyArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct DependencyEdgeArgs {
+    /// The other end of the edge: a `task_…` id or a short `T<n>` id inside this
+    /// run's neighbourhood.
+    #[arg(long)]
+    on: String,
+
+    #[command(flatten)]
+    common: IdempotencyArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct RedispatchArgs {
+    /// A note for the next worker, inline: quote a declared blocker and the
+    /// evidence it is stale so it is not re-declared.
+    #[arg(long = "brief-addendum", conflicts_with = "brief_addendum_file")]
+    brief_addendum: Option<String>,
+
+    /// Path to a file containing the note.
+    #[arg(long = "brief-addendum-file", value_name = "PATH", conflicts_with = "brief_addendum")]
+    brief_addendum_file: Option<PathBuf>,
+
+    #[command(flatten)]
+    common: IdempotencyArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ClearSignalArgs {
+    /// The `blocked_reason` to clear: `merge_conflict`, `ci_failure` or
+    /// `ci_failure_exhausted`.
+    #[arg(long, value_parser = boss_protocol::CLEARABLE_BLOCK_REASONS.to_vec())]
+    reason: String,
+
+    #[command(flatten)]
+    common: IdempotencyArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ArchiveRevisionArgs {
+    /// The revision to archive: a `task_…` id or a short `T<n>` id.
+    #[arg(value_name = "REVISION")]
+    revision: String,
+
+    /// Why it is dead.
+    #[arg(long)]
+    reason: String,
+
+    #[command(flatten)]
+    common: IdempotencyArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct UnblockArgs {
+    #[command(flatten)]
+    common: IdempotencyArgs,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -419,6 +558,14 @@ pub(crate) struct RunDoneArgs {
     )]
     choices: Vec<String>,
 
+    /// Progression agents only, and required there: which of the four numbered
+    /// reasons for asking the owner this question meets (1 the action is
+    /// human-only, 2 every direct verb is spent or refused, 3 a decision only the
+    /// owner can make, 4 the evidence contradicts itself). Recorded with the
+    /// question so asking can be audited.
+    #[arg(long, value_parser = ["1", "2", "3", "4"], requires = "question")]
+    criterion: Option<String>,
+
     /// Self-contained decision explanation with these labels on their own lines,
     /// in order: Context:, Yes:, No:, Recommendation:, and optional Details:.
     /// For `multiple-choice` use only Context:, Recommendation:, and optional
@@ -528,6 +675,14 @@ pub(crate) enum ProposalKindArg {
     ReviewVerdict,
     RunDone,
     Wait,
+    Revise,
+    Precursor,
+    Depend,
+    Undepend,
+    Redispatch,
+    ClearSignal,
+    ArchiveRevision,
+    Unblock,
 }
 
 impl From<ProposalKindArg> for ProposalKind {
@@ -545,6 +700,14 @@ impl From<ProposalKindArg> for ProposalKind {
             ProposalKindArg::ReviewVerdict => ProposalKind::ReviewVerdict,
             ProposalKindArg::RunDone => ProposalKind::RunDone,
             ProposalKindArg::Wait => ProposalKind::Wait,
+            ProposalKindArg::Revise => ProposalKind::Revise,
+            ProposalKindArg::Precursor => ProposalKind::Precursor,
+            ProposalKindArg::Depend => ProposalKind::Depend,
+            ProposalKindArg::Undepend => ProposalKind::Undepend,
+            ProposalKindArg::Redispatch => ProposalKind::Redispatch,
+            ProposalKindArg::ClearSignal => ProposalKind::ClearSignal,
+            ProposalKindArg::ArchiveRevision => ProposalKind::ArchiveRevision,
+            ProposalKindArg::Unblock => ProposalKind::Unblock,
         }
     }
 }
@@ -775,9 +938,9 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
             .map_err(CliError::internal)?,
             args.common.idempotency_key,
         ),
-        ProposeCommand::Done(args) => (
-            ProposalKind::RunDone,
-            serde_json::to_value(RunDoneProposalPayload {
+        ProposeCommand::Done(args) => {
+            let criterion = args.criterion.clone();
+            let mut payload = serde_json::to_value(RunDoneProposalPayload {
                 queue_ci_evidence: read_queue_ci_evidence(args.queue_ci_evidence_file)?,
                 outcome: RunDoneOutcome::from(args.outcome),
                 summary: args.summary,
@@ -794,7 +957,71 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
                     },
                 )?,
             })
+            .map_err(CliError::internal)?;
+            // The criterion rides beside the typed payload; see
+            // `boss_protocol::run_done_question_criterion`.
+            if let (Some(criterion), Some(object)) = (criterion, payload.as_object_mut()) {
+                object.insert("criterion".to_owned(), serde_json::Value::String(criterion));
+            }
+            (ProposalKind::RunDone, payload, args.common.idempotency_key)
+        }
+        ProposeCommand::Revise(args) => {
+            let brief = resolve_text_or_file("brief", args.brief, args.brief_file)?;
+            (
+                ProposalKind::Revise,
+                serde_json::to_value(boss_protocol::ReviseProposalPayload { brief }).map_err(CliError::internal)?,
+                args.common.idempotency_key,
+            )
+        }
+        ProposeCommand::Precursor(args) => {
+            let brief = resolve_text_or_file("brief", args.brief, args.brief_file)?;
+            (
+                ProposalKind::Precursor,
+                serde_json::to_value(boss_protocol::PrecursorProposalPayload { name: args.name, brief })
+                    .map_err(CliError::internal)?,
+                args.common.idempotency_key,
+            )
+        }
+        ProposeCommand::Depend(args) => (
+            ProposalKind::Depend,
+            serde_json::to_value(boss_protocol::DependProposalPayload { on: args.on }).map_err(CliError::internal)?,
+            args.common.idempotency_key,
+        ),
+        ProposeCommand::Undepend(args) => (
+            ProposalKind::Undepend,
+            serde_json::to_value(boss_protocol::UndependProposalPayload { on: args.on }).map_err(CliError::internal)?,
+            args.common.idempotency_key,
+        ),
+        ProposeCommand::Redispatch(args) => {
+            let brief_addendum = match (args.brief_addendum, args.brief_addendum_file) {
+                (None, None) => None,
+                (text, file) => Some(resolve_text_or_file("brief-addendum", text, file)?),
+            };
+            (
+                ProposalKind::Redispatch,
+                serde_json::to_value(boss_protocol::RedispatchProposalPayload { brief_addendum })
+                    .map_err(CliError::internal)?,
+                args.common.idempotency_key,
+            )
+        }
+        ProposeCommand::ClearSignal(args) => (
+            ProposalKind::ClearSignal,
+            serde_json::to_value(boss_protocol::ClearSignalProposalPayload { reason: args.reason })
+                .map_err(CliError::internal)?,
+            args.common.idempotency_key,
+        ),
+        ProposeCommand::ArchiveRevision(args) => (
+            ProposalKind::ArchiveRevision,
+            serde_json::to_value(boss_protocol::ArchiveRevisionProposalPayload {
+                revision: args.revision,
+                reason: args.reason,
+            })
             .map_err(CliError::internal)?,
+            args.common.idempotency_key,
+        ),
+        ProposeCommand::Unblock(args) => (
+            ProposalKind::Unblock,
+            serde_json::to_value(boss_protocol::UnblockProposalPayload {}).map_err(CliError::internal)?,
             args.common.idempotency_key,
         ),
         ProposeCommand::Wait(args) => {
@@ -1073,6 +1300,15 @@ fn flag_hint_for_field(kind: ProposalKind, field: &str) -> Option<&'static str> 
         (ProposalKind::Wait, "reason") => Some("--reason"),
         (ProposalKind::Wait, "duration_secs") => Some("--duration"),
         (ProposalKind::Wait, "waiting_on") => Some("--waiting-on"),
+        (ProposalKind::RunDone, "criterion") => Some("--criterion"),
+        (ProposalKind::Revise, "brief") => Some("--brief / --brief-file"),
+        (ProposalKind::Precursor, "name") => Some("--name"),
+        (ProposalKind::Precursor, "brief") => Some("--brief / --brief-file"),
+        (ProposalKind::Depend | ProposalKind::Undepend, "on") => Some("--on"),
+        (ProposalKind::Redispatch, "brief_addendum") => Some("--brief-addendum / --brief-addendum-file"),
+        (ProposalKind::ClearSignal, "reason") => Some("--reason"),
+        (ProposalKind::ArchiveRevision, "revision") => Some("<REVISION>"),
+        (ProposalKind::ArchiveRevision, "reason") => Some("--reason"),
 
         _ => None,
     }
@@ -1659,6 +1895,131 @@ mod tests {
 
     fn command_for(args: &[&str]) -> ProposeCommand {
         parse_propose(args).command.expect("expected a subcommand")
+    }
+
+    #[test]
+    fn progression_verbs_pin_their_wire_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let brief = dir.path().join("brief.md");
+        std::fs::write(&brief, "Fix the fixture.\n").unwrap();
+        let brief = brief.to_str().unwrap();
+        let shape = |args: &[&str]| {
+            let (kind, payload, key) = payload_for(command_for(args)).unwrap();
+            assert!(key.is_none());
+            (kind, payload)
+        };
+        assert_eq!(
+            shape(&["revise", "--brief-file", brief]),
+            (ProposalKind::Revise, serde_json::json!({"brief": "Fix the fixture.\n"}))
+        );
+        assert_eq!(
+            shape(&["precursor", "--name", "Fix it on main", "--brief", "Standalone."]),
+            (
+                ProposalKind::Precursor,
+                serde_json::json!({"name": "Fix it on main", "brief": "Standalone."})
+            )
+        );
+        assert_eq!(
+            shape(&["depend", "--on", "task_12"]),
+            (ProposalKind::Depend, serde_json::json!({"on": "task_12"}))
+        );
+        assert_eq!(
+            shape(&["undepend", "--on", "task_x"]),
+            (ProposalKind::Undepend, serde_json::json!({"on": "task_x"}))
+        );
+        assert_eq!(
+            shape(&["redispatch"]),
+            (ProposalKind::Redispatch, serde_json::json!({}))
+        );
+        assert_eq!(
+            shape(&["redispatch", "--brief-addendum", "The blocker is stale."]),
+            (
+                ProposalKind::Redispatch,
+                serde_json::json!({"brief_addendum": "The blocker is stale."})
+            )
+        );
+        assert_eq!(
+            shape(&["clear-signal", "--reason", "merge_conflict"]),
+            (
+                ProposalKind::ClearSignal,
+                serde_json::json!({"reason": "merge_conflict"})
+            )
+        );
+        assert_eq!(
+            shape(&["archive-revision", "T9", "--reason", "dead; parent is green"]),
+            (
+                ProposalKind::ArchiveRevision,
+                serde_json::json!({"revision": "T9", "reason": "dead; parent is green"})
+            )
+        );
+        assert_eq!(shape(&["unblock"]), (ProposalKind::Unblock, serde_json::json!({})));
+    }
+
+    #[test]
+    fn progression_verbs_reject_malformed_invocations() {
+        for args in [
+            vec!["revise", "--brief", "a", "--brief-file", "b.md"],
+            vec!["precursor", "--brief", "no name"],
+            vec!["depend"],
+            vec!["clear-signal", "--reason", "worker_failed"],
+            vec!["archive-revision", "T1"],
+            vec!["redispatch", "--brief-addendum", "a", "--brief-addendum-file", "b.md"],
+        ] {
+            let mut full = vec!["boss", "propose"];
+            full.extend(&args);
+            assert!(Cli::try_parse_from(full).is_err(), "{args:?} should not parse");
+        }
+        // A brief is required, as text or as a readable file.
+        assert!(payload_for(command_for(&["revise"])).is_err());
+        assert!(payload_for(command_for(&["revise", "--brief-file", "/nonexistent/brief.md"])).is_err());
+    }
+
+    #[test]
+    fn done_criterion_is_carried_beside_the_typed_payload_and_needs_a_question() {
+        let base = [
+            "done",
+            "--outcome",
+            "blocked",
+            "--summary",
+            "Needs the owner",
+            "--question",
+            "Merge it?",
+            "--answer-type",
+            "yes-no",
+            "--explanation",
+        ];
+        let explanation = "Context:\nThe PR is ready.\nYes:\nMerge it.\nNo:\nLeave it.\nRecommendation:\nI recommend Yes because CI is green.";
+        let mut args = base.to_vec();
+        args.extend([explanation, "--criterion", "1"]);
+        let (kind, payload, _) = payload_for(command_for(&args)).unwrap();
+        assert_eq!(kind, ProposalKind::RunDone);
+        assert_eq!(payload["criterion"], "1");
+        assert_eq!(payload["question"]["text"], "Merge it?");
+        // Without the flag the payload is unchanged.
+        let mut plain = base.to_vec();
+        plain.push(explanation);
+        let (_, payload, _) = payload_for(command_for(&plain)).unwrap();
+        assert!(payload.get("criterion").is_none());
+        // The criterion only accompanies a question, and only 1 to 4 are meaningful.
+        assert!(
+            Cli::try_parse_from([
+                "boss",
+                "propose",
+                "done",
+                "--outcome",
+                "delivered",
+                "--summary",
+                "s",
+                "--criterion",
+                "1"
+            ])
+            .is_err()
+        );
+        let mut out_of_range = base.to_vec();
+        out_of_range.extend([explanation, "--criterion", "5"]);
+        let mut full = vec!["boss", "propose"];
+        full.extend(&out_of_range);
+        assert!(Cli::try_parse_from(full).is_err());
     }
 
     #[test]
