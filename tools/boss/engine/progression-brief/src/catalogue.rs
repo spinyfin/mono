@@ -7,14 +7,13 @@ pub fn render_budget(budget: &VerbBudget) -> String {
     let remaining = budget.create_max.saturating_sub(budget.create_used);
     format!(
         "Remaining create budget: {remaining} of {} revisions-plus-precursors this window ({}s).\n\
-         Remaining redispatch allowance: {} (no prior redispatch recorded). At most one progression \
+         Remaining redispatch allowance: {}. At most one progression \
          redispatch per item per stuck kind until a non-progression work run completes.",
         budget.create_max, budget.create_window_secs, budget.redispatch_remaining
     )
 }
 
-/// The 2.4 verb table, as the agent reads it. The verbs themselves land in a
-/// later change; the brief still names them so a run knows what it is choosing.
+/// The 2.4 verb table, as the agent reads it.
 pub fn render_verb_catalogue(budget: &VerbBudget) -> String {
     format!(
         "## Verb catalogue\n\

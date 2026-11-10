@@ -66,7 +66,7 @@ fn render_item(out: &mut String, packet: &ProgressionBriefPacket) {
 }
 
 fn render_ledger(out: &mut String, packet: &ProgressionBriefPacket) {
-    out.push_str("## Ledger (last 3 status changes)\n\n");
+    out.push_str("## Ledger (last 3 status changes and the row that entered the stuck state)\n\n");
     if packet.ledger.is_empty() {
         out.push_str("(none)\n\n");
         return;
@@ -148,6 +148,9 @@ fn render_declared_blocker(out: &mut String, packet: &ProgressionBriefPacket) {
     match &packet.declared_blocker {
         Some(blocker) => {
             out.push_str(&format!("Producer: {}\n\n", blocker.producer));
+            if let Some(note) = blocker.sweep_note.as_deref() {
+                out.push_str(&format!("Engine sweep note (not the worker's words): {note}\n\n"));
+            }
             out.push_str("Verbatim:\n\n");
             out.push_str("```\n");
             out.push_str(blocker.verbatim.trim_end());
@@ -159,6 +162,11 @@ fn render_declared_blocker(out: &mut String, packet: &ProgressionBriefPacket) {
 
 fn render_pr(out: &mut String, packet: &ProgressionBriefPacket) {
     out.push_str("## PR\n\n");
+    if let Some(owner) = packet.pr_owner.as_deref() {
+        out.push_str(&format!(
+            "Parent PR (owned by chain root {owner}); this item is a revision.\n\n"
+        ));
+    }
     match packet.pr_url.as_deref() {
         None | Some("") => {
             out.push_str("(no PR bound)\n\n");
@@ -217,7 +225,7 @@ fn render_conflict_attempts(out: &mut String, packet: &ProgressionBriefPacket) {
         match attempt.conflict_diagnosis.as_deref() {
             Some(json) => {
                 out.push_str("  diagnosis:\n");
-                render_conflict_diagnosis(out, json);
+                render_conflict_diagnosis(out, json, packet.pr_head_sha.as_deref());
             }
             None => out.push_str("  diagnosis: (not stored; agent may `gh pr view`)\n"),
         }
@@ -225,11 +233,18 @@ fn render_conflict_attempts(out: &mut String, packet: &ProgressionBriefPacket) {
     out.push('\n');
 }
 
-fn render_conflict_diagnosis(out: &mut String, json: &str) {
+fn render_conflict_diagnosis(out: &mut String, json: &str, current_head: Option<&str>) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
         out.push_str("  (unparseable diagnosis JSON)\n");
         return;
     };
+    if let (Some(stored), Some(current)) = (value.get("head_sha").and_then(|v| v.as_str()), current_head)
+        && stored != current
+    {
+        out.push_str(&format!(
+            "  STALE: stored for head {stored}; the PR head is now {current}\n"
+        ));
+    }
     if let Some(error) = value.get("error").and_then(|v| v.as_str()) {
         out.push_str(&format!("  probe error: {error}\n"));
     }
@@ -260,6 +275,14 @@ fn render_ci_attempts(out: &mut String, packet: &ProgressionBriefPacket) {
             failure = attempt.failure_reason.as_deref().unwrap_or("(none)"),
             checks = attempt.failed_checks,
         ));
+        if let Some(current) = packet.pr_head_sha.as_deref()
+            && attempt.head_sha_at_trigger != current
+        {
+            out.push_str(&format!(
+                "  STALE: attempt ran on head {}; the PR head is now {current}\n",
+                attempt.head_sha_at_trigger
+            ));
+        }
         match attempt.log_excerpt.as_deref() {
             Some(excerpt) => {
                 out.push_str("  log excerpt:\n```\n");
@@ -275,15 +298,21 @@ fn render_ci_attempts(out: &mut String, packet: &ProgressionBriefPacket) {
 fn render_check_history(out: &mut String, packet: &ProgressionBriefPacket) {
     out.push_str("### Failing-check history (other open PRs in this product)\n\n");
     out.push_str(
-        "Stored `ci_required_detail` on this product's other PRs is the proxy for outcomes on main: \
-         a check red here and red elsewhere is likely unrelated or flaky; a check red only here is \
-         likely this PR's change.\n\n",
+        "The engine stores no main-branch check outcomes, so main is unobserved (unknown, not passing). \
+         The only cross-PR signal is the stored required-check detail on this product's other open or \
+         recently completed PRs. Verify main with `gh run list --branch main` before attributing a red \
+         check to this PR.\n\n",
     );
     let failing_here = failing_check_names(packet.ci_required_detail.as_deref());
     if failing_here.is_empty() {
         out.push_str("(no failing required checks recorded on this item)\n\n");
         return;
     }
+    let unobserved = packet
+        .other_pr_ci
+        .iter()
+        .filter(|snap| snap.ci_required_detail.is_none())
+        .count();
     for check in &failing_here {
         let others: Vec<&str> = packet
             .other_pr_ci
@@ -293,7 +322,8 @@ fn render_check_history(out: &mut String, packet: &ProgressionBriefPacket) {
             .collect();
         if others.is_empty() {
             out.push_str(&format!(
-                "- `{check}` failed on this PR only → likely this PR's change.\n"
+                "- `{check}` failed on this PR; no other PR with stored detail shows it failing \
+                 ({unobserved} other PRs have no stored detail), main unobserved → attribution unknown.\n"
             ));
         } else {
             out.push_str(&format!(
@@ -306,6 +336,10 @@ fn render_check_history(out: &mut String, packet: &ProgressionBriefPacket) {
     out.push('\n');
 }
 
+/// Names of the checks in a stored `ci_required_detail`. The merge poller
+/// stores only failing required checks, with GitHub's uppercase conclusion
+/// (`FAILURE`, `TIMED_OUT`, `ERROR`, `STARTUP_FAILURE`, …), so a check counts as
+/// failing unless its conclusion is one of the pass values.
 fn failing_check_names(detail: Option<&str>) -> Vec<String> {
     let Some(detail) = detail else {
         return Vec::new();
@@ -321,11 +355,11 @@ fn failing_check_names(detail: Option<&str>) -> Vec<String> {
         .filter_map(|item| {
             let name = item.get("name")?.as_str()?;
             let conclusion = item.get("conclusion").and_then(|v| v.as_str()).unwrap_or("");
-            if matches!(conclusion, "failure" | "failed" | "cancelled" | "timed_out") {
-                Some(name.to_owned())
-            } else {
-                None
-            }
+            let passing = matches!(
+                conclusion.to_ascii_uppercase().as_str(),
+                "SUCCESS" | "NEUTRAL" | "SKIPPED"
+            );
+            (!passing).then(|| name.to_owned())
         })
         .collect()
 }
@@ -336,14 +370,18 @@ fn check_failed_on(detail: &Option<String>, check: &str) -> bool {
 
 fn render_attentions(out: &mut String, packet: &ProgressionBriefPacket) {
     out.push_str("## Open attentions\n\n");
-    let open: Vec<_> = packet.attentions.iter().filter(|item| item.status == "open").collect();
+    let open: Vec<_> = packet
+        .attentions
+        .iter()
+        .filter(|(_, item)| item.status == "open")
+        .collect();
     if open.is_empty() {
         out.push_str("(none)\n\n");
         return;
     }
-    for item in open {
+    for (owner, item) in open {
         out.push_str(&format!(
-            "- {id} kind={kind} title={title}\n  {body}\n",
+            "- {id} on={owner} kind={kind} title={title}\n  {body}\n",
             id = item.id,
             kind = item.kind,
             title = item.title,
@@ -361,8 +399,9 @@ fn render_questions(out: &mut String, packet: &ProgressionBriefPacket) {
     }
     for question in &packet.questions {
         out.push_str(&format!(
-            "- {id} status={status:?} {text}\n",
+            "- {id} on={owner} status={status:?} {text}\n",
             id = question.question.id,
+            owner = question.work_item_id,
             status = question.status,
             text = question.question.text,
         ));
@@ -387,7 +426,7 @@ fn render_history(out: &mut String, packet: &ProgressionBriefPacket) {
             ));
         }
     }
-    out.push_str("Prior fingerprint actions: none recorded (the actions table lands with the verbs change).\n\n");
+    out.push_str("Prior fingerprint actions: none recorded.\n\n");
 }
 
 fn line(out: &mut String, key: &str, value: &str) {

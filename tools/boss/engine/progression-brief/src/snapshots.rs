@@ -17,11 +17,12 @@ use boss_work_db::{
 use regex::Regex;
 
 use crate::compose_progression_brief;
+use crate::golden;
 
 const REQUIRED_SECTIONS: &[&str] = &[
     "# Progression diagnosis",
     "## Item",
-    "## Ledger (last 3 status changes)",
+    "## Ledger (last 3 status changes and the row that entered the stuck state)",
     "## Dependencies",
     "## Executions (item and revision chain)",
     "## Declared blocker (2.9)",
@@ -31,7 +32,7 @@ const REQUIRED_SECTIONS: &[&str] = &[
     "## Progression history",
     "Current fingerprint:",
     "Prior fingerprint actions: none recorded",
-    "Remaining redispatch allowance: 1 (no prior redispatch recorded)",
+    "Remaining redispatch allowance: 1.",
     "## Verb catalogue",
     "## When you may ask the owner",
     "The action the item needs is on the human-only list",
@@ -76,6 +77,22 @@ impl Fixture {
             .unwrap();
     }
 
+    fn poll(&self, id: &str, head: &str, detail: &str) {
+        self.db
+            .update_task_pr_poll_state(
+                id,
+                PrPollStateInput {
+                    ci_required_state: "fail",
+                    review_required_state: "",
+                    ci_required_detail: (detail != "[]").then_some(detail),
+                    pr_mergeable_state: "MERGEABLE",
+                    pr_head_sha: Some(head),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+
     fn brief(&self, id: &str) -> String {
         normalize(&compose_progression_brief(&self.db, id).unwrap())
     }
@@ -83,11 +100,36 @@ impl Fixture {
 
 fn normalize(text: &str) -> String {
     let timestamps = Regex::new(r"\b1[0-9]{9}\b").unwrap();
-    let ids = Regex::new(r"\b([a-z]+_)[0-9a-f]{8,}\b").unwrap();
+    let ids = Regex::new(r"\b([a-z]+_)[0-9a-f]{8,}(_[0-9a-f]+)?\b").unwrap();
     let fingerprint = Regex::new(r"(Current fingerprint: `)[0-9a-f]{16}(`)").unwrap();
     let text = timestamps.replace_all(text, "<TS>");
-    let text = ids.replace_all(&text, "$1ID");
+    let text = ids.replace_all(&text, "${1}ID");
     fingerprint.replace_all(&text, "${1}<FINGERPRINT>${2}").into_owned()
+}
+
+/// The packet up to the static verb catalogue, which `catalogue_tail_is_present`
+/// pins separately so each golden covers only what varies per item.
+fn variable_part(text: &str) -> &str {
+    text.split("## Verb catalogue").next().unwrap_or(text)
+}
+
+/// Compare the normalized packet to its full expected text, in order.
+fn assert_golden(name: &str, text: &str) {
+    let actual = variable_part(text);
+    let expected = golden::lookup(name);
+    assert!(
+        actual == expected,
+        "{name}: packet differs from golden\n=====GOLDEN-BEGIN {name}\n{actual}=====GOLDEN-END"
+    );
+}
+
+/// Stored `ci_required_detail` exactly as the merge poller writes it.
+fn poller_detail(checks: &[(&str, &str)]) -> String {
+    let items: Vec<serde_json::Value> = checks
+        .iter()
+        .map(|(name, conclusion)| serde_json::json!({"name": name, "conclusion": conclusion}))
+        .collect();
+    serde_json::to_string(&items).unwrap()
 }
 
 fn assert_shape(name: &str, text: &str, needles: &[&str]) {
@@ -122,6 +164,7 @@ fn s1_dispatch_failure() {
             "Declared blocker (2.9)\n\n(none)",
         ],
     );
+    assert_golden("s1", &text);
 }
 
 #[test]
@@ -143,24 +186,46 @@ fn s2_churn_guard() {
             "three unproductive runs",
         ],
     );
+    assert_golden("s2", &text);
 }
 
 #[test]
 fn s3_deliberate_park_verbatim_blocker() {
     let f = fixture();
-    let id = f.chore("Parked");
-    f.sql(&format!("UPDATE tasks SET status = 'active' WHERE id = '{id}'"));
-    assert!(f.db.bounce_deliberate_park_to_backlog(&id, "the worker said it needs a human on the API shape", None));
+    let id = start_then_fail(
+        &f,
+        "Parked",
+        WorkerFailureBasis::DeclaredBlocked,
+        "the worker said it needs a human on the API shape",
+    );
+    // Production shape: the declaration attention hangs off the execution and
+    // the sweep parks the item with its own generic note.
+    let execution = f.db.list_execution_diagnoses_for_chain(&id).unwrap().remove(0);
+    f.sql(&format!(
+        "UPDATE tasks SET status = 'active', blocked_reason = NULL WHERE id = '{id}'"
+    ));
+    f.db.create_attention_item(
+        CreateAttentionItemInput::builder()
+            .execution_id(&execution.id)
+            .kind(RUN_DONE_BLOCKED_ATTENTION_KIND)
+            .title("Worker declared blocked")
+            .body_markdown("Should the API return 404 or 410 for retired ids? I need the owner to pick.")
+            .build(),
+    )
+    .unwrap();
+    assert!(f.db.bounce_deliberate_park_to_backlog(&id, "orphan_sweep", None));
     let text = f.brief(&id);
     assert_shape(
         "S3",
         &text,
         &[
             "stuck: S3_deliberate_park",
-            "Producer: deliberate_park",
-            "the worker said it needs a human on the API shape",
+            "Producer: declared_blocked",
+            "Engine sweep note (not the worker's words): The `orphan_sweep` sweep is holding",
+            "Should the API return 404 or 410 for retired ids? I need the owner to pick.",
         ],
     );
+    assert_golden("s3", &text);
 }
 
 #[test]
@@ -193,6 +258,8 @@ fn s5_merge_conflict_with_diagnosis() {
     });
     f.db.set_conflict_resolution_diagnosis(&attempt.id, &diagnosis.to_string())
         .unwrap();
+    // The PR moved on after the diagnosis was taken.
+    f.poll(&id, "ccc333", &poller_detail(&[]));
     let text = f.brief(&id);
     assert_shape(
         "S5",
@@ -204,6 +271,7 @@ fn s5_merge_conflict_with_diagnosis() {
             "src/lib.rs (content)",
         ],
     );
+    assert_golden("s5", &text);
 }
 
 #[test]
@@ -213,7 +281,8 @@ fn s6_ci_failure_check_history_flags_unrelated() {
     f.bind_pr(&id, 50);
     let other = f.chore("Sibling PR");
     f.bind_pr(&other, 51);
-    let detail = r#"[{"name":"bazel-test","conclusion":"failure"}]"#;
+    let detail = poller_detail(&[("bazel-test", "FAILURE"), ("checkleft", "TIMED_OUT")]);
+    let detail = detail.as_str();
     f.db.update_task_pr_poll_state(
         &id,
         PrPollStateInput {
@@ -269,6 +338,7 @@ fn s6_ci_failure_check_history_flags_unrelated() {
             "`bazel-test` failed on this PR and on 1 other open/recent PRs (Sibling PR) → likely unrelated or flaky.",
         ],
     );
+    assert_golden("s6", &text);
 }
 
 fn start_then_fail(f: &Fixture, name: &str, basis: WorkerFailureBasis, detail: &str) -> String {
@@ -300,6 +370,10 @@ fn start_then_fail(f: &Fixture, name: &str, basis: WorkerFailureBasis, detail: &
     id
 }
 
+fn first_execution(f: &Fixture, id: &str) -> String {
+    f.db.list_execution_diagnoses_for_chain(id).unwrap().remove(0).id
+}
+
 #[test]
 fn s7_declared_blocked_verbatim() {
     let f = fixture();
@@ -311,7 +385,7 @@ fn s7_declared_blocked_verbatim() {
     );
     f.db.create_attention_item(
         CreateAttentionItemInput::builder()
-            .work_item_id(&id)
+            .execution_id(first_execution(&f, &id))
             .kind(RUN_DONE_BLOCKED_ATTENTION_KIND)
             .title("Worker declared blocked")
             .body_markdown("need a decision on the retry budget")
@@ -329,6 +403,7 @@ fn s7_declared_blocked_verbatim() {
             "need a decision on the retry budget",
         ],
     );
+    assert_golden("s7_declared", &text);
 }
 
 #[test]
@@ -342,7 +417,7 @@ fn s7_nudge_breaker_verbatim() {
     );
     f.db.create_attention_item(
         CreateAttentionItemInput::builder()
-            .work_item_id(&id)
+            .execution_id(first_execution(&f, &id))
             .kind(NUDGE_BREAKER_ATTENTION_KIND)
             .title("Nudge breaker")
             .body_markdown("nudge loop bounded after silence")
@@ -360,6 +435,7 @@ fn s7_nudge_breaker_verbatim() {
             "nudge loop bounded after silence",
         ],
     );
+    assert_golden("s7_nudge", &text);
 }
 
 #[test]
@@ -376,6 +452,7 @@ fn s9_execution_recovery() {
             "blocked_reason: execution_recovery_failed",
         ],
     );
+    assert_golden("s9", &text);
 }
 
 #[test]
@@ -389,6 +466,7 @@ fn s11_pr_binding() {
         &text,
         &["stuck: S11_pr_binding", "blocked_reason: pr_binding_unresolved"],
     );
+    assert_golden("s11", &text);
 }
 
 #[test]
@@ -397,6 +475,8 @@ fn s13_revision_chain_tail() {
     let parent = f.chore("Parent green");
     f.bind_pr(&parent, 90);
     f.stick(&parent, "status = 'in_review', ci_required_state = 'success'");
+    f.poll(&parent, "feed90", "[]");
+    f.stick(&parent, "ci_required_state = 'success'");
     let revision = f.chore("Dead revision");
     f.sql(&format!(
         "UPDATE tasks SET kind = 'revision', parent_task_id = '{parent}',
@@ -417,8 +497,11 @@ fn s13_revision_chain_tail() {
             "stuck: S13_revision_chain",
             "blocked_reason: worker_failed",
             "kind: revision",
+            "Parent PR (owned by chain root",
+            "head_sha: feed90",
         ],
     );
+    assert_golden("s13", &text);
 }
 
 #[test]
@@ -445,6 +528,7 @@ fn s14_worker_recovery() {
             "three API-error resumes failed",
         ],
     );
+    assert_golden("s14", &text);
 }
 
 #[test]
@@ -456,6 +540,7 @@ fn s16_review_churn() {
     f.db.file_churn_guard_parked_attention(&id, "pr_review_recovery", 4, &[], "terminal pr_review executions");
     let text = f.brief(&id);
     assert_shape("S16", &text, &["stuck: S16_review_churn", "kind=churn_guard_parked"]);
+    assert_golden("s16", &text);
 }
 
 #[test]
@@ -484,6 +569,7 @@ fn s22_abandoned_branch() {
             "pushed boss/orphan-branch more than 24h ago",
         ],
     );
+    assert_golden("s22", &text);
 }
 
 #[test]
@@ -510,4 +596,142 @@ fn fingerprint_is_stable_for_the_same_inputs() {
     assert_eq!(a, b);
     assert_eq!(a.len(), 16);
     assert_ne!(a, c);
+}
+
+fn progression_run(f: &Fixture, id: &str) -> String {
+    let execution =
+        f.db.create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(id)
+                .kind(ExecutionKind::Progression)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    f.sql(&format!(
+        "UPDATE work_executions SET status = 'completed', run_done_outcome = 'no_action' WHERE id = '{}'",
+        execution.id
+    ));
+    execution.id
+}
+
+fn fingerprint_of(text: &str) -> String {
+    Regex::new(r"Current fingerprint: `([0-9a-f]{16})`")
+        .unwrap()
+        .captures(text)
+        .expect("fingerprint line")[1]
+        .to_owned()
+}
+
+#[test]
+fn completed_progression_run_leaves_the_fingerprint_unchanged() {
+    let f = fixture();
+    let id = start_then_fail(
+        &f,
+        "Stays stuck",
+        WorkerFailureBasis::DeclaredBlocked,
+        "needs a decision",
+    );
+    let before = compose_progression_brief(&f.db, &id).unwrap();
+    progression_run(&f, &id);
+    let after = compose_progression_brief(&f.db, &id).unwrap();
+    assert_eq!(fingerprint_of(&before), fingerprint_of(&after));
+    assert!(after.contains("Prior progression runs:\n- "), "{after}");
+}
+
+#[test]
+fn ledger_keeps_status_rows_after_later_non_status_writes() {
+    let f = fixture();
+    let id = start_then_fail(
+        &f,
+        "Noisy audit",
+        WorkerFailureBasis::DeclaredBlocked,
+        "needs a decision",
+    );
+    for n in 0..5 {
+        f.sql(&format!(
+            "INSERT INTO task_status_audit (work_item_id, property, old_value, new_value, actor, basis, changed_at)
+             VALUES ('{id}', 'autostart', '{n}', '{}', 'engine', 'noise', '2026-01-01T00:00:0{n}Z')",
+            n + 1
+        ));
+    }
+    let text = compose_progression_brief(&f.db, &id).unwrap();
+    let ledger = text.split("## Dependencies").next().unwrap();
+    assert!(ledger.contains("- status "), "{ledger}");
+    assert!(ledger.contains("- blocked_reason "), "entry row missing:\n{ledger}");
+    assert!(!ledger.contains("autostart"), "{ledger}");
+}
+
+#[test]
+fn chain_evidence_on_the_parent_reaches_a_stuck_revision() {
+    let f = fixture();
+    let parent = f.chore("Parent with question");
+    f.bind_pr(&parent, 70);
+    let revision = f.chore("Stuck revision");
+    f.sql(&format!(
+        "UPDATE tasks SET kind = 'revision', parent_task_id = '{parent}',
+                status = 'blocked', blocked_reason = 'execution_recovery_failed'
+         WHERE id = '{revision}'"
+    ));
+    f.db.create_attention_item(
+        CreateAttentionItemInput::builder()
+            .work_item_id(&parent)
+            .kind("abandoned_branch_no_pr")
+            .title("Parent attention")
+            .body_markdown("parent-only evidence")
+            .build(),
+    )
+    .unwrap();
+    let text = compose_progression_brief(&f.db, &revision).unwrap();
+    assert!(
+        text.contains(&format!("on={parent} kind=abandoned_branch_no_pr")),
+        "{text}"
+    );
+    assert!(text.contains("parent-only evidence"), "{text}");
+    assert!(text.contains("url: https://github.com/spinyfin/mono/pull/70"), "{text}");
+}
+
+#[test]
+fn s6_failing_only_here_is_attributed_unknown_not_this_pr() {
+    let f = fixture();
+    let id = f.chore("Red alone");
+    f.bind_pr(&id, 60);
+    let other = f.chore("Green sibling");
+    f.bind_pr(&other, 61);
+    f.poll(&id, "deadbeef", &poller_detail(&[("bazel-test", "FAILURE")]));
+    f.stick(&id, "status = 'blocked', blocked_reason = 'ci_failure_exhausted'");
+    let text = f.brief(&id);
+    assert!(
+        text.contains("`bazel-test` failed on this PR; no other PR with stored detail shows it failing (1 other PRs have no stored detail), main unobserved → attribution unknown."),
+        "{text}"
+    );
+    assert!(!text.contains("likely this PR's change"), "{text}");
+}
+
+#[test]
+fn redispatch_allowance_counts_progression_started_work_since_the_last_clean_run() {
+    use boss_work_db::ExecutionDiagnosis;
+    let run = |id: &str, kind: &str, status: &str, via: Option<&str>| {
+        ExecutionDiagnosis::builder()
+            .id(id)
+            .work_item_id("task_1")
+            .kind(kind)
+            .status(status)
+            .maybe_created_via(via)
+            .created_at("t")
+            .build()
+    };
+    let none = vec![run("a", "chore_implementation", "failed", None)];
+    assert_eq!(crate::gather::redispatch_remaining(&none), 1);
+    let redispatched = vec![
+        run("a", "chore_implementation", "failed", None),
+        run("b", "progression", "completed", None),
+        run("c", "chore_implementation", "failed", Some("progression:redispatch")),
+    ];
+    assert_eq!(crate::gather::redispatch_remaining(&redispatched), 0);
+    let cleared = vec![
+        run("c", "chore_implementation", "failed", Some("progression:redispatch")),
+        run("d", "chore_implementation", "completed", None),
+    ];
+    assert_eq!(crate::gather::redispatch_remaining(&cleared), 1);
 }

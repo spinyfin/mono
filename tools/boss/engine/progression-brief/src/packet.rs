@@ -37,11 +37,15 @@ pub struct Neighbour {
 #[derive(Debug, Clone)]
 pub struct DeclaredBlocker {
     pub producer: String,
+    /// The worker's own words, from the open declaration attention or the
+    /// stored operator question.
     pub verbatim: String,
+    /// The engine's wrapper text (the sweep's note on the item), shown apart
+    /// from the worker's words so the agent never classifies engine prose.
+    pub sweep_note: Option<String>,
 }
 
-/// Prior progression run the packet lists. Fingerprint actions are a later
-/// table; until it exists this is the execution row plus its declaration.
+/// Prior progression run the packet lists: the execution row plus its declaration.
 #[derive(Debug, Clone)]
 pub struct PriorProgressionRun {
     pub execution_id: String,
@@ -57,8 +61,9 @@ pub struct VerbBudget {
     pub create_used: i64,
     pub create_max: i64,
     pub create_window_secs: i64,
-    /// Always 1 until the verbs change records a redispatch. The brief still
-    /// states the 2.5 cross-fingerprint bound so the agent knows the rule.
+    /// 2.5 allows one progression redispatch per item until a non-progression
+    /// work run completes; this is that bound minus the redispatches the
+    /// execution history shows since the last such run.
     pub redispatch_remaining: u32,
 }
 
@@ -79,6 +84,9 @@ pub struct ProgressionBriefPacket {
     pub churn_window_terminal_count: i64,
     pub declared_blocker: Option<DeclaredBlocker>,
     pub pr_url: Option<String>,
+    /// Set when the PR belongs to the revision chain's root rather than the
+    /// stuck item itself: the root's id.
+    pub pr_owner: Option<String>,
     pub pr_mergeable: Option<String>,
     pub pr_merge_state_status: Option<String>,
     pub pr_head_sha: Option<String>,
@@ -89,7 +97,9 @@ pub struct ProgressionBriefPacket {
     pub conflict_attempts: Vec<ConflictResolution>,
     pub ci_attempts: Vec<CiRemediation>,
     pub other_pr_ci: Vec<ProductPrCiSnapshot>,
-    pub attentions: Vec<WorkAttentionItem>,
+    /// Attentions on the item and its chain, each with its owning work item id.
+    pub attentions: Vec<(String, WorkAttentionItem)>,
+    /// Operator questions on the item and its chain (each carries its owner).
     pub questions: Vec<OperatorQuestionRecord>,
     pub prior_progression: Vec<PriorProgressionRun>,
     pub fingerprint: String,

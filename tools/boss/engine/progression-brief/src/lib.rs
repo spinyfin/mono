@@ -3,8 +3,9 @@
 //! The engine composes this from stored work-db state so the agent spends its
 //! turns deciding rather than discovering. Compose never talks to git or CI:
 //! conflict diagnosis and check logs are the rows already stored on
-//! `conflict_resolutions` and `ci_remediations`. The agent may still run
-//! `gh pr view|checks` itself.
+//! `conflict_resolutions` and `ci_remediations`, flagged stale when they were
+//! taken on a different PR head. The agent may still run `gh pr view|checks`
+//! itself.
 
 mod catalogue;
 mod gather;
@@ -22,5 +23,7 @@ pub fn compose_progression_brief(db: &boss_work_db::WorkDb, work_item_id: &str) 
     Ok(render_progression_brief(&packet))
 }
 
+#[cfg(test)]
+mod golden;
 #[cfg(test)]
 mod snapshots;

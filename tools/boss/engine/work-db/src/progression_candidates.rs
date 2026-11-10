@@ -182,7 +182,7 @@ const LIVE_OR_PENDING: &str = "('queued','ready','waiting_dependency','claimed',
 /// Execution statuses of a progression run that died rather than reported.
 const INFRASTRUCTURE_FAILED: &str = "('failed','orphaned','abandoned')";
 
-fn limit_sql(key: &str, default: i64) -> String {
+pub(crate) fn limit_sql(key: &str, default: i64) -> String {
     format!("COALESCE((SELECT CAST(value AS INTEGER) FROM metadata WHERE key = '{key}'), {default})")
 }
 
@@ -510,10 +510,29 @@ fn real_candidates_view_sql() -> String {
 /// minted for this item inside the rolling window, identified by
 /// `created_via LIKE 'progression:%'` (design 2.4).
 fn create_budget_exhausted_sql(a: &str, max_creates: &str, window: &str) -> String {
+    format!("({}) >= ({max_creates})", create_budget_used_sql(a, window))
+}
+
+/// Count of revisions and precursors a progression run minted for `{a}` inside
+/// the `window` (seconds) SQL expression. Shared by the candidate clause and the
+/// diagnosis packet so the budget the agent reads is the one the sweep enforces.
+/// SQL expressions for the per-item create cap and its rolling window, read from
+/// metadata with the published defaults.
+pub(crate) fn create_budget_limit_sqls() -> (String, String) {
+    (
+        limit_sql(
+            METADATA_KEY_MAX_CREATES_PER_ITEM_WINDOW,
+            i64::from(DEFAULT_MAX_CREATES_PER_ITEM_WINDOW),
+        ),
+        limit_sql(METADATA_KEY_MAX_CREATES_WINDOW_SECS, DEFAULT_MAX_CREATES_WINDOW_SECS),
+    )
+}
+
+pub(crate) fn create_budget_used_sql(a: &str, window: &str) -> String {
     // Two indexed arms (children by parent, precursors by dependent) rather than
     // one scan of every task with an OR across both relations.
     format!(
-        "(SELECT COUNT(*) FROM (
+        "SELECT COUNT(*) FROM (
               SELECT created.id FROM tasks created
               WHERE created.parent_task_id = {a}.id
                 AND created.created_via LIKE 'progression:%'
@@ -525,8 +544,7 @@ fn create_budget_exhausted_sql(a: &str, max_creates: &str, window: &str) -> Stri
               WHERE d.dependent_id = {a}.id
                 AND created.created_via LIKE 'progression:%'
                 AND created.deleted_at IS NULL
-                AND CAST(created.created_at AS INTEGER) > {NOW} - ({window})))
-         >= ({max_creates})"
+                AND CAST(created.created_at AS INTEGER) > {NOW} - ({window}))"
     )
 }
 
@@ -594,11 +612,7 @@ fn run_state_select(cooldown: &str) -> String {
 fn views_sql() -> String {
     let stuck_after = limit_sql(METADATA_KEY_STUCK_AFTER_SECS, DEFAULT_STUCK_AFTER_SECS);
     let cooldown = limit_sql(METADATA_KEY_COOLDOWN_SECS, DEFAULT_COOLDOWN_SECS);
-    let max_creates = limit_sql(
-        METADATA_KEY_MAX_CREATES_PER_ITEM_WINDOW,
-        i64::from(DEFAULT_MAX_CREATES_PER_ITEM_WINDOW),
-    );
-    let create_window = limit_sql(METADATA_KEY_MAX_CREATES_WINDOW_SECS, DEFAULT_MAX_CREATES_WINDOW_SECS);
+    let (max_creates, create_window) = create_budget_limit_sqls();
     let parked = parked_task_sql("t");
     let human_held = human_held_sql("t");
     let stuck_kind = stuck_kind_sql("t", "root");

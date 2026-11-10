@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::chain_helpers::collect_chain_revision_ids;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 
 /// One `task_status_audit` row, newest first in listings.
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
@@ -61,15 +61,28 @@ pub struct ProgressionCreateBudget {
 
 #[work_db_boundary::instrument]
 impl WorkDb {
-    /// Newest ledger rows for `work_item_id`, capped at `limit`.
+    /// Ledger rows for the packet: the last `limit` `status` changes, plus the
+    /// row that entered the current stuck state (the newest `blocked_reason` or
+    /// `dispatch_failed_reason` write that set a value), deduplicated and
+    /// returned newest first. Writes to other properties never crowd these out.
     pub fn list_recent_status_audit(&self, work_item_id: &str, limit: i64) -> Result<Vec<StatusAuditRow>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT property, old_value, new_value, actor, basis, changed_at
              FROM task_status_audit
-             WHERE work_item_id = ?1
-             ORDER BY id DESC
-             LIMIT ?2",
+             WHERE id IN (
+                 SELECT id FROM (
+                     SELECT id FROM task_status_audit
+                     WHERE work_item_id = ?1 AND property = 'status'
+                     ORDER BY id DESC LIMIT ?2)
+                 UNION
+                 SELECT id FROM (
+                     SELECT id FROM task_status_audit
+                     WHERE work_item_id = ?1
+                       AND property IN ('blocked_reason', 'dispatch_failed_reason')
+                       AND new_value IS NOT NULL
+                     ORDER BY id DESC LIMIT 1))
+             ORDER BY id DESC",
         )?;
         let rows = stmt.query_map(params![work_item_id, limit], |row| {
             Ok(StatusAuditRow {
@@ -87,15 +100,7 @@ impl WorkDb {
     /// Latest `task_status_audit.basis` for `property` on this item.
     pub fn latest_status_audit_basis(&self, work_item_id: &str, property: &str) -> Result<Option<String>> {
         let conn = self.connect()?;
-        Ok(conn
-            .query_row(
-                "SELECT basis FROM task_status_audit
-                 WHERE work_item_id = ?1 AND property = ?2
-                 ORDER BY id DESC LIMIT 1",
-                params![work_item_id, property],
-                |row| row.get(0),
-            )
-            .optional()?)
+        crate::stuck_report::latest_basis(&conn, work_item_id, property)
     }
 
     /// Executions for `chain_root_id` and every live revision in its chain,
@@ -173,46 +178,49 @@ impl WorkDb {
     }
 
     /// Revisions plus precursors minted with `created_via LIKE 'progression:%'`
-    /// for this item inside the published rolling window.
+    /// for this item inside the published rolling window. The count and limits
+    /// come from the same SQL fragments the candidate clause uses.
     pub fn progression_create_budget(&self, work_item_id: &str) -> Result<ProgressionCreateBudget> {
         let conn = self.connect()?;
-        let max = metadata_i64(
-            &conn,
-            boss_engine_storage_values::progression::METADATA_KEY_MAX_CREATES_PER_ITEM_WINDOW,
-            i64::from(boss_engine_storage_values::progression::DEFAULT_MAX_CREATES_PER_ITEM_WINDOW),
-        )?;
-        let window_secs = metadata_i64(
-            &conn,
-            boss_engine_storage_values::progression::METADATA_KEY_MAX_CREATES_WINDOW_SECS,
-            boss_engine_storage_values::progression::DEFAULT_MAX_CREATES_WINDOW_SECS,
-        )?;
-        let used: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM (
-                 SELECT created.id FROM tasks created
-                 WHERE created.parent_task_id = ?1
-                   AND created.created_via LIKE 'progression:%'
-                   AND created.deleted_at IS NULL
-                   AND CAST(created.created_at AS INTEGER)
-                       > CAST(strftime('%s','now') AS INTEGER) - ?2
-                 UNION
-                 SELECT created.id FROM work_item_dependencies d
-                 JOIN tasks created ON created.id = d.prerequisite_id
-                 WHERE d.dependent_id = ?1
-                   AND created.created_via LIKE 'progression:%'
-                   AND created.deleted_at IS NULL
-                   AND CAST(created.created_at AS INTEGER)
-                       > CAST(strftime('%s','now') AS INTEGER) - ?2
-             )",
-            params![work_item_id, window_secs],
-            |row| row.get(0),
-        )?;
+        let (max_sql, window_sql) = crate::progression_candidates::create_budget_limit_sqls();
+        let used_sql = crate::progression_candidates::create_budget_used_sql("t", &window_sql);
+        let sql = format!("SELECT ({used_sql}), ({max_sql}), ({window_sql}) FROM tasks t WHERE t.id = ?1");
+        let (used, max, window_secs) = conn.query_row(&sql, params![work_item_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+        })?;
         Ok(ProgressionCreateBudget { used, max, window_secs })
     }
-}
 
-fn metadata_i64(conn: &Connection, key: &str, fallback: i64) -> Result<i64> {
-    let stored: Option<String> = conn
-        .query_row("SELECT value FROM metadata WHERE key = ?1", [key], |row| row.get(0))
-        .optional()?;
-    Ok(stored.and_then(|value| value.parse().ok()).unwrap_or(fallback))
+    /// Attention items on any of `work_item_ids`, directly or through one of
+    /// their executions (a declared-blocked or nudge-breaker item attaches to
+    /// the execution), each paired with the id of the work item that owns it.
+    pub fn list_attention_items_for_work_items(
+        &self,
+        work_item_ids: &[String],
+    ) -> Result<Vec<(String, boss_protocol::WorkAttentionItem)>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at, converted_task_id
+             FROM work_attention_items
+             WHERE work_item_id = ?1
+                OR execution_id IN (SELECT id FROM work_executions WHERE work_item_id = ?1)
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let mut out = Vec::new();
+        for id in work_item_ids {
+            let rows = stmt.query_map([id], crate::mappers::map_attention_item)?;
+            for item in collect_rows(rows)? {
+                out.push((id.clone(), item));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The chain root plus every live revision in its chain.
+    pub fn list_chain_work_item_ids(&self, chain_root_id: &str) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        let mut ids = vec![chain_root_id.to_owned()];
+        ids.extend(collect_chain_revision_ids(&conn, chain_root_id)?);
+        Ok(ids)
+    }
 }
