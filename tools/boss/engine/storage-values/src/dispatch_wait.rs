@@ -65,8 +65,8 @@ pub const DISPATCH_WAIT_REASON_INTERACTIVE_CAP: &str = "interactive_concurrency_
 /// An unmet `blocks` prerequisite gates the row.
 pub const DISPATCH_WAIT_REASON_WAITING_DEPENDENCY: &str = "waiting_dependency";
 
-/// The row is a later task of a project whose earlier task has not finished
-/// starting: the reconciler holds every project task but the first incomplete
+/// The row is a later task of a project whose earlier task has not yet reached
+/// review or completion: the reconciler holds every project task but the first incomplete
 /// one in `waiting_dependency`.
 pub const DISPATCH_WAIT_REASON_PROJECT_ORDER: &str = "project_order";
 

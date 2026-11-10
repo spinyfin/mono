@@ -966,6 +966,12 @@ fn an_idle_active_item_outside_the_sweeps_clock_is_an_anomaly() {
     let product = create_test_product(&db);
     let item = create_test_chore(&db, &product.id, "invalid update clock");
     set_status(&db, &item.id, "active");
+    let run = pending(&db, &item.id, ExecutionKind::PrReview, ExecutionStatus::Completed);
+    db.connect().unwrap().execute(
+        "INSERT INTO pr_review_verdicts(id,execution_id,work_item_id,head_sha,findings_count,revision_warranted,gate_outcome,created_at)
+         VALUES ('productive',?1,?2,'head',0,0,'completed_clean','1')",
+        params![run.id, item.id],
+    ).unwrap();
     // No legitimate hold explains this row: its invalid timestamp excludes
     // it even from the candidate walk with the broadest possible cutoff.
     db.connect()
@@ -1000,6 +1006,7 @@ fn review_states_use_admission_and_current_head_evidence_on_every_surface() -> B
         ("admission", DISPATCH_WAIT_REASON_REVIEW_RESERVATION),
         ("parked", DISPATCH_WAIT_REASON_PARKED),
         ("human", DISPATCH_WAIT_REASON_HUMAN_DRIVEN),
+        ("fallback", DISPATCH_WAIT_REASON_AWAITING_MERGE),
         ("unexplained", DISPATCH_WAIT_REASON_UNCLASSIFIED),
     ] {
         let item = create_test_chore(&db, &product.id, name);
@@ -1013,6 +1020,12 @@ fn review_states_use_admission_and_current_head_evidence_on_every_surface() -> B
             )
             .unwrap();
         match name {
+            "unexplained" => {
+                db.connect()
+                    .unwrap()
+                    .execute("UPDATE tasks SET pr_url = NULL WHERE id = ?1", [&item.id])
+                    .unwrap();
+            }
             "clean" | "revision" | "findings" => {
                 let run = pending(&db, &item.id, ExecutionKind::PrReview, ExecutionStatus::Completed);
                 let revision = if name == "revision" {
@@ -1116,4 +1129,63 @@ fn review_states_use_admission_and_current_head_evidence_on_every_surface() -> B
         );
     }
     covered
+}
+
+#[test]
+fn excluded_review_kinds_wait_for_merge_without_false_attention() {
+    let db = db();
+    let product = create_test_product(&db);
+    for kind in ["design", "investigation", "design_postmortem"] {
+        let item = create_test_chore(&db, &product.id, kind);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET kind = ?2, status = 'in_review',
+             pr_url = 'https://github.com/test/repo/pull/7', review_required_state = 'unknown' WHERE id = ?1",
+                params![item.id, kind],
+            )
+            .unwrap();
+        assert_named(
+            kind,
+            &wait_of(&db, &product.id, &item.id),
+            DISPATCH_WAIT_REASON_AWAITING_MERGE,
+        );
+        assert!(
+            !db.list_unexplained_dispatch_waits()
+                .unwrap()
+                .iter()
+                .any(|wait| wait.work_item_id == item.id)
+        );
+        // An outstanding reviewer must prevent the merge-only fallback.
+        pending(&db, &item.id, ExecutionKind::PrReview, ExecutionStatus::WaitingReview);
+        assert_eq!(
+            db.get_task_runtime(&item.id).unwrap().dispatch_wait_reason.as_deref(),
+            Some(DISPATCH_WAIT_REASON_UNCLASSIFIED)
+        );
+    }
+}
+
+#[test]
+fn merge_only_wait_requires_the_whole_revision_family_to_be_idle() {
+    let db = db();
+    let product = create_test_product(&db);
+    let root = make_in_review_chore(&db, &product.id, "https://github.com/test/repo/pull/8");
+    let child = create_test_chore(&db, &product.id, "pending revision");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET kind = 'revision', parent_task_id = ?2, status = 'active' WHERE id = ?1",
+            params![child.id, root],
+        )
+        .unwrap();
+    assert_eq!(
+        db.get_task_runtime(&root).unwrap().dispatch_wait_reason.as_deref(),
+        Some(DISPATCH_WAIT_REASON_UNCLASSIFIED)
+    );
+    set_status(&db, &child.id, "in_review");
+    pending(&db, &child.id, ExecutionKind::PrReview, ExecutionStatus::Running);
+    assert_eq!(
+        db.get_task_runtime(&root).unwrap().dispatch_wait_reason.as_deref(),
+        Some(DISPATCH_WAIT_REASON_UNCLASSIFIED)
+    );
 }

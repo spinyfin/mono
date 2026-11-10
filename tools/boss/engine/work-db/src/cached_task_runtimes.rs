@@ -6,8 +6,9 @@ use super::*;
 /// Epochs are read in the same snapshot as the fallback computation, so a hit
 /// is exactly the value the uncached path would compute from that snapshot;
 /// only misses (changed, expired, never seen, or consulting other items) run
-/// the point queries. The returned statement count covers the misses plus the
-/// one epoch query, which keeps the population trace honest about what ran.
+/// execution point queries. Task-derived wait annotation runs on hits too.
+/// The returned statement count includes those annotation statements, cache
+/// misses and the epoch query.
 pub(crate) fn collect_task_runtimes_cached(
     conn: &Connection,
     product_id: &str,
@@ -53,7 +54,11 @@ pub(crate) fn collect_task_runtimes_cached(
         // Applied to hits as well as misses: the cache holds the
         // execution-derived runtime, and why a card with no execution is
         // queued comes from its task row, which no epoch versions.
-        super::queued_wait::annotate_unscheduled(conn, task, &mut runtime)?;
+        let (annotation, statements) = super::db_diagnostics::count_statements(conn, || {
+            super::queued_wait::annotate_unscheduled(conn, task, &mut runtime)
+        });
+        queries += statements;
+        annotation?;
         if let Some(validity) = validity.as_mut() {
             validity.insert((*id).to_owned(), (cacheable, expires_at));
         }

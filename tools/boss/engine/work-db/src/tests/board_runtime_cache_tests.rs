@@ -8,6 +8,24 @@ use std::time::Instant;
 
 const FAR_FUTURE: &str = "4102444800";
 
+#[test]
+fn review_wait_statements_are_counted_on_runtime_cache_hits() {
+    let board = Board::new(WorkDb::open(temp_db_path("review-wait-query-count")).unwrap());
+    let id = board.chore("waiting for merge");
+    board.sql(
+        "UPDATE tasks SET status = 'in_review', review_required_state = 'unknown',
+         pr_url = 'https://github.com/test/repo/pull/7' WHERE id = ?1",
+        &[&id],
+    );
+    board.assert_equivalent();
+    let (misses, queries) = board.assert_equivalent();
+    assert_eq!(misses, 0);
+    assert!(
+        queries > 1,
+        "review annotation statements must accompany the epoch read"
+    );
+}
+
 struct Board {
     db: WorkDb,
     product_id: String,
@@ -67,6 +85,23 @@ impl Board {
 
     fn sql(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) {
         self.db.connect().unwrap().execute(sql, params).unwrap();
+    }
+
+    fn annotation_statements(&self) -> i64 {
+        let tree = self.db.get_work_tree(&self.product_id).unwrap();
+        let conn = self.db.connect().unwrap();
+        let (_, statements) = crate::db_diagnostics::count_statements(&conn, || {
+            for task in tree.tasks.iter().chain(&tree.chores) {
+                let mut runtime = tree
+                    .task_runtimes
+                    .iter()
+                    .find(|r| r.work_item_id == task.id)
+                    .unwrap()
+                    .clone();
+                crate::queued_wait::annotate_unscheduled(&conn, task, &mut runtime).unwrap();
+            }
+        });
+        statements as i64
     }
 
     /// Assemble through the cache and without it, assert the trees are equal,
@@ -385,7 +420,11 @@ fn every_runtime_input_write_invalidates_exactly_its_item() {
         let (misses, _) = board.assert_equivalent();
         assert_eq!(misses, changed, "{label}: recomputed items");
         let (misses, queries) = board.assert_equivalent();
-        assert_eq!((misses, queries), (0, 1), "{label}: settled board is served from cache");
+        assert_eq!(
+            (misses, queries),
+            (0, 1 + board.annotation_statements()),
+            "{label}: settled board runs only the epoch read and task-derived annotation"
+        );
     }
 }
 

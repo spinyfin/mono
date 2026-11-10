@@ -2,6 +2,28 @@ use super::*;
 use crate::WorkDb;
 use crate::test_support::log_capture;
 
+#[test]
+fn statement_counter_counts_cached_and_nested_queries_and_clears_its_callback() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let read = || conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0)).unwrap();
+    let (_, count) = count_statements(&conn, || {
+        assert_eq!(read(), 1);
+        conn.prepare_cached("SELECT 2")
+            .unwrap()
+            .query_row([], |_| Ok(()))
+            .unwrap();
+        assert_eq!(read(), 1);
+    });
+    assert_eq!(count, 3);
+    assert_eq!(read(), 1);
+    assert_eq!(count_statements(&conn, read), (1, 1));
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        count_statements(&conn, || panic!("projection failed"));
+    }));
+    assert!(panic.is_err());
+    assert_eq!(read(), 1);
+}
+
 #[tokio::test]
 async fn attributed_hold_excludes_non_sql_work_from_query_time() {
     let logs = log_capture::install();

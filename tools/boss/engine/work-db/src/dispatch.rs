@@ -2014,6 +2014,29 @@ pub(crate) fn live_pre_merge_batch_holds(conn: &Connection, id: &str) -> Result<
     )?)
 }
 
+/// Latest review attempts owned by review recovery, shared with wait classification.
+pub(crate) fn review_recovery_holds_sql(item: &str) -> String {
+    let unproductive_completed = super::review_verdicts::unproductive_completed_pr_review_sql();
+    format!(
+        r#"EXISTS (
+               SELECT 1 FROM work_executions we
+               WHERE we.work_item_id = {item}
+                 AND we.kind = 'pr_review'
+                 AND (
+                     we.status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
+                     OR {unproductive_completed}
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM work_executions we2
+                     WHERE we2.work_item_id = {item}
+                       AND we2.kind = 'pr_review'
+                       AND (we2.created_at > we.created_at
+                            OR (we2.created_at = we.created_at AND we2.id > we.id))
+                 )
+           )"#
+    )
+}
+
 /// The orphan sweep's candidate walk: `active` items older than `cutoff`
 /// (epoch seconds) with no run pending or live, minus the holds the sweep
 /// leaves alone. `only` restricts the walk to one item. See
@@ -2039,15 +2062,10 @@ pub(crate) fn orphan_active_candidates(conn: &Connection, cutoff: i64, only: Opt
     // each own one death signal, with their own corroboration rules,
     // and reconcile such a row to `orphaned`/`abandoned`. This query
     // legitimately picks the work item up on the pass after that.
-    let unproductive_completed = super::review_verdicts::unproductive_completed_pr_review_sql();
+    let review_recovery = review_recovery_holds_sql("t.id");
     let upkeep = super::parking::upkeep_eligible_task_sql("t");
-    let walk = super::cycle_root_walk_cte(
-        "t.status = 'active'\n               AND t.deleted_at IS NULL\n               AND (?2 IS NULL OR t.id = ?2)",
-    );
     let stmt_sql = format!(
-        "{walk}
-         SELECT t.id FROM tasks t
-         JOIN roots ON roots.task_id = t.id
+        "SELECT t.id FROM tasks t
          WHERE t.status = 'active'
            AND t.deleted_at IS NULL
            AND {upkeep}
@@ -2064,25 +2082,8 @@ pub(crate) fn orphan_active_candidates(conn: &Connection, cutoff: i64, only: Opt
                  AND a.status = 'open'
                  AND a.kind IN ('{permanent}', '{exhausted}')
            )
-           AND NOT EXISTS (
-               SELECT 1 FROM work_executions we
-               WHERE we.work_item_id = t.id
-                 AND we.kind = 'pr_review'
-                 AND (
-                     we.status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
-                     OR {unproductive_completed}
-                 )
-                 AND NOT EXISTS (
-                     SELECT 1 FROM work_executions we2
-                     WHERE we2.work_item_id = t.id
-                       AND we2.kind = 'pr_review'
-                       AND (we2.created_at > we.created_at
-                            OR (we2.created_at = we.created_at AND we2.id > we.id))
-                 )
-           )
-
+           AND NOT ({review_recovery})
          ORDER BY t.updated_at ASC, t.id ASC",
-        walk = walk,
         upkeep = upkeep,
         permanent = ATTENTION_KIND_RECOVERY_PERMANENT,
         exhausted = ATTENTION_KIND_RECOVERY_EXHAUSTED,

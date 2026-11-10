@@ -1041,6 +1041,7 @@ impl WorkDb {
                  AND t.pr_url IS NOT NULL
                  AND t.pr_url != ''
                  AND t.deleted_at IS NULL
+                 AND (?2 IS NULL OR t.id = ?2)
                  AND {upkeep}",
         ));
         let needs_readmission = super::review_batches::pre_merge_review_needs_readmission_sql("roots.cycle_root_id");

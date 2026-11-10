@@ -24,21 +24,21 @@ The app formats two things itself, because they need the local clock: a retry co
 
 A pending execution:
 
-| Reason                              | Meaning                                                                                            |
-| ----------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `awaiting_dispatch`                 | `ready`, and no scheduler pass has held it. The next pass claims it or records what stops it.      |
-| `not_before`                        | `ready`, with a dispatch deadline still ahead (retry backoff, merge-order stagger).                |
-| `dispatch_paused`                   | The global dispatch pause holds it.                                                                |
-| `automation_paused`                 | The automation pause holds it.                                                                     |
-| `focus_mode`                        | It is outside the dispatch focus set.                                                              |
-| `pool_exhausted`                    | Its worker pool has no free slot.                                                                  |
-| `dispatch_preflight`                | Startup preflight (boot recovery, the capability probe, or a failed runtime check) holds dispatch. |
-| `progression_unavailable`           | The engine cannot start progression agents yet.                                                    |
-| `awaiting_predecessor_preservation` | The run it recovers from has not released its workspace, so that run's work is not preserved yet.  |
-| a sentence                          | The interactive cap, a workspace lease, or a chain hold naming the blocking task and PR.           |
-| `waiting_dependency`                | An unmet `blocks` prerequisite gates it. The card names the prerequisite.                          |
-| `project_order`                     | It is a later task of a project whose earlier task has not been started. The card names that task. |
-| `autostart_off`                     | Its task has automatic start off, so the queued execution waits for an explicit start.             |
+| Reason                              | Meaning                                                                                                                |
+| ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `awaiting_dispatch`                 | `ready`, and no scheduler pass has held it. The next pass claims it or records what stops it.                          |
+| `not_before`                        | `ready`, with a dispatch deadline still ahead (retry backoff, merge-order stagger).                                    |
+| `dispatch_paused`                   | The global dispatch pause holds it.                                                                                    |
+| `automation_paused`                 | The automation pause holds it.                                                                                         |
+| `focus_mode`                        | It is outside the dispatch focus set.                                                                                  |
+| `pool_exhausted`                    | Its worker pool has no free slot.                                                                                      |
+| `dispatch_preflight`                | Startup preflight (boot recovery, the capability probe, or a failed runtime check) holds dispatch.                     |
+| `progression_unavailable`           | The engine cannot start progression agents yet.                                                                        |
+| `awaiting_predecessor_preservation` | The run it recovers from has not released its workspace, so that run's work is not preserved yet.                      |
+| a sentence                          | The interactive cap, a workspace lease, or a chain hold naming the blocking task and PR.                               |
+| `waiting_dependency`                | An unmet `blocks` prerequisite gates it. The card names the prerequisite.                                              |
+| `project_order`                     | It is a later task of a project whose earlier task has not yet reached review or completion. The card names that task. |
+| `autostart_off`                     | Its task has automatic start off, so the queued execution waits for an explicit start.                                 |
 
 A card queued on the board with nothing pending. These are the reconciler's own refusals to mint an execution:
 

@@ -353,6 +353,16 @@ fn current_head_review_badge_findings_revision_delivered_without_head_change_is_
 
     // Delivered with no commit (PR body edit / justified no-change).
     complete_revision_execution(&db, &revision, None);
+    assert_eq!(
+        db.get_task_runtime(&root).unwrap().dispatch_wait_reason.as_deref(),
+        Some(boss_engine_storage_values::dispatch_wait::DISPATCH_WAIT_REASON_AWAITING_MERGE)
+    );
+    assert!(
+        !db.list_unexplained_dispatch_waits()
+            .unwrap()
+            .iter()
+            .any(|wait| wait.work_item_id == root)
+    );
     let delivered = card(&db, &product, &root);
     assert_eq!(delivered.ai_review_state.as_deref(), Some("not_reviewed"));
     assert!(delivered.ai_review_findings_revision_id.is_none());
