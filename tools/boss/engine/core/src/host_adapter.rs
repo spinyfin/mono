@@ -32,14 +32,14 @@ use tokio::sync::Mutex;
 use crate::config::RuntimeConfig;
 use crate::host_registry::Host;
 use crate::remote_wrapper::remote_wrapper_path;
-use crate::runner::{ComposedWorkerSpawn, WorkerSpawnOpts, compose_worker_spawn, work_item_name, work_item_task_kind};
+use crate::runner::{ComposedWorkerSpawn, WorkerSpawnOpts, compose_worker_spawn, work_item_name};
 use crate::ssh_spawn::{
     REASON_WORKER_LAUNCH_FAILED, RemoteSpawnPlan, SshExec, perform_remote_launch, reap_failed_remote_turn,
     remote_events_socket_path,
 };
 use crate::ssh_transport::{SshOutput, SshTransport};
 use crate::work::{WorkDb, WorkExecution, WorkItem};
-use crate::worker_setup::{WorkerSetupInput, render_remote_settings_json};
+use crate::worker_setup::WorkerSetupInput;
 use crate::wrapper_distribution::{WrapperPushLocks, WrapperPushOutcome, ensure_wrapper_current};
 use boss_execution_contracts::CubeClient;
 use boss_execution_contracts::{ExecutionRunner, RunOutcome, RunWaitState};
@@ -615,6 +615,7 @@ fn remote_spawn_opts(
     repo_guidance: Option<Arc<dyn boss_execution_runner::repo_guidance::RepoGuidanceSource>>,
 ) -> WorkerSpawnOpts {
     WorkerSpawnOpts::builder()
+        .remote_workspace(true)
         .review_signal_checks(crate::merge_poller::review_signal_checks_for_owner)
         .max_embed_diff_lines(max_embed_diff_lines)
         .maybe_bazel_workspace(bazel_workspace)
@@ -1013,12 +1014,8 @@ impl HostAdapter for SshHostAdapter {
             bazel_workspace,
             self.repo_guidance.clone(),
         );
-        // `spawn_opts` is consumed by the composer below; the worker-setup
-        // input further down reads these two gates from the same value.
-        let run_done_proposals_seam_enabled = spawn_opts.run_done_proposals_seam_enabled;
-        let worker_signal_proposals_seam_enabled = spawn_opts.worker_signal_proposals_seam_enabled;
         let ComposedWorkerSpawn {
-            mut prompt_text,
+            prompt_text,
             spawn_config,
             embedded_output_path,
         } = compose_worker_spawn(
@@ -1065,98 +1062,31 @@ impl HostAdapter for SshHostAdapter {
             // affected today; wiring feature flags into the remote path
             // MUST land before remote bring-up if that seam is on.
             // Every seam flag is left at its builder default (`false`).
-            spawn_opts,
+            spawn_opts.clone(),
         )
         .await?;
-        // The shared composer runs on the engine and therefore embeds its own
-        // temp path in the review prompt. A remote worker cannot write there:
-        // the wrapper resolves a path under *its* temp root and exports it.
-        // Keep the prompt and environment in one contract by referring to the
-        // exported value instead of shipping a coordinator-local pathname.
-        let structured_output_kind = crate::runner::designated_output_kind(execution, work_item);
-        // Assert against the path the composer actually rendered, not the
-        // path `designated_output_kind` alone would predict: a degraded
-        // fallback (e.g. an automation-triage spawn whose automation row
-        // failed to resolve) legitimately renders the generic prompt with
-        // no structured-output path at all, and that must not fail the
-        // spawn — only a designated kind that WAS supposed to be embedded
-        // but is missing from the prompt is a real bug worth bailing on.
-        if let Some(local_path) = embedded_output_path.as_deref() {
-            if !prompt_text.contains(local_path) {
-                bail!("remote spawn prompt omitted structured-output path {local_path:?} for execution {run_id}");
-            }
-            prompt_text = prompt_text.replace(local_path, "$BOSS_STRUCTURED_OUTPUT");
-        }
-        // 4. Render the remote worker settings: the same boss-event hooks
-        //    as a local worker, but pointed at the FORWARDED events
-        //    socket and the remote shim, and without the engine-data-dir
-        //    sandbox (there is no Boss engine on the remote). Shipped
-        //    outside the workspace tree and loaded via `--settings`,
-        //    mirroring the local runner.
+        let structured_output_kind = embedded_output_path
+            .as_ref()
+            .and_then(|_| crate::runner::designated_output_kind(execution, work_item));
         let remote_socket = remote_events_socket_path(&run_id);
-        // Mirrors the local pane-spawn path's own lookup: only a review
-        // batch's Supervisor-role member gets the supervisor CLAUDE.md, and
-        // only a PostMergeReviewer-role member gets the post-merge one.
-        let review_batch_member_role = if execution.kind == boss_protocol::ExecutionKind::PrReview {
-            self.work_db
-                .review_batch_member_for_execution(&execution.id)
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "determining whether execution {} is a review supervisor: {error}",
-                        execution.id
-                    )
-                })?
-                .map(|member| member.role)
-        } else {
-            None
-        };
-        let is_review_supervisor = review_batch_member_role == Some(boss_protocol::ReviewBatchMemberRole::Supervisor);
-        let is_post_merge_reviewer =
-            review_batch_member_role == Some(boss_protocol::ReviewBatchMemberRole::PostMergeReviewer);
-        // Deliberately use the builder: forwarding a new setting here is one
-        // explicit edit, instead of requiring every WorkerSetupInput caller to change.
-        let settings_input = WorkerSetupInput::builder()
-            .run_id(run_id.clone())
-            .lease_id(lease_id.clone())
-            .workspace_path(PathBuf::from(&workspace))
-            .events_socket_path(PathBuf::from(&remote_socket))
-            .boss_event_path(PathBuf::from(REMOTE_BOSS_EVENT_BIN))
-            .execution_kind(execution.kind.as_str().to_owned())
-            .maybe_task_kind(work_item_task_kind(work_item).map(str::to_owned))
-            // Derive the restricted posture the same way the local path does,
-            // so a reviewer/triage/answer-agent dispatched remotely still gets
-            // its reduced surface instead of silently becoming Standard.
-            .worker_kind(crate::worker_setup::worker_kind_for_execution(&execution.kind))
-            .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
-            .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
-            .is_review_supervisor(is_review_supervisor)
-            .is_post_merge_reviewer(is_post_merge_reviewer)
-            // Mirrors `WorkerSpawnOpts` above: a remotely dispatched triage
-            // worker always gets the legacy marker-only CLAUDE.md, since
-            // SshHostAdapter has no FeatureFlagsStore to read
-            // `automation_outcome_proposals_seam` from.
-            .build();
-        // Resolve the same driver `compose_worker_spawn` already validated
-        // against the registry — settings wiring (ProgressObservation +
-        // ToolUseInterception) must come from that driver, not a hardcoded
-        // Claude reference.
-        let driver = crate::driver::DriverRegistry::default()
-            .require(&spawn_config.driver)
-            .map_err(|err| anyhow::anyhow!("remote spawn: {err}"))?;
-        reject_host_local_remote_spawn_plan(driver.as_ref(), &spawn_config.driver, &host)?;
-        // Fail closed on a driver the remote path cannot observe. The remote
-        // spawn ships exactly one observability channel — this settings
-        // file, whose `boss-event` hooks tunnel back over the reverse
-        // events socket — and the wrapper execs the resolved driver's rendered command. A
-        // driver that reports progress as a byte stream instead renders an
-        // EMPTY hooks map here, so the worker would launch and then be
-        // completely invisible: no live-status entry, no transcript path,
-        // no `Stop`, therefore no completion and no PR, with nothing in the
-        // dispatch timeline to say why. That is not hypothetical — a
-        // settings file containing exactly `"hooks": {}` was recovered from
-        // a remote host after this shipped. Refuse the spawn instead.
-        reject_unobservable_remote_driver(driver.as_ref(), &spawn_config.driver, &settings_input, &host)?;
-        let settings_json = render_remote_settings_json(&settings_input, driver.as_ref());
+        let crate::hub_spawn::RemoteLaunch {
+            prompt_text,
+            settings_input,
+            driver,
+            settings_json,
+        } = crate::hub_spawn::prepare_remote_launch(
+            &self.work_db,
+            execution,
+            work_item,
+            (&spawn_config.driver, &lease_id, &host),
+            (
+                Path::new(&workspace),
+                Path::new(&remote_socket),
+                Path::new(REMOTE_BOSS_EVENT_BIN),
+            ),
+            spawn_opts,
+            (prompt_text, embedded_output_path.as_deref()),
+        )?;
 
         // 5. Ship the prompt to the path the driver's SpawnPlan reads and
         //    settings outside the workspace tree under `~/.boss-remote/`.
@@ -1771,7 +1701,7 @@ pub const REASON_HOST_DRIVER_UNSUPPORTED: &str = "host_driver_unsupported";
 /// the coordinator. Remote provisioning for those drivers is not implemented;
 /// descriptor opt-in keeps an added driver from silently inheriting unsafe
 /// remote eligibility.
-fn reject_host_local_remote_spawn_plan(
+pub(crate) fn reject_host_local_remote_spawn_plan(
     driver: &dyn crate::driver::AgentDriver,
     driver_slug: &str,
     host: &str,
@@ -1816,7 +1746,7 @@ async fn remote_home_dir(transport: &SshTransport) -> Result<String> {
 /// Checked on the driver's declared capability rather than its slug, so a
 /// future driver that DOES wire hooks into the settings file passes without
 /// this gate needing to learn its name.
-fn reject_unobservable_remote_driver(
+pub(crate) fn reject_unobservable_remote_driver(
     driver: &dyn crate::driver::AgentDriver,
     driver_slug: &str,
     settings_input: &WorkerSetupInput,

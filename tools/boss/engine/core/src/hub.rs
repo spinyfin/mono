@@ -1,12 +1,8 @@
 //! Hub listener configuration and production startup.
 //!
 //! The hub stream is inert until listen address, credential directory and
-//! TLS identity are all set. A test-fixture engine never binds production's
-//! listener or uses production's CA or server certificate: production-equal
-//! or production-shaped values are treated as inherited pane environment, and
-//! the listener starts only when every piece is private. When a fixture has
-//! isolated listen and TLS but inherited production credentials, the
-//! credential directory is derived from the fixture socket stem.
+//! TLS identity are all set. Fixtures always derive credentials and accept
+//! only an ephemeral loopback bind with TLS files inside the derived directory.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -46,37 +42,11 @@ pub const DEFAULT_HUB_ID: &str = "hub";
 /// Default [`HubConfig::authority_generation`] when unset.
 pub const DEFAULT_HUB_AUTHORITY_GENERATION: &str = "1";
 
-/// Production locations of hub identity files, used by fixture isolation to
-/// tell inherited pane environment apart from a deliberate private override.
-#[derive(Debug, Clone, Default)]
-pub struct HubProductionPaths {
-    pub credentials_dir: Option<PathBuf>,
-    pub tls_cert: Option<PathBuf>,
-    pub tls_key: Option<PathBuf>,
-}
-
-impl HubProductionPaths {
-    /// Resolve production locations from the current process state root.
-    pub fn current() -> Self {
-        Self::under_state_root(boss_log_files::default_state_root().as_deref())
-    }
-
-    /// Resolve production locations as if the state root were `root`.
-    pub fn under_state_root(root: Option<&Path>) -> Self {
-        Self {
-            credentials_dir: root.map(|root| root.join(CREDENTIALS_DIRNAME)),
-            tls_cert: root.map(|root| root.join(TLS_CERT_FILENAME)),
-            tls_key: root.map(|root| root.join(TLS_KEY_FILENAME)),
-        }
-    }
-}
-
-/// Operator configuration for the hub stream listener.
+/// Configuration for the hub stream listener.
 ///
 /// All four of listen, credentials directory, TLS cert and TLS key must be
 /// set before the engine binds a socket. The default (everything unset) is
-/// inert: dispatch stays on SSH until an operator configures the listener
-/// and a later PR installs the host adapter.
+/// inert: no listener is bound and dispatch stays on SSH.
 #[derive(Debug, Clone, bon::Builder)]
 #[builder(on(String, into))]
 pub struct HubConfig {
@@ -139,7 +109,11 @@ impl HubConfig {
                 .map(|s| s.trim().to_owned())
                 .filter(|s| !s.is_empty())
         };
-        let path = |name: &str| lookup(name).map(PathBuf::from);
+        let path = |name: &str| {
+            lookup(name)
+                .filter(|value| !value.to_string_lossy().trim().is_empty())
+                .map(PathBuf::from)
+        };
         let config = Self {
             listen: nonempty(LISTEN_ENV),
             credentials_dir: path(CREDENTIALS_DIR_ENV),
@@ -153,44 +127,32 @@ impl HubConfig {
         Ok(config)
     }
 
-    /// Fixture isolation: skip the listener unless listen, credentials and
-    /// TLS identity are all present and none of them is production.
-    ///
-    /// - Listen must be loopback so a fixture cannot collide with a
-    ///   production bind.
-    /// - TLS cert/key that are production-equal or production-shaped are
-    ///   dropped (inherited pane environment, not operator intent).
-    /// - Credentials that are production-equal or production-shaped are
-    ///   replaced with `derived_credentials_dir` (the fixture socket stem).
-    /// - If any of the four is then missing, the listener is inert.
-    pub fn isolate_for_fixture(
-        self,
-        is_test_fixture: bool,
-        derived_credentials_dir: Option<PathBuf>,
-        production: &HubProductionPaths,
-    ) -> Self {
+    /// Fixtures use derived credentials, TLS files beneath that directory,
+    /// and an ephemeral loopback port. Inherited identity is never opened.
+    pub fn isolate_for_fixture(self, is_test_fixture: bool, derived_credentials_dir: Option<PathBuf>) -> Self {
         if !is_test_fixture {
             return self;
         }
         let HubConfig {
             listen,
-            credentials_dir,
+            credentials_dir: _,
             tls_cert,
             tls_key,
             hub_id,
             authority_generation,
         } = self;
         let listen = listen.filter(|addr| fixture_safe_listen(addr));
-        let tls_cert =
-            tls_cert.filter(|path| !is_production_hub_path(path, production.tls_cert.as_deref(), TLS_CERT_FILENAME));
-        let tls_key =
-            tls_key.filter(|path| !is_production_hub_path(path, production.tls_key.as_deref(), TLS_KEY_FILENAME));
-        let credentials_dir = match credentials_dir {
-            Some(dir) if !is_production_hub_path(&dir, production.credentials_dir.as_deref(), CREDENTIALS_DIRNAME) => {
-                Some(dir)
-            }
-            _ => derived_credentials_dir,
-        };
+        let tls_cert = tls_cert.filter(|path| {
+            derived_credentials_dir
+                .as_ref()
+                .is_some_and(|root| fixture_owned_path(path, root))
+        });
+        let tls_key = tls_key.filter(|path| {
+            derived_credentials_dir
+                .as_ref()
+                .is_some_and(|root| fixture_owned_path(path, root))
+        });
+        let credentials_dir = derived_credentials_dir;
         if listen.is_some() && tls_cert.is_some() && tls_key.is_some() && credentials_dir.is_some() {
             Self {
                 listen,
@@ -212,7 +174,7 @@ impl HubConfig {
         }
     }
 
-    /// `Ok(None)` when the listener is inert. `Err` when the operator set
+    /// `Ok(None)` when the listener is inert. `Err` when configuration sets
     /// some of the four required fields but not all of them, or when listen
     /// is not a socket address.
     pub fn listener_plan(&self) -> Result<Option<HubListenerPlan>> {
@@ -291,16 +253,40 @@ fn load_server_identity(cert: &Path, key: &Path) -> Result<Identity> {
     Ok(Identity::from_pem(cert_pem, key_pem))
 }
 
-fn fixture_safe_listen(listen: &str) -> bool {
-    listen.parse::<SocketAddr>().is_ok_and(|addr| addr.ip().is_loopback())
+fn fixture_owned_path(path: &Path, root: &Path) -> bool {
+    match (path.canonicalize(), root.canonicalize()) {
+        (Ok(path), Ok(root)) => path.starts_with(&root) && path != root,
+        _ => false,
+    }
 }
 
-fn is_production_hub_path(path: &Path, production: Option<&Path>, filename: &str) -> bool {
-    production.is_some_and(|production| production == path) || boss_log_files::is_production_shaped(path, filename)
+fn fixture_safe_listen(listen: &str) -> bool {
+    listen
+        .parse::<SocketAddr>()
+        .is_ok_and(|addr| addr.ip().is_loopback() && addr.port() == 0)
 }
 
 #[cfg(test)]
 mod tests {
+    /// Production-shaped paths for fixture regression tests.
+    #[derive(Debug, Clone, Default)]
+    pub struct HubProductionPaths {
+        pub credentials_dir: Option<PathBuf>,
+        pub tls_cert: Option<PathBuf>,
+        pub tls_key: Option<PathBuf>,
+    }
+
+    impl HubProductionPaths {
+        /// Resolve production locations as if the state root were `root`.
+        pub fn under_state_root(root: Option<&Path>) -> Self {
+            Self {
+                credentials_dir: root.map(|root| root.join(CREDENTIALS_DIRNAME)),
+                tls_cert: root.map(|root| root.join(TLS_CERT_FILENAME)),
+                tls_key: root.map(|root| root.join(TLS_KEY_FILENAME)),
+            }
+        }
+    }
+
     use super::*;
     use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
@@ -323,6 +309,25 @@ mod tests {
 
     fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
         |name| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| OsString::from(*v))
+    }
+
+    #[test]
+    fn empty_path_variables_are_unset() {
+        let config =
+            HubConfig::load_from(env(&[(TLS_CERT_ENV, ""), (TLS_KEY_ENV, ""), (CREDENTIALS_DIR_ENV, "")])).unwrap();
+        assert!(config.listener_plan().unwrap().is_none());
+    }
+
+    #[test]
+    fn custom_inherited_identity_is_never_used_by_a_fixture() {
+        let config = HubConfig::builder()
+            .listen("127.0.0.1:8443")
+            .credentials_dir(PathBuf::from("/custom/identity"))
+            .tls_cert(PathBuf::from("/custom/server.pem"))
+            .tls_key(PathBuf::from("/custom/key.pem"))
+            .build();
+        let isolated = config.isolate_for_fixture(true, Some(PathBuf::from("/tmp/fixture-identity")));
+        assert!(isolated.listener_plan().unwrap().is_none());
     }
 
     #[test]
@@ -370,7 +375,7 @@ mod tests {
             hub_id: "hub".into(),
             authority_generation: "1".into(),
         };
-        let isolated = configured.isolate_for_fixture(true, Some(derived.clone()), &production);
+        let isolated = configured.isolate_for_fixture(true, Some(derived.clone()));
         assert!(isolated.listener_plan().unwrap().is_none());
         assert!(isolated.listen.is_none());
         assert!(isolated.credentials_dir.is_none());
@@ -380,20 +385,26 @@ mod tests {
     fn fixture_isolation_derives_credentials_when_listen_and_tls_are_private() {
         let production_root = PathBuf::from("/Users/someone/Library/Application Support/Boss");
         let production = HubProductionPaths::under_state_root(Some(&production_root));
-        let derived = PathBuf::from("/tmp/boss-test-uuid.hub-credentials");
+        let root = tempfile::tempdir().unwrap();
+        let derived = root.path().join("credentials");
+        std::fs::create_dir(&derived).unwrap();
+        let cert = derived.join("fixture.crt");
+        let key = derived.join("fixture.key");
+        std::fs::write(&cert, "cert").unwrap();
+        std::fs::write(&key, "key").unwrap();
         let configured = HubConfig {
             listen: Some("127.0.0.1:0".into()),
             credentials_dir: production.credentials_dir.clone(),
-            tls_cert: Some(PathBuf::from("/tmp/fixture.crt")),
-            tls_key: Some(PathBuf::from("/tmp/fixture.key")),
+            tls_cert: Some(cert.clone()),
+            tls_key: Some(key),
             hub_id: "hub".into(),
             authority_generation: "1".into(),
         };
-        let isolated = configured.isolate_for_fixture(true, Some(derived.clone()), &production);
+        let isolated = configured.isolate_for_fixture(true, Some(derived.clone()));
         let plan = isolated.listener_plan().unwrap().expect("fixture hub should start");
         assert!(plan.listen.ip().is_loopback());
         assert_eq!(plan.credentials_dir, derived);
-        assert_eq!(plan.tls_cert, PathBuf::from("/tmp/fixture.crt"));
+        assert_eq!(plan.tls_cert, cert);
     }
 
     #[test]
@@ -410,7 +421,7 @@ mod tests {
         };
         let kept = configured
             .clone()
-            .isolate_for_fixture(false, Some(PathBuf::from("/tmp/unused")), &production);
+            .isolate_for_fixture(false, Some(PathBuf::from("/tmp/unused")));
         assert_eq!(kept.listen, configured.listen);
         assert_eq!(kept.credentials_dir, configured.credentials_dir);
     }

@@ -35,11 +35,6 @@ pub async fn run(cli: Cli) -> Result<()> {
     // `$HOME`. Workers inherit this as `BOSS_SOCKET_PATH` so a driver that
     // scopes `$HOME` (Grok) still reaches this engine.
     work.frontend_socket_path = Some(socket_path.clone());
-    work.hub = work.hub.isolate_for_fixture(
-        isolation.is_test_fixture,
-        isolation.scoped_path("hub-credentials"),
-        &boss_engine_runtime::hub::HubProductionPaths::current(),
-    );
     let cfg = Arc::new(boss_engine_runtime::config::RuntimeConfig::from_parts(work, None));
 
     run_server(cli, cfg, isolation).await
@@ -378,6 +373,8 @@ fn stamped_frontend_socket_path(_existing: Option<&Path>, bound: &Path) -> std::
 /// Optional `serve` collaborators tests inject instead of production ones.
 #[derive(Default)]
 pub struct ServeOverrides {
+    /// Reports whether the shared hub handle exists after startup recovery and binding.
+    pub hub_listener_ready: Option<tokio::sync::oneshot::Sender<bool>>,
     /// Fake live-CI probe for RPC validation. `None` uses `CommandMergeProbe`.
     pub merge_probe: Option<Arc<dyn boss_engine_merge_poller::MergeProbe>>,
     /// Background poller probe, separate from RPC fixtures so a sweep cannot
@@ -520,11 +517,11 @@ async fn serve_scoped(
     // CA and TLS identity here so both `run` and in-process `serve` isolate
     // before the listener binds. Production sockets are unchanged.
     let isolation = IsolationPaths::derive(&socket_path.to_string_lossy());
-    let isolated_hub = cfg.work.hub.clone().isolate_for_fixture(
-        isolation.is_test_fixture,
-        isolation.scoped_path("hub-credentials"),
-        &boss_engine_runtime::hub::HubProductionPaths::current(),
-    );
+    let isolated_hub = cfg
+        .work
+        .hub
+        .clone()
+        .isolate_for_fixture(isolation.is_test_fixture, isolation.scoped_path("hub-credentials"));
     let cfg = {
         let mut work = cfg.work.clone();
         work.hub = isolated_hub;
@@ -621,22 +618,6 @@ async fn serve_scoped(
         },
     )?;
     pre_bind.mark("server_state");
-    if let Some(bound) = boss_engine_runtime::hub::bind_hub_listener(&cfg.work.hub, (*server_state.work_db).clone())
-        .await
-        .context("starting hub listener")?
-    {
-        server_state.set_hub_stream(bound.stream.clone());
-        tracing::info!(
-            addr = %bound.local_addr,
-            handle = server_state.hub_stream().is_some(),
-            "hub listener serving"
-        );
-        boss_task_scope::spawn(async move {
-            if let Err(err) = bound.serve().await {
-                tracing::error!(error = %err, "hub listener ended");
-            }
-        });
-    }
     super::panic_hook::install(&server_state);
 
     // Local host capability discovery (`uname`, `gh auth status`, one login
@@ -971,6 +952,27 @@ async fn serve_scoped(
     }
 
     pre_bind.mark("planner_run_recovery");
+
+    if let Some(bound) = boss_engine_runtime::hub::bind_hub_listener(&cfg.work.hub, (*server_state.work_db).clone())
+        .await
+        .context("starting hub listener")?
+    {
+        server_state.set_hub_stream(bound.stream.clone());
+        tracing::info!(
+            addr = %bound.local_addr,
+            handle = server_state.hub_stream().is_some(),
+            "hub listener serving"
+        );
+        boss_task_scope::spawn(async move {
+            if let Err(err) = bound.serve().await {
+                tracing::error!(error = %err, "hub listener ended");
+            }
+        });
+    }
+
+    if let Some(observer) = overrides.hub_listener_ready {
+        let _ = observer.send(server_state.hub_stream().is_some());
+    }
 
     // Always attempt to unlink any existing file at the path before
     // binding. `path.exists()` lies for dangling symlinks and races

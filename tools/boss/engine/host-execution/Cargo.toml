@@ -9,6 +9,7 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
 boss-engine-driver = { path = "../driver" }
+boss-engine-structured-output = { path = "../structured-output" }
 boss-engine-recovery = { path = "../recovery" }
 boss-engine-utils = { path = "../utils" }
 boss-protocol = { path = "../../protocol" }

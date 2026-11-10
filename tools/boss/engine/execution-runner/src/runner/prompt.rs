@@ -124,6 +124,8 @@ pub(super) struct ExecutionPromptParams<'a> {
     /// is non-Bazel (SSH composition sees a remote path). Remote spawns set
     /// this from an over-SSH marker probe before composing.
     bazel_workspace: Option<bool>,
+    #[builder(default)]
+    remote_workspace: bool,
 }
 
 /// The structured-output payload this execution's prompt is built around —
@@ -227,8 +229,13 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
         run_done_proposals_seam_enabled,
         merge_order_preservation,
         bazel_workspace,
+        remote_workspace,
     } = params;
-    let bazel_workspace = resolved_bazel_workspace(workspace_path, bazel_workspace);
+    let bazel_workspace = if remote_workspace {
+        bazel_workspace
+    } else {
+        resolved_bazel_workspace(workspace_path, bazel_workspace)
+    };
     // Phase 9 #29: ci_remediation has its own templated prompt — embed
     // the engine-collected log excerpt, the failing-check set, and the
     // attempt-kind-specific playbook (rebase-first for `fix`, just the
@@ -368,6 +375,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
                     deferred_scope_proposals_seam_enabled,
                     run_done_proposals_seam_enabled,
                     bazel_workspace,
+                    remote_workspace,
                 ),
             ));
         }
@@ -443,7 +451,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
     ) {
         prompt.push_str(&prepush_gate_text(
             bazel_workspace,
-            workspace_path,
+            (!remote_workspace).then_some(workspace_path),
             false,
             worker_signal_proposals_seam_enabled,
             run_done_proposals_seam_enabled,
@@ -613,7 +621,7 @@ fn resolved_bazel_workspace(workspace_path: &Path, bazel_workspace: Option<bool>
 /// apply the matching policy; if nothing is discoverable, stop as blocked.
 fn prepush_gate_text(
     bazel_workspace: Option<bool>,
-    workspace_path: &Path,
+    workspace_path: Option<&Path>,
     conflict_resolution: bool,
     worker_signal_seam_enabled: bool,
     run_done_seam_enabled: bool,
@@ -1696,7 +1704,7 @@ fn compose_revision_directive(
     //  deferred_scope_proposals_seam_enabled, run_done_proposals_seam_enabled,
     //  bazel_workspace)
     // — bundled to keep the parameter count under clippy::too_many_arguments.
-    recovery_and_proposals: (bool, bool, bool, bool, Option<bool>),
+    recovery_and_proposals: (bool, bool, bool, bool, Option<bool>, bool),
 ) -> String {
     let (
         recovered_work,
@@ -1704,6 +1712,7 @@ fn compose_revision_directive(
         deferred_scope_proposals_seam_enabled,
         run_done_proposals_seam_enabled,
         bazel_workspace,
+        remote_workspace,
     ) = recovery_and_proposals;
     let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     let parent_pr_url = execution.pr_url.as_deref().unwrap_or("(unknown)");
@@ -1755,7 +1764,7 @@ fn compose_revision_directive(
     // test commands.
     out.push_str(&prepush_gate_text(
         bazel_workspace,
-        workspace_path,
+        (!remote_workspace).then_some(workspace_path),
         is_conflict_resolution,
         worker_signal_proposals_seam_enabled,
         run_done_proposals_seam_enabled,

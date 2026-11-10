@@ -38,11 +38,11 @@ fn detected_manifests(workspace_path: &Path) -> Vec<&'static str> {
 /// reported. Bazel conflict policy (compile only, tests in CI) lives in
 /// the parent module.
 pub(super) fn non_bazel_gate_text(
-    workspace_path: &Path,
+    workspace_path: Option<&Path>,
     conflict_resolution: bool,
     worker_signal_seam_enabled: bool,
 ) -> String {
-    let manifests = detected_manifests(workspace_path);
+    let manifests = workspace_path.map(detected_manifests).unwrap_or_default();
     let detected = if manifests.is_empty() {
         "No build-system manifest was detected at the workspace root; look for the documented commands in the repo docs instead.".to_owned()
     } else {

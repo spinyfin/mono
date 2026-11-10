@@ -227,6 +227,9 @@ message Spawn {
   string context_revision = 12;
   bytes worker_policy_json = 13;
   string policy_revision = 14;
+  optional string effort = 15;
+  optional string structured_output_kind = 16;
+  bool pr_url_output = 17;
 }
 message Env {
   string name = 1;

@@ -67,6 +67,7 @@ rustls = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+rcgen = { workspace = true }
 boss-engine-runtime = { path = "../core/runtime", features = ["test-support"] }
 boss-engine-completion = { path = "../completion", features = ["test-support"] }
 boss-engine-live-worker-state = { path = "../live-worker-state", features = ["test-support"] }
