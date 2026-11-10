@@ -56,6 +56,13 @@ pub(crate) fn refuse_progression_done(
             Ok(None)
         }
         RunDoneOutcome::Blocked => {
+            if let Some((id, status)) =
+                crate::progression_verbs::live_or_pending_execution(conn, &execution.work_item_id)?
+            {
+                return Ok(Some(format!(
+                    "work has resumed ({id}, {status}); a stale progression question cannot park it"
+                )));
+            }
             if payload.question.is_none() {
                 return Ok(Some(
                     "a progression run that needs the owner must ask one specific question; a bare `blocked` is \
@@ -123,6 +130,14 @@ pub(crate) fn record_disposition(conn: &Connection, execution_id: &str, outcome:
 /// resolved and any dispatch-failure stamp is cleared; the question is the one
 /// hold, and the owner's answer restarts the item.
 fn park_item_on_question(conn: &Connection, execution: &WorkExecution) -> Result<()> {
+    if crate::progression_verbs::live_or_pending_execution(conn, &execution.work_item_id)?.is_some() {
+        conn.execute(
+            "UPDATE operator_questions SET status = 'withdrawn', withdrawn_reason = 'work_resumed'
+             WHERE execution_id = ?1 AND status = 'open'",
+            [&execution.id],
+        )?;
+        return Ok(());
+    }
     let question: Option<String> = conn
         .query_row(
             "SELECT json_extract(question_json, '$.text') FROM operator_questions

@@ -155,7 +155,15 @@ pub(super) fn precursor(
     // dependency cascade releases it when the chore is satisfied.
     via_engine_path(
         verb,
-        add_dependency_edge_in_tx(pending, conn, &ctx.item.id, &chore.id, RELATION_BLOCKS, &now_string()),
+        crate::dep_helpers::add_dependency_edge_in_tx_as_actor(
+            pending,
+            conn,
+            &ctx.item.id,
+            &chore.id,
+            RELATION_BLOCKS,
+            &now_string(),
+            PROGRESSION,
+        ),
     )?;
     stage_task_board_change(pending, conn, &chore.id)?;
     Ok(Applied {
@@ -187,7 +195,15 @@ pub(super) fn depend(
     ctx.refuse_repeat(conn, verb, &on)?;
     via_engine_path(
         verb,
-        add_dependency_edge_in_tx(pending, conn, &ctx.item.id, &on, RELATION_BLOCKS, &now_string()),
+        crate::dep_helpers::add_dependency_edge_in_tx_as_actor(
+            pending,
+            conn,
+            &ctx.item.id,
+            &on,
+            RELATION_BLOCKS,
+            &now_string(),
+            PROGRESSION,
+        ),
     )?;
     Ok(Applied {
         result_ref: Some(on.clone()),
@@ -261,7 +277,13 @@ pub(super) fn undepend(
     deps::delete_edge(conn, &ctx.item.id, &on, RELATION_BLOCKS)?;
     // The engine-owned dependency block lifts once nothing gates the item; a
     // progression or human block of another reason is left alone.
-    maybe_engine_unblock_dependent(pending, conn, &ctx.item.id, &now_string())?;
+    crate::dep_helpers::maybe_engine_unblock_dependent_as_actor(
+        pending,
+        conn,
+        &ctx.item.id,
+        &now_string(),
+        PROGRESSION,
+    )?;
     stage_task_board_change(pending, conn, &ctx.item.id)?;
     Ok(Applied {
         result_ref: Some(on.clone()),
@@ -393,7 +415,7 @@ pub(super) fn redispatch(
         // transaction (`request_execution_in_tx_with_live_check`).
         let execution = via_engine_path(
             verb,
-            request_execution_in_tx_with_live_check(
+            crate::dispatch_helpers::request_execution_in_tx_as_actor(
                 pending,
                 conn,
                 RequestExecutionInput::builder()
@@ -401,6 +423,7 @@ pub(super) fn redispatch(
                     .explicit_start(true)
                     .build(),
                 |_| true,
+                PROGRESSION,
             ),
         )?;
         conn.execute(
@@ -441,6 +464,7 @@ pub(super) fn clear_signal(
         .into()
     };
     let reason = payload.reason.as_str();
+    ctx.refuse_repeat(conn, verb, reason)?;
     let is_ci = reason.starts_with("ci_failure");
     // The two CI reasons share one retire path and one probe.
     let blocked_on = item.blocked_reason.as_deref().filter(|blocked| {
@@ -486,15 +510,11 @@ pub(super) fn clear_signal(
         .into());
     }
 
-    ctx.refuse_repeat(conn, verb, reason)?;
-    let cleared = if is_ci {
-        crate::blocking::clear_blocked_ci_failure_in_tx(conn, &item.id, pr_url, false, PROGRESSION)?
-    } else {
-        crate::blocking::clear_blocked_merge_conflict_in_tx(conn, &item.id, pr_url, PROGRESSION)?
-    };
+    let cleared =
+        crate::signal_retirement::clear_resolved_signal_in_tx(conn, pending, &item.id, pr_url, is_ci, PROGRESSION)?;
     if cleared.is_none() {
         return Err(precondition(format!(
-            "{} changed underneath the clear; nothing was written",
+            "{} has an unresolved queue-side failure or changed underneath the clear; nothing was written",
             item.id
         )));
     }

@@ -6,7 +6,7 @@
 //! like every other, but none goes through the generic auto-apply pipeline:
 //! [`WorkDb::submit_progression_verb`] runs the replay lookup, the rate caps, the
 //! verb's checks and its effect, the proposal row and the `progression_actions`
-//! row in **one** transaction. A refusal rolls all of it back and stores nothing,
+//! row in **one** transaction. A refusal rolls back effects and records a rate-cap count,
 //! so a retry is judged on the engine's state at that moment, never replayed from
 //! a stored refusal (the same reason a refused review guide stores no row).
 //!
@@ -21,13 +21,9 @@
 //!    owner parked the item must not revive it.
 //! 3. Every target is inside the neighbourhood captured when the run was spawned
 //!    ([`check_progression_scope_on`]).
-//! 4. **The fingerprint rule.** `(item, fingerprint, verb, subject)` is recorded
-//!    for every applied verb, and a repeat is refused with a typed error naming
-//!    the prior run. `subject` is the thing the verb acted on (the edge's other
-//!    end, the revision archived, the signal cleared); it is empty for the verbs
-//!    that act on the item itself. Two `archive-revision` calls on different
-//!    revisions are therefore not a repeat, which is what a chain with several
-//!    dead revisions needs, while the same call twice is.
+//! 4. **The fingerprint rule.** `(item, fingerprint, verb)` is recorded for
+//!    every applied verb. Subject is audit metadata, not a repeat allowance.
+//!    Refusals name the execution that already applied the verb.
 //! 5. The bounds that stop a loop whose fingerprint keeps changing: the
 //!    `redispatch` bound, the create budget, one open progression revision per
 //!    PR, and one open progression-created precursor per item.
@@ -63,7 +59,7 @@ pub(crate) const LIVE_OR_PENDING_SQL: &str =
 /// Create `progression_actions` and `work_executions.progression_disposition`.
 ///
 /// `progression_actions` holds one row per applied mutating verb. Its unique
-/// index is the fingerprint rule: the same verb on the same subject at the same
+/// index is the fingerprint rule: the same verb on the same item at the same
 /// fingerprint cannot be recorded twice. It deliberately has no foreign key to
 /// `work_executions`: the record outlives a pruned execution, and a refusal
 /// still names the prior run.
@@ -82,7 +78,7 @@ pub(super) fn migrate_actions(conn: &Connection) -> Result<()> {
             created_at TEXT NOT NULL
          );
          CREATE UNIQUE INDEX IF NOT EXISTS progression_actions_one_per_fingerprint
-            ON progression_actions(work_item_id, fingerprint, verb, subject);
+            ON progression_actions(work_item_id, fingerprint, verb);
          CREATE INDEX IF NOT EXISTS progression_actions_by_item
             ON progression_actions(work_item_id, verb, stuck_kind);",
     )?;
@@ -237,7 +233,7 @@ pub(crate) fn via_engine_path<T>(verb: ProposalKind, result: Result<T>) -> VerbR
 
 /// What an applied verb produced, for the proposal row and the action record.
 pub(crate) struct Applied {
-    /// What the verb acted on, for the fingerprint rule; empty for the verbs
+    /// What the verb acted on, for auditing; empty for the verbs
     /// that act on the item itself.
     pub subject: String,
     /// The row the verb created or touched: the revision, the chore, the
@@ -303,14 +299,14 @@ impl VerbContext {
         })
     }
 
-    /// Refuse a repeat of `verb` on `subject` at this run's fingerprint.
+    /// Refuse a repeat of `verb` at this run's fingerprint; subject is audit context.
     pub(crate) fn refuse_repeat(&self, conn: &Connection, verb: ProposalKind, subject: &str) -> VerbResult<()> {
         let prior: Option<String> = conn
             .query_row(
                 "SELECT execution_id FROM progression_actions
-                 WHERE work_item_id = ?1 AND fingerprint = ?2 AND verb = ?3 AND subject = ?4
+                 WHERE work_item_id = ?1 AND fingerprint = ?2 AND verb = ?3
                  ORDER BY rowid LIMIT 1",
-                params![self.item.id, self.fingerprint, verb.as_str(), subject],
+                params![self.item.id, self.fingerprint, verb.as_str()],
                 |row| row.get(0),
             )
             .optional()?;
@@ -486,11 +482,21 @@ fn apply_verb(
 }
 
 impl ProgressionVerbRefusal {
-    /// The submission error the agent sees. Nothing was stored, so its next
+    /// The submission error the agent sees. No proposal was stored, so its next
     /// attempt is a fresh submission.
     fn into_submission_error(self) -> ProposalSubmissionError {
         ProposalSubmissionError::new(ProposalErrorCode::NotAccepted, self.to_string())
     }
+}
+
+fn record_refusal(conn: &Connection, key: &str) -> Result<()> {
+    conn.execute_batch("ROLLBACK TO progression_effect; RELEASE progression_effect")?;
+    conn.execute(
+        "INSERT INTO metadata(key, value) VALUES (?1, '1')
+         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+        [key],
+    )?;
+    Ok(())
 }
 
 #[work_db_boundary::instrument]
@@ -498,7 +504,7 @@ impl WorkDb {
     /// Apply one progression verb for the progression run `input.execution_id`.
     ///
     /// Returns `Ok(Err(..))` for a refusal (a typed [`ProposalErrorCode::NotAccepted`]
-    /// whose message is the [`ProgressionVerbRefusal`]; nothing is stored) and
+    /// whose message is the [`ProgressionVerbRefusal`]; only a refusal count is stored) and
     /// `Err` only for an engine fault. `pr_checker` supplies the live PR state for
     /// the verbs that touch a PR (`revise`, and the review restart a `redispatch`
     /// of an `in_review` item performs).
@@ -533,20 +539,36 @@ impl WorkDb {
                 review_batch_quorum_outcome: None,
             }));
         }
-        let counts = crate::proposals::count_proposals_in_tx(&tx, input.execution_id, input.kind)?;
+        let mut counts = crate::proposals::count_proposals_in_tx(&tx, input.execution_id, input.kind)?;
+        let prefix = format!("progression.refusals.{}.", input.execution_id);
+        let key = format!("{prefix}{}", input.kind.as_str());
+        let (total, for_kind): (i64, i64) = tx.query_row(
+            "SELECT COALESCE(SUM(CAST(value AS INTEGER)), 0),
+                    COALESCE(SUM(CASE WHEN key = ?2 THEN CAST(value AS INTEGER) ELSE 0 END), 0)
+             FROM metadata WHERE substr(key, 1, length(?1)) = ?1",
+            params![prefix, key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        counts.total += total as usize;
+        counts.for_kind += for_kind as usize;
         if let Err(refusal) = boss_engine_proposal_validation::check_rate_caps(input.kind, counts) {
             return Ok(Err(refusal));
         }
 
+        tx.execute_batch("SAVEPOINT progression_effect")?;
         let mut pending = PendingEvents::new();
         let ctx = match VerbContext::load(&tx, input.execution_id, input.kind) {
             Ok(ctx) => ctx,
-            Err(VerbError::Refused(refusal)) => return Ok(Err(refusal.into_submission_error())),
+            Err(VerbError::Refused(refusal)) => {
+                record_refusal(&tx, &key)?;
+                tx.commit()?;
+                return Ok(Err(refusal.into_submission_error()));
+            }
             Err(VerbError::Internal(error)) => return Err(error),
         };
         let applied = match apply_verb(&tx, &mut pending, &ctx, input.kind, input.payload_json, pr_checker) {
             Ok(applied) => applied,
-            // Dropping `tx` rolls back every write the verb made before refusing.
+            // Roll back verb effects while retaining the refusal rate count.
             Err(VerbError::Refused(refusal)) => {
                 tracing::info!(
                     execution_id = %input.execution_id,
@@ -555,6 +577,8 @@ impl WorkDb {
                     refusal = %refusal,
                     "progression verb refused",
                 );
+                record_refusal(&tx, &key)?;
+                tx.commit()?;
                 return Ok(Err(refusal.into_submission_error()));
             }
             Err(VerbError::Internal(error)) => return Err(error),

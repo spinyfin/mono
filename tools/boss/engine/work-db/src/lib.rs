@@ -694,6 +694,8 @@ mod audit_misc;
 mod automations;
 mod blocked_workspace;
 mod blocking;
+mod signal_retirement;
+pub use signal_retirement::SignalRetirement;
 pub mod board_caches;
 mod board_notifications;
 mod board_patch;

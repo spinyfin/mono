@@ -2165,7 +2165,7 @@ pub(crate) fn clear_blocked_merge_conflict_in_tx(
     if rows == 0 {
         return Ok(None);
     }
-    // Phase 10 #31: mark the matching side-table row(s) cleared so
+    // Mark the matching side-table row(s) cleared so
     // the polymorphic clear dispatch doesn't re-fire on the next
     // probe. Mirrors `clear_chore_blocked_ci_failure`.
     conn.execute(

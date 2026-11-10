@@ -170,14 +170,14 @@ pub(crate) enum ProposeCommand {
     /// with a diagnosis-bearing brief. Counts against the item's create budget;
     /// at most one open progression revision per PR; refused if the PR is closed.
     ///
-    /// Example: `boss propose revise --brief-file brief.md`
+    /// Example: `boss propose revise --brief "Fix the diagnosed failure"`
     Revise(ReviseArgs),
     /// Progression agents only: create a chore and make this item depend on it
     /// (a red check that belongs on `main`, a missing prerequisite). Counts
     /// against the create budget; at most one open precursor per item.
     ///
     /// Example: `boss propose precursor --name "Fix the flaky fixture on main"
-    /// --brief-file brief.md`
+    /// --brief "Repair the fixture that also fails on main"`
     Precursor(PrecursorArgs),
     /// Progression agents only: add a dependency edge from this item to another
     /// item in its neighbourhood.
@@ -218,7 +218,7 @@ pub(crate) enum ProposeCommand {
 #[derive(Debug, Clone, Args)]
 pub(crate) struct ReviseArgs {
     /// The brief of the revision, inline. Exactly one of `--brief` /
-    /// `--brief-file` is required; prefer `--brief-file`.
+    /// `--brief-file` is required; progression agents use `--brief` because they cannot write files.
     #[arg(long, conflicts_with = "brief_file")]
     brief: Option<String>,
 
@@ -238,7 +238,7 @@ pub(crate) struct PrecursorArgs {
 
     /// The precursor's brief, inline. Exactly one of `--brief` / `--brief-file`
     /// is required; the precursor's worker sees nothing else, so make it stand
-    /// alone.
+    /// alone. Progression agents use `--brief` because they cannot write files.
     #[arg(long, conflicts_with = "brief_file")]
     brief: Option<String>,
 

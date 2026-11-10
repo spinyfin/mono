@@ -330,6 +330,17 @@ fn precursor_creates_the_chore_and_the_dependency_edge() {
     let waiting = fx.task(&item);
     assert_eq!(waiting.status, TaskStatus::Blocked);
     assert_eq!(waiting.blocked_reason.as_deref(), Some("dependency"));
+    assert_progression_status(&fx, &item);
+    fx.sql(&format!("UPDATE tasks SET status = 'done' WHERE id = '{chore}'"));
+    crate::dep_helpers::cascade_dependents_after_prereq_status_change(
+        &mut PendingEvents::new(),
+        &fx.db.connect().unwrap(),
+        &chore,
+        "done",
+        &now_string(),
+    )
+    .unwrap();
+    assert_eq!(fx.task(&item).status, TaskStatus::InReview);
 }
 
 #[test]
@@ -394,6 +405,7 @@ fn depend_adds_an_edge_inside_the_neighbourhood_and_refuses_outside_it() {
     let target = fx.applied(&run, ProposalKind::Depend, json!({"on": revision}));
 
     assert_eq!(target, revision);
+    assert_progression_status(&fx, &item);
     assert!(
         crate::work_dependencies::query_edge(&fx.db.connect().unwrap(), &item, &revision, "blocks")
             .unwrap()
@@ -466,6 +478,7 @@ fn undepend_may_drop_a_dead_revision_whose_parent_pr_is_green() {
 
     fx.applied(&run, ProposalKind::Undepend, json!({"on": dead}));
 
+    assert_progression_status(&fx, &waiting);
     let released = fx.task(&waiting);
     assert_eq!(
         released.status,
@@ -1276,4 +1289,258 @@ fn the_owners_answer_returns_an_asked_pr_item_to_review_instead_of_failing() {
         fx.db.list_operator_questions(&item).unwrap()[0].status,
         boss_protocol::OperatorQuestionStatus::Answered
     );
+}
+
+fn assert_progression_status(fx: &Fx, item: &str) {
+    assert_eq!(fx.actor(item), LAST_STATUS_ACTOR_PROGRESSION);
+    let actor: String = fx.db.connect().unwrap().query_row(
+        "SELECT actor FROM task_status_audit WHERE work_item_id = ?1 AND property = 'status' ORDER BY rowid DESC LIMIT 1",
+        [item], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(actor, LAST_STATUS_ACTOR_PROGRESSION);
+}
+
+fn declared_blocker(fx: &Fx, item: &str) -> String {
+    let earlier = fx
+        .db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(item)
+                .kind(ExecutionKind::TaskImplementation)
+                .status(ExecutionStatus::Running)
+                .build(),
+        )
+        .unwrap();
+    let proposal = done(
+        fx,
+        &earlier.id,
+        json!({"outcome": "blocked", "summary": "Cannot proceed: choose the retention period."}),
+        "worker-blocked",
+    );
+    assert_eq!(proposal.proposal.state, ProposalState::Applied);
+    fx.db
+        .record_worker_failure_with_basis(
+            &earlier.id,
+            "Cannot proceed: choose the retention period.",
+            crate::pr_flow::WorkerFailureBasis::DeclaredBlocked,
+        )
+        .unwrap()
+        .unwrap();
+    let attention = fx
+        .db
+        .create_attention_item(
+            CreateAttentionItemInput::builder()
+                .execution_id(&earlier.id)
+                .kind("run_done_declared_blocked")
+                .title("Worker declared a blocker")
+                .body_markdown("Choose the retention period.")
+                .build(),
+        )
+        .unwrap();
+    attention.id
+}
+
+#[test]
+fn declared_blocker_converts_to_redispatch_with_worker_text_and_addendum() {
+    let fx = fx();
+    let item = fx.chore("Retention policy");
+    let attention = declared_blocker(&fx, &item);
+    let run = fx.run(&item, FINGERPRINT, STUCK);
+    let next = fx.applied(&run, ProposalKind::Redispatch,
+        json!({"brief_addendum": "Worker: Cannot proceed: choose the retention period. The owner has now selected seven days."}));
+    assert_progression_status(&fx, &item);
+    assert!(fx.task(&item).description.contains("choose the retention period"));
+    assert!(fx.task(&item).description.contains("selected seven days"));
+    assert_eq!(fx.db.get_execution(&next).unwrap().status, ExecutionStatus::Ready);
+    assert_eq!(fx.db.get_attention_item(&attention).unwrap().status, "resolved");
+    assert_eq!(
+        done(
+            &fx,
+            &run,
+            json!({"outcome":"delivered","summary":"Restarted with the decision"}),
+            "complete"
+        )
+        .proposal
+        .state,
+        ProposalState::Applied
+    );
+    fx.db.finish_progression_declared(&run).unwrap().unwrap();
+}
+
+#[test]
+fn declared_blocker_converts_to_question_with_worker_text_and_human_decision() {
+    let fx = fx();
+    let item = fx.chore("Retention policy");
+    let attention = declared_blocker(&fx, &item);
+    let run = fx.run(&item, FINGERPRINT, STUCK);
+    let asked = done(
+        &fx,
+        &run,
+        json!({
+            "outcome":"blocked", "summary":"Needs a retention decision", "criterion":"3",
+            "question":{"text":"Keep records for seven days?", "answer_type":{"kind":"yes_no"},
+                "explanation":"Context:\nRetention needs a decision.\nYes:\nKeep seven days.\nNo:\nKeep thirty days.\nRecommendation:\nYes.\nDetails:\nWorker: Cannot proceed: choose the retention period."}
+        }),
+        "ask",
+    );
+    assert_eq!(asked.proposal.state, ProposalState::Applied);
+    assert_eq!(
+        boss_protocol::run_done_question_criterion(&asked.proposal.payload_json),
+        Some(boss_protocol::ProgressionQuestionCriterion::HumanDecision)
+    );
+    let questions = fx.db.list_operator_questions(&item).unwrap();
+    let stored = serde_json::to_string(&questions[0]).unwrap();
+    assert!(stored.contains("Details:"));
+    assert!(stored.contains("Worker: Cannot proceed: choose the retention period."));
+    fx.db.finish_progression_declared(&run).unwrap().unwrap();
+    assert_eq!(
+        fx.task(&item).blocked_reason.as_deref(),
+        Some("awaiting_operator_answer")
+    );
+    assert!(!fx.task(&item).autostart);
+    assert_eq!(fx.db.get_attention_item(&attention).unwrap().status, "resolved");
+}
+
+#[test]
+fn question_is_refused_or_withdrawn_when_work_resumes() {
+    for status in [ExecutionStatus::Ready, ExecutionStatus::Running] {
+        for before_submission in [true, false] {
+            let fx = fx();
+            let item = fx.chore("Restart race");
+            let run = fx.run(&item, FINGERPRINT, STUCK);
+            let restart = || {
+                fx.db
+                    .create_execution(
+                        CreateExecutionInput::builder()
+                            .work_item_id(&item)
+                            .kind(ExecutionKind::TaskImplementation)
+                            .status(status.clone())
+                            .build(),
+                    )
+                    .unwrap()
+            };
+            if before_submission {
+                restart();
+            }
+            let asked = done(
+                &fx,
+                &run,
+                json!({"outcome":"blocked","summary":"Ask","question":question(),"criterion":"3"}),
+                "ask",
+            );
+            if before_submission {
+                assert_eq!(asked.proposal.state, ProposalState::Rejected);
+            } else {
+                assert_eq!(asked.proposal.state, ProposalState::Applied);
+                restart();
+                let before = fx.task(&item);
+                fx.db.finish_progression_declared(&run).unwrap().unwrap();
+                let after = fx.task(&item);
+                assert_eq!(before.status, after.status);
+                assert_eq!(before.autostart, after.autostart);
+                assert_eq!(
+                    fx.db.list_operator_questions(&item).unwrap()[0].status,
+                    boss_protocol::OperatorQuestionStatus::Withdrawn
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn changing_the_dependency_subject_does_not_bypass_the_fingerprint_rule() {
+    let fx = fx();
+    let item = fx.pr_item("Parent", "fail");
+    let first = fx.revision_of(&item, "First", "blocked");
+    let second = fx.revision_of(&item, "Second", "blocked");
+    let run = fx.run(&item, FINGERPRINT, STUCK);
+    fx.applied(&run, ProposalKind::Depend, json!({"on": first}));
+    let refusal = fx.refused(&run, ProposalKind::Depend, json!({"on": second}));
+    assert!(
+        refusal.contains(&run) && refusal.contains("already applied"),
+        "{refusal}"
+    );
+}
+
+#[test]
+fn refused_verbs_consume_the_execution_rate_cap() {
+    let fx = fx();
+    let item = fx.chore("No PR");
+    let run = fx.run(&item, FINGERPRINT, STUCK);
+    let mut capped = false;
+    for _ in 0..100 {
+        let result = fx
+            .submit(&run, ProposalKind::ClearSignal, json!({"reason":"ci_failure"}))
+            .unwrap_err();
+        if result.code != ProposalErrorCode::NotAccepted {
+            capped = true;
+            break;
+        }
+    }
+    assert!(capped, "refused commands must eventually hit the proposal rate cap");
+    assert!(fx.actions(&item).is_empty());
+}
+
+#[test]
+fn clear_signal_retires_attempts_but_refuses_unresolved_queue_failures() {
+    for queue in [false, true] {
+        let fx = fx();
+        let item = fx.pr_item("CI failure", "success");
+        fx.sql(&format!(
+            "UPDATE tasks SET status = 'blocked', blocked_reason = 'ci_failure' WHERE id = '{item}'"
+        ));
+        let revision = fx.revision_of(&item, "Repair", "todo");
+        fx.sql(&format!(
+            "UPDATE tasks SET created_via = 'ci-fix:attempt' WHERE id = '{revision}'"
+        ));
+        let attempt = fx
+            .db
+            .insert_ci_remediation(crate::CiRemediationInsertInput {
+                product_id: fx.product.clone(),
+                work_item_id: item.clone(),
+                pr_url: fx.task(&item).pr_url.unwrap(),
+                pr_number: 100,
+                head_branch: "feature".into(),
+                head_sha_at_trigger: "abc".into(),
+                attempt_kind: "fix".into(),
+                consumes_budget: 1,
+                failed_checks: "[]".into(),
+                failure_kind: if queue { "merge_queue_rebounce" } else { "pr_branch_ci" }.into(),
+                before_commit_sha: None,
+            })
+            .unwrap()
+            .unwrap();
+        fx.sql(&format!(
+            "UPDATE ci_remediations SET revision_task_id = '{revision}' WHERE id = '{}'",
+            attempt.id
+        ));
+        let run = fx.run(&item, FINGERPRINT, "S6_ci_failure");
+        if queue {
+            let error = fx.refused(&run, ProposalKind::ClearSignal, json!({"reason":"ci_failure"}));
+            assert!(error.contains("queue-side"), "{error}");
+            assert_eq!(fx.task(&item).blocked_reason.as_deref(), Some("ci_failure"));
+            assert!(fx.db.active_ci_remediation_for_work_item(&item).unwrap().is_some());
+        } else {
+            fx.applied(&run, ProposalKind::ClearSignal, json!({"reason":"ci_failure"}));
+            assert!(fx.db.active_ci_remediation_for_work_item(&item).unwrap().is_none());
+            assert_eq!(
+                query_ci_remediation(&fx.db.connect().unwrap(), &attempt.id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "succeeded"
+            );
+            assert_eq!(fx.task(&revision).status, TaskStatus::Archived);
+            assert_eq!(fx.actor(&revision), LAST_STATUS_ACTOR_PROGRESSION);
+            fx.sql(&format!(
+                "UPDATE tasks SET status = 'blocked', blocked_reason = 'ci_failure' WHERE id = '{item}'"
+            ));
+            let error = fx.refused(
+                &run,
+                ProposalKind::ClearSignal,
+                json!({"reason":"ci_failure_exhausted"}),
+            );
+            assert!(error.contains(&run) && error.contains("already applied"), "{error}");
+        }
+    }
 }
