@@ -156,6 +156,7 @@ impl ExecutionCoordinator {
             // engine's own boot-time `kick()` (see `app.rs`).
             tokio::time::sleep(interval).await;
             let interval_ms = interval.as_millis() as u64;
+            let mut unexplained_waits = UnexplainedWaitWatch::default();
             loop {
                 let ready = match coordinator.work_db.list_ready_executions() {
                     Ok(rows) => rows,
@@ -199,6 +200,8 @@ impl ExecutionCoordinator {
                     );
                 }
                 coordinator.raise_ready_answer_agent_alarms(&ready, ANSWER_AGENT_READY_AGE_ALARM_THRESHOLD);
+                // A wait the engine cannot name is reported here, never repaired.
+                coordinator.flag_unexplained_waits(&mut unexplained_waits).await;
                 // NOT `kick()`: when `enable_dispatch_ready_bus` is on,
                 // `kick()` only publishes to the event bus and returns —
                 // routing the heartbeat through it would make the bus the
@@ -856,7 +859,7 @@ impl ExecutionCoordinator {
     /// the currently-live one.
     /// Persist the operator-facing `dispatch_wait_reason` for an execution,
     /// logging a warning (rather than failing dispatch) if the DB write errors.
-    fn record_dispatch_wait_reason(
+    pub(super) fn record_dispatch_wait_reason(
         &self,
         execution: &WorkExecution,
         reason: &str,
@@ -901,7 +904,7 @@ impl ExecutionCoordinator {
         }
     }
 
-    async fn publish_dispatch_runtime_changed(&self, executions: &[WorkExecution], reason: &str) {
+    pub(super) async fn publish_dispatch_runtime_changed(&self, executions: &[WorkExecution], reason: &str) {
         for execution in executions {
             if let Ok(item) = self.resolve_execution_work_item(execution) {
                 // The drain only rewrites this execution's wait reason or claims
@@ -1069,6 +1072,7 @@ impl ExecutionCoordinator {
             } else {
                 tracing::error!(%reason, "local dispatch held by startup preflight");
             }
+            self.record_preflight_hold();
             return DrainOutcome::QueueEmpty;
         }
         // Global pause gate, read once as a snapshot so "are we paused" and

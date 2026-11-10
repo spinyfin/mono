@@ -386,13 +386,13 @@ fn a_chain_hold_follows_its_blockers_liveness() {
     let blocker_exec = board.execution(&blocker, ExecutionStatus::Running);
     board.execution(&held, ExecutionStatus::Ready);
     board.sql(
-        "UPDATE work_executions SET dispatch_wait_reason = 'chain_hold', dispatch_wait_blocker_id = ?2
+        "UPDATE work_executions SET dispatch_wait_reason = 'chain_serialized', dispatch_wait_blocker_id = ?2
          WHERE work_item_id = ?1",
         &[&held, &blocker],
     );
     board.assert_equivalent();
     let holding = board.runtime_of(&held);
-    assert_eq!(holding["dispatch_wait_reason"], "chain_hold");
+    assert_eq!(holding["dispatch_wait_reason"], "chain_serialized");
     assert_eq!(holding["dispatch_wait_blocker"]["work_item_id"], blocker.as_str());
 
     board.sql(
@@ -424,11 +424,10 @@ fn a_future_deadline_expires_the_entry_when_the_clock_passes_it() {
     // No write happens from here on; only the clock moves.
     let (misses, _) = board.assert_equivalent_at(deadline);
     assert_eq!(misses, 1, "the elapsed deadline forces a recompute");
-    assert!(
-        board
-            .runtime_of_at(&item, deadline)
-            .get("dispatch_wait_reason")
-            .is_none()
+    assert_eq!(
+        board.runtime_of_at(&item, deadline)["dispatch_wait_reason"],
+        "awaiting_dispatch",
+        "past its deadline the row is back on the scheduler's walk"
     );
     let (misses, _) = board.assert_equivalent_at(deadline + 5);
     assert_eq!(misses, 0, "and the recomputed value is stable");

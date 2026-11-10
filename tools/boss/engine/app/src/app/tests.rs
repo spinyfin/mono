@@ -488,6 +488,7 @@ mod tmux_stub;
 mod tmux_teardown;
 mod tmux_worker_statuses;
 mod transient_recovery_slot_release;
+mod transition_dispatch_gap;
 mod trust_authorization;
 mod unpark_reconcile;
 mod viewer_reconcile;

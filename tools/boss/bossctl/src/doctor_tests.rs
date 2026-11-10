@@ -1025,3 +1025,107 @@ fn the_trace_scan_keeps_in_scope_records_and_skips_unreadable_lines() {
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0]["fields"]["execution_id"], Value::String("exec_trace".into()));
 }
+
+/// `dispatch diagnose` prints the engine's own wait classification for the
+/// item: the reason and phrase the board card shows, what it is waiting
+/// behind, and an explicit marker when the engine could not name the wait.
+#[test]
+fn diagnose_wait_line_reports_the_engines_reason() {
+    use boss_protocol::{CreateChoreInput, CreateExecutionInput, CreateProductInput, ExecutionKind, ExecutionStatus};
+
+    let db = boss_engine::work::WorkDb::open(":memory:".into()).unwrap();
+    let product = db
+        .create_product(
+            CreateProductInput::builder()
+                .name("Diagnose wait")
+                .repo_remote_url("git@example.com:diagnose/wait.git")
+                .build(),
+        )
+        .unwrap();
+    let chore = |name: &str| {
+        db.create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name(name)
+                .build(),
+        )
+        .unwrap()
+    };
+    let execution = |work_item_id: &str, status| {
+        db.create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(work_item_id)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(status)
+                .build(),
+        )
+        .unwrap()
+    };
+    let line = |work_item_id: &str| dispatch_wait_line(&db.get_task_runtime(work_item_id).unwrap());
+
+    // A hold the scheduler recorded.
+    let held = chore("held by a full pool");
+    let held_execution = execution(&held.id, ExecutionStatus::Ready);
+    db.set_dispatch_wait_reason(&held_execution.id, "pool_exhausted")
+        .unwrap();
+    assert_eq!(
+        line(&held.id),
+        format!(
+            "waiting: pool_exhausted — worker pool full (execution {}, ready)",
+            held_execution.id
+        )
+    );
+
+    // A wait behind another item names it.
+    let prerequisite = chore("prerequisite");
+    let gated = chore("gated");
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO work_item_dependencies (dependent_id, prerequisite_id, relation, created_at)
+             VALUES (?1, ?2, 'blocks', '1')",
+            [&gated.id, &prerequisite.id],
+        )
+        .unwrap();
+    let gated_execution = execution(&gated.id, ExecutionStatus::WaitingDependency);
+    assert_eq!(
+        line(&gated.id),
+        format!(
+            "waiting: waiting_dependency — waiting for T{} (execution {}, waiting_dependency); behind task {}",
+            prerequisite.short_id.unwrap(),
+            gated_execution.id,
+            prerequisite.id
+        )
+    );
+
+    // Queued on the board with nothing pending.
+    let finished = chore("its run was cancelled before it started");
+    execution(&finished.id, ExecutionStatus::Cancelled);
+    assert_eq!(
+        line(&finished.id),
+        "waiting: run_ended — its last run ended; start it again to queue a new run (no execution queued)"
+    );
+
+    // A wait the engine cannot name is called out, never given a reason.
+    let stranded = chore("active with an ungated waiting_dependency row");
+    db.update_work_item(
+        &stranded.id,
+        boss_protocol::WorkItemPatch {
+            status: Some("active".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    execution(&stranded.id, ExecutionStatus::WaitingDependency);
+    let unexpected = line(&stranded.id);
+    assert!(
+        unexpected.starts_with("waiting: unclassified — the engine has no reason recorded for this wait"),
+        "{unexpected}"
+    );
+    assert!(unexpected.contains("UNEXPECTED"), "{unexpected}");
+    assert!(!unexpected.to_lowercase().contains("unknown"), "{unexpected}");
+
+    let json = dispatch_wait_json(&db.get_task_runtime(&gated.id).unwrap());
+    assert_eq!(json["reason"], "waiting_dependency");
+    assert_eq!(json["blocker"]["work_item_id"], prerequisite.id.as_str());
+}

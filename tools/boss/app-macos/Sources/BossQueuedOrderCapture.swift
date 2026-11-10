@@ -6,7 +6,8 @@ import UpdateCore
 /// Quiet, isolated fixture: --capture-reveal-state=queued-order --capture-to.
 /// Hosts the real ContentView on a Doing column holding a coding card, two
 /// operator decisions, and a queue in engine dispatch order (the oldest task
-/// is deliberately not first), plus cards the dispatcher is not taking.
+/// is deliberately not first), plus cards the dispatcher is not taking: each
+/// with the wait reason the engine sends, and one the engine could not name.
 @MainActor
 enum BossQueuedOrderCapture {
     private static var window: NSWindow?
@@ -41,12 +42,14 @@ enum BossQueuedOrderCapture {
             )
             return task
         }
-        func runtime(_ id: String, status: String = "ready", reason: String? = nil,
+        // `label` is the phrase the engine sends with each reason.
+        func runtime(_ id: String, status: String = "ready", reason: String = "awaiting_dispatch",
+                     label: String = "ready for the dispatcher's next pass",
                      blocker: DispatchWaitBlocker? = nil) -> WorkTaskRuntime {
             WorkTaskRuntime(
                 workItemID: id, executionStatus: status, runStatus: nil, executionID: "exec_\(id)",
                 dispatchRetryAt: nil, dispatchWaitReason: reason, dispatchWaitSince: nil,
-                dispatchWaitBlocker: blocker
+                dispatchWaitBlocker: blocker, dispatchWaitLabel: label
             )
         }
 
@@ -63,14 +66,22 @@ enum BossQueuedOrderCapture {
             card("paused", "Nightly triage report", age: 6, shortID: 106),
             card("review", "Review the cache PR", age: 7, shortID: 107),
             card("conflict", "Resolve merge conflict", age: 8, shortID: 108),
+            card("ordered", "Second task of its project", age: 9, shortID: 109),
+            card("unnamed", "Waiting with no reason the engine can name", age: 10, shortID: 110),
         ]
         let blocker = DispatchWaitBlocker(workItemID: "coding", productID: product.id, shortID: 101)
         let runtimes = [
             runtime("conflict"),
             runtime("review"),
-            runtime("retried", reason: "pool_exhausted"),
-            runtime("paused", reason: "automation_paused"),
-            runtime("waiting", status: "waiting_dependency", reason: "waiting_dependency", blocker: blocker),
+            runtime("retried", reason: "pool_exhausted", label: "worker pool full"),
+            runtime("paused", reason: "automation_paused", label: "automation paused"),
+            runtime("waiting", status: "waiting_dependency", reason: "waiting_dependency",
+                    label: "waiting for \(blocker.label)", blocker: blocker),
+            runtime("ordered", status: "waiting_dependency", reason: "project_order",
+                    label: "waiting for \(blocker.label), an earlier task in its project", blocker: blocker),
+            // What a card shows when the engine could not classify its wait.
+            runtime("unnamed", status: "waiting_dependency", reason: "unclassified",
+                    label: "the engine has no reason recorded for this wait"),
         ]
         model.applyEventForTest(.workTree(
             product: product, projects: [], tasks: [], chores: rows,
@@ -87,7 +98,8 @@ enum BossQueuedOrderCapture {
             ]
         ))
         let captureWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1320, height: 900),
+            // Tall enough for every queued card, down to the unnamed wait.
+            contentRect: NSRect(x: 0, y: 0, width: 1320, height: 1280),
             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false
         )
         captureWindow.title = "Boss [agent capture]"

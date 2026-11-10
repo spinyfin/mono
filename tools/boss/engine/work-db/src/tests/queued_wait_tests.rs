@@ -1,0 +1,640 @@
+use super::*;
+
+use boss_engine_storage_values::dispatch_wait::*;
+use std::collections::BTreeSet;
+
+// Every waiting state must name why it is waiting. These tests enumerate the
+// states the engine can leave a work item in while it is not running and
+// assert each one classifies to a named reason; the one state that has no
+// name is asserted to be reported as unclassified, never given a default.
+
+fn db() -> WorkDb {
+    WorkDb::open(temp_db_path("queued-wait")).unwrap()
+}
+
+fn pending(db: &WorkDb, work_item_id: &str, kind: ExecutionKind, status: ExecutionStatus) -> WorkExecution {
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(work_item_id)
+            .kind(kind)
+            .status(status)
+            .build(),
+    )
+    .unwrap()
+}
+
+fn ready_chore(db: &WorkDb, product_id: &str, name: &str) -> (Task, WorkExecution) {
+    let chore = create_test_chore(db, product_id, name);
+    let execution = pending(
+        db,
+        &chore.id,
+        ExecutionKind::ChoreImplementation,
+        ExecutionStatus::Ready,
+    );
+    (chore, execution)
+}
+
+/// A project whose design is done and whose two tasks are still to do.
+fn project_with_two_tasks(db: &WorkDb, product_id: &str, autostart: bool) -> (Task, Task) {
+    let project = db
+        .create_project(CreateProjectInput {
+            product_id: product_id.to_owned(),
+            name: "Ordered project".to_owned(),
+            description: None,
+            goal: None,
+            autostart: true,
+            no_design_task: false,
+            design_reasoning_effort_xhigh: false,
+        })
+        .unwrap();
+    let task = |name: &str| {
+        db.create_task(
+            CreateTaskInput::builder()
+                .product_id(product_id)
+                .project_id(project.id.clone())
+                .name(name)
+                .autostart(autostart)
+                .build(),
+        )
+        .unwrap()
+    };
+    let (first, second) = (task("First"), task("Second"));
+    complete_design_for_project(db, &project.id);
+    (first, second)
+}
+
+fn set_status(db: &WorkDb, id: &str, status: &str) {
+    db.update_work_item(
+        id,
+        WorkItemPatch {
+            status: Some(status.to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+}
+
+fn execution_status(db: &WorkDb, work_item_id: &str) -> ExecutionStatus {
+    db.list_executions(Some(work_item_id)).unwrap()[0].status.clone()
+}
+
+/// The classified wait for `work_item_id`, asserted to be the same answer on
+/// the single-item read `bossctl dispatch diagnose` uses and on the board's
+/// work-tree projection.
+fn wait_of(db: &WorkDb, product_id: &str, work_item_id: &str) -> TaskRuntime {
+    let runtime = db.get_task_runtime(work_item_id).unwrap();
+    let tree = db.get_work_tree(product_id).unwrap();
+    let on_board = tree
+        .task_runtimes
+        .iter()
+        .find(|runtime| runtime.work_item_id == work_item_id)
+        .unwrap_or_else(|| panic!("{work_item_id} is missing from the board"));
+    assert_eq!(
+        (&on_board.dispatch_wait_reason, &on_board.dispatch_wait_label),
+        (&runtime.dispatch_wait_reason, &runtime.dispatch_wait_label),
+        "the board and the single-item read disagree about why {work_item_id} is waiting"
+    );
+    runtime
+}
+
+/// Asserts `runtime` carries `code` with a phrase that is the registered one
+/// (or, for a wait behind another item, one that names it), and returns the
+/// code so the caller can record that the state is covered.
+fn assert_named(state: &str, runtime: &TaskRuntime, code: &str) -> String {
+    assert_eq!(runtime.dispatch_wait_reason.as_deref(), Some(code), "{state}");
+    let label = runtime
+        .dispatch_wait_label
+        .as_deref()
+        .unwrap_or_else(|| panic!("{state}: a reason with no phrase"));
+    assert!(!label.trim().is_empty(), "{state}");
+    assert!(!label.to_lowercase().contains("unknown"), "{state}: {label}");
+    assert_ne!(code, DISPATCH_WAIT_REASON_UNCLASSIFIED, "{state}");
+    if runtime.dispatch_wait_blocker.is_none() {
+        assert_eq!(label, dispatch_wait_phrase(code), "{state}");
+    }
+    code.to_owned()
+}
+
+#[test]
+fn every_waiting_state_yields_a_named_reason() {
+    let db = db();
+    let product = create_test_product(&db);
+    let pid = product.id.as_str();
+    let mut covered = BTreeSet::new();
+
+    // ── A `ready` execution ───────────────────────────────────────────────
+    let (chore, execution) = ready_chore(&db, pid, "ready, not yet reached by a scheduler pass");
+    covered.insert(assert_named(
+        "ready with no hold",
+        &wait_of(&db, pid, &chore.id),
+        DISPATCH_WAIT_REASON_AWAITING_DISPATCH,
+    ));
+
+    // Every hold the scheduler records under a code.
+    for hold in [
+        DISPATCH_WAIT_REASON_POOL_EXHAUSTED,
+        DISPATCH_WAIT_REASON_DISPATCH_PAUSED,
+        DISPATCH_WAIT_REASON_AUTOMATION_PAUSED,
+        DISPATCH_WAIT_REASON_FOCUS_MODE,
+        DISPATCH_WAIT_REASON_PROGRESSION_UNAVAILABLE,
+        DISPATCH_WAIT_REASON_AWAITING_PREDECESSOR_PRESERVATION,
+        DISPATCH_WAIT_REASON_PREFLIGHT_HOLD,
+        DISPATCH_WAIT_REASON_CHAIN_SERIALIZED,
+        DISPATCH_WAIT_REASON_CHAIN_SERIALIZED_REVIEW_HELD,
+        DISPATCH_WAIT_REASON_INTERACTIVE_CAP,
+    ] {
+        db.set_dispatch_wait_reason(&execution.id, hold).unwrap();
+        covered.insert(assert_named(hold, &wait_of(&db, pid, &chore.id), hold));
+    }
+
+    // Holds the scheduler records as a sentence are shown as written.
+    for sentence in [
+        interactive_cap_wait_reason(3, 0),
+        interactive_cap_wait_reason(2, 9),
+        WAITING_FOR_WORKSPACE_REASON.to_owned(),
+        "blocked by T41 'Earlier review' on repo#42 (revisions on the same PR run one at a time)".to_owned(),
+    ] {
+        db.set_dispatch_wait_reason(&execution.id, &sentence).unwrap();
+        let runtime = wait_of(&db, pid, &chore.id);
+        assert_eq!(runtime.dispatch_wait_reason.as_deref(), Some(sentence.as_str()));
+        assert_eq!(runtime.dispatch_wait_label.as_deref(), Some(sentence.as_str()));
+    }
+
+    // A chain hold names the live writer it is behind.
+    let writer = create_test_chore(&db, pid, "live writer on the same PR");
+    pending(
+        &db,
+        &writer.id,
+        ExecutionKind::ChoreImplementation,
+        ExecutionStatus::Running,
+    );
+    db.set_dispatch_wait_with_blocker(&execution.id, "blocked by an earlier review", Some(&writer.id))
+        .unwrap();
+    let held = wait_of(&db, pid, &chore.id);
+    assert_eq!(
+        held.dispatch_wait_label.as_deref(),
+        Some("blocked by an earlier review")
+    );
+    assert_eq!(held.dispatch_wait_blocker.unwrap().work_item_id, writer.id);
+
+    // A dispatch deadline still ahead.
+    let future = (boss_engine_utils::epoch_time::now_epoch_secs() + 3600).to_string();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET dispatch_not_before = ?2 WHERE id = ?1",
+            params![execution.id, future],
+        )
+        .unwrap();
+    let deadline = wait_of(&db, pid, &chore.id);
+    assert_eq!(deadline.dispatch_not_before.as_deref(), Some(future.as_str()));
+    covered.insert(assert_named(
+        "future deadline",
+        &deadline,
+        DISPATCH_WAIT_REASON_NOT_BEFORE,
+    ));
+
+    // ── A `waiting_dependency` execution ──────────────────────────────────
+    let prerequisite = create_test_chore(&db, pid, "prerequisite");
+    let dependent = create_test_chore(&db, pid, "gated by a prerequisite");
+    db.add_dependency(AddDependencyInput {
+        dependent: dependent.id.clone(),
+        prerequisite: prerequisite.id.clone(),
+        relation: None,
+    })
+    .unwrap();
+    db.reconcile_product_executions(pid).unwrap();
+    assert_eq!(execution_status(&db, &dependent.id), ExecutionStatus::WaitingDependency);
+    let gated = wait_of(&db, pid, &dependent.id);
+    covered.insert(assert_named(
+        "unmet prerequisite",
+        &gated,
+        DISPATCH_WAIT_REASON_WAITING_DEPENDENCY,
+    ));
+    assert_eq!(
+        gated.dispatch_wait_label.as_deref(),
+        Some(format!("waiting for T{}", prerequisite.short_id.unwrap()).as_str())
+    );
+    assert_eq!(gated.dispatch_wait_blocker.unwrap().work_item_id, prerequisite.id);
+
+    let (first, second) = project_with_two_tasks(&db, pid, true);
+    db.reconcile_product_executions(pid).unwrap();
+    assert_eq!(execution_status(&db, &second.id), ExecutionStatus::WaitingDependency);
+    let ordered = wait_of(&db, pid, &second.id);
+    covered.insert(assert_named(
+        "later task of a project",
+        &ordered,
+        DISPATCH_WAIT_REASON_PROJECT_ORDER,
+    ));
+    assert_eq!(
+        ordered.dispatch_wait_label.as_deref(),
+        Some(
+            format!(
+                "waiting for T{}, an earlier task in its project",
+                first.short_id.unwrap()
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(ordered.dispatch_wait_blocker.unwrap().work_item_id, first.id);
+
+    let manual = create_test_chore_manual(&db, pid, "automatic start off, execution left behind");
+    pending(
+        &db,
+        &manual.id,
+        ExecutionKind::ChoreImplementation,
+        ExecutionStatus::WaitingDependency,
+    );
+    covered.insert(assert_named(
+        "automatic start off",
+        &db.get_task_runtime(&manual.id).unwrap(),
+        DISPATCH_WAIT_REASON_AUTOSTART_OFF,
+    ));
+
+    // ── Queued on the board (`todo`, automatic start on) with no execution ─
+    let chore_with = |name: &str, human_driven: bool, deferred: bool| {
+        db.create_chore(
+            CreateChoreInput::builder()
+                .product_id(pid)
+                .name(name)
+                .human_driven(human_driven)
+                .deferred(deferred)
+                .build(),
+        )
+        .unwrap()
+    };
+    // Marking a row human-driven switches automatic start off; switching it
+    // back on queues the card without making an agent eligible for it.
+    let human = chore_with("a human does this one", true, false);
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET autostart = 1 WHERE id = ?1", [&human.id])
+        .unwrap();
+    covered.insert(assert_named(
+        "human-driven",
+        &wait_of(&db, pid, &human.id),
+        DISPATCH_WAIT_REASON_HUMAN_DRIVEN,
+    ));
+
+    let deferred = chore_with("future scope", false, true);
+    covered.insert(assert_named(
+        "deferred",
+        &wait_of(&db, pid, &deferred.id),
+        DISPATCH_WAIT_REASON_DEFERRED,
+    ));
+
+    let parked = create_test_chore(&db, pid, "parked by its owner");
+    db.park_work_item_as_actor(&parked.id, true, Some("not now"), "human")
+        .unwrap();
+    covered.insert(assert_named(
+        "parked",
+        &db.get_task_runtime(&parked.id).unwrap(),
+        DISPATCH_WAIT_REASON_PARKED,
+    ));
+
+    let finished = create_test_chore(&db, pid, "its only run was cancelled before it started");
+    pending(
+        &db,
+        &finished.id,
+        ExecutionKind::ChoreImplementation,
+        ExecutionStatus::Cancelled,
+    );
+    covered.insert(assert_named(
+        "last run ended",
+        &wait_of(&db, pid, &finished.id),
+        DISPATCH_WAIT_REASON_RUN_ENDED,
+    ));
+
+    let delivered = create_test_chore(&db, pid, "pull request already open");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = 'https://github.com/test/repo/pull/7' WHERE id = ?1",
+            [&delivered.id],
+        )
+        .unwrap();
+    covered.insert(assert_named(
+        "pull request open",
+        &wait_of(&db, pid, &delivered.id),
+        DISPATCH_WAIT_REASON_PR_OPEN,
+    ));
+
+    // Creation refuses a card with no repository, so the state only arises
+    // when the product's default is removed afterwards.
+    let repoless = create_test_product_named(&db, "Repository removed");
+    let unresolved = create_test_chore(&db, repoless.id.clone(), "nowhere to run");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE products SET repo_remote_url = NULL WHERE id = ?1",
+            [&repoless.id],
+        )
+        .unwrap();
+    covered.insert(assert_named(
+        "no repository",
+        &wait_of(&db, &repoless.id, &unresolved.id),
+        DISPATCH_WAIT_REASON_REPO_UNRESOLVED,
+    ));
+
+    let root = make_in_review_chore(&db, pid, "https://github.com/test/repo/pull/42");
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db.create_revision(revision_input(&root), &checker).unwrap();
+    {
+        let conn = db.connect().unwrap();
+        conn.execute("DELETE FROM work_executions WHERE work_item_id = ?1", [&revision.id])
+            .unwrap();
+        conn.execute("UPDATE tasks SET pr_url = NULL WHERE id = ?1", [&root])
+            .unwrap();
+    }
+    assert_eq!((revision.status.clone(), revision.autostart), (TaskStatus::Todo, true));
+    covered.insert(assert_named(
+        "revision whose parent has no pull request",
+        &db.get_task_runtime(&revision.id).unwrap(),
+        DISPATCH_WAIT_REASON_AWAITING_PARENT_PR,
+    ));
+
+    // Every reason in the vocabulary is reachable from a state above, so a
+    // reason cannot be added without a state that produces it.
+    let vocabulary: BTreeSet<String> = DISPATCH_WAIT_REASON_CODES
+        .iter()
+        .map(|(code, _)| (*code).to_owned())
+        .filter(|code| code != DISPATCH_WAIT_REASON_UNCLASSIFIED)
+        .collect();
+    assert_eq!(covered, vocabulary);
+}
+
+#[test]
+fn a_wait_nothing_explains_is_unclassified_and_never_given_a_default() {
+    let db = db();
+    let product = create_test_product(&db);
+    let pid = product.id.as_str();
+    let unclassified = |state: &str, runtime: TaskRuntime| {
+        assert_eq!(
+            runtime.dispatch_wait_reason.as_deref(),
+            Some(DISPATCH_WAIT_REASON_UNCLASSIFIED),
+            "{state}"
+        );
+        let label = runtime.dispatch_wait_label.unwrap();
+        assert!(
+            label.starts_with(&dispatch_wait_phrase(DISPATCH_WAIT_REASON_UNCLASSIFIED)),
+            "{state}: {label}"
+        );
+        assert!(runtime.dispatch_wait_blocker.is_none(), "{state}");
+    };
+
+    // An active item whose execution sits off the scheduler's walk with no
+    // prerequisite and no project order behind it. A hold recorded while the
+    // row was `ready` says nothing about it now and is not reused.
+    let stranded = create_test_chore(&db, pid, "active, parked off the ready walk");
+    set_status(&db, &stranded.id, "active");
+    let execution = pending(
+        &db,
+        &stranded.id,
+        ExecutionKind::ChoreImplementation,
+        ExecutionStatus::Ready,
+    );
+    db.set_dispatch_wait_reason(&execution.id, DISPATCH_WAIT_REASON_POOL_EXHAUSTED)
+        .unwrap();
+    db.downgrade_ready_to_waiting_dependency(&execution.id).unwrap();
+    unclassified(
+        "active with an ungated waiting_dependency row",
+        wait_of(&db, pid, &stranded.id),
+    );
+
+    // Nothing in the engine walks a `queued` row.
+    let queued = create_test_chore(&db, pid, "legacy queued status");
+    pending(
+        &db,
+        &queued.id,
+        ExecutionKind::ChoreImplementation,
+        ExecutionStatus::Queued,
+    );
+    unclassified("queued with no hold", wait_of(&db, pid, &queued.id));
+
+    // The board queues this card, yet no execution exists and nothing the
+    // reconciler checks would have withheld one.
+    let unminted = create_test_chore(&db, pid, "queued on the board, nothing minted");
+    unclassified("no execution and no refusal", wait_of(&db, pid, &unminted.id));
+
+    // A hold recorded under a code nobody gave a phrase is not shown as an
+    // identifier.
+    let (coded, coded_execution) = ready_chore(&db, pid, "held under an unnamed code");
+    db.set_dispatch_wait_reason(&coded_execution.id, "some_new_hold")
+        .unwrap();
+    let runtime = wait_of(&db, pid, &coded.id);
+    assert!(
+        runtime
+            .dispatch_wait_label
+            .as_deref()
+            .unwrap()
+            .contains("some_new_hold")
+    );
+    unclassified("unnamed hold code", runtime);
+
+    // The heartbeat is handed exactly these, plus the one `ready` row no pass
+    // has explained yet.
+    let (fresh, _) = ready_chore(&db, pid, "ready and about to be picked up");
+    let reported: BTreeSet<(String, String)> = db
+        .list_unexplained_dispatch_waits()
+        .unwrap()
+        .into_iter()
+        .map(|wait| (wait.work_item_id, wait.reason))
+        .collect();
+    let expected: BTreeSet<(String, String)> = [
+        (stranded.id.clone(), DISPATCH_WAIT_REASON_UNCLASSIFIED),
+        (queued.id.clone(), DISPATCH_WAIT_REASON_UNCLASSIFIED),
+        (unminted.id.clone(), DISPATCH_WAIT_REASON_UNCLASSIFIED),
+        (coded.id.clone(), DISPATCH_WAIT_REASON_UNCLASSIFIED),
+        (fresh.id.clone(), DISPATCH_WAIT_REASON_AWAITING_DISPATCH),
+    ]
+    .into_iter()
+    .map(|(id, reason)| (id, reason.to_owned()))
+    .collect();
+    assert_eq!(reported, expected);
+}
+
+#[test]
+fn a_running_claimed_or_finished_item_carries_no_wait() {
+    let db = db();
+    let product = create_test_product(&db);
+    let (chore, execution) = ready_chore(&db, &product.id, "moves through its lifecycle");
+    set_status(&db, &chore.id, "active");
+    db.set_dispatch_wait_reason(&execution.id, DISPATCH_WAIT_REASON_POOL_EXHAUSTED)
+        .unwrap();
+    for status in ["claimed", "running", "waiting_human", "completed"] {
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET status = ?2 WHERE id = ?1",
+                params![execution.id, status],
+            )
+            .unwrap();
+        let runtime = wait_of(&db, &product.id, &chore.id);
+        assert!(
+            runtime.dispatch_wait_reason.is_none() && runtime.dispatch_wait_label.is_none(),
+            "{status} is not a wait on dispatch: {runtime:?}"
+        );
+    }
+    assert!(db.list_unexplained_dispatch_waits().unwrap().is_empty());
+}
+
+#[test]
+fn the_stuck_report_names_the_same_reason_as_the_board() {
+    let db = db();
+    let product = create_test_product(&db);
+    let (_, second) = project_with_two_tasks(&db, &product.id, true);
+    db.reconcile_product_executions(&product.id).unwrap();
+    let on_board = wait_of(&db, &product.id, &second.id);
+    assert_eq!(
+        on_board.dispatch_wait_reason.as_deref(),
+        Some(DISPATCH_WAIT_REASON_PROJECT_ORDER)
+    );
+
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    let report = db.stuck_report(0, now, &|_| false).unwrap();
+    let row = report
+        .rows
+        .iter()
+        .find(|row| row.work_item_id == second.id)
+        .expect("a task held off the ready walk is in the stuck report");
+    assert_eq!(
+        row.classification,
+        format!("S20_dispatch_wait:{DISPATCH_WAIT_REASON_PROJECT_ORDER}")
+    );
+}
+
+// ── The transition-dispatch gap ───────────────────────────────────────────
+//
+// Moving a later task of a project to Doing mints a `ready` execution and
+// reports it dispatched. The reconcile that runs in the same request used to
+// apply the project's ordinal chain to that row and park it in
+// `waiting_dependency`, where no scheduler pass looks; only the orphan sweep,
+// 90 s later, put it back. An item that is already `active` has been started
+// and is not the chain's to hold.
+
+/// What moving a card to Doing does in the engine, in the order the
+/// `UpdateWorkItem` handler does it: flip the status, mint the execution,
+/// then reconcile the product.
+fn move_to_doing(db: &WorkDb, product_id: &str, task_id: &str) -> WorkExecution {
+    set_status(db, task_id, "active");
+    let execution = db
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(task_id)
+                .explicit_start(true)
+                .build(),
+        )
+        .unwrap();
+    db.reconcile_product_executions(product_id).unwrap();
+    execution
+}
+
+#[test]
+fn a_task_moved_to_doing_stays_queued_for_a_worker_through_the_reconcile() {
+    let db = db();
+    let product = create_test_product(&db);
+    // Planner-style tasks: nothing starts until a person moves the card.
+    let (first, second) = project_with_two_tasks(&db, &product.id, false);
+
+    let first_execution = move_to_doing(&db, &product.id, &first.id);
+    assert_eq!(first_execution.status, ExecutionStatus::Ready);
+    let second_execution = move_to_doing(&db, &product.id, &second.id);
+    assert_eq!(second_execution.status, ExecutionStatus::Ready);
+
+    // No sweep has run. The request for a worker is still in the queue the
+    // scheduler drains, for both tasks.
+    let ready: Vec<String> = db
+        .list_ready_executions()
+        .unwrap()
+        .into_iter()
+        .map(|execution| execution.id)
+        .collect();
+    assert!(ready.contains(&first_execution.id), "{ready:?}");
+    assert!(
+        ready.contains(&second_execution.id),
+        "the later task's execution left the ready queue after the transition reported it \
+         dispatched; ready={ready:?}, status={:?}",
+        db.get_execution(&second_execution.id).unwrap().status
+    );
+    assert_eq!(
+        db.get_task_runtime(&second.id).unwrap().dispatch_wait_reason.as_deref(),
+        Some(DISPATCH_WAIT_REASON_AWAITING_DISPATCH)
+    );
+    // Nor is there anything for the orphan sweep to find later: backdate both
+    // cards past its age floor and it still has no candidate.
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET updated_at = '1' WHERE status = 'active'", [])
+        .unwrap();
+    assert!(db.list_orphan_active_candidates(90).unwrap().is_empty());
+
+    // Later reconciles (any card edit in the product runs one) leave it alone.
+    db.reconcile_product_executions(&product.id).unwrap();
+    assert_eq!(
+        db.get_execution(&second_execution.id).unwrap().status,
+        ExecutionStatus::Ready
+    );
+}
+
+#[test]
+fn moving_a_chain_held_task_to_doing_releases_its_execution() {
+    let db = db();
+    let product = create_test_product(&db);
+    let (first, second) = project_with_two_tasks(&db, &product.id, true);
+    db.reconcile_product_executions(&product.id).unwrap();
+    assert_eq!(execution_status(&db, &first.id), ExecutionStatus::Ready);
+    assert_eq!(execution_status(&db, &second.id), ExecutionStatus::WaitingDependency);
+
+    // The held row already owns the dispatch slot, so the handler mints
+    // nothing: the status flip and the reconcile are all that happen.
+    set_status(&db, &second.id, "active");
+    db.reconcile_product_executions(&product.id).unwrap();
+
+    assert_eq!(execution_status(&db, &second.id), ExecutionStatus::Ready);
+    assert_eq!(db.list_executions(Some(&second.id)).unwrap().len(), 1);
+    assert_eq!(execution_status(&db, &first.id), ExecutionStatus::Ready);
+}
+
+#[test]
+fn the_project_chain_still_holds_a_task_nobody_started() {
+    let db = db();
+    let product = create_test_product(&db);
+    let (first, second) = project_with_two_tasks(&db, &product.id, true);
+    db.reconcile_product_executions(&product.id).unwrap();
+
+    // The first task starting does not release the second...
+    set_status(&db, &first.id, "active");
+    db.reconcile_product_executions(&product.id).unwrap();
+    assert_eq!(execution_status(&db, &second.id), ExecutionStatus::WaitingDependency);
+    assert_eq!(
+        db.get_task_runtime(&second.id).unwrap().dispatch_wait_reason.as_deref(),
+        Some(DISPATCH_WAIT_REASON_PROJECT_ORDER)
+    );
+
+    // ...and a declared prerequisite still gates an active task: the chain
+    // exemption is about ordinal order only.
+    let third = db
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(first.project_id.clone().unwrap())
+                .name("Third")
+                .build(),
+        )
+        .unwrap();
+    set_status(&db, &third.id, "active");
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO work_item_dependencies (dependent_id, prerequisite_id, relation, created_at)
+             VALUES (?1, ?2, 'blocks', '1')",
+            params![third.id, second.id],
+        )
+        .unwrap();
+    db.reconcile_product_executions(&product.id).unwrap();
+    assert_eq!(execution_status(&db, &third.id), ExecutionStatus::WaitingDependency);
+    assert_eq!(
+        db.get_task_runtime(&third.id).unwrap().dispatch_wait_reason.as_deref(),
+        Some(DISPATCH_WAIT_REASON_WAITING_DEPENDENCY)
+    );
+}

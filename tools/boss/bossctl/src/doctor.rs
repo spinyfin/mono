@@ -1861,6 +1861,39 @@ pub fn render_findings(findings: &[Finding], integrity: &crate::stream_integrity
 /// match signatures, print timeline + findings (or JSON).
 ///
 /// `db` is optional — file-scan-first; missing/unreadable state.db is fine.
+/// The `waiting:` line of `dispatch diagnose`: the engine's wait reason for
+/// the item (code and phrase), the execution it applies to, and what it is
+/// waiting behind. `unclassified` is called out as the anomaly it is.
+fn dispatch_wait_line(runtime: &boss_protocol::TaskRuntime) -> String {
+    let reason = runtime.dispatch_wait_reason.as_deref().unwrap_or_default();
+    let label = runtime.dispatch_wait_label.as_deref().unwrap_or(reason);
+    let mut line = match (&runtime.execution_id, &runtime.execution_status) {
+        (Some(id), Some(status)) if !status.is_terminal() => {
+            format!("waiting: {reason} — {label} (execution {id}, {status})")
+        }
+        _ => format!("waiting: {reason} — {label} (no execution queued)"),
+    };
+    if let Some(blocker) = &runtime.dispatch_wait_blocker {
+        line.push_str(&format!("; behind {} {}", blocker.kind, blocker.work_item_id));
+    }
+    if reason == boss_protocol::DISPATCH_WAIT_REASON_UNCLASSIFIED {
+        line.push_str("\n  UNEXPECTED: the engine could not name this wait; it is reported as a `dispatch_wait_unclassified` attention item");
+    }
+    line
+}
+
+fn dispatch_wait_json(runtime: &boss_protocol::TaskRuntime) -> Value {
+    serde_json::json!({
+        "reason": runtime.dispatch_wait_reason,
+        "label": runtime.dispatch_wait_label,
+        "execution_id": runtime.execution_id,
+        "execution_status": runtime.execution_status,
+        "blocker": runtime.dispatch_wait_blocker,
+        "since_epoch_s": runtime.dispatch_wait_since,
+        "not_before_epoch_s": runtime.dispatch_not_before,
+    })
+}
+
 pub fn run_diagnose(
     root: &Path,
     id: &str,
@@ -1978,6 +2011,17 @@ pub fn run_diagnose(
             .ok()
     });
 
+    // Why the item is waiting right now is a fact about its current rows, not
+    // a dispatch event, so diagnose reads it from state.db: the same engine
+    // classification the board's card shows.
+    let wait_diagnosis = db.zip(scope.work_item_id.as_deref()).and_then(|(work_db, item_id)| {
+        work_db
+            .get_task_runtime(item_id)
+            .map_err(|err| eprintln!("warning: dispatch wait lookup skipped: {err:#}"))
+            .ok()
+            .filter(|runtime| runtime.dispatch_wait_reason.is_some())
+    });
+
     let mut findings = match_dispatch_signatures(&events, now_ms, Some(&fleet), Some(&db_facts), &scope_execs);
 
     match load_scope_trace_records(root, &scope_execs, &scope_items) {
@@ -2066,6 +2110,9 @@ pub fn run_diagnose(
         if let Some(progression) = &progression_diagnosis {
             payload.insert("progression".into(), progression.to_json());
         }
+        if let Some(wait) = &wait_diagnosis {
+            payload.insert("wait".into(), dispatch_wait_json(wait));
+        }
         println!("{}", Value::Object(payload));
         return Ok(());
     }
@@ -2106,6 +2153,10 @@ pub fn run_diagnose(
         for line in progression.lines(i64::try_from(now_ms / 1000).unwrap_or(i64::MAX)) {
             println!("{line}");
         }
+    }
+
+    if let Some(wait) = &wait_diagnosis {
+        println!("{}", dispatch_wait_line(wait));
     }
 
     if events.is_empty() && findings.is_empty() {

@@ -838,6 +838,8 @@ mod preserved_work;
 mod progression_spawn;
 mod run;
 mod scheduler;
+mod unexplained_wait;
+use unexplained_wait::UnexplainedWaitWatch;
 
 pub use config::{LOCAL_CAPABILITY_DISCOVERY_PENDING_REASON, STARTUP_RECOVERY_PENDING_REASON};
 pub use dispatch_admission::{PauseBypassOutcome, pause_bypass_decision};

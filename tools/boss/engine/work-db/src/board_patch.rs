@@ -275,8 +275,10 @@ pub(super) fn read_cards(
     let mut validity = HashMap::new();
     for task in tasks.iter().chain(chores.iter()) {
         let computed = dispatch_helpers::compute_task_runtime(conn, &task.id, &mut queries, now)?;
+        let mut runtime = computed.runtime;
+        super::queued_wait::annotate_unscheduled(conn, task, &mut runtime)?;
         validity.insert(task.id.clone(), (computed.cacheable, computed.expires_at));
-        runtimes.insert(task.id.clone(), computed.runtime);
+        runtimes.insert(task.id.clone(), runtime);
     }
 
     let mut trace = PopulationTrace::disabled();

@@ -27,29 +27,37 @@ pub(crate) fn collect_task_runtimes_cached(
     let lookup = cache.lookup(product_id, &items, now);
     let mut runtimes = Vec::with_capacity(items.len());
     let mut fresh = Vec::new();
-    for (((id, epoch), hit), expires_at) in items.iter().zip(lookup.hits).zip(lookup.expiries) {
-        if let Some(runtime) = hit {
-            if let Some(validity) = validity.as_mut() {
-                validity.insert((*id).to_owned(), (true, expires_at));
+    for ((((id, epoch), hit), expires_at), task) in items
+        .iter()
+        .zip(lookup.hits)
+        .zip(lookup.expiries)
+        .zip(tasks.iter().chain(chores))
+    {
+        let (mut runtime, cacheable, expires_at) = match hit {
+            Some(runtime) => (runtime, true, expires_at),
+            None => {
+                let computed = compute_task_runtime(conn, id, &mut queries, now)?;
+                if computed.cacheable {
+                    fresh.push((
+                        (*id).to_owned(),
+                        CachedRuntime {
+                            epoch: *epoch,
+                            expires_at: computed.expires_at,
+                            runtime: computed.runtime.clone(),
+                        },
+                    ));
+                }
+                (computed.runtime, computed.cacheable, computed.expires_at)
             }
-            runtimes.push(runtime);
-            continue;
-        }
-        let computed = compute_task_runtime(conn, id, &mut queries, now)?;
+        };
+        // Applied to hits as well as misses: the cache holds the
+        // execution-derived runtime, and why a card with no execution is
+        // queued comes from its task row, which no epoch versions.
+        super::queued_wait::annotate_unscheduled(conn, task, &mut runtime)?;
         if let Some(validity) = validity.as_mut() {
-            validity.insert((*id).to_owned(), (computed.cacheable, computed.expires_at));
+            validity.insert((*id).to_owned(), (cacheable, expires_at));
         }
-        if computed.cacheable {
-            fresh.push((
-                (*id).to_owned(),
-                CachedRuntime {
-                    epoch: *epoch,
-                    expires_at: computed.expires_at,
-                    runtime: computed.runtime.clone(),
-                },
-            ));
-        }
-        runtimes.push(computed.runtime);
+        runtimes.push(runtime);
     }
     cache.complete(product_id, lookup.pass, fresh);
     Ok((runtimes, queries))

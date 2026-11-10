@@ -3,42 +3,108 @@ import XCTest
 
 @MainActor
 final class QueuedWaitTests: XCTestCase {
-    func testRecordedReasonLabels() {
-        let labels = [
-            "unknown": "Queued — reason unknown",
-            "waiting_dependency": "Queued — waiting for a dependency",
-            "dispatch_paused": "Queued — dispatch paused",
-            "automation_paused": "Queued — automation paused",
-            "Waiting for an available worker (3 working)":
-                "Queued — Waiting for an available worker (3 working)",
-            "Waiting for an available worker (2 working, 9 waiting for a workspace)":
-                "Queued — Waiting for an available worker (2 working, 9 waiting for a workspace)",
-            "Waiting for a workspace":
-                "Queued — Waiting for a workspace",
-            "pool_exhausted": "Queued — worker pool full",
-            "blocked by an earlier review": "Queued — blocked by an earlier review"
+    /// The card renders the engine's phrase as given, for a wait code and
+    /// for a scheduler sentence alike. It holds no code-to-text table.
+    func testEnginePhraseIsRenderedAsGiven() {
+        let waits = [
+            ("waiting_dependency", "waiting for a dependency"),
+            ("project_order", "waiting for an earlier task in its project"),
+            ("dispatch_paused", "dispatch paused"),
+            ("automation_paused", "automation paused"),
+            ("focus_mode", "outside the dispatch focus set"),
+            ("pool_exhausted", "worker pool full"),
+            ("awaiting_dispatch", "ready for the dispatcher's next pass"),
+            ("Waiting for an available worker (3 working)", "Waiting for an available worker (3 working)"),
+            ("Waiting for a workspace", "Waiting for a workspace"),
+            ("blocked by an earlier review", "blocked by an earlier review")
         ]
-        for (reason, label) in labels {
-            XCTAssertEqual(WorkCardLiveStatus.queuedLabel(runtime: runtime(reason: reason), now: Date()), label)
+        for (reason, label) in waits {
+            XCTAssertEqual(
+                WorkCardLiveStatus.queuedLabel(runtime: runtime(reason: reason, label: label), now: Date()),
+                "Queued — \(label)"
+            )
+        }
+    }
+
+    /// A wait code with no phrase from the engine is never turned into text
+    /// by the app: the card says the state is unexpected.
+    func testAReasonWithoutAnEnginePhraseIsNotLabelledByTheApp() {
+        for reason in ["pool_exhausted", "dispatch_paused", "waiting_dependency", "some_future_code"] {
+            XCTAssertEqual(
+                WorkCardLiveStatus.queuedLabel(runtime: runtime(reason: reason, label: nil), now: Date()),
+                "Unexpected state — the engine sent no reason for this wait"
+            )
+        }
+    }
+
+    func testUnclassifiedWaitSaysTheStateIsUnexpected() {
+        let label = "the engine has no reason recorded for this wait"
+        let unclassified = runtime(reason: "unclassified", label: label, status: "waiting_dependency")
+        XCTAssertEqual(
+            WorkCardLiveStatus.queuedLabel(runtime: unclassified, now: Date()),
+            "Unexpected state — \(label)"
+        )
+        XCTAssertEqual(
+            WorkCardLiveStatus.nextUpLabel(runtime: unclassified, now: Date()),
+            "Next up — Unexpected state — \(label)"
+        )
+        XCTAssertEqual(WorkCardLiveStatus.resolve(
+            task: task(status: "active"), column: .doing, runtime: unclassified, liveState: nil
+        ), "Unexpected state — \(label)")
+    }
+
+    /// Every queued shape, with and without an engine reason: none of them
+    /// renders "unknown", and none renders an empty reason.
+    func testNoQueuedCardRendersUnknown() {
+        var notBefore = runtime(reason: "not_before", label: "held until its scheduled dispatch time")
+        notBefore.dispatchNotBefore = "1900000000"
+        var retrying = runtime(reason: "not_before", label: "held until its scheduled dispatch time")
+        retrying.dispatchRetryAt = String(Int(Date().timeIntervalSince1970) + 120)
+        let runtimes: [WorkTaskRuntime?] = [
+            nil,
+            runtime(reason: nil, label: nil),
+            runtime(reason: nil, label: nil, status: "waiting_dependency"),
+            runtime(reason: nil, label: nil, status: "queued"),
+            runtime(reason: nil, label: nil, status: "completed"),
+            runtime(reason: "unclassified", label: "the engine has no reason recorded for this wait"),
+            runtime(reason: "pool_exhausted", label: "worker pool full"),
+            runtime(reason: "run_ended", label: "its last run ended; start it again to queue a new run",
+                    status: "cancelled"),
+            notBefore,
+            retrying
+        ]
+        for pending in runtimes {
+            for nextUp in [false, true] {
+                let line = WorkCardLiveStatus.resolve(
+                    task: task(status: "todo"), column: .doing, runtime: pending, liveState: nil, isNextUp: nextUp
+                )
+                let text = line ?? ""
+                XCTAssertFalse(text.isEmpty, "a queued card always has a status line")
+                XCTAssertFalse(text.lowercased().contains("unknown"), text)
+                XCTAssertFalse(text.hasSuffix("— "), text)
+            }
         }
     }
 
     func testNotBeforeIncludesTheRecordedTime() {
-        var pending = runtime(reason: "not_before")
+        let label = "held until its scheduled dispatch time"
+        var pending = runtime(reason: "not_before", label: label)
         pending.dispatchNotBefore = "1900000000"
         let date = Date(timeIntervalSince1970: 1_900_000_000)
         XCTAssertEqual(
             WorkCardLiveStatus.queuedLabel(runtime: pending, now: Date()),
             "Queued — not before \(date.formatted(date: .abbreviated, time: .shortened))"
         )
+        // A deadline the app cannot parse still names the hold, in the
+        // engine's words.
         pending.dispatchNotBefore = "bad"
-        XCTAssertEqual(WorkCardLiveStatus.queuedLabel(runtime: pending, now: Date()), "Queued — reason unknown")
+        XCTAssertEqual(WorkCardLiveStatus.queuedLabel(runtime: pending, now: Date()), "Queued — \(label)")
     }
 
     func testRetryBackoffWinsOverNotBeforeWhenBothAreSet() {
         let now = Date()
         let future = String(Int(now.timeIntervalSince1970) + 120)
-        var pending = runtime(reason: "not_before")
+        var pending = runtime(reason: "not_before", label: "held until its scheduled dispatch time")
         pending.dispatchNotBefore = future
         pending.dispatchRetryAt = future
         XCTAssertTrue(WorkCardLiveStatus.queuedLabel(runtime: pending, now: now)
@@ -49,11 +115,13 @@ final class QueuedWaitTests: XCTestCase {
         let client = EngineClient(socketPath: "/tmp/queued-project-test-\(UUID().uuidString).sock")
         let pending = try XCTUnwrap(client.parseTaskRuntime([
             "work_item_id": "task_waiting", "execution_status": "waiting_dependency",
-            "dispatch_wait_reason": "waiting_dependency",
+            "dispatch_wait_reason": "waiting_dependency", "dispatch_wait_label": "waiting for P7",
             "dispatch_wait_blocker": [
                 "work_item_id": "proj_blocker", "product_id": "product_test", "short_id": 7, "kind": "project"
             ]
         ]))
+        XCTAssertEqual(pending.dispatchWaitLabel, "waiting for P7")
+        XCTAssertEqual(pending.dispatchWaitBlocker?.label, "P7")
         XCTAssertEqual(WorkCardLiveStatus.queuedLabel(runtime: pending, now: Date()), "Queued — waiting for P7")
     }
 
@@ -61,7 +129,7 @@ final class QueuedWaitTests: XCTestCase {
         let client = EngineClient(socketPath: "/tmp/queued-wait-test-\(UUID().uuidString).sock")
         let pending = try XCTUnwrap(client.parseTaskRuntime([
             "work_item_id": "task_waiting", "execution_status": "waiting_dependency",
-            "dispatch_wait_reason": "waiting_dependency",
+            "dispatch_wait_reason": "waiting_dependency", "dispatch_wait_label": "waiting for T\(42)",
             "dispatch_wait_blocker": [
                 "work_item_id": "task_blocker", "product_id": "product_test", "short_id": 42
             ]
@@ -81,32 +149,36 @@ final class QueuedWaitTests: XCTestCase {
         // Reproduce a claimed execution with stale wait fields: the state wins,
         // and both the text and the clickable target disappear in the same snapshot.
         model.taskRuntimesByID[waiting.id] = runtime(
-            reason: "waiting_dependency", status: "claimed", blocker: blocker
+            reason: "waiting_dependency", label: "waiting for T\(42)", status: "claimed", blocker: blocker
         )
         let claimed = self.snapshot(model, waiting)
         XCTAssertNotEqual(snapshot, claimed)
         XCTAssertEqual(claimed.liveStatus, "Starting worker")
         XCTAssertNil(WorkBoardCardLiveStatusRowSlice(snapshot: claimed)?.blocker)
-        model.taskRuntimesByID[waiting.id] = runtime(reason: nil, status: "running")
+        model.taskRuntimesByID[waiting.id] = runtime(reason: nil, label: nil, status: "running")
         let running = self.snapshot(model, task(id: waiting.id, status: "active"))
         XCTAssertNil(running.liveStatus)
         XCTAssertNil(running.dispatchWaitBlocker)
     }
 
-    func testQueuedActiveCardAndOldPayloadRemainReadable() throws {
-        let pending = runtime(reason: "dispatch_paused")
+    func testQueuedActiveCardAndAPayloadWithNoReasonRemainReadable() throws {
+        let pending = runtime(reason: "dispatch_paused", label: "dispatch paused")
         XCTAssertEqual(WorkCardLiveStatus.resolve(
             task: task(status: "active"), column: .doing, runtime: pending, liveState: nil
         ), "Queued — dispatch paused")
+        // A runtime that carries no reason at all (an engine that predates
+        // the wait classifier) is not given one by the app.
         let client = EngineClient(socketPath: "/tmp/queued-old-test-\(UUID().uuidString).sock")
-        let old = try XCTUnwrap(client.parseTaskRuntime(["work_item_id": "task_waiting"]))
-        XCTAssertNil(old.dispatchWaitBlocker)
+        let bare = try XCTUnwrap(client.parseTaskRuntime(["work_item_id": "task_waiting"]))
+        XCTAssertNil(bare.dispatchWaitBlocker)
+        XCTAssertNil(bare.dispatchWaitLabel)
         XCTAssertEqual(WorkCardLiveStatus.resolve(
-            task: task(status: "todo"), column: .doing, runtime: old, liveState: nil
-        ), "Queued — reason unknown")
+            task: task(status: "todo"), column: .doing, runtime: bare, liveState: nil
+        ), "Unexpected state — the engine sent no reason for this wait")
         let blocker = DispatchWaitBlocker(workItemID: "task_internal", productID: "product_test", shortID: nil)
         XCTAssertEqual(WorkCardLiveStatus.queuedLabel(
-            runtime: runtime(reason: "waiting_dependency", blocker: blocker), now: Date()
+            runtime: runtime(reason: "waiting_dependency", label: "waiting for a dependency", blocker: blocker),
+            now: Date()
         ), "Queued — waiting for a dependency")
     }
 
@@ -142,15 +214,23 @@ final class QueuedWaitTests: XCTestCase {
 
     func testExistingHoldWordingIsPreserved() {
         let reason = "blocked by T\(42) 'Earlier review' on example/repo#42"
-        let held = runtime(reason: reason)
+        let held = runtime(reason: reason, label: reason)
         XCTAssertEqual(WorkCardLiveStatus.queuedLabel(runtime: held, now: Date()), "Queued — \(reason)")
     }
 
-    func testQueuedTaskDoesNotReuseThePreviousTerminalExecutionsReason() {
-        let stale = runtime(reason: "blocked by an earlier review", status: "completed")
+    /// A card the board queues with no execution pending shows the engine's
+    /// reason for that state. A finished run's hold is never reused: the
+    /// engine does not send one, and the app does not keep one.
+    func testQueuedCardWithNothingPendingShowsTheEnginesReason() {
+        let label = "its last run ended; start it again to queue a new run"
         XCTAssertEqual(WorkCardLiveStatus.resolve(
-            task: task(status: "todo"), column: .doing, runtime: stale, liveState: nil
-        ), "Queued — reason unknown")
+            task: task(status: "todo"), column: .doing,
+            runtime: runtime(reason: "run_ended", label: label, status: "completed"), liveState: nil
+        ), "Queued — \(label)")
+        XCTAssertEqual(WorkCardLiveStatus.resolve(
+            task: task(status: "todo"), column: .doing,
+            runtime: runtime(reason: nil, label: nil, status: "completed"), liveState: nil
+        ), "Unexpected state — the engine sent no reason for this wait")
     }
 
     private func snapshot(_ model: ChatViewModel, _ task: WorkTask) -> WorkCardSnapshot {
@@ -158,10 +238,13 @@ final class QueuedWaitTests: XCTestCase {
                                isFrontierHighlighted: false, boardStyle: .elevated, liveState: nil)
     }
 
-    private func runtime(reason: String?, status: String = "ready", blocker: DispatchWaitBlocker? = nil) -> WorkTaskRuntime {
+    /// `label` is the phrase the engine sends with `reason`.
+    private func runtime(
+        reason: String?, label: String?, status: String = "ready", blocker: DispatchWaitBlocker? = nil
+    ) -> WorkTaskRuntime {
         WorkTaskRuntime(workItemID: "task_waiting", executionStatus: status, runStatus: nil,
                         executionID: "exec_waiting", dispatchRetryAt: nil, dispatchWaitReason: reason,
-                        dispatchWaitSince: nil, dispatchWaitBlocker: blocker)
+                        dispatchWaitSince: nil, dispatchWaitBlocker: blocker, dispatchWaitLabel: label)
     }
 
     private func task(id: String = "task_waiting", status: String) -> WorkTask {
