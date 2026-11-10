@@ -16,6 +16,13 @@
 
 use super::*;
 
+/// Boss-synthesized `trunk_merge_intents.last_trunk_state` sentinels. Trunk
+/// never writes these; they are namespaced `boss:` so they cannot collide
+/// with a real (or future) Trunk state string.
+pub const TRUNK_INTENT_AWAITING_RESUBMIT: &str = "boss:awaiting_resubmit";
+pub const TRUNK_INTENT_SUPERSEDED_BY_CONFLICT: &str = "boss:superseded_by_conflict";
+pub const TRUNK_INTENT_SUBMIT_FAILED: &str = "boss:submit_failed";
+
 /// One `trunk_merge_intents` row.
 ///
 /// `bon::Builder` is kept here even though nothing constructs one today
@@ -159,15 +166,19 @@ impl WorkDb {
     /// The active `trunk_merge_intents` row for `work_item_id`, if any.
     pub fn get_active_trunk_merge_intent(&self, work_item_id: &str) -> Result<Option<TrunkMergeIntent>> {
         let conn = self.connect()?;
-        let sql = format!(
-            "SELECT {TRUNK_MERGE_INTENT_COLUMNS} FROM trunk_merge_intents \
-             WHERE work_item_id = ?1 AND status = 'active'"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let row = stmt
-            .query_row(params![work_item_id], map_trunk_merge_intent)
-            .optional()?;
-        Ok(row)
+        query_active_trunk_merge_intent(&conn, work_item_id)
+    }
+
+    /// Flip an active intent to [`TRUNK_INTENT_AWAITING_RESUBMIT`] when its
+    /// current `last_trunk_state` is one of `allowed_from`. A no-op when there
+    /// is no active intent or it is in a different sub-state.
+    pub fn mark_active_trunk_intent_awaiting_resubmit(
+        &self,
+        work_item_id: &str,
+        allowed_from: &[&str],
+    ) -> Result<bool> {
+        let conn = self.connect()?;
+        mark_active_trunk_intent_awaiting_resubmit_in_tx(&conn, work_item_id, allowed_from)
     }
 
     /// Every `active` intent whose task is still live, oldest first.
@@ -274,15 +285,7 @@ impl WorkDb {
     /// Only ever touches an `active` row.
     pub fn record_trunk_merge_intent_state(&self, id: &str, state: &str) -> Result<bool> {
         let conn = self.connect()?;
-        let changed = conn.execute(
-            "UPDATE trunk_merge_intents
-             SET last_trunk_state = ?2, last_trunk_state_at = ?3
-             WHERE id = ?1
-               AND status = 'active'
-               AND (last_trunk_state IS NULL OR last_trunk_state <> ?2)",
-            params![id, state, now_string()],
-        )?;
-        Ok(changed > 0)
+        record_trunk_merge_intent_state_in_tx(&conn, id, state)
     }
 
     /// Record a Boss-driven resubmit: bump `submit_count` and clear
@@ -347,6 +350,48 @@ fn query_trunk_merge_intent(conn: &Connection, id: &str) -> Result<Option<TrunkM
     let mut stmt = conn.prepare(&sql)?;
     let row = stmt.query_row(params![id], map_trunk_merge_intent).optional()?;
     Ok(row)
+}
+
+fn query_active_trunk_merge_intent(conn: &Connection, work_item_id: &str) -> Result<Option<TrunkMergeIntent>> {
+    let sql = format!(
+        "SELECT {TRUNK_MERGE_INTENT_COLUMNS} FROM trunk_merge_intents \
+         WHERE work_item_id = ?1 AND status = 'active'"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let row = stmt
+        .query_row(params![work_item_id], map_trunk_merge_intent)
+        .optional()?;
+    Ok(row)
+}
+
+fn record_trunk_merge_intent_state_in_tx(conn: &Connection, id: &str, state: &str) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE trunk_merge_intents
+         SET last_trunk_state = ?2, last_trunk_state_at = ?3
+         WHERE id = ?1
+           AND status = 'active'
+           AND (last_trunk_state IS NULL OR last_trunk_state <> ?2)",
+        params![id, state, now_string()],
+    )?;
+    Ok(changed > 0)
+}
+
+pub(crate) fn mark_active_trunk_intent_awaiting_resubmit_in_tx(
+    conn: &Connection,
+    work_item_id: &str,
+    allowed_from: &[&str],
+) -> Result<bool> {
+    let Some(intent) = query_active_trunk_merge_intent(conn, work_item_id)? else {
+        return Ok(false);
+    };
+    if !intent
+        .last_trunk_state
+        .as_deref()
+        .is_some_and(|state| allowed_from.contains(&state))
+    {
+        return Ok(false);
+    }
+    record_trunk_merge_intent_state_in_tx(conn, &intent.id, TRUNK_INTENT_AWAITING_RESUBMIT)
 }
 
 #[cfg(test)]

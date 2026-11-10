@@ -68,8 +68,8 @@ use crate::work::{PendingMergeCheck, TrunkMergeIntentInsertInput, WorkDb};
 /// sweep after this ships would otherwise adopt every long-abandoned queue
 /// attempt in the repo at once — each minting a `ci-fix` revision, and each
 /// carrying the same authority as a merge-verb intent, whose tail is
-/// `ci_watch::on_ci_resolved` -> `mark_trunk_intent_awaiting_resubmit` ->
-/// `resubmit_intent`. That is Boss re-enqueueing and merging a PR whose
+/// `clear_resolved_signal_in_tx` -> `mark_active_trunk_intent_awaiting_resubmit`
+/// -> `resubmit_intent`. That is Boss re-enqueueing and merging a PR whose
 /// queue attempt a human deliberately walked away from days ago, which no
 /// part of this design intends.
 ///

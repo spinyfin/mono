@@ -8,6 +8,7 @@
 //! | `--outcome delivered` | `progressed` | the run acted, or diagnosed and left the item to the work it created |
 //! | `--outcome no-changes-needed` | `no_action` | the run judged the item not stuck in a way any verb addresses; files nothing |
 //! | `--outcome blocked --question … --criterion …` | `asked` | the owner was asked one specific question |
+//! | (finalization, work resumed) | `withdrawn` | a question was filed then withdrawn; it never reached the owner |
 //!
 //! There is no PR to resolve (the run holds no checkout), so `delivered` and
 //! `no-changes-needed` finish the run without looking for one. A bare `blocked`
@@ -129,14 +130,14 @@ pub(crate) fn record_disposition(conn: &Connection, execution_id: &str, outcome:
 /// item was stuck in, so a `deliberate_park` / `nudge_breaker` attention is
 /// resolved and any dispatch-failure stamp is cleared; the question is the one
 /// hold, and the owner's answer restarts the item.
-fn park_item_on_question(conn: &Connection, execution: &WorkExecution) -> Result<()> {
+fn park_item_on_question(conn: &Connection, execution: &WorkExecution) -> Result<bool> {
     if crate::progression_verbs::live_or_pending_execution(conn, &execution.work_item_id)?.is_some() {
         conn.execute(
             "UPDATE operator_questions SET status = 'withdrawn', withdrawn_reason = 'work_resumed'
              WHERE execution_id = ?1 AND status = 'open'",
             [&execution.id],
         )?;
-        return Ok(());
+        return Ok(true);
     }
     let question: Option<String> = conn
         .query_row(
@@ -148,7 +149,7 @@ fn park_item_on_question(conn: &Connection, execution: &WorkExecution) -> Result
         .optional()?;
     let Some(question) = question else {
         // Superseded or withdrawn: there is nothing for the item to wait on.
-        return Ok(());
+        return Ok(true);
     };
     crate::task_status_audit::execute(
         conn,
@@ -168,7 +169,7 @@ fn park_item_on_question(conn: &Connection, execution: &WorkExecution) -> Result
         ],
     )?;
     crate::dispatch_admission::resolve_deliberate_park_attention(conn, &execution.work_item_id)?;
-    Ok(())
+    Ok(false)
 }
 
 #[work_db_boundary::instrument]
@@ -219,7 +220,12 @@ impl WorkDb {
             .map_err(anyhow::Error::msg)?;
         let mut pending = PendingEvents::new();
         if disposition == ProgressionDisposition::Asked {
-            park_item_on_question(&tx, &execution)?;
+            if park_item_on_question(&tx, &execution)? {
+                tx.execute(
+                    "UPDATE work_executions SET progression_disposition = ?2 WHERE id = ?1",
+                    params![execution_id, ProgressionDisposition::Withdrawn.as_str()],
+                )?;
+            }
             stage_task_board_change(&mut pending, &tx, &execution.work_item_id)?;
         }
         let summary: Option<String> = tx

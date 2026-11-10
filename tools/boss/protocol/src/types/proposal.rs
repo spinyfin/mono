@@ -664,6 +664,8 @@ pub struct UnblockProposalPayload {}
 /// (`work_executions.progression_disposition`) when it declares `done`
 /// (design 2.5). There is deliberately no "needs a human" value: a run that
 /// needs the owner must say what it needs, as a question (`Asked`).
+/// `Withdrawn` is written at finalization when that question never reached
+/// the owner because work resumed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProgressionDisposition {
@@ -675,6 +677,11 @@ pub enum ProgressionDisposition {
     NoAction,
     /// `done --outcome blocked` with a question: the owner was asked.
     Asked,
+    /// A question was filed at submission, then withdrawn at finalization
+    /// because work had resumed. Distinct from [`Self::Asked`] (the question
+    /// never reached the owner) and from [`Self::NoAction`] (three consecutive
+    /// `no_action` runs fire the escalation ladder).
+    Withdrawn,
 }
 
 impl ProgressionDisposition {
@@ -682,6 +689,7 @@ impl ProgressionDisposition {
         ProgressionDisposition::Progressed,
         ProgressionDisposition::NoAction,
         ProgressionDisposition::Asked,
+        ProgressionDisposition::Withdrawn,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -689,6 +697,7 @@ impl ProgressionDisposition {
             ProgressionDisposition::Progressed => "progressed",
             ProgressionDisposition::NoAction => "no_action",
             ProgressionDisposition::Asked => "asked",
+            ProgressionDisposition::Withdrawn => "withdrawn",
         }
     }
 
@@ -715,8 +724,9 @@ impl std::str::FromStr for ProgressionDisposition {
             "progressed" => Ok(ProgressionDisposition::Progressed),
             "no_action" => Ok(ProgressionDisposition::NoAction),
             "asked" => Ok(ProgressionDisposition::Asked),
+            "withdrawn" => Ok(ProgressionDisposition::Withdrawn),
             other => Err(format!(
-                "unknown progression disposition `{other}`; expected one of: progressed, no_action, asked"
+                "unknown progression disposition `{other}`; expected one of: progressed, no_action, asked, withdrawn"
             )),
         }
     }

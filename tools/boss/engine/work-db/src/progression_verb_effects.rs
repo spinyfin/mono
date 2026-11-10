@@ -101,6 +101,7 @@ pub(super) fn revise(
     Ok(Applied {
         subject: String::new(),
         result_ref: Some(revision.id),
+        signal_retirement: None,
     })
 }
 
@@ -169,6 +170,7 @@ pub(super) fn precursor(
     Ok(Applied {
         subject: String::new(),
         result_ref: Some(chore.id),
+        signal_retirement: None,
     })
 }
 
@@ -208,6 +210,7 @@ pub(super) fn depend(
     Ok(Applied {
         result_ref: Some(on.clone()),
         subject: on,
+        signal_retirement: None,
     })
 }
 
@@ -288,6 +291,7 @@ pub(super) fn undepend(
     Ok(Applied {
         result_ref: Some(on.clone()),
         subject: on,
+        signal_retirement: None,
     })
 }
 
@@ -442,6 +446,7 @@ pub(super) fn redispatch(
     Ok(Applied {
         subject: String::new(),
         result_ref: Some(execution.id),
+        signal_retirement: None,
     })
 }
 
@@ -510,18 +515,33 @@ pub(super) fn clear_signal(
         .into());
     }
 
-    let cleared =
-        crate::signal_retirement::clear_resolved_signal_in_tx(conn, pending, &item.id, pr_url, is_ci, PROGRESSION)?;
-    if cleared.is_none() {
-        return Err(precondition(format!(
-            "{} has an unresolved queue-side failure or changed underneath the clear; nothing was written",
-            item.id
-        )));
-    }
+    let retirement = match crate::signal_retirement::clear_resolved_signal_in_tx(
+        conn,
+        pending,
+        &item.id,
+        pr_url,
+        is_ci,
+        PROGRESSION,
+    )? {
+        crate::ClearResolvedSignal::Applied(retirement) => *retirement,
+        crate::ClearResolvedSignal::QueueSideUnresolved { .. } => {
+            return Err(precondition(format!(
+                "{} has an unresolved queue-side failure; head CI is not evidence it cleared",
+                item.id
+            )));
+        }
+        crate::ClearResolvedSignal::Nothing => {
+            return Err(precondition(format!(
+                "{} changed underneath the clear; nothing was written",
+                item.id
+            )));
+        }
+    };
     stage_task_board_change(pending, conn, &item.id)?;
     Ok(Applied {
         subject: reason.to_owned(),
         result_ref: Some(item.id.clone()),
+        signal_retirement: Some(retirement),
     })
 }
 
@@ -596,6 +616,7 @@ pub(super) fn archive_revision(
     Ok(Applied {
         result_ref: Some(revision.id),
         subject: target,
+        signal_retirement: None,
     })
 }
 
@@ -677,5 +698,6 @@ pub(super) fn unblock(conn: &Connection, pending: &mut PendingEvents, ctx: &Verb
     Ok(Applied {
         subject: String::new(),
         result_ref: Some(item.id.clone()),
+        signal_retirement: None,
     })
 }

@@ -39,8 +39,8 @@ use crate::merge_poller::{PrLifecycleProbe, pr_labels_opt_out, stored_pr_number}
 #[cfg(test)]
 use crate::work::TaskStatus;
 use crate::work::{
-    ARCHIVE_MECHANISM_CONFLICT_WATCH_SUPERSESSION, ArchiveProvenance, ConflictResolutionInsertInput, PendingMergeCheck,
-    PrStateChecker, WorkDb,
+    ARCHIVE_MECHANISM_CONFLICT_WATCH_SUPERSESSION, ArchiveProvenance, ClearResolvedSignal,
+    ConflictResolutionInsertInput, PendingMergeCheck, PrStateChecker, WorkDb,
 };
 use boss_execution_contracts::{CubeClient, ExecutionPublisher};
 
@@ -1647,42 +1647,26 @@ pub async fn on_resolved(
     }
     crate::conflict_ladder::clear_lockfile_regeneration_failed_attention(work_db, &candidate.work_item_id);
     let result = match work_db.clear_resolved_pr_signal(&candidate.work_item_id, &candidate.pr_url, false) {
-        Ok(Some(result)) => result,
-        Ok(None) => return false,
+        Ok(ClearResolvedSignal::Applied(result)) => *result,
+        Ok(ClearResolvedSignal::QueueSideUnresolved { .. } | ClearResolvedSignal::Nothing) => return false,
         Err(err) => {
-            tracing::warn!(?err, "conflict_watch: signal retirement failed");
+            tracing::warn!(
+                ?err,
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                "conflict_watch: signal retirement failed"
+            );
             return false;
         }
     };
-    if let Some(succeeded) = result.conflict_attempt {
-        if let (Some(client), Some(lease)) = (cube_client, succeeded.cube_lease_id.as_deref())
-            && let Err(err) = client.release_workspace(lease).await
-        {
-            tracing::debug!(?err, "conflict_watch: lease release on retire failed");
-        }
-        publisher
-            .publish_frontend_event_on_product(
-                &candidate.product_id,
-                FrontendEvent::ConflictResolutionSucceeded {
-                    attempt: work_db.remediation_entry(succeeded.list_entry()),
-                    product_id: candidate.product_id.clone(),
-                    work_item_id: candidate.work_item_id.clone(),
-                    attempt_id: succeeded.id.clone(),
-                    pr_url: candidate.pr_url.clone(),
-                },
-            )
-            .await;
-    }
-    if result.task_transitioned {
-        publisher
-            .publish_work_item_changed(
-                &candidate.product_id,
-                &candidate.work_item_id,
-                "merge_conflict_resolved",
-            )
-            .await;
-    }
+    let attempt_id = result.conflict_attempt.as_ref().map(|attempt| attempt.id.clone());
+    let task_transitioned = result.task_transitioned;
+    crate::ci_watch::apply_retired_signal(work_db, publisher, cube_client, candidate, result).await;
     tracing::info!(
+        work_item_id = %candidate.work_item_id,
+        pr_url = %candidate.pr_url,
+        attempt_id = attempt_id.as_deref(),
+        task_transitioned,
         raw_mergeable,
         raw_merge_state_status,
         "conflict_watch: PR mergeable again; retire path ran"

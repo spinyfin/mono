@@ -77,6 +77,11 @@ pub struct SubmitWorkerProposalOutcome {
     /// submission's own transaction and has no publisher of its own, unlike
     /// `finalize_passes.rs`'s member-failure dispatch, which does.
     pub review_batch_quorum_outcome: Option<super::ReviewBatchQuorumOutcome>,
+    /// Present only for a fresh progression `clear-signal` that retired a
+    /// CI or conflict attempt. The caller runs the shared post-commit
+    /// retirement handler after this transaction commits. `None` on replay
+    /// and on every other kind.
+    pub signal_retirement: Option<super::SignalRetirement>,
 }
 
 // ---- mapper ----
@@ -326,6 +331,7 @@ impl WorkDb {
                     already_submitted: true,
                     staged_followup: None,
                     review_batch_quorum_outcome: None,
+                    signal_retirement: None,
                 }));
             }
 
@@ -498,6 +504,7 @@ impl WorkDb {
             already_submitted: false,
             staged_followup,
             review_batch_quorum_outcome,
+            signal_retirement: None,
         }))
     }
 

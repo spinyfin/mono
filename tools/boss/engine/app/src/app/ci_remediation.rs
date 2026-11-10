@@ -195,9 +195,9 @@ pub(super) async fn handle_mark_ci_remediation_retriggered(ctx: Dispatch, req: F
             );
             // The resubmit path differs by kind: for `trunk_queue_eviction`
             // the engine itself owns the resubmit (see
-            // `trunk_merge::mark_trunk_intent_awaiting_resubmit`, driven by
-            // `ci_watch::on_ci_resolved`'s `trunk_eviction_fix_concluded`
-            // gate). `merge_queue_rebounce` has no Boss sentinel and no
+            // `clear_resolved_signal_in_tx`, which marks the intent
+            // awaiting resubmit once the spawned revision comes to rest
+            // and head CI is green). `merge_queue_rebounce` has no Boss sentinel and no
             // engine-initiated resubmit at all — GitHub's own merge queue
             // automatically re-tries an evicted-but-still-armed PR once its
             // checks pass again; telling a rebounce worker to wait on an

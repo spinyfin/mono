@@ -43,13 +43,14 @@ use serde::Serialize;
 use crate::blocking_signal::{self, SignalKind};
 use crate::work::{
     ARCHIVE_MECHANISM_CI_WATCH_SUPERSESSION, ArchiveProvenance, CiRemediation, CiRemediationInsertInput,
-    CreateExecutionInput, PendingMergeCheck, PrStateChecker, StrandedCiRemediationAttempt, WorkDb,
+    ClearResolvedSignal, CreateExecutionInput, PendingMergeCheck, PrStateChecker, SignalRetirement,
+    StrandedCiRemediationAttempt, WorkDb,
 };
 use crate::{
     OpenPrCiStatus, OpenPrMergeability, PrLifecycleProbe, PrLifecycleState, RequiredCheckFailure, pr_labels_opt_out,
     stored_pr_number,
 };
-use boss_execution_contracts::ExecutionPublisher;
+use boss_execution_contracts::{CubeClient, ExecutionPublisher};
 
 /// Pre-spawn classification (design §Q4 "pre-triage"): if every failure
 /// has `conclusion ∈ {STARTUP_FAILURE, CANCELLED}` (engine-discernible
@@ -2237,6 +2238,80 @@ pub(crate) fn retire_moot_ci_fix_revisions(
     }
     closed
 }
+/// Post-commit effects after a retire transaction commits: release a
+/// succeeded conflict attempt's cube lease and publish the typed CI /
+/// conflict completion events. Shared by the poller retire paths and
+/// progression `clear-signal`. Callers must not invoke this on a
+/// replayed submission — the durable writes already happened.
+pub async fn apply_retired_signal(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    cube_client: Option<&dyn CubeClient>,
+    candidate: &PendingMergeCheck,
+    result: SignalRetirement,
+) {
+    if let Some(succeeded) = result.conflict_attempt {
+        if let (Some(client), Some(lease)) = (cube_client, succeeded.cube_lease_id.as_deref())
+            && let Err(err) = client.release_workspace(lease).await
+        {
+            tracing::debug!(?err, "conflict_watch: lease release on retire failed");
+        }
+        publisher
+            .publish_frontend_event_on_product(
+                &candidate.product_id,
+                FrontendEvent::ConflictResolutionSucceeded {
+                    attempt: work_db.remediation_entry(succeeded.list_entry()),
+                    product_id: candidate.product_id.clone(),
+                    work_item_id: candidate.work_item_id.clone(),
+                    attempt_id: succeeded.id.clone(),
+                    pr_url: candidate.pr_url.clone(),
+                },
+            )
+            .await;
+    }
+    if result.ci {
+        let had_ci_attempt = result.ci_attempt.is_some();
+        if let Some(succeeded) = result.ci_attempt {
+            publisher
+                .publish_frontend_event_on_product(
+                    &candidate.product_id,
+                    FrontendEvent::CiRemediationSucceeded {
+                        attempt: work_db.remediation_entry(succeeded.list_entry()),
+                        product_id: candidate.product_id.clone(),
+                        work_item_id: candidate.work_item_id.clone(),
+                        attempt_id: succeeded.id.clone(),
+                        pr_url: candidate.pr_url.clone(),
+                    },
+                )
+                .await;
+        } else {
+            publisher
+                .publish_frontend_event_on_product(
+                    &candidate.product_id,
+                    FrontendEvent::CiFailureCleared {
+                        product_id: candidate.product_id.clone(),
+                        work_item_id: candidate.work_item_id.clone(),
+                        pr_url: candidate.pr_url.clone(),
+                    },
+                )
+                .await;
+        }
+        if result.task_transitioned || !had_ci_attempt {
+            publisher
+                .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, "ci_failure_resolved")
+                .await;
+        }
+    } else if result.task_transitioned {
+        publisher
+            .publish_work_item_changed(
+                &candidate.product_id,
+                &candidate.work_item_id,
+                "merge_conflict_resolved",
+            )
+            .await;
+    }
+}
+
 /// Symmetric retire path: flip a `blocked: ci_failure` (or
 /// `ci_failure_exhausted`) row back to `in_review` when the probe
 /// says CI is green again. Returns `true` on transition.
@@ -2256,44 +2331,27 @@ pub async fn on_ci_resolved(
     }
 
     let result = match work_db.clear_resolved_pr_signal(&candidate.work_item_id, &candidate.pr_url, true) {
-        Ok(Some(result)) => result,
-        Ok(None) => return false,
+        Ok(ClearResolvedSignal::Applied(result)) => *result,
+        Ok(ClearResolvedSignal::QueueSideUnresolved { attempt }) => {
+            record_declined_evaluation(candidate, &attempt, None, "queue_failure_not_cleared_by_head_ci_clean");
+            return false;
+        }
+        Ok(ClearResolvedSignal::Nothing) => return false,
         Err(err) => {
             tracing::warn!(?err, work_item_id = %candidate.work_item_id, "ci_watch: signal retirement failed");
             return false;
         }
     };
-    let publish_change = result.task_transitioned || result.ci_attempt.is_none();
-    if let Some(succeeded) = result.ci_attempt {
-        publisher
-            .publish_frontend_event_on_product(
-                &candidate.product_id,
-                FrontendEvent::CiRemediationSucceeded {
-                    attempt: work_db.remediation_entry(succeeded.list_entry()),
-                    product_id: candidate.product_id.clone(),
-                    work_item_id: candidate.work_item_id.clone(),
-                    attempt_id: succeeded.id.clone(),
-                    pr_url: candidate.pr_url.clone(),
-                },
-            )
-            .await;
-    } else {
-        publisher
-            .publish_frontend_event_on_product(
-                &candidate.product_id,
-                FrontendEvent::CiFailureCleared {
-                    product_id: candidate.product_id.clone(),
-                    work_item_id: candidate.work_item_id.clone(),
-                    pr_url: candidate.pr_url.clone(),
-                },
-            )
-            .await;
-    }
-    if publish_change {
-        publisher
-            .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, "ci_failure_resolved")
-            .await;
-    }
+    let attempt_id = result.ci_attempt.as_ref().map(|attempt| attempt.id.clone());
+    let task_transitioned = result.task_transitioned;
+    apply_retired_signal(work_db, publisher, None, candidate, result).await;
+    tracing::info!(
+        work_item_id = %candidate.work_item_id,
+        pr_url = %candidate.pr_url,
+        attempt_id = attempt_id.as_deref(),
+        task_transitioned,
+        "ci_watch: PR CI clean again; retire path ran"
+    );
     true
 }
 
@@ -2489,3 +2547,180 @@ pub async fn on_pr_merged(work_db: &WorkDb, publisher: &dyn ExecutionPublisher, 
 #[cfg(test)]
 #[path = "ci_watch_tests/mod.rs"]
 mod tests;
+
+#[cfg(test)]
+mod retirement_post_commit_tests {
+    use super::*;
+    use crate::test_support::{RecordingPublisher, create_test_chore_manual, create_test_product};
+    use crate::tests::RecordingCubeClient;
+    use crate::work::{
+        CiRemediationInsertInput, ConflictResolutionInsertInput, FakePrStateChecker, PrOpenState,
+        SubmitWorkerProposalInput,
+    };
+    use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus, ProposalKind};
+
+    fn open_db() -> WorkDb {
+        WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap()
+    }
+
+    fn bind_pr(db: &WorkDb, item: &str, pr: &str) {
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET pr_url = ?2, status = 'in_review' WHERE id = ?1",
+                rusqlite::params![item, pr],
+            )
+            .unwrap();
+    }
+
+    fn progression_run(db: &WorkDb, item: &str, stuck: &str) -> String {
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(item)
+                    .kind(ExecutionKind::Progression)
+                    .status(ExecutionStatus::Running)
+                    .build(),
+            )
+            .unwrap();
+        db.capture_progression_neighbourhood(&execution.id).unwrap();
+        db.record_progression_episode(&execution.id, "fp-retire", stuck)
+            .unwrap();
+        execution.id
+    }
+
+    fn submit_clear(db: &WorkDb, run: &str, item: &str, reason: &str) -> crate::work::SubmitWorkerProposalOutcome {
+        db.submit_progression_verb(
+            SubmitWorkerProposalInput {
+                execution_id: run,
+                work_item_id: item,
+                kind: ProposalKind::ClearSignal,
+                payload_json: &format!(r#"{{"reason":"{reason}"}}"#),
+                idempotency_key: "clear-1",
+            },
+            &FakePrStateChecker::always(PrOpenState::Open),
+        )
+        .unwrap()
+        .unwrap_or_else(|error| panic!("clear-signal refused: {error}"))
+    }
+
+    #[tokio::test]
+    async fn progression_clear_signal_releases_conflict_lease_and_publishes_once() {
+        let db = open_db();
+        let product = create_test_product(&db).id;
+        let item = create_test_chore_manual(&db, product.clone(), "Conflicted").id;
+        let pr = "https://github.com/spinyfin/mono/pull/3522";
+        bind_pr(&db, &item, pr);
+        assert!(db.mark_chore_blocked_merge_conflict(&item, pr).unwrap().is_some());
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET pr_mergeable_state = 'MERGEABLE' WHERE id = ?1",
+                [&item],
+            )
+            .unwrap();
+        let attempt = db
+            .insert_conflict_resolution(ConflictResolutionInsertInput {
+                product_id: product.clone(),
+                work_item_id: item.clone(),
+                pr_url: pr.into(),
+                pr_number: 3522,
+                head_branch: "feature".into(),
+                base_branch: "main".into(),
+                base_sha_at_trigger: Some("base-1".into()),
+                head_sha_before: Some("head-1".into()),
+            })
+            .unwrap()
+            .expect("conflict attempt");
+        db.mark_conflict_resolution_running(&attempt.id, "lease-conflict-1", "ws-1", "worker-1")
+            .unwrap();
+
+        let run = progression_run(&db, &item, "S5_merge_conflict");
+        let outcome = submit_clear(&db, &run, &item, "merge_conflict");
+        let retirement = outcome.signal_retirement.expect("fresh clear-signal retires");
+        let replay = submit_clear(&db, &run, &item, "merge_conflict");
+        assert!(replay.already_submitted);
+        assert!(
+            replay.signal_retirement.is_none(),
+            "replay must not re-run post-commit lease release or events"
+        );
+        let cube = RecordingCubeClient::default();
+        let publisher = RecordingPublisher::default();
+        let candidate = PendingMergeCheck {
+            work_item_id: item.clone(),
+            product_id: product.clone(),
+            pr_url: pr.into(),
+        };
+        apply_retired_signal(&db, &publisher, Some(&cube), &candidate, retirement).await;
+
+        let releases = cube.releases.lock().await.clone();
+        assert_eq!(releases, vec!["lease-conflict-1".to_owned()]);
+        let succeeded = publisher
+            .typed_events
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, event)| matches!(event, FrontendEvent::ConflictResolutionSucceeded { .. }))
+            .count();
+        assert_eq!(succeeded, 1);
+    }
+
+    #[tokio::test]
+    async fn progression_clear_signal_publishes_ci_success_once() {
+        let db = open_db();
+        let product = create_test_product(&db).id;
+        let item = create_test_chore_manual(&db, product.clone(), "CI red").id;
+        let pr = "https://github.com/spinyfin/mono/pull/3523";
+        bind_pr(&db, &item, pr);
+        let attempt = db
+            .insert_ci_remediation(CiRemediationInsertInput {
+                product_id: product.clone(),
+                work_item_id: item.clone(),
+                pr_url: pr.into(),
+                pr_number: 3523,
+                head_branch: "feature".into(),
+                head_sha_at_trigger: "head-1".into(),
+                attempt_kind: "fix".into(),
+                consumes_budget: 1,
+                failed_checks: "[]".into(),
+                failure_kind: "pr_branch_ci".into(),
+                before_commit_sha: None,
+            })
+            .unwrap()
+            .expect("ci attempt");
+        assert!(
+            db.mark_chore_blocked_ci_failure(&item, pr, Some(&attempt.id))
+                .unwrap()
+                .is_some()
+        );
+        db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET ci_required_state = 'success' WHERE id = ?1", [&item])
+            .unwrap();
+
+        let run = progression_run(&db, &item, "S6_ci_failure");
+        let outcome = submit_clear(&db, &run, &item, "ci_failure");
+        let retirement = outcome.signal_retirement.expect("fresh clear-signal retires");
+        let replay = submit_clear(&db, &run, &item, "ci_failure");
+        assert!(replay.already_submitted);
+        assert!(replay.signal_retirement.is_none());
+        let cube = RecordingCubeClient::default();
+        let publisher = RecordingPublisher::default();
+        let candidate = PendingMergeCheck {
+            work_item_id: item.clone(),
+            product_id: product.clone(),
+            pr_url: pr.into(),
+        };
+        apply_retired_signal(&db, &publisher, Some(&cube), &candidate, retirement).await;
+
+        assert!(cube.releases.lock().await.is_empty());
+        let succeeded = publisher
+            .typed_events
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, event)| matches!(event, FrontendEvent::CiRemediationSucceeded { .. }))
+            .count();
+        assert_eq!(succeeded, 1);
+    }
+}

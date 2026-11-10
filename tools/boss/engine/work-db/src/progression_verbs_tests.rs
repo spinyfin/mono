@@ -1442,6 +1442,10 @@ fn question_is_refused_or_withdrawn_when_work_resumes() {
                     fx.db.list_operator_questions(&item).unwrap()[0].status,
                     boss_protocol::OperatorQuestionStatus::Withdrawn
                 );
+                assert_eq!(
+                    fx.db.progression_disposition(&run).unwrap(),
+                    Some(ProgressionDisposition::Withdrawn)
+                );
             }
         }
     }

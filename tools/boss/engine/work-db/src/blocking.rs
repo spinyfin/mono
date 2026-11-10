@@ -4,6 +4,74 @@ use super::*;
 /// `(per_pr_override, product_default, attempts_used, status, blocked_reason)`.
 type CiBudgetRow = (Option<i64>, i64, i64, Option<String>, Option<String>);
 
+pub(crate) fn mark_ci_remediation_succeeded_in_tx(
+    conn: &Connection,
+    attempt_id: &str,
+    head_sha_after: Option<&str>,
+) -> Result<Option<CiRemediation>> {
+    let now = now_string();
+    let rows = conn.execute(
+        "UPDATE ci_remediations
+            SET status         = 'succeeded',
+                head_sha_after = COALESCE(?2, head_sha_after),
+                finished_at    = COALESCE(finished_at, ?3)
+          WHERE id = ?1
+            AND status IN ('pending', 'running')",
+        params![attempt_id, head_sha_after, now],
+    )?;
+    if rows == 0 {
+        return Ok(None);
+    }
+    query_ci_remediation(conn, attempt_id)
+}
+
+pub(crate) fn abandon_active_ci_remediations_for_work_item_in_tx(
+    conn: &Connection,
+    work_item_id: &str,
+    reason: &str,
+    include_queue_side: bool,
+) -> Result<Vec<CiRemediation>> {
+    let now = now_string();
+    let queue_side_filter = if include_queue_side {
+        ""
+    } else {
+        " AND (failure_kind IS NULL OR failure_kind NOT IN ('trunk_queue_eviction', 'merge_queue_rebounce'))"
+    };
+    let ids: Vec<String> = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id FROM ci_remediations
+              WHERE work_item_id = ?1
+                AND status IN ('pending', 'running')
+                {queue_side_filter}
+              ORDER BY created_at ASC, id ASC",
+        ))?;
+        let rows = stmt.query_map([work_item_id], |row| row.get(0))?;
+        collect_rows(rows)?
+    };
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    conn.execute(
+        &format!(
+            "UPDATE ci_remediations
+                SET status         = 'abandoned',
+                    failure_reason = ?2,
+                    finished_at    = COALESCE(finished_at, ?3)
+              WHERE work_item_id = ?1
+                AND status IN ('pending', 'running')
+                {queue_side_filter}",
+        ),
+        params![work_item_id, reason, now],
+    )?;
+    let mut abandoned = Vec::with_capacity(ids.len());
+    for id in &ids {
+        if let Some(row) = query_ci_remediation(conn, id)? {
+            abandoned.push(row);
+        }
+    }
+    Ok(abandoned)
+}
+
 #[work_db_boundary::instrument]
 impl WorkDb {
     /// Chores and project_tasks the engine previously flagged with
@@ -1413,8 +1481,9 @@ impl WorkDb {
     /// consumer of this read. That is survivable only because the settle
     /// paths sweep the whole work item rather than the row this read picked:
     /// see [`Self::abandon_active_ci_remediations_for_work_item`], which
-    /// `on_ci_resolved` and `on_pr_merged` both call. Do not add a consumer
-    /// that assumes this row is the ONLY active attempt.
+    /// `clear_resolved_signal_in_tx` (the poller retire paths and the
+    /// progression `clear-signal` verb) and `on_pr_merged` both call. Do not
+    /// add a consumer that assumes this row is the ONLY active attempt.
     pub fn active_ci_remediation_for_work_item(&self, work_item_id: &str) -> Result<Option<CiRemediation>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
@@ -1631,17 +1700,9 @@ impl WorkDb {
     ) -> Result<Option<CiRemediation>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let now = now_string();
-        let rows = tx.execute(
-            "UPDATE ci_remediations
-                SET status         = 'succeeded',
-                    head_sha_after = COALESCE(?2, head_sha_after),
-                    finished_at    = COALESCE(finished_at, ?3)
-              WHERE id = ?1
-                AND status IN ('pending', 'running')",
-            params![attempt_id, head_sha_after, now],
-        )?;
-        finish_attempt_update(tx, rows, attempt_id, query_ci_remediation)
+        let updated = mark_ci_remediation_succeeded_in_tx(&tx, attempt_id, head_sha_after)?;
+        tx.commit()?;
+        Ok(updated)
     }
 
     /// Honor a *validated-green* "no CI to fix" signal atomically.
@@ -1824,7 +1885,7 @@ impl WorkDb {
     /// `ci_watch::on_ci_resolved` and `on_ci_in_flight_supersedes_failure`).
     /// `ci_watch::on_pr_merged` passes `true`: the PR merging settles every
     /// open CI question unconditionally, queue-side included.
-    /// `ci_watch::on_ci_resolved`'s sweep passes `true` only when the
+    /// `clear_resolved_signal_in_tx`'s sweep passes `true` only when the
     /// attempt it just retired was itself queue-side (the back-to-back
     /// eviction case, where sweeping the older queue-side episode is
     /// correct), and `false` otherwise, so a queue-side row is never
@@ -1837,45 +1898,8 @@ impl WorkDb {
     ) -> Result<Vec<CiRemediation>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let now = now_string();
-        let queue_side_filter = if include_queue_side {
-            ""
-        } else {
-            " AND (failure_kind IS NULL OR failure_kind NOT IN ('trunk_queue_eviction', 'merge_queue_rebounce'))"
-        };
-        let ids: Vec<String> = {
-            let mut stmt = tx.prepare(&format!(
-                "SELECT id FROM ci_remediations
-                  WHERE work_item_id = ?1
-                    AND status IN ('pending', 'running')
-                    {queue_side_filter}
-                  ORDER BY created_at ASC, id ASC",
-            ))?;
-            let rows = stmt.query_map([work_item_id], |row| row.get(0))?;
-            collect_rows(rows)?
-        };
-        if ids.is_empty() {
-            tx.commit()?;
-            return Ok(Vec::new());
-        }
-        tx.execute(
-            &format!(
-                "UPDATE ci_remediations
-                    SET status         = 'abandoned',
-                        failure_reason = ?2,
-                        finished_at    = COALESCE(finished_at, ?3)
-                  WHERE work_item_id = ?1
-                    AND status IN ('pending', 'running')
-                    {queue_side_filter}",
-            ),
-            params![work_item_id, reason, now],
-        )?;
-        let mut abandoned = Vec::with_capacity(ids.len());
-        for id in &ids {
-            if let Some(row) = query_ci_remediation(&tx, id)? {
-                abandoned.push(row);
-            }
-        }
+        let abandoned =
+            abandon_active_ci_remediations_for_work_item_in_tx(&tx, work_item_id, reason, include_queue_side)?;
         tx.commit()?;
         Ok(abandoned)
     }

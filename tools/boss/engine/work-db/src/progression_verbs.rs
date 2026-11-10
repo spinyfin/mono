@@ -239,6 +239,11 @@ pub(crate) struct Applied {
     /// The row the verb created or touched: the revision, the chore, the
     /// execution a redispatch minted, the cleared item.
     pub result_ref: Option<String>,
+    /// Present only for a fresh `clear-signal` that retired a CI or conflict
+    /// attempt. The submission caller runs the shared post-commit handler
+    /// (lease release, typed success events) after this transaction commits.
+    /// Replay leaves this `None` so those effects are not duplicated.
+    pub signal_retirement: Option<crate::SignalRetirement>,
 }
 
 /// The run a verb was submitted from, loaded and checked once per submission.
@@ -537,6 +542,7 @@ impl WorkDb {
                 already_submitted: true,
                 staged_followup: None,
                 review_batch_quorum_outcome: None,
+                signal_retirement: None,
             }));
         }
         let mut counts = crate::proposals::count_proposals_in_tx(&tx, input.execution_id, input.kind)?;
@@ -641,6 +647,7 @@ impl WorkDb {
             already_submitted: false,
             staged_followup: None,
             review_batch_quorum_outcome: None,
+            signal_retirement: applied.signal_retirement,
         }))
     }
 }

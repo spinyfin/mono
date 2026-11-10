@@ -622,11 +622,27 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
             already_submitted,
             staged_followup,
             review_batch_quorum_outcome,
+            signal_retirement,
         })) => {
             record_proposal_submitted(&server_state.metrics, kind);
             if kind.is_progression_verb() && !already_submitted {
                 // A revision, a precursor or a restart may have minted a ready execution.
                 server_state.publisher.kick_scheduler();
+            }
+            if !already_submitted && let Some(retirement) = signal_retirement {
+                let candidate = boss_work_db::PendingMergeCheck {
+                    work_item_id: retirement.work_item_id.clone(),
+                    product_id: retirement.product_id.clone(),
+                    pr_url: retirement.pr_url.clone(),
+                };
+                boss_engine_merge_poller::ci_watch::apply_retired_signal(
+                    &work_db,
+                    server_state.publisher.as_ref(),
+                    Some(server_state.cube_client.as_ref()),
+                    &candidate,
+                    retirement,
+                )
+                .await;
             }
             if let Some(payload) = wait_payload
                 && !already_submitted

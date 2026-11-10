@@ -641,10 +641,12 @@ Scope: in-scope
 - Each verb uses one scoped transaction; refused effects roll back while a refusal counter still consumes the execution's rate allowance.
 - The repeat key is `(item, fingerprint, verb)`; subject remains audit metadata. Refusals identify the prior execution.
 - `precursor` creates a standalone chore in the product so project sequencing cannot order it behind its dependent. Dependency blocks carry progression attribution; release returns an item with an awaiting-review PR to `in_review`.
-- `clear-signal` uses the CI/conflict pollers' shared transactional retirement path, including queue-side eligibility, remediation retirement, moot revisions and signal cleanup.
-- The criterion is stored beside the typed `run_done` payload. A question is refused if work has resumed and withdrawn if work resumes before finalization, without parking the item.
+- `clear-signal` uses the CI/conflict pollers' shared transactional retirement path, including queue-side eligibility, remediation retirement, moot revisions and signal cleanup, then the shared post-commit handler that releases a conflict lease and publishes the typed CI/conflict success events.
+- The criterion is stored beside the typed `run_done` payload. A question is refused if work has resumed and withdrawn if work resumes before finalization, without parking the item. Finalization records disposition `withdrawn` so reports do not count it as asked.
 - Declarations complete progression runs without PR resolution. A declared blocker converts to either a redispatch brief carrying the worker text and addendum, or a question carrying that text in Details and a recorded criterion.
 - The agent rules, verb catalogue and CLI help teach inline `--brief` and `--brief-addendum` text because progression agents cannot write files.
+
+Scope: in-scope
 
 ### Progression escalation ladder
 
