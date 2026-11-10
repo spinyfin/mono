@@ -38,6 +38,11 @@ pub use preserved_cleanup::{PreservedScope, forget_preserved_references};
 #[cfg(test)]
 mod preserved_cleanup_tests;
 
+mod legacy_cleanup;
+pub use legacy_cleanup::{LegacyArchive, LegacyCleanupReport, cleanup_legacy_store};
+#[cfg(test)]
+mod legacy_cleanup_tests;
+
 /// Which invariant a damaged pointer broke. Lineage between the pointers and
 /// the baseline is deliberately not an invariant: jj rewrites commits and
 /// merges concurrent operations as a matter of course, so the recorded

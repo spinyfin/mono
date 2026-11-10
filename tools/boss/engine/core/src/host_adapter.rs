@@ -344,6 +344,18 @@ impl HostAdapter for LocalHostAdapter {
         self.cube_client.list_repos().await
     }
 
+    async fn cleanup_legacy_store(
+        &self,
+        repo: &Path,
+        published_heads: &[String],
+    ) -> Result<execution_bookmark::LegacyCleanupReport> {
+        execution_bookmark::cleanup_legacy_store(&LocalJj, repo, published_heads).await
+    }
+
+    async fn gc_cube_repo(&self, repo_id: &str) -> Result<()> {
+        self.cube_client.gc_repo(repo_id).await
+    }
+
     fn command_repr(&self, args: &[&str]) -> Option<(String, String)> {
         self.cube_client.command_repr(args)
     }
@@ -912,6 +924,18 @@ impl HostAdapter for SshHostAdapter {
 
     async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
         crate::cube_commands::list_repos(self).await
+    }
+
+    async fn cleanup_legacy_store(
+        &self,
+        repo: &Path,
+        published_heads: &[String],
+    ) -> Result<execution_bookmark::LegacyCleanupReport> {
+        execution_bookmark::cleanup_legacy_store(self, repo, published_heads).await
+    }
+
+    async fn gc_cube_repo(&self, repo_id: &str) -> Result<()> {
+        crate::cube_commands::gc_repo(self, repo_id).await
     }
 
     fn command_repr(&self, args: &[&str]) -> Option<(String, String)> {

@@ -144,6 +144,7 @@ pub use boss_metrics as metrics;
 // are `#[macro_export]`ed from `boss_engine_metrics_registry` and
 // re-exported through `boss_metrics`.
 pub use boss_metrics::{register_counter, register_gauge};
+pub mod legacy_store_cleanup;
 pub mod orphan_sweep;
 pub mod planner;
 pub mod pool_claim_sweep;

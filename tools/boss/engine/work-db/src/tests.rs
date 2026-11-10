@@ -585,6 +585,7 @@ mod effort_model_tests;
 mod followup_membership_tests;
 mod human_driven_tests;
 mod idea_tests;
+mod legacy_store_cleanup_tests;
 mod preserved_cleanup_tests;
 mod progression_candidates_tests;
 mod project_membership_move_tests;

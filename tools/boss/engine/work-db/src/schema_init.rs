@@ -795,6 +795,7 @@ mod floor_tests {
         super::super::spoke_ingress::migrate(&expected).unwrap();
         preserved_cleanup::migrate_archive_cleanup(&expected).unwrap();
         super::super::spoke_hub::migrate_legacy_destinations(&expected).unwrap();
+        legacy_store_cleanup::migrate(&expected).unwrap();
         let before = capture(&expected);
         drop(expected);
         let upgrade = |version: i32| {
