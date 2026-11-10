@@ -22,9 +22,7 @@ fn resources() -> (f64, i64) {
 
 #[test]
 fn board_projection_scale_measurement() {
-    let (_dir, path) = disk_db_path("projection-scale");
-    let db = WorkDb::open(path).unwrap();
-    super::work_tree_scale_tests::seed(&db.connect().unwrap());
+    let (_dir, db) = super::work_tree_scale_tests::open_seeded("projection-scale");
     let product = "scale-product-0";
     let samples: usize = std::env::var("BOSS_BENCH_SAMPLES")
         .map(|s| s.parse().unwrap())

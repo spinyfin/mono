@@ -315,6 +315,34 @@ mod tests {
         assert!(view_count(&db.connect().unwrap()) > 0, "init recreates the views");
     }
 
+    /// Independent connections must not queue on a lock shared by the whole
+    /// process. The bundled build gets that from the `libsqlite3-sys`
+    /// annotation in MODULE.bazel; this fails if an upgrade drops an option.
+    #[test]
+    fn sqlite_build_has_no_process_wide_page_cache_lock() {
+        let conn = Connection::open_in_memory().unwrap();
+        let options: Vec<String> = conn
+            .prepare("PRAGMA compile_options")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let has = |option: &str| options.iter().any(|found| found == option);
+        assert!(
+            !has("ENABLE_MEMORY_MANAGEMENT"),
+            "every connection shares one page cache and its mutex: {options:?}"
+        );
+        assert!(
+            has("DISABLE_PAGECACHE_OVERFLOW_STATS"),
+            "page allocation takes the status-counter mutex: {options:?}"
+        );
+        assert!(
+            has("DEFAULT_MEMSTATUS=0"),
+            "every allocation takes the memory-accounting mutex: {options:?}"
+        );
+    }
+
     #[test]
     fn fresh_database_produces_current_schema() {
         let db = WorkDb::open_in_memory().unwrap();
@@ -765,7 +793,7 @@ mod floor_tests {
         super::super::dispatch_focus::migrate_explicit_launch(&expected).unwrap();
         let before = capture(&expected);
         drop(expected);
-        for version in 32..=60 {
+        let upgrade = |version: i32| {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("supported.db");
             let conn = Connection::open(&path).unwrap();
@@ -895,7 +923,14 @@ mod floor_tests {
                     .unwrap();
                 assert_eq!(value, "keep me");
             }
-        }
+        };
+        // Every version upgrades a database of its own, so none waits on another.
+        let upgrade = &upgrade;
+        std::thread::scope(|scope| {
+            for version in 32..=60 {
+                scope.spawn(move || upgrade(version));
+            }
+        });
     }
 
     #[test]
