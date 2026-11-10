@@ -115,10 +115,9 @@ impl ExecutionCoordinator {
         self.progression_pool = pool;
     }
 
-    /// Declare that a `progression` agent can actually be spawned (see the
-    /// `progression_spawn_enabled` field). Until a progression worker kind is
-    /// registered this stays false, so `progression` executions are held `ready`
-    /// and never reach a worker slot, a cube lease, or a pane.
+    /// Enable spawning the dedicated progression worker. Production enables this
+    /// during server setup; coordinators that do not opt in hold rows ready.
+    /// The default-off `progression_agents` flag controls minting rows.
     pub fn set_progression_spawn_enabled(&mut self, enabled: bool) {
         self.progression_spawn_enabled = enabled;
     }

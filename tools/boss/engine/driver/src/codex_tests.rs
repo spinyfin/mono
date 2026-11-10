@@ -1693,6 +1693,8 @@ fn run_progression_guard(payload: serde_json::Value) -> String {
 #[test]
 fn progression_guard_admits_only_inspection_and_declaration() {
     for command in [
+        "boss propose done --summary 'Is the archived prerequisite still needed?'",
+        "boss propose done --summary '$5 < $10 {estimate} ~ ! * ? [note]'",
         "\"$BOSS_BIN\" propose done --outcome delivered --summary 'stuck item re-dispatched'",
         "boss task show chore_1 --json",
         "\"$BOSS_BIN\" task list --json",
@@ -1707,6 +1709,9 @@ fn progression_guard_admits_only_inspection_and_declaration() {
     }
     for command in [
         "gh pr comment 1 --body hi",
+        "boss propose done --summary 'safe'$HOME",
+        "boss propose done --summary \"'unsafe $HOME'\"",
+        "boss propose done --summary \\'$HOME\\'",
         "gh pr merge 1",
         "gh api -X POST repos/o/r/issues",
         "gh api repos/o/r/pulls/1",

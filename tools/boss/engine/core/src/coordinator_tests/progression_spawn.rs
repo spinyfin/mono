@@ -19,7 +19,7 @@ fn fixture() -> Fixture {
     Fixture { db, product, _dir: dir }
 }
 
-/// Every task column a run start used to rewrite (status, autostart and the
+/// The task columns the ordinary run start rewrites (status, autostart and the
 /// `dispatch_failed_*` stamp), plus the fields a reconcile audit would touch.
 fn item_snapshot(db: &WorkDb, id: &str) -> Vec<Option<String>> {
     db.connect()
@@ -83,6 +83,85 @@ async fn assert_no_cube_call(cube: &FakeCubeClient) {
     assert!(cube.create_calls.lock().await.is_empty(), "no change create");
     assert!(cube.release_calls.lock().await.is_empty(), "no release");
     assert!(cube.heartbeat_calls.lock().await.is_empty(), "no lease heartbeat");
+}
+
+#[tokio::test]
+async fn live_progression_does_not_replace_or_abandon_requested_implementation_work() {
+    let f = fixture();
+    let (item_id, run) = f.stuck_item_with_progression_run();
+    let (coordinator, _cube, runner) = f.coordinator(FakeExecutionRunner {
+        pending: true,
+        ..FakeExecutionRunner::default()
+    });
+    coordinator.drain_ready_queue_for_test().await;
+    wait_for_execution_status(&f.db, &run.id, ExecutionStatus::Running).await;
+    let progression_before = f.db.get_execution(&run.id).unwrap();
+    assert!(f.db.live_writers_in_chain(&item_id).unwrap().is_empty());
+
+    let implementation =
+        f.db.request_execution_with_live_check(
+            RequestExecutionInput::builder()
+                .work_item_id(&item_id)
+                .priority(99)
+                .build(),
+            |id| id == run.id,
+        )
+        .unwrap();
+    assert_ne!(implementation.id, run.id);
+    assert_eq!(implementation.kind, ExecutionKind::ChoreImplementation);
+    assert_eq!(implementation.status, ExecutionStatus::Ready);
+    let progression_after = f.db.get_execution(&run.id).unwrap();
+    assert_eq!(progression_after.priority, progression_before.priority);
+    assert_eq!(progression_after.status, ExecutionStatus::Running);
+
+    coordinator
+        .force_dispatch(&implementation.id, DispatchAdmission::OperatorForced)
+        .await
+        .unwrap();
+    wait_for_execution_status(&f.db, &implementation.id, ExecutionStatus::Running).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runner.calls.lock().await.len() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both workers reach the execution runner");
+    assert_eq!(runner.calls.lock().await.len(), 2);
+    let writers = f.db.live_writers_in_chain(&item_id).unwrap();
+    assert_eq!(writers.len(), 1);
+    assert_eq!(writers[0].id, implementation.id);
+    // Progression scheduling must still see real live work on its item.
+    assert_eq!(
+        f.db.get_live_execution_for_work_item(&item_id, &run.id)
+            .unwrap()
+            .unwrap()
+            .id,
+        implementation.id
+    );
+    let _ = boss_execution_contracts::progression_scratch::remove_scratch_dir(&run.id);
+}
+
+#[test]
+fn progression_dedup_still_sees_another_live_progression_run() {
+    let f = fixture();
+    let (item_id, run) = f.stuck_item_with_progression_run();
+    let live =
+        f.db.create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&item_id)
+                .kind(ExecutionKind::Progression)
+                .status(ExecutionStatus::WaitingHuman)
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(
+        f.db.get_live_execution_for_work_item(&item_id, &run.id)
+            .unwrap()
+            .unwrap()
+            .id,
+        live.id
+    );
+    assert!(f.db.get_live_execution_for_work_item(&item_id, "").unwrap().is_none());
 }
 
 #[tokio::test]

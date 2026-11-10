@@ -505,7 +505,7 @@ pub(crate) fn query_latest_execution_for_work_item(
     .map_err(Into::into)
 }
 
-/// Most-recent execution for `work_item_id` whose DB status is *live* —
+/// Most-recent non-progression execution for `work_item_id` whose DB status is *live* —
 /// a worker may currently be attached. Unlike
 /// [`query_latest_execution_for_work_item`], the result is NOT shadowed
 /// by a newer terminal row: a re-dispatch storm produces stalled
@@ -526,6 +526,7 @@ pub(crate) fn query_live_execution_for_work_item(
                 pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
          FROM work_executions
          WHERE work_item_id = ?1
+           AND kind != 'progression'
            AND status IN ('running', 'waiting_human')
          ORDER BY created_at DESC, id DESC
          LIMIT 1",

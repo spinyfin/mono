@@ -1285,7 +1285,7 @@ READ_COMMANDS = ('cat', 'ls', 'head', 'tail', 'nl', 'wc', 'rg')
 SECRET_MARKERS = ('.codex', '.ssh', '.aws', '.gnupg', 'auth.json')
 # Characters the shell expands or reinterprets. shlex does no expansion, so a
 # token it returns is not the argument the shell will pass; admit only text with
-# none of these (after the one literal leading `$BOSS_BIN` executable).
+# none of these outside single quotes (after the leading `$BOSS_BIN`).
 UNSAFE_CHARS = ('$', '<', '>', '{', '}', '~', '!', '*', '?', '[', ']', '\n', '\r', '\x00')
 RG_SAFE_FLAGS = frozenset((
     '-n', '-i', '-S', '-s', '-l', '-c', '-w', '-F', '-v', '-H', '-N', '-o', '-q',
@@ -1304,7 +1304,26 @@ def literal_only(command, head):
             if rest.startswith(form):
                 rest = rest[len(form):]
                 break
-    return not any(ch in rest for ch in UNSAFE_CHARS)
+    quote = None
+    escaped = False
+    for ch in rest:
+        if ch in ('\n', '\r', '\x00'):
+            return False
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            continue
+        if ch in UNSAFE_CHARS:
+            return False
+        if escaped:
+            escaped = False
+        elif ch == '\\':
+            escaped = True
+        elif ch == quote:
+            quote = None
+        elif quote is None and ch in ("'", '"'):
+            quote = ch
+    return quote is None and not escaped
 
 def rg_safe(rest):
     options_done = False
