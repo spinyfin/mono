@@ -56,6 +56,11 @@ pub fn render_progression_claude_md(scratch_dir: &str, boss: &str) -> String {
      \"<one line>\"` as your last command. Describe what you found in the\n\
      summary. There is no pull request to open and no URL to print.\n\
      \n\
+     The engine may refuse `{boss} propose done` for a progression run until\n\
+     progression declarations are enabled. If it does, do not retry it and do\n\
+     not try other proposal kinds: put your findings in your final message and\n\
+     end your turn.\n\
+     \n\
      ## Your working directory\n\
      \n\
      - Scratch directory: `{scratch_dir}`\n\
@@ -91,5 +96,13 @@ mod tests {
         assert!(!md.contains("PR is the deliverable"));
         assert!(!md.contains("pr create --branch"));
         assert!(!md.contains("Cube lease id"));
+    }
+
+    #[test]
+    fn claude_md_tells_the_agent_not_to_retry_a_refused_propose_done() {
+        let md = render_progression_claude_md("/scratch/x", "\"$BOSS_BIN\"");
+        assert!(md.contains("may refuse `\"$BOSS_BIN\" propose done`"));
+        assert!(md.contains("do not retry it"));
+        assert!(md.contains("put your findings in your final message and\nend your turn"));
     }
 }

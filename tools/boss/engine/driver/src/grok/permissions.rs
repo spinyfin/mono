@@ -239,6 +239,21 @@ pub fn extra_args(
             args.extend(["--allow".into(), rule]);
         }
     }
+    // The progression agent gets the same capability table Claude renders into
+    // its settings: under the forced `dontAsk` mode the allowlist is the whole
+    // set of actions it can take, and the deny belt (every write, `jj`/`git`,
+    // `cube`, mutating `gh`) sits on top. This is what confines it on local
+    // macOS, where Grok runs with `--sandbox off` like every other local kind.
+    if worker_kind == WorkerKind::Progression {
+        for rule in crate::capability_rules::progression_deny_rules() {
+            if !args.windows(2).any(|pair| pair[0] == "--deny" && pair[1] == rule) {
+                args.extend(["--deny".into(), rule]);
+            }
+        }
+        for rule in crate::capability_rules::progression_allow_rules() {
+            args.extend(["--allow".into(), rule]);
+        }
+    }
     if let Some(mode) = permission_mode_for_worker_kind(worker_kind) {
         args.push("--permission-mode".to_owned());
         args.push(mode.to_owned());
@@ -262,6 +277,49 @@ mod tests {
         }
         assert!(args.windows(2).any(|pair| pair == ["--deny", "Edit(**)"]));
         assert!(args.windows(2).any(|pair| pair == ["--permission-mode", "dontAsk"]));
+    }
+
+    #[test]
+    fn progression_gets_the_shared_allowlist_deny_belt_and_dont_ask_on_every_platform() {
+        for is_remote in [false, true] {
+            let args = extra_args(WorkerKind::Progression, None, Path::new("/scratch"), is_remote);
+            for rule in crate::capability_rules::progression_allow_rules() {
+                assert!(
+                    args.windows(2).any(|pair| pair == ["--allow", &rule]),
+                    "missing allow {rule}"
+                );
+            }
+            for rule in crate::capability_rules::progression_deny_rules() {
+                assert!(
+                    args.windows(2).any(|pair| pair == ["--deny", &rule]),
+                    "missing deny {rule}"
+                );
+            }
+            for rule in [
+                "Bash(jj:*)",
+                "Bash(git:*)",
+                "Edit(**)",
+                "NotebookEdit(**)",
+                "Bash(cube:*)",
+            ] {
+                assert!(
+                    args.windows(2).any(|pair| pair == ["--deny", rule]),
+                    "missing deny {rule}"
+                );
+            }
+            assert!(args.windows(2).any(|pair| pair == ["--permission-mode", "dontAsk"]));
+            let sandbox = &args[1];
+            if is_remote {
+                assert_eq!(sandbox, "read-only");
+            } else if cfg!(target_os = "macos") {
+                assert_eq!(
+                    sandbox, "off",
+                    "local macOS Grok runs unsandboxed; the rules are the confinement"
+                );
+            } else {
+                assert_eq!(sandbox, "boss-read-only");
+            }
+        }
     }
 
     #[test]

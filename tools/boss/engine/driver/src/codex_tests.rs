@@ -1,6 +1,34 @@
 use super::*;
 
 #[test]
+fn progression_profile_is_read_only_with_the_engine_socket_and_github_hosts_only() {
+    let config: toml::Value = toml::from_str(&render_progression_config(
+        Path::new("/repo"),
+        Path::new("/tmp/frontend.sock"),
+    ))
+    .unwrap();
+    assert_eq!(config["default_permissions"].as_str(), Some("progression"));
+    assert_eq!(
+        config["permissions"]["progression"]["extends"].as_str(),
+        Some(":read-only")
+    );
+    assert!(config.get("sandbox_workspace_write").is_none());
+    assert_eq!(config["web_search"].as_str(), Some("disabled"));
+    let network = &config["permissions"]["progression"]["network"];
+    let sockets = network["unix_sockets"].as_table().unwrap();
+    assert_eq!(sockets.len(), 1);
+    assert_eq!(sockets["/tmp/frontend.sock"].as_str(), Some("allow"));
+    let mut domains: Vec<_> = network["domains"].as_table().unwrap().keys().cloned().collect();
+    domains.sort();
+    assert_eq!(domains, ["api.github.com", "github.com"]);
+    for (_, mode) in network["domains"].as_table().unwrap() {
+        assert_eq!(mode.as_str(), Some("allow"));
+    }
+    let proxy_domains = config["features"]["network_proxy"]["domains"].as_table().unwrap();
+    assert_eq!(proxy_domains.len(), 2);
+}
+
+#[test]
 fn guide_sandbox_is_read_only_with_only_the_proposal_socket() {
     for enforced in [false, true] {
         assert_eq!(codex_sandbox_for_worker_kind(WorkerKind::ReviewGuide, enforced), None);
@@ -1348,13 +1376,12 @@ fn standard_worker_sandbox_defaults_to_danger_full_access() {
         codex_sandbox_for_worker_kind(WorkerKind::AnswerAgent, false),
         Some("danger-full-access")
     );
-    // A progression agent holds no checkout and writes nothing: read-only
-    // whatever the enforcement flag says, never the Standard posture.
+    // A progression agent holds no checkout and writes nothing: its read-only
+    // profile is selected in the rendered config (never the Standard posture,
+    // and no bare `--sandbox read-only` that would cut off the engine socket).
     for enforced in [false, true] {
-        assert_eq!(
-            codex_sandbox_for_worker_kind(WorkerKind::Progression, enforced),
-            Some("read-only")
-        );
+        assert_eq!(codex_sandbox_for_worker_kind(WorkerKind::Progression, enforced), None);
+        assert!(codex_sandbox_extra_args(WorkerKind::Progression, enforced).is_empty());
     }
     // codex_sandbox_enforced=true restores the OS-enforced fence.
     assert_eq!(

@@ -140,3 +140,17 @@ async fn an_ordinary_readopted_worker_stays_at_the_ordinary_tier() {
 
     assert_eq!(spawner.registry.registered_tier(4321), Some(false));
 }
+
+#[test]
+fn an_unreadable_execution_row_registers_the_pane_confined_not_as_an_ordinary_worker() {
+    let (_dir, db) = open_db_arc();
+    let spawner = RecordingSpawner::default();
+
+    register_adopted_pid(&spawner, &db, 777, "exec_that_does_not_exist");
+
+    assert_eq!(
+        spawner.registry.registered_tier(777),
+        Some(true),
+        "a failed kind lookup must fail closed to the confined tier, never the ordinary one"
+    );
+}

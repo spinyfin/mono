@@ -791,13 +791,14 @@ where
     outcome
 }
 
-/// Rebuild derived bookkeeping for one confirmed-live, non-terminal match.
 /// Register a re-adopted pane's shell pid with the tier its execution kind
 /// demands. A `progression` pane must come back confined to its captured
 /// neighbourhood: registered as an ordinary worker it would be unconfined
-/// whenever the `worker_rpc_tier` flag is off. An unreadable execution row is
-/// registered as an ordinary worker, matching the behaviour before progression
-/// panes existed (the row is what says which tier applies).
+/// whenever the `worker_rpc_tier` flag is off. The execution row is what says
+/// which tier applies, so when it cannot be read this fails closed: the pane
+/// is registered confined (with whatever scope can be captured, none if the
+/// row is unreadable). That is strictly narrower than the ordinary posture, so
+/// a transient read error can never leave a progression pane unconfined.
 fn register_adopted_pid<S>(spawner: &S, work_db: &WorkDb, shell_pid: libc::pid_t, execution_id: &str)
 where
     S: WorkerSpawner + ?Sized,
@@ -805,12 +806,13 @@ where
     let progression = match work_db.get_execution(execution_id) {
         Ok(execution) => execution.kind == boss_protocol::ExecutionKind::Progression,
         Err(error) => {
-            tracing::warn!(
+            tracing::error!(
                 execution_id,
                 %error,
-                "tmux adoption: could not read the execution kind to pick a registry tier",
+                "tmux adoption: could not read the execution kind to pick a registry tier; \
+                 registering the pane confined",
             );
-            false
+            true
         }
     };
     spawner
@@ -818,6 +820,7 @@ where
         .register_for_run(shell_pid, execution_id, progression, Some(work_db));
 }
 
+/// Rebuild derived bookkeeping for one confirmed-live, non-terminal match.
 #[allow(clippy::too_many_arguments)]
 async fn adopt_one<S>(
     work_db: &WorkDb,

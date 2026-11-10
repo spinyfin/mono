@@ -618,10 +618,13 @@ pub fn codex_sandbox_for_worker_kind(worker_kind: WorkerKind, sandbox_enforced: 
         // codex_sandbox_extra_args's doc comment for why.
         WorkerKind::ReviewGuide => None,
         // The progression agent holds no checkout and never writes files, so it
-        // gets Codex's most restrictive filesystem sandbox regardless of the
-        // enforcement flag — never the Standard `workspace-write` /
-        // `danger-full-access` posture.
-        WorkerKind::Progression => Some("read-only"),
+        // gets a read-only profile regardless of the enforcement flag — never
+        // the Standard `workspace-write` / `danger-full-access` posture. A bare
+        // `--sandbox read-only` would also cut it off from the engine socket and
+        // GitHub, which it needs to read the state it diagnoses, so the profile
+        // (`render_progression_config`) is selected in the rendered config file
+        // like ReviewGuide's.
+        WorkerKind::Progression => None,
         WorkerKind::Standard | WorkerKind::Triage | WorkerKind::AnswerAgent => {
             if sandbox_enforced {
                 Some("workspace-write")
@@ -826,6 +829,20 @@ fn codex_hook_context(workspace: &Path) -> (String, PathBuf) {
 /// domains the proxy rejects all IP destinations; Seatbelt also blocks direct
 /// IP connections. Never replace this with unrestricted network_access.
 fn render_review_guide_config(workspace: &Path, socket: &Path) -> String {
+    render_read_only_socket_profile(workspace, socket, "review-guide", &[])
+}
+
+/// The progression agent's profile: the same read-only filesystem and single
+/// attributed engine-socket exception as the review guide, plus network access
+/// to exactly the GitHub hosts `gh pr view` / `gh pr checks` read from, so the
+/// agent can inspect the state it diagnoses. Nothing else is reachable.
+const PROGRESSION_ALLOWED_DOMAINS: &[&str] = &["api.github.com", "github.com"];
+
+fn render_progression_config(workspace: &Path, socket: &Path) -> String {
+    render_read_only_socket_profile(workspace, socket, "progression", PROGRESSION_ALLOWED_DOMAINS)
+}
+
+fn render_read_only_socket_profile(workspace: &Path, socket: &Path, profile: &str, allowed_domains: &[&str]) -> String {
     // Codex 0.153.4 requires a default whenever named permissions exist:
     // https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/core/src/config/mod.rs#L3404-L3413
     // Unchanged on 0.160.1 ("config defines `[permissions]` profiles but does
@@ -834,13 +851,26 @@ fn render_review_guide_config(workspace: &Path, socket: &Path) -> String {
     // The hook-trust app-server loads this file before the worker's CLI
     // overrides exist, so selecting the profile only on the command line
     // makes hooks/list reject the config and return no hooks.
-    let mut config = String::from("default_permissions = \"review-guide\"\nweb_search = \"disabled\"\n");
+    let domains = format!(
+        "{{ {} }}",
+        allowed_domains
+            .iter()
+            .map(|domain| format!("{} = \"allow\"", toml_basic_string(domain)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let domains = if allowed_domains.is_empty() {
+        "{}".to_owned()
+    } else {
+        domains
+    };
+    let mut config = format!("default_permissions = \"{profile}\"\nweb_search = \"disabled\"\n");
     config.push_str(&render_config_toml(workspace, String::new()).replace(
         "[features]\n",
-        "[features]\nnetwork_proxy = { enabled = true, domains = {}, allow_upstream_proxy = false, proxy_url = \"http://127.0.0.1:0\", socks_url = \"http://127.0.0.1:0\" }\n",
+        &format!("[features]\nnetwork_proxy = {{ enabled = true, domains = {domains}, allow_upstream_proxy = false, proxy_url = \"http://127.0.0.1:0\", socks_url = \"http://127.0.0.1:0\" }}\n"),
     ));
     config.push_str(&format!(
-        "\n[permissions.review-guide]\nextends = \":read-only\"\n[permissions.review-guide.network]\nenabled = true\ndomains = {{}}\nunix_sockets = {{ {} = \"allow\" }}\n",
+        "\n[permissions.{profile}]\nextends = \":read-only\"\n[permissions.{profile}.network]\nenabled = true\ndomains = {domains}\nunix_sockets = {{ {} = \"allow\" }}\n",
         toml_basic_string(&socket.display().to_string()),
     ));
     config
@@ -1934,12 +1964,22 @@ impl AgentDriver for CodexDriver {
         // When path/checkleft scripts are supplied via PermissionInput they
         // win; otherwise leave those guards off (remote / early unit tests).
         let (mut base_config, hook_cwd) = codex_hook_context(&input.workspace_path);
-        if input.worker_kind == WorkerKind::ReviewGuide {
-            let socket = input
-                .frontend_socket_path
-                .as_deref()
-                .context("review-guide requires a bound frontend socket")?;
-            base_config = render_review_guide_config(&input.workspace_path, socket);
+        if matches!(input.worker_kind, WorkerKind::ReviewGuide | WorkerKind::Progression) {
+            let socket = input.frontend_socket_path.as_deref().with_context(|| {
+                format!(
+                    "{} requires a bound frontend socket",
+                    if input.worker_kind == WorkerKind::Progression {
+                        "progression"
+                    } else {
+                        "review-guide"
+                    }
+                )
+            })?;
+            base_config = if input.worker_kind == WorkerKind::Progression {
+                render_progression_config(&input.workspace_path, socket)
+            } else {
+                render_review_guide_config(&input.workspace_path, socket)
+            };
         }
         let codex_bin = resolve_codex_bin();
         write_hooks_and_attest(&codex_home, &hook_cwd, &base_config, &interception, &codex_bin)?;

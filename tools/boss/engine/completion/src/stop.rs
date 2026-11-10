@@ -578,6 +578,27 @@ impl WorkerCompletionHandler {
             );
         }
 
+        // A `progression` execution holds no checkout and never opens a PR. Its
+        // Stop only finalizes the run; the stuck item it was sent to diagnose
+        // must not enter PR detection, the nudge loop, the driver-error
+        // finalizer (which files an attention that resolves onto the item) or
+        // the no-op finalizer (which can close a PR-less item as done), so this
+        // branch precedes all of them. A driver-reported fatal error is
+        // recorded as a failed progression run, never against the item.
+        if execution.kind == ExecutionKind::Progression {
+            let driver_error = if turn_end.map(|end| end.reason) == Some(boss_protocol::StopReason::Other) {
+                Some(
+                    self.read_final_triage_message(execution_id)
+                        .await
+                        .into_message()
+                        .unwrap_or_else(|| "the driver reported a fatal error".to_owned()),
+                )
+            } else {
+                None
+            };
+            return self.finalize_progression(&execution, driver_error.as_deref()).await;
+        }
+
         // Driver-reported fatal error (StopReason::Other): the run's driver
         // — today, Codex's rollout `task_complete.error` or a stdout
         // `turn.failed` / fatal `error` envelope — has told us this Stop is
@@ -645,13 +666,6 @@ impl WorkerCompletionHandler {
             return self
                 .finalize_no_op_completion_retaining(&execution, contribution, attention)
                 .await;
-        }
-
-        // A `progression` execution holds no checkout and never opens a PR. Its
-        // Stop only finalizes the run; the stuck item it was sent to diagnose
-        // must not enter PR detection or the nudge loop, and is left untouched.
-        if execution.kind == ExecutionKind::Progression {
-            return self.finalize_progression(&execution).await;
         }
 
         // Maint task 6: an `automation_triage` execution never opens a PR.

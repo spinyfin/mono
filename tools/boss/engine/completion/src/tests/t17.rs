@@ -322,13 +322,22 @@ async fn turn_end_during_an_in_flight_finalize_waits_and_sees_the_terminal_state
     );
 }
 
-#[tokio::test]
-async fn on_stop_finalizes_a_progression_run_without_touching_the_stuck_item() {
-    // A progression run holds no lease and no checkout. Its Stop must finalize
-    // the execution and release the pane only: no PR detection, no nudge, no
-    // cube call, and — above all — no change to the item it was sent to inspect.
-    let dir = tempdir().unwrap();
-    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+fn item_snapshot(db: &WorkDb, id: &str) -> Vec<Option<String>> {
+    db.connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, CAST(autostart AS TEXT), dispatch_failed_reason, dispatch_failed_error,
+                    dispatch_failed_at, updated_at, description, pr_url FROM tasks WHERE id = ?1",
+            [id],
+            |row| (0..8).map(|i| row.get::<_, Option<String>>(i)).collect(),
+        )
+        .unwrap()
+}
+
+/// A stuck item carrying dispatch-failure evidence, with a started
+/// `progression` execution bound to it.
+fn stuck_item_with_started_progression(dir: &Path) -> (Arc<WorkDb>, String, crate::work::WorkExecution) {
+    let db = Arc::new(WorkDb::open(dir.join("boss.db")).unwrap());
     let product = db
         .create_product(
             CreateProductInput::builder()
@@ -347,17 +356,6 @@ async fn on_stop_finalizes_a_progression_run_without_touching_the_stuck_item() {
             [&chore.id],
         )
         .unwrap();
-    let snapshot = |db: &WorkDb| -> Vec<Option<String>> {
-        db.connect()
-            .unwrap()
-            .query_row(
-                "SELECT status, CAST(autostart AS TEXT), dispatch_failed_reason, dispatch_failed_error,
-                        dispatch_failed_at, updated_at, description, pr_url FROM tasks WHERE id = ?1",
-                [&chore.id],
-                |row| (0..8).map(|i| row.get::<_, Option<String>>(i)).collect(),
-            )
-            .unwrap()
-    };
     let execution = db
         .create_execution(
             boss_protocol::CreateExecutionInput::builder()
@@ -374,7 +372,17 @@ async fn on_stop_finalizes_a_progression_run_without_touching_the_stuck_item() {
         true,
     )
     .unwrap();
-    let before = snapshot(&db);
+    (db, chore.id, execution)
+}
+
+#[tokio::test]
+async fn on_stop_finalizes_a_progression_run_without_touching_the_stuck_item() {
+    // A progression run holds no lease and no checkout. Its Stop must finalize
+    // the execution and release the pane only: no PR detection, no nudge, no
+    // cube call, and — above all — no change to the item it was sent to inspect.
+    let dir = tempdir().unwrap();
+    let (db, chore_id, execution) = stuck_item_with_started_progression(dir.path());
+    let before = item_snapshot(&db, &chore_id);
 
     // A detector that would bind a PR if the progression run reached PR detection.
     let TestHarness {
@@ -395,5 +403,26 @@ async fn on_stop_finalizes_a_progression_run_without_touching_the_stuck_item() {
         cube.release_calls.lock().await.is_empty(),
         "no lease was held, so none is released"
     );
-    assert_eq!(snapshot(&db), before, "the stuck item is untouched by the run ending");
+    assert_eq!(
+        item_snapshot(&db, &chore_id),
+        before,
+        "the stuck item is untouched by the run ending"
+    );
+}
+
+#[tokio::test]
+async fn a_progression_stop_with_a_no_changes_needed_stamp_and_both_flags_on_leaves_the_item_alone() {
+    // The no-op finalizer closes PR-less work as done. A progression run must
+    // never reach it, even if a declaration got stamped on its execution.
+    let dir = tempdir().unwrap();
+    let (db, chore_id, execution) = stuck_item_with_started_progression(dir.path());
+    crate::test_support::declare_no_changes_needed(&db, &execution.id);
+    let before = item_snapshot(&db, &chore_id);
+
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let handler = handler.with_feature_flags(flags_on(dir.path()));
+    let outcome = handler.on_stop(&execution.id).await;
+
+    assert!(matches!(outcome, StopOutcome::Progression), "got {outcome:?}");
+    assert_eq!(item_snapshot(&db, &chore_id), before, "the stuck item is unchanged");
 }

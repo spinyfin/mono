@@ -149,3 +149,64 @@ fn the_engine_publishes_the_timeout_the_sweep_reads() {
     .unwrap();
     assert_eq!(progression_run_timeout_secs(&db), 77);
 }
+
+fn open_stale_worker_attention_count(db: &WorkDb, work_item_id: &str) -> usize {
+    db.list_attention_items_for_work_item(work_item_id)
+        .unwrap()
+        .iter()
+        .filter(|item| item.kind == STALE_WORKER_ATTENTION_KIND && item.status == "open")
+        .count()
+}
+
+fn seed_stale_worker_attention(db: &WorkDb, work_item_id: &str) {
+    db.upsert_external_tracker_attention(work_item_id, STALE_WORKER_ATTENTION_KIND, "stuck item", "pre-existing")
+        .unwrap();
+    assert_eq!(open_stale_worker_attention_count(db, work_item_id), 1);
+}
+
+#[tokio::test]
+async fn a_progression_timeout_reap_leaves_the_items_existing_stale_worker_attention_open() {
+    let (_dir, db, work_item_id, _execution_id, live_states, coordinator) = progression_fixture(Some(60)).await;
+    seed_stale_worker_attention(&db, &work_item_id);
+    let reaper = RecordingReaper::new(coordinator.clone());
+
+    let outcome = sweep(&db, &live_states, &coordinator, &reaper).await;
+
+    assert_eq!(outcome.reaped, 1);
+    assert_eq!(open_stale_worker_attention_count(&db, &work_item_id), 1);
+}
+
+#[tokio::test]
+async fn a_progression_run_seen_terminal_by_the_sweep_leaves_the_items_stale_worker_attention_open() {
+    let (_dir, db, work_item_id, execution_id, live_states, coordinator) = progression_fixture(Some(3_600)).await;
+    seed_stale_worker_attention(&db, &work_item_id);
+    db.mark_execution_orphaned(&execution_id, "test: ended").unwrap();
+    let reaper = RecordingReaper::new(coordinator.clone());
+
+    sweep(&db, &live_states, &coordinator, &reaper).await;
+
+    assert_eq!(open_stale_worker_attention_count(&db, &work_item_id), 1);
+}
+
+#[tokio::test]
+async fn the_pane_release_cleanup_helper_skips_a_progression_run_but_still_resolves_for_an_ordinary_one() {
+    let (_dir, db, work_item_id, execution_id, _live_states, _coordinator) = progression_fixture(Some(3_600)).await;
+    seed_stale_worker_attention(&db, &work_item_id);
+
+    resolve_stale_worker_attention(&db, &execution_id);
+    assert_eq!(
+        open_stale_worker_attention_count(&db, &work_item_id),
+        1,
+        "progression teardown keeps the item's evidence"
+    );
+
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET kind = 'chore_implementation' WHERE id = ?1",
+            [&execution_id],
+        )
+        .unwrap();
+    resolve_stale_worker_attention(&db, &execution_id);
+    assert_eq!(open_stale_worker_attention_count(&db, &work_item_id), 0);
+}

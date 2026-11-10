@@ -129,6 +129,50 @@ async fn a_progression_run_takes_no_lease_runs_in_a_scratch_dir_and_leaves_the_i
 }
 
 #[tokio::test]
+async fn the_attention_reconcile_backstop_does_not_read_a_progression_run_as_the_item_resuming() {
+    let f = fixture();
+    let (item_id, run) = f.stuck_item_with_progression_run();
+    f.db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO work_attention_items
+                 (id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at)
+             VALUES ('attn_stuck_evidence', NULL, ?1, ?2, 'open', 'stuck', 'stuck', '1000', NULL)",
+            rusqlite::params![item_id, crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND],
+        )
+        .unwrap();
+    let before = item_snapshot(&f.db, &item_id);
+    let (coordinator, _cube, _runner) = f.coordinator(FakeExecutionRunner {
+        pending: true,
+        ..FakeExecutionRunner::default()
+    });
+
+    coordinator.drain_ready_queue_for_test().await;
+    wait_for_execution_status(&f.db, &run.id, ExecutionStatus::Running).await;
+    f.db.reconcile_stale_attention_signals().unwrap();
+
+    assert_eq!(
+        item_snapshot(&f.db, &item_id),
+        before,
+        "the backstop must keep the dispatch_failed_* evidence while only a progression run has started"
+    );
+    let status: String =
+        f.db.connect()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM work_attention_items WHERE id = 'attn_stuck_evidence'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+    assert_eq!(
+        status, "open",
+        "a WorkResumed attention must survive a progression run start"
+    );
+    let _ = boss_execution_contracts::progression_scratch::remove_scratch_dir(&run.id);
+}
+
+#[tokio::test]
 async fn a_progression_run_on_a_gated_item_still_spawns() {
     let f = fixture();
     let (item_id, run) = f.stuck_item_with_progression_run();

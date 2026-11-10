@@ -683,13 +683,23 @@ impl WorkerCompletionHandler {
     /// execution and run rows and release the pane. It holds no cube lease, so
     /// no workspace release is attempted (its scratch directory is removed by
     /// the driver teardown), and it never touches the work item it inspected —
-    /// no PR detection, no nudge, no status change.
-    pub(super) async fn finalize_progression(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
+    /// no PR detection, no nudge, no status change. A `driver_error` (the
+    /// driver reported the turn boundary as a fatal error) is recorded on the
+    /// run as a failure, never as an attention or status change on the item.
+    pub(super) async fn finalize_progression(
+        &self,
+        execution: &crate::work::WorkExecution,
+        driver_error: Option<&str>,
+    ) -> StopOutcome {
         let workspace_path = execution.workspace_path.clone();
         let teardown = self.begin_teardown(&execution.id);
+        let (run_status, summary) = match driver_error {
+            Some(detail) => ("failed", format!("progression: driver error: {detail}")),
+            None => ("completed", "progression: run ended".to_owned()),
+        };
         match self
             .work_db
-            .complete_pane_parked_execution(&execution.id, "completed", Some("progression: run ended"))
+            .complete_pane_parked_execution(&execution.id, run_status, Some(&summary))
         {
             Ok(Some(_)) => {}
             Ok(None) => tracing::debug!(

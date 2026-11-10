@@ -104,6 +104,7 @@ fn work_resumed_evidence() -> String {
              FROM work_runs r
              JOIN work_executions e ON e.id = r.execution_id
              WHERE e.work_item_id = {ATTENTION_WORK_ITEM}
+               AND e.kind <> 'progression'
                AND r.started_at IS NOT NULL
                AND (work_attention_items.kind != 'pane_spawn_failed' OR r.status = 'completed')
                AND CAST(r.started_at AS INTEGER) >= CAST({ATTENTION_RAISED_AT} AS INTEGER)
@@ -266,6 +267,7 @@ fn clear_stale_dispatch_failures(conn: &Connection) -> Result<usize> {
                FROM work_runs r
                JOIN work_executions e ON e.id = r.execution_id
                WHERE e.work_item_id = tasks.id
+                 AND e.kind <> 'progression'
                  AND r.started_at IS NOT NULL
                  AND CAST(r.started_at AS INTEGER) >= CAST(tasks.dispatch_failed_at AS INTEGER)
            )",

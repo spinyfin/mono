@@ -479,6 +479,17 @@ pub fn resolve_stale_worker_attention(work_db: &WorkDb, execution_id: &str) {
     ) else {
         return;
     };
+    resolve_stale_worker_attention_for_execution(work_db, &execution);
+}
+
+/// Resolve any open `stale_worker` attention for the work item `execution`
+/// ran against — except for a `progression` execution. A progression run is
+/// bound to the stuck item it diagnoses, so its teardown or timeout must not
+/// clear that item's pre-existing `stale_worker` evidence.
+pub fn resolve_stale_worker_attention_for_execution(work_db: &WorkDb, execution: &boss_protocol::WorkExecution) {
+    if execution.kind == boss_protocol::ExecutionKind::Progression {
+        return;
+    }
     resolve_stale_worker_attention_for_work_item(work_db, &execution.work_item_id);
 }
 
@@ -882,7 +893,7 @@ pub async fn run_one_pass_with_terminal_and_grace(
         };
         if execution.status.is_terminal() {
             live_states.mark_terminated(&state.run_id);
-            resolve_stale_worker_attention_for_work_item(work_db, &execution.work_item_id);
+            resolve_stale_worker_attention_for_execution(work_db, &execution);
             continue;
         }
 
@@ -1055,7 +1066,7 @@ pub async fn run_one_pass_with_terminal_and_grace(
         match (verdict, &identity) {
             (SemanticStaleness::Healthy, _) => {
                 outcome.alive_and_working += 1;
-                resolve_stale_worker_attention_for_work_item(work_db, &execution.work_item_id);
+                resolve_stale_worker_attention_for_execution(work_db, &execution);
             }
             (verdict, TmuxIdentity::ProbeUnavailable) => {
                 raise_probe_unavailable_attention(
@@ -1635,7 +1646,7 @@ async fn execute_auto_reap(
         );
         return false;
     }
-    resolve_stale_worker_attention_for_work_item(work_db, &execution.work_item_id);
+    resolve_stale_worker_attention_for_execution(work_db, execution);
     if let Some(work_item_id) = state.work_item_id.as_deref().map(|id| work_db.owning_work_item_id(id))
         && let Err(err) = crate::reconcile_audit::append_reconcile_audit(
             work_db,
@@ -1841,7 +1852,7 @@ async fn run_cadence_fallback(
     // entry, so no later pass can reconcile a still-open stale_worker
     // attention for this work item — resolve it now while we still hold
     // `execution.work_item_id`.
-    resolve_stale_worker_attention_for_work_item(work_db, &execution.work_item_id);
+    resolve_stale_worker_attention_for_execution(work_db, execution);
 
     // Reap termination path (stale-worker sweep): tear down any
     // driver-owned state outside the workspace. `mark_execution_orphaned`
