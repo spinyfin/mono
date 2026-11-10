@@ -595,13 +595,12 @@ async fn process_state(
                 return;
             }
             let predecessor_lease = release_predecessor_lease(work_db, cube_client, &execution).await;
-            if !matches!(predecessor_lease, PredecessorLease::None | PredecessorLease::Released) {
-                tracing::warn!(
-                    execution_id,
-                    "transient-recovery: lease release incomplete; resume waits"
-                );
-                return;
-            }
+            // A kept or failed release does not stop the resume. The pane is
+            // gone, so this execution is no longer in the live states and no
+            // later pass would revisit it; orphaning it here makes it
+            // terminal, which the leftover-lease sweep retries, and the resume
+            // row (carrying the incremented retry count and backoff) is held by
+            // dispatch until that release completes.
             let dispatch_not_before = now_epoch_secs + backoff.as_secs() as i64;
             let reason = format!(
                 "{stall_reason} (auto-resume attempt {attempt}/{max}): {clipped}",
@@ -859,7 +858,8 @@ impl PredecessorLease {
 /// occupies the workspace.
 ///
 /// Never retries or waits for the outcome: a lease that is kept stays
-/// recorded and no resume row is inserted until release completes.
+/// recorded, and the caller still orphans the run and inserts the resume row,
+/// which dispatch holds until a later sweep completes the release.
 async fn release_predecessor_lease(
     work_db: &WorkDb,
     cube_client: &dyn CubeClient,
@@ -893,7 +893,7 @@ async fn release_predecessor_lease(
                 lease_id,
                 keep_reason = reason.label(),
                 "transient-recovery: the stalled run's cube lease was kept; the resume execution \
-                 stays held until a later sweep releases it",
+                 is held by dispatch until the leftover-lease sweep releases it",
             );
             PredecessorLease::Kept
         }
@@ -903,7 +903,7 @@ async fn release_predecessor_lease(
                 lease_id,
                 error = %error,
                 "transient-recovery: cube refused to release the stalled run's lease; the resume \
-                 execution stays held until a later sweep releases it",
+                 execution is held by dispatch until the leftover-lease sweep releases it",
             );
             PredecessorLease::CubeFailed
         }
@@ -1083,6 +1083,16 @@ mod tests {
         transcript_path: &str,
         prior_transient_failures: i64,
     ) -> String {
+        create_running_execution_on(db, work_item_id, transcript_path, prior_transient_failures, "local")
+    }
+
+    fn create_running_execution_on(
+        db: &WorkDb,
+        work_item_id: &str,
+        transcript_path: &str,
+        prior_transient_failures: i64,
+        host_id: &str,
+    ) -> String {
         use boss_protocol::RequestExecutionInput;
         let execution = db
             .request_execution(
@@ -1092,13 +1102,14 @@ mod tests {
                     .build(),
             )
             .unwrap();
-        db.start_execution_run(
+        db.start_execution_run_on_host(
             &execution.id,
             "worker-1",
             "repo-1",
             "lease-1",
             "mono-agent-007",
             "/tmp/mono-agent-007",
+            host_id,
         )
         .unwrap();
         db.set_run_transcript_path_if_unset(&execution.id, transcript_path)
@@ -1359,12 +1370,16 @@ mod tests {
     /// teardown reports `teardown`. The run holds `lease-1` but has no
     /// recorded store location, so its work cannot be preserved.
     async fn resume_with_teardown(teardown: PaneReleaseOutcome) -> ResumeRun {
+        resume_with_teardown_on(teardown, "local").await
+    }
+
+    async fn resume_with_teardown_on(teardown: PaneReleaseOutcome, host_id: &str) -> ResumeRun {
         let (dir, db) = open_db();
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let transcript = write_transcript(&dir, "t.jsonl", &[NORMAL_LINE, SOCKET_ERROR_LINE]);
         let db = Arc::new(db);
-        let dead_id = create_running_execution(&db, &work_item_id, &transcript, 0);
+        let dead_id = create_running_execution_on(&db, &work_item_id, &transcript, 0, host_id);
 
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
@@ -1452,6 +1467,43 @@ mod tests {
         assert!(item.body_markdown.contains("lease-1"), "{}", item.body_markdown);
         let events = sink.events().await;
         assert_eq!(events[0].details["predecessor_lease"], "released");
+    }
+
+    /// A confirmed-gone worker on a remote host cannot be released from here
+    /// (no adapter), so the lease is kept. The run must still be orphaned and
+    /// a resume row inserted with the incremented count and backoff, held by
+    /// dispatch until the leftover-lease sweep releases the predecessor.
+    #[tokio::test]
+    async fn resume_with_a_kept_lease_still_orphans_and_inserts_a_held_successor() {
+        let ResumeRun {
+            db,
+            dead_id,
+            sink,
+            released,
+            ..
+        } = resume_with_teardown_on(PaneReleaseOutcome::Reaped, "remote-host").await;
+
+        assert!(
+            released.is_empty(),
+            "a remote lease may not be released here: {released:?}"
+        );
+        let dead = db.get_execution(&dead_id).unwrap();
+        assert_eq!(dead.status, ExecutionStatus::Orphaned);
+        assert_eq!(dead.cube_lease_id.as_deref(), Some("lease-1"));
+        let successors: Vec<_> = db
+            .list_executions(Some(&dead.work_item_id))
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.id != dead_id)
+            .collect();
+        assert_eq!(successors.len(), 1);
+        let next = &successors[0];
+        assert_eq!(next.status, ExecutionStatus::Ready);
+        assert_eq!(next.transient_failure_count, 1);
+        assert!(next.dispatch_not_before.is_some());
+        let held = db.recovery_predecessor_holding_lease(next).unwrap();
+        assert_eq!(held.map(|e| e.id), Some(dead_id));
+        assert_eq!(sink.events().await[0].details["predecessor_lease"], "kept");
     }
 
     #[tokio::test]

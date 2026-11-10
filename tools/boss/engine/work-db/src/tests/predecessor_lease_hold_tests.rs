@@ -138,3 +138,60 @@ fn resume_reuses_a_successor_inserted_during_teardown() {
     assert_eq!(resumed.id, next.id);
     assert_eq!(db.list_executions(Some(&prior.work_item_id)).unwrap().len(), 2);
 }
+
+#[test]
+fn resume_reuse_raises_the_adopted_successors_retry_count_and_backoff() {
+    let db = WorkDb::open(temp_db_path("resume-reuse-count")).unwrap();
+    let (prior, next) = finished_predecessor_and_successor(&db, "reuse count");
+    assert_eq!(next.transient_failure_count, 0);
+    let resumed = db
+        .request_resume_execution(&prior.id, 3, 4_000_000_000, "retry")
+        .unwrap();
+    assert_eq!(resumed.id, next.id);
+    assert_eq!(resumed.transient_failure_count, 3);
+    assert_eq!(
+        resumed.dispatch_not_before.as_deref().map(str::trim),
+        Some("4000000000")
+    );
+}
+
+#[test]
+fn resume_does_not_reuse_a_terminal_later_execution() {
+    let db = WorkDb::open(temp_db_path("resume-no-reuse-terminal")).unwrap();
+    let (_, _, id) = make_waiting_human_chore(&db, "terminal later");
+    db.record_worker_failure(&id, "worker stopped").unwrap();
+    let prior = db.get_execution(&id).unwrap();
+    let next = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(prior.work_item_id.clone())
+                .kind(prior.kind)
+                .status(ExecutionStatus::Abandoned)
+                .build(),
+        )
+        .unwrap();
+    assert!(db.get_execution(&next.id).unwrap().status.is_terminal());
+    let resumed = db.request_resume_execution(&prior.id, 1, 0, "retry").unwrap();
+    assert_ne!(resumed.id, next.id);
+    assert_eq!(resumed.status, ExecutionStatus::Ready);
+}
+
+#[test]
+fn resume_does_not_adopt_a_sibling_of_a_read_only_kind() {
+    let db = WorkDb::open(temp_db_path("resume-no-reuse-sibling")).unwrap();
+    let (_, task, _) = make_waiting_human_chore(&db, "sibling");
+    let make = |status| {
+        db.create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(task.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(status)
+                .build(),
+        )
+        .unwrap()
+    };
+    let stalled = make(ExecutionStatus::Running);
+    let sibling = make(ExecutionStatus::Ready);
+    let resumed = db.request_resume_execution(&stalled.id, 1, 0, "retry").unwrap();
+    assert_ne!(resumed.id, sibling.id);
+}

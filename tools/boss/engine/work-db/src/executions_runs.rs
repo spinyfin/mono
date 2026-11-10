@@ -448,7 +448,8 @@ impl WorkDb {
     ///      dispatch can find it as its recovery predecessor
     ///      ([`Self::recovery_predecessor`]) and restore the unpublished work
     ///      preserved when its workspace lease is released.
-    ///   2. Insert a fresh `ready` execution for the same work item, carrying
+    ///   2. Reuse the live successor if one exists, else insert a fresh
+    ///      `ready` execution for the same work item, carrying
     ///      `transient_failure_count = new_count` and deferred until
     ///      `dispatch_not_before_epoch` (the backoff window — the same
     ///      `dispatch_not_before` gate the pre-start retry path uses,
@@ -459,17 +460,22 @@ impl WorkDb {
     /// across through the preserved tip recorded when its lease is released;
     /// so the row carries no `preferred_workspace_id` and no `allow_dirty`,
     /// which nothing on that path would read. What it does depend on is that
-    /// the predecessor's work is preserved and its lease released first. The
-    /// transient-recovery path does that itself right after confirming the
-    /// pane is gone, and dispatch holds the successor
-    /// ([`Self::recovery_predecessor_holding_lease`]) until the predecessor's
-    /// lease is released, so a successor can never start from trunk in the
-    /// window between the two.
+    /// the predecessor's work is preserved and its lease released. The caller
+    /// confirms worker teardown and attempts that release first; if the lease
+    /// is kept, this method still runs, and dispatch holds the successor
+    /// ([`Self::recovery_predecessor_holding_lease`]) until the now-terminal
+    /// predecessor's lease is released by the leftover-lease sweep, so the
+    /// successor never starts from trunk.
     ///
-    /// Returns the new `ready` execution. The caller confirms worker teardown
-    /// and preserves and releases its lease before calling this method. Because
-    /// the work item now has a `ready` execution, the orphan-active sweep
-    /// skips it (no double dispatch).
+    /// If another reconciler already created the live successor (the next
+    /// execution of the work item and kind, non-terminal, of a kind that
+    /// recovers from its predecessor), that row is reused instead of inserting
+    /// a duplicate, with its `transient_failure_count` and `dispatch_not_before`
+    /// raised to at least the requested values. Otherwise a fresh `ready`
+    /// execution is inserted.
+    ///
+    /// Returns the successor, new or reused. Because the work item now has a
+    /// live execution, the orphan-active sweep skips it (no double dispatch).
     pub fn request_resume_execution(
         &self,
         dead_execution_id: &str,
@@ -502,21 +508,42 @@ impl WorkDb {
         }
 
         // Another reconciler can settle the run while teardown is in flight.
-        // Reuse its successor under the insertion transaction rather than
-        // minting a duplicate after the asynchronous preservation step.
-        let successor: Option<String> = tx
-            .query_row(
-                "SELECT id FROM work_executions WHERE work_item_id = ?1 AND kind = ?2
-             AND rowid > (SELECT rowid FROM work_executions WHERE id = ?3)
-             ORDER BY rowid ASC LIMIT 1",
-                params![dead.work_item_id, dead.kind.as_str(), dead_execution_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(id) = successor {
-            let successor = query_execution(&tx, &id)?.context("resume successor disappeared")?;
-            tx.commit()?;
-            return Ok(successor);
+        // Adopt the successor it created, but only the row that is genuinely
+        // this execution's resume: the next execution of the work item and
+        // kind, still live, and of a kind that recovers from its predecessor.
+        // Read-only kinds (PR review batch members share one work item) have
+        // no recovery predecessor, so a later row there is a sibling, never a
+        // resume. A terminal row is finished work, not a successor.
+        if !dead.kind.never_writes_pr_branch() {
+            let next: Option<String> = tx
+                .query_row(
+                    "SELECT id FROM work_executions WHERE work_item_id = ?1 AND kind = ?2
+                 AND rowid > (SELECT rowid FROM work_executions WHERE id = ?3)
+                 ORDER BY rowid ASC LIMIT 1",
+                    params![dead.work_item_id, dead.kind.as_str(), dead_execution_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(id) = next {
+                let candidate = query_execution(&tx, &id)?.context("resume successor disappeared")?;
+                if !candidate.status.is_terminal() {
+                    // The retry budget and backoff still apply to the adopted
+                    // row: raise, never lower, what the other reconciler set.
+                    tx.execute(
+                        "UPDATE work_executions
+                         SET transient_failure_count = MAX(transient_failure_count, ?2),
+                             dispatch_not_before = CASE
+                                 WHEN dispatch_not_before IS NULL
+                                      OR CAST(dispatch_not_before AS INTEGER) < ?3
+                                 THEN ?3 ELSE dispatch_not_before END
+                         WHERE id = ?1",
+                        params![id, new_count, dispatch_not_before_epoch.to_string()],
+                    )?;
+                    let successor = query_execution(&tx, &id)?.context("resume successor disappeared")?;
+                    tx.commit()?;
+                    return Ok(successor);
+                }
+            }
         }
 
         let new_id = next_id("exec");
