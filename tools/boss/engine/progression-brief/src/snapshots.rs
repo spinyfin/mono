@@ -757,6 +757,83 @@ fn pr_section_carries_the_ai_review_verdict() {
     );
 }
 
+impl Fixture {
+    /// Record a `pr_review` verdict row for `item` the way a completed review
+    /// pass leaves it.
+    fn review_verdict(&self, item: &str, head: Option<&str>, warranted: bool, revision_task: Option<&str>) {
+        let execution = self
+            .db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(item)
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        let head = head.map_or("NULL".to_owned(), |h| format!("'{h}'"));
+        let revision = revision_task.map_or("NULL".to_owned(), |r| format!("'{r}'"));
+        self.sql(&format!(
+            "INSERT INTO pr_review_verdicts (id, execution_id, work_item_id, head_sha, findings_count,
+                 revision_warranted, gate_outcome, revision_task_id, created_at)
+             VALUES ('rvv-{id}', '{id}', '{item}', {head}, 3, {w}, 'revision_created', {revision},
+                 '2026-01-01T00:00:00Z')",
+            id = execution.id,
+            w = warranted as i64,
+        ));
+    }
+}
+
+#[test]
+fn ai_review_verdict_reports_head_freshness() {
+    for (reviewed, expect) in [
+        (Some("cafe01"), "matches_current_head=true"),
+        (Some("old000"), "matches_current_head=false"),
+        (None, "matches_current_head=unknown"),
+    ] {
+        let f = fixture();
+        let id = f.chore("Reviewed");
+        f.bind_pr(&id, 67);
+        f.poll(&id, "cafe01", "[]");
+        f.stick(&id, "status = 'in_review'");
+        f.review_verdict(&id, reviewed, true, Some("rev-task-1"));
+        let text = f.brief(&id);
+        assert!(
+            text.contains(&format!(
+                "gate_outcome=revision_created revision_warranted=true findings=3 revision_task=rev-task-1 reviewed_head={} {expect}",
+                reviewed.unwrap_or("(unrecorded)")
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("latest verdict: (none recorded"), "{text}");
+    }
+}
+
+#[test]
+fn stuck_revision_reads_the_chain_roots_review_verdict() {
+    let f = fixture();
+    let parent = f.chore("Reviewed parent");
+    f.bind_pr(&parent, 68);
+    f.poll(&parent, "beef68", "[]");
+    f.stick(&parent, "status = 'in_review'");
+    f.review_verdict(&parent, Some("beef68"), false, None);
+    let revision = f.chore("Stuck revision");
+    f.sql(&format!(
+        "UPDATE tasks SET kind = 'revision', parent_task_id = '{parent}',
+                status = 'blocked', blocked_reason = 'worker_failed'
+         WHERE id = '{revision}'"
+    ));
+    f.review_verdict(&revision, Some("other00"), true, Some("not-this-one"));
+    let text = f.brief(&revision);
+    assert!(
+        text.contains(
+            "revision_warranted=false findings=3 revision_task=(none) reviewed_head=beef68 matches_current_head=true"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("not-this-one"), "{text}");
+}
+
 #[test]
 fn s6_failing_only_here_is_attributed_unknown_not_this_pr() {
     let f = fixture();

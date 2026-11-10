@@ -7,7 +7,7 @@ use crate::gh_runner::gh_output;
 
 /// Verdict bucket a legacy commit-status / GraphQL `StatusContext`
 /// `state` value maps to. Shared by the GraphQL rollup classifier
-/// (`merge_poller::normalize_leaf`) and the REST `/commits/{sha}/status`
+/// (`classify_rollup_leaf`) and the REST `/commits/{sha}/status`
 /// parser ([`parse_commit_statuses_for_failures`]) so the two paths
 /// cannot drift on which states count as failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,36 +68,50 @@ pub fn leaf_verdict_token(leaf: &serde_json::Value) -> Option<&str> {
         .or_else(|| leaf.get("state").and_then(|v| v.as_str()))
 }
 
-/// True when a `CheckRun` or `StatusContext` leaf is a terminal failure.
-pub fn leaf_is_failure(leaf: &serde_json::Value) -> bool {
-    match leaf
+/// Classify one GraphQL `statusCheckRollup` leaf — a `CheckRun` or a
+/// `StatusContext` — into Pass / Fail / InFlight. This is the single leaf
+/// classifier: the merge poller and the progression brief both build on it.
+///
+/// `StatusContext` leaves (dispatched on `__typename`, or "has `state` but no
+/// `conclusion`") carry the verdict in `state`. `CheckRun` leaves use
+/// `conclusion`; an empty or missing conclusion, or an unknown one, is
+/// in-flight rather than a guessed failure.
+pub fn classify_rollup_leaf(leaf: &serde_json::Value) -> StatusContextVerdict {
+    let typename = leaf.get("__typename").and_then(|v| v.as_str()).unwrap_or("");
+    let has_status_context_shape = typename.eq_ignore_ascii_case("StatusContext")
+        || (leaf.get("state").is_some() && leaf.get("conclusion").is_none());
+    if has_status_context_shape {
+        let state = leaf.get("state").and_then(|v| v.as_str()).unwrap_or("");
+        return classify_status_context_state(state);
+    }
+    let conclusion = leaf
         .get("conclusion")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-    {
-        Some(conclusion) => is_failure_conclusion(conclusion),
-        None => matches!(
-            leaf.get("state")
-                .map(|s| classify_status_context_state(s.as_str().unwrap_or(""))),
-            Some(StatusContextVerdict::Fail { .. })
-        ),
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    if conclusion.is_empty() {
+        StatusContextVerdict::InFlight
+    } else if is_failure_conclusion(&conclusion) {
+        StatusContextVerdict::Fail { conclusion }
+    } else {
+        // Pass, or an unknown conclusion shape (treated as in-flight rather
+        // than misclassified as a failure).
+        if is_pass_conclusion(&conclusion) {
+            StatusContextVerdict::Pass
+        } else {
+            StatusContextVerdict::InFlight
+        }
     }
+}
+
+/// True when a `CheckRun` or `StatusContext` leaf is a terminal failure.
+pub fn leaf_is_failure(leaf: &serde_json::Value) -> bool {
+    matches!(classify_rollup_leaf(leaf), StatusContextVerdict::Fail { .. })
 }
 
 /// True when a `CheckRun` or `StatusContext` leaf is a terminal pass.
 pub fn leaf_is_pass(leaf: &serde_json::Value) -> bool {
-    match leaf
-        .get("conclusion")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-    {
-        Some(conclusion) => is_pass_conclusion(conclusion),
-        None => matches!(
-            leaf.get("state")
-                .map(|s| classify_status_context_state(s.as_str().unwrap_or(""))),
-            Some(StatusContextVerdict::Pass)
-        ),
-    }
+    matches!(classify_rollup_leaf(leaf), StatusContextVerdict::Pass)
 }
 
 /// CI provider inferred from a check's `targetUrl` host. The CI-watch
@@ -290,8 +304,8 @@ pub fn parse_check_runs_for_failures(body: &[u8]) -> Vec<RequiredCheckFailure> {
             None => continue,
         };
         // `cancelled` is deliberately excluded here (unlike
-        // `merge_poller::is_failure_conclusion`, which does treat it as a
-        // failure): the merge queue cancels sibling checks on dequeue, so
+        // [`is_failure_conclusion`], which treats `CANCELLED` and `STALE` as
+        // failures): the merge queue cancels sibling checks on dequeue, so
         // counting a cancellation as a "required check failure" on this
         // rebounce-detection path would misreport queue churn as a real CI
         // failure. `stale` is excluded for the same reason — GitHub marks a
@@ -419,6 +433,16 @@ mod tests {
         assert!(!leaf_is_failure(&empty_run) && !leaf_is_pass(&empty_run));
         assert_eq!(leaf_verdict_token(&ctx_fail), Some("ERROR"));
         assert_eq!(leaf_verdict_token(&empty_run), None);
+        let null_run = serde_json::json!({"__typename": "CheckRun", "status": "COMPLETED", "conclusion": null});
+        assert_eq!(classify_rollup_leaf(&null_run), StatusContextVerdict::InFlight);
+        assert_eq!(classify_rollup_leaf(&empty_run), StatusContextVerdict::InFlight);
+        let typed_ctx = serde_json::json!({"__typename": "StatusContext", "state": "FAILURE"});
+        assert_eq!(
+            classify_rollup_leaf(&typed_ctx),
+            StatusContextVerdict::Fail {
+                conclusion: "FAILURE".into()
+            }
+        );
     }
 
     #[test]

@@ -153,7 +153,7 @@ async fn bounded<T>(limit: Duration, probe: impl Future<Output = Result<T>>) -> 
 
 /// The product's configured remote, when it has one; otherwise the PR's own
 /// repository over HTTPS.
-fn conflict_remote(packet: &ProgressionBriefPacket, pr_url: &str) -> Result<String> {
+pub(crate) fn conflict_remote(packet: &ProgressionBriefPacket, pr_url: &str) -> Result<String> {
     if let Some(remote) = packet.repo_remote_url.as_deref() {
         return Ok(remote.to_owned());
     }
