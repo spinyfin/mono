@@ -2,6 +2,7 @@ use super::*;
 mod frontend_metrics;
 mod mismatch_answer_dispatch;
 mod read_freshness;
+mod server_fixture;
 mod work_tree_delta;
 use boss_protocol::TopicEventPayload;
 
@@ -52,9 +53,13 @@ pub(super) fn test_server_state() -> (Arc<ServerState>, tempfile::TempDir) {
 }
 
 pub(super) fn test_server_state_with_overrides(
-    overrides: ServerStateOverrides,
+    mut overrides: ServerStateOverrides,
 ) -> (Arc<ServerState>, tempfile::TempDir) {
-    let temp = tempfile::tempdir().unwrap();
+    // Copy the storage fixture's immutable, fully migrated schema instead of
+    // replaying every migration for every server (480 times in the question
+    // matrix alone). Each fixture still owns its own on-disk WAL database.
+    let (temp, db) = boss_work_db::test_support::open_db();
+    overrides.work_db = Some(db);
     let cfg = Arc::new(RuntimeConfig::from_parts(
         boss_engine_runtime::config::WorkConfig::builder()
             .cwd(temp.path().to_path_buf())
@@ -76,53 +81,23 @@ pub(super) fn test_server_state_with_overrides(
 /// both side-effecting and dependent on host state (pool/capability/
 /// scheduling) rather than deterministic.
 pub(super) fn test_server_state_with_fakes() -> (Arc<ServerState>, tempfile::TempDir) {
-    let temp = tempfile::tempdir().unwrap();
-    let cfg = Arc::new(RuntimeConfig::from_parts(
-        boss_engine_runtime::config::WorkConfig::builder()
-            .cwd(temp.path().to_path_buf())
-            .db_path(temp.path().join("state.db"))
-            .build(),
-        None,
-    ));
-    let state = ServerState::new_arc_with_app_pid_and_merge_probe(
-        cfg,
-        None,
-        None,
-        ServerStateOverrides {
-            cube_client: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsCube)),
-            execution_runner: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsRunner)),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    (state, temp)
+    test_server_state_with_overrides(ServerStateOverrides {
+        cube_client: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsCube)),
+        execution_runner: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsRunner)),
+        ..Default::default()
+    })
 }
 
 /// Build a server with deterministic PR state for comment submission.
 pub(super) fn test_server_state_with_pr_state_checker(
     checker: Arc<dyn boss_work_db::PrStateChecker>,
 ) -> (Arc<ServerState>, tempfile::TempDir) {
-    let temp = tempfile::tempdir().unwrap();
-    let cfg = Arc::new(RuntimeConfig::from_parts(
-        boss_engine_runtime::config::WorkConfig::builder()
-            .cwd(temp.path().to_path_buf())
-            .db_path(temp.path().join("state.db"))
-            .build(),
-        None,
-    ));
-    let state = ServerState::new_arc_with_app_pid_and_merge_probe(
-        cfg,
-        None,
-        None,
-        ServerStateOverrides {
-            cube_client: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsCube)),
-            execution_runner: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsRunner)),
-            pr_state_checker: Some(checker),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    (state, temp)
+    test_server_state_with_overrides(ServerStateOverrides {
+        cube_client: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsCube)),
+        execution_runner: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsRunner)),
+        pr_state_checker: Some(checker),
+        ..Default::default()
+    })
 }
 
 /// Like [`test_server_state_with_fakes`], but also swaps in a fake
@@ -136,28 +111,13 @@ pub(super) fn test_server_state_with_source_collector(
     collector: boss_engine_completion::review_guide_capture::SourcePacketCollector,
     branch_verifier: Arc<dyn boss_engine_completion::BranchVerifier>,
 ) -> (Arc<ServerState>, tempfile::TempDir) {
-    let temp = tempfile::tempdir().unwrap();
-    let cfg = Arc::new(RuntimeConfig::from_parts(
-        boss_engine_runtime::config::WorkConfig::builder()
-            .cwd(temp.path().to_path_buf())
-            .db_path(temp.path().join("state.db"))
-            .build(),
-        None,
-    ));
-    let state = ServerState::new_arc_with_app_pid_and_merge_probe(
-        cfg,
-        None,
-        None,
-        ServerStateOverrides {
-            cube_client: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsCube)),
-            execution_runner: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsRunner)),
-            source_packet_collector: Some(collector),
-            branch_verifier: Some(branch_verifier),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    (state, temp)
+    test_server_state_with_overrides(ServerStateOverrides {
+        cube_client: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsCube)),
+        execution_runner: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsRunner)),
+        source_packet_collector: Some(collector),
+        branch_verifier: Some(branch_verifier),
+        ..Default::default()
+    })
 }
 
 /// Like [`test_server_state_with_fakes`], but also swaps in a fake
@@ -171,28 +131,13 @@ pub(super) fn test_server_state_with_fakes_and_pr_detector(
     pr_detector: Arc<dyn boss_engine_completion::PrDetector>,
     workspace_diff_verifier: Option<Arc<dyn boss_engine_completion::WorkspaceDiffVerifier>>,
 ) -> (Arc<ServerState>, tempfile::TempDir) {
-    let temp = tempfile::tempdir().unwrap();
-    let cfg = Arc::new(RuntimeConfig::from_parts(
-        boss_engine_runtime::config::WorkConfig::builder()
-            .cwd(temp.path().to_path_buf())
-            .db_path(temp.path().join("state.db"))
-            .build(),
-        None,
-    ));
-    let state = ServerState::new_arc_with_app_pid_and_merge_probe(
-        cfg,
-        None,
-        None,
-        ServerStateOverrides {
-            cube_client: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsCube)),
-            execution_runner: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsRunner)),
-            pr_detector: Some(pr_detector),
-            workspace_diff_verifier,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    (state, temp)
+    test_server_state_with_overrides(ServerStateOverrides {
+        cube_client: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsCube)),
+        execution_runner: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsRunner)),
+        pr_detector: Some(pr_detector),
+        workspace_diff_verifier,
+        ..Default::default()
+    })
 }
 
 /// [`boss_engine_completion::PrDetector`] stub returning one canned status for

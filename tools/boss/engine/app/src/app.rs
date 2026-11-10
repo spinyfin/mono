@@ -543,6 +543,9 @@ type CoordinatorInstalledVersionCache = Arc<StdMutex<Option<CoordinatorInstalled
 #[derive(Default, bon::Builder)]
 #[builder(on(String, into))]
 struct ServerStateOverrides {
+    /// An independent, already initialized fixture database. `None` runs
+    /// production database startup at the configured path.
+    work_db: Option<WorkDb>,
     design_docs: Option<Arc<boss_engine_design_docs::DesignDocsService>>,
     read_admission: Option<Arc<read_admission::ReadAdmission>>,
     live_read_admission: Option<Arc<read_admission::ReadAdmission>>,
@@ -1280,6 +1283,7 @@ impl ServerState {
         overrides: ServerStateOverrides,
     ) -> Result<Arc<Self>> {
         let ServerStateOverrides {
+            work_db: work_db_override,
             design_docs: design_docs_override,
             read_admission: read_admission_override,
             live_read_admission: live_read_admission_override,
@@ -1318,8 +1322,12 @@ impl ServerState {
         // Arc<ServerState> is in hand so a duplicate registration panics
         // during this boot path instead of inside the first increment.
         let metrics_registry = Arc::new(boss_metrics::Registry::new());
+        let work_db = match work_db_override {
+            Some(db) => db,
+            None => WorkDb::open(cfg.work.db_path.clone())?,
+        };
         let work_db = Arc::new(
-            WorkDb::open(cfg.work.db_path.clone())?
+            work_db
                 .with_event_bus(event_bus.clone())
                 .with_persona_metrics(metrics_registry.clone())
                 .with_token_generator(std::sync::Arc::new(boss_engine_runtime::engine_control::generate_token))
