@@ -502,7 +502,7 @@ crate::stub_cube_client! { FakeCubeClient {
             ).await;
         }
         Ok(boss_engine_recovery::execution_bookmark::ExecutionBookmark {
-            execution_id: execution_id.to_owned(), repo_path: workspace.to_path_buf(), host_id: "local".to_owned(), base_commit: None, pr_head_before: None, has_recovery_head: None,
+            execution_id: execution_id.to_owned(), repo_path: workspace.to_path_buf(), host_id: "local".to_owned(), base_commit: None, pr_head_before: None
         })
     }
     async fn positioned_parent(&self, workspace: &std::path::Path) -> Result<String> {

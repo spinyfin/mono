@@ -427,10 +427,6 @@ pub async fn reconcile_if_pane_dead(
 
     let prior_status = execution.status.as_str();
 
-    // Export the recorded shared-store reference, independently of the lease.
-    // A failed inspection raises recovery attention while the reap continues.
-    let recovery_patch = crate::execution_bookmark_recovery::backup_dead_execution(work_db, execution).await;
-
     // State only what was observed. This previously asserted "pane died with
     // its host app", which is a hardcoded causal claim this code never
     // verifies — it does not check whether the app is running. When five live
@@ -463,7 +459,6 @@ pub async fn reconcile_if_pane_dead(
             "prior_status": prior_status,
             "shell_pid": shell_pid,
             "kind": execution.kind.as_str(),
-            "recovery_patch": recovery_patch.as_deref().map(|p| p.display().to_string()),
         }),
     )
     .await;

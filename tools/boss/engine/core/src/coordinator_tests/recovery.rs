@@ -284,7 +284,7 @@ async fn recovery_uses_shared_store_when_cube_recovered_nothing() {
 }
 
 #[tokio::test]
-async fn missing_baseline_bookmark_is_not_an_integrity_failure() {
+async fn an_unrecorded_baseline_commit_is_not_an_integrity_failure() {
     use boss_engine_test_git::jj::JjRepo;
     for recorded_commit in [true, false] {
         let dir = tempdir().unwrap();
@@ -295,7 +295,6 @@ async fn missing_baseline_bookmark_is_not_an_integrity_failure() {
         std::fs::write(repo.worker.join("hello.txt"), "recovered work\n").unwrap();
         JjRepo::run(&repo.worker, &["status"]);
         preserve_work(&db, &dead_id, &repo.worker).await;
-        JjRepo::run(&repo.repo, &["bookmark", "delete", &format!("boss-base/{dead_id}")]);
         if !recorded_commit {
             db.connect()
                 .unwrap()
@@ -326,9 +325,9 @@ async fn missing_baseline_bookmark_is_not_an_integrity_failure() {
             .into_iter()
             .filter(|item| item.kind == crate::execution_bookmark_recovery::RECOVERY_RETIRED)
             .collect();
-        // A lost baseline bookmark, with or without a recorded baseline commit
-        // (trunk is the floor without one), is not an integrity failure: the
-        // work is recovered, nothing is rebuilt and nothing is retired.
+        // A record with or without a baseline commit (trunk is the floor without
+        // one) is not an integrity failure: the work is recovered and nothing is
+        // retired.
         assert_eq!(
             restored.map(|r| (r.predecessor, r.has_work)),
             Some((dead_id.clone(), true)),
@@ -911,10 +910,6 @@ async fn resume_pane_spawn_continues_when_the_recorded_heads_are_missing() {
     let repo = JjRepo::new(root.path());
     let record = create(&LocalJj, &repo.worker, &exec.id, "local").await.unwrap();
     db.record_execution_bookmark(&record).unwrap();
-    JjRepo::run(
-        &repo.repo,
-        &["bookmark", "delete", &record.head(), &record.publication()],
-    );
 
     let runner = Arc::new(FakeExecutionRunner {
         slot_id: Some(1),

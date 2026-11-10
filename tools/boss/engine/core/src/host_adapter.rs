@@ -264,14 +264,17 @@ impl HostAdapter for LocalHostAdapter {
         execution_bookmark::preserved_work_unpublished(&LocalJj, record, recorded).await
     }
 
-    async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {
-        if record.host_id != "local" {
-            return Err(execution_bookmark::pointer_integrity_error(format!(
-                "recovery bookmark belongs to host {}",
-                record.host_id
-            )));
+    async fn forget_preserved_references(
+        &self,
+        record: &ExecutionBookmark,
+        scope: execution_bookmark::PreservedScope,
+    ) -> Result<Vec<String>> {
+        if record.host_id != self.host_id() {
+            return Err(execution_bookmark::pointer_integrity_error(
+                "preserved work belongs to another host",
+            ));
         }
-        execution_bookmark::unpublished_diff(&LocalJj, record).await
+        execution_bookmark::forget_preserved_references(&LocalJj, record, scope).await
     }
 
     async fn positioned_parent(&self, workspace: &Path) -> Result<String> {
@@ -280,21 +283,6 @@ impl HostAdapter for LocalHostAdapter {
     async fn start_fresh_workspace(&self, workspace: &Path) -> Result<String> {
         execution_bookmark::start_fresh(&LocalJj, workspace).await
     }
-    async fn prune_execution_bookmark(
-        &self,
-        record: &ExecutionBookmark,
-        vouchers: &[execution_bookmark::Voucher],
-        trunk: &str,
-    ) -> Result<execution_bookmark::PruneOutcome> {
-        if record.host_id != "local" {
-            return Err(execution_bookmark::pointer_integrity_error(format!(
-                "recovery bookmark belongs to host {}",
-                record.host_id
-            )));
-        }
-        execution_bookmark::prune(&LocalJj, record, vouchers, trunk).await
-    }
-
     fn host_id(&self) -> &str {
         "local"
     }
@@ -832,14 +820,17 @@ impl HostAdapter for SshHostAdapter {
         execution_bookmark::preserved_work_unpublished(self, record, recorded).await
     }
 
-    async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {
+    async fn forget_preserved_references(
+        &self,
+        record: &ExecutionBookmark,
+        scope: execution_bookmark::PreservedScope,
+    ) -> Result<Vec<String>> {
         if record.host_id != self.host_id() {
-            return Err(execution_bookmark::pointer_integrity_error(format!(
-                "recovery bookmark belongs to host {}",
-                record.host_id
-            )));
+            return Err(execution_bookmark::pointer_integrity_error(
+                "preserved work belongs to another host",
+            ));
         }
-        execution_bookmark::unpublished_diff(self, record).await
+        execution_bookmark::forget_preserved_references(self, record, scope).await
     }
 
     async fn positioned_parent(&self, workspace: &Path) -> Result<String> {

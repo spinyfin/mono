@@ -246,8 +246,6 @@ enum WorkspaceKind {
   LIST_WORKSPACES = 10;
   LIST_REPOS = 11;
   CREATE_BOOKMARK = 12;
-  DIFF_BOOKMARK = 13;
-  RESTORE_BOOKMARK = 14;
   RESTORE_REBASED = 16;
   CHECKPOINT_BASELINE = 17;
   PREPARE_RECOVERY_PR = 18;
@@ -269,15 +267,18 @@ enum WorkspaceKind {
   // request_json carries the recorded tip and the result is a JSON boolean.
   // A store operation: it needs no lease.
   CHECK_PRESERVED_UNPUBLISHED = 25;
-  // Forget a finished execution's pointers once a voucher proves its preserved
-  // work is published. request_json carries the vouchers, `trunk` names the
-  // repository's main branch, and the result is the prune outcome as JSON.
-  // A store operation: it needs no lease.
-  PRUNE_BOOKMARK = 26;
-  // 15 (DISCARD_BASELINE), 20 (RELEASE_HEADS) and 27 (RELEASE_HEADS_CONFIGURED)
-  // were retired with the per-execution baseline and recovery pointers.
-  reserved 15, 20, 27;
-  reserved "DISCARD_BASELINE", "RELEASE_HEADS", "RELEASE_HEADS_CONFIGURED";
+  // 13 (DIFF_BOOKMARK), 14 (RESTORE_BOOKMARK), 15 (DISCARD_BASELINE), 20
+  // (RELEASE_HEADS), 26 (PRUNE_BOOKMARK) and 27 (RELEASE_HEADS_CONFIGURED) were
+  // retired with the per-execution baseline and recovery pointers.
+  reserved 13, 14, 15, 20, 26, 27;
+  reserved "DIFF_BOOKMARK", "RESTORE_BOOKMARK", "DISCARD_BASELINE", "RELEASE_HEADS", "PRUNE_BOOKMARK",
+      "RELEASE_HEADS_CONFIGURED";
+  // Forget an execution's preserved references (`preserved/<execution>`, and
+  // with the archive scope its inspection archives) in one operation once a
+  // successor has published or its item has been closed for a fixed age.
+  // request_json names the scope and the result is the forgotten names as a
+  // JSON array. A store operation: it needs no lease.
+  FORGET_PRESERVED = 28;
 }
 // A discriminated, typed operation, not an argv tunnel: kind selects which
 // fields are required and which are forbidden. Paths from a peer are display
@@ -299,13 +300,15 @@ message WorkspaceOp {
   Bookmark bookmark = 14;
   optional Bookmark predecessor = 15;
   string inherited_base = 16;
-  bool self_retry = 17;
   string pr_bookmark = 18;
-  string trunk = 19;
+  // 17 (self_retry) and 19 (trunk) belonged to the retired restore and prune
+  // operations.
+  reserved 17, 19;
+  reserved "self_retry", "trunk";
   // A bounded JSON compatibility payload for the recovery kinds whose
   // arguments are the recovery crate's own value types. Required for
   // CONFIRM_RECOVERY, RESTORE_PRESERVED, CHECK_PRESERVED_UNPUBLISHED,
-  // PRUNE_BOOKMARK, and forbidden for every other
+  // FORGET_PRESERVED, and forbidden for every other
   // kind. It names no path, argv or revset. It carries no version marker: new
   // semantics always need a new WorkspaceKind so older hosts reject the
   // operation rather than silently dropping unknown fields.
@@ -314,9 +317,10 @@ message WorkspaceOp {
 message Bookmark {
   string repo_id = 1;
   string execution_id = 2;
-  string head = 3;
-  string recovery = 4;
-  string base = 5;
+  // 3 (head), 4 (recovery) and 5 (base) named the per-execution bookmarks,
+  // which no longer exist.
+  reserved 3, 4, 5;
+  reserved "head", "recovery", "base";
   string anchor_commit = 6;
   // Bound-PR head snapshot; the floor when anchor_commit is empty or unusable.
   string pr_head_before = 7;

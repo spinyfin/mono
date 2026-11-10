@@ -779,7 +779,6 @@ async fn db_preservation_errors_for_a_remote_row_without_an_adapter() {
         host_id: "anaplian".into(),
         base_commit: None,
         pr_head_before: None,
-        has_recovery_head: None,
     })
     .unwrap();
     let error = DbPreservation { db: &db, adapter: None }

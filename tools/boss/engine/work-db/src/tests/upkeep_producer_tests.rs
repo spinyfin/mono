@@ -639,8 +639,12 @@ const NOT_UPKEEP: &[(&str, &str)] = &[
         "re-submits a guide body already produced by a finished attempt; no work item is acted on",
     ),
     (
-        "list_prune_candidates",
-        "housekeeping of terminal executions' recovery bookmarks; no work item is acted on",
+        "list_superseded_preserved",
+        "housekeeping of terminal executions' preserved bookmarks once a successor published; no work item is acted on",
+    ),
+    (
+        "list_closed_chain_preserved",
+        "housekeeping of terminal executions' preserved bookmarks once their item has been closed for a fixed age; no work item is acted on",
     ),
     (
         "list_unranked_pending_executions",

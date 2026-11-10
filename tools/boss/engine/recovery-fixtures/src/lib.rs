@@ -1,9 +1,8 @@
-//! Test fixtures that build the legacy three-bookmark recovery layout.
+//! Test fixtures that record an execution the way dispatch does.
 //!
-//! Dispatch records only a baseline commit on the execution row. Tests that
-//! exercise recovery of in-flight legacy executions need the older
-//! `boss-base/`, `boss-recovery/` and `boss/` names, which production code no
-//! longer creates; this crate keeps that construction out of the production API.
+//! Dispatch records only a baseline commit on the execution row and creates no
+//! bookmark. These helpers pick the baseline from where a test positioned its
+//! workspace, which production resolves from the PR head or trunk.
 
 use std::path::Path;
 
@@ -34,15 +33,14 @@ async fn positioned_base(jj: &dyn Jj, workspace: &Path) -> Result<String> {
     Ok(ids[0].to_owned())
 }
 
-/// Construct a legacy three-bookmark record for recovery compatibility fixtures,
-/// using the commit below `@` as the baseline.
+/// Record an execution whose baseline is the commit below `@`.
 pub async fn create(jj: &dyn Jj, workspace: &Path, execution_id: &str, host_id: &str) -> Result<ExecutionBookmark> {
     let baseline = positioned_base(jj, workspace).await?;
     create_from(jj, workspace, execution_id, host_id, None, Some(&baseline)).await
 }
 
-/// Same layout as [`create`], with a predecessor or an explicit recorded floor
-/// for tests that reconstruct a bound-PR dispatch.
+/// Same as [`create`], with a predecessor or an explicit recorded floor for
+/// tests that reconstruct a bound-PR dispatch.
 pub async fn create_from(
     jj: &dyn Jj,
     workspace: &Path,
@@ -51,7 +49,7 @@ pub async fn create_from(
     predecessor: Option<&ExecutionBookmark>,
     inherited_base: Option<&str>,
 ) -> Result<ExecutionBookmark> {
-    let mut record = boss_engine_recovery::execution_bookmark::create_from(
+    boss_engine_recovery::execution_bookmark::create_from(
         jj,
         workspace,
         execution_id,
@@ -59,23 +57,5 @@ pub async fn create_from(
         predecessor,
         inherited_base,
     )
-    .await?;
-    jj.run(
-        workspace,
-        &[
-            "bookmark",
-            "set",
-            &record.base(),
-            "-r",
-            record.base_commit.as_deref().unwrap(),
-        ],
-    )
-    .await?;
-    jj.run(
-        workspace,
-        &["bookmark", "set", &record.head(), &record.publication(), "-r", "@"],
-    )
-    .await?;
-    record.has_recovery_head = Some(true);
-    Ok(record)
+    .await
 }

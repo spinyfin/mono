@@ -252,11 +252,34 @@ pub(super) async fn reject_unsafe_outcome(
     Ok(outcome)
 }
 
+/// Does `variant` (a rewrite of `commit` sharing its change id) carry the same
+/// content? An empty interdiff, ignoring bookkeeping paths, proves it.
+async fn same_change_content(jj: &dyn Jj, repo: &Path, commit: &str, variant: &str) -> Result<bool> {
+    let interdiff = jj
+        .run(
+            repo,
+            &[
+                "--ignore-working-copy",
+                "interdiff",
+                "--from",
+                commit,
+                "--to",
+                variant,
+                "--git",
+            ],
+        )
+        .await?;
+    Ok(crate::recovery_apply::filter_bookkeeping(&interdiff)
+        .text
+        .trim()
+        .is_empty())
+}
+
 /// A bookmark follows its change through every rewrite a later holder makes
 /// (`jj squash`, `jj absorb`, `jj diffedit`). Only a pure rebase, which leaves
 /// the added and removed lines untouched, may move `preserved/<exec>` off the
 /// commit teardown recorded; any other evolution may carry foreign edits.
-/// Content is compared with `prune::same_change_content` (an `interdiff`,
+/// Content is compared with `same_change_content` (an `interdiff`,
 /// so paths, modes and binary changes count), for every commit of the recorded
 /// ancestry including empty ones: a later holder can squash text into an empty
 /// boundary. A rebase onto a moved base compares equal even when it leaves
@@ -316,8 +339,8 @@ pub(in super::super) async fn reject_content_evolution(
         .await?;
         let mut unchanged = true;
         for candidate in moved.lines().filter(|id| !id.is_empty()) {
-            unchanged &= candidate == original
-                || super::prune::same_change_content(jj, &record.repo_path, original, candidate).await?;
+            unchanged &=
+                candidate == original || same_change_content(jj, &record.repo_path, original, candidate).await?;
         }
         if !unchanged {
             return Err(pointer_integrity_error(format!(

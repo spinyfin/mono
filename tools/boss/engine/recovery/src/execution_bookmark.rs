@@ -1,12 +1,13 @@
-//! Engine-created recovery references in the shared jj repository.
+//! The engine's record of where an execution's work sits in the shared jj
+//! repository.
 //!
-//! Teardown preserves unpublished workspace edits; workers create their
-//! publication branch immediately before opening a PR. Legacy recovery
-//! references remain readable so existing records still restore. The baseline
-//! is the commit id recorded on the execution row at dispatch (`pr_head_before`
-//! for a bound PR, the trunk commit for a fresh item), so rewriting or
-//! abandoning any bookmark never invalidates it; published upstream history is
-//! excluded when checking for abandoned work.
+//! Dispatch records only the commit an execution starts from (`pr_head_before`
+//! for a bound PR, the trunk commit for a fresh item) and creates no bookmark.
+//! Teardown preserves unpublished workspace edits under one
+//! `preserved/<execution>` bookmark. The next dispatch restages from it, and
+//! it is forgotten once a successor publishes or its chain has been closed for
+//! a fixed age. Workers create their own publication branch immediately
+//! before opening a PR.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -14,9 +15,6 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-
-/// Editable setup state, without authored content, a message, or merge topology.
-const EMPTY_SETUP_CHANGES: &str = r#"(empty() & description(exact:"")) ~ (merges() | root())"#;
 
 mod preserved;
 #[cfg(test)]
@@ -35,11 +33,10 @@ pub use preserved::{
 mod preserved_restore;
 pub use preserved_restore::restore_preserved;
 
-mod prune;
-pub use prune::{HostVoucher, MissingChange, PruneOutcome, RewrittenChange, Voucher, prune};
-
+mod preserved_cleanup;
+pub use preserved_cleanup::{PreservedScope, forget_preserved_references};
 #[cfg(test)]
-mod prune_tests;
+mod preserved_cleanup_tests;
 
 /// Which invariant a damaged pointer broke. Lineage between the pointers and
 /// the baseline is deliberately not an invariant: jj rewrites commits and
@@ -145,23 +142,6 @@ pub fn is_legacy_reconcilable_blocker(detail: &str) -> bool {
     false
 }
 
-/// Neither execution head exists. Dispatch can start cleanly; inspection and
-/// crash backups still report this as missing, never as a verified empty run.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MissingPointerError(pub String);
-
-impl std::fmt::Display for MissingPointerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for MissingPointerError {}
-
-pub fn is_missing_pointer_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| cause.is::<MissingPointerError>())
-}
-
 /// The requested PR base branch cannot be resolved to a commit (no such remote
 /// bookmark, or a non-GitHub origin). Unlike a failed fetch or SSH hop, retrying
 /// cannot fix it, so it is the only failure that may justify restaging onto a
@@ -192,8 +172,7 @@ pub struct ExecutionBookmark {
     pub execution_id: String,
     pub repo_path: PathBuf,
     pub host_id: String,
-    /// The baseline commit id recorded at dispatch: the floor of this
-    /// execution's work. Recovery reads this, never the `boss-base/…` bookmark.
+    /// The commit id recorded at dispatch: the floor of this execution's work.
     /// Legacy records may lack it, in which case `pr_head_before` is the floor
     /// for a bound PR, then trunk.
     #[serde(default)]
@@ -202,28 +181,6 @@ pub struct ExecutionBookmark {
     /// is missing or no longer in the store, before falling back to trunk.
     #[serde(default)]
     pub pr_head_before: Option<String>,
-    /// Whether `create_from` wrote a `boss-recovery/` head. `None` is a row
-    /// that predates this column: inspect the store. `Some(false)` records only
-    /// dispatch-time state; workers may subsequently create publication heads.
-    /// Inspect the local store; leave remote publication heads for pruning.
-    #[serde(default)]
-    pub has_recovery_head: Option<bool>,
-}
-
-impl ExecutionBookmark {
-    pub fn head(&self) -> String {
-        format!("boss-recovery/{}", self.execution_id)
-    }
-
-    /// Publication refs can be consumed by cube after merging. Recovery owns
-    /// a separate namespace and does not need a handshake with cube's pool.
-    pub fn publication(&self) -> String {
-        format!("boss/{}", self.execution_id)
-    }
-
-    pub fn base(&self) -> String {
-        format!("boss-base/{}", self.execution_id)
-    }
 }
 
 /// The transport is supplied by the host adapter; no engine types belong here.
@@ -307,62 +264,6 @@ fn revision(bookmark: &str) -> String {
     )
 }
 
-/// Resolve several bookmarks of one repository in a single `jj` invocation.
-///
-/// Returns every visible commit each named bookmark points at (a conflicted
-/// bookmark lists more than one; an absent bookmark is missing from the
-/// map). Bookmark names are matched by the template's `name()`, never the
-/// decorated `name*` / `name??` rendering.
-#[cfg(test)]
-pub(crate) async fn resolve_bookmark_targets(
-    jj: &dyn Jj,
-    repo: &Path,
-    bookmarks: &[String],
-) -> Result<std::collections::HashMap<String, Vec<String>>> {
-    if bookmarks.is_empty() {
-        return Ok(std::collections::HashMap::new());
-    }
-    let revset = bookmarks
-        .iter()
-        .map(|name| revision(name))
-        .collect::<Vec<_>>()
-        .join(" | ");
-    Ok(bookmark_targets_in(
-        &commits_with_bookmarks(jj, repo, &revset).await?,
-        bookmarks,
-    ))
-}
-
-/// Resolve a bookmark to the single commit it targets. Commit ids, unlike
-/// change ids, stay unique when a change is divergent (two visible commits
-/// sharing one change id), so ancestry checks built on them cannot match a
-/// sibling of the bookmarked commit. A conflicted bookmark resolves to several
-/// commits and is a real pointer-integrity error.
-async fn resolve_optional(jj: &dyn Jj, repo: &Path, bookmark: &str) -> Result<Option<String>> {
-    let output = jj
-        .run(
-            repo,
-            &[
-                "--ignore-working-copy",
-                "log",
-                "--no-graph",
-                "-r",
-                &revision(bookmark),
-                "-T",
-                "commit_id ++ \"\\n\"",
-            ],
-        )
-        .await?;
-    let ids: Vec<_> = output.lines().filter(|s| !s.is_empty()).collect();
-    if ids.len() > 1 {
-        return Err(pointer_integrity_error(format!(
-            "recovery bookmark {bookmark} {UNRESOLVED_MESSAGE}; found {}",
-            ids.len()
-        )));
-    }
-    Ok(ids.first().map(|id| (*id).to_owned()))
-}
-
 /// True when `commit` (a full commit id) exists in the store, visible or not.
 async fn commit_exists(jj: &dyn Jj, repo: &Path, commit: &str) -> Result<bool> {
     if commit.is_empty() || !commit.bytes().all(|c| c.is_ascii_hexdigit()) {
@@ -390,259 +291,11 @@ async fn commit_exists(jj: &dyn Jj, repo: &Path, commit: &str) -> Result<bool> {
         .unwrap_or(false))
 }
 
-fn missing_heads_error(record: &ExecutionBookmark) -> anyhow::Error {
-    anyhow::Error::new(MissingPointerError(format!(
-        "expected recovery pointer {} or {} to resolve to exactly one change; both are missing",
-        record.head(),
-        record.publication()
-    )))
-}
-
-/// The two heads of one execution. Both are optional (cube may have
-/// consumed `boss/…`), but never both absent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Heads {
-    pub(crate) recovery: Option<String>,
-    pub(crate) publication: Option<String>,
-}
-
-impl Heads {
-    /// `(bookmark name, commit)` for each head that exists.
-    pub(crate) fn named(&self, record: &ExecutionBookmark) -> Vec<(String, String)> {
-        [
-            (record.head(), &self.recovery),
-            (record.publication(), &self.publication),
-        ]
-        .into_iter()
-        .filter_map(|(name, commit)| commit.clone().map(|commit| (name, commit)))
-        .collect()
-    }
-}
-
-/// The recovery head and the floor of the execution's work.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Pointers {
-    /// A revset naming the floor: the recorded baseline commit id, or `trunk()`.
-    pub(crate) base: String,
-    pub(crate) heads: Heads,
-}
-
-/// What one `jj` invocation reads for a record: the commits its two head
-/// bookmarks target and which of its recorded floor commits exist in the
-/// store, visible or not. Every resolver below derives its answer from this,
-/// so resolving heads, floor or both costs one child process.
-struct PointerQuery {
-    targets: std::collections::HashMap<String, Vec<String>>,
-    present: std::collections::HashSet<String>,
-}
-
-/// The recorded floor candidates that can be commit ids, in precedence order.
-fn floor_candidates(record: &ExecutionBookmark) -> impl Iterator<Item = &str> {
-    [record.base_commit.as_deref(), record.pr_head_before.as_deref()]
-        .into_iter()
-        .flatten()
-        .filter(|commit| !commit.is_empty() && commit.bytes().all(|c| c.is_ascii_hexdigit()))
-}
-
-/// Every commit `revset` names, with the local bookmarks it carries, in one
-/// `jj` invocation. Hidden commits named explicitly are listed too.
-pub(crate) async fn commits_with_bookmarks(
-    jj: &dyn Jj,
-    repo: &Path,
-    revset: &str,
-) -> Result<Vec<(String, Vec<String>)>> {
-    let output = jj
-        .run(
-            repo,
-            &[
-                "--ignore-working-copy",
-                "log",
-                "--no-graph",
-                "-r",
-                revset,
-                "-T",
-                "commit_id ++ \"\\t\" ++ local_bookmarks.map(|b| b.name()).join(\"\\t\") ++ \"\\n\"",
-            ],
-        )
-        .await?;
-    Ok(output
-        .lines()
-        .filter(|line| !line.is_empty())
-        .filter_map(|line| {
-            let mut fields = line.split('\t');
-            let commit = fields.next().filter(|commit| !commit.is_empty())?;
-            Some((
-                commit.to_owned(),
-                fields.filter(|name| !name.is_empty()).map(str::to_owned).collect(),
-            ))
-        })
-        .collect())
-}
-
-/// The commits each of `bookmarks` targets among `commits`: a conflicted
-/// bookmark lists more than one, an absent bookmark is missing from the map.
-pub(crate) fn bookmark_targets_in(
-    commits: &[(String, Vec<String>)],
-    bookmarks: &[String],
-) -> std::collections::HashMap<String, Vec<String>> {
-    let mut targets: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-    for (commit, names) in commits {
-        for name in names.iter().filter(|name| bookmarks.contains(name)) {
-            targets.entry(name.clone()).or_default().push(commit.clone());
-        }
-    }
-    targets
-}
-
-async fn query_pointers(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<PointerQuery> {
-    let names = [record.head(), record.publication()];
-    let mut revset: Vec<String> = names.iter().map(|name| revision(name)).collect();
-    // `present()` turns a commit that is not in the store into an empty set
-    // instead of a resolution error; a hidden commit named by id is listed.
-    revset.extend(floor_candidates(record).map(|commit| format!("present({commit})")));
-    let commits = commits_with_bookmarks(jj, &record.repo_path, &revset.join(" | ")).await?;
-    Ok(PointerQuery {
-        targets: bookmark_targets_in(&commits, &names),
-        present: commits.into_iter().map(|(commit, _)| commit).collect(),
-    })
-}
-
-impl PointerQuery {
-    /// The single commit `bookmark` targets. A conflicted bookmark resolves to
-    /// several commits and is a real pointer-integrity error.
-    fn single(&self, bookmark: &str) -> Result<Option<String>> {
-        match self.targets.get(bookmark).map(Vec::as_slice) {
-            None | Some([]) => Ok(None),
-            Some([commit]) => Ok(Some(commit.clone())),
-            Some(commits) => Err(pointer_integrity_error(format!(
-                "recovery bookmark {bookmark} {UNRESOLVED_MESSAGE}; found {}",
-                commits.len()
-            ))),
-        }
-    }
-
-    fn heads(&self, record: &ExecutionBookmark) -> Result<Heads> {
-        let recovery = self.single(&record.head())?;
-        let publication = self.single(&record.publication())?;
-        if recovery.is_none() && publication.is_none() {
-            return Err(missing_heads_error(record));
-        }
-        Ok(Heads { recovery, publication })
-    }
-
-    /// The floor of the execution's work: the commit id recorded on its row. A
-    /// rewritten or abandoned baseline commit still exists in the store, so it
-    /// keeps working as a floor. A record with no usable `base_commit` (legacy,
-    /// or collected from the store) uses the bound PR's `pr_head_before`, then
-    /// trunk. Neither is an error. A recorded id is used only when the store
-    /// returned exactly it, never a commit it merely prefixes.
-    fn base(&self, record: &ExecutionBookmark) -> String {
-        floor_candidates(record)
-            .find(|commit| self.present.contains(*commit))
-            .map_or_else(|| "trunk()".to_owned(), str::to_owned)
-    }
-}
-
-#[cfg(test)]
-pub(crate) async fn resolve_heads(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<Heads> {
-    query_pointers(jj, record).await?.heads(record)
-}
-
-/// See [`PointerQuery::base`]. Works for a record whose heads are gone.
-pub(crate) async fn resolve_base(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
-    Ok(query_pointers(jj, record).await?.base(record))
-}
-
-pub(crate) async fn resolve_pointers(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<Pointers> {
-    let query = query_pointers(jj, record).await?;
-    Ok(Pointers {
-        base: query.base(record),
-        heads: query.heads(record)?,
-    })
-}
-
 async fn usable_commit(jj: &dyn Jj, repo: &Path, commit: Option<&str>) -> Result<Option<String>> {
     match commit {
         Some(commit) if commit_exists(jj, repo, commit).await? => Ok(Some(commit.to_owned())),
         _ => Ok(None),
     }
-}
-
-/// Work above the floor: everything the head reaches that the floor's own
-/// ancestry does not. Ancestry is subtracted by commit id, so the floor needs
-/// no bookmark and no descent relationship with the head: a head that was
-/// rebased away from it (or a floor that was abandoned) still has a
-/// well-defined range.
-pub(crate) fn above_floor(base: &str, head: &str) -> String {
-    format!("(::({head}) ~ ::({base}))")
-}
-
-/// True when `descendant` is reachable from `ancestor` (or is it).
-pub(crate) async fn descends(jj: &dyn Jj, repo: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
-    let connected = jj
-        .run(
-            repo,
-            &[
-                "--ignore-working-copy",
-                "log",
-                "--no-graph",
-                "-r",
-                &format!("({ancestor})::({descendant}) & ({descendant})"),
-                "-T",
-                "commit_id",
-            ],
-        )
-        .await?;
-    Ok(connected.trim() == descendant)
-}
-
-/// The head bookmarks to resume from. One head normally; the one that
-/// descends from the other when they sit on the same line. Two heads on
-/// different lines are not an integrity failure and neither is dropped: both
-/// are resumed, so work that only one of them carries is still recovered.
-pub(crate) async fn resume_heads(jj: &dyn Jj, record: &ExecutionBookmark, pointers: &Pointers) -> Result<Vec<String>> {
-    match (&pointers.heads.recovery, &pointers.heads.publication) {
-        // Unreachable while `resolve_heads` rejects two missing heads;
-        // typed so an edit that moves it degrades instead of panicking.
-        (None, None) => Err(missing_heads_error(record)),
-        (Some(recovery), Some(publication)) if recovery != publication => {
-            if descends(jj, &record.repo_path, recovery, publication).await? {
-                return Ok(vec![record.publication()]);
-            }
-            if descends(jj, &record.repo_path, publication, recovery).await? {
-                return Ok(vec![record.head()]);
-            }
-            Ok(vec![record.head(), record.publication()])
-        }
-        (Some(_), _) => Ok(vec![record.head()]),
-        (None, Some(_)) => Ok(vec![record.publication()]),
-    }
-}
-
-/// A revset naming every resumed head.
-pub(crate) fn heads_revset(heads: &[String]) -> String {
-    format!(
-        "({})",
-        heads.iter().map(|head| revision(head)).collect::<Vec<_>>().join(" | ")
-    )
-}
-
-/// Legacy heads follow the working-copy change, so a later holder's snapshot
-/// can move them onto edits teardown quarantined. Restaging such a head would
-/// adopt those edits, so it is refused the same way `preserved/<exec>` is.
-pub(crate) async fn reject_quarantined_heads(jj: &dyn Jj, record: &ExecutionBookmark, heads: &[String]) -> Result<()> {
-    let revisions: Vec<String> = heads.iter().map(|head| revision(head)).collect();
-    let safe = preserved::safe_candidates(jj, record, revisions.clone()).await?;
-    if safe.len() != revisions.len() {
-        return Err(pointer_integrity_error_of(
-            PointerIntegrityKind::Quarantined,
-            format!(
-                "recovery head of {} descends from work quarantined as possibly belonging to a later holder; not restaging it",
-                record.execution_id
-            ),
-        ));
-    }
-    Ok(())
 }
 
 /// The report a restore hands to the successor worker's prompt.
@@ -715,12 +368,12 @@ impl RestoreReport {
     }
 }
 
-/// Compatibility fixtures for the pre-migration three-bookmark layout, used only by this
-/// crate's own tests. Other crates use `boss_engine_recovery_fixtures`.
+/// Record fixtures used only by this crate's own tests. Other crates use
+/// `boss_engine_recovery_fixtures`.
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
-pub(crate) use test_support::create_legacy_three_bookmark_fixture as create;
+pub(crate) use test_support::create;
 
 /// Baseline recording failed after identifying the shared store.
 #[derive(Debug)]
@@ -757,7 +410,6 @@ pub async fn create_from(
         host_id: host_id.to_owned(),
         base_commit: None,
         pr_head_before: None,
-        has_recovery_head: None,
     };
     let result = async {
         if let Some(prior) = predecessor
@@ -768,8 +420,8 @@ pub async fn create_from(
             ));
         }
         // A restore-report, positioned-commit, or `pr_head_before` hash is
-        // the floor only when it still exists. A missing hash is not copied:
-        // `jj bookmark create` would fail on every retry. Fall back to the
+        // the floor only when it still exists. A missing hash is not copied,
+        // because nothing could ever resolve it. Fall back to the
         // predecessor's resolved floor, then the trunk commit. The positioned
         // workspace's ancestry is never walked to infer a floor.
         let baseline = if let Some(commit) = usable_commit(jj, &record.repo_path, inherited_base).await? {
@@ -780,9 +432,6 @@ pub async fn create_from(
             one_commit(jj, workspace, "trunk()").await?
         };
         record.base_commit = Some(baseline.clone());
-        // Dispatch records only its starting commit and never creates a
-        // recovery head; teardown preserves workspace edits itself.
-        record.has_recovery_head = Some(false);
         Ok(record.clone())
     }
     .await;
@@ -790,13 +439,17 @@ pub async fn create_from(
 }
 
 /// Effective floor of a predecessor whose restore report did not supply one:
-/// the floor `resolve_base` computes (its recorded `base_commit`, else
-/// `pr_head_before`, else trunk), as a commit id. The legacy `boss-base/`
-/// bookmark is never read. Never inferred from the successor workspace (which
-/// has already been restored onto the predecessor heads) and never an
-/// unchecked raw hash.
+/// its recorded `base_commit`, else its `pr_head_before`, whichever still
+/// exists in the store, else the trunk commit. Never inferred from the
+/// successor workspace (which has already been restored onto the
+/// predecessor's work) and never an unchecked raw hash.
 async fn predecessor_floor(jj: &dyn Jj, prior: &ExecutionBookmark) -> Result<String> {
-    one_commit(jj, &prior.repo_path, &resolve_base(jj, prior).await?).await
+    for commit in [prior.base_commit.as_deref(), prior.pr_head_before.as_deref()] {
+        if let Some(commit) = usable_commit(jj, &prior.repo_path, commit).await? {
+            return Ok(commit);
+        }
+    }
+    one_commit(jj, &prior.repo_path, "trunk()").await
 }
 
 /// Resolve a revset to exactly one commit id.
@@ -826,155 +479,6 @@ pub async fn start_fresh(jj: &dyn Jj, workspace: &Path) -> Result<String> {
     let trunk = one_commit(jj, workspace, "trunk()").await?;
     jj.run(workspace, &["new", &trunk, "-m", "Fresh execution"]).await?;
     Ok(trunk)
-}
-
-/// Deliberately unguarded by the quarantine: `backup_execution_patch` exports
-/// quarantined heads so their content is kept, and nothing here restages them.
-/// Any caller that restages must go through `unpublished_diff` or call
-/// `reject_quarantined_heads` on the heads it resolved itself.
-///
-/// Diff for each resumed head, concatenated, from the newest common ancestor
-/// of the head with the floor or trunk. Bounding by trunk keeps upstream
-/// changes a rebase pulled in out of the patch.
-/// A successful empty patch proves an empty run (including a head that shares
-/// no history with the floor beyond the fork, such as `root()`). Missing or
-/// conflicted references and unavailable jj are errors, never empty results.
-pub async fn diff(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
-    let pointers = resolve_pointers(jj, record).await?;
-    let heads = resume_heads(jj, record, &pointers).await?;
-    diff_of(jj, record, &pointers, &heads).await
-}
-
-/// [`diff`] for pointers and resumed heads the caller already resolved.
-async fn diff_of(jj: &dyn Jj, record: &ExecutionBookmark, pointers: &Pointers, heads: &[String]) -> Result<String> {
-    let mut patches = String::new();
-    for head in heads {
-        let head = revision(head);
-        let patch = jj
-            .run(
-                &record.repo_path,
-                &[
-                    "--ignore-working-copy",
-                    "diff",
-                    "--git",
-                    "--from",
-                    // Tolerates a floor that the head no longer descends from
-                    // (a rewrite or an abandon). Bounding by trunk keeps the
-                    // upstream changes a rebase pulled in out of the patch.
-                    &format!("fork_point(heads(::({head}) & (::({}) | ::trunk())))", pointers.base),
-                    "--to",
-                    &head,
-                ],
-            )
-            .await?;
-        patches.push_str(&crate::recovery_apply::filter_bookkeeping(&patch).text);
-    }
-    Ok(patches)
-}
-
-/// Fork from the reference so later edits cannot rewrite the predecessor's work.
-pub async fn restore(jj: &dyn Jj, record: &ExecutionBookmark, workspace: &Path) -> Result<bool> {
-    restore_for_retry(jj, record, workspace, false).await
-}
-
-/// A retry must keep its own baseline and pointers in the working history,
-/// even when that execution has no unpublished diff.
-pub async fn restore_for_retry(
-    jj: &dyn Jj,
-    record: &ExecutionBookmark,
-    workspace: &Path,
-    self_retry: bool,
-) -> Result<bool> {
-    ensure!(
-        jj.shared_repo(workspace).await? == record.repo_path,
-        "recovery destination belongs to a different shared repository"
-    );
-    let pointers = resolve_pointers(jj, record).await?;
-    let heads = resume_heads(jj, record, &pointers).await?;
-    let has_work = !unpublished_diff_of(jj, record, &pointers, &heads)
-        .await?
-        .trim()
-        .is_empty();
-    if !has_work && !self_retry {
-        return Ok(false);
-    }
-    reject_quarantined_heads(jj, record, &heads).await?;
-    let head = heads_revset(&heads);
-    if self_retry && heads.len() == 1 {
-        let empty_setup = jj
-            .run(
-                workspace,
-                &[
-                    "log",
-                    "--no-graph",
-                    "-r",
-                    &format!("{head} & ({EMPTY_SETUP_CHANGES})"),
-                    "-T",
-                    "commit_id",
-                ],
-            )
-            .await?;
-        if !empty_setup.trim().is_empty() {
-            // This execution still owns its untouched editable change. Resume
-            // it, so a retry cannot strand it below a newly authored child.
-            // Its existing baseline and head pointers continue to follow edits.
-            jj.run(workspace, &["edit", &head]).await?;
-            return Ok(has_work);
-        }
-    }
-    // Several heads (different lines) become the parents of one resumed change.
-    let mut args = vec!["new".to_owned()];
-    args.extend(heads.iter().map(|head| revision(head)));
-    args.extend(["-m".to_owned(), "Resume recovered execution work".to_owned()]);
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    jj.run(workspace, &args).await?;
-    Ok(has_work)
-}
-
-/// Ignore work already reachable from a remote bookmark, including an empty
-/// working-copy child left after publishing. Still validate both local refs.
-pub async fn unpublished_diff(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
-    let pointers = resolve_pointers(jj, record).await?;
-    let heads = resume_heads(jj, record, &pointers).await?;
-    unpublished_diff_of(jj, record, &pointers, &heads).await
-}
-
-/// [`unpublished_diff`] for pointers and resumed heads the caller already
-/// resolved, so one operation resolves them once.
-pub(crate) async fn unpublished_diff_of(
-    jj: &dyn Jj,
-    record: &ExecutionBookmark,
-    pointers: &Pointers,
-    heads: &[String],
-) -> Result<String> {
-    let patch = diff_of(jj, record, pointers, heads).await?;
-    if patch.trim().is_empty() {
-        return Ok(patch);
-    }
-    reject_quarantined_heads(jj, record, heads).await?;
-    let range = format!(
-        "({} ~ ::remote_bookmarks()) & ~empty()",
-        above_floor(&pointers.base, &heads_revset(heads))
-    );
-    let unpublished = jj
-        .run(
-            &record.repo_path,
-            &[
-                "--ignore-working-copy",
-                "log",
-                "--no-graph",
-                "-r",
-                &range,
-                "-T",
-                "change_id ++ \"\\n\"",
-            ],
-        )
-        .await?;
-    Ok(if unpublished.trim().is_empty() {
-        String::new()
-    } else {
-        patch
-    })
 }
 
 #[cfg(test)]

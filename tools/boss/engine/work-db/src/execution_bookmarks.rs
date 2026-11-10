@@ -12,6 +12,25 @@ pub(crate) fn migrate_has_recovery_head(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// The prune sweep and the `boss-recovery/` head are gone, so the state they
+/// kept on the record is too. Open `execution_bookmark_prune_unproven` items
+/// described a sweep that no longer runs and nothing would ever resolve them.
+pub(crate) const RETIRE_PRUNE_STATE_MIGRATION_ID: &str = "20261109_1500_execution_bookmark_retire_prune_state";
+
+pub(crate) fn migrate_retire_prune_state(conn: &Connection) -> Result<()> {
+    for column in ["prune_checked_at", "prune_outcome", "has_recovery_head"] {
+        if table_has_column(conn, "execution_bookmarks", column)? {
+            conn.execute_batch(&format!("ALTER TABLE execution_bookmarks DROP COLUMN {column}"))?;
+        }
+    }
+    conn.execute(
+        "UPDATE work_attention_items SET status = 'resolved', resolved_at = CAST(unixepoch('now') AS TEXT)
+         WHERE kind = 'execution_bookmark_prune_unproven' AND status = 'open'",
+        [],
+    )?;
+    Ok(())
+}
+
 #[work_db_boundary::instrument]
 impl WorkDb {
     pub fn record_execution_restore_report(
@@ -74,11 +93,10 @@ impl WorkDb {
     /// attention item filed at retirement keeps that history.
     pub fn record_execution_bookmark(&self, record: &ExecutionBookmark) -> Result<()> {
         let changed = self.connect()?.execute(
-            "INSERT INTO execution_bookmarks (execution_id, repo_path, host_id, base_commit, has_recovery_head)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO execution_bookmarks (execution_id, repo_path, host_id, base_commit)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(execution_id) DO UPDATE SET
                 repo_path = excluded.repo_path, host_id = excluded.host_id, base_commit = excluded.base_commit,
-                has_recovery_head = excluded.has_recovery_head,
                 recovered_from = NULL, recovered_work = NULL, reconciliation_note = NULL,
                 retired_at = NULL, retired_reason = NULL
              WHERE retired_at IS NOT NULL",
@@ -87,7 +105,6 @@ impl WorkDb {
                 record.repo_path.to_str().context("shared repo path is not UTF-8")?,
                 record.host_id,
                 record.base_commit,
-                record.has_recovery_head.map(i64::from),
             ],
         )?;
         anyhow::ensure!(changed == 1, "execution bookmark record already exists and is live");
@@ -156,8 +173,7 @@ impl WorkDb {
         Ok(self
             .connect()?
             .query_row(
-                "SELECT eb.execution_id, eb.repo_path, eb.host_id, eb.base_commit, we.pr_head_before,
-                        eb.has_recovery_head
+                "SELECT eb.execution_id, eb.repo_path, eb.host_id, eb.base_commit, we.pr_head_before
                  FROM execution_bookmarks eb
                  LEFT JOIN work_executions we ON we.id = eb.execution_id
                  WHERE eb.execution_id = ?1 AND eb.retired_at IS NULL",
@@ -169,7 +185,6 @@ impl WorkDb {
                         host_id: row.get(2)?,
                         base_commit: row.get(3)?,
                         pr_head_before: row.get(4)?,
-                        has_recovery_head: row.get::<_, Option<i64>>(5)?.map(|value| value != 0),
                     })
                 },
             )
@@ -278,142 +293,8 @@ pub struct RecoverySource {
     pub has_preserved_tip: bool,
 }
 
-/// Where the prune sweep left a record. Stored in
-/// `execution_bookmarks.prune_outcome`; the sweep re-examines a record on a
-/// schedule that depends on it.
-pub mod prune_outcome {
-    pub const PUBLISHED: &str = "published";
-    pub const ALREADY_GONE: &str = "already_gone";
-    pub const UNPROVEN: &str = "unproven";
-    pub const PR_OPEN: &str = "pr_open";
-    pub const ERROR: &str = "error";
-}
-
-/// A terminal, local execution whose recovery record is still live, with
-/// everything the prune sweep can prove publication from.
-#[derive(Debug, Clone, bon::Builder)]
-#[builder(on(String, into))]
-pub struct PruneCandidate {
-    pub execution: WorkExecution,
-    /// The chain root's PR, when one was ever bound.
-    pub pr_url: Option<String>,
-    /// True when the chain root is `done` or `archived`: its PR is merged
-    /// or closed, or a human closed the item without one.
-    pub chain_closed: bool,
-    /// `tasks.pr_head_sha` of the chain root: the last PR head the merge
-    /// poller observed, which for a merged PR is the head that merged.
-    pub observed_pr_head: Option<String>,
-    /// PR heads the chain's executions recorded around their own pushes
-    /// (`pr_head_before` / `pr_head_after`), oldest first, deduplicated.
-    pub recorded_pr_heads: Vec<String>,
-}
-
 #[work_db_boundary::instrument]
 impl WorkDb {
-    /// Live local recovery records of terminal executions that are due for
-    /// a prune check: never checked, or checked long enough ago for their
-    /// last outcome. Oldest-finished first, never-checked before re-checks,
-    /// at most `limit` rows so one pass stays bounded however large the
-    /// backlog is.
-    pub fn list_prune_candidates(
-        &self,
-        grace_secs: i64,
-        recheck_open_secs: i64,
-        recheck_unproven_secs: i64,
-        limit: usize,
-    ) -> Result<Vec<PruneCandidate>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare(
-            "SELECT we.id FROM work_executions we
-             JOIN execution_bookmarks eb ON eb.execution_id = we.id
-             WHERE eb.retired_at IS NULL
-               AND eb.host_id = 'local'
-               AND we.status IN ('completed', 'failed', 'cancelled', 'orphaned', 'abandoned')
-               AND we.finished_at IS NOT NULL
-               AND CAST(we.finished_at AS INTEGER) <= unixepoch('now') - ?1
-               AND COALESCE(eb.prune_checked_at, 0)
-                   + CASE eb.prune_outcome WHEN 'unproven' THEN ?3 WHEN 'error' THEN ?3 ELSE ?2 END
-                   <= unixepoch('now')
-             ORDER BY (eb.prune_checked_at IS NOT NULL), CAST(we.finished_at AS INTEGER) ASC, we.id ASC
-             LIMIT ?4",
-        )?;
-        let ids = stmt
-            .query_map(
-                params![grace_secs, recheck_open_secs, recheck_unproven_secs, limit as i64],
-                |row| row.get::<_, String>(0),
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        // The database has one connection behind a mutex, so everything that
-        // needs it is read here before it is released: the chain walk below
-        // (`list_executions_for_chain`) takes its own.
-        let mut rows = Vec::with_capacity(ids.len());
-        for id in ids {
-            let execution = query_execution(&conn, &id)?.context("prune candidate disappeared")?;
-            let chain_root_id = super::chain_helpers::chain_root(&conn, &execution.work_item_id)?;
-            let root: Option<(String, Option<String>, Option<String>)> = conn
-                .query_row(
-                    "SELECT status, pr_url, pr_head_sha FROM tasks WHERE id = ?1",
-                    [&chain_root_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .optional()?;
-            rows.push((execution, chain_root_id, root.unwrap_or_default()));
-        }
-        drop(stmt);
-        drop(conn);
-        let mut candidates = Vec::with_capacity(rows.len());
-        for (execution, chain_root_id, (status, pr_url, observed_pr_head)) in rows {
-            let mut recorded_pr_heads = Vec::new();
-            let mut push_head = |head: Option<String>| {
-                if let Some(head) = head.filter(|h| !h.trim().is_empty())
-                    && !recorded_pr_heads.contains(&head)
-                {
-                    recorded_pr_heads.push(head);
-                }
-            };
-            // Chronological, so the head that merged tends to come last and
-            // the vouchers are tried oldest first; the sweep reverses them.
-            for chained in self.list_executions_for_chain(&chain_root_id)? {
-                push_head(chained.pr_head_before.clone());
-                push_head(chained.pr_head_after.clone());
-            }
-            candidates.push(PruneCandidate {
-                execution,
-                pr_url: pr_url.filter(|url| !url.trim().is_empty()),
-                chain_closed: matches!(status.as_str(), "done" | "archived"),
-                observed_pr_head: observed_pr_head.filter(|sha| !sha.trim().is_empty()),
-                recorded_pr_heads,
-            });
-        }
-        Ok(candidates)
-    }
-
-    /// Stamp the outcome of a prune examination so the next pass can
-    /// schedule the re-check. A retired record is stamped too: the row
-    /// stays as the audit trail of what was proven.
-    pub fn record_execution_bookmark_prune_check(&self, execution_id: &str, outcome: &str) -> Result<()> {
-        let changed = self.connect()?.execute(
-            "UPDATE execution_bookmarks SET prune_checked_at = unixepoch('now'), prune_outcome = ?2
-             WHERE execution_id = ?1",
-            params![execution_id, outcome],
-        )?;
-        anyhow::ensure!(changed == 1, "execution bookmark record to stamp is missing");
-        Ok(())
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn execution_bookmark_prune_outcome(&self, execution_id: &str) -> Result<Option<String>> {
-        Ok(self
-            .connect()?
-            .query_row(
-                "SELECT prune_outcome FROM execution_bookmarks WHERE execution_id = ?1",
-                [execution_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .flatten())
-    }
-
     /// File a preserved-work inspection verdict for `execution_id`, or fold it
     /// into the open item: earlier evidence is kept and only commits and a
     /// reason the body does not yet carry are appended.
@@ -566,7 +447,6 @@ mod pr_head_before_loader_tests {
             host_id: "local".into(),
             base_commit: None,
             pr_head_before: None,
-            has_recovery_head: None,
         })
         .unwrap();
         let record = db.execution_bookmark(&execution.id).unwrap();

@@ -7,6 +7,51 @@ fn commit(repo: &std::path::Path, rev: &str) -> String {
     JjRepo::run(repo, &["log", "--no-graph", "-r", rev, "-T", "commit_id"])
 }
 
+fn legacy_head(record: &recovery::ExecutionBookmark) -> String {
+    format!("boss-recovery/{}", record.execution_id)
+}
+
+fn legacy_publication(record: &recovery::ExecutionBookmark) -> String {
+    format!("boss/{}", record.execution_id)
+}
+
+fn legacy_base(record: &recovery::ExecutionBookmark) -> String {
+    format!("boss-base/{}", record.execution_id)
+}
+
+/// Record an execution the way dispatch does, then leave the three bookmarks an
+/// earlier engine created for it. Nothing reads or removes them any more, so
+/// each test that includes them proves that leftover state stays inert.
+async fn legacy_record(
+    workspace: &std::path::Path,
+    execution_id: &str,
+    host: &str,
+) -> anyhow::Result<recovery::ExecutionBookmark> {
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, workspace, execution_id, host).await?;
+    JjRepo::run(
+        workspace,
+        &[
+            "bookmark",
+            "set",
+            &legacy_base(&record),
+            "-r",
+            record.base_commit.as_deref().unwrap(),
+        ],
+    );
+    JjRepo::run(
+        workspace,
+        &[
+            "bookmark",
+            "set",
+            &legacy_head(&record),
+            &legacy_publication(&record),
+            "-r",
+            "@",
+        ],
+    );
+    Ok(record)
+}
+
 fn advance_trunk(repo: &std::path::Path) {
     JjRepo::run(repo, &["new", "main", "-m", "Upstream advance"]);
     std::fs::write(repo.join("upstream.txt"), "someone else's work").unwrap();
@@ -27,7 +72,7 @@ fn conflict_recovery_head(repo: &std::path::Path, record: &recovery::ExecutionBo
                 operation.trim(),
                 "bookmark",
                 "set",
-                &record.head(),
+                &legacy_head(record),
                 "-r",
                 &target,
                 "--allow-backwards",
@@ -73,13 +118,11 @@ async fn fresh_start_on_host(kind: ExecutionKind, resume: bool, pr: bool, disabl
     let source = if resume { next.id.clone() } else { prior.id.clone() };
     let repo = JjRepo::new(dir.path());
     super::recovery::configure_recovery_origin(&repo.repo);
-    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &source, "local")
-        .await
-        .unwrap();
+    let record = legacy_record(&repo.worker, &source, "local").await.unwrap();
     db.record_execution_bookmark(&record).unwrap();
     std::fs::write(repo.worker.join("shared.txt"), "unpublished, non-compiling work\n").unwrap();
     JjRepo::run(&repo.worker, &["describe", "-m", "Preserved edit"]);
-    let preserved = commit(&repo.repo, &record.head());
+    let preserved = commit(&repo.repo, &legacy_head(&record));
     JjRepo::run(&repo.repo, &["new", "main", "-m", "Rebased PR"]);
     std::fs::write(repo.repo.join("shared.txt"), "current published work\n").unwrap();
     JjRepo::run(&repo.repo, &["bookmark", "set", "pr/99", "-r", "@"]);
@@ -100,18 +143,13 @@ async fn fresh_start_on_host(kind: ExecutionKind, resume: bool, pr: bool, disabl
                     operation.trim(),
                     "bookmark",
                     "set",
-                    &record.head(),
+                    &legacy_head(&record),
                     "-r",
                     &target,
                     "--allow-backwards",
                 ],
             );
         }
-        let failure = recovery::diff(&LocalJj, &record).await.unwrap_err();
-        assert_eq!(
-            recovery::pointer_integrity_kind(&failure),
-            Some(recovery::PointerIntegrityKind::Other)
-        );
     }
     if kind == ExecutionKind::PrReviewGuide {
         let packet = crate::test_support::review_guide_source_packet(&commit(&repo.repo, "main"), &current);
@@ -214,7 +252,13 @@ async fn fresh_start_on_host(kind: ExecutionKind, resume: bool, pr: bool, disabl
         assert!(
             JjRepo::run(
                 &repo.repo,
-                &["bookmark", "list", &fresh.base(), &fresh.head(), &fresh.publication()]
+                &[
+                    "bookmark",
+                    "list",
+                    &legacy_base(&fresh),
+                    &legacy_head(&fresh),
+                    &legacy_publication(&fresh)
+                ]
             )
             .is_empty()
         );
@@ -309,13 +353,11 @@ async fn source_host_dispatch(full: bool) {
     let next = db.get_execution(&next.id).unwrap();
     let repo = JjRepo::new(dir.path());
     super::recovery::configure_recovery_origin(&repo.repo);
-    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "source")
-        .await
-        .unwrap();
+    let record = legacy_record(&repo.worker, &prior.id, "source").await.unwrap();
     db.record_execution_bookmark(&record).unwrap();
     std::fs::write(repo.worker.join("work.txt"), "intact source work").unwrap();
     JjRepo::run(&repo.worker, &["status"]);
-    let old = commit(&repo.repo, &record.head());
+    let old = commit(&repo.repo, &legacy_head(&record));
     let cube = Arc::new(FakeCubeClient {
         real_bookmarks: true,
         position_real_workspace: true,
@@ -345,7 +387,7 @@ async fn source_host_dispatch(full: bool) {
     assert_eq!(next.pre_start_failure_count, 0);
     assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
     assert!(db.execution_bookmark_retired_reason(&prior.id).unwrap().is_none());
-    for name in [record.head(), record.publication()] {
+    for name in [legacy_head(&record), legacy_publication(&record)] {
         assert_eq!(commit(&repo.repo, &name), old);
     }
     assert!(
@@ -378,9 +420,7 @@ async fn free_recovery_source_host_is_preferred_over_another_eligible_host() {
     let next = db.get_execution(&next.id).unwrap();
     let repo = JjRepo::new(dir.path());
     super::recovery::configure_recovery_origin(&repo.repo);
-    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "source")
-        .await
-        .unwrap();
+    let record = legacy_record(&repo.worker, &prior.id, "source").await.unwrap();
     db.record_execution_bookmark(&record).unwrap();
     std::fs::write(repo.worker.join("work.txt"), "intact source work").unwrap();
     JjRepo::run(&repo.worker, &["status"]);
@@ -456,9 +496,7 @@ async fn host_preference_uses_a_retired_row_that_still_holds_preserved_work() {
     let next = db.get_execution(&next.id).unwrap();
     let repo = JjRepo::new(dir.path());
     super::recovery::configure_recovery_origin(&repo.repo);
-    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "source")
-        .await
-        .unwrap();
+    let record = legacy_record(&repo.worker, &prior.id, "source").await.unwrap();
     db.record_execution_bookmark(&record).unwrap();
     std::fs::write(repo.worker.join("work.txt"), "preserved on a retired row").unwrap();
     JjRepo::run(&repo.worker, &["status"]);
@@ -534,7 +572,6 @@ async fn cross_host_empty_predecessor_starts_fresh_without_the_source_adapter() 
     let record = recovery::create_from(&LocalJj, &repo.worker, &prior.id, "source", None, None)
         .await
         .unwrap();
-    assert_eq!(record.has_recovery_head, Some(false));
     db.record_execution_bookmark(&record).unwrap();
     let cube = Arc::new(FakeCubeClient {
         real_bookmarks: true,
@@ -627,20 +664,16 @@ async fn stale_current_names_do_not_change_initialization_or_predecessor() {
     let (db, prior, next) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
     let repo = JjRepo::new(dir.path());
     super::recovery::configure_recovery_origin(&repo.repo);
-    let source = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "local")
-        .await
-        .unwrap();
+    let source = legacy_record(&repo.worker, &prior.id, "local").await.unwrap();
     db.record_execution_bookmark(&source).unwrap();
     std::fs::write(repo.worker.join("work.txt"), "recovered work").unwrap();
     JjRepo::run(&repo.worker, &["status"]);
-    let head = commit(&repo.repo, &source.head());
+    let head = commit(&repo.repo, &legacy_head(&source));
     JjRepo::run(&repo.replacement, &["new", &head, "-m", "Recovered"]);
-    let stale = boss_engine_recovery_fixtures::create(&LocalJj, &repo.replacement, &next.id, "local")
-        .await
-        .unwrap();
+    let stale = legacy_record(&repo.replacement, &next.id, "local").await.unwrap();
     std::fs::write(repo.replacement.join("stale.txt"), "distinct stale work").unwrap();
     JjRepo::run(&repo.replacement, &["status"]);
-    let stale_head = commit(&repo.repo, &stale.head());
+    let stale_head = commit(&repo.repo, &legacy_head(&stale));
     JjRepo::run(&repo.replacement, &["new", &head, "-m", "Adopt predecessor"]);
     let cube = Arc::new(FakeCubeClient {
         real_bookmarks: true,
@@ -664,7 +697,7 @@ async fn stale_current_names_do_not_change_initialization_or_predecessor() {
         .create_execution_bookmark(&lease.workspace_path, &next.id, None, source.base_commit.as_deref())
         .await
         .unwrap();
-    assert_eq!(commit(&repo.repo, &stale.head()), stale_head);
+    assert_eq!(commit(&repo.repo, &legacy_head(&stale)), stale_head);
     assert!(
         db.list_attention_items_for_work_item(&next.work_item_id)
             .unwrap()
@@ -778,13 +811,11 @@ async fn startup_resume(unrelated: bool) {
     seed_local_claude_driver(&db);
     let repo = JjRepo::new(dir.path());
     super::recovery::configure_recovery_origin(&repo.repo);
-    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &next.id, "local")
-        .await
-        .unwrap();
+    let record = legacy_record(&repo.worker, &next.id, "local").await.unwrap();
     db.record_execution_bookmark(&record).unwrap();
     std::fs::write(repo.worker.join("work.txt"), "keep unpublished work").unwrap();
     JjRepo::run(&repo.worker, &["status"]);
-    let old = commit(&repo.repo, &record.head());
+    let old = commit(&repo.repo, &legacy_head(&record));
     conflict_recovery_head(&repo.repo, &record);
     let existing = if unrelated {
         JjRepo::run(&repo.repo, &["new", "main", "-m", "Separate unpublished work"]);
@@ -847,7 +878,7 @@ async fn startup_resume(unrelated: bool) {
         .resume_pane_spawn_for_running_execution(&next)
         .await
         .unwrap();
-    assert_eq!(commit(&repo.repo, &record.publication()), old);
+    assert_eq!(commit(&repo.repo, &legacy_publication(&record)), old);
     assert_eq!(db.execution_bookmark(&next.id).unwrap(), record);
     assert!(repo.worker.join("work.txt").exists());
     if let Some(existing) = existing {
@@ -898,12 +929,10 @@ async fn initialization_fallback(inherited: bool) {
     let source_id = if inherited { &source.id } else { &next.id };
     let repo = JjRepo::new(dir.path());
     super::recovery::configure_recovery_origin(&repo.repo);
-    let prior = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, source_id, "local")
-        .await
-        .unwrap();
+    let prior = legacy_record(&repo.worker, source_id, "local").await.unwrap();
     std::fs::write(repo.worker.join("lost.txt"), "keep this work").unwrap();
     JjRepo::run(&repo.worker, &["status"]);
-    let old = commit(&repo.repo, &prior.head());
+    let old = commit(&repo.repo, &legacy_head(&prior));
     if inherited {
         // The source head became ambiguous between recovery and adoption.
         db.record_execution_bookmark(&prior).unwrap();
@@ -966,10 +995,6 @@ async fn initialization_fallback(inherited: bool) {
                 .unwrap()
                 .is_empty()
         );
-        assert!(
-            recovery::diff(&LocalJj, &prior).await.is_err(),
-            "the conflicted predecessor was left intact"
-        );
         return;
     };
     // Leftover names from a crash between writing refs and inserting the
@@ -1029,8 +1054,14 @@ impl crate::host_adapter::HostAdapter for ScratchDestination {
         Ok(record)
     }
 
-    async fn execution_bookmark_diff(&self, record: &recovery::ExecutionBookmark) -> Result<String> {
-        self.inner.execution_bookmark_diff(&self.on_inner_store(record)).await
+    async fn forget_preserved_references(
+        &self,
+        record: &recovery::ExecutionBookmark,
+        scope: recovery::PreservedScope,
+    ) -> Result<Vec<String>> {
+        self.inner
+            .forget_preserved_references(&self.on_inner_store(record), scope)
+            .await
     }
 
     async fn restore_preserved_work(
@@ -1053,17 +1084,6 @@ impl crate::host_adapter::HostAdapter for ScratchDestination {
     ) -> Result<recovery::PreserveOutcome> {
         self.inner
             .confirm_workspace_recovery(&self.on_inner_store(record), workspace, recorded, since_unix)
-            .await
-    }
-
-    async fn prune_execution_bookmark(
-        &self,
-        record: &recovery::ExecutionBookmark,
-        vouchers: &[recovery::Voucher],
-        trunk: &str,
-    ) -> Result<recovery::PruneOutcome> {
-        self.inner
-            .prune_execution_bookmark(&self.on_inner_store(record), vouchers, trunk)
             .await
     }
 

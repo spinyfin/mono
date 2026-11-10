@@ -136,7 +136,7 @@ impl WorkDb {
         Ok(self
             .connect()?
             .query_row(
-                "SELECT eb.repo_path, eb.host_id, eb.base_commit, we.pr_head_before, eb.has_recovery_head
+                "SELECT eb.repo_path, eb.host_id, eb.base_commit, we.pr_head_before
                  FROM execution_bookmarks eb
                  LEFT JOIN work_executions we ON we.id = eb.execution_id
                  WHERE eb.execution_id = ?1",
@@ -148,7 +148,6 @@ impl WorkDb {
                         host_id: row.get(1)?,
                         base_commit: row.get(2)?,
                         pr_head_before: row.get(3)?,
-                        has_recovery_head: row.get::<_, Option<i64>>(4)?.map(|value| value != 0),
                     })
                 },
             )

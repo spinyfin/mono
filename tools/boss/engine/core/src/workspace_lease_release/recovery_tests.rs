@@ -31,15 +31,10 @@ async fn fixture(db: &WorkDb, workspace: &Path) -> WorkExecution {
 }
 
 #[tokio::test]
-async fn teardown_preserves_workspace_even_when_legacy_pointers_are_missing() {
+async fn teardown_preserves_workspace_without_any_execution_bookmark() {
     let (dir, db) = open_db();
     let repo = boss_engine_test_git::jj::JjRepo::new(dir.path());
     let execution = fixture(&db, &repo.worker).await;
-    let record = db.execution_bookmark(&execution.id).unwrap();
-    LocalJj
-        .run(&repo.worker, &["bookmark", "delete", &record.head()])
-        .await
-        .unwrap();
     std::fs::write(repo.worker.join("work.txt"), "preserve this work").unwrap();
     let outcome = apply_release(
         &db,
@@ -735,7 +730,6 @@ async fn only_an_unstarted_unrecorded_execution_is_never_positioned() {
         host_id: "local".to_owned(),
         base_commit: None,
         pr_head_before: None,
-        has_recovery_head: None,
     })
     .unwrap();
     assert!(!never_positioned(&db, &execution));
@@ -748,17 +742,6 @@ async fn occupied_workspace_is_not_preserved() {
     let (dir, db) = open_db();
     let repo = boss_engine_test_git::jj::JjRepo::new(dir.path());
     let execution = fixture(&db, &repo.worker).await;
-    let head_at = || {
-        let worker = repo.worker.clone();
-        let head = db.execution_bookmark(&execution.id).unwrap().head();
-        async move {
-            LocalJj
-                .run(&worker, &["log", "--no-graph", "-r", &head, "-T", "commit_id"])
-                .await
-                .unwrap()
-        }
-    };
-    let before = head_at().await;
     LocalJj
         .run(&repo.worker, &["new", "-m", "Past the head"])
         .await
@@ -786,7 +769,14 @@ async fn occupied_workspace_is_not_preserved() {
             reason: KeepReason::ProcessInWorkspace
         }
     );
-    assert_eq!(head_at().await, before, "the recovery head must not move");
+    let bookmarks = LocalJj
+        .run(&repo.repo, &["bookmark", "list", "-T", "name ++ \"\\n\""])
+        .await
+        .unwrap();
+    assert!(
+        !bookmarks.lines().any(|name| name.starts_with("preserved")),
+        "an occupied workspace must not be bookmarked: {bookmarks}"
+    );
     assert!(db.preserved_tip(&execution.id).unwrap().is_none());
     assert!(open_kinds(&db, &execution.id).is_empty());
 }

@@ -926,19 +926,11 @@ pub(crate) async fn reap_never_started_spawn(
     )
     .await;
 
-    // Export the dispatch-created reference. An empty run yields no patch;
-    // a missing or unreadable reference raises recovery attention.
-    let recovery_patch = crate::execution_bookmark_recovery::backup_dead_execution(ctx.work_db, execution).await;
-
     // Append an [engine-reconcile] audit line to the work item's description
     // so a human inspecting the chore can see why it was reset.
-    if let Err(err) = crate::reconcile_audit::append_reconcile_audit(
-        ctx.work_db,
-        work_item_id,
-        now_epoch_secs,
-        &audit_note,
-        recovery_patch.as_deref(),
-    ) {
+    if let Err(err) =
+        crate::reconcile_audit::append_reconcile_audit(ctx.work_db, work_item_id, now_epoch_secs, &audit_note)
+    {
         tracing::warn!(
             work_item_id,
             ?err,
@@ -992,7 +984,6 @@ pub(crate) async fn reap_never_started_spawn(
     let mut details = serde_json::json!({
         "slot_id": slot_id,
         "shell_pid": shell_pid,
-        "recovery_patch": recovery_patch.as_deref().map(|p| p.display().to_string()),
     });
     match &cause {
         ReapCause::DriverStartTimeout {

@@ -428,7 +428,6 @@ async fn repair_candidate(
              `{expected_branch}`; the latter is",
             candidate.bound_pr_url
         ),
-        None,
     ) {
         tracing::warn!(task_id = %candidate.task_id, ?err, "pr-binding-repair sweep: audit line append failed (non-fatal)");
     }

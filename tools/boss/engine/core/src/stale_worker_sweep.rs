@@ -1499,10 +1499,7 @@ async fn execute_auto_reap(
         "stale-worker sweep: two-hour token-verified auto-reap firing",
     );
 
-    // 1. Export the engine-created execution reference from the shared store.
-    let recovery_patch = crate::execution_bookmark_recovery::backup_dead_execution(work_db, execution).await;
-
-    // 2. Orphan + audit.
+    // 1. Orphan + audit.
     let reason = format!(
         "stale-worker-auto-reap: tmux session {session_name} confirmed live and idle for more than \
          {auto_reap_threshold_secs}s (last driver event: {progress_at}); worker force-reaped after a \
@@ -1527,7 +1524,6 @@ async fn execute_auto_reap(
                  live but idle for more than {auto_reap_threshold_secs}s (last driver event: {progress_at}); \
                  chore reset to todo for redispatch"
             ),
-            recovery_patch.as_deref(),
         )
     {
         tracing::warn!(
@@ -1581,9 +1577,6 @@ async fn execute_auto_reap(
                     "session_name": session_name,
                     "progress_at": progress_at,
                     "auto_reap_threshold_secs": auto_reap_threshold_secs,
-                    "recovery_patch": recovery_patch
-                        .as_deref()
-                        .map(|p| p.display().to_string()),
                 })),
         )
         .await;
@@ -1740,13 +1733,8 @@ async fn run_cadence_fallback(
     )
     .await;
 
-    // Export the wedged worker's recorded shared-store reference.
-    // Missing or unreadable references raise recovery attention.
-    let recovery_patch = crate::execution_bookmark_recovery::backup_dead_execution(work_db, execution).await;
-
     // Append [engine-reconcile] audit line to the task description so
-    // a human inspecting the chore can see why it was reset (and
-    // where to find the recovery patch, if one was captured).
+    // a human inspecting the chore can see why it was reset.
     if let Some(work_item_id) = state.work_item_id.as_deref().map(|id| work_db.owning_work_item_id(id))
         && let Err(err) = crate::reconcile_audit::append_reconcile_audit(
             work_db,
@@ -1755,7 +1743,6 @@ async fn run_cadence_fallback(
             &format!(
                 "stale worker (exec {execution_id}) detected — no transcript progress for > {stale_threshold_secs}s while working; chore reset to todo for redispatch"
             ),
-            recovery_patch.as_deref(),
         )
     {
         tracing::warn!(
@@ -1801,9 +1788,6 @@ async fn run_cadence_fallback(
                     "slot_id": state.slot_id,
                     "last_event_at": last_event_at,
                     "stale_threshold_secs": stale_threshold_secs,
-                    "recovery_patch": recovery_patch
-                        .as_deref()
-                        .map(|p| p.display().to_string()),
                 })),
         )
         .await;

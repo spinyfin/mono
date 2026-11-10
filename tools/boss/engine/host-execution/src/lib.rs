@@ -1213,7 +1213,7 @@ mod validation {
     pub(crate) fn store_operation(kind: Kind) -> bool {
         matches!(
             kind,
-            Kind::DiffBookmark | Kind::CheckpointBaseline | Kind::CheckPreservedUnpublished | Kind::PruneBookmark
+            Kind::CheckpointBaseline | Kind::CheckPreservedUnpublished | Kind::ForgetPreserved
         )
     }
 
@@ -1258,12 +1258,6 @@ mod validation {
             "invalid recovery execution id"
         );
         ensure!(value.repo_id == repo, "bookmark belongs to another repository");
-        ensure!(
-            value.head == format!("boss/{}", value.execution_id)
-                && value.recovery == format!("boss-recovery/{}", value.execution_id)
-                && value.base == format!("boss-base/{}", value.execution_id),
-            "unexpected recovery bookmark names"
-        );
         if !value.anchor_commit.is_empty() {
             commit(&value.anchor_commit)?;
         }
@@ -1398,49 +1392,36 @@ mod validation {
                 allowed.predecessor.clone_from(&op.predecessor);
                 allowed.inherited_base.clone_from(&op.inherited_base);
             }
-            Kind::RestoreBookmark => {
-                allowed.self_retry = op.self_retry;
-            }
             Kind::RestoreRebased | Kind::PrepareRecoveryPr | Kind::ReconcileBookmark => {
                 unreachable!("retired operations are rejected before field validation")
             }
             Kind::PositionedParent | Kind::StartFresh => {}
-            Kind::ConfirmRecovery | Kind::RestorePreserved | Kind::CheckPreservedUnpublished | Kind::PruneBookmark => {
+            Kind::ConfirmRecovery
+            | Kind::RestorePreserved
+            | Kind::CheckPreservedUnpublished
+            | Kind::ForgetPreserved => {
                 ensure!(
                     !op.request_json.is_empty(),
                     "recovery operation requires its request payload"
                 );
                 let request = crate::recovery_ops::parse_request(&op.request_json)?;
-                match kind {
-                    Kind::CheckPreservedUnpublished => ensure!(
+                if kind == Kind::CheckPreservedUnpublished {
+                    ensure!(
                         request.recorded.is_some(),
                         "preserved-work check requires the recorded tip"
-                    ),
-                    Kind::PruneBookmark => {
-                        reference(&op.trunk)?;
-                        crate::recovery_ops::vouchers(&request)?;
-                        allowed.trunk.clone_from(&op.trunk);
-                    }
-                    _ => {}
+                    );
                 }
                 allowed.request_json.clone_from(&op.request_json);
             }
-            Kind::Release
-            | Kind::Status
-            | Kind::ListWorkspaces
-            | Kind::ListRepos
-            | Kind::DiffBookmark
-            | Kind::CheckpointBaseline => {}
+            Kind::Release | Kind::Status | Kind::ListWorkspaces | Kind::ListRepos | Kind::CheckpointBaseline => {}
         }
         if matches!(
             kind,
-            Kind::DiffBookmark
-                | Kind::RestoreBookmark
-                | Kind::CheckpointBaseline
+            Kind::CheckpointBaseline
                 | Kind::ConfirmRecovery
                 | Kind::RestorePreserved
                 | Kind::CheckPreservedUnpublished
-                | Kind::PruneBookmark
+                | Kind::ForgetPreserved
         ) {
             let value = op
                 .bookmark
@@ -1548,7 +1529,6 @@ pub mod workspace {
                         | Kind::ListRepos
                         | Kind::ListWorkspaces
                         | Kind::Status
-                        | Kind::DiffBookmark
                         | Kind::PositionedParent
                         | Kind::CheckPreservedUnpublished
                 )
@@ -1830,11 +1810,6 @@ pub mod workspace {
                                     result.bookmark = Some(wire_bookmark(&op.repo_id, &created));
                                     json!({})
                                 }
-                                Kind::DiffBookmark => json!(recovery::unpublished_diff(&LocalJj, &record).await?),
-                                Kind::RestoreBookmark => {
-                                    *phase = Phase::Effect;
-                                    json!(recovery::restore_for_retry(&LocalJj, &record, &path, op.self_retry).await?)
-                                }
                                 Kind::CheckpointBaseline => {
                                     *phase = Phase::Effect;
                                     json!(record.base_commit.clone().unwrap_or_default())
@@ -1853,10 +1828,10 @@ pub mod workspace {
                                     let request = crate::recovery_ops::parse_request(&op.request_json)?;
                                     crate::recovery_ops::preserved_unpublished(&record, &request).await?
                                 }
-                                Kind::PruneBookmark => {
+                                Kind::ForgetPreserved => {
                                     *phase = Phase::Effect;
                                     let request = crate::recovery_ops::parse_request(&op.request_json)?;
-                                    crate::recovery_ops::prune(&record, &request, &op.trunk).await?
+                                    crate::recovery_ops::forget_preserved(&record, &request).await?
                                 }
                                 _ => anyhow::bail!("unsupported workspace operation"),
                             };
@@ -1875,7 +1850,6 @@ pub mod workspace {
                 host_id: self.host_id.clone(),
                 base_commit: bookmark.and_then(|b| optional(&b.anchor_commit)).map(str::to_owned),
                 pr_head_before: bookmark.and_then(|b| optional(&b.pr_head_before)).map(str::to_owned),
-                has_recovery_head: None,
             })
         }
     }
@@ -1884,9 +1858,6 @@ pub mod workspace {
         Bookmark {
             repo_id: repo.into(),
             execution_id: record.execution_id.clone(),
-            head: record.publication(),
-            recovery: record.head(),
-            base: record.base(),
             anchor_commit: record.base_commit.clone().unwrap_or_default(),
             pr_head_before: record.pr_head_before.clone().unwrap_or_default(),
         }
@@ -2136,13 +2107,10 @@ mod tests {
         let bookmark = v1::Bookmark {
             repo_id: "repo".into(),
             execution_id: assignment.execution_id.clone(),
-            head: "boss/exec_test".into(),
-            recovery: "boss-recovery/exec_test".into(),
-            base: "boss-base/exec_test".into(),
             anchor_commit: "a".repeat(40),
             pr_head_before: String::new(),
         };
-        for number in 1..=27 {
+        for number in 1..=28 {
             // Retired kinds have their numbers reserved in the schema.
             let Ok(kind) = Kind::try_from(number) else {
                 continue;
@@ -2170,11 +2138,9 @@ mod tests {
                 Kind::GotoPr => request.pr_number = 1,
                 Kind::GotoRevision => request.revision = "a".repeat(40),
                 Kind::ForceRelease => request.reason = "hub authorized release".into(),
-                Kind::PruneBookmark => {
-                    request.trunk = "main".into();
+                Kind::ConfirmRecovery | Kind::RestorePreserved | Kind::ForgetPreserved => {
                     request.request_json = b"{}".to_vec();
                 }
-                Kind::ConfirmRecovery | Kind::RestorePreserved => request.request_json = b"{}".to_vec(),
                 Kind::CheckPreservedUnpublished => {
                     request.request_json = serde_json::to_vec(
                         &serde_json::json!({"recorded": {"commit_id": "a".repeat(40), "change_id": "k".repeat(32), "count": 1}}),
@@ -2187,7 +2153,14 @@ mod tests {
                 request.workspace_id.clear();
                 request.lease_id.clear();
             }
-            if matches!(number, 13..=20 | 23..=27) {
+            if matches!(
+                kind,
+                Kind::CheckpointBaseline
+                    | Kind::ConfirmRecovery
+                    | Kind::RestorePreserved
+                    | Kind::CheckPreservedUnpublished
+                    | Kind::ForgetPreserved
+            ) {
                 request.bookmark = Some(bookmark.clone());
             }
             assert_eq!(validate_workspace(&request, Some(&assignment)).unwrap(), kind);
@@ -2386,7 +2359,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatcher_recovers_bookmark_diff_after_workspace_removal() {
+    async fn dispatch_creates_no_recovery_or_publication_refs() {
         use boss_engine_recovery::execution_bookmark::{Jj, LocalJj};
         let root = tempfile::tempdir().unwrap();
         let repo = boss_engine_test_git::jj::JjRepo::new(root.path());
@@ -2396,7 +2369,7 @@ mod tests {
             cube,
             host_id: "host".into(),
         };
-        std::fs::write(repo.worker.join("preserved.txt"), "survives workspace removal").unwrap();
+        std::fs::write(repo.worker.join("preserved.txt"), "unpublished").unwrap();
         LocalJj.run(&repo.worker, &["status"]).await.unwrap();
         let result = executor.execute(&command(op(Kind::CreateBookmark)), false, 1).await;
         assert_eq!(result.code, v1::ResultCode::Ok as i32, "{}", result.reason);
@@ -2404,98 +2377,17 @@ mod tests {
             panic!("missing bookmark result")
         };
         let names = LocalJj
-            .run(&repo.repo, &["bookmark", "list", "glob:boss*"])
+            .run(&repo.repo, &["bookmark", "list", "-T", "name ++ \"\\n\""])
             .await
             .unwrap();
         assert!(
-            names.is_empty(),
-            "dispatch must not create recovery or publication refs"
+            names.lines().all(|name| name == "main"),
+            "dispatch must not create recovery or publication refs: {names}"
         );
-        // The legacy diff endpoint also supports a branch explicitly created by the worker.
-        LocalJj
-            .run(&repo.worker, &["bookmark", "set", "boss/exec_test", "-r", "@"])
-            .await
-            .unwrap();
-        LocalJj
-            .run(&repo.repo, &["workspace", "forget", "worker"])
-            .await
-            .unwrap();
-        std::fs::remove_dir_all(&repo.worker).unwrap();
-        *executor.cube.owner.lock().unwrap() = None;
-        let request = v1::WorkspaceOp {
-            kind: Kind::DiffBookmark.into(),
-            repo_id: "repo".into(),
-            bookmark: created.bookmark,
-            ..Default::default()
-        };
-        let result = executor.execute(&command(request), false, 1).await;
-        assert_eq!(result.code, v1::ResultCode::Ok as i32, "{}", result.reason);
-        let Some(command_result::Value::Workspace(diff)) = result.value else {
-            panic!("missing diff result")
-        };
-        let diff: String = serde_json::from_slice(&diff.cube_result_json).unwrap();
-        assert!(diff.contains("survives workspace removal"));
-    }
-
-    #[tokio::test]
-    async fn typed_diff_uses_pr_head_before_when_the_anchor_is_absent() {
-        use boss_engine_recovery::execution_bookmark::{Jj, LocalJj};
-        let root = tempfile::tempdir().unwrap();
-        let repo = boss_engine_test_git::jj::JjRepo::new(root.path());
-        // A bound PR's published commit that is not on trunk.
-        LocalJj
-            .run(&repo.worker, &["new", "trunk()", "-m", "PR baseline"])
-            .await
-            .unwrap();
-        std::fs::write(repo.worker.join("pr.txt"), "published by the PR").unwrap();
-        LocalJj.run(&repo.worker, &["status"]).await.unwrap();
-        let pr_head = LocalJj
-            .run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"])
-            .await
-            .unwrap();
-        LocalJj
-            .run(&repo.worker, &["new", "-m", "Worker change"])
-            .await
-            .unwrap();
-        let cube = Cube::new(root.path());
-        *cube.owner.lock().unwrap() = Some(workspace::lease_owner(&run()));
-        let executor = workspace::Executor {
-            cube,
-            host_id: "host".into(),
-        };
-        let mut create = op(Kind::CreateBookmark);
-        create.inherited_base = pr_head.trim().to_owned();
-        let result = executor.execute(&command(create), false, 1).await;
-        assert_eq!(result.code, v1::ResultCode::Ok as i32, "{}", result.reason);
-        let Some(command_result::Value::Workspace(created)) = result.value else {
-            panic!("missing bookmark result")
-        };
-        std::fs::write(repo.worker.join("work.txt"), "worker edit").unwrap();
-        LocalJj.run(&repo.worker, &["status"]).await.unwrap();
-        // Dispatch creates no publication branch; create it as a worker does before publishing.
-        LocalJj
-            .run(&repo.worker, &["bookmark", "set", "boss/exec_test", "-r", "@"])
-            .await
-            .unwrap();
-        for anchor in [String::new(), "0123456789abcdef0123456789abcdef01234567".to_owned()] {
-            let mut bookmark = created.bookmark.clone().unwrap();
-            bookmark.anchor_commit = anchor;
-            bookmark.pr_head_before = pr_head.trim().to_owned();
-            let request = v1::WorkspaceOp {
-                kind: Kind::DiffBookmark.into(),
-                repo_id: "repo".into(),
-                bookmark: Some(bookmark),
-                ..Default::default()
-            };
-            let result = executor.execute(&command(request), false, 1).await;
-            assert_eq!(result.code, v1::ResultCode::Ok as i32, "{}", result.reason);
-            let Some(command_result::Value::Workspace(diff)) = result.value else {
-                panic!("missing diff result")
-            };
-            let diff: String = serde_json::from_slice(&diff.cube_result_json).unwrap();
-            assert!(diff.contains("work.txt"), "{diff}");
-            assert!(!diff.contains("pr.txt"), "PR baseline leaked into the diff: {diff}");
-        }
+        assert!(
+            !created.bookmark.unwrap().anchor_commit.is_empty(),
+            "dispatch records the commit it started from"
+        );
     }
 
     #[tokio::test]
@@ -2550,28 +2442,17 @@ mod recovery_tests {
         let Some(command_result::Value::Workspace(created)) = created.value else {
             panic!("missing bookmark")
         };
-        // These compatibility operations still inspect a worker-created publication branch.
-        LocalJj
-            .run(&repo.worker, &["bookmark", "set", "boss/exec_test", "-r", "@"])
-            .await
-            .unwrap();
-        for kind in [Kind::CheckpointBaseline, Kind::RestoreBookmark] {
-            let mut request = op(kind);
-            request.bookmark = created.bookmark.clone();
-            if kind != Kind::RestoreBookmark {
-                request.workspace_id.clear();
-                request.lease_id.clear();
-            }
-            let result = executor.execute(&command(request), false, 1).await;
-            assert_eq!(result.code, v1::ResultCode::Ok as i32, "{kind:?}: {}", result.reason);
-            if kind == Kind::CheckpointBaseline {
-                let Some(command_result::Value::Workspace(value)) = result.value else {
-                    panic!("missing checkpoint")
-                };
-                let base: String = serde_json::from_slice(&value.cube_result_json).unwrap();
-                assert_eq!(base, created.bookmark.as_ref().unwrap().anchor_commit);
-            }
-        }
+        let mut request = op(Kind::CheckpointBaseline);
+        request.bookmark = created.bookmark.clone();
+        request.workspace_id.clear();
+        request.lease_id.clear();
+        let result = executor.execute(&command(request), false, 1).await;
+        assert_eq!(result.code, v1::ResultCode::Ok as i32, "{}", result.reason);
+        let Some(command_result::Value::Workspace(value)) = result.value else {
+            panic!("missing checkpoint")
+        };
+        let base: String = serde_json::from_slice(&value.cube_result_json).unwrap();
+        assert_eq!(base, created.bookmark.as_ref().unwrap().anchor_commit);
         assert_eq!(
             std::fs::read_to_string(repo.worker.join("work.txt")).unwrap(),
             "preserved"

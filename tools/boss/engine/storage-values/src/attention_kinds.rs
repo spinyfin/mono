@@ -178,10 +178,6 @@ pub const ANSWER_AGENT_READY_AGE_ATTENTION_KIND: &str = "answer_agent_ready_age"
 /// keeps the surface simple; the overrun specifics live in the title/body.
 pub const ENVELOPE_OVERRUN_ATTENTION_KIND: &str = "envelope_overrun";
 
-/// Attention kind raised when a finished PR's execution left preserved work
-/// that nothing the engine recorded can vouch for.
-pub const EXECUTION_BOOKMARK_PRUNE_UNPROVEN_ATTENTION_KIND: &str = "execution_bookmark_prune_unproven";
-
 pub const EXECUTION_BOOKMARK_RECOVERY_FAILED_ATTENTION_KIND: &str = "execution_bookmark_recovery_failed";
 
 /// Filed when a recorded preserved tip cannot be restaged into a new lease.

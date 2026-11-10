@@ -1556,13 +1556,6 @@ async fn serve_scoped(
                     boss_engine_completion::driver_teardown::TeardownReason::AppCrashReconcile,
                 )
                 .await;
-                // Export shared-store evidence without reading the old workspace.
-                // Recovery inspection failures raise attention and retain the ref.
-                boss_engine_runtime::execution_bookmark_recovery::backup_dead_execution(
-                    &server_state.work_db,
-                    &execution,
-                )
-                .await;
             }
             Err(err) => {
                 // Already-terminal rows are benign here — a parallel

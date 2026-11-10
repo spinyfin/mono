@@ -171,6 +171,15 @@ impl WorkDb {
             )?;
             id
         };
+        if kind == boss_engine_storage_values::attention_kinds::PRESERVED_WORK_ARCHIVED_ATTENTION_KIND
+            || kind == boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND
+        {
+            // Archive references may now exist; closed-chain cleanup looks for them.
+            tx.execute(
+                "UPDATE execution_bookmarks SET archive_cleanup_pending = 1 WHERE execution_id = ?1",
+                [execution_id],
+            )?;
+        }
         tx.commit()?;
         Ok(id)
     }

@@ -398,10 +398,6 @@ async fn reconcile_if_execution_dead_at(
         "execution-liveness reconcile: {pane_clause} (prior status `{prior_status}`, age {age_in_status_secs:?}s)"
     );
 
-    // Recovery evidence comes from the shared store even when the workspace
-    // is gone. Export its recorded reference; report failures as attention.
-    let recovery_patch = crate::execution_bookmark_recovery::backup_dead_execution(work_db, execution).await;
-
     let reconciled = crate::execution_liveness::finalize_gone_execution(
         work_db,
         dispatch_events,
@@ -416,7 +412,6 @@ async fn reconcile_if_execution_dead_at(
             "shell_pid": shell_pid,
             "latest_tmux_observed_pid": latest_tmux_observed_pid,
             "kind": execution.kind.as_str(),
-            "recovery_patch": recovery_patch.as_deref().map(|p| p.display().to_string()),
         }),
     )
     .await;
