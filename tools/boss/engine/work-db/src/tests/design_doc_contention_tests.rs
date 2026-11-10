@@ -216,7 +216,11 @@ fn sixty_one_concurrent_resolvers_allow_writes_and_release_before_workspace_look
         }
         barrier.wait();
         let conn = db.connect().unwrap();
-        conn.busy_timeout(Duration::ZERO).unwrap();
+        // The reader callback asserts mutex release with `try_lock`. Writes
+        // use a short busy timeout to retry transient WAL shared-memory
+        // contention from 61 concurrent readers instead of surfacing
+        // `SQLITE_BUSY`.
+        conn.busy_timeout(Duration::from_millis(250)).unwrap();
         for n in 0..100 {
             conn.execute(
                 "INSERT OR REPLACE INTO metadata(key,value) VALUES('contention-test',?1)",
