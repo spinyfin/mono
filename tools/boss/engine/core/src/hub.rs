@@ -30,13 +30,6 @@ pub const HUB_ID_ENV: &str = "BOSS_HUB_ID";
 /// Environment override for the authority generation carried in `Welcome`.
 pub const AUTHORITY_GENERATION_ENV: &str = "BOSS_HUB_AUTHORITY_GENERATION";
 
-/// Directory name under the state root for production host credentials.
-pub const CREDENTIALS_DIRNAME: &str = "hub-credentials";
-/// Production hub server certificate filename under the state root.
-pub const TLS_CERT_FILENAME: &str = "hub-tls.crt";
-/// Production hub server private key filename under the state root.
-pub const TLS_KEY_FILENAME: &str = "hub-tls.key";
-
 /// Default [`HubConfig::hub_id`] when `BOSS_HUB_ID` is unset.
 pub const DEFAULT_HUB_ID: &str = "hub";
 /// Default [`HubConfig::authority_generation`] when unset.
@@ -83,9 +76,8 @@ pub struct HubListenerPlan {
     pub tls_key: PathBuf,
 }
 
-/// A bound hub listener and the shared [`HubStream`] handle later adapter
-/// composition submits commands through. The caller owns serving the
-/// incoming socket (typically on the engine task scope).
+/// A bound hub listener and its shared [`HubStream`] handle. The caller owns
+/// serving the incoming socket (typically on the engine task scope).
 pub struct BoundHub {
     pub stream: HubStream,
     pub local_addr: SocketAddr,
@@ -289,6 +281,10 @@ mod tests {
 
     use super::*;
     use std::ffi::OsString;
+
+    const CREDENTIALS_DIRNAME: &str = "hub-credentials";
+    const TLS_CERT_FILENAME: &str = "hub-tls.crt";
+    const TLS_KEY_FILENAME: &str = "hub-tls.key";
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 

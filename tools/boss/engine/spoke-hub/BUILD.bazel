@@ -5,8 +5,7 @@ exports_files(["Cargo.toml"])
 
 # Production hub stream service: WorkDb-backed journals, enrollment, and the
 # authenticated listener. engine/core binds this at startup from config;
-# dispatch stays on SSH until a later adapter is present and host readiness
-# is proven.
+# dispatch does not route through it.
 rust_library(
     name = "spoke-hub",
     srcs = glob(["src/**/*.rs"]),

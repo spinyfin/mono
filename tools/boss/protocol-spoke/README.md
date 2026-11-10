@@ -148,7 +148,8 @@ reader behavior with unknown fields, enum values and variants.
 - **Negotiation.** `Contracts::first_release()` is the epoch-1 contract set: the
   eight execution features are required (`execution`, `journal`, `workspace`,
   `worker-event`, `worker-api`, `proposal-json`, `transcript-delta`,
-  `artifact`), `pane-capture` and `upgrade` are optional. `select` checks the
+  `artifact`), `pane-capture`, `upgrade` and `spawn-launch-inputs` (the `Spawn` effort and
+  output-environment fields) are optional. `select` checks the
   epoch range before anything else in `Hello`, so a future-epoch peer is told to
   upgrade even if the rest of its `Hello` no longer parses; `confirm` lets the
   spoke check the hub's `Welcome`.

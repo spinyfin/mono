@@ -27,9 +27,10 @@ use crate::runner::compose_worker_spawn;
 use crate::work::{WorkDb, WorkExecution, WorkItem};
 use crate::worker_setup::{WorkerSetupInput, render_remote_settings_json, worker_kind_for_execution};
 
-/// Shim binary name resolved on the spoke PATH, matching the SSH remote
-/// spawn's `boss-event` contract.
-const SPOKE_BOSS_EVENT: &str = "boss-event";
+/// Shim binary name resolved on the remote PATH by both the SSH and spoke
+/// transports. Cube's standard install puts `boss-event` on the worker's PATH,
+/// so hook commands resolve it by name rather than an engine-local path.
+pub(crate) const REMOTE_BOSS_EVENT_BIN: &str = "boss-event";
 
 use boss_host_execution::worker::HOST_ENV_DENY;
 
@@ -95,13 +96,15 @@ pub async fn compose_remote_spawn(request: ComposeRemoteSpawn<'_>) -> Result<Spa
         prompt_text,
         driver,
         settings_json,
+        structured_output_kind,
+        pr_url_output,
         ..
     } = prepare_remote_launch(
         db,
         execution,
         item,
         (&composed.spawn_config.driver, lease_id, host_id),
-        (workspace_path, events_socket_path, Path::new(SPOKE_BOSS_EVENT)),
+        (workspace_path, events_socket_path, Path::new(REMOTE_BOSS_EVENT_BIN)),
         opts,
         (composed.prompt_text, composed.embedded_output_path.as_deref()),
     )?;
@@ -134,7 +137,7 @@ pub async fn compose_remote_spawn(request: ComposeRemoteSpawn<'_>) -> Result<Spa
         });
     }
 
-    let spawn = Spawn {
+    let mut spawn = Spawn {
         lease_id: lease_id.to_owned(),
         workspace_id: workspace_id.to_owned(),
         driver_id: composed.spawn_config.driver.clone(),
@@ -143,31 +146,37 @@ pub async fn compose_remote_spawn(request: ComposeRemoteSpawn<'_>) -> Result<Spa
         settings_json: settings_json.into_bytes(),
         env,
         effort: composed.spawn_config.effort_value.map(str::to_owned),
-        structured_output_kind: composed
-            .embedded_output_path
-            .as_ref()
-            .and_then(|_| crate::runner::designated_output_kind(execution, item))
-            .map(|kind| kind.slug().to_owned()),
-        pr_url_output: matches!(
-            execution.kind,
-            ExecutionKind::TaskImplementation
-                | ExecutionKind::ChoreImplementation
-                | ExecutionKind::ProjectDesign
-                | ExecutionKind::InvestigationImplementation
-        ),
+        structured_output_kind,
+        pr_url_output,
         ..Default::default()
     };
+    // Peers that predate these fields would launch with default effort and
+    // without the output variables the prompt references, so the spawn must
+    // be refused for them rather than silently degraded.
+    if spawn.effort.is_some() || spawn.structured_output_kind.is_some() || spawn.pr_url_output {
+        spawn.required_features.push(boss_protocol_spoke::v1::Feature {
+            name: boss_protocol_spoke::negotiate::feature::SPAWN_LAUNCH_INPUTS.to_owned(),
+            revision: 1,
+        });
+    }
     spawn
         .validate()
         .map_err(|err: ValidationError| anyhow::anyhow!("spoke spawn: {err}"))?;
     Ok(spawn)
 }
 
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub(crate) struct RemoteLaunch {
     pub prompt_text: String,
     pub settings_input: WorkerSetupInput,
     pub driver: std::sync::Arc<dyn crate::driver::AgentDriver>,
     pub settings_json: String,
+    /// Slug of the designated structured-output payload the prompt now reads
+    /// from `$BOSS_STRUCTURED_OUTPUT`; `None` when the prompt embeds none.
+    pub structured_output_kind: Option<String>,
+    /// Whether the prompt reads `$BOSS_PR_URL_OUTPUT`.
+    pub pr_url_output: bool,
 }
 
 /// Shared prompt relocation, remote eligibility and driver settings policy.
@@ -231,12 +240,25 @@ pub(crate) fn prepare_remote_launch(
     crate::host_adapter::reject_unobservable_remote_driver(driver.as_ref(), driver_slug, &settings_input, host)?;
     let settings_json = render_remote_settings_json(&settings_input, driver.as_ref());
 
-    Ok(RemoteLaunch {
-        prompt_text,
-        settings_input,
-        driver,
-        settings_json,
-    })
+    let structured_output_kind = embedded_output_path
+        .and_then(|_| crate::runner::designated_output_kind(execution, item))
+        .map(|kind| kind.slug().to_owned());
+    let pr_url_output = matches!(
+        execution.kind,
+        ExecutionKind::TaskImplementation
+            | ExecutionKind::ChoreImplementation
+            | ExecutionKind::ProjectDesign
+            | ExecutionKind::InvestigationImplementation
+    );
+
+    Ok(RemoteLaunch::builder()
+        .maybe_structured_output_kind(structured_output_kind)
+        .pr_url_output(pr_url_output)
+        .prompt_text(prompt_text)
+        .settings_input(settings_input)
+        .driver(driver)
+        .settings_json(settings_json)
+        .build())
 }
 
 fn env_allowed(name: &str) -> bool {

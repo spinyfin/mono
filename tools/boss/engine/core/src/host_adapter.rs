@@ -26,7 +26,6 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use boss_engine_recovery::execution_bookmark::{self, ExecutionBookmark, Jj, LocalJj, WorkspaceTipSource};
-use boss_protocol::ExecutionKind;
 use tokio::sync::Mutex;
 
 use crate::config::RuntimeConfig;
@@ -53,10 +52,7 @@ use boss_host_execution::types::{
 /// settings under the system temp dir.
 const REMOTE_SETTINGS_DIR: &str = ".boss-remote/settings";
 
-/// Remote shim binary name. Cube's standard install puts `boss-event` on
-/// the worker's PATH (see the wrapper's note), so the hook command
-/// resolves it by name rather than an engine-local absolute path.
-const REMOTE_BOSS_EVENT_BIN: &str = "boss-event";
+use crate::hub_spawn::REMOTE_BOSS_EVENT_BIN;
 
 /// Prints `EMPTY`, `OCCUPIED` or `UNKNOWN` for "does any process owned by the
 /// current user have its cwd in `$1`". Only the user's own processes are
@@ -1065,15 +1061,14 @@ impl HostAdapter for SshHostAdapter {
             spawn_opts.clone(),
         )
         .await?;
-        let structured_output_kind = embedded_output_path
-            .as_ref()
-            .and_then(|_| crate::runner::designated_output_kind(execution, work_item));
         let remote_socket = remote_events_socket_path(&run_id);
         let crate::hub_spawn::RemoteLaunch {
             prompt_text,
             settings_input,
             driver,
             settings_json,
+            structured_output_kind,
+            pr_url_output,
         } = crate::hub_spawn::prepare_remote_launch(
             &self.work_db,
             execution,
@@ -1178,14 +1173,8 @@ impl HostAdapter for SshHostAdapter {
                 .driver_binary(driver_binary.clone())
                 .driver_command(command)
                 .driver_env(driver_env)
-                .maybe_structured_output_kind(structured_output_kind.map(|kind| kind.slug().to_owned()))
-                .pr_url_output(matches!(
-                    execution.kind,
-                    ExecutionKind::TaskImplementation
-                        | ExecutionKind::ChoreImplementation
-                        | ExecutionKind::ProjectDesign
-                        | ExecutionKind::InvestigationImplementation
-                ))
+                .maybe_structured_output_kind(structured_output_kind)
+                .pr_url_output(pr_url_output)
                 .build();
             let engine_socket = engine_socket.clone();
             async move { perform_remote_launch(&self.transport, &plan, &engine_socket).await }

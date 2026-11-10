@@ -922,7 +922,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         }
     }
 
-    /// Remove the run's input home and settings file. The outcome is recorded
+    /// Remove the run's input home, outputs directory and settings file. The outcome is recorded
     /// on the record: `reclaimed` once clean, otherwise the error to retry.
     fn reclaim(&self, record: &mut ExecutionRecord) {
         if record.reclaimed {
@@ -934,6 +934,12 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             && error.kind() != std::io::ErrorKind::NotFound
         {
             errors.push(format!("settings file: {error}"));
+        }
+        let outputs = outputs_root(&self.homes_root, &record.spawn_token);
+        if let Err(error) = std::fs::remove_dir_all(&outputs)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            errors.push(format!("outputs directory: {error}"));
         }
         let home = if let Some(state) = &record.runtime_state {
             // Provisioning wrote files somewhere; a state naming no home the
@@ -1008,6 +1014,16 @@ pub async fn heartbeat_leases<T: CubeJsonTransport>(cube: &T, store: &impl Execu
     failures
 }
 
+const OUTPUT_ENV_NAMES: &[&str] = &[
+    "BOSS_STRUCTURED_OUTPUT",
+    "BOSS_STRUCTURED_OUTPUT_KIND",
+    "BOSS_PR_URL_OUTPUT",
+];
+
+fn outputs_root(homes_root: &Path, spawn_token: &str) -> PathBuf {
+    homes_root.join(format!("outputs-{}", hex_token(spawn_token)))
+}
+
 /// Output locations are allocated on the execution host beside its private homes.
 fn insert_output_environment(
     environment: &mut BTreeMap<String, String>,
@@ -1015,7 +1031,12 @@ fn insert_output_environment(
     homes_root: &Path,
     spawn_token: &str,
 ) -> Result<()> {
-    let root = homes_root.join(format!("outputs-{}", hex_token(spawn_token)));
+    let root = outputs_root(homes_root, spawn_token);
+    // The supervisor alone decides the output contract; caller values for these
+    // names must never reach the worker.
+    for name in OUTPUT_ENV_NAMES {
+        environment.remove(*name);
+    }
     if spawn.structured_output_kind.is_some() || spawn.pr_url_output {
         std::fs::create_dir_all(&root)?;
         use std::os::unix::fs::PermissionsExt;
@@ -1036,7 +1057,9 @@ fn insert_output_environment(
         .into_iter()
         .chain(spawn.pr_url_output.then_some(StructuredOutputKind::PrUrl))
     {
-        let path = prepare(&root, spawn_token, kind)?;
+        // The identifier is the hex token, never the raw token: the raw
+        // value can hold `/` or `..` and would escape the private directory.
+        let path = prepare(&root, &hex_token(spawn_token), kind)?;
         environment.extend(
             default_structured_output_wiring(&StructuredOutputRequest {
                 kind,
@@ -2455,6 +2478,51 @@ mod tests {
             Phase::Alive,
             "phase must not stay stuck"
         );
+    }
+
+    #[test]
+    fn output_paths_stay_under_the_outputs_directory_for_hostile_tokens() {
+        let root = tempfile::tempdir().unwrap();
+        let homes = root.path().join("homes");
+        std::fs::create_dir_all(&homes).unwrap();
+        let outside = root.path().join("outside.txt");
+        std::fs::write(&outside, "keep").unwrap();
+        for token in [
+            format!("{}/outside", root.path().display()),
+            "../outside".to_owned(),
+            "a/b/c".to_owned(),
+        ] {
+            let spawn = Spawn {
+                structured_output_kind: Some("review-result".into()),
+                pr_url_output: true,
+                ..Default::default()
+            };
+            let mut env = BTreeMap::new();
+            insert_output_environment(&mut env, &spawn, &homes, &token).unwrap();
+            let dir = outputs_root(&homes, &token);
+            assert!(dir.starts_with(&homes) && dir.is_dir(), "{token}");
+            for name in ["BOSS_STRUCTURED_OUTPUT", "BOSS_PR_URL_OUTPUT"] {
+                assert!(Path::new(&env[name]).starts_with(&dir), "{token}: {name}={}", env[name]);
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+    }
+
+    #[test]
+    fn caller_cannot_set_output_variables_when_no_output_is_designated() {
+        let root = tempfile::tempdir().unwrap();
+        let mut env: BTreeMap<String, String> = [
+            ("BOSS_STRUCTURED_OUTPUT", "/etc/passwd"),
+            ("BOSS_STRUCTURED_OUTPUT_KIND", "forged"),
+            ("BOSS_PR_URL_OUTPUT", "/etc/passwd"),
+            ("KEEP_ME", "yes"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        insert_output_environment(&mut env, &Spawn::default(), root.path(), "token").unwrap();
+        assert_eq!(env.keys().map(String::as_str).collect::<Vec<_>>(), ["KEEP_ME"]);
+        assert!(!outputs_root(root.path(), "token").exists());
     }
 
     #[tokio::test]

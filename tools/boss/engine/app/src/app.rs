@@ -625,9 +625,8 @@ struct ServerState {
     work_db: Arc<WorkDb>,
     /// Shared hub stream manager handle. `None` when the hub listener is
     /// inert (listen/credentials/TLS not all configured, or a fixture
-    /// refused production identity). Later adapter composition submits
-    /// commands through this same handle; this field does not install a
-    /// host adapter.
+    /// refused production identity). No host adapter routes dispatch
+    /// through it.
     #[builder(default)]
     hub_stream: StdMutex<Option<boss_engine_runtime::hub::HubStream>>,
     /// Socket this engine's tmux handle must target. Resolved once from
@@ -1287,8 +1286,8 @@ impl ServerState {
             .map(boss_engine_attachments::http::base_url)
     }
 
-    /// Shared hub stream manager handle. `None` when the listener is inert.
-    /// Later adapter composition submits commands through this same handle.
+    /// Shared hub stream manager handle; `None` when the hub listener is
+    /// inert. No host adapter routes dispatch through it.
     pub(crate) fn hub_stream(&self) -> Option<boss_engine_runtime::hub::HubStream> {
         self.hub_stream.lock().expect("hub_stream lock").clone()
     }

@@ -59,7 +59,7 @@ impl HubStream {
         )
     }
 
-    /// The stream manager later adapter composition submits commands through.
+    /// The stream manager serving connected spokes.
     pub fn manager(&self) -> &StreamManager {
         &self.manager
     }
