@@ -70,6 +70,21 @@ pub mod parse {
     /// be exactly the misleading-number failure this parser exists to prevent.
     const CLAUDE_WEEK_PREFIX: &str = "Current week (all models):";
 
+    /// Validate login independently of the quota windows or percentage format.
+    pub fn claude_usage_authenticated(stdout: &str) -> bool {
+        let Ok(envelope) = serde_json::from_str::<serde_json::Value>(stdout) else {
+            return false;
+        };
+        if envelope.get("is_error").and_then(serde_json::Value::as_bool) == Some(true) {
+            return false;
+        }
+        let Some(report) = envelope.get("result").and_then(serde_json::Value::as_str) else {
+            return false;
+        };
+        let report = report.to_lowercase();
+        !report.contains("not logged in") && !report.contains("/login")
+    }
+
     /// Parse the JSON envelope `claude -p "/usage" --output-format json` emits.
     ///
     /// `/usage` is handled locally by the CLI: the envelope comes back with

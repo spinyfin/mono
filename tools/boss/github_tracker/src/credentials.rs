@@ -50,7 +50,7 @@ pub trait TrackerCredentialResolver: Send + Sync {
 ///
 /// On success the returned credential is ambient (empty token): every
 /// subsequent `gh api` call will use the user's existing `gh` login.
-/// On failure, a structured warning is logged so T11's attention-item hook
+/// On failure, a structured warning is logged so the attention-item hook
 /// can surface it; the caller gets `AuthFailed`.
 pub struct GhAuthStatusResolver {
     gh_binary: PathBuf,
@@ -121,7 +121,7 @@ impl TrackerCredentialResolver for GhAuthStatusResolver {
                 }
 
                 let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-                // Structured log marker; T11's attention-item hook watches this target.
+                // Structured log marker; the attention-item hook watches this target.
                 tracing::warn!(
                     target: "boss_github_tracker::credentials",
                     %host,

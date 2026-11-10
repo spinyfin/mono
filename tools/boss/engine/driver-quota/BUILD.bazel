@@ -13,6 +13,7 @@ rust_library(
     visibility = [
         "//tools/boss/engine/app:__pkg__",
         "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/spoke-preflight:__pkg__",
     ],
     deps = all_crate_deps(normal = True) + [
         "//tools/boss/engine/codex-hook-trust",
