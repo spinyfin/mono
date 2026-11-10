@@ -372,7 +372,61 @@ fn release_refreshes_an_existing_admission_deferred_item() {
         .unwrap();
     assert_eq!(items.len(), 1);
     assert_ne!(items[0].title, "stale");
-    assert!(items[0].body_markdown.contains("focus"));
+    assert!(items[0].body_markdown.contains("dispatch focus mode excludes this PR"));
+    // Released batch members are terminal, so the root has no reviewer to
+    // launch: the advertised command must be the explicit admission verb.
+    assert!(
+        items[0]
+            .body_markdown
+            .contains("`bossctl review start --pr 42 --repo example/repo`")
+    );
+    assert!(!items[0].body_markdown.contains("pool is full, or"));
+}
+
+/// Only the focus hold advertises an explicit start; a full pool and an
+/// all-spawns pause name their own remediation and no focus launch hint.
+#[test]
+fn deferred_attention_text_is_specific_to_each_hold_cause() {
+    let pr_url = "https://github.com/example/repo/pull/78";
+    let file = |db: &WorkDb, root: &str| {
+        db.file_admission_deferred_attention(root, pr_url).unwrap();
+        db.list_open_attention_items_of_kind(PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.work_item_id.as_deref() == Some(root))
+            .expect("attention item filed")
+    };
+    let db = WorkDb::open(temp_db_path("deferred-attention-causes")).unwrap();
+    let product = create_test_product(&db);
+    let other = project(&db, &product.id, "Other");
+    let root = project_task(&db, &product.id, &other.id, "Held root");
+
+    let pool = file(&db, &root.id);
+    assert_eq!(pool.title, "Automated reviewer: waiting for a review-pool slot");
+    assert!(pool.body_markdown.contains("review-pool reservation capacity is full"));
+
+    db.set_metadata("dispatch_paused", "1").unwrap();
+    db.set_metadata("dispatch_paused_origin", "operator").unwrap();
+    db.set_metadata("dispatch_paused_scope", "all_spawns").unwrap();
+    let paused = file(&db, &root.id);
+    assert_eq!(paused.title, "Automated reviewer: dispatch paused");
+    assert!(paused.body_markdown.contains("Resume dispatch"));
+
+    db.set_metadata("dispatch_paused", "0").unwrap();
+    let focused = project(&db, &product.id, "Focused");
+    focus_on_project(&db, &focused.id);
+    let held = file(&db, &root.id);
+    assert_eq!(held.title, "Automated reviewer: held by focus mode");
+    assert!(
+        held.body_markdown
+            .contains("`bossctl review start --pr 78 --repo example/repo`")
+    );
+
+    for text in [&pool.body_markdown, &paused.body_markdown] {
+        assert!(!text.contains("bossctl review start"), "{text}");
+        assert!(!text.contains("bossctl agents launch"), "{text}");
+        assert!(!text.contains("focus mode"), "{text}");
+    }
 }
 
 /// A deleted root or producing revision must not poison the release pass

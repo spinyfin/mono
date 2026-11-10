@@ -859,16 +859,37 @@ fn pre_merge_dispatch_hold_on(conn: &Connection, cycle_root_id: &str) -> Result<
 /// copy of this text: every filer goes through
 /// [`file_admission_deferred_attention_in_tx`] or
 /// [`WorkDb::file_admission_deferred_attention`].
-fn admission_deferred_attention_text(pr_url: &str) -> (&'static str, String) {
-    (
-        "Automated reviewer: waiting for a review-pool slot",
-        format!(
-            "Pre-merge review for {pr_url} was deferred because it cannot occupy a review-pool \
-             reservation right now: the pool is full, or dispatch focus / an all-spawns pause is \
-             holding this PR. The review starts once a reservation is free and this PR is \
-             allowed to dispatch. Dismiss this item once that pass starts."
+fn admission_deferred_attention_text(
+    conn: &Connection,
+    work_item_id: &str,
+    pr_url: &str,
+) -> Result<(&'static str, String)> {
+    let root = super::chain_helpers::chain_root(conn, work_item_id)?;
+    let (title, remediation) = match pre_merge_dispatch_hold_on(conn, &root)? {
+        Some("focus_mode") => {
+            let command = super::dispatch::parent_review_command(conn, &root, Some(pr_url))?;
+            (
+                "Automated reviewer: held by focus mode",
+                format!(
+                    "dispatch focus mode excludes this PR. A free review-pool slot alone will not start it. To explicitly start this review through focus mode, run `{command}`. Other dispatch constraints still apply"
+                ),
+            )
+        }
+        Some(_) => (
+            "Automated reviewer: dispatch paused",
+            "an all-spawns dispatch pause is holding this PR. Resume dispatch to allow automatic review".to_owned(),
         ),
-    )
+        None => (
+            "Automated reviewer: waiting for a review-pool slot",
+            "the review-pool reservation capacity is full. Automatic review waits for a free reservation".to_owned(),
+        ),
+    };
+    Ok((
+        title,
+        format!(
+            "Pre-merge review for {pr_url} was deferred because {remediation}. Dismiss this item once that pass starts."
+        ),
+    ))
 }
 
 fn file_admission_deferred_attention_in_tx(tx: &Transaction<'_>, work_item_id: &str, pr_url: &str) -> Result<()> {
@@ -876,7 +897,7 @@ fn file_admission_deferred_attention_in_tx(tx: &Transaction<'_>, work_item_id: &
     if super::query_task(tx, work_item_id)?.is_none_or(|task| task.deleted_at.is_some()) {
         return Ok(());
     }
-    let (title, body) = admission_deferred_attention_text(pr_url);
+    let (title, body) = admission_deferred_attention_text(tx, work_item_id, pr_url)?;
     super::workitems::upsert_refreshing_work_item_attention_in_tx(
         tx,
         work_item_id,
@@ -1505,7 +1526,10 @@ impl WorkDb {
     /// item for `work_item_id`. The single filer behind the pool-full,
     /// focus-hold and all-spawns-hold paths.
     pub fn file_admission_deferred_attention(&self, work_item_id: &str, pr_url: &str) -> Result<()> {
-        let (title, body) = admission_deferred_attention_text(pr_url);
+        let (title, body) = {
+            let conn = self.connect()?;
+            admission_deferred_attention_text(&conn, work_item_id, pr_url)?
+        };
         self.upsert_refreshing_work_item_attention(
             work_item_id,
             PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
@@ -1602,6 +1626,9 @@ impl WorkDb {
                 bail!("cannot review {}: task PR changed while fetching metadata", task.id);
             }
         }
+        if explicit {
+            super::dispatch_focus::record_explicit_launch_on(&tx, &input.cycle_root_id)?;
+        }
         let mut generation = 1;
         if let Some(batch) = review_batch_for_target_in(&tx, &input.cycle_root_id, input.phase, &input.target_sha)? {
             let remint = if explicit {
@@ -1696,9 +1723,9 @@ impl WorkDb {
             tx.commit()?;
             return Ok(ReviewBatchDispatch::AlreadyReviewed);
         }
-        // Explicit starts are requested by name, never released by the hold, and
-        // their members can still be run with `bossctl agents launch`, so the
-        // hold only defers automatic admission.
+        // Explicit starts skip the hold because admission records launch
+        // intent, which lets their members dispatch through focus on their
+        // own; the hold only defers automatic admission.
         if !explicit && pre_merge_dispatch_hold_on(&tx, &input.cycle_root_id)?.is_some() {
             tx.commit()?;
             return Ok(ReviewBatchDispatch::AdmissionDeferred);

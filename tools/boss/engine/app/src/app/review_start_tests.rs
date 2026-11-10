@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "review_focus_tests.rs"]
+mod focus;
+
 use boss_engine_runtime::test_support::{create_test_chore_manual, create_test_product_with_repo};
 use boss_protocol::{
     ProposalKind, ReviewBatch, ReviewBatchMemberRole, ReviewBatchPhase, ReviewBatchStatus, WorkExecution,
@@ -763,6 +766,9 @@ async fn member_insert_failure_rolls_back_batch_and_all_executions() {
         .unwrap();
     assert_eq!(members, 0);
     assert_eq!(state.work_db.review_pool_reserved_units().unwrap().0, 0);
+    let mut focus = boss_protocol::DispatchFocus::default();
+    focus.insert(boss_protocol::DispatchFocusTargetKind::Project, "proj_elsewhere".into());
+    assert!(!state.work_db.work_item_in_dispatch_focus(&id, &focus).unwrap());
 
     state
         .work_db

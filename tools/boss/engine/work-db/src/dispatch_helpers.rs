@@ -1602,10 +1602,7 @@ pub fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
     // review and repair work after its implementation execution completes.
     // This write shares the request transaction, so refusals roll it back.
     if force {
-        conn.execute(
-            "UPDATE tasks SET explicitly_launched = 1 WHERE id = ?1",
-            [&work_item_id],
-        )?;
+        super::dispatch_focus::record_explicit_launch_on(conn, &work_item_id)?;
     }
 
     // Idempotency / re-dispatch-storm guard.

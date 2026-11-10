@@ -38,6 +38,12 @@ use super::*;
 /// Metadata KV key holding the JSON-encoded [`DispatchFocus`].
 const METADATA_KEY_DISPATCH_FOCUS: &str = "dispatch_focus";
 
+/// Persist explicit launch intent inside the caller's admission transaction.
+pub(super) fn record_explicit_launch_on(conn: &Connection, work_item_id: &str) -> Result<()> {
+    conn.execute("UPDATE tasks SET explicitly_launched = 1 WHERE id = ?1", [work_item_id])?;
+    Ok(())
+}
+
 pub(super) fn migrate_explicit_launch(conn: &Connection) -> Result<()> {
     if !super::schema_init::table_has_column(conn, "tasks", "explicitly_launched")? {
         conn.execute_batch("ALTER TABLE tasks ADD COLUMN explicitly_launched INTEGER NOT NULL DEFAULT 0")?;
@@ -88,34 +94,8 @@ impl<'a> ScopeResolver<'a> {
         }
         if id.starts_with("cmt_") {
             // An answer agent runs on a comment; attribute it to the task
-            // that owns the commented artifact. Answer agents only spawn for
-            // design/investigation-owned `pr_doc` comments and
-            // `pr_review_guide` comments.
-            let comment: Option<(String, String)> = self
-                .conn
-                .query_row(
-                    "SELECT artifact_kind, artifact_id FROM work_comments WHERE id = ?1",
-                    [id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            let Some((kind, artifact_id)) = comment else {
-                return Ok(false);
-            };
-            let owner: Option<String> = match kind.as_str() {
-                "work_item" if artifact_id != id => Some(artifact_id),
-                "pr_doc" => resolve_doc_owner_on(self.conn, &kind, &artifact_id)?.map(|owner| owner.task_id),
-                "pr_review_guide" => self
-                    .conn
-                    .query_row(
-                        "SELECT root_task_id FROM pr_review_guide_source_series WHERE id = ?1",
-                        [&artifact_id],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()?,
-                _ => None,
-            };
-            return match owner {
+            // that owns the commented artifact.
+            return match comment_owner_on(self.conn, id)? {
                 Some(owner_id) => self.resolve(&owner_id, depth + 1),
                 None => Ok(false),
             };
@@ -207,6 +187,36 @@ impl<'a> ScopeResolver<'a> {
     }
 }
 
+/// The work item that owns the artifact a comment is on. Answer agents only
+/// spawn for design/investigation-owned `pr_doc` comments, `pr_review_guide`
+/// comments and work-item comments; every other artifact has no owner. Shared
+/// by focus scope resolution and the explicit answer-agent launch so both
+/// attribute a comment to the same task.
+fn comment_owner_on(conn: &Connection, comment_id: &str) -> Result<Option<String>> {
+    let comment: Option<(String, String)> = conn
+        .query_row(
+            "SELECT artifact_kind, artifact_id FROM work_comments WHERE id = ?1",
+            [comment_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((kind, artifact_id)) = comment else {
+        return Ok(None);
+    };
+    Ok(match kind.as_str() {
+        "work_item" if artifact_id != comment_id => Some(artifact_id),
+        "pr_doc" => resolve_doc_owner_on(conn, &kind, &artifact_id)?.map(|owner| owner.task_id),
+        "pr_review_guide" => conn
+            .query_row(
+                "SELECT root_task_id FROM pr_review_guide_source_series WHERE id = ?1",
+                [&artifact_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?,
+        _ => None,
+    })
+}
+
 /// The persisted focus set against an open connection or transaction.
 pub(crate) fn load_dispatch_focus_on(conn: &Connection) -> Result<DispatchFocus> {
     let raw: Option<String> = conn
@@ -243,6 +253,33 @@ impl WorkDb {
     pub fn load_dispatch_focus(&self) -> Result<DispatchFocus> {
         let conn = self.connect()?;
         load_dispatch_focus_on(&conn)
+    }
+
+    /// Explicitly launch the queued answer agent on `comment_id`: records
+    /// launch intent on the task that owns the comment's artifact, which
+    /// admits the answer agent through focus mode without touching the focus
+    /// set, and returns the execution to force-dispatch. Refuses when the
+    /// comment has no owning task or no queued answer agent.
+    pub fn admit_answer_agent_launch(&self, comment_id: &str) -> Result<WorkExecution> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let owner = comment_owner_on(&tx, comment_id)?
+            .filter(|owner| owner.starts_with("task_"))
+            .with_context(|| format!("{comment_id} has no owning task to launch the answer agent under"))?;
+        let execution = tx
+            .query_row(
+                "SELECT id FROM work_executions
+                 WHERE work_item_id = ?1 AND kind = ?2 AND status = 'ready'
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+                params![comment_id, boss_protocol::EXECUTION_KIND_ANSWER_AGENT],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .with_context(|| format!("{comment_id} has no queued answer agent to launch"))?;
+        record_explicit_launch_on(&tx, &owner)?;
+        let execution = query_execution(&tx, &execution).require("execution", &execution)?;
+        tx.commit()?;
+        Ok(execution)
     }
 
     /// Persist the focus set. An inactive (empty) set is stored as such
