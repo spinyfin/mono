@@ -55,6 +55,24 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
         send_work_error(&sink, &request_id, &err);
         return;
     }
+    if input.work_item_id.starts_with("cmt_") {
+        // An answer agent has no task of its own: launching its comment
+        // admits the queued execution through focus (under the owning
+        // task) and force-dispatches it.
+        let launched = match work_db.admit_answer_agent_launch(&input.work_item_id) {
+            Ok(execution) => server_state
+                .execution_coordinator
+                .force_dispatch(&execution.id, DispatchAdmission::OperatorForced)
+                .await
+                .map(|_| execution.id),
+            Err(err) => Err(err),
+        };
+        match launched.and_then(|id| work_db.get_execution(&id)) {
+            Ok(execution) => send_response(&sink, &request_id, FrontendEvent::ExecutionRequested { execution }),
+            Err(err) => send_work_error(&sink, &request_id, &err),
+        }
+        return;
+    }
     input.work_item_id = match server_state.resolve_work_item_id(&input.work_item_id).await {
         Ok(id) => id,
         Err(err) => {

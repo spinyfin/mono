@@ -243,16 +243,128 @@ async fn never_admitted_review_recovery_command_starts_both_reviewers() {
         "{error}"
     );
 
+    // `dispatch diagnose` on the held guide, and the guide `agents launch`
+    // refusal, must advertise this same command.
+    let guide = state
+        .work_db
+        .create_pr_review_guide_execution(&comparison, "https://github.com/example/repo")
+        .unwrap();
+    let output = cli(&[
+        "dispatch",
+        "diagnose",
+        &guide.id,
+        "--state-root",
+        dir.path().to_str().unwrap(),
+    ])
+    .await;
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let diagnosed = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(advertised(&diagnosed), command, "{diagnosed}");
+    let socket = dir.path().join("never-admitted.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let server_state = state.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(super::super::super::handle_frontend_connection(
+                stream,
+                server_state.clone(),
+                None,
+            ));
+        }
+    });
+    let output = cli(&["--socket-path", socket.to_str().unwrap(), "agents", "launch", &guide.id]).await;
+    assert!(!output.status.success());
+    assert_eq!(advertised(&String::from_utf8(output.stderr).unwrap()), command);
+    server.abort();
+    let _ = server.await;
+
     let words: Vec<&str> = command.split_whitespace().collect();
     let number: i64 = words[words.iter().position(|w| *w == "--pr").unwrap() + 1]
         .parse()
         .unwrap();
     let repo = words[words.iter().position(|w| *w == "--repo").unwrap() + 1];
     triggered(request(&state, number, Some(repo), Ok(metadata("head"))).await);
-    let executions = state.work_db.list_executions(Some(&root)).unwrap();
+    let executions: Vec<_> = state
+        .work_db
+        .list_executions(Some(&root))
+        .unwrap()
+        .into_iter()
+        .filter(|execution| execution.kind == ExecutionKind::PrReview)
+        .collect();
     assert_eq!(executions.len(), 2);
     state.execution_coordinator.drain_ready_queue_for_test().await;
     for execution in executions {
         wait_running(&state, &execution.id).await;
     }
+}
+
+/// A focus-held answer agent on an out-of-focus task's comment: the command
+/// `dispatch diagnose` prints, and the execution-id refusal, must start it.
+#[tokio::test]
+async fn held_answer_agent_diagnosed_launch_command_starts_it() {
+    let (state, dir) = focused_state(true);
+    let (_, series) = boss_work_db::test_support::seed_published_guide(&state.work_db, 42);
+    let comment = boss_work_db::test_support::add_guide_comment(&state.work_db, &series, "why?");
+    let execution = state
+        .work_db
+        .create_answer_agent_execution(&comment.id, "https://github.com/example/repo")
+        .unwrap();
+    let focus = state.work_db.load_dispatch_focus().unwrap();
+    assert_eq!(
+        state
+            .work_db
+            .executions_outside_dispatch_focus(std::slice::from_ref(&execution), &focus)
+            .unwrap(),
+        vec![execution.id.clone()].into_iter().collect()
+    );
+
+    let socket = dir.path().join("frontend.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let server_state = state.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(super::super::super::handle_frontend_connection(
+                stream,
+                server_state.clone(),
+                None,
+            ));
+        }
+    });
+    let expected = format!("bossctl agents launch {}", comment.id);
+    let output = cli(&[
+        "dispatch",
+        "diagnose",
+        &execution.id,
+        "--state-root",
+        dir.path().to_str().unwrap(),
+    ])
+    .await;
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let text = String::from_utf8(output.stdout).unwrap();
+    let command = text
+        .split('`')
+        .find(|part| part.starts_with("bossctl agents launch "))
+        .expect(&text);
+    assert_eq!(command, expected);
+
+    let output = cli(&[
+        "--socket-path",
+        socket.to_str().unwrap(),
+        "agents",
+        "launch",
+        &execution.id,
+    ])
+    .await;
+    assert!(!output.status.success());
+    assert!(String::from_utf8(output.stderr).unwrap().contains(&expected));
+
+    let mut args = vec!["--socket-path", socket.to_str().unwrap()];
+    args.extend(command.split_whitespace().skip(1));
+    let output = cli(&args).await;
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    wait_running(&state, &execution.id).await;
+    server.abort();
+    let _ = server.await;
 }

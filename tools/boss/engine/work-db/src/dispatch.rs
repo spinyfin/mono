@@ -1369,12 +1369,10 @@ impl WorkDb {
     }
 
     /// The CLI command that explicitly starts `id`, or `None` when no
-    /// command the engine accepts starts it (an answer-agent comment has no
-    /// launch verb). A review guide starts through its parent task.
+    /// command the engine accepts starts it. An answer-agent comment starts
+    /// through `agents launch <cmt_ id>`; a review guide starts through its
+    /// parent task.
     pub fn launch_command_for(&self, id: &str) -> Result<Option<String>> {
-        if id.starts_with("cmt_") {
-            return Ok(None);
-        }
         if !id.starts_with("prgc_") {
             return Ok(Some(format!("bossctl agents launch {id}")));
         }
