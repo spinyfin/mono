@@ -399,8 +399,7 @@ async fn git_ref_transaction(jj: &dyn Jj, repo: &Path, updates: &str) -> Result<
 
 async fn run_ref_transaction(jj: &dyn Jj, repo: &Path, updates: &str) -> Result<()> {
     let edits = format!("start\n{updates}prepare\ncommit\n");
-    let shared = jj.shared_repo(repo).await?;
-    let git = shared.join(".jj/repo/store/git_target");
+    let git = repo.join(".jj/repo/store/git_target");
     jj.run(
         repo,
         &[
@@ -429,6 +428,10 @@ printf '%s' "$2" | git --git-dir="$git_dir" update-ref --stdin"#,
 /// Shrink the view before creating archives, and never release an unpublished
 /// source until its archive exists. Publication branches include live workers.
 pub async fn cleanup_legacy_store(jj: &dyn Jj, repo: &Path, published_heads: &[String]) -> Result<LegacyCleanupReport> {
+    // Probe on the owning host; transport and permission errors remain retryable.
+    if !jj.workspace_exists(repo).await? {
+        return Ok(LegacyCleanupReport::default());
+    }
     // Reconcile Git tracking before taking a snapshot, including a retry that
     // previously removed backing refs but crashed before forgetting names.
     let before_import = operation(jj, repo).await?;

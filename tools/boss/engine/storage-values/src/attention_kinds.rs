@@ -219,6 +219,9 @@ pub const PRESERVED_WORK_ARCHIVED_ATTENTION_KIND: &str = "preserved_work_archive
 /// never restored automatically.
 pub const PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND: &str = "preserved_work_needs_inspection";
 
+/// Repeated legacy store cleanup failure; background retries continue.
+pub const LEGACY_STORE_CLEANUP_FAILED_ATTENTION_KIND: &str = "legacy_store_cleanup_failed";
+
 pub const REVISION_CHAIN_RECOVERY_BLOCKED_ATTENTION_KIND: &str = "revision_chain_recovery_blocked";
 
 pub const EXECUTION_BOOKMARK_CREATE_FAILED_ATTENTION_KIND: &str = "execution_bookmark_create_failed";
