@@ -19,6 +19,7 @@ rust_library(
         "//tools/boss/engine/execution-runner:__pkg__",
         "//tools/boss/engine/live-worker-state:__pkg__",
         "//tools/boss/engine/merge-poller:__pkg__",
+        "//tools/boss/engine/progression-brief:__pkg__",
         "//tools/boss/engine/work-db:__pkg__",
     ],
     deps = [

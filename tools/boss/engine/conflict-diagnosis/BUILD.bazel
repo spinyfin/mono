@@ -15,6 +15,7 @@ rust_library(
         "//tools/boss/engine/deterministic-resolvers:__pkg__",
         "//tools/boss/engine/dispatch:__pkg__",
         "//tools/boss/engine/execution-runner:__pkg__",
+        "//tools/boss/engine/progression-brief:__pkg__",
         "//tools/boss/engine/work-db:__pkg__",
     ],
     deps = all_crate_deps(normal = True),

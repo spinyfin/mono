@@ -152,6 +152,7 @@ impl CiLogReader for BuildkiteLogReader {
 #[derive(Debug, Clone)]
 pub struct GithubActionsLogReader {
     binary: String,
+    repository: Option<String>,
 }
 
 impl Default for GithubActionsLogReader {
@@ -164,11 +165,29 @@ impl GithubActionsLogReader {
     pub fn new() -> Self {
         Self {
             binary: "gh".to_owned(),
+            repository: None,
         }
     }
 
     pub fn with_binary(binary: impl Into<String>) -> Self {
-        Self { binary: binary.into() }
+        Self {
+            binary: binary.into(),
+            repository: None,
+        }
+    }
+
+    /// Pin repository discovery for engine probes that run outside a checkout.
+    pub fn with_repository(mut self, repository: impl Into<String>) -> Self {
+        self.repository = Some(repository.into());
+        self
+    }
+
+    async fn run(&self, args: &[&str]) -> Result<String> {
+        let mut args = args.to_vec();
+        if let Some(repository) = self.repository.as_deref() {
+            args.extend(["--repo", repository]);
+        }
+        run_capture(&self.binary, &args).await
     }
 }
 
@@ -180,19 +199,24 @@ impl CiLogReader for GithubActionsLogReader {
     }
 
     async fn read_log_full(&self, job_id: &str) -> Result<String> {
-        run_capture(&self.binary, &["run", "view", "--log-failed", "--job", job_id]).await
+        self.run(&["run", "view", "--log-failed", "--job", job_id]).await
     }
 
     async fn retrigger(&self, id: &str) -> Result<String> {
         // `gh run rerun <run-id> --failed` re-runs failed jobs of an
         // existing workflow run; GHA reuses the same run id, so we
         // surface it back to the caller as the new id.
-        run_capture(&self.binary, &["run", "rerun", id, "--failed"]).await?;
+        self.run(&["run", "rerun", id, "--failed"]).await?;
         Ok(id.to_owned())
     }
 
     fn worker_cli_invocation_hint(&self, job_id: &str) -> String {
-        format!("{} run view --log-failed --job {job_id}", self.binary)
+        let suffix = self
+            .repository
+            .as_ref()
+            .map(|repo| format!(" --repo {repo}"))
+            .unwrap_or_default();
+        format!("{} run view --log-failed --job {job_id}{suffix}", self.binary)
     }
 }
 
@@ -381,7 +405,16 @@ pub fn reader_for_with_binaries(
                 "could not parse pipeline slug and build number from target_url {target_url:?}"
             ))),
         },
-        CiProvider::GithubActions => Box::new(GithubActionsLogReader::with_binary(gh_binary)),
+        CiProvider::GithubActions => {
+            let mut reader = GithubActionsLogReader::with_binary(gh_binary);
+            if let Some(path) = target_url.strip_prefix("https://github.com/") {
+                let mut parts = path.split('/');
+                if let (Some(owner), Some(repo)) = (parts.next(), parts.next()) {
+                    reader = reader.with_repository(format!("{owner}/{repo}"));
+                }
+            }
+            Box::new(reader)
+        }
         CiProvider::Other => Box::new(UnknownProviderReader),
     }
 }
@@ -1036,6 +1069,21 @@ exit 2
     fn gha_invocation_hint_embeds_job_id() {
         let r = GithubActionsLogReader::new();
         assert_eq!(r.worker_cli_invocation_hint("99"), "gh run view --log-failed --job 99");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn gha_log_probe_pins_repo_outside_a_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_script(dir.path(), "gh", "#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
+        let reader = reader_for_with_binaries(
+            CiProvider::GithubActions,
+            "https://github.com/owner/repo/actions/runs/1/job/2",
+            "bk",
+            script.to_str().unwrap(),
+        );
+        let output = reader.read_log_full("2").await.unwrap();
+        assert_eq!(output, "run\nview\n--log-failed\n--job\n2\n--repo\nowner/repo\n");
     }
 
     #[test]

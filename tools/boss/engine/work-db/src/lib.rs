@@ -807,6 +807,7 @@ pub use schema_init::table_exists;
 #[cfg(test)]
 use schema_init::table_has_column;
 mod execution_wait_history;
+mod progression_brief_reads;
 mod semantic_progress;
 mod spoke_hub;
 mod spoke_ingress;
@@ -814,6 +815,7 @@ mod spoke_probe;
 mod stuck_activity;
 mod stuck_report;
 mod stuck_snapshot;
+pub use progression_brief_reads::{ExecutionDiagnosis, ProductPrCiSnapshot, ProgressionCreateBudget, StatusAuditRow};
 mod sweep_reads;
 mod task_status_audit;
 mod task_status_backfill;

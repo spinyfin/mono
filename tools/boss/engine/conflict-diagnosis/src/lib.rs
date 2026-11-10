@@ -131,6 +131,7 @@ async fn run_git(args: &[&str], workspace_path: &Path, git_dir: &Path) -> std::i
         .args(args)
         .current_dir(workspace_path)
         .env("GIT_DIR", git_dir)
+        .kill_on_drop(true)
         .output()
         .await
 }
@@ -229,6 +230,73 @@ pub async fn collect(workspace_path: &Path, base_sha: &str, head_sha: &str) -> s
     } else {
         collect_legacy(workspace_path, &git_dir, base_sha, head_sha).await
     }
+}
+
+/// Collect without a leased checkout. Fetch the two immutable endpoints into
+/// an engine-owned scratch object store, then use the same merge-tree collector.
+/// No working tree, branch, shared cube store or worker lease is modified.
+pub async fn collect_remote(
+    scratch: &Path,
+    remote: &str,
+    base_sha: &str,
+    head_sha: &str,
+) -> std::io::Result<ConflictDiagnosis> {
+    if ![base_sha, head_sha]
+        .iter()
+        .all(|sha| matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Ok(ConflictDiagnosis::errored(
+            base_sha,
+            head_sha,
+            "probe endpoints must be full commit SHAs",
+        ));
+    }
+    std::fs::create_dir_all(scratch)?;
+    let git_dir = scratch.join(".git");
+    let init = Command::new("git")
+        .args(["init", "--bare"])
+        .arg(&git_dir)
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    if !init.status.success() {
+        return Ok(ConflictDiagnosis::errored(
+            base_sha,
+            head_sha,
+            format!("scratch git init failed: {}", String::from_utf8_lossy(&init.stderr)),
+        ));
+    }
+    // Blob-less partial fetch: commits and trees for both endpoints, with the
+    // few blobs `merge-tree` needs for conflicting paths fetched lazily. A full
+    // fetch would download close to the whole repository on every probe.
+    let remote_add = run_git(&["remote", "add", "origin", "--", remote], scratch, &git_dir).await?;
+    if !remote_add.status.success() {
+        return Ok(ConflictDiagnosis::errored(
+            base_sha,
+            head_sha,
+            format!(
+                "scratch remote setup failed: {}",
+                String::from_utf8_lossy(&remote_add.stderr)
+            ),
+        ));
+    }
+    let fetch = run_git(
+        &["fetch", "--no-tags", "--filter=blob:none", "origin", base_sha, head_sha],
+        scratch,
+        &git_dir,
+    )
+    .await?;
+    if !fetch.status.success() {
+        return Ok(ConflictDiagnosis::errored(
+            base_sha,
+            head_sha,
+            format!(
+                "scratch endpoint fetch failed: {}",
+                String::from_utf8_lossy(&fetch.stderr)
+            ),
+        ));
+    }
+    collect(scratch, base_sha, head_sha).await
 }
 
 /// New-syntax path: `git merge-tree --write-tree --name-only --no-messages
@@ -635,6 +703,25 @@ changed in both\n\
         assert!(diag.error.is_none(), "diagnosis errored: {:?}", diag.error);
         assert_eq!(diag.files.len(), 1, "expected one conflicted file");
         assert_eq!(diag.files[0].path, "a.txt");
+
+        // Progression has only a scratch directory: fetch immutable endpoints
+        // without creating a working tree or using a lease.
+        let sha = |branch: &str| {
+            std::process::Command::new("git")
+                .args(["rev-parse", branch])
+                .current_dir(repo)
+                .output()
+                .unwrap()
+        };
+        let base = String::from_utf8(sha("main").stdout).unwrap();
+        let head = String::from_utf8(sha("feature").stdout).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let remote_diag = collect_remote(scratch.path(), repo.to_str().unwrap(), base.trim(), head.trim())
+            .await
+            .unwrap();
+        assert!(remote_diag.error.is_none(), "{remote_diag:?}");
+        assert_eq!(remote_diag.files[0].path, "a.txt");
+        assert!(!scratch.path().join("a.txt").exists());
     }
 
     /// Regression test: `collect` must succeed when the workspace is

@@ -24,6 +24,7 @@ use boss_protocol::{
 };
 
 use super::answer_agent_prompt::compose_answer_agent_prompt;
+use super::progression_prompt::compose_progression_prompt;
 use super::prompt::{
     ExecutionPromptParams, append_bazel_caching_rule, compose_execution_prompt, designated_output_kind,
     render_merge_order_preservation_lines, with_bazel_caching_rule,
@@ -1091,6 +1092,10 @@ pub async fn compose_worker_spawn(
         // of the ordinary implementer prompt. Its `work_item_id` is the
         // comment id (see `WorkDb::create_answer_agent_execution`).
         with_bazel_caching_rule(compose_answer_agent_prompt(work_db, execution).await)
+    } else if execution.kind == ExecutionKind::Progression {
+        // Administrative unstick agent: no checkout, so the diagnosis packet
+        // is the brief. Bookmark-recovery instructions do not apply.
+        with_bazel_caching_rule(compose_progression_prompt(work_db, execution, workspace_path).await)
     } else if execution.kind == ExecutionKind::PrReviewGuide {
         // A `pr_review_guide` execution renders the review-guide prompt
         // (exact versioned template + embedded source packet) instead of
@@ -1123,7 +1128,10 @@ pub async fn compose_worker_spawn(
                 .build(),
         )
     };
-    let prompt_text = if execution.kind == ExecutionKind::PrReviewGuide {
+    let prompt_text = if matches!(
+        execution.kind,
+        ExecutionKind::PrReviewGuide | ExecutionKind::Progression
+    ) {
         prompt_text
     } else {
         let bookmark_instructions = crate::execution_bookmark_recovery::worker_instructions();
