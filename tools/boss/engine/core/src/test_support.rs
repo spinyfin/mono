@@ -132,6 +132,12 @@ crate::stub_cube_client! { AlwaysSucceedsCube {
     async fn create_change(&self, _workspace_path: &Path, _title: &str) -> Result<CubeChangeHandle> {
         Ok(CubeChangeHandle { change_id: "test-change-1".to_owned() })
     }
+    async fn goto_workspace(&self, _workspace_path: &Path, _pr: u64) -> Result<()> {
+        Ok(())
+    }
+    async fn goto_workspace_revision(&self, _workspace_path: &Path, _sha: &str) -> Result<()> {
+        Ok(())
+    }
     async fn release_workspace(&self, _lease_id: &str) -> Result<()> {
         Ok(())
     }

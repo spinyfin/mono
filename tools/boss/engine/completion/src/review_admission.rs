@@ -35,7 +35,7 @@ where
     db.refuse_if_parked(work_item_id)?;
     let Some(pool) = pool else {
         return db
-            .request_pr_review(work_item_id, pr_checker)
+            .request_explicit_pr_review(work_item_id, pr_checker)
             .map(ReviewAdmission::Legacy);
     };
     let pr_url = pr_url.ok_or_else(|| anyhow::anyhow!("task has no PR URL"))?;

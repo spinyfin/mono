@@ -87,12 +87,14 @@ rust_test(
     },
     crate = ":app",
     data = [
+        "//tools/boss/bossctl",
         # Config loading requires an engine-owned cube, just like the engine.
         "//tools/cube",
         "@jj_test_tools//:jj",
     ],
     edition = "2024",
     env = {
+        "BOSSCTL_TEST_BINARY": "$(rootpath //tools/boss/bossctl)",
         "BOSS_EVENT_BIN": "/opt/boss/bin/boss-event",
         "BOSS_JJ_BIN": "$(rootpath @jj_test_tools//:jj)",
         "HOME": "/tmp",

@@ -114,9 +114,9 @@ pub(crate) fn focus_json(focus: &DispatchFocusState) -> serde_json::Value {
 pub(crate) struct FocusDiagnosis {
     pub(crate) focus: boss_protocol::DispatchFocus,
     pub(crate) targets: Vec<boss_protocol::DispatchFocusTarget>,
-    /// `(execution id, work item id)` of each in-scope-ness verdict for a
-    /// `ready` execution: `true` when focus mode is holding it.
-    pub(crate) ready: Vec<(String, String, bool)>,
+    /// `(execution id, work item id, held by focus, launch target)` for each
+    /// ready execution. Guides launch through their owning task.
+    pub(crate) ready: Vec<(String, String, bool, String)>,
 }
 
 impl FocusDiagnosis {
@@ -135,7 +135,8 @@ impl FocusDiagnosis {
         let held = db.executions_outside_dispatch_focus(&executions, &focus)?;
         for execution in executions {
             let is_held = held.contains(&execution.id);
-            ready.push((execution.id, execution.work_item_id, is_held));
+            let launch_target = db.owning_work_item_id(&execution.work_item_id);
+            ready.push((execution.id, execution.work_item_id, is_held, launch_target));
         }
         Ok(Self { focus, targets, ready })
     }
@@ -144,7 +145,7 @@ impl FocusDiagnosis {
         serde_json::json!({
             "active": self.focus.is_active(),
             "targets": self.targets,
-            "ready_executions": self.ready.iter().map(|(execution_id, work_item_id, held)| serde_json::json!({
+            "ready_executions": self.ready.iter().map(|(execution_id, work_item_id, held, _)| serde_json::json!({
                 "execution_id": execution_id,
                 "work_item_id": work_item_id,
                 "held_by_focus": held,
@@ -157,7 +158,7 @@ impl FocusDiagnosis {
         let state = DispatchFocusState {
             active: self.focus.is_active(),
             targets: self.targets.clone(),
-            held_count: self.ready.iter().filter(|(_, _, held)| *held).count(),
+            held_count: self.ready.iter().filter(|(_, _, held, _)| *held).count(),
             restore_error: None,
         };
         let mut lines = focus_lines(&state);
@@ -166,12 +167,12 @@ impl FocusDiagnosis {
         if state.active {
             lines.pop();
         }
-        for (execution_id, work_item_id, held) in &self.ready {
+        for (execution_id, work_item_id, held, launch_target) in &self.ready {
             if *held {
                 lines.push(format!(
                     "  HELD by focus mode: {execution_id} ({work_item_id}) is outside the focus set — \
                      wait reason `{}`; it dispatches once focus is cleared or its project/product is added \
-                     (`bossctl agents launch {execution_id}` bypasses focus)",
+                     (`bossctl agents launch {launch_target}` bypasses focus)",
                     boss_protocol::DISPATCH_WAIT_REASON_FOCUS_MODE,
                 ));
             } else if state.active {
@@ -375,7 +376,7 @@ mod tests {
 
         // Focus off: nothing is held and nothing is printed about it.
         let off = FocusDiagnosis::load(&db, &ids).unwrap();
-        assert!(off.ready.iter().all(|(_, _, held)| !held));
+        assert!(off.ready.iter().all(|(_, _, held, _)| !held));
 
         let mut focus = DispatchFocus::default();
         focus.insert(DispatchFocusTargetKind::Project, focused.id.clone());

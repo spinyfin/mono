@@ -1,0 +1,200 @@
+//! Explicit review admission and actionable focus diagnostics across CLI/RPC.
+use super::*;
+use boss_protocol::{DispatchFocus, DispatchFocusTargetKind};
+
+fn focused_state(fanout: bool) -> (Arc<ServerState>, tempfile::TempDir) {
+    let (dir, db) = boss_work_db::test_support::open_db();
+    for driver in ["claude", "codex"] {
+        boss_engine_runtime::test_support::insert_host_capability(&db, "local", &format!("driver={driver}"), "auto");
+    }
+    let cfg = Arc::new(RuntimeConfig::from_parts(
+        boss_engine_runtime::config::WorkConfig::builder()
+            .cwd(dir.path().to_path_buf())
+            .db_path(dir.path().join("state.db"))
+            .review_pool_size(2)
+            .build(),
+        None,
+    ));
+    let state = ServerState::new_arc_with_app_pid_and_merge_probe(
+        cfg,
+        None,
+        None,
+        ServerStateOverrides {
+            work_db: Some(db),
+            pr_state_checker: Some(Arc::new(OpenPr)),
+            branch_verifier: Some(Arc::new(crate::app::tests::SettableHeadRefVerifier::default())),
+            cube_client: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsCube)),
+            execution_runner: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsRunner)),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    state.feature_flags.set("review_batch_fanout", fanout).unwrap();
+    let mut focus = DispatchFocus::default();
+    focus.insert(DispatchFocusTargetKind::Project, "proj_elsewhere".into());
+    state.work_db.save_dispatch_focus(&focus).unwrap();
+    state.execution_coordinator.restore_dispatch_focus(focus);
+    (state, dir)
+}
+
+async fn wait_running(state: &ServerState, id: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if state.work_db.get_execution(id).unwrap().status == ExecutionStatus::Running {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("execution did not dispatch: {:?}", state.work_db.get_execution(id)));
+}
+
+#[tokio::test]
+async fn explicit_review_start_dispatches_every_member_outside_focus() {
+    for fanout in [false, true] {
+        let (state, _dir) = focused_state(fanout);
+        let root = seed(&state, "example/repo", 42);
+        let sibling = seed(&state, "example/repo", 43);
+        let held = state
+            .work_db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(&sibling)
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        triggered(request(&state, 42, None, Ok(metadata("head"))).await);
+        let focus = state.work_db.load_dispatch_focus().unwrap();
+        assert!(
+            state
+                .work_db
+                .executions_outside_dispatch_focus(&state.work_db.list_executions(Some(&root)).unwrap(), &focus)
+                .unwrap()
+                .is_empty()
+        );
+        // A second explicit request must also release an existing batch.
+        state
+            .work_db
+            .connect()
+            .unwrap()
+            .execute("UPDATE tasks SET explicitly_launched = 0 WHERE id = ?1", [&root])
+            .unwrap();
+        triggered(request(&state, 42, None, Ok(metadata("head"))).await);
+        let executions = state.work_db.list_executions(Some(&root)).unwrap();
+        assert_eq!(executions.len(), if fanout { 2 } else { 1 });
+        state.execution_coordinator.drain_ready_queue_for_test().await;
+        for execution in executions {
+            wait_running(&state, &execution.id).await;
+        }
+        assert_eq!(
+            state.work_db.get_execution(&held.id).unwrap().status,
+            ExecutionStatus::Ready
+        );
+        assert_eq!(
+            state
+                .work_db
+                .get_execution(&held.id)
+                .unwrap()
+                .dispatch_wait_reason
+                .as_deref(),
+            Some("focus_mode")
+        );
+    }
+}
+
+async fn cli(args: &[&str]) -> std::process::Output {
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::process::Command::new(std::env::var("BOSSCTL_TEST_BINARY").unwrap())
+            .args(args)
+            .kill_on_drop(true)
+            .output()
+            .await
+            .unwrap()
+    })
+    .await
+    .expect("CLI did not complete its request")
+}
+
+#[tokio::test]
+async fn diagnosed_bypass_and_guide_refusal_commands_pass_cli_and_engine() {
+    for diagnose_guide in [true, false] {
+        let (state, dir) = focused_state(true);
+        let root = seed(&state, "example/repo", 42);
+        let (_, comparison) = boss_work_db::test_support::seed_review_guide_series_for_pr(
+            &state.work_db,
+            &root,
+            "https://github.com/example/repo/pull/42",
+            "base",
+            "head",
+        );
+        let guide = state
+            .work_db
+            .create_pr_review_guide_execution(&comparison, "https://github.com/example/repo")
+            .unwrap();
+        let review = state
+            .work_db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(&root)
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .repo_remote_url("https://github.com/example/repo")
+                    .build(),
+            )
+            .unwrap();
+        let socket = dir.path().join("frontend.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(super::super::super::handle_frontend_connection(
+                    stream,
+                    server_state.clone(),
+                    None,
+                ));
+            }
+        });
+        for id in [&comparison, &guide.id] {
+            let output = cli(&["--socket-path", socket.to_str().unwrap(), "agents", "launch", id]).await;
+            assert!(!output.status.success());
+            let error = String::from_utf8(output.stderr).unwrap();
+            assert!(error.contains(&format!("bossctl agents launch {root}")), "{error}");
+            assert!(
+                error.contains("review guide, not a pre-merge review request"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            state.work_db.get_execution(&guide.id).unwrap().status,
+            ExecutionStatus::Ready
+        );
+        let execution = if diagnose_guide { &guide } else { &review };
+        let output = cli(&[
+            "dispatch",
+            "diagnose",
+            &execution.id,
+            "--state-root",
+            dir.path().to_str().unwrap(),
+        ])
+        .await;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let text = String::from_utf8(output.stdout).unwrap();
+        let command = text
+            .split('`')
+            .find(|part| part.starts_with("bossctl agents launch "))
+            .expect(&text);
+        assert_eq!(command, format!("bossctl agents launch {root}"));
+
+        let mut args = vec!["--socket-path", socket.to_str().unwrap()];
+        args.extend(command.split_whitespace().skip(1));
+        let output = cli(&args).await;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        wait_running(&state, &review.id).await;
+        server.abort();
+        let _ = server.await;
+    }
+}

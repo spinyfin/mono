@@ -68,10 +68,31 @@ impl WorkDb {
     /// [`dispatch_helpers::request_pr_review_in_tx`] for the full refusal
     /// conditions and idempotency contract.
     pub fn request_pr_review(&self, work_item_id: &str, pr_checker: &dyn PrStateChecker) -> Result<WorkExecution> {
+        self.request_pr_review_with_launch_intent(work_item_id, pr_checker, false)
+    }
+
+    /// Explicit review admission also releases the item's follow-ups from focus.
+    pub fn request_explicit_pr_review(
+        &self,
+        work_item_id: &str,
+        pr_checker: &dyn PrStateChecker,
+    ) -> Result<WorkExecution> {
+        self.request_pr_review_with_launch_intent(work_item_id, pr_checker, true)
+    }
+
+    fn request_pr_review_with_launch_intent(
+        &self,
+        work_item_id: &str,
+        pr_checker: &dyn PrStateChecker,
+        explicit: bool,
+    ) -> Result<WorkExecution> {
         let mut conn = self.connect()?;
         let resolved = resolve_friendly_work_item_id(&conn, work_item_id)?.unwrap_or_else(|| work_item_id.to_owned());
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let execution = request_pr_review_in_tx(&tx, &resolved, pr_checker)?;
+        if explicit {
+            super::dispatch_focus::record_explicit_launch_on(&tx, &resolved)?;
+        }
         tx.commit()?;
         Ok(execution)
     }
@@ -1328,40 +1349,28 @@ impl WorkDb {
         Ok(all_executions)
     }
 
-    /// Resolve a manual-start target (`bossctl agents launch` / `work start`)
-    /// that names a PR review guide item rather than a task.
-    ///
-    /// A review guide item (`prgc_…`) is dispatched by the automatic review
-    /// path, which already stamped the repo on its execution; it is not a
-    /// task, so the task-shaped request path (repo resolution, bound-PR
-    /// refusal) does not apply. Returns `Ok(None)` for any other id so the
-    /// caller falls through to the ordinary path. For a `prgc_` id returns
-    /// the latest non-terminal review guide execution (never creating one),
-    /// or an error when none is pending. An execution id of a review guide
-    /// run maps to that run's item; any other execution id is refused with
-    /// a message naming the work item id to use instead.
-    pub fn pending_review_guide_launch_target(&self, id: &str) -> Result<Option<WorkExecution>> {
-        let work_item_id = if id.starts_with("exec_") {
-            let execution = self.get_execution(id)?;
-            if execution.kind != ExecutionKind::PrReviewGuide {
-                bail!(
-                    "{id} is an execution id, not a work item id; launch its work item {} instead",
-                    execution.work_item_id
-                );
-            }
-            execution.work_item_id
-        } else if id.starts_with("prgc_") {
-            id.to_owned()
+    /// Refuse non-task launch targets with an actionable parent command.
+    /// A guide launch alone cannot request the pre-merge review it describes.
+    pub fn validate_manual_launch_target(&self, id: &str) -> Result<()> {
+        let execution = if id.starts_with("exec_") {
+            Some(self.get_execution(id)?)
         } else {
-            return Ok(None);
+            None
         };
-        let conn = self.connect()?;
-        let pending = query_latest_execution_for_work_item(&conn, &work_item_id)?
-            .filter(|e| e.kind == ExecutionKind::PrReviewGuide && !e.status.is_terminal());
-        match pending {
-            Some(execution) => Ok(Some(execution)),
-            None => bail!("review item {work_item_id} has no pending review execution to launch"),
+        let item = execution.as_ref().map_or(id, |e| e.work_item_id.as_str());
+        if item.starts_with("prgc_") {
+            let capture = self
+                .get_pr_review_guide_comparison_by_id(item)?
+                .ok_or_else(|| anyhow::anyhow!("unknown review guide item: {item}"))?;
+            bail!(
+                "{item} is a review guide, not a pre-merge review request; start its parent review with `bossctl agents launch {}`",
+                capture.root_task_id
+            );
         }
+        if execution.is_some() {
+            bail!("{id} is an execution id, not a work item id; run `bossctl agents launch {item}` instead");
+        }
+        Ok(())
     }
 
     /// An absent execution is distinct from a failed database read.

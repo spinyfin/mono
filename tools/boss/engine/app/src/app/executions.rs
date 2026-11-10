@@ -51,38 +51,9 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
     // This RPC is the human-facing start verb (kanban drag, `bossctl work
     // start`); automatic recovery calls the DB layer directly.
     input.explicit_start = true;
-    // A PR review guide item (or the id of one of its executions) is not a
-    // task: launch its already-queued execution rather than running the
-    // task-shaped request path, which would demand a repo resolution and
-    // refuse on a bound PR.
-    match work_db.pending_review_guide_launch_target(&input.work_item_id) {
-        Ok(Some(execution)) => {
-            let coordinator = server_state.execution_coordinator.clone();
-            let mut execution = execution;
-            if execution.status == ExecutionStatus::Ready {
-                if input.force || input.bypass_dispatch_pause {
-                    if let Err(err) = coordinator
-                        .force_dispatch(&execution.id, DispatchAdmission::OperatorForced)
-                        .await
-                    {
-                        send_work_error(&sink, &request_id, &err);
-                        return;
-                    }
-                    if let Ok(refreshed) = work_db.get_execution(&execution.id) {
-                        execution = refreshed;
-                    }
-                } else {
-                    coordinator.kick();
-                }
-            }
-            send_response(&sink, &request_id, FrontendEvent::ExecutionRequested { execution });
-            return;
-        }
-        Ok(None) => {}
-        Err(err) => {
-            send_work_error(&sink, &request_id, &err);
-            return;
-        }
+    if let Err(err) = work_db.validate_manual_launch_target(&input.work_item_id) {
+        send_work_error(&sink, &request_id, &err);
+        return;
     }
     input.work_item_id = match server_state.resolve_work_item_id(&input.work_item_id).await {
         Ok(id) => id,

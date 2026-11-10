@@ -372,7 +372,13 @@ fn release_refreshes_an_existing_admission_deferred_item() {
         .unwrap();
     assert_eq!(items.len(), 1);
     assert_ne!(items[0].title, "stale");
-    assert!(items[0].body_markdown.contains("focus"));
+    assert!(items[0].body_markdown.contains("dispatch focus mode excludes this PR"));
+    assert!(
+        items[0]
+            .body_markdown
+            .contains(&format!("bossctl agents launch {}", root.id))
+    );
+    assert!(!items[0].body_markdown.contains("pool is full, or"));
 }
 
 /// A deleted root or producing revision must not poison the release pass

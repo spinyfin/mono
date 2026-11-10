@@ -93,28 +93,26 @@ fn list_executions_for_task_includes_its_review_guide_runs() {
 }
 
 #[test]
-fn launch_target_for_review_item_is_its_pending_execution() {
+fn launch_target_for_review_item_refuses_and_names_parent_command() {
     let (_dir, db) = open_db();
     let (root, _series_id, comparison_id) = seeded_series(&db);
-
-    // Nothing pending yet: refuse, naming the review item, and create nothing.
-    let err = db.pending_review_guide_launch_target(&comparison_id).unwrap_err();
-    assert!(err.to_string().contains("no pending review execution"), "{err}");
-
+    let command = format!("bossctl agents launch {root}");
+    let err = db.validate_manual_launch_target(&comparison_id).unwrap_err();
+    assert!(err.to_string().contains(&command), "{err}");
     let execution = db
         .create_pr_review_guide_execution(&comparison_id, "acme/widget")
         .unwrap();
-
-    // The review item id resolves to the existing pending execution.
-    let target = db.pending_review_guide_launch_target(&comparison_id).unwrap().unwrap();
-    assert_eq!(target.id, execution.id);
-    // An execution id of that run maps to the same execution.
-    let by_exec = db.pending_review_guide_launch_target(&execution.id).unwrap().unwrap();
-    assert_eq!(by_exec.id, execution.id);
-    // No second execution was created.
+    for id in [&comparison_id, &execution.id] {
+        let err = db.validate_manual_launch_target(id).unwrap_err();
+        assert!(
+            err.to_string().contains("review guide, not a pre-merge review request"),
+            "{err}"
+        );
+        assert!(err.to_string().contains(&command), "{err}");
+    }
+    assert_eq!(db.get_execution(&execution.id).unwrap().status, ExecutionStatus::Ready);
     assert_eq!(db.list_executions(Some(&root)).unwrap().len(), 1);
-    // A task id is not a review target.
-    assert!(db.pending_review_guide_launch_target(&root).unwrap().is_none());
+    db.validate_manual_launch_target(&root).unwrap();
 }
 
 #[test]
@@ -124,7 +122,7 @@ fn launch_target_rejects_non_review_execution_id_naming_work_item() {
     let execution = db
         .request_execution(RequestExecutionInput::builder().work_item_id(root.clone()).build())
         .unwrap();
-    let err = db.pending_review_guide_launch_target(&execution.id).unwrap_err();
+    let err = db.validate_manual_launch_target(&execution.id).unwrap_err();
     assert!(err.to_string().contains(&root), "{err}");
 }
 

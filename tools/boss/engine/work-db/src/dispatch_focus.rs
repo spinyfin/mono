@@ -38,6 +38,12 @@ use super::*;
 /// Metadata KV key holding the JSON-encoded [`DispatchFocus`].
 const METADATA_KEY_DISPATCH_FOCUS: &str = "dispatch_focus";
 
+/// Persist explicit launch intent inside the caller's admission transaction.
+pub(super) fn record_explicit_launch_on(conn: &Connection, work_item_id: &str) -> Result<()> {
+    conn.execute("UPDATE tasks SET explicitly_launched = 1 WHERE id = ?1", [work_item_id])?;
+    Ok(())
+}
+
 pub(super) fn migrate_explicit_launch(conn: &Connection) -> Result<()> {
     if !super::schema_init::table_has_column(conn, "tasks", "explicitly_launched")? {
         conn.execute_batch("ALTER TABLE tasks ADD COLUMN explicitly_launched INTEGER NOT NULL DEFAULT 0")?;
