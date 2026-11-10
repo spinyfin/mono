@@ -255,6 +255,32 @@ final class QueuedWaitTests: XCTestCase {
         }
     }
 
+    func testReviewRuntimeReachesBoardSnapshot() {
+        let model = ChatViewModel(socketPath: "/tmp/review-snapshot-\(UUID().uuidString).sock")
+        let item = task(status: "in_review")
+        model.choresByProductID = ["product_test": [item]]
+        for reason in ["review_reservation", "review_batch", "awaiting_merge",
+                       "review_complete", "revision_pending", "human_review", "unclassified"] {
+            model.taskRuntimesByID[item.id] = runtime(reason: reason, label: "engine phrase", status: "completed")
+            let card = model.workCardSnapshot(
+                for: item, column: .review, isSelected: false,
+                isFrontierHighlighted: false, boardStyle: .elevated, liveState: nil
+            )
+            XCTAssertEqual(card.liveStatus, "\(reason == "unclassified" ? "Unexpected state" : "Waiting") — engine phrase")
+        }
+    }
+
+    func testApplyingAIReviewCaptionWinsOverIdleWait() {
+        var item = task(status: "active")
+        item.aiReviewing = true
+        item.aiReviewStage = "applying"
+        XCTAssertEqual(WorkCardLiveStatus.resolve(
+            task: item, column: .doing,
+            runtime: runtime(reason: "awaiting_review", label: "generic review wait", status: "completed"),
+            liveState: nil
+        ), "Applying AI review verdict")
+    }
+
     func testEngineWaitDoesNotOverrideLiveOrHumanWork() {
         for status in ["claimed", "running", "waiting_human"] {
             XCTAssertFalse(WorkCardLiveStatus.isQueued(

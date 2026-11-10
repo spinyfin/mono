@@ -420,6 +420,15 @@ fn every_waiting_state_yields_a_named_reason() {
         (ExecutionStatus::WaitingMerge, DISPATCH_WAIT_REASON_AWAITING_MERGE),
     ] {
         let item = idle(reason);
+        if status == ExecutionStatus::WaitingReview {
+            db.connect()
+                .unwrap()
+                .execute(
+                    "UPDATE tasks SET pr_url = 'https://github.com/test/repo/pull/7', updated_at = '1' WHERE id = ?1",
+                    [&item.id],
+                )
+                .unwrap();
+        }
         pending(&db, &item.id, ExecutionKind::ChoreImplementation, status);
         covered.insert(assert_named(reason, &wait_of(&db, pid, &item.id), reason));
     }
@@ -452,6 +461,7 @@ fn every_waiting_state_yields_a_named_reason() {
 
     // Every reason in the vocabulary is reachable from a state above, so a
     // reason cannot be added without a state that produces it.
+    covered.extend(review_states_use_admission_and_current_head_evidence_on_every_surface());
     let vocabulary: BTreeSet<String> = DISPATCH_WAIT_REASON_CODES
         .iter()
         .map(|(code, _)| (*code).to_owned())
@@ -918,7 +928,7 @@ fn idle_admission_holds_and_review_waits_agree_across_surfaces() {
         (parked, DISPATCH_WAIT_REASON_DELIBERATE_PARK),
     ];
     for (status, reason) in [
-        (ExecutionStatus::WaitingReview, DISPATCH_WAIT_REASON_REVIEW_RESERVATION),
+        (ExecutionStatus::WaitingReview, DISPATCH_WAIT_REASON_UNCLASSIFIED),
         (ExecutionStatus::WaitingMerge, DISPATCH_WAIT_REASON_AWAITING_MERGE),
     ] {
         let item = create_test_chore(&db, &product.id, reason);
@@ -975,4 +985,135 @@ fn an_idle_active_item_outside_the_sweeps_clock_is_an_anomaly() {
             .iter()
             .any(|wait| wait.work_item_id == item.id && wait.reason == DISPATCH_WAIT_REASON_UNCLASSIFIED)
     );
+}
+
+fn review_states_use_admission_and_current_head_evidence_on_every_surface() -> BTreeSet<String> {
+    let db = db();
+    let product = create_test_product(&db);
+    let mut cases = Vec::new();
+    for (name, expected) in [
+        ("clean", DISPATCH_WAIT_REASON_REVIEW_COMPLETE),
+        ("revision", DISPATCH_WAIT_REASON_REVISION_PENDING),
+        ("findings", DISPATCH_WAIT_REASON_HUMAN_REVIEW),
+        ("changes", DISPATCH_WAIT_REASON_HUMAN_REVIEW),
+        ("cycle", DISPATCH_WAIT_REASON_HUMAN_REVIEW),
+        ("admission", DISPATCH_WAIT_REASON_REVIEW_RESERVATION),
+        ("parked", DISPATCH_WAIT_REASON_PARKED),
+        ("human", DISPATCH_WAIT_REASON_HUMAN_DRIVEN),
+        ("unexplained", DISPATCH_WAIT_REASON_UNCLASSIFIED),
+    ] {
+        let item = create_test_chore(&db, &product.id, name);
+        set_status(&db, &item.id, "in_review");
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET pr_url = 'https://github.com/test/repo/pull/7', pr_head_sha = 'head'
+             WHERE id = ?1",
+                [&item.id],
+            )
+            .unwrap();
+        match name {
+            "clean" | "revision" | "findings" => {
+                let run = pending(&db, &item.id, ExecutionKind::PrReview, ExecutionStatus::Completed);
+                let revision = if name == "revision" {
+                    let child = create_test_chore(&db, &product.id, "findings revision");
+                    db.connect()
+                        .unwrap()
+                        .execute(
+                            "UPDATE tasks SET kind = 'revision', parent_task_id = ?2, status = 'active' WHERE id = ?1",
+                            params![child.id, item.id],
+                        )
+                        .unwrap();
+                    Some(child.id)
+                } else {
+                    None
+                };
+                db.connect().unwrap().execute(
+                    "INSERT INTO pr_review_batches(id,cycle_root_id,base_sha,classification_json,created_at,phase,pr_number,pr_url,status,target_sha,updated_at)
+                     VALUES (?1,?2,'base','{}','1','pre_merge',7,'https://github.com/test/repo/pull/7','completed','head','1')",
+                    params![format!("batch-{name}"), item.id],
+                ).unwrap();
+                db.connect().unwrap().execute(
+                    "INSERT INTO pr_review_verdicts(id,execution_id,work_item_id,head_sha,findings_count,revision_warranted,gate_outcome,revision_task_id,created_at,batch_id)
+                     VALUES (?1,?2,?3,'head',?4,?4,?5,?6,'1',?7)",
+                    params![format!("verdict-{name}"), run.id, item.id, i64::from(name != "clean"),
+                        if name != "clean" { "completed_with_findings" } else { "completed_clean" },
+                        revision, format!("batch-{name}")],
+                ).unwrap();
+                db.connect()
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO work_attention_items(id,work_item_id,kind,status,title,body_markdown,created_at)
+                     VALUES (?1,?2,'pr_review_admission_deferred','open','admission','admission','1')",
+                        params![format!("old-admission-{name}"), item.id],
+                    )
+                    .unwrap();
+            }
+            "changes" => {
+                db.connect()
+                    .unwrap()
+                    .execute(
+                        "UPDATE tasks SET review_required_state = 'changes_requested' WHERE id = ?1",
+                        [&item.id],
+                    )
+                    .unwrap();
+            }
+            "cycle" | "admission" => {
+                db.connect()
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO work_attention_items(id,work_item_id,kind,status,title,body_markdown,created_at)
+                     VALUES (?1,?2,?3,'open','review','review','1')",
+                        params![
+                            format!("attention-{name}"),
+                            item.id,
+                            if name == "cycle" {
+                                "pr_review_cycle_bound"
+                            } else {
+                                "pr_review_admission_deferred"
+                            }
+                        ],
+                    )
+                    .unwrap();
+            }
+            "parked" => {
+                db.connect()
+                    .unwrap()
+                    .execute("UPDATE tasks SET parked_at = '1' WHERE id = ?1", [&item.id])
+                    .unwrap();
+            }
+            "human" => {
+                db.connect()
+                    .unwrap()
+                    .execute(
+                        "UPDATE tasks SET human_driven = 1, pr_url = NULL WHERE id = ?1",
+                        [&item.id],
+                    )
+                    .unwrap();
+            }
+            _ => {}
+        }
+        cases.push((item.id, expected));
+    }
+    let report = db
+        .stuck_report(0, boss_engine_utils::epoch_time::now_epoch_secs(), &|_| false)
+        .unwrap();
+    let anomalies = db.list_unexplained_dispatch_waits().unwrap();
+    let mut covered = BTreeSet::new();
+    for (id, expected) in cases {
+        if expected != DISPATCH_WAIT_REASON_UNCLASSIFIED {
+            covered.insert(expected.to_owned());
+        }
+        let runtime = wait_of(&db, &product.id, &id);
+        assert_eq!(runtime.dispatch_wait_reason.as_deref(), Some(expected), "{id}");
+        let row = report.rows.iter().find(|row| row.work_item_id == id).unwrap();
+        assert_eq!(row.wait_reason, runtime.dispatch_wait_reason);
+        assert_eq!(row.wait_label, runtime.dispatch_wait_label);
+        assert_eq!(
+            anomalies.iter().any(|wait| wait.work_item_id == id),
+            expected == DISPATCH_WAIT_REASON_UNCLASSIFIED,
+            "{id}"
+        );
+    }
+    covered
 }

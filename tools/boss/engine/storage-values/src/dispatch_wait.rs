@@ -123,6 +123,12 @@ pub const DISPATCH_WAIT_REASON_AWAITING_REVIEW: &str = "awaiting_review";
 pub const DISPATCH_WAIT_REASON_REVIEW_RESERVATION: &str = "review_reservation";
 /// A review batch is collecting or applying its verdicts.
 pub const DISPATCH_WAIT_REASON_REVIEW_BATCH: &str = "review_batch";
+/// The current head has a clean internal verdict; checks and merge handling own it.
+pub const DISPATCH_WAIT_REASON_REVIEW_COMPLETE: &str = "review_complete";
+/// A findings revision has not delivered yet.
+pub const DISPATCH_WAIT_REASON_REVISION_PENDING: &str = "revision_pending";
+/// A human review decision is required.
+pub const DISPATCH_WAIT_REASON_HUMAN_REVIEW: &str = "human_review";
 /// Review is complete and merge handling owns the next step.
 pub const DISPATCH_WAIT_REASON_AWAITING_MERGE: &str = "awaiting_merge";
 /// A worker deliberately stopped for a person to decide the next step.
@@ -147,6 +153,15 @@ pub use boss_protocol::DISPATCH_WAIT_REASON_UNCLASSIFIED;
 /// reported as [`DISPATCH_WAIT_REASON_UNCLASSIFIED`], so a new hold cannot
 /// reach a card as a bare identifier.
 pub const DISPATCH_WAIT_REASON_CODES: &[(&str, &str)] = &[
+    (
+        DISPATCH_WAIT_REASON_REVIEW_COMPLETE,
+        "review complete; waiting for checks and merge handling",
+    ),
+    (
+        DISPATCH_WAIT_REASON_REVISION_PENDING,
+        "waiting for its findings revision to finish",
+    ),
+    (DISPATCH_WAIT_REASON_HUMAN_REVIEW, "waiting for a human review decision"),
     (
         DISPATCH_WAIT_REASON_REVIEW_RESERVATION,
         "waiting for a review reservation",

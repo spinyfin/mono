@@ -527,7 +527,14 @@ enum WorkCardLiveStatus {
         let isAIReviewing = task.aiReviewing && task.status == "active"
 
         if runtime?.executionStatus == "claimed" { return "Starting worker" }
-        if isQueued(task: task, runtime: runtime) {
+        // Transient-recovery banner wins outright — a worker being
+        // auto-resumed after a Claude API error looks idle to every
+        // other signal, so without this the card would silently show
+        // stale/no text instead of "recovering from API error …".
+        if let recovering = liveState?.recoveryStatus, !recovering.isEmpty {
+            return recovering
+        }
+        if !isAIReviewing && isQueued(task: task, runtime: runtime) {
             return isNextUp
                 ? nextUpLabel(runtime: runtime, now: now)
                 : queuedLabel(runtime: runtime, now: now,
@@ -546,13 +553,6 @@ enum WorkCardLiveStatus {
         // the engine reports it is waiting on rather than leaving a bare dot.
         if isAIReviewing {
             return liveState == nil ? AgentActivityState.aiReviewCaption(stage: task.aiReviewStage) : nil
-        }
-        // Transient-recovery banner wins outright — a worker being
-        // auto-resumed after a Claude API error looks idle to every
-        // other signal, so without this the card would silently show
-        // stale/no text instead of "recovering from API error …".
-        if let recovering = liveState?.recoveryStatus, !recovering.isEmpty {
-            return recovering
         }
         return liveState?.liveStatus
     }

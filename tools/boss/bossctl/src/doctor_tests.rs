@@ -1075,6 +1075,27 @@ fn diagnose_wait_line_reports_the_engines_reason() {
         (ExecutionStatus::WaitingMerge, "awaiting_merge"),
     ] {
         let item = chore(reason);
+        if status == ExecutionStatus::WaitingReview {
+            db.update_work_item(
+                &item.id,
+                boss_protocol::WorkItemPatch {
+                    status: Some("active".into()),
+                    pr_url: Some("https://github.com/test/repo/pull/7".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            db.create_attention_item(boss_protocol::CreateAttentionItemInput {
+                work_item_id: Some(item.id.clone()),
+                kind: "pr_review_admission_deferred".into(),
+                title: "Review admission deferred".into(),
+                body_markdown: "Waiting for reviewer capacity".into(),
+                execution_id: None,
+                status: None,
+                resolved_at: None,
+            })
+            .unwrap();
+        }
         execution(&item.id, status);
         assert!(line(&item.id).starts_with(&format!("waiting: {reason} — ")));
     }

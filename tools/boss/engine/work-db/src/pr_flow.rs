@@ -1017,6 +1017,13 @@ impl WorkDb {
     /// replaces), so it needs neither marker nor inertia cutoff.
     pub fn list_tasks_awaiting_pre_merge_review_admission(&self) -> Result<Vec<DeferredReviewAdmissionCandidate>> {
         let conn = self.connect()?;
+        Self::pre_merge_review_admission_candidates_in(&conn, None)
+    }
+
+    pub(super) fn pre_merge_review_admission_candidates_in(
+        conn: &Connection,
+        only: Option<&str>,
+    ) -> Result<Vec<DeferredReviewAdmissionCandidate>> {
         let inertia_cutoff = (boss_engine_utils::epoch_time::now_epoch_secs() as u64)
             .saturating_sub(super::REVIEW_BATCH_STALE_SECS)
             .to_string();
@@ -1095,12 +1102,13 @@ impl WorkDb {
                      OR t.updated_at < ?1
                      OR ({needs_readmission} AND t.id = roots.cycle_root_id)
                    )
+               AND (?2 IS NULL OR t.id = ?2)
              ORDER BY t.updated_at ASC",
             walk = walk,
             needs_readmission = needs_readmission,
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([inertia_cutoff], |row| {
+        let rows = stmt.query_map(params![inertia_cutoff, only], |row| {
             Ok(DeferredReviewAdmissionCandidate {
                 task_id: row.get(0)?,
                 product_id: row.get(1)?,

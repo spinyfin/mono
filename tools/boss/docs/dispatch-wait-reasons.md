@@ -63,7 +63,7 @@ An `active` item with no run pending or live. The orphan sweep's own candidate p
 | `awaiting_redispatch` | Its worker ended. The orphan sweep starts a replacement.                      |
 | `awaiting_review`     | Its pull request is with review and merge handling, which owns the next step. |
 
-Review and merge waits use `review_reservation` before reviewer admission, `review_batch` while a matching pre-merge batch is live, and `awaiting_merge` when merge handling owns the next step. An in-review item without a pull request or an explaining execution is `unclassified`.
+Review and merge waits use `review_reservation` only when the shared admission query identifies the item, `review_batch` while a matching pre-merge batch is live, and `awaiting_merge` when merge handling owns the next step. A clean verdict at the observed head yields `review_complete`; an unfinished findings revision yields `revision_pending`. A cycle-limit attention or an outstanding human review decision yields `human_review`. Human-driven and parked holds take precedence. Review cards receive the same runtime projection as Doing cards. Other unexplained review states remain `unclassified`.
 
 Before promising `awaiting_redispatch`, the classifier applies admission's shared pause exemptions and deliberate-park predicate. `dispatch_paused` names a pause that holds the item; `deliberate_park` means its worker stopped for a person. Critical main-pool work and reviews retain admission's operator-pause exemptions.
 

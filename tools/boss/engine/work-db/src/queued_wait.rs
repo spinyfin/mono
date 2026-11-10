@@ -290,30 +290,84 @@ pub(super) fn for_unscheduled(
     match task.status {
         TaskStatus::Todo if task.autostart => for_queued_card(conn, task, latest).map(Some),
         TaskStatus::Active => for_idle_active(conn, task).map(Some),
-        TaskStatus::InReview => {
-            let code = if super::dispatch::live_pre_merge_batch_holds(conn, &task.id)? {
-                DISPATCH_WAIT_REASON_REVIEW_BATCH
-            } else if task.pr_url.as_deref().is_none_or(|url| url.trim().is_empty()) {
-                DISPATCH_WAIT_REASON_UNCLASSIFIED
-            } else if task.review_required_state.as_deref() == Some("approved") {
-                DISPATCH_WAIT_REASON_AWAITING_MERGE
-            } else {
-                DISPATCH_WAIT_REASON_REVIEW_RESERVATION
-            };
-            Ok(Some(DispatchWait::named(code)))
-        }
+        TaskStatus::InReview => review_wait(conn, &task.id).map(Some),
         _ => Ok(None),
     }
 }
 
+/// Holds shared by idle cards and review handling, including inherited holds.
+fn item_hold(conn: &Connection, task: &Task) -> Result<Option<&'static str>> {
+    Ok(if task.human_driven || work_item_is_human_driven(conn, &task.id)? {
+        Some(DISPATCH_WAIT_REASON_HUMAN_DRIVEN)
+    } else if task.is_parked() || !parking::upkeep_eligible(conn, &task.id)? {
+        Some(DISPATCH_WAIT_REASON_PARKED)
+    } else {
+        None
+    })
+}
+
 fn review_wait(conn: &Connection, id: &str) -> Result<DispatchWait> {
-    Ok(DispatchWait::named(
-        if super::dispatch::live_pre_merge_batch_holds(conn, id)? {
-            DISPATCH_WAIT_REASON_REVIEW_BATCH
-        } else {
-            DISPATCH_WAIT_REASON_REVIEW_RESERVATION
-        },
-    ))
+    use boss_engine_storage_values::dispatch_wait::{
+        DISPATCH_WAIT_REASON_HUMAN_REVIEW, DISPATCH_WAIT_REASON_REVIEW_COMPLETE, DISPATCH_WAIT_REASON_REVISION_PENDING,
+    };
+    let Some(task) = query_task(conn, id)? else {
+        return Ok(DispatchWait::named(DISPATCH_WAIT_REASON_UNCLASSIFIED));
+    };
+    if let Some(code) = item_hold(conn, &task)? {
+        return Ok(DispatchWait::named(code));
+    }
+    let root = chain_root(conn, id)?;
+    let human_review = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM work_attention_items
+         WHERE work_item_id IN (?1, ?2) AND kind = 'pr_review_cycle_bound' AND status = 'open')",
+        params![id, root],
+        |row| row.get::<_, bool>(0),
+    )?;
+    let reviews =
+        super::review_badge::fetch_current_heads(conn, &[id.to_owned()], super::review_badge::ReviewKey::Card)?;
+    let review = reviews.get(id);
+    let revision_pending = review
+        .and_then(|review| review.findings_revision_id.as_deref())
+        .map(|id| query_task(conn, id))
+        .transpose()?
+        .flatten()
+        .is_some_and(|revision| {
+            revision.deleted_at.is_none()
+                && matches!(
+                    revision.status,
+                    TaskStatus::Todo | TaskStatus::Active | TaskStatus::Blocked
+                )
+        });
+    let code = if human_review {
+        DISPATCH_WAIT_REASON_HUMAN_REVIEW
+    } else if super::dispatch::live_pre_merge_batch_holds(conn, id)? {
+        DISPATCH_WAIT_REASON_REVIEW_BATCH
+    } else if revision_pending {
+        DISPATCH_WAIT_REASON_REVISION_PENDING
+    } else if task.review_required_state.as_deref() == Some("changes_requested")
+        || review.is_some_and(|review| review.state == AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS)
+    {
+        DISPATCH_WAIT_REASON_HUMAN_REVIEW
+    } else if review.is_some_and(|review| {
+        matches!(
+            review.state,
+            AI_REVIEW_STATE_REVIEWED_CLEAN_PENDING | AI_REVIEW_STATE_REVIEWED_ALL_CLEAR
+        )
+    }) {
+        DISPATCH_WAIT_REASON_REVIEW_COMPLETE
+    } else if !WorkDb::pre_merge_review_admission_candidates_in(conn, Some(id))?.is_empty() {
+        DISPATCH_WAIT_REASON_REVIEW_RESERVATION
+    } else if task.review_required_state.as_deref() == Some("approved") {
+        DISPATCH_WAIT_REASON_AWAITING_MERGE
+    } else if matches!(
+        task.review_required_state.as_deref(),
+        Some("required" | "review_required")
+    ) {
+        DISPATCH_WAIT_REASON_HUMAN_REVIEW
+    } else {
+        DISPATCH_WAIT_REASON_UNCLASSIFIED
+    };
+    Ok(DispatchWait::named(code))
 }
 
 /// An `active` item with no run pending or live. The orphan sweep is what
@@ -321,10 +375,8 @@ fn review_wait(conn: &Connection, id: &str) -> Result<DispatchWait> {
 /// ordinary state; the holds it leaves alone are named in turn. Anything
 /// else is the anomaly [`DISPATCH_WAIT_REASON_UNCLASSIFIED`].
 fn for_idle_active(conn: &Connection, task: &Task) -> Result<DispatchWait> {
-    let code = if task.human_driven || work_item_is_human_driven(conn, &task.id)? {
-        DISPATCH_WAIT_REASON_HUMAN_DRIVEN
-    } else if task.is_parked() || !parking::upkeep_eligible(conn, &task.id)? {
-        DISPATCH_WAIT_REASON_PARKED
+    let code = if let Some(code) = item_hold(conn, task)? {
+        code
     } else if task.dispatch_failed_reason.is_some() {
         DISPATCH_WAIT_REASON_DISPATCH_FAILED
     } else if conn.query_row(
@@ -368,22 +420,10 @@ fn for_idle_active(conn: &Connection, task: &Task) -> Result<DispatchWait> {
 /// A `todo` card with automatic start on, nothing pending for it and no live
 /// run.
 fn for_queued_card(conn: &Connection, task: &Task, latest: Option<&ExecutionStatus>) -> Result<DispatchWait> {
-    // The row's own flags are consulted first: a board can carry many
-    // deferred or parked cards, and those need no query. Not every caller's
-    // row carries the flags, so the stored columns are read when the row says
-    // no.
-    let code = if task.human_driven {
-        DISPATCH_WAIT_REASON_HUMAN_DRIVEN
-    } else if task.deferred {
+    let code = if let Some(code) = item_hold(conn, task)? {
+        code
+    } else if task.deferred || work_item_is_deferred(conn, &task.id)? {
         DISPATCH_WAIT_REASON_DEFERRED
-    } else if task.is_parked() {
-        DISPATCH_WAIT_REASON_PARKED
-    } else if work_item_is_human_driven(conn, &task.id)? {
-        DISPATCH_WAIT_REASON_HUMAN_DRIVEN
-    } else if work_item_is_deferred(conn, &task.id)? {
-        DISPATCH_WAIT_REASON_DEFERRED
-    } else if !parking::upkeep_eligible(conn, &task.id)? {
-        DISPATCH_WAIT_REASON_PARKED
     } else if latest.is_some() {
         // The reconciler never mints a replacement after a finished run.
         DISPATCH_WAIT_REASON_RUN_ENDED
