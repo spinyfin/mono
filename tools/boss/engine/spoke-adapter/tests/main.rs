@@ -1,5 +1,6 @@
 //! The hub adapter against a real hub: mTLS gRPC stream manager, work database
 //! outbox, and a scripted spoke on the other end of the stream.
+mod coordinator;
 mod regressions;
 mod routing;
 mod support;

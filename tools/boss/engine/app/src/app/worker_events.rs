@@ -1677,6 +1677,9 @@ async fn dispatch_probe_on_stop_inner(
         );
         return ProbeDispatchOutcome::AlreadyInFlight;
     }
+    if let Some(outcome) = super::spoke_probes::dispatch(server_state, run_id).await {
+        return outcome;
+    }
     let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
         // Leave queued probes alone — no slot means we cannot deliver
         // and must not drop them by claiming them. If the run is genuinely
@@ -2073,6 +2076,9 @@ pub(super) async fn dispatch_probe_on_post_tool_use(
         return ProbeDispatchOutcome::AlreadyInFlight;
     }
 
+    if let Some(outcome) = super::spoke_probes::dispatch(server_state, run_id).await {
+        return outcome;
+    }
     let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
         // Leave the probe queued — a later PostToolUse / Stop after slot
         // registration can still deliver it.
@@ -2372,6 +2378,9 @@ async fn dispatch_probe_now_inner(server_state: &Arc<ServerState>, run_id: &str)
     if queued == 0 {
         tracing::debug!(run_id, "probe-now: nothing queued for this run");
         return ProbeDispatchOutcome::NothingQueued;
+    }
+    if let Some(outcome) = super::spoke_probes::dispatch(server_state, run_id).await {
+        return outcome;
     }
     let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
         // Worker not yet mapped to a slot (spawning) — probe stays queued.

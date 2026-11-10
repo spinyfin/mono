@@ -310,7 +310,7 @@ impl SpawnComposer for Composer {
 pub struct Fixture {
     pub db: Arc<WorkDb>,
     pub signals: Arc<PromptSignals>,
-    pub provider: SpokeHostAdapterProvider,
+    pub provider: Arc<SpokeHostAdapterProvider>,
     pub manager: StreamManager,
     legacy: Arc<Legacy>,
     dialer: Endpoint,
@@ -407,7 +407,7 @@ impl Fixture {
         Self::builder()
             .signals(signals)
             .db(db)
-            .provider(provider)
+            .provider(Arc::new(provider))
             .manager(manager)
             .legacy(legacy)
             .dialer(dialer)

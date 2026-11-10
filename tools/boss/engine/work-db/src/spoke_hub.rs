@@ -351,6 +351,16 @@ fn now_ms() -> i64 {
 
 #[work_db_boundary::instrument]
 impl WorkDb {
+    /// Whether dispatch must retain ownership while a host command is unresolved.
+    pub fn spoke_execution_in_doubt(&self, execution_id: &str) -> Result<bool> {
+        Ok(self.connect()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM spoke_assignments WHERE execution_id = ?1
+              AND resolved_at_ms IS NULL AND in_doubt <> 0)",
+            [execution_id],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Reserve `execution_id` for `host_id`, or return the reservation it already
     /// holds there. Atomic: the check and the insert share one transaction, so
     /// two dispatchers cannot both win. Fails with [`SpokeHeldByOtherHost`] while
@@ -1042,8 +1052,8 @@ impl WorkDb {
     /// * has a wire sequence the peer has not durably received, or the highest
     ///   sequence stored (allocation is max(stored sequence, durable receipt)
     ///   and never reuses a sequence);
-    /// * belongs to an assignment that is still unresolved, whose commands are
-    ///   the evidence it may have started;
+    /// * is a stable lease, spawn or stop request for an unresolved assignment;
+    ///   transient observations can expire without losing ownership evidence;
     /// * settled at or after `settled_before_ms`, or is among the `keep_recent`
     ///   newest settled commands, so a retry of a recent id still finds its result.
     ///
@@ -1069,12 +1079,14 @@ impl WorkDb {
         let removed = tx.execute(
             "DELETE FROM host_commands
              WHERE host_id = ?1 AND result IS NOT NULL AND settled_at_ms < ?2
-               AND (sequence IS NULL OR (sequence <= ?3 AND sequence < ?4))
+               AND (sequence IS NULL OR (sequence < ?3 AND sequence < ?4))
                AND NOT (run_execution_id IS NOT NULL AND EXISTS(
                     SELECT 1 FROM spoke_assignments a
                      WHERE a.execution_id = host_commands.run_execution_id
                        AND a.assignment_generation = host_commands.run_generation
-                       AND a.resolved_at_ms IS NULL))
+                       AND a.resolved_at_ms IS NULL
+                       AND (command_id GLOB 'lease-*' OR command_id GLOB 'spawn-*'
+                            OR command_id GLOB 'stop-*')))
                AND command_id NOT IN (
                     SELECT command_id FROM host_commands
                      WHERE host_id = ?1 AND result IS NOT NULL
@@ -1886,25 +1898,25 @@ mod tests {
         let db = spoke_db();
         let owned = db.reserve_spoke_assignment("exec_1", "h").unwrap();
         let run = key(&owned);
-        let names = ["a", "b", "c", "d", "unsettled", "run"];
+        let names = ["a", "b", "c", "d", "unsettled", "spawn-run"];
         append(&db, "h", "a", None, b"1").unwrap();
         append(&db, "h", "b", None, b"2").unwrap();
         append(&db, "h", "c", None, b"3").unwrap();
         append(&db, "h", "d", None, b"4").unwrap();
         append(&db, "h", "unsettled", None, b"5").unwrap();
-        append(&db, "h", "run", Some(&run), b"6").unwrap();
+        append(&db, "h", "spawn-run", Some(&run), b"6").unwrap();
         for id in ["a", "b", "c", "d"] {
             db.settle_host_command("h", id, None, b"r").unwrap();
         }
-        db.settle_host_command("h", "run", Some(&run), b"r").unwrap();
+        db.settle_host_command("h", "spawn-run", Some(&run), b"r").unwrap();
         let (journal, _) = db.resume_host_command_journal("h", None).unwrap();
         // The peer has durably received a, b and c only.
         db.record_host_command_receipt("h", &journal, 3).unwrap();
         let far_future = i64::MAX;
         let removed = db.prune_settled_host_commands("h", far_future, 0).unwrap();
-        // d is past the receipt, unsettled is unfinished, run belongs to an open assignment.
-        assert_eq!(removed, 3);
-        assert_eq!(ids(&db, "h", &names), ["d", "unsettled", "run"]);
+        // The receipt and later rows stay, as does the stable spawn for the open assignment.
+        assert_eq!(removed, 2);
+        assert_eq!(ids(&db, "h", &names), ["c", "d", "unsettled", "spawn-run"]);
         // Sequences are never reused: the stored tail still allocates after it.
         assert_eq!(append(&db, "h", "next", None, b"7").unwrap().sequence, 7);
         // Once the assignment resolves and the peer catches up, the rest can go,
@@ -1912,8 +1924,27 @@ mod tests {
         db.resolve_spoke_assignment("exec_1", 1, "released").unwrap();
         db.record_host_command_receipt("h", &journal, 7).unwrap();
         db.settle_host_command("h", "next", None, b"r").unwrap();
-        assert_eq!(db.prune_settled_host_commands("h", far_future, 0).unwrap(), 2);
-        assert_eq!(ids(&db, "h", &["d", "unsettled", "run", "next"]), ["unsettled", "next"]);
+        assert_eq!(db.prune_settled_host_commands("h", far_future, 0).unwrap(), 3);
+        assert_eq!(
+            ids(&db, "h", &["d", "unsettled", "spawn-run", "next"]),
+            ["unsettled", "next"]
+        );
+    }
+
+    #[test]
+    fn retention_expires_observations_but_keeps_stable_commands_for_live_runs() {
+        let db = spoke_db();
+        let assignment = db.reserve_spoke_assignment("exec_1", "h").unwrap();
+        let run = key(&assignment);
+        let names = ["lease-run", "spawn-run", "stop-run", "observe-run", "receipt"];
+        for name in names {
+            append(&db, "h", name, Some(&run), name.as_bytes()).unwrap();
+            db.settle_host_command("h", name, Some(&run), b"result").unwrap();
+        }
+        let (journal, _) = db.resume_host_command_journal("h", None).unwrap();
+        db.record_host_command_receipt("h", &journal, 5).unwrap();
+        assert_eq!(db.prune_settled_host_commands("h", i64::MAX, 0).unwrap(), 1);
+        assert_eq!(ids(&db, "h", &names), ["lease-run", "spawn-run", "stop-run", "receipt"]);
     }
 
     #[test]
@@ -1950,7 +1981,8 @@ mod tests {
         db.settle_host_command("h", "b", None, b"r").unwrap();
         let (journal, _) = db.resume_host_command_journal("h", None).unwrap();
         db.record_host_command_receipt("h", &journal, 2).unwrap();
-        assert_eq!(db.prune_settled_host_commands("h", i64::MAX, 0).unwrap(), 2);
+        assert_eq!(db.prune_settled_host_commands("h", i64::MAX, 0).unwrap(), 1);
+        assert!(db.host_command_wire("h", "b").unwrap().is_some());
         let result = |id: &str| id.as_bytes().to_vec();
         db.reject_host_command("h", 3, &result, &|wire: &[u8], _| Ok(wire.to_vec()))
             .unwrap();

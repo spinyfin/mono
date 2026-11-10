@@ -12,6 +12,11 @@ filegroup(
 )
 
 APP_DEPS = [
+    "//tools/boss/engine/spoke-adapter",
+    "//tools/boss/engine/spoke-hub",
+    "//tools/boss/engine/spoke-stream",
+    "//tools/boss/engine/host-enrollment",
+    "//tools/boss/protocol-spoke",
     "//tools/boss/command-runner",
     "//tools/boss/engine/execution-runner",
     "//tools/boss/engine/execution-contracts",
@@ -82,6 +87,10 @@ rust_test(
     # against the fixture variant under its usual Rust name instead. App also
     # depends on the runtime crate, so swap that too.
     aliases = TEST_ALIASES | {
+        "//tools/boss/engine/spoke-adapter": "boss_spoke_adapter_production",
+        "//tools/boss/engine/spoke-adapter:spoke_adapter_test_support": "boss_spoke_adapter",
+        "//tools/boss/engine/spoke-hub": "boss_spoke_hub_production",
+        "//tools/boss/engine/spoke-hub:spoke_hub_test_support": "boss_spoke_hub",
         "//tools/boss/engine/core:runtime": "boss_engine_runtime_production",
         "//tools/boss/engine/core:runtime_test_support": "boss_engine_runtime",
     },
@@ -109,6 +118,8 @@ rust_test(
     deps = TEST_DEPS + [
         "//tools/boss/engine/core:runtime_test_support",
         "//tools/boss/engine/prose-vocabulary",
+        "//tools/boss/engine/spoke-adapter:spoke_adapter_test_support",
+        "//tools/boss/engine/spoke-hub:spoke_hub_test_support",
         "//tools/boss/engine/task-scope",
     ] + all_crate_deps(
         normal = True,

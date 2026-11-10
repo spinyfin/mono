@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+boss-spoke-adapter = { path = "../spoke-adapter" }
+boss-spoke-hub = { path = "../spoke-hub" }
+boss-spoke-stream = { path = "../spoke-stream" }
+boss-host-enrollment = { path = "../host-enrollment" }
+boss-protocol-spoke = { path = "../../protocol-spoke" }
+tonic = { workspace = true }
 boss-command-runner = { path = "../../command-runner" }
 boss-engine-runtime = { path = "../core/runtime" }
 boss-execution-runner = { path = "../execution-runner" }

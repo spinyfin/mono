@@ -420,7 +420,10 @@ impl ServerState {
                     .map_err(|err| InterruptPaneError::Host(format!("{err:#}")))?;
                 return spoke_delivery(outcome)
                     .map(|()| boss_protocol::REMOTE_SLOT_BASE)
-                    .map_err(|err| InterruptPaneError::Host(err.to_string()));
+                    .map_err(|err| match err {
+                        SendInputError::Host(reason) => InterruptPaneError::Host(reason),
+                        other => InterruptPaneError::Host(other.to_string()),
+                    });
             }
             Ok(None) => {}
             Err(err) => return Err(InterruptPaneError::Host(format!("{err:#}"))),
@@ -1299,9 +1302,21 @@ impl ServerState {
                 return;
             }
         };
-        match adapter.stop_worker(run_id, SPOKE_STOP_GRACE).await {
-            Ok(outcome) => tracing::info!(run_id, ?outcome, "asked a spoke host to stop its worker"),
-            Err(err) => tracing::warn!(run_id, error = %format!("{err:#}"), "stopping a spoke worker failed"),
+        // The adapter persists a stable Stop command. Releasing a pane must not
+        // wait through the host grace period on every completion sweep; a lost
+        // reply remains uncertain and the next call reuses that command.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            adapter.stop_worker(run_id, SPOKE_STOP_GRACE),
+        )
+        .await
+        {
+            Ok(Ok(outcome)) => tracing::info!(run_id, ?outcome, "asked a spoke host to stop its worker"),
+            Ok(Err(err)) => tracing::warn!(run_id, error = %format!("{err:#}"), "stopping a spoke worker failed"),
+            Err(_) => tracing::info!(
+                run_id,
+                "spoke stop remains pending; release continues with remote proof checks"
+            ),
         }
     }
 }
