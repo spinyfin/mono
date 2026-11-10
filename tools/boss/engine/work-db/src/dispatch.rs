@@ -470,9 +470,18 @@ impl WorkDb {
                AND t.dispatch_failed_at IS NOT NULL
                AND CAST(t.dispatch_failed_at AS INTEGER) < ?1
                AND {upkeep}
+               -- A conflict revision whose attempt failed in workspace
+               -- preparation is recovered only by the conflict-workspace
+               -- probe; respawning it here would repeat the same refusal.
+               AND NOT EXISTS (
+                   SELECT 1 FROM conflict_resolutions cr
+                    WHERE cr.revision_task_id = t.id AND cr.status = 'failed'
+                      AND cr.failure_reason LIKE ?2 || '%')
              ORDER BY CAST(t.dispatch_failed_at AS INTEGER) ASC, t.id ASC",
         ))?;
-        let rows = stmt.query_map([cutoff], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![cutoff, crate::CONFLICT_WORKSPACE_FAILURE], |row| {
+            row.get::<_, String>(0)
+        })?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -1325,6 +1334,19 @@ impl WorkDb {
             )
             .optional()?;
         Ok(host.flatten())
+    }
+
+    /// Record the scheduler-selected host of a not-yet-started execution so a
+    /// pre-start failure can be attributed to the host that produced it. The
+    /// run-start write stores the same value later. Every selection is
+    /// recorded, local included and overwriting an earlier retry's host, so the
+    /// value always names the host of the most recent attempt.
+    pub fn record_pre_start_host(&self, execution_id: &str, host_id: &str) -> Result<()> {
+        self.connect()?.execute(
+            "UPDATE work_executions SET host_id = ?2 WHERE id = ?1 AND started_at IS NULL",
+            params![execution_id, host_id],
+        )?;
+        Ok(())
     }
 
     /// `work_executions.host_id` for every execution of `work_item_id`, in

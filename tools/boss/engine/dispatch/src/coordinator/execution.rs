@@ -1172,6 +1172,9 @@ impl ExecutionCoordinator {
                 return Err(err);
             }
         };
+        if let Err(err) = self.work_db.record_pre_start_host(&execution.id, &selected_host.id) {
+            tracing::warn!(execution_id = %execution.id, ?err, "failed to record selected host before start");
+        }
         let adapter = match self.host_adapter_provider.adapter_for(&selected_host).await {
             Ok(adapter) => adapter,
             Err(err) => {
@@ -2561,7 +2564,43 @@ impl ExecutionCoordinator {
     ) -> Result<()> {
         let (attention_kind, attention_title) = attention;
         let error_text = format!("{error:#}");
-        let retry_delays = &self.pre_start_retry_delays;
+        // A typed Cube refusal during preparation cannot be repaired by
+        // replacing the conflict revision. Preserve it on the owning attempt.
+        let conflict_workspace = if matches!(
+            attention_kind,
+            "cube_workspace_positioning_failed" | "cube_workspace_lease_failed"
+        ) && error.is::<crate::cube_commands::CubeCliError>()
+        {
+            self.work_db
+                .conflict_resolution_for_revision(&execution.work_item_id)?
+                .filter(|attempt| {
+                    matches!(attempt.status.as_str(), "pending" | "running")
+                        || boss_work_db::conflict_workspace_failed(attempt)
+                })
+        } else {
+            None
+        };
+        // A goto/positioning refusal is deterministic, so it fails the attempt
+        // at once. A lease-stage Cube error can be transient (unreachable
+        // remote, clone or fetch failure), so it follows the ordinary retry
+        // schedule and fails the attempt only on the final failure. Either way
+        // the attempt fails before the execution failure commits, so no
+        // detection pass can observe the dead revision while its attempt still
+        // looks live.
+        let positioning = attention_kind == "cube_workspace_positioning_failed";
+        let final_failure = execution.pre_start_failure_count >= self.pre_start_retry_delays.len() as i64;
+        if let Some(attempt) = &conflict_workspace
+            && (positioning || final_failure)
+        {
+            let host = self.work_db.execution_host_id(&execution.id).ok().flatten();
+            self.work_db
+                .fail_conflict_workspace_on_host(&attempt.id, &error_text, host.as_deref())?;
+        }
+        let retry_delays = if conflict_workspace.is_some() && positioning {
+            &[][..]
+        } else {
+            &self.pre_start_retry_delays[..]
+        };
         let transition =
             self.work_db
                 .record_pre_start_failure(&execution.id, worker_id, cube_repo_id, &error_text, retry_delays);
@@ -2639,6 +2678,54 @@ impl ExecutionCoordinator {
                 });
             }
             PreStartFailureOutcome::PermanentFail => {
+                if let Some(attempt) = conflict_workspace {
+                    self.publisher
+                        .publish_work_item_changed(
+                            &attempt.product_id,
+                            &attempt.work_item_id,
+                            "conflict_workspace_failed",
+                        )
+                        .await;
+                    self.publisher
+                        .publish_work_item_changed(
+                            &attempt.product_id,
+                            &execution.work_item_id,
+                            "conflict_workspace_failed",
+                        )
+                        .await;
+                    self.publisher
+                        .publish(
+                            &execution.id,
+                            &execution.work_item_id,
+                            execution.status.as_str(),
+                            "execution_start_failed",
+                        )
+                        .await;
+                    // The revision keeps the ordinary "Failed to start"
+                    // bookkeeping; only the duplicate generic attention is
+                    // suppressed because the attempt's own stop is surfaced.
+                    let bounced = self
+                        .work_db
+                        .bounce_dispatch_failed_to_backlog(&execution.work_item_id, attention_kind, &error_text)
+                        .unwrap_or_else(|bounce_err| {
+                            tracing::error!(?bounce_err, work_item_id = %execution.work_item_id, "failed to record conflict revision dispatch failure");
+                            false
+                        });
+                    self.dispatch_events
+                        .emit(
+                            DispatchEvent::new(Stage::PreStartRetriesExhausted, DispatchOutcome::Error, &execution.id)
+                                .with_work_item(&execution.work_item_id)
+                                .with_worker(worker_id)
+                                .with_error(error)
+                                .with_details(serde_json::json!({
+                                    "reason": attention_kind,
+                                    "pre_start_failure_count": execution.pre_start_failure_count,
+                                    "bounced_to_backlog": bounced,
+                                })),
+                        )
+                        .await;
+                    return Ok(());
+                }
                 let run_id = run.as_ref().map(|r| r.id.as_str()).unwrap_or("(none)");
                 tracing::warn!(
                     execution_id = %execution.id,

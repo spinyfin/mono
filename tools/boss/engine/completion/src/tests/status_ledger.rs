@@ -1151,6 +1151,16 @@ fn chain_conflict_and_queue_producers_record_exact_bases() {
         .unwrap()
         .unwrap();
     db.mark_conflict_resolution_failed(&attempt.id, "failed").unwrap();
+    assert_latest(
+        &db,
+        &conflict_parent.id,
+        "blocked_reason",
+        "surface_conflict_stop",
+        "engine",
+    );
+    // Clear the block that the failure surfaced so retry must write it
+    // again, retaining coverage of retry's provenance.
+    db.clear_chore_blocked_merge_conflict(&conflict_parent.id, pr).unwrap();
     db.retry_conflict_resolution(&attempt.id).unwrap();
     assert_latest(
         &db,

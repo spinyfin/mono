@@ -128,6 +128,9 @@ pub(super) struct FakeCubeClient {
     /// to model a single bad workspace being skipped via `any_free`
     /// retry when `preferred_workspace_id=null`.
     pub(super) fail_first_n_leases: usize,
+    /// As `fail_first_n_leases`, but each failure is a typed [`CubeCliError`]
+    /// (an unreachable remote or fetch failure).
+    pub(super) fail_first_n_cube_cli_leases: usize,
     pub(super) fail_create: bool,
     pub(super) fail_bookmark_create: bool,
     pub(super) real_bookmarks: bool,
@@ -137,6 +140,7 @@ pub(super) struct FakeCubeClient {
     /// The `inherited_base` each bookmark creation was handed, in call order.
     pub(super) bookmark_inherited_bases: Mutex<Vec<Option<String>>>,
     pub(super) fail_goto: bool,
+    pub(super) goto_cube_error: Option<String>,
     /// Fail the first N `goto_workspace` calls, then succeed.
     pub(super) fail_first_n_goto: usize,
     /// Fail the first N `release_workspace` calls, then succeed.
@@ -321,6 +325,15 @@ crate::stub_cube_client! { FakeCubeClient {
                 "cube workspace lease failed: preferred workspace held by another worker"
             ));
         }
+        if call_index < self.fail_first_n_cube_cli_leases {
+            return Err(crate::cube_commands::CubeCliError {
+                host: "local".to_owned(),
+                exit_code: Some(1),
+                stderr: "fetch failed: network unreachable".to_owned(),
+                stdout: String::new(),
+            }
+            .into());
+        }
         if call_index < self.fail_first_n_leases {
             return Err(anyhow!("cube workspace lease failed: workspace has uncommitted work"));
         }
@@ -370,6 +383,11 @@ crate::stub_cube_client! { FakeCubeClient {
     }
 
     async fn goto_workspace(&self, workspace_path: &std::path::Path, pr: u64) -> Result<()> {
+        if let Some(stderr) = &self.goto_cube_error {
+            return Err(crate::cube_commands::CubeCliError {
+                host: "local".into(), exit_code: Some(1), stderr: stderr.clone(), stdout: String::new(),
+            }.into());
+        }
         let call_index = {
             let mut calls = self.goto_calls.lock().await;
             calls.push((workspace_path.display().to_string(), pr));

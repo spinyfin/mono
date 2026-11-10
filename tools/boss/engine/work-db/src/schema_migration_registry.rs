@@ -384,6 +384,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: parking_reconcile::migrate,
         },
         Migration {
+            id: conflict_stop::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: conflict_stop::migrate,
+        },
+        Migration {
             id: "20261108_2100_parking_cancel_provenance".into(),
             legacy_version: None,
             apply: parking_reconcile::migrate_cancel_provenance,

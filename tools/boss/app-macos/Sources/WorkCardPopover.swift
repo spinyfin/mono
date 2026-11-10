@@ -147,9 +147,11 @@ struct WorkCardPopoverView: View {
                 }
             }
 
-            ForEach((model.attentionItemsByWorkItemID[task.id] ?? []).filter {
-                $0.kind == "execution_bookmark_recovery_retired"
-            }) { note in
+            // A stopped conflict remediation is shown here as well as in the
+            // blocked detail: a higher-priority blocker (dependency, review
+            // feedback) owns the blocked detail, so the attention is the only
+            // card-visible place the stop reason reaches in that case.
+            ForEach((model.attentionItemsByWorkItemID[task.id] ?? []).filter(\.isCardDisclosure)) { note in
                 DisclosureGroup(note.title) {
                     Text(note.bodyMarkdown)
                         .font(.caption)
@@ -821,5 +823,21 @@ struct PRURLLink: View {
             return "\(full)\n\(urlString)"
         }
         return urlString
+    }
+}
+
+extension WorkAttentionItem {
+    /// Attention kinds whose body is shown on the work card itself. These are
+    /// the backend kind strings (`storage-values/src/attention_kinds.rs`),
+    /// including the `conflict_`-prefixed lockfile kind.
+    static let cardDisclosureKinds: Set<String> = [
+        "execution_bookmark_recovery_retired",
+        "conflict_remediation_stopped",
+        "conflict_lockfile_regeneration_failed",
+    ]
+
+    /// Whether this open item belongs in the card's attention disclosure.
+    var isCardDisclosure: Bool {
+        Self.cardDisclosureKinds.contains(kind) && resolvedAt == nil
     }
 }
