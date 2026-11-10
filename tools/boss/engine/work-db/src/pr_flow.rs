@@ -1027,20 +1027,17 @@ impl WorkDb {
         let inertia_cutoff = (boss_engine_utils::epoch_time::now_epoch_secs() as u64)
             .saturating_sub(super::REVIEW_BATCH_STALE_SECS)
             .to_string();
-        // Shared with `list_orphan_active_candidates`: same walk, same
-        // `CYCLE_ROOT_WALK_SQL_DEPTH_BOUND` (`MAX_CHAIN_DEPTH - 1`). The
-        // previous inlined copy used `depth < 64`, which could emit depth 64
-        // and overshoot [`super::chain_root`]. The seed admits every
-        // `in_review` PR task because the readmission arm below needs the
-        // walked cycle root, which the seed filter cannot see yet; the
-        // outer WHERE narrows `in_review` rows to the marker and
-        // readmission arms.
+        // Match chain_root's MAX_CHAIN_DEPTH - 1 recursive bound. When ?2
+        // names one item, bound the seed before walking its ancestors. With
+        // no requested item, admit all eligible active/in_review PR rows;
+        // the outer WHERE narrows them to marker and readmission cases.
         let upkeep = super::parking::upkeep_eligible_task_sql("t");
         let walk = super::cycle_root_walk_cte(&format!(
             "t.status IN ('active', 'in_review')
                  AND t.pr_url IS NOT NULL
                  AND t.pr_url != ''
                  AND t.deleted_at IS NULL
+                 AND (?2 IS NULL OR t.id = ?2)
                  AND {upkeep}",
         ));
         let needs_readmission = super::review_batches::pre_merge_review_needs_readmission_sql("roots.cycle_root_id");

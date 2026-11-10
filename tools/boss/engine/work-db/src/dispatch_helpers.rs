@@ -274,9 +274,9 @@ pub(crate) fn collect_product_dependencies(conn: &Connection, product_id: &str) 
 
 /// Hydrate the per-item runtime for every task and chore. This is the
 /// primary N+1 on the `get_work_tree` path: one call per work item, each
-/// running 1-4 point queries. Returns the runtimes alongside the total
-/// number of SQL statements executed, so `boss_engine::population_timing` can
-/// attribute the per-row subquery fan-out.
+/// running execution point queries plus task-derived wait annotation. Returns
+/// the runtimes alongside the total number of SQL statements executed, so
+/// `boss_engine::population_timing` can attribute the per-row subquery fan-out.
 pub(crate) fn collect_task_runtimes(
     conn: &Connection,
     tasks: &[Task],
@@ -287,26 +287,36 @@ pub(crate) fn collect_task_runtimes(
     let mut queries = 0u64;
     for task in tasks.iter().chain(chores.iter()) {
         let mut runtime = compute_task_runtime(conn, &task.id, &mut queries, now)?.runtime;
-        super::queued_wait::annotate_unscheduled(conn, task, &mut runtime)?;
+        let (annotation, statements) = super::db_diagnostics::count_statements(conn, || {
+            super::queued_wait::annotate_unscheduled(conn, task, &mut runtime)
+        });
+        queries += statements;
+        annotation?;
         runtimes.push(runtime);
     }
     Ok((runtimes, queries))
 }
 
 /// Runtime snapshot for a single work item. `queries` is incremented by the
-/// number of SQL statements this call actually executes (1-4, depending on
+/// number of execution point queries (1-4, depending on
 /// whether a live-execution fallback, a non-abandoned-execution fallback for
 /// an all-abandoned work item, and a latest-run lookup are needed) so N+1
-/// callers can report an accurate aggregate subquery count.
+/// callers can report an aggregate subquery count. Task lookup and wait
+/// annotation statements are counted as well.
 pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str, queries: &mut u64) -> Result<TaskRuntime> {
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
     let mut runtime = compute_task_runtime(conn, work_item_id, queries, now)?.runtime;
     // A card queued with no execution is explained from its task row, which
     // the execution-keyed projection above never reads.
-    if runtime.dispatch_wait_reason.is_none()
-        && let Some(task) = query_task(conn, work_item_id)?
-    {
-        super::queued_wait::annotate_unscheduled(conn, &task, &mut runtime)?;
+    if runtime.dispatch_wait_reason.is_none() {
+        let (annotation, statements) = super::db_diagnostics::count_statements(conn, || -> Result<()> {
+            if let Some(task) = query_task(conn, work_item_id)? {
+                super::queued_wait::annotate_unscheduled(conn, &task, &mut runtime)?;
+            }
+            Ok(())
+        });
+        *queries += statements;
+        annotation?;
     }
     Ok(runtime)
 }

@@ -24,21 +24,21 @@ The app formats two things itself, because they need the local clock: a retry co
 
 A pending execution:
 
-| Reason                              | Meaning                                                                                            |
-| ----------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `awaiting_dispatch`                 | `ready`, and no scheduler pass has held it. The next pass claims it or records what stops it.      |
-| `not_before`                        | `ready`, with a dispatch deadline still ahead (retry backoff, merge-order stagger).                |
-| `dispatch_paused`                   | The global dispatch pause holds it.                                                                |
-| `automation_paused`                 | The automation pause holds it.                                                                     |
-| `focus_mode`                        | It is outside the dispatch focus set.                                                              |
-| `pool_exhausted`                    | Its worker pool has no free slot.                                                                  |
-| `dispatch_preflight`                | Startup preflight (boot recovery, the capability probe, or a failed runtime check) holds dispatch. |
-| `progression_unavailable`           | The engine cannot start progression agents yet.                                                    |
-| `awaiting_predecessor_preservation` | The run it recovers from has not released its workspace, so that run's work is not preserved yet.  |
-| a sentence                          | The interactive cap, a workspace lease, or a chain hold naming the blocking task and PR.           |
-| `waiting_dependency`                | An unmet `blocks` prerequisite gates it. The card names the prerequisite.                          |
-| `project_order`                     | It is a later task of a project whose earlier task has not been started. The card names that task. |
-| `autostart_off`                     | Its task has automatic start off, so the queued execution waits for an explicit start.             |
+| Reason                              | Meaning                                                                                                                |
+| ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `awaiting_dispatch`                 | `ready`, and no scheduler pass has held it. The next pass claims it or records what stops it.                          |
+| `not_before`                        | `ready`, with a dispatch deadline still ahead (retry backoff, merge-order stagger).                                    |
+| `dispatch_paused`                   | The global dispatch pause holds it.                                                                                    |
+| `automation_paused`                 | The automation pause holds it.                                                                                         |
+| `focus_mode`                        | It is outside the dispatch focus set.                                                                                  |
+| `pool_exhausted`                    | Its worker pool has no free slot.                                                                                      |
+| `dispatch_preflight`                | Startup preflight (boot recovery, the capability probe, or a failed runtime check) holds dispatch.                     |
+| `progression_unavailable`           | The engine cannot start progression agents yet.                                                                        |
+| `awaiting_predecessor_preservation` | The run it recovers from has not released its workspace, so that run's work is not preserved yet.                      |
+| a sentence                          | The interactive cap, a workspace lease, or a chain hold naming the blocking task and PR.                               |
+| `waiting_dependency`                | An unmet `blocks` prerequisite gates it. The card names the prerequisite.                                              |
+| `project_order`                     | It is a later task of a project whose earlier task has not yet reached review or completion. The card names that task. |
+| `autostart_off`                     | Its task has automatic start off, so the queued execution waits for an explicit start.                                 |
 
 A card queued on the board with nothing pending. These are the reconciler's own refusals to mint an execution:
 
@@ -63,7 +63,7 @@ An `active` item with no run pending or live. The orphan sweep's own candidate p
 | `awaiting_redispatch` | Its worker ended. The orphan sweep starts a replacement.                      |
 | `awaiting_review`     | Its pull request is with review and merge handling, which owns the next step. |
 
-Review and merge waits use `review_reservation` only when the shared admission query identifies the item, `review_batch` while a matching pre-merge batch is live, and `awaiting_merge` when merge handling owns the next step. A clean verdict at the observed head yields `review_complete`; an unfinished findings revision yields `revision_pending`. A cycle-limit attention or an outstanding human review decision yields `human_review`. Human-driven and parked holds take precedence. Review cards receive the same runtime projection as Doing cards. Other unexplained review states remain `unclassified`.
+Review and merge waits use `review_reservation` only when the shared admission query identifies the item, `review_batch` while a matching pre-merge batch is live, and `awaiting_merge` when merge handling owns the next step. The merge fallback uses the chain root’s PR and review requirement: an open PR with an unknown or absent requirement waits for merge when its kind excludes AI review or its head is `not_reviewed`, and no family revision or reviewer remains outstanding. Outstanding family revisions yield `revision_pending`; non-terminal family reviewers yield `review_batch`. A clean verdict at the observed head yields `review_complete`; an unfinished findings revision yields `revision_pending`. A cycle-limit attention or an outstanding human review decision yields `human_review`. Human-driven and parked holds take precedence. Review cards receive the same runtime projection as Doing cards. Other unexplained review states remain `unclassified`.
 
 Before promising `awaiting_redispatch`, the classifier applies admission's shared pause exemptions and deliberate-park predicate. `dispatch_paused` names a pause that holds the item; `deliberate_park` means its worker stopped for a person. Critical main-pool work and reviews retain admission's operator-pause exemptions.
 

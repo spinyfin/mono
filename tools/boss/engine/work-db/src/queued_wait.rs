@@ -317,15 +317,24 @@ fn review_wait(conn: &Connection, id: &str) -> Result<DispatchWait> {
         return Ok(DispatchWait::named(code));
     }
     let root = chain_root(conn, id)?;
+    let owner = if root == id {
+        task.clone()
+    } else {
+        query_task(conn, &root)?.unwrap_or_else(|| task.clone())
+    };
     let human_review = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM work_attention_items
          WHERE work_item_id IN (?1, ?2) AND kind = 'pr_review_cycle_bound' AND status = 'open')",
         params![id, root],
         |row| row.get::<_, bool>(0),
     )?;
-    let reviews =
-        super::review_badge::fetch_current_heads(conn, &[id.to_owned()], super::review_badge::ReviewKey::Card)?;
-    let review = reviews.get(id);
+    // Reuse the resolved owner instead of walking the card's chain again.
+    let reviews = super::review_badge::fetch_current_heads(
+        conn,
+        std::slice::from_ref(&root),
+        super::review_badge::ReviewKey::Owner,
+    )?;
+    let review = reviews.get(&root);
     let revision_pending = review
         .and_then(|review| review.findings_revision_id.as_deref())
         .map(|id| query_task(conn, id))
@@ -364,6 +373,35 @@ fn review_wait(conn: &Connection, id: &str) -> Result<DispatchWait> {
         Some("required" | "review_required")
     ) {
         DISPATCH_WAIT_REASON_HUMAN_REVIEW
+    } else if owner.pr_url.as_deref().is_some_and(|url| !url.trim().is_empty())
+        && matches!(owner.review_required_state.as_deref(), None | Some("unknown"))
+        && (task_kind_excluded_from_ai_review(&owner.kind)
+            || review.is_some_and(|review| review.state == AI_REVIEW_STATE_NOT_REVIEWED))
+    {
+        // Inspect the family only after the cheap fallback gates pass.
+        // Name outstanding work even when there is no AI verdict.
+        let (revision, reviewer) = conn.query_row(
+            &format!(
+                "{} SELECT
+                 EXISTS(SELECT 1 FROM family f JOIN tasks t ON t.id = f.id
+                     WHERE t.deleted_at IS NULL AND t.kind = 'revision'
+                         AND t.status IN ('todo', 'active', 'blocked')),
+                 EXISTS(SELECT 1 FROM family f JOIN tasks t ON t.id = f.id
+                     JOIN work_executions e ON e.work_item_id = t.id
+                     WHERE t.deleted_at IS NULL AND e.kind = 'pr_review'
+                         AND e.status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned'))",
+                super::review_badge::review_family_cte("?1", super::review_badge::ReviewKey::Card)
+            ),
+            [id],
+            |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+        )?;
+        if revision {
+            DISPATCH_WAIT_REASON_REVISION_PENDING
+        } else if reviewer {
+            DISPATCH_WAIT_REASON_REVIEW_BATCH
+        } else {
+            DISPATCH_WAIT_REASON_AWAITING_MERGE
+        }
     } else {
         DISPATCH_WAIT_REASON_UNCLASSIFIED
     };
@@ -402,7 +440,7 @@ fn for_idle_active(conn: &Connection, task: &Task) -> Result<DispatchWait> {
         || super::dispatch_admission::revision_implementation_completed(conn, &task.id)?
         || super::dispatch::live_pre_merge_batch_holds(conn, &task.id)?
         || conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM work_executions WHERE work_item_id = ?1 AND kind = 'pr_review')",
+            &format!("SELECT {}", super::dispatch::review_recovery_holds_sql("?1")),
             [&task.id],
             |row| row.get::<_, bool>(0),
         )?

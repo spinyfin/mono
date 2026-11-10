@@ -55,10 +55,8 @@ pub const CYCLE_ROOT_WALK_SQL_DEPTH_BOUND: usize = MAX_CHAIN_DEPTH - 1;
 /// `kind = 'revision'`, then pick the deepest visited row.
 ///
 /// `base_filter_sql` is the base-case `WHERE` on `tasks t` (a caller-supplied
-/// SQL literal, never user input). The recursive arm and the `roots` CTE are
-/// shared so the two consumers (`list_orphan_active_candidates` and
-/// `list_tasks_awaiting_pre_merge_review_admission`) cannot drift on the
-/// depth bound again.
+/// SQL literal, never user input). Admission uses this walk to resolve cycle
+/// roots with the same depth bound as the Rust traversal.
 ///
 /// The fragment defines `walk` and `roots` (`roots.task_id`,
 /// `roots.cycle_root_id`). Callers append their `SELECT`.

@@ -9,6 +9,43 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Count statements in a synchronous projection, including nested helper queries.
+/// Installs a temporary SQLite statement trace callback and removes it on exit.
+/// Assumes no other trace callback is installed on this connection.
+pub(super) fn count_statements<T>(conn: &rusqlite::Connection, work: impl FnOnce() -> T) -> (T, u64) {
+    use std::ffi::{c_int, c_uint, c_void};
+    unsafe extern "C" fn count(_: c_uint, context: *mut c_void, _: *mut c_void, _: *mut c_void) -> c_int {
+        // SAFETY: the counter lives until the trace is removed below. SQLite
+        // invokes this callback synchronously on the connection's thread.
+        unsafe { *context.cast::<u64>() += 1 };
+        0
+    }
+    struct TraceGuard(*mut rusqlite::ffi::sqlite3);
+    impl Drop for TraceGuard {
+        fn drop(&mut self) {
+            // SAFETY: the borrowed connection outlives this guard, including
+            // during unwinding; no callback retains the stack counter.
+            unsafe { rusqlite::ffi::sqlite3_trace_v2(self.0, 0, None, std::ptr::null_mut()) };
+        }
+    }
+    let mut statements = 0u64;
+    // SAFETY: exclusive synchronous use of the connection's trace hook; the
+    // guard removes it before the stack counter or connection can be dropped.
+    let guard = unsafe {
+        let db = conn.handle();
+        rusqlite::ffi::sqlite3_trace_v2(
+            db,
+            rusqlite::ffi::SQLITE_TRACE_STMT as c_uint,
+            Some(count),
+            (&mut statements as *mut u64).cast(),
+        );
+        TraceGuard(db)
+    };
+    let result = work();
+    drop(guard);
+    (result, statements)
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Attribution {
     pub verb: String,
