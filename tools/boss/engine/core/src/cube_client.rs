@@ -216,6 +216,10 @@ impl CubeClient for CommandCubeClient {
         crate::cube_commands::list_repos(self).await
     }
 
+    async fn gc_repo(&self, repo_id: &str) -> Result<()> {
+        crate::cube_commands::gc_repo(self, repo_id).await
+    }
+
     async fn goto_workspace(&self, workspace_path: &Path, pr: u64) -> Result<()> {
         crate::cube_commands::goto_workspace(self, workspace_path, "--pr", &pr.to_string()).await
     }

@@ -2235,6 +2235,14 @@ async fn serve_scoped(
     let (_abandoned_branch_pr_sweep_handle, _pr_binding_repair_sweep_handle) =
         pr_recovery_sweeps::spawn_pr_recovery_sweeps(&server_state);
 
+    // One-shot cleanup of the per-execution bookmarks earlier engines left in
+    // the shared jj stores. It starts a minute after boot, never delays
+    // dispatch, and ends once every store is clean.
+    let _legacy_store_cleanup_handle = boss_engine_runtime::legacy_store_cleanup::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.execution_coordinator.host_adapter_provider(),
+    );
+
     // Engine-restart reattach (distributed-execution PR4): a remote
     // worker is launched detached and survives the engine restarting,
     // but the reverse events-socket forward carrying its hook stream

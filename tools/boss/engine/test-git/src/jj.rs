@@ -27,15 +27,19 @@ enum Template {
     /// [`Template::Plain`] with an `origin` remote that is the store's own
     /// git repository, and `main` exported to it.
     Origin,
+    /// Cube's layout: jj over a colocated `.git` directory.
+    Colocated,
 }
 
 impl Template {
     fn cell(self) -> &'static OnceLock<PathBuf> {
         static PLAIN: OnceLock<PathBuf> = OnceLock::new();
         static ORIGIN: OnceLock<PathBuf> = OnceLock::new();
+        static COLOCATED: OnceLock<PathBuf> = OnceLock::new();
         match self {
             Template::Plain => &PLAIN,
             Template::Origin => &ORIGIN,
+            Template::Colocated => &COLOCATED,
         }
     }
 
@@ -43,6 +47,7 @@ impl Template {
         match self {
             Template::Plain => "plain",
             Template::Origin => "origin",
+            Template::Colocated => "colocated",
         }
     }
 }
@@ -52,6 +57,11 @@ impl JjRepo {
     /// baseline commit, with `worker` and `replacement` workspaces on it.
     pub fn new(root: &Path) -> Self {
         Self::from_template(Template::Plain, root)
+    }
+
+    /// A shared store backed by a colocated Git directory, as cube creates.
+    pub fn colocated(root: &Path) -> Self {
+        Self::from_template(Template::Colocated, root)
     }
 
     /// [`JjRepo::new`] plus an `origin` remote that is the store's own git
@@ -74,6 +84,20 @@ impl JjRepo {
             copy_dir(&source.join(name), &root.join(name));
         }
         let layout = Self::layout(root);
+        if matches!(template, Template::Colocated) {
+            let pointer = layout.repo.join(".jj/repo/store/git_target");
+            let target = std::fs::read_to_string(&pointer).unwrap();
+            if Path::new(target.trim()).is_absolute() {
+                std::fs::write(
+                    &pointer,
+                    std::fs::canonicalize(layout.repo.join(".git"))
+                        .unwrap()
+                        .as_os_str()
+                        .as_encoded_bytes(),
+                )
+                .unwrap();
+            }
+        }
         let store = std::fs::canonicalize(layout.repo.join(".jj/repo")).expect("copied store exists");
         for workspace in [&layout.worker, &layout.replacement] {
             std::fs::write(workspace.join(".jj/repo"), store.as_os_str().as_encoded_bytes()).unwrap();
@@ -117,7 +141,7 @@ impl JjRepo {
             std::fs::remove_dir_all(&root).unwrap();
         }
         std::fs::create_dir_all(&root).unwrap();
-        Self::build(&root);
+        Self::build(&root, matches!(template, Template::Colocated));
         if matches!(template, Template::Origin) {
             let shared = root.join("shared");
             Self::run(&shared, &["git", "remote", "add", "origin", &Self::origin_url(&root)]);
@@ -127,14 +151,15 @@ impl JjRepo {
     }
 
     /// Build the layout through `jj`, one process per step.
-    fn build(root: &Path) -> Self {
+    fn build(root: &Path, colocated: bool) -> Self {
         let layout = Self::layout(root);
         let repo = &layout.repo;
-        let output = Command::new(Self::binary())
-            .args(["git", "init"])
-            .arg(repo)
-            .output()
-            .expect("Bazel must provide jj");
+        let mut init = Command::new(Self::binary());
+        init.args(["git", "init"]);
+        if colocated {
+            init.arg("--colocate");
+        }
+        let output = init.arg(repo).output().expect("Bazel must provide jj");
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         Self::run(repo, &["config", "set", "--repo", "user.name", "Recovery test"]);
         Self::run(

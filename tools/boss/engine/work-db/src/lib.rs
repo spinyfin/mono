@@ -985,6 +985,8 @@ pub use spoke_ingress::{
 };
 pub use trunk_merge_intents::{ActiveTrunkMergeIntent, TrunkMergeIntent, TrunkMergeIntentInsertInput};
 
+mod legacy_store_cleanup;
+pub use legacy_store_cleanup::{LegacyStoreCleanup, LegacyStoreCleanupStatus};
 mod preserved_cleanup;
 mod preserved_work;
 mod teardown_preservation_attention;

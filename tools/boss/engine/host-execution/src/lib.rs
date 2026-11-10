@@ -469,6 +469,27 @@ pub mod cube {
         Ok(payload.repos)
     }
 
+    /// Run `cube repo gc <repo_id>`: abandon the shared jj store's operations
+    /// older than cube's keep window and collect what nothing references.
+    ///
+    /// Runs under [`crate::cube_op_budget::REPO_GC`]. A collection deletes one
+    /// file per abandoned operation and view and waits for an instant with no
+    /// `jj` process on the host, so it takes minutes, not the transport's
+    /// generic bound.
+    pub async fn gc_repo<T: CubeJsonTransport + ?Sized>(transport: &T, repo_id: &str) -> Result<()> {
+        anyhow::ensure!(
+            !repo_id.is_empty() && !repo_id.starts_with('-') && !repo_id.chars().any(char::is_whitespace),
+            "invalid cube repo id {repo_id:?}"
+        );
+        transport
+            .run_cube_json_within(
+                &["--json", "repo", "gc", repo_id],
+                crate::cube_op_budget::repo_gc_transport_budget(),
+            )
+            .await?;
+        Ok(())
+    }
+
     pub fn repo_ensure_args(repo_ref: &str) -> Vec<&str> {
         if git_utils::repo_slug::is_bare_repo_slug(repo_ref) {
             vec!["--json", "repo", "ensure", repo_ref.trim()]
@@ -683,6 +704,22 @@ pub mod cube {
             let t = RecordingTransport::new(json!({ "repo_id": "repo-123" }));
             ensure_repo(&t, "bduff").await.unwrap();
             assert_eq!(t.budget(), Some(crate::cube_op_budget::repo_ensure_transport_budget()));
+        }
+
+        /// A store collection takes minutes, so it asks for its own budget, and a
+        /// repo id can never be read as a flag.
+        #[tokio::test]
+        async fn gc_repo_requests_the_collection_budget_and_rejects_flag_like_ids() {
+            let t = RecordingTransport::new(json!({ "store_gc": {} }));
+            gc_repo(&t, "mono").await.unwrap();
+            assert_eq!(t.budget(), Some(crate::cube_op_budget::repo_gc_transport_budget()));
+            assert_eq!(t.argv(), ["--json", "repo", "gc", "mono"]);
+
+            let rejected = RecordingTransport::new(json!({}));
+            for id in ["", "--dry-run", "two words"] {
+                assert!(gc_repo(&rejected, id).await.is_err(), "{id:?}");
+            }
+            assert_eq!(rejected.budget(), None, "nothing ran");
         }
 
         /// Cheap reads keep the transport default so unreachable hosts fail promptly.
@@ -1031,6 +1068,11 @@ pub mod cube_op_budget {
     /// Positioning may fetch a large repository; stay within the executor's 300s bound.
     pub const GOTO: Duration = Duration::from_secs(290);
 
+    /// Upper bound on one `cube repo gc`. The mono store's collection took
+    /// 622 s once the host was quiet, and cube waits up to five more minutes
+    /// for that instant, so this leaves room for a slow disk.
+    pub const REPO_GC: Duration = Duration::from_secs(45 * 60);
+
     /// Margin between a caller's outer budget and the budget handed to the
     /// transport underneath it.
     ///
@@ -1059,6 +1101,11 @@ pub mod cube_op_budget {
     /// Transport-level budget for `cube repo ensure`.
     pub const fn repo_ensure_transport_budget() -> Duration {
         transport_budget(REPO_ENSURE)
+    }
+
+    /// Transport-level budget for `cube repo gc`.
+    pub const fn repo_gc_transport_budget() -> Duration {
+        transport_budget(REPO_GC)
     }
 }
 pub mod input {

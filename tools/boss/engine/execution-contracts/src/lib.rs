@@ -551,6 +551,14 @@ pub trait CubeClient: Send + Sync {
     /// callers use it to inspect pool config for advisory checks like
     /// the cold-repo probe.
     async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>>;
+    /// Run `cube repo gc <repo_id>` on this machine: abandon the shared jj
+    /// store's old operations and collect what nothing references. Takes
+    /// minutes. Default errors so the many test doubles need no change; only
+    /// `CommandCubeClient` provides a real implementation.
+    async fn gc_repo(&self, repo_id: &str) -> Result<()> {
+        let _ = repo_id;
+        Err(anyhow!("gc_repo is not supported by this CubeClient"))
+    }
     /// Returns `(command_string, cwd)` for the subprocess that would be
     /// spawned with `args`. Used to populate `cube_command`/`cube_cwd`
     /// in dispatch events so failures are reproducible from the terminal.
@@ -1558,6 +1566,24 @@ pub trait HostAdapter: Send + Sync {
     ) -> Result<Vec<String>> {
         let _ = (record, scope);
         bail!("preserved reference cleanup is not supported by this host adapter")
+    }
+
+    /// Archive the unpublished work of, and forget, the per-execution bookmarks
+    /// earlier engines left in the shared jj store at `repo` on this host.
+    /// `published_heads` are the pushed heads the engine recorded.
+    async fn cleanup_legacy_store(
+        &self,
+        repo: &Path,
+        published_heads: &[String],
+    ) -> Result<execution_bookmark::LegacyCleanupReport> {
+        let _ = (repo, published_heads);
+        bail!("legacy store cleanup is not supported by this host adapter")
+    }
+
+    /// Run `cube repo gc <repo_id>` on this host.
+    async fn gc_cube_repo(&self, repo_id: &str) -> Result<()> {
+        let _ = repo_id;
+        bail!("cube repo gc is not supported by this host adapter")
     }
 
     /// Position a fresh child of the repository's configured trunk, resolved

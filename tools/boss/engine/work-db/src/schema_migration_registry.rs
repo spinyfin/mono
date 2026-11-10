@@ -413,6 +413,11 @@ pub(super) fn all() -> Vec<Migration> {
             legacy_version: None,
             apply: board_projection_schema::refine_triggers,
         },
+        Migration {
+            id: legacy_store_cleanup::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: legacy_store_cleanup::migrate,
+        },
     ]);
     migrations
 }
