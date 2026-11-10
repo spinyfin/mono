@@ -114,6 +114,8 @@ pub(super) fn seed_store_files(source: &std::path::Path) -> std::path::PathBuf {
     std::fs::create_dir_all(&op_heads).unwrap();
     std::fs::write(op_heads.join("head"), b"").unwrap();
     std::fs::create_dir_all(source.join(".git")).unwrap();
+    std::fs::create_dir_all(source.join(".jj/repo/index")).unwrap();
+    std::fs::write(source.join(".jj/repo/index/type"), "default").unwrap();
     source.to_path_buf()
 }
 
@@ -181,6 +183,7 @@ fn repo_gc_abandons_old_operations_collects_and_drops_stale_pr_refs() {
     let cut = "d".repeat(64);
     let mut expected = vec![
         op_log_command(&source, &op_log(now)),
+        fresh_index_command(&source),
         // The host is quiet before the abandon...
         ps_command(&source, "/bin/sh\n"),
         ps_command(&source, ""),
@@ -193,12 +196,9 @@ fn repo_gc_abandons_old_operations_collects_and_drops_stale_pr_refs() {
         index_command(&source),
         // ...and right after it: collect immediately.
         ps_command(&source, "/bin/sh\n/usr/bin/git\n"),
-        ExpectedCommand::ok(
-            source.clone(),
-            "jj",
-            &["--ignore-working-copy", "util", "gc", "--expire", "now"],
-            "",
-        ),
+        fresh_index_command(&source),
+        gc_index_command(&source, &["util", "gc", "--expire", "now"]),
+        fresh_index_command(&source),
     ];
     expected.extend(pr_ref_commands(&source, "refs/heads/pr/1\nrefs/heads/pr/2\n", "pr/2\n"));
     expected.push(ExpectedCommand::ok(
@@ -280,13 +280,11 @@ fn repo_gc_with_nothing_old_enough_still_collects() {
             &source,
             &format!("{} {}\n{} {}\n", "a".repeat(64), now, "b".repeat(64), now - HOUR),
         ),
+        fresh_index_command(&source),
         ps_command(&source, ""),
-        ExpectedCommand::ok(
-            source.clone(),
-            "jj",
-            &["--ignore-working-copy", "util", "gc", "--expire", "now"],
-            "",
-        ),
+        fresh_index_command(&source),
+        gc_index_command(&source, &["util", "gc", "--expire", "now"]),
+        fresh_index_command(&source),
     ];
     expected.extend(pr_ref_commands(&source, "", ""));
     let runner = FakeRunner::new(expected);
@@ -319,6 +317,7 @@ fn collection_is_deferred_to_the_two_week_threshold_when_jj_goes_busy_after_the_
     let now = crate::app::util::current_epoch_s().unwrap();
     let mut expected = vec![
         op_log_command(&source, &op_log(now)),
+        fresh_index_command(&source),
         ps_command(&source, ""),
         ps_command(&source, ""),
         ExpectedCommand::ok(
@@ -336,7 +335,9 @@ fn collection_is_deferred_to_the_two_week_threshold_when_jj_goes_busy_after_the_
         // A busy probe defers after its polling budget outside exclusivity.
         ps_command(&source, "/opt/homebrew/bin/jj\n/bin/sh\n"),
         // So the collection keeps jj's two-week threshold: no `--expire now`.
-        ExpectedCommand::ok(source.clone(), "jj", &["--ignore-working-copy", "util", "gc"], ""),
+        fresh_index_command(&source),
+        gc_index_command(&source, &["util", "gc"]),
+        fresh_index_command(&source),
     ];
     expected.extend(pr_ref_commands(&source, "", ""));
     let runner = FakeRunner::new(expected);
@@ -397,13 +398,11 @@ fn repo_gc_runs_on_its_own_lock_and_never_waits_on_the_lease_lock() {
     let _lease_lock = RepoLock::acquire(&repo_lock_path("mono", Some(&database_path)).unwrap()).unwrap();
     let mut expected = vec![
         op_log_command(&source, &format!("{} {}\n", "a".repeat(64), now)),
+        fresh_index_command(&source),
         ps_command(&source, ""),
-        ExpectedCommand::ok(
-            source.clone(),
-            "jj",
-            &["--ignore-working-copy", "util", "gc", "--expire", "now"],
-            "",
-        ),
+        fresh_index_command(&source),
+        gc_index_command(&source, &["util", "gc", "--expire", "now"]),
+        fresh_index_command(&source),
     ];
     expected.extend(pr_ref_commands(&source, "", ""));
     let runner = FakeRunner::new(expected);
@@ -649,13 +648,11 @@ fn lease_and_store_gc_paths_create_no_child_process_of_the_test_binary() {
     let now = crate::app::util::current_epoch_s().unwrap();
     let mut expected = vec![
         op_log_command(&source, &format!("{} {}\n", "a".repeat(64), now)),
+        fresh_index_command(&source),
         ps_command(&source, ""),
-        ExpectedCommand::ok(
-            source.clone(),
-            "jj",
-            &["--ignore-working-copy", "util", "gc", "--expire", "now"],
-            "",
-        ),
+        fresh_index_command(&source),
+        gc_index_command(&source, &["util", "gc", "--expire", "now"]),
+        fresh_index_command(&source),
     ];
     expected.extend(pr_ref_commands(&source, "", ""));
     let gc_runner = FakeRunner::new(expected);
@@ -706,6 +703,7 @@ fn a_busy_store_is_neither_abandoned_nor_collected() {
     // the FakeRunner has no abandon or gc expectation, so one would fail it.
     let mut expected = vec![
         op_log_command(&source, &op_log(now)),
+        fresh_index_command(&source),
         ps_command(&source, "/opt/homebrew/bin/jj\n"),
     ];
     expected.extend(pr_ref_commands(&source, "", ""));
@@ -740,6 +738,7 @@ fn a_second_operation_head_after_the_abandon_stops_the_pass_before_collecting() 
     let now = crate::app::util::current_epoch_s().unwrap();
     let runner = FakeRunner::new(vec![
         op_log_command(&source, &op_log(now)),
+        fresh_index_command(&source),
         ps_command(&source, ""),
         ps_command(&source, ""),
         ExpectedCommand::ok(
@@ -815,6 +814,7 @@ fn slow_abandon_is_bounded_and_releases_the_gate_without_collecting() {
     let now = crate::app::util::current_epoch_s().unwrap();
     let runner = FakeRunner::new(vec![
         op_log_command(&source, &op_log(now)),
+        fresh_index_command(&source),
         ps_command(&source, ""),
         ps_command(&source, ""),
         abandon_command(&source).taking(Duration::from_millis(900)),
@@ -849,6 +849,7 @@ fn timed_out_abandon_with_two_heads_quarantines_readers() {
     });
     let fake = FakeRunner::new(vec![
         op_log_command(&source, &op_log(crate::app::util::current_epoch_s().unwrap())),
+        fresh_index_command(&source),
         ps_command(&source, ""),
         ps_command(&source, ""),
         abandon,
@@ -863,7 +864,7 @@ fn timed_out_abandon_with_two_heads_quarantines_readers() {
         Some(&database),
         &mono_record(&database),
         DEFAULT_KEEP,
-        Duration::ZERO,
+        super::support::EXCLUSIVE_GATE_WAIT,
         false,
     )
     .unwrap_err();
@@ -873,9 +874,11 @@ fn timed_out_abandon_with_two_heads_quarantines_readers() {
     );
     assert_eq!(*probe.observed.borrow(), vec![("abandon".into(), true)]);
     let recovery = FakeRunner::new(vec![ps_command(&source, "")]);
-    let error = crate::command_runner::JjGate::shared_for_database_with_runner(Some(&database), &recovery)
-        .err()
-        .expect("unsafe heads must keep readers blocked after the gate is dropped");
+    let error = super::support::after_recovery_admission(&recovery, || {
+        crate::command_runner::JjGate::shared_for_database_with_runner(Some(&database), &recovery)
+    })
+    .err()
+    .expect("unsafe heads must keep readers blocked after the gate is dropped");
     assert!(error.to_string().contains("2 operation heads"));
     recovery.assert_exhausted();
     fake.assert_exhausted();
@@ -888,6 +891,7 @@ fn busy_host_becomes_quiet_without_excluding_readers() {
     let source = seed_store_files(&source_of(&database));
     let mut expected = vec![
         op_log_command(&source, &op_log(crate::app::util::current_epoch_s().unwrap())),
+        fresh_index_command(&source),
         ps_command(&source, "jj"),
         ps_command(&source, "jj"),
         ps_command(&source, ""),
@@ -897,12 +901,9 @@ fn busy_host_becomes_quiet_without_excluding_readers() {
         ps_command(&source, "jj"),
         ps_command(&source, "jj"),
         ps_command(&source, ""),
-        ExpectedCommand::ok(
-            source.clone(),
-            "jj",
-            &["--ignore-working-copy", "util", "gc", "--expire", "now"],
-            "",
-        ),
+        fresh_index_command(&source),
+        gc_index_command(&source, &["util", "gc", "--expire", "now"]),
+        fresh_index_command(&source),
     ];
     expected.extend(pr_ref_commands(&source, "", ""));
     let fake = FakeRunner::new(expected);
@@ -961,6 +962,7 @@ fn a_head_that_appears_after_the_abandon_returns_stops_the_pass_before_collectin
     // abandon saw one head. No `util gc` is expected.
     let runner = FakeRunner::new(vec![
         op_log_command(&source, &op_log(now)),
+        fresh_index_command(&source),
         ps_command(&source, ""),
         ps_command(&source, ""),
         abandon_command(&source),
@@ -992,6 +994,7 @@ fn a_head_that_appears_while_the_post_abandon_wait_fails_stops_the_deferred_coll
     let now = crate::app::util::current_epoch_s().unwrap();
     let runner = FakeRunner::new(vec![
         op_log_command(&source, &op_log(now)),
+        fresh_index_command(&source),
         ps_command(&source, ""),
         ps_command(&source, ""),
         abandon_command(&source),
@@ -1025,6 +1028,7 @@ fn a_failed_pass_and_a_skipped_pass_are_each_recorded_and_surfaced_by_workspace_
     let now = crate::app::util::current_epoch_s().unwrap();
     let runner = FakeRunner::new(vec![
         op_log_command(&source, &op_log(now)),
+        fresh_index_command(&source),
         ps_command(&source, ""),
         ps_command(&source, ""),
         abandon_command(&source),
@@ -1122,17 +1126,15 @@ fn cube_started_jj_commands_are_held_off_for_the_abandon_but_not_the_collection(
     let now = crate::app::util::current_epoch_s().unwrap();
     let mut expected = vec![
         op_log_command(&source, &op_log(now)),
+        fresh_index_command(&source),
         ps_command(&source, ""),
         ps_command(&source, ""),
         abandon_command(&source),
         index_command(&source),
         ps_command(&source, ""),
-        ExpectedCommand::ok(
-            source.clone(),
-            "jj",
-            &["--ignore-working-copy", "util", "gc", "--expire", "now"],
-            "",
-        ),
+        fresh_index_command(&source),
+        gc_index_command(&source, &["util", "gc", "--expire", "now"]),
+        fresh_index_command(&source),
     ];
     expected.extend(pr_ref_commands(&source, "", ""));
     let fake = FakeRunner::new(expected);
@@ -1174,6 +1176,7 @@ fn post_abandon_head_check_fails_the_pass_after_releasing_exclusivity() {
     // committed late would leave it.
     let fake = FakeRunner::new(vec![
         op_log_command(&source, &op_log(now)),
+        fresh_index_command(&source),
         ps_command(&source, ""),
         ps_command(&source, ""),
         abandon_command(&source),
@@ -1219,7 +1222,11 @@ fn cube_jj_commands_still_running_skip_the_abandon() {
         Duration::from_millis(100),
     )
     .unwrap();
-    let mut expected = vec![op_log_command(&source, &op_log(now)), ps_command(&source, "")];
+    let mut expected = vec![
+        op_log_command(&source, &op_log(now)),
+        fresh_index_command(&source),
+        ps_command(&source, ""),
+    ];
     expected.extend(pr_ref_commands(&source, "", ""));
     let runner = FakeRunner::new(expected);
     let report = gc_repo_store(
@@ -1234,4 +1241,16 @@ fn cube_jj_commands_still_running_skip_the_abandon() {
     runner.assert_exhausted();
     assert_eq!(report.collection, Collection::Skipped);
     assert_eq!(report.abandoned_through, None);
+}
+
+/// Commands run against an independent index over the shared store.
+pub(super) fn gc_index_command(source: &std::path::Path, args: &[&str]) -> ExpectedCommand {
+    let path = source.join(".jj/cube-gc-index");
+    let mut command = vec!["--ignore-working-copy", "--repository", path.to_str().unwrap()];
+    command.extend_from_slice(args);
+    ExpectedCommand::ok(source.to_path_buf(), "jj", &command, "")
+}
+
+pub(super) fn fresh_index_command(source: &std::path::Path) -> ExpectedCommand {
+    gc_index_command(source, &["debug", "reindex"])
 }

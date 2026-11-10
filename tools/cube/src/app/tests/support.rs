@@ -32,6 +32,27 @@ pub(super) static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// delay: the lock is retried every 25ms and taken as soon as it is free.
 pub(super) const EXCLUSIVE_GATE_WAIT: Duration = Duration::from_secs(30);
 
+/// Reader recovery tries exclusivity without waiting and may legitimately
+/// return a retryable error before calling its runner. Wait for admission,
+/// not for a successful recovery: callers still assert the actual outcome
+/// and every expected command once the recovery probe has run.
+pub(super) fn after_recovery_admission<T>(fake: &FakeRunner, mut run: impl FnMut() -> Result<T>) -> Result<T> {
+    let expected = fake.expectations.borrow().len();
+    let started = std::time::Instant::now();
+    loop {
+        let result = run();
+        if fake.expectations.borrow().len() < expected {
+            return result;
+        }
+        assert!(matches!(result, Err(CubeError::MaintenanceQuarantined(_))));
+        assert!(
+            started.elapsed() < EXCLUSIVE_GATE_WAIT,
+            "recovery never acquired the gate"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// A fresh database whose daily pool-GC pass counts as having just run.
 /// A test of leasing is a test of leasing: the periodic pass would
 /// otherwise run on the first lease of every test, against the test's

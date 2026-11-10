@@ -40,6 +40,12 @@
 //!    keeps. If the post-abandon polling never finds a quiet instant, the
 //!    pass falls back to the two-week default. Either way it collects only
 //!    when the head re-check found a single head.
+//!    Collection uses a private, freshly rebuilt index over the shared store.
+//!    Inherited indexes are not trusted: newer jj versions can omit legacy
+//!    predecessors that jj 0.26 still needs when rebuilding. Fresh validation
+//!    also runs before abandon (preserving the live cache on failure), and
+//!    again after collection. Any validation failure fails the upkeep and
+//!    records a failed audit event; a successful cached read is insufficient.
 //!
 //! The abandon holds the exclusive host-wide [`JjGate`] from before the
 //! abandon through the head check and read-only commit-index warm-up. Every
@@ -95,6 +101,7 @@ use crate::store::Store;
 
 use crate::app::errors::{CubeError, Result};
 use crate::app::jj::run_jj;
+use crate::app::store_gc_integrity::GcIndex;
 
 /// Operations newer than this are never abandoned. Three days of history
 /// keeps `jj op undo` useful while the log stays bounded.
@@ -530,6 +537,15 @@ pub(super) fn gc_repo_store(
         EXCLUSIVE_COMMAND_TIMEOUT,
         dry_run,
     )
+    .inspect_err(|error| {
+        audit!(
+            database_path,
+            "repo.store_gc",
+            repo = record.repo,
+            outcome = "failed",
+            error = error.to_string()
+        );
+    })
 }
 
 /// [`gc_repo_store`] with the bound on each command run under the exclusive
@@ -600,6 +616,14 @@ pub(super) fn gc_repo_store_with_deadline(
     let mut collection_ms = 0;
     let mut abandoned_through = abandoned_through;
     if !dry_run {
+        // Validate before rewriting operations: a damaged store can still
+        // load from its live cached index, which must remain usable on error.
+        let index = {
+            let _reader = JjGate::shared_for_database(database_path)?;
+            let index = GcIndex::new(&source)?;
+            index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "before abandon")?;
+            index
+        };
         // Held through the head check and commit-index warm-up:
         // cube-started jj commands wait on it, so
         // none of them can load the pre-rewrite head in between.
@@ -675,7 +699,7 @@ pub(super) fn gc_repo_store_with_deadline(
             // The observation that makes `--expire now` safe has to come
             // after the abandon: it is the commands that loaded the store
             // before the rewrite that must have finished.
-            let mut gc_args = vec!["--ignore-working-copy", "util", "gc"];
+            let mut gc_args = vec!["util", "gc"];
             exclusive_ms = exclusive_started.map_or(0, |start| start.elapsed().as_millis());
             drop(gate);
             let _reader = JjGate::shared_for_database(database_path)?;
@@ -694,7 +718,9 @@ pub(super) fn gc_repo_store_with_deadline(
             // Collection is a reader: leases proceed, but another rewrite
             // cannot invalidate the head this collector loaded.
             let collection_started = Instant::now();
-            runner.run_with_timeout(&gated_jj_invocation(&source, &gc_args), MAINTENANCE_CMD_TIMEOUT)?;
+            index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "before collection")?;
+            index.run(runner, &gc_args, MAINTENANCE_CMD_TIMEOUT)?;
+            index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "after collection")?;
             collection_ms = collection_started.elapsed().as_millis();
         }
     }
@@ -766,6 +792,7 @@ pub(super) fn gc_repo_store_with_deadline(
         duration_ms = report.duration_ms as u64,
         exclusive_ms = report.exclusive_ms as u64,
         collection_ms = report.collection_ms as u64,
+        fresh_index_verified = matches!(report.collection, Collection::Immediate | Collection::Deferred),
     );
     Ok(report)
 }

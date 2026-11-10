@@ -1,0 +1,64 @@
+# Recovering a store with missing predecessor commits
+
+A successful cached `jj log` does not prove that a shared store can rebuild its
+index. jj 0.26 walks legacy predecessor commits during a full rebuild, but can
+read a newer index that omits them. Collection using that inherited index can
+remove the predecessor objects while ordinary commands continue working.
+
+Cube builds a private index before abandoning operations, rebuilds it before
+collection, collects using that index, and rebuilds it afterward. An error fails
+the pass and records a failed `repo.store_gc` audit event. The preflight leaves
+the live index and operation head intact if objects are already missing. This
+applies to both daily collection and collection after legacy bookmark cleanup.
+
+## Determine whether recovery is needed
+
+Neither an immediate-collection success row nor a reduced operation-store size
+proves integrity. A store collected using only jj 0.26's own complete index is
+not necessarily damaged: the regression control preserves its evolution history.
+A store that inherited a newer index can be damaged even if it still loads.
+Cube's fresh-index verification detects this before another rewrite or collection.
+Do not delete the live index to investigate; it may be the only reason the store
+still opens. Preserve the original error, jj versions, and audit records.
+
+## Recover without deleting predecessor records
+
+The tested forward recovery is a coordinated transition to jj 0.32.0, whose
+[index retention change](https://github.com/jj-vcs/jj/commit/ea8aa1e17ca845fa28fbbe5867527f2e2963f860)
+does not require those legacy predecessor objects. This restores rebuildability
+for the newer clients; it cannot recreate already-deleted evolution history.
+It is an operator procedure, not an automatic fallback during collection.
+
+1. Stop writers and collectors for the affected shared store, including workers
+   and the engine's cleanup. Back up the complete store and working-copy state
+   while quiescent. Keep the backup until validation and normal use succeed.
+2. Test on an independent copy of the store and its Git object database first.
+   The copy must not point back to the live `.jj/repo`, Git directory, or Git
+   alternates. Preserve predecessor metadata, operation heads, and indexes.
+3. Use jj 0.32.0 for every client sharing the store, including cube's `jj` on
+   `PATH`, engine processes, and worker shells. Verify `jj --version` in each
+   launch environment. Do not mix upgraded collectors with older readers.
+4. On the independent copy, run
+   `jj --ignore-working-copy --repository <copy> debug reindex`.
+   Compare visible commit IDs, bookmarks, and working-copy
+   revisions against the readable original. Check files containing unpublished
+   work. A missing Git ancestor, tree, blob, or view is a different corruption:
+   stop and restore the required objects instead of proceeding.
+5. With all clients upgraded and the live store still quiescent, run the same
+   fresh reindex against the live store. Check its primary and secondary
+   workspaces before resuming writers. Resume collection using the fixed cube;
+   its post-collection verification must succeed before upkeep reports success.
+
+The regression test reproduces a 0.26 missing-predecessor failure, switches both
+readers and the collector to 0.32, rebuilds, collects twice, and checks fresh
+rebuilds, identical visible commit IDs, file content, and secondary-workspace
+loads. This procedure requires the operator to upgrade the shared clients; merely
+upgrading one shell or copying a newer cached index is insufficient.
+
+If older clients must remain, restore the exact missing objects from a known
+good backup or another complete object store, including their required trees and
+blobs. Verify object identities and a fresh index on an independent copy before
+restoring them to the live store. Predecessor metadata and cached indexes do not
+contain enough information to recreate arbitrary lost Git objects. Repointing
+an operation head at an old cached index only restores temporary readability;
+it does not repair the missing objects.

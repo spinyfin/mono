@@ -763,6 +763,14 @@ checkout and not aware of anything above jj:
    back to the two-week threshold. Collection holds the gate shared, so leases can
    proceed throughout it. Reports and audit events include `exclusive_ms`
    and `collection_ms` to distinguish rewrite contention from collection cost.
+   Cube reconstructs a private commit index before abandoning operations and
+   again before collection, uses that index for GC, and verifies a fresh rebuild
+   afterward. This protects predecessor commits required by the active jj
+   version even when an inherited index omits them. A verification failure
+   returns an error and writes a failed `repo.store_gc` audit row; preflight
+   preserves the live cached index on an already-damaged store. See
+   [missing-predecessor recovery](store-gc-recovery.md) for the tested recovery
+   procedure and shared-client version requirements.
    Working-copy health checks can also be expensive after the operation IDs
    change: jj rebuilds its commit index by walking operation ancestry, so
    maintenance warms that index before releasing exclusivity. A large-store experiment measured 23 seconds in `jj status` before

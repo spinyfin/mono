@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::store_gc_tests::{
-    abandon_command, index_command, mono_record, op_log, op_log_command, pr_ref_commands, ps_command, seed_store_files,
-    source_of,
+    abandon_command, fresh_index_command, gc_index_command, index_command, mono_record, op_log, op_log_command,
+    pr_ref_commands, ps_command, seed_store_files, source_of,
 };
 use super::support::{EXCLUSIVE_GATE_WAIT, ExpectedCommand, FakeRunner, seed_mono_repo, with_database_path};
 use crate::app::errors::CubeError;
@@ -22,12 +22,7 @@ fn write_marker(database: &Path, owner: &Path) {
 }
 
 fn collect_command(source: &Path) -> ExpectedCommand {
-    ExpectedCommand::ok(
-        source.to_path_buf(),
-        "jj",
-        &["--ignore-working-copy", "util", "gc", "--expire", "now"],
-        "",
-    )
+    gc_index_command(source, &["util", "gc", "--expire", "now"])
 }
 
 fn run_pass(runner: &FakeRunner, database: &Path, quiescence: Duration) -> Result<Collection, CubeError> {
@@ -52,12 +47,15 @@ fn a_stale_marker_with_a_single_head_is_cleared_by_the_next_pass() {
     let mut expected = vec![
         ps_command(&source, ""),
         op_log_command(&source, &op_log(now)),
+        fresh_index_command(&source),
         ps_command(&source, ""),
         ps_command(&source, ""),
         abandon_command(&source),
         index_command(&source),
         ps_command(&source, ""),
+        fresh_index_command(&source),
         collect_command(&source),
+        fresh_index_command(&source),
     ];
     expected.extend(pr_ref_commands(&source, "", ""));
     let fake = FakeRunner::new(expected);
@@ -115,6 +113,7 @@ fn a_racing_reprobe_is_retried_within_the_budget() {
     let now = crate::app::util::current_epoch_s().unwrap();
     let mut expected = vec![
         op_log_command(&source, &op_log(now)),
+        fresh_index_command(&source),
         // First attempt: quiet, then a jj appears under the gate.
         ps_command(&source, ""),
         ps_command(&source, "jj"),
@@ -124,7 +123,9 @@ fn a_racing_reprobe_is_retried_within_the_budget() {
         abandon_command(&source),
         index_command(&source),
         ps_command(&source, ""),
+        fresh_index_command(&source),
         collect_command(&source),
+        fresh_index_command(&source),
     ];
     expected.extend(pr_ref_commands(&source, "", ""));
     let fake = FakeRunner::new(expected);
@@ -148,12 +149,15 @@ fn a_failed_index_warm_up_after_a_verified_abandon_still_collects() {
     });
     let mut expected = vec![
         op_log_command(&source, &op_log(crate::app::util::current_epoch_s().unwrap())),
+        fresh_index_command(&source),
         ps_command(&source, ""),
         ps_command(&source, ""),
         abandon_command(&source),
         warm,
         ps_command(&source, ""),
+        fresh_index_command(&source),
         collect_command(&source),
+        fresh_index_command(&source),
     ];
     expected.extend(pr_ref_commands(&source, "", ""));
     let fake = FakeRunner::new(expected);
@@ -175,13 +179,15 @@ fn orphaned_jj_keeps_readers_out_until_quiet_recovery() {
     let source = seed_store_files(&source_of(&database));
     write_marker(&database, &source);
     let fake = FakeRunner::new(vec![ps_command(&source, "jj")]);
-    let error = run_pass(&fake, &database, Duration::ZERO).unwrap_err();
+    let error = run_pass(&fake, &database, EXCLUSIVE_GATE_WAIT).unwrap_err();
     assert_eq!(error.exit_code(), std::process::ExitCode::from(75));
     fake.assert_exhausted();
     assert!(marker_path(&database).exists());
     let busy = FakeRunner::new(vec![ps_command(&source, "jj")]);
     let lease = || Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "marker recovery"]);
-    let error = run_with_dependencies(lease(), Some(&database), &busy).unwrap_err();
+    let error =
+        super::support::after_recovery_admission(&busy, || run_with_dependencies(lease(), Some(&database), &busy))
+            .unwrap_err();
     assert_eq!(error.exit_code(), std::process::ExitCode::from(75));
     busy.assert_exhausted();
     assert!(marker_path(&database).exists());
@@ -189,7 +195,8 @@ fn orphaned_jj_keeps_readers_out_until_quiet_recovery() {
     std::fs::create_dir_all(workspace.join(".jj")).unwrap();
     let quiet = super::support::lease_runner_for(&workspace, "abc1234");
     quiet.expectations.borrow_mut().push_front(ps_command(&source, ""));
-    run_with_dependencies(lease(), Some(&database), &quiet).unwrap();
+    super::support::after_recovery_admission(&quiet, || run_with_dependencies(lease(), Some(&database), &quiet))
+        .unwrap();
     quiet.assert_exhausted();
     assert!(!marker_path(&database).exists());
     JjGate::shared_for_database(Some(&database)).unwrap();
@@ -230,6 +237,7 @@ fn foreign_marker_published_after_listing_stops_the_pass() {
     let runner = PublishOnProbe {
         fake: FakeRunner::new(vec![
             op_log_command(&source, &op_log(crate::app::util::current_epoch_s().unwrap())),
+            fresh_index_command(&source),
             ps_command(&source, ""),
         ]),
         database: database.clone(),

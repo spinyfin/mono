@@ -31,6 +31,7 @@ mod reset;
 mod salvage;
 mod stage;
 pub(crate) mod store_gc;
+mod store_gc_integrity;
 mod util;
 mod workspace;
 mod workspace_local_rebase;
