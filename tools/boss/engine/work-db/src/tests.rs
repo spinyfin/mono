@@ -15,6 +15,10 @@ fn temp_db_path(_label: &str) -> PathBuf {
 /// re-open via `WorkDb::open`). All other tests should use
 /// `temp_db_path` so the database stays in RAM.
 ///
+/// A fresh path opened with `WorkDb::open` is seeded from the migrated test
+/// template. Opening an existing file runs startup, including the migration
+/// ledger check; migration tests must populate that file before opening it.
+///
 /// The returned `TempDir` must be kept alive for as long as the path
 /// is in use — dropping it deletes the backing file.
 fn disk_db_path(label: &str) -> (tempfile::TempDir, PathBuf) {
