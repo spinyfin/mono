@@ -9,8 +9,8 @@ pub fn render_progression_brief(packet: &ProgressionBriefPacket) -> String {
     out.push_str("# Progression diagnosis\n\n");
     out.push_str(
         "You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item \
-         from the packet below and act with `boss propose` verbs. Compose never fetched git or CI: \
-         conflict diagnosis and check logs are the stored rows. You may run `gh pr view` and `gh pr checks` \
+         from the packet below and act with `boss propose` verbs. Stored attempts are supplemented \
+         by engine probes for current conflict, CI-log and main-branch evidence before spawn. You may run `gh pr view` and `gh pr checks` \
          if you need a live check.\n\n",
     );
     render_item(&mut out, packet);
@@ -297,12 +297,7 @@ fn render_ci_attempts(out: &mut String, packet: &ProgressionBriefPacket) {
 
 fn render_check_history(out: &mut String, packet: &ProgressionBriefPacket) {
     out.push_str("### Failing-check history (other open PRs in this product)\n\n");
-    out.push_str(
-        "The engine stores no main-branch check outcomes, so main is unobserved (unknown, not passing). \
-         The only cross-PR signal is the stored required-check detail on this product's other open or \
-         recently completed PRs. Verify main with `gh run list --branch main` before attributing a red \
-         check to this PR.\n\n",
-    );
+    out.push_str("Stored cross-PR observations follow. Engine probes below supply recent main-branch outcomes before spawn; missing observations remain unknown.\n\n");
     let failing_here = failing_check_names(packet.ci_required_detail.as_deref());
     if failing_here.is_empty() {
         out.push_str("(no failing required checks recorded on this item)\n\n");
@@ -323,7 +318,7 @@ fn render_check_history(out: &mut String, packet: &ProgressionBriefPacket) {
         if others.is_empty() {
             out.push_str(&format!(
                 "- `{check}` failed on this PR; no other PR with stored detail shows it failing \
-                 ({unobserved} other PRs have no stored detail), main unobserved → attribution unknown.\n"
+                 ({unobserved} other PRs have no stored detail), main not in stored snapshot → attribution unknown until engine probe.\n"
             ));
         } else {
             out.push_str(&format!(
@@ -424,9 +419,17 @@ fn render_history(out: &mut String, packet: &ProgressionBriefPacket) {
                 done = run.run_done_outcome.as_deref().unwrap_or("(none)"),
                 error = run.last_error.as_deref().unwrap_or("(none)"),
             ));
+            out.push_str(&format!(
+                "  fingerprint={} matches_current={}\n",
+                run.fingerprint.as_deref().unwrap_or("(unrecorded)"),
+                run.fingerprint.as_deref() == Some(&packet.fingerprint)
+            ));
+            for action in &run.actions {
+                out.push_str(&format!("  action: {action}\n"));
+            }
         }
     }
-    out.push_str("Prior fingerprint actions: none recorded.\n\n");
+    out.push_str("Prior fingerprint actions: see applied proposals above.\n\n");
 }
 
 fn line(out: &mut String, key: &str, value: &str) {

@@ -1,7 +1,7 @@
 //! Assemble a [`ProgressionBriefPacket`] from stored work-db state.
 
 use anyhow::{Context, Result, bail};
-use boss_engine_storage_values::attention_kinds::{NUDGE_BREAKER_ATTENTION_KIND, RUN_DONE_BLOCKED_ATTENTION_KIND};
+use boss_engine_storage_values::attention_kinds::NUDGE_BREAKER_ATTENTION_KIND;
 use boss_protocol::{
     DependencyDirection, ListDependenciesInput, OperatorQuestionRecord, Task, WorkItem, WorkItemDependencyDetail,
 };
@@ -58,7 +58,7 @@ pub fn gather_progression_brief(db: &WorkDb, work_item_id: &str) -> Result<Progr
     for id in &chain_ids {
         questions.extend(db.list_operator_questions(id).context("load operator questions")?);
     }
-    let declared_blocker = declared_blocker_from(&item, &failure_basis, &attentions, &questions);
+    let declared_blocker = declared_blocker_from(db, &item, &failure_basis, &executions, &attentions, &questions)?;
 
     // A revision never carries a PR: the PR, its poll snapshot and its CI state
     // live on the chain root.
@@ -69,21 +69,35 @@ pub fn gather_progression_brief(db: &WorkDb, work_item_id: &str) -> Result<Progr
     };
     let pr_source = pr_item.as_ref().unwrap_or(&item);
     let snapshot = db.get_pr_status_snapshot(&pr_source.id)?;
-    let conflict_attempts = db.list_conflict_resolutions(None, &[], Some(work_item_id), None)?;
-    let ci_attempts = db.list_ci_remediations(None, &[], Some(work_item_id), None)?;
+    let conflict_attempts = db.list_conflict_resolutions(None, &[], Some(&pr_source.id), None)?;
+    let ci_attempts = db.list_ci_remediations(None, &[], Some(&pr_source.id), None)?;
     let other_pr_ci = db.list_product_pr_ci_snapshots(&item.product_id, &pr_source.id)?;
 
     let prior_progression = executions
         .iter()
-        .filter(|row| row.kind == ExecutionKind::Progression.as_str())
-        .map(|row| PriorProgressionRun {
-            execution_id: row.id.clone(),
-            status: row.status.clone(),
-            created_at: row.created_at.clone(),
-            run_done_outcome: row.run_done_outcome.clone(),
-            last_error: row.last_error.clone().or_else(|| row.latest_run_error.clone()),
+        .filter(|row| row.kind == ExecutionKind::Progression.as_str() && is_terminal_status(&row.status))
+        .map(|row| {
+            Ok(PriorProgressionRun {
+                fingerprint: db.get_metadata(&format!("progression.fingerprint.{}", row.id))?,
+                actions: db
+                    .list_worker_proposals(
+                        Some(&row.id),
+                        None,
+                        None,
+                        Some(boss_protocol::ProposalState::Applied),
+                        None,
+                    )?
+                    .into_iter()
+                    .map(|p| format!("{}: {}", p.kind, p.payload_json))
+                    .collect(),
+                execution_id: row.id.clone(),
+                status: row.status.clone(),
+                created_at: row.created_at.clone(),
+                run_done_outcome: row.run_done_outcome.clone(),
+                last_error: row.last_error.clone().or_else(|| row.latest_run_error.clone()),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     // The fingerprint must not move because a progression run ended: only work
     // runs count as "something happened since".
@@ -106,7 +120,7 @@ pub fn gather_progression_brief(db: &WorkDb, work_item_id: &str) -> Result<Progr
         create_used: create_budget.used,
         create_max: create_budget.max,
         create_window_secs: create_budget.window_secs,
-        redispatch_remaining: redispatch_remaining(&executions),
+        redispatch_remaining: redispatch_remaining(db, &executions, work_item_id, &stuck_kind)?,
     };
 
     Ok(ProgressionBriefPacket {
@@ -143,22 +157,37 @@ pub fn gather_progression_brief(db: &WorkDb, work_item_id: &str) -> Result<Progr
     })
 }
 
-/// The 2.5 bound of one progression redispatch per item, less the work runs a
-/// progression run has started since the last work run that was not itself a
-/// progression redispatch and reached `completed`.
-pub(crate) fn redispatch_remaining(executions: &[ExecutionDiagnosis]) -> u32 {
-    let from_progression = |row: &ExecutionDiagnosis| {
-        row.created_via
-            .as_deref()
-            .is_some_and(|via| via.starts_with("progression:"))
-    };
-    let is_work = |row: &&ExecutionDiagnosis| row.kind != ExecutionKind::Progression.as_str();
-    let last_clean = executions
+/// One redispatch per item and stuck kind, reset by any completed work run on
+/// that item, including work started by progression.
+pub(crate) fn redispatch_remaining(
+    db: &WorkDb,
+    executions: &[ExecutionDiagnosis],
+    item: &str,
+    kind: &str,
+) -> Result<u32> {
+    for row in executions
         .iter()
-        .rposition(|row| is_work(&row) && !from_progression(row) && row.status == "completed");
-    let since = &executions[last_clean.map_or(0, |index| index + 1)..];
-    let used = since.iter().filter(is_work).filter(|row| from_progression(row)).count();
-    1u32.saturating_sub(u32::try_from(used).unwrap_or(u32::MAX))
+        .rev()
+        .filter(|row| row.work_item_id == item && row.kind != ExecutionKind::Progression.as_str())
+    {
+        if row.status == "completed" {
+            return Ok(1);
+        }
+        if let Some(origin) = row
+            .created_via
+            .as_deref()
+            .and_then(|via| via.strip_prefix("progression:"))
+            && executions.iter().any(|producer| {
+                producer.id == origin
+                    && producer.work_item_id == item
+                    && producer.kind == ExecutionKind::Progression.as_str()
+            })
+            && db.get_metadata(&format!("progression.stuck_kind.{origin}"))?.as_deref() == Some(kind)
+        {
+            return Ok(0);
+        }
+    }
+    Ok(1)
 }
 
 fn task_from_work_item(db: &WorkDb, work_item_id: &str) -> Result<Task> {
@@ -189,66 +218,87 @@ fn neighbours(db: &WorkDb, deps: &WorkItemDependencyDetail, prereqs: bool) -> Re
     Ok(out)
 }
 
-fn declared_blocker_from(
+pub(crate) fn declared_blocker_from(
+    db: &WorkDb,
     item: &Task,
     failure_basis: &Option<String>,
+    executions: &[ExecutionDiagnosis],
     attentions: &[(String, boss_protocol::WorkAttentionItem)],
     questions: &[OperatorQuestionRecord],
-) -> Option<DeclaredBlocker> {
+) -> Result<Option<DeclaredBlocker>> {
     let parked = item.dispatch_failed_reason.as_deref() == Some("deliberate_park");
-    let producer = if parked {
-        // The park note does not say which producer parked the item; the open
-        // declaration attention does.
-        attentions
-            .iter()
-            .filter(|(_, attention)| attention.status == "open")
-            .find_map(|(_, attention)| producer_for_kind(&attention.kind))
-            .unwrap_or("deliberate_park")
-    } else {
-        failure_basis
-            .as_deref()
-            .filter(|basis| matches!(*basis, "declared_blocked" | "nudge_breaker"))?
-    };
-    let attention_kind = match producer {
-        "nudge_breaker" => NUDGE_BREAKER_ATTENTION_KIND,
-        _ => RUN_DONE_BLOCKED_ATTENTION_KIND,
-    };
-    let from_attention = attentions
-        .iter()
-        .rev()
-        .find(|(_, attention)| attention.kind == attention_kind && attention.status == "open")
-        .map(|(_, attention)| attention.body_markdown.clone());
-    let from_question = || {
-        questions.last().map(|record| {
-            let explanation = record.question.explanation.trim();
-            if explanation.is_empty() {
-                record.question.text.clone()
-            } else {
-                format!("{}\n\n{explanation}", record.question.text)
-            }
-        })
-    };
-    let verbatim = from_attention
-        .or_else(from_question)
-        .or_else(|| item.blocked_detail.clone())
-        .unwrap_or_else(|| "(no blocker text stored)".to_owned());
-    Some(DeclaredBlocker {
-        producer: producer.to_owned(),
-        verbatim,
-        sweep_note: if parked {
-            item.dispatch_failed_error.clone()
-        } else {
-            None
-        },
-    })
-}
-
-fn producer_for_kind(kind: &str) -> Option<&'static str> {
-    match kind {
-        NUDGE_BREAKER_ATTENTION_KIND => Some("nudge_breaker"),
-        RUN_DONE_BLOCKED_ATTENTION_KIND => Some("declared_blocked"),
-        _ => None,
+    if !parked && !matches!(failure_basis.as_deref(), Some("declared_blocked" | "nudge_breaker")) {
+        return Ok(None);
     }
+    let nudge = attentions
+        .iter()
+        .filter(|(owner, a)| owner == &item.id && a.status == "open" && a.kind == NUDGE_BREAKER_ATTENTION_KIND)
+        .max_by_key(|(_, a)| (&a.created_at, &a.id));
+    let blocked = executions.iter().rev().find(|e| {
+        e.work_item_id == item.id
+            && e.kind != ExecutionKind::Progression.as_str()
+            && e.run_done_outcome.as_deref() == Some("blocked")
+    });
+    let use_nudge = failure_basis.as_deref() == Some("nudge_breaker")
+        || (parked
+            && nudge.is_some()
+            && nudge.is_some_and(|(_, a)| blocked.is_none_or(|e| a.created_at >= e.created_at)));
+    let execution_id = if use_nudge {
+        nudge.and_then(|(_, a)| a.execution_id.as_deref())
+    } else {
+        blocked.map(|e| e.id.as_str())
+    };
+    let mut verbatim = None;
+    if use_nudge {
+        verbatim = nudge.map(|(_, a)| a.body_markdown.clone());
+    } else if let Some(id) = execution_id {
+        let proposals = db.list_worker_proposals(
+            Some(id),
+            Some(&item.id),
+            None,
+            Some(boss_protocol::ProposalState::Applied),
+            None,
+        )?;
+        for p in proposals {
+            let value: serde_json::Value = serde_json::from_str(&p.payload_json)?;
+            if (p.kind == boss_protocol::ProposalKind::RunDone && value["outcome"] == "blocked")
+                || p.kind == boss_protocol::ProposalKind::Blocked
+            {
+                let mut words = Vec::new();
+                for field in ["summary", "reason"] {
+                    if let Some(text) = value[field].as_str() {
+                        words.push(text.to_owned());
+                    }
+                }
+                if let Some(q) = value.get("question").filter(|q| !q.is_null()) {
+                    words.push(serde_json::to_string_pretty(q)?);
+                }
+                if !words.is_empty() {
+                    verbatim = Some(words.join("\n\n"));
+                    break;
+                }
+            }
+        }
+    }
+    let question = questions
+        .iter()
+        .filter(|q| {
+            q.work_item_id == item.id
+                && q.status == boss_protocol::OperatorQuestionStatus::Open
+                && execution_id.is_none_or(|id| q.question.execution_id == id)
+        })
+        .max_by_key(|q| (&q.question.asked_at, &q.question.id));
+    let verbatim = verbatim
+        .or_else(|| question.map(|q| format!("{}\n\n{}", q.question.text, q.question.explanation)))
+        .unwrap_or_else(|| "(no worker declaration stored)".to_owned());
+    Ok(Some(DeclaredBlocker {
+        producer: if use_nudge { "nudge_breaker" } else { "declared_blocked" }.to_owned(),
+        verbatim,
+        sweep_note: item
+            .dispatch_failed_error
+            .clone()
+            .or_else(|| item.blocked_detail.clone()),
+    }))
 }
 
 /// The candidate view's label when the item still has one. An item that has

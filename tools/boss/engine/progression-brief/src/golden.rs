@@ -3,7 +3,7 @@
 
 const S16: &str = r#"# Progression diagnosis
 
-You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Compose never fetched git or CI: conflict diagnosis and check logs are the stored rows. You may run `gh pr view` and `gh pr checks` if you need a live check.
+You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Stored attempts are supplemented by engine probes for current conflict, CI-log and main-branch evidence before spawn. You may run `gh pr view` and `gh pr checks` if you need a live check.
 
 ## Item
 
@@ -61,7 +61,7 @@ Churn-window terminal count (1h, excluding progression): 0
 
 ### Failing-check history (other open PRs in this product)
 
-The engine stores no main-branch check outcomes, so main is unobserved (unknown, not passing). The only cross-PR signal is the stored required-check detail on this product's other open or recently completed PRs. Verify main with `gh run list --branch main` before attributing a red check to this PR.
+Stored cross-PR observations follow. Engine probes below supply recent main-branch outcomes before spawn; missing observations remain unknown.
 
 (no failing required checks recorded on this item)
 
@@ -79,13 +79,13 @@ The engine stores no main-branch check outcomes, so main is unobserved (unknown,
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: none recorded.
+Prior fingerprint actions: see applied proposals above.
 
 "#;
 
 const S14: &str = r#"# Progression diagnosis
 
-You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Compose never fetched git or CI: conflict diagnosis and check logs are the stored rows. You may run `gh pr view` and `gh pr checks` if you need a live check.
+You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Stored attempts are supplemented by engine probes for current conflict, CI-log and main-branch evidence before spawn. You may run `gh pr view` and `gh pr checks` if you need a live check.
 
 ## Item
 
@@ -149,13 +149,13 @@ Churn-window terminal count (1h, excluding progression): 0
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: none recorded.
+Prior fingerprint actions: see applied proposals above.
 
 "#;
 
 const S3: &str = r#"# Progression diagnosis
 
-You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Compose never fetched git or CI: conflict diagnosis and check logs are the stored rows. You may run `gh pr view` and `gh pr checks` if you need a live check.
+You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Stored attempts are supplemented by engine probes for current conflict, CI-log and main-branch evidence before spawn. You may run `gh pr view` and `gh pr checks` if you need a live check.
 
 ## Item
 
@@ -168,7 +168,9 @@ You are a restricted unstick agent. You hold no code checkout. Diagnose this stu
 - stuck: S3_deliberate_park
 - stuck since: <TS>
 - blocked_reason: (none)
-- blocked_detail: the worker said it needs a human on the API shape
+- blocked_detail: Should the API return 404 or 410 for retired ids? I need the owner to pick.
+
+Should the API return 404 or 410 for retired ids? I need the owner to pick.
 - dispatch_failed_reason: deliberate_park
 - dispatch_failed_error: The `orphan_sweep` sweep is holding this work item in Backlog because its worker's most recent execution ended in a deliberate park — either it declared itself blocked (`boss propose done --outcome blocked`) or the auto-nudge breaker gave up waiting for a response — and the attention item raised at the time is still open. This is not a failure: the worker did its job and is waiting on a decision. Review the open attention item, then run `bossctl work start task_ID` (or drag the card to Doing) to resume it.
 - pr_url: (none)
@@ -191,7 +193,9 @@ Dependents:
 
 Churn-window terminal count (1h, excluding progression): 1
 
-- exec_ID item=task_ID kind=chore_implementation status=failed via=(unset) run_done=(none) error=the worker said it needs a human on the API shape
+- exec_ID item=task_ID kind=chore_implementation status=failed via=(unset) run_done=blocked error=Should the API return 404 or 410 for retired ids? I need the owner to pick.
+
+Should the API return 404 or 410 for retired ids? I need the owner to pick.
 
 ## Declared blocker (2.9)
 
@@ -219,8 +223,7 @@ Should the API return 404 or 410 for retired ids? I need the owner to pick.
 
 ## Open attentions
 
-- attn_ID on=task_ID kind=run_done_declared_blocked title=Worker declared blocked
-  Should the API return 404 or 410 for retired ids? I need the owner to pick.
+(none)
 
 ## Operator questions
 
@@ -231,13 +234,13 @@ Should the API return 404 or 410 for retired ids? I need the owner to pick.
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: none recorded.
+Prior fingerprint actions: see applied proposals above.
 
 "#;
 
 const S1: &str = r#"# Progression diagnosis
 
-You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Compose never fetched git or CI: conflict diagnosis and check logs are the stored rows. You may run `gh pr view` and `gh pr checks` if you need a live check.
+You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Stored attempts are supplemented by engine probes for current conflict, CI-log and main-branch evidence before spawn. You may run `gh pr view` and `gh pr checks` if you need a live check.
 
 ## Item
 
@@ -303,13 +306,13 @@ Churn-window terminal count (1h, excluding progression): 0
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: none recorded.
+Prior fingerprint actions: see applied proposals above.
 
 "#;
 
 const S22: &str = r#"# Progression diagnosis
 
-You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Compose never fetched git or CI: conflict diagnosis and check logs are the stored rows. You may run `gh pr view` and `gh pr checks` if you need a live check.
+You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Stored attempts are supplemented by engine probes for current conflict, CI-log and main-branch evidence before spawn. You may run `gh pr view` and `gh pr checks` if you need a live check.
 
 ## Item
 
@@ -373,13 +376,13 @@ Churn-window terminal count (1h, excluding progression): 0
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: none recorded.
+Prior fingerprint actions: see applied proposals above.
 
 "#;
 
 const S11: &str = r#"# Progression diagnosis
 
-You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Compose never fetched git or CI: conflict diagnosis and check logs are the stored rows. You may run `gh pr view` and `gh pr checks` if you need a live check.
+You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Stored attempts are supplemented by engine probes for current conflict, CI-log and main-branch evidence before spawn. You may run `gh pr view` and `gh pr checks` if you need a live check.
 
 ## Item
 
@@ -443,13 +446,13 @@ Churn-window terminal count (1h, excluding progression): 0
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: none recorded.
+Prior fingerprint actions: see applied proposals above.
 
 "#;
 
 const S2: &str = r#"# Progression diagnosis
 
-You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Compose never fetched git or CI: conflict diagnosis and check logs are the stored rows. You may run `gh pr view` and `gh pr checks` if you need a live check.
+You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Stored attempts are supplemented by engine probes for current conflict, CI-log and main-branch evidence before spawn. You may run `gh pr view` and `gh pr checks` if you need a live check.
 
 ## Item
 
@@ -515,13 +518,13 @@ Churn-window terminal count (1h, excluding progression): 0
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: none recorded.
+Prior fingerprint actions: see applied proposals above.
 
 "#;
 
 const S13: &str = r#"# Progression diagnosis
 
-You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Compose never fetched git or CI: conflict diagnosis and check logs are the stored rows. You may run `gh pr view` and `gh pr checks` if you need a live check.
+You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Stored attempts are supplemented by engine probes for current conflict, CI-log and main-branch evidence before spawn. You may run `gh pr view` and `gh pr checks` if you need a live check.
 
 ## Item
 
@@ -579,11 +582,15 @@ Parent PR (owned by chain root task_ID); this item is a revision.
 
 ### CI remediations
 
-(none)
+- cir_ID status=pending kind=fix failure=(none) checks=[{"name":"parent-check","conclusion":"FAILURE"}]
+  log excerpt:
+```
+parent remediation evidence
+```
 
 ### Failing-check history (other open PRs in this product)
 
-The engine stores no main-branch check outcomes, so main is unobserved (unknown, not passing). The only cross-PR signal is the stored required-check detail on this product's other open or recently completed PRs. Verify main with `gh run list --branch main` before attributing a red check to this PR.
+Stored cross-PR observations follow. Engine probes below supply recent main-branch outcomes before spawn; missing observations remain unknown.
 
 (no failing required checks recorded on this item)
 
@@ -600,13 +607,13 @@ The engine stores no main-branch check outcomes, so main is unobserved (unknown,
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: none recorded.
+Prior fingerprint actions: see applied proposals above.
 
 "#;
 
 const S5: &str = r#"# Progression diagnosis
 
-You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Compose never fetched git or CI: conflict diagnosis and check logs are the stored rows. You may run `gh pr view` and `gh pr checks` if you need a live check.
+You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Stored attempts are supplemented by engine probes for current conflict, CI-log and main-branch evidence before spawn. You may run `gh pr view` and `gh pr checks` if you need a live check.
 
 ## Item
 
@@ -668,7 +675,7 @@ Churn-window terminal count (1h, excluding progression): 0
 
 ### Failing-check history (other open PRs in this product)
 
-The engine stores no main-branch check outcomes, so main is unobserved (unknown, not passing). The only cross-PR signal is the stored required-check detail on this product's other open or recently completed PRs. Verify main with `gh run list --branch main` before attributing a red check to this PR.
+Stored cross-PR observations follow. Engine probes below supply recent main-branch outcomes before spawn; missing observations remain unknown.
 
 (no failing required checks recorded on this item)
 
@@ -685,13 +692,13 @@ The engine stores no main-branch check outcomes, so main is unobserved (unknown,
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: none recorded.
+Prior fingerprint actions: see applied proposals above.
 
 "#;
 
 const S7_DECLARED: &str = r#"# Progression diagnosis
 
-You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Compose never fetched git or CI: conflict diagnosis and check logs are the stored rows. You may run `gh pr view` and `gh pr checks` if you need a live check.
+You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Stored attempts are supplemented by engine probes for current conflict, CI-log and main-branch evidence before spawn. You may run `gh pr view` and `gh pr checks` if you need a live check.
 
 ## Item
 
@@ -705,6 +712,8 @@ You are a restricted unstick agent. You hold no code checkout. Diagnose this stu
 - stuck since: <TS>
 - blocked_reason: worker_failed
 - blocked_detail: need a decision on the retry budget
+
+need a decision on the retry budget
 - dispatch_failed_reason: (none)
 - failure_basis: declared_blocked
 - pr_url: (none)
@@ -727,11 +736,17 @@ Dependents:
 
 Churn-window terminal count (1h, excluding progression): 1
 
-- exec_ID item=task_ID kind=chore_implementation status=failed via=(unset) run_done=(none) error=need a decision on the retry budget
+- exec_ID item=task_ID kind=chore_implementation status=failed via=(unset) run_done=blocked error=need a decision on the retry budget
+
+need a decision on the retry budget
 
 ## Declared blocker (2.9)
 
 Producer: declared_blocked
+
+Engine sweep note (not the worker's words): need a decision on the retry budget
+
+need a decision on the retry budget
 
 Verbatim:
 
@@ -753,8 +768,7 @@ need a decision on the retry budget
 
 ## Open attentions
 
-- attn_ID on=task_ID kind=run_done_declared_blocked title=Worker declared blocked
-  need a decision on the retry budget
+(none)
 
 ## Operator questions
 
@@ -765,13 +779,13 @@ need a decision on the retry budget
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: none recorded.
+Prior fingerprint actions: see applied proposals above.
 
 "#;
 
 const S7_NUDGE: &str = r#"# Progression diagnosis
 
-You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Compose never fetched git or CI: conflict diagnosis and check logs are the stored rows. You may run `gh pr view` and `gh pr checks` if you need a live check.
+You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Stored attempts are supplemented by engine probes for current conflict, CI-log and main-branch evidence before spawn. You may run `gh pr view` and `gh pr checks` if you need a live check.
 
 ## Item
 
@@ -813,6 +827,8 @@ Churn-window terminal count (1h, excluding progression): 1
 
 Producer: nudge_breaker
 
+Engine sweep note (not the worker's words): nudge loop bounded after silence
+
 Verbatim:
 
 ```
@@ -845,13 +861,13 @@ nudge loop bounded after silence
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: none recorded.
+Prior fingerprint actions: see applied proposals above.
 
 "#;
 
 const S6: &str = r#"# Progression diagnosis
 
-You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Compose never fetched git or CI: conflict diagnosis and check logs are the stored rows. You may run `gh pr view` and `gh pr checks` if you need a live check.
+You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Stored attempts are supplemented by engine probes for current conflict, CI-log and main-branch evidence before spawn. You may run `gh pr view` and `gh pr checks` if you need a live check.
 
 ## Item
 
@@ -914,7 +930,7 @@ FAIL: tools/boss/engine/core/src/lib.rs unused import
 
 ### Failing-check history (other open PRs in this product)
 
-The engine stores no main-branch check outcomes, so main is unobserved (unknown, not passing). The only cross-PR signal is the stored required-check detail on this product's other open or recently completed PRs. Verify main with `gh run list --branch main` before attributing a red check to this PR.
+Stored cross-PR observations follow. Engine probes below supply recent main-branch outcomes before spawn; missing observations remain unknown.
 
 - `bazel-test` failed on this PR and on 1 other open/recent PRs (Sibling PR) → likely unrelated or flaky.
 - `checkleft` failed on this PR and on 1 other open/recent PRs (Sibling PR) → likely unrelated or flaky.
@@ -932,13 +948,13 @@ The engine stores no main-branch check outcomes, so main is unobserved (unknown,
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: none recorded.
+Prior fingerprint actions: see applied proposals above.
 
 "#;
 
 const S9: &str = r#"# Progression diagnosis
 
-You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Compose never fetched git or CI: conflict diagnosis and check logs are the stored rows. You may run `gh pr view` and `gh pr checks` if you need a live check.
+You are a restricted unstick agent. You hold no code checkout. Diagnose this stuck work item from the packet below and act with `boss propose` verbs. Stored attempts are supplemented by engine probes for current conflict, CI-log and main-branch evidence before spawn. You may run `gh pr view` and `gh pr checks` if you need a live check.
 
 ## Item
 
@@ -1002,7 +1018,7 @@ Churn-window terminal count (1h, excluding progression): 0
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: none recorded.
+Prior fingerprint actions: see applied proposals above.
 
 "#;
 

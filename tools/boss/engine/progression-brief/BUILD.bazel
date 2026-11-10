@@ -14,8 +14,11 @@ rust_library(
         "//tools/boss/engine/execution-runner:__pkg__",
     ],
     deps = [
+        "//tools/boss/engine/ci-log-reader",
+        "//tools/boss/engine/conflict-diagnosis",
         "//tools/boss/engine/storage-values",
         "//tools/boss/engine/work-db",
+        "//tools/boss/github",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
 )
@@ -35,8 +38,11 @@ rust_library(
         "//tools/boss/engine/execution-runner:__pkg__",
     ],
     deps = [
+        "//tools/boss/engine/ci-log-reader",
+        "//tools/boss/engine/conflict-diagnosis",
         "//tools/boss/engine/storage-values",
         "//tools/boss/engine/work-db:work_db_test_support",
+        "//tools/boss/github",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
 )
@@ -55,8 +61,11 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//tools/boss/engine/ci-log-reader",
+        "//tools/boss/engine/conflict-diagnosis",
         "//tools/boss/engine/storage-values",
         "//tools/boss/engine/work-db:work_db_test_support",
+        "//tools/boss/github",
         "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,

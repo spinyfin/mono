@@ -37,8 +37,8 @@ pub struct Neighbour {
 #[derive(Debug, Clone)]
 pub struct DeclaredBlocker {
     pub producer: String,
-    /// The worker's own words, from the open declaration attention or the
-    /// stored operator question.
+    /// The worker's own words from its applied declaration, nudge-breaker
+    /// attention, or open question on the same item and execution.
     pub verbatim: String,
     /// The engine's wrapper text (the sweep's note on the item), shown apart
     /// from the worker's words so the agent never classifies engine prose.
@@ -46,9 +46,12 @@ pub struct DeclaredBlocker {
 }
 
 /// Prior progression run the packet lists: the execution row plus its declaration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub struct PriorProgressionRun {
     pub execution_id: String,
+    pub fingerprint: Option<String>,
+    pub actions: Vec<String>,
     pub status: String,
     pub created_at: String,
     pub run_done_outcome: Option<String>,
@@ -61,9 +64,8 @@ pub struct VerbBudget {
     pub create_used: i64,
     pub create_max: i64,
     pub create_window_secs: i64,
-    /// 2.5 allows one progression redispatch per item until a non-progression
-    /// work run completes; this is that bound minus the redispatches the
-    /// execution history shows since the last such run.
+    /// One progression redispatch per item and stuck kind, reset by a completed
+    /// work run on that item, including work started by progression.
     pub redispatch_remaining: u32,
 }
 

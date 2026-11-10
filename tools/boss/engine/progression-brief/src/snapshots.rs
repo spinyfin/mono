@@ -4,7 +4,7 @@
 //! packet's wording rather than minted tokens.
 
 use boss_engine_storage_values::attention_kinds::{
-    ATTENTION_KIND_ABANDONED_BRANCH_NO_PR, NUDGE_BREAKER_ATTENTION_KIND, RUN_DONE_BLOCKED_ATTENTION_KIND,
+    ATTENTION_KIND_ABANDONED_BRANCH_NO_PR, NUDGE_BREAKER_ATTENTION_KIND,
 };
 use boss_protocol::{
     AddDependencyInput, CreateAttentionItemInput, CreateExecutionInput, ExecutionKind, ExecutionStatus,
@@ -31,7 +31,7 @@ const REQUIRED_SECTIONS: &[&str] = &[
     "## Operator questions",
     "## Progression history",
     "Current fingerprint:",
-    "Prior fingerprint actions: none recorded",
+    "Prior fingerprint actions: see applied proposals above",
     "Remaining redispatch allowance: 1.",
     "## Verb catalogue",
     "## When you may ask the owner",
@@ -107,8 +107,7 @@ fn normalize(text: &str) -> String {
     fingerprint.replace_all(&text, "${1}<FINGERPRINT>${2}").into_owned()
 }
 
-/// The packet up to the static verb catalogue, which `catalogue_tail_is_present`
-/// pins separately so each golden covers only what varies per item.
+/// The packet up to the static verb catalogue; shape assertions pin its required tail.
 fn variable_part(text: &str) -> &str {
     text.split("## Verb catalogue").next().unwrap_or(text)
 }
@@ -196,23 +195,11 @@ fn s3_deliberate_park_verbatim_blocker() {
         &f,
         "Parked",
         WorkerFailureBasis::DeclaredBlocked,
-        "the worker said it needs a human on the API shape",
+        "Should the API return 404 or 410 for retired ids? I need the owner to pick.",
     );
-    // Production shape: the declaration attention hangs off the execution and
-    // the sweep parks the item with its own generic note.
-    let execution = f.db.list_execution_diagnoses_for_chain(&id).unwrap().remove(0);
     f.sql(&format!(
         "UPDATE tasks SET status = 'active', blocked_reason = NULL WHERE id = '{id}'"
     ));
-    f.db.create_attention_item(
-        CreateAttentionItemInput::builder()
-            .execution_id(&execution.id)
-            .kind(RUN_DONE_BLOCKED_ATTENTION_KIND)
-            .title("Worker declared blocked")
-            .body_markdown("Should the API return 404 or 410 for retired ids? I need the owner to pick.")
-            .build(),
-    )
-    .unwrap();
     assert!(f.db.bounce_deliberate_park_to_backlog(&id, "orphan_sweep", None));
     let text = f.brief(&id);
     assert_shape(
@@ -365,6 +352,20 @@ fn start_then_fail(f: &Fixture, name: &str, basis: WorkerFailureBasis, detail: &
             .build(),
     )
     .unwrap();
+    if matches!(basis, WorkerFailureBasis::DeclaredBlocked) {
+        let payload = serde_json::json!({"outcome":"blocked", "summary":detail}).to_string();
+        let applied =
+            f.db.submit_worker_proposal(boss_work_db::SubmitWorkerProposalInput {
+                execution_id: &execution.id,
+                work_item_id: &id,
+                kind: boss_protocol::ProposalKind::RunDone,
+                payload_json: &payload,
+                idempotency_key: "blocked",
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(applied.proposal.state, boss_protocol::ProposalState::Applied);
+    }
     f.db.record_worker_failure_with_basis(&execution.id, detail, basis)
         .unwrap();
     id
@@ -383,15 +384,6 @@ fn s7_declared_blocked_verbatim() {
         WorkerFailureBasis::DeclaredBlocked,
         "need a decision on the retry budget",
     );
-    f.db.create_attention_item(
-        CreateAttentionItemInput::builder()
-            .execution_id(first_execution(&f, &id))
-            .kind(RUN_DONE_BLOCKED_ATTENTION_KIND)
-            .title("Worker declared blocked")
-            .body_markdown("need a decision on the retry budget")
-            .build(),
-    )
-    .unwrap();
     let text = f.brief(&id);
     assert_shape(
         "S7 declared",
@@ -477,6 +469,24 @@ fn s13_revision_chain_tail() {
     f.stick(&parent, "status = 'in_review', ci_required_state = 'success'");
     f.poll(&parent, "feed90", "[]");
     f.stick(&parent, "ci_required_state = 'success'");
+    let attempt =
+        f.db.insert_ci_remediation(CiRemediationInsertInput {
+            product_id: f.product.clone(),
+            work_item_id: parent.clone(),
+            pr_url: "https://github.com/spinyfin/mono/pull/90".into(),
+            pr_number: 90,
+            head_branch: "boss/parent".into(),
+            head_sha_at_trigger: "feed90".into(),
+            attempt_kind: "fix".into(),
+            consumes_budget: 1,
+            failed_checks: poller_detail(&[("parent-check", "FAILURE")]),
+            failure_kind: "pr_branch_ci".into(),
+            before_commit_sha: None,
+        })
+        .unwrap()
+        .unwrap();
+    f.db.set_ci_remediation_log_excerpt(&attempt.id, "parent remediation evidence")
+        .unwrap();
     let revision = f.chore("Dead revision");
     f.sql(&format!(
         "UPDATE tasks SET kind = 'revision', parent_task_id = '{parent}',
@@ -499,6 +509,7 @@ fn s13_revision_chain_tail() {
             "kind: revision",
             "Parent PR (owned by chain root",
             "head_sha: feed90",
+            "parent remediation evidence",
         ],
     );
     assert_golden("s13", &text);
@@ -702,36 +713,236 @@ fn s6_failing_only_here_is_attributed_unknown_not_this_pr() {
     f.stick(&id, "status = 'blocked', blocked_reason = 'ci_failure_exhausted'");
     let text = f.brief(&id);
     assert!(
-        text.contains("`bazel-test` failed on this PR; no other PR with stored detail shows it failing (1 other PRs have no stored detail), main unobserved → attribution unknown."),
+        text.contains("`bazel-test` failed on this PR; no other PR with stored detail shows it failing (1 other PRs have no stored detail), main not in stored snapshot → attribution unknown until engine probe."),
         "{text}"
     );
     assert!(!text.contains("likely this PR's change"), "{text}");
 }
 
 #[test]
-fn redispatch_allowance_counts_progression_started_work_since_the_last_clean_run() {
+fn redispatch_allowance_is_per_item_and_kind_and_resets_on_completed_work() {
     use boss_work_db::ExecutionDiagnosis;
-    let run = |id: &str, kind: &str, status: &str, via: Option<&str>| {
+    let f = fixture();
+    f.db.set_metadata("progression.stuck_kind.redispatch", "S7_worker_failed")
+        .unwrap();
+    let run = |item: &str, kind: &str, status: &str, via: Option<&str>| {
         ExecutionDiagnosis::builder()
-            .id(id)
-            .work_item_id("task_1")
+            .id("e")
+            .work_item_id(item)
             .kind(kind)
             .status(status)
             .maybe_created_via(via)
             .created_at("t")
             .build()
     };
-    let none = vec![run("a", "chore_implementation", "failed", None)];
-    assert_eq!(crate::gather::redispatch_remaining(&none), 1);
-    let redispatched = vec![
-        run("a", "chore_implementation", "failed", None),
-        run("b", "progression", "completed", None),
-        run("c", "chore_implementation", "failed", Some("progression:redispatch")),
+    let remaining = |runs: &[ExecutionDiagnosis], kind: &str| {
+        let mut producer = run("target", "progression", "completed", None);
+        producer.id = "redispatch".into();
+        let mut history = vec![producer];
+        history.extend_from_slice(runs);
+        crate::gather::redispatch_remaining(&f.db, &history, "target", kind).unwrap()
+    };
+    f.db.set_metadata("progression.stuck_kind.foreign", "S7_worker_failed")
+        .unwrap();
+    let mut foreign = run("parent", "progression", "completed", None);
+    foreign.id = "foreign".into();
+    assert_eq!(
+        remaining(
+            &[
+                foreign,
+                run(
+                    "target",
+                    "revision_implementation",
+                    "failed",
+                    Some("progression:foreign")
+                )
+            ],
+            "S7_worker_failed"
+        ),
+        1
+    );
+    let spent = run(
+        "target",
+        "chore_implementation",
+        "failed",
+        Some("progression:redispatch"),
+    );
+    assert_eq!(remaining(std::slice::from_ref(&spent), "S7_worker_failed"), 0);
+    assert_eq!(remaining(std::slice::from_ref(&spent), "S6_ci_failure"), 1);
+    for kind in ["chore_implementation", "revision_implementation", "task_implementation"] {
+        assert_eq!(
+            remaining(
+                &[
+                    spent.clone(),
+                    run("target", kind, "completed", Some("progression:redispatch"))
+                ],
+                "S7_worker_failed"
+            ),
+            1
+        );
+        assert_eq!(
+            remaining(
+                &[spent.clone(), run("sibling", kind, "completed", None)],
+                "S7_worker_failed"
+            ),
+            0
+        );
+        assert_eq!(
+            remaining(
+                &[run("precursor", kind, "failed", Some("progression:redispatch"))],
+                "S7_worker_failed"
+            ),
+            1
+        );
+    }
+    assert_eq!(
+        remaining(
+            &[spent, run("target", "progression", "completed", None)],
+            "S7_worker_failed"
+        ),
+        0
+    );
+}
+
+#[test]
+fn prior_progression_episodes_are_persisted_once_and_compared() {
+    let f = fixture();
+    let id = f.chore("Episode history");
+    let fingerprint = crate::gather_progression_brief(&f.db, &id).unwrap().fingerprint;
+    for value in [&fingerprint, "another-episode"] {
+        let execution =
+            f.db.create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(&id)
+                    .kind(ExecutionKind::Progression)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        f.db.record_progression_episode(&execution.id, value, "S7_worker_failed")
+            .unwrap();
+        let proposal =
+            f.db.submit_worker_proposal(boss_work_db::SubmitWorkerProposalInput {
+                execution_id: &execution.id,
+                work_item_id: &id,
+                kind: boss_protocol::ProposalKind::RunDone,
+                payload_json: r#"{"outcome":"no_changes_needed","summary":"inspected episode"}"#,
+                idempotency_key: "inspection",
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(proposal.proposal.state, boss_protocol::ProposalState::Applied);
+        f.db.record_progression_episode(&execution.id, "must-not-overwrite", "S6_ci_failure")
+            .unwrap();
+        f.sql(&format!(
+            "UPDATE work_executions SET status='completed' WHERE id='{}'",
+            execution.id
+        ));
+    }
+    let text = f.brief(&id);
+    assert!(text.contains("matches_current=true"), "{text}");
+    assert!(text.contains("matches_current=false"), "{text}");
+    assert!(text.contains("fingerprint=another-episode"), "{text}");
+    assert!(!text.contains("must-not-overwrite"));
+    assert!(
+        text.contains("action: run_done:") && text.contains("inspected episode"),
+        "{text}"
+    );
+}
+
+#[test]
+fn declared_blocker_ignores_parent_sibling_and_answered_questions() {
+    let f = fixture();
+    let parent = start_then_fail(&f, "Parent", WorkerFailureBasis::DeclaredBlocked, "parent declaration");
+    let sibling = start_then_fail(
+        &f,
+        "Sibling",
+        WorkerFailureBasis::DeclaredBlocked,
+        "sibling declaration",
+    );
+    let target = start_then_fail(&f, "Target", WorkerFailureBasis::DeclaredBlocked, "target declaration");
+    for revision in [&sibling, &target] {
+        f.stick(revision, &format!("kind='revision', parent_task_id='{parent}'"));
+    }
+    f.db.create_attention_item(
+        CreateAttentionItemInput::builder()
+            .execution_id(first_execution(&f, &sibling))
+            .kind(NUDGE_BREAKER_ATTENTION_KIND)
+            .title("Sibling nudge")
+            .body_markdown("sibling nudge words")
+            .build(),
+    )
+    .unwrap();
+    let packet = crate::gather_progression_brief(&f.db, &target).unwrap();
+    assert_eq!(packet.declared_blocker.as_ref().unwrap().verbatim, "target declaration");
+    let make_question = |owner: &str, execution: &str, status, text: &str, time: &str| {
+        boss_protocol::OperatorQuestionRecord::builder()
+            .question(
+                boss_protocol::OperatorQuestionView::builder()
+                    .id(text)
+                    .text(text)
+                    .answer_type(boss_protocol::OperatorAnswerType::YesNo)
+                    .explanation("explanation")
+                    .asked_at(time)
+                    .execution_id(execution)
+                    .build(),
+            )
+            .work_item_id(owner)
+            .status(status)
+            .build()
+    };
+    let execution = first_execution(&f, &target);
+    let questions = vec![
+        make_question(
+            &parent,
+            "parent-exec",
+            boss_protocol::OperatorQuestionStatus::Open,
+            "parent question",
+            "99",
+        ),
+        make_question(
+            &target,
+            &execution,
+            boss_protocol::OperatorQuestionStatus::Answered,
+            "answered question",
+            "99",
+        ),
+        make_question(
+            &target,
+            "other-exec",
+            boss_protocol::OperatorQuestionStatus::Open,
+            "wrong execution",
+            "99",
+        ),
+        make_question(
+            &target,
+            &execution,
+            boss_protocol::OperatorQuestionStatus::Open,
+            "newest own question",
+            "20",
+        ),
+        make_question(
+            &target,
+            &execution,
+            boss_protocol::OperatorQuestionStatus::Open,
+            "older own question",
+            "10",
+        ),
     ];
-    assert_eq!(crate::gather::redispatch_remaining(&redispatched), 0);
-    let cleared = vec![
-        run("c", "chore_implementation", "failed", Some("progression:redispatch")),
-        run("d", "chore_implementation", "completed", None),
-    ];
-    assert_eq!(crate::gather::redispatch_remaining(&cleared), 1);
+    // Remove proposal evidence to exercise the question fallback independently.
+    f.sql(&format!(
+        "DELETE FROM worker_proposals WHERE execution_id='{execution}'"
+    ));
+    let blocker = crate::gather::declared_blocker_from(
+        &f.db,
+        &packet.item,
+        &Some("declared_blocked".into()),
+        &packet.executions,
+        &packet.attentions,
+        &questions,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(blocker.verbatim, "newest own question\n\nexplanation");
+    assert_ne!(blocker.sweep_note.as_deref(), Some(blocker.verbatim.as_str()));
 }

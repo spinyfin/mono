@@ -1095,7 +1095,7 @@ pub async fn compose_worker_spawn(
     } else if execution.kind == ExecutionKind::Progression {
         // Administrative unstick agent: no checkout, so the diagnosis packet
         // is the brief. Bookmark-recovery instructions do not apply.
-        with_bazel_caching_rule(compose_progression_prompt(work_db, execution))
+        with_bazel_caching_rule(compose_progression_prompt(work_db, execution, workspace_path).await)
     } else if execution.kind == ExecutionKind::PrReviewGuide {
         // A `pr_review_guide` execution renders the review-guide prompt
         // (exact versioned template + embedded source packet) instead of

@@ -7,9 +7,26 @@ use crate::work::{WorkDb, WorkExecution};
 /// The worker holds no checkout; the diagnosis packet is the brief. Falls
 /// back to a short diagnostic prompt if gathering fails, so a spawn still
 /// happens rather than dying in compose.
-pub(super) fn compose_progression_prompt(work_db: &WorkDb, execution: &WorkExecution) -> String {
-    match boss_progression_brief::compose_progression_brief(work_db, &execution.work_item_id) {
-        Ok(body) => body,
+pub(super) async fn compose_progression_prompt(
+    work_db: &WorkDb,
+    execution: &WorkExecution,
+    workspace: &std::path::Path,
+) -> String {
+    match boss_progression_brief::gather_progression_brief(work_db, &execution.work_item_id) {
+        Ok(packet) => {
+            if let Err(error) =
+                work_db.record_progression_episode(&execution.id, &packet.fingerprint, &packet.stuck_kind)
+            {
+                return fallback_prompt(&execution.id, &execution.work_item_id, &error);
+            }
+            let evidence =
+                boss_progression_brief::gather_evidence(&packet, &boss_progression_brief::EngineEvidence { workspace })
+                    .await;
+            format!(
+                "{}\n{evidence}",
+                boss_progression_brief::render_progression_brief(&packet)
+            )
+        }
         Err(error) => {
             tracing::warn!(
                 execution_id = %execution.id,

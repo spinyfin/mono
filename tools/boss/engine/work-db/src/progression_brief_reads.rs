@@ -61,6 +61,22 @@ pub struct ProgressionCreateBudget {
 
 #[work_db_boundary::instrument]
 impl WorkDb {
+    /// Persist the episode at first composition. Retries cannot rewrite the
+    /// original fingerprint or the stuck-kind provenance of a redispatch.
+    pub fn record_progression_episode(&self, execution: &str, fingerprint: &str, stuck_kind: &str) -> Result<()> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for (field, value) in [("fingerprint", fingerprint), ("stuck_kind", stuck_kind)] {
+            tx.execute(
+                "INSERT OR IGNORE INTO metadata(key, value)
+                SELECT ?1, ?2 WHERE EXISTS(SELECT 1 FROM work_executions WHERE id = ?3 AND kind = 'progression')",
+                params![format!("progression.{field}.{execution}"), value, execution],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Ledger rows for the packet: the last `limit` `status` changes, plus the
     /// row that entered the current stuck state (the newest `blocked_reason` or
     /// `dispatch_failed_reason` write that set a value), deduplicated and
@@ -142,8 +158,8 @@ impl WorkDb {
     }
 
     /// Required-check snapshots on the product's other PRs (open, or done
-    /// inside the last seven days). Proxy for "this check's recent outcomes
-    /// on main": a check that is red across PRs is likely unrelated or flaky.
+    /// inside the last seven days). These are cross-PR observations, not main
+    /// branch outcomes.
     pub fn list_product_pr_ci_snapshots(
         &self,
         product_id: &str,

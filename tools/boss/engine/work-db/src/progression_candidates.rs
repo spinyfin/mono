@@ -513,9 +513,6 @@ fn create_budget_exhausted_sql(a: &str, max_creates: &str, window: &str) -> Stri
     format!("({}) >= ({max_creates})", create_budget_used_sql(a, window))
 }
 
-/// Count of revisions and precursors a progression run minted for `{a}` inside
-/// the `window` (seconds) SQL expression. Shared by the candidate clause and the
-/// diagnosis packet so the budget the agent reads is the one the sweep enforces.
 /// SQL expressions for the per-item create cap and its rolling window, read from
 /// metadata with the published defaults.
 pub(crate) fn create_budget_limit_sqls() -> (String, String) {
@@ -528,6 +525,9 @@ pub(crate) fn create_budget_limit_sqls() -> (String, String) {
     )
 }
 
+/// Count of revisions and precursors a progression run minted for `{a}` inside
+/// the `window` (seconds) SQL expression. Shared by the candidate clause and the
+/// diagnosis packet so the budget the agent reads is the one the sweep enforces.
 pub(crate) fn create_budget_used_sql(a: &str, window: &str) -> String {
     // Two indexed arms (children by parent, precursors by dependent) rather than
     // one scan of every task with an OR across both relations.
