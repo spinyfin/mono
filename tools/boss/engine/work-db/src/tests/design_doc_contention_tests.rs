@@ -216,7 +216,14 @@ fn sixty_one_concurrent_resolvers_allow_writes_and_release_before_workspace_look
         }
         barrier.wait();
         let conn = db.connect().unwrap();
-        conn.busy_timeout(Duration::ZERO).unwrap();
+        // Mutex release is the property under test, and the reader callback
+        // already asserts it with `try_lock`. These writes used to set
+        // `busy_timeout(0)` as a second SQLite-level check, but WAL shm
+        // contention with 61 connections scanning a 50k-row synthetic
+        // history returns `SQLITE_BUSY` on a loaded CI host (this crate's
+        // tests run next to ~180 other targets). A short timeout absorbs
+        // that blip without waiting out a lock held for the lookup sleep.
+        conn.busy_timeout(Duration::from_millis(250)).unwrap();
         for n in 0..100 {
             conn.execute(
                 "INSERT OR REPLACE INTO metadata(key,value) VALUES('contention-test',?1)",

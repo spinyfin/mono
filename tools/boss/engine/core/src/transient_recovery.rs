@@ -134,7 +134,9 @@ use crate::transient_error::{
     ErrorClass, EscalateReason, RecoveryDecision, RecoveryPolicy, extract_worker_error, transcript_shows_no_activity,
 };
 use crate::work::{ATTENTION_KIND_RECOVERY_EXHAUSTED, ATTENTION_KIND_RECOVERY_PERMANENT, WorkDb};
-use crate::workspace_lease_release::{LeaseReleaseOutcome, PaneStatus, release_lease_after_inferred_death};
+use crate::workspace_lease_release::{
+    LeaseReleaseOutcome, PaneStatus, WorkspaceOccupancy, release_lease_after_inferred_death_with,
+};
 use boss_execution_contracts::HostAdapterProvider;
 
 /// How often the sweep runs.
@@ -383,9 +385,19 @@ pub async fn run_one_pass(
     nudged_executions: &mut HashSet<String>,
     now_epoch_secs: i64,
 ) -> TransientRecoveryOutcome {
+    run_one_pass_with_occupancy(cx, nudged_executions, now_epoch_secs, None).await
+}
+
+/// Run recovery with a deterministic occupancy probe, or scan the host when absent.
+pub(crate) async fn run_one_pass_with_occupancy(
+    cx: &RecoveryContext<'_>,
+    nudged_executions: &mut HashSet<String>,
+    now_epoch_secs: i64,
+    occupancy: Option<&dyn WorkspaceOccupancy>,
+) -> TransientRecoveryOutcome {
     let mut outcome = TransientRecoveryOutcome::default();
     for state in cx.live_states.snapshot() {
-        process_state(cx, nudged_executions, now_epoch_secs, state, &mut outcome).await;
+        process_state(cx, nudged_executions, now_epoch_secs, state, &mut outcome, occupancy).await;
     }
     outcome
 }
@@ -409,7 +421,7 @@ pub async fn run_for_execution(
     let Some(state) = cx.live_states.snapshot().into_iter().find(|s| s.run_id == execution_id) else {
         return outcome;
     };
-    process_state(cx, nudged_executions, now_epoch_secs, state, &mut outcome).await;
+    process_state(cx, nudged_executions, now_epoch_secs, state, &mut outcome, None).await;
     outcome
 }
 
@@ -422,6 +434,7 @@ async fn process_state(
     now_epoch_secs: i64,
     state: LiveWorkerState,
     outcome: &mut TransientRecoveryOutcome,
+    occupancy: Option<&dyn WorkspaceOccupancy>,
 ) {
     let &RecoveryContext {
         work_db,
@@ -613,7 +626,8 @@ async fn process_state(
                 tracing::warn!(execution_id, "transient-recovery: teardown unconfirmed; resume waits");
                 return;
             }
-            let predecessor_lease = release_predecessor_lease(work_db, cube_client, host_adapters, &execution).await;
+            let predecessor_lease =
+                release_predecessor_lease(work_db, cube_client, host_adapters, &execution, occupancy).await;
             // A kept or failed release does not stop the resume. The pane is
             // gone, so this execution is no longer in the live states and no
             // later pass would revisit it; orphaning it here makes it
@@ -882,7 +896,7 @@ impl PredecessorLease {
 
 /// Preserve the stalled run's unpublished work and return its cube workspace
 /// lease, through the same inferred-death release every other reaping sweep
-/// uses ([`release_lease_after_inferred_death`]): it records the work as the
+/// uses ([`release_lease_after_inferred_death_with`]): it records the work as the
 /// run's `preserved/<execution>` tip before it lets go of the lease. When the
 /// work cannot be preserved the lease is still returned, and an inspection
 /// attention item carries the error. The pane is already confirmed gone, so
@@ -906,6 +920,7 @@ async fn release_predecessor_lease(
     cube_client: &dyn CubeClient,
     host_adapters: &dyn HostAdapterProvider,
     execution: &WorkExecution,
+    occupancy: Option<&dyn WorkspaceOccupancy>,
 ) -> PredecessorLease {
     let Some(lease_id) = execution.cube_lease_id.as_deref() else {
         return PredecessorLease::None;
@@ -937,11 +952,12 @@ async fn release_predecessor_lease(
             None => cube_client.force_release_lease(lease_id, REASON).await,
         }
     };
-    let outcome = release_lease_after_inferred_death(
+    let outcome = release_lease_after_inferred_death_with(
         work_db,
         execution,
         PaneStatus::Gone,
         adapter.as_deref(),
+        occupancy,
         Some(cube_client),
         release,
     )

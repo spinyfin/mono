@@ -15,7 +15,7 @@ use crate::dispatch_events::RecordingDispatchEventSink;
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::transient_error::RecoveryPolicy;
 use crate::transient_recovery::{
-    NoopWorkerNudger, RecoveryContext, TransientRecoveryOutcome, TransientRecoveryReaper, run_one_pass,
+    NoopWorkerNudger, RecoveryContext, TransientRecoveryOutcome, TransientRecoveryReaper, run_one_pass_with_occupancy,
 };
 use crate::workspace_lease_release::{
     DbPreservation, EmptyOccupancy, LeaseReleaseOutcome, PaneStatus, ReleaseEvidence, TerminalCause, apply_release,
@@ -184,10 +184,12 @@ impl Stalled {
             cube_client: self.cube.as_ref(),
             host_adapters: &NoHosts,
         };
-        let outcome = run_one_pass(
+        // These fixtures own empty workspaces; host processes cannot supply their evidence.
+        let outcome = run_one_pass_with_occupancy(
             &cx,
             &mut HashSet::new(),
             boss_engine_utils::epoch_time::now_epoch_secs(),
+            Some(&EmptyOccupancy),
         )
         .await;
         (outcome, sink)
