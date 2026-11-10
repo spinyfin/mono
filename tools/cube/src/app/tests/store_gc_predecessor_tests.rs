@@ -70,6 +70,14 @@ fn inherit_newer_index(f: &Fixture) {
 }
 
 fn collect(f: &Fixture, keep: Duration) -> Result<crate::app::store_gc::StoreGcReport> {
+    collect_with_runner(f, keep, &QuietRunner(&f.runner))
+}
+
+fn collect_with_runner(
+    f: &Fixture,
+    keep: Duration,
+    runner: &dyn CommandRunner,
+) -> Result<crate::app::store_gc::StoreGcReport> {
     let record = RepoRecord {
         repo: "scratch".into(),
         origin: f.root.display().to_string(),
@@ -80,13 +88,82 @@ fn collect(f: &Fixture, keep: Duration) -> Result<crate::app::store_gc::StoreGcR
         clone_command: None,
     };
     gc_repo_store(
-        &QuietRunner(&f.runner),
+        runner,
         Some(&f._dir.path().join("state.db")),
         &record,
         keep,
         Duration::from_millis(100),
         false,
     )
+}
+
+#[test]
+fn store_gc_predecessor_warmup_does_not_merge_a_racing_head() {
+    let f = fixture();
+    let original_head = f.jj(
+        &f.root,
+        &[
+            "--ignore-working-copy",
+            "op",
+            "log",
+            "--no-graph",
+            "--limit",
+            "1",
+            "-T",
+            "id",
+        ],
+    );
+    struct RacingHead<'a> {
+        fixture: &'a Fixture,
+        original_head: String,
+    }
+    impl CommandRunner for RacingHead<'_> {
+        fn run(&self, invocation: &CommandInvocation) -> Result<String> {
+            if invocation.program == "ps" {
+                return Ok(String::new());
+            }
+            if invocation.args.iter().any(|arg| arg == "root()") {
+                // A writer loaded the old head before abandon and publishes
+                // it while the warm-up is starting. An unpinned read would
+                // merge it, hiding the race from the collector's head check.
+                std::fs::write(
+                    self.fixture
+                        .root
+                        .join(".jj/repo/op_heads/heads")
+                        .join(self.original_head.trim()),
+                    b"",
+                )
+                .unwrap();
+            }
+            let output = self.fixture.runner.run(invocation)?;
+            if invocation
+                .args
+                .iter()
+                .any(|arg| arg == crate::app::store_gc::OP_LOG_TEMPLATE)
+            {
+                // Age only the cut selection; keep the actual operation DAG.
+                return Ok(output
+                    .lines()
+                    .map(|line| format!("{} 1\n", line.split_once(' ').unwrap().0))
+                    .collect());
+            }
+            Ok(output)
+        }
+    }
+    let error = collect_with_runner(
+        &f,
+        Duration::ZERO,
+        &RacingHead {
+            fixture: &f,
+            original_head,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("2 operation heads before the collection"),
+        "{error}"
+    );
+    assert_eq!(crate::app::store_gc::count_op_heads(&f.root).unwrap(), 2);
 }
 
 fn cached_read(f: &Fixture) {

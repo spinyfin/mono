@@ -48,14 +48,16 @@
 //!    records a failed audit event; a successful cached read is insufficient.
 //!
 //! The abandon holds the exclusive host-wide [`JjGate`] from before the
-//! abandon through the head check and read-only commit-index warm-up. Every
+//! abandon through the head check. Every
 //! `jj` command cube starts
 //! (lease, goto, push, fetch; see `command_runner`) holds the gate shared for
 //! its run, so none of those can load the pre-rewrite head; cube commands
 //! wait at most two seconds, then return a retryable maintenance error.
-//! Abandon has a two-minute deadline and index warm-up has a separate 20s
-//! deadline: at most 140s of subprocess work excludes readers. Warm-up failure
-//! is non-fatal; the next reader builds the index. Interrupted rewrites are
+//! Abandon has a two-minute deadline. Read-only index warm-up runs afterward
+//! under a shared gate with its own five-minute deadline, pinned to the verified
+//! operation so it cannot merge a racing head. Warm-up failure is audited and
+//! non-fatal: independent fresh-index verification still gates collection.
+//! Interrupted rewrites are
 //! checked before releasing exclusivity. A durable, atomically published
 //! marker rejects readers until recovery observes no jj processes and one
 //! head under the exclusive gate. Readers attempt this recovery immediately,
@@ -120,9 +122,9 @@ const QUIESCENCE_POLL: Duration = Duration::from_millis(250);
 /// Timeout kills and reaps the child; heads are checked even on failure.
 /// The scale regression exercises 16,800 retained operations.
 const EXCLUSIVE_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
-/// Best-effort warm-up keeps combined exclusive subprocess work to 140s.
-/// Leave the rewrite bound large enough for the measured retained DAG.
-const INDEX_WARMUP_TIMEOUT: Duration = Duration::from_secs(20);
+/// A full rebuild of mono's 18 GiB operation store took 148s. Allow roughly
+/// twice that measured time without extending host-wide reader exclusion.
+const INDEX_WARMUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Template the cut-point selection reads: one `<operation id> <end epoch>`
 /// line per operation, newest first.
 pub(super) const OP_LOG_TEMPLATE: &str = r#"id ++ " " ++ time.end().format("%s") ++ "\n""#;
@@ -352,10 +354,14 @@ pub(crate) fn count_op_heads(source: &Path) -> Result<usize> {
 /// Stop the pass unless the store holds exactly one operation head. A second
 /// head means a jj command raced the abandon: the next jj command merges the
 /// heads against an empty base, so nothing may be collected.
-fn require_single_op_head(record: &RepoRecord, source: &Path, when: &str) -> Result<()> {
-    let heads = count_op_heads(source)?;
-    if heads == 1 {
-        return Ok(());
+fn require_single_op_head(record: &RepoRecord, source: &Path, when: &str) -> Result<String> {
+    let entries = std::fs::read_dir(source.join(".jj/repo/op_heads/heads"))
+        .map_err(CubeError::Io)?
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(CubeError::Io)?;
+    let heads = entries.len();
+    if let [head] = entries.as_slice() {
+        return Ok(head.file_name().to_string_lossy().into_owned());
     }
     Err(CubeError::InvalidArgument(format!(
         "repo `{}`: the store holds {heads} operation heads {when} (expected 1); \
@@ -528,6 +534,7 @@ pub(super) fn gc_repo_store(
     quiescence: Duration,
     dry_run: bool,
 ) -> Result<StoreGcReport> {
+    let started = Instant::now();
     gc_repo_store_with_deadline(
         runner,
         database_path,
@@ -542,7 +549,10 @@ pub(super) fn gc_repo_store(
             database_path,
             "repo.store_gc",
             repo = record.repo,
+            source = record.source,
+            dry_run = dry_run,
             outcome = "failed",
+            duration_ms = started.elapsed().as_millis() as u64,
             error = error.to_string()
         );
     })
@@ -624,7 +634,8 @@ pub(super) fn gc_repo_store_with_deadline(
             index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "before abandon")?;
             index
         };
-        // Held through the head check and commit-index warm-up:
+        let mut rewritten_head = None;
+        // Held through the rewrite and head check:
         // cube-started jj commands wait on it, so
         // none of them can load the pre-rewrite head in between.
         let mut gate = None;
@@ -660,35 +671,9 @@ pub(super) fn gc_repo_store_with_deadline(
                     &gated_jj_invocation(&source, &["--ignore-working-copy", "op", "abandon", &range]),
                     exclusive_timeout,
                 );
-                require_single_op_head(record, &source, "after the abandon")?;
+                rewritten_head = Some(require_single_op_head(record, &source, "after the abandon")?);
                 active_gate.clear_quarantine(&source)?;
                 abandon?;
-                // Rewritten operation IDs invalidate jj's commit-index lookup.
-                // Build that read-only index before readers resume, rather than
-                // making the first lease pay for it while holding the registry
-                // lock. It has its own deadline, and failing it is not fatal:
-                // the rewrite is verified, and the first reader rebuilds the
-                // index instead.
-                if let Err(error) = runner.run_with_timeout(
-                    &gated_jj_invocation(
-                        &source,
-                        &[
-                            "--ignore-working-copy",
-                            "log",
-                            "-r",
-                            "root()",
-                            "--no-graph",
-                            "-T",
-                            "commit_id",
-                        ],
-                    ),
-                    INDEX_WARMUP_TIMEOUT.min(exclusive_timeout),
-                ) {
-                    eprintln!(
-                        "cube: store gc: {}: commit-index warm-up failed after a verified abandon: {error}",
-                        record.repo
-                    );
-                }
             } else {
                 gate = None;
                 abandoned_through = None;
@@ -703,6 +688,48 @@ pub(super) fn gc_repo_store_with_deadline(
             exclusive_ms = exclusive_started.map_or(0, |start| start.elapsed().as_millis());
             drop(gate);
             let _reader = JjGate::shared_for_database(database_path)?;
+            if let Some(head) = rewritten_head {
+                // Rewritten operation IDs invalidate jj's commit-index lookup.
+                // Populate it without excluding readers across every repo for
+                // a large rebuild. Pin the checked head: a read at the current
+                // operation could silently merge a concurrent second head.
+                // Fresh-index verification below remains mandatory even when
+                // this best-effort optimization fails.
+                let warmup_started = Instant::now();
+                let warmup_timeout = INDEX_WARMUP_TIMEOUT;
+                let warmup = runner.run_with_timeout(
+                    &gated_jj_invocation(
+                        &source,
+                        &[
+                            "--ignore-working-copy",
+                            "--at-operation",
+                            &head,
+                            "log",
+                            "-r",
+                            "root()",
+                            "--no-graph",
+                            "-T",
+                            "commit_id",
+                        ],
+                    ),
+                    warmup_timeout,
+                );
+                audit!(
+                    database_path,
+                    "repo.store_gc.index_warmup",
+                    repo = record.repo,
+                    outcome = if warmup.is_ok() { "succeeded" } else { "failed" },
+                    duration_ms = warmup_started.elapsed().as_millis() as u64,
+                    timeout_ms = warmup_timeout.as_millis() as u64,
+                    error = warmup.as_ref().err().map(ToString::to_string),
+                );
+                if let Err(error) = warmup {
+                    eprintln!(
+                        "cube: store gc: {}: commit-index warm-up failed after a verified abandon: {error}",
+                        record.repo
+                    );
+                }
+            }
             let quiet = wait_for_jj_quiescence(runner, &source, quiescence, QUIESCENCE_POLL)?;
             // A command that started during the abandon loaded the old head
             // and may have committed on it since; its head only shows up

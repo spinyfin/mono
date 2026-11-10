@@ -166,7 +166,7 @@ fn a_failed_index_warm_up_after_a_verified_abandon_still_collects() {
         Collection::Immediate
     );
     fake.assert_exhausted();
-    assert!(fake.observed_timeouts().contains(&Duration::from_secs(20)));
+    assert!(fake.observed_timeouts().contains(&Duration::from_secs(300)));
 }
 
 #[test]

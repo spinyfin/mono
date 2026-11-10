@@ -772,6 +772,8 @@ pub(super) fn index_command(source: &std::path::Path) -> ExpectedCommand {
         "jj",
         &[
             "--ignore-working-copy",
+            "--at-operation",
+            "head",
             "log",
             "-r",
             "root()",
@@ -1157,7 +1159,7 @@ fn cube_started_jj_commands_are_held_off_for_the_abandon_but_not_the_collection(
         *probe.observed.borrow(),
         vec![
             ("abandon".to_owned(), true),
-            ("index".to_owned(), true),
+            ("index".to_owned(), false),
             ("gc".to_owned(), false)
         ],
         "a jj command that starts mid-abandon waits on the gate; the collection runs after it is released"
@@ -1200,7 +1202,7 @@ fn post_abandon_head_check_fails_the_pass_after_releasing_exclusivity() {
     fake.assert_exhausted();
     assert_eq!(
         *probe.observed.borrow(),
-        vec![("abandon".to_owned(), true), ("index".to_owned(), true)]
+        vec![("abandon".to_owned(), true), ("index".to_owned(), false)]
     );
     crate::command_runner::JjGate::shared(
         &crate::command_runner::JjGate::path(tempdir.path()),

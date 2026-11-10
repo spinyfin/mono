@@ -21,6 +21,23 @@ Cube's fresh-index verification detects this before another rewrite or collectio
 Do not delete the live index to investigate; it may be the only reason the store
 still opens. Preserve the original error, jj versions, and audit records.
 
+An operation reparented onto root is not itself evidence of missing objects.
+Read its ancestry with `jj --ignore-working-copy --at-operation <operation-id>
+op log --no-graph`; a retained operation followed by the all-zero root confirms
+the rewrite. To distinguish a slow rebuild from missing predecessors, rebuild
+an independent copy as described below. Include the complete operation store,
+not just its latest view: rebuild cost depends on retained views and commits,
+not only the number of operations.
+
+For a pass that refuses multiple operation heads, do not immediately retry the
+engine's post-cleanup collection. A second head may still name abandoned ancestry;
+merging it against the empty root can restore deleted bookmarks or move workspace
+heads. Preserve the error and inspect the heads before repair. After the store
+has a verified single head, cube's regular upkeep can try again with fresh-index
+checks. Cleanup remains complete when its collection fails; it does not need to
+be replayed. Inspect `repo.store_gc` and `repo.store_gc.index_warmup` together to
+see both a warm-up timeout and a subsequent refusal.
+
 ## Recover without deleting predecessor records
 
 The tested forward recovery is a coordinated transition to jj 0.32.0, whose
