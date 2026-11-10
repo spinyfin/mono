@@ -5,7 +5,7 @@ use boss_engine_recovery::execution_bookmark::PreservedTip;
 /// the `ready` successor of the same work item.
 fn finished_predecessor_and_successor(db: &WorkDb, label: &str) -> (WorkExecution, WorkExecution) {
     let (_, task, id) = make_waiting_human_chore(db, label);
-    db.record_worker_failure(&id, "worker stopped").unwrap();
+    db.mark_execution_orphaned(&id, "worker stopped").unwrap();
     let prior = db.get_execution(&id).unwrap();
     assert!(prior.status.is_terminal());
     assert_eq!(prior.cube_lease_id.as_deref(), Some("lease-1"));
@@ -116,7 +116,10 @@ fn a_resume_row_names_no_workspace() {
     let (_, task, id) = make_waiting_human_chore(&db, "resume");
     db.force_transient_failure_count_for_test(&id, 1).unwrap();
 
-    let resumed = db.request_resume_execution(&id, 2, 0, "test").unwrap();
+    let resumed = db
+        .request_resume_execution(&id, 2, 0, "test")
+        .unwrap()
+        .expect("resumable predecessor");
 
     assert_eq!(resumed.work_item_id, task);
     assert_eq!(resumed.status, ExecutionStatus::Ready);
@@ -134,7 +137,10 @@ fn a_resume_row_names_no_workspace() {
 fn resume_reuses_a_successor_inserted_during_teardown() {
     let db = WorkDb::open(temp_db_path("resume-insertion-race")).unwrap();
     let (prior, next) = finished_predecessor_and_successor(&db, "concurrent resume");
-    let resumed = db.request_resume_execution(&prior.id, 1, 0, "retry").unwrap();
+    let resumed = db
+        .request_resume_execution(&prior.id, 1, 0, "retry")
+        .unwrap()
+        .expect("resumable predecessor");
     assert_eq!(resumed.id, next.id);
     assert_eq!(db.list_executions(Some(&prior.work_item_id)).unwrap().len(), 2);
 }
@@ -146,7 +152,8 @@ fn resume_reuse_raises_the_adopted_successors_retry_count_and_backoff() {
     assert_eq!(next.transient_failure_count, 0);
     let resumed = db
         .request_resume_execution(&prior.id, 3, 4_000_000_000, "retry")
-        .unwrap();
+        .unwrap()
+        .expect("resumable predecessor");
     assert_eq!(resumed.id, next.id);
     assert_eq!(resumed.transient_failure_count, 3);
     assert_eq!(
@@ -159,7 +166,7 @@ fn resume_reuse_raises_the_adopted_successors_retry_count_and_backoff() {
 fn resume_does_not_reuse_a_terminal_later_execution() {
     let db = WorkDb::open(temp_db_path("resume-no-reuse-terminal")).unwrap();
     let (_, _, id) = make_waiting_human_chore(&db, "terminal later");
-    db.record_worker_failure(&id, "worker stopped").unwrap();
+    db.mark_execution_orphaned(&id, "worker stopped").unwrap();
     let prior = db.get_execution(&id).unwrap();
     let next = db
         .create_execution(
@@ -171,7 +178,10 @@ fn resume_does_not_reuse_a_terminal_later_execution() {
         )
         .unwrap();
     assert!(db.get_execution(&next.id).unwrap().status.is_terminal());
-    let resumed = db.request_resume_execution(&prior.id, 1, 0, "retry").unwrap();
+    let resumed = db
+        .request_resume_execution(&prior.id, 1, 0, "retry")
+        .unwrap()
+        .expect("resumable predecessor");
     assert_ne!(resumed.id, next.id);
     assert_eq!(resumed.status, ExecutionStatus::Ready);
 }
@@ -192,6 +202,23 @@ fn resume_does_not_adopt_a_sibling_of_a_read_only_kind() {
     };
     let stalled = make(ExecutionStatus::Running);
     let sibling = make(ExecutionStatus::Ready);
-    let resumed = db.request_resume_execution(&stalled.id, 1, 0, "retry").unwrap();
+    let resumed = db
+        .request_resume_execution(&stalled.id, 1, 0, "retry")
+        .unwrap()
+        .expect("resumable predecessor");
     assert_ne!(resumed.id, sibling.id);
+}
+
+#[test]
+fn resume_inserts_nothing_for_a_predecessor_cancelled_during_preservation() {
+    let db = WorkDb::open(temp_db_path("resume-cancelled")).unwrap();
+    let (_, task, id) = make_waiting_human_chore(&db, "cancelled");
+    db.cancel_running_execution(&id).unwrap();
+    assert_eq!(db.get_execution(&id).unwrap().status, ExecutionStatus::Cancelled);
+
+    let resumed = db.request_resume_execution(&id, 1, 0, "retry").unwrap();
+
+    assert!(resumed.is_none(), "a settled predecessor must not be resumed");
+    assert_eq!(db.list_executions(Some(&task)).unwrap().len(), 1);
+    assert_eq!(db.get_execution(&id).unwrap().status, ExecutionStatus::Cancelled);
 }

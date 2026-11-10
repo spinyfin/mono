@@ -109,6 +109,7 @@ async fn seed_stalled_worker_without_slot_mapping(error_line: &str) -> SeededWor
 async fn run_recovery(server: &Arc<ServerState>) -> boss_engine_runtime::transient_recovery::TransientRecoveryOutcome {
     let sink = Arc::new(RecordingDispatchEventSink::new());
     let policy = RecoveryPolicy::default();
+    let hosts = server.execution_coordinator.host_adapter_provider();
     let cx = RecoveryContext {
         work_db: server.work_db.as_ref(),
         live_states: &server.live_worker_states,
@@ -118,6 +119,7 @@ async fn run_recovery(server: &Arc<ServerState>) -> boss_engine_runtime::transie
         nudger: &NoopWorkerNudger,
         reaper: server.as_ref(),
         cube_client: server.cube_client.as_ref(),
+        host_adapters: hosts.as_ref(),
     };
     run_one_pass(
         &cx,

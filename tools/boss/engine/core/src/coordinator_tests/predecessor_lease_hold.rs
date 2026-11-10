@@ -182,6 +182,7 @@ impl Stalled {
             nudger: &NoopWorkerNudger,
             reaper: &reaper,
             cube_client: self.cube.as_ref(),
+            host_adapters: &NoHosts,
         };
         let outcome = run_one_pass(
             &cx,
@@ -486,4 +487,17 @@ async fn inline_reconcile_keeps_successor_held_until_preservation_finishes() {
         std::fs::read_to_string(s.repo.replacement.join("fix")).unwrap(),
         "unpublished fix"
     );
+}
+
+/// Every run in these tests is local, so no host adapter is ever requested.
+struct NoHosts;
+
+#[async_trait::async_trait]
+impl boss_execution_contracts::HostAdapterProvider for NoHosts {
+    async fn adapter_for(
+        &self,
+        host: &crate::host_registry::Host,
+    ) -> anyhow::Result<std::sync::Arc<dyn boss_execution_contracts::HostAdapter>> {
+        anyhow::bail!("unexpected adapter request for host {}", host.id)
+    }
 }

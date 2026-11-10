@@ -823,7 +823,10 @@ pub(super) async fn chain_harness(chain_root_pr: bool, origin: bool, conflict: b
     )
     .unwrap();
     db.mark_execution_orphaned(&prior.id, "engine crash").unwrap();
-    let next = db.request_resume_execution(&prior.id, 1, 0, "test").unwrap();
+    let next = db
+        .request_resume_execution(&prior.id, 1, 0, "test")
+        .unwrap()
+        .expect("resumable predecessor");
     assert!(next.pr_url.is_none(), "resume executions carry no pr_url");
 
     let repo = JjRepo::new(dir.path());
@@ -1027,7 +1030,10 @@ async fn rewritten_pr_dispatch_preserves_successor_work_through_second_recovery(
     db.mark_execution_orphaned(&h.next.id, "second crash").unwrap();
     // The second crash's lease is returned once its work is preserved, as for the first.
     release_finished_execution_lease(&db, &h.next.id);
-    h.next = db.request_resume_execution(&h.next.id, 1, 0, "test").unwrap();
+    h.next = db
+        .request_resume_execution(&h.next.id, 1, 0, "test")
+        .unwrap()
+        .expect("resumable predecessor");
     *h.cube.next_workspace_id.lock().await = Some("replacement".into());
     // A fresh coordinator models the restart and gives dispatch a fresh pool.
     h.coordinator = Arc::new(ExecutionCoordinator::new(

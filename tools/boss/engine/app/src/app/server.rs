@@ -2230,6 +2230,7 @@ async fn serve_scoped(
             reaper: Arc::clone(&server_state)
                 as Arc<dyn boss_engine_runtime::transient_recovery::TransientRecoveryReaper>,
             cube_client: server_state.cube_client.clone(),
+            host_adapters: server_state.execution_coordinator.host_adapter_provider(),
         },
         boss_engine_runtime::transient_recovery::DEFAULT_INTERVAL,
         transient_error_idle,

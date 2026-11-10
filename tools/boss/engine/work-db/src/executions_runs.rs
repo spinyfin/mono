@@ -476,16 +476,26 @@ impl WorkDb {
     ///
     /// Returns the successor, new or reused. Because the work item now has a
     /// live execution, the orphan-active sweep skips it (no double dispatch).
+    ///
+    /// Returns `None`, changing nothing, when the predecessor was settled by
+    /// someone else while the caller was preserving its work: it is already
+    /// `cancelled`, `completed`, `failed` or `abandoned`. A resume there would
+    /// restart cancelled work or duplicate finished work. Only an `orphaned`
+    /// predecessor (another recovery path got there first) still resumes.
     pub fn request_resume_execution(
         &self,
         dead_execution_id: &str,
         new_count: i64,
         dispatch_not_before_epoch: i64,
         reason: &str,
-    ) -> Result<WorkExecution> {
+    ) -> Result<Option<WorkExecution>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let dead = query_execution(&tx, dead_execution_id).require("execution", dead_execution_id)?;
+
+        if dead.status.is_terminal() && dead.status != ExecutionStatus::Orphaned {
+            return Ok(None);
+        }
 
         let now = now_string();
         if !dead.status.is_terminal() {
@@ -541,7 +551,7 @@ impl WorkDb {
                     )?;
                     let successor = query_execution(&tx, &id)?.context("resume successor disappeared")?;
                     tx.commit()?;
-                    return Ok(successor);
+                    return Ok(Some(successor));
                 }
             }
         }
@@ -574,7 +584,7 @@ impl WorkDb {
         let new_execution = query_execution(&tx, &new_id)?
             .with_context(|| format!("missing execution after resume insert: {new_id}"))?;
         tx.commit()?;
-        Ok(new_execution)
+        Ok(Some(new_execution))
     }
 
     /// Path of the most recent run's transcript for `execution_id`, or

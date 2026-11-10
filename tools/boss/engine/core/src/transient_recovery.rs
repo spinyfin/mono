@@ -50,12 +50,23 @@
 //!   4. **Resume** (transient, under the cap, not nudgeable): confirm pane
 //!      teardown, then preserve unpublished work and release the cube lease
 //!      through [`crate::workspace_lease_release::release_lease_after_inferred_death`].
-//!      An unconfirmed teardown or a kept lease leaves the execution live for
-//!      reconciliation and retry. Only after release completes does one
-//!      transaction orphan the execution and insert a `ready` successor with
-//!      the incremented retry count and backoff. It reuses any successor a
-//!      concurrent reconciler has inserted. The successor restores the
-//!      `preserved/<execution>` tip onto any free workspace. Preservation
+//!      An unconfirmed teardown leaves the execution live for reconciliation
+//!      and retry. Once teardown is confirmed, one transaction orphans the
+//!      execution and inserts a `ready` successor with the incremented retry
+//!      count and backoff (reusing any successor a concurrent reconciler has
+//!      inserted), whether or not the release completed. A release that
+//!      completes lets the successor restore the `preserved/<execution>` tip
+//!      onto any free workspace at once. A release that is kept or refused
+//!      leaves the now-terminal predecessor holding its lease, and dispatch
+//!      holds the successor until the responsible reconciler finishes the
+//!      release: the leftover-lease sweep for local runs, and
+//!      `remote_lease_reconcile` for runs on a remote host (the host's adapter
+//!      is passed here too, so an unoccupied remote workspace is released
+//!      immediately). A remote run with no recorded worker pid cannot be
+//!      probed by that reconciler, so a release that does not complete raises
+//!      an inspection attention item instead of holding silently. If the
+//!      predecessor was settled some other way (cancelled, completed) while
+//!      its work was being preserved, no successor is created. Preservation
 //!      failure raises an inspection attention item before releasing the
 //!      lease, so missing work is explicit.
 //!   5. **Escalate** (permanent / unrecognised / retry cap reached):
@@ -124,6 +135,7 @@ use crate::transient_error::{
 };
 use crate::work::{ATTENTION_KIND_RECOVERY_EXHAUSTED, ATTENTION_KIND_RECOVERY_PERMANENT, WorkDb};
 use crate::workspace_lease_release::{LeaseReleaseOutcome, PaneStatus, release_lease_after_inferred_death};
+use boss_execution_contracts::HostAdapterProvider;
 
 /// How often the sweep runs.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
@@ -198,6 +210,9 @@ pub struct RecoveryWorkers {
     /// Cube registry and lease operations, used to preserve a resumed run's
     /// work and return its workspace lease once its pane is gone.
     pub cube_client: Arc<dyn CubeClient>,
+    /// Resolves the owning host's adapter, so a remote run's workspace can be
+    /// probed and its lease released from here.
+    pub host_adapters: Arc<dyn HostAdapterProvider>,
 }
 
 /// No-op nudger used in tests and contexts without an app session.
@@ -245,6 +260,7 @@ pub struct RecoveryContext<'a> {
     pub nudger: &'a dyn WorkerNudger,
     pub reaper: &'a dyn TransientRecoveryReaper,
     pub cube_client: &'a dyn CubeClient,
+    pub host_adapters: &'a dyn HostAdapterProvider,
 }
 
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`,
@@ -286,6 +302,7 @@ pub fn spawn_loop(
                 nudger: workers.nudger.as_ref(),
                 reaper: workers.reaper.as_ref(),
                 cube_client: workers.cube_client.as_ref(),
+                host_adapters: workers.host_adapters.as_ref(),
             };
             let outcome = run_one_pass(&cx, &mut nudged_executions, now).await;
             if outcome.has_activity() {
@@ -319,6 +336,7 @@ pub fn spawn_loop(
                                     nudger: workers.nudger.as_ref(),
                                     reaper: workers.reaper.as_ref(),
                                     cube_client: workers.cube_client.as_ref(),
+                                    host_adapters: workers.host_adapters.as_ref(),
                                 };
                                 let outcome = run_for_execution(&cx, &mut nudged_executions, now, &execution_id).await;
                                 if outcome.has_activity() {
@@ -413,6 +431,7 @@ async fn process_state(
         nudger,
         reaper,
         cube_client,
+        host_adapters,
         ..
     } = cx;
     let coordinator = cx.coordinator.clone();
@@ -594,27 +613,40 @@ async fn process_state(
                 tracing::warn!(execution_id, "transient-recovery: teardown unconfirmed; resume waits");
                 return;
             }
-            let predecessor_lease = release_predecessor_lease(work_db, cube_client, &execution).await;
+            let predecessor_lease = release_predecessor_lease(work_db, cube_client, host_adapters, &execution).await;
             // A kept or failed release does not stop the resume. The pane is
             // gone, so this execution is no longer in the live states and no
             // later pass would revisit it; orphaning it here makes it
-            // terminal, which the leftover-lease sweep retries, and the resume
-            // row (carrying the incremented retry count and backoff) is held by
-            // dispatch until that release completes.
+            // terminal, which its reconciler (the leftover-lease sweep, or
+            // `remote_lease_reconcile` for a remote host) retries, and the
+            // resume row (carrying the incremented retry count and backoff) is
+            // held by dispatch until that release completes.
             let dispatch_not_before = now_epoch_secs + backoff.as_secs() as i64;
             let reason = format!(
                 "{stall_reason} (auto-resume attempt {attempt}/{max}): {clipped}",
                 max = policy.max_attempts(),
             );
-            if let Err(err) =
-                work_db.request_resume_execution(&execution_id, attempt as i64, dispatch_not_before, &reason)
-            {
-                tracing::warn!(
-                    execution_id,
-                    ?err,
-                    "transient-recovery: failed to create resume execution; skipping",
-                );
-                return;
+            match work_db.request_resume_execution(&execution_id, attempt as i64, dispatch_not_before, &reason) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    // Cancelled, completed or abandoned while its work was
+                    // being preserved: resuming would restart finished work.
+                    tracing::info!(
+                        execution_id,
+                        work_item_id = %work_item_id,
+                        "transient-recovery: execution was settled while its work was being \
+                         preserved; no resume execution created",
+                    );
+                    return;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        execution_id,
+                        ?err,
+                        "transient-recovery: failed to create resume execution; skipping",
+                    );
+                    return;
+                }
             }
             tracing::info!(
                 execution_id,
@@ -857,24 +889,61 @@ impl PredecessorLease {
 /// what remains for the gates to decide is whether a stray process still
 /// occupies the workspace.
 ///
+/// A run on a remote host is released through that host's adapter (resolved
+/// from the registry), which probes the remote workspace for occupancy and
+/// preserves over the same connection. Without an adapter the release cannot
+/// confirm the workspace is free, so the lease is kept.
+///
 /// Never retries or waits for the outcome: a lease that is kept stays
 /// recorded, and the caller still orphans the run and inserts the resume row,
-/// which dispatch holds until a later sweep completes the release.
+/// which dispatch holds until the responsible reconciler completes the release
+/// (the leftover-lease sweep for a local run, `remote_lease_reconcile` for a
+/// remote one that recorded a worker pid). A remote run with no recorded pid
+/// is beyond that reconciler's reach, so it raises an inspection attention
+/// item instead of leaving the successor held without anyone owning it.
 async fn release_predecessor_lease(
     work_db: &WorkDb,
     cube_client: &dyn CubeClient,
+    host_adapters: &dyn HostAdapterProvider,
     execution: &WorkExecution,
 ) -> PredecessorLease {
     let Some(lease_id) = execution.cube_lease_id.as_deref() else {
         return PredecessorLease::None;
     };
+    let host_id = work_db
+        .execution_host_id(&execution.id)
+        .ok()
+        .flatten()
+        .filter(|host| host != "local");
+    let adapter = match host_id.as_deref() {
+        Some(host_id) => match crate::host_adapter::resolve_host_adapter(work_db, host_adapters, host_id).await {
+            Ok(adapter) => Some(adapter),
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    host_id,
+                    error = %format!("{err:#}"),
+                    "transient-recovery: could not resolve the owning host's adapter; the lease will be kept",
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    const REASON: Option<&str> = Some("transient-recovery: stalled worker auto-resumed");
+    let release = async {
+        match adapter.as_deref() {
+            Some(adapter) => adapter.force_release_lease(lease_id, REASON).await,
+            None => cube_client.force_release_lease(lease_id, REASON).await,
+        }
+    };
     let outcome = release_lease_after_inferred_death(
         work_db,
         execution,
         PaneStatus::Gone,
-        None,
+        adapter.as_deref(),
         Some(cube_client),
-        cube_client.force_release_lease(lease_id, Some("transient-recovery: stalled worker auto-resumed")),
+        release,
     )
     .await;
     match outcome {
@@ -893,8 +962,9 @@ async fn release_predecessor_lease(
                 lease_id,
                 keep_reason = reason.label(),
                 "transient-recovery: the stalled run's cube lease was kept; the resume execution \
-                 is held by dispatch until the leftover-lease sweep releases it",
+                 is held by dispatch until the lease reconciler releases it",
             );
+            flag_unowned_hold(work_db, execution, host_id.as_deref(), lease_id, reason.label());
             PredecessorLease::Kept
         }
         LeaseReleaseOutcome::CubeFailed { error } => {
@@ -903,10 +973,49 @@ async fn release_predecessor_lease(
                 lease_id,
                 error = %error,
                 "transient-recovery: cube refused to release the stalled run's lease; the resume \
-                 execution is held by dispatch until the leftover-lease sweep releases it",
+                 execution is held by dispatch until the lease reconciler releases it",
+            );
+            flag_unowned_hold(
+                work_db,
+                execution,
+                host_id.as_deref(),
+                lease_id,
+                "cube refused the release",
             );
             PredecessorLease::CubeFailed
         }
+    }
+}
+
+/// Raise an inspection attention item when a remote run's lease was not
+/// released and no reconciler can pick it up later. `remote_lease_reconcile`
+/// finishes a remote release only for a run with a recorded worker pid (it
+/// proves death by probing that pid); without one the held successor would
+/// wait indefinitely.
+fn flag_unowned_hold(work_db: &WorkDb, execution: &WorkExecution, host_id: Option<&str>, lease_id: &str, why: &str) {
+    let Some(host_id) = host_id else {
+        return;
+    };
+    let has_pid = matches!(
+        work_db.latest_remote_run_for_execution(&execution.id),
+        Ok(Some(handle)) if handle.remote_pid.is_some()
+    );
+    if has_pid {
+        return;
+    }
+    let body = format!(
+        "The stalled worker on `{host_id}` is gone, but its cube lease `{lease_id}` could not be released ({why}) and \
+         no worker pid was recorded for the run, so the remote lease reconciler cannot release it later. The resume \
+         execution is held until the lease is released: inspect the workspace on `{host_id}`, recover anything \
+         unpublished, and release the lease."
+    );
+    if let Err(err) = work_db.upsert_execution_attention(
+        &execution.id,
+        boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND,
+        "Preserved work needs inspection",
+        &body,
+    ) {
+        tracing::warn!(execution_id = %execution.id, ?err, "transient-recovery: failed to raise the held-lease attention item");
     }
 }
 
@@ -1189,6 +1298,7 @@ mod tests {
             nudger,
             reaper: &reaper,
             cube_client: &cube,
+            host_adapters: &StubHosts(None),
         };
         let outcome = run_one_pass(&cx, nudged, now()).await;
         let reaped = reaper.reaped_ids().await;
@@ -1356,6 +1466,46 @@ mod tests {
     }
 
     /// The state left by [`resume_with_teardown`].
+    /// Resolves every host to the one stub adapter, or fails when none is set.
+    struct StubHosts(Option<Arc<dyn boss_execution_contracts::HostAdapter>>);
+
+    #[async_trait]
+    impl HostAdapterProvider for StubHosts {
+        async fn adapter_for(
+            &self,
+            _host: &crate::host_registry::Host,
+        ) -> Result<Arc<dyn boss_execution_contracts::HostAdapter>> {
+            self.0
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("no adapter for this host"))
+        }
+    }
+
+    /// A remote host whose workspace is unoccupied and whose cube releases.
+    struct RemoteStub {
+        host_id: String,
+        released: std::sync::Mutex<Vec<String>>,
+    }
+
+    crate::stub_host_adapter! { RemoteStub {
+        fn host_id(&self) -> &str {
+            &self.host_id
+        }
+        async fn force_release_lease(&self, lease_id: &str, _reason: Option<&str>) -> Result<()> {
+            self.released.lock().unwrap().push(lease_id.to_owned());
+            Ok(())
+        }
+        async fn probe_workspace_occupancy(&self, _: &std::path::Path) -> anyhow::Result<crate::workspace_lease_release::Occupancy> {
+            Ok(crate::workspace_lease_release::Occupancy::Empty)
+        }
+        async fn confirm_workspace_recovery(&self, record: &boss_engine_recovery::execution_bookmark::ExecutionBookmark, workspace: &std::path::Path, _recorded: Option<&boss_engine_recovery::execution_bookmark::PreservedTip>, _since_unix: Option<i64>) -> anyhow::Result<boss_engine_recovery::execution_bookmark::PreserveOutcome> {
+            crate::test_support::confirm_remote_test_recovery(record, workspace, &self.host_id).map(|()| Default::default())
+        }
+        async fn confirm_workspace_recovery_from(&self, record: &boss_engine_recovery::execution_bookmark::ExecutionBookmark, workspace: &std::path::Path, _recorded: Option<&boss_engine_recovery::execution_bookmark::PreservedTip>, _since_unix: Option<i64>, _tip_source: boss_engine_recovery::execution_bookmark::WorkspaceTipSource) -> anyhow::Result<boss_engine_recovery::execution_bookmark::PreserveOutcome> {
+            crate::test_support::confirm_remote_test_recovery(record, workspace, &self.host_id).map(|()| Default::default())
+        }
+    } }
+
     struct ResumeRun {
         /// Keeps the on-disk DB alive while `db` is used.
         _dir: TempDir,
@@ -1374,12 +1524,29 @@ mod tests {
     }
 
     async fn resume_with_teardown_on(teardown: PaneReleaseOutcome, host_id: &str) -> ResumeRun {
+        resume_with_hosts(teardown, host_id, None).await
+    }
+
+    /// [`resume_with_teardown_on`] where `host_adapter`, when given, is the
+    /// registered adapter of `host_id`; otherwise the host cannot be resolved.
+    async fn resume_with_hosts(
+        teardown: PaneReleaseOutcome,
+        host_id: &str,
+        host_adapter: Option<Arc<dyn boss_execution_contracts::HostAdapter>>,
+    ) -> ResumeRun {
         let (dir, db) = open_db();
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let transcript = write_transcript(&dir, "t.jsonl", &[NORMAL_LINE, SOCKET_ERROR_LINE]);
         let db = Arc::new(db);
         let dead_id = create_running_execution_on(&db, &work_item_id, &transcript, 0, host_id);
+        let hosts = match host_adapter {
+            Some(adapter) => {
+                db.add_host(host_id, "user@remote", 4, &[]).unwrap();
+                StubHosts(Some(adapter))
+            }
+            None => StubHosts(None),
+        };
 
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
@@ -1402,6 +1569,7 @@ mod tests {
             nudger: &NoopWorkerNudger,
             reaper: &reaper,
             cube_client: &cube,
+            host_adapters: &hosts,
         };
         let outcome = run_one_pass(&cx, &mut HashSet::new(), now()).await;
         assert_eq!(outcome.resumed, usize::from(teardown == PaneReleaseOutcome::Reaped));
@@ -1469,10 +1637,29 @@ mod tests {
         assert_eq!(events[0].details["predecessor_lease"], "released");
     }
 
-    /// A confirmed-gone worker on a remote host cannot be released from here
-    /// (no adapter), so the lease is kept. The run must still be orphaned and
-    /// a resume row inserted with the incremented count and backoff, held by
-    /// dispatch until the leftover-lease sweep releases the predecessor.
+    /// The successors of `dead_id` in its work item.
+    fn successors(db: &WorkDb, dead: &WorkExecution) -> Vec<WorkExecution> {
+        db.list_executions(Some(&dead.work_item_id))
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.id != dead.id)
+            .collect()
+    }
+
+    fn remote_stub() -> Arc<RemoteStub> {
+        Arc::new(RemoteStub {
+            host_id: "remote-host".into(),
+            released: std::sync::Mutex::default(),
+        })
+    }
+
+    /// A remote host whose adapter cannot be resolved cannot confirm the
+    /// workspace is free, so the lease is kept. The run must still be orphaned
+    /// and a resume row inserted with the incremented count and backoff, held
+    /// by dispatch; and because the run recorded no worker pid, no reconciler
+    /// could ever release it, so an attention item names the stranded lease.
+    /// Once the adapter is available the release goes through and the hold
+    /// clears.
     #[tokio::test]
     async fn resume_with_a_kept_lease_still_orphans_and_inserts_a_held_successor() {
         let ResumeRun {
@@ -1490,20 +1677,129 @@ mod tests {
         let dead = db.get_execution(&dead_id).unwrap();
         assert_eq!(dead.status, ExecutionStatus::Orphaned);
         assert_eq!(dead.cube_lease_id.as_deref(), Some("lease-1"));
-        let successors: Vec<_> = db
-            .list_executions(Some(&dead.work_item_id))
-            .unwrap()
-            .into_iter()
-            .filter(|e| e.id != dead_id)
-            .collect();
+        let successors = successors(&db, &dead);
         assert_eq!(successors.len(), 1);
         let next = &successors[0];
         assert_eq!(next.status, ExecutionStatus::Ready);
         assert_eq!(next.transient_failure_count, 1);
         assert!(next.dispatch_not_before.is_some());
         let held = db.recovery_predecessor_holding_lease(next).unwrap();
-        assert_eq!(held.map(|e| e.id), Some(dead_id));
+        assert_eq!(held.map(|e| e.id), Some(dead_id.clone()));
         assert_eq!(sink.events().await[0].details["predecessor_lease"], "kept");
+        let items = db.list_attention_items(&dead_id).unwrap();
+        let item = items
+            .iter()
+            .find(|item| {
+                item.kind == boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND
+            })
+            .unwrap_or_else(|| panic!("a hold nobody owns must raise an attention item: {items:?}"));
+        assert!(item.body_markdown.contains("lease-1"), "{}", item.body_markdown);
+
+        // The responsible release, once the host is reachable.
+        let adapter = remote_stub();
+        let recorder = adapter.clone();
+        let outcome = crate::remote_lease_reconcile::release_remote_lease(
+            &db,
+            adapter.as_ref(),
+            &dead_id,
+            crate::workspace_lease_release::PaneStatus::Gone,
+            |lease_id| async move {
+                recorder.released.lock().unwrap().push(lease_id);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            crate::workspace_lease_release::LeaseReleaseOutcome::Released
+        ));
+        assert!(db.recovery_predecessor_holding_lease(next).unwrap().is_none());
+        assert_eq!(db.get_execution(&next.id).unwrap().transient_failure_count, 1);
+    }
+
+    /// A confirmed-gone worker on a remote host is released through its own
+    /// host's adapter, so the resume row is not held at all.
+    #[tokio::test]
+    async fn resume_releases_a_remote_lease_through_the_owning_hosts_adapter() {
+        let adapter = remote_stub();
+        let ResumeRun {
+            db,
+            dead_id,
+            sink,
+            released,
+            ..
+        } = resume_with_hosts(
+            PaneReleaseOutcome::Reaped,
+            "remote-host",
+            Some(adapter.clone() as Arc<dyn boss_execution_contracts::HostAdapter>),
+        )
+        .await;
+
+        assert!(
+            released.is_empty(),
+            "the local cube must not release a remote lease: {released:?}"
+        );
+        assert_eq!(*adapter.released.lock().unwrap(), vec!["lease-1".to_owned()]);
+        let dead = db.get_execution(&dead_id).unwrap();
+        assert_eq!(dead.status, ExecutionStatus::Orphaned);
+        assert!(dead.cube_lease_id.is_none());
+        let successors = successors(&db, &dead);
+        assert_eq!(successors.len(), 1);
+        assert_eq!(successors[0].transient_failure_count, 1);
+        assert!(db.recovery_predecessor_holding_lease(&successors[0]).unwrap().is_none());
+        assert_eq!(sink.events().await[0].details["predecessor_lease"], "released");
+    }
+
+    /// An execution cancelled while its work was being preserved is not
+    /// resumed: no successor, no event.
+    #[tokio::test]
+    async fn resume_skips_an_execution_settled_during_preservation() {
+        let (dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let transcript = write_transcript(&dir, "t.jsonl", &[NORMAL_LINE, SOCKET_ERROR_LINE]);
+        let db = Arc::new(db);
+        let dead_id = create_running_execution(&db, &work_item_id, &transcript, 0);
+        let live = Arc::new(LiveWorkerStateRegistry::new());
+        let coordinator = make_coordinator(db.clone(), 2);
+        let worker_id = coordinator.worker_pool().claim_worker(&dead_id, None).await.unwrap();
+        let slot_id = boss_execution_contracts::slot_id_from_worker_id(&worker_id).unwrap();
+        register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
+
+        /// Cancels the run the moment its lease is released: the window
+        /// between preservation and the resume transaction.
+        struct CancelOnRelease(Arc<WorkDb>);
+        crate::stub_cube_client! { CancelOnRelease {
+            async fn force_release_lease(&self, _lease_id: &str, _reason: Option<&str>) -> Result<()> {
+                let id = self.0.list_executions(None).unwrap()[0].id.clone();
+                self.0.cancel_running_execution(&id).unwrap();
+                Ok(())
+            }
+            async fn list_workspaces(&self) -> Result<Vec<boss_host_execution::types::CubeWorkspaceStatus>> {
+                Ok(Vec::new())
+            }
+        } }
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let reaper = RecordingReaper::reporting(PaneReleaseOutcome::Reaped);
+        let cube = CancelOnRelease(db.clone());
+        let cx = RecoveryContext {
+            work_db: &db,
+            live_states: &live,
+            coordinator: coordinator.clone(),
+            dispatch_events: sink.as_ref(),
+            policy: &RecoveryPolicy::default(),
+            nudger: &NoopWorkerNudger,
+            reaper: &reaper,
+            cube_client: &cube,
+            host_adapters: &StubHosts(None),
+        };
+        let outcome = run_one_pass(&cx, &mut HashSet::new(), now()).await;
+
+        assert_eq!(outcome.resumed, 0);
+        assert_eq!(db.get_execution(&dead_id).unwrap().status, ExecutionStatus::Cancelled);
+        assert_eq!(db.list_executions(Some(&work_item_id)).unwrap().len(), 1);
+        assert!(sink.events().await.is_empty(), "{:?}", sink.events().await);
     }
 
     #[tokio::test]
@@ -2096,6 +2392,7 @@ mod tests {
             nudger: &nudger,
             reaper: &reaper,
             cube_client: &cube,
+            host_adapters: &StubHosts(None),
         };
         let mut nudged = HashSet::new();
 
@@ -2131,6 +2428,7 @@ mod tests {
             nudger: &NoopWorkerNudger,
             reaper: &reaper,
             cube_client: &cube,
+            host_adapters: &StubHosts(None),
         };
         let mut nudged = HashSet::new();
 
@@ -2178,6 +2476,7 @@ mod tests {
             nudger: &NoopWorkerNudger,
             reaper: &reaper,
             cube_client: &cube,
+            host_adapters: &StubHosts(None),
         };
         let mut nudged = HashSet::new();
 

@@ -70,12 +70,21 @@ so with the loss on record.
 
 Transient recovery confirms pane teardown, preserves the stalled run's work,
 and releases its lease through the same inferred-death release the dead-pid,
-stale-worker and spawn-ack sweeps use before inserting a successor. Unconfirmed
-teardown or incomplete release leaves the execution live for reconciliation
-and retry. After release, one transaction orphans the stalled run and inserts
-its successor, reusing an existing successor if a concurrent reconciler
-created one. The successor carries no workspace preference and leases any
-free workspace; the work reaches it through the preserved tip.
+stale-worker and spawn-ack sweeps use (for a remote run, through the owning
+host's adapter) before inserting a successor. Unconfirmed teardown leaves the
+execution live for reconciliation and retry. Once teardown is confirmed, one
+transaction orphans the stalled run and inserts its successor (reusing an
+existing successor if a concurrent reconciler created one), whether or not the
+release completed. If the release was kept or refused, the orphaned
+predecessor keeps its lease and dispatch holds the successor until the
+responsible reconciler finishes preservation and release: the leftover-lease
+sweep for a local run, and the remote lease reconcile for a remote run with a
+recorded worker pid. A remote run with no recorded pid is beyond that
+reconciler, so an incomplete release raises a `preserved_work_needs_inspection`
+attention item on the predecessor rather than holding silently. If the run was
+cancelled or otherwise settled while its work was being preserved, no successor
+is created. The successor carries no workspace preference and leases any free
+workspace; the work reaches it through the preserved tip.
 
 ## How orphans get detected
 
