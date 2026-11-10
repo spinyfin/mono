@@ -281,10 +281,6 @@ mod tests {
 
     use super::*;
     use std::ffi::OsString;
-
-    const CREDENTIALS_DIRNAME: &str = "hub-credentials";
-    const TLS_CERT_FILENAME: &str = "hub-tls.crt";
-    const TLS_KEY_FILENAME: &str = "hub-tls.key";
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
@@ -293,6 +289,7 @@ mod tests {
     use boss_protocol_spoke::v1::enrollment_client::EnrollmentClient;
     use boss_protocol_spoke::v1::spoke_hub_client::SpokeHubClient;
     use boss_protocol_spoke::v1::{self, EnrollRequest, spoke_frame};
+
     use rcgen::string::Ia5String;
     use rcgen::{
         BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
@@ -302,6 +299,10 @@ mod tests {
     use tokio_stream::wrappers::ReceiverStream;
     use tonic::Code;
     use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
+
+    const CREDENTIALS_DIRNAME: &str = "hub-credentials";
+    const TLS_CERT_FILENAME: &str = "hub-tls.crt";
+    const TLS_KEY_FILENAME: &str = "hub-tls.key";
 
     fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
         |name| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| OsString::from(*v))

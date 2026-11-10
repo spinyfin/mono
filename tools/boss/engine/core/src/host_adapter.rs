@@ -30,6 +30,7 @@ use tokio::sync::Mutex;
 
 use crate::config::RuntimeConfig;
 use crate::host_registry::Host;
+use crate::hub_spawn::REMOTE_BOSS_EVENT_BIN;
 use crate::remote_wrapper::remote_wrapper_path;
 use crate::runner::{ComposedWorkerSpawn, WorkerSpawnOpts, compose_worker_spawn, work_item_name};
 use crate::ssh_spawn::{
@@ -51,8 +52,6 @@ use boss_host_execution::types::{
 /// sees them — the same invariant the local runner keeps by writing
 /// settings under the system temp dir.
 const REMOTE_SETTINGS_DIR: &str = ".boss-remote/settings";
-
-use crate::hub_spawn::REMOTE_BOSS_EVENT_BIN;
 
 /// Prints `EMPTY`, `OCCUPIED` or `UNKNOWN` for "does any process owned by the
 /// current user have its cwd in `$1`". Only the user's own processes are

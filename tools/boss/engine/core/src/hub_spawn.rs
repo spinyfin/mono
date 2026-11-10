@@ -150,19 +150,24 @@ pub async fn compose_remote_spawn(request: ComposeRemoteSpawn<'_>) -> Result<Spa
         pr_url_output,
         ..Default::default()
     };
-    // Peers that predate these fields would launch with default effort and
-    // without the output variables the prompt references, so the spawn must
-    // be refused for them rather than silently degraded.
+    require_launch_inputs(&mut spawn);
+    spawn
+        .validate()
+        .map_err(|err: ValidationError| anyhow::anyhow!("spoke spawn: {err}"))?;
+    Ok(spawn)
+}
+
+/// Peers that predate the launch-input fields would launch with default
+/// effort and without the output variables the prompt references, so a spawn
+/// that depends on them is refused for those peers rather than silently
+/// degraded.
+fn require_launch_inputs(spawn: &mut Spawn) {
     if spawn.effort.is_some() || spawn.structured_output_kind.is_some() || spawn.pr_url_output {
         spawn.required_features.push(boss_protocol_spoke::v1::Feature {
             name: boss_protocol_spoke::negotiate::feature::SPAWN_LAUNCH_INPUTS.to_owned(),
             revision: 1,
         });
     }
-    spawn
-        .validate()
-        .map_err(|err: ValidationError| anyhow::anyhow!("spoke spawn: {err}"))?;
-    Ok(spawn)
 }
 
 #[derive(bon::Builder)]
@@ -470,6 +475,13 @@ mod tests {
         assert_eq!(spawn.effort.as_deref(), Some("medium"));
         assert_eq!(spawn.structured_output_kind.as_deref(), Some("followups"));
         assert!(spawn.pr_url_output);
+        assert_eq!(
+            spawn.required_features,
+            vec![boss_protocol_spoke::v1::Feature {
+                name: "spawn-launch-inputs".into(),
+                revision: 1,
+            }]
+        );
         assert!(!spawn.model.is_empty());
         assert!(!spawn.prompt_utf8.is_empty());
         let settings = String::from_utf8(spawn.settings_json.clone()).unwrap();
@@ -497,5 +509,33 @@ mod tests {
             "credential or hub events env leaked: {:?}",
             spawn.env
         );
+    }
+
+    #[test]
+    fn require_launch_inputs_only_when_a_launch_input_is_set() {
+        let required = |mut spawn: Spawn| {
+            require_launch_inputs(&mut spawn);
+            spawn.required_features
+        };
+        assert!(required(Spawn::default()).is_empty());
+        for spawn in [
+            Spawn {
+                effort: Some("high".into()),
+                ..Default::default()
+            },
+            Spawn {
+                structured_output_kind: Some("followups".into()),
+                ..Default::default()
+            },
+            Spawn {
+                pr_url_output: true,
+                ..Default::default()
+            },
+        ] {
+            let features = required(spawn);
+            assert_eq!(features.len(), 1);
+            assert_eq!(features[0].name, "spawn-launch-inputs");
+            assert_eq!(features[0].revision, 1);
+        }
     }
 }

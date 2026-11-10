@@ -421,8 +421,14 @@ pub fn contracts() -> Contracts {
 /// Features offered when a workspace executor is attached. Keep this list in
 /// lockstep with executor support: every workspace op that needs a negotiated
 /// feature is advertised from here, so Hello and the executor cannot drift.
-/// Protocol-optional names stay optional; the rest are required.
-const EXECUTOR_FEATURES: &[&str] = &[feature::WORKSPACE, feature::EXECUTION, feature::WORKSPACE_RESET_RELEASE];
+/// Protocol-optional names (`workspace-reset-release`, `spawn-launch-inputs`)
+/// stay optional; the rest are required.
+const EXECUTOR_FEATURES: &[&str] = &[
+    feature::WORKSPACE,
+    feature::EXECUTION,
+    feature::WORKSPACE_RESET_RELEASE,
+    feature::SPAWN_LAUNCH_INPUTS,
+];
 
 /// Journal contracts plus the executor-backed workspace/execution set.
 pub fn executor_contracts() -> Contracts {
@@ -437,6 +443,13 @@ pub fn executor_contracts() -> Contracts {
         }
     }
     contracts
+}
+
+/// What a spoke that runs workers itself offers. Same set as
+/// [`executor_contracts`]: journal plus executor-backed workspace/execution,
+/// including optional `workspace-reset-release` and `spawn-launch-inputs`.
+pub fn execution_contracts() -> Contracts {
+    executor_contracts()
 }
 
 pub fn hello(journal: &Journal, boot_id: &str, nonce: &[u8]) -> Result<Hello> {
@@ -550,6 +563,17 @@ mod tests {
                 .iter()
                 .any(|name| name == feature::WORKSPACE_RESET_RELEASE),
             "reset-release stays optional so older hubs can still connect"
+        );
+        assert!(
+            offered
+                .features
+                .iter()
+                .any(|item| item.name == feature::SPAWN_LAUNCH_INPUTS && item.revision == 1),
+            "executor Hello must advertise spawn-launch-inputs/1"
+        );
+        assert!(
+            !offered.required.iter().any(|name| name == feature::SPAWN_LAUNCH_INPUTS),
+            "spawn-launch-inputs stays optional so older hubs can still connect"
         );
         assert_eq!(
             offered.features.len(),

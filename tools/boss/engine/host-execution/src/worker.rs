@@ -922,7 +922,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         }
     }
 
-    /// Remove the run's input home, outputs directory and settings file. The outcome is recorded
+    /// Remove the run's input home and settings file; the outputs directory is retained (see below). The outcome is recorded
     /// on the record: `reclaimed` once clean, otherwise the error to retry.
     fn reclaim(&self, record: &mut ExecutionRecord) {
         if record.reclaimed {
@@ -935,12 +935,10 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         {
             errors.push(format!("settings file: {error}"));
         }
-        let outputs = outputs_root(&self.homes_root, &record.spawn_token);
-        if let Err(error) = std::fs::remove_dir_all(&outputs)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            errors.push(format!("outputs directory: {error}"));
-        }
+        // The outputs directory is deliberately kept: it holds the files the
+        // worker wrote through the output variables, which are completion
+        // evidence until the hub has finalized the run. `prune_stale_outputs`
+        // removes it once the retention window has passed.
         let home = if let Some(state) = &record.runtime_state {
             // Provisioning wrote files somewhere; a state naming no home the
             // spoke recognises cannot be cleaned up, so it never counts as done.
@@ -968,6 +966,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
     /// command on the same record, and works from persisted records so it also
     /// covers workers that exited while the daemon was down.
     pub async fn sweep(&self) -> Vec<(String, String)> {
+        prune_stale_outputs(&self.homes_root, OUTPUT_RETENTION);
         let Ok(records) = assigned_records(&self.store) else {
             return vec![("-".into(), "execution store unavailable".into())];
         };
@@ -1019,6 +1018,32 @@ const OUTPUT_ENV_NAMES: &[&str] = &[
     "BOSS_STRUCTURED_OUTPUT_KIND",
     "BOSS_PR_URL_OUTPUT",
 ];
+
+/// How long a run's output files survive after the run last touched them.
+const OUTPUT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Remove `outputs-*` directories under `homes_root` untouched for longer than
+/// `retention`. Best effort: a directory that cannot be removed is retried by
+/// the next sweep.
+fn prune_stale_outputs(homes_root: &Path, retention: Duration) {
+    let Ok(entries) = std::fs::read_dir(homes_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with("outputs-") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > retention);
+        if stale {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
 
 fn outputs_root(homes_root: &Path, spawn_token: &str) -> PathBuf {
     homes_root.join(format!("outputs-{}", hex_token(spawn_token)))
@@ -2506,6 +2531,28 @@ mod tests {
             }
         }
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+    }
+
+    #[tokio::test]
+    async fn terminal_settle_keeps_an_already_written_output_file() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeTmux::default());
+        let supervisor = supervisor(root.path(), fake.clone()).await;
+        seed(&supervisor.store, Phase::Alive);
+        let mut record = stored(&supervisor.store);
+        let dir = outputs_root(&supervisor.homes_root, &record.spawn_token);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("result.json"), "evidence").unwrap();
+        supervisor.reclaim(&mut record);
+        assert!(record.reclaimed, "{:?}", record.reclaim_error);
+        assert_eq!(std::fs::read_to_string(dir.join("result.json")).unwrap(), "evidence");
+        prune_stale_outputs(&supervisor.homes_root, OUTPUT_RETENTION);
+        assert!(
+            dir.join("result.json").exists(),
+            "fresh output survives the retention sweep"
+        );
+        prune_stale_outputs(&supervisor.homes_root, Duration::ZERO);
+        assert!(!dir.exists(), "output past retention is removed");
     }
 
     #[test]

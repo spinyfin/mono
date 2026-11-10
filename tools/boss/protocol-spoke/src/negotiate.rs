@@ -294,6 +294,7 @@ mod tests {
             .expect("required features suffice");
         assert!(!selection.has(feature::PANE_CAPTURE));
         assert!(!selection.has(feature::UPGRADE));
+        assert!(!selection.has(feature::WORKSPACE_RESET_RELEASE));
         assert!(!selection.has(feature::SPAWN_LAUNCH_INPUTS));
         assert!(selection.has(feature::EXECUTION));
     }
