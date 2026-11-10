@@ -792,6 +792,7 @@ mod floor_tests {
         super::super::parking_reconcile::migrate_cancel_provenance(&expected).unwrap();
         super::super::dispatch_focus::migrate_explicit_launch(&expected).unwrap();
         execution_bookmarks::migrate_retire_prune_state(&expected).unwrap();
+        super::super::spoke_ingress::migrate(&expected).unwrap();
         preserved_cleanup::migrate_archive_cleanup(&expected).unwrap();
         let before = capture(&expected);
         drop(expected);

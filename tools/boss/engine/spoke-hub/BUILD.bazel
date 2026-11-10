@@ -1,0 +1,45 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+# Production hub stream service: WorkDb-backed journals, enrollment, and the
+# authenticated listener. engine/core adds itself to `visibility` when it
+# installs an adapter. Dispatch stays on SSH until that adapter is present
+# and host readiness is proven.
+rust_library(
+    name = "spoke-hub",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "boss_spoke_hub",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = [
+        "//tools/boss/engine/host-enrollment",
+        "//tools/boss/engine/spoke-stream",
+        "//tools/boss/engine/work-db",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "integration_test",
+    size = "medium",
+    srcs = glob(["tests/**/*.rs"]),
+    crate_root = "tests/main.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":spoke-hub",
+        "//tools/boss/engine/host-enrollment",
+        "//tools/boss/engine/spoke-stream",
+        "//tools/boss/engine/work-db",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

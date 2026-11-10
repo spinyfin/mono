@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 
 use crate::StreamManager;
+use crate::store::CommandAdmission;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CommandOutcome {
@@ -27,18 +28,26 @@ impl StreamManager {
     /// Persist then wake the writer. Only a committed matching result succeeds.
     /// A timeout, cancellation or disconnect never deletes the durable command.
     /// Retry with exactly the same ID and content; never redispatch to a new host.
+    /// The caller states whether this command starts work or only addresses an
+    /// existing assignment (`admission`); the stream does not infer it.
     pub async fn command(
         &self,
         host_id: &str,
+        admission: CommandAdmission,
         command: Command,
         deadline: Duration,
     ) -> Result<CommandResult, CommandOutcome> {
-        tokio::time::timeout(deadline, self.command_inner(host_id, command))
+        tokio::time::timeout(deadline, self.command_inner(host_id, admission, command))
             .await
             .unwrap_or(Err(CommandOutcome::OutcomeUncertain))
     }
 
-    async fn command_inner(&self, host_id: &str, mut command: Command) -> Result<CommandResult, CommandOutcome> {
+    async fn command_inner(
+        &self,
+        host_id: &str,
+        admission: CommandAdmission,
+        mut command: Command,
+    ) -> Result<CommandResult, CommandOutcome> {
         use CommandOutcome::*;
         if command.sequence != 0 {
             return Err(Invalid);
@@ -79,7 +88,7 @@ impl StreamManager {
         let (tx, rx) = oneshot::channel();
         connection.waiters.insert(id.clone(), tx);
         let storage = &self.0.storage.outbox;
-        if storage.append(host_id, command).await.is_err() {
+        if storage.append(host_id, admission, command).await.is_err() {
             connection.waiters.remove(&id);
             return Err(OutcomeUncertain);
         }

@@ -27,6 +27,18 @@ pub struct Session {
     pub selection: Selection,
 }
 
+/// Whether a run-bound command may start new work or only address an
+/// assignment that has already been made. The authorizing caller decides; the
+/// outbox never infers it from the command body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandAdmission {
+    /// The newest assignment generation must still be unresolved.
+    Start,
+    /// Stays addressable after the assignment resolves: cleanup, structured
+    /// output reads, and bookmark recovery.
+    Recovery,
+}
+
 pub struct Admission {
     pub generation: u64,
     pub received: Cursor,
@@ -71,10 +83,11 @@ pub trait CommandOutbox: Send + Sync {
     async fn resume(&self, host: &str, receipt: Option<&Cursor>) -> Result<CommandJournal, StoreError>;
 
     /// Persist an already-authorized request/assignment and allocate sequence.
-    /// Input sequence is zero. Reusing an ID with identical input returns the
+    /// `admission` is the caller's decision about whether the run may still be
+    /// started or is only being addressed. Input sequence is zero. Reusing an ID with identical input returns the
     /// original command; changed input is denied. Enforce durable count/byte
     /// quotas, including unresolved receipted commands. Never delete on timeout.
-    async fn append(&self, host: &str, command: Command) -> Result<Command, StoreError>;
+    async fn append(&self, host: &str, admission: CommandAdmission, command: Command) -> Result<Command, StoreError>;
 
     /// Return at most one original encoded Command after `after`, in sequence
     /// order. Delivered sequences are a contiguous prefix: the result is always

@@ -263,6 +263,11 @@ pub struct RecoveryContext<'a> {
     pub reaper: &'a dyn TransientRecoveryReaper,
     pub cube_client: &'a dyn CubeClient,
     pub host_adapters: &'a dyn HostAdapterProvider,
+    /// Occupancy probe used when the resume releases the stalled run's lease.
+    /// Production leaves this `None` so the host process table is scanned.
+    /// Tests that are covering preservation, not occupancy, inject
+    /// [`crate::workspace_lease_release::EmptyOccupancy`].
+    pub occupancy: Option<&'a dyn WorkspaceOccupancy>,
 }
 
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`,
@@ -305,6 +310,7 @@ pub fn spawn_loop(
                 reaper: workers.reaper.as_ref(),
                 cube_client: workers.cube_client.as_ref(),
                 host_adapters: workers.host_adapters.as_ref(),
+                occupancy: None,
             };
             let outcome = run_one_pass(&cx, &mut nudged_executions, now).await;
             if outcome.has_activity() {
@@ -339,6 +345,7 @@ pub fn spawn_loop(
                                     reaper: workers.reaper.as_ref(),
                                     cube_client: workers.cube_client.as_ref(),
                                     host_adapters: workers.host_adapters.as_ref(),
+                                    occupancy: None,
                                 };
                                 let outcome = run_for_execution(&cx, &mut nudged_executions, now, &execution_id).await;
                                 if outcome.has_activity() {
@@ -626,8 +633,14 @@ async fn process_state(
                 tracing::warn!(execution_id, "transient-recovery: teardown unconfirmed; resume waits");
                 return;
             }
-            let predecessor_lease =
-                release_predecessor_lease(work_db, cube_client, host_adapters, &execution, occupancy).await;
+            let predecessor_lease = release_predecessor_lease(
+                work_db,
+                cube_client,
+                host_adapters,
+                &execution,
+                occupancy.or(cx.occupancy),
+            )
+            .await;
             // A kept or failed release does not stop the resume. The pane is
             // gone, so this execution is no longer in the live states and no
             // later pass would revisit it; orphaning it here makes it
@@ -1315,6 +1328,7 @@ mod tests {
             reaper: &reaper,
             cube_client: &cube,
             host_adapters: &StubHosts(None),
+            occupancy: None,
         };
         let outcome = run_one_pass(&cx, nudged, now()).await;
         let reaped = reaper.reaped_ids().await;
@@ -1586,6 +1600,7 @@ mod tests {
             reaper: &reaper,
             cube_client: &cube,
             host_adapters: &hosts,
+            occupancy: None,
         };
         let outcome = run_one_pass(&cx, &mut HashSet::new(), now()).await;
         assert_eq!(outcome.resumed, usize::from(teardown == PaneReleaseOutcome::Reaped));
@@ -1809,6 +1824,7 @@ mod tests {
             reaper: &reaper,
             cube_client: &cube,
             host_adapters: &StubHosts(None),
+            occupancy: None,
         };
         let outcome = run_one_pass(&cx, &mut HashSet::new(), now()).await;
 
@@ -2409,6 +2425,7 @@ mod tests {
             reaper: &reaper,
             cube_client: &cube,
             host_adapters: &StubHosts(None),
+            occupancy: None,
         };
         let mut nudged = HashSet::new();
 
@@ -2445,6 +2462,7 @@ mod tests {
             reaper: &reaper,
             cube_client: &cube,
             host_adapters: &StubHosts(None),
+            occupancy: None,
         };
         let mut nudged = HashSet::new();
 
@@ -2493,6 +2511,7 @@ mod tests {
             reaper: &reaper,
             cube_client: &cube,
             host_adapters: &StubHosts(None),
+            occupancy: None,
         };
         let mut nudged = HashSet::new();
 
