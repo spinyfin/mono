@@ -320,7 +320,7 @@ fn legacy_binding(conn: &Connection, execution_id: &str) -> Result<Option<String
     Ok(conn
         .query_row(
             // A claim binds while its destination can be leasing or running: a
-            // run was recorded on the claimed host, or the claim is recent and
+            // live execution has a run on the claimed host, or the claim is recent and
             // the host still has the transport it was made under. A claim whose
             // destination never leased (an unreachable SSH host) expires, and
             // one made while the host was `spoke_pending` stops binding once the
@@ -328,7 +328,9 @@ fn legacy_binding(conn: &Connection, execution_id: &str) -> Result<Option<String
             "SELECT d.host_id FROM legacy_destinations d
               WHERE d.execution_id = ?1
                 AND (EXISTS(SELECT 1 FROM work_runs r
-                             WHERE r.execution_id = d.execution_id AND COALESCE(r.host_id, 'local') = d.host_id)
+                             JOIN work_executions e ON e.id = r.execution_id
+                             WHERE r.execution_id = d.execution_id AND e.status IN ('running', 'waiting_human')
+                               AND COALESCE(r.host_id, 'local') = d.host_id)
                      OR (d.claimed_at_ms > ?2
                          AND d.transport = COALESCE((SELECT transport FROM host_transports WHERE host_id = d.host_id),
                                                     'legacy_ssh')))",
@@ -1540,6 +1542,22 @@ mod tests {
         assert_eq!(db.legacy_destination_host("exec_1").unwrap().as_deref(), Some("ssh-a"));
         let refused = db.reserve_spoke_assignment("exec_1", "host-a").unwrap_err();
         assert_eq!(legacy_held_by(&refused).as_deref(), Some("ssh-a"));
+        // The dispatch action finishing does not imply the worker has ended.
+        let conn = db.connect().unwrap();
+        conn.execute("UPDATE work_runs SET status = 'completed' WHERE id = 'run_1'", [])
+            .unwrap();
+        drop(conn);
+        assert_eq!(db.legacy_destination_host("exec_1").unwrap().as_deref(), Some("ssh-a"));
+        // A terminal execution with no lease must not stay bound by its history.
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = 'exec_1'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(db.legacy_destination_host("exec_1").unwrap().is_none());
+        db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
     }
 
     #[test]

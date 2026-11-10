@@ -281,7 +281,13 @@ impl SpokeHostAdapter {
         };
         let sent = match stable_id {
             Some(prefix) => {
-                let id = self.stable_control_id(&assignment, &prefix).await?;
+                let id = if name == "adopt" {
+                    self.hub
+                        .current_attempt(self.host_name(), &format!("{prefix}-{}", assignment.run_id), |_| true)
+                        .await?
+                } else {
+                    self.stable_control_id(&assignment, &prefix).await?
+                };
                 self.hub
                     .send_stable(self.host_name(), name, id, Some(run_of(&assignment)), body, deadline)
                     .await
@@ -399,11 +405,12 @@ impl SpokeHostAdapter {
             return Ok(None);
         }
         let sent = self
-            .control(
+            .control_with(
                 execution_id,
                 "adopt",
                 self.hub.config.command_deadline,
                 command::Body::Adopt(Empty {}),
+                Some("adopt".to_owned()),
             )
             .await?;
         match sent {

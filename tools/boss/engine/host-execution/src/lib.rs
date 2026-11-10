@@ -1413,7 +1413,12 @@ mod validation {
                 }
                 allowed.request_json.clone_from(&op.request_json);
             }
-            Kind::Release | Kind::Status | Kind::ListWorkspaces | Kind::ListRepos | Kind::CheckpointBaseline => {}
+            Kind::Release
+            | Kind::ReleaseWithReset
+            | Kind::Status
+            | Kind::ListWorkspaces
+            | Kind::ListRepos
+            | Kind::CheckpointBaseline => {}
         }
         if matches!(
             kind,
@@ -1519,13 +1524,16 @@ pub mod workspace {
                 result.reason = "command expired".into();
                 return result;
             }
-            // Only reads and acquisition reconciliation may run after an uncertain
+            // Reads, acquisition and release reconciliation may run after an uncertain
             // effect. In particular, replaying a heartbeat would extend a relative
             // TTL beyond the original attempt; that policy decision belongs to the hub.
             if interrupted
                 && !matches!(
                     kind,
                     Kind::Lease
+                        | Kind::Release
+                        | Kind::ReleaseWithReset
+                        | Kind::ForceRelease
                         | Kind::ListRepos
                         | Kind::ListWorkspaces
                         | Kind::Status
@@ -1620,7 +1628,7 @@ pub mod workspace {
             // working directory disappeared. Only filesystem operations open it.
             let path = if matches!(
                 Kind::try_from(op.kind)?,
-                Kind::Release | Kind::ForceRelease | Kind::Heartbeat | Kind::Status
+                Kind::Release | Kind::ReleaseWithReset | Kind::ForceRelease | Kind::Heartbeat | Kind::Status
             ) {
                 ws.workspace_path.clone()
             } else {
@@ -1710,6 +1718,27 @@ pub mod workspace {
             ))
         }
 
+        /// After authorization, cube may commit a release and then lose its
+        /// reply. Its registry proves whether this exact lease is still held.
+        async fn release(&self, op: &WorkspaceOp, kind: Kind) -> Result<()> {
+            let outcome = match kind {
+                Kind::ReleaseWithReset => cube::release_workspace_with_reset(&self.cube, &op.lease_id).await,
+                Kind::ForceRelease => cube::force_release_lease(&self.cube, &op.lease_id, Some(&op.reason)).await,
+                _ => cube::release_workspace(&self.cube, &op.lease_id).await,
+            };
+            if outcome.is_err() && self.lease_is_gone(op).await? {
+                return Ok(());
+            }
+            outcome
+        }
+
+        async fn lease_is_gone(&self, op: &WorkspaceOp) -> Result<bool> {
+            Ok(!cube::registered_workspaces(&self.cube)
+                .await?
+                .iter()
+                .any(|row| row.status.lease_id.as_deref() == Some(&op.lease_id)))
+        }
+
         async fn dispatch(
             &self,
             command: &Command,
@@ -1726,6 +1755,15 @@ pub mod workspace {
                 ..Default::default()
             };
             let mut value = json!({});
+            // A replay of a journaled, interrupted release may arrive after
+            // cube ended the lease. Never touch a newer holder of the workspace.
+            if interrupted
+                && matches!(kind, Kind::Release | Kind::ReleaseWithReset | Kind::ForceRelease)
+                && self.lease_is_gone(op).await?
+            {
+                result.cube_result_json = serde_json::to_vec(&value)?;
+                return Ok((result, false));
+            }
             match kind {
                 Kind::EnsureRepo => {
                     *phase = Phase::Effect;
@@ -1755,6 +1793,7 @@ pub mod workspace {
                     if matches!(
                         kind,
                         Kind::Release
+                            | Kind::ReleaseWithReset
                             | Kind::ForceRelease
                             | Kind::Heartbeat
                             | Kind::CreateChange
@@ -1765,10 +1804,7 @@ pub mod workspace {
                         *phase = Phase::Effect;
                     }
                     match kind {
-                        Kind::Release => cube::release_workspace(&self.cube, &op.lease_id).await?,
-                        Kind::ForceRelease => {
-                            cube::force_release_lease(&self.cube, &op.lease_id, Some(&op.reason)).await?
-                        }
+                        Kind::Release | Kind::ReleaseWithReset | Kind::ForceRelease => self.release(op, kind).await?,
                         Kind::Heartbeat => {
                             cube::heartbeat_lease(
                                 &self.cube,
@@ -1943,22 +1979,23 @@ mod tests {
             body: Some(command::Body::Workspace(op)),
         }
     }
+    #[derive(bon::Builder)]
+    #[builder(on(String, into))]
     pub(super) struct Cube {
+        #[builder(default = true)]
         lost_reply: bool,
+        #[builder(default)]
+        lose_release_reply: bool,
         root: PathBuf,
         path: PathBuf,
+        #[builder(default)]
         pub(super) owner: Mutex<Option<String>>,
+        #[builder(default)]
         calls: Mutex<Vec<Vec<String>>>,
     }
     impl Cube {
         pub(super) fn new(root: &std::path::Path) -> Self {
-            Self {
-                lost_reply: true,
-                root: root.into(),
-                path: root.join("worker"),
-                owner: Mutex::new(None),
-                calls: Mutex::new(Vec::new()),
-            }
+            Self::builder().root(root.into()).path(root.join("worker")).build()
         }
         fn lease_calls(&self) -> usize {
             self.calls
@@ -1994,6 +2031,10 @@ mod tests {
                     Ok(
                         json!({"workspace": {"workspace_id": "worker", "lease_id": "lease", "workspace_path": self.path}}),
                     )
+                }
+                ["--json", "workspace", "release" | "force-release", ..] if self.lose_release_reply => {
+                    *self.owner.lock().unwrap() = None;
+                    anyhow::bail!("reply lost after cube released lease");
                 }
                 ["--json", "change", "create", ..] => Ok(json!({"change": {"change_id": "change"}})),
                 _ => Ok(json!({})),
@@ -2333,6 +2374,7 @@ mod tests {
             Kind::GotoPr,
             Kind::GotoRevision,
             Kind::Release,
+            Kind::ReleaseWithReset,
             Kind::ForceRelease,
         ] {
             let mut request = op(kind);
@@ -2348,6 +2390,11 @@ mod tests {
         }
         assert_eq!(executor.cube.lease_calls(), 1);
         let calls = executor.cube.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|args| args == &["--json", "workspace", "release", "--lease", "lease", "--force-reset"])
+        );
         let goto = calls
             .iter()
             .find(|args| args.get(2).is_some_and(|s| s == "goto"))
@@ -2356,6 +2403,32 @@ mod tests {
             goto[4],
             root.path().join("worker").canonicalize().unwrap().to_str().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn release_reconciles_cube_commit_and_interrupted_replay() {
+        for kind in [Kind::Release, Kind::ReleaseWithReset, Kind::ForceRelease] {
+            let root = tempfile::tempdir().unwrap();
+            let mut cube = Cube::new(root.path());
+            cube.lose_release_reply = true;
+            *cube.owner.lock().unwrap() = Some(workspace::lease_owner(&run()));
+            let executor = workspace::Executor {
+                cube,
+                host_id: "host".into(),
+            };
+            let mut request = op(kind);
+            if kind == Kind::ForceRelease {
+                request.reason = "operator fenced".into();
+            }
+            let command = command(request);
+            let result = executor.execute(&command, false, 1).await;
+            assert_eq!(result.code, v1::ResultCode::Ok as i32, "{}", result.reason);
+            let before = executor.cube.calls.lock().unwrap().len();
+            let replay = executor.execute(&command, true, 1).await;
+            assert_eq!(replay.code, v1::ResultCode::Ok as i32, "{}", replay.reason);
+            let calls = executor.cube.calls.lock().unwrap();
+            assert!(calls[before..].iter().all(|args| args[2] == "list"));
+        }
     }
 
     #[tokio::test]

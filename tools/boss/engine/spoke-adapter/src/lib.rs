@@ -2,8 +2,7 @@
 //!
 //! [`SpokeHostAdapter`] implements the same [`HostAdapter`] the SSH and local
 //! adapters do, but every operation is a typed command on the host's one
-//! persistent stream instead of a shell line. Three rules shape it
-//! (design §§2.1, 2.5, 3.2 step 4):
+//! persistent stream instead of a shell line. Three rules shape it:
 //!
 //! * **Ownership is recorded first.** [`SpokeHostAdapterProvider::adapter_for_execution`]
 //!   reserves `(execution, run, generation, host, spawn token)` in the work
@@ -489,9 +488,9 @@ impl SpokeHostAdapter {
         }
     }
 
-    /// Cube names a workspace's directory after its id, so the last path
-    /// component addresses it. The path is display-only; the host resolves the
-    /// id in its own lease registry.
+    /// Workspace ids are local to each user's cube store. Match the recorded
+    /// full display path so a legacy user's identically named workspace cannot
+    /// address a spoke lease.
     pub(crate) async fn route_path(&self, path: &Path) -> Result<Route> {
         let name = path
             .file_name()
@@ -502,6 +501,7 @@ impl SpokeHostAdapter {
         match self
             .db(move |db| db.open_spoke_assignment_for_workspace(&host, &name))
             .await?
+            .filter(|assignment| assignment.display_path.as_deref().map(Path::new) == Some(path))
         {
             Some(assignment) => Ok(Route::Spoke(Box::new(assignment))),
             None => Ok(Route::Legacy(self.legacy_adapter("a workspace operation").await?)),
@@ -640,9 +640,7 @@ impl HostAdapter for SpokeHostAdapter {
 
     async fn release_workspace_with_reset(&self, lease_id: &str) -> Result<()> {
         match self.route_lease(lease_id).await? {
-            // Cube's release resets the working copy on the host; the wire has
-            // one release kind.
-            Route::Spoke(assignment) => self.ws_release(&assignment, lease_id, ReleaseMode::Normal).await,
+            Route::Spoke(assignment) => self.ws_release(&assignment, lease_id, ReleaseMode::Reset).await,
             Route::Legacy(legacy) => legacy.release_workspace_with_reset(lease_id).await,
         }
     }

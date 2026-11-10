@@ -1,5 +1,6 @@
 //! The hub adapter against a real hub: mTLS gRPC stream manager, work database
 //! outbox, and a scripted spoke on the other end of the stream.
+mod regressions;
 mod routing;
 mod support;
 
@@ -35,7 +36,9 @@ fn workspace_kind(command: &Command) -> Option<Kind> {
 fn standard(command: &Command) -> Option<CommandResult> {
     match (&command.body, workspace_kind(command)) {
         (_, Some(Kind::Lease)) => Some(ok(command, Some(workspace(command, lease_json())))),
-        (_, Some(Kind::Release | Kind::ForceRelease)) => Some(ok(command, Some(workspace(command, json!({}))))),
+        (_, Some(Kind::Release | Kind::ReleaseWithReset | Kind::ForceRelease)) => {
+            Some(ok(command, Some(workspace(command, json!({})))))
+        }
         (Some(command::Body::Spawn(_)), _) => Some(ok(command, Some(pane(PaneLife::Alive)))),
         _ => None,
     }
@@ -135,7 +138,7 @@ async fn a_command_naming_a_run_the_hub_does_not_hold_is_never_stored_or_sent() 
             Duration::from_secs(2),
         )
         .await;
-    assert_eq!(outcome, Err(boss_spoke_stream::CommandOutcome::OutcomeUncertain));
+    assert_eq!(outcome, Err(boss_spoke_stream::CommandOutcome::NotSubmitted));
     assert!(fx.db.host_command_wire(HOST, "forged").unwrap().is_none());
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(peer.commands().is_empty());

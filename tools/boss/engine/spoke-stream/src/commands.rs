@@ -22,6 +22,8 @@ pub enum CommandOutcome {
     Invalid,
     #[error("outcome uncertain; reconcile using the same command ID")]
     OutcomeUncertain,
+    #[error("outbox refused command; command not submitted")]
+    NotSubmitted,
 }
 
 impl StreamManager {
@@ -88,9 +90,12 @@ impl StreamManager {
         let (tx, rx) = oneshot::channel();
         connection.waiters.insert(id.clone(), tx);
         let storage = &self.0.storage.outbox;
-        if storage.append(host_id, admission, command).await.is_err() {
+        if let Err(error) = storage.append(host_id, admission, command).await {
             connection.waiters.remove(&id);
-            return Err(OutcomeUncertain);
+            return Err(match error {
+                crate::store::StoreError::Denied | crate::store::StoreError::Full => NotSubmitted,
+                _ => OutcomeUncertain,
+            });
         }
         if let Ok(Some(result)) = storage.completed(host_id, &id).await {
             connection.waiters.remove(&id);
