@@ -8,6 +8,40 @@ use crate::cli::Cli;
 use crate::app::dispatch::run_with_dependencies;
 use crate::app::errors::CubeError;
 
+const HEAD_SHA: &str = "aabbccddeeff00112233445566778899aabbccdd";
+
+/// GitHub's current head of `branch`: the authoritative record of where the PR is.
+fn github_head_cmd(cwd: &std::path::Path, branch: &str, sha: &str) -> ExpectedCommand {
+    ExpectedCommand::ok(
+        cwd.to_path_buf(),
+        "gh",
+        &[
+            "api",
+            &format!("repos/spinyfin/mono/branches/{branch}"),
+            "--jq",
+            ".commit.sha",
+        ],
+        &format!("{sha}\n"),
+    )
+}
+
+/// The fast-forward check: GitHub's head must be an ancestor of `@`.
+fn ancestry_cmd(cwd: &std::path::Path, out: &str) -> ExpectedCommand {
+    ExpectedCommand::ok(
+        cwd.to_path_buf(),
+        "jj",
+        &[
+            "log",
+            "-r",
+            &format!("present({HEAD_SHA}) & ancestors(@)"),
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ],
+        out,
+    )
+}
+
 /// Build the standard remote-list response for a github-remote workspace.
 pub(super) fn remote_list_github() -> &'static str {
     "origin\t/Users/bduff/dev/agents/repos/mono\ngithub\tgit@github.com:spinyfin/mono.git\n"
@@ -33,69 +67,11 @@ fn pr_push_happy_path_advance() {
             &["log", "-r", "@", "--no-graph", "-T", "empty"],
             "false",
         ),
-        // ancestor check: pr/42 is an ancestor of @
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &["log", "-r", "pr/42 & ancestors(@)", "--no-graph", "-T", "commit_id"],
-            "aabbcc\n",
-        ),
+        // fast-forward check against GitHub's current head
+        github_head_cmd(&cwd, "boss/exec_abc", HEAD_SHA),
+        ancestry_cmd(&cwd, "aabbcc\n"),
         // advance head-branch bookmark
         ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "boss/exec_abc", "-r", "@"], ""),
-        // advance pr/42 bookmark
-        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &["log", "--no-graph", "-r", "@", "-T", r#"commit_id ++ "\n""#],
-            "head",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                r#"bookmarks(exact:"pr/42")"#,
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &["bookmark", "set", "pr/42", "-r", "@", "--allow-backwards"],
-            "",
-        ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                r#"bookmarks(exact:"pr/42")"#,
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "head",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                "present(pr/42@git)",
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "head",
-        ),
         // push (no --allow-new)
         ExpectedCommand::ok(
             cwd.clone(),
@@ -122,72 +98,6 @@ fn pr_push_happy_path_advance() {
             ],
             "deadbeef\n",
         ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &["log", "--no-graph", "-r", "deadbeef", "-T", r#"commit_id ++ "\n""#],
-            "deadbeef",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                r#"bookmarks(exact:"pr/42")"#,
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &["bookmark", "set", "pr/42", "-r", "deadbeef", "--allow-backwards"],
-            "",
-        ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                r#"bookmarks(exact:"pr/42")"#,
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "deadbeef",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                "present(pr/42@git)",
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "deadbeef",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "log",
-                "-r",
-                r#"bookmarks(exact:"pr/42")"#,
-                "--no-graph",
-                "-T",
-                "commit_id",
-            ],
-            "deadbeef\n",
-        ),
     ]);
 
     let cli = Cli::parse_from(["cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc"]);
@@ -202,7 +112,7 @@ fn pr_push_happy_path_advance() {
 
 #[test]
 fn pr_push_noop_idempotency() {
-    // @ is empty AND pr/42 sha matches GitHub head → no-op success.
+    // @ is empty AND local branch matches GitHub head → no-op success.
     let cwd = std::env::current_dir().expect("cwd");
     let runner = FakeRunner::new(vec![
         ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
@@ -231,11 +141,11 @@ fn pr_push_noop_idempotency() {
             ],
             "abc123\n",
         ),
-        // fetch pr/42 sha — matches github
+        // the local head branch matches github
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["log", "-r", "pr/42", "--no-graph", "-T", "commit_id"],
+            &["log", "-r", "boss/exec_abc", "--no-graph", "-T", "commit_id"],
             "abc123\n",
         ),
     ]);
@@ -249,7 +159,7 @@ fn pr_push_noop_idempotency() {
 
 #[test]
 fn pr_push_empty_at_nothing_to_land() {
-    // @ is empty AND pr/42 sha does NOT match GitHub head → error.
+    // @ is empty AND local branch does NOT match GitHub head → error.
     let cwd = std::env::current_dir().expect("cwd");
     let runner = FakeRunner::new(vec![
         ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
@@ -279,7 +189,7 @@ fn pr_push_empty_at_nothing_to_land() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["log", "-r", "pr/42", "--no-graph", "-T", "commit_id"],
+            &["log", "-r", "boss/exec_abc", "--no-graph", "-T", "commit_id"],
             "local_sha\n",
         ),
     ]);
@@ -295,7 +205,7 @@ fn pr_push_empty_at_nothing_to_land() {
 
 #[test]
 fn pr_push_detached_refusal() {
-    // @ is not a descendant of pr/42 → refuse.
+    // @ is not a descendant of GitHub's head → refuse.
     let cwd = std::env::current_dir().expect("cwd");
     let runner = FakeRunner::new(vec![
         ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
@@ -312,12 +222,8 @@ fn pr_push_detached_refusal() {
             "false",
         ),
         // ancestor check returns empty → not a descendant
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &["log", "-r", "pr/42 & ancestors(@)", "--no-graph", "-T", "commit_id"],
-            "",
-        ),
+        github_head_cmd(&cwd, "boss/exec_abc", HEAD_SHA),
+        ancestry_cmd(&cwd, ""),
     ]);
 
     let cli = Cli::parse_from(["cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc"]);
@@ -362,66 +268,9 @@ fn pr_push_stale_push_error() {
             &["log", "-r", "@", "--no-graph", "-T", "empty"],
             "false",
         ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &["log", "-r", "pr/42 & ancestors(@)", "--no-graph", "-T", "commit_id"],
-            "aabbcc\n",
-        ),
+        github_head_cmd(&cwd, "boss/exec_abc", HEAD_SHA),
+        ancestry_cmd(&cwd, "aabbcc\n"),
         ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "boss/exec_abc", "-r", "@"], ""),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &["log", "--no-graph", "-r", "@", "-T", r#"commit_id ++ "\n""#],
-            "head",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                r#"bookmarks(exact:"pr/42")"#,
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &["bookmark", "set", "pr/42", "-r", "@", "--allow-backwards"],
-            "",
-        ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                r#"bookmarks(exact:"pr/42")"#,
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "head",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                "present(pr/42@git)",
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "head",
-        ),
         // push fails
         ExpectedCommand {
             cwd: cwd.clone(),
@@ -533,7 +382,7 @@ fn pr_push_force_with_lease_happy_path() {
         ),
         // advance bookmarks
         ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "boss/exec_abc", "-r", "@"], ""),
-        // Export only the branch; PR repair follows push verification.
+        // Export the branch ref the git push reads.
         ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
         // force push via git
         ExpectedCommand::ok(
@@ -557,72 +406,6 @@ fn pr_push_force_with_lease_happy_path() {
                 "repos/spinyfin/mono/branches/boss/exec_abc",
                 "--jq",
                 ".commit.sha",
-            ],
-            "new_sha\n",
-        ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &["log", "--no-graph", "-r", "new_sha", "-T", r#"commit_id ++ "\n""#],
-            "new_sha",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                r#"bookmarks(exact:"pr/42")"#,
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &["bookmark", "set", "pr/42", "-r", "new_sha", "--allow-backwards"],
-            "",
-        ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                r#"bookmarks(exact:"pr/42")"#,
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "new_sha",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                "present(pr/42@git)",
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "new_sha",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "log",
-                "-r",
-                r#"bookmarks(exact:"pr/42")"#,
-                "--no-graph",
-                "-T",
-                "commit_id",
             ],
             "new_sha\n",
         ),
@@ -711,19 +494,31 @@ fn pr_push_infers_from_ancestry() {
     let cwd = std::env::current_dir().expect("cwd");
     let runner = FakeRunner::new(vec![
         ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
-        // Inference query
+        // Inference query: the nearest local branch bookmark in ancestry
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
             &[
                 "log",
+                "-n",
+                "20",
                 "-r",
-                r#"latest(ancestors(@) & bookmarks(glob:"pr/*"))"#,
+                "ancestors(@) & bookmarks()",
                 "--no-graph",
                 "-T",
-                r#"bookmarks.map(|b| b.name()).join("\n")"#,
+                r#"local_bookmarks.map(|b| b.name()).join("\n") ++ "\n""#,
             ],
-            "boss/exec_abc\npr/42\n",
+            "boss-base/exec_abc\nboss/exec_abc\nmain\n",
+        ),
+        // GitHub says which PR the branch heads
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "gh",
+            &[
+                "api",
+                "repos/spinyfin/mono/pulls?head=spinyfin:boss/exec_abc&state=open",
+            ],
+            r#"[{"number":42,"html_url":"https://github.com/spinyfin/mono/pull/42"}]"#,
         ),
         // check PR is open
         ExpectedCommand::ok(
@@ -740,67 +535,10 @@ fn pr_push_infers_from_ancestry() {
             "false",
         ),
         // ancestor check
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &["log", "-r", "pr/42 & ancestors(@)", "--no-graph", "-T", "commit_id"],
-            "aabbcc\n",
-        ),
+        github_head_cmd(&cwd, "boss/exec_abc", HEAD_SHA),
+        ancestry_cmd(&cwd, "aabbcc\n"),
         // advance bookmarks
         ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "boss/exec_abc", "-r", "@"], ""),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &["log", "--no-graph", "-r", "@", "-T", r#"commit_id ++ "\n""#],
-            "head",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                r#"bookmarks(exact:"pr/42")"#,
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &["bookmark", "set", "pr/42", "-r", "@", "--allow-backwards"],
-            "",
-        ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                r#"bookmarks(exact:"pr/42")"#,
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "head",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                "present(pr/42@git)",
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "head",
-        ),
         // push
         ExpectedCommand::ok(
             cwd.clone(),
@@ -823,72 +561,6 @@ fn pr_push_infers_from_ancestry() {
                 "repos/spinyfin/mono/branches/boss/exec_abc",
                 "--jq",
                 ".commit.sha",
-            ],
-            "deadbeef\n",
-        ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &["log", "--no-graph", "-r", "deadbeef", "-T", r#"commit_id ++ "\n""#],
-            "deadbeef",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                r#"bookmarks(exact:"pr/42")"#,
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &["bookmark", "set", "pr/42", "-r", "deadbeef", "--allow-backwards"],
-            "",
-        ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                r#"bookmarks(exact:"pr/42")"#,
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "deadbeef",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                "present(pr/42@git)",
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "deadbeef",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "log",
-                "-r",
-                r#"bookmarks(exact:"pr/42")"#,
-                "--no-graph",
-                "-T",
-                "commit_id",
             ],
             "deadbeef\n",
         ),

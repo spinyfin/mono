@@ -1343,70 +1343,11 @@ fn workspace_lease_allow_dirty_errors_when_preferred_leased() {
 }
 
 #[test]
-fn workspace_lease_one_clean_n_conflicted_uses_clean() {
-    // Pool: conflicted(003), clean(007) → should skip conflicted, use clean.
-    let (tempdir, database_path) = with_database_path();
-    let workspace_root = tempdir.path().join("workspaces");
-    let conflicted_path = workspace_root.join("mono-agent-003");
-    let clean_path = workspace_root.join("mono-agent-007");
-    std::fs::create_dir_all(conflicted_path.join(".jj")).expect("conflicted dir");
-    std::fs::create_dir_all(clean_path.join(".jj")).expect("clean dir");
-
-    seed_mono_repo(&workspace_root, &database_path);
-
-    let runner = FakeRunner::new(vec![
-        // health-check 003 → conflicted (save as fallback, keep looking)
-        ExpectedCommand::ok(
-            conflicted_path.clone(),
-            "jj",
-            &["status", "--no-pager"],
-            &jj_status_conflicted("fix-burst"),
-        ),
-        // health-check 007 → clean → use
-        ExpectedCommand::ok(clean_path.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
-        ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "fetch"], ""),
-        ExpectedCommand::ok(
-            clean_path.clone(),
-            "jj",
-            &["git", "remote", "list"],
-            "origin\tgit@github.com:spinyfin/mono.git\n",
-        ),
-        ExpectedCommand::ok(
-            clean_path.clone(),
-            "jj",
-            &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
-            "",
-        ),
-        ExpectedCommand::ok(clean_path.clone(), "jj", &["new", "main@origin"], ""),
-        ExpectedCommand::ok(
-            clean_path.clone(),
-            "jj",
-            &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
-            "abc1234",
-        ),
-    ]);
-
-    let result = run_with_dependencies(
-        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "prefer clean"]),
-        Some(&database_path),
-        &runner,
-    )
-    .expect("lease");
-    runner.assert_exhausted();
-
-    // 007 was used; 003 (conflicted) was not repaired because 007 was clean.
-    assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-007");
-    let hc = result.payload["health_check"].as_array().expect("health_check");
-    assert_eq!(hc.len(), 2);
-    assert_eq!(hc[0]["workspace_id"], "mono-agent-003");
-    assert_eq!(hc[0]["health"], "conflicted");
-    assert_eq!(hc[1]["workspace_id"], "mono-agent-007");
-    assert_eq!(hc[1]["health"], "clean");
-}
-
-#[test]
-fn workspace_lease_all_conflicted_repairs_lowest_and_returns_it() {
-    // Pool: conflicted(003), conflicted(007) → repair 003 (lowest) and use it.
+fn workspace_lease_does_not_skip_a_workspace_for_a_store_wide_bookmark_conflict() {
+    // Bookmarks live in the shared store, so `jj status` in every workspace
+    // lists the same conflicts. The first workspace is used as it stands: no
+    // bookmark is forgotten or repaired (the strict runner would panic on it)
+    // and the second workspace is never probed.
     let (tempdir, database_path) = with_database_path();
     let workspace_root = tempdir.path().join("workspaces");
     let path_003 = workspace_root.join("mono-agent-003");
@@ -1417,23 +1358,12 @@ fn workspace_lease_all_conflicted_repairs_lowest_and_returns_it() {
     seed_mono_repo(&workspace_root, &database_path);
 
     let runner = FakeRunner::new(vec![
-        // health-check 003 → conflicted (save as first fallback)
         ExpectedCommand::ok(
             path_003.clone(),
             "jj",
             &["status", "--no-pager"],
             &jj_status_conflicted("fix-burst"),
         ),
-        // health-check 007 → conflicted (already have a fallback, don't replace)
-        ExpectedCommand::ok(
-            path_007.clone(),
-            "jj",
-            &["status", "--no-pager"],
-            &jj_status_conflicted("fix-burst"),
-        ),
-        // repair 003: forget the conflicted bookmark
-        ExpectedCommand::ok(path_003.clone(), "jj", &["bookmark", "forget", "fix-burst"], ""),
-        // reset 003
         ExpectedCommand::ok(path_003.clone(), "jj", &["git", "fetch"], ""),
         ExpectedCommand::ok(
             path_003.clone(),
@@ -1457,7 +1387,7 @@ fn workspace_lease_all_conflicted_repairs_lowest_and_returns_it() {
     ]);
 
     let result = run_with_dependencies(
-        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "all conflicted"]),
+        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "store-wide conflict"]),
         Some(&database_path),
         &runner,
     )
@@ -1466,14 +1396,9 @@ fn workspace_lease_all_conflicted_repairs_lowest_and_returns_it() {
 
     assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-003");
     let hc = result.payload["health_check"].as_array().expect("health_check");
-    // Both conflicted workspaces appear in health_check
-    assert_eq!(hc.len(), 2);
+    assert_eq!(hc.len(), 1);
     assert_eq!(hc[0]["workspace_id"], "mono-agent-003");
-    assert_eq!(hc[0]["health"], "conflicted");
-    // 003 was chosen (not skipped), 007 was skipped (already have a candidate)
-    assert_eq!(hc[0]["skipped"], false);
-    assert_eq!(hc[1]["workspace_id"], "mono-agent-007");
-    assert_eq!(hc[1]["skipped"], true);
+    assert_eq!(hc[0]["health"], "clean");
 }
 
 #[test]

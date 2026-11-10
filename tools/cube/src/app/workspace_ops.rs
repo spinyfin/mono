@@ -11,9 +11,9 @@ use crate::store::Store;
 use crate::app::checkleft_gate::run_checkleft_gate;
 use crate::app::errors::{CubeError, Result, RunResult};
 use crate::app::gh_pr;
-use crate::app::jj::{run_jj, run_jj_network};
-use crate::app::pr::{record_published_pr_head, resolve_workspace_pr_number, verify_push_reached_github};
-use crate::app::pr_bookmarks;
+use crate::app::jj::{ENGINE_POINTER_BOOKMARK_PREFIXES, rebase_branch_onto, run_jj, run_jj_network};
+use crate::app::pr::verify_push_reached_github;
+use crate::app::pr_head;
 use crate::app::provision::find_workspace_record;
 use crate::app::reset::resolve_github_remote_for_workspace;
 
@@ -504,8 +504,8 @@ pub(super) enum BookmarkPolicy<'a> {
     /// Any bookmark blocks the collapse (the rebase path).
     Strict,
     /// The push path: the branch about to be advanced to `@` and the engine's
-    /// own pointer namespaces are not stack boundaries. Anything else
-    /// (notably a published `pr/<n>` pointer) still blocks.
+    /// own pointer namespaces are not stack boundaries. Anything else still
+    /// blocks.
     PushBranch(&'a str),
 }
 
@@ -521,7 +521,7 @@ pub(super) fn commit_has_blocking_bookmark(
     Ok(out.lines().map(str::trim).any(|name| {
         !name.is_empty()
             && name != branch
-            && !super::health::ENGINE_POINTER_BOOKMARK_PREFIXES
+            && !ENGINE_POINTER_BOOKMARK_PREFIXES
                 .iter()
                 .any(|prefix| name.starts_with(prefix))
     }))
@@ -603,7 +603,7 @@ pub(super) fn workspace_goto(
         );
     }
 
-    let mut pr_head: Option<pr_bookmarks::PrHead> = None;
+    let mut pr_head: Option<pr_head::PrHead> = None;
     let branch: String = if let Some(b) = bookmark {
         strip_remote_suffix(&b).to_string()
     } else if let Some(n) = pr {
@@ -621,10 +621,10 @@ pub(super) fn workspace_goto(
                 CubeError::InvalidArgument(format!("PR {n} ({owner_repo}) returned no head.ref from GitHub"))
             })?
             .to_string();
-        // GitHub's `head.sha` is the PR head, the same commit lease repair
-        // uses. The branch name only labels it: on a fork-headed PR the same
-        // name on the base remote is an unrelated branch.
-        pr_head = Some(pr_bookmarks::resolve_pr_head(
+        // GitHub's `head.sha` is the PR head. The branch name only labels it:
+        // on a fork-headed PR the same name on the base remote is an
+        // unrelated branch.
+        pr_head = Some(pr_head::resolve_pr_head(
             runner,
             database_path,
             &cwd,
@@ -662,13 +662,6 @@ pub(super) fn workspace_goto(
         }
     };
 
-    let _pr_lock = runner.lock_pr_bookmarks(&cwd)?;
-
-    // Move the working copy first and set the bookmarks last. Workspace gc
-    // deletes an unreferenced `pr/<n>` alias under the same PR-bookmark lock
-    // held here, so it cannot run between the steps below; ordering them this
-    // way as well means the alias never exists unreferenced, even for a
-    // reader that does not take the lock.
     // Idempotency check: if @ already has <remote_ref> as a direct parent,
     // skip `jj new` — the workspace is already positioned correctly.
     let already_positioned = runner
@@ -695,16 +688,6 @@ pub(super) fn workspace_goto(
         )?;
     }
 
-    // Also set the pr/<n> bookmark when the caller specified --pr so that
-    // `cube pr push` and `cube workspace rebase` can find the PR number later.
-    // This repairs a conflicted `pr/<n>` to the GitHub head (refusing when the
-    // other side has unique content) and exports to the colocated git repo, so
-    // a stale `refs/heads/pr/<n>` cannot re-conflict it on the next auto-import.
-    if let Some(n) = pr {
-        pr_bookmarks::record_published_head(&cwd, n, &remote_ref);
-        pr_bookmarks::point_pr_bookmark(runner, database_path, &cwd, n, &remote_ref)?;
-    }
-
     // Set the local bookmark to track the head (idempotent; --allow-backwards
     // handles any local divergence). A fork's branch name is never mapped onto
     // a local bookmark: it could be `main`.
@@ -727,32 +710,6 @@ pub(super) fn workspace_goto(
             "remote_ref": remote_ref,
             "already_positioned": already_positioned,
         }),
-    )
-}
-
-/// `cube workspace repair-pr-bookmark --pr N`: point the shared `pr/<N>` alias
-/// at the PR's current GitHub head without touching any working copy. Uses the
-/// guarded writer behind `goto --pr` and lease repair, so it serializes with
-/// workspace GC and other alias writes, refuses to override a conflicted side
-/// holding unique content, and leaves jj and git agreeing about the alias.
-pub(super) fn workspace_repair_pr_bookmark(
-    database_path: Option<&Path>,
-    runner: &dyn CommandRunner,
-    workspace: Option<String>,
-    pr: u64,
-) -> Result<RunResult> {
-    let cwd: PathBuf = match workspace {
-        Some(ref p) => PathBuf::from(p),
-        None => std::env::current_dir().map_err(CubeError::Io)?,
-    };
-    let name = git_utils::pr_bookmark::pr_bookmark_name(pr);
-    let repair = crate::app::health::repair_pr_bookmarks(runner, database_path, &cwd, std::slice::from_ref(&name))?;
-    if let Some((_, why)) = repair.failures.into_iter().next() {
-        return Err(CubeError::InvalidArgument(format!("cannot repair `{name}`: {why}")));
-    }
-    RunResult::new(
-        format!("Repaired {name} from GitHub."),
-        json!({ "pr": pr, "bookmark": name }),
     )
 }
 
@@ -977,8 +934,7 @@ pub(super) fn rebase_workspace_branch(
     // required because the boss commit is referenced via its immutable
     // `@<remote>` form.
     let main_ref = format!("{main_branch}@{github_remote}");
-    let rebase_out =
-        super::pr_rebase::rebase_preserving_pr_bookmarks(runner, database_path, cwd, &boss_branch, &main_ref)?;
+    let rebase_out = rebase_branch_onto(runner, database_path, cwd, &boss_branch, &main_ref)?;
 
     // Check whether the rebase left any conflicts anywhere in the range of
     // commits this rebase will push — not just the working-copy tip. `@` is
@@ -1174,7 +1130,6 @@ pub(super) fn rebase_workspace_branch(
     // commit — the legitimate, expected shape of a rebase, not a force-flag
     // anomaly. Surface a lease mismatch clearly instead of letting the worker
     // reach for force flags.
-    let number = resolve_workspace_pr_number(runner, cwd, owner_repo, &boss_branch, opts.explicit_pr)?;
     if let Err(err) = runner.run(&RealCommandRunner::invocation(
         cwd,
         "jj",
@@ -1187,8 +1142,7 @@ pub(super) fn rebase_workspace_branch(
              `{push_cmd}`."
         )));
     }
-    let published = verify_push_reached_github(runner, cwd, owner_repo, &boss_branch)?;
-    record_published_pr_head(runner, cwd, &boss_branch, number, &published)?;
+    verify_push_reached_github(runner, cwd, owner_repo, &boss_branch)?;
 
     eprintln!("cube: workspace rebase: {boss_branch} rebased onto {main_branch} cleanly and pushed");
     RunResult::new(
@@ -1348,8 +1302,6 @@ pub(super) fn workspace_push_at(
     // `cube pr update`'s equivalent call for the full rationale.
     run_checkleft_gate(&cwd, None)?;
 
-    let number = resolve_workspace_pr_number(runner, &cwd, &owner_repo, &boss_branch, pr)?;
-
     // jj's own tracked remote-bookmark state (refreshed by callers via `cube
     // workspace goto`/`rebase`'s fetch) is the compare-and-swap token here —
     // no destructive `--force` flag needed for what is, from jj's point of
@@ -1362,8 +1314,7 @@ pub(super) fn workspace_push_at(
         ))
         .map_err(|e| CubeError::InvalidArgument(format!("failed to push `{boss_branch}`: {e}")))?;
 
-    let published = verify_push_reached_github(runner, &cwd, &owner_repo, &boss_branch)?;
-    record_published_pr_head(runner, &cwd, &boss_branch, number, &published)?;
+    verify_push_reached_github(runner, &cwd, &owner_repo, &boss_branch)?;
 
     RunResult::new(
         format!("PUSHED: branch `{boss_branch}` pushed to `{github_remote}`."),

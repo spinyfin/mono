@@ -1,7 +1,6 @@
 use super::support::{
-    ExpectedCommand, FakeRunner, head_status_command, head_status_output, jj_status_clean, jj_status_conflicted,
-    lease_runner_for, release_guard_reusable_command, release_runner_for, seed_mono_repo, unpushed_probe_command,
-    with_database_path,
+    ExpectedCommand, FakeRunner, head_status_command, head_status_output, jj_status_conflicted, lease_runner_for,
+    release_guard_reusable_command, release_runner_for, seed_mono_repo, unpushed_probe_command, with_database_path,
 };
 use clap::Parser;
 
@@ -74,7 +73,7 @@ fn workspace_release_clears_health_status() {
 #[test]
 fn workspace_lease_release_list_workspace_list_shows_effective_state() {
     // `cube workspace list` output message should show `free-conflicted`
-    // for a workspace whose health_status is `conflicted`.
+    // for a workspace whose cached health_status is `conflicted`.
     let (tempdir, database_path) = with_database_path();
     let workspace_root = tempdir.path().join("workspaces");
     let conflicted_path = workspace_root.join("mono-agent-003");
@@ -84,7 +83,8 @@ fn workspace_lease_release_list_workspace_list_shows_effective_state() {
 
     seed_mono_repo(&workspace_root, &database_path);
 
-    // Run a lease that skips the conflicted workspace and picks the clean one.
+    // Run a lease so both workspaces are registered. A bookmark conflict in
+    // the shared store is not workspace damage, so the first one is simply used.
     let lease_runner = FakeRunner::new(vec![
         ExpectedCommand::ok(
             conflicted_path.clone(),
@@ -92,23 +92,22 @@ fn workspace_lease_release_list_workspace_list_shows_effective_state() {
             &["status", "--no-pager"],
             &jj_status_conflicted("fix-burst"),
         ),
-        ExpectedCommand::ok(clean_path.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
-        ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "fetch"], ""),
+        ExpectedCommand::ok(conflicted_path.clone(), "jj", &["git", "fetch"], ""),
         ExpectedCommand::ok(
-            clean_path.clone(),
+            conflicted_path.clone(),
             "jj",
             &["git", "remote", "list"],
             "origin\tgit@github.com:spinyfin/mono.git\n",
         ),
         ExpectedCommand::ok(
-            clean_path.clone(),
+            conflicted_path.clone(),
             "jj",
             &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
             "",
         ),
-        ExpectedCommand::ok(clean_path.clone(), "jj", &["new", "main@origin"], ""),
+        ExpectedCommand::ok(conflicted_path.clone(), "jj", &["new", "main@origin"], ""),
         ExpectedCommand::ok(
-            clean_path.clone(),
+            conflicted_path.clone(),
             "jj",
             &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
             "abc1234",
@@ -122,6 +121,12 @@ fn workspace_lease_release_list_workspace_list_shows_effective_state() {
     .expect("lease");
     lease_runner.assert_exhausted();
 
+    // A row an older cube cached as `conflicted` still lists as such.
+    Store::open_at(&database_path)
+        .unwrap()
+        .update_workspace_health("mono", "mono-agent-007", WorkspaceHealth::Conflicted)
+        .expect("mark conflicted");
+
     let list = run_with_dependencies(
         Cli::parse_from(["cube", "workspace", "list"]),
         Some(&database_path),
@@ -129,7 +134,7 @@ fn workspace_lease_release_list_workspace_list_shows_effective_state() {
     )
     .expect("list");
 
-    // The human-readable message should contain "free-conflicted" for 003.
+    // The human-readable message should contain "free-conflicted" for 007.
     assert!(
         list.message.contains("free-conflicted"),
         "expected free-conflicted in list message: {}",

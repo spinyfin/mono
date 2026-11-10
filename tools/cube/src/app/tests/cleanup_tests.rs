@@ -12,7 +12,7 @@ use clap::Parser;
 use tempfile::TempDir;
 
 use super::support::{
-    ExpectedCommand, FakeRunner, audit_events, gc_exec_sweep_command, gc_pr_noop_command, write_setup_yaml,
+    ExpectedCommand, FakeRunner, audit_events, gc_exec_sweep_command, gc_exec_unpublished_command, write_setup_yaml,
 };
 
 use crate::app::cleanup::{CleanupOptions, CleanupReport, CleanupTrigger, run_cleanup_pass};
@@ -584,7 +584,7 @@ fn workspace_gc_dry_run_reports_the_cleanup_plan_through_the_cli() {
     let runner = FakeRunner::new(vec![
         ExpectedCommand::ok(workspace.clone(), "jj", &["git", "fetch"], ""),
         gc_exec_sweep_command(&workspace, "boss/exec_dry_01"),
-        gc_pr_noop_command(&workspace),
+        gc_exec_unpublished_command(&workspace, ""),
     ]);
 
     let result = run_with_dependencies(
@@ -690,9 +690,7 @@ fn gc_clear_failed_cleanup_under_pressure_does_not_run_cleanup_again() {
     let runner = FakeRunner::new(vec![
         ExpectedCommand::ok(workspace.clone(), "jj", &["git", "fetch"], ""),
         ExpectedCommand::ok(workspace.clone(), "jj", &["git", "remote", "list"], ""),
-        super::support::gc_git_import_command(workspace),
         gc_exec_sweep_command(workspace, ""),
-        gc_pr_noop_command(workspace),
     ]);
     run_with_dependencies(
         Cli::parse_from(["cube", "workspace", "gc", "--clear-failed-cleanup"]),

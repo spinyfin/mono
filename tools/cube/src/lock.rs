@@ -33,44 +33,17 @@ impl RepoLock {
         self._file
     }
 
-    /// Serialize PR bookmark mutation and positioning across secondary workspaces.
-    /// Reuse the existing file-lock implementation with a separate store-wide lock
-    /// so callers already holding the pool/registry lock cannot deadlock.
-    pub fn for_workspace(cwd: &Path) -> Result<Self, CubeError> {
-        crate::lock::RepoLock::acquire(&shared_repo_dir(cwd)?.join("cube-pr-bookmarks.lock"))
-    }
-
     /// Serialize git remote additions and removals across the processes
     /// sharing the store `cwd` belongs to. jj rewrites the store's git config
     /// for each remote change under a fail-fast lock, so unserialized
     /// concurrent changes make one side fail. Separate from
-    /// [`Self::for_workspace`]: a fetch never runs under this lock, and a
-    /// holder of the PR-bookmark lock may take it.
+    /// the pool/registry lock: a fetch never runs under this lock.
     pub fn for_git_remotes(cwd: &Path) -> Result<Self, CubeError> {
         crate::lock::RepoLock::acquire(&shared_repo_dir(cwd)?.join("cube-git-remotes.lock"))
     }
 
     pub fn acquire(lock_path: &Path) -> Result<Self, CubeError> {
         Self::open_and_lock(lock_path, true)?.ok_or_else(|| unreachable!("a blocking lock always acquires"))
-    }
-
-    /// [`Self::for_workspace`] that gives up once `timeout` has elapsed rather
-    /// than waiting on a stalled holder indefinitely.
-    pub fn for_workspace_within(cwd: &Path, timeout: std::time::Duration) -> Result<Self, CubeError> {
-        let lock_path = shared_repo_dir(cwd)?.join("cube-pr-bookmarks.lock");
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            if let Some(lock) = Self::try_acquire(&lock_path)? {
-                return Ok(lock);
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(CubeError::InvalidArgument(format!(
-                    "timed out after {}s waiting for the PR-bookmark lock held by another cube process",
-                    timeout.as_secs()
-                )));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
     }
 
     /// Take the lock if nobody holds it; `None` when it is held elsewhere.
@@ -132,21 +105,6 @@ mod tests {
         assert!(RepoLock::try_acquire(&lock_path).unwrap().is_none());
         drop(held);
         assert!(RepoLock::try_acquire(&lock_path).unwrap().is_some());
-    }
-
-    #[test]
-    fn for_workspace_within_times_out_while_held_then_succeeds_once_released() {
-        let dir = tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".jj/repo")).unwrap();
-        let held = RepoLock::for_workspace(dir.path()).unwrap();
-        let started = Instant::now();
-        let err = RepoLock::for_workspace_within(dir.path(), Duration::from_millis(200))
-            .err()
-            .expect("held lock must time out");
-        assert!(started.elapsed() >= Duration::from_millis(200));
-        assert!(err.to_string().contains("timed out"), "{err}");
-        drop(held);
-        RepoLock::for_workspace_within(dir.path(), Duration::from_millis(200)).expect("free lock");
     }
 
     #[test]

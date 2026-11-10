@@ -193,41 +193,6 @@ pub(super) fn budgeted_timeout(deadline: Option<Instant>, default: Duration) -> 
     }
 }
 
-thread_local! {
-    /// Wall-clock deadline every `jj` call on this thread must also respect,
-    /// installed by [`scope_deadline`].
-    static AMBIENT_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
-}
-
-/// Restores the previous ambient deadline when dropped.
-pub(super) struct DeadlineScope {
-    previous: Option<Instant>,
-}
-
-impl Drop for DeadlineScope {
-    fn drop(&mut self) {
-        AMBIENT_DEADLINE.with(|cell| cell.set(self.previous));
-    }
-}
-
-/// Bound every [`run_jj_within`] / [`run_jj_network_within`] call made on this
-/// thread until the returned guard drops by `deadline` (or an enclosing
-/// scope's earlier one). This lets an operation with an end-to-end budget
-/// bound helpers that take no deadline of their own.
-pub(super) fn scope_deadline(deadline: Instant) -> DeadlineScope {
-    let previous = AMBIENT_DEADLINE.with(|cell| cell.get());
-    let effective = previous.map_or(deadline, |p| p.min(deadline));
-    AMBIENT_DEADLINE.with(|cell| cell.set(Some(effective)));
-    DeadlineScope { previous }
-}
-
-fn effective_deadline(deadline: Option<Instant>) -> Option<Instant> {
-    match (deadline, AMBIENT_DEADLINE.with(|cell| cell.get())) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    }
-}
-
 /// Whether `err` means "we don't actually know the answer because the
 /// caller's time budget ran out or the subprocess was killed on its own
 /// timeout" — as opposed to a genuine command failure (bad revset, auth
@@ -272,7 +237,6 @@ pub(super) fn run_jj_network_within(
     invocation: &CommandInvocation,
     deadline: Option<Instant>,
 ) -> Result<String> {
-    let deadline = effective_deadline(deadline);
     let mut attempt: u32 = 0;
     loop {
         match run_jj_within(runner, database_path, invocation, deadline) {
@@ -329,6 +293,33 @@ pub(super) fn run_jj(
     run_jj_within(runner, database_path, invocation, None)
 }
 
+/// Engine-owned pointer namespaces: per-execution recovery and base
+/// bookmarks, teardown-preserved tips, and archived unpublished heads. They
+/// are never the branch a PR is published from, nor stacked-PR boundaries.
+pub(super) const ENGINE_POINTER_BOOKMARK_PREFIXES: [&str; 4] =
+    ["boss-recovery/", "boss-base/", "preserved/", "preserved-archive/"];
+
+/// Rebase `branch` and its descendants onto `destination`. `-b` rewrites the
+/// whole descendant closure; branch bookmarks follow their commits, and no
+/// other pointer is saved or restored around it.
+pub(super) fn rebase_branch_onto(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    cwd: &Path,
+    branch: &str,
+    destination: &str,
+) -> Result<String> {
+    run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(
+            cwd,
+            "jj",
+            &["rebase", "-b", branch, "-d", destination, "--ignore-immutable"],
+        ),
+    )
+}
+
 /// [`run_jj`] under a caller's wall-clock `deadline`. Every subprocess this
 /// spawns — the invocation itself and each recovery retry — is bounded by
 /// whatever the deadline has left, and a deadline that has already passed
@@ -339,7 +330,6 @@ pub(super) fn run_jj_within(
     invocation: &CommandInvocation,
     deadline: Option<Instant>,
 ) -> Result<String> {
-    let deadline = effective_deadline(deadline);
     let Some(timeout) = budgeted_timeout(deadline, network_cmd_timeout()) else {
         return Err(deadline_exceeded(invocation));
     };

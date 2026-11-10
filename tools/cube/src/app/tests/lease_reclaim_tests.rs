@@ -413,12 +413,14 @@ fn lease_reclaim_honours_exclude() {
     assert_eq!(provisioned[0]["free_workspaces"][0]["reason"], "excluded");
 }
 
-/// Bookmarks are store-wide, so one conflicted `pr/<n>` marks every free
-/// workspace the scan probes as `conflicted`. Repairing it in the chosen
-/// workspace fixes all of them; the cache must say so, or the siblings stay
-/// withheld and the next lease mints around them.
+/// Bookmarks are store-wide, so `jj status` in every workspace of a repo
+/// reports the same conflicted `pr/<n>`. That is not damage to any one
+/// workspace: a row cached `conflicted` from when it was read that way is
+/// revalidated to clean, and the lease repairs, forgets and deletes no
+/// bookmark. The scripted runner is a strict FIFO of exact-match commands, so
+/// any bookmark, import or export command would panic as unexpected.
 #[test]
-fn repairing_a_conflicted_bookmark_clears_the_cached_conflict_of_sibling_workspaces() {
+fn a_store_wide_bookmark_conflict_does_not_withhold_a_workspace() {
     let (tempdir, database_path) = with_database_path();
     let (_root, paths) = seed_unhealthy_pool(
         &tempdir,
@@ -427,110 +429,9 @@ fn repairing_a_conflicted_bookmark_clears_the_cached_conflict_of_sibling_workspa
         WorkspaceHealth::Conflicted,
         "",
     );
-    let (ws1, ws2) = (&paths[0], &paths[1]);
+    let ws1 = &paths[0];
 
-    let mut script = vec![
-        // The revalidation window re-probes both; both report the same
-        // store-wide conflict. The first becomes the repairable candidate.
-        scan_status_command(ws1, &jj_status_conflicted("pr/3226")),
-        scan_status_command(ws2, &jj_status_conflicted("pr/3226")),
-        ExpectedCommand::ok(
-            ws1.clone(),
-            "jj",
-            &["git", "remote", "list"],
-            "origin https://github.com/spinyfin/mono",
-        ),
-        ExpectedCommand::ok(ws1.clone(), "jj", &["git", "fetch", "--remote", "origin"], ""),
-        ExpectedCommand::ok(
-            ws1.clone(),
-            "gh",
-            &["api", "repos/spinyfin/mono/pulls/3226"],
-            r#"{"head":{"ref":"feature","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#,
-        ),
-        ExpectedCommand::ok(
-            ws1.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                "present(bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)",
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        ),
-        ExpectedCommand::ok(ws1.clone(), "jj", &["git", "import"], ""),
-        ExpectedCommand::ok(
-            ws1.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "head",
-        ),
-        ExpectedCommand::ok(
-            ws1.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                r#"bookmarks(exact:"pr/3226")"#,
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "old\nhead",
-        ),
-        ExpectedCommand::ok(
-            ws1.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-n",
-                "101",
-                "-r",
-                "(::old) ~ (::head) ~ ::(present(main@origin) | present(master@origin) | present(main@github) | present(master@github))",
-                "-T",
-                r#"change_id ++ "\t" ++ commit_id ++ "\n""#,
-            ],
-            "",
-        ),
-        ExpectedCommand::ok(
-            ws1.clone(),
-            "jj",
-            &[
-                "bookmark",
-                "set",
-                "pr/3226",
-                "-r",
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                "--allow-backwards",
-            ],
-            "",
-        ),
-        ExpectedCommand::ok(ws1.clone(), "jj", &["git", "export"], ""),
-        ExpectedCommand::ok(
-            ws1.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                r#"bookmarks(exact:"pr/3226")"#,
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "head",
-        ),
-        super::support::pr_git_verify_command(ws1, "pr/3226", "head"),
-    ];
+    let mut script = vec![scan_status_command(ws1, &jj_status_conflicted("pr/3226"))];
     script.extend(claim_reset_commands_for(ws1, "def5678"));
     let runner = FakeRunner::new(script);
 
@@ -539,23 +440,18 @@ fn repairing_a_conflicted_bookmark_clears_the_cached_conflict_of_sibling_workspa
 
     assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-001");
     assert_eq!(pool_size(&database_path), 2, "no workspace may be minted");
-    let sibling = row(&database_path, "mono-agent-002");
-    assert_eq!(sibling.state, WorkspaceState::Free);
-    assert_eq!(
-        sibling.health_status, None,
-        "the sibling's cached conflict must be cleared once the bookmark is repaired"
-    );
-    assert_eq!(sibling.unhealthy_since_epoch_s, None);
-
     let events = audit_events(&tempdir);
-    let cleared: Vec<_> = events
-        .iter()
-        .filter(|e| e["event"] == "workspace.conflicted_cache_cleared")
-        .collect();
-    assert_eq!(cleared.len(), 1);
-    assert_eq!(cleared[0]["repaired_in"], "mono-agent-001");
-    assert_eq!(cleared[0]["cleared"], 1);
-    assert_eq!(cleared[0]["bookmarks"][0], "pr/3226");
+    for forbidden in [
+        "workspace.bookmark_forgotten",
+        "workspace.bookmark_forget_skipped",
+        "workspace.pr_bookmark_repair_skipped",
+        "workspace.conflicted_cache_cleared",
+    ] {
+        assert!(
+            !events.iter().any(|e| e["event"] == forbidden),
+            "unexpected {forbidden} event: {events:?}"
+        );
+    }
 }
 
 /// The fetch, head read and unpushed probe of a reclaim attempt that finds

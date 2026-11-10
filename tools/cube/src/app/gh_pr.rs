@@ -31,19 +31,6 @@ pub(super) fn fetch_pr_json(runner: &dyn CommandRunner, cwd: &Path, owner_repo: 
     Ok(serde_json::from_str(&json)?)
 }
 
-/// Bounded REST lookup for maintenance passes with a shared network deadline.
-pub(super) fn fetch_pr_json_with_timeout(
-    runner: &dyn CommandRunner,
-    cwd: &Path,
-    owner_repo: &str,
-    pr_number: u64,
-    timeout: Duration,
-) -> Result<Value> {
-    let api_path = format!("repos/{owner_repo}/pulls/{pr_number}");
-    let json = runner.run_with_timeout(&RealCommandRunner::invocation(cwd, "gh", &["api", &api_path]), timeout)?;
-    Ok(serde_json::from_str(&json)?)
-}
-
 /// Extract `head.ref` from a PR's REST JSON.
 pub(super) fn head_ref(value: &Value) -> Option<&str> {
     value.get("head").and_then(|h| h.get("ref")).and_then(|v| v.as_str())
