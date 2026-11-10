@@ -11,6 +11,22 @@ fn capacity(body: spoke_frame::Body) -> v1::Record {
     record
 }
 
+/// Opens the journal once the stopped daemon's exclusive lock is released.
+/// The lock drops when the kernel finishes tearing the killed process down,
+/// which on a loaded host can trail the parent's `wait` by a moment.
+fn open_after_daemon_exit(root: &std::path::Path) -> Journal {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match Journal::open(root, "host", Limits::default()) {
+            Ok(journal) => return journal,
+            Err(error) if error.to_string().contains("lock is held") && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => panic!("journal open failed: {error}"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn actual_daemon_reconnects_replays_and_recovers_command_receipt_after_sigkill() {
     let mut hub = Fixture::new().await;
@@ -96,7 +112,7 @@ async fn actual_daemon_reconnects_replays_and_recovers_command_receipt_after_sig
     assert_eq!(result_count, 1);
     drop(third);
     drop(_restarted);
-    let journal = Journal::open(&hub.root(), "host", Limits::default()).unwrap();
+    let journal = open_after_daemon_exit(&hub.root());
     assert_eq!(journal.applied_commands().unwrap(), 1);
     let mut after = 0;
     let mut results = 0;
