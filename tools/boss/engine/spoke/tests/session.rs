@@ -676,3 +676,34 @@ printf '%s\n' '{"repos":[]}'
         .await;
     assert_eq!(connection.next().await, spoke_frame::Body::Record(result_record));
 }
+
+#[tokio::test]
+async fn daemon_reports_pending_then_missing_driver_preflights() {
+    let mut hub = Fixture::new().await;
+    let _daemon = hub.start_without_tools();
+    let mut connection = hub.connection().await;
+    connection.welcome(0).await;
+    let mut pending = false;
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            if let spoke_frame::Body::Record(record) = connection.next().await {
+                connection.receipt(record.sequence).await;
+                if let Some(record::Body::Capacity(capacity)) = record.body {
+                    let failures = capacity.inventory.unwrap().failed_preflights;
+                    assert!(!failures.iter().any(|name| name == "private_homes"));
+                    if failures.iter().any(|name| name == "preflight_pending") {
+                        pending = true;
+                    } else {
+                        assert!(pending, "initial capacity must report pending readiness");
+                        for name in ["tool_claude", "claude_credentials", "tool_codex", "codex_credentials"] {
+                            assert!(failures.iter().any(|failure| failure == name), "{failures:?}");
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("completed preflights must reach the hub");
+}

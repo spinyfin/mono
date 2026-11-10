@@ -48,6 +48,11 @@ enum Cli {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Print a public key fingerprint before trusting it.
+    Fingerprint {
+        #[arg(long)]
+        key: PathBuf,
+    },
     /// Check a release without installing it.
     Verify {
         #[arg(long)]
@@ -161,6 +166,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             // The release log records which key signed, never the key.
             println!("signed with key {}", key.public().fingerprint());
         }
+        Cli::Fingerprint { key } => println!("{}", read_key(&key)?.fingerprint()),
         Cli::Verify {
             manifest,
             signature,
@@ -168,6 +174,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             trusted_key,
         } => {
             let key = read_key(&trusted_key)?;
+            println!("release key fingerprint: {}", key.fingerprint());
             let verified = manifest::verify_release(
                 &key,
                 &fs::read(manifest)?,

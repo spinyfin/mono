@@ -257,7 +257,7 @@ async fn claude_credentials(program: &Path) -> Outcome {
         program.as_os_str(),
         &["-p", "/usage", "--output-format", "json"],
         &[],
-        &["ANTHROPIC_API_KEY"],
+        boss_engine_driver_quota::probes::claude::CLAUDE_UNSET_ENV_VARS,
     )
     .await;
     Outcome::of(
@@ -344,6 +344,7 @@ async fn probe(program: &OsStr, args: &[&str], envs: &[(&str, &str)], unset: &[&
     let mut command = Command::new(program);
     command
         .args(args)
+        .current_dir("/")
         .envs(envs.iter().copied())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

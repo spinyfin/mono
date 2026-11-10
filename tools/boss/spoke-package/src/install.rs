@@ -215,6 +215,8 @@ pub trait Host {
     fn service_registered(&self) -> Result<bool>;
     fn restart_service(&self) -> Result<()>;
     fn service_running(&self) -> Result<bool>;
+    /// PID and service-manager launch count, absent when no instance is running.
+    fn service_instance(&self) -> Result<Option<(u32, u64)>>;
     /// Runs `program` as `account` with exactly `env` and nothing inherited.
     fn run_as(&self, account: &Account, env: &[(String, String)], program: &Path, args: &[String])
     -> Result<RunOutput>;
@@ -307,7 +309,7 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
         report.changed.push("etc directory");
     }
     if newly_pinned {
-        write_logical(layout, &layout.pinned_key_path(), key.to_text().as_bytes(), 0o644, None)?;
+        write_logical(layout, &layout.pinned_key_path(), key.to_text().as_bytes(), 0o644)?;
         report.changed.push("release key pinned");
     }
     if ensure_state(layout, &account)? {
@@ -356,7 +358,7 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
         .build();
     let mut record_bytes = serde_json::to_vec_pretty(&record)?;
     record_bytes.push(b'\n');
-    if write_logical(layout, &layout.config_path(), &record_bytes, 0o644, None)? {
+    if write_logical(layout, &layout.config_path(), &record_bytes, 0o644)? {
         report.changed.push("install record");
     }
     let definition = if layout.platform.is_macos() {
@@ -384,12 +386,26 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
         Err(error) if secure_fs::is_not_found(&error) => true,
         Err(error) => return Err(error),
     };
-    let definition_changed = write_logical(layout, &definition_path, definition.as_bytes(), 0o644, None)?;
+    let definition_changed = write_logical(layout, &definition_path, definition.as_bytes(), 0o644)?;
     if definition_changed {
         report.changed.push("service definition");
     }
-    if pending || definition_changed || !host.service_registered()? {
+    let registration_pending = match secure_fs::read_file_at(&etc, "definition-registered") {
+        Ok((bytes, metadata)) => {
+            secure_fs::verify_installer_file(&metadata, "definition registration record")?;
+            bytes != definition.as_bytes()
+        }
+        Err(error) if secure_fs::is_not_found(&error) => true,
+        Err(error) => return Err(error),
+    };
+    if registration_pending || definition_changed || !host.service_registered()? {
         host.register_service(&layout.definition())?;
+        write_logical(
+            layout,
+            &layout.etc().join("definition-registered"),
+            definition.as_bytes(),
+            0o644,
+        )?;
         if !definition_changed {
             report.changed.push("service registration");
         }
@@ -408,7 +424,7 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
         wait_healthy(host, &request.health, layout)?;
         report.restarted = true;
     }
-    write_logical(layout, &reconciled_path, &reconciled, 0o644, None)?;
+    write_logical(layout, &reconciled_path, &reconciled, 0o644)?;
     Ok(report)
 }
 
@@ -494,20 +510,15 @@ fn ensure_state(layout: &Layout, account: &Account) -> Result<bool> {
 /// Writes `bytes` into an installer-owned directory walked from the layout
 /// base. The parent is re-checked (owner, no group/other write, not a symlink)
 /// before the file is created.
-fn write_logical(layout: &Layout, logical: &Path, bytes: &[u8], mode: u32, owner: Option<&Account>) -> Result<bool> {
+fn write_logical(layout: &Layout, logical: &Path, bytes: &[u8], mode: u32) -> Result<bool> {
     let parent = logical.parent().context("destination has no parent")?;
     let name = logical
         .file_name()
         .and_then(|name| name.to_str())
         .context("destination has no name")?;
-    let dir = if owner.is_none() {
-        let dir = secure_fs::open_installer_dir(layout.base(), parent)?;
-        secure_fs::verify_installer_dir(&dir, &parent.display().to_string())?;
-        dir
-    } else {
-        secure_fs::open_dir(layout.base(), parent)?
-    };
-    secure_fs::write_file_at(&dir, name, bytes, mode, owner)
+    let dir = secure_fs::open_installer_dir(layout.base(), parent)?;
+    secure_fs::verify_installer_dir(&dir, &parent.display().to_string())?;
+    secure_fs::write_file_at(&dir, name, bytes, mode, None)
 }
 
 /// Unpacks into a staging directory next to the final one and renames it into
@@ -555,9 +566,9 @@ fn point_current(layout: &Layout, release_id: &str) -> Result<bool> {
 fn wait_healthy(host: &dyn Host, health: &Health, layout: &Layout) -> Result<()> {
     let started = Instant::now();
     loop {
-        if host.service_running()? {
+        if let Some(instance) = host.service_instance()? {
             std::thread::sleep(health.stable);
-            if host.service_running()? {
+            if host.service_instance()? == Some(instance) {
                 return Ok(());
             }
         }

@@ -25,8 +25,14 @@ const INSTANT: Health = Health {
     stable: Duration::ZERO,
 };
 
-struct ServiceFlags {
+struct InstanceState {
     running: Cell<bool>,
+    changes: Cell<bool>,
+    reads: Cell<u64>,
+}
+
+struct ServiceFlags {
+    instance: InstanceState,
     registered: Cell<bool>,
     register_fails: Cell<bool>,
     restart_fails: Cell<bool>,
@@ -49,7 +55,11 @@ impl Recording {
             account: Account { uid, gid },
             user_exists: Cell::new(true),
             service: ServiceFlags {
-                running: Cell::new(false),
+                instance: InstanceState {
+                    running: Cell::new(false),
+                    changes: Cell::new(false),
+                    reads: Cell::new(0),
+                },
                 registered: Cell::new(false),
                 register_fails: Cell::new(false),
                 restart_fails: Cell::new(false),
@@ -66,6 +76,17 @@ impl Recording {
 }
 
 impl Host for Recording {
+    fn service_instance(&self) -> Result<Option<(u32, u64)>> {
+        let reads = self.service.instance.reads.get();
+        self.service.instance.reads.set(reads + 1);
+        Ok(self
+            .service
+            .instance
+            .running
+            .get()
+            .then_some((42, if self.service.instance.changes.get() { reads } else { 0 })))
+    }
+
     fn lookup_user(&self, _: &str) -> Result<Option<Account>> {
         Ok(self.user_exists.get().then_some(self.account))
     }
@@ -94,12 +115,12 @@ impl Host for Recording {
         if self.service.restart_fails.get() {
             anyhow::bail!("restart failed");
         }
-        self.service.running.set(self.service.restart_stays_up);
+        self.service.instance.running.set(self.service.restart_stays_up);
         Ok(())
     }
 
     fn service_running(&self) -> Result<bool> {
-        Ok(self.service.running.get())
+        Ok(self.service.instance.running.get())
     }
 
     fn run_as(
@@ -270,7 +291,7 @@ fn installing_again_changes_and_restarts_nothing() {
     let first = release("1.0.1");
     fixture.install(&first).unwrap();
     fixture.enroll();
-    fixture.host.service.running.set(true);
+    fixture.host.service.instance.running.set(true);
 
     let report = fixture.install(&first).unwrap();
     assert!(report.changed.is_empty(), "{:?}", report.changed);
@@ -310,7 +331,7 @@ fn an_upgrade_switches_current_and_restarts_an_enrolled_host_keeping_its_state()
 
     assert!(report.changed.contains(&"current release switched"));
     assert!(report.enrolled && report.restarted);
-    assert_eq!(fixture.host.calls(), ["register", "register", "restart"]);
+    assert_eq!(fixture.host.calls(), ["register", "restart"]);
     assert_eq!(fixture.current_target(), Path::new("releases/1.0.2"));
     assert!(
         fixture.at(fixture.layout().release_dir("1.0.1")).is_dir(),
@@ -336,7 +357,7 @@ fn a_new_hub_ca_restarts_an_enrolled_host_but_a_new_host_id_is_refused() {
     let first = release("1.0.1");
     fixture.install(&first).unwrap();
     fixture.enroll();
-    fixture.host.service.running.set(true);
+    fixture.host.service.instance.running.set(true);
 
     let rotated = b"-----BEGIN CERTIFICATE-----\nMIIC\n-----END CERTIFICATE-----\n";
     let request = |host_id: &'static str, ca: &'static [u8]| {
@@ -353,7 +374,7 @@ fn a_new_hub_ca_restarts_an_enrolled_host_but_a_new_host_id_is_refused() {
             .build()
     };
     let report = install::install(&fixture.host, &request("host-one", rotated)).unwrap();
-    assert_eq!(report.changed, ["hub trust installed", "service registration"]);
+    assert_eq!(report.changed, ["hub trust installed"]);
     assert!(report.restarted, "the daemon reads its CA only at startup");
 
     let error = install::install(&fixture.host, &request("host-two", rotated)).unwrap_err();
@@ -774,6 +795,9 @@ fn startup_input_retry(upgrade: bool, fail_registration: bool) {
     let record = fixture.at(fixture.layout().etc().join("service-reconciled"));
     let previous = fs::read(&record).unwrap();
     fixture.host.service.register_fails.set(fail_registration);
+    if fail_registration {
+        fixture.host.service.registered.set(false);
+    }
     fixture.host.service.restart_fails.set(!fail_registration);
     let error = install::install(&fixture.host, &request).unwrap_err();
     assert!(error.to_string().contains(if fail_registration {
@@ -782,8 +806,8 @@ fn startup_input_retry(upgrade: bool, fail_registration: bool) {
         "restart failed"
     }));
     assert_eq!(fs::read(&record).unwrap(), previous);
-    assert!(fixture.host.service.registered.get());
-    assert!(fixture.host.service.running.get());
+    assert_eq!(fixture.host.service.registered.get(), !fail_registration);
+    assert!(fixture.host.service.instance.running.get());
     assert_eq!(
         fs::read(fixture.at(fixture.layout().state_dir().join("credentials/ca.pem"))).unwrap(),
         ca
@@ -796,7 +820,14 @@ fn startup_input_retry(upgrade: bool, fail_registration: bool) {
     fixture.host.service.restart_fails.set(false);
     fixture.host.calls.borrow_mut().clear();
     assert!(install::install(&fixture.host, &request).unwrap().restarted);
-    assert_eq!(fixture.host.calls(), ["register", "restart"]);
+    assert_eq!(
+        fixture.host.calls(),
+        if fail_registration {
+            vec!["register", "restart"]
+        } else {
+            vec!["restart"]
+        }
+    );
     fixture.host.calls.borrow_mut().clear();
     let report = install::install(&fixture.host, &request).unwrap();
     assert!(!report.restarted && report.changed.is_empty());
@@ -829,7 +860,7 @@ fn changed_definition_retries_registration_and_restart_for_an_enabled_service() 
     let first = release("1.0.1");
     fixture.install(&first).unwrap();
     fixture.enroll();
-    fixture.host.service.running.set(true);
+    fixture.host.service.instance.running.set(true);
     fixture.host.service.register_fails.set(true);
     let request = Request::builder()
         .manifest(&first.manifest)
@@ -849,7 +880,7 @@ fn changed_definition_retries_registration_and_restart_for_an_enabled_service() 
             .contains("registration failed")
     );
     assert!(fixture.host.service.registered.get());
-    assert!(fixture.host.service.running.get());
+    assert!(fixture.host.service.instance.running.get());
     fixture.host.service.register_fails.set(false);
     let report = install::install(&fixture.host, &request).unwrap();
     assert!(report.restarted);
@@ -857,4 +888,33 @@ fn changed_definition_retries_registration_and_restart_for_an_enabled_service() 
     let report = install::install(&fixture.host, &request).unwrap();
     assert!(!report.restarted);
     assert!(report.changed.is_empty());
+}
+
+#[test]
+fn a_crash_loop_with_running_samples_is_not_healthy() {
+    let fixture = Fixture::new();
+    fixture.install(&release("1.0.1")).unwrap();
+    fixture.enroll();
+    fixture.host.service.instance.changes.set(true);
+    let error = fixture.install(&release("1.0.2")).unwrap_err().to_string();
+    assert!(error.contains("did not stay running"), "{error}");
+}
+
+#[test]
+fn fingerprint_is_available_before_installation() {
+    let dir = tempfile::tempdir().unwrap();
+    let public = dir.path().join("release.pub");
+    fs::write(&public, key().public().to_text()).unwrap();
+    let output = Command::new(std::env::var("INSTALLER_BIN").unwrap())
+        .arg("fingerprint")
+        .arg("--key")
+        .arg(&public)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        key().public().fingerprint()
+    );
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
 }
