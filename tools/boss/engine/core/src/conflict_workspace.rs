@@ -1,33 +1,83 @@
 //! Recovery probes for a failed conflict workspace never rebase or publish.
 use crate::work::{ConflictResolution, PendingMergeCheck, WorkDb};
-use boss_execution_contracts::{CubeClient, ExecutionPublisher};
+use anyhow::Result;
+use async_trait::async_trait;
+use boss_execution_contracts::{
+    CubeClient, CubeRepoHandle, CubeWorkspaceLease, ExecutionPublisher, HostAdapter, HostAdapterProvider,
+};
+use std::path::Path;
 
+/// The Cube operations a recovery probe needs, over either this engine's own
+/// Cube or a remote host's adapter.
+#[async_trait]
+trait Probe: Send + Sync {
+    async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle>;
+    async fn lease(&self, repo_id: &str, label: &str) -> Result<CubeWorkspaceLease>;
+    async fn goto(&self, path: &Path, pr: u64) -> Result<()>;
+    async fn release(&self, lease_id: &str) -> Result<()>;
+}
+
+#[async_trait]
+impl Probe for &dyn CubeClient {
+    async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle> {
+        CubeClient::ensure_repo(*self, origin).await
+    }
+    async fn lease(&self, repo_id: &str, label: &str) -> Result<CubeWorkspaceLease> {
+        self.lease_workspace(repo_id, label, None, false, &[]).await
+    }
+    async fn goto(&self, path: &Path, pr: u64) -> Result<()> {
+        self.goto_workspace(path, pr).await
+    }
+    async fn release(&self, lease_id: &str) -> Result<()> {
+        self.release_workspace(lease_id).await
+    }
+}
+
+#[async_trait]
+impl Probe for std::sync::Arc<dyn HostAdapter> {
+    async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle> {
+        HostAdapter::ensure_repo(self.as_ref(), origin).await
+    }
+    async fn lease(&self, repo_id: &str, label: &str) -> Result<CubeWorkspaceLease> {
+        self.lease_workspace(repo_id, label, None, false, &[]).await
+    }
+    async fn goto(&self, path: &Path, pr: u64) -> Result<()> {
+        self.goto_workspace(path, pr).await
+    }
+    async fn release(&self, lease_id: &str) -> Result<()> {
+        self.release_workspace(lease_id).await
+    }
+}
+
+/// Probe preparation on the host whose refusal failed the attempt: this
+/// engine's Cube for a local or mechanical-rung failure, the remote host's
+/// adapter otherwise. A host that cannot be reached is reported on the
+/// surfaced stop and leaves the failed attempt in place.
 pub(crate) async fn recover(
     db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
     cube: &dyn CubeClient,
+    hosts: Option<&dyn HostAdapterProvider>,
     candidate: &PendingMergeCheck,
     attempt: &ConflictResolution,
     probe: &crate::merge_poller::PrLifecycleProbe,
 ) -> bool {
-    // The local Cube cannot vouch for a remote host's repository. A refusal
-    // that came from another host is only retried once GitHub shows the head
-    // or base moved; otherwise the failed attempt stays surfaced.
-    if let Some(host) = failing_remote_host(db, attempt) {
-        let moved = probe
-            .head_ref_oid
-            .as_deref()
-            .is_some_and(|head| attempt.head_sha_before.as_deref() != Some(head))
-            || probe
-                .base_ref_oid
-                .as_deref()
-                .is_some_and(|base| attempt.base_sha_at_trigger.as_deref() != Some(base));
-        if !moved {
-            tracing::warn!(attempt_id = %attempt.id, %host, "conflict workspace refusal came from a remote host; retaining failed attempt until head or base moves");
-            return false;
-        }
-    } else if let Err(error) = prepare(db, cube, candidate).await {
+    let prepared = match db.conflict_workspace_failure_host(&attempt.id) {
+        Ok(None) => prepare(db, &cube, candidate, true).await,
+        Ok(Some(host_id)) => match remote_probe(db, hosts, &host_id).await {
+            Ok(adapter) => prepare(db, &adapter, candidate, false).await,
+            Err(error) => Err(error.context(format!("could not probe host {host_id}"))),
+        },
+        Err(error) => Err(error),
+    };
+    if let Err(error) = prepared {
         tracing::warn!(attempt_id = %attempt.id, error = %format!("{error:#}"), "conflict workspace remains unavailable; retaining failed attempt");
+        if let Err(note_error) = db.note_workspace_recovery(
+            &attempt.id,
+            &format!("The last recovery probe did not succeed: {error:#}"),
+        ) {
+            tracing::warn!(attempt_id = %attempt.id, ?note_error, "could not record recovery probe result");
+        }
         return false;
     }
     match db.resume_conflict_workspace(
@@ -53,16 +103,19 @@ pub(crate) async fn recover(
     }
 }
 
-/// A host other than this engine's own where the failed revision was placed.
-fn failing_remote_host(db: &WorkDb, attempt: &ConflictResolution) -> Option<String> {
-    let revision = attempt.revision_task_id.as_deref()?;
-    db.execution_host_ids_for_item(revision)
-        .ok()?
-        .into_values()
-        .find(|host| host != boss_protocol::LOCAL_HOST_ID)
+async fn remote_probe(
+    db: &WorkDb,
+    hosts: Option<&dyn HostAdapterProvider>,
+    host_id: &str,
+) -> Result<std::sync::Arc<dyn HostAdapter>> {
+    let hosts = hosts.ok_or_else(|| anyhow::anyhow!("no remote host adapters are available to this recovery path"))?;
+    let host = db
+        .get_host(host_id)?
+        .ok_or_else(|| anyhow::anyhow!("host {host_id} is not registered"))?;
+    hosts.adapter_for(&host).await
 }
 
-async fn prepare(db: &WorkDb, cube: &dyn CubeClient, candidate: &PendingMergeCheck) -> anyhow::Result<()> {
+async fn prepare(db: &WorkDb, cube: &impl Probe, candidate: &PendingMergeCheck, local: bool) -> Result<()> {
     // Held until the probe finishes so no worker starts on the chain meanwhile.
     let _chain_hold = crate::conflict_ladder::hold_chain_for_engine_rebase(db, &candidate.work_item_id)
         .map_err(|writers| anyhow::anyhow!("workspace recovery deferred while a worker owns the branch: {writers}"))?;
@@ -78,11 +131,16 @@ async fn prepare(db: &WorkDb, cube: &dyn CubeClient, candidate: &PendingMergeChe
         crate::ladder_lease_reap::engine_install_id(),
         candidate.work_item_id
     );
-    let lease = cube.lease_workspace(&repo.repo_id, &label, None, false, &[]).await?;
-    crate::ladder_lease_registry::register(&lease);
-    let prepared = cube.goto_workspace(&lease.workspace_path, pr as u64).await;
-    let released = cube.release_workspace(&lease.lease_id).await;
-    crate::ladder_lease_registry::unregister(&lease.lease_id);
+    let lease = cube.lease(&repo.repo_id, &label).await?;
+    // The shutdown registry releases through the local Cube only.
+    if local {
+        crate::ladder_lease_registry::register(&lease);
+    }
+    let prepared = cube.goto(&lease.workspace_path, pr as u64).await;
+    let released = cube.release(&lease.lease_id).await;
+    if local {
+        crate::ladder_lease_registry::unregister(&lease.lease_id);
+    }
     // Neither a successful lease nor changed GitHub SHAs prove the bookmark
     // safe: only Cube's normal goto may make that decision.
     prepared?;

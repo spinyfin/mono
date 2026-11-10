@@ -38,6 +38,9 @@ pub struct CoreSweepHost {
     /// 60-second sweep into a 32-minute detection blackout. `None` runs the
     /// ladder inline on the sweep's task when the sweep has a cube client.
     remediation: Option<ConflictRemediationQueue>,
+    /// Filled once the execution coordinator's host adapters exist; lets the
+    /// remediation job probe a failed workspace on the host that refused it.
+    host_adapters: Option<Arc<std::sync::OnceLock<Arc<dyn boss_execution_contracts::HostAdapterProvider>>>>,
     design: CoreDocDetection,
     /// Where the just-in-time conflict-resolution flags are read on every
     /// detection. `None` (tests, and any host built without flags) resolves
@@ -49,9 +52,19 @@ impl CoreSweepHost {
     /// The production host: conflict remediation is handed to a bounded
     /// background queue that drives the escalation ladder.
     pub fn new(work_db: Arc<WorkDb>, publisher: Arc<dyn ExecutionPublisher>, cube_client: Arc<dyn CubeClient>) -> Self {
-        Self::with_remediation(Some(ConflictRemediationQueue::new(Arc::new(
-            LadderRemediationJob::new(work_db, publisher, cube_client),
-        ))))
+        let job = LadderRemediationJob::new(work_db, publisher, cube_client);
+        let slot = job.host_adapter_slot();
+        let mut host = Self::with_remediation(Some(ConflictRemediationQueue::new(Arc::new(job))));
+        host.host_adapters = Some(slot);
+        host
+    }
+
+    /// Give conflict-workspace recovery the host adapters, so a remote host's
+    /// refusal is probed on that host. No-op for hosts built without a job.
+    pub fn set_host_adapter_provider(&self, provider: Arc<dyn boss_execution_contracts::HostAdapterProvider>) {
+        if let Some(slot) = &self.host_adapters {
+            let _ = slot.set(provider);
+        }
     }
 
     /// A host with the given remediator — `None` runs the ladder inline when the
@@ -60,6 +73,7 @@ impl CoreSweepHost {
     pub fn with_remediation(remediation: Option<ConflictRemediationQueue>) -> Self {
         Self {
             remediation,
+            host_adapters: None,
             design: CoreDocDetection,
             feature_flags: None,
         }

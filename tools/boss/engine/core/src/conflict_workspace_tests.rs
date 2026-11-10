@@ -466,3 +466,279 @@ fn workspace_resumes_on_an_unchanged_head_are_bounded() {
         "a moved head lifts the bound"
     );
 }
+
+/// A remote host's Cube adapter that can be told to keep refusing goto.
+struct RemoteCube {
+    refuse: std::sync::atomic::AtomicBool,
+    gotos: std::sync::Mutex<u32>,
+}
+
+crate::stub_host_adapter! { RemoteCube {
+    fn host_id(&self) -> &str {
+        "remote-1"
+    }
+    async fn ensure_repo(&self, _origin: &str) -> Result<CubeRepoHandle> {
+        Ok(CubeRepoHandle { repo_id: "repo-remote".to_owned() })
+    }
+    async fn lease_workspace(
+        &self,
+        _repo_id: &str,
+        _task: &str,
+        _prefer: Option<&str>,
+        _allow_dirty: bool,
+        _exclude: &[&str],
+    ) -> Result<CubeWorkspaceLease> {
+        Ok(CubeWorkspaceLease {
+            lease_id: "remote-lease".to_owned(),
+            workspace_id: "remote-ws".to_owned(),
+            workspace_path: PathBuf::from("/tmp/remote-ws"),
+            dirty_verified: None,
+        })
+    }
+    async fn release_workspace(&self, _lease_id: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn goto_workspace(&self, _workspace_path: &std::path::Path, _pr: u64) -> Result<()> {
+        *self.gotos.lock().unwrap() += 1;
+        if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(boss_host_execution::cube::CubeCliError {
+                host: "remote-1".into(), exit_code: Some(1), stdout: String::new(),
+                stderr: "remote bookmark pr/42 diverged".into(),
+            }.into());
+        }
+        Ok(())
+    }
+} }
+
+struct RemoteProvider(Arc<RemoteCube>);
+
+#[async_trait::async_trait]
+impl boss_execution_contracts::HostAdapterProvider for RemoteProvider {
+    async fn adapter_for(
+        &self,
+        _host: &crate::host_registry::Host,
+    ) -> Result<Arc<dyn boss_execution_contracts::HostAdapter>> {
+        Ok(self.0.clone() as Arc<dyn boss_execution_contracts::HostAdapter>)
+    }
+}
+
+#[tokio::test]
+async fn remote_refusal_is_probed_on_the_remote_host_and_recovers_after_a_bookmark_repair() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    db.add_host("remote-1", "user@remote-1", 1, &[]).unwrap();
+    let (candidate, attempt, chore) = blocked_with_attempt(&db);
+    db.fail_conflict_workspace_on_host(&attempt.id, "remote bookmark pr/42 diverged", Some("remote-1"))
+        .unwrap();
+    // Local preparation would succeed; only the remote host refuses.
+    let local = ScriptCube::new(Script::CleanPushed);
+    let remote = Arc::new(RemoteCube {
+        refuse: std::sync::atomic::AtomicBool::new(true),
+        gotos: std::sync::Mutex::new(0),
+    });
+    let provider = RemoteProvider(remote.clone());
+    let publisher = RecordingPublisher::default();
+    let mut moved = probe();
+    moved.head_ref_oid = Some("head222".into());
+    moved.base_ref_oid = Some("base111".into());
+    for _ in 0..3 {
+        let current = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+        assert!(
+            !crate::conflict_workspace::recover(&db, &publisher, &local, Some(&provider), &candidate, &current, &moved)
+                .await
+        );
+    }
+    assert_eq!(*remote.gotos.lock().unwrap(), 3, "the remote host was asked each time");
+    assert_eq!(
+        *local.lease_calls.lock().await,
+        0,
+        "the local Cube never vouches for a remote host"
+    );
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert!(crate::work::conflict_workspace_failed(&row));
+    let items = db.list_attention_items_for_work_item(&chore).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].status, "open");
+    assert!(
+        items[0].body_markdown.contains("did not succeed"),
+        "{}",
+        items[0].body_markdown
+    );
+
+    // The remote bookmark is repaired; head and base are unchanged.
+    remote.refuse.store(false, std::sync::atomic::Ordering::SeqCst);
+    let current = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert!(
+        crate::conflict_workspace::recover(&db, &publisher, &local, Some(&provider), &candidate, &current, &moved)
+            .await
+    );
+    assert_eq!(
+        db.get_conflict_resolution(&attempt.id).unwrap().unwrap().status,
+        "pending"
+    );
+    assert_eq!(*local.lease_calls.lock().await, 0);
+
+    // Without adapters a remote refusal can only be reported, not probed.
+    db.fail_conflict_workspace_on_host(&attempt.id, "remote bookmark pr/42 diverged", Some("remote-1"))
+        .unwrap();
+    let current = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert!(!crate::conflict_workspace::recover(&db, &publisher, &local, None, &candidate, &current, &moved).await);
+    let items = db.list_attention_items_for_work_item(&chore).unwrap();
+    assert!(
+        items
+            .iter()
+            .any(|item| item.status == "open" && item.body_markdown.contains("host remote-1"))
+    );
+}
+
+#[tokio::test]
+async fn mechanical_refusal_under_a_foreign_blocker_keeps_the_blocker_and_shows_the_stop() {
+    use crate::work::WorkItemPatch;
+    for blocker in ["dependency", "review_feedback"] {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let (candidate, attempt, chore) = blocked_with_attempt(&db);
+        db.update_work_item(
+            &chore,
+            WorkItemPatch {
+                status: Some("blocked".into()),
+                blocked_reason: Some(blocker.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let outcome = crate::conflict_ladder::try_mechanical_rungs(
+            &db,
+            &RecordingPublisher::default(),
+            &ScriptCube::new(Script::GotoDivergence),
+            &candidate,
+            &attempt,
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            crate::conflict_ladder::LadderOutcome::WorkspacePreparationFailed
+        ));
+        let WorkItem::Chore(task) = db.get_work_item(&chore).unwrap() else {
+            panic!()
+        };
+        assert_eq!(task.blocked_reason.as_deref(), Some(blocker));
+        let items = db.list_attention_items_for_work_item(&chore).unwrap();
+        assert_eq!(items.len(), 1, "{blocker}");
+        assert_eq!(items[0].kind, CONFLICT_REMEDIATION_STOPPED_ATTENTION_KIND);
+        assert_eq!(items[0].status, "open");
+        assert!(items[0].body_markdown.contains("unique content"));
+    }
+}
+
+#[test]
+fn resumes_without_a_revision_are_counted_on_the_attempt() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (_, attempt, _) = blocked_with_attempt(&db);
+    let mut resumed = 0;
+    for _ in 0..6 {
+        db.fail_conflict_workspace(&attempt.id, "cube divergence").unwrap();
+        if db
+            .resume_conflict_workspace(&attempt.id, Some("head222"), Some("base111"))
+            .unwrap()
+            .is_some()
+        {
+            resumed += 1;
+        }
+    }
+    assert_eq!(resumed, 3, "a mechanical failure cycle cannot repeat without bound");
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    let chore = row.work_item_id.clone();
+    let items = db.list_attention_items_for_work_item(&chore).unwrap();
+    assert!(
+        items
+            .iter()
+            .any(|item| item.status == "open" && item.body_markdown.contains("Automatic recovery is paused")),
+        "a held attempt says recovery is paused: {items:?}"
+    );
+    assert!(
+        db.resume_conflict_workspace(&attempt.id, Some("head222"), Some("new-base"))
+            .unwrap()
+            .is_some(),
+        "a moved base reopens the budget"
+    );
+}
+
+#[test]
+fn a_changed_failure_reopens_the_resume_budget() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (_, attempt, _) = blocked_with_attempt(&db);
+    for _ in 0..3 {
+        db.fail_conflict_workspace(&attempt.id, "cube divergence").unwrap();
+        assert!(db.resume_conflict_workspace(&attempt.id, None, None).unwrap().is_some());
+    }
+    // The same refusal again is held; a different refusal (the bookmark Cube
+    // complained about changed) is a new episode.
+    db.fail_conflict_workspace(&attempt.id, "cube cannot find pr/42")
+        .unwrap();
+    assert!(db.resume_conflict_workspace(&attempt.id, None, None).unwrap().is_some());
+    db.fail_conflict_workspace(&attempt.id, "cube cannot find pr/42")
+        .unwrap();
+    assert!(db.resume_conflict_workspace(&attempt.id, None, None).unwrap().is_some());
+}
+
+#[test]
+fn a_consumed_churn_stop_is_not_reclassified_again() {
+    use boss_protocol::CreateRevisionInput;
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, first, chore) = blocked_with_attempt(&db);
+    let checker = StaticPrStateChecker(PrOpenState::Open);
+    let revision = db
+        .create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(&chore)
+                .description("Resolve merge conflict")
+                .created_via(format!("merge-conflict:{}", first.id))
+                .build(),
+            &checker,
+        )
+        .unwrap();
+    db.set_conflict_resolution_revision_task_id(&first.id, &revision.id)
+        .unwrap();
+    for queued in db.list_executions(Some(&revision.id)).unwrap() {
+        if !queued.status.is_terminal() {
+            db.cancel_execution(&queued.id).unwrap();
+        }
+    }
+    db.bounce_dispatch_failed_to_backlog(&revision.id, "cube_workspace_positioning_failed", "refused")
+        .unwrap();
+    db.close_moot_revision_task(
+        &revision.id,
+        crate::work::ArchiveProvenance::new(
+            crate::work::ARCHIVE_MECHANISM_CONFLICT_WATCH_SUPERSESSION,
+            "workspace preparation recovered",
+        ),
+    )
+    .unwrap();
+    db.abandon_conflict_resolution_for_supersede(&first.id, "superseded_stale_head")
+        .unwrap();
+    let new_attempt = |base: &str| ConflictResolutionInsertInput {
+        product_id: candidate.product_id.clone(),
+        work_item_id: chore.clone(),
+        pr_url: PR.into(),
+        pr_number: 42,
+        head_branch: "feature".into(),
+        base_branch: "main".into(),
+        head_sha_before: Some("head222".into()),
+        base_sha_at_trigger: Some(base.into()),
+    };
+    for base in ["base-two", "base-three"] {
+        let prior = db.insert_conflict_resolution(new_attempt(base)).unwrap().unwrap();
+        db.abandon_conflict_resolution_for_supersede(&prior.id, "superseded_stale_head")
+            .unwrap();
+    }
+    let stopped = db.insert_conflict_resolution(new_attempt("base111")).unwrap().unwrap();
+    assert_eq!(stopped.failure_reason.as_deref(), Some(crate::work::CHURN_GUARD_REASON));
+    assert!(
+        !db.retain_conflict_revision_workspace_failure(&stopped.id).unwrap(),
+        "the revision's failure was already consumed by a recovery"
+    );
+}

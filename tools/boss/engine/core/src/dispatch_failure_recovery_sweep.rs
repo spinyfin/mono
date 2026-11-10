@@ -606,6 +606,50 @@ mod tests {
         );
     }
 
+    /// A conflict revision whose attempt failed in workspace preparation is
+    /// recovered only by the conflict-workspace probe. Respawning it here
+    /// would repeat the same Cube refusal every pass and block that probe.
+    #[tokio::test]
+    async fn workspace_failed_conflict_revision_is_never_respawned() {
+        use crate::work::ConflictResolutionInsertInput;
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_bounced_chore(&db, &product_id);
+        make_failure_old(&db, &work_item_id, DISPATCH_FAILURE_RECOVERY_MIN_AGE_SECS + 60);
+        let attempt = db
+            .insert_conflict_resolution(ConflictResolutionInsertInput {
+                product_id: product_id.clone(),
+                work_item_id: work_item_id.clone(),
+                pr_url: "https://github.com/foo/bar/pull/42".into(),
+                pr_number: 42,
+                head_branch: "feature".into(),
+                base_branch: "main".into(),
+                head_sha_before: Some("head".into()),
+                base_sha_at_trigger: Some("base".into()),
+            })
+            .unwrap()
+            .unwrap();
+        db.set_conflict_resolution_revision_task_id(&attempt.id, &work_item_id)
+            .unwrap();
+        assert_eq!(
+            db.list_dispatch_failed_recovery_candidates(DISPATCH_FAILURE_RECOVERY_MIN_AGE_SECS)
+                .unwrap(),
+            vec![work_item_id.clone()],
+            "control: a live attempt leaves the bounced revision a candidate"
+        );
+        db.fail_conflict_workspace(&attempt.id, "cube refused").unwrap();
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        for _ in 0..2 {
+            let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref()).await;
+            assert_eq!(outcome.redispatched, 0);
+        }
+        assert!(db.list_executions(Some(&work_item_id)).unwrap().is_empty());
+        assert!(!get_task(&db, &work_item_id).autostart);
+    }
+
     /// If `request_execution` fails *after* autostart has been
     /// re-enabled, the whole re-enable-and-request must roll back
     /// together: the item is left exactly as it was before the sweep
