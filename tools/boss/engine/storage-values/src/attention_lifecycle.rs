@@ -189,6 +189,11 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         "Restore restaged the selected tip and archived unpublished unselected variants. A later restage of that selected tip does not recover the archived work, so this signal stays open for inspection until a human resolves it or the preserved-reference cleanup forgets the archives of an item whose chain has been closed for the retention period.",
     ),
     entry(
+        LEGACY_STORE_CLEANUP_FAILED_ATTENTION_KIND,
+        ClearedBy::HumanDecision,
+        "A store cleanup failed at least three times. Filed once per store against a recorded execution; retries continue while archive cleanup stays protected. Inspect the host, path and error before dismissing.",
+    ),
+    entry(
         PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND,
         ClearedBy::HumanDecision,
         "Teardown released the lease and deleted nothing, but could not safely preserve the workspace: teardown could not run the preservation at all (the recovery record, workspace path, owning host or cube registry was unavailable, or jj failed), the tip and the existing work could not be combined (the existing bookmark is kept unless it contains a change rejected as unsafe, which is then kept only under the unsafe archive), no lease boundary or journaled tip at it was available, a lease-boundary journal walk exhausted its operation-view budget, unpublished registered work was absent from the boundary tip (the boundary tip is still bookmarked), the boundary change was rewritten afterwards, snapshotting a free workspace hid the boundary commit, or the boundary commit is still a reassigned workspace's working-copy commit. Depending on the trigger the item names both tips, one, or none. Work rejected as unsafe is retained only under inspection-only `preserved-archive/<exec>/unsafe/<change>/<commit>` references, which are never restored automatically. A later restage of the old tip does not recover work the item names.",

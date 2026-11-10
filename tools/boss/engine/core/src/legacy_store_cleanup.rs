@@ -17,7 +17,9 @@
 //!    its multi-megabyte view, are collected by cube.
 //!
 //! A failure leaves the store pending and is retried after [`RETRY_AFTER`]. The
-//! cleanup is housekeeping: nothing here ever blocks or delays a dispatch.
+//! third failure files one inspection attention per store. Missing stores complete
+//! after a probe on their owning host. Persistent failures keep the loop alive
+//! and retrying until cleanup succeeds. Nothing here blocks or delays dispatch.
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;

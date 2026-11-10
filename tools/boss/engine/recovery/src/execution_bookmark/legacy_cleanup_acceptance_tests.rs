@@ -2,6 +2,47 @@ use super::*;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+/// Models the SSH adapter's workspace-pointer reader at a store root.
+struct StoreRootJj;
+
+struct MissingRemoteStore;
+
+#[async_trait]
+impl Jj for MissingRemoteStore {
+    async fn workspace_exists(&self, _workspace: &Path) -> Result<bool> {
+        Ok(false)
+    }
+
+    async fn run(&self, _repo: &Path, _args: &[&str]) -> Result<String> {
+        anyhow::bail!("must not run jj in a missing remote store")
+    }
+
+    async fn shared_repo(&self, _workspace: &Path) -> Result<PathBuf> {
+        anyhow::bail!("must not read a missing remote store")
+    }
+}
+
+#[async_trait]
+impl Jj for StoreRootJj {
+    async fn run(&self, repo: &Path, args: &[&str]) -> Result<String> {
+        LocalJj.run(repo, args).await
+    }
+
+    async fn shared_repo(&self, _workspace: &Path) -> Result<PathBuf> {
+        anyhow::bail!("cannot read shared jj store pointer: Is a directory")
+    }
+}
+
+#[tokio::test]
+async fn a_missing_remote_store_completes_without_running_jj() {
+    let dir = tempfile::tempdir().unwrap();
+    // The path exists locally; only the owning host's probe is authoritative.
+    let report = cleanup_legacy_store(&MissingRemoteStore, dir.path(), &[])
+        .await
+        .unwrap();
+    assert_eq!(report, LegacyCleanupReport::default());
+}
+
 fn git_dir(s: &Store) -> PathBuf {
     let marker = s.repo.repo.join(".jj/repo/store/git_target");
     if marker.is_file() {
@@ -35,7 +76,7 @@ async fn a_colocated_cube_store_removes_git_refs_and_preserves_unpublished_work(
     let main = s.commit_of("main");
     s.bookmark(&["boss-base/exec_colocated"], &main);
     s.bookmark(&["boss-recovery/exec_colocated"], &work);
-    let report = cleanup_legacy_store(&LocalJj, &s.repo.repo, &[]).await.unwrap();
+    let report = cleanup_legacy_store(&StoreRootJj, &s.repo.repo, &[]).await.unwrap();
     assert_eq!(report.archived.len(), 1, "{report:?}");
     assert_eq!(report.archived[0].commit_id, work);
     s.run(&["git", "import"]);
@@ -238,7 +279,7 @@ async fn a_recorded_restaged_source_is_published_across_change_identities() {
     s.bookmark(&["boss-recovery/exec_original"], &original);
     s.bookmark(&["boss-recovery/exec_later"], &later);
     // The database's published recovery lineage supplies the source tip;
-    // evolution reads no longer scan unrelated published change identities.
+    // evolution reads cover published commits sharing a candidate change identity.
     let report = cleanup_legacy_store(&LocalJj, &s.repo.repo, &[published, original.clone()])
         .await
         .unwrap();

@@ -140,11 +140,44 @@ impl WorkDb {
 
     /// Keep the store pending and remember why the attempt failed.
     pub fn fail_legacy_store_cleanup(&self, host_id: &str, repo_path: &Path, error: &str) -> Result<()> {
-        self.connect()?.execute(
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
             "UPDATE legacy_store_cleanups SET last_error = ?3
              WHERE host_id = ?1 AND repo_path = ?2 AND completed_at IS NULL",
             params![host_id, path_text(repo_path)?, error],
         )?;
+        let kind = boss_engine_storage_values::attention_kinds::LEGACY_STORE_CLEANUP_FAILED_ATTENTION_KIND;
+        // Every migrated store comes from an execution recovery record. Retain
+        // dismissed signals so retries never nag again, even after a restart.
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT eb.execution_id FROM execution_bookmarks eb
+             JOIN legacy_store_cleanups lc ON lc.host_id = eb.host_id AND lc.repo_path = eb.repo_path
+             JOIN work_executions we ON we.id = eb.execution_id
+             WHERE lc.host_id = ?1 AND lc.repo_path = ?2 AND lc.attempts >= 3
+               AND lc.completed_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM work_attention_items ai
+                   JOIN execution_bookmarks owner ON owner.execution_id = ai.execution_id
+                   WHERE owner.host_id = lc.host_id AND owner.repo_path = lc.repo_path AND ai.kind = ?3)
+             ORDER BY eb.execution_id LIMIT 1",
+                params![host_id, path_text(repo_path)?, kind],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(owner) = owner {
+            super::attention_filing::upsert_execution_attention_in_tx(
+                &tx,
+                &owner,
+                kind,
+                "Legacy store cleanup keeps failing",
+                &format!(
+                    "Cleanup of `{}` on host `{host_id}` has failed at least three times. Automatic retries continue hourly; archive cleanup for this store remains suspended until cleanup completes.\n\nLast error:\n\n{error}",
+                    repo_path.display()
+                ),
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 

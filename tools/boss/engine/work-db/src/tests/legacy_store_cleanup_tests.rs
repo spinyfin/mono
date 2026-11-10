@@ -1,6 +1,56 @@
 use super::*;
 use boss_engine_recovery::execution_bookmark::{ExecutionBookmark, LegacyArchive, LegacyCleanupReport};
 
+#[test]
+fn repeated_failures_surface_once_per_store_including_after_restart_and_dismissal() {
+    let (_dir, path) = disk_db_path("legacy-store-failure");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore_manual(&db, product.id, "Store maintenance");
+    recorded_execution(&db, &chore.id, "remote", "/stores/mono", "mono");
+    recorded_execution(&db, &chore.id, "remote", "/stores/mono", "mono");
+    drop(db);
+    let db = reapply_migration(&path);
+    let repo = Path::new("/stores/mono");
+    let kind = boss_engine_storage_values::attention_kinds::LEGACY_STORE_CLEANUP_FAILED_ATTENTION_KIND;
+    for attempt in 1..=3 {
+        db.begin_legacy_store_cleanup("remote", repo).unwrap();
+        db.fail_legacy_store_cleanup("remote", repo, "SSH permission denied")
+            .unwrap();
+        let items = db.list_open_attention_items_of_kind(kind).unwrap();
+        assert_eq!(items.len(), usize::from(attempt == 3));
+    }
+    let items = db.list_open_attention_items_of_kind(kind).unwrap();
+    let body = &items[0].body_markdown;
+    for detail in ["remote", "/stores/mono", "SSH permission denied", "suspended"] {
+        assert!(body.contains(detail), "{body}");
+    }
+    sql(
+        &db,
+        "UPDATE work_attention_items SET status = 'resolved' WHERE kind = ?1",
+        [kind],
+    );
+    drop(db);
+    let db = WorkDb::open(path).unwrap();
+    db.begin_legacy_store_cleanup("remote", repo).unwrap();
+    db.fail_legacy_store_cleanup("remote", repo, "still unavailable")
+        .unwrap();
+    let count: i64 = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM work_attention_items WHERE kind = ?1",
+            [kind],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    let status = db.legacy_store_cleanup_status("remote", repo).unwrap().unwrap();
+    assert_eq!(status.attempts, 4);
+    assert!(!status.completed);
+    assert_eq!(status.last_error.as_deref(), Some("still unavailable"));
+}
+
 fn sql(db: &WorkDb, statement: &str, parameters: impl rusqlite::Params) {
     db.connect().unwrap().execute(statement, parameters).unwrap();
 }
