@@ -228,6 +228,15 @@ impl Fixture {
     pub fn start(&self) -> Daemon {
         Daemon::start(self.dir.path(), &self.endpoint, Path::new("cube"), None)
     }
+    pub fn start_without_tools(&self) -> Daemon {
+        Daemon::start_with_path(
+            self.dir.path(),
+            &self.endpoint,
+            Path::new("cube"),
+            None,
+            Some(self.dir.path()),
+        )
+    }
     pub fn start_with_cube(&self, cube: &Path) -> Daemon {
         Daemon::start(self.dir.path(), &self.endpoint, cube, None)
     }
@@ -248,6 +257,9 @@ pub struct Daemon {
 }
 impl Daemon {
     fn start(dir: &Path, endpoint: &str, cube: &Path, tmux: Option<&Path>) -> Self {
+        Self::start_with_path(dir, endpoint, cube, tmux, None)
+    }
+    fn start_with_path(dir: &Path, endpoint: &str, cube: &Path, tmux: Option<&Path>, path: Option<&Path>) -> Self {
         let log = dir.join("daemon.log");
         let mut command = Command::new(std::env::var("SPOKE_BIN").unwrap());
         command
@@ -262,6 +274,9 @@ impl Daemon {
             .stderr(std::fs::File::create(&log).unwrap());
         if let Some(tmux) = tmux {
             command.arg("--tmux-bin").arg(tmux);
+        }
+        if let Some(path) = path {
+            command.env("PATH", path);
         }
         let child = command.spawn().unwrap();
         Self { child, log }

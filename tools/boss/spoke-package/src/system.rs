@@ -131,6 +131,21 @@ impl Host for System {
         }
     }
 
+    fn service_instance(&self) -> Result<Option<(u32, u64)>> {
+        let output = if self.platform.is_macos() {
+            run("launchctl", &["print", &format!("system/{LAUNCHD_LABEL}")])?
+        } else {
+            run("systemctl", &["show", "-p", "MainPID", "-p", "NRestarts", SYSTEMD_UNIT])?
+        };
+        if !output.status.success() {
+            return Ok(None);
+        }
+        Ok(parse_instance(
+            &String::from_utf8(output.stdout)?,
+            self.platform.is_macos(),
+        ))
+    }
+
     fn run_as(
         &self,
         account: &Account,
@@ -148,6 +163,10 @@ impl Host for System {
 pub struct Staged;
 
 impl Host for Staged {
+    fn service_instance(&self) -> Result<Option<(u32, u64)>> {
+        Ok(Some((1, 0)))
+    }
+
     fn lookup_user(&self, _: &str) -> Result<Option<Account>> {
         // SAFETY: geteuid and getegid have no preconditions and cannot fail.
         let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
@@ -228,6 +247,18 @@ pub fn run_as(account: &Account, env: &[(String, String)], program: &Path, args:
     })
 }
 
+fn parse_instance(text: &str, macos: bool) -> Option<(u32, u64)> {
+    let value = |name: &str| {
+        text.lines().find_map(|line| {
+            let (key, value) = line.trim().split_once('=')?;
+            (key.trim() == name).then_some(value.trim())
+        })
+    };
+    let pid = value(if macos { "pid" } else { "MainPID" })?.parse().ok()?;
+    let runs = value(if macos { "runs" } else { "NRestarts" })?.parse().ok()?;
+    (pid != 0).then_some((pid, runs))
+}
+
 fn free_service_uid(listing: &str) -> Result<i64> {
     let used = listing
         .lines()
@@ -247,6 +278,16 @@ fn free_service_uid(listing: &str) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_instances_require_a_pid_and_launch_count() {
+        assert_eq!(parse_instance("MainPID=42\nNRestarts=3\n", false), Some((42, 3)));
+        assert_eq!(parse_instance("\tpid = 42\n\truns = 4\n", true), Some((42, 4)));
+        for text in ["MainPID=0\nNRestarts=3", "MainPID=42", "MainPID=bad\nNRestarts=3"] {
+            assert_eq!(parse_instance(text, false), None);
+        }
+        assert_eq!(parse_instance("state = waiting\nruns = 2", true), None);
+    }
 
     #[test]
     fn service_uid_skips_occupied_ids_and_accepts_negative_system_ids() {

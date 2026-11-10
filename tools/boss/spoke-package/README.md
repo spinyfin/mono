@@ -38,7 +38,9 @@ The release key is an Ed25519 key, separate from the hub's host CA.
   `BOSS_SPOKE_RELEASE_SIGNING_KEY`; the public half and its fingerprint are
   published to the people who install.
 - The **first** install on a host needs `--trusted-key release.pub`. After
-  confirming the fingerprint the installer prints with the release owner, the
+  running `boss-spoke-package fingerprint --key release.pub` (or `verify`) and
+  confirming the printed fingerprint with the release owner, install with
+  `--trusted-key release.pub`. The
   key is **pinned** in `/etc/boss-spoke/release-verify-key.pub` (root-owned).
   Later installs verify against the pinned key. Giving a different key is
   refused (`trusted_key_changed`); to trust a new key, remove the pinned file as
