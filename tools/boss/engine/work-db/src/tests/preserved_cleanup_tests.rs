@@ -77,11 +77,11 @@ fn a_published_successor_supersedes_every_restaged_predecessor_in_its_lineage() 
     restaged(&db, &third, &second);
 
     assert!(
-        db.list_superseded_preserved(10).unwrap().is_empty(),
+        db.list_superseded_preserved(10, &[]).unwrap().is_empty(),
         "nothing has published yet"
     );
     publish(&db, &third);
-    let cleanups = db.list_superseded_preserved(10).unwrap();
+    let cleanups = db.list_superseded_preserved(10, &[]).unwrap();
     let mut expected = vec![first.clone(), second.clone()];
     expected.sort();
     assert_eq!(
@@ -99,13 +99,13 @@ fn a_published_successor_supersedes_every_restaged_predecessor_in_its_lineage() 
         assert_eq!(cleanup.scope, PreservedScope::Tip);
     }
     assert_eq!(
-        db.list_superseded_preserved(1).unwrap().len(),
+        db.list_superseded_preserved(1, &[]).unwrap().len(),
         1,
         "bounded by the limit"
     );
 
-    db.finish_preserved_cleanup(&first, &[]).unwrap();
-    assert_eq!(ids(&db.list_superseded_preserved(10).unwrap()), vec![second]);
+    db.finish_preserved_cleanup(&first, PreservedScope::Tip, &[]).unwrap();
+    assert_eq!(ids(&db.list_superseded_preserved(10, &[]).unwrap()), vec![second]);
 }
 
 #[test]
@@ -116,7 +116,7 @@ fn a_successor_that_did_not_restage_the_work_supersedes_nothing() {
     let abandoned = preserved_execution(&db, &chore.id, 10);
     let fresh = preserved_execution(&db, &chore.id, 9);
     publish(&db, &fresh);
-    assert!(db.list_superseded_preserved(10).unwrap().is_empty());
+    assert!(db.list_superseded_preserved(10, &[]).unwrap().is_empty());
     assert!(db.preserved_tip(&abandoned).unwrap().is_some());
 }
 
@@ -130,7 +130,7 @@ fn a_restage_cycle_in_the_record_cannot_loop_the_listing() {
     restaged(&db, &a, &b);
     restaged(&db, &b, &a);
     publish(&db, &a);
-    let cleanups = db.list_superseded_preserved(10).unwrap();
+    let cleanups = db.list_superseded_preserved(10, &[]).unwrap();
     assert_eq!(ids(&cleanups), vec![b]);
 }
 
@@ -163,7 +163,9 @@ fn a_closed_chain_lists_its_tip_only_after_the_retention_period() {
         params![archived.id, 30 * DAY],
     );
 
-    let cleanups = db.list_closed_chain_preserved(CLOSED_CHAIN_RETENTION_SECS, 10).unwrap();
+    let cleanups = db
+        .list_closed_chain_preserved(CLOSED_CHAIN_RETENTION_SECS, 10, &[])
+        .unwrap();
     let mut expected = vec![done.clone(), gone.clone()];
     expected.sort();
     assert_eq!(ids(&cleanups), expected);
@@ -179,13 +181,13 @@ fn a_closed_chain_lists_its_tip_only_after_the_retention_period() {
         assert_eq!(cleanup.scope, PreservedScope::TipAndArchives);
     }
     assert_eq!(
-        db.list_closed_chain_preserved(CLOSED_CHAIN_RETENTION_SECS, 1)
+        db.list_closed_chain_preserved(CLOSED_CHAIN_RETENTION_SECS, 1, &[])
             .unwrap()
             .len(),
         1
     );
     assert!(
-        db.list_closed_chain_preserved(60 * DAY, 10).unwrap().is_empty(),
+        db.list_closed_chain_preserved(60 * DAY, 10, &[]).unwrap().is_empty(),
         "a longer retention period holds everything back"
     );
 }
@@ -203,7 +205,7 @@ fn a_revision_is_judged_by_its_chain_root() {
     );
     let tip = preserved_execution(&db, &revision.id, 100 * DAY);
     assert!(
-        db.list_closed_chain_preserved(CLOSED_CHAIN_RETENTION_SECS, 10)
+        db.list_closed_chain_preserved(CLOSED_CHAIN_RETENTION_SECS, 10, &[])
             .unwrap()
             .is_empty()
     );
@@ -213,7 +215,9 @@ fn a_revision_is_judged_by_its_chain_root() {
         params![root.id, 30 * DAY],
     );
     assert_eq!(
-        ids(&db.list_closed_chain_preserved(CLOSED_CHAIN_RETENTION_SECS, 10).unwrap()),
+        ids(&db
+            .list_closed_chain_preserved(CLOSED_CHAIN_RETENTION_SECS, 10, &[])
+            .unwrap()),
         vec![tip]
     );
 }
@@ -232,7 +236,9 @@ fn an_open_inspection_request_keeps_the_archives_but_not_the_tip() {
     );
     db.upsert_execution_attention(&tip, PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND, "Inspect", "body")
         .unwrap();
-    let cleanups = db.list_closed_chain_preserved(CLOSED_CHAIN_RETENTION_SECS, 10).unwrap();
+    let cleanups = db
+        .list_closed_chain_preserved(CLOSED_CHAIN_RETENTION_SECS, 10, &[])
+        .unwrap();
     assert_eq!(ids(&cleanups), vec![tip]);
     assert_eq!(cleanups[0].scope, PreservedScope::Tip);
 }
@@ -252,8 +258,12 @@ fn finishing_a_cleanup_clears_the_tip_and_resolves_only_the_named_attention() {
     ] {
         db.upsert_execution_attention(&tip, kind, "title", "body").unwrap();
     }
-    db.finish_preserved_cleanup(&tip, &[ABANDONED_EXECUTION_BOOKMARK_ATTENTION_KIND])
-        .unwrap();
+    db.finish_preserved_cleanup(
+        &tip,
+        PreservedScope::Tip,
+        &[ABANDONED_EXECUTION_BOOKMARK_ATTENTION_KIND],
+    )
+    .unwrap();
     assert!(db.preserved_tip(&tip).unwrap().is_none());
     let status = |kind: &str| {
         db.list_attention_items(&tip)
@@ -305,4 +315,51 @@ fn retiring_the_prune_state_drops_its_columns_and_resolves_its_open_items() {
     assert_eq!(resolved, "resolved");
     assert!(at.is_some());
     assert_eq!(status("other"), ("open".to_owned(), None));
+}
+
+#[test]
+fn a_metadata_only_successor_keeps_its_predecessors_tip() {
+    let db = WorkDb::open(temp_db_path("metadata-only-preserved")).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore_manual(&db, product.id, "metadata only");
+    let prior = preserved_execution(&db, &chore.id, DAY);
+    let successor = preserved_execution(&db, &chore.id, 1);
+    restaged(&db, &successor, &prior);
+    publish(&db, &successor);
+    sql(
+        &db,
+        "UPDATE work_executions SET pr_head_before = pr_head_after WHERE id = ?1",
+        [&successor],
+    );
+    assert!(db.list_superseded_preserved(10, &[]).unwrap().is_empty());
+    assert!(db.preserved_tip(&prior).unwrap().is_some());
+    sql(
+        &db,
+        "UPDATE work_executions SET pr_head_after = 'new-head' WHERE id = ?1",
+        [&successor],
+    );
+    assert_eq!(
+        ids(&db.list_superseded_preserved(10, &[]).unwrap()),
+        vec![prior.clone()]
+    );
+    assert!(db.list_superseded_preserved(1, &[prior]).unwrap().is_empty());
+}
+
+#[test]
+fn archive_cleanup_migration_is_idempotent_and_preserves_archive_only_records() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE execution_bookmarks (execution_id TEXT PRIMARY KEY); INSERT INTO execution_bookmarks VALUES ('old');").unwrap();
+    for _ in 0..2 {
+        crate::preserved_cleanup::migrate_archive_cleanup(&conn).unwrap();
+    }
+    conn.execute("INSERT INTO execution_bookmarks (execution_id) VALUES ('new')", [])
+        .unwrap();
+    let pending: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM execution_bookmarks WHERE archive_cleanup_pending = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending, 2);
 }

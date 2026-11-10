@@ -5,12 +5,11 @@
 //! it is finished with, and neither needs a proof about commits:
 //!
 //! - a later execution that restaged it (`execution_bookmarks.recovered_from`,
-//!   directly or through a chain of restages) has published, which stamps
+//!   directly or through a chain of restages) has published, with a changed
 //!   `work_executions.pr_head_after`;
 //! - the item's PR chain has been closed (merged, closed or archived) for
 //!   [`CLOSED_CHAIN_RETENTION_SECS`], so the work was either carried by a
-//!   later execution or abandoned, and an open attention item already told the
-//!   operator which.
+//!   later execution or abandoned; open unrecovered-work items keep the tip.
 use super::*;
 use boss_engine_recovery::execution_bookmark::PreservedScope;
 use boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND;
@@ -41,8 +40,8 @@ pub struct PreservedCleanup {
     pub reason: PreservedCleanupReason,
     /// Which of the execution's references to forget. A superseded tip goes
     /// alone: inspection archives hold variants that were not restaged. A
-    /// closed chain's archives go with it, unless an operator was asked to
-    /// inspect work teardown set aside and has not resolved the request.
+    /// closed chain's archives go with it unless a
+    /// `preserved_work_needs_inspection` item for the execution is open.
     pub scope: PreservedScope,
 }
 
@@ -50,7 +49,7 @@ pub struct PreservedCleanup {
 impl WorkDb {
     /// Executions whose preserved tip a later, published execution carried,
     /// with the published execution that vouches for each. At most `limit`.
-    pub fn list_superseded_preserved(&self, limit: usize) -> Result<Vec<PreservedCleanup>> {
+    pub fn list_superseded_preserved(&self, limit: usize, excluded: &[String]) -> Result<Vec<PreservedCleanup>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "WITH RECURSIVE lineage(published, ancestor, depth) AS (
@@ -59,6 +58,7 @@ impl WorkDb {
                  JOIN work_executions we ON we.id = eb.execution_id
                  WHERE eb.recovered_from IS NOT NULL
                    AND we.pr_head_after IS NOT NULL AND we.pr_head_after != ''
+                   AND we.pr_head_after IS NOT we.pr_head_before
                  UNION
                  SELECT l.published, eb.recovered_from, l.depth + 1
                  FROM lineage l
@@ -70,14 +70,16 @@ impl WorkDb {
              JOIN work_executions p ON p.id = l.ancestor
              JOIN execution_bookmarks pe ON pe.execution_id = p.id
              WHERE p.preserved_commit_id IS NOT NULL AND p.id != l.published
+               AND p.id NOT IN (SELECT value FROM json_each(?3))
              GROUP BY p.id
              ORDER BY p.id
              LIMIT ?1",
         )?;
         let pairs = stmt
-            .query_map(params![limit as i64, MAX_LINEAGE_DEPTH], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
+            .query_map(
+                params![limit as i64, MAX_LINEAGE_DEPTH, serde_json::to_string(excluded)?],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
         let mut cleanups = Vec::with_capacity(pairs.len());
@@ -95,17 +97,26 @@ impl WorkDb {
     /// Terminal executions still holding a preserved tip whose PR chain has
     /// been closed for at least `retention_secs`. At most `limit`, oldest
     /// finished first.
-    pub fn list_closed_chain_preserved(&self, retention_secs: i64, limit: usize) -> Result<Vec<PreservedCleanup>> {
+    pub fn list_closed_chain_preserved(
+        &self,
+        retention_secs: i64,
+        limit: usize,
+        excluded: &[String],
+    ) -> Result<Vec<PreservedCleanup>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT we.id FROM work_executions we
              JOIN execution_bookmarks eb ON eb.execution_id = we.id
-             WHERE we.preserved_commit_id IS NOT NULL
+             WHERE (we.preserved_commit_id IS NOT NULL OR eb.archive_cleanup_pending = 1)
+               AND we.id NOT IN (SELECT value FROM json_each(?1))
+               AND NOT EXISTS (SELECT 1 FROM work_attention_items a
+                   WHERE a.execution_id = we.id AND a.status = 'open'
+                     AND a.kind IN ('preserved_work_not_restaged', 'abandoned_execution_bookmark'))
                AND we.status IN ('completed', 'failed', 'cancelled', 'orphaned', 'abandoned')
              ORDER BY CAST(we.finished_at AS INTEGER) ASC, we.id ASC",
         )?;
         let ids = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
+            .query_map([serde_json::to_string(excluded)?], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
         let cutoff = boss_engine_utils::epoch_time::now_epoch_secs() - retention_secs;
@@ -143,6 +154,14 @@ impl WorkDb {
                 params![id, PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND],
                 |row| row.get(0),
             )?;
+            let has_tip: bool = conn.query_row(
+                "SELECT preserved_commit_id IS NOT NULL FROM work_executions WHERE id = ?1",
+                [&id],
+                |row| row.get(0),
+            )?;
+            if keep_inspection_archives && !has_tip {
+                continue;
+            }
             cleanups.push(PreservedCleanup {
                 execution,
                 reason: PreservedCleanupReason::ClosedChain { closed_at_epoch },
@@ -159,7 +178,12 @@ impl WorkDb {
     /// Record that `execution_id`'s preserved references were forgotten: its
     /// tip no longer exists to restage, and the attention items that pointed
     /// at those references (`resolve_kinds`) are finished with.
-    pub fn finish_preserved_cleanup(&self, execution_id: &str, resolve_kinds: &[&str]) -> Result<()> {
+    pub fn finish_preserved_cleanup(
+        &self,
+        execution_id: &str,
+        scope: PreservedScope,
+        resolve_kinds: &[&str],
+    ) -> Result<()> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
@@ -167,6 +191,12 @@ impl WorkDb {
                 preserved_commit_count = NULL WHERE id = ?1",
             params![execution_id],
         )?;
+        if scope == PreservedScope::TipAndArchives {
+            tx.execute(
+                "UPDATE execution_bookmarks SET archive_cleanup_pending = 0 WHERE execution_id = ?1",
+                [execution_id],
+            )?;
+        }
         let now = now_string();
         for kind in resolve_kinds {
             tx.execute(
@@ -178,4 +208,15 @@ impl WorkDb {
         tx.commit()?;
         Ok(())
     }
+}
+
+/// Store records may hold archives even when their restageable tip is gone.
+/// Keep a pending archive scan independently until closed-chain cleanup finishes it.
+pub(crate) fn migrate_archive_cleanup(conn: &rusqlite::Connection) -> Result<()> {
+    if !crate::schema_init::table_has_column(conn, "execution_bookmarks", "archive_cleanup_pending")? {
+        conn.execute_batch(
+            "ALTER TABLE execution_bookmarks ADD COLUMN archive_cleanup_pending INTEGER NOT NULL DEFAULT 1",
+        )?;
+    }
+    Ok(())
 }

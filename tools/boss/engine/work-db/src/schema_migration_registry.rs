@@ -393,6 +393,11 @@ pub(super) fn all() -> Vec<Migration> {
             legacy_version: None,
             apply: execution_bookmarks::migrate_retire_prune_state,
         },
+        Migration {
+            id: "20261109_1930_preserved_archive_cleanup".into(),
+            legacy_version: None,
+            apply: preserved_cleanup::migrate_archive_cleanup,
+        },
     ]);
     migrations
 }

@@ -801,7 +801,7 @@ mod preserved_cleanup_sweep {
     }
 
     #[tokio::test]
-    async fn a_superseded_tip_leaves_inspection_archives_for_a_human() {
+    async fn superseded_archives_are_cleaned_after_the_chain_closes() {
         let mut f = fixture();
         let chore = f.chore("Archived variants");
         let prior = f.preserved(&chore, "prior.txt").await;
@@ -824,6 +824,10 @@ mod preserved_cleanup_sweep {
             f.exists(&archive),
             "unselected variants wait for a human or the retention period"
         );
+        f.close_chain(&chore, 30 * DAY);
+        assert_eq!(f.pass().await.closed_chain, 1);
+        assert!(!f.exists(&archive));
+        assert_eq!(f.pass().await, CleanupReport::default());
     }
 
     #[tokio::test]
@@ -881,6 +885,14 @@ mod preserved_cleanup_sweep {
         assert!(!f.exists(&preserved_name(&id)));
         assert!(f.exists(&archive), "work a human was asked to inspect is not deleted");
         assert_eq!(f.db.list_attention_items(&id).unwrap()[0].status, "open");
+        assert_eq!(f.pass().await, CleanupReport::default());
+        f.sql(
+            "UPDATE work_attention_items SET status = 'resolved' WHERE execution_id = ?1",
+            [&id],
+        );
+        assert_eq!(f.pass().await.closed_chain, 1);
+        assert!(!f.exists(&archive));
+        assert_eq!(f.pass().await, CleanupReport::default());
     }
 
     #[tokio::test]
@@ -904,6 +916,58 @@ mod preserved_cleanup_sweep {
         assert_eq!((second.failed, second.deferred), (0, 1), "{second:?}");
     }
 
+    #[tokio::test]
+    async fn more_than_a_batch_of_failed_stores_cannot_starve_a_healthy_store() {
+        use crate::preserved_cleanup_sweep::BATCH_SIZE;
+        let mut f = fixture();
+        let chore = f.chore("Many unreachable stores");
+        let template = f.preserved(&chore, "template.txt").await;
+        let record = f.db.preservation_source(&template).unwrap().unwrap();
+        let tip = f.db.preserved_tip(&template).unwrap().unwrap();
+        for _ in 0..=BATCH_SIZE {
+            let id = f.execution(&chore);
+            let mut record = record.clone();
+            record.execution_id = id.clone();
+            record.host_id = "gone".into();
+            f.db.record_execution_bookmark(&record).unwrap();
+            f.db.record_preserved_tip(&id, &tip).unwrap();
+            f.db.mark_execution_orphaned(&id, "terminated").unwrap();
+            f.sql("UPDATE work_executions SET finished_at = '1' WHERE id = ?1", [&id]);
+        }
+        f.close_chain(&chore, 30 * DAY);
+        assert_eq!(f.pass().await.failed, BATCH_SIZE);
+        assert!(f.exists(&preserved_name(&template)));
+        let report = f.pass().await;
+        assert_eq!((report.failed, report.closed_chain), (1, 1), "{report:?}");
+        assert!(!f.exists(&preserved_name(&template)));
+    }
+
+    #[tokio::test]
+    async fn a_closed_chain_keeps_work_with_an_open_not_restaged_or_abandoned_item() {
+        use boss_engine_storage_values::attention_kinds::{
+            ABANDONED_EXECUTION_BOOKMARK_ATTENTION_KIND, PRESERVED_WORK_NOT_RESTAGED_ATTENTION_KIND,
+        };
+        let mut f = fixture();
+        for kind in [
+            PRESERVED_WORK_NOT_RESTAGED_ATTENTION_KIND,
+            ABANDONED_EXECUTION_BOOKMARK_ATTENTION_KIND,
+        ] {
+            let chore = f.chore("Unrecovered work");
+            let id = f.preserved(&chore, kind).await;
+            f.db.upsert_execution_attention(&id, kind, "Unrecovered", "body")
+                .unwrap();
+            f.close_chain(&chore, 30 * DAY);
+            assert_eq!(f.pass().await, CleanupReport::default());
+            assert!(f.exists(&preserved_name(&id)));
+            assert_eq!(f.db.list_attention_items(&id).unwrap()[0].status, "open");
+            f.sql(
+                "UPDATE work_attention_items SET status = 'resolved' WHERE execution_id = ?1",
+                [&id],
+            );
+            assert_eq!(f.pass().await.closed_chain, 1);
+            assert!(!f.exists(&preserved_name(&id)));
+        }
+    }
     #[tokio::test]
     async fn a_repository_that_no_longer_exists_has_nothing_to_forget() {
         let mut f = fixture();

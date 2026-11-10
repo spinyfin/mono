@@ -171,7 +171,7 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     entry(
         ABANDONED_EXECUTION_BOOKMARK_ATTENTION_KIND,
         ClearedBy::ProducerReconciles,
-        "The bookmark sweep resolves this signal when the execution has no remaining unpublished work, and the preserved-reference cleanup resolves it when it forgets the tip.",
+        "The bookmark sweep resolves this signal when the execution has no remaining unpublished work, and preserved-reference cleanup resolves it after a restaging successor publishes a changed PR head. An open item prevents age-based tip cleanup.",
     ),
     entry(
         EXECUTION_BOOKMARK_RECOVERY_RETIRED_ATTENTION_KIND,
@@ -181,11 +181,11 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     entry(
         PRESERVED_WORK_NOT_RESTAGED_ATTENTION_KIND,
         ClearedBy::ProducerReconciles,
-        "Dispatch files this when a recorded preserved tip cannot be restaged. A later successful restage of the selected tip resolves it; starting fresh is not evidence the work was recovered. Unpublished unselected variants use preserved_work_archived.",
+        "Dispatch files this when a recorded preserved tip cannot be restaged. A later successful restage of the selected tip resolves it; starting fresh is not evidence the work was recovered. Cleanup also resolves it after a restaging successor publishes a changed PR head; an open item prevents age-based tip cleanup. Unpublished unselected variants use preserved_work_archived.",
     ),
     entry(
         PRESERVED_WORK_ARCHIVED_ATTENTION_KIND,
-        ClearedBy::HumanDecision,
+        ClearedBy::ProducerReconciles,
         "Restore restaged the selected tip and archived unpublished unselected variants. A later restage of that selected tip does not recover the archived work, so this signal stays open for inspection until a human resolves it or the preserved-reference cleanup forgets the archives of an item whose chain has been closed for the retention period.",
     ),
     entry(

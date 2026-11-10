@@ -10,8 +10,8 @@
 //! - a later execution that restaged the tip has published, so the tip was
 //!   carried by a push;
 //! - the item's PR chain has been closed for a fixed age, so the work was
-//!   either carried by a later execution or abandoned, and an attention item
-//!   already told the operator which.
+//!   either carried by a later execution or abandoned; open unrecovered-work
+//!   items keep the tip.
 //!
 //! Each pass forgets a bounded batch, one jj operation per execution. A host
 //! that cannot be reached is retried after [`RETRY_AFTER`] rather than on every
@@ -70,11 +70,18 @@ pub(crate) async fn run_one_pass(
     coordinator: &ExecutionCoordinator,
     backoff: &mut Backoff,
 ) -> Result<CleanupReport> {
-    let mut cleanups = db.list_superseded_preserved(BATCH_SIZE)?;
-    cleanups.extend(db.list_closed_chain_preserved(CLOSED_CHAIN_RETENTION_SECS, BATCH_SIZE)?);
+    let now = Instant::now();
+    let excluded: Vec<_> = backoff
+        .failed_at
+        .keys()
+        .filter(|id| !backoff.due(id, now))
+        .cloned()
+        .collect();
+    let mut cleanups = db.list_superseded_preserved(BATCH_SIZE, &excluded)?;
+    cleanups.extend(db.list_closed_chain_preserved(CLOSED_CHAIN_RETENTION_SECS, BATCH_SIZE, &excluded)?);
     let mut report = CleanupReport::default();
     let mut seen = HashSet::new();
-    let now = Instant::now();
+    report.deferred = excluded.len();
     for cleanup in cleanups {
         let execution_id = cleanup.execution.id.clone();
         if !seen.insert(execution_id.clone()) {
@@ -124,14 +131,17 @@ async fn forget_one(db: &WorkDb, coordinator: &ExecutionCoordinator, cleanup: &P
     } else {
         coordinator.forget_preserved_references(&record, scope).await?
     };
-    let mut resolved = vec![
-        ABANDONED_EXECUTION_BOOKMARK_ATTENTION_KIND,
-        PRESERVED_WORK_NOT_RESTAGED_ATTENTION_KIND,
-    ];
+    let mut resolved = Vec::new();
+    if matches!(cleanup.reason, PreservedCleanupReason::Superseded { .. }) {
+        resolved.extend([
+            ABANDONED_EXECUTION_BOOKMARK_ATTENTION_KIND,
+            PRESERVED_WORK_NOT_RESTAGED_ATTENTION_KIND,
+        ]);
+    }
     if scope == PreservedScope::TipAndArchives {
         resolved.push(PRESERVED_WORK_ARCHIVED_ATTENTION_KIND);
     }
-    db.finish_preserved_cleanup(&execution.id, &resolved)?;
+    db.finish_preserved_cleanup(&execution.id, scope, &resolved)?;
     tracing::info!(
         execution_id = %execution.id,
         reason = ?cleanup.reason,
