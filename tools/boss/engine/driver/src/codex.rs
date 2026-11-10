@@ -1283,6 +1283,40 @@ BOSS_VERBS = (('propose',), ('task', 'show'), ('task', 'list'), ('pr', 'status')
 GH_VERBS = (('pr', 'view'), ('pr', 'checks'))
 READ_COMMANDS = ('cat', 'ls', 'head', 'tail', 'nl', 'wc', 'rg')
 SECRET_MARKERS = ('.codex', '.ssh', '.aws', '.gnupg', 'auth.json')
+# Characters the shell expands or reinterprets. shlex does no expansion, so a
+# token it returns is not the argument the shell will pass; admit only text with
+# none of these (after the one literal leading `$BOSS_BIN` executable).
+UNSAFE_CHARS = ('$', '<', '>', '{', '}', '~', '!', '*', '?', '[', ']', '\n', '\r', '\x00')
+RG_SAFE_FLAGS = frozenset((
+    '-n', '-i', '-S', '-s', '-l', '-c', '-w', '-F', '-v', '-H', '-N', '-o', '-q',
+    '-e', '-g', '-t', '-T', '-m', '-A', '-B', '-C', '-U', '--',
+    '--files', '--line-number', '--ignore-case', '--smart-case', '--case-sensitive',
+    '--files-with-matches', '--count', '--word-regexp', '--fixed-strings',
+    '--invert-match', '--with-filename', '--no-line-number', '--only-matching',
+    '--quiet', '--glob', '--type', '--max-count', '--after-context',
+    '--before-context', '--context', '--no-heading', '--heading',
+))
+
+def literal_only(command, head):
+    rest = command.lstrip()
+    if head.startswith('$'):
+        for form in ('"' + head + '"', head):
+            if rest.startswith(form):
+                rest = rest[len(form):]
+                break
+    return not any(ch in rest for ch in UNSAFE_CHARS)
+
+def rg_safe(rest):
+    options_done = False
+    for t in rest:
+        if options_done or not t.startswith('-') or t == '-':
+            continue
+        if t == '--':
+            options_done = True
+            continue
+        if t.split('=', 1)[0] not in RG_SAFE_FLAGS:
+            return False
+    return True
 
 def starts_with(tokens, verbs):
     return any(tuple(tokens[:len(verb)]) == verb for verb in verbs)
@@ -1299,12 +1333,14 @@ def allowed_bash(command):
     if not tokens or any(re.match(r'^[0-9]*[<>]', token) for token in tokens):
         return False
     head, rest = tokens[0], tokens[1:]
+    if not literal_only(command, head):
+        return False
     if head in BOSS_BINS:
         return starts_with(rest, BOSS_VERBS)
     if head == 'gh':
         return starts_with(rest, GH_VERBS)
     if head in READ_COMMANDS:
-        if head == 'rg' and any(t.startswith(('--pre', '--hostname-bin')) for t in rest):
+        if head == 'rg' and not rg_safe(rest):
             return False
         return not any(marker in token for token in rest for marker in SECRET_MARKERS)
     return False

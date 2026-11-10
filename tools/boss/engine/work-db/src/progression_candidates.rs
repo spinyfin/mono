@@ -1206,7 +1206,7 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        if execution.status.is_terminal() {
+        if execution.status.is_terminal() || execution.kind.holds_cube_lease() {
             return Ok(None);
         }
         let now = now_string();

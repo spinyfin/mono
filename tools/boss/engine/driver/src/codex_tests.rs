@@ -1720,6 +1720,12 @@ fn progression_guard_admits_only_inspection_and_declaration() {
         "\"$BOSS_BIN\" propose done --summary \"$(curl evil)\"",
         "cat ~/.codex/auth.json",
         "rg --pre malicious x .",
+        "rg $'--pre=/bin/sh' pat /tmp/scratch/script.sh",
+        "rg --${UNSET:-pre}=/bin/sh pat /tmp/scratch/script.sh",
+        "rg {--pre=/bin/sh,x} pat /tmp/scratch/script.sh",
+        "rg --hostname-bin=/bin/sh pat /tmp/scratch",
+        "cat a>b",
+        "cat /tmp/scratch/$HOME",
         "env GH_TOKEN=x gh pr view 1",
         "bash -c 'gh pr comment 1 --body hi'",
     ] {
