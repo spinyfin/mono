@@ -633,8 +633,14 @@ async fn process_state(
                 tracing::warn!(execution_id, "transient-recovery: teardown unconfirmed; resume waits");
                 return;
             }
-            let predecessor_lease =
-                release_predecessor_lease(work_db, cube_client, host_adapters, &execution, occupancy.or(cx.occupancy)).await;
+            let predecessor_lease = release_predecessor_lease(
+                work_db,
+                cube_client,
+                host_adapters,
+                &execution,
+                occupancy.or(cx.occupancy),
+            )
+            .await;
             // A kept or failed release does not stop the resume. The pane is
             // gone, so this execution is no longer in the live states and no
             // later pass would revisit it; orphaning it here makes it
