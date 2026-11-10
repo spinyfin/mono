@@ -341,3 +341,128 @@ async fn workspace_recovery_waits_for_live_writer_before_positioning() {
     assert!(on_conflict_detected(&db, &publisher, Some(&cube), &checker, &candidate, &probe()).await);
     assert_eq!(*cube.lease_calls.lock().await, 1);
 }
+
+#[test]
+fn churn_stop_with_old_positioning_failure_stays_terminal_when_later_attempts_died_elsewhere() {
+    use boss_protocol::CreateRevisionInput;
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, first, chore) = blocked_with_attempt(&db);
+    let checker = StaticPrStateChecker(PrOpenState::Open);
+    let mut attempts = vec![first];
+    let new_attempt = |base: &str| ConflictResolutionInsertInput {
+        product_id: candidate.product_id.clone(),
+        work_item_id: chore.clone(),
+        pr_url: PR.into(),
+        pr_number: 42,
+        head_branch: "feature".into(),
+        base_branch: "main".into(),
+        head_sha_before: Some("head222".into()),
+        base_sha_at_trigger: Some(base.into()),
+    };
+    for base in ["base-two", "base-three"] {
+        attempts.push(db.insert_conflict_resolution(new_attempt(base)).unwrap().unwrap());
+    }
+    // The oldest attempt failed positioning; the later ones died for other reasons.
+    for (index, attempt) in attempts.iter().enumerate() {
+        let revision = db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(&chore)
+                    .description("Resolve merge conflict")
+                    .created_via(format!("merge-conflict:{}", attempt.id))
+                    .build(),
+                &checker,
+            )
+            .unwrap();
+        db.set_conflict_resolution_revision_task_id(&attempt.id, &revision.id)
+            .unwrap();
+        let reason = if index == 0 {
+            "cube_workspace_positioning_failed"
+        } else {
+            "worker_died"
+        };
+        db.bounce_dispatch_failed_to_backlog(&revision.id, reason, "boom")
+            .unwrap();
+        db.abandon_conflict_resolution_for_supersede(&attempt.id, "superseded_stale_head")
+            .unwrap();
+    }
+    let stopped = db.insert_conflict_resolution(new_attempt("base111")).unwrap().unwrap();
+    assert_eq!(stopped.failure_reason.as_deref(), Some(crate::work::CHURN_GUARD_REASON));
+    assert!(!db.retain_conflict_revision_workspace_failure(&stopped.id).unwrap());
+    let row = db.get_conflict_resolution(&stopped.id).unwrap().unwrap();
+    assert_eq!(row.failure_reason.as_deref(), Some(crate::work::CHURN_GUARD_REASON));
+}
+
+#[test]
+fn workspace_failure_is_surfaced_when_a_foreign_blocker_owns_the_parent() {
+    use crate::work::WorkItemPatch;
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (_, attempt, chore) = blocked_with_attempt(&db);
+    db.update_work_item(
+        &chore,
+        WorkItemPatch {
+            status: Some("blocked".into()),
+            blocked_reason: Some("review_feedback".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.fail_conflict_workspace(&attempt.id, "cube divergence").unwrap();
+    let WorkItem::Chore(task) = db.get_work_item(&chore).unwrap() else {
+        panic!()
+    };
+    assert_eq!(task.blocked_reason.as_deref(), Some("review_feedback"));
+    let items = db.list_attention_items_for_work_item(&chore).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].kind, CONFLICT_REMEDIATION_STOPPED_ATTENTION_KIND);
+    assert!(items[0].body_markdown.contains("cube divergence"));
+    assert!(!db.ensure_conflict_stop_visible(&attempt.id).unwrap());
+}
+
+#[test]
+fn workspace_resumes_on_an_unchanged_head_are_bounded() {
+    use boss_protocol::CreateRevisionInput;
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (_, attempt, chore) = blocked_with_attempt(&db);
+    let checker = StaticPrStateChecker(PrOpenState::Open);
+    let mut resumed = 0;
+    for _ in 0..6 {
+        let revision = db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(&chore)
+                    .description("Resolve merge conflict")
+                    .created_via(format!("merge-conflict:{}", attempt.id))
+                    .build(),
+                &checker,
+            )
+            .unwrap();
+        db.set_conflict_resolution_revision_task_id(&attempt.id, &revision.id)
+            .unwrap();
+        for queued in db.list_executions(Some(&revision.id)).unwrap() {
+            if !queued.status.is_terminal() {
+                db.cancel_execution(&queued.id).unwrap();
+            }
+        }
+        db.fail_conflict_workspace(&attempt.id, "cube divergence").unwrap();
+        if db
+            .resume_conflict_workspace(&attempt.id, Some("head222"), Some("base111"))
+            .unwrap()
+            .is_some()
+        {
+            resumed += 1;
+        }
+    }
+    assert_eq!(resumed, 3);
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert!(crate::work::conflict_workspace_failed(&row));
+    assert!(
+        db.resume_conflict_workspace(&attempt.id, Some("moved"), Some("base111"))
+            .unwrap()
+            .is_some(),
+        "a moved head lifts the bound"
+    );
+}

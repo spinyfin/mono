@@ -45,6 +45,12 @@ async fn scheduling_cube_refusal_survives_watcher_probes_and_recovers() {
         .unwrap()
         .unwrap();
     let revision = attempt.revision_task_id.clone().unwrap();
+    // The revision's creation-time execution is superseded by the one below.
+    for queued in db.list_executions(Some(&revision)).unwrap() {
+        if !queued.status.is_terminal() {
+            db.cancel_execution(&queued.id).unwrap();
+        }
+    }
     let exec = db
         .create_execution(
             CreateExecutionInput::builder()
@@ -87,7 +93,12 @@ async fn scheduling_cube_refusal_survives_watcher_probes_and_recovers() {
     let WorkItem::Task(retained) = db.get_work_item(&revision).unwrap() else {
         panic!()
     };
-    assert_eq!(retained.status, TaskStatus::Blocked);
+    assert_eq!(retained.status, TaskStatus::Todo);
+    assert_eq!(
+        retained.dispatch_failed_reason.as_deref(),
+        Some("cube_workspace_positioning_failed")
+    );
+    assert!(retained.dispatch_failed_error.unwrap().contains(diagnostic));
     assert!(retained.deleted_at.is_none());
     let WorkItem::Chore(blocked) = db.get_work_item(&parent.id).unwrap() else {
         panic!()

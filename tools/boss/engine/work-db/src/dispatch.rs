@@ -1327,6 +1327,17 @@ impl WorkDb {
         Ok(host.flatten())
     }
 
+    /// Record the scheduler-selected host of a not-yet-started execution so a
+    /// pre-start failure can be attributed to the host that produced it. The
+    /// run-start write stores the same value later.
+    pub fn record_pre_start_host(&self, execution_id: &str, host_id: &str) -> Result<()> {
+        self.connect()?.execute(
+            "UPDATE work_executions SET host_id = ?2 WHERE id = ?1 AND host_id IS NULL",
+            params![execution_id, host_id],
+        )?;
+        Ok(())
+    }
+
     /// `work_executions.host_id` for every execution of `work_item_id`, in
     /// one query. Backs `bossctl work executions`, which previously issued
     /// one [`Self::execution_host_id`] point read per row; batching avoids

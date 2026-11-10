@@ -1172,6 +1172,11 @@ impl ExecutionCoordinator {
                 return Err(err);
             }
         };
+        if selected_host.id != boss_protocol::LOCAL_HOST_ID
+            && let Err(err) = self.work_db.record_pre_start_host(&execution.id, &selected_host.id)
+        {
+            tracing::warn!(execution_id = %execution.id, ?err, "failed to record selected host before start");
+        }
         let adapter = match self.host_adapter_provider.adapter_for(&selected_host).await {
             Ok(adapter) => adapter,
             Err(err) => {
@@ -2562,8 +2567,7 @@ impl ExecutionCoordinator {
         let (attention_kind, attention_title) = attention;
         let error_text = format!("{error:#}");
         // A typed Cube refusal during preparation cannot be repaired by
-        // replacing the conflict revision. Preserve it on the owning attempt
-        // before the watcher can mistake this execution for a stale worker.
+        // replacing the conflict revision. Preserve it on the owning attempt.
         let conflict_workspace = if matches!(
             attention_kind,
             "cube_workspace_positioning_failed" | "cube_workspace_lease_failed"
@@ -2578,6 +2582,11 @@ impl ExecutionCoordinator {
         } else {
             None
         };
+        // Fail the attempt first so no detection pass can observe the dead
+        // revision while its attempt still looks live.
+        if let Some(attempt) = &conflict_workspace {
+            self.work_db.fail_conflict_workspace(&attempt.id, &error_text)?;
+        }
         let retry_delays = if conflict_workspace.is_some() {
             &[][..]
         } else {
@@ -2605,21 +2614,6 @@ impl ExecutionCoordinator {
                 return Err(bookkeeping_error.context(PreStartFailureReported));
             }
         };
-
-        if let Some(attempt) = &conflict_workspace {
-            self.work_db.fail_conflict_workspace(&attempt.id, &error_text)?;
-            self.work_db.update_work_item_as_actor(
-                &execution.work_item_id,
-                boss_work_db::WorkItemPatch {
-                    status: Some("blocked".into()),
-                    blocked_reason: Some("merge_conflict".into()),
-                    blocked_detail: Some(error_text.clone()),
-                    autostart: Some(false),
-                    ..Default::default()
-                },
-                "engine",
-            )?;
-        }
 
         // The tracing log alone is not enough: `bossctl dispatch diagnose`
         // and the stage-stalled detector read the dispatch event stream, and
@@ -2696,6 +2690,29 @@ impl ExecutionCoordinator {
                             &execution.work_item_id,
                             execution.status.as_str(),
                             "execution_start_failed",
+                        )
+                        .await;
+                    // The revision keeps the ordinary "Failed to start"
+                    // bookkeeping; only the duplicate generic attention is
+                    // suppressed because the attempt's own stop is surfaced.
+                    let bounced = self
+                        .work_db
+                        .bounce_dispatch_failed_to_backlog(&execution.work_item_id, attention_kind, &error_text)
+                        .unwrap_or_else(|bounce_err| {
+                            tracing::error!(?bounce_err, work_item_id = %execution.work_item_id, "failed to record conflict revision dispatch failure");
+                            false
+                        });
+                    self.dispatch_events
+                        .emit(
+                            DispatchEvent::new(Stage::PreStartRetriesExhausted, DispatchOutcome::Error, &execution.id)
+                                .with_work_item(&execution.work_item_id)
+                                .with_worker(worker_id)
+                                .with_error(error)
+                                .with_details(serde_json::json!({
+                                    "reason": attention_kind,
+                                    "pre_start_failure_count": execution.pre_start_failure_count,
+                                    "bounced_to_backlog": bounced,
+                                })),
                         )
                         .await;
                     return Ok(());
