@@ -360,8 +360,29 @@ pub(crate) async fn try_mechanical_rungs_with(
                  unavailable this attempt",
             );
             // A lease-stage error (unreachable remote, clone or fetch failure)
-            // is not a deterministic refusal of this PR's branch; the lease was
-            // already retried once, and the next conflict_watch tick tries again.
+            // is not by itself a deterministic refusal of this PR's branch, so
+            // the next conflict_watch tick tries again, but only a bounded
+            // number of consecutive times: a persistent failure (unregistered
+            // repo, clone failure) must fail the attempt with Cube's last
+            // error and surface it, not spin silently.
+            let failures = match work_db.record_rung1_lease_failure(&attempt.id) {
+                Ok(count) => count,
+                Err(db_err) => {
+                    tracing::error!(attempt_id = %attempt.id, ?db_err, "conflict_ladder: could not count rung-1 lease failure");
+                    0
+                }
+            };
+            if failures >= boss_work_db::MAX_RUNG1_LEASE_FAILURES {
+                log_routing_verdict(
+                    &candidate.work_item_id,
+                    Some(pr_number),
+                    &[],
+                    "skip",
+                    "rung-1 lease kept failing; attempt failed with the last Cube error",
+                );
+                halt_workspace_failure(work_db, publisher, candidate, attempt, &err).await;
+                return LadderOutcome::WorkspacePreparationFailed;
+            }
             log_routing_verdict(
                 &candidate.work_item_id,
                 Some(pr_number),
@@ -373,6 +394,10 @@ pub(crate) async fn try_mechanical_rungs_with(
             return LadderOutcome::MechanicalRungsUnavailable;
         }
     };
+
+    if let Err(err) = work_db.clear_rung1_lease_failures(&attempt.id) {
+        tracing::warn!(attempt_id = %attempt.id, ?err, "conflict_ladder: could not reset rung-1 lease failure count");
+    }
 
     // Persist that a mechanical rung is now in flight against this attempt,
     // stamping the lease/workspace, so a restart mid-rung is recoverable

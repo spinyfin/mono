@@ -323,3 +323,83 @@ async fn lease_stage_cube_error_retries_and_fails_the_attempt_only_when_retries_
     let row = db.get_conflict_resolution(&attempt).unwrap().unwrap();
     assert!(crate::work::conflict_workspace_failed(&row), "{row:?}");
 }
+
+/// A typed lease failure on the first attempt is transient: the retry policy
+/// reschedules it, the attempt stays live with no stop raised, and the retry
+/// starts the conflict worker normally.
+#[tokio::test]
+async fn transient_lease_failure_then_success_starts_the_conflict_worker() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let (parent, attempt, _revision, exec_id) = conflict_revision_fixture(&db, None).await;
+    let exec = db.get_execution(&exec_id).unwrap();
+    let cube = Arc::new(FakeCubeClient {
+        fail_first_n_cube_cli_leases: 1,
+        ..Default::default()
+    });
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube,
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..Default::default()
+            }),
+        )
+        .with_pre_start_retry_delays(vec![Duration::from_millis(5), Duration::from_millis(5)]),
+    );
+    let worker = coordinator.worker_pool().claim_worker(&exec.id, None).await.unwrap();
+    let _ = coordinator
+        .schedule_execution_for_test(&exec, &worker, DispatchAdmission::Queued)
+        .await;
+    let row = db.get_conflict_resolution(&attempt).unwrap().unwrap();
+    assert!(!crate::work::conflict_workspace_failed(&row), "{row:?}");
+    assert!(db.list_attention_items_for_work_item(&parent).unwrap().is_empty());
+
+    assert_eq!(db.get_execution(&exec.id).unwrap().status, ExecutionStatus::Running);
+    let row = db.get_conflict_resolution(&attempt).unwrap().unwrap();
+    assert!(matches!(row.status.as_str(), "pending" | "running"), "{row:?}");
+    assert!(db.list_attention_items_for_work_item(&parent).unwrap().is_empty());
+}
+
+/// The host that refused the attempt is the host of the *latest* scheduling
+/// attempt. A retry that lands locally after an earlier selection recorded a
+/// remote host must not leave the stale remote host on the attempt, or
+/// recovery would probe a host that did not refuse it.
+#[tokio::test]
+async fn refusal_after_a_retry_moves_hosts_is_attributed_to_the_latest_host() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let (parent, attempt, _revision, exec_id) = conflict_revision_fixture(&db, None).await;
+    db.record_pre_start_host(&exec_id, "remote-1").unwrap();
+    let exec = db.get_execution(&exec_id).unwrap();
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            Arc::new(FakeCubeClient {
+                goto_cube_error: Some("cube will not pick a side with unique content".into()),
+                ..Default::default()
+            }),
+            Arc::new(FakeExecutionRunner::default()),
+        )
+        .with_pre_start_retry_delays(vec![Duration::from_secs(60)]),
+    );
+    let worker = coordinator.worker_pool().claim_worker(&exec.id, None).await.unwrap();
+    assert!(
+        coordinator
+            .schedule_execution_for_test(&exec, &worker, DispatchAdmission::Queued)
+            .await
+            .is_err()
+    );
+    assert!(crate::work::conflict_workspace_failed(
+        &db.get_conflict_resolution(&attempt).unwrap().unwrap()
+    ));
+    assert_eq!(db.execution_host_id(&exec.id).unwrap().as_deref(), Some("local"));
+    assert_eq!(
+        db.conflict_workspace_failure_host(&attempt).unwrap(),
+        None,
+        "a local refusal is probed locally, not on the stale first host: {parent}"
+    );
+}

@@ -218,4 +218,25 @@ final class AttentionsTests: XCTestCase {
         """)
         XCTAssertFalse(withoutEdit.editedCanonical)
     }
+
+    // MARK: - Work card attention disclosure
+
+    private func item(kind: String, resolvedAt: String? = nil) -> WorkAttentionItem {
+        WorkAttentionItem(
+            id: "a1", executionID: nil, workItemID: "w1", kind: kind, status: "open",
+            title: "Conflict remediation stopped", bodyMarkdown: "body", createdAt: "0",
+            resolvedAt: resolvedAt, convertedTaskID: nil
+        )
+    }
+
+    func testBackendConflictKindsAreShown() {
+        XCTAssertTrue(item(kind: "conflict_remediation_stopped").isCardDisclosure)
+        XCTAssertTrue(item(kind: "conflict_lockfile_regeneration_failed").isCardDisclosure)
+    }
+
+    func testResolvedAndUnrelatedKindsAreHidden() {
+        XCTAssertFalse(item(kind: "conflict_lockfile_regeneration_failed", resolvedAt: "1").isCardDisclosure)
+        XCTAssertFalse(item(kind: "lockfile_regeneration_failed").isCardDisclosure)
+        XCTAssertFalse(item(kind: "deferred_scope").isCardDisclosure)
+    }
 }

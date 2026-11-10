@@ -1338,10 +1338,12 @@ impl WorkDb {
 
     /// Record the scheduler-selected host of a not-yet-started execution so a
     /// pre-start failure can be attributed to the host that produced it. The
-    /// run-start write stores the same value later.
+    /// run-start write stores the same value later. Every selection is
+    /// recorded, local included and overwriting an earlier retry's host, so the
+    /// value always names the host of the most recent attempt.
     pub fn record_pre_start_host(&self, execution_id: &str, host_id: &str) -> Result<()> {
         self.connect()?.execute(
-            "UPDATE work_executions SET host_id = ?2 WHERE id = ?1 AND host_id IS NULL",
+            "UPDATE work_executions SET host_id = ?2 WHERE id = ?1 AND started_at IS NULL",
             params![execution_id, host_id],
         )?;
         Ok(())

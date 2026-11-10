@@ -128,6 +128,9 @@ pub(super) struct FakeCubeClient {
     /// to model a single bad workspace being skipped via `any_free`
     /// retry when `preferred_workspace_id=null`.
     pub(super) fail_first_n_leases: usize,
+    /// As `fail_first_n_leases`, but each failure is a typed [`CubeCliError`]
+    /// (an unreachable remote or fetch failure).
+    pub(super) fail_first_n_cube_cli_leases: usize,
     pub(super) fail_create: bool,
     pub(super) fail_bookmark_create: bool,
     pub(super) real_bookmarks: bool,
@@ -321,6 +324,15 @@ crate::stub_cube_client! { FakeCubeClient {
             return Err(anyhow!(
                 "cube workspace lease failed: preferred workspace held by another worker"
             ));
+        }
+        if call_index < self.fail_first_n_cube_cli_leases {
+            return Err(crate::cube_commands::CubeCliError {
+                host: "local".to_owned(),
+                exit_code: Some(1),
+                stderr: "fetch failed: network unreachable".to_owned(),
+                stdout: String::new(),
+            }
+            .into());
         }
         if call_index < self.fail_first_n_leases {
             return Err(anyhow!("cube workspace lease failed: workspace has uncommitted work"));

@@ -7,8 +7,10 @@ pub(super) const MIGRATION_ID: &str = "20261109_1500_conflict_workspace_recovery
 
 /// Per-attempt recovery bookkeeping for a failed conflict workspace: how many
 /// times a recovery probe resumed it, the host whose refusal failed it
-/// (`NULL` for a local or mechanical-rung failure), and the failure text that
-/// was current at the last resume.
+/// (`NULL` for a local or mechanical-rung failure), the failure context
+/// (host plus PR head and base) the last resume saw, whether its revision's
+/// failure was already consumed by a resume, and how many consecutive
+/// mechanical-rung lease failures it has had.
 pub(super) fn migrate(conn: &Connection) -> Result<()> {
     for (column, ddl) in [
         (
@@ -20,8 +22,16 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
             "ALTER TABLE conflict_resolutions ADD COLUMN workspace_failure_host TEXT",
         ),
         (
-            "workspace_resume_failure",
-            "ALTER TABLE conflict_resolutions ADD COLUMN workspace_resume_failure TEXT",
+            "workspace_resume_context",
+            "ALTER TABLE conflict_resolutions ADD COLUMN workspace_resume_context TEXT",
+        ),
+        (
+            "workspace_failure_consumed",
+            "ALTER TABLE conflict_resolutions ADD COLUMN workspace_failure_consumed INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "rung1_lease_failures",
+            "ALTER TABLE conflict_resolutions ADD COLUMN rung1_lease_failures INTEGER NOT NULL DEFAULT 0",
         ),
     ] {
         if !super::schema_init::table_has_column(conn, "conflict_resolutions", column)? {
@@ -108,10 +118,9 @@ pub(crate) fn surface_conflict_stop(conn: &rusqlite::Transaction<'_>, attempt_id
 /// state until the head or base moves.
 pub const MAX_UNCHANGED_WORKSPACE_RESUMES: i64 = 3;
 
-/// Once the unchanged-context resume budget is spent, a recovery probe that
-/// succeeds still resumes the attempt, but at most this often. This is how a
-/// repaired bookmark or repository on the failing host is picked up.
-pub const PAUSED_WORKSPACE_RETRY_SECS: i64 = 3600;
+/// Consecutive mechanical-rung lease failures tolerated before the attempt
+/// fails with Cube's last error and is surfaced.
+pub const MAX_RUNG1_LEASE_FAILURES: i64 = 5;
 
 pub(crate) const WORKSPACE_RECOVERED_ARCHIVE_REASON: &str = "workspace preparation recovered";
 
@@ -151,7 +160,8 @@ fn workspace_failure_candidate(conn: &rusqlite::Connection, attempt_id: &str) ->
              WHERE current.id = ?1
                AND t.dispatch_failed_reason IN ('cube_workspace_positioning_failed', 'cube_workspace_lease_failed')
                AND t.dispatch_failed_error IS NOT NULL
-               AND t.archived_reason IS NOT ?2",
+               AND t.archived_reason IS NOT ?2
+               AND prior.workspace_failure_consumed = 0",
             params![attempt_id, WORKSPACE_RECOVERED_ARCHIVE_REASON],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -206,14 +216,33 @@ impl WorkDb {
         let Some((error, revision)) = workspace_failure_candidate(&tx, attempt_id)? else {
             return Ok(false);
         };
+        // The host that produced the refusal is the host of the revision's
+        // last execution (every pre-start selection records its host; a NULL
+        // host predates remote selection and so ran locally). With no
+        // execution at all the host is unknown: keep the churn stop and its
+        // diagnostic rather than guess a host to probe.
+        let host: Option<Option<String>> = tx
+            .query_row(
+                "SELECT host_id FROM work_executions WHERE work_item_id = ?1
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+                [&revision],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(host) = host else {
+            return Ok(false);
+        };
+        let remote = host.filter(|host| host != boss_protocol::LOCAL_HOST_ID);
         tx.execute(
             "UPDATE conflict_resolutions SET status = 'failed', failure_reason = ?2,
-            finished_at = COALESCE(finished_at, ?3), resolved_by_rung = NULL, revision_task_id = ?4 WHERE id = ?1",
+            finished_at = COALESCE(finished_at, ?3), resolved_by_rung = NULL, revision_task_id = ?4,
+            workspace_failure_host = ?5 WHERE id = ?1",
             params![
                 attempt_id,
                 format!("{CONFLICT_WORKSPACE_FAILURE}{error}"),
                 now_string(),
-                revision
+                revision,
+                remote
             ],
         )?;
         surface_conflict_stop(&tx, attempt_id)?;
@@ -276,13 +305,63 @@ impl WorkDb {
     }
 
     /// Resumes already spent on the attempt's current failure episode, and the
-    /// failure text that was current at the last resume.
+    /// failure context that was current at the last resume.
     fn workspace_resume_state(&self, attempt_id: &str) -> Result<(i64, Option<String>)> {
         Ok(self.connect()?.query_row(
-            "SELECT workspace_resumes, workspace_resume_failure FROM conflict_resolutions WHERE id = ?1",
+            "SELECT workspace_resumes, workspace_resume_context FROM conflict_resolutions WHERE id = ?1",
             [attempt_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?)
+    }
+
+    /// The stable identity of a failure episode: the host whose refusal failed
+    /// the attempt plus the PR head and base the refusal was about. Diagnostic
+    /// text is deliberately not part of it, so wording drift cannot reopen the
+    /// budget.
+    fn workspace_failure_context(
+        &self,
+        attempt: &ConflictResolution,
+        head: Option<&str>,
+        base: Option<&str>,
+    ) -> Result<String> {
+        let host = self.conflict_workspace_failure_host(&attempt.id)?;
+        Ok(format!(
+            "{}|{}|{}",
+            host.as_deref().unwrap_or(boss_protocol::LOCAL_HOST_ID),
+            head.or(attempt.head_sha_before.as_deref()).unwrap_or_default(),
+            base.or(attempt.base_sha_at_trigger.as_deref()).unwrap_or_default(),
+        ))
+    }
+
+    /// Resumes spent in the current failure episode, and its context identity.
+    fn workspace_resume_budget(
+        &self,
+        attempt: &ConflictResolution,
+        head: Option<&str>,
+        base: Option<&str>,
+    ) -> Result<(i64, String)> {
+        let context = self.workspace_failure_context(attempt, head, base)?;
+        let (spent, last) = self.workspace_resume_state(&attempt.id)?;
+        let spent = if last.as_deref().is_some_and(|last| last != context) {
+            0
+        } else {
+            spent
+        };
+        Ok((spent, context))
+    }
+
+    /// Whether a recovery probe that succeeds would be refused because the
+    /// failure episode (same host, same PR head and base) has already used its
+    /// resume budget. The probe cannot observe the bookmark or repository state
+    /// Cube refused, so only a change of host, head or base reopens it.
+    pub fn workspace_resume_paused(&self, attempt_id: &str, head: Option<&str>, base: Option<&str>) -> Result<bool> {
+        let Some(attempt) = self
+            .get_conflict_resolution(attempt_id)?
+            .filter(conflict_workspace_failed)
+        else {
+            return Ok(false);
+        };
+        Ok(self.workspace_resume_budget(&attempt, head, base)?.0 >= MAX_UNCHANGED_WORKSPACE_RESUMES)
     }
 
     /// Called only after Cube has successfully prepared the workspace again on
@@ -291,10 +370,8 @@ impl WorkDb {
     /// attempt without consuming the churn cap.
     ///
     /// The resume budget lives on the attempt and is spent atomically by every
-    /// resume, with or without a revision. A moved head or base, or a failure
-    /// that differs from the one the last resume saw, reopens it. Once spent,
-    /// the attempt stays surfaced as paused and is only retried once per
-    /// [`PAUSED_WORKSPACE_RETRY_SECS`].
+    /// resume, with or without a revision. A changed failing host, PR head or
+    /// base reopens it. Once spent, the attempt stays surfaced as paused.
     pub fn resume_conflict_workspace(
         &self,
         attempt_id: &str,
@@ -307,26 +384,18 @@ impl WorkDb {
         else {
             return Ok(None);
         };
-        let context_moved = head.is_some_and(|h| attempt.head_sha_before.as_deref() != Some(h))
-            || base.is_some_and(|b| attempt.base_sha_at_trigger.as_deref() != Some(b));
-        let (spent, last_failure) = self.workspace_resume_state(attempt_id)?;
-        let new_failure = last_failure.is_some() && last_failure != attempt.failure_reason;
-        let spent = if context_moved || new_failure { 0 } else { spent };
+        let (spent, context) = self.workspace_resume_budget(&attempt, head, base)?;
         if spent >= MAX_UNCHANGED_WORKSPACE_RESUMES {
-            let finished: i64 = attempt
-                .finished_at
-                .as_deref()
-                .and_then(|at| at.parse().ok())
-                .unwrap_or(0);
-            if boss_engine_utils::epoch_time::now_epoch_secs() - finished < PAUSED_WORKSPACE_RETRY_SECS {
-                self.note_workspace_recovery_paused(&attempt)?;
-                return Ok(None);
-            }
+            self.note_workspace_recovery_paused(&attempt)?;
+            return Ok(None);
         }
         if let Some(revision) = &attempt.revision_task_id {
             if self.is_conflict_revision_running_or_queued(revision)? {
                 return Ok(None);
             }
+            // Archiving is a no-op for a revision that is already archived,
+            // done, in review or deleted; the consumed marker below is what
+            // keeps its failure from being replayed.
             self.close_moot_revision_task(
                 revision,
                 ArchiveProvenance::new(
@@ -337,13 +406,19 @@ impl WorkDb {
         }
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(revision) = &attempt.revision_task_id {
+            tx.execute(
+                "UPDATE conflict_resolutions SET workspace_failure_consumed = 1 WHERE revision_task_id = ?1",
+                [revision],
+            )?;
+        }
         let rows = tx.execute(
             "UPDATE conflict_resolutions SET status = 'pending', failure_reason = NULL,
                  finished_at = NULL, revision_task_id = NULL, workspace_failure_host = NULL,
-                 workspace_resumes = ?5 + 1, workspace_resume_failure = ?2,
+                 workspace_resumes = ?5 + 1, workspace_resume_context = ?6, rung1_lease_failures = 0,
                  head_sha_before = COALESCE(?3, head_sha_before), base_sha_at_trigger = COALESCE(?4, base_sha_at_trigger)
              WHERE id = ?1 AND status = 'failed' AND failure_reason = ?2",
-            params![attempt_id, attempt.failure_reason, head, base, spent],
+            params![attempt_id, attempt.failure_reason, head, base, spent, context],
         )?;
         if rows == 0 {
             return Ok(None);
@@ -362,36 +437,38 @@ impl WorkDb {
 
     /// Tell whoever follows the surfaced advice that automatic recovery is
     /// paused and what lifts the pause, on both the attention and the card.
-    fn note_workspace_recovery_paused(&self, attempt: &ConflictResolution) -> Result<()> {
+    /// Returns whether a row changed.
+    pub fn note_workspace_recovery_paused(&self, attempt: &ConflictResolution) -> Result<bool> {
         self.note_workspace_recovery(
             &attempt.id,
             &format!(
-                "Automatic recovery is paused after {MAX_UNCHANGED_WORKSPACE_RESUMES} unsuccessful resumes. It resumes \
-                 when the PR head or base moves, when the failure changes, or on the next check after {} minutes.",
-                PAUSED_WORKSPACE_RETRY_SECS / 60
+                "Automatic recovery is paused after {MAX_UNCHANGED_WORKSPACE_RESUMES} unsuccessful resumes on the \
+                 same host and PR head and base. It resumes when the PR head or base moves or the failure \
+                 occurs on a different host."
             ),
         )
     }
 
     /// Append `note` (why recovery is not happening right now) to the surfaced
-    /// stop. Idempotent: repeated identical notes write nothing.
-    pub fn note_workspace_recovery(&self, attempt_id: &str, note: &str) -> Result<()> {
+    /// stop. Idempotent: repeated identical notes write nothing. Returns
+    /// whether the card or the attention text actually changed.
+    pub fn note_workspace_recovery(&self, attempt_id: &str, note: &str) -> Result<bool> {
         let Some(attempt) = self
             .get_conflict_resolution(attempt_id)?
             .filter(conflict_workspace_failed)
         else {
-            return Ok(());
+            return Ok(false);
         };
         let reason = attempt.failure_reason.as_deref().unwrap_or_default();
         let detail = format!("Conflict remediation stopped: {reason}\n\n{note}");
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        tx.execute(
+        let card = tx.execute(
             "UPDATE tasks SET blocked_detail = ?2 WHERE id = ?1 AND blocked_attempt_id = ?3
                AND blocked_reason = 'merge_conflict' AND blocked_detail IS NOT ?2",
             params![attempt.work_item_id, detail, attempt.id],
         )?;
-        tx.execute(
+        let attention = tx.execute(
             "UPDATE work_attention_items SET body_markdown = ?3 WHERE work_item_id = ?1 AND status = 'open'
                AND kind = ?2 AND body_markdown IS NOT ?3",
             params![
@@ -401,6 +478,33 @@ impl WorkDb {
             ],
         )?;
         tx.commit()?;
+        Ok(card + attention > 0)
+    }
+
+    /// Record one more consecutive mechanical-rung lease failure on the
+    /// attempt and return the new count.
+    pub fn record_rung1_lease_failure(&self, attempt_id: &str) -> Result<i64> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE conflict_resolutions SET rung1_lease_failures = rung1_lease_failures + 1 WHERE id = ?1",
+            [attempt_id],
+        )?;
+        Ok(conn
+            .query_row(
+                "SELECT rung1_lease_failures FROM conflict_resolutions WHERE id = ?1",
+                [attempt_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    /// A lease succeeded: the failures are no longer consecutive.
+    pub fn clear_rung1_lease_failures(&self, attempt_id: &str) -> Result<()> {
+        self.connect()?.execute(
+            "UPDATE conflict_resolutions SET rung1_lease_failures = 0 WHERE id = ?1 AND rung1_lease_failures != 0",
+            [attempt_id],
+        )?;
         Ok(())
     }
 }

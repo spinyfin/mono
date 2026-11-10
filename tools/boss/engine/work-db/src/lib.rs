@@ -711,7 +711,7 @@ mod conflict_mismatch;
 mod conflict_res;
 mod conflict_stop;
 pub use boss_engine_storage_values::attention_kinds::CONFLICT_REMEDIATION_STOPPED_ATTENTION_KIND;
-pub use conflict_stop::{CONFLICT_WORKSPACE_FAILURE, conflict_workspace_failed};
+pub use conflict_stop::{CONFLICT_WORKSPACE_FAILURE, MAX_RUNG1_LEASE_FAILURES, conflict_workspace_failed};
 mod coordinator_guidance_cache;
 mod coordinator_handoff_store;
 mod coordinator_tmux;

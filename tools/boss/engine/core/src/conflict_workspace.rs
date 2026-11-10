@@ -62,6 +62,26 @@ pub(crate) async fn recover(
     attempt: &ConflictResolution,
     probe: &crate::merge_poller::PrLifecycleProbe,
 ) -> bool {
+    // A spent budget on an unchanged failure episode is not worth a probe:
+    // keep the stop and say why it is not recovering.
+    match db.workspace_resume_paused(
+        &attempt.id,
+        probe.head_ref_oid.as_deref(),
+        probe.base_ref_oid.as_deref(),
+    ) {
+        Ok(true) => {
+            publish_if_changed(
+                db.note_workspace_recovery_paused(attempt),
+                publisher,
+                candidate,
+                &attempt.id,
+            )
+            .await;
+            return false;
+        }
+        Ok(false) => {}
+        Err(error) => tracing::warn!(attempt_id = %attempt.id, ?error, "could not read workspace resume budget"),
+    }
     let prepared = match db.conflict_workspace_failure_host(&attempt.id) {
         Ok(None) => prepare(db, &cube, candidate, true).await,
         Ok(Some(host_id)) => match remote_probe(db, hosts, &host_id).await {
@@ -72,12 +92,16 @@ pub(crate) async fn recover(
     };
     if let Err(error) = prepared {
         tracing::warn!(attempt_id = %attempt.id, error = %format!("{error:#}"), "conflict workspace remains unavailable; retaining failed attempt");
-        if let Err(note_error) = db.note_workspace_recovery(
+        publish_if_changed(
+            db.note_workspace_recovery(
+                &attempt.id,
+                &format!("The last recovery probe did not succeed: {error:#}"),
+            ),
+            publisher,
+            candidate,
             &attempt.id,
-            &format!("The last recovery probe did not succeed: {error:#}"),
-        ) {
-            tracing::warn!(attempt_id = %attempt.id, ?note_error, "could not record recovery probe result");
-        }
+        )
+        .await;
         return false;
     }
     match db.resume_conflict_workspace(
@@ -100,6 +124,29 @@ pub(crate) async fn recover(
             tracing::error!(attempt_id = %attempt.id, ?error, "could not resume recovered conflict workspace");
             false
         }
+    }
+}
+
+/// A recovery note changes the card and the open attention; tell listeners
+/// when it actually did.
+async fn publish_if_changed(
+    changed: Result<bool>,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    attempt_id: &str,
+) {
+    match changed {
+        Ok(true) => {
+            publisher
+                .publish_work_item_changed(
+                    &candidate.product_id,
+                    &candidate.work_item_id,
+                    "conflict_workspace_noted",
+                )
+                .await
+        }
+        Ok(false) => {}
+        Err(error) => tracing::warn!(attempt_id, ?error, "could not record recovery note"),
     }
 }
 
@@ -138,6 +185,17 @@ async fn prepare(db: &WorkDb, cube: &impl Probe, candidate: &PendingMergeCheck, 
     }
     let prepared = cube.goto(&lease.workspace_path, pr as u64).await;
     let released = cube.release(&lease.lease_id).await;
+    if let Err(error) = &released {
+        // Remote leases are not in the shutdown registry or the orphan reaper,
+        // so the lease id in this line is the only handle to reclaim a leak.
+        tracing::error!(
+            lease_id = %lease.lease_id,
+            workspace_id = %lease.workspace_id,
+            local,
+            error = %format!("{error:#}"),
+            "failed to release a conflict recovery probe lease; it must be released by hand",
+        );
+    }
     if local {
         crate::ladder_lease_registry::unregister(&lease.lease_id);
     }
