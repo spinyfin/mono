@@ -253,6 +253,56 @@ impl WorkerRegistry {
         Ok(())
     }
 
+    /// Register a freshly spawned or re-adopted worker pid with the tier its
+    /// kind demands. A non-progression worker is registered as before. A
+    /// progression worker goes through [`Self::register_progression`] so its
+    /// neighbourhood is captured and the RPC tier classifies it.
+    ///
+    /// Fails closed: if the neighbourhood cannot be captured (no work db
+    /// handle, or the capture errors) the pid is still registered as a
+    /// progression, never as an ordinary worker. With no captured scope every
+    /// scoped mutation is refused, which is strictly narrower than the
+    /// unconfined posture an ordinary registration would give.
+    pub fn register_for_run(
+        &self,
+        pid: libc::pid_t,
+        run_id: &str,
+        progression: bool,
+        db: Option<&crate::work::WorkDb>,
+    ) {
+        if !progression {
+            self.register(pid, run_id);
+            return;
+        }
+        let captured = match db {
+            Some(db) => self.register_progression(pid, run_id, db),
+            None => Err(anyhow::anyhow!("no work db handle available")),
+        };
+        if let Err(error) = captured {
+            tracing::error!(
+                pid,
+                run_id,
+                %error,
+                "worker registry: could not capture the progression neighbourhood; registering the \
+                 pane confined with no scope",
+            );
+            self.register_identity(pid, run_id.to_owned(), true);
+        }
+    }
+
+    /// Whether `pid` is registered, and at the confined progression tier.
+    /// `None` when the pid is not registered. Test-only: production code
+    /// classifies through an ancestor walk, which needs a live process tree.
+    #[cfg(test)]
+    pub(crate) fn registered_tier(&self, pid: libc::pid_t) -> Option<bool> {
+        self.inner
+            .lock()
+            .expect("registry poisoned")
+            .pid_to_run
+            .get(&pid)
+            .map(|entry| entry.progression)
+    }
+
     fn register_identity(&self, pid: libc::pid_t, run_id: String, progression: bool) {
         let start = match self.processes.snapshot(pid) {
             Ok(snapshot) => Some(snapshot.start),

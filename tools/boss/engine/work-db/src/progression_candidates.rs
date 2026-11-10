@@ -113,8 +113,8 @@ use boss_engine_storage_values::dispatch_wait::{
 use boss_engine_storage_values::progression::{
     CREATED_VIA_PROGRESSION_SWEEP, DEFAULT_COOLDOWN_SECS, DEFAULT_MAX_CREATES_PER_ITEM_WINDOW,
     DEFAULT_MAX_CREATES_WINDOW_SECS, DEFAULT_STUCK_AFTER_SECS, INFRASTRUCTURE_FAILURE_CAP, METADATA_KEY_COOLDOWN_SECS,
-    METADATA_KEY_MAX_CREATES_PER_ITEM_WINDOW, METADATA_KEY_MAX_CREATES_WINDOW_SECS, METADATA_KEY_STUCK_AFTER_SECS,
-    NO_ACTION_COOLDOWN_MULTIPLIER, ProgressionSettings,
+    METADATA_KEY_MAX_CREATES_PER_ITEM_WINDOW, METADATA_KEY_MAX_CREATES_WINDOW_SECS, METADATA_KEY_RUN_TIMEOUT_SECS,
+    METADATA_KEY_STUCK_AFTER_SECS, NO_ACTION_COOLDOWN_MULTIPLIER, ProgressionSettings,
 };
 
 pub(super) const GRACE_COLUMN_MIGRATION_ID: &str = "20261106_1200_progression_grace_waived_at";
@@ -867,6 +867,12 @@ impl WorkDb {
                 i64::from(settings.max_creates_per_item_window),
             ),
             (METADATA_KEY_MAX_CREATES_WINDOW_SECS, settings.max_creates_window_secs),
+            // Not read by the candidate views: the stale-worker sweep applies it
+            // to a live progression run.
+            (
+                METADATA_KEY_RUN_TIMEOUT_SECS,
+                i64::try_from(settings.run_timeout_secs).unwrap_or(i64::MAX),
+            ),
         ] {
             tx.execute(
                 "INSERT INTO metadata (key, value) VALUES (?1, ?2)
@@ -1109,4 +1115,120 @@ pub(crate) fn read_clauses(conn: &Connection, work_item_id: &str) -> Result<Opti
             },
         )
         .optional()?)
+}
+
+impl WorkDb {
+    /// Record a `progression` run, its host and its tmux hosting, **without
+    /// touching the work item it was sent to diagnose**.
+    ///
+    /// [`WorkDb::start_execution_run_on_host_with_tmux_hosting`] also advances
+    /// the item to `active`, consumes its `autostart` and clears its
+    /// `dispatch_failed_*` stamp in the same transaction. For a progression run
+    /// that would erase the very evidence of the stuck state the agent is
+    /// started to inspect, so this variant writes only the execution and run
+    /// rows. The run holds no cube lease: the lease, repo and workspace columns
+    /// stay unset and `workspace_path` records the engine-owned scratch
+    /// directory it runs in.
+    pub fn start_progression_run_on_local_host(
+        &self,
+        execution_id: &str,
+        agent_id: &str,
+        scratch_path: &str,
+        tmux_hosted: bool,
+    ) -> Result<(WorkExecution, WorkRun)> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
+        if execution.kind.holds_cube_lease() {
+            bail!(
+                "execution {execution_id} is a `{}` run; only a progression run may start without a lease",
+                execution.kind
+            );
+        }
+        if !execution.status.can_begin_run() {
+            bail!(
+                "execution {execution_id} is not ready and cannot start a run from status `{}`",
+                execution.status
+            );
+        }
+
+        let now = now_string();
+        let updated = tx.execute(
+            "UPDATE work_executions
+             SET status = 'running',
+                 workspace_path = ?2,
+                 host_id = 'local',
+                 started_at = COALESCE(started_at, ?3),
+                 finished_at = NULL,
+                 last_error = NULL
+             WHERE id = ?1
+               AND status IN ('ready', 'claimed')",
+            params![execution_id, scratch_path, now],
+        )?;
+        if updated == 0 {
+            let current = query_execution(&tx, execution_id).require("execution", execution_id)?;
+            bail!(
+                "execution {execution_id} is not ready and cannot start a run from status `{}`",
+                current.status
+            );
+        }
+
+        let run_id = next_id("run");
+        tx.execute(
+            "INSERT INTO work_runs (
+                id, execution_id, agent_id, status, error_text, result_summary, transcript_path,
+                artifacts_path, created_at, started_at, finished_at, host_id, tmux_hosted
+             ) VALUES (?1, ?2, ?3, 'active', NULL, NULL, NULL, NULL, ?4, ?4, NULL, 'local', ?5)",
+            params![run_id, execution_id, agent_id, now, tmux_hosted],
+        )?;
+
+        let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
+        let overflow = personas::allocate(&tx, &run_id)?;
+        let run = query_run(&tx, &run_id)?.with_context(|| format!("missing run after insert: {run_id}"))?;
+        tx.commit()?;
+        self.record_persona_overflow(u64::from(overflow));
+        Ok((execution, run))
+    }
+
+    /// Drive a `progression` execution to the `failed` terminal status and
+    /// record `result_summary` as the failure detail on its most recent run,
+    /// even when that run was already closed as `completed` by the pane spawn
+    /// (the normal case for a pane-hosted worker). The ordinary pane-parked
+    /// finalizer always reports `completed`, which would hide a driver error
+    /// from the candidate view's infrastructure-failure cap. Never touches the
+    /// work item. Idempotent: returns `Ok(None)` if the execution is already
+    /// terminal.
+    pub fn fail_progression_execution(
+        &self,
+        execution_id: &str,
+        result_summary: &str,
+    ) -> Result<Option<WorkExecution>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
+        if execution.status.is_terminal() || execution.kind.holds_cube_lease() {
+            return Ok(None);
+        }
+        let now = now_string();
+        let summary = normalize_optional_text(Some(result_summary.to_owned()));
+        tx.execute(
+            "UPDATE work_runs
+             SET status = 'failed',
+                 error_text = COALESCE(?2, error_text),
+                 result_summary = COALESCE(?2, result_summary),
+                 finished_at = COALESCE(finished_at, ?3)
+             WHERE id = (SELECT id FROM work_runs WHERE execution_id = ?1
+                         ORDER BY created_at DESC, id DESC LIMIT 1)",
+            params![execution_id, summary, now],
+        )?;
+        tx.execute(
+            "UPDATE work_executions SET status = 'failed', finished_at = ?2 WHERE id = ?1",
+            params![execution_id, now],
+        )?;
+        let updated = query_execution(&tx, execution_id).require("execution", execution_id)?;
+        let mut pending = PendingEvents::new();
+        stage_execution_terminal(&mut pending, &tx, execution_id, &updated.work_item_id)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
+        Ok(Some(updated))
+    }
 }

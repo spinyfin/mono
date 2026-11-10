@@ -791,6 +791,35 @@ where
     outcome
 }
 
+/// Register a re-adopted pane's shell pid with the tier its execution kind
+/// demands. A `progression` pane must come back confined to its captured
+/// neighbourhood: registered as an ordinary worker it would be unconfined
+/// whenever the `worker_rpc_tier` flag is off. The execution row is what says
+/// which tier applies, so when it cannot be read this fails closed: the pane
+/// is registered confined (with whatever scope can be captured, none if the
+/// row is unreadable). That is strictly narrower than the ordinary posture, so
+/// a transient read error can never leave a progression pane unconfined.
+fn register_adopted_pid<S>(spawner: &S, work_db: &WorkDb, shell_pid: libc::pid_t, execution_id: &str)
+where
+    S: WorkerSpawner + ?Sized,
+{
+    let progression = match work_db.get_execution(execution_id) {
+        Ok(execution) => execution.kind == boss_protocol::ExecutionKind::Progression,
+        Err(error) => {
+            tracing::error!(
+                execution_id,
+                %error,
+                "tmux adoption: could not read the execution kind to pick a registry tier; \
+                 registering the pane confined",
+            );
+            true
+        }
+    };
+    spawner
+        .worker_registry()
+        .register_for_run(shell_pid, execution_id, progression, Some(work_db));
+}
+
 /// Rebuild derived bookkeeping for one confirmed-live, non-terminal match.
 #[allow(clippy::too_many_arguments)]
 async fn adopt_one<S>(
@@ -869,7 +898,7 @@ async fn adopt_one<S>(
     spawner
         .worker_registry()
         .register_tmux_run_slot(execution_id.to_owned(), slot_id, session_name);
-    spawner.worker_registry().register(shell_pid, execution_id.to_owned());
+    register_adopted_pid(spawner, work_db, shell_pid, execution_id);
 
     if !coordinator.reclaim_slot(&handle.agent_id, execution_id).await {
         tracing::warn!(
@@ -1094,7 +1123,7 @@ async fn classify_untracked_session<S>(
         // The pid was just observed live in the tmux pane, so (unlike a durable
         // pid) it is safe to trust. Register it before convergence returns the
         // worker to Running so its requests are attributed and confined at once.
-        spawner.worker_registry().register(shell_pid, execution_id.clone());
+        register_adopted_pid(spawner, work_db, shell_pid, &execution_id);
         convergence
             .converge_live_worker(&execution_id, TERMINAL_HANDOFF_TRIGGER)
             .await;
@@ -1950,6 +1979,9 @@ mod tests {
 
     #[path = "tmux_adoption_persona_tests.rs"]
     mod persona_tests;
+
+    #[path = "tmux_adoption_progression_tests.rs"]
+    mod progression_tests;
 
     /// The cardinal case: engine restarts, the worker's tmux session (and its
     /// non-terminal execution row) survived. The pass must rebuild the slot

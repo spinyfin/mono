@@ -47,7 +47,7 @@ fn sandbox_base_profile(worker_kind: WorkerKind) -> &'static str {
         // Codex's `gpt-6-astra`), but this match must stay total. Read-only
         // is the closest existing posture — strictly narrower than the empty
         // Codex allowlist would allow, never wider.
-        WorkerKind::Reviewer | WorkerKind::ReviewGuide => "read-only",
+        WorkerKind::Reviewer | WorkerKind::ReviewGuide | WorkerKind::Progression => "read-only",
         WorkerKind::Standard | WorkerKind::Triage | WorkerKind::AnswerAgent => "workspace",
     }
 }
@@ -56,7 +56,7 @@ fn sandbox_base_profile(worker_kind: WorkerKind) -> &'static str {
 /// base profile so the two postures never collide in the same file.
 fn boss_sandbox_profile_name(worker_kind: WorkerKind) -> &'static str {
     match worker_kind {
-        WorkerKind::Reviewer | WorkerKind::ReviewGuide => "boss-read-only",
+        WorkerKind::Reviewer | WorkerKind::ReviewGuide | WorkerKind::Progression => "boss-read-only",
         WorkerKind::Standard | WorkerKind::Triage | WorkerKind::AnswerAgent => "boss-workspace",
     }
 }
@@ -209,7 +209,7 @@ pub fn structural_deny_rules(
 /// value alongside it is an interaction the investigation never exercised.
 pub fn permission_mode_for_worker_kind(worker_kind: WorkerKind) -> Option<&'static str> {
     match worker_kind {
-        WorkerKind::AnswerAgent | WorkerKind::ReviewGuide => Some("dontAsk"),
+        WorkerKind::AnswerAgent | WorkerKind::ReviewGuide | WorkerKind::Progression => Some("dontAsk"),
         WorkerKind::Standard | WorkerKind::Reviewer | WorkerKind::Triage => None,
     }
 }
@@ -239,6 +239,21 @@ pub fn extra_args(
             args.extend(["--allow".into(), rule]);
         }
     }
+    // The progression agent gets the same capability table Claude renders into
+    // its settings: under the forced `dontAsk` mode the allowlist is the whole
+    // set of actions it can take, and the deny belt (every write, `jj`/`git`,
+    // `cube`, mutating `gh`) sits on top. This is what confines it on local
+    // macOS, where Grok runs with `--sandbox off` like every other local kind.
+    if worker_kind == WorkerKind::Progression {
+        for rule in crate::capability_rules::progression_deny_rules() {
+            if !args.windows(2).any(|pair| pair[0] == "--deny" && pair[1] == rule) {
+                args.extend(["--deny".into(), rule]);
+            }
+        }
+        for rule in crate::capability_rules::progression_allow_rules() {
+            args.extend(["--allow".into(), rule]);
+        }
+    }
     if let Some(mode) = permission_mode_for_worker_kind(worker_kind) {
         args.push("--permission-mode".to_owned());
         args.push(mode.to_owned());
@@ -262,6 +277,79 @@ mod tests {
         }
         assert!(args.windows(2).any(|pair| pair == ["--deny", "Edit(**)"]));
         assert!(args.windows(2).any(|pair| pair == ["--permission-mode", "dontAsk"]));
+    }
+
+    #[test]
+    fn progression_gets_the_shared_allowlist_deny_belt_and_dont_ask_on_every_platform() {
+        for is_remote in [false, true] {
+            let args = extra_args(WorkerKind::Progression, None, Path::new("/scratch"), is_remote);
+            for rule in crate::capability_rules::progression_allow_rules() {
+                assert!(
+                    args.windows(2).any(|pair| pair == ["--allow", &rule]),
+                    "missing allow {rule}"
+                );
+            }
+            for rule in crate::capability_rules::progression_deny_rules() {
+                assert!(
+                    args.windows(2).any(|pair| pair == ["--deny", &rule]),
+                    "missing deny {rule}"
+                );
+            }
+            for rule in [
+                "Bash(jj:*)",
+                "Bash(git:*)",
+                "Edit(**)",
+                "NotebookEdit(**)",
+                "Bash(cube:*)",
+            ] {
+                assert!(
+                    args.windows(2).any(|pair| pair == ["--deny", rule]),
+                    "missing deny {rule}"
+                );
+            }
+            assert!(args.windows(2).any(|pair| pair == ["--permission-mode", "dontAsk"]));
+            // Under `dontAsk` an extra `--allow` is the regression that matters:
+            // the allow set must be exactly the shared progression table.
+            let allows: Vec<&str> = args
+                .windows(2)
+                .filter(|pair| pair[0] == "--allow")
+                .map(|pair| pair[1].as_str())
+                .collect();
+            let expected_allows = crate::capability_rules::progression_allow_rules();
+            assert_eq!(
+                allows,
+                expected_allows.iter().map(String::as_str).collect::<Vec<_>>(),
+                "the --allow set is exactly the shared progression allowlist"
+            );
+            if cfg!(target_os = "macos") && !is_remote {
+                let mut expected: Vec<String> = vec!["--sandbox".into(), "off".into()];
+                let mut denies = structural_deny_rules(None, WorkerKind::Progression, Some(Path::new("/scratch")));
+                for rule in crate::capability_rules::progression_deny_rules() {
+                    if !denies.contains(&rule) {
+                        denies.push(rule);
+                    }
+                }
+                for rule in denies {
+                    expected.extend(["--deny".into(), rule]);
+                }
+                for rule in expected_allows {
+                    expected.extend(["--allow".into(), rule]);
+                }
+                expected.extend(["--permission-mode".into(), "dontAsk".into()]);
+                assert_eq!(args, expected, "full local macOS Progression argument vector");
+            }
+            let sandbox = &args[1];
+            if is_remote {
+                assert_eq!(sandbox, "read-only");
+            } else if cfg!(target_os = "macos") {
+                assert_eq!(
+                    sandbox, "off",
+                    "local macOS Grok runs unsandboxed; the rules are the confinement"
+                );
+            } else {
+                assert_eq!(sandbox, "boss-read-only");
+            }
+        }
     }
 
     #[test]
@@ -378,6 +466,20 @@ mod tests {
         assert_eq!(permission_mode_for_worker_kind(WorkerKind::Standard), None);
         assert_eq!(permission_mode_for_worker_kind(WorkerKind::Reviewer), None);
         assert_eq!(permission_mode_for_worker_kind(WorkerKind::Triage), None);
+    }
+
+    #[test]
+    fn progression_gets_the_most_restrictive_posture_never_standard() {
+        assert_eq!(sandbox_base_profile(WorkerKind::Progression), "read-only");
+        assert_eq!(boss_sandbox_profile_name(WorkerKind::Progression), "boss-read-only");
+        assert_ne!(
+            sandbox_base_profile(WorkerKind::Progression),
+            sandbox_base_profile(WorkerKind::Standard)
+        );
+        assert_eq!(
+            permission_mode_for_worker_kind(WorkerKind::Progression),
+            Some("dontAsk")
+        );
     }
 
     #[test]

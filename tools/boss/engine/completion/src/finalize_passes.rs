@@ -679,6 +679,70 @@ impl WorkerCompletionHandler {
         StopOutcome::AnswerAgent { replied }
     }
 
+    /// Finalize a `progression` execution at its Stop boundary: complete the
+    /// execution and run rows and release the pane. It holds no cube lease, so
+    /// no workspace release is attempted (its scratch directory is removed by
+    /// the driver teardown), and it never touches the work item it inspected —
+    /// no PR detection, no nudge, no status change. A `driver_error` (the
+    /// driver reported the turn boundary as a fatal error) is recorded on the
+    /// run as a failure, never as an attention or status change on the item.
+    pub(super) async fn finalize_progression(
+        &self,
+        execution: &crate::work::WorkExecution,
+        driver_error: Option<&str>,
+    ) -> StopOutcome {
+        let workspace_path = execution.workspace_path.clone();
+        let teardown = self.begin_teardown(&execution.id);
+        let finished = match driver_error {
+            Some(detail) => self
+                .work_db
+                .fail_progression_execution(&execution.id, &format!("progression: driver error: {detail}")),
+            None => {
+                self.work_db
+                    .complete_pane_parked_execution(&execution.id, "completed", Some("progression: run ended"))
+            }
+        };
+        match finished {
+            Ok(Some(_)) => {}
+            Ok(None) => tracing::debug!(
+                execution_id = %execution.id,
+                "progression finalise: execution already terminal; nothing to do",
+            ),
+            Err(err) => tracing::error!(
+                execution_id = %execution.id,
+                ?err,
+                "failed to finalise progression execution row",
+            ),
+        }
+        self.finish_worker_teardown(
+            &execution.id,
+            &execution.work_item_id,
+            None,
+            workspace_path.as_deref().map(std::path::Path::new),
+            "progression",
+            teardown,
+        )
+        .await;
+        self.publisher
+            .publish(
+                &execution.id,
+                &execution.work_item_id,
+                if driver_error.is_some() { "failed" } else { "completed" },
+                if driver_error.is_some() {
+                    "progression_failed"
+                } else {
+                    "progression_completed"
+                },
+            )
+            .await;
+        tracing::info!(
+            execution_id = %execution.id,
+            work_item_id = %execution.work_item_id,
+            "progression execution finalised (work item untouched)",
+        );
+        StopOutcome::Progression
+    }
+
     /// Finalize a `pr_review_guide` execution: consume its submitted
     /// Markdown proposal, validate it against the
     /// comparison it was generated from, and durably publish or fail the

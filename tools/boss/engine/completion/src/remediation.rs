@@ -287,6 +287,9 @@ impl WorkerCompletionHandler {
             // Unreachable here for the same reason: an answer-agent outcome
             // must never mark a CI attempt failed either.
             StopOutcome::AnswerAgent { .. } => false,
+            // Unreachable here for the same reason: a progression outcome
+            // must never mark a CI attempt failed either.
+            StopOutcome::Progression => false,
             // Unreachable here for the same reason: a review-guide outcome
             // must never mark a CI attempt failed either (this finalizer
             // only runs for `ci_remediation` kind).

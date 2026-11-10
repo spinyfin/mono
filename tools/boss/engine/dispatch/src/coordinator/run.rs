@@ -1132,16 +1132,20 @@ impl ExecutionCoordinator {
     pub async fn resume_pane_spawn_for_running_execution(self: &Arc<Self>, execution: &WorkExecution) -> Result<()> {
         // The already-held workspace is the live source of truth. Resuming a
         // pane must neither inspect legacy pointers nor reposition its edits.
-        let lease_id = execution
-            .cube_lease_id
-            .as_deref()
-            .ok_or_else(|| anyhow!("cannot resume pane spawn for {}: missing cube_lease_id", execution.id))?;
-        let workspace_id = execution.cube_workspace_id.as_deref().ok_or_else(|| {
-            anyhow!(
+        let leaseless = !execution.kind.holds_cube_lease();
+        let lease_id = match execution.cube_lease_id.as_deref() {
+            Some(id) => id,
+            None if leaseless => "",
+            None => anyhow::bail!("cannot resume pane spawn for {}: missing cube_lease_id", execution.id),
+        };
+        let workspace_id = match execution.cube_workspace_id.as_deref() {
+            Some(id) => id,
+            None if leaseless => "",
+            None => anyhow::bail!(
                 "cannot resume pane spawn for {}: missing cube_workspace_id",
                 execution.id
-            )
-        })?;
+            ),
+        };
         let workspace_path = execution
             .workspace_path
             .as_deref()
@@ -1192,6 +1196,21 @@ impl ExecutionCoordinator {
             ));
         }
         let adapter = self.host_adapter();
+
+        if leaseless {
+            // A checkout-free run re-enters its own spawn path: the scratch
+            // directory is recreated (it lives in the temp dir) and nothing
+            // lease-shaped is built.
+            let scratch = boss_execution_contracts::progression_scratch::create_scratch_dir(&execution.id)?;
+            let execution = execution.clone();
+            let coordinator = Arc::clone(self);
+            boss_task_scope::spawn(async move {
+                coordinator
+                    .run_progression_execution(execution, run, work_item, worker_id, scratch, adapter)
+                    .await;
+            });
+            return Ok(());
+        }
 
         let lease = CubeWorkspaceLease {
             lease_id: lease_id.to_owned(),

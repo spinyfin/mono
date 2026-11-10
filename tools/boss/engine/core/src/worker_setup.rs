@@ -75,8 +75,8 @@ use crate::ssh_transport::shell_quote;
 
 mod deny_rules;
 pub use deny_rules::{
-    answer_agent_allow_rules, answer_agent_deny_rules, review_guide_allow_rules, review_guide_deny_rules,
-    reviewer_deny_rules, triage_deny_rules,
+    answer_agent_allow_rules, answer_agent_deny_rules, progression_allow_rules, progression_deny_rules,
+    review_guide_allow_rules, review_guide_deny_rules, reviewer_deny_rules, triage_deny_rules,
 };
 mod git_store_guard;
 pub use git_store_guard::{ensure_git_store_guard_script_in, git_store_guard_script_path};
@@ -438,6 +438,12 @@ fn permissions_value(input: &WorkerSetupInput, fence: DataDirFence) -> serde_jso
             "allow": review_guide_allow_rules(),
             "deny": deny_rules(input, fence),
         })
+    } else if input.worker_kind == WorkerKind::Progression {
+        serde_json::json!({
+            "defaultMode": "dontAsk",
+            "allow": progression_allow_rules(),
+            "deny": deny_rules(input, fence),
+        })
     } else if input.worker_kind == WorkerKind::AnswerAgent {
         serde_json::json!({
             "defaultMode": "dontAsk",
@@ -560,6 +566,7 @@ fn deny_rules(input: &WorkerSetupInput, fence: DataDirFence) -> Vec<String> {
         WorkerKind::Triage => rules.extend(triage_deny_rules()),
         WorkerKind::AnswerAgent => rules.extend(answer_agent_deny_rules()),
         WorkerKind::ReviewGuide => rules.extend(review_guide_deny_rules()),
+        WorkerKind::Progression => rules.extend(progression_deny_rules()),
         WorkerKind::Standard => {}
     }
 

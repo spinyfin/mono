@@ -291,6 +291,7 @@ mod git_store_guard_tests {
             (WorkerKind::Triage, "automation_triage"),
             (WorkerKind::AnswerAgent, "answer_agent"),
             (WorkerKind::ReviewGuide, "pr_review_guide"),
+            (WorkerKind::Progression, "progression"),
         ] {
             let mut input = sample_input();
             input.worker_kind = kind.clone();

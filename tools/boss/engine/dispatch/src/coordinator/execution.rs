@@ -914,6 +914,15 @@ impl ExecutionCoordinator {
             }
         }
 
+        // A kind that holds no cube lease (`progression`) takes the checkout-free
+        // spawn path. It deliberately skips the gating-prerequisite check
+        // below: a progression run on a `blocked: dependency` item is the whole
+        // point, and downgrading its row to `waiting_dependency` would hold it
+        // forever.
+        if !execution.kind.holds_cube_lease() {
+            return self.schedule_progression_execution(execution, worker_id).await;
+        }
+
         // At-dispatch gate check: if the work item is still gated by an
         // unmet prerequisite, the execution must not be dispatched. This
         // closes the timing window where a `ready` row was created before
@@ -2707,11 +2716,17 @@ impl ExecutionCoordinator {
                 // (`pr_review`, `ci_remediation`, `conflict_resolution`)
                 // whose work item sits in `in_review`/`blocked` — bouncing
                 // those would erase review context.
-                let bounced = match self.work_db.bounce_dispatch_failed_to_backlog(
-                    &execution.work_item_id,
-                    attention_kind,
-                    &error_text,
-                ) {
+                //
+                // A `progression` run is never the reason its item failed to
+                // dispatch: it only reads the item, so its own start failure
+                // must not move or stamp that item.
+                let bounced_result = if execution.kind.holds_cube_lease() {
+                    self.work_db
+                        .bounce_dispatch_failed_to_backlog(&execution.work_item_id, attention_kind, &error_text)
+                } else {
+                    Ok(false)
+                };
+                let bounced = match bounced_result {
                     Ok(true) => {
                         tracing::info!(
                             execution_id = %execution.id,

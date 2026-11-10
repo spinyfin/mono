@@ -92,6 +92,14 @@ impl ExecutionKind {
         matches!(self, Self::PrReview | Self::PrReviewGuide | Self::Progression)
     }
 
+    /// Whether a run of this kind is given a cube workspace lease. A
+    /// `progression` run holds no checkout: it runs in an engine-owned scratch
+    /// directory, so lease-keyed spawn, reconcile and teardown paths must not
+    /// expect a lease id or workspace for it.
+    pub fn holds_cube_lease(&self) -> bool {
+        !matches!(self, Self::Progression)
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::AnswerAgent => "answer_agent",

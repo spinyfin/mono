@@ -597,6 +597,10 @@ pub enum StopOutcome {
     /// the comment doesn't sit in `answering` forever). The execution is
     /// finalised (`completed`) and its pane/workspace released either way.
     AnswerAgent { replied: bool },
+    /// A `progression` execution finished. The run is finalised (`completed`)
+    /// and its pane torn down; the stuck work item it was sent to diagnose is
+    /// left exactly as it was.
+    Progression,
     /// A `pr_review_guide` execution finished. `published` is `true` when its
     /// raw output passed validation and was durably published as the
     /// series' new readable version (subject to the publication fence — a

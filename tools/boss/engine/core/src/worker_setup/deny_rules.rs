@@ -147,6 +147,19 @@ pub fn answer_agent_deny_rules() -> Vec<String> {
     read_only_worker_deny_rules()
 }
 
+/// The `permissions.allow` allowlist for [`WorkerKind::Progression`]. The
+/// table is shared with the Grok driver, which renders it as `--allow`
+/// arguments; see [`crate::driver::capability_rules`].
+pub fn progression_allow_rules() -> Vec<String> {
+    crate::driver::capability_rules::progression_allow_rules()
+}
+
+/// Defense-in-depth `permissions.deny` belt for [`WorkerKind::Progression`];
+/// shared with the Grok driver (see [`progression_allow_rules`]).
+pub fn progression_deny_rules() -> Vec<String> {
+    crate::driver::capability_rules::progression_deny_rules()
+}
+
 /// Review-guide workers inspect pinned source and submit one result. The shared
 /// hook narrows Bash to literal reads and immutable git-object inspection.
 pub fn review_guide_allow_rules() -> Vec<String> {
@@ -160,74 +173,11 @@ pub fn review_guide_deny_rules() -> Vec<String> {
 }
 
 /// Shared deny body for workers that must not write files, publish, or
-/// mutate cube state. [`answer_agent_deny_rules`] and
-/// [`review_guide_deny_rules`] stay as named public builders so the two
-/// postures can still diverge and so each kind's tests can assert its own
-/// set.
+/// mutate cube state (see [`crate::driver::capability_rules`]).
 fn read_only_worker_deny_rules() -> Vec<String> {
-    let mut rules = vec!["Edit(**)".to_owned(), "NotebookEdit(**)".to_owned()];
-    rules.extend(publish_deny_rules());
-    // `publish_deny_rules` already denies `cube pr`; deny the rest of `cube`
-    // (workspace lease/release, config, …) so the worker cannot touch cube state.
-    rules.push("Bash(cube)".to_owned());
-    rules.push("Bash(cube:*)".to_owned());
-    rules.push(r#"Bash("$CUBE_BIN")"#.to_owned());
-    rules.push(r#"Bash("$CUBE_BIN":*)"#.to_owned());
-    rules.push("Bash($CUBE_BIN)".to_owned());
-    rules.push("Bash($CUBE_BIN:*)".to_owned());
-    rules
+    crate::driver::capability_rules::read_only_worker_deny_rules()
 }
 
-/// Shared no-publish deny set used by both reviewer and triage workers:
-/// neither kind may push commits or write to GitHub. The file-write deny is
-/// kind-specific and lives in [`reviewer_deny_rules`] / [`triage_deny_rules`]
-/// (workspace-scoped vs. blanket), so it is NOT part of this set.
-///
-/// Rules cover:
-/// - VCS push — `jj git push` and `git push` in all their CLI forms
-/// - PR mutation via `gh` — create, merge, close, edit, comment, review
-/// - Issue write via `gh` — create, comment, close, edit
-/// - `cube pr create` / `cube pr update` — Boss's PR helpers
-///
-/// Note: `jj describe`, `jj bookmark create`, and similar *local* VCS
-/// operations are intentionally not denied. They touch only the local
-/// repo state and can never publish commits or PR changes to GitHub.
 fn publish_deny_rules() -> Vec<String> {
-    vec![
-        // VCS push — both the bare command and the trailing-args form.
-        "Bash(jj git push)".to_owned(),
-        "Bash(jj git push:*)".to_owned(),
-        "Bash(git push)".to_owned(),
-        "Bash(git push:*)".to_owned(),
-        // gh PR mutations — creation, merge, close, edit, comments, reviews.
-        "Bash(gh pr create)".to_owned(),
-        "Bash(gh pr create:*)".to_owned(),
-        "Bash(gh pr merge)".to_owned(),
-        "Bash(gh pr merge:*)".to_owned(),
-        "Bash(gh pr close)".to_owned(),
-        "Bash(gh pr close:*)".to_owned(),
-        "Bash(gh pr edit)".to_owned(),
-        "Bash(gh pr edit:*)".to_owned(),
-        "Bash(gh pr comment)".to_owned(),
-        "Bash(gh pr comment:*)".to_owned(),
-        "Bash(gh pr review)".to_owned(),
-        "Bash(gh pr review:*)".to_owned(),
-        // gh issue mutations — these workers should never file or update issues.
-        "Bash(gh issue create)".to_owned(),
-        "Bash(gh issue create:*)".to_owned(),
-        "Bash(gh issue comment)".to_owned(),
-        "Bash(gh issue comment:*)".to_owned(),
-        "Bash(gh issue close)".to_owned(),
-        "Bash(gh issue close:*)".to_owned(),
-        "Bash(gh issue edit)".to_owned(),
-        "Bash(gh issue edit:*)".to_owned(),
-        // cube pr operations — Boss's PR management helper. Workers are
-        // taught `"$CUBE_BIN"` so the named-binary form must be denied too.
-        "Bash(cube pr)".to_owned(),
-        "Bash(cube pr:*)".to_owned(),
-        r#"Bash("$CUBE_BIN" pr)"#.to_owned(),
-        r#"Bash("$CUBE_BIN" pr:*)"#.to_owned(),
-        "Bash($CUBE_BIN pr)".to_owned(),
-        "Bash($CUBE_BIN pr:*)".to_owned(),
-    ]
+    crate::driver::capability_rules::publish_deny_rules()
 }

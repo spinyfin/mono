@@ -661,7 +661,7 @@ async fn reap_dead_execution(
     // Resolve the work item's stale-worker attention before that happens so
     // the periodic sweep, the pane-input path, and tmux-observed death path
     // cannot strand an attention item after the slot is gone.
-    crate::stale_worker_sweep::resolve_stale_worker_attention_for_work_item(work_db, &execution.work_item_id);
+    crate::stale_worker_sweep::resolve_stale_worker_attention_for_execution(work_db, execution);
 
     // Reap termination path (dead-pid reconcile): tear down any
     // driver-owned state outside the workspace. `mark_execution_orphaned`

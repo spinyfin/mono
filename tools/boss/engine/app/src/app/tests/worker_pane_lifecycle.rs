@@ -176,6 +176,58 @@ async fn release_worker_pane_resolves_open_stale_worker_attention() {
     );
 }
 
+/// A progression run is bound to the stuck item it diagnoses, so ending it —
+/// through the pane release a Stop uses, or through the stale-worker sweep's
+/// timeout reap, which calls the same release — must leave that item's
+/// pre-existing `stale_worker` evidence open and the item unchanged.
+#[tokio::test]
+async fn progression_pane_release_and_timeout_reap_leave_the_items_stale_worker_attention_open() {
+    use boss_engine_runtime::stale_worker_sweep::{STALE_WORKER_ATTENTION_KIND, StaleWorkerReaper};
+
+    for via_timeout_reap in [false, true] {
+        let (server_state, _dir) = test_server_state();
+        let product_id = create_product(&server_state.work_db);
+        let work_item_id = create_active_chore(&server_state.work_db, &product_id, "stuck chore");
+        let execution_id = create_old_execution(&server_state.work_db, &work_item_id);
+        server_state
+            .work_db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET kind = 'progression' WHERE id = ?1",
+                [&execution_id],
+            )
+            .unwrap();
+        super::tmux_stub::install_teardown(&server_state, &execution_id, 4_194_303);
+        server_state
+            .work_db
+            .upsert_external_tracker_attention(&work_item_id, STALE_WORKER_ATTENTION_KIND, "stuck item", "prior body")
+            .unwrap();
+        server_state.worker_registry.register_run_slot(&execution_id, 1);
+        let item_before = format!("{:?}", server_state.work_db.get_work_item(&work_item_id).unwrap());
+
+        if via_timeout_reap {
+            StaleWorkerReaper::reap_worker(&*server_state, &execution_id).await;
+        } else {
+            server_state.release_worker_pane(&execution_id).await;
+        }
+
+        let open = server_state
+            .work_db
+            .list_attention_items_for_work_item(&work_item_id)
+            .unwrap()
+            .into_iter()
+            .filter(|item| item.kind == STALE_WORKER_ATTENTION_KIND && item.status == "open")
+            .count();
+        assert_eq!(open, 1, "via_timeout_reap={via_timeout_reap}: the evidence stays open");
+        assert_eq!(
+            format!("{:?}", server_state.work_db.get_work_item(&work_item_id).unwrap()),
+            item_before,
+            "via_timeout_reap={via_timeout_reap}: the item is unchanged"
+        );
+    }
+}
+
 #[tokio::test]
 async fn release_worker_pane_reaps_the_tmux_session_for_a_slot_mapped_run() {
     // Regression coverage for the slot-mapped call site

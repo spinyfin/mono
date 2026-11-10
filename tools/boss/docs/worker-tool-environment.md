@@ -87,6 +87,49 @@ to explicit toolchain manifests, locale and SDK selection, and
 credential-variable inheritance. Those policies should be specified
 independently of this fix.
 
+## The progression agent: no workspace
+
+A `progression` run (the agent that diagnoses one stuck work item) holds no
+code checkout and no cube lease. It is spawned through the same local path as
+every other worker, but its working directory is an engine-owned scratch
+directory, `<system temp>/boss-progression-scratch/<execution id>`, outside every
+repository, created before the spawn and removed when the run is torn down.
+The spawn machinery needs a directory to write the agent-rules file, the settings
+pointer and the initial-input script, and nothing else lives there.
+
+What it can run is an allowlist under `--permission-mode dontAsk`, which the
+dispatcher forces so it cannot be downgraded: `Read`, `Grep` and `Glob`;
+`boss propose`, read-only `boss task show|list` and `boss pr status` (in both
+the bare `boss` and `"$BOSS_BIN"` spellings); and `gh pr view|checks`. Everything
+else is denied: file writes, all of `jj`, `git` and `cube`, mutating `gh` verbs
+and `gh api` with a mutating method or field flag. The ordinary worker denylist
+still applies on top. The confinement differs per driver, and none of them uses
+the Standard posture:
+
+- **Claude** relies on the allowlist and deny belt above under `dontAsk`.
+- **Codex** gets no `--sandbox` flag; its config renders a `progression`
+  permission profile instead: a read-only filesystem, the attributed engine
+  socket, and network access to `github.com` and `api.github.com` only. A host
+  allowlist cannot tell a GitHub read from an authenticated write, so a
+  deny-by-default `PreToolUse` guard (matcher `.*`) is installed as the second
+  layer. It admits only `boss propose`, `boss task show|list`, `boss pr status`,
+  `gh pr view|checks` and a few read-only file commands (`cat`, `ls`, `head`,
+  `tail`, `nl`, `wc`, `rg` without `--pre`), as a single command with no
+  chaining, redirection or substitution, and rejects mutating `gh`, `jj`, `git`,
+  `cube` and every file write.
+- **Grok** receives the same allow and deny rules as `--allow` / `--deny`
+  arguments under `--permission-mode dontAsk`. On local macOS it runs with
+  `--sandbox off` like every other local kind, so those rules are the only
+  confinement there; elsewhere it also gets the read-only sandbox profile.
+
+The PATH and launcher environment described above applies unchanged: the boss
+and cube launchers are materialized in the worker tool directory and the sealed
+`BOSS_WORKER_TOOL_PATH` is exported. Because the scratch directory has no
+`REPOBIN.toml`, it gets no checkleft launcher, and `BOSS_LEASE_ID` is empty.
+The pane's pid is registered at the confined progression tier of the worker RPC
+surface (with its neighbourhood captured first), on a fresh spawn and again when
+the pane is re-adopted after an engine restart.
+
 ## Validation
 
 The worker-bin Bazel tests put a stale checkleft ahead of the composed PATH

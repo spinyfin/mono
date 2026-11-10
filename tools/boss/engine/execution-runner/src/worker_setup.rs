@@ -172,6 +172,12 @@ fn render_worker_rules_body(input: &WorkerSetupInput, preamble: &str, config_dir
             input.checkout_positioned_on_pr_head,
         );
     }
+    if input.worker_kind == WorkerKind::Progression {
+        return crate::progression_agent::render_progression_claude_md(
+            &input.workspace_path.display().to_string(),
+            boss_engine_worker_bin::WORKER_BOSS_INVOCATION,
+        );
+    }
     let workspace = input.workspace_path.display();
     let lease = &input.lease_id;
     let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;

@@ -201,7 +201,10 @@ async fn consider_one(
     ) {
         return OneOutcome::NotCandidate;
     }
-    if execution.cube_lease_id.is_none() || execution.workspace_path.as_ref().is_none_or(|p| p.is_empty()) {
+    // A checkout-free kind (`progression`) never holds a lease; its recorded
+    // workspace is the engine-owned scratch directory, so only that is required.
+    let missing_lease = execution.kind.holds_cube_lease() && execution.cube_lease_id.is_none();
+    if missing_lease || execution.workspace_path.as_ref().is_none_or(|p| p.is_empty()) {
         tracing::error!(
             execution_id = %execution.id,
             "startup pane reconcile: Live-verdict running execution is missing lease/workspace columns; \
@@ -469,6 +472,46 @@ mod tests {
             live_states: None,
             tmux_adopted,
         }
+    }
+
+    /// A leaseless `progression` run is a valid candidate: it never has a cube
+    /// lease, so the missing lease must not read as a failure, and the spawn is
+    /// re-driven like any other unspawned run.
+    #[tokio::test]
+    async fn a_leaseless_progression_run_is_redriven_not_failed() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_test_chore_manual(&db, product.id.clone(), "stuck item");
+        let created = db
+            .create_execution(
+                boss_protocol::CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(boss_protocol::ExecutionKind::Progression)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        let (exec, _run) = db
+            .start_progression_run_on_local_host(&created.id, "progression-1", "/tmp/boss-progression-scratch/x", true)
+            .unwrap();
+        assert_eq!(exec.status, ExecutionStatus::Running);
+        assert!(exec.cube_lease_id.is_none());
+
+        let resumer = RecordingResumer::new();
+        let sink = RecordingDispatchEventSink::new();
+        let outcome = reconcile_unspawned_running(
+            &db,
+            std::slice::from_ref(&exec),
+            &live_verdicts(&exec.id),
+            &StaticOracle(PanePresence::Absent),
+            &resumer,
+            &sink,
+        )
+        .await;
+
+        assert_eq!(outcome.failed, 0, "a missing lease is not a failure for this kind");
+        assert_eq!(outcome.respawned, 1);
+        assert_eq!(*resumer.calls.lock().unwrap(), vec![exec.id.clone()]);
     }
 
     /// The gap this module exists to close: `running`, lease re-adopted at

@@ -47,6 +47,16 @@ pub enum WorkerKind {
     /// `"$BOSS_BIN" propose review-guide --body`. A shared PreToolUse allowlist
     /// allows only source reads and submission; Claude additionally uses dontAsk.
     ReviewGuide,
+    /// Restricted "progression" agent that diagnoses one stuck work item and
+    /// tries to unstick it. It holds **no code checkout**: it runs in an
+    /// engine-owned scratch directory outside any repo and has no cube
+    /// workspace lease. Like [`WorkerKind::AnswerAgent`] it is enforced with an
+    /// **allowlist, not a blocklist** (deny-by-default `dontAsk`): read-only
+    /// tools, `boss propose`, read-only `boss task`/`boss pr status` and
+    /// `gh pr view|checks`. It MUST NOT edit files, run `jj`/`git`/`cube`,
+    /// mutate GitHub, or push; there is no PR deliverable and the run ends with
+    /// `"$BOSS_BIN" propose done`.
+    Progression,
 }
 
 impl WorkerKind {
@@ -67,7 +77,7 @@ impl WorkerKind {
     /// downgradable default.
     pub fn forced_permission_mode(&self) -> Option<&'static str> {
         match self {
-            WorkerKind::AnswerAgent | WorkerKind::ReviewGuide => Some("dontAsk"),
+            WorkerKind::AnswerAgent | WorkerKind::ReviewGuide | WorkerKind::Progression => Some("dontAsk"),
             WorkerKind::Standard | WorkerKind::Reviewer | WorkerKind::Triage => None,
         }
     }
@@ -82,6 +92,7 @@ impl WorkerKind {
             WorkerKind::Triage => "triage",
             WorkerKind::AnswerAgent => "answer-agent",
             WorkerKind::ReviewGuide => "review-guide",
+            WorkerKind::Progression => "progression",
         }
     }
 }
@@ -102,14 +113,7 @@ pub fn worker_kind_for_execution(kind: &ExecutionKind) -> WorkerKind {
         ExecutionKind::AutomationTriage => WorkerKind::Triage,
         ExecutionKind::AnswerAgent => WorkerKind::AnswerAgent,
         ExecutionKind::PrReviewGuide => WorkerKind::ReviewGuide,
-        // Interim posture: the engine cannot spawn a progression agent yet (the
-        // dispatcher holds every `progression` row `ready`; see
-        // `ExecutionCoordinator::progression_spawn_enabled`). Should one ever
-        // reach a spawn path anyway, it gets the most restricted surface that
-        // exists today — the answer agent's deny-by-default allowlist, with no
-        // write access to a repo — and never `Standard`'s full write and push
-        // access.
-        ExecutionKind::Progression => WorkerKind::AnswerAgent,
+        ExecutionKind::Progression => WorkerKind::Progression,
         ExecutionKind::ChoreImplementation
         | ExecutionKind::CiRemediation
         | ExecutionKind::ConflictResolution

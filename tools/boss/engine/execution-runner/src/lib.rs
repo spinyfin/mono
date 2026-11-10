@@ -83,6 +83,7 @@ pub mod automation_triage;
 pub mod ci_failure;
 pub mod host;
 mod operator_question;
+pub mod progression_agent;
 pub mod prompt_fragments;
 pub mod worker_setup;
 use boss_engine_planner_validation::breakdown;

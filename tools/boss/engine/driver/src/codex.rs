@@ -617,6 +617,14 @@ pub fn codex_sandbox_for_worker_kind(worker_kind: WorkerKind, sandbox_enforced: 
         // (render_review_guide_config), not a CLI override — see
         // codex_sandbox_extra_args's doc comment for why.
         WorkerKind::ReviewGuide => None,
+        // The progression agent holds no checkout and never writes files, so it
+        // gets a read-only profile regardless of the enforcement flag — never
+        // the Standard `workspace-write` / `danger-full-access` posture. A bare
+        // `--sandbox read-only` would also cut it off from the engine socket and
+        // GitHub, which it needs to read the state it diagnoses, so the profile
+        // (`render_progression_config`) is selected in the rendered config file
+        // like ReviewGuide's.
+        WorkerKind::Progression => None,
         WorkerKind::Standard | WorkerKind::Triage | WorkerKind::AnswerAgent => {
             if sandbox_enforced {
                 Some("workspace-write")
@@ -821,6 +829,20 @@ fn codex_hook_context(workspace: &Path) -> (String, PathBuf) {
 /// domains the proxy rejects all IP destinations; Seatbelt also blocks direct
 /// IP connections. Never replace this with unrestricted network_access.
 fn render_review_guide_config(workspace: &Path, socket: &Path) -> String {
+    render_read_only_socket_profile(workspace, socket, "review-guide", &[])
+}
+
+/// The progression agent's profile: the same read-only filesystem and single
+/// attributed engine-socket exception as the review guide, plus network access
+/// to exactly the GitHub hosts `gh pr view` / `gh pr checks` read from, so the
+/// agent can inspect the state it diagnoses. Nothing else is reachable.
+const PROGRESSION_ALLOWED_DOMAINS: &[&str] = &["api.github.com", "github.com"];
+
+fn render_progression_config(workspace: &Path, socket: &Path) -> String {
+    render_read_only_socket_profile(workspace, socket, "progression", PROGRESSION_ALLOWED_DOMAINS)
+}
+
+fn render_read_only_socket_profile(workspace: &Path, socket: &Path, profile: &str, allowed_domains: &[&str]) -> String {
     // Codex 0.153.4 requires a default whenever named permissions exist:
     // https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/core/src/config/mod.rs#L3404-L3413
     // Unchanged on 0.160.1 ("config defines `[permissions]` profiles but does
@@ -829,13 +851,26 @@ fn render_review_guide_config(workspace: &Path, socket: &Path) -> String {
     // The hook-trust app-server loads this file before the worker's CLI
     // overrides exist, so selecting the profile only on the command line
     // makes hooks/list reject the config and return no hooks.
-    let mut config = String::from("default_permissions = \"review-guide\"\nweb_search = \"disabled\"\n");
+    let domains = format!(
+        "{{ {} }}",
+        allowed_domains
+            .iter()
+            .map(|domain| format!("{} = \"allow\"", toml_basic_string(domain)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let domains = if allowed_domains.is_empty() {
+        "{}".to_owned()
+    } else {
+        domains
+    };
+    let mut config = format!("default_permissions = \"{profile}\"\nweb_search = \"disabled\"\n");
     config.push_str(&render_config_toml(workspace, String::new()).replace(
         "[features]\n",
-        "[features]\nnetwork_proxy = { enabled = true, domains = {}, allow_upstream_proxy = false, proxy_url = \"http://127.0.0.1:0\", socks_url = \"http://127.0.0.1:0\" }\n",
+        &format!("[features]\nnetwork_proxy = {{ enabled = true, domains = {domains}, allow_upstream_proxy = false, proxy_url = \"http://127.0.0.1:0\", socks_url = \"http://127.0.0.1:0\" }}\n"),
     ));
     config.push_str(&format!(
-        "\n[permissions.review-guide]\nextends = \":read-only\"\n[permissions.review-guide.network]\nenabled = true\ndomains = {{}}\nunix_sockets = {{ {} = \"allow\" }}\n",
+        "\n[permissions.{profile}]\nextends = \":read-only\"\n[permissions.{profile}.network]\nenabled = true\ndomains = {domains}\nunix_sockets = {{ {} = \"allow\" }}\n",
         toml_basic_string(&socket.display().to_string()),
     ));
     config
@@ -1221,9 +1256,133 @@ pub struct MaterializedGuard {
     pub timeout_sec: Option<u64>,
 }
 
+/// Deny-by-default `PreToolUse` guard for the Codex progression agent.
+///
+/// Codex has no declarative `permissions.deny`, and the progression profile
+/// opens `github.com` / `api.github.com` (so `gh pr view` works) — a network
+/// allowlist cannot tell a GitHub read from an authenticated write. This guard
+/// is the command-level layer: it admits only the progression inspection and
+/// declaration surface (the same set as `progression_allow_rules`) plus a few
+/// read-only file commands, and rejects everything else, including mutating
+/// `gh`, `jj`, `git`, `cube`, redirections, substitutions and chaining.
+fn codex_progression_guard_script() -> String {
+    guard_python::with_command_tokenizer(PROGRESSION_SCRIPT_TEMPLATE)
+}
+
+const PROGRESSION_SCRIPT_TEMPLATE: &str = r#"#!/usr/bin/env python3
+import json
+import os
+import re
+import shlex
+import sys
+
+# COMMAND_TOKENIZER_FRAGMENT
+
+BOSS_BINS = ('boss', '$BOSS_BIN', '${BOSS_BIN}')
+BOSS_VERBS = (('propose',), ('task', 'show'), ('task', 'list'), ('pr', 'status'))
+GH_VERBS = (('pr', 'view'), ('pr', 'checks'))
+READ_COMMANDS = ('cat', 'ls', 'head', 'tail', 'nl', 'wc', 'rg')
+SECRET_MARKERS = ('.codex', '.ssh', '.aws', '.gnupg', 'auth.json')
+# Characters the shell expands or reinterprets. shlex does no expansion, so a
+# token it returns is not the argument the shell will pass; admit only text with
+# none of these (after the one literal leading `$BOSS_BIN` executable).
+UNSAFE_CHARS = ('$', '<', '>', '{', '}', '~', '!', '*', '?', '[', ']', '\n', '\r', '\x00')
+RG_SAFE_FLAGS = frozenset((
+    '-n', '-i', '-S', '-s', '-l', '-c', '-w', '-F', '-v', '-H', '-N', '-o', '-q',
+    '-e', '-g', '-t', '-T', '-m', '-A', '-B', '-C', '-U', '--',
+    '--files', '--line-number', '--ignore-case', '--smart-case', '--case-sensitive',
+    '--files-with-matches', '--count', '--word-regexp', '--fixed-strings',
+    '--invert-match', '--with-filename', '--no-line-number', '--only-matching',
+    '--quiet', '--glob', '--type', '--max-count', '--after-context',
+    '--before-context', '--context', '--no-heading', '--heading',
+))
+
+def literal_only(command, head):
+    rest = command.lstrip()
+    if head.startswith('$'):
+        for form in ('"' + head + '"', head):
+            if rest.startswith(form):
+                rest = rest[len(form):]
+                break
+    return not any(ch in rest for ch in UNSAFE_CHARS)
+
+def rg_safe(rest):
+    options_done = False
+    for t in rest:
+        if options_done or not t.startswith('-') or t == '-':
+            continue
+        if t == '--':
+            options_done = True
+            continue
+        if t.split('=', 1)[0] not in RG_SAFE_FLAGS:
+            return False
+    return True
+
+def starts_with(tokens, verbs):
+    return any(tuple(tokens[:len(verb)]) == verb for verb in verbs)
+
+def allowed_bash(command):
+    if not isinstance(command, str):
+        return False
+    if any(marker in command for marker in ('`', '$(', '<(', '>(')):
+        return False
+    groups = command_groups(command)
+    if len(groups) != 1:
+        return False
+    tokens = list(groups[0])
+    if not tokens or any(re.match(r'^[0-9]*[<>]', token) for token in tokens):
+        return False
+    head, rest = tokens[0], tokens[1:]
+    if not literal_only(command, head):
+        return False
+    if head in BOSS_BINS:
+        return starts_with(rest, BOSS_VERBS)
+    if head == 'gh':
+        return starts_with(rest, GH_VERBS)
+    if head in READ_COMMANDS:
+        if head == 'rg' and not rg_safe(rest):
+            return False
+        return not any(marker in token for token in rest for marker in SECRET_MARKERS)
+    return False
+
+def allowed(payload):
+    if not isinstance(payload, dict):
+        return False
+    tool = payload.get('tool_name')
+    if tool in ('Read', 'Grep', 'Glob'):
+        return True
+    if tool != 'Bash':
+        return False
+    tool_input = payload.get('tool_input')
+    return isinstance(tool_input, dict) and allowed_bash(tool_input.get('command'))
+
+try:
+    payload = json.load(sys.stdin)
+    approved = allowed(payload)
+except Exception:
+    payload = None
+    approved = False
+if approved:
+    print(json.dumps({"decision": "approve"}))
+else:
+    tool = payload.get("tool_name", "(unreadable payload)") if isinstance(payload, dict) else "(unreadable payload)"
+    print(json.dumps({"decision": "block", "reason": "Blocked: the progression agent may only inspect state (boss task show/list, boss pr status, gh pr view/checks, read-only file commands) and declare through boss propose; edits, writes, jj/git/cube and mutating gh are forbidden (matched tool: " + str(tool) + ")."}))
+"#;
+
 /// Materialise Boss guard scripts under `codex_home/guards/` and return the
 /// absolute paths Codex will invoke.
+#[cfg(test)]
 fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> anyhow::Result<Vec<MaterializedGuard>> {
+    materialize_guards_for(codex_home, config, false)
+}
+
+/// [`materialize_guards`] with the worker-kind posture the interception config
+/// does not carry: `progression` arms the deny-by-default progression guard.
+fn materialize_guards_for(
+    codex_home: &Path,
+    config: &ToolUseInterceptionConfig,
+    progression: bool,
+) -> anyhow::Result<Vec<MaterializedGuard>> {
     let guards_dir = codex_home.join("guards");
     fs::create_dir_all(&guards_dir).with_context(|| format!("creating {}", guards_dir.display()))?;
 
@@ -1379,6 +1538,18 @@ fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> 
         });
     }
 
+    // The progression agent holds no checkout and may only inspect and declare.
+    // Its profile opens GitHub hosts, which a network allowlist alone cannot
+    // split into reads and writes, so every tool call goes through this guard.
+    if progression {
+        planned.push(Planned {
+            name: "progression_guard",
+            source: GuardSource::Inline(codex_progression_guard_script()),
+            matcher: ".*",
+            extra_env: Vec::new(),
+        });
+    }
+
     // 7. Revision PR guard.
     if config.is_revision {
         planned.push(Planned {
@@ -1509,11 +1680,12 @@ pub fn write_hooks_and_attest(
     hook_cwd: &Path,
     base_config: &str,
     config: &ToolUseInterceptionConfig,
+    progression: bool,
     codex_bin: &Path,
 ) -> anyhow::Result<()> {
     fs::create_dir_all(codex_home).with_context(|| format!("creating CODEX_HOME {}", codex_home.display()))?;
 
-    let guards = materialize_guards(codex_home, config)?;
+    let guards = materialize_guards_for(codex_home, config, progression)?;
     let full = append_hooks_toml(base_config, &guards);
     let config_path = codex_home.join("config.toml");
     fs::write(&config_path, full).with_context(|| format!("writing {}", config_path.display()))?;
@@ -1929,15 +2101,32 @@ impl AgentDriver for CodexDriver {
         // When path/checkleft scripts are supplied via PermissionInput they
         // win; otherwise leave those guards off (remote / early unit tests).
         let (mut base_config, hook_cwd) = codex_hook_context(&input.workspace_path);
-        if input.worker_kind == WorkerKind::ReviewGuide {
-            let socket = input
-                .frontend_socket_path
-                .as_deref()
-                .context("review-guide requires a bound frontend socket")?;
-            base_config = render_review_guide_config(&input.workspace_path, socket);
+        if matches!(input.worker_kind, WorkerKind::ReviewGuide | WorkerKind::Progression) {
+            let socket = input.frontend_socket_path.as_deref().with_context(|| {
+                format!(
+                    "{} requires a bound frontend socket",
+                    if input.worker_kind == WorkerKind::Progression {
+                        "progression"
+                    } else {
+                        "review-guide"
+                    }
+                )
+            })?;
+            base_config = if input.worker_kind == WorkerKind::Progression {
+                render_progression_config(&input.workspace_path, socket)
+            } else {
+                render_review_guide_config(&input.workspace_path, socket)
+            };
         }
         let codex_bin = resolve_codex_bin();
-        write_hooks_and_attest(&codex_home, &hook_cwd, &base_config, &interception, &codex_bin)?;
+        write_hooks_and_attest(
+            &codex_home,
+            &hook_cwd,
+            &base_config,
+            &interception,
+            input.worker_kind == WorkerKind::Progression,
+            &codex_bin,
+        )?;
 
         let extra_args = codex_sandbox_extra_args(input.worker_kind, input.codex_sandbox_enforced);
 
