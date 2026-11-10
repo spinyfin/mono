@@ -746,64 +746,81 @@ fn a_corrupt_install_record_does_not_bypass_the_host_id_guard() {
     );
 }
 
+// Each reconciliation scenario launches the installed preflight repeatedly.
+// Keep them independent so one test does not serialize all four scenarios.
+fn startup_input_retry(upgrade: bool, fail_registration: bool) {
+    let fixture = Fixture::new();
+    fixture.install(&release("1.0.1")).unwrap();
+    fixture.enroll();
+    fixture.install(&release("1.0.1")).unwrap();
+    fixture.host.calls.borrow_mut().clear();
+    let next = release(if upgrade { "1.0.2" } else { "1.0.1" });
+    let ca = if upgrade {
+        CA
+    } else {
+        b"-----BEGIN CERTIFICATE-----\nROTATED\n"
+    };
+    let request = Request::builder()
+        .manifest(&next.manifest)
+        .signature(&next.signature)
+        .package(&next.package)
+        .host_id("host-one")
+        .hub_url("https://hub.example:7443")
+        .hub_ca(ca)
+        .platform(Platform::host().unwrap())
+        .layout(fixture.layout())
+        .health(INSTANT)
+        .build();
+    let record = fixture.at(fixture.layout().etc().join("service-reconciled"));
+    let previous = fs::read(&record).unwrap();
+    fixture.host.service.register_fails.set(fail_registration);
+    fixture.host.service.restart_fails.set(!fail_registration);
+    let error = install::install(&fixture.host, &request).unwrap_err();
+    assert!(error.to_string().contains(if fail_registration {
+        "registration failed"
+    } else {
+        "restart failed"
+    }));
+    assert_eq!(fs::read(&record).unwrap(), previous);
+    assert!(fixture.host.service.registered.get());
+    assert!(fixture.host.service.running.get());
+    assert_eq!(
+        fs::read(fixture.at(fixture.layout().state_dir().join("credentials/ca.pem"))).unwrap(),
+        ca
+    );
+    assert_eq!(
+        fixture.current_target(),
+        Path::new("releases").join(if upgrade { "1.0.2" } else { "1.0.1" })
+    );
+    fixture.host.service.register_fails.set(false);
+    fixture.host.service.restart_fails.set(false);
+    fixture.host.calls.borrow_mut().clear();
+    assert!(install::install(&fixture.host, &request).unwrap().restarted);
+    assert_eq!(fixture.host.calls(), ["register", "restart"]);
+    fixture.host.calls.borrow_mut().clear();
+    let report = install::install(&fixture.host, &request).unwrap();
+    assert!(!report.restarted && report.changed.is_empty());
+    assert!(fixture.host.calls().is_empty());
+}
+
 #[test]
-fn startup_input_changes_retry_until_an_enabled_running_service_is_reconciled() {
-    for upgrade in [true, false] {
-        for fail_registration in [true, false] {
-            let fixture = Fixture::new();
-            fixture.install(&release("1.0.1")).unwrap();
-            fixture.enroll();
-            fixture.install(&release("1.0.1")).unwrap();
-            fixture.host.calls.borrow_mut().clear();
-            let next = release(if upgrade { "1.0.2" } else { "1.0.1" });
-            let ca = if upgrade {
-                CA
-            } else {
-                b"-----BEGIN CERTIFICATE-----\nROTATED\n"
-            };
-            let request = Request::builder()
-                .manifest(&next.manifest)
-                .signature(&next.signature)
-                .package(&next.package)
-                .host_id("host-one")
-                .hub_url("https://hub.example:7443")
-                .hub_ca(ca)
-                .platform(Platform::host().unwrap())
-                .layout(fixture.layout())
-                .health(INSTANT)
-                .build();
-            let record = fixture.at(fixture.layout().etc().join("service-reconciled"));
-            let previous = fs::read(&record).unwrap();
-            fixture.host.service.register_fails.set(fail_registration);
-            fixture.host.service.restart_fails.set(!fail_registration);
-            let error = install::install(&fixture.host, &request).unwrap_err();
-            assert!(error.to_string().contains(if fail_registration {
-                "registration failed"
-            } else {
-                "restart failed"
-            }));
-            assert_eq!(fs::read(&record).unwrap(), previous);
-            assert!(fixture.host.service.registered.get());
-            assert!(fixture.host.service.running.get());
-            assert_eq!(
-                fs::read(fixture.at(fixture.layout().state_dir().join("credentials/ca.pem"))).unwrap(),
-                ca
-            );
-            assert_eq!(
-                fixture.current_target(),
-                Path::new("releases").join(if upgrade { "1.0.2" } else { "1.0.1" })
-            );
-            fixture.host.service.register_fails.set(false);
-            fixture.host.service.restart_fails.set(false);
-            fixture.host.calls.borrow_mut().clear();
-            assert!(install::install(&fixture.host, &request).unwrap().restarted);
-            assert_eq!(fixture.host.calls(), ["register", "restart"]);
-            fixture.host.calls.borrow_mut().clear();
-            let report = install::install(&fixture.host, &request).unwrap();
-            assert!(!report.restarted && report.changed.is_empty());
-            assert!(fixture.host.calls().is_empty());
-        }
-    }
+fn release_upgrade_retries_failed_registration() {
+    startup_input_retry(true, true);
+}
+
+#[test]
+fn release_upgrade_retries_failed_restart() {
+    startup_input_retry(true, false);
+}
+
+#[test]
+fn ca_rotation_retries_failed_registration() {
+    startup_input_retry(false, true);
+}
+
+#[test]
+fn ca_rotation_retries_failed_restart() {
+    startup_input_retry(false, false);
 }
 
 #[test]

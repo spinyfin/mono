@@ -587,10 +587,13 @@ echo '{"id":2,"result":{}}'
     async fn stalled_codex_is_bounded_and_reaped() {
         let (temp, program) = stub_script(
             "codex",
-            r#"echo $$ > "$0.pid"; read request; read request; read request"#,
+            r#"[ "$1" = --version ] && exit 0
+echo $$ > "$0.pid"; read request; read request; read request"#,
         );
-        // The 1s probe timeout leaves room for the stub shell to start under load;
-        // cleanup must still finish within 3s and leave no live child.
+        // Warm the freshly written executable before timing the stall: macOS
+        // first-exec scanning can otherwise consume the entire probe deadline.
+        assert!(tool("tool_codex", program.as_os_str()).await.passed());
+        // Cleanup must still finish within 3s and leave no live child.
         let started = std::time::Instant::now();
         assert!(
             !codex_credentials_with_timeout(&program, Duration::from_secs(1))
