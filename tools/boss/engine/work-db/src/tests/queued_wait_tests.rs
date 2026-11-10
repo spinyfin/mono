@@ -353,6 +353,68 @@ fn every_waiting_state_yields_a_named_reason() {
         DISPATCH_WAIT_REASON_AWAITING_PARENT_PR,
     ));
 
+    // ── An `active` item with no run pending or live ──────────────────────
+    let idle = |name: &str| {
+        let chore = create_test_chore(&db, pid, name);
+        set_status(&db, &chore.id, "active");
+        chore
+    };
+    let finished = idle("active, its last run ended");
+    let run = pending(
+        &db,
+        &finished.id,
+        ExecutionKind::ChoreImplementation,
+        ExecutionStatus::Ready,
+    );
+    set_execution_status(&db, &run.id, "completed");
+    covered.insert(assert_named(
+        "active, worker ended, waiting for the orphan sweep",
+        &wait_of(&db, pid, &finished.id),
+        DISPATCH_WAIT_REASON_AWAITING_REDISPATCH,
+    ));
+    let never_run = idle("active, never ran");
+    assert_named(
+        "active with no execution",
+        &wait_of(&db, pid, &never_run.id),
+        DISPATCH_WAIT_REASON_AWAITING_REDISPATCH,
+    );
+
+    let failed = idle("active, held by a dispatch failure");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET dispatch_failed_reason = 'churn_guard' WHERE id = ?1",
+            [&failed.id],
+        )
+        .unwrap();
+    covered.insert(assert_named(
+        "active, held by the churn guard",
+        &wait_of(&db, pid, &failed.id),
+        DISPATCH_WAIT_REASON_DISPATCH_FAILED,
+    ));
+
+    let recovering = idle("active, worker recovery gave up");
+    insert_recovery_attention(&db, &recovering.id);
+    covered.insert(assert_named(
+        "active, recovery attention item open",
+        &wait_of(&db, pid, &recovering.id),
+        DISPATCH_WAIT_REASON_RECOVERY_ATTENTION,
+    ));
+
+    let delivered = idle("active, pull request delivered");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = 'https://github.com/test/repo/pull/7' WHERE id = ?1",
+            [&delivered.id],
+        )
+        .unwrap();
+    covered.insert(assert_named(
+        "active, pull request with review handling",
+        &wait_of(&db, pid, &delivered.id),
+        DISPATCH_WAIT_REASON_AWAITING_REVIEW,
+    ));
+
     // Every reason in the vocabulary is reachable from a state above, so a
     // reason cannot be added without a state that produces it.
     let vocabulary: BTreeSet<String> = DISPATCH_WAIT_REASON_CODES
@@ -470,12 +532,181 @@ fn a_running_claimed_or_finished_item_carries_no_wait() {
             )
             .unwrap();
         let runtime = wait_of(&db, &product.id, &chore.id);
+        if status == "completed" {
+            // An active item whose run ended waits for the orphan sweep.
+            assert_eq!(
+                runtime.dispatch_wait_reason.as_deref(),
+                Some(DISPATCH_WAIT_REASON_AWAITING_REDISPATCH)
+            );
+            continue;
+        }
         assert!(
             runtime.dispatch_wait_reason.is_none() && runtime.dispatch_wait_label.is_none(),
             "{status} is not a wait on dispatch: {runtime:?}"
         );
     }
     assert!(db.list_unexplained_dispatch_waits().unwrap().is_empty());
+}
+
+fn set_execution_status(db: &WorkDb, execution_id: &str, status: &str) {
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = ?2 WHERE id = ?1",
+            params![execution_id, status],
+        )
+        .unwrap();
+}
+
+fn insert_recovery_attention(db: &WorkDb, work_item_id: &str) {
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO work_attention_items (id, work_item_id, kind, status, title, body_markdown, created_at)
+             VALUES (?1, ?2, ?3, 'open', 'recovery', 'recovery gave up', '1')",
+            params![
+                format!("attn_{work_item_id}"),
+                work_item_id,
+                ATTENTION_KIND_RECOVERY_EXHAUSTED
+            ],
+        )
+        .unwrap();
+}
+
+/// An `active` item held only by a live pre-merge review batch whose head
+/// matches the producer's, with no pull request and no review pass of its
+/// own: no named condition explains why it is waiting.
+fn active_item_nothing_explains(db: &WorkDb, product_id: &str) -> Task {
+    let chore = create_test_chore(db, product_id, "active, held by a batch nothing names");
+    set_status(db, &chore.id, "active");
+    let run = pending(
+        db,
+        &chore.id,
+        ExecutionKind::ChoreImplementation,
+        ExecutionStatus::Ready,
+    );
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE work_executions SET status = 'completed', finished_at = '5', pr_head_after = 'head' WHERE id = ?1",
+        [&run.id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO pr_review_batches(id,cycle_root_id,base_sha,classification_json,created_at,phase,pr_number,pr_url,status,target_sha,updated_at)
+         VALUES ('batch-1',?1,'base','{}','1','pre_merge',7,'https://github.com/test/repo/pull/7','collecting','head','1')",
+        [&chore.id],
+    )
+    .unwrap();
+    chore
+}
+
+#[test]
+fn an_active_item_nothing_explains_is_unclassified_and_reported() {
+    let db = db();
+    let product = create_test_product(&db);
+    let chore = active_item_nothing_explains(&db, &product.id);
+
+    let runtime = wait_of(&db, &product.id, &chore.id);
+    assert_eq!(
+        runtime.dispatch_wait_reason.as_deref(),
+        Some(DISPATCH_WAIT_REASON_UNCLASSIFIED)
+    );
+    assert!(
+        runtime
+            .dispatch_wait_label
+            .unwrap()
+            .starts_with(&dispatch_wait_phrase(DISPATCH_WAIT_REASON_UNCLASSIFIED))
+    );
+    let reported: Vec<_> = db
+        .list_unexplained_dispatch_waits()
+        .unwrap()
+        .into_iter()
+        .map(|wait| (wait.work_item_id, wait.reason, wait.task_status))
+        .collect();
+    assert_eq!(
+        reported,
+        vec![(
+            chore.id.clone(),
+            DISPATCH_WAIT_REASON_UNCLASSIFIED.to_owned(),
+            Some("active".to_owned())
+        )]
+    );
+}
+
+#[test]
+fn an_active_item_awaiting_the_orphan_sweep_is_named_and_not_reported() {
+    let db = db();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, &product.id, "active, its worker ended");
+    set_status(&db, &chore.id, "active");
+    assert_eq!(
+        wait_of(&db, &product.id, &chore.id).dispatch_wait_reason.as_deref(),
+        Some(DISPATCH_WAIT_REASON_AWAITING_REDISPATCH)
+    );
+    assert!(db.list_unexplained_dispatch_waits().unwrap().is_empty());
+}
+
+/// The stuck report carries the board's reason for every kind of item the
+/// board explains, with no execution pending as well as with one.
+#[test]
+fn the_stuck_report_names_the_boards_reason_for_items_with_nothing_pending() {
+    let db = db();
+    let product = create_test_product(&db);
+    let pid = product.id.as_str();
+
+    let deferred = create_test_chore(&db, pid, "deferred");
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET deferred = 1 WHERE id = ?1", [&deferred.id])
+        .unwrap();
+
+    let ended = create_test_chore(&db, pid, "todo, its run ended");
+    let run = pending(
+        &db,
+        &ended.id,
+        ExecutionKind::ChoreImplementation,
+        ExecutionStatus::Ready,
+    );
+    set_execution_status(&db, &run.id, "cancelled");
+
+    let repoless = create_test_product_named(&db, "Repository removed");
+    let unresolved = create_test_chore(&db, repoless.id.clone(), "no repository");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE products SET repo_remote_url = NULL WHERE id = ?1",
+            [&repoless.id],
+        )
+        .unwrap();
+
+    let unclassified = active_item_nothing_explains(&db, pid);
+    let redispatch = create_test_chore(&db, pid, "active, worker ended");
+    set_status(&db, &redispatch.id, "active");
+
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    let report = db.stuck_report(0, now, &|_| false).unwrap();
+    for (item, product_id, expected) in [
+        (&deferred, pid, DISPATCH_WAIT_REASON_DEFERRED),
+        (&ended, pid, DISPATCH_WAIT_REASON_RUN_ENDED),
+        (&unresolved, repoless.id.as_str(), DISPATCH_WAIT_REASON_REPO_UNRESOLVED),
+        (&unclassified, pid, DISPATCH_WAIT_REASON_UNCLASSIFIED),
+        (&redispatch, pid, DISPATCH_WAIT_REASON_AWAITING_REDISPATCH),
+    ] {
+        let on_board = wait_of(&db, product_id, &item.id);
+        assert_eq!(
+            on_board.dispatch_wait_reason.as_deref(),
+            Some(expected),
+            "{}",
+            item.name
+        );
+        let row = report
+            .rows
+            .iter()
+            .find(|row| row.work_item_id == item.id)
+            .unwrap_or_else(|| panic!("{} is missing from the stuck report", item.name));
+        assert_eq!(row.wait_reason, on_board.dispatch_wait_reason, "{}", item.name);
+        assert_eq!(row.wait_label, on_board.dispatch_wait_label, "{}", item.name);
+    }
 }
 
 #[test]
@@ -503,14 +734,13 @@ fn the_stuck_report_names_the_same_reason_as_the_board() {
     );
 }
 
-// ── The transition-dispatch gap ───────────────────────────────────────────
+// ── The transition-dispatch gap ──────────────────────────────────────────
 //
 // Moving a later task of a project to Doing mints a `ready` execution and
-// reports it dispatched. The reconcile that runs in the same request used to
-// apply the project's ordinal chain to that row and park it in
-// `waiting_dependency`, where no scheduler pass looks; only the orphan sweep,
-// 90 s later, put it back. An item that is already `active` has been started
-// and is not the chain's to hold.
+// reports it dispatched. The reconcile in the same request leaves that row
+// `ready`: an item that is already `active` has been started and is not the
+// project chain's to hold, so no row lands in `waiting_dependency`, which no
+// scheduler pass reads.
 
 /// What moving a card to Doing does in the engine, in the order the
 /// `UpdateWorkItem` handler does it: flip the status, mint the execution,

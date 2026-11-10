@@ -111,6 +111,22 @@ pub const DISPATCH_WAIT_REASON_RUN_ENDED: &str = "run_ended";
 /// to push to yet.
 pub const DISPATCH_WAIT_REASON_AWAITING_PARENT_PR: &str = "awaiting_parent_pr";
 
+/// The item is `active` with no run pending or live: its worker ended and the
+/// orphan sweep will start a replacement.
+pub const DISPATCH_WAIT_REASON_AWAITING_REDISPATCH: &str = "awaiting_redispatch";
+
+/// The item is `active` with no run pending or live because its pull request
+/// is with review and merge handling, which owns the next step.
+pub const DISPATCH_WAIT_REASON_AWAITING_REVIEW: &str = "awaiting_review";
+
+/// The item is `active` with no run pending or live because a dispatch
+/// failure (the churn guard, a deliberate park) is holding it.
+pub const DISPATCH_WAIT_REASON_DISPATCH_FAILED: &str = "dispatch_failed";
+
+/// The item is `active` with no run pending or live because worker recovery
+/// gave up and raised an attention item for a person.
+pub const DISPATCH_WAIT_REASON_RECOVERY_ATTENTION: &str = "recovery_attention";
+
 /// The engine could not name why the item is waiting. Never a reason in its
 /// own right: it is reported as an anomaly (logged, and raised as a
 /// `dispatch_wait_unclassified` attention item), and the card says the item is
@@ -185,6 +201,22 @@ pub const DISPATCH_WAIT_REASON_CODES: &[(&str, &str)] = &[
     (
         DISPATCH_WAIT_REASON_AWAITING_PARENT_PR,
         "waiting for the parent task to open its pull request",
+    ),
+    (
+        DISPATCH_WAIT_REASON_AWAITING_REDISPATCH,
+        "its worker ended; the engine will start a new run",
+    ),
+    (
+        DISPATCH_WAIT_REASON_AWAITING_REVIEW,
+        "its pull request is with review and merge handling",
+    ),
+    (
+        DISPATCH_WAIT_REASON_DISPATCH_FAILED,
+        "held after a dispatch failure; see the failure on the card",
+    ),
+    (
+        DISPATCH_WAIT_REASON_RECOVERY_ATTENTION,
+        "worker recovery gave up; waiting for a person",
     ),
     (
         DISPATCH_WAIT_REASON_UNCLASSIFIED,

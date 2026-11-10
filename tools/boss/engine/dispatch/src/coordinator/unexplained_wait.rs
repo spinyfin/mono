@@ -240,8 +240,7 @@ mod tests {
         let (_dir, db) = open_db();
         let chore = create_active_chore(&db, &create_product(&db), "active with nothing behind it");
         // An active item whose only execution is parked off the scheduler's
-        // walk, with no prerequisite, project order or hold: the state a
-        // reconciler demotion used to leave behind.
+        // walk, with no prerequisite, project order or hold.
         let execution = pending(&db, &chore, ExecutionStatus::WaitingDependency);
         let mut watch = UnexplainedWaitWatch::default();
         let start = Instant::now();

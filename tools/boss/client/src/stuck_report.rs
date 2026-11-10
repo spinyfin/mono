@@ -42,12 +42,16 @@ pub fn render(report: &StuckReport) -> String {
         for row in rows {
             writeln!(
                 out,
-                "  {}  {}{}s  {}  basis={}  {}",
+                "  {}  {}{}s  {}  basis={}{}  {}",
                 row.work_item_id,
                 if row.age_is_lower_bound { ">=" } else { "" },
                 row.age_in_state_secs,
                 row.classification,
                 row.last_ledger_basis,
+                row.wait_reason
+                    .as_deref()
+                    .map(|reason| format!("  waiting={reason}"))
+                    .unwrap_or_default(),
                 row.name
             )
             .unwrap();

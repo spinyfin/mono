@@ -50,6 +50,15 @@ pub struct StuckRow {
     /// missing ledger row falls back to tasks.updated_at, which any mutation can reset.
     pub age_is_lower_bound: bool,
     pub failure_basis: Option<String>,
+    /// Why the item is waiting rather than running, from the engine's wait
+    /// classifier: the same answer the board card and `dispatch diagnose`
+    /// show. Independent of `classification` and `bucket`, which are this
+    /// report's own taxonomy. `None` when the item is not waiting on dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_reason: Option<String>,
+    /// The phrase for `wait_reason`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]

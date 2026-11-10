@@ -122,6 +122,10 @@ pub(super) fn build(
             .unwrap_or((task.updated_at.parse().unwrap_or(now), true));
         let execution = query_latest_execution_for_work_item(conn, &id)?;
         let wait = super::queued_wait::for_execution(conn, execution.as_ref(), now)?.reason;
+        // The reason the board shows for the item, which also covers an item
+        // with nothing pending. Reported alongside the bucket and
+        // classification below; it does not change them.
+        let item_wait = super::queued_wait::for_item(conn, &task, execution.as_ref(), now)?;
         if let Some(execution) = &waiting_human {
             (changed_at, legacy) = conn
                 .query_row(
@@ -226,6 +230,8 @@ pub(super) fn build(
                 .classification(classification)
                 .last_ledger_basis(basis)
                 .maybe_failure_basis(failure_basis.filter(|_| task.blocked_reason.as_deref() == Some("worker_failed")))
+                .maybe_wait_reason(item_wait.reason)
+                .maybe_wait_label(item_wait.label)
                 .build(),
         );
     }

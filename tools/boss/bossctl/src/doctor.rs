@@ -1857,10 +1857,6 @@ pub fn render_findings(findings: &[Finding], integrity: &crate::stream_integrity
     out
 }
 
-/// Full `bossctl dispatch diagnose` pipeline: resolve scope, load artifacts,
-/// match signatures, print timeline + findings (or JSON).
-///
-/// `db` is optional — file-scan-first; missing/unreadable state.db is fine.
 /// The `waiting:` line of `dispatch diagnose`: the engine's wait reason for
 /// the item (code and phrase), the execution it applies to, and what it is
 /// waiting behind. `unclassified` is called out as the anomaly it is.
@@ -1894,6 +1890,10 @@ fn dispatch_wait_json(runtime: &boss_protocol::TaskRuntime) -> Value {
     })
 }
 
+/// Full `bossctl dispatch diagnose` pipeline: resolve scope, load artifacts,
+/// match signatures, print timeline + findings (or JSON).
+///
+/// `db` is optional — file-scan-first; missing/unreadable state.db is fine.
 pub fn run_diagnose(
     root: &Path,
     id: &str,

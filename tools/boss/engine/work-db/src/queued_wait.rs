@@ -4,19 +4,22 @@
 //! Every surface that shows a wait reads it from here: the board's runtime
 //! projection, `bossctl dispatch stuck`, `bossctl dispatch diagnose`, and the
 //! scheduler heartbeat's unexplained-wait check. The classification is total:
-//! a pending execution, and a card the board queues with no execution at all,
-//! always get a reason from `boss_engine_storage_values::dispatch_wait`. When
+//! a pending execution, a card the board queues with no execution at all, and
+//! an `active` item with no run pending or live always get a reason from
+//! `boss_engine_storage_values::dispatch_wait`. [`for_item`] is the entry
+//! point that covers all three. When
 //! no named condition holds the answer is
 //! [`DISPATCH_WAIT_REASON_UNCLASSIFIED`], which is reported as an anomaly
 //! rather than shown as a reason.
 use super::*;
 use boss_engine_storage_values::dispatch_wait::{
     DISPATCH_WAIT_REASON_AUTOSTART_OFF, DISPATCH_WAIT_REASON_AWAITING_DISPATCH,
-    DISPATCH_WAIT_REASON_AWAITING_PARENT_PR, DISPATCH_WAIT_REASON_DEFERRED, DISPATCH_WAIT_REASON_HUMAN_DRIVEN,
-    DISPATCH_WAIT_REASON_NOT_BEFORE, DISPATCH_WAIT_REASON_PARKED, DISPATCH_WAIT_REASON_PR_OPEN,
-    DISPATCH_WAIT_REASON_PROJECT_ORDER, DISPATCH_WAIT_REASON_REPO_UNRESOLVED, DISPATCH_WAIT_REASON_RUN_ENDED,
-    DISPATCH_WAIT_REASON_UNCLASSIFIED, DISPATCH_WAIT_REASON_WAITING_DEPENDENCY, UnexplainedWait, dispatch_wait_phrase,
-    is_unlabelled_wait_code,
+    DISPATCH_WAIT_REASON_AWAITING_PARENT_PR, DISPATCH_WAIT_REASON_AWAITING_REDISPATCH,
+    DISPATCH_WAIT_REASON_AWAITING_REVIEW, DISPATCH_WAIT_REASON_DEFERRED, DISPATCH_WAIT_REASON_DISPATCH_FAILED,
+    DISPATCH_WAIT_REASON_HUMAN_DRIVEN, DISPATCH_WAIT_REASON_NOT_BEFORE, DISPATCH_WAIT_REASON_PARKED,
+    DISPATCH_WAIT_REASON_PR_OPEN, DISPATCH_WAIT_REASON_PROJECT_ORDER, DISPATCH_WAIT_REASON_RECOVERY_ATTENTION,
+    DISPATCH_WAIT_REASON_REPO_UNRESOLVED, DISPATCH_WAIT_REASON_RUN_ENDED, DISPATCH_WAIT_REASON_UNCLASSIFIED,
+    DISPATCH_WAIT_REASON_WAITING_DEPENDENCY, UnexplainedWait, dispatch_wait_phrase, is_unlabelled_wait_code,
 };
 use boss_protocol::DispatchWaitBlocker;
 
@@ -224,12 +227,37 @@ fn project_order_head(conn: &Connection, task: &Task) -> Result<Option<String>> 
     Ok(None)
 }
 
-/// Classify a card the board lists as queued (`todo` with automatic start on)
-/// although nothing is pending for it. `latest` is the item's most recent
-/// execution. Returns `None` when the item is not in that state.
+/// The one item-level classification: why `task` is waiting rather than
+/// running, or the default (no reason) when it is not waiting on dispatch.
+/// `latest` is the item's most recent execution.
 ///
-/// The named reasons are the reconciler's own refusals to mint an execution,
-/// in its order (`reconcile_work_item_execution` /
+/// A pending latest execution is classified from that row; otherwise the
+/// item is classified from its own row ([`for_unscheduled`]). Every surface
+/// that names a wait goes through here, so they cannot disagree.
+pub(super) fn for_item(
+    conn: &Connection,
+    task: &Task,
+    latest: Option<&WorkExecution>,
+    now: i64,
+) -> Result<DispatchWait> {
+    if latest.is_some_and(|execution| {
+        matches!(
+            execution.status,
+            ExecutionStatus::WaitingDependency | ExecutionStatus::Ready | ExecutionStatus::Queued
+        )
+    }) {
+        return for_execution(conn, latest, now);
+    }
+    Ok(for_unscheduled(conn, task, latest.map(|execution| &execution.status))?.unwrap_or_default())
+}
+
+/// Classify an item with nothing pending for it: a card the board lists as
+/// queued (`todo` with automatic start on), or an `active` item with no run
+/// pending or live. `latest` is the item's most recent execution. Returns
+/// `None` when the item is in neither state.
+///
+/// For a queued card the named reasons are the reconciler's own refusals to
+/// mint an execution, in its order (`reconcile_work_item_execution` /
 /// `reconcile_revision_execution`). When none of them applies the reconciler
 /// would have minted one, so its absence is unclassified.
 pub(super) fn for_unscheduled(
@@ -237,13 +265,61 @@ pub(super) fn for_unscheduled(
     task: &Task,
     latest: Option<&ExecutionStatus>,
 ) -> Result<Option<DispatchWait>> {
-    if task.status != TaskStatus::Todo
-        || !task.autostart
-        || task.deleted_at.is_some()
-        || latest.is_some_and(|status| !status.is_terminal())
-    {
+    if task.deleted_at.is_some() || latest.is_some_and(|status| !status.is_terminal()) {
         return Ok(None);
     }
+    match task.status {
+        TaskStatus::Todo if task.autostart => for_queued_card(conn, task, latest).map(Some),
+        TaskStatus::Active => for_idle_active(conn, task).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// An `active` item with no run pending or live. The orphan sweep is what
+/// starts a replacement run, so the sweep's own candidate predicate names the
+/// ordinary state; the holds it leaves alone are named in turn. Anything
+/// else is the anomaly [`DISPATCH_WAIT_REASON_UNCLASSIFIED`].
+fn for_idle_active(conn: &Connection, task: &Task) -> Result<DispatchWait> {
+    let code = if task.human_driven || work_item_is_human_driven(conn, &task.id)? {
+        DISPATCH_WAIT_REASON_HUMAN_DRIVEN
+    } else if task.is_parked() || !parking::upkeep_eligible(conn, &task.id)? {
+        DISPATCH_WAIT_REASON_PARKED
+    } else if task.dispatch_failed_reason.is_some() {
+        DISPATCH_WAIT_REASON_DISPATCH_FAILED
+    } else if conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM work_attention_items
+         WHERE work_item_id = ?1 AND status = 'open' AND kind IN (?2, ?3))",
+        params![
+            task.id,
+            ATTENTION_KIND_RECOVERY_PERMANENT,
+            ATTENTION_KIND_RECOVERY_EXHAUSTED
+        ],
+        |row| row.get::<_, bool>(0),
+    )? {
+        DISPATCH_WAIT_REASON_RECOVERY_ATTENTION
+    } else if !super::dispatch::orphan_active_candidates(conn, i64::MAX, Some(&task.id))?.is_empty() {
+        DISPATCH_WAIT_REASON_AWAITING_REDISPATCH
+    } else if super::dispatch_admission::primary_pr_awaits_review(conn, &task.id)?
+        || super::dispatch_admission::revision_implementation_completed(conn, &task.id)?
+        || conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_executions WHERE work_item_id = ?1 AND kind = 'pr_review')",
+            [&task.id],
+            |row| row.get::<_, bool>(0),
+        )?
+    {
+        // The sweep leaves these to review handling: a delivered pull request,
+        // a completed revision, a live review batch or a review pass that
+        // review recovery owns.
+        DISPATCH_WAIT_REASON_AWAITING_REVIEW
+    } else {
+        DISPATCH_WAIT_REASON_UNCLASSIFIED
+    };
+    Ok(DispatchWait::named(code))
+}
+
+/// A `todo` card with automatic start on, nothing pending for it and no live
+/// run.
+fn for_queued_card(conn: &Connection, task: &Task, latest: Option<&ExecutionStatus>) -> Result<DispatchWait> {
     // The row's own flags are consulted first: a board can carry many
     // deferred or parked cards, and those need no query. Not every caller's
     // row carries the flags, so the stored columns are read when the row says
@@ -277,7 +353,7 @@ pub(super) fn for_unscheduled(
     } else {
         DISPATCH_WAIT_REASON_UNCLASSIFIED
     };
-    Ok(Some(DispatchWait::named(code)))
+    Ok(DispatchWait::named(code))
 }
 
 /// Write [`for_unscheduled`]'s answer onto `runtime`, for callers that hold
@@ -396,6 +472,36 @@ impl WorkDb {
             .query_map([], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         for id in unscheduled {
+            let Some(task) = query_task(&conn, &id)? else {
+                continue;
+            };
+            let latest = query_latest_execution_for_work_item(&conn, &id)?.map(|execution| execution.status);
+            if for_unscheduled(&conn, &task, latest.as_ref())?.is_some_and(|wait| wait.is_unclassified()) {
+                waits.push(UnexplainedWait {
+                    work_item_id: id,
+                    execution: None,
+                    reason: DISPATCH_WAIT_REASON_UNCLASSIFIED.to_owned(),
+                    task_status: Some(task.status.as_str().to_owned()),
+                });
+            }
+        }
+
+        // Active items with no run pending or live: the orphan sweep starts a
+        // replacement, so most are `awaiting_redispatch`; any the classifier
+        // cannot name is reported.
+        let idle_active: Vec<String> = conn
+            .prepare(
+                "SELECT t.id FROM tasks t
+                 WHERE t.status = 'active' AND t.deleted_at IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM work_executions we
+                       WHERE we.work_item_id = t.id
+                         AND we.status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned'))
+                 ORDER BY t.id ASC",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for id in idle_active {
             let Some(task) = query_task(&conn, &id)? else {
                 continue;
             };

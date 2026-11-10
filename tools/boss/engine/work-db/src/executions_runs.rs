@@ -2438,14 +2438,11 @@ pub(crate) fn reconcile_tasks(
         //
         // The chain decides which task the engine starts next. It does not
         // hold a task that is already `active`: that task has been started,
-        // by a move to Doing or by an earlier run, and the explicit-start
-        // path mints its execution `ready` regardless of ordinal. Applying
-        // the chain to it un-queued that execution in the same request that
-        // had just reported it dispatched: the handler mints the row, then
-        // reconciles the product, and the row landed in `waiting_dependency`
-        // before the scheduler's claim. No scheduler pass looks there, so the
-        // card sat with no worker and no reason until the orphan sweep
-        // promoted the row back 90 s later. The prerequisite gate in
+        // by a move to Doing or by an earlier run. The explicit-start path
+        // mints its execution `ready` regardless of ordinal and reconciles
+        // the product in the same request, before the scheduler claims it.
+        // Demoting that row would move it to `waiting_dependency`, which no
+        // scheduler pass reads. The prerequisite gate in
         // `reconcile_work_item_execution` still applies to an active task.
         let first_incomplete = tasks.iter().position(task_accepts_execution);
 
