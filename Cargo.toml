@@ -38,6 +38,7 @@ members = [
   "tools/boss/engine/live-worker-state",
   "tools/boss/engine/merge-poller",
   "tools/boss/engine/single-flight",
+  "tools/boss/engine/spoke-adapter",
   "tools/boss/engine/spoke-journal",
   "tools/boss/engine/spoke-outbound",
   "tools/boss/engine/spoke",
