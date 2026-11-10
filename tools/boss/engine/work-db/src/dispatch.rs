@@ -1532,7 +1532,8 @@ impl WorkDb {
     /// `work_item_id`, excluding `exclude_id`. Used by the double-spawn
     /// guard in the coordinator: before spawning, if another execution is
     /// already live, the new one is redundant and should be abandoned
-    /// without starting a worker.
+    /// without starting a worker. Progression observers only block another
+    /// progression run; they never replace the item's own work.
     pub fn get_live_execution_for_work_item(
         &self,
         work_item_id: &str,
@@ -1547,6 +1548,10 @@ impl WorkDb {
              FROM work_executions
              WHERE work_item_id = ?1
                AND id != ?2
+               AND (kind != 'progression' OR EXISTS (
+                   SELECT 1 FROM work_executions scheduled
+                   WHERE scheduled.id = ?2 AND scheduled.kind = 'progression'
+               ))
                AND status IN ('running', 'waiting_human')
              ORDER BY created_at DESC, id DESC
              LIMIT 1",
@@ -1736,8 +1741,8 @@ impl WorkDb {
 
     /// Executions of the PR's whole chain (the root and every revision,
     /// including `work_item_id` itself) that may be writing the PR branch
-    /// right now: status `claimed`, `running` or `waiting_human`, and not a
-    /// review (`pr_review` / `pr_review_guide` never rewrite PR history).
+    /// right now: status `claimed`, `running` or `waiting_human`, and not
+    /// a kind whose `never_writes_pr_branch()` contract forbids branch writes.
     ///
     /// The engine's own rebases (the conflict ladder's rung 1 and rung 0 push
     /// and the speculative no-push rebase) rewrite the PR branch's commits in
@@ -1758,12 +1763,14 @@ impl WorkDb {
                  FROM work_executions
                  WHERE work_item_id = ?1
                    AND status IN ('claimed', 'running', 'waiting_human')
-                   AND kind NOT IN ('pr_review', 'pr_review_guide')
                  ORDER BY created_at DESC, id DESC",
             )?;
             let rows = statement.query_map(rusqlite::params![member_id], map_execution)?;
             for row in rows {
-                writers.push(row?);
+                let execution = row?;
+                if !execution.kind.never_writes_pr_branch() {
+                    writers.push(execution);
+                }
             }
         }
         Ok(writers)

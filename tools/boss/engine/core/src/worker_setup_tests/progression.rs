@@ -33,7 +33,7 @@ fn progression_execution_kind_maps_to_the_progression_worker_kind() {
     assert_eq!(
         worker_kind_for_execution(&ExecutionKind::Progression),
         WorkerKind::Progression,
-        "no longer the interim answer-agent posture"
+        "a progression execution gets its own worker kind"
     );
     assert_eq!(WorkerKind::Progression.label(), "progression");
     assert_eq!(WorkerKind::Progression.forced_permission_mode(), Some("dontAsk"));
@@ -133,29 +133,9 @@ fn progression_deny_belt_is_exactly_this_set() {
         "Bash(gh issue unpin:*)",
         "Bash(gh issue lock:*)",
         "Bash(gh issue unlock:*)",
-        // gh api with a mutating method.
-        "Bash(gh api * -X POST*)",
-        "Bash(gh api * -X=POST*)",
-        "Bash(gh api * -X PUT*)",
-        "Bash(gh api * -X=PUT*)",
-        "Bash(gh api * -X PATCH*)",
-        "Bash(gh api * -X=PATCH*)",
-        "Bash(gh api * -X DELETE*)",
-        "Bash(gh api * -X=DELETE*)",
-        "Bash(gh api * --method POST*)",
-        "Bash(gh api * --method=POST*)",
-        "Bash(gh api * --method PUT*)",
-        "Bash(gh api * --method=PUT*)",
-        "Bash(gh api * --method PATCH*)",
-        "Bash(gh api * --method=PATCH*)",
-        "Bash(gh api * --method DELETE*)",
-        "Bash(gh api * --method=DELETE*)",
-        // gh api field flags imply POST.
-        "Bash(gh api * -f *)",
-        "Bash(gh api * -F *)",
-        "Bash(gh api * --field *)",
-        "Bash(gh api * --raw-field *)",
-        "Bash(gh api * --input *)",
+        // All API calls, including flag-first mutations.
+        "Bash(gh api)",
+        "Bash(gh api:*)",
     ] {
         expected.push(rule.to_owned());
     }

@@ -678,7 +678,8 @@ async fn reap_dead_execution(
     // Append [engine-reconcile] audit line to the task description
     // so a human inspecting the chore can see why it was reset.
     let detection_source = evidence.audit_source();
-    if let Some(work_item_id) = &state.work_item_id
+    if execution.kind.holds_cube_lease()
+        && let Some(work_item_id) = &state.work_item_id
         && let Err(err) = crate::reconcile_audit::append_reconcile_audit(
             work_db,
             work_item_id,
@@ -1180,6 +1181,67 @@ mod tests {
         assert_eq!(
             events[0].details["detection_source"],
             DeathEvidence::DriverExitAtPaneInput.as_str(),
+        );
+    }
+
+    #[tokio::test]
+    async fn reaping_progression_preserves_the_stuck_item_snapshot() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "stuck chore");
+        let db = Arc::new(db);
+        let execution_id = create_execution_started_now(&db, &work_item_id);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET kind = 'progression' WHERE id = ?1",
+                [&execution_id],
+            )
+            .unwrap();
+        let snapshot = || -> Vec<Option<String>> {
+            db.connect()
+                .unwrap()
+                .query_row(
+                    "SELECT status, CAST(autostart AS TEXT), dispatch_failed_reason, dispatch_failed_error,
+                        dispatch_failed_at, updated_at, description FROM tasks WHERE id = ?1",
+                    [&work_item_id],
+                    |row| (0..7).map(|i| row.get(i)).collect(),
+                )
+                .unwrap()
+        };
+        let before = snapshot();
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_binding(&live_states, 1, &execution_id, std::process::id() as i32, &work_item_id);
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+        let sink = RecordingDispatchEventSink::new();
+        assert!(
+            reap_driver_exit_at_pane_input(
+                db.as_ref(),
+                &live_states,
+                coordinator.clone(),
+                &sink,
+                &NoopCube,
+                &execution_id,
+            )
+            .await
+        );
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Orphaned
+        );
+        assert_eq!(
+            snapshot(),
+            before,
+            "progression cleanup must not rewrite the stuck item"
+        );
+        assert!(db.list_attention_items(&execution_id).unwrap().is_empty());
+        assert!(
+            !coordinator
+                .worker_pool()
+                .claimed_execution_ids()
+                .await
+                .contains(&execution_id)
         );
     }
 

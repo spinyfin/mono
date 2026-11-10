@@ -1465,14 +1465,9 @@ impl ExecutionCoordinator {
                 continue;
             }
 
-            // A `progression` row cannot spawn until the engine has a
-            // progression worker kind: spawned today it would be an ordinary
-            // coding worker with a repo checkout, which is exactly what the
-            // administrative agent must never be. Hold it `ready`, before any
-            // slot, lease or pane is touched. Operator-forced rows get no
-            // exemption: forcing the dispatch of a row that has no agent to run
-            // would only fail it, and that failure would be recorded against
-            // the stuck item it is meant to help.
+            // Production enables progression spawning at server setup. Hold rows
+            // ready in coordinators that have not opted in, before claiming a
+            // slot. The progression_agents flag separately guards row minting.
             if is_progression && !self.progression_spawn_enabled {
                 changed_waits.extend(self.record_dispatch_wait_reason(
                     &execution,

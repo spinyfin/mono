@@ -2439,8 +2439,7 @@ pub mod capability_rules {
     /// ([`progression_allow_rules`]); deny always wins over allow. On top of the
     /// read-only worker set (file writes, publish verbs, all of `cube`) it denies
     /// every `jj` and `git` invocation (the agent holds no checkout), the mutating
-    /// `gh pr` / `gh issue` verbs beyond the publish set, and `gh api` with a
-    /// mutating method or field flag (`-f`/`-F` imply POST).
+    /// `gh pr` / `gh issue` verbs beyond the publish set, and all `gh api` calls.
     pub fn progression_deny_rules() -> Vec<String> {
         let mut rules = read_only_worker_deny_rules();
         for vcs in ["jj", "git"] {
@@ -2462,17 +2461,8 @@ pub mod capability_rules {
         ] {
             rules.push(format!("Bash(gh {verb}:*)"));
         }
-        // `gh api` defaults to GET; a method flag naming a write verb, or any field
-        // flag (which makes `gh api` default to POST), is a mutation.
-        for flag in ["-X", "--method"] {
-            for method in ["POST", "PUT", "PATCH", "DELETE"] {
-                rules.push(format!("Bash(gh api * {flag} {method}*)"));
-                rules.push(format!("Bash(gh api * {flag}={method}*)"));
-            }
-        }
-        for flag in ["-f", "-F", "--field", "--raw-field", "--input"] {
-            rules.push(format!("Bash(gh api * {flag} *)"));
-        }
+        rules.push("Bash(gh api)".to_owned());
+        rules.push("Bash(gh api:*)".to_owned());
         rules
     }
 

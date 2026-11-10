@@ -545,17 +545,15 @@ impl ExecutionCoordinator {
         worker_id: &str,
         admission: DispatchAdmission,
     ) -> Result<()> {
-        // A `progression` row has no agent to run until the engine has a
-        // progression worker kind. The drain holds it before claiming a slot;
-        // this is the chokepoint backstop for `force_dispatch`, so the row
-        // cannot start as an ordinary coding worker with a repo checkout. Not a
-        // spawn failure: the claim is handed back.
+        // Enforce the coordinator's progression spawning switch here as well as
+        // in the drain, so force_dispatch cannot bypass it. Return the claim
+        // without recording a spawn failure against the stuck item.
         if self.execution_targets_progression_pool(execution) && !self.progression_spawn_enabled {
             tracing::warn!(
                 execution_id = %execution.id,
                 work_item_id = %execution.work_item_id,
                 worker_id = %worker_id,
-                "spawn_attempt refused: the engine cannot spawn a progression agent yet",
+                "spawn_attempt refused: progression spawning is disabled in this coordinator",
             );
             if let Err(err) = self.work_db.release_dispatch_claim(&execution.id) {
                 tracing::error!(
