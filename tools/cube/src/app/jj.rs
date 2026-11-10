@@ -301,7 +301,8 @@ pub(super) const ENGINE_POINTER_BOOKMARK_PREFIXES: [&str; 4] =
 
 /// Rebase `branch` and its descendants onto `destination`. `-b` rewrites the
 /// whole descendant closure; branch bookmarks follow their commits, and no
-/// other pointer is saved or restored around it.
+/// other pointer is saved or restored around it. Legacy `pr/<n>` bookmarks
+/// in the rewritten range also follow their commits, including into conflicts.
 pub(super) fn rebase_branch_onto(
     runner: &dyn CommandRunner,
     database_path: Option<&Path>,

@@ -1048,3 +1048,75 @@ fn rebase_clean_path_runs_no_linearization_probes() {
 // taking an explicit `cwd` param, so these tests capture the ambient
 // test-process cwd (matching the `pr_push` test convention) instead of
 // a synthetic path.
+
+#[test]
+fn local_rebase_fetches_real_github_base_without_alias_operations() {
+    for (base, existing_pr) in [
+        ("main", true),
+        ("parent-pr", true),
+        ("main", false),
+        ("parent-pr", false),
+    ] {
+        let cwd = PathBuf::from("/ws");
+        let ok = |args: &[&str], output: &str| ExpectedCommand::ok(cwd.clone(), "jj", args, output);
+        let destination = format!("\"{base}\"@\"github\"");
+        let mut commands = vec![
+            ok(
+                &["git", "remote", "list"],
+                "origin /stale/mirror\ngithub git@github.com:org/repo.git\n",
+            ),
+            ok(&["git", "fetch", "--remote", "github"], ""),
+            ok(
+                &["rebase", "-b", "@", "-d", &destination, "--ignore-immutable"],
+                "rebased",
+            ),
+            ok(
+                &[
+                    "log",
+                    "-r",
+                    &format!("{destination}..@"),
+                    "--no-graph",
+                    "-T",
+                    "commit_id ++ \" conflicts=\" ++ conflict ++ \"\\n\"",
+                ],
+                "cccc conflicts=false\n",
+            ),
+        ];
+        if existing_pr {
+            commands.insert(
+                1,
+                ExpectedCommand::ok(
+                    cwd.clone(),
+                    "gh",
+                    &[
+                        "pr",
+                        "view",
+                        "77",
+                        "-R",
+                        "org/repo",
+                        "--json",
+                        "baseRefName",
+                        "--jq",
+                        ".baseRefName",
+                    ],
+                    base,
+                ),
+            );
+        }
+        let runner = FakeRunner::new(commands);
+        let result = crate::app::workspace_local_rebase::rebase_at(
+            &runner,
+            None,
+            &cwd,
+            existing_pr.then_some(77),
+            (!existing_pr).then_some(base),
+        )
+        .unwrap();
+        runner.assert_exhausted();
+        assert_eq!(result.payload["destination"], destination);
+        assert_eq!(result.payload["base_branch"], base);
+        assert_eq!(result.payload["remote"], "github");
+        assert_eq!(result.payload["commits"], "cccc conflicts=false\n");
+        assert!(result.message.contains("cccc conflicts=false"));
+    }
+}

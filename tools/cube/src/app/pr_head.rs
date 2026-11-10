@@ -38,7 +38,7 @@ pub(super) struct PrHead {
     pub(super) same_repo: bool,
 }
 
-fn head_repo_full_name(info: &Value) -> Option<&str> {
+pub(super) fn head_repo_full_name(info: &Value) -> Option<&str> {
     info.get("head")?.get("repo")?.get("full_name")?.as_str()
 }
 
@@ -70,7 +70,7 @@ fn sha_is_present(runner: &dyn CommandRunner, database_path: Option<&Path>, cwd:
 /// the head repository's branch through a temporary jj remote, falling back
 /// to the base repository's `refs/pull/<n>/head`. The fetched commit must
 /// equal `head.sha` exactly; a head that cannot be had is an error. Network
-/// work is bounded by `deadline` .
+/// work is bounded by `deadline`.
 pub(super) fn resolve_pr_head(
     runner: &dyn CommandRunner,
     database_path: Option<&Path>,
@@ -240,6 +240,8 @@ fn fetch_pull_ref(
     let remote = temp_remote_name(number);
     add_remote(runner, database_path, cwd, &remote, &url)?;
     let refspec = format!("+refs/pull/{number}/head:refs/remotes/{remote}/pull-{number}");
+    // Serialize fetches as well as config changes: git shares shallow.lock.
+    let fetch_lock = runner.lock_git_remotes(cwd)?;
     let fetched = run_jj_network_within(
         runner,
         database_path,
@@ -259,6 +261,7 @@ fn fetch_pull_ref(
         deadline,
     );
     let imported = fetched.and_then(|_| import_git_refs(runner, database_path, cwd));
+    drop(fetch_lock);
     let _ = remove_remote(runner, database_path, cwd, &remote);
     imported
 }
@@ -284,6 +287,8 @@ fn fetch_head_from_head_repo(
     prune_stale_temp_remotes(runner, database_path, cwd);
     let remote = temp_remote_name(number);
     add_remote(runner, database_path, cwd, &remote, &url)?;
+    // Serialize fetches as well as config changes: git shares shallow.lock.
+    let fetch_lock = runner.lock_git_remotes(cwd)?;
     let fetched = run_jj_network_within(
         runner,
         database_path,
@@ -292,6 +297,7 @@ fn fetch_head_from_head_repo(
     );
     // Remove the temporary remote whether or not the fetch worked. The fetched
     // commits stay in the store.
+    drop(fetch_lock);
     let _ = remove_remote(runner, database_path, cwd, &remote);
     fetched.map(|_| ())
 }

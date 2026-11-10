@@ -30,12 +30,12 @@ pub trait CommandRunner {
     ) -> Result<(), CubeError> {
         std::fs::write(destination, self.run_with_timeout(invocation, timeout)?).map_err(CubeError::Io)
     }
-    /// Shared-store critical section for adding or removing a git remote.
+    /// Shared-store critical section for remote changes and temporary-remote fetches.
     ///
     /// jj rewrites the store's git config for each remote change under a
     /// fail-fast config lock, so two cube processes adding their temporary
-    /// fetch remotes at once make one of them fail instead of waiting. Held
-    /// only around the config write, never around a fetch.
+    /// fetch remotes at once make one of them fail instead of waiting. Fetches
+    /// also hold this lock because git shares shallow.lock across remotes.
     fn lock_git_remotes(&self, cwd: &Path) -> Result<crate::lock::RepoLock, CubeError> {
         crate::lock::RepoLock::for_git_remotes(cwd)
     }

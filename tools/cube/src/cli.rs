@@ -632,7 +632,7 @@ pub enum PrCommand {
     Ensure(PrCreateArgs),
     /// Advance an existing PR by pushing the current commit to its head branch.
     ///
-    /// Advances both the remote head branch and the local `pr/<n>` bookmark to
+    /// Advances the local and remote head branch to
     /// `@` (fast-forward only by default) and pushes to GitHub. Idempotent: a
     /// re-run with nothing new to land is a no-op. Refuses non-descendants,
     /// merged/closed PRs, and empty commits (unless already pushed).
@@ -645,12 +645,12 @@ pub enum PrCommand {
 
 #[derive(Debug, Args)]
 pub struct PrPushArgs {
-    /// PR number to advance. If omitted, inferred from the nearest `pr/<n>`
-    /// bookmark in `@`'s ancestry.
+    /// PR number to advance. If omitted, looked up on GitHub using the supplied
+    /// branch or the nearest local branch bookmark in `@`'s ancestry.
     #[arg(long)]
     pub pr: Option<u64>,
-    /// Head branch name to push. If omitted, inferred from the co-located
-    /// non-`pr/*` bookmark on the same commit as the `pr/<n>` ancestor.
+    /// Head branch name to push. If omitted with --pr, uses GitHub's head.ref;
+    /// otherwise uses the nearest local branch bookmark in `@`'s ancestry.
     #[arg(long)]
     pub branch: Option<String>,
     /// Force-push with lease semantics: verifies that GitHub's head has not

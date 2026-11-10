@@ -555,10 +555,10 @@ fn lease_with_unrelated_conflicted_bookmarks_touches_none_and_marks_no_workspace
 // ── PR head resolution: pull-ref fallback, fork fetches, temporary remotes ──
 
 /// Two processes bringing the same fork head in at once each add their own
-/// temporary remote, fetch while the other's remote exists, and leave none
+/// temporary remote, fetch under the shared-store lock, and leave none
 /// behind. The remote additions themselves are serialized by the store's
 /// remote-change lock (unserialized, jj's fail-fast git config lock makes one
-/// of them fail), so the two sides meet once both fetches are about to start.
+/// of them fail), so the two sides meet after both observe the head is missing.
 #[test]
 fn concurrent_fork_fetches_use_distinct_remotes() {
     /// A two-party meeting point with a bound: a side whose partner never
@@ -598,15 +598,15 @@ fn concurrent_fork_fetches_use_distinct_remotes() {
             {
                 self.added.lock().unwrap().push(invocation.args[3].clone());
             }
-            if invocation
-                .args
-                .starts_with(&["git".into(), "fetch".into(), "--remote".into()])
+            let output = self.jj.run(invocation)?;
+            if invocation.args.first().is_some_and(|arg| arg == "log")
+                && invocation.args.iter().any(|arg| arg.starts_with("present("))
+                && output.trim().is_empty()
             {
-                // Both temporary remotes exist from here until the first
-                // fetch finishes and removes its own.
+                // Both callers observe the missing head before either fetches.
                 self.both_fetching.wait();
             }
-            self.jj.run(invocation)
+            Ok(output)
         }
     }
     let f = Fixture::new();
@@ -631,12 +631,9 @@ fn concurrent_fork_fetches_use_distinct_remotes() {
         assert_eq!(first.join().unwrap(), sha);
         assert_eq!(second.join().unwrap(), sha);
     });
-    // Two fetches racing for git's `shallow.lock` can lose it; the loser then
-    // falls back to the base repository's pull ref through a third temporary
-    // remote of its own. What must hold is that no two fetches ever share a
-    // remote name, so compare the whole set rather than an exact count.
+    // Serialized fetches need exactly one distinct remote per caller.
     let names = runner.added.lock().unwrap();
-    assert!(names.len() >= 2, "{names:?}");
+    assert_eq!(names.len(), 2, "{names:?}");
     let distinct: std::collections::BTreeSet<_> = names.iter().collect();
     assert_eq!(distinct.len(), names.len(), "remote names are unique: {names:?}");
     assert!(!f.jj(&f.ws, &["git", "remote", "list"]).contains("cube-pr-fetch-"));

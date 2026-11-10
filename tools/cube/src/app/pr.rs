@@ -743,6 +743,7 @@ fn resolve_pr_push_target(
             // Have the PR number; GitHub names its head branch.
             let info = gh_pr::fetch_pr_json(runner, cwd, owner_repo, n)
                 .map_err(|e| CubeError::InvalidArgument(format!("failed to resolve PR {n} in {owner_repo}: {e}")))?;
+            require_same_repo_head(&info, owner_repo, n)?;
             let head_branch = gh_pr::head_ref(&info).ok_or_else(|| {
                 CubeError::InvalidArgument(format!(
                     "PR {n} ({owner_repo}) returned no head.ref from GitHub; pass --branch explicitly"
@@ -781,6 +782,15 @@ fn resolve_pr_push_target(
     }
 }
 
+fn require_same_repo_head(info: &serde_json::Value, owner_repo: &str, number: u64) -> Result<()> {
+    if !super::pr_head::head_repo_full_name(info).is_some_and(|name| name.eq_ignore_ascii_case(owner_repo)) {
+        return Err(CubeError::InvalidArgument(format!(
+            "PR {number} does not have a head repository matching {owner_repo}; refusing to push a fork or unknown head"
+        )));
+    }
+    Ok(())
+}
+
 /// Verify the PR identified by `pr_number` is open on GitHub; error if merged/closed.
 fn check_pr_open(runner: &dyn CommandRunner, cwd: &Path, owner_repo: &str, pr_number: u64) -> Result<()> {
     let pr_info = gh_pr::fetch_pr_json(runner, cwd, owner_repo, pr_number)
@@ -792,7 +802,7 @@ fn check_pr_open(runner: &dyn CommandRunner, cwd: &Path, owner_repo: &str, pr_nu
              Only OPEN pull requests can be advanced with `cube pr push`."
         )));
     }
-    Ok(())
+    require_same_repo_head(&pr_info, owner_repo, pr_number)
 }
 
 /// Fetch the current head SHA of `branch` from GitHub (authoritative source).

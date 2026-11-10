@@ -33,11 +33,11 @@ impl RepoLock {
         self._file
     }
 
-    /// Serialize git remote additions and removals across the processes
+    /// Serialize git remote changes and temporary-remote fetches across processes
     /// sharing the store `cwd` belongs to. jj rewrites the store's git config
     /// for each remote change under a fail-fast lock, so unserialized
     /// concurrent changes make one side fail. Separate from
-    /// the pool/registry lock: a fetch never runs under this lock.
+    /// the pool/registry lock. Fetches share it to avoid git's shallow.lock race.
     pub fn for_git_remotes(cwd: &Path) -> Result<Self, CubeError> {
         crate::lock::RepoLock::acquire(&shared_repo_dir(cwd)?.join("cube-git-remotes.lock"))
     }

@@ -58,7 +58,7 @@ fn pr_push_happy_path_advance() {
             cwd.clone(),
             "gh",
             &["api", "repos/spinyfin/mono/pulls/42"],
-            r#"{"state":"open","merged":false}"#,
+            r#"{"state":"open","merged":false,"head":{"repo":{"full_name":"spinyfin/mono"}}}"#,
         ),
         // @ is not empty
         ExpectedCommand::ok(
@@ -120,7 +120,7 @@ fn pr_push_noop_idempotency() {
             cwd.clone(),
             "gh",
             &["api", "repos/spinyfin/mono/pulls/42"],
-            r#"{"state":"open","merged":false}"#,
+            r#"{"state":"open","merged":false,"head":{"repo":{"full_name":"spinyfin/mono"}}}"#,
         ),
         // @ is empty
         ExpectedCommand::ok(
@@ -167,7 +167,7 @@ fn pr_push_empty_at_nothing_to_land() {
             cwd.clone(),
             "gh",
             &["api", "repos/spinyfin/mono/pulls/42"],
-            r#"{"state":"open","merged":false}"#,
+            r#"{"state":"open","merged":false,"head":{"repo":{"full_name":"spinyfin/mono"}}}"#,
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -213,7 +213,7 @@ fn pr_push_detached_refusal() {
             cwd.clone(),
             "gh",
             &["api", "repos/spinyfin/mono/pulls/42"],
-            r#"{"state":"open","merged":false}"#,
+            r#"{"state":"open","merged":false,"head":{"repo":{"full_name":"spinyfin/mono"}}}"#,
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -260,7 +260,7 @@ fn pr_push_stale_push_error() {
             cwd.clone(),
             "gh",
             &["api", "repos/spinyfin/mono/pulls/42"],
-            r#"{"state":"open","merged":false}"#,
+            r#"{"state":"open","merged":false,"head":{"repo":{"full_name":"spinyfin/mono"}}}"#,
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -352,7 +352,7 @@ fn pr_push_force_with_lease_happy_path() {
             cwd.clone(),
             "gh",
             &["api", "repos/spinyfin/mono/pulls/42"],
-            r#"{"state":"open","merged":false}"#,
+            r#"{"state":"open","merged":false,"head":{"repo":{"full_name":"spinyfin/mono"}}}"#,
         ),
         // @ is not empty
         ExpectedCommand::ok(
@@ -439,7 +439,7 @@ fn pr_push_force_with_lease_concurrent_advance_refusal() {
             cwd.clone(),
             "gh",
             &["api", "repos/spinyfin/mono/pulls/42"],
-            r#"{"state":"open","merged":false}"#,
+            r#"{"state":"open","merged":false,"head":{"repo":{"full_name":"spinyfin/mono"}}}"#,
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -525,7 +525,7 @@ fn pr_push_infers_from_ancestry() {
             cwd.clone(),
             "gh",
             &["api", "repos/spinyfin/mono/pulls/42"],
-            r#"{"state":"open","merged":false}"#,
+            r#"{"state":"open","merged":false,"head":{"repo":{"full_name":"spinyfin/mono"}}}"#,
         ),
         // @ is not empty
         ExpectedCommand::ok(
@@ -596,3 +596,33 @@ fn pr_push_guard_rejects_pr_bookmark_head_branch() {
 }
 
 // --- pr_number_from_url tests ---
+
+#[test]
+fn pr_push_refuses_fork_main_before_mutation() {
+    for force in [false, true] {
+        for explicit_branch in [false, true] {
+            let cwd = std::env::current_dir().unwrap();
+            let runner = FakeRunner::new(vec![
+                ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
+                ExpectedCommand::ok(
+                    cwd.clone(),
+                    "gh",
+                    &["api", "repos/spinyfin/mono/pulls/42"],
+                    r#"{"state":"open","head":{"ref":"main","repo":{"full_name":"contributor/mono"}}}"#,
+                ),
+            ]);
+            let mut args = vec!["cube", "pr", "push", "--pr", "42"];
+            if explicit_branch {
+                args.extend(["--branch", "main"]);
+            }
+            if force {
+                args.push("--force-with-lease");
+            }
+            let err = run_with_dependencies(Cli::parse_from(args), None, &runner).unwrap_err();
+            assert!(matches!(err, CubeError::InvalidArgument(_)));
+            assert!(err.to_string().contains("refusing to push a fork"));
+            // The exact queue permits neither bookmark mutation nor push.
+            runner.assert_exhausted();
+        }
+    }
+}

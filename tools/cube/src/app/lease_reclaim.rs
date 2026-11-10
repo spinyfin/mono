@@ -468,7 +468,7 @@ pub(super) fn reclaim_unhealthy_workspace_for_lease(
         }
 
         // 3. Hand it back to the pool. The caller claims it by id and runs the
-        //    ordinary fetch-and-reset () as for any other
+        //    ordinary fetch-and-reset as for any other
         //    candidate; `undo` lets it put everything back if that fails.
         if !store.gc_clear_workspace_unhealthy_state(repo, ws_id)? {
             if let Some(path) = &salvaged_to {
