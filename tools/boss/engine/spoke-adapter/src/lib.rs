@@ -288,6 +288,47 @@ impl Hub {
         }
     }
 
+    /// Serialize selection through completion so a concurrent sweep cannot
+    /// prune a result while another caller is about to retry that attempt.
+    pub(crate) async fn send_probe(
+        &self,
+        host_id: &str,
+        op: &'static str,
+        base: String,
+        run: Run,
+        body: command::Body,
+        deadline: Duration,
+    ) -> Result<CommandResult> {
+        // Separate from the command-id lock, including the first (base) id.
+        let key = format!("probe\0{host_id}\0{base}");
+        let lock = Arc::clone(
+            self.stable_locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(key.clone())
+                .or_default(),
+        );
+        let guard = lock.lock().await;
+        let outcome = async {
+            let db = Arc::clone(&self.db);
+            let host = host_id.to_owned();
+            let id = tokio::task::spawn_blocking(move || db.refresh_host_probe(&host, &base))
+                .await
+                .context("work database task failed")??;
+            Ok(self.send_stable(host_id, op, id, Some(run), body, deadline).await?)
+        }
+        .await;
+        drop(guard);
+        let mut locks = self
+            .stable_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if Arc::strong_count(&lock) == 2 {
+            locks.remove(&key);
+        }
+        outcome
+    }
+
     /// The id of the current attempt at a repeatable request. Attempts are
     /// `base`, `base-a1`, `base-a2`, ... and the current one is the first not
     /// settled in a way `superseded` calls final: an unsettled attempt is reused

@@ -398,17 +398,13 @@ impl SpokeHostAdapter {
 
     pub(crate) async fn ws_status(&self, assignment: &SpokeAssignment) -> Result<CubeWorkspaceStatus> {
         let op = Self::op(assignment, Kind::Status, true)?;
-        let id = self
-            .hub
-            .current_attempt(self.host_name(), &format!("status-{}", assignment.run_id), |_| true)
-            .await?;
         let result = self
             .hub
-            .send_stable(
+            .send_probe(
                 self.host_name(),
                 "status",
-                id,
-                Some(run_of(assignment)),
+                format!("status-{}", assignment.run_id),
+                run_of(assignment),
                 command::Body::Workspace(op),
                 self.hub.config.command_deadline,
             )

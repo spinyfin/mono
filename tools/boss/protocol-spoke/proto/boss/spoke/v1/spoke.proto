@@ -280,7 +280,8 @@ enum WorkspaceKind {
   // JSON array. A store operation: it needs no lease.
   FORGET_PRESERVED = 28;
   // Release after preservation, resetting even unpublished working-copy changes.
-  // A distinct kind makes older hosts reject rather than ignore the reset intent.
+  // Requires negotiated workspace-reset-release/1; never send to older hosts.
+  // The hub refuses unsupported submissions and settles unsupported replay locally.
   RELEASE_WITH_RESET = 29;
 }
 // A discriminated, typed operation, not an argv tunnel: kind selects which

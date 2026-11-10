@@ -810,6 +810,7 @@ mod execution_wait_history;
 mod semantic_progress;
 mod spoke_hub;
 mod spoke_ingress;
+mod spoke_probe;
 mod stuck_activity;
 mod stuck_report;
 mod stuck_snapshot;

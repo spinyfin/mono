@@ -3,6 +3,37 @@ use boss_protocol_spoke::v1::{Cursor, WorkspaceOp};
 use prost::Message;
 
 #[tokio::test]
+async fn reset_release_is_clearly_unsent_to_an_old_peer() {
+    use boss_protocol_spoke::negotiate::{Contracts, feature};
+    let fx = Fixture::new().await;
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let mut contracts = Contracts::first_release();
+    contracts
+        .features
+        .retain(|f| f.name != feature::WORKSPACE_RESET_RELEASE);
+    let peer = fx.spoke_contracts(Box::new(standard), None, 0, contracts).await;
+    lease(&adapter).await;
+    let error = adapter.release_workspace_with_reset("lease-1").await.unwrap_err();
+    assert!(
+        matches!(error.downcast_ref::<HostCallError>(), Some(HostCallError::NotSent { reason, .. })
+        if reason.contains("workspace-reset-release/1"))
+    );
+    assert_eq!(peer.commands().len(), 1);
+    let count: u32 = fx
+        .db
+        .connect()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM host_commands WHERE host_id = ?1", [HOST], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 1);
+    adapter.release_workspace("lease-1").await.unwrap();
+    assert_eq!(peer.commands().len(), 2);
+}
+
+#[tokio::test]
 async fn same_workspace_basename_does_not_cross_stores() {
     let fx = Fixture::new().await;
     fx.ready(HOST);
@@ -127,6 +158,60 @@ async fn unanswered_sweep_queries_reuse_their_commands() {
             .filter(|c| workspace_kind(c) == Some(Kind::Status))
             .count(),
         1
+    );
+}
+
+#[tokio::test]
+async fn answered_sweeps_keep_probe_history_and_lookup_work_bounded() {
+    let fx = Fixture::new().await;
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let _peer = fx
+        .spoke(
+            Box::new(|c| match (&c.body, workspace_kind(c)) {
+                (Some(command::Body::Adopt(_)), _) => Some(ok(c, Some(pane(PaneLife::Alive)))),
+                (_, Some(Kind::Status)) => Some(ok(
+                    c,
+                    Some(workspace(
+                        c,
+                        json!({
+                            "workspace_id": "worker", "workspace_path": PATH, "state": "leased", "lease_id": "lease-1"
+                        }),
+                    )),
+                )),
+                _ => standard(c),
+            }),
+            None,
+            0,
+        )
+        .await;
+    lease(&adapter).await;
+    spawn(&adapter).await.unwrap();
+    let assignment = fx.db.spoke_assignment_for_execution("exec_1").unwrap().unwrap();
+    for sweep in 0..25 {
+        assert_eq!(adapter.probe_remote_worker_alive(4242).await.unwrap(), Some(true));
+        adapter.heartbeat_lease("lease-1", None).await.unwrap();
+        let conn = fx.db.connect().unwrap();
+        let count: u32 = conn
+            .query_row("SELECT COUNT(*) FROM host_commands WHERE host_id = ?1", [HOST], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        // Lease + spawn, and at most two attempts per observation. The single
+        // range lookup in refresh_host_probe therefore examines bounded history.
+        assert!(count <= 6, "sweep {sweep}: {count} commands");
+    }
+    // A restarted hub starts from the retained latest attempt, not attempt zero.
+    for prefix in ["adopt", "status"] {
+        let base = format!("{prefix}-{}", assignment.run_id);
+        assert_eq!(fx.db.refresh_host_probe(HOST, &base).unwrap(), format!("{base}-a25"));
+    }
+    assert!(
+        !fx.db
+            .spoke_assignment_for_execution("exec_1")
+            .unwrap()
+            .unwrap()
+            .resolved
     );
 }
 
