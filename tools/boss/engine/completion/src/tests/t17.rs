@@ -382,6 +382,10 @@ async fn on_stop_finalizes_a_progression_run_without_touching_the_stuck_item() {
     // cube call, and — above all — no change to the item it was sent to inspect.
     let dir = tempdir().unwrap();
     let (db, chore_id, execution) = stuck_item_with_started_progression(dir.path());
+    // The item's pre-existing stale-worker evidence must survive the Stop's
+    // production teardown path.
+    db.upsert_external_tracker_attention(&chore_id, "stale_worker", "stuck item", "pre-existing")
+        .unwrap();
     let before = item_snapshot(&db, &chore_id);
 
     // A detector that would bind a PR if the progression run reached PR detection.
@@ -408,6 +412,13 @@ async fn on_stop_finalizes_a_progression_run_without_touching_the_stuck_item() {
         before,
         "the stuck item is untouched by the run ending"
     );
+    assert!(
+        db.list_attention_items_for_work_item(&chore_id)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == "stale_worker" && item.status == "open"),
+        "the item's stale_worker attention stays open"
+    );
 }
 
 #[tokio::test]
@@ -425,4 +436,50 @@ async fn a_progression_stop_with_a_no_changes_needed_stamp_and_both_flags_on_lea
 
     assert!(matches!(outcome, StopOutcome::Progression), "got {outcome:?}");
     assert_eq!(item_snapshot(&db, &chore_id), before, "the stuck item is unchanged");
+}
+
+#[tokio::test]
+async fn a_progression_driver_error_stop_records_a_failed_execution_and_run_but_leaves_the_item_alone() {
+    // Start from the real post-spawn state: the pane spawn already closed the
+    // run as `completed` and the execution is still live. A driver-reported
+    // fatal error at Stop must still land as a failed execution and run, so the
+    // candidate view's infrastructure-failure cap can see it.
+    let dir = tempdir().unwrap();
+    let (db, chore_id, execution) = stuck_item_with_started_progression(dir.path());
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET status = 'completed', finished_at = '2026-11-01T00:00:01Z' WHERE execution_id = ?1",
+            [&execution.id],
+        )
+        .unwrap();
+    let before = item_snapshot(&db, &chore_id);
+
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let turn_end = crate::driver::TurnEnd {
+        session_id: "progression-session".to_owned(),
+        reason: boss_protocol::StopReason::Other,
+        continuation: false,
+    };
+    let outcome = handler.on_stop_with_turn_end(&execution.id, Some(&turn_end)).await;
+
+    assert!(matches!(outcome, StopOutcome::Progression), "got {outcome:?}");
+    assert_eq!(db.get_execution(&execution.id).unwrap().status, ExecutionStatus::Failed);
+    let (run_status, summary): (String, Option<String>) = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, result_summary FROM work_runs WHERE execution_id = ?1",
+            [&execution.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(run_status, "failed");
+    assert!(
+        summary
+            .as_deref()
+            .is_some_and(|s| s.contains("progression: driver error")),
+        "the failure detail is recorded on the run: {summary:?}"
+    );
+    assert_eq!(item_snapshot(&db, &chore_id), before, "the item is unchanged");
 }

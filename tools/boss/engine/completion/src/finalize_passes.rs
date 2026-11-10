@@ -693,14 +693,16 @@ impl WorkerCompletionHandler {
     ) -> StopOutcome {
         let workspace_path = execution.workspace_path.clone();
         let teardown = self.begin_teardown(&execution.id);
-        let (run_status, summary) = match driver_error {
-            Some(detail) => ("failed", format!("progression: driver error: {detail}")),
-            None => ("completed", "progression: run ended".to_owned()),
+        let finished = match driver_error {
+            Some(detail) => self
+                .work_db
+                .fail_progression_execution(&execution.id, &format!("progression: driver error: {detail}")),
+            None => {
+                self.work_db
+                    .complete_pane_parked_execution(&execution.id, "completed", Some("progression: run ended"))
+            }
         };
-        match self
-            .work_db
-            .complete_pane_parked_execution(&execution.id, run_status, Some(&summary))
-        {
+        match finished {
             Ok(Some(_)) => {}
             Ok(None) => tracing::debug!(
                 execution_id = %execution.id,
@@ -725,8 +727,12 @@ impl WorkerCompletionHandler {
             .publish(
                 &execution.id,
                 &execution.work_item_id,
-                "completed",
-                "progression_completed",
+                if driver_error.is_some() { "failed" } else { "completed" },
+                if driver_error.is_some() {
+                    "progression_failed"
+                } else {
+                    "progression_completed"
+                },
             )
             .await;
         tracing::info!(

@@ -103,7 +103,8 @@ fn expected_guards(kind: WorkerKind, remote: bool, revision: bool) -> Vec<&'stat
         }
         WorkerKind::Reviewer => names.extend(["reviewer_static_analysis_guard", "reviewer_publish_guard"]),
         WorkerKind::ReviewGuide => names.push("review_guide_guard"),
-        WorkerKind::Triage | WorkerKind::AnswerAgent | WorkerKind::Progression => {}
+        WorkerKind::Progression => names.push("progression_guard"),
+        WorkerKind::Triage | WorkerKind::AnswerAgent => {}
     }
     if revision {
         names.push("revision_pr_guard");

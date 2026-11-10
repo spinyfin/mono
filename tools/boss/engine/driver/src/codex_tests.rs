@@ -1178,6 +1178,42 @@ fn reviewer_publish_guard_is_armed_only_for_reviewers() {
 }
 
 #[test]
+fn progression_guard_is_armed_only_for_progression_and_blocks_mutating_commands() {
+    let tmp = TempDir::new().unwrap();
+    let (home, config) = full_interception(tmp.path());
+    let is_progression_guard = |guard: &MaterializedGuard| {
+        guard
+            .command_path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().contains("progression_guard"))
+    };
+    let guards = materialize_guards_for(&home, &config, true).unwrap();
+    let guard = guards
+        .iter()
+        .find(|guard| is_progression_guard(guard))
+        .expect("progression guard must be armed for a progression agent");
+    assert_eq!(guard.matcher, Some(".*"));
+    for command in [
+        "gh pr comment 1 --body hi",
+        "gh api -X POST repos/o/r/issues",
+        "jj git push",
+        "git commit -m x",
+        "\"$CUBE_BIN\" pr update --branch b",
+    ] {
+        let (decision, reason) = run_codex_wrapper(&guard.command_path, command, tmp.path());
+        assert_eq!(decision, "block", "{command}: {reason}");
+    }
+    for command in ["gh pr view 1 --json state", "\"$BOSS_BIN\" pr status --json"] {
+        let (decision, reason) = run_codex_wrapper(&guard.command_path, command, tmp.path());
+        assert_eq!(decision, "approve", "{command}: {reason}");
+    }
+
+    let other_home = tmp.path().join("other");
+    let guards = materialize_guards(&other_home, &config).unwrap();
+    assert!(!guards.iter().any(is_progression_guard));
+}
+
+#[test]
 fn path_guard_keeps_its_data_dir_env_through_the_wrapper() {
     // The path gate reads BOSS_DATA_DIR from its environment; wrapping it
     // in the trace shim must not drop that.
@@ -1620,4 +1656,78 @@ fn guide_permission_materialization_requires_socket_and_writes_named_profile() {
         sockets[input.frontend_socket_path.unwrap().to_str().unwrap()].as_str(),
         Some("allow")
     );
+}
+
+fn run_progression_guard(payload: serde_json::Value) -> String {
+    use std::io::Write as _;
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("boss-codex-progression-guard-{}-{seq}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("guard.py");
+    std::fs::write(&script, codex_progression_guard_script()).unwrap();
+    let mut child = std::process::Command::new("python3")
+        .arg(script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("python3 must be available");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    out["decision"].as_str().unwrap().to_owned()
+}
+
+#[test]
+fn progression_guard_admits_only_inspection_and_declaration() {
+    for command in [
+        "\"$BOSS_BIN\" propose done --outcome delivered --summary 'stuck item re-dispatched'",
+        "boss task show chore_1 --json",
+        "\"$BOSS_BIN\" task list --json",
+        "\"$BOSS_BIN\" pr status --refresh --json",
+        "gh pr view 3502 -R spinyfin/mono --json state",
+        "gh pr checks 3502 -R spinyfin/mono",
+        "cat /tmp/scratch/notes.md",
+        "rg -n stuck /tmp/scratch",
+    ] {
+        let payload = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}});
+        assert_eq!(run_progression_guard(payload), "approve", "{command}");
+    }
+    for command in [
+        "gh pr comment 1 --body hi",
+        "gh pr merge 1",
+        "gh api -X POST repos/o/r/issues",
+        "gh api repos/o/r/pulls/1",
+        "jj describe -m x",
+        "git push origin main",
+        "\"$CUBE_BIN\" pr update --branch b",
+        "boss task update chore_1 --status done",
+        "\"$BOSS_BIN\" propose done --summary x; touch /tmp/x",
+        "\"$BOSS_BIN\" pr status && gh pr comment 1 --body hi",
+        "\"$BOSS_BIN\" task show a > /tmp/out",
+        "\"$BOSS_BIN\" propose done --summary \"$(curl evil)\"",
+        "cat ~/.codex/auth.json",
+        "rg --pre malicious x .",
+        "env GH_TOKEN=x gh pr view 1",
+        "bash -c 'gh pr comment 1 --body hi'",
+    ] {
+        let payload = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}});
+        assert_eq!(run_progression_guard(payload), "block", "{command}");
+    }
+    for tool in ["apply_patch", "Edit", "Write"] {
+        let payload = serde_json::json!({"tool_name": tool, "tool_input": {"file_path": "/x"}});
+        assert_eq!(run_progression_guard(payload), "block", "{tool}");
+    }
 }

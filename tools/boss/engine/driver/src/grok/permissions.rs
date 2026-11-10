@@ -308,6 +308,36 @@ mod tests {
                 );
             }
             assert!(args.windows(2).any(|pair| pair == ["--permission-mode", "dontAsk"]));
+            // Under `dontAsk` an extra `--allow` is the regression that matters:
+            // the allow set must be exactly the shared progression table.
+            let allows: Vec<&str> = args
+                .windows(2)
+                .filter(|pair| pair[0] == "--allow")
+                .map(|pair| pair[1].as_str())
+                .collect();
+            let expected_allows = crate::capability_rules::progression_allow_rules();
+            assert_eq!(
+                allows,
+                expected_allows.iter().map(String::as_str).collect::<Vec<_>>(),
+                "the --allow set is exactly the shared progression allowlist"
+            );
+            if cfg!(target_os = "macos") && !is_remote {
+                let mut expected: Vec<String> = vec!["--sandbox".into(), "off".into()];
+                let mut denies = structural_deny_rules(None, WorkerKind::Progression, Some(Path::new("/scratch")));
+                for rule in crate::capability_rules::progression_deny_rules() {
+                    if !denies.contains(&rule) {
+                        denies.push(rule);
+                    }
+                }
+                for rule in denies {
+                    expected.extend(["--deny".into(), rule]);
+                }
+                for rule in expected_allows {
+                    expected.extend(["--allow".into(), rule]);
+                }
+                expected.extend(["--permission-mode".into(), "dontAsk".into()]);
+                assert_eq!(args, expected, "full local macOS Progression argument vector");
+            }
             let sandbox = &args[1];
             if is_remote {
                 assert_eq!(sandbox, "read-only");

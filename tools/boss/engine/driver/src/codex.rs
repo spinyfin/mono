@@ -1256,9 +1256,97 @@ pub struct MaterializedGuard {
     pub timeout_sec: Option<u64>,
 }
 
+/// Deny-by-default `PreToolUse` guard for the Codex progression agent.
+///
+/// Codex has no declarative `permissions.deny`, and the progression profile
+/// opens `github.com` / `api.github.com` (so `gh pr view` works) — a network
+/// allowlist cannot tell a GitHub read from an authenticated write. This guard
+/// is the command-level layer: it admits only the progression inspection and
+/// declaration surface (the same set as `progression_allow_rules`) plus a few
+/// read-only file commands, and rejects everything else, including mutating
+/// `gh`, `jj`, `git`, `cube`, redirections, substitutions and chaining.
+fn codex_progression_guard_script() -> String {
+    guard_python::with_command_tokenizer(PROGRESSION_SCRIPT_TEMPLATE)
+}
+
+const PROGRESSION_SCRIPT_TEMPLATE: &str = r#"#!/usr/bin/env python3
+import json
+import os
+import re
+import shlex
+import sys
+
+# COMMAND_TOKENIZER_FRAGMENT
+
+BOSS_BINS = ('boss', '$BOSS_BIN', '${BOSS_BIN}')
+BOSS_VERBS = (('propose',), ('task', 'show'), ('task', 'list'), ('pr', 'status'))
+GH_VERBS = (('pr', 'view'), ('pr', 'checks'))
+READ_COMMANDS = ('cat', 'ls', 'head', 'tail', 'nl', 'wc', 'rg')
+SECRET_MARKERS = ('.codex', '.ssh', '.aws', '.gnupg', 'auth.json')
+
+def starts_with(tokens, verbs):
+    return any(tuple(tokens[:len(verb)]) == verb for verb in verbs)
+
+def allowed_bash(command):
+    if not isinstance(command, str):
+        return False
+    if any(marker in command for marker in ('`', '$(', '<(', '>(')):
+        return False
+    groups = command_groups(command)
+    if len(groups) != 1:
+        return False
+    tokens = list(groups[0])
+    if not tokens or any(re.match(r'^[0-9]*[<>]', token) for token in tokens):
+        return False
+    head, rest = tokens[0], tokens[1:]
+    if head in BOSS_BINS:
+        return starts_with(rest, BOSS_VERBS)
+    if head == 'gh':
+        return starts_with(rest, GH_VERBS)
+    if head in READ_COMMANDS:
+        if head == 'rg' and any(t.startswith(('--pre', '--hostname-bin')) for t in rest):
+            return False
+        return not any(marker in token for token in rest for marker in SECRET_MARKERS)
+    return False
+
+def allowed(payload):
+    if not isinstance(payload, dict):
+        return False
+    tool = payload.get('tool_name')
+    if tool in ('Read', 'Grep', 'Glob'):
+        return True
+    if tool != 'Bash':
+        return False
+    tool_input = payload.get('tool_input')
+    return isinstance(tool_input, dict) and allowed_bash(tool_input.get('command'))
+
+try:
+    payload = json.load(sys.stdin)
+    approved = allowed(payload)
+except Exception:
+    payload = None
+    approved = False
+if approved:
+    print(json.dumps({"decision": "approve"}))
+else:
+    tool = payload.get("tool_name", "(unreadable payload)") if isinstance(payload, dict) else "(unreadable payload)"
+    print(json.dumps({"decision": "block", "reason": "Blocked: the progression agent may only inspect state (boss task show/list, boss pr status, gh pr view/checks, read-only file commands) and declare through boss propose; edits, writes, jj/git/cube and mutating gh are forbidden (matched tool: " + str(tool) + ")."}))
+"#;
+
 /// Materialise Boss guard scripts under `codex_home/guards/` and return the
 /// absolute paths Codex will invoke.
+#[cfg(test)]
 fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> anyhow::Result<Vec<MaterializedGuard>> {
+    materialize_guards_for(codex_home, config, false)
+}
+
+/// [`materialize_guards`] with the worker-kind posture the interception config
+/// does not carry: `progression` arms the deny-by-default progression guard.
+fn materialize_guards_for(
+    codex_home: &Path,
+    config: &ToolUseInterceptionConfig,
+    progression: bool,
+) -> anyhow::Result<Vec<MaterializedGuard>> {
     let guards_dir = codex_home.join("guards");
     fs::create_dir_all(&guards_dir).with_context(|| format!("creating {}", guards_dir.display()))?;
 
@@ -1414,6 +1502,18 @@ fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> 
         });
     }
 
+    // The progression agent holds no checkout and may only inspect and declare.
+    // Its profile opens GitHub hosts, which a network allowlist alone cannot
+    // split into reads and writes, so every tool call goes through this guard.
+    if progression {
+        planned.push(Planned {
+            name: "progression_guard",
+            source: GuardSource::Inline(codex_progression_guard_script()),
+            matcher: ".*",
+            extra_env: Vec::new(),
+        });
+    }
+
     // 7. Revision PR guard.
     if config.is_revision {
         planned.push(Planned {
@@ -1544,11 +1644,12 @@ pub fn write_hooks_and_attest(
     hook_cwd: &Path,
     base_config: &str,
     config: &ToolUseInterceptionConfig,
+    progression: bool,
     codex_bin: &Path,
 ) -> anyhow::Result<()> {
     fs::create_dir_all(codex_home).with_context(|| format!("creating CODEX_HOME {}", codex_home.display()))?;
 
-    let guards = materialize_guards(codex_home, config)?;
+    let guards = materialize_guards_for(codex_home, config, progression)?;
     let full = append_hooks_toml(base_config, &guards);
     let config_path = codex_home.join("config.toml");
     fs::write(&config_path, full).with_context(|| format!("writing {}", config_path.display()))?;
@@ -1982,7 +2083,14 @@ impl AgentDriver for CodexDriver {
             };
         }
         let codex_bin = resolve_codex_bin();
-        write_hooks_and_attest(&codex_home, &hook_cwd, &base_config, &interception, &codex_bin)?;
+        write_hooks_and_attest(
+            &codex_home,
+            &hook_cwd,
+            &base_config,
+            &interception,
+            input.worker_kind == WorkerKind::Progression,
+            &codex_bin,
+        )?;
 
         let extra_args = codex_sandbox_extra_args(input.worker_kind, input.codex_sandbox_enforced);
 

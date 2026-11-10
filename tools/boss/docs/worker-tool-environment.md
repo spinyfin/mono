@@ -103,8 +103,24 @@ dispatcher forces so it cannot be downgraded: `Read`, `Grep` and `Glob`;
 the bare `boss` and `"$BOSS_BIN"` spellings); and `gh pr view|checks`. Everything
 else is denied: file writes, all of `jj`, `git` and `cube`, mutating `gh` verbs
 and `gh api` with a mutating method or field flag. The ordinary worker denylist
-still applies on top. Codex runs it with `--sandbox read-only` and Grok with the
-read-only sandbox profile, never the Standard posture.
+still applies on top. The confinement differs per driver, and none of them uses
+the Standard posture:
+
+- **Claude** relies on the allowlist and deny belt above under `dontAsk`.
+- **Codex** gets no `--sandbox` flag; its config renders a `progression`
+  permission profile instead: a read-only filesystem, the attributed engine
+  socket, and network access to `github.com` and `api.github.com` only. A host
+  allowlist cannot tell a GitHub read from an authenticated write, so a
+  deny-by-default `PreToolUse` guard (matcher `.*`) is installed as the second
+  layer. It admits only `boss propose`, `boss task show|list`, `boss pr status`,
+  `gh pr view|checks` and a few read-only file commands (`cat`, `ls`, `head`,
+  `tail`, `nl`, `wc`, `rg` without `--pre`), as a single command with no
+  chaining, redirection or substitution, and rejects mutating `gh`, `jj`, `git`,
+  `cube` and every file write.
+- **Grok** receives the same allow and deny rules as `--allow` / `--deny`
+  arguments under `--permission-mode dontAsk`. On local macOS it runs with
+  `--sandbox off` like every other local kind, so those rules are the only
+  confinement there; elsewhere it also gets the read-only sandbox profile.
 
 The PATH and launcher environment described above applies unchanged: the boss
 and cube launchers are materialized in the worker tool directory and the sealed
