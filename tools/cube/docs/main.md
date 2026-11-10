@@ -773,12 +773,23 @@ checkout and not aware of anything above jj:
    preserves the live cached index on an already-damaged store. See
    [missing-predecessor recovery](store-gc-recovery.md) for the tested recovery
    procedure and shared-client version requirements.
+   The pre-collection rebuild is pinned to the checked operation head, and the
+   quiet observation and single-head check follow it immediately before
+   `util gc`; a head published during the rebuild stops the pass. The collector
+   must also be the oldest client sharing the store: a newer `jj` omits legacy
+   predecessors from its index, prunes them, and still passes its own
+   verifications. The `jj` on `PATH` is therefore refused when newer than 0.26
+   (override with `CUBE_OLDEST_JJ_CLIENT=<major.minor>` once every client is
+   upgraded), and its `jj --version` is recorded on the `repo.store_gc` and
+   `repo.store_gc.index_warmup` audit rows. jj 0.26's `util gc` does not prune
+   the default index store, so skipping the live `.jj/repo/index` loses no
+   reclamation.
    Working-copy health checks can also be expensive after the operation IDs
    change: jj rebuilds its commit index by walking operation ancestry, so
    maintenance warms that index without holding the host-wide exclusive gate.
    Rebuilding an isolated copy of mono's 18 GiB operation store indexed 66,490
-   commits in 148 seconds, far beyond the former 20-second warm-up limit.
-   The five-minute deadline leaves roughly twice that measured time while
+   commits in 148 seconds, so the warm-up deadline is five minutes: roughly
+   twice that measured time, while
    allowing readers of other stores to proceed. A reader of the same store
    can still need to build its own index before warm-up finishes.
    Lease health probes and stale recovery share a

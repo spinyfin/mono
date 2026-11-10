@@ -97,8 +97,7 @@ fn collect_with_runner(
     )
 }
 
-#[test]
-fn store_gc_predecessor_warmup_does_not_merge_a_racing_head() {
+fn race_with_head(during_rebuild: bool) {
     let f = fixture();
     let original_head = f.jj(
         &f.root,
@@ -116,13 +115,26 @@ fn store_gc_predecessor_warmup_does_not_merge_a_racing_head() {
     struct RacingHead<'a> {
         fixture: &'a Fixture,
         original_head: String,
+        during_rebuild: bool,
+        reindexes: std::cell::Cell<usize>,
     }
     impl CommandRunner for RacingHead<'_> {
         fn run(&self, invocation: &CommandInvocation) -> Result<String> {
             if invocation.program == "ps" {
                 return Ok(String::new());
             }
-            if invocation.args.iter().any(|arg| arg == "root()") {
+            let reindex = invocation.args.iter().any(|arg| arg == "reindex");
+            if reindex {
+                self.reindexes.set(self.reindexes.get() + 1);
+            }
+            // The second reindex is the pre-collection rebuild: pinned to the
+            // checked head, it must not merge the head published under it.
+            let publish = if self.during_rebuild {
+                reindex && self.reindexes.get() == 2
+            } else {
+                invocation.args.iter().any(|arg| arg == "root()")
+            };
+            if publish {
                 // A writer loaded the old head before abandon and publishes
                 // it while the warm-up is starting. An unpinned read would
                 // merge it, hiding the race from the collector's head check.
@@ -156,6 +168,8 @@ fn store_gc_predecessor_warmup_does_not_merge_a_racing_head() {
         &RacingHead {
             fixture: &f,
             original_head,
+            during_rebuild,
+            reindexes: Default::default(),
         },
     )
     .unwrap_err();
@@ -164,6 +178,16 @@ fn store_gc_predecessor_warmup_does_not_merge_a_racing_head() {
         "{error}"
     );
     assert_eq!(crate::app::store_gc::count_op_heads(&f.root).unwrap(), 2);
+}
+
+#[test]
+fn store_gc_predecessor_warmup_does_not_merge_a_racing_head() {
+    race_with_head(false);
+}
+
+#[test]
+fn store_gc_predecessor_pre_collection_rebuild_does_not_merge_a_racing_head() {
+    race_with_head(true);
 }
 
 fn cached_read(f: &Fixture) {
@@ -338,6 +362,8 @@ fn store_gc_predecessor_recovery_with_newer_clients_preserves_visible_work() {
     // Recovery requires switching every client, including the collector.
     // No predecessor metadata is edited and no operations are restored.
     f.runner.binary = std::fs::canonicalize(std::env::var("CUBE_NEWER_JJ_BIN").unwrap()).unwrap();
+    // Every client has been upgraded, which the collector is told by declaration.
+    crate::app::store_gc_integrity::OLDEST_CLIENT_OVERRIDE.with(|cell| cell.set(Some((0, 34))));
     reindex(&f).unwrap();
     assert_eq!(visible(&f), before);
     for keep in [Duration::from_secs(86400), Duration::ZERO] {

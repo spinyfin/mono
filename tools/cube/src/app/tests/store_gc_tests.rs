@@ -195,8 +195,8 @@ fn repo_gc_abandons_old_operations_collects_and_drops_stale_pr_refs() {
         ),
         index_command(&source),
         // ...and right after it: collect immediately.
-        ps_command(&source, "/bin/sh\n/usr/bin/git\n"),
         fresh_index_command(&source),
+        ps_command(&source, "/bin/sh\n/usr/bin/git\n"),
         gc_index_command(&source, &["util", "gc", "--expire", "now"]),
         fresh_index_command(&source),
     ];
@@ -281,8 +281,8 @@ fn repo_gc_with_nothing_old_enough_still_collects() {
             &format!("{} {}\n{} {}\n", "a".repeat(64), now, "b".repeat(64), now - HOUR),
         ),
         fresh_index_command(&source),
-        ps_command(&source, ""),
         fresh_index_command(&source),
+        ps_command(&source, ""),
         gc_index_command(&source, &["util", "gc", "--expire", "now"]),
         fresh_index_command(&source),
     ];
@@ -332,10 +332,10 @@ fn collection_is_deferred_to_the_two_week_threshold_when_jj_goes_busy_after_the_
             "",
         ),
         index_command(&source),
+        fresh_index_command(&source),
         // A busy probe defers after its polling budget outside exclusivity.
         ps_command(&source, "/opt/homebrew/bin/jj\n/bin/sh\n"),
         // So the collection keeps jj's two-week threshold: no `--expire now`.
-        fresh_index_command(&source),
         gc_index_command(&source, &["util", "gc"]),
         fresh_index_command(&source),
     ];
@@ -399,8 +399,8 @@ fn repo_gc_runs_on_its_own_lock_and_never_waits_on_the_lease_lock() {
     let mut expected = vec![
         op_log_command(&source, &format!("{} {}\n", "a".repeat(64), now)),
         fresh_index_command(&source),
-        ps_command(&source, ""),
         fresh_index_command(&source),
+        ps_command(&source, ""),
         gc_index_command(&source, &["util", "gc", "--expire", "now"]),
         fresh_index_command(&source),
     ];
@@ -649,8 +649,8 @@ fn lease_and_store_gc_paths_create_no_child_process_of_the_test_binary() {
     let mut expected = vec![
         op_log_command(&source, &format!("{} {}\n", "a".repeat(64), now)),
         fresh_index_command(&source),
-        ps_command(&source, ""),
         fresh_index_command(&source),
+        ps_command(&source, ""),
         gc_index_command(&source, &["util", "gc", "--expire", "now"]),
         fresh_index_command(&source),
     ];
@@ -729,7 +729,6 @@ fn a_second_operation_head_after_the_abandon_stops_the_pass_before_collecting() 
     let workspace_root = tempdir.path().join("workspaces");
     seed_mono_repo(&workspace_root, &database_path);
     let source = seed_store_files(&source_of(&database_path));
-    std::fs::write(source.join(".jj/repo/op_heads/heads/raced"), b"").unwrap();
     let record = Store::open_at(&database_path)
         .unwrap()
         .get_repo("mono")
@@ -751,7 +750,8 @@ fn a_second_operation_head_after_the_abandon_stops_the_pass_before_collecting() 
                 &format!("..{}", "d".repeat(64)),
             ],
             "",
-        ),
+        )
+        .creating_dir(source.join(".jj/repo/op_heads/heads/raced")),
     ]);
     let err = gc_repo_store(
         &runner,
@@ -828,7 +828,10 @@ fn slow_abandon_is_bounded_and_releases_the_gate_without_collecting() {
         &record,
         DEFAULT_KEEP,
         QUIESCENCE_WAIT,
-        Duration::from_millis(300),
+        crate::app::store_gc::Collector {
+            exclusive_timeout: Duration::from_millis(300),
+            jj_version: Some("jj 0.26.0"),
+        },
         false,
     )
     .expect_err("slow rewrite must yield to leases");
@@ -900,10 +903,10 @@ fn busy_host_becomes_quiet_without_excluding_readers() {
         ps_command(&source, ""),
         abandon_command(&source),
         index_command(&source),
+        fresh_index_command(&source),
         ps_command(&source, "jj"),
         ps_command(&source, "jj"),
         ps_command(&source, ""),
-        fresh_index_command(&source),
         gc_index_command(&source, &["util", "gc", "--expire", "now"]),
         fresh_index_command(&source),
     ];
@@ -969,6 +972,7 @@ fn a_head_that_appears_after_the_abandon_returns_stops_the_pass_before_collectin
         ps_command(&source, ""),
         abandon_command(&source),
         index_command(&source),
+        fresh_index_command(&source),
         ps_command(&source, "").creating_dir(source.join(".jj/repo/op_heads/heads/raced")),
     ]);
     let err = gc_repo_store(
@@ -1001,6 +1005,7 @@ fn a_head_that_appears_while_the_post_abandon_wait_fails_stops_the_deferred_coll
         ps_command(&source, ""),
         abandon_command(&source),
         index_command(&source),
+        fresh_index_command(&source),
         // A busy probe also reveals a racing head. Even the two-week
         // collection must not run in that case.
         ps_command(&source, "/opt/homebrew/bin/jj\n").creating_dir(source.join(".jj/repo/op_heads/heads/raced")),
@@ -1026,14 +1031,13 @@ fn a_failed_pass_and_a_skipped_pass_are_each_recorded_and_surfaced_by_workspace_
     let (tempdir, database_path) = with_database_path();
     seed_mono_repo(&tempdir.path().join("workspaces"), &database_path);
     let source = seed_store_files(&source_of(&database_path));
-    std::fs::write(source.join(".jj/repo/op_heads/heads/raced"), b"").unwrap();
     let now = crate::app::util::current_epoch_s().unwrap();
     let runner = FakeRunner::new(vec![
         op_log_command(&source, &op_log(now)),
         fresh_index_command(&source),
         ps_command(&source, ""),
         ps_command(&source, ""),
-        abandon_command(&source),
+        abandon_command(&source).creating_dir(source.join(".jj/repo/op_heads/heads/raced")),
     ]);
     run_with_dependencies(
         Cli::parse_from(["cube", "repo", "gc", "mono"]),
@@ -1133,8 +1137,8 @@ fn cube_started_jj_commands_are_held_off_for_the_abandon_but_not_the_collection(
         ps_command(&source, ""),
         abandon_command(&source),
         index_command(&source),
-        ps_command(&source, ""),
         fresh_index_command(&source),
+        ps_command(&source, ""),
         gc_index_command(&source, &["util", "gc", "--expire", "now"]),
         fresh_index_command(&source),
     ];
@@ -1183,6 +1187,7 @@ fn post_abandon_head_check_fails_the_pass_after_releasing_exclusivity() {
         ps_command(&source, ""),
         abandon_command(&source),
         index_command(&source),
+        fresh_index_command(&source),
         ps_command(&source, "").creating_dir(source.join(".jj/repo/op_heads/heads/raced")),
     ]);
     let probe = GateProbe {
@@ -1254,5 +1259,5 @@ pub(super) fn gc_index_command(source: &std::path::Path, args: &[&str]) -> Expec
 }
 
 pub(super) fn fresh_index_command(source: &std::path::Path) -> ExpectedCommand {
-    gc_index_command(source, &["debug", "reindex"])
+    gc_index_command(source, &["--at-operation", "head", "debug", "reindex"])
 }

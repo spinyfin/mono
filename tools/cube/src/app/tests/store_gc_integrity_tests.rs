@@ -13,17 +13,19 @@ use clap::Parser;
 
 #[test]
 fn store_gc_integrity_failure_never_reports_success() {
-    for after_collection in [false, true] {
+    for phase in 0..3 {
         let (tempdir, database) = with_database_path();
         seed_mono_repo(&tempdir.path().join("workspaces"), &database);
         let source = seed_store_files(&source_of(&database));
         let now = crate::app::util::current_epoch_s().unwrap();
         let mut expected = vec![op_log_command(&source, &format!("{} {now}\n", "a".repeat(64)))];
-        if after_collection {
+        if phase >= 1 {
+            expected.push(fresh_index_command(&source));
+        }
+        if phase == 2 {
             expected.extend([
                 fresh_index_command(&source),
                 ps_command(&source, ""),
-                fresh_index_command(&source),
                 gc_index_command(&source, &["util", "gc", "--expire", "now"]),
             ]);
         }
@@ -45,11 +47,9 @@ fn store_gc_integrity_failure_never_reports_success() {
             "{error}"
         );
         assert!(
-            error.to_string().contains(if after_collection {
-                "after collection"
-            } else {
-                "before abandon"
-            }),
+            error
+                .to_string()
+                .contains(["before abandon", "before collection", "after collection"][phase]),
             "{error}"
         );
         let store = Store::open_at(&database).unwrap();
@@ -87,6 +87,7 @@ fn store_gc_warmup_timeout_and_late_head_are_both_audited_without_collecting() {
         ps_command(&source, ""),
         abandon_command(&source),
         warmup,
+        fresh_index_command(&source),
         ps_command(&source, "").creating_dir(source.join(".jj/repo/op_heads/heads/raced")),
     ]);
     let error = run_with_dependencies(Cli::parse_from(["cube", "repo", "gc", "mono"]), Some(&database), &fake)
@@ -135,8 +136,8 @@ fn store_gc_warmup_can_outlast_the_exclusive_rewrite_deadline() {
         ps_command(&source, ""),
         abandon_command(&source),
         index_command(&source).taking(Duration::from_millis(600)),
-        ps_command(&source, ""),
         fresh_index_command(&source),
+        ps_command(&source, ""),
         gc_index_command(&source, &["util", "gc", "--expire", "now"]),
         fresh_index_command(&source),
     ]);
@@ -146,7 +147,10 @@ fn store_gc_warmup_can_outlast_the_exclusive_rewrite_deadline() {
         &mono_record(&database),
         crate::app::store_gc::DEFAULT_KEEP,
         crate::app::store_gc::QUIESCENCE_WAIT,
-        Duration::from_millis(300),
+        crate::app::store_gc::Collector {
+            exclusive_timeout: Duration::from_millis(300),
+            jj_version: Some("jj 0.26.0"),
+        },
         false,
     )
     .unwrap();
@@ -164,5 +168,92 @@ fn store_gc_warmup_can_outlast_the_exclusive_rewrite_deadline() {
         events
             .iter()
             .any(|row| row["event"] == "repo.store_gc" && row["fresh_index_verified"] == true)
+    );
+}
+
+#[test]
+fn a_head_published_during_the_pre_collection_rebuild_stops_both_collection_paths() {
+    use crate::app::store_gc::{count_op_heads, gc_repo_store};
+    use std::time::Duration;
+
+    for probe_output in ["", "/opt/homebrew/bin/jj\n"] {
+        let (tempdir, database) = with_database_path();
+        seed_mono_repo(&tempdir.path().join("workspaces"), &database);
+        let source = seed_store_files(&source_of(&database));
+        // The writer loaded the pre-abandon head and publishes it while the
+        // slow fresh-index rebuild runs; the pass sees it only afterwards.
+        let racing = fresh_index_command(&source).creating_dir(source.join(".jj/repo/op_heads/heads/raced"));
+        let fake = FakeRunner::new(vec![
+            op_log_command(&source, &op_log(crate::app::util::current_epoch_s().unwrap())),
+            fresh_index_command(&source),
+            ps_command(&source, ""),
+            ps_command(&source, ""),
+            abandon_command(&source),
+            index_command(&source),
+            racing,
+            ps_command(&source, probe_output),
+        ]);
+        let error = gc_repo_store(
+            &fake,
+            Some(&database),
+            &mono_record(&database),
+            crate::app::store_gc::DEFAULT_KEEP,
+            Duration::from_millis(200),
+            false,
+        )
+        .expect_err("a head published during the rebuild must refuse collection");
+        // No `util gc` was scripted, so none was run.
+        fake.assert_exhausted();
+        assert!(
+            error.to_string().contains("2 operation heads before the collection"),
+            "{error}"
+        );
+        assert_eq!(count_op_heads(&source).unwrap(), 2);
+        let failed: Vec<_> = audit_events(&tempdir)
+            .into_iter()
+            .filter(|row| row["event"] == "repo.store_gc" && row["outcome"] == "failed")
+            .collect();
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0]["error"].as_str().unwrap().contains("2 operation heads"));
+    }
+}
+
+#[test]
+fn a_collector_newer_than_the_oldest_client_is_refused_and_its_version_audited() {
+    use super::support::ExpectedCommand;
+    use crate::app::store_gc::gc_repo_store;
+    use std::time::Duration;
+
+    let (tempdir, database) = with_database_path();
+    seed_mono_repo(&tempdir.path().join("workspaces"), &database);
+    let source = seed_store_files(&source_of(&database));
+    let version = |text: &str| ExpectedCommand::ok(source.clone(), "jj", &["--version"], text);
+    let run = |fake: &FakeRunner| {
+        gc_repo_store(
+            fake,
+            Some(&database),
+            &mono_record(&database),
+            crate::app::store_gc::DEFAULT_KEEP,
+            Duration::from_millis(200),
+            false,
+        )
+    };
+    let fake = FakeRunner::new(vec![version("jj 0.34.0\n")]);
+    let error = run(&fake).expect_err("newer collector");
+    fake.assert_exhausted();
+    assert!(error.to_string().contains("jj 0.34.0"), "{error}");
+    assert!(error.to_string().contains("oldest client"), "{error}");
+
+    // An accepted collector's version lands on the failed row of a pass that
+    // then fails for another reason.
+    let mut op_log = op_log_command(&source, "");
+    op_log.result = Err(CubeError::InvalidArgument("op log unreadable".into()));
+    let fake = FakeRunner::new(vec![version("jj 0.26.1\n"), op_log]);
+    run(&fake).expect_err("op log failure");
+    fake.assert_exhausted();
+    assert!(
+        audit_events(&tempdir)
+            .iter()
+            .any(|row| row["outcome"] == "failed" && row["collector_jj_version"] == "jj 0.26.1")
     );
 }

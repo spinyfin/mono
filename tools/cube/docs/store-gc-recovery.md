@@ -44,7 +44,7 @@ The tested forward recovery is a coordinated transition to jj 0.32.0, whose
 [index retention change](https://github.com/jj-vcs/jj/commit/ea8aa1e17ca845fa28fbbe5867527f2e2963f860)
 does not require those legacy predecessor objects. This restores rebuildability
 for the newer clients; it cannot recreate already-deleted evolution history.
-It is an operator procedure, not an automatic fallback during collection.
+It is a manual procedure, not an automatic fallback during collection.
 
 1. Stop writers and collectors for the affected shared store, including workers
    and the engine's cleanup. Back up the complete store and working-copy state
@@ -53,7 +53,8 @@ It is an operator procedure, not an automatic fallback during collection.
    The copy must not point back to the live `.jj/repo`, Git directory, or Git
    alternates. Preserve predecessor metadata, operation heads, and indexes.
 3. Use jj 0.32.0 for every client sharing the store, including cube's `jj` on
-   `PATH`, engine processes, and worker shells. Verify `jj --version` in each
+   `PATH`, engine processes, and worker shells (after upgrading, declare it with
+   `CUBE_OLDEST_JJ_CLIENT=0.32` so the collector is not refused as too new). Verify `jj --version` in each
    launch environment. Do not mix upgraded collectors with older readers.
 4. On the independent copy, run
    `jj --ignore-working-copy --repository <copy> debug reindex`.
@@ -69,7 +70,7 @@ It is an operator procedure, not an automatic fallback during collection.
 The regression test reproduces a 0.26 missing-predecessor failure, switches both
 readers and the collector to 0.32, rebuilds, collects twice, and checks fresh
 rebuilds, identical visible commit IDs, file content, and secondary-workspace
-loads. This procedure requires the operator to upgrade the shared clients; merely
+loads. This procedure requires upgrading every shared client; merely
 upgrading one shell or copying a newer cached index is insufficient.
 
 If older clients must remain, restore the exact missing objects from a known

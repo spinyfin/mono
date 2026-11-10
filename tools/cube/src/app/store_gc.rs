@@ -103,7 +103,7 @@ use crate::store::Store;
 
 use crate::app::errors::{CubeError, Result};
 use crate::app::jj::run_jj;
-use crate::app::store_gc_integrity::GcIndex;
+use crate::app::store_gc_integrity::{GcIndex, collector_version};
 
 /// Operations newer than this are never abandoned. Three days of history
 /// keeps `jj op undo` useful while the log stays bounded.
@@ -346,28 +346,32 @@ pub(super) fn jj_processes(ps_output: &str) -> Vec<String> {
 /// Number of operation heads in the store at `source`. One means every
 /// workspace's operations descend from a single head.
 pub(crate) fn count_op_heads(source: &Path) -> Result<usize> {
-    let heads = source.join(".jj/repo/op_heads/heads");
-    let mut entries = std::fs::read_dir(&heads).map_err(CubeError::Io)?;
-    entries.try_fold(0, |count, entry| entry.map(|_| count + 1).map_err(CubeError::Io))
+    Ok(op_heads(source)?.len())
+}
+
+/// The operation head ids in the store at `source`, one directory entry each.
+fn op_heads(source: &Path) -> Result<Vec<String>> {
+    std::fs::read_dir(source.join(".jj/repo/op_heads/heads"))
+        .map_err(CubeError::Io)?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<_>>()
+        .map_err(CubeError::Io)
 }
 
 /// Stop the pass unless the store holds exactly one operation head. A second
 /// head means a jj command raced the abandon: the next jj command merges the
 /// heads against an empty base, so nothing may be collected.
 fn require_single_op_head(record: &RepoRecord, source: &Path, when: &str) -> Result<String> {
-    let entries = std::fs::read_dir(source.join(".jj/repo/op_heads/heads"))
-        .map_err(CubeError::Io)?
-        .collect::<std::io::Result<Vec<_>>>()
-        .map_err(CubeError::Io)?;
-    let heads = entries.len();
-    if let [head] = entries.as_slice() {
-        return Ok(head.file_name().to_string_lossy().into_owned());
+    let mut heads = op_heads(source)?;
+    if heads.len() == 1 {
+        return Ok(heads.remove(0));
     }
     Err(CubeError::InvalidArgument(format!(
-        "repo `{}`: the store holds {heads} operation heads {when} (expected 1); \
+        "repo `{}`: the store holds {} operation heads {when} (expected 1); \
          the rewrite is unsafe, so nothing was collected. Repair the operation heads in {} \
          before allowing commands to merge abandoned ancestry",
         record.repo,
+        heads.len(),
         source.display()
     )))
 }
@@ -535,27 +539,49 @@ pub(super) fn gc_repo_store(
     dry_run: bool,
 ) -> Result<StoreGcReport> {
     let started = Instant::now();
-    gc_repo_store_with_deadline(
-        runner,
-        database_path,
-        record,
-        keep,
-        quiescence,
-        EXCLUSIVE_COMMAND_TIMEOUT,
-        dry_run,
-    )
-    .inspect_err(|error| {
-        audit!(
-            database_path,
-            "repo.store_gc",
-            repo = record.repo,
-            source = record.source,
-            dry_run = dry_run,
-            outcome = "failed",
-            duration_ms = started.elapsed().as_millis() as u64,
-            error = error.to_string()
-        );
-    })
+    let mut collector_jj = None;
+    let probe = match (dry_run, record.source.as_deref()) {
+        (false, Some(source)) if source.join(".jj/repo").is_dir() => {
+            collector_version(runner, source).map(|version| collector_jj = Some(version))
+        }
+        _ => Ok(()),
+    };
+    probe
+        .and_then(|()| {
+            gc_repo_store_with_deadline(
+                runner,
+                database_path,
+                record,
+                keep,
+                quiescence,
+                Collector {
+                    exclusive_timeout: EXCLUSIVE_COMMAND_TIMEOUT,
+                    jj_version: collector_jj.as_deref(),
+                },
+                dry_run,
+            )
+        })
+        .inspect_err(|error| {
+            audit!(
+                database_path,
+                "repo.store_gc",
+                repo = record.repo,
+                source = record.source,
+                dry_run = dry_run,
+                outcome = "failed",
+                collector_jj_version = collector_jj,
+                duration_ms = started.elapsed().as_millis() as u64,
+                error = error.to_string()
+            );
+        })
+}
+
+/// How a pass drives `jj`: the bound on each command run under the exclusive
+/// gate (production always uses [`EXCLUSIVE_COMMAND_TIMEOUT`]) and the
+/// version of the `jj` that collects, recorded in the audit rows.
+pub(super) struct Collector<'a> {
+    pub(super) exclusive_timeout: Duration,
+    pub(super) jj_version: Option<&'a str>,
 }
 
 /// [`gc_repo_store`] with the bound on each command run under the exclusive
@@ -566,9 +592,13 @@ pub(super) fn gc_repo_store_with_deadline(
     record: &RepoRecord,
     keep: Duration,
     quiescence: Duration,
-    exclusive_timeout: Duration,
+    collector: Collector<'_>,
     dry_run: bool,
 ) -> Result<StoreGcReport> {
+    let Collector {
+        exclusive_timeout,
+        jj_version: collector_jj,
+    } = collector;
     let started = Instant::now();
     let source = record.source.clone().ok_or_else(|| {
         CubeError::InvalidArgument(format!(
@@ -631,7 +661,8 @@ pub(super) fn gc_repo_store_with_deadline(
         let index = {
             let _reader = JjGate::shared_for_database(database_path)?;
             let index = GcIndex::new(&source)?;
-            index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "before abandon")?;
+            let head = require_single_op_head(record, &source, "before the abandon")?;
+            index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "before abandon", &head)?;
             index
         };
         let mut rewritten_head = None;
@@ -718,6 +749,7 @@ pub(super) fn gc_repo_store_with_deadline(
                     database_path,
                     "repo.store_gc.index_warmup",
                     repo = record.repo,
+                    collector_jj_version = collector_jj,
                     outcome = if warmup.is_ok() { "succeeded" } else { "failed" },
                     duration_ms = warmup_started.elapsed().as_millis() as u64,
                     timeout_ms = warmup_timeout.as_millis() as u64,
@@ -730,12 +762,27 @@ pub(super) fn gc_repo_store_with_deadline(
                     );
                 }
             }
+            // The fresh-index rebuild can take minutes, so it runs first and
+            // pinned to the checked head: a head published meanwhile cannot
+            // be merged into it. The quiet observation and the head check
+            // come after it, immediately before `util gc`, so neither goes
+            // stale.
+            let collection_started = Instant::now();
+            let head = require_single_op_head(record, &source, "before the collection rebuild")?;
+            index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "before collection", &head)?;
             let quiet = wait_for_jj_quiescence(runner, &source, quiescence, QUIESCENCE_POLL)?;
-            // A command that started during the abandon loaded the old head
-            // and may have committed on it since; its head only shows up
-            // now, so the heads are counted again after the wait and before
-            // any collection, on both the immediate and the deferred path.
-            require_single_op_head(record, &source, "before the collection")?;
+            // A command that started during the abandon or the rebuild
+            // loaded an older head and may have committed on it since; that
+            // head only shows up now, on both the immediate and deferred
+            // paths.
+            let current = require_single_op_head(record, &source, "before the collection")?;
+            if current != head {
+                return Err(CubeError::InvalidArgument(format!(
+                    "repo `{}`: the operation head moved during the pre-collection rebuild \
+                     ({head} -> {current}); nothing was collected",
+                    record.repo
+                )));
+            }
             if quiet {
                 gc_args.extend(["--expire", "now"]);
                 collection = Collection::Immediate;
@@ -744,10 +791,8 @@ pub(super) fn gc_repo_store_with_deadline(
             }
             // Collection is a reader: leases proceed, but another rewrite
             // cannot invalidate the head this collector loaded.
-            let collection_started = Instant::now();
-            index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "before collection")?;
             index.run(runner, &gc_args, MAINTENANCE_CMD_TIMEOUT)?;
-            index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "after collection")?;
+            index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "after collection", &current)?;
             collection_ms = collection_started.elapsed().as_millis();
         }
     }
@@ -819,6 +864,7 @@ pub(super) fn gc_repo_store_with_deadline(
         duration_ms = report.duration_ms as u64,
         exclusive_ms = report.exclusive_ms as u64,
         collection_ms = report.collection_ms as u64,
+        collector_jj_version = collector_jj,
         fresh_index_verified = matches!(report.collection, Collection::Immediate | Collection::Deferred),
     );
     Ok(report)

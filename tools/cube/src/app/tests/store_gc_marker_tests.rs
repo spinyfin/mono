@@ -52,8 +52,8 @@ fn a_stale_marker_with_a_single_head_is_cleared_by_the_next_pass() {
         ps_command(&source, ""),
         abandon_command(&source),
         index_command(&source),
-        ps_command(&source, ""),
         fresh_index_command(&source),
+        ps_command(&source, ""),
         collect_command(&source),
         fresh_index_command(&source),
     ];
@@ -122,8 +122,8 @@ fn a_racing_reprobe_is_retried_within_the_budget() {
         ps_command(&source, ""),
         abandon_command(&source),
         index_command(&source),
-        ps_command(&source, ""),
         fresh_index_command(&source),
+        ps_command(&source, ""),
         collect_command(&source),
         fresh_index_command(&source),
     ];
@@ -154,8 +154,8 @@ fn a_failed_index_warm_up_after_a_verified_abandon_still_collects() {
         ps_command(&source, ""),
         abandon_command(&source),
         warm,
-        ps_command(&source, ""),
         fresh_index_command(&source),
+        ps_command(&source, ""),
         collect_command(&source),
         fresh_index_command(&source),
     ];

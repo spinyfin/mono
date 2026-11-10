@@ -392,6 +392,18 @@ impl FakeRunner {
     }
 
     fn next_expectation(&self, invocation: &CommandInvocation) -> ExpectedCommand {
+        // The collector's version probe is not part of any scripted store
+        // sequence: answer it as the oldest supported client unless the test
+        // scripted a `--version` expectation itself.
+        if invocation.args == ["--version"]
+            && !self
+                .expectations
+                .borrow()
+                .front()
+                .is_some_and(|next| next.args == invocation.args)
+        {
+            return ExpectedCommand::ok(invocation.cwd.clone(), &invocation.program, &["--version"], "jj 0.26.0");
+        }
         let next = self.expectations.borrow_mut().pop_front();
         let expected = match next {
             Some(expected) => expected,
