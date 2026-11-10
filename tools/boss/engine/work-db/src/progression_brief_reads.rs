@@ -1,0 +1,218 @@
+//! Read helpers for the progression diagnosis packet (design 2.3).
+//!
+//! Kept out of `pr_flow.rs` / `progression_candidates.rs` so those files stay
+//! under the line cap. Every method is a Deferred-style read: `connect()` and
+//! query, no implicit transaction.
+
+use super::*;
+use crate::chain_helpers::collect_chain_revision_ids;
+use rusqlite::{OptionalExtension, params};
+
+/// One `task_status_audit` row, newest first in listings.
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct StatusAuditRow {
+    pub property: String,
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+    pub actor: String,
+    pub basis: Option<String>,
+    pub changed_at: String,
+}
+
+/// One execution on the item or its revision chain, with the columns the
+/// protocol `WorkExecution` mapper does not carry (`created_via`,
+/// `run_done_outcome`) plus the latest run's `error_text`.
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct ExecutionDiagnosis {
+    pub id: String,
+    pub work_item_id: String,
+    pub kind: String,
+    pub status: String,
+    pub created_via: Option<String>,
+    pub last_error: Option<String>,
+    pub run_done_outcome: Option<String>,
+    pub created_at: String,
+    pub finished_at: Option<String>,
+    pub latest_run_error: Option<String>,
+}
+
+/// Stored required-check snapshot on another of the product's PRs, used to
+/// tell an unrelated or flaky failure from one this PR caused.
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct ProductPrCiSnapshot {
+    pub work_item_id: String,
+    pub name: String,
+    pub pr_url: String,
+    pub status: String,
+    pub ci_required_state: Option<String>,
+    pub ci_required_detail: Option<String>,
+}
+
+/// How much of `progression.max_creates_per_item_window` this item has used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgressionCreateBudget {
+    pub used: i64,
+    pub max: i64,
+    pub window_secs: i64,
+}
+
+#[work_db_boundary::instrument]
+impl WorkDb {
+    /// Newest ledger rows for `work_item_id`, capped at `limit`.
+    pub fn list_recent_status_audit(&self, work_item_id: &str, limit: i64) -> Result<Vec<StatusAuditRow>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT property, old_value, new_value, actor, basis, changed_at
+             FROM task_status_audit
+             WHERE work_item_id = ?1
+             ORDER BY id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![work_item_id, limit], |row| {
+            Ok(StatusAuditRow {
+                property: row.get(0)?,
+                old_value: row.get(1)?,
+                new_value: row.get(2)?,
+                actor: row.get(3)?,
+                basis: row.get(4)?,
+                changed_at: row.get(5)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Latest `task_status_audit.basis` for `property` on this item.
+    pub fn latest_status_audit_basis(&self, work_item_id: &str, property: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        Ok(conn
+            .query_row(
+                "SELECT basis FROM task_status_audit
+                 WHERE work_item_id = ?1 AND property = ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![work_item_id, property],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Executions for `chain_root_id` and every live revision in its chain,
+    /// oldest first, with provenance and the latest run error.
+    pub fn list_execution_diagnoses_for_chain(&self, chain_root_id: &str) -> Result<Vec<ExecutionDiagnosis>> {
+        let conn = self.connect()?;
+        let mut ids = vec![chain_root_id.to_owned()];
+        ids.extend(collect_chain_revision_ids(&conn, chain_root_id)?);
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT e.id, e.work_item_id, e.kind, e.status, e.created_via, e.last_error,
+                    e.run_done_outcome, e.created_at, e.finished_at,
+                    (SELECT r.error_text FROM work_runs r
+                      WHERE r.execution_id = e.id
+                      ORDER BY r.created_at DESC, r.id DESC LIMIT 1)
+             FROM work_executions e
+             WHERE e.work_item_id IN ({placeholders})
+             ORDER BY e.created_at ASC, e.id ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+            Ok(ExecutionDiagnosis {
+                id: row.get(0)?,
+                work_item_id: row.get(1)?,
+                kind: row.get(2)?,
+                status: row.get(3)?,
+                created_via: row.get(4)?,
+                last_error: row.get(5)?,
+                run_done_outcome: row.get(6)?,
+                created_at: row.get(7)?,
+                finished_at: row.get(8)?,
+                latest_run_error: row.get(9)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Required-check snapshots on the product's other PRs (open, or done
+    /// inside the last seven days). Proxy for "this check's recent outcomes
+    /// on main": a check that is red across PRs is likely unrelated or flaky.
+    pub fn list_product_pr_ci_snapshots(
+        &self,
+        product_id: &str,
+        exclude_work_item_id: &str,
+    ) -> Result<Vec<ProductPrCiSnapshot>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, pr_url, status, ci_required_state, ci_required_detail
+             FROM tasks
+             WHERE product_id = ?1
+               AND id != ?2
+               AND deleted_at IS NULL
+               AND pr_url IS NOT NULL
+               AND (
+                    status NOT IN ('done', 'archived')
+                    OR (status = 'done' AND CAST(completed_at AS INTEGER)
+                        > CAST(strftime('%s','now') AS INTEGER) - 7 * 86400)
+               )
+             ORDER BY updated_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map(params![product_id, exclude_work_item_id], |row| {
+            Ok(ProductPrCiSnapshot {
+                work_item_id: row.get(0)?,
+                name: row.get(1)?,
+                pr_url: row.get(2)?,
+                status: row.get(3)?,
+                ci_required_state: row.get(4)?,
+                ci_required_detail: row.get(5)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Revisions plus precursors minted with `created_via LIKE 'progression:%'`
+    /// for this item inside the published rolling window.
+    pub fn progression_create_budget(&self, work_item_id: &str) -> Result<ProgressionCreateBudget> {
+        let conn = self.connect()?;
+        let max = metadata_i64(
+            &conn,
+            boss_engine_storage_values::progression::METADATA_KEY_MAX_CREATES_PER_ITEM_WINDOW,
+            i64::from(boss_engine_storage_values::progression::DEFAULT_MAX_CREATES_PER_ITEM_WINDOW),
+        )?;
+        let window_secs = metadata_i64(
+            &conn,
+            boss_engine_storage_values::progression::METADATA_KEY_MAX_CREATES_WINDOW_SECS,
+            boss_engine_storage_values::progression::DEFAULT_MAX_CREATES_WINDOW_SECS,
+        )?;
+        let used: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM (
+                 SELECT created.id FROM tasks created
+                 WHERE created.parent_task_id = ?1
+                   AND created.created_via LIKE 'progression:%'
+                   AND created.deleted_at IS NULL
+                   AND CAST(created.created_at AS INTEGER)
+                       > CAST(strftime('%s','now') AS INTEGER) - ?2
+                 UNION
+                 SELECT created.id FROM work_item_dependencies d
+                 JOIN tasks created ON created.id = d.prerequisite_id
+                 WHERE d.dependent_id = ?1
+                   AND created.created_via LIKE 'progression:%'
+                   AND created.deleted_at IS NULL
+                   AND CAST(created.created_at AS INTEGER)
+                       > CAST(strftime('%s','now') AS INTEGER) - ?2
+             )",
+            params![work_item_id, window_secs],
+            |row| row.get(0),
+        )?;
+        Ok(ProgressionCreateBudget { used, max, window_secs })
+    }
+}
+
+fn metadata_i64(conn: &Connection, key: &str, fallback: i64) -> Result<i64> {
+    let stored: Option<String> = conn
+        .query_row("SELECT value FROM metadata WHERE key = ?1", [key], |row| row.get(0))
+        .optional()?;
+    Ok(stored.and_then(|value| value.parse().ok()).unwrap_or(fallback))
+}

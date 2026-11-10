@@ -1,0 +1,20 @@
+[package]
+name = "boss-progression-brief"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+anyhow = { workspace = true }
+bon = { workspace = true }
+boss-engine-storage-values = { path = "../storage-values" }
+boss-protocol = { path = "../../protocol" }
+boss-work-db = { path = "../work-db" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+boss-work-db = { path = "../work-db", features = ["test-support"] }
+regex = { workspace = true }
+tempfile = { workspace = true }

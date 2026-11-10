@@ -1309,6 +1309,7 @@ dependencies = [
  "boss-pr-review",
  "boss-pr-review-sources",
  "boss-pr-template",
+ "boss-progression-brief",
  "boss-prose-vocabulary",
  "boss-protocol",
  "boss-review-guide",
@@ -1552,6 +1553,22 @@ dependencies = [
 name = "boss-pr-template"
 version = "0.1.0"
 dependencies = [
+ "tempfile",
+]
+
+[[package]]
+name = "boss-progression-brief"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bon",
+ "boss-engine-storage-values",
+ "boss-protocol",
+ "boss-work-db",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
 ]
 

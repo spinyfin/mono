@@ -31,6 +31,7 @@ RUNNER_DEPS = [
     "//tools/boss/engine/review-guide",
     "//tools/boss/tmux",
     "//tools/boss/engine/work-db",
+    "//tools/boss/engine/progression-brief",
     "//lib/rust/git_utils",
 ]
 
@@ -58,6 +59,7 @@ rust_library(
         "//tools/boss/engine/pane-summary:pane_summary_test_support": "boss_pane_summary",
         "//tools/boss/engine/work-db:work_db_test_support": "boss_work_db",
         "//tools/boss/engine/execution-contracts:execution_contracts_test_support": "boss_execution_contracts",
+        "//tools/boss/engine/progression-brief:progression_brief_test_support": "boss_progression_brief",
     },
     compile_data = ["//:CHECKS.yaml"],
     crate_features = ["test-support"],
@@ -74,9 +76,11 @@ rust_library(
         "//tools/boss/engine/pane-summary",
         "//tools/boss/engine/work-db",
         "//tools/boss/engine/execution-contracts",
+        "//tools/boss/engine/progression-brief",
     ]] + [
         "//tools/boss/engine/execution-contracts:execution_contracts_test_support",
         "//tools/boss/engine/pane-summary:pane_summary_test_support",
+        "//tools/boss/engine/progression-brief:progression_brief_test_support",
         "//tools/boss/engine/work-db:work_db_test_support",
     ] + all_crate_deps(normal = True),
 )
@@ -90,6 +94,8 @@ rust_test(
         "//tools/boss/engine/work-db": "boss_work_db_production",
         "//tools/boss/engine/pane-summary": "boss_pane_summary_production",
         "//tools/boss/engine/work-db:work_db_test_support": "boss_work_db",
+        "//tools/boss/engine/progression-brief": "boss_progression_brief_production",
+        "//tools/boss/engine/progression-brief:progression_brief_test_support": "boss_progression_brief",
     },
     crate = ":execution-runner",
     edition = "2024",
@@ -100,6 +106,7 @@ rust_test(
     ),
     deps = [
         "//tools/boss/engine/pane-summary:pane_summary_test_support",
+        "//tools/boss/engine/progression-brief:progression_brief_test_support",
         "//tools/boss/engine/prose-vocabulary",
         "//tools/boss/engine/work-db:work_db_test_support",
     ] + all_crate_deps(

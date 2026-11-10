@@ -1129,6 +1129,7 @@ mod compose_worker_spawn_tests {
             ExecutionKind::PrReview,
             ExecutionKind::AutomationTriage,
             ExecutionKind::AnswerAgent,
+            ExecutionKind::Progression,
         ] {
             assert_eq!(
                 prompt_addendum_to_prepend(&kind, addendum),
@@ -1316,6 +1317,62 @@ mod compose_worker_spawn_tests {
                 composed.prompt_text.lines().next(),
             );
         }
+    }
+
+    /// A progression spawn renders the diagnosis packet and skips the
+    /// bookmark-recovery block: the worker holds no checkout.
+    #[tokio::test]
+    async fn progression_spawn_uses_diagnosis_packet_and_skips_bookmark_instructions() {
+        use crate::test_support::{create_test_chore_manual, create_test_product_named};
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        let product = create_test_product_named(&db, "Progression prompt");
+        let chore = create_test_chore_manual(&db, &product.id, "Lease failed");
+        db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET status = 'active' WHERE id = ?1", [&chore.id])
+            .unwrap();
+        assert!(
+            db.bounce_dispatch_failed_to_backlog(&chore.id, "cube_workspace_lease_failed", "cube refused the lease")
+                .unwrap()
+        );
+        let execution = WorkExecution::builder()
+            .id("exec_prog_01")
+            .work_item_id(chore.id.clone())
+            .kind(ExecutionKind::Progression)
+            .status(ExecutionStatus::Running)
+            .repo_remote_url("git@github.com:org/repo.git")
+            .workspace_path("/tmp/workspace")
+            .created_at("2026-05-15T00:00:00Z")
+            .build();
+        let composed = compose_worker_spawn(
+            &db,
+            "worker-1",
+            &execution,
+            &db.get_work_item(&chore.id).unwrap(),
+            workspace.path(),
+            None,
+            WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
+        )
+        .await
+        .unwrap();
+        assert_bazel_caching_rule(&composed.prompt_text);
+        assert!(
+            composed.prompt_text.contains("# Progression diagnosis"),
+            "{}",
+            composed.prompt_text
+        );
+        assert!(
+            composed.prompt_text.contains("stuck: S1_dispatch_failure"),
+            "{}",
+            composed.prompt_text
+        );
+        assert!(composed.prompt_text.contains("## Verb catalogue"));
+        assert!(
+            !composed.prompt_text.contains("## Workspace state"),
+            "progression holds no checkout, so bookmark-recovery instructions must not be prepended:\n{}",
+            composed.prompt_text
+        );
     }
 
     /// A `Product`-scoped execution picks up the product's

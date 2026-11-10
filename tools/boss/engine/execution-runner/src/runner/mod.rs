@@ -1,5 +1,6 @@
 pub(crate) mod answer_agent_prompt;
 pub mod pane_spawn;
+pub(crate) mod progression_prompt;
 pub(crate) mod prompt;
 pub(crate) mod review_brief;
 pub(crate) mod review_guide_prompt;

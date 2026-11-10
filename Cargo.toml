@@ -76,6 +76,7 @@ members = [
   "tools/boss/engine/pr-review-sources",
   "tools/boss/engine/review-guide",
   "tools/boss/engine/proposal-validation",
+  "tools/boss/engine/progression-brief",
   "tools/boss/engine/recovery",
   "tools/boss/engine/recovery-fixtures",
   "tools/boss/engine/worker-bin",
