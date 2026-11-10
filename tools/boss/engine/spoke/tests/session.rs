@@ -32,23 +32,7 @@ async fn actual_daemon_reconnects_replays_and_recovers_command_receipt_after_sig
     let mut hub = Fixture::new().await;
     let daemon = hub.start();
     let mut first = hub.connection().await;
-    assert_eq!(
-        first.hello.features,
-        vec![
-            v1::Feature {
-                name: "journal".into(),
-                revision: 1
-            },
-            v1::Feature {
-                name: "workspace".into(),
-                revision: 1
-            },
-            v1::Feature {
-                name: "execution".into(),
-                revision: 1
-            }
-        ]
-    );
+    assert_eq!(first.hello.features, boss_spoke_outbound::executor_contracts().features);
     let identity = first.hello.journal_id.clone();
     let boot = first.hello.boot_id.clone();
     first.welcome(0).await;
@@ -607,6 +591,78 @@ printf '%s\n' '{"repos":[]}'
     let mut connection = hub.connection().await;
     connection.welcome(result_record.sequence - 1).await;
     assert_eq!(connection.next().await, spoke_frame::Body::Record(result_record));
+}
+
+#[tokio::test]
+async fn actual_daemon_offers_reset_release_and_dispatches_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut hub = Fixture::new().await;
+    let cube = hub.dir.path().join("cube-fixture");
+    let seen = hub.dir.path().join("reset-release.seen");
+    std::fs::write(
+        &cube,
+        format!(
+            r#"#!/bin/sh
+if [ "$*" = "--json workspace list" ]; then
+printf '%s\n' '{{"workspaces":[{{"repo":"repo","workspace_id":"worker","workspace_path":"/tmp/unused","state":"leased","lease_id":"lease","task":"boss-spoke:exec1:run1:1:token"}}]}}'
+exit 0
+fi
+if [ "$*" = "--json workspace release --lease lease --force-reset" ]; then
+touch '{seen}'
+printf '%s\n' '{{}}'
+exit 0
+fi
+exit 9
+"#,
+            seen = seen.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&cube, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let daemon = hub.start_with_cube(&cube);
+    let mut connection = hub.connection().await;
+    assert_eq!(
+        connection.hello.features,
+        boss_spoke_outbound::executor_contracts().features
+    );
+    assert!(connection.hello.features.iter().any(|feature| {
+        feature.name == boss_protocol_spoke::negotiate::feature::WORKSPACE_RESET_RELEASE && feature.revision == 1
+    }));
+    connection.welcome(0).await;
+    let request = v1::Command {
+        sequence: 1,
+        command_id: "reset-release".into(),
+        not_after_unix_ms: i64::MAX,
+        run: Some(v1::Run {
+            execution_id: "exec1".into(),
+            run_id: "run1".into(),
+            spawn_token: "token".into(),
+            assignment_generation: 1,
+        }),
+        body: Some(command::Body::Workspace(v1::WorkspaceOp {
+            kind: v1::WorkspaceKind::ReleaseWithReset.into(),
+            repo_id: "repo".into(),
+            workspace_id: "worker".into(),
+            lease_id: "lease".into(),
+            ..Default::default()
+        })),
+    };
+    connection.send(hub_frame::Body::Command(request)).await;
+    let result_record = loop {
+        if let spoke_frame::Body::Record(record) = connection.next().await {
+            if matches!(record.body, Some(record::Body::Result(_))) {
+                break record;
+            }
+            connection.receipt(record.sequence).await;
+        }
+    };
+    let Some(record::Body::Result(result)) = &result_record.body else {
+        unreachable!()
+    };
+    assert_eq!(result.code, v1::ResultCode::Ok as i32, "{}", result.reason);
+    assert!(seen.is_file(), "reset release must reach cube --force-reset");
+    drop(connection);
+    drop(daemon);
 }
 
 #[tokio::test]

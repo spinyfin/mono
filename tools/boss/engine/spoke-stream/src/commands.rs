@@ -20,8 +20,12 @@ pub enum CommandOutcome {
     Busy,
     #[error("invalid or unnegotiated command; command not submitted")]
     Invalid,
+    #[error("host did not negotiate workspace-reset-release/1; reset release not submitted")]
+    ResetReleaseUnsupported,
     #[error("outcome uncertain; reconcile using the same command ID")]
     OutcomeUncertain,
+    #[error("outbox refused command; command not submitted")]
+    NotSubmitted,
 }
 
 impl StreamManager {
@@ -76,7 +80,11 @@ impl StreamManager {
             };
         }
         if !supported(&command, &connection.session.selection) {
-            return Err(Invalid);
+            return Err(if reset_release(&command) {
+                ResetReleaseUnsupported
+            } else {
+                Invalid
+            });
         }
         connection.waiters.retain(|_, sender| !sender.is_closed());
         if connection.waiters.len() >= self.0.config.max_pending || connection.waiters.contains_key(&command.command_id)
@@ -88,9 +96,12 @@ impl StreamManager {
         let (tx, rx) = oneshot::channel();
         connection.waiters.insert(id.clone(), tx);
         let storage = &self.0.storage.outbox;
-        if storage.append(host_id, admission, command).await.is_err() {
+        if let Err(error) = storage.append(host_id, admission, command).await {
             connection.waiters.remove(&id);
-            return Err(OutcomeUncertain);
+            return Err(match error {
+                crate::store::StoreError::Denied | crate::store::StoreError::Full => NotSubmitted,
+                _ => OutcomeUncertain,
+            });
         }
         if let Ok(Some(result)) = storage.completed(host_id, &id).await {
             connection.waiters.remove(&id);
@@ -112,6 +123,14 @@ pub(crate) fn supported(command: &Command, selection: &boss_protocol_spoke::nego
             .all(|feature| selection.revision(&feature.name) == Some(feature.revision)),
         Some(command::Body::Capture(_)) => selection.has(feature::PANE_CAPTURE),
         Some(command::Body::Upgrade(_)) => selection.has(feature::UPGRADE),
+        Some(command::Body::Workspace(_)) if reset_release(command) => {
+            selection.revision(feature::WORKSPACE_RESET_RELEASE) == Some(1)
+        }
         _ => true,
     }
+}
+
+fn reset_release(command: &Command) -> bool {
+    matches!(&command.body, Some(command::Body::Workspace(op))
+        if op.kind == boss_protocol_spoke::v1::WorkspaceKind::ReleaseWithReset as i32)
 }

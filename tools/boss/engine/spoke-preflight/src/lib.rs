@@ -490,6 +490,23 @@ mod tests {
         let path = temp.path().join(name);
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        // Tests run in parallel threads; a sibling's fork can briefly inherit the
+        // write fd and make exec fail with ETXTBSY on Linux. Wait until the
+        // script is executable so the probe under test never sees that race.
+        for _ in 0..200 {
+            let spawned = std::process::Command::new(&path)
+                .arg("--version")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            match spawned {
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => break,
+            }
+        }
         (temp, path)
     }
 

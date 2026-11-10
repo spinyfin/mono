@@ -30,6 +30,61 @@ async fn spawn_cannot_require_an_unnegotiated_feature() {
 }
 
 #[tokio::test]
+async fn old_peer_refuses_reset_submission_and_skips_reset_replay_without_losing_controls() {
+    use boss_protocol_spoke::negotiate::feature;
+    use boss_spoke_stream::store::CommandOutbox;
+    let fx = Fixture::new().await;
+    let mut reset = command("reset");
+    reset.body = Some(command::Body::Workspace(WorkspaceOp {
+        kind: WorkspaceKind::ReleaseWithReset.into(),
+        repo_id: "repo".into(),
+        workspace_id: "workspace".into(),
+        lease_id: "lease".into(),
+        ..Default::default()
+    }));
+    // An outstanding command from a newer connection must never reach the old
+    // daemon, whose enum validator would terminate the transport.
+    fx.store
+        .append("host", CommandAdmission::Start, reset.clone())
+        .await
+        .unwrap();
+    let mut old = hello();
+    old.features.retain(|f| f.name != feature::WORKSPACE_RESET_RELEASE);
+    let mut peer = fx.connect(old).await.unwrap();
+    peer.welcome().await;
+    let mut new_reset = reset.clone();
+    new_reset.command_id = "new-reset".into();
+    assert_eq!(
+        fx.manager
+            .command("host", CommandAdmission::Start, new_reset, STEP)
+            .await,
+        Err(CommandOutcome::ResetReleaseUnsupported)
+    );
+    let manager = fx.manager.clone();
+    let waiting = tokio::spawn(async move {
+        manager
+            .command("host", CommandAdmission::Start, command("stop"), STEP)
+            .await
+    });
+    expect_command(&mut peer, "stop", 1).await;
+    receipt(&peer, 1).await;
+    let mut completed = record(1);
+    completed.body = Some(record::Body::Result(CommandResult {
+        command_id: "stop".into(),
+        code: ResultCode::Ok.into(),
+        value: Some(command_result::Value::Completed(Empty {})),
+        ..Default::default()
+    }));
+    peer.send(spoke_frame::Body::Record(completed)).await;
+    assert_eq!(waiting.await.unwrap().unwrap().code, ResultCode::Ok as i32);
+    assert_eq!(
+        fx.store.completed("host", "reset").await.unwrap().unwrap().code,
+        ResultCode::Rejected as i32
+    );
+    assert_eq!(fx.store.outbox.lock().unwrap().commands.len(), 2);
+}
+
+#[tokio::test]
 async fn revocation_closes_response_while_command_storage_is_busy() {
     let fx = Fixture::new().await;
     let mut peer = fx.connect(hello()).await.unwrap();

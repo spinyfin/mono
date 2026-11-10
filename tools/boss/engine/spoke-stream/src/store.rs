@@ -1,6 +1,6 @@
 //! Hub-owned durable transactions. Implementations must offload blocking DB I/O.
-//! No network write occurs while a transaction is held. Errors never imply a
-//! command was not committed: callers reconcile by its stable command ID.
+//! No network write occurs while a transaction is held. Denied and Full from
+//! append guarantee no commit; other errors require reconciliation by command ID.
 //! Operations must be cancellation-safe and bounded: dropped futures cannot
 //! roll back a committed request or leave a transaction/lock alive indefinitely.
 

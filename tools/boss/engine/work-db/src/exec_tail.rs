@@ -177,19 +177,21 @@ impl WorkDb {
 
     /// Only one releaser may call cube for an execution's expected lease.
     pub fn claim_execution_workspace_release(&self, execution_id: &str, lease_id: &str) -> Result<bool> {
-        let conn = self.connect()?;
-        let claimed = conn.execute(
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let claimed = tx.execute(
             "UPDATE work_executions SET cube_lease_id = NULL
              WHERE id = ?1 AND cube_lease_id = ?2",
             params![execution_id, lease_id],
         )? == 1;
         if claimed {
             // The legacy destination's hold ends with its lease.
-            conn.execute(
+            tx.execute(
                 "DELETE FROM legacy_destinations WHERE execution_id = ?1",
                 [execution_id],
             )?;
         }
+        tx.commit()?;
         Ok(claimed)
     }
 

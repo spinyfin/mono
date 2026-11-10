@@ -5,10 +5,8 @@
 //! A workspace is addressed by the id and lease the host granted, and the host
 //! checks both against its own registry and against the run that holds them.
 //!
-//! Only two operations use stable command ids: the lease and the spawn. A retry
-//! of either must find the command it already stored instead of acquiring or
-//! starting something a second time. Every other operation is a fresh command,
-//! and an uncertain one is reconciled by the caller rather than blindly resent.
+//! Lease, spawn and release retries reuse their durable commands. Read-only
+//! status probes reuse an unanswered request and refresh after it settles.
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -26,7 +24,7 @@ use boss_work_db::SpokeAssignment;
 use prost::Message;
 use serde::de::DeserializeOwned;
 
-use crate::{HostCallError, SpokeHostAdapter, expect_ok, request_digest, run_of};
+use crate::{SpokeHostAdapter, expect_ok, request_digest, run_of};
 
 /// Keep a task label within what the host accepts without dropping its start.
 fn clip(text: &str, max: usize) -> String {
@@ -48,6 +46,7 @@ fn non_empty(text: &str) -> Option<String> {
 /// How a release ends the lease.
 pub(crate) enum ReleaseMode {
     Normal,
+    Reset,
     Force(String),
 }
 
@@ -218,7 +217,7 @@ impl SpokeHostAdapter {
             Ok(result) => result,
             Err(error) => {
                 // A command that was never stored cannot have leased anything.
-                if matches!(error, HostCallError::NotSent { .. }) && self.hub_command_unknown(&id).await? {
+                if self.hub_command_unknown(&id).await? {
                     self.set_doubt(&assignment, false).await?;
                 }
                 return Err(error.into());
@@ -312,7 +311,12 @@ impl SpokeHostAdapter {
             "lease {lease_id} is not the lease of assignment {}",
             assignment.run_id
         );
-        let mut op = Self::op(assignment, if force { Kind::ForceRelease } else { Kind::Release }, true)?;
+        let (name, kind) = match &mode {
+            ReleaseMode::Normal => ("release", Kind::Release),
+            ReleaseMode::Reset => ("release_reset", Kind::ReleaseWithReset),
+            ReleaseMode::Force(_) => ("force_release", Kind::ForceRelease),
+        };
+        let mut op = Self::op(assignment, kind, true)?;
         if let ReleaseMode::Force(reason) = &mode {
             op.reason = if reason.is_empty() {
                 "force release requested by the hub".to_owned()
@@ -320,8 +324,38 @@ impl SpokeHostAdapter {
                 clip(reason, 4000)
             };
         }
-        self.send(if force { "force_release" } else { "release" }, assignment, op, None)
+        let id = self
+            .hub
+            .current_attempt(
+                self.host_name(),
+                &format!("{name}-{}-{lease_id}", assignment.run_id),
+                |result| result.code != ResultCode::Ok as i32,
+            )
             .await?;
+        let result = self
+            .hub
+            .send_stable(
+                self.host_name(),
+                name,
+                id,
+                Some(run_of(assignment)),
+                command::Body::Workspace(op),
+                self.hub.config.command_deadline,
+            )
+            .await?;
+        if let Err(error) = expect_ok(self.host_name(), name, result) {
+            // A settled uncertain attempt can have ended the lease before cube
+            // returned an error. A fresh attempt then cannot pass ownership.
+            // Resolve only after the host's complete registry proves it gone.
+            if self
+                .ws_list_workspaces()
+                .await?
+                .iter()
+                .any(|status| status.lease_id.as_deref() == Some(lease_id))
+            {
+                return Err(error.into());
+            }
+        }
         let (execution, generation) = (assignment.execution_id.clone(), assignment.assignment_generation);
         let resolution = if force { "force_released" } else { "released" };
         self.db(move |db| db.resolve_spoke_assignment(&execution, generation, resolution))
@@ -364,7 +398,25 @@ impl SpokeHostAdapter {
 
     pub(crate) async fn ws_status(&self, assignment: &SpokeAssignment) -> Result<CubeWorkspaceStatus> {
         let op = Self::op(assignment, Kind::Status, true)?;
-        json(&self.send("status", assignment, op, None).await?, "status")
+        let result = self
+            .hub
+            .send_probe(
+                self.host_name(),
+                "status",
+                format!("status-{}", assignment.run_id),
+                run_of(assignment),
+                command::Body::Workspace(op),
+                self.hub.config.command_deadline,
+            )
+            .await?;
+        json(
+            &Self::workspace_value(
+                self.host_name(),
+                "status",
+                expect_ok(self.host_name(), "status", result)?,
+            )?,
+            "status",
+        )
     }
 
     pub(crate) async fn ws_create_change(&self, assignment: &SpokeAssignment, title: &str) -> Result<CubeChangeHandle> {
@@ -439,6 +491,12 @@ impl SpokeHostAdapter {
         fill: impl FnOnce(&mut WorkspaceOp),
     ) -> Result<WorkspaceResult> {
         self.owned_record(record)?;
+        ensure!(
+            record.execution_id == assignment.execution_id,
+            "recovery record belongs to execution {}, not {}",
+            record.execution_id,
+            assignment.execution_id
+        );
         let mut op = Self::op(assignment, kind, addresses_lease)?;
         op.bookmark = Some(Self::wire_bookmark(assignment, record)?);
         fill(&mut op);

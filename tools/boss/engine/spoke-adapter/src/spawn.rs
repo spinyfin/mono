@@ -87,6 +87,12 @@ fn pane_in(result: &CommandResult) -> Option<WorkerPane> {
     }
 }
 
+enum ControlId {
+    Fresh,
+    StableUntilOk(String),
+    Refreshing(String),
+}
+
 impl SpokeHostAdapter {
     pub(crate) async fn spawn(
         &self,
@@ -261,17 +267,18 @@ impl SpokeHostAdapter {
         deadline: Duration,
         body: command::Body,
     ) -> Result<std::result::Result<CommandResult, ControlOutcome>> {
-        self.control_with(execution_id, name, deadline, body, None).await
+        self.control_with(execution_id, name, deadline, body, ControlId::Fresh)
+            .await
     }
 
-    /// `stable_id` names a command whose retry must reuse the stored one.
+    /// The caller chooses whether completion is reusable or needs a fresh observation.
     async fn control_with(
         &self,
         execution_id: &str,
         name: &'static str,
         deadline: Duration,
         body: command::Body,
-        stable_id: Option<String>,
+        policy: ControlId,
     ) -> Result<std::result::Result<CommandResult, ControlOutcome>> {
         let Some(assignment) = self.control_target(execution_id).await? else {
             return Ok(Err(ControlOutcome::NotSubmitted(format!(
@@ -279,14 +286,27 @@ impl SpokeHostAdapter {
                 self.host_name()
             ))));
         };
-        let sent = match stable_id {
-            Some(prefix) => {
+        let sent = match policy {
+            ControlId::Refreshing(prefix) => {
+                return Ok(Ok(self
+                    .hub
+                    .send_probe(
+                        self.host_name(),
+                        name,
+                        format!("{prefix}-{}", assignment.run_id),
+                        run_of(&assignment),
+                        body,
+                        deadline,
+                    )
+                    .await?));
+            }
+            ControlId::StableUntilOk(prefix) => {
                 let id = self.stable_control_id(&assignment, &prefix).await?;
                 self.hub
                     .send_stable(self.host_name(), name, id, Some(run_of(&assignment)), body, deadline)
                     .await
             }
-            None => {
+            ControlId::Fresh => {
                 let id = self.hub.unique_id(name, &assignment.run_id);
                 self.hub
                     .send(self.host_name(), name, id, Some(run_of(&assignment)), body, deadline)
@@ -381,7 +401,7 @@ impl SpokeHostAdapter {
                     "stop",
                     deadline,
                     command::Body::Stop(Stop { grace_ms }),
-                    Some(format!("stop-{grace_ms}")),
+                    ControlId::StableUntilOk(format!("stop-{grace_ms}")),
                 )
                 .await?
             {
@@ -399,11 +419,12 @@ impl SpokeHostAdapter {
             return Ok(None);
         }
         let sent = self
-            .control(
+            .control_with(
                 execution_id,
                 "adopt",
                 self.hub.config.command_deadline,
                 command::Body::Adopt(Empty {}),
+                ControlId::Refreshing("adopt".to_owned()),
             )
             .await?;
         match sent {

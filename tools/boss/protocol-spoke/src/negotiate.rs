@@ -33,6 +33,7 @@ pub mod feature {
     pub const ARTIFACT: &str = "artifact";
     pub const PANE_CAPTURE: &str = "pane-capture";
     pub const UPGRADE: &str = "upgrade";
+    pub const WORKSPACE_RESET_RELEASE: &str = "workspace-reset-release";
 }
 
 /// Features without which no execution traffic is possible. A peer missing one
@@ -50,7 +51,11 @@ pub const REQUIRED_FEATURES: [&str; 8] = [
 
 /// Negotiated per connection when both sides offer them; a mixed-version
 /// connection keeps execution without them.
-pub const OPTIONAL_FEATURES: [&str; 2] = [feature::PANE_CAPTURE, feature::UPGRADE];
+pub const OPTIONAL_FEATURES: [&str; 3] = [
+    feature::PANE_CAPTURE,
+    feature::UPGRADE,
+    feature::WORKSPACE_RESET_RELEASE,
+];
 
 /// `Reject.code` values.
 pub mod reject_code {

@@ -127,7 +127,7 @@ mod session {
     use super::{
         SharedJournal,
         codec::{RawCodec, Received, record_frame},
-        contracts, hello, locked, network, status,
+        contracts, executor_contracts, hello, locked, network, status,
     };
 
     const DEADLINE: Duration = Duration::from_secs(20);
@@ -202,18 +202,13 @@ mod session {
             .max_encoding_message_size(MAX_FRAME_BYTES as usize);
         grpc.ready().await.map_err(network)?;
         let (tx, rx) = mpsc::channel(2);
+        let selected_contracts = if external_executor {
+            executor_contracts()
+        } else {
+            contracts()
+        };
         let mut hello = hello(&*locked(journal)?, &stamp()?.boot_id, nonce)?;
-        let mut selected_contracts = contracts();
-        if external_executor {
-            for name in ["workspace", "execution"] {
-                selected_contracts.features.push(v1::Feature {
-                    name: name.into(),
-                    revision: 1,
-                });
-                selected_contracts.required.push(name.into());
-            }
-            hello.features = selected_contracts.features.clone();
-        }
+        hello.features = selected_contracts.features.clone();
         send(
             &tx,
             control(spoke_frame::Body::Hello(hello.clone())),
@@ -399,7 +394,7 @@ mod session {
 
 use anyhow::{Result, ensure};
 use boss_protocol_spoke::{
-    negotiate::{Contracts, EPOCH},
+    negotiate::{Contracts, EPOCH, OPTIONAL_FEATURES, feature},
     v1::{Feature, Hello, Stamp},
 };
 use boss_spoke_journal::Journal;
@@ -416,11 +411,32 @@ pub fn contracts() -> Contracts {
         min_epoch: EPOCH,
         max_epoch: EPOCH,
         features: vec![Feature {
-            name: "journal".into(),
+            name: feature::JOURNAL.into(),
             revision: 1,
         }],
-        required: vec!["journal".into()],
+        required: vec![feature::JOURNAL.into()],
     }
+}
+
+/// Features offered when a workspace executor is attached. Keep this list in
+/// lockstep with executor support: every workspace op that needs a negotiated
+/// feature is advertised from here, so Hello and the executor cannot drift.
+/// Protocol-optional names stay optional; the rest are required.
+const EXECUTOR_FEATURES: &[&str] = &[feature::WORKSPACE, feature::EXECUTION, feature::WORKSPACE_RESET_RELEASE];
+
+/// Journal contracts plus the executor-backed workspace/execution set.
+pub fn executor_contracts() -> Contracts {
+    let mut contracts = contracts();
+    for &name in EXECUTOR_FEATURES {
+        contracts.features.push(Feature {
+            name: name.into(),
+            revision: 1,
+        });
+        if !OPTIONAL_FEATURES.contains(&name) {
+            contracts.required.push(name.into());
+        }
+    }
+    contracts
 }
 
 pub fn hello(journal: &Journal, boot_id: &str, nonce: &[u8]) -> Result<Hello> {
@@ -508,5 +524,42 @@ pub(crate) fn status(error: tonic::Status) -> anyhow::Error {
         | tonic::Code::Aborted
         | tonic::Code::AlreadyExists => network(error),
         _ => error.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use boss_protocol_spoke::negotiate::feature;
+
+    #[test]
+    fn executor_hello_offers_reset_release_from_the_shared_list() {
+        let offered = executor_contracts();
+        assert!(
+            offered
+                .features
+                .iter()
+                .any(|item| item.name == feature::WORKSPACE_RESET_RELEASE && item.revision == 1),
+            "executor Hello must advertise workspace-reset-release/1"
+        );
+        assert!(offered.required.iter().any(|name| name == feature::WORKSPACE));
+        assert!(offered.required.iter().any(|name| name == feature::EXECUTION));
+        assert!(
+            !offered
+                .required
+                .iter()
+                .any(|name| name == feature::WORKSPACE_RESET_RELEASE),
+            "reset-release stays optional so older hubs can still connect"
+        );
+        assert_eq!(
+            offered.features.len(),
+            contracts().features.len() + EXECUTOR_FEATURES.len()
+        );
+        assert!(
+            !contracts()
+                .features
+                .iter()
+                .any(|item| item.name == feature::WORKSPACE_RESET_RELEASE)
+        );
     }
 }

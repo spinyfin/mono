@@ -482,6 +482,17 @@ impl Fixture {
 
     /// Connect a scripted spoke that has already produced `last_record` records.
     pub async fn spoke(&self, script: Script, command_cursor: Option<Cursor>, last_record: u64) -> Peer {
+        self.spoke_contracts(script, command_cursor, last_record, Contracts::first_release())
+            .await
+    }
+
+    pub async fn spoke_contracts(
+        &self,
+        script: Script,
+        command_cursor: Option<Cursor>,
+        last_record: u64,
+        contracts: Contracts,
+    ) -> Peer {
         let (tx, rx) = mpsc::channel(32);
         tx.send(SpokeFrame {
             body: Some(spoke_frame::Body::Hello(Hello {
@@ -490,7 +501,7 @@ impl Fixture {
                 boot_id: "boot".into(),
                 min_epoch: 1,
                 max_epoch: 1,
-                features: Contracts::first_release().features,
+                features: contracts.features,
                 instance_nonce: vec![1; 16],
                 first_retained: 1,
                 last_record,
