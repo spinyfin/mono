@@ -115,8 +115,8 @@ pub(crate) struct FocusDiagnosis {
     pub(crate) focus: boss_protocol::DispatchFocus,
     pub(crate) targets: Vec<boss_protocol::DispatchFocusTarget>,
     /// `(execution id, work item id, held by focus, launch target)` for each
-    /// ready execution. Guides launch through their owning task.
-    pub(crate) ready: Vec<(String, String, bool, String)>,
+    /// ready execution. `None` when no CLI command launches it.
+    pub(crate) ready: Vec<(String, String, bool, Option<String>)>,
 }
 
 impl FocusDiagnosis {
@@ -135,7 +135,7 @@ impl FocusDiagnosis {
         let held = db.executions_outside_dispatch_focus(&executions, &focus)?;
         for execution in executions {
             let is_held = held.contains(&execution.id);
-            let launch_target = db.owning_work_item_id(&execution.work_item_id);
+            let launch_target = db.launch_command_for(&execution.work_item_id)?;
             ready.push((execution.id, execution.work_item_id, is_held, launch_target));
         }
         Ok(Self { focus, targets, ready })
@@ -169,10 +169,13 @@ impl FocusDiagnosis {
         }
         for (execution_id, work_item_id, held, launch_target) in &self.ready {
             if *held {
+                let bypass = launch_target
+                    .as_ref()
+                    .map(|command| format!(" (`{command}` bypasses focus)"))
+                    .unwrap_or_default();
                 lines.push(format!(
                     "  HELD by focus mode: {execution_id} ({work_item_id}) is outside the focus set — \
-                     wait reason `{}`; it dispatches once focus is cleared or its project/product is added \
-                     (`bossctl agents launch {launch_target}` bypasses focus)",
+                     wait reason `{}`; it dispatches once focus is cleared or its project/product is added{bypass}",
                     boss_protocol::DISPATCH_WAIT_REASON_FOCUS_MODE,
                 ));
             } else if state.active {

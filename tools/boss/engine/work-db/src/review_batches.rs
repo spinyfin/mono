@@ -865,24 +865,29 @@ fn admission_deferred_attention_text(
     pr_url: &str,
 ) -> Result<(&'static str, String)> {
     let root = super::chain_helpers::chain_root(conn, work_item_id)?;
-    let (title, reason) = match pre_merge_dispatch_hold_on(conn, &root)? {
-        Some("focus_mode") => (
-            "Automated reviewer: held by focus mode",
-            "dispatch focus mode excludes this PR. A free review-pool slot alone will not start it",
-        ),
+    let (title, remediation) = match pre_merge_dispatch_hold_on(conn, &root)? {
+        Some("focus_mode") => {
+            let command = super::dispatch::parent_review_command(conn, &root, Some(pr_url))?;
+            (
+                "Automated reviewer: held by focus mode",
+                format!(
+                    "dispatch focus mode excludes this PR. A free review-pool slot alone will not start it. To explicitly start this review through focus mode, run `{command}`. Other dispatch constraints still apply"
+                ),
+            )
+        }
         Some(_) => (
             "Automated reviewer: dispatch paused",
-            "an all-spawns dispatch pause is holding this PR. Resume dispatch to allow automatic review",
+            "an all-spawns dispatch pause is holding this PR. Resume dispatch to allow automatic review".to_owned(),
         ),
         None => (
             "Automated reviewer: waiting for a review-pool slot",
-            "the review-pool reservation capacity is full. Automatic review waits for a free reservation",
+            "the review-pool reservation capacity is full. Automatic review waits for a free reservation".to_owned(),
         ),
     };
     Ok((
         title,
         format!(
-            "Pre-merge review for {pr_url} was deferred because {reason}. To explicitly start this review through focus mode, run `bossctl agents launch {root}`. Other dispatch constraints still apply. Dismiss this item once that pass starts."
+            "Pre-merge review for {pr_url} was deferred because {remediation}. Dismiss this item once that pass starts."
         ),
     ))
 }
@@ -1718,9 +1723,9 @@ impl WorkDb {
             tx.commit()?;
             return Ok(ReviewBatchDispatch::AlreadyReviewed);
         }
-        // Explicit starts are requested by name, never released by the hold, and
-        // their members can still be run with `bossctl agents launch`, so the
-        // hold only defers automatic admission.
+        // Explicit starts skip the hold because admission records launch
+        // intent, which lets their members dispatch through focus on their
+        // own; the hold only defers automatic admission.
         if !explicit && pre_merge_dispatch_hold_on(&tx, &input.cycle_root_id)?.is_some() {
             tx.commit()?;
             return Ok(ReviewBatchDispatch::AdmissionDeferred);

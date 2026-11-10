@@ -1359,18 +1359,35 @@ impl WorkDb {
         };
         let item = execution.as_ref().map_or(id, |e| e.work_item_id.as_str());
         if item.starts_with("prgc_") {
-            let capture = self
-                .get_pr_review_guide_comparison_by_id(item)?
-                .ok_or_else(|| anyhow::anyhow!("unknown review guide item: {item}"))?;
-            bail!(
-                "{item} is a review guide, not a pre-merge review request; start its parent review with `bossctl agents launch {}`",
-                capture.root_task_id
-            );
+            let command = self.launch_command_for(item)?.unwrap_or_default();
+            bail!("{item} is a review guide, not a pre-merge review request; start its parent review with `{command}`");
         }
         if execution.is_some() {
             bail!("{id} is an execution id, not a work item id; run `bossctl agents launch {item}` instead");
         }
         Ok(())
+    }
+
+    /// The CLI command that explicitly starts `id`, or `None` when no
+    /// command the engine accepts starts it (an answer-agent comment has no
+    /// launch verb). A review guide starts through its parent task.
+    pub fn launch_command_for(&self, id: &str) -> Result<Option<String>> {
+        if id.starts_with("cmt_") {
+            return Ok(None);
+        }
+        if !id.starts_with("prgc_") {
+            return Ok(Some(format!("bossctl agents launch {id}")));
+        }
+        let capture = self
+            .get_pr_review_guide_comparison_by_id(id)?
+            .ok_or_else(|| anyhow::anyhow!("unknown review guide item: {id}"))?;
+        let conn = self.connect()?;
+        let pr_url = query_task(&conn, &capture.root_task_id)?.and_then(|task| task.pr_url);
+        Ok(Some(parent_review_command(
+            &conn,
+            &capture.root_task_id,
+            pr_url.as_deref(),
+        )?))
     }
 
     /// An absent execution is distinct from a failed database read.
@@ -2049,6 +2066,20 @@ fn chain_member_ids_on(conn: &Connection, work_item_id: &str) -> Result<Vec<Stri
     member_ids.push(root_id.clone());
     member_ids.extend(collect_chain_revision_ids_including_deleted(conn, &root_id)?);
     Ok(member_ids)
+}
+
+/// The command that explicitly starts the pre-merge review of `root`.
+///
+/// With a nonterminal execution on the root, `agents launch` runs it. With
+/// none (a review that was never admitted), launching the root would only
+/// hit the bound-PR refusal, so the explicit review-admission verb is named.
+pub(crate) fn parent_review_command(conn: &Connection, root: &str, pr_url: Option<&str>) -> Result<String> {
+    let live =
+        query_latest_execution_for_work_item(conn, root)?.is_some_and(|execution| !execution.status.is_terminal());
+    if !live && let Some((owner, repo, number)) = pr_url.and_then(boss_github::pr_url::parse_pr_url_parts) {
+        return Ok(format!("bossctl review start --pr {number} --repo {owner}/{repo}"));
+    }
+    Ok(format!("bossctl agents launch {root}"))
 }
 
 #[cfg(test)]

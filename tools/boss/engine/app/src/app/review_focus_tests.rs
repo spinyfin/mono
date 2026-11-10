@@ -198,3 +198,61 @@ async fn diagnosed_bypass_and_guide_refusal_commands_pass_cli_and_engine() {
         let _ = server.await;
     }
 }
+
+/// The state the attention item is filed in: implementation complete, PR
+/// bound, a review guide pending, and no reviewer ever admitted. Every command
+/// the engine prints for it must start both reviewers when run.
+#[tokio::test]
+async fn never_admitted_review_recovery_command_starts_both_reviewers() {
+    let (state, dir) = focused_state(true);
+    let root = seed(&state, "example/repo", 42);
+    let pr_url = "https://github.com/example/repo/pull/42";
+    let (_, comparison) =
+        boss_work_db::test_support::seed_review_guide_series_for_pr(&state.work_db, &root, pr_url, "base", "head");
+    assert!(state.work_db.list_executions(Some(&root)).unwrap().is_empty());
+
+    state.work_db.file_admission_deferred_attention(&root, pr_url).unwrap();
+    let item = state
+        .work_db
+        .list_open_attention_items_of_kind(boss_work_db::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND)
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("deferred-admission attention filed");
+    let advertised = |text: &str| {
+        text.split('`')
+            .find(|part| part.starts_with("bossctl "))
+            .unwrap_or_else(|| panic!("no command in {text}"))
+            .to_owned()
+    };
+    let command = advertised(&item.body_markdown);
+    let refusal = state.work_db.validate_manual_launch_target(&comparison).unwrap_err();
+    assert_eq!(advertised(&refusal.to_string()), command);
+    assert_eq!(command, "bossctl review start --pr 42 --repo example/repo");
+
+    // The CLI must accept the printed arguments (no usage error); the review
+    // request itself is then served by the engine handler below, because the
+    // CLI's handler fetches PR metadata with `gh`.
+    let unreachable = dir.path().join("none.sock");
+    let mut args = vec!["--socket-path", unreachable.to_str().unwrap()];
+    args.extend(command.split_whitespace().skip(1));
+    let output = cli(&args).await;
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !error.contains("Usage:") && !error.contains("unexpected argument"),
+        "{error}"
+    );
+
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let number: i64 = words[words.iter().position(|w| *w == "--pr").unwrap() + 1]
+        .parse()
+        .unwrap();
+    let repo = words[words.iter().position(|w| *w == "--repo").unwrap() + 1];
+    triggered(request(&state, number, Some(repo), Ok(metadata("head"))).await);
+    let executions = state.work_db.list_executions(Some(&root)).unwrap();
+    assert_eq!(executions.len(), 2);
+    state.execution_coordinator.drain_ready_queue_for_test().await;
+    for execution in executions {
+        wait_running(&state, &execution.id).await;
+    }
+}

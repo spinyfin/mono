@@ -115,6 +115,30 @@ fn launch_target_for_review_item_refuses_and_names_parent_command() {
     db.validate_manual_launch_target(&root).unwrap();
 }
 
+/// A root whose PR is bound but that has no queued reviewer cannot be
+/// launched (the bound-PR refusal), so the guide refusal names the explicit
+/// review-admission verb instead.
+#[test]
+fn guide_refusal_names_review_start_when_no_reviewer_is_queued() {
+    let (_dir, db) = open_db();
+    let (root, _series_id, comparison_id) = seeded_series(&db);
+    db.update_work_item(
+        &root,
+        WorkItemPatch {
+            pr_url: Some("https://github.com/acme/widget/pull/9".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let err = db.validate_manual_launch_target(&comparison_id).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("`bossctl review start --pr 9 --repo acme/widget`"),
+        "{err}"
+    );
+    assert!(!err.to_string().contains("agents launch"), "{err}");
+}
+
 #[test]
 fn launch_target_rejects_non_review_execution_id_naming_work_item() {
     let (_dir, db) = open_db();
