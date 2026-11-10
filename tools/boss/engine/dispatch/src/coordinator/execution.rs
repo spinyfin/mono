@@ -1142,9 +1142,7 @@ impl ExecutionCoordinator {
                 return Err(err);
             }
         };
-        if selected_host.id != boss_protocol::LOCAL_HOST_ID
-            && let Err(err) = self.work_db.record_pre_start_host(&execution.id, &selected_host.id)
-        {
+        if let Err(err) = self.work_db.record_pre_start_host(&execution.id, &selected_host.id) {
             tracing::warn!(execution_id = %execution.id, ?err, "failed to record selected host before start");
         }
         // Resolved per execution so a transport that records which host owns an

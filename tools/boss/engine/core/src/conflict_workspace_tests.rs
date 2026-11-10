@@ -550,6 +550,16 @@ async fn remote_refusal_is_probed_on_the_remote_host_and_recovers_after_a_bookma
     }
     assert_eq!(*remote.gotos.lock().unwrap(), 3, "the remote host was asked each time");
     assert_eq!(
+        publisher
+            .lifecycle_reasons()
+            .await
+            .iter()
+            .filter(|reason| *reason == "conflict_workspace_noted")
+            .count(),
+        1,
+        "the probe-failure note is published once, when it first changes the card"
+    );
+    assert_eq!(
         *local.lease_calls.lock().await,
         0,
         "the local Cube never vouches for a remote host"
@@ -666,7 +676,7 @@ fn resumes_without_a_revision_are_counted_on_the_attempt() {
 }
 
 #[test]
-fn a_changed_failure_reopens_the_resume_budget() {
+fn only_a_changed_host_head_or_base_reopens_the_resume_budget() {
     let dir = tempdir().unwrap();
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
     let (_, attempt, _) = blocked_with_attempt(&db);
@@ -674,14 +684,66 @@ fn a_changed_failure_reopens_the_resume_budget() {
         db.fail_conflict_workspace(&attempt.id, "cube divergence").unwrap();
         assert!(db.resume_conflict_workspace(&attempt.id, None, None).unwrap().is_some());
     }
-    // The same refusal again is held; a different refusal (the bookmark Cube
-    // complained about changed) is a new episode.
+    // A reworded diagnostic on the same host, head and base is the same episode.
     db.fail_conflict_workspace(&attempt.id, "cube cannot find pr/42")
         .unwrap();
-    assert!(db.resume_conflict_workspace(&attempt.id, None, None).unwrap().is_some());
-    db.fail_conflict_workspace(&attempt.id, "cube cannot find pr/42")
+    assert!(db.workspace_resume_paused(&attempt.id, None, None).unwrap());
+    assert!(db.resume_conflict_workspace(&attempt.id, None, None).unwrap().is_none());
+    // The same refusal observed from a different host is a new episode.
+    db.fail_conflict_workspace_on_host(&attempt.id, "cube cannot find pr/42", Some("remote-2"))
         .unwrap();
+    assert!(!db.workspace_resume_paused(&attempt.id, None, None).unwrap());
     assert!(db.resume_conflict_workspace(&attempt.id, None, None).unwrap().is_some());
+}
+
+#[test]
+fn an_unchanged_episode_stays_paused_however_long_it_has_been() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (_, attempt, _) = blocked_with_attempt(&db);
+    for _ in 0..3 {
+        db.fail_conflict_workspace(&attempt.id, "cube divergence").unwrap();
+        assert!(db.resume_conflict_workspace(&attempt.id, None, None).unwrap().is_some());
+    }
+    db.fail_conflict_workspace(&attempt.id, "cube divergence").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    assert!(db.resume_conflict_workspace(&attempt.id, None, None).unwrap().is_none());
+}
+
+#[test]
+fn persistent_rung1_lease_failure_fails_the_attempt_once_and_stops_spinning() {
+    use crate::conflict_ladder::{LadderOutcome, try_mechanical_rungs};
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, chore) = blocked_with_attempt(&db);
+    let publisher = RecordingPublisher::default();
+    let cube = ScriptCube::with_lease_failures(Script::CleanPushed, u32::MAX);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let bound = crate::work::MAX_RUNG1_LEASE_FAILURES;
+    for pass in 1..bound {
+        let outcome = rt.block_on(try_mechanical_rungs(&db, &publisher, &cube, &candidate, &attempt));
+        assert_eq!(outcome, LadderOutcome::MechanicalRungsUnavailable, "pass {pass}");
+        assert!(db.list_attention_items_for_work_item(&chore).unwrap().is_empty());
+    }
+    let outcome = rt.block_on(try_mechanical_rungs(&db, &publisher, &cube, &candidate, &attempt));
+    assert_eq!(outcome, LadderOutcome::WorkspacePreparationFailed);
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert!(crate::work::conflict_workspace_failed(&row), "{row:?}");
+    let items = db.list_attention_items_for_work_item(&chore).unwrap();
+    assert_eq!(items.len(), 1);
+    assert!(
+        items[0].body_markdown.contains("lease boom"),
+        "{}",
+        items[0].body_markdown
+    );
+    assert_eq!(
+        *rt.block_on(cube.lease_calls.lock()),
+        2 * bound as u32,
+        "each pass leases once and retries once; nothing leases after the bound"
+    );
 }
 
 #[test]
@@ -741,4 +803,138 @@ fn a_consumed_churn_stop_is_not_reclassified_again() {
         !db.retain_conflict_revision_workspace_failure(&stopped.id).unwrap(),
         "the revision's failure was already consumed by a recovery"
     );
+}
+
+/// Build a churn-stopped attempt whose revision died on a Cube positioning
+/// refusal, with `host` recorded as the host its execution was scheduled on.
+/// `archive_first` retires the revision as superseded before any recovery.
+fn churn_stop_with_failed_revision(
+    db: &WorkDb,
+    host: Option<&str>,
+    archive_first: bool,
+) -> (ConflictResolution, ConflictResolution, String, String) {
+    use boss_protocol::CreateRevisionInput;
+    let (candidate, first, chore) = blocked_with_attempt(db);
+    let checker = StaticPrStateChecker(PrOpenState::Open);
+    let revision = db
+        .create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(&chore)
+                .description("Resolve merge conflict")
+                .created_via(format!("merge-conflict:{}", first.id))
+                .build(),
+            &checker,
+        )
+        .unwrap();
+    db.set_conflict_resolution_revision_task_id(&first.id, &revision.id)
+        .unwrap();
+    for queued in db.list_executions(Some(&revision.id)).unwrap() {
+        if !queued.status.is_terminal() {
+            db.cancel_execution(&queued.id).unwrap();
+        }
+    }
+    let execution = db
+        .create_execution(
+            crate::work::CreateExecutionInput::builder()
+                .work_item_id(&revision.id)
+                .kind(boss_protocol::ExecutionKind::RevisionImplementation)
+                .status(boss_protocol::ExecutionStatus::Failed)
+                .build(),
+        )
+        .unwrap();
+    if let Some(host) = host {
+        db.record_pre_start_host(&execution.id, host).unwrap();
+    }
+    db.bounce_dispatch_failed_to_backlog(&revision.id, "cube_workspace_positioning_failed", "refused")
+        .unwrap();
+    if archive_first {
+        db.close_moot_revision_task(
+            &revision.id,
+            crate::work::ArchiveProvenance::new(
+                crate::work::ARCHIVE_MECHANISM_CONFLICT_WATCH_SUPERSESSION,
+                "superseded by a newer head",
+            ),
+        )
+        .unwrap();
+    }
+    db.abandon_conflict_resolution_for_supersede(&first.id, "superseded_stale_head")
+        .unwrap();
+    let new_attempt = |base: &str| ConflictResolutionInsertInput {
+        product_id: candidate.product_id.clone(),
+        work_item_id: chore.clone(),
+        pr_url: PR.into(),
+        pr_number: 42,
+        head_branch: "feature".into(),
+        base_branch: "main".into(),
+        head_sha_before: Some("head222".into()),
+        base_sha_at_trigger: Some(base.into()),
+    };
+    // A second same-head attempt also points at the failed revision.
+    let second = db.insert_conflict_resolution(new_attempt("base-two")).unwrap().unwrap();
+    db.set_conflict_resolution_revision_task_id(&second.id, &revision.id)
+        .unwrap();
+    (first, second, chore, revision.id)
+}
+
+fn churn_stop_for(db: &WorkDb, product: &str, chore: &str, bases: &[&str]) -> ConflictResolution {
+    let insert = |base: &str| {
+        db.insert_conflict_resolution(ConflictResolutionInsertInput {
+            product_id: product.into(),
+            work_item_id: chore.into(),
+            pr_url: PR.into(),
+            pr_number: 42,
+            head_branch: "feature".into(),
+            base_branch: "main".into(),
+            head_sha_before: Some("head222".into()),
+            base_sha_at_trigger: Some(base.into()),
+        })
+        .unwrap()
+        .unwrap()
+    };
+    for base in bases {
+        let prior = insert(base);
+        db.abandon_conflict_resolution_for_supersede(&prior.id, "superseded_stale_head")
+            .unwrap();
+    }
+    insert("base111")
+}
+
+#[test]
+fn a_source_revision_archived_before_recovery_is_still_consumed() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (_first, second, chore, _revision) = churn_stop_with_failed_revision(&db, None, true);
+    db.fail_conflict_workspace(&second.id, "refused").unwrap();
+    assert!(
+        db.resume_conflict_workspace(&second.id, Some("head222"), Some("base-two"))
+            .unwrap()
+            .is_some()
+    );
+    db.abandon_conflict_resolution_for_supersede(&second.id, "superseded_stale_head")
+        .unwrap();
+    let stopped = churn_stop_for(&db, &second.product_id, &chore, &["base-three", "base-four"]);
+    assert_eq!(stopped.failure_reason.as_deref(), Some(crate::work::CHURN_GUARD_REASON));
+    assert!(
+        !db.retain_conflict_revision_workspace_failure(&stopped.id).unwrap(),
+        "the earlier attempt's pointer at the consumed revision cannot reopen remediation"
+    );
+}
+
+#[test]
+fn legacy_churn_reclassification_records_the_failing_host() {
+    for (host, expected) in [(Some("remote-1"), Some("remote-1")), (None, None)] {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let (_first, second, chore, revision) = churn_stop_with_failed_revision(&db, host, false);
+        db.abandon_conflict_resolution_for_supersede(&second.id, "superseded_stale_head")
+            .unwrap();
+        let stopped = churn_stop_for(&db, &second.product_id, &chore, &["base-three"]);
+        assert!(db.retain_conflict_revision_workspace_failure(&stopped.id).unwrap());
+        let row = db.get_conflict_resolution(&stopped.id).unwrap().unwrap();
+        assert_eq!(row.revision_task_id.as_deref(), Some(revision.as_str()));
+        assert_eq!(
+            db.conflict_workspace_failure_host(&stopped.id).unwrap().as_deref(),
+            expected
+        );
+    }
 }
