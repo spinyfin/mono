@@ -120,11 +120,18 @@ pub(crate) fn stamp_create_provenance(conn: &Connection, task_id: &str, actor: &
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{create_test_product, open_db};
+    use crate::WorkDb;
+    use crate::test_support::create_test_product;
     use boss_protocol::{
         CreateChoreInput, CreateInvestigationInput, LAST_STATUS_ACTOR_BOOTHBY, LAST_STATUS_ACTOR_BOSS,
         LAST_STATUS_ACTOR_ENGINE, Task, WorkItem, WorkItemPatch,
     };
+
+    fn open_db() -> (tempfile::TempDir, WorkDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        (dir, db)
+    }
 
     fn task_of(item: WorkItem) -> Task {
         match item {

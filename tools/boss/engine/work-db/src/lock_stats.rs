@@ -308,7 +308,9 @@ mod tests {
     #[test]
     fn real_writer_busy_failure_reaches_global_flush_and_counter() {
         let _serial = GLOBAL_TEST.lock().unwrap();
-        let (_dir, db) = crate::test_support::open_db();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let db = crate::WorkDb::open(path).unwrap();
         let holder = db.connect_new().unwrap();
         holder.execute_batch("BEGIN IMMEDIATE").unwrap();
         db.connect().unwrap().busy_timeout(Duration::from_millis(30)).unwrap();

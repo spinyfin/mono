@@ -15,22 +15,16 @@ fn temp_db_path(_label: &str) -> PathBuf {
 /// re-open via `WorkDb::open`). All other tests should use
 /// `temp_db_path` so the database stays in RAM.
 ///
+/// A fresh path opened with `WorkDb::open` is seeded from the migrated test
+/// template. Opening an existing file runs startup, including the migration
+/// ledger check; migration tests must populate that file before opening it.
+///
 /// The returned `TempDir` must be kept alive for as long as the path
 /// is in use — dropping it deletes the backing file.
 fn disk_db_path(label: &str) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::TempDir::new().unwrap();
     let file = format!("boss-{label}-{}.sqlite3", next_id("test"));
     let path = dir.path().join(file);
-    (dir, path)
-}
-
-/// Like [`disk_db_path`], but the file already holds the fully migrated schema,
-/// copied from the shared template. Open it with `WorkDb::open_existing`. Use it
-/// for tests that need a real file but do not exercise the open, migration or
-/// upgrade path; those keep `disk_db_path` and pay for the cold migration.
-fn migrated_disk_db_path(label: &str) -> (tempfile::TempDir, PathBuf) {
-    let (dir, path) = disk_db_path(label);
-    copy_migrated_template(&path);
     (dir, path)
 }
 
@@ -221,10 +215,10 @@ fn make_resolve_scaffold(
     label: &str,
     product_repo: Option<&str>,
 ) -> (tempfile::TempDir, PathBuf, WorkDb, String, String) {
-    // Migrated file so resolve_repo_errors_when_parent_product_is_missing
-    // can open a second raw connection without replaying the migration chain.
-    let (dir, path) = migrated_disk_db_path(label);
-    let db = WorkDb::open_existing(path.clone()).unwrap();
+    // disk_db_path so that resolve_repo_errors_when_parent_product_is_missing
+    // can open a second raw connection to the same database file.
+    let (dir, path) = disk_db_path(label);
+    let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", product_repo);
     let project = db
         .create_project(CreateProjectInput {

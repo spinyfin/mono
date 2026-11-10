@@ -2,8 +2,9 @@ use super::*;
 
 #[test]
 fn inspection_never_migrates_or_waits_for_the_wal_writer() {
-    let (dir, db) = crate::test_support::open_db();
+    let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
+    let db = WorkDb::open(path.clone()).unwrap();
     let writer = db.connect_new().unwrap();
     writer
         .execute_batch("BEGIN IMMEDIATE; UPDATE metadata SET value = value")
@@ -36,7 +37,8 @@ fn inspection_does_not_create_missing_databases() {
 
 #[test]
 fn admitted_queries_do_not_wait_for_the_engine_connection_mutex() {
-    let (_dir, db) = crate::test_support::open_db();
+    let dir = tempfile::tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("state.db")).unwrap();
     let held = db.connect().unwrap();
     let reader = db.query_connection().unwrap();
     assert!(reader.review_batches_for_cycle_root("absent").unwrap().is_empty());
@@ -50,7 +52,8 @@ fn admitted_queries_do_not_wait_for_the_engine_connection_mutex() {
 /// while a writer owns the reservation, including the writable query opener.
 #[test]
 fn concurrent_boards_and_review_accounting_do_not_take_the_writer_lock() {
-    let (_dir, db) = crate::test_support::open_db();
+    let dir = tempfile::tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("state.db")).unwrap();
     let products: Vec<_> = (0..16)
         .map(|i| {
             let product = crate::test_support::create_test_product_named(&db, &format!("product-{i}"));
@@ -100,7 +103,8 @@ fn concurrent_boards_and_review_accounting_do_not_take_the_writer_lock() {
 
 #[test]
 fn board_projections_share_one_snapshot_while_a_writer_commits() {
-    let (_dir, db) = crate::test_support::open_db();
+    let dir = tempfile::tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("state.db")).unwrap();
     let product = crate::test_support::create_test_product_named(&db, "before");
     for i in 0..64 {
         crate::test_support::create_test_chore(&db, &product.id, format!("fixture-{i}"));

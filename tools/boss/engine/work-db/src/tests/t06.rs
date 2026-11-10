@@ -2,8 +2,8 @@ use super::*;
 
 #[test]
 fn list_engine_attempts_zero_limit_does_not_query_attempt_tables() {
-    let (_dir, path) = migrated_disk_db_path("zero-limit-engine-attempts");
-    let db = WorkDb::open_existing(path).unwrap();
+    let (_dir, path) = disk_db_path("zero-limit-engine-attempts");
+    let db = WorkDb::open(path).unwrap();
     db.connect()
         .unwrap()
         .execute_batch(
@@ -26,8 +26,8 @@ fn list_engine_attempts_zero_limit_does_not_query_attempt_tables() {
 /// `task_blocked_signals` row is also cleared.
 #[test]
 fn retry_ci_remediation_resets_counter_and_unblocks_exhausted_parent() {
-    let (_dir, path) = migrated_disk_db_path("ci-retry-resets");
-    let db = WorkDb::open_existing(path.clone()).unwrap();
+    let (_dir, path) = disk_db_path("ci-retry-resets");
+    let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore = create_test_chore_manual(&db, product.id.clone(), "chore-retry");
     let pr_url = "https://github.com/foo/bar/pull/200".to_owned();
@@ -103,8 +103,8 @@ fn retry_ci_remediation_resets_counter_and_unblocks_exhausted_parent() {
 /// and orders by `created_at DESC`.
 #[test]
 fn list_engine_attempts_unions_three_subsystems_with_kind_filter() {
-    let (_dir, path) = migrated_disk_db_path("list-engine-attempts");
-    let db = WorkDb::open_existing(path.clone()).unwrap();
+    let (_dir, path) = disk_db_path("list-engine-attempts");
+    let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore = create_test_chore_manual(&db, product.id.clone(), "chore-attempts");
     let pr_url = "https://github.com/foo/bar/pull/300".to_owned();

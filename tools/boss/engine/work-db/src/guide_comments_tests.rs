@@ -153,7 +153,7 @@ fn guide_comment_context_survives_regeneration_resolution_and_reopen() {
     assert_eq!(readable, new.id);
     assert!(db.get_pr_review_guide_version(&readable).unwrap().is_some());
     assert!(db.get_pr_review_guide_version(&old.id).unwrap().is_some());
-    let reopened = WorkDb::open_existing(dir.path().join("state.db")).unwrap();
+    let reopened = WorkDb::open(dir.path().join("state.db")).unwrap();
     // Reopening must preserve authored evidence even on a resolved comment.
     assert_eq!(
         reopened.list_comments("pr_review_guide", &series, true).unwrap()[0].guide_context,

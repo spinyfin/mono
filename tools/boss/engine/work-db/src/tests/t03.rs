@@ -5,8 +5,8 @@ use super::*;
 /// drags wait their turn.
 #[test]
 fn rescan_orders_candidates_by_updated_at_ascending() {
-    let (_dir, path) = migrated_disk_db_path("rescan-fifo");
-    let db = WorkDb::open_existing(path.clone()).unwrap();
+    let (_dir, path) = disk_db_path("rescan-fifo");
+    let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
     let mut chore_ids = Vec::new();
     for index in 0..3 {
@@ -49,8 +49,8 @@ fn rescan_orders_candidates_by_updated_at_ascending() {
 /// for every later candidate too.
 #[test]
 fn rescan_skips_gated_active_chore_silently() {
-    let (_dir, path) = migrated_disk_db_path("rescan-gated");
-    let db = WorkDb::open_existing(path.clone()).unwrap();
+    let (_dir, path) = disk_db_path("rescan-gated");
+    let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
     let prereq = create_test_chore(&db, product.id.clone(), "Prereq");
     let dependent = create_test_chore(&db, product.id.clone(), "Dependent");

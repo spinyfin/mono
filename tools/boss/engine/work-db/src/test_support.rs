@@ -4,8 +4,6 @@ use boss_protocol::QueueCiEvidence;
 
 #[path = "test_db_template.rs"]
 mod db_template;
-#[cfg(test)]
-pub(crate) use db_template::copy_to as copy_migrated_template;
 pub(crate) use db_template::{open_memory_db, seed_new_file_db};
 
 /// Run a synchronization callback while holding the database connection.

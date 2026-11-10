@@ -2,8 +2,8 @@ use super::*;
 
 #[test]
 fn open_remediation_snapshot_is_compact_complete_and_recovers_exhaustion() {
-    let (_dir, path) = migrated_disk_db_path("open-remediation");
-    let db = WorkDb::open_existing(path).unwrap();
+    let (_dir, path) = disk_db_path("open-remediation");
+    let db = WorkDb::open(path).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore = create_test_chore_manual(&db, product.id.clone(), "open PR");
     let pr_url = "https://github.com/foo/bar/pull/42";
@@ -87,8 +87,8 @@ fn open_remediation_snapshot_is_compact_complete_and_recovers_exhaustion() {
 /// signal is still armed after a fix revision spawned.
 #[test]
 fn ci_card_state_matches_open_snapshot_for_every_parent_shape() {
-    let (_dir, path) = migrated_disk_db_path("ci-card-state");
-    let db = WorkDb::open_existing(path).unwrap();
+    let (_dir, path) = disk_db_path("ci-card-state");
+    let db = WorkDb::open(path).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore = create_test_chore_manual(&db, product.id.clone(), "open PR");
     let pr_url = "https://github.com/foo/bar/pull/42";

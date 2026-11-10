@@ -64,8 +64,9 @@ mod tests {
 
     #[test]
     fn scope_is_a_durable_one_hop_snapshot_and_fails_closed() {
-        let (dir, db) = crate::test_support::open_db();
-        let path = dir.path().join("state.db");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scope.db");
+        let db = WorkDb::open(path.clone()).unwrap();
         let product = create_test_product(&db);
         let item = create_test_chore_manual(&db, &product.id, "Item");
         let revision = create_test_chore_manual(&db, &product.id, "Revision");
@@ -120,7 +121,7 @@ mod tests {
         drop(conn);
         db.capture_progression_neighbourhood(&execution.id).unwrap();
         drop(db);
-        let db = WorkDb::open_existing(path).unwrap();
+        let db = WorkDb::open(path).unwrap();
         db.check_progression_scope(&execution.id, &dependent.id).unwrap();
         assert!(db.check_progression_scope(&execution.id, &outside.id).is_err());
         assert!(db.check_progression_scope("missing", &item.id).is_err());

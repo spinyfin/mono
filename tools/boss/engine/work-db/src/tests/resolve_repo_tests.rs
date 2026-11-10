@@ -76,8 +76,8 @@ fn resolve_repo_returns_none_when_both_null() {
 /// without any task-level `--repo` set."
 #[test]
 fn resolve_repo_uses_design_repo_for_design_kind() {
-    let (_dir, path) = migrated_disk_db_path("resolve-design-repo");
-    let db = WorkDb::open_existing(path.clone()).unwrap();
+    let (_dir, path) = disk_db_path("resolve-design-repo");
+    let db = WorkDb::open(path.clone()).unwrap();
     let product = db
         .create_product(
             CreateProductInput::builder()
@@ -141,8 +141,8 @@ fn resolve_repo_uses_design_repo_for_design_kind() {
 /// exactly as before.
 #[test]
 fn resolve_repo_design_kind_without_design_repo_falls_through_to_product_repo() {
-    let (_dir, path) = migrated_disk_db_path("resolve-design-no-override");
-    let db = WorkDb::open_existing(path.clone()).unwrap();
+    let (_dir, path) = disk_db_path("resolve-design-no-override");
+    let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
     let project = db
         .create_project(CreateProjectInput {
@@ -183,8 +183,8 @@ fn resolve_repo_design_kind_without_design_repo_falls_through_to_product_repo() 
 /// task-creation invariant and writes the column directly.
 #[test]
 fn resolve_repo_task_override_wins_over_design_repo() {
-    let (_dir, path) = migrated_disk_db_path("resolve-design-override-wins");
-    let db = WorkDb::open_existing(path.clone()).unwrap();
+    let (_dir, path) = disk_db_path("resolve-design-override-wins");
+    let db = WorkDb::open(path.clone()).unwrap();
     let product = db
         .create_product(
             CreateProductInput::builder()
@@ -237,8 +237,8 @@ fn resolve_repo_task_override_wins_over_design_repo() {
 /// the column rather than silently ignoring it.
 #[test]
 fn product_design_repo_set_and_clear() {
-    let (_dir, path) = migrated_disk_db_path("design-repo-set-clear");
-    let db = WorkDb::open_existing(path.clone()).unwrap();
+    let (_dir, path) = disk_db_path("design-repo-set-clear");
+    let db = WorkDb::open(path.clone()).unwrap();
     let product = db
         .create_product(
             CreateProductInput::builder()
@@ -282,8 +282,8 @@ fn product_design_repo_set_and_clear() {
 /// Implementation-kind tasks on the same product are unaffected.
 #[test]
 fn resolve_repo_uses_docs_repo_for_investigation_kind() {
-    let (_dir, path) = migrated_disk_db_path("resolve-docs-repo");
-    let db = WorkDb::open_existing(path.clone()).unwrap();
+    let (_dir, path) = disk_db_path("resolve-docs-repo");
+    let db = WorkDb::open(path.clone()).unwrap();
     let product = db
         .create_product(
             CreateProductInput::builder()
@@ -335,8 +335,8 @@ fn resolve_repo_uses_docs_repo_for_investigation_kind() {
 /// silently ignoring it.
 #[test]
 fn product_docs_repo_set_and_clear() {
-    let (_dir, path) = migrated_disk_db_path("docs-repo-set-clear");
-    let db = WorkDb::open_existing(path.clone()).unwrap();
+    let (_dir, path) = disk_db_path("docs-repo-set-clear");
+    let db = WorkDb::open(path.clone()).unwrap();
     let product = db
         .create_product(
             CreateProductInput::builder()
