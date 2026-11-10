@@ -1041,13 +1041,10 @@ fn rebase_clean_path_runs_no_linearization_probes() {
     assert_eq!(result.payload["linearized_commits"], 0);
 }
 
-// ───────────────────────── workspace push ─────────────────────────
+// ───────────────────── workspace local-rebase ─────────────────────
 //
-// `workspace_push` is the testable unit for `cube workspace push`. Like
-// `pr_push`, it reads `std::env::current_dir()` directly rather than
-// taking an explicit `cwd` param, so these tests capture the ambient
-// test-process cwd (matching the `pr_push` test convention) instead of
-// a synthetic path.
+// `local-rebase` resolves the PR's real GitHub remote and base branch, then
+// rebases onto the freshly fetched tracking ref without touching `pr/<n>`.
 
 #[test]
 fn local_rebase_fetches_real_github_base_without_alias_operations() {

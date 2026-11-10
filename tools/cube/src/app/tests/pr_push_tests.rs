@@ -595,7 +595,7 @@ fn pr_push_guard_rejects_pr_bookmark_head_branch() {
     );
 }
 
-// --- pr_number_from_url tests ---
+// --- pr push fork guard ---
 
 #[test]
 fn pr_push_refuses_fork_main_before_mutation() {

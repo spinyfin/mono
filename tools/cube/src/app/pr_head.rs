@@ -102,13 +102,13 @@ pub(super) fn resolve_pr_head(
         return Ok(head);
     }
 
-    let fetch_error = fetch_head_from_head_repo(runner, database_path, cwd, number, info, deadline);
+    let fetch_error = fetch_head_from_head_repo(runner, database_path, cwd, number, info, &sha, deadline);
     if sha_is_present(runner, database_path, cwd, &sha)? {
         return Ok(head);
     }
     // The source branch is gone (deleted on merge) or its fork was deleted, but
     // the base repository keeps `refs/pull/<n>/head` for the life of the PR.
-    let pull_error = fetch_pull_ref(runner, database_path, cwd, owner_repo, number, deadline);
+    let pull_error = fetch_pull_ref(runner, database_path, cwd, owner_repo, number, &sha, deadline);
     if sha_is_present(runner, database_path, cwd, &sha)? {
         return Ok(head);
     }
@@ -232,6 +232,7 @@ fn fetch_pull_ref(
     cwd: &Path,
     owner_repo: &str,
     number: u64,
+    sha: &str,
     deadline: Option<Instant>,
 ) -> Result<()> {
     let url = base_repo_url(runner, database_path, cwd, owner_repo);
@@ -240,8 +241,15 @@ fn fetch_pull_ref(
     let remote = temp_remote_name(number);
     add_remote(runner, database_path, cwd, &remote, &url)?;
     let refspec = format!("+refs/pull/{number}/head:refs/remotes/{remote}/pull-{number}");
-    // Serialize fetches as well as config changes: git shares shallow.lock.
+    // Serialize cube's temporary-remote fetches against each other (git shares
+    // shallow.lock); base-remote fetches do not take this lock.
     let fetch_lock = runner.lock_git_remotes(cwd)?;
+    // A caller that waited behind another import of this head need not refetch.
+    if sha_is_present(runner, database_path, cwd, sha)? {
+        drop(fetch_lock);
+        let _ = remove_remote(runner, database_path, cwd, &remote);
+        return Ok(());
+    }
     let fetched = run_jj_network_within(
         runner,
         database_path,
@@ -272,6 +280,7 @@ fn fetch_head_from_head_repo(
     cwd: &Path,
     number: u64,
     info: &Value,
+    sha: &str,
     deadline: Option<Instant>,
 ) -> Result<()> {
     let head = info.get("head");
@@ -287,8 +296,15 @@ fn fetch_head_from_head_repo(
     prune_stale_temp_remotes(runner, database_path, cwd);
     let remote = temp_remote_name(number);
     add_remote(runner, database_path, cwd, &remote, &url)?;
-    // Serialize fetches as well as config changes: git shares shallow.lock.
+    // Serialize cube's temporary-remote fetches against each other (git shares
+    // shallow.lock); base-remote fetches do not take this lock.
     let fetch_lock = runner.lock_git_remotes(cwd)?;
+    // A caller that waited behind another import of this head need not refetch.
+    if sha_is_present(runner, database_path, cwd, sha)? {
+        drop(fetch_lock);
+        let _ = remove_remote(runner, database_path, cwd, &remote);
+        return Ok(());
+    }
     let fetched = run_jj_network_within(
         runner,
         database_path,
