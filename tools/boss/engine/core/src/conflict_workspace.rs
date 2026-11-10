@@ -10,8 +10,23 @@ pub(crate) async fn recover(
     attempt: &ConflictResolution,
     probe: &crate::merge_poller::PrLifecycleProbe,
 ) -> bool {
-    let result = prepare(db, cube, candidate).await;
-    if let Err(error) = result {
+    // The local Cube cannot vouch for a remote host's repository. A refusal
+    // that came from another host is only retried once GitHub shows the head
+    // or base moved; otherwise the failed attempt stays surfaced.
+    if let Some(host) = failing_remote_host(db, attempt) {
+        let moved = probe
+            .head_ref_oid
+            .as_deref()
+            .is_some_and(|head| attempt.head_sha_before.as_deref() != Some(head))
+            || probe
+                .base_ref_oid
+                .as_deref()
+                .is_some_and(|base| attempt.base_sha_at_trigger.as_deref() != Some(base));
+        if !moved {
+            tracing::warn!(attempt_id = %attempt.id, %host, "conflict workspace refusal came from a remote host; retaining failed attempt until head or base moves");
+            return false;
+        }
+    } else if let Err(error) = prepare(db, cube, candidate).await {
         tracing::warn!(attempt_id = %attempt.id, error = %format!("{error:#}"), "conflict workspace remains unavailable; retaining failed attempt");
         return false;
     }
@@ -38,10 +53,19 @@ pub(crate) async fn recover(
     }
 }
 
+/// A host other than this engine's own where the failed revision was placed.
+fn failing_remote_host(db: &WorkDb, attempt: &ConflictResolution) -> Option<String> {
+    let revision = attempt.revision_task_id.as_deref()?;
+    db.execution_host_ids_for_item(revision)
+        .ok()?
+        .into_values()
+        .find(|host| host != boss_protocol::LOCAL_HOST_ID)
+}
+
 async fn prepare(db: &WorkDb, cube: &dyn CubeClient, candidate: &PendingMergeCheck) -> anyhow::Result<()> {
-    if let Some(writers) = crate::conflict_ladder::live_writers_blocking_rebase(db, &candidate.work_item_id) {
-        anyhow::bail!("workspace recovery deferred while a worker owns the branch: {writers}");
-    }
+    // Held until the probe finishes so no worker starts on the chain meanwhile.
+    let _chain_hold = crate::conflict_ladder::hold_chain_for_engine_rebase(db, &candidate.work_item_id)
+        .map_err(|writers| anyhow::anyhow!("workspace recovery deferred while a worker owns the branch: {writers}"))?;
     let repo = db
         .resolve_repo_for_task(&candidate.work_item_id)?
         .ok_or_else(|| anyhow::anyhow!("conflict workspace has no repository"))?;
