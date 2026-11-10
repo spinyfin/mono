@@ -183,11 +183,6 @@ impl Stalled {
             reaper: &reaper,
             cube_client: self.cube.as_ref(),
             host_adapters: &NoHosts,
-            // These tests cover preservation and lease return, not occupancy.
-            // A live /proc walk keeps the lease when a leftover jj process
-            // still has this workspace as cwd, which is what failed the
-            // Linux merge-queue run.
-            occupancy: Some(&EmptyOccupancy),
         };
         // These fixtures own empty workspaces; host processes cannot supply their evidence.
         let outcome = run_one_pass_with_occupancy(
