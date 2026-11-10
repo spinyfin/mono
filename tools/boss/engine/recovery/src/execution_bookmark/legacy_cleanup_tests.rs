@@ -2,6 +2,9 @@ use super::*;
 use boss_engine_test_git::jj::JjRepo;
 use std::sync::Mutex;
 
+#[path = "legacy_cleanup_acceptance_tests.rs"]
+mod acceptance;
+
 struct Store {
     _dir: tempfile::TempDir,
     repo: JjRepo,
@@ -123,8 +126,11 @@ async fn forgets_what_holds_nothing_unpublished_and_archives_what_does() {
         }]
     );
     assert_eq!(report.kept, vec!["boss/exec_b".to_owned(), "pr/8".to_owned()]);
-    assert_eq!(report.operations, 2, "one archive and one forget: {report:?}");
-    assert_eq!(s.operations(), before + 2);
+    assert_eq!(
+        report.operations, 4,
+        "two forgets, one archive and one published head hidden: {report:?}"
+    );
+    assert_eq!(s.operations(), before + 4);
     let names = s.names();
     for gone in [
         "boss-base/exec_a",
@@ -284,7 +290,12 @@ async fn a_second_run_changes_nothing() {
     let names = s.names();
     let report = cleanup_legacy_store(&LocalJj, &s.repo.repo, &[]).await.unwrap();
     assert_eq!(report.forgotten, 0, "{report:?}");
-    assert!(report.archived.is_empty(), "{report:?}");
+    assert_eq!(
+        report.archived.len(),
+        1,
+        "existing archives are reported for crash-safe inspection filing"
+    );
+    assert_eq!(report.archived[0].commit_id, lost);
     assert_eq!(report.kept, vec!["boss/exec_e".to_owned()]);
     assert_eq!(report.operations, 0);
     assert_eq!(s.operations(), before);
@@ -298,18 +309,19 @@ struct MovesBookmark {
     repo: PathBuf,
     target: String,
     listings: Mutex<usize>,
+    on_forget: bool,
 }
 
 #[async_trait]
 impl Jj for MovesBookmark {
     async fn run(&self, repo: &Path, args: &[&str]) -> Result<String> {
-        if args.contains(&"--all-remotes") {
+        if args.contains(&"--all-remotes") || (self.on_forget && args.contains(&"forget")) {
             let listing = {
                 let mut listings = self.listings.lock().unwrap();
                 *listings += 1;
                 *listings
             };
-            if listing == 2 {
+            if (!self.on_forget && listing == 2) || (self.on_forget && args.contains(&"forget")) {
                 self.inner
                     .run(
                         &self.repo,
@@ -344,9 +356,29 @@ async fn a_name_that_moved_during_the_cleanup_is_left_in_place() {
         repo: s.repo.repo.clone(),
         target: new_work.clone(),
         listings: Mutex::new(0),
+        on_forget: false,
     };
     let report = cleanup_legacy_store(&jj, &s.repo.repo, &[]).await.unwrap();
     assert_eq!(report.forgotten, 0, "{report:?}");
     assert_eq!(report.kept, vec!["boss-recovery/exec_f".to_owned()]);
     assert_eq!(s.commit_of("bookmarks(exact:\"boss-recovery/exec_f\")"), new_work);
+}
+
+#[tokio::test]
+async fn a_move_after_the_last_recheck_survives_the_forget_operation_merge() {
+    let s = Store::new();
+    let main = s.commit_of("main");
+    let work = s.work("main", "concurrent.txt");
+    s.bookmark(&["boss-recovery/exec_f"], &main);
+    let jj = MovesBookmark {
+        inner: LocalJj,
+        repo: s.repo.repo.clone(),
+        target: work.clone(),
+        listings: Mutex::new(0),
+        on_forget: true,
+    };
+    let report = cleanup_legacy_store(&jj, &s.repo.repo, &[]).await.unwrap();
+    assert_eq!(report.forgotten, 0, "{report:?}");
+    assert_eq!(report.kept, vec!["boss-recovery/exec_f".to_owned()]);
+    assert_eq!(s.commit_of("bookmarks(exact:\"boss-recovery/exec_f\")"), work);
 }

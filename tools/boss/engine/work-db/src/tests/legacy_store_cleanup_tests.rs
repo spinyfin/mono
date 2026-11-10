@@ -232,3 +232,52 @@ fn pushed_heads_come_from_every_recorded_source_as_lowercase_full_commit_ids() {
         "sorted, deduplicated, with the uppercase head lowercased and the fragments dropped"
     );
 }
+
+#[test]
+fn new_archives_on_an_old_closed_chain_survive_until_inspected() {
+    let db = WorkDb::open(temp_db_path("legacy-old-chain-archives")).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore_manual(&db, product.id, "old closed chain");
+    let execution = recorded_execution(&db, &chore.id, "local", "/stores/mono", "mono");
+    sql(
+        &db,
+        "UPDATE tasks SET status = 'done', completed_at = '1', updated_at = '1' WHERE id = ?1",
+        [&chore.id],
+    );
+    sql(
+        &db,
+        "INSERT INTO legacy_store_cleanups (host_id, repo_path) VALUES ('local', '/stores/mono')",
+        [],
+    );
+    let archived = report(&[&execution], 1, 0);
+    for _ in 0..2 {
+        db.finish_legacy_store_cleanup("local", Path::new("/stores/mono"), &archived)
+            .unwrap();
+    }
+    assert!(
+        db.list_closed_chain_preserved(CLOSED_CHAIN_RETENTION_SECS, 100, &[])
+            .unwrap()
+            .is_empty(),
+        "new inspection archives survive even though the chain closed long ago"
+    );
+    let conn = db.connect().unwrap();
+    let (count, body): (i64, String) = conn.query_row(
+        "SELECT count(*), body_markdown FROM work_attention_items WHERE execution_id = ?1 AND kind = 'preserved_work_needs_inspection' AND status = 'open'",
+        [&execution], |r| Ok((r.get(0)?, r.get(1)?)),
+    ).unwrap();
+    assert_eq!(count, 1, "one deduplicated inspection item per execution");
+    assert!(body.contains(&archived.archived[0].archive));
+    conn.execute(
+        "UPDATE work_attention_items SET status = 'resolved' WHERE execution_id = ?1",
+        [&execution],
+    )
+    .unwrap();
+    drop(conn);
+    assert_eq!(
+        db.list_closed_chain_preserved(CLOSED_CHAIN_RETENTION_SECS, 100, &[])
+            .unwrap()
+            .len(),
+        1,
+        "human inspection releases the archives"
+    );
+}

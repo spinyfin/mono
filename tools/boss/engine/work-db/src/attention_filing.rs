@@ -149,38 +149,50 @@ impl WorkDb {
         title: &str,
         body_markdown: &str,
     ) -> Result<String> {
-        warn_if_lifecycle_undeclared(kind);
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        ensure_execution_exists(&tx, execution_id)?;
-        let id = if let Some(id) = reraise_open_execution_attention(&tx, execution_id, kind)? {
-            tx.execute(
-                "UPDATE work_attention_items SET title = ?2, body_markdown = ?3 WHERE id = ?1",
-                params![id, title, body_markdown],
-            )?;
-            id
-        } else {
-            let id = next_id("attn");
-            let now = now_string();
-            tx.execute(
-                "INSERT INTO work_attention_items (
-                    id, execution_id, work_item_id, kind, status, title, body_markdown, created_at,
-                    resolved_at, last_raised_at
-                 ) VALUES (?1, ?2, NULL, ?3, 'open', ?4, ?5, ?6, NULL, ?6)",
-                params![id, execution_id, kind, title, body_markdown, now],
-            )?;
-            id
-        };
-        if kind == boss_engine_storage_values::attention_kinds::PRESERVED_WORK_ARCHIVED_ATTENTION_KIND
-            || kind == boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND
-        {
-            // Archive references may now exist; closed-chain cleanup looks for them.
-            tx.execute(
-                "UPDATE execution_bookmarks SET archive_cleanup_pending = 1 WHERE execution_id = ?1",
-                [execution_id],
-            )?;
-        }
+        let id = upsert_execution_attention_in_tx(&tx, execution_id, kind, title, body_markdown)?;
         tx.commit()?;
         Ok(id)
     }
+}
+
+/// File an execution attention atomically with the state that requires it.
+pub(crate) fn upsert_execution_attention_in_tx(
+    conn: &Connection,
+    execution_id: &str,
+    kind: &str,
+    title: &str,
+    body_markdown: &str,
+) -> Result<String> {
+    warn_if_lifecycle_undeclared(kind);
+    ensure_execution_exists(conn, execution_id)?;
+    let id = if let Some(id) = reraise_open_execution_attention(conn, execution_id, kind)? {
+        conn.execute(
+            "UPDATE work_attention_items SET title = ?2, body_markdown = ?3 WHERE id = ?1",
+            params![id, title, body_markdown],
+        )?;
+        id
+    } else {
+        let id = next_id("attn");
+        let now = now_string();
+        conn.execute(
+            "INSERT INTO work_attention_items (
+                    id, execution_id, work_item_id, kind, status, title, body_markdown, created_at,
+                    resolved_at, last_raised_at
+                 ) VALUES (?1, ?2, NULL, ?3, 'open', ?4, ?5, ?6, NULL, ?6)",
+            params![id, execution_id, kind, title, body_markdown, now],
+        )?;
+        id
+    };
+    if kind == boss_engine_storage_values::attention_kinds::PRESERVED_WORK_ARCHIVED_ATTENTION_KIND
+        || kind == boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND
+    {
+        // Archive references may now exist; closed-chain cleanup looks for them.
+        conn.execute(
+            "UPDATE execution_bookmarks SET archive_cleanup_pending = 1 WHERE execution_id = ?1",
+            [execution_id],
+        )?;
+    }
+    Ok(id)
 }

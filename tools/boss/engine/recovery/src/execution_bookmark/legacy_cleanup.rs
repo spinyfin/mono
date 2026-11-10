@@ -2,8 +2,8 @@
 //! shared jj store.
 //!
 //! Earlier engines created `boss-base/<execution>`, `boss-recovery/<execution>`
-//! and `boss/<execution>` for every execution, and cube kept a `pr/<n>` alias
-//! per positioned PR. Nothing reads them any more, but jj writes every
+//! for every execution, and cube kept a `pr/<n>` alias per positioned PR.
+//! Worker publication branches still use `boss/<execution>`. jj writes every
 //! bookmark into the view of every operation, so thousands of finished
 //! executions' names make every later jj command in every workspace of the
 //! store slower and larger.
@@ -15,8 +15,8 @@
 //! with the item); `boss/*` and `pr/*` with such work are left where they are.
 //! A commit counts as published when a remote bookmark, the trunk, or a head
 //! the engine recorded after a push (`published_heads`) contains it, judged by
-//! ancestry of exact commit ids. A rewritten variant is never matched by change
-//! id: that would forget later edits that share a change id with pushed work.
+//! ancestry and evolution predecessors of published commits. A later edit
+//! sharing the same change identity is not a predecessor and remains protected.
 //! When in doubt the work is archived, which costs one extra bookmark and never
 //! loses anything.
 //!
@@ -24,7 +24,11 @@
 //! store with thousands of names takes a handful of operations rather than
 //! thousands.
 use super::*;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
+
+#[path = "legacy_publication.rs"]
+mod publication;
+use std::collections::BTreeSet;
 
 /// Names forgotten by one `jj bookmark forget`, keeping the command line far
 /// below the 128 KiB argument limit of a remote shell.
@@ -35,19 +39,13 @@ const REVSET_BATCH: usize = 200;
 /// Every legacy name this cleanup may consider, as a revset.
 const LEGACY_BOOKMARKS: &str = r#"bookmarks(glob:"boss-base/exec_*") | bookmarks(glob:"boss-recovery/exec_*") | bookmarks(glob:"boss/exec_*") | bookmarks(glob:"pr/*")"#;
 
-/// Non-empty commits behind a legacy name that no remote bookmark or the trunk
-/// contains. The recorded pushed heads narrow this further.
-fn unpublished_by_store() -> String {
-    format!("((::({LEGACY_BOOKMARKS}) ~ ::remote_bookmarks()) ~ ::trunk()) ~ empty()")
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Family {
     /// `boss-base/<execution>`: the floor the execution started from.
     Baseline,
     /// `boss-recovery/<execution>`: the head the worker advanced.
     RecoveryHead,
-    /// `boss/<execution>`: the branch the worker pushed.
+    /// `boss/<execution>`: the publication branch, also used by live workers.
     Publication,
     /// `pr/<n>`: cube's alias for a positioned PR head.
     PrAlias,
@@ -81,7 +79,7 @@ fn classify(name: &str) -> Option<(Family, Option<String>)> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LegacyArchive {
     pub execution_id: String,
-    /// The legacy name the work was found under.
+    /// The legacy source, or the existing archive when retrying after a crash.
     pub source: String,
     pub archive: String,
     pub commit_id: String,
@@ -113,7 +111,7 @@ async fn commit_lines(jj: &dyn Jj, repo: &Path, revset: &str) -> Result<Vec<Stri
 
 /// Every legacy name with the commit(s) it points at, and the names that still
 /// have a remote twin (a branch that exists on GitHub).
-async fn list_legacy(jj: &dyn Jj, repo: &Path) -> Result<(Vec<Legacy>, HashSet<String>)> {
+async fn list_legacy(jj: &dyn Jj, repo: &Path) -> Result<(Vec<Legacy>, HashSet<String>, BTreeMap<String, String>)> {
     let out = jj
         .run(
             repo,
@@ -133,6 +131,7 @@ async fn list_legacy(jj: &dyn Jj, repo: &Path) -> Result<(Vec<Legacy>, HashSet<S
         .await?;
     let mut legacy = Vec::new();
     let mut twins = HashSet::new();
+    let mut exported = BTreeMap::new();
     for line in out.lines() {
         let mut fields = line.splitn(3, '\t');
         let (Some(name), Some(remote), Some(targets)) = (fields.next(), fields.next(), fields.next()) else {
@@ -145,6 +144,10 @@ async fn list_legacy(jj: &dyn Jj, repo: &Path) -> Result<(Vec<Legacy>, HashSet<S
             // The `git` remote is the colocated repository, not GitHub.
             if remote != "git" {
                 twins.insert(name.to_owned());
+            } else {
+                if let Some(target) = targets.split(',').find(|t| is_commit_id(t)) {
+                    exported.insert(name.to_owned(), target.to_owned());
+                }
             }
             continue;
         }
@@ -165,40 +168,13 @@ async fn list_legacy(jj: &dyn Jj, repo: &Path) -> Result<(Vec<Legacy>, HashSet<S
     }
     legacy.sort_by(|a, b| a.name.cmp(&b.name));
     legacy.dedup_by(|a, b| a.name == b.name);
-    Ok((legacy, twins))
+    Ok((legacy, twins, exported))
 }
 
 /// Commits that carry a legacy name and have unpublished, non-empty work at or
 /// below them.
-async fn holding_commits(jj: &dyn Jj, repo: &Path, published_heads: &[String]) -> Result<HashSet<String>> {
-    let candidates = commit_lines(jj, repo, &unpublished_by_store()).await?;
-    if candidates.is_empty() {
-        return Ok(HashSet::new());
-    }
-    let mut unpublished: BTreeSet<String> = candidates.into_iter().collect();
-    let heads: BTreeSet<&str> = published_heads
-        .iter()
-        .map(String::as_str)
-        .filter(|head| is_commit_id(head))
-        .collect();
-    let heads: Vec<&str> = heads.into_iter().collect();
-    for chunk in heads.chunks(REVSET_BATCH) {
-        if unpublished.is_empty() {
-            break;
-        }
-        // `present` skips a head this store never held or has collected.
-        let pushed = chunk
-            .iter()
-            .map(|head| format!("present({head})"))
-            .collect::<Vec<_>>()
-            .join(" | ");
-        let covered = commit_lines(jj, repo, &format!("({}) & ::({pushed})", unpublished_by_store())).await?;
-        for commit in covered {
-            unpublished.remove(&commit);
-        }
-    }
+async fn holding_commits(jj: &dyn Jj, repo: &Path, unpublished: &[String]) -> Result<HashSet<String>> {
     let mut holding = HashSet::new();
-    let unpublished: Vec<String> = unpublished.into_iter().collect();
     for chunk in unpublished.chunks(REVSET_BATCH) {
         let work = chunk
             .iter()
@@ -227,88 +203,243 @@ async fn existing_archives(jj: &dyn Jj, repo: &Path) -> Result<HashSet<String>> 
     Ok(out.lines().filter(|name| !name.is_empty()).map(str::to_owned).collect())
 }
 
-/// Archive the unpublished work of the engine-owned names, then forget every
-/// legacy name that holds nothing unpublished, in batches.
-///
-/// `published_heads` are commit ids the engine recorded after a push; ones this
-/// store does not hold are ignored. A failure before the forgetting starts
-/// leaves every name in place, and a rerun finishes the job: archives that
-/// already exist are not created again.
-pub async fn cleanup_legacy_store(jj: &dyn Jj, repo: &Path, published_heads: &[String]) -> Result<LegacyCleanupReport> {
-    let (legacy, twins) = list_legacy(jj, repo).await?;
-    let mut report = LegacyCleanupReport {
-        found: legacy.len(),
-        ..LegacyCleanupReport::default()
-    };
-    if legacy.is_empty() {
-        return Ok(report);
-    }
-    let holding = holding_commits(jj, repo, published_heads).await?;
-    let holds_work = |entry: &Legacy| entry.targets.iter().any(|target| holding.contains(target));
+/// Pin reads and mutations to the same jj operation. A move committed after
+/// the read is merged as a concurrent update, never silently forgotten.
+struct AtOperation<'a> {
+    jj: &'a dyn Jj,
+    operation: &'a str,
+}
 
-    let mut archives = existing_archives(jj, repo).await?;
-    let mut planned: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for entry in &legacy {
-        let work = holds_work(entry);
-        let forget = match entry.family {
-            Family::Baseline | Family::RecoveryHead => {
-                if work && let Some(execution_id) = &entry.execution_id {
-                    for target in &entry.targets {
-                        let archive = preserved_archive_name(execution_id, target);
-                        if archives.insert(archive.clone()) {
-                            jj.run(
-                                repo,
-                                &["--ignore-working-copy", "bookmark", "create", &archive, "-r", target],
-                            )
-                            .await?;
-                            report.operations += 1;
-                        }
-                        let record = LegacyArchive {
-                            execution_id: execution_id.clone(),
-                            source: entry.name.clone(),
-                            archive,
-                            commit_id: target.clone(),
-                        };
-                        if !report.archived.contains(&record) {
-                            report.archived.push(record);
-                        }
-                    }
-                }
-                true
+#[async_trait]
+impl Jj for AtOperation<'_> {
+    async fn run(&self, repo: &Path, args: &[&str]) -> Result<String> {
+        let mut pinned = vec!["--at-op", self.operation];
+        pinned.extend_from_slice(args);
+        self.jj
+            .run(repo, &pinned)
+            .await
+            .with_context(|| format!("legacy cleanup: jj {args:?}"))
+    }
+
+    async fn shared_repo(&self, workspace: &Path) -> Result<PathBuf> {
+        self.jj.shared_repo(workspace).await
+    }
+}
+
+async fn operation(jj: &dyn Jj, repo: &Path) -> Result<String> {
+    Ok(jj
+        .run(
+            repo,
+            &[
+                "--ignore-working-copy",
+                "op",
+                "log",
+                "--no-graph",
+                "-n",
+                "1",
+                "-T",
+                "id",
+            ],
+        )
+        .await?
+        .trim()
+        .to_owned())
+}
+
+/// Recheck every batch at the operation the forget will modify. Concurrent
+/// writers retain their moved targets through jj's operation merge.
+async fn forget_planned(
+    jj: &dyn Jj,
+    repo: &Path,
+    planned: &BTreeMap<String, Vec<String>>,
+    report: &mut LegacyCleanupReport,
+) -> Result<()> {
+    let names: Vec<_> = planned.keys().collect();
+    for batch in names.chunks(FORGET_BATCH) {
+        let op = operation(jj, repo).await?;
+        let pinned = AtOperation { jj, operation: &op };
+        let (current, _, exported) = list_legacy(&pinned, repo).await?;
+        let current: BTreeMap<_, _> = current.into_iter().map(|e| (e.name, e.targets)).collect();
+        let mut patterns = Vec::new();
+        for name in batch {
+            match current.get(*name) {
+                Some(targets) if targets == &planned[*name] => patterns.push(format!("exact:{name}")),
+                Some(_) => report.kept.push((*name).clone()),
+                None => {}
             }
-            // A branch that still exists on the remote is a live PR's branch.
-            Family::Publication => !work && !twins.contains(&entry.name),
-            Family::PrAlias => !work,
-        };
-        if forget {
-            planned.insert(entry.name.clone(), entry.targets.clone());
-        } else {
-            report.kept.push(entry.name.clone());
         }
-    }
-
-    // A worker of an earlier engine may still be advancing its bookmarks. A name
-    // that moved since it was evaluated is not forgotten: its new target was
-    // never checked.
-    let (current, _) = list_legacy(jj, repo).await?;
-    let current: BTreeMap<&str, &Vec<String>> = current.iter().map(|e| (e.name.as_str(), &e.targets)).collect();
-    let mut forget = Vec::new();
-    for (name, targets) in planned {
-        match current.get(name.as_str()) {
-            Some(now) if **now == targets => forget.push(name),
-            Some(_) => report.kept.push(name),
-            None => {} // already gone
+        if patterns.is_empty() {
+            continue;
         }
-    }
-    for batch in forget.chunks(FORGET_BATCH) {
-        // Forget, not delete: a git-exported bookmark also has a remote-tracking
-        // twin that `delete` would leave in the view.
-        let patterns: Vec<String> = batch.iter().map(|name| format!("exact:{name}")).collect();
+        let refs: Vec<_> = patterns
+            .iter()
+            .filter_map(|p| {
+                let name = p.trim_start_matches("exact:");
+                exported.get(name).map(|target| (name, target.as_str()))
+            })
+            .collect();
+        remove_exported_refs(jj, repo, &refs).await?;
         let mut args = vec!["--ignore-working-copy", "bookmark", "forget"];
         args.extend(patterns.iter().map(String::as_str));
-        jj.run(repo, &args).await?;
+        pinned.run(repo, &args).await?;
         report.operations += 1;
-        report.forgotten += batch.len();
+        let (remaining, _, _) = list_legacy(jj, repo).await?;
+        let remaining: HashSet<_> = remaining.into_iter().map(|e| e.name).collect();
+        for pattern in patterns {
+            let name = pattern.trim_start_matches("exact:");
+            if remaining.contains(name) {
+                report.kept.push(name.to_owned());
+            } else {
+                report.forgotten += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Remove exported refs in one Git transaction with expected-old-value checks.
+/// `jj git export` visits every branch and takes a separate packed-ref lock for
+/// each deletion; thousands of refs make that quadratic. jj's external-command
+/// transport runs this same bounded transaction locally and over SSH.
+async fn remove_exported_refs(jj: &dyn Jj, repo: &Path, refs: &[(&str, &str)]) -> Result<()> {
+    if refs.is_empty() {
+        return Ok(());
+    }
+    let mut edits = String::from("start\n");
+    for (name, target) in refs {
+        ensure!(
+            classify(name).is_some() && is_commit_id(target),
+            "invalid legacy Git ref"
+        );
+        edits.push_str(&format!("delete refs/heads/{name} {target}\n"));
+    }
+    edits.push_str("prepare\ncommit\n");
+    let shared = jj.shared_repo(repo).await?;
+    let git = shared.join(".jj/repo/store/git_target");
+    jj.run(
+        repo,
+        &[
+            "--ignore-working-copy",
+            "util",
+            "exec",
+            "--",
+            "sh",
+            "-c",
+            r#"set -eu
+target=$(cat "$1")
+case "$target" in
+    /*) git_dir=$target ;;
+    *) git_dir="$(dirname "$1")/$target" ;;
+esac
+printf '%s' "$2" | git --git-dir="$git_dir" update-ref --stdin"#,
+            "legacy-ref-cleanup",
+            git.to_str().context("Git store path is not UTF-8")?,
+            &edits,
+        ],
+    )
+    .await
+    .context("removing exported legacy Git refs atomically")?;
+    Ok(())
+}
+
+/// Shrink the view before creating archives, and never release an unpublished
+/// source until its archive exists. Publication branches include live workers.
+pub async fn cleanup_legacy_store(jj: &dyn Jj, repo: &Path, published_heads: &[String]) -> Result<LegacyCleanupReport> {
+    // Reconcile Git tracking before taking a snapshot, including a retry that
+    // previously removed backing refs but crashed before forgetting names.
+    let before_import = operation(jj, repo).await?;
+    jj.run(repo, &["--ignore-working-copy", "git", "import"]).await?;
+    let op = operation(jj, repo).await?;
+    let pinned = AtOperation { jj, operation: &op };
+    let (legacy, twins, _) = list_legacy(&pinned, repo).await?;
+    let mut report = LegacyCleanupReport {
+        found: legacy.len(),
+        operations: usize::from(before_import != op),
+        ..LegacyCleanupReport::default()
+    };
+    let publication = publication::evidence(&pinned, repo, published_heads).await?;
+    let unpublished = publication.unpublished(&pinned, repo).await?;
+    let holding = holding_commits(&pinned, repo, &unpublished).await?;
+    let mut archives = existing_archives(jj, repo).await?;
+    // A previous pass may have crashed after forgetting the sources but before
+    // the database transaction that files inspection items. Report those
+    // archives too, so completing a retry cannot leave them unprotected.
+    for archive in &archives {
+        if let Some((execution, commit)) = archive
+            .strip_prefix("preserved-archive/")
+            .and_then(|s| s.split_once('/'))
+            && is_execution_id(execution)
+            && is_commit_id(commit)
+        {
+            report.archived.push(LegacyArchive {
+                execution_id: execution.to_owned(),
+                source: archive.clone(),
+                archive: archive.clone(),
+                commit_id: commit.to_owned(),
+            });
+        }
+    }
+    let mut published = BTreeMap::new();
+    let mut sources = BTreeMap::new();
+    let mut creates: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for entry in &legacy {
+        let work = entry.targets.iter().any(|t| holding.contains(t));
+        match entry.family {
+            Family::Publication if work || twins.contains(&entry.name) => report.kept.push(entry.name.clone()),
+            Family::PrAlias if work => report.kept.push(entry.name.clone()),
+            Family::Baseline | Family::RecoveryHead if work => {
+                for target in &entry.targets {
+                    let execution_id = entry
+                        .execution_id
+                        .as_ref()
+                        .context("legacy recovery name has no execution")?;
+                    let archive = preserved_archive_name(execution_id, target);
+                    if archives.insert(archive.clone()) {
+                        creates.entry(target.clone()).or_default().push(archive.clone());
+                    }
+                    report.archived.push(LegacyArchive {
+                        execution_id: execution_id.clone(),
+                        source: entry.name.clone(),
+                        archive,
+                        commit_id: target.clone(),
+                    });
+                }
+                sources.insert(entry.name.clone(), entry.targets.clone());
+            }
+            _ => {
+                published.insert(entry.name.clone(), entry.targets.clone());
+            }
+        }
+    }
+    // Most names have no work. Drop them before writing any archive views.
+    forget_planned(jj, repo, &published, &mut report).await?;
+    for (target, names) in creates {
+        for batch in names.chunks(FORGET_BATCH) {
+            let mut args = vec!["--ignore-working-copy", "bookmark", "create"];
+            args.extend(batch.iter().map(String::as_str));
+            args.extend(["-r", &target]);
+            jj.run(repo, &args).await?;
+            report.operations += 1;
+        }
+    }
+    forget_planned(jj, repo, &sources, &mut report).await?;
+    // Reconcile the removed backing refs now, rather than leaving their Git
+    // tracking entries in the view until cube's next import.
+    let before = operation(jj, repo).await?;
+    jj.run(repo, &["--ignore-working-copy", "git", "import"]).await?;
+    if operation(jj, repo).await? != before {
+        report.operations += 1;
+    }
+    // Exported refs were removed transactionally; import cannot resurrect them.
+    // Hide the published heads the names used to keep visible, protecting all
+    // named history, all working copies, and every unpublished non-empty stack.
+    loop {
+        let op = operation(jj, repo).await?;
+        let pinned = AtOperation { jj, operation: &op };
+        let work = publication.unpublished(&pinned, repo).await?;
+        if !publication::hide_with_evidence(&pinned, repo, &work, &mut report).await? {
+            break;
+        }
     }
     Ok(report)
 }

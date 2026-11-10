@@ -6,7 +6,7 @@
 //! has ever used, taken from `execution_bookmarks`, as pending. The runner
 //! (`boss_engine::legacy_store_cleanup`) cleans one store at a time and marks
 //! it completed, so a store is cleaned once and never again, a store first seen
-//! after the upgrade is never listed (nothing creates those names any more), and
+//! after the upgrade is never listed (only publication branches are still created), and
 //! a failure leaves the store pending for a later attempt.
 use super::*;
 use boss_engine_recovery::execution_bookmark::LegacyCleanupReport;
@@ -139,6 +139,16 @@ impl WorkDb {
         Ok(())
     }
 
+    /// A removed host cannot be retried. Retain the reason in diagnostics.
+    pub fn retire_legacy_store_cleanup(&self, host_id: &str, repo_path: &Path, reason: &str) -> Result<()> {
+        self.connect()?.execute(
+            "UPDATE legacy_store_cleanups SET completed_at = ?3, last_error = ?4
+             WHERE host_id = ?1 AND repo_path = ?2 AND completed_at IS NULL",
+            params![host_id, path_text(repo_path)?, now_string(), reason],
+        )?;
+        Ok(())
+    }
+
     /// Mark the store cleaned, and let the closed-chain cleanup forget the
     /// archives made for work found in it once the item is long closed.
     pub fn finish_legacy_store_cleanup(
@@ -163,10 +173,40 @@ impl WorkDb {
                 report.kept.len() as i64
             ],
         )?;
-        for archive in &report.archived {
-            tx.execute(
-                "UPDATE execution_bookmarks SET archive_cleanup_pending = 1 WHERE execution_id = ?1",
-                [&archive.execution_id],
+        let executions: std::collections::BTreeSet<_> = report.archived.iter().map(|a| &a.execution_id).collect();
+        for execution in executions {
+            // Some legacy names predate the database's execution history. Keep
+            // their archives indefinitely rather than inventing an owner.
+            if query_execution(&tx, execution)?.is_none() {
+                continue;
+            }
+            let names = report
+                .archived
+                .iter()
+                .filter(|a| &a.execution_id == execution)
+                .map(|a| format!("- `{}` (from `{}`)", a.archive, a.source))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let kind = boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND;
+            let existing: Option<String> = tx.query_row(
+                "SELECT body_markdown FROM work_attention_items WHERE execution_id = ?1 AND kind = ?2 AND status != 'resolved' ORDER BY created_at, id LIMIT 1",
+                params![execution, kind], |row| row.get(0),
+            ).optional()?;
+            let note = format!(
+                "Legacy store cleanup found unpublished work in `{}` on `{host_id}`. Inspect these archives before dismissing this item:\n\n{names}",
+                repo_path.display()
+            );
+            let body = match existing {
+                Some(body) if body.contains(&note) => body,
+                Some(body) => format!("{body}\n\n{note}"),
+                None => note,
+            };
+            super::attention_filing::upsert_execution_attention_in_tx(
+                &tx,
+                execution,
+                kind,
+                "Unpublished work recovered from legacy bookmarks",
+                &body,
             )?;
         }
         tx.commit()?;
