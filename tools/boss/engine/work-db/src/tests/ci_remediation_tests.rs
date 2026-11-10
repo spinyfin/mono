@@ -11,8 +11,8 @@ use super::*;
 /// status.
 #[test]
 fn list_ci_remediations_filters_and_orders_freshest_first() {
-    let (_dir, path) = disk_db_path("list-ci-remediations-filters");
-    let db = WorkDb::open(path.clone()).unwrap();
+    let (_dir, path) = migrated_disk_db_path("list-ci-remediations-filters");
+    let db = WorkDb::open_existing(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore_a = create_test_chore_manual(&db, product.id.clone(), "chore-a");
     let chore_b = create_test_chore_manual(&db, product.id.clone(), "chore-b");
@@ -111,8 +111,8 @@ fn list_ci_remediations_filters_and_orders_freshest_first() {
 /// currently `status='blocked'`.
 #[test]
 fn ci_budget_snapshot_combines_override_and_product_default() {
-    let (_dir, path) = disk_db_path("ci-budget-snapshot");
-    let db = WorkDb::open(path.clone()).unwrap();
+    let (_dir, path) = migrated_disk_db_path("ci-budget-snapshot");
+    let db = WorkDb::open_existing(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore = create_test_chore_manual(&db, product.id.clone(), "chore-budget");
 

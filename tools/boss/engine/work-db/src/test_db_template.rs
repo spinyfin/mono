@@ -23,7 +23,7 @@ static TEMPLATE: LazyLock<TempDir> = LazyLock::new(|| {
     directory
 });
 
-pub(super) fn copy_to(path: &Path) {
+pub(crate) fn copy_to(path: &Path) {
     std::fs::copy(TEMPLATE.path().join("schema.db"), path).unwrap();
 }
 

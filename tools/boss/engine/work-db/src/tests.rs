@@ -24,6 +24,16 @@ fn disk_db_path(label: &str) -> (tempfile::TempDir, PathBuf) {
     (dir, path)
 }
 
+/// Like [`disk_db_path`], but the file already holds the fully migrated schema,
+/// copied from the shared template. Open it with `WorkDb::open_existing`. Use it
+/// for tests that need a real file but do not exercise the open, migration or
+/// upgrade path; those keep `disk_db_path` and pay for the cold migration.
+fn migrated_disk_db_path(label: &str) -> (tempfile::TempDir, PathBuf) {
+    let (dir, path) = disk_db_path(label);
+    copy_migrated_template(&path);
+    (dir, path)
+}
+
 /// Project creation auto-spawns a `kind = 'design'` task, which
 /// otherwise sits at the head of the project's task chain and
 /// holds the dispatcher's `ready` slot. Most legacy tests pre-date

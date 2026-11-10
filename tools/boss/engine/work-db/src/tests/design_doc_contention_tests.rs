@@ -146,8 +146,8 @@ fn in_flight_plan_avoids_terminal_history_and_sort() {
 
 #[test]
 fn sixty_one_concurrent_resolvers_allow_writes_and_release_before_workspace_lookup() {
-    let (_dir, path) = disk_db_path("design-doc-contention");
-    let db = WorkDb::open(path.clone()).unwrap();
+    let (_dir, path) = migrated_disk_db_path("design-doc-contention");
+    let db = WorkDb::open_existing(path.clone()).unwrap();
     let product = create_test_product(&db);
     let project = project(&db, &product.id);
     let index_sql: String = {
@@ -233,8 +233,8 @@ fn sixty_one_concurrent_resolvers_allow_writes_and_release_before_workspace_look
 
 #[test]
 fn open_kind_probe_uses_partial_index_over_large_resolved_history() {
-    let (_dir, path) = disk_db_path("attention-open-kind-plan");
-    let db = WorkDb::open(path).unwrap();
+    let (_dir, path) = migrated_disk_db_path("attention-open-kind-plan");
+    let db = WorkDb::open_existing(path).unwrap();
     let conn = db.connect().unwrap();
     conn.execute_batch(
         "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<20000)

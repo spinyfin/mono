@@ -15,8 +15,8 @@ fn allocator_concurrent_inserts_produce_distinct_short_ids() {
     // Must use an on-disk database: WAL mode (which serialises
     // concurrent writers via busy_timeout) is incompatible with
     // SQLite's shared-cache in-memory mode.
-    let (_dir, path) = disk_db_path("short-id-concurrent");
-    let db = WorkDb::open(path.clone()).unwrap();
+    let (_dir, path) = migrated_disk_db_path("short-id-concurrent");
+    let db = WorkDb::open_existing(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:concurrent.git"));
 
     const N: usize = 16;

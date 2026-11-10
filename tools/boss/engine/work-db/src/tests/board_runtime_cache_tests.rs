@@ -436,8 +436,8 @@ fn a_future_deadline_expires_the_entry_when_the_clock_passes_it() {
 
 #[test]
 fn a_write_from_another_connection_is_seen_by_a_fresh_reader() {
-    let (_dir, path) = disk_db_path("board-runtime-cache");
-    let board = Board::new(WorkDb::open(path.clone()).unwrap());
+    let (_dir, path) = migrated_disk_db_path("board-runtime-cache");
+    let board = Board::new(WorkDb::open_existing(path.clone()).unwrap());
     let item = board.chore("A");
     let exec = board.execution(&item, ExecutionStatus::Ready);
     // Production loads on an independent read-only connection every time.

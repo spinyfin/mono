@@ -53,8 +53,8 @@ fn utc_day_rollover_stores_a_new_report() {
 #[test]
 fn concurrent_samplers_converge_on_one_stored_report() {
     // Concurrent writers need an on-disk database (WAL + busy_timeout).
-    let (_dir, path) = disk_db_path("stuck-snapshot-concurrent");
-    let db = std::sync::Arc::new(WorkDb::open(path).unwrap());
+    let (_dir, path) = migrated_disk_db_path("stuck-snapshot-concurrent");
+    let db = std::sync::Arc::new(WorkDb::open_existing(path).unwrap());
     let product = create_test_product_named(&db, "Concurrent");
     create_test_chore_manual(&db, &product.id, "Item");
     let now = 20_000 * DAY + 123;
@@ -77,8 +77,8 @@ fn concurrent_samplers_converge_on_one_stored_report() {
 
 #[test]
 fn report_build_does_not_take_the_shared_writer_connection() {
-    let (_dir, path) = disk_db_path("stuck-snapshot-reader");
-    let db = WorkDb::open(path).unwrap();
+    let (_dir, path) = migrated_disk_db_path("stuck-snapshot-reader");
+    let db = WorkDb::open_existing(path).unwrap();
     let product = create_test_product_named(&db, "Reader");
     create_test_chore_manual(&db, &product.id, "Item");
     let now = 20_000 * DAY + 5;
@@ -94,8 +94,8 @@ fn report_build_does_not_take_the_shared_writer_connection() {
 
 #[test]
 fn snapshot_read_transaction_does_not_block_a_writer() {
-    let (_dir, path) = disk_db_path("stuck-snapshot-read-tx-overlap");
-    let db = std::sync::Arc::new(WorkDb::open(path).unwrap());
+    let (_dir, path) = migrated_disk_db_path("stuck-snapshot-read-tx-overlap");
+    let db = std::sync::Arc::new(WorkDb::open_existing(path).unwrap());
     let product = create_test_product_named(&db, "Overlap");
     create_test_chore_manual(&db, &product.id, "Item");
     let now = 20_000 * DAY + 5;

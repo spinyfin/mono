@@ -675,8 +675,8 @@ fn list_external_refs_returns_empty_when_no_refs_set() {
 /// distinct, because `attempt_kind` is part of the key.
 #[test]
 fn ci_remediations_unique_key_enforced() {
-    let (_dir, path) = disk_db_path("ci-rem-unique");
-    let _db = WorkDb::open(path.clone()).unwrap();
+    let (_dir, path) = migrated_disk_db_path("ci-rem-unique");
+    let _db = WorkDb::open_existing(path.clone()).unwrap();
     let conn = rusqlite::Connection::open(&path).unwrap();
     let insert = |id: &str, head: &str, kind: &str| -> rusqlite::Result<usize> {
         conn.execute(
@@ -715,8 +715,8 @@ fn ci_remediations_unique_key_enforced() {
 /// the side table exists to model).
 #[test]
 fn task_blocked_signals_pk_enforced() {
-    let (_dir, path) = disk_db_path("tbs-pk");
-    let _db = WorkDb::open(path.clone()).unwrap();
+    let (_dir, path) = migrated_disk_db_path("tbs-pk");
+    let _db = WorkDb::open_existing(path.clone()).unwrap();
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute(
         "INSERT INTO task_blocked_signals
@@ -769,8 +769,8 @@ fn task_blocked_signals_pk_enforced() {
 /// invalidates it automatically per design §Q5.
 #[test]
 fn manual_override_writes_ci_failure_suppression() {
-    let (_dir, path) = disk_db_path("ci-manual-override");
-    let db = WorkDb::open(path.clone()).unwrap();
+    let (_dir, path) = migrated_disk_db_path("ci-manual-override");
+    let db = WorkDb::open_existing(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore = create_test_chore_manual(&db, product.id.clone(), "chore-manual");
     let pr_url = "https://github.com/foo/bar/pull/77".to_owned();
@@ -833,8 +833,8 @@ fn manual_override_writes_ci_failure_suppression() {
 /// reasons as equivalent triggers for the suppression write.
 #[test]
 fn manual_override_from_exhausted_writes_suppression() {
-    let (_dir, path) = disk_db_path("ci-manual-override-exh");
-    let db = WorkDb::open(path.clone()).unwrap();
+    let (_dir, path) = migrated_disk_db_path("ci-manual-override-exh");
+    let db = WorkDb::open_existing(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore = create_test_chore_manual(&db, product.id.clone(), "chore-exh");
     let pr_url = "https://github.com/foo/bar/pull/78".to_owned();
@@ -883,8 +883,8 @@ fn manual_override_from_exhausted_writes_suppression() {
 /// still proceed after surfacing a loud warning.
 #[test]
 fn ci_retry_rate_limit_fires_after_five_attempts_in_one_hour() {
-    let (_dir, path) = disk_db_path("ci-churn");
-    let db = WorkDb::open(path.clone()).unwrap();
+    let (_dir, path) = migrated_disk_db_path("ci-churn");
+    let db = WorkDb::open_existing(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore = create_test_chore_manual(&db, product.id.clone(), "chore-churn");
 
@@ -966,8 +966,8 @@ fn ci_retry_rate_limit_fires_after_five_attempts_in_one_hour() {
 /// `ci_failure_exhausted` are an override signal.
 #[test]
 fn manual_move_unrelated_to_ci_does_not_write_suppression() {
-    let (_dir, path) = disk_db_path("ci-manual-override-noop");
-    let db = WorkDb::open(path.clone()).unwrap();
+    let (_dir, path) = migrated_disk_db_path("ci-manual-override-noop");
+    let db = WorkDb::open_existing(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore = create_test_chore_manual(&db, product.id.clone(), "chore-noop");
     let pr_url = "https://github.com/foo/bar/pull/79".to_owned();

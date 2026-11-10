@@ -23,8 +23,8 @@ fn concurrent_writes_do_not_return_database_locked() {
     // concurrent writers via busy_timeout) is incompatible with
     // SQLite's shared-cache in-memory mode, causing
     // SQLITE_LOCKED_SHAREDCACHE errors that busy_timeout cannot retry.
-    let (_dir, path) = disk_db_path("concurrent-writes");
-    let db = std::sync::Arc::new(WorkDb::open(path.clone()).unwrap());
+    let (_dir, path) = migrated_disk_db_path("concurrent-writes");
+    let db = std::sync::Arc::new(WorkDb::open_existing(path.clone()).unwrap());
 
     let product = create_test_product(&db);
 

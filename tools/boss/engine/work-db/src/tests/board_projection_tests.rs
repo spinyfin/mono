@@ -209,8 +209,8 @@ fn board_projection_recovers_gaps_broad_changes_and_bounded_closures() {
 
 #[test]
 fn board_projection_external_commit_and_rollback_are_snapshot_consistent() {
-    let (_dir, path) = disk_db_path("projection-external");
-    let db = WorkDb::open(path).unwrap();
+    let (_dir, path) = migrated_disk_db_path("projection-external");
+    let db = WorkDb::open_existing(path).unwrap();
     let product = make_revision_product(&db, "projection");
     let task = create_test_chore_manual(&db, product.clone(), "before").id;
     let mut model = None;
@@ -419,8 +419,8 @@ fn board_projection_large_ready_backlog_stays_incremental() {
 
 #[test]
 fn board_projection_review_guide_changes_are_card_scoped() {
-    let (_dir, path) = disk_db_path("projection-guide");
-    let db = WorkDb::open(path).unwrap();
+    let (_dir, path) = migrated_disk_db_path("projection-guide");
+    let db = WorkDb::open_existing(path).unwrap();
     let product = make_revision_product(&db, "guide");
     let other = make_revision_product(&db, "unrelated");
     let root = make_in_review_chore(&db, &product, "https://github.com/acme/widget/pull/9");
