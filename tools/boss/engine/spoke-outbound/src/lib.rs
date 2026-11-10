@@ -555,6 +555,15 @@ mod tests {
         );
         assert!(offered.required.iter().any(|name| name == feature::WORKSPACE));
         assert!(offered.required.iter().any(|name| name == feature::EXECUTION));
+        for name in [feature::WORKER_EVENT, feature::TRANSCRIPT_DELTA] {
+            assert!(
+                offered
+                    .features
+                    .iter()
+                    .any(|item| item.name == name && item.revision == 1)
+            );
+            assert!(offered.required.iter().any(|required| required == name));
+        }
         assert!(
             !offered
                 .required
