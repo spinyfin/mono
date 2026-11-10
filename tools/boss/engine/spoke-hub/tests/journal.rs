@@ -220,7 +220,13 @@ async fn the_caller_chooses_which_commands_stay_addressable_after_resolve() {
         .await
         .unwrap();
     assert_eq!(stored.command_id, "c2");
+    assert_eq!(stored.sequence, 1);
     // Identical retry is idempotent; a different run is still denied.
+    let retried = outbox
+        .append("host-a", CommandAdmission::Recovery, stop_command("c2", run.clone()))
+        .await
+        .unwrap();
+    assert_eq!(retried, stored);
     let mut foreign = run;
     foreign.spawn_token = "forged".into();
     assert!(matches!(
