@@ -2075,6 +2075,8 @@ impl MergeProbe for FixedMergeabilityProbe {
 #[cfg(test)]
 mod conflict_delivery;
 #[cfg(test)]
+mod local_teardown;
+#[cfg(test)]
 mod revision_delivery;
 #[cfg(test)]
 mod status_ledger;

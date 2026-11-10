@@ -4,6 +4,8 @@ use boss_engine_recovery::execution_bookmark::ExecutionBookmark;
 use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus};
 use std::sync::Mutex;
 
+mod preservation_retry;
+
 struct SweepCube;
 crate::stub_cube_client! { SweepCube {
     async fn release_workspace(&self, _: &str) -> Result<()> { Ok(()) }

@@ -980,3 +980,4 @@ pub use spoke_hub::{
 pub use trunk_merge_intents::{ActiveTrunkMergeIntent, TrunkMergeIntent, TrunkMergeIntentInsertInput};
 
 mod preserved_work;
+mod teardown_preservation_attention;

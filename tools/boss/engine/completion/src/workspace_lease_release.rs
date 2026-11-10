@@ -381,11 +381,17 @@ pub async fn apply_release_choosing<Fut: Future<Output = Result<()>>>(
             let preserve_error = preservation.preserve(execution, cause).await.err();
             match db.claim_execution_workspace_release(&execution.id, lease_id) {
                 Ok(true) => {}
-                Ok(false) => return LeaseReleaseOutcome::NoLease,
+                Ok(false) => {
+                    let outcome = LeaseReleaseOutcome::NoLease;
+                    report_preservation_result(db, execution, lease_id, preserve_error.as_ref(), &outcome);
+                    return outcome;
+                }
                 Err(err) => {
-                    return LeaseReleaseOutcome::CubeFailed {
+                    let outcome = LeaseReleaseOutcome::CubeFailed {
                         error: format!("{err:#}"),
                     };
+                    report_preservation_result(db, execution, lease_id, preserve_error.as_ref(), &outcome);
+                    return outcome;
                 }
             }
             let result = match release(preserve_error.is_none()).await {
@@ -442,9 +448,7 @@ pub async fn apply_release_choosing<Fut: Future<Output = Result<()>>>(
                     LeaseReleaseOutcome::CubeFailed { error }
                 }
             };
-            if let Some(err) = &preserve_error {
-                report_preservation_failure(db, execution, lease_id, err, &result);
-            }
+            report_preservation_result(db, execution, lease_id, preserve_error.as_ref(), &result);
             if result == LeaseReleaseOutcome::Released {
                 if let Err(err) = db.finish_execution_workspace_release(execution) {
                     tracing::error!(error = %err, "failed to clear released workspace metadata");
@@ -559,6 +563,20 @@ fn raise_inspect_attention(
     }
 }
 
+fn report_preservation_result(
+    db: &WorkDb,
+    execution: &WorkExecution,
+    lease_id: &str,
+    error: Option<&anyhow::Error>,
+    outcome: &LeaseReleaseOutcome,
+) {
+    if let Some(err) = error {
+        report_preservation_failure(db, execution, lease_id, err, outcome);
+    } else if let Err(err) = db.refresh_teardown_preservation_attention(&execution.id, None, &format!("{outcome:?}")) {
+        tracing::error!(execution_id = %execution.id, %err, "could not refresh teardown preservation attention");
+    }
+}
+
 /// Teardown could not preserve the workspace's edits. This is the one durable
 /// pointer to the unbookmarked work, worded from what the release actually did.
 fn report_preservation_failure(
@@ -575,28 +593,23 @@ fn report_preservation_failure(
         "teardown could not preserve the workspace",
     );
     let what_happened = match outcome {
-        LeaseReleaseOutcome::Released => format!(
-            "lease `{lease_id}` was released without cube's forced reset, so cube's own unpushed-work guard keeps or \
-             salvages a dirty tree"
-        ),
+        LeaseReleaseOutcome::Released => {
+            format!("lease `{lease_id}` was released without a forced reset; the workspace tree was not reset")
+        }
         LeaseReleaseOutcome::CubeFailed { .. } => format!(
-            "lease `{lease_id}` is still held because cube's release failed, and the leftover-lease sweep retries it"
+            "lease `{lease_id}` is still held because release could not complete, and the leftover-lease sweep retries it"
         ),
         _ => format!("lease `{lease_id}` is no longer held for this run"),
     };
-    let inspect = boss_engine_recovery::execution_bookmark::PreserveInspect {
-        existing_commit_id: None,
-        workspace_change_id: None,
-        workspace_commit_id: None,
-        workspace_count: None,
-        reason: format!(
-            "Teardown could not preserve this run's workspace edits ({err:#}); {what_happened}. The worker's last \
+    let reason = format!(
+        "Teardown could not preserve this run's workspace edits ({err:#}); {what_happened}. The worker's last \
              working-copy commit is not bookmarked as `preserved/{id}`; locate it in the shared jj store (for \
              example with `jj op log`)",
-            id = execution.id
-        ),
-    };
-    raise_inspect_attention(db, execution, inspect);
+        id = execution.id
+    );
+    if let Err(err) = db.refresh_teardown_preservation_attention(&execution.id, Some(&reason), &what_happened) {
+        tracing::error!(execution_id = %execution.id, %err, "could not report teardown preservation failure");
+    }
 }
 
 pub fn raise_attention(db: &WorkDb, execution: &WorkExecution, kind: &str, title: &str, body: &str) {

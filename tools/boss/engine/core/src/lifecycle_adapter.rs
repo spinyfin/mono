@@ -301,6 +301,60 @@ mod tests {
     use crate::host_adapter::LocalHostAdapterProvider;
     use crate::test_support::{NoopCube, NoopRunner, open_db_arc};
 
+    struct RecordingRelease(std::sync::Mutex<Vec<bool>>);
+    crate::stub_host_adapter! { RecordingRelease {
+        fn host_id(&self) -> &str { "local" }
+        async fn release_workspace(&self, _: &str) -> Result<()> {
+            self.0.lock().unwrap().push(false);
+            Ok(())
+        }
+        async fn release_workspace_with_reset(&self, _: &str) -> Result<()> {
+            self.0.lock().unwrap().push(true);
+            Ok(())
+        }
+    } }
+
+    #[tokio::test]
+    async fn proven_release_forces_reset_only_after_preservation_succeeds() {
+        use crate::test_support::{create_test_chore, create_test_product};
+        use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus};
+        for preserved in [false, true] {
+            let (_dir, db) = open_db_arc();
+            let product = create_test_product(&db);
+            let chore = create_test_chore(&db, product.id, "Proven release");
+            let execution = db
+                .create_execution(
+                    CreateExecutionInput::builder()
+                        .work_item_id(chore.id)
+                        .kind(ExecutionKind::ChoreImplementation)
+                        .status(ExecutionStatus::Completed)
+                        .cube_lease_id("lease")
+                        .build(),
+                )
+                .unwrap();
+            if !preserved {
+                // A positioned execution without a workspace path cannot be preserved.
+                db.record_execution_bookmark(&boss_engine_recovery::execution_bookmark::ExecutionBookmark {
+                    execution_id: execution.id.clone(),
+                    repo_path: "/tmp/unavailable".into(),
+                    host_id: "local".into(),
+                    base_commit: None,
+                    pr_head_before: None,
+                    has_recovery_head: None,
+                })
+                .unwrap();
+            }
+            // The success mirror is a never-positioned run: no worker edits exist.
+            let adapter = RecordingRelease(Default::default());
+            let result = CoreLifecycleServices::new(db.clone())
+                .apply_proven_workspace_release(&execution, "lease", TerminalCause::ProvenCompleted, &adapter)
+                .await;
+            assert_eq!(result, LeaseReleaseOutcome::Released);
+            assert_eq!(*adapter.0.lock().unwrap(), vec![preserved]);
+            assert!(db.get_execution(&execution.id).unwrap().cube_lease_id.is_none());
+        }
+    }
+
     #[test]
     fn builder_registers_injected_lifecycle_metrics_in_shared_registry() {
         let (_dir, db) = open_db_arc();
