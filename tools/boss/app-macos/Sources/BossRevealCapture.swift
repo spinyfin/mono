@@ -164,7 +164,8 @@ enum BossRevealCapture {
                 dispatchWaitReason: "waiting_dependency", dispatchWaitSince: nil,
                 dispatchWaitBlocker: DispatchWaitBlocker(
                     workItemID: rows[0].id, productID: product.id, shortID: rows[0].shortID
-                )
+                ),
+                dispatchWaitLabel: "waiting for T\(rows[0].shortID ?? 0)"
             )]
         }
         if state == "doing-sections" {

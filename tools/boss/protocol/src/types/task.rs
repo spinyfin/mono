@@ -1334,6 +1334,12 @@ pub fn parked_via_project(project_id: &str) -> String {
     format!("project:{project_id}")
 }
 
+/// [`TaskRuntime::dispatch_wait_reason`] for a wait the engine could not
+/// name. Not a reason: it marks a break in the engine's state model, which the
+/// engine logs and raises as a `dispatch_wait_unclassified` attention item. A
+/// client shows it as an unexpected state, never as an ordinary queue reason.
+pub const DISPATCH_WAIT_REASON_UNCLASSIFIED: &str = "unclassified";
+
 /// Live runtime status for a single task/chore — the current execution
 /// and most recent run, summarized for the kanban view. `None` fields
 /// mean no execution (or no run) exists yet for the work item.
@@ -1372,12 +1378,21 @@ pub struct TaskRuntime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_retry_at: Option<String>,
 
-    /// The current pending execution's wait reason: recorded scheduler hold,
-    /// dependency gating, or future dispatch deadline. Absent after claiming
-    /// a slot, when a recorded blocker has stopped running, or when no reason
-    /// is known. Consumers must not infer capacity from an absent reason.
+    /// Why the item is waiting rather than running: a wait code (dependency
+    /// gating, project order, a scheduler hold, a future dispatch deadline,
+    /// ...) or the scheduler's own sentence for one hold. Present for every
+    /// pending execution and for a queued item with no execution; absent only
+    /// when the item is not waiting on dispatch (running, claimed, finished).
+    /// `unclassified` marks a wait the engine could not name, which it reports
+    /// as an anomaly. Consumers must not infer capacity from an absent reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_wait_reason: Option<String>,
+
+    /// The phrase to show for `dispatch_wait_reason`, produced by the same
+    /// engine classifier. Clients render it as given; they never map a wait
+    /// code to text themselves. Present whenever `dispatch_wait_reason` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_wait_label: Option<String>,
 
     /// Unix epoch seconds (as a string) since `dispatch_wait_reason` took
     /// its current value. `None` whenever `dispatch_wait_reason` is `None`.

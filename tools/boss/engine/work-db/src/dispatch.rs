@@ -917,97 +917,7 @@ impl WorkDb {
     pub fn list_orphan_active_candidates(&self, min_age_secs: i64) -> Result<Vec<String>> {
         let conn = self.connect()?;
         let now_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
-        let cutoff = now_secs - min_age_secs;
-        // The recovery-escalation exclusion: once the transient-recovery
-        // sweep has raised an open attention item because a worker's API
-        // error is non-retryable (permanent/unrecognised) or the retry
-        // cap was reached, this work item must NOT be blindly
-        // re-dispatched — it is flagged for a human. Resolving the
-        // attention item makes it a candidate again.
-        // Both live statuses are excluded. `running` and `waiting_human`
-        // are the same fact — a worker the engine dispatched and has not
-        // concluded — differing only in whether its agent is currently
-        // blocked on a person; a worker in either one may have released
-        // its worker-pool slot without being dead. Excluding them prevents
-        // the sweep from reading an unclaimed slot as "dead worker" and
-        // abandoning a valid in-flight execution.
-        //
-        // Deciding that a live row is actually dead is NOT this sweep's
-        // job and never was: `dead_pane_sweep`, `husk_pane_sweep`,
-        // `lost_workspace_sweep`, `dead_pid_sweep` and `spawn_ack_sweep`
-        // each own one death signal, with their own corroboration rules,
-        // and reconcile such a row to `orphaned`/`abandoned`. This query
-        // legitimately picks the work item up on the pass after that.
-        let unproductive_completed = super::review_verdicts::unproductive_completed_pr_review_sql();
-        let upkeep = super::parking::upkeep_eligible_task_sql("t");
-        let walk = super::cycle_root_walk_cte("t.status = 'active'\n               AND t.deleted_at IS NULL");
-        let stmt_sql = format!(
-            "{walk}
-             SELECT t.id FROM tasks t
-             JOIN roots ON roots.task_id = t.id
-             WHERE t.status = 'active'
-               AND t.deleted_at IS NULL
-               AND {upkeep}
-               AND CAST(t.updated_at AS INTEGER) < ?1
-               AND NOT EXISTS (
-                   SELECT 1 FROM work_executions we
-                   WHERE we.work_item_id = t.id
-                     AND we.status IN ('ready', 'claimed', 'running', 'waiting_human')
-               )
-               AND NOT EXISTS (
-                   SELECT 1 FROM work_attention_items a
-                   WHERE a.work_item_id = t.id
-                     AND a.status = 'open'
-                     AND a.kind IN ('{permanent}', '{exhausted}')
-               )
-               AND NOT EXISTS (
-                   SELECT 1 FROM work_executions we
-                   WHERE we.work_item_id = t.id
-                     AND we.kind = 'pr_review'
-                     AND (
-                         we.status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
-                         OR {unproductive_completed}
-                     )
-                     AND NOT EXISTS (
-                         SELECT 1 FROM work_executions we2
-                         WHERE we2.work_item_id = t.id
-                           AND we2.kind = 'pr_review'
-                           AND (we2.created_at > we.created_at
-                                OR (we2.created_at = we.created_at AND we2.id > we.id))
-                     )
-               )
-               AND NOT EXISTS (
-                   SELECT 1 FROM pr_review_batches b
-                   WHERE b.cycle_root_id = roots.cycle_root_id
-                     AND b.phase = 'pre_merge'
-                     AND b.status NOT IN ('completed', 'failed')
-                     AND (
-                           SELECT COALESCE(NULLIF(we.pr_head_after, ''), b.target_sha)
-                           FROM work_executions we
-                           WHERE we.work_item_id = t.id
-                             AND we.kind != 'pr_review'
-                           ORDER BY we.finished_at DESC, we.id DESC
-                           LIMIT 1
-                         ) = b.target_sha
-               )
-             ORDER BY t.updated_at ASC, t.id ASC",
-            walk = walk,
-            upkeep = upkeep,
-            permanent = ATTENTION_KIND_RECOVERY_PERMANENT,
-            exhausted = ATTENTION_KIND_RECOVERY_EXHAUSTED,
-        );
-        let mut stmt = conn.prepare(&stmt_sql)?;
-        let rows = stmt.query_map([cutoff], |row| row.get::<_, String>(0))?;
-        let mut out = Vec::new();
-        for row in rows {
-            let id = row?;
-            // A completed producer waiting for review admission is not
-            // an orphan. Review recovery owns it, even without a batch.
-            if !primary_pr_awaits_review(&conn, &id)? && !revision_implementation_completed(&conn, &id)? {
-                out.push(id);
-            }
-        }
-        Ok(out)
+        orphan_active_candidates(&conn, now_secs - min_age_secs, None)
     }
 
     /// Return every non-terminal, non-deleted work item with an open PR
@@ -2078,6 +1988,113 @@ pub(crate) fn parent_review_command(conn: &Connection, root: &str, pr_url: Optio
         return Ok(format!("bossctl review start --pr {number} --repo {owner}/{repo}"));
     }
     Ok(format!("bossctl agents launch {root}"))
+}
+
+/// Whether a live review batch still covers this producer head.
+pub(crate) fn live_pre_merge_batch_holds(conn: &Connection, id: &str) -> Result<bool> {
+    let root = chain_root(conn, id)?;
+    Ok(conn.query_row(
+        r#"SELECT EXISTS (
+            SELECT 1 FROM pr_review_batches b
+            WHERE b.cycle_root_id = ?2 AND b.phase = 'pre_merge'
+              AND b.status NOT IN ('completed', 'failed')
+              AND (SELECT COALESCE(NULLIF(we.pr_head_after, ''), b.target_sha)
+                   FROM work_executions we WHERE we.work_item_id = ?1 AND we.kind != 'pr_review'
+                   ORDER BY we.finished_at DESC, we.id DESC LIMIT 1) = b.target_sha
+        )"#,
+        params![id, root],
+        |row| row.get(0),
+    )?)
+}
+
+/// The orphan sweep's candidate walk: `active` items older than `cutoff`
+/// (epoch seconds) with no run pending or live, minus the holds the sweep
+/// leaves alone. `only` restricts the walk to one item. See
+/// [`WorkDb::list_orphan_active_candidates`] for each exclusion.
+pub(crate) fn orphan_active_candidates(conn: &Connection, cutoff: i64, only: Option<&str>) -> Result<Vec<String>> {
+    // The recovery-escalation exclusion: once the transient-recovery
+    // sweep has raised an open attention item because a worker's API
+    // error is non-retryable (permanent/unrecognised) or the retry
+    // cap was reached, this work item must NOT be blindly
+    // re-dispatched — it is flagged for a human. Resolving the
+    // attention item makes it a candidate again.
+    // Both live statuses are excluded. `running` and `waiting_human`
+    // are the same fact — a worker the engine dispatched and has not
+    // concluded — differing only in whether its agent is currently
+    // blocked on a person; a worker in either one may have released
+    // its worker-pool slot without being dead. Excluding them prevents
+    // the sweep from reading an unclaimed slot as "dead worker" and
+    // abandoning a valid in-flight execution.
+    //
+    // Deciding that a live row is actually dead is NOT this sweep's
+    // job and never was: `dead_pane_sweep`, `husk_pane_sweep`,
+    // `lost_workspace_sweep`, `dead_pid_sweep` and `spawn_ack_sweep`
+    // each own one death signal, with their own corroboration rules,
+    // and reconcile such a row to `orphaned`/`abandoned`. This query
+    // legitimately picks the work item up on the pass after that.
+    let unproductive_completed = super::review_verdicts::unproductive_completed_pr_review_sql();
+    let upkeep = super::parking::upkeep_eligible_task_sql("t");
+    let walk = super::cycle_root_walk_cte(
+        "t.status = 'active'\n               AND t.deleted_at IS NULL\n               AND (?2 IS NULL OR t.id = ?2)",
+    );
+    let stmt_sql = format!(
+        "{walk}
+         SELECT t.id FROM tasks t
+         JOIN roots ON roots.task_id = t.id
+         WHERE t.status = 'active'
+           AND t.deleted_at IS NULL
+           AND {upkeep}
+           AND CAST(t.updated_at AS INTEGER) < ?1
+           AND (?2 IS NULL OR t.id = ?2)
+           AND NOT EXISTS (
+               SELECT 1 FROM work_executions we
+               WHERE we.work_item_id = t.id
+                 AND we.status IN ('ready', 'claimed', 'running', 'waiting_human')
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM work_attention_items a
+               WHERE a.work_item_id = t.id
+                 AND a.status = 'open'
+                 AND a.kind IN ('{permanent}', '{exhausted}')
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM work_executions we
+               WHERE we.work_item_id = t.id
+                 AND we.kind = 'pr_review'
+                 AND (
+                     we.status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
+                     OR {unproductive_completed}
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM work_executions we2
+                     WHERE we2.work_item_id = t.id
+                       AND we2.kind = 'pr_review'
+                       AND (we2.created_at > we.created_at
+                            OR (we2.created_at = we.created_at AND we2.id > we.id))
+                 )
+           )
+
+         ORDER BY t.updated_at ASC, t.id ASC",
+        walk = walk,
+        upkeep = upkeep,
+        permanent = ATTENTION_KIND_RECOVERY_PERMANENT,
+        exhausted = ATTENTION_KIND_RECOVERY_EXHAUSTED,
+    );
+    let mut stmt = conn.prepare(&stmt_sql)?;
+    let rows = stmt.query_map(params![cutoff, only], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let id = row?;
+        // A completed producer waiting for review admission is not
+        // an orphan. Review recovery owns it, even without a batch.
+        if !primary_pr_awaits_review(conn, &id)?
+            && !revision_implementation_completed(conn, &id)?
+            && !live_pre_merge_batch_holds(conn, &id)?
+        {
+            out.push(id);
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

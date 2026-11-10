@@ -236,6 +236,14 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          and on unblock; a run start is unambiguous evidence the serialization ended.",
     ),
     entry(
+        DISPATCH_WAIT_UNCLASSIFIED_ATTENTION_KIND,
+        ClearedBy::ProducerReconciles,
+        "Asserts the item is waiting for a reason the engine cannot name. The scheduler heartbeat \
+         re-classifies every waiting item on each beat and resolves this the moment the item is \
+         running, gone, or waiting for a named reason; it reads the stored open items rather than \
+         its own memory, so a restart cannot strand one.",
+    ),
+    entry(
         REPO_UNRESOLVED_ATTENTION_KIND,
         ClearedBy::WorkResumed,
         "Asserts the item has no repo resolution. `ensure_dispatch_repo_resolvable` is a hard gate \

@@ -27,6 +27,11 @@ pub fn persisted_origin_is_operator(origin: Option<&str>) -> bool {
     origin == Some(PERSISTED_ORIGIN_OPERATOR)
 }
 
+/// Admission's exemption for reviews and critical main-pool work.
+pub fn exempts_work(overridable: bool, review: bool, critical_main: bool) -> bool {
+    overridable && (review || critical_main)
+}
+
 /// The scope a pause of the given persisted origin holds when no scope was
 /// stored: operator pauses exempt reviews (`new_work`); anything else holds
 /// everything (`all_spawns`).

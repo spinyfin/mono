@@ -1533,7 +1533,7 @@ pub fn resolve_diagnose_scope(
                 work_item_id: resolved.work_item_id,
             });
         }
-        if !resolved.execution_ids.is_empty() {
+        if resolved.work_item_id.is_some() {
             return Ok(DiagnoseScope {
                 input_id: id.to_owned(),
                 resolved_as: ResolvedAs::WorkItem,
@@ -1857,6 +1857,39 @@ pub fn render_findings(findings: &[Finding], integrity: &crate::stream_integrity
     out
 }
 
+/// The `waiting:` line of `dispatch diagnose`: the engine's wait reason for
+/// the item (code and phrase), the execution it applies to, and what it is
+/// waiting behind. `unclassified` is called out as the anomaly it is.
+fn dispatch_wait_line(runtime: &boss_protocol::TaskRuntime) -> String {
+    let reason = runtime.dispatch_wait_reason.as_deref().unwrap_or_default();
+    let label = runtime.dispatch_wait_label.as_deref().unwrap_or(reason);
+    let mut line = match (&runtime.execution_id, &runtime.execution_status) {
+        (Some(id), Some(status)) if !status.is_terminal() => {
+            format!("waiting: {reason} — {label} (execution {id}, {status})")
+        }
+        _ => format!("waiting: {reason} — {label} (no execution queued)"),
+    };
+    if let Some(blocker) = &runtime.dispatch_wait_blocker {
+        line.push_str(&format!("; behind {} {}", blocker.kind, blocker.work_item_id));
+    }
+    if reason == boss_protocol::DISPATCH_WAIT_REASON_UNCLASSIFIED {
+        line.push_str("\n  UNEXPECTED: the engine could not name this wait; it is reported as a `dispatch_wait_unclassified` attention item");
+    }
+    line
+}
+
+fn dispatch_wait_json(runtime: &boss_protocol::TaskRuntime) -> Value {
+    serde_json::json!({
+        "reason": runtime.dispatch_wait_reason,
+        "label": runtime.dispatch_wait_label,
+        "execution_id": runtime.execution_id,
+        "execution_status": runtime.execution_status,
+        "blocker": runtime.dispatch_wait_blocker,
+        "since_epoch_s": runtime.dispatch_wait_since,
+        "not_before_epoch_s": runtime.dispatch_not_before,
+    })
+}
+
 /// Full `bossctl dispatch diagnose` pipeline: resolve scope, load artifacts,
 /// match signatures, print timeline + findings (or JSON).
 ///
@@ -1869,6 +1902,20 @@ pub fn run_diagnose(
     now_ms: u128,
     db: Option<&boss_engine::work::WorkDb>,
 ) -> Result<()> {
+    if let Some(payload) = diagnose_report(root, id, json, signatures_only, now_ms, db)? {
+        println!("{payload}");
+    }
+    Ok(())
+}
+
+fn diagnose_report(
+    root: &Path,
+    id: &str,
+    json: bool,
+    signatures_only: bool,
+    now_ms: u128,
+    db: Option<&boss_engine::work::WorkDb>,
+) -> Result<Option<Value>> {
     let db_resolution = db.and_then(|work_db| {
         if let Ok(exec) = work_db.get_execution(id) {
             return Some(WorkItemResolution {
@@ -1877,8 +1924,8 @@ pub fn run_diagnose(
                 execution_ids: vec![id.to_owned()],
             });
         }
-        if let Ok(list) = work_db.list_executions(Some(id))
-            && !list.is_empty()
+        if work_db.get_work_item(id).is_ok()
+            && let Ok(list) = work_db.list_executions(Some(id))
         {
             return Some(WorkItemResolution {
                 as_execution: false,
@@ -1978,6 +2025,17 @@ pub fn run_diagnose(
             .ok()
     });
 
+    // Why the item is waiting right now is a fact about its current rows, not
+    // a dispatch event, so diagnose reads it from state.db: the same engine
+    // classification the board's card shows.
+    let wait_diagnosis = db.zip(scope.work_item_id.as_deref()).and_then(|(work_db, item_id)| {
+        work_db
+            .get_task_runtime(item_id)
+            .map_err(|err| eprintln!("warning: dispatch wait lookup skipped: {err:#}"))
+            .ok()
+            .filter(|runtime| runtime.dispatch_wait_reason.is_some())
+    });
+
     let mut findings = match_dispatch_signatures(&events, now_ms, Some(&fleet), Some(&db_facts), &scope_execs);
 
     match load_scope_trace_records(root, &scope_execs, &scope_items) {
@@ -2066,8 +2124,10 @@ pub fn run_diagnose(
         if let Some(progression) = &progression_diagnosis {
             payload.insert("progression".into(), progression.to_json());
         }
-        println!("{}", Value::Object(payload));
-        return Ok(());
+        if let Some(wait) = &wait_diagnosis {
+            payload.insert("wait".into(), dispatch_wait_json(wait));
+        }
+        return Ok(Some(Value::Object(payload)));
     }
 
     match scope.resolved_as {
@@ -2108,6 +2168,10 @@ pub fn run_diagnose(
         }
     }
 
+    if let Some(wait) = &wait_diagnosis {
+        println!("{}", dispatch_wait_line(wait));
+    }
+
     if events.is_empty() && findings.is_empty() {
         // "Nothing here" is precisely the conclusion damage invalidates, so it
         // is the one case that must never be stated bare.
@@ -2118,7 +2182,7 @@ pub fn run_diagnose(
             println!("  {}", crate::stream_integrity::NO_EVENTS_CAVEAT);
         }
         integrity.print_footer();
-        return Ok(());
+        return Ok(None);
     }
 
     if !signatures_only {
@@ -2140,7 +2204,7 @@ pub fn run_diagnose(
     println!();
     print!("{}", render_findings(&findings, &integrity));
     integrity.print_footer();
-    Ok(())
+    Ok(None)
 }
 
 /// Render one execution's timeline with its unreadable regions marked in place.

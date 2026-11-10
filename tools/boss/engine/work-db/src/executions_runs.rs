@@ -2435,13 +2435,22 @@ pub(crate) fn reconcile_tasks(
         // (the scheduler had already picked the row up as `ready`). The
         // `claimed` status + CAS write close the race; aligning this
         // rule with the prerequisite graph is a separate change.
+        //
+        // The chain decides which task the engine starts next. It does not
+        // hold a task that is already `active`: that task has been started,
+        // by a move to Doing or by an earlier run. The explicit-start path
+        // mints its execution `ready` regardless of ordinal and reconciles
+        // the product in the same request, before the scheduler claims it.
+        // Demoting that row would move it to `waiting_dependency`, which no
+        // scheduler pass reads. The prerequisite gate in
+        // `reconcile_work_item_execution` still applies to an active task.
         let first_incomplete = tasks.iter().position(task_accepts_execution);
 
         for (index, task) in tasks.iter().enumerate() {
             if !task_accepts_execution(task) {
                 continue;
             }
-            let desired_status = if Some(index) == first_incomplete {
+            let desired_status = if Some(index) == first_incomplete || task.status == TaskStatus::Active {
                 ExecutionStatus::Ready
             } else {
                 ExecutionStatus::WaitingDependency

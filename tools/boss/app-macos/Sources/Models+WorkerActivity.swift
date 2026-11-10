@@ -326,9 +326,10 @@ enum AgentActivityState: Equatable {
     case unknown(reason: String)
     case errored(reason: String)
     case none
-    /// The row is `status=todo, autostart=true` and no worker slot is
-    /// free yet. The engine has committed to dispatching it; the pool
-    /// is just full. Renders as a hourglass rather than a coloured dot
+    /// The card is queued: no worker is attached to it yet. Why it is
+    /// waiting is the engine's to say and is shown on the card's status
+    /// line (`WorkCardLiveStatus.queuedLabel`); this state carries no
+    /// reason of its own. Renders as a hourglass rather than a coloured dot
     /// so it reads as "queued" rather than "active or paused worker".
     case dispatchPending
 
@@ -352,8 +353,10 @@ enum AgentActivityState: Equatable {
             // Gating on it here would paint every such worker as "Run
             // completed".
             self = .active
-        case "ready":
-            self = .waiting(reason: "Queued for a worker")
+        case "ready", "waiting_dependency":
+            // Not started yet. Why is the engine's to say: the same line the
+            // card shows, never a reason inferred from the execution status.
+            self = .waiting(reason: WorkCardLiveStatus.queuedLabel(runtime: runtime, now: Date()))
         case "claimed":
             self = .waiting(reason: "Starting worker")
         case "waiting_human":
@@ -362,8 +365,6 @@ enum AgentActivityState: Equatable {
             self = .waiting(reason: "Waiting on review")
         case "waiting_merge":
             self = .waiting(reason: "Waiting on merge")
-        case "waiting_dependency":
-            self = .waiting(reason: "Waiting on dependency")
         case "failed":
             self = .waiting(reason: "Last run failed")
         case "completed":
@@ -530,7 +531,9 @@ enum AgentActivityState: Equatable {
         case .none:
             return "No agent attached"
         case .dispatchPending:
-            return "Queued — waiting for a worker slot"
+            // No reason here: a full pool is only one of the things a queued
+            // card can be waiting on, and the status line names the real one.
+            return "Queued — no worker attached yet; the status line says why"
         }
     }
 }

@@ -2001,7 +2001,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         ))
     }
 
-    func testLiveStatusDispatchPendingWithoutReasonIsUnknown() {
+    func testLiveStatusDispatchPendingWithoutReasonIsAnUnexpectedState() {
         let task = Self.makeTask(status: "todo", autostart: true)
         let runtime = WorkTaskRuntime(
             workItemID: task.id,
@@ -2016,7 +2016,7 @@ final class WorkCardSnapshotTests: XCTestCase {
             WorkCardLiveStatus.resolve(
                 task: task, column: .doing, runtime: runtime, liveState: nil
             ),
-            "Queued — reason unknown"
+            "Unexpected state — the engine sent no reason for this wait"
         )
     }
 
@@ -2047,14 +2047,15 @@ final class WorkCardSnapshotTests: XCTestCase {
             runStatus: nil,
             executionID: nil,
             dispatchRetryAt: nil,
-            dispatchWaitReason: nil,
-            dispatchWaitSince: nil
+            dispatchWaitReason: "project_order",
+            dispatchWaitSince: nil,
+            dispatchWaitLabel: "waiting for an earlier task in its project"
         )
         XCTAssertEqual(
             WorkCardLiveStatus.resolve(
                 task: task, column: .doing, runtime: runtime, liveState: nil
             ),
-            "Queued — reason unknown"
+            "Queued — waiting for an earlier task in its project"
         )
     }
 
@@ -2067,7 +2068,8 @@ final class WorkCardSnapshotTests: XCTestCase {
             executionID: "exec-1",
             dispatchRetryAt: nil,
             dispatchWaitReason: "pool_exhausted",
-            dispatchWaitSince: nil
+            dispatchWaitSince: nil,
+            dispatchWaitLabel: "worker pool full"
         )
         XCTAssertEqual(
             WorkCardLiveStatus.resolve(

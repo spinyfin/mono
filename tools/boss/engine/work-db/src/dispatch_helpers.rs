@@ -286,7 +286,9 @@ pub(crate) fn collect_task_runtimes(
     let mut runtimes = Vec::with_capacity(tasks.len() + chores.len());
     let mut queries = 0u64;
     for task in tasks.iter().chain(chores.iter()) {
-        runtimes.push(compute_task_runtime(conn, &task.id, &mut queries, now)?.runtime);
+        let mut runtime = compute_task_runtime(conn, &task.id, &mut queries, now)?.runtime;
+        super::queued_wait::annotate_unscheduled(conn, task, &mut runtime)?;
+        runtimes.push(runtime);
     }
     Ok((runtimes, queries))
 }
@@ -298,7 +300,15 @@ pub(crate) fn collect_task_runtimes(
 /// callers can report an accurate aggregate subquery count.
 pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str, queries: &mut u64) -> Result<TaskRuntime> {
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
-    Ok(compute_task_runtime(conn, work_item_id, queries, now)?.runtime)
+    let mut runtime = compute_task_runtime(conn, work_item_id, queries, now)?.runtime;
+    // A card queued with no execution is explained from its task row, which
+    // the execution-keyed projection above never reads.
+    if runtime.dispatch_wait_reason.is_none()
+        && let Some(task) = query_task(conn, work_item_id)?
+    {
+        super::queued_wait::annotate_unscheduled(conn, &task, &mut runtime)?;
+    }
+    Ok(runtime)
 }
 
 /// A freshly computed runtime plus what the board runtime cache needs to know
@@ -323,8 +333,13 @@ pub struct ComputedRuntime {
 /// - the chosen execution's latest `work_runs` row: insert, delete, or an
 ///   update of `status`, `execution_id` or `created_at`;
 /// - `dispatch_not_before` against `now`: `expires_at`;
-/// - dependency gating and chain-hold blockers: not versioned, `cacheable`
-///   is false.
+/// - dependency gating, project order and chain-hold blockers: not
+///   versioned, `cacheable` is false.
+///
+/// The item's own task row is not an input here. A card queued with no
+/// execution is explained from that row by `queued_wait::annotate_unscheduled`,
+/// which callers holding the row apply after this projection (and after any
+/// cache hit).
 ///
 /// A new input must be added to one of those four mechanisms, or the cache
 /// will serve it stale; `every_runtime_input_write_invalidates_exactly_its_item`
@@ -417,6 +432,7 @@ pub(crate) fn compute_task_runtime(
         .maybe_current_run_id(current_run_id)
         .maybe_dispatch_retry_at(dispatch_retry_at)
         .maybe_dispatch_wait_reason(wait.reason)
+        .maybe_dispatch_wait_label(wait.label)
         .maybe_dispatch_wait_since(dispatch_wait_since)
         .maybe_dispatch_not_before(wait.not_before)
         .maybe_dispatch_wait_blocker(wait.blocker)

@@ -156,6 +156,17 @@ pub const REMOTE_COLLECTION_FAILED_ATTENTION_KIND: &str = "remote_collection_fai
 /// was reconciled dead — see `ExecutionCoordinator::live_chain_siblings`).
 pub const CHAIN_SERIALIZED_STALL_ATTENTION_KIND: &str = "chain_serialized_stall";
 
+/// `work_attention_items.kind` filed when a work item is waiting and the
+/// engine cannot name why: a pending execution with no hold, gate or order
+/// behind it, a `ready` row scheduler passes neither claim nor hold, or a card
+/// queued on the board with no execution and nothing that withheld one. Every
+/// wait is supposed to map to a reason in `dispatch_wait`, so this is an
+/// invariant break in the engine's state model, not a queue state. The
+/// scheduler heartbeat files it once the wait has stayed unexplained past its
+/// grace period, and resolves it as soon as the item is running, gone, or
+/// waiting for a reason it can name.
+pub const DISPATCH_WAIT_UNCLASSIFIED_ATTENTION_KIND: &str = "dispatch_wait_unclassified";
+
 /// Filed against a run when spawn or spawn confirmation failed (tmux creation
 /// failure, viewer rejection, prompt composition error, composer never ready,
 /// or no turn-start evidence). The pane may have come up and then been reaped.

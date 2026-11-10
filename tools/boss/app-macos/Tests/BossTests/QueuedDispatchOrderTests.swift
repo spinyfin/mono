@@ -113,11 +113,14 @@ final class QueuedDispatchOrderTests: XCTestCase {
     func testOnlyTheNextUpCardCarriesTheMarkerAndKeepsItsWaitReason() {
         let runtime = WorkTaskRuntime(
             workItemID: "next", executionStatus: "ready", runStatus: nil, executionID: "exec_next",
-            dispatchRetryAt: nil, dispatchWaitReason: "pool_exhausted", dispatchWaitSince: nil
+            dispatchRetryAt: nil, dispatchWaitReason: "pool_exhausted", dispatchWaitSince: nil,
+            dispatchWaitLabel: "worker pool full"
         )
+        // Ready with no hold on it: the engine says the dispatcher takes it next pass.
         let plain = WorkTaskRuntime(
             workItemID: "later", executionStatus: "ready", runStatus: nil, executionID: "exec_later",
-            dispatchRetryAt: nil, dispatchWaitReason: nil, dispatchWaitSince: nil
+            dispatchRetryAt: nil, dispatchWaitReason: "awaiting_dispatch", dispatchWaitSince: nil,
+            dispatchWaitLabel: "ready for the dispatcher's next pass"
         )
         func status(_ id: String, runtime: WorkTaskRuntime?, nextUp: Bool) -> String? {
             WorkCardLiveStatus.resolve(
@@ -126,7 +129,9 @@ final class QueuedDispatchOrderTests: XCTestCase {
         }
         XCTAssertEqual(status("next", runtime: runtime, nextUp: true), "Next up — worker pool full")
         XCTAssertEqual(status("next", runtime: plain, nextUp: true), "Next up")
-        XCTAssertEqual(status("later", runtime: plain, nextUp: false), "Queued — reason unknown")
+        XCTAssertEqual(
+            status("later", runtime: plain, nextUp: false), "Queued — ready for the dispatcher's next pass"
+        )
         XCTAssertEqual(status("next", runtime: runtime, nextUp: false), "Queued — worker pool full")
     }
 
@@ -137,11 +142,13 @@ final class QueuedDispatchOrderTests: XCTestCase {
         model.taskRuntimesByID = [
             "next": WorkTaskRuntime(
                 workItemID: "next", executionStatus: "ready", runStatus: nil, executionID: "e1",
-                dispatchRetryAt: nil, dispatchWaitReason: nil, dispatchWaitSince: nil
+                dispatchRetryAt: nil, dispatchWaitReason: "awaiting_dispatch", dispatchWaitSince: nil,
+                dispatchWaitLabel: "ready for the dispatcher's next pass"
             ),
             "other": WorkTaskRuntime(
                 workItemID: "other", executionStatus: "ready", runStatus: nil, executionID: "e2",
-                dispatchRetryAt: nil, dispatchWaitReason: nil, dispatchWaitSince: nil
+                dispatchRetryAt: nil, dispatchWaitReason: "awaiting_dispatch", dispatchWaitSince: nil,
+                dispatchWaitLabel: "ready for the dispatcher's next pass"
             ),
         ]
         model.applyEventForTest(.workerLiveStatesList(states: [], queuedDispatch: [
@@ -156,6 +163,6 @@ final class QueuedDispatchOrderTests: XCTestCase {
             ).liveStatus
         }
         XCTAssertEqual(liveStatus(next), "Next up")
-        XCTAssertEqual(liveStatus(other), "Queued — reason unknown")
+        XCTAssertEqual(liveStatus(other), "Queued — ready for the dispatcher's next pass")
     }
 }

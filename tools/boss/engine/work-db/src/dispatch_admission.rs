@@ -202,60 +202,59 @@ pub(crate) fn revision_implementation_completed(conn: &Connection, work_item_id:
 #[work_db_boundary::instrument]
 impl WorkDb {
     pub fn dispatch_admission_facts(&self, work_item_id: &str) -> Result<DispatchAdmissionFacts> {
-        // Every raw query against `conn` happens in this inner block, which
-        // ends (dropping `conn`) before any call below to a `self.*` helper
-        // that itself does `self.connect()` — `WorkDb::connect` is a single
-        // `Mutex<Connection>`, not a real pool (see `schema_init::connect`),
-        // so holding this guard across such a call would self-deadlock the
-        // thread on the second `.lock()` rather than error.
-        struct RawFacts {
-            resolved_work_item_id: String,
-            ineligible_reason: Option<String>,
-            churn_guard_parked: bool,
-            autostart_disabled: bool,
-            deliberate_parked: bool,
-            kind: Option<ExecutionKind>,
-            is_critical: bool,
-        }
-        let raw = {
-            let conn = self.connect()?;
-            let resolved_work_item_id =
-                resolve_friendly_work_item_id(&conn, work_item_id)?.unwrap_or_else(|| work_item_id.to_owned());
+        let conn = self.connect()?;
+        dispatch_admission_facts_on(&conn, work_item_id)
+    }
+}
 
-            if !resolved_work_item_id.starts_with("task_") {
-                // Projects/products never carry an execution lifecycle.
-                RawFacts {
-                    resolved_work_item_id: resolved_work_item_id.clone(),
-                    ineligible_reason: Some(format!("{resolved_work_item_id} is not a dispatchable work item")),
-                    churn_guard_parked: false,
-                    autostart_disabled: false,
-                    deliberate_parked: false,
-                    kind: None,
-                    is_critical: false,
-                }
-            } else {
-                let row: Option<(String, Option<String>, i64, i64, String)> = conn
+/// Admission facts read using an existing connection.
+pub(crate) fn dispatch_admission_facts_on(conn: &Connection, work_item_id: &str) -> Result<DispatchAdmissionFacts> {
+    struct RawFacts {
+        resolved_work_item_id: String,
+        ineligible_reason: Option<String>,
+        churn_guard_parked: bool,
+        autostart_disabled: bool,
+        deliberate_parked: bool,
+        kind: Option<ExecutionKind>,
+        is_critical: bool,
+    }
+    let raw = {
+        let resolved_work_item_id =
+            resolve_friendly_work_item_id(conn, work_item_id)?.unwrap_or_else(|| work_item_id.to_owned());
+
+        if !resolved_work_item_id.starts_with("task_") {
+            // Projects/products never carry an execution lifecycle.
+            RawFacts {
+                resolved_work_item_id: resolved_work_item_id.clone(),
+                ineligible_reason: Some(format!("{resolved_work_item_id} is not a dispatchable work item")),
+                churn_guard_parked: false,
+                autostart_disabled: false,
+                deliberate_parked: false,
+                kind: None,
+                is_critical: false,
+            }
+        } else {
+            let row: Option<(String, Option<String>, i64, i64, String)> = conn
                     .query_row(
                         "SELECT status, archived_reason, autostart, deleted_at IS NOT NULL, priority FROM tasks WHERE id = ?1",
                         params![resolved_work_item_id],
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
                     )
                     .optional()?;
-                let Some((status_str, archived_reason, autostart, deleted, priority)) = row else {
-                    return Ok(DispatchAdmissionFacts::builder()
-                        .resolved_work_item_id(resolved_work_item_id.clone())
-                        .ineligible_reason(format!("unknown work item: {resolved_work_item_id}"))
-                        .build());
-                };
-                let status: TaskStatus = status_str.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-                // Shares `status_ineligibility` with
-                // `request_execution_in_tx_with_live_check` (see its doc)
-                // so this read-only evaluator can never diverge from what
-                // the mutating request path actually enforces on the
-                // status axis.
-                let ineligible_reason = if let Some(ineligibility) =
-                    status_ineligibility(&status, archived_reason.as_deref(), deleted != 0)
-                {
+            let Some((status_str, archived_reason, autostart, deleted, priority)) = row else {
+                return Ok(DispatchAdmissionFacts::builder()
+                    .resolved_work_item_id(resolved_work_item_id.clone())
+                    .ineligible_reason(format!("unknown work item: {resolved_work_item_id}"))
+                    .build());
+            };
+            let status: TaskStatus = status_str.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+            // Shares `status_ineligibility` with
+            // `request_execution_in_tx_with_live_check` (see its doc)
+            // so this read-only evaluator can never diverge from what
+            // the mutating request path actually enforces on the
+            // status axis.
+            let ineligible_reason =
+                if let Some(ineligibility) = status_ineligibility(&status, archived_reason.as_deref(), deleted != 0) {
                     Some(match ineligibility {
                         StatusIneligibility::Deleted => format!("{resolved_work_item_id} is deleted"),
                         StatusIneligibility::Terminal {
@@ -269,15 +268,15 @@ impl WorkDb {
                             )
                         }
                     })
-                } else if let Some(refusal) = parking::unpark_first_refusal(&conn, &resolved_work_item_id)? {
+                } else if let Some(refusal) = parking::unpark_first_refusal(conn, &resolved_work_item_id)? {
                     Some(refusal.to_string())
-                } else if primary_pr_awaits_review(&conn, &resolved_work_item_id)?
-                    && query_live_execution_for_work_item(&conn, &resolved_work_item_id)?.is_none()
-                    && query_latest_execution_for_work_item(&conn, &resolved_work_item_id)?
+                } else if primary_pr_awaits_review(conn, &resolved_work_item_id)?
+                    && query_live_execution_for_work_item(conn, &resolved_work_item_id)?.is_none()
+                    && query_latest_execution_for_work_item(conn, &resolved_work_item_id)?
                         .is_none_or(|execution| execution.status.is_terminal())
                 {
                     Some("Work already has a bound PR; use a revision to change it".into())
-                } else if work_item_is_human_driven(&conn, &resolved_work_item_id)? {
+                } else if work_item_is_human_driven(conn, &resolved_work_item_id)? {
                     Some(format!(
                         "{resolved_work_item_id} is human-driven — no agent worker will run"
                     ))
@@ -288,96 +287,118 @@ impl WorkDb {
                     // for an item the mutating request would then reject —
                     // read-only, so unlike that path this never records the
                     // sticky repo-unresolved attention item itself.
-                    match resolve_repo_for_work_item(&conn, &resolved_work_item_id)? {
+                    match resolve_repo_for_work_item(conn, &resolved_work_item_id)? {
                         Some(_) => None,
                         None => {
-                            let label = repo_unresolved_kind_label(&conn, &resolved_work_item_id)?;
+                            let label = repo_unresolved_kind_label(conn, &resolved_work_item_id)?;
                             Some(repo_unresolved_attention_body(&resolved_work_item_id, label))
                         }
                     }
                 };
-                // Two representations, one per caller: `orphan_sweep` bounces
-                // an `active` task straight to `dispatch_failed_reason =
-                // 'churn_guard'` (see `WorkDb::bounce_churn_guard_parked_to_backlog`),
-                // while `pr_review_recovery` still files the
-                // `churn_guard_parked` attention item for an `in_review` task
-                // (Backlog is not a meaningful bounce target for a task with
-                // an open PR under review). Checking both keeps this
-                // informational-only fact accurate for either source — see
-                // `docs/designs/dispatch-halt-state-vs-attention-items.md`.
-                let churn_guard_parked: i64 = conn.query_row(
-                    "SELECT
+            // Two representations, one per caller: `orphan_sweep` bounces
+            // an `active` task straight to `dispatch_failed_reason =
+            // 'churn_guard'` (see `WorkDb::bounce_churn_guard_parked_to_backlog`),
+            // while `pr_review_recovery` still files the
+            // `churn_guard_parked` attention item for an `in_review` task
+            // (Backlog is not a meaningful bounce target for a task with
+            // an open PR under review). Checking both keeps this
+            // informational-only fact accurate for either source — see
+            // `docs/designs/dispatch-halt-state-vs-attention-items.md`.
+            let churn_guard_parked: i64 = conn.query_row(
+                "SELECT
                         (SELECT COUNT(*) FROM tasks
                           WHERE id = ?1 AND dispatch_failed_reason = ?3)
                         + (SELECT COUNT(*) FROM work_attention_items
                             WHERE work_item_id = ?1 AND kind = ?2 AND status = 'open')",
-                    params![
-                        resolved_work_item_id,
-                        CHURN_GUARD_PARKED_ATTENTION_KIND,
-                        CHURN_GUARD_DISPATCH_FAILED_REASON
-                    ],
-                    |row| row.get(0),
-                )?;
-                let autostart_disabled = autostart == 0 && status == TaskStatus::Todo;
-                let deliberate_parked = work_item_is_deliberately_parked(&conn, &resolved_work_item_id)?;
-                // Mirrors the request path's own idempotency/re-dispatch
-                // guard (`request_execution_in_tx_with_live_check`'s
-                // "governing" execution): a non-terminal execution already
-                // present for this work item — notably a `ready`
-                // `pr_review` execution — is REUSED rather than a fresh one
-                // being created, so its own kind (not the task's kind-
-                // derived hypothetical fresh-execution kind) is what
-                // actually governs pool routing and the operator-pause
-                // review exemption. Falls back to the fresh-execution kind
-                // when no non-terminal execution exists yet.
-                let live = query_live_execution_for_work_item(&conn, &resolved_work_item_id)?;
-                let latest = query_latest_execution_for_work_item(&conn, &resolved_work_item_id)?;
-                let governing = live.or(latest).filter(|e| !e.status.is_terminal());
-                let kind = match governing {
-                    Some(execution) => execution.kind,
-                    None => execution_kind_for_work_item(&conn, &resolved_work_item_id)?,
-                };
-                RawFacts {
+                params![
                     resolved_work_item_id,
-                    ineligible_reason,
-                    churn_guard_parked: churn_guard_parked > 0,
-                    autostart_disabled,
-                    deliberate_parked,
-                    kind: Some(kind),
-                    is_critical: critical_priority::is_critical(&priority),
-                }
+                    CHURN_GUARD_PARKED_ATTENTION_KIND,
+                    CHURN_GUARD_DISPATCH_FAILED_REASON
+                ],
+                |row| row.get(0),
+            )?;
+            let autostart_disabled = autostart == 0 && status == TaskStatus::Todo;
+            let deliberate_parked = work_item_is_deliberately_parked(conn, &resolved_work_item_id)?;
+            // Mirrors the request path's own idempotency/re-dispatch
+            // guard (`request_execution_in_tx_with_live_check`'s
+            // "governing" execution): a non-terminal execution already
+            // present for this work item — notably a `ready`
+            // `pr_review` execution — is REUSED rather than a fresh one
+            // being created, so its own kind (not the task's kind-
+            // derived hypothetical fresh-execution kind) is what
+            // actually governs pool routing and the operator-pause
+            // review exemption. Falls back to the fresh-execution kind
+            // when no non-terminal execution exists yet.
+            let live = query_live_execution_for_work_item(conn, &resolved_work_item_id)?;
+            let latest = query_latest_execution_for_work_item(conn, &resolved_work_item_id)?;
+            let governing = live.or(latest).filter(|e| !e.status.is_terminal());
+            let kind = match governing {
+                Some(execution) => execution.kind,
+                None => execution_kind_for_work_item(conn, &resolved_work_item_id)?,
+            };
+            RawFacts {
+                resolved_work_item_id,
+                ineligible_reason,
+                churn_guard_parked: churn_guard_parked > 0,
+                autostart_disabled,
+                deliberate_parked,
+                kind: Some(kind),
+                is_critical: critical_priority::is_critical(&priority),
             }
-        };
+        }
+    };
 
-        let unmet_dependencies = if raw.ineligible_reason.is_none() {
-            self.gating_prereqs_for(&raw.resolved_work_item_id)?
-        } else {
-            Vec::new()
-        };
-        let exempt_from_operator_pause = raw.kind == Some(ExecutionKind::PrReview);
-        let targets_main_pool = match raw.kind {
-            Some(kind) => {
-                kind != ExecutionKind::PrReview
-                    && kind != ExecutionKind::AutomationTriage
-                    && !matches!(
-                        self.source_automation_id_for_work_item(&raw.resolved_work_item_id),
-                        Ok(Some(_))
-                    )
-            }
-            None => false,
-        };
-        Ok(DispatchAdmissionFacts::builder()
-            .resolved_work_item_id(raw.resolved_work_item_id)
-            .maybe_ineligible_reason(raw.ineligible_reason)
-            .unmet_dependencies(unmet_dependencies)
-            .churn_guard_parked(raw.churn_guard_parked)
-            .autostart_disabled(raw.autostart_disabled)
-            .deliberate_parked(raw.deliberate_parked)
-            .targets_main_pool(targets_main_pool)
-            .is_critical(raw.is_critical)
-            .exempt_from_operator_pause(exempt_from_operator_pause)
-            .build())
+    let unmet_dependencies = if raw.ineligible_reason.is_none() {
+        deps::gating_prereqs_for(conn, &raw.resolved_work_item_id)?
+    } else {
+        Vec::new()
+    };
+    let exempt_from_operator_pause = raw.kind == Some(ExecutionKind::PrReview);
+    let targets_main_pool = match raw.kind {
+        Some(kind) => {
+            kind != ExecutionKind::PrReview
+                && kind != ExecutionKind::AutomationTriage
+                && !matches!(
+                    super::automations::source_automation_id_on(conn, &raw.resolved_work_item_id),
+                    Ok(Some(_))
+                )
+        }
+        None => false,
+    };
+    Ok(DispatchAdmissionFacts::builder()
+        .resolved_work_item_id(raw.resolved_work_item_id)
+        .maybe_ineligible_reason(raw.ineligible_reason)
+        .unmet_dependencies(unmet_dependencies)
+        .churn_guard_parked(raw.churn_guard_parked)
+        .autostart_disabled(raw.autostart_disabled)
+        .deliberate_parked(raw.deliberate_parked)
+        .targets_main_pool(targets_main_pool)
+        .is_critical(raw.is_critical)
+        .exempt_from_operator_pause(exempt_from_operator_pause)
+        .build())
+}
+
+/// The persisted pause, with the same exemptions as coordinator admission.
+pub(crate) fn pause_holds_on(conn: &Connection, id: &str) -> Result<bool> {
+    use boss_engine_storage_values::dispatch_pause::*;
+    let metadata = |key: &str| -> Result<Option<String>> {
+        Ok(conn
+            .query_row("SELECT value FROM metadata WHERE key = ?1", [key], |r| r.get(0))
+            .optional()?)
+    };
+    if metadata(METADATA_KEY_DISPATCH_PAUSED)?.as_deref() != Some("1") {
+        return Ok(false);
     }
+    let origin = metadata(METADATA_KEY_DISPATCH_PAUSE_ORIGIN)?;
+    let scope = metadata(METADATA_KEY_DISPATCH_PAUSE_SCOPE)?;
+    let overridable = persisted_origin_is_operator(origin.as_deref())
+        && !resolve_persisted_pause_scope(scope.as_deref(), origin.as_deref()).holds_reviews();
+    let facts = dispatch_admission_facts_on(conn, id)?;
+    Ok(!exempts_work(
+        overridable,
+        facts.exempt_from_operator_pause,
+        facts.targets_main_pool && facts.is_critical,
+    ))
 }
 
 #[cfg(test)]

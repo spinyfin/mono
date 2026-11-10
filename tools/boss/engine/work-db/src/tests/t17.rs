@@ -171,11 +171,15 @@ fn queued_wait_payload_preserves_holds_and_clears_the_blocker() {
             [&blocker_execution.id],
         )
         .unwrap();
+    // The hold is gone, so the row is simply ready for the next scheduler pass.
     let cleared = db.get_task_runtime(&chore_id).unwrap();
-    assert!(cleared.dispatch_wait_reason.is_none());
+    assert_eq!(cleared.dispatch_wait_reason.as_deref(), Some("awaiting_dispatch"));
     assert!(cleared.dispatch_wait_blocker.is_none());
     db.clear_dispatch_wait_reason(&execution.id).unwrap();
-    assert!(db.get_task_runtime(&chore_id).unwrap().dispatch_wait_reason.is_none());
+    assert_eq!(
+        db.get_task_runtime(&chore_id).unwrap().dispatch_wait_reason.as_deref(),
+        Some("awaiting_dispatch")
+    );
 }
 
 #[test]
@@ -193,7 +197,10 @@ fn queued_wait_payload_exposes_backoff_without_a_prior_failure_and_hides_stale_h
     assert_eq!(wait.dispatch_wait_reason.as_deref(), Some("not_before"));
     assert_eq!(wait.dispatch_not_before.as_deref(), Some(future.as_str()));
 
-    for state in ["claimed", "running", "completed"] {
+    // The chore is still `todo` with automatic start on, so once its only run
+    // has ended the card is queued with nothing pending: that is its own
+    // reason, not the finished run's hold.
+    for (state, reason) in [("claimed", None), ("running", None), ("completed", Some("run_ended"))] {
         db.connect()
             .unwrap()
             .execute(
@@ -203,10 +210,10 @@ fn queued_wait_payload_exposes_backoff_without_a_prior_failure_and_hides_stale_h
             .unwrap();
         let json = serde_json::to_value(db.get_task_runtime(&chore_id).unwrap()).unwrap();
         assert!(
-            json.get("dispatch_wait_reason").is_none()
+            json.get("dispatch_wait_reason").and_then(|value| value.as_str()) == reason
                 && json.get("dispatch_wait_blocker").is_none()
                 && json.get("dispatch_not_before").is_none(),
-            "stale wait in {state}"
+            "stale wait in {state}: {json}"
         );
     }
 }
@@ -214,12 +221,17 @@ fn queued_wait_payload_exposes_backoff_without_a_prior_failure_and_hides_stale_h
 #[test]
 fn queued_wait_missing_execution_is_absent_and_missing_prerequisite_is_honest() {
     let (db, _, chore_id) = setup_product_and_chore();
-    assert!(db.get_task_runtime(&chore_id).unwrap().dispatch_wait_reason.is_none());
+    // The board queues this chore, nothing is pending for it, and nothing the
+    // reconciler checks withheld an execution: no reason exists to report.
+    assert_eq!(
+        db.get_task_runtime(&chore_id).unwrap().dispatch_wait_reason.as_deref(),
+        Some("unclassified")
+    );
     let execution = seed_ready_execution(&db, &chore_id);
     // Nothing gates: do not invent a dependency wait.
     db.downgrade_ready_to_waiting_dependency(&execution.id).unwrap();
     let wait = db.get_task_runtime(&chore_id).unwrap();
-    assert!(wait.dispatch_wait_reason.is_none());
+    assert_eq!(wait.dispatch_wait_reason.as_deref(), Some("unclassified"));
     assert!(wait.dispatch_wait_blocker.is_none());
     // An edge to a prerequisite row that no longer exists still gates, without a link.
     db.connect()
@@ -265,7 +277,8 @@ fn queued_wait_chain_hold_survives_claimed_blocker_and_clears_when_terminal() {
             )
             .unwrap();
         let wait = db.get_task_runtime(&chore_id).unwrap();
-        assert_eq!(wait.dispatch_wait_reason.is_some(), held, "reason in {status}");
+        let reason = if held { "chain_serialized" } else { "awaiting_dispatch" };
+        assert_eq!(wait.dispatch_wait_reason.as_deref(), Some(reason), "reason in {status}");
         assert_eq!(wait.dispatch_wait_blocker.is_some(), held, "blocker in {status}");
     }
 }

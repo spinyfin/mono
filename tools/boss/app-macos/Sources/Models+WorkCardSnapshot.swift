@@ -512,7 +512,7 @@ enum WorkCardLiveStatus {
         isNextUp: Bool = false,
         now: Date = Date()
     ) -> String? {
-        guard column == .doing else { return nil }
+        guard column == .doing || (column == .review && isQueued(task: task, runtime: runtime)) else { return nil }
 
         // Human-driven rows occupy Doing without a worker — never paint
         // them as "Waiting for a slot" / stalled agent work.
@@ -527,10 +527,18 @@ enum WorkCardLiveStatus {
         let isAIReviewing = task.aiReviewing && task.status == "active"
 
         if runtime?.executionStatus == "claimed" { return "Starting worker" }
-        if isQueued(task: task, runtime: runtime) {
+        // Transient-recovery banner wins outright — a worker being
+        // auto-resumed after a Claude API error looks idle to every
+        // other signal, so without this the card would silently show
+        // stale/no text instead of "recovering from API error …".
+        if let recovering = liveState?.recoveryStatus, !recovering.isEmpty {
+            return recovering
+        }
+        if !isAIReviewing && isQueued(task: task, runtime: runtime) {
             return isNextUp
                 ? nextUpLabel(runtime: runtime, now: now)
-                : queuedLabel(runtime: runtime, now: now)
+                : queuedLabel(runtime: runtime, now: now,
+                              lead: task.status != "todo" && !isPendingExecution(runtime) ? "Waiting" : "Queued")
         }
         // A declared job wait names what the worker is waiting on, so it
         // is shown even for conflict / CI-remediation runs.
@@ -545,13 +553,6 @@ enum WorkCardLiveStatus {
         // the engine reports it is waiting on rather than leaving a bare dot.
         if isAIReviewing {
             return liveState == nil ? AgentActivityState.aiReviewCaption(stage: task.aiReviewStage) : nil
-        }
-        // Transient-recovery banner wins outright — a worker being
-        // auto-resumed after a Claude API error looks idle to every
-        // other signal, so without this the card would silently show
-        // stale/no text instead of "recovering from API error …".
-        if let recovering = liveState?.recoveryStatus, !recovering.isEmpty {
-            return recovering
         }
         return liveState?.liveStatus
     }
