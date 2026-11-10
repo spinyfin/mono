@@ -221,10 +221,10 @@ fn make_resolve_scaffold(
     label: &str,
     product_repo: Option<&str>,
 ) -> (tempfile::TempDir, PathBuf, WorkDb, String, String) {
-    // disk_db_path so that resolve_repo_errors_when_parent_product_is_missing
-    // can open a second raw connection to the same database file.
-    let (dir, path) = disk_db_path(label);
-    let db = WorkDb::open(path.clone()).unwrap();
+    // Migrated file so resolve_repo_errors_when_parent_product_is_missing
+    // can open a second raw connection without replaying the migration chain.
+    let (dir, path) = migrated_disk_db_path(label);
+    let db = WorkDb::open_existing(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", product_repo);
     let project = db
         .create_project(CreateProjectInput {

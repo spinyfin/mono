@@ -7,13 +7,13 @@ use std::{sync::LazyLock, time::Instant};
 // cost so ~70k inserts finish well inside the test budget.
 const FIXTURE_PRAGMAS: &str = "PRAGMA synchronous = OFF; PRAGMA journal_mode = MEMORY; PRAGMA temp_store = MEMORY;";
 
-/// The seeded database, built once per test process: a cold open plus ~70k
-/// inserts that every scale test would otherwise repeat before its first
+/// The seeded database, built once per test process: a migrated template plus
+/// ~70k inserts that every scale test would otherwise repeat before its first
 /// assertion. Tests take a private copy from [`open_seeded`] and never write
 /// to this file.
 static SEEDED: LazyLock<(tempfile::TempDir, PathBuf)> = LazyLock::new(|| {
-    let (dir, path) = disk_db_path("scale-fixture");
-    let db = WorkDb::open(path.clone()).unwrap();
+    let (dir, path) = migrated_disk_db_path("scale-fixture");
+    let db = WorkDb::open_existing(path.clone()).unwrap();
     seed(&db.connect().unwrap());
     // The in-memory journal leaves nothing beside the database file, and
     // closing the only connection means no page is still unwritten.

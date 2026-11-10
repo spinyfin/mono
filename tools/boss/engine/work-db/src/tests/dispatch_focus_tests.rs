@@ -91,9 +91,8 @@ fn ready_execution(db: &WorkDb, work_item_id: &str, kind: ExecutionKind) -> Work
 
 #[test]
 fn explicit_launch_admits_only_its_lineage_after_database_reload() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("boss.db");
-    let db = WorkDb::open(path.clone()).unwrap();
+    let (_dir, path) = migrated_disk_db_path("focus-reload");
+    let db = WorkDb::open_existing(path.clone()).unwrap();
     let product = create_test_product(&db);
     let focused = project(&db, &product.id, "Focused", false);
     let focus = focus_on_project(&focused.id);
@@ -152,7 +151,7 @@ fn explicit_launch_admits_only_its_lineage_after_database_reload() {
         )
         .unwrap();
     drop(db);
-    let db = WorkDb::open(path).unwrap();
+    let db = WorkDb::open_existing(path).unwrap();
     let restored_focus = db.load_dispatch_focus().unwrap();
     assert_eq!(restored_focus, focus);
     let expected: HashSet<_> = held.iter().map(|execution| execution.id.clone()).collect();

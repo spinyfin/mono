@@ -124,11 +124,10 @@ impl WorkDb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::create_test_product;
+    use crate::test_support::{create_test_product, open_db};
 
     fn fixture() -> (tempfile::TempDir, WorkDb, Vec<String>) {
-        let dir = tempfile::tempdir().unwrap();
-        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let (dir, db) = open_db();
         let product = create_test_product(&db);
         let ids = (0..2)
             .map(|i| {

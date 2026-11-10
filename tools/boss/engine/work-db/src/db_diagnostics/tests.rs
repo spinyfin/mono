@@ -5,8 +5,7 @@ use crate::test_support::log_capture;
 #[tokio::test]
 async fn attributed_hold_excludes_non_sql_work_from_query_time() {
     let logs = log_capture::install();
-    let directory = tempfile::tempdir().unwrap();
-    let db = WorkDb::open(directory.path().join("timing.db")).unwrap();
+    let (_directory, db) = crate::test_support::open_db();
     let from = logs.lock().len();
     Attribution {
         verb: "diagnostic_slow_section".into(),
@@ -54,10 +53,8 @@ async fn attributed_hold_excludes_non_sql_work_from_query_time() {
 #[tokio::test]
 async fn busy_names_actual_writer_and_counts_rate_limited_failures() {
     let logs = log_capture::install();
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("busy.db");
-    let writer = WorkDb::open(path.clone()).unwrap();
-    let reader = WorkDb::open_existing(path).unwrap();
+    let (directory, writer) = crate::test_support::open_db();
+    let reader = WorkDb::open_existing(directory.path().join("state.db")).unwrap();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
     let release = barrier.clone();
     let from = logs.lock().len();

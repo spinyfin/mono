@@ -159,9 +159,7 @@ mod tests {
     use super::*;
 
     fn db() -> (tempfile::TempDir, WorkDb) {
-        let dir = tempfile::tempdir().unwrap();
-        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
-        (dir, db)
+        crate::test_support::open_db()
     }
 
     #[test]
