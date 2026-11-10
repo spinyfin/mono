@@ -149,7 +149,11 @@ engine's own credentials, outside the worker allowlist:
   `boss-progression-scratch/<execution id>` and removed when the probe ends.
   It fetches from the product's configured remote, falling back to the PR's
   repository over HTTPS, with `GIT_TERMINAL_PROMPT=0` so missing credentials
-  fail the probe instead of waiting on a prompt.
+  fail the probe instead of waiting on a prompt. SSH defaults to
+  `ssh -o BatchMode=yes` to prevent prompts through `/dev/tty`; a configured
+  `core.sshCommand` retains its key and connection options with BatchMode
+  appended. Existing `GIT_SSH_COMMAND` or `GIT_SSH` settings are preserved
+  unchanged and must themselves provide noninteractive behavior.
 - A CI log tail for each failing check whose stored attempt is not already for
   the current head.
 

@@ -5,17 +5,17 @@
 
 use crate::gh_runner::gh_output;
 
-/// Verdict bucket a legacy commit-status / GraphQL `StatusContext`
-/// `state` value maps to. Shared by the GraphQL rollup classifier
+/// Verdict bucket a single check-rollup leaf (`CheckRun` or `StatusContext`)
+/// contributes to. Shared by the GraphQL rollup classifier
 /// (`classify_rollup_leaf`) and the REST `/commits/{sha}/status`
 /// parser ([`parse_commit_statuses_for_failures`]) so the two paths
 /// cannot drift on which states count as failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeafVerdict {
-    /// Terminal success (`SUCCESS`).
+    /// Terminal success (`SUCCESS`, or `NEUTRAL` / `SKIPPED` for `CheckRun`).
     Pass,
-    /// Terminal failure. `conclusion` is the uppercased state token
-    /// (`FAILURE` / `ERROR`) kept verbatim for the worker prompt /
+    /// Terminal failure. `conclusion` is the uppercased state or conclusion token
+    /// (e.g. `FAILURE` / `ERROR` / `TIMED_OUT`) kept for the worker prompt /
     /// `ci_remediations.failed_checks` JSON — matching the GraphQL
     /// rollup path's spelling.
     Fail { conclusion: String },

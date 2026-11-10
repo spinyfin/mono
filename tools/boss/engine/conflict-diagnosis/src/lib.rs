@@ -38,6 +38,8 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 mod classify;
+#[cfg(test)]
+mod ssh_tests;
 pub use classify::classify_conflict_class;
 
 /// Structured pre-spawn conflict-diagnosis blob. Wire-encoded as JSON
@@ -127,6 +129,19 @@ async fn git_version() -> Option<(u32, u32, u32)> {
 /// invocation (e.g. new-syntax `merge-tree` treats exit 1 as a conflict
 /// signal rather than a failure).
 async fn run_git(args: &[&str], workspace_path: &Path, git_dir: &Path) -> std::io::Result<Output> {
+    probe_command(args, workspace_path, git_dir, |key| std::env::var_os(key))
+        .await?
+        .kill_on_drop(true)
+        .output()
+        .await
+}
+
+async fn probe_command(
+    args: &[&str],
+    workspace_path: &Path,
+    git_dir: &Path,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> std::io::Result<Command> {
     let mut command = Command::new("git");
     command
         .args(args)
@@ -134,12 +149,33 @@ async fn run_git(args: &[&str], workspace_path: &Path, git_dir: &Path) -> std::i
         .env("GIT_DIR", git_dir)
         // A probe must fail fast on missing credentials, never wait on a prompt.
         .env("GIT_TERMINAL_PROMPT", "0");
-    // ssh prompts (host key, key passphrase) go via /dev/tty, which
-    // GIT_TERMINAL_PROMPT does not cover; keep any operator-configured command.
-    if std::env::var_os("GIT_SSH_COMMAND").is_none() {
-        command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    // SSH prompts use /dev/tty, which GIT_TERMINAL_PROMPT does not cover.
+    // Preserve explicit SSH environment settings; otherwise append BatchMode
+    // to core.sshCommand, retaining its key and connection options.
+    if env("GIT_SSH_COMMAND").is_none() && env("GIT_SSH").is_none() {
+        let config = Command::new("git")
+            .args(["config", "--get", "core.sshCommand"])
+            .current_dir(workspace_path)
+            .env("GIT_DIR", git_dir)
+            .kill_on_drop(true)
+            .output()
+            .await?;
+        let mut ssh_command = if config.status.success() {
+            let value = String::from_utf8(config.stdout)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            value.strip_suffix('\n').unwrap_or(&value).to_owned()
+        } else if config.status.code() == Some(1) {
+            "ssh".to_owned()
+        } else {
+            return Err(std::io::Error::other(format!(
+                "could not read core.sshCommand: {}",
+                String::from_utf8_lossy(&config.stderr)
+            )));
+        };
+        ssh_command.push_str(" -o BatchMode=yes");
+        command.env("GIT_SSH_COMMAND", ssh_command);
     }
-    command.kill_on_drop(true).output().await
+    Ok(command)
 }
 
 /// Resolve the jj repo directory (the dir that directly contains
