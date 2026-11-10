@@ -107,28 +107,6 @@ pub(crate) fn poll_tier_for_probe(probe: &PrLifecycleProbe) -> Option<PollTier> 
     }
 }
 
-/// Closed set of conclusion strings that count as "failure" for the
-/// required-check predicate (design §Q1). `ACTION_REQUIRED` is a
-/// special case: the worker can't approve manual workflows, so we
-/// surface it as a failure but the engine's pre-triage immediately
-/// flags it `manual_action_required` (design §Q4). `ERROR` is the
-/// legacy-commit-status equivalent of `FAILURE` (StatusContext leaves
-/// — see [`normalize_leaf`]) and lands in the same bucket.
-pub(crate) fn is_failure_conclusion(c: &str) -> bool {
-    matches!(
-        c.to_ascii_uppercase().as_str(),
-        "FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "STARTUP_FAILURE" | "ACTION_REQUIRED" | "STALE"
-    )
-}
-
-/// Closed set of conclusion strings that count as "successful enough
-/// to ignore" for the required-check predicate. `NEUTRAL` and
-/// `SKIPPED` do not gate merge per branch protection; `SUCCESS` is
-/// the happy path.
-pub(crate) fn is_pass_conclusion(c: &str) -> bool {
-    matches!(c.to_ascii_uppercase().as_str(), "SUCCESS" | "NEUTRAL" | "SKIPPED",)
-}
-
 /// A "no PR is due" placeholder wait — long enough to never race the
 /// periodic full-sweep interval or a kick, short enough to stay well
 /// under `tokio::time::sleep`'s max duration.

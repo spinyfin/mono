@@ -16,7 +16,13 @@ use boss_work_db::{
 };
 use regex::Regex;
 
-use crate::compose_progression_brief;
+use crate::{gather_progression_brief, render_progression_brief};
+
+/// The stored-state half of the prompt, as production renders it after the
+/// episode write; engine probes are covered in `evidence_tests`.
+fn compose_progression_brief(db: &WorkDb, id: &str) -> anyhow::Result<String> {
+    Ok(render_progression_brief(&gather_progression_brief(db, id)?))
+}
 use crate::golden;
 
 const REQUIRED_SECTIONS: &[&str] = &[
@@ -703,6 +709,55 @@ fn chain_evidence_on_the_parent_reaches_a_stuck_revision() {
 }
 
 #[test]
+fn s6_green_sibling_is_evidence_the_failure_is_specific_to_this_pr() {
+    let f = fixture();
+    let id = f.chore("Red alone");
+    f.bind_pr(&id, 62);
+    let green = f.chore("Green sibling");
+    f.bind_pr(&green, 63);
+    let pending = f.chore("Pending sibling");
+    f.bind_pr(&pending, 64);
+    let other_fail = f.chore("Different failure");
+    f.bind_pr(&other_fail, 65);
+    f.poll(&id, "deadbeef", &poller_detail(&[("bazel-test", "FAILURE")]));
+    f.poll(&other_fail, "feedface", &poller_detail(&[("checkleft", "FAILURE")]));
+    f.db.update_task_pr_poll_state(
+        &green,
+        PrPollStateInput {
+            ci_required_state: "success",
+            review_required_state: "",
+            ci_required_detail: None,
+            pr_mergeable_state: "MERGEABLE",
+            pr_head_sha: Some("cafebabe"),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    f.stick(&id, "status = 'blocked', blocked_reason = 'ci_failure_exhausted'");
+    let text = f.brief(&id);
+    assert!(
+        text.contains("no other PR shows it failing (not failing on 2 other PRs with stored state, unobserved on 1) → more likely specific to this PR"),
+        "{text}"
+    );
+}
+
+#[test]
+fn pr_section_carries_the_ai_review_verdict() {
+    let f = fixture();
+    let id = f.chore("Reviewed");
+    f.bind_pr(&id, 66);
+    f.poll(&id, "deadbeef", "[]");
+    f.stick(&id, "status = 'in_review', review_cycle = 2");
+    let text = f.brief(&id);
+    assert!(text.contains("### AI review"), "{text}");
+    assert!(text.contains("- review_cycle: 2"), "{text}");
+    assert!(
+        text.contains("latest verdict: (none recorded; unknown, not clean)"),
+        "{text}"
+    );
+}
+
+#[test]
 fn s6_failing_only_here_is_attributed_unknown_not_this_pr() {
     let f = fixture();
     let id = f.chore("Red alone");
@@ -713,7 +768,7 @@ fn s6_failing_only_here_is_attributed_unknown_not_this_pr() {
     f.stick(&id, "status = 'blocked', blocked_reason = 'ci_failure_exhausted'");
     let text = f.brief(&id);
     assert!(
-        text.contains("`bazel-test` failed on this PR; no other PR with stored detail shows it failing (1 other PRs have no stored detail), main not in stored snapshot → attribution unknown until engine probe."),
+        text.contains("`bazel-test` failed on this PR; no other PR shows it failing (not failing on 0 other PRs with stored state, unobserved on 1) → main not in stored snapshot → attribution unknown until engine probe."),
         "{text}"
     );
     assert!(!text.contains("likely this PR's change"), "{text}");

@@ -41,6 +41,65 @@ pub fn classify_status_context_state(state: &str) -> StatusContextVerdict {
     }
 }
 
+/// Closed set of conclusion strings that count as "failure" for the
+/// required-check predicate. `ACTION_REQUIRED` is surfaced as a failure
+/// because the worker cannot approve manual workflows; `ERROR` is the
+/// legacy-commit-status equivalent of `FAILURE`. Case-insensitive. Shared
+/// by the merge poller and the progression brief so they cannot drift.
+pub fn is_failure_conclusion(c: &str) -> bool {
+    matches!(
+        c.to_ascii_uppercase().as_str(),
+        "FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "STARTUP_FAILURE" | "ACTION_REQUIRED" | "STALE"
+    )
+}
+
+/// Closed set of conclusion strings that count as "successful enough to
+/// ignore" for the required-check predicate. Case-insensitive.
+pub fn is_pass_conclusion(c: &str) -> bool {
+    matches!(c.to_ascii_uppercase().as_str(), "SUCCESS" | "NEUTRAL" | "SKIPPED")
+}
+
+/// Verdict token of one GraphQL rollup leaf: a `CheckRun`'s `conclusion`, or a
+/// `StatusContext`'s `state`. `None` when the leaf carries neither.
+pub fn leaf_verdict_token(leaf: &serde_json::Value) -> Option<&str> {
+    leaf.get("conclusion")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| leaf.get("state").and_then(|v| v.as_str()))
+}
+
+/// True when a `CheckRun` or `StatusContext` leaf is a terminal failure.
+pub fn leaf_is_failure(leaf: &serde_json::Value) -> bool {
+    match leaf
+        .get("conclusion")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        Some(conclusion) => is_failure_conclusion(conclusion),
+        None => matches!(
+            leaf.get("state")
+                .map(|s| classify_status_context_state(s.as_str().unwrap_or(""))),
+            Some(StatusContextVerdict::Fail { .. })
+        ),
+    }
+}
+
+/// True when a `CheckRun` or `StatusContext` leaf is a terminal pass.
+pub fn leaf_is_pass(leaf: &serde_json::Value) -> bool {
+    match leaf
+        .get("conclusion")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        Some(conclusion) => is_pass_conclusion(conclusion),
+        None => matches!(
+            leaf.get("state")
+                .map(|s| classify_status_context_state(s.as_str().unwrap_or(""))),
+            Some(StatusContextVerdict::Pass)
+        ),
+    }
+}
+
 /// CI provider inferred from a check's `targetUrl` host. The CI-watch
 /// `CiLogReader` impls (Buildkite + GitHub Actions) dispatch on this;
 /// the `Other` variant captures anything we don't know how to read
@@ -316,6 +375,51 @@ pub fn parse_commit_statuses_for_failures(body: &[u8]) -> Vec<RequiredCheckFailu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conclusion_predicates_partition_closed_sets() {
+        let failures = [
+            "FAILURE",
+            "ERROR",
+            "TIMED_OUT",
+            "CANCELLED",
+            "STARTUP_FAILURE",
+            "ACTION_REQUIRED",
+            "STALE",
+        ];
+        for c in failures {
+            assert!(is_failure_conclusion(c), "{c} should be a failure");
+            assert!(!is_pass_conclusion(c), "{c} must not also be a pass");
+            assert!(is_failure_conclusion(&c.to_ascii_lowercase()));
+        }
+        for c in ["SUCCESS", "NEUTRAL", "SKIPPED"] {
+            assert!(is_pass_conclusion(c), "{c} should be a pass");
+            assert!(!is_failure_conclusion(c), "{c} must not also be a failure");
+            assert!(is_pass_conclusion(&c.to_ascii_lowercase()));
+        }
+        for unknown in ["", "WAT", "in_progress", "queued"] {
+            assert!(!is_failure_conclusion(unknown), "{unknown:?} must not be a failure");
+            assert!(!is_pass_conclusion(unknown), "{unknown:?} must not be a pass");
+        }
+    }
+
+    #[test]
+    fn leaf_helpers_cover_check_runs_and_status_contexts() {
+        let run_fail = serde_json::json!({"name": "a", "conclusion": "TIMED_OUT"});
+        let run_pass = serde_json::json!({"name": "a", "conclusion": "SUCCESS"});
+        let ctx_fail = serde_json::json!({"context": "b", "state": "ERROR"});
+        let ctx_pass = serde_json::json!({"context": "b", "state": "SUCCESS"});
+        let ctx_pending = serde_json::json!({"context": "b", "state": "PENDING"});
+        let empty_run = serde_json::json!({"name": "a", "conclusion": ""});
+        assert!(leaf_is_failure(&run_fail) && !leaf_is_pass(&run_fail));
+        assert!(leaf_is_pass(&run_pass) && !leaf_is_failure(&run_pass));
+        assert!(leaf_is_failure(&ctx_fail) && !leaf_is_pass(&ctx_fail));
+        assert!(leaf_is_pass(&ctx_pass) && !leaf_is_failure(&ctx_pass));
+        assert!(!leaf_is_failure(&ctx_pending) && !leaf_is_pass(&ctx_pending));
+        assert!(!leaf_is_failure(&empty_run) && !leaf_is_pass(&empty_run));
+        assert_eq!(leaf_verdict_token(&ctx_fail), Some("ERROR"));
+        assert_eq!(leaf_verdict_token(&empty_run), None);
+    }
 
     #[test]
     fn parse_check_runs_for_failures_returns_failing_entries() {

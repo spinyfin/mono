@@ -47,7 +47,9 @@ use tokio::sync::Notify;
 
 use boss_event_bus::Event;
 pub use boss_github::{CiProvider, RequiredCheckFailure};
-use boss_github::{fetch_failing_checks_for_commit, parse_provider_job_id, provider_for_url};
+use boss_github::{
+    fetch_failing_checks_for_commit, is_failure_conclusion, is_pass_conclusion, parse_provider_job_id, provider_for_url,
+};
 pub(crate) use boss_observation_contracts::{
     CompletionRequests, MergeQueueTimeline, PrPollStateWriter, ReviewBatchEnqueuer, StopOutcome,
     file_admission_deferred_attention,

@@ -3,7 +3,7 @@
 use boss_protocol::{
     CiRemediation, ConflictResolution, DependencyEdge, OperatorQuestionRecord, Task, WorkAttentionItem,
 };
-use boss_work_db::{ExecutionDiagnosis, ProductPrCiSnapshot, ProgressionCreateBudget, StatusAuditRow};
+use boss_work_db::{ExecutionDiagnosis, ProductPrCiSnapshot, ProgressionCreateBudget, ReviewVerdict, StatusAuditRow};
 use sha2::{Digest, Sha256};
 
 /// Fingerprint of the current stuck episode (design 2.5):
@@ -96,6 +96,15 @@ pub struct ProgressionBriefPacket {
     pub ci_required_state: Option<String>,
     pub ci_required_detail: Option<String>,
     pub review_required_state: Option<String>,
+    /// Boss's own AI-review state for the PR owner (not GitHub's review gate).
+    pub ai_review_state: Option<String>,
+    pub ai_review_stage: Option<String>,
+    pub review_cycle: i64,
+    /// Most recent recorded AI-review verdict for the PR owner; `None` means
+    /// unknown, never a clean verdict.
+    pub latest_review: Option<ReviewVerdict>,
+    /// The product's configured git remote, used by the conflict probe.
+    pub repo_remote_url: Option<String>,
     pub conflict_attempts: Vec<ConflictResolution>,
     pub ci_attempts: Vec<CiRemediation>,
     pub other_pr_ci: Vec<ProductPrCiSnapshot>,

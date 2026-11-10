@@ -130,6 +130,33 @@ The pane's pid is registered at the confined progression tier of the worker RPC
 surface (with its neighbourhood captured first), on a fresh spawn and again when
 the pane is re-adopted after an engine restart.
 
+### Engine-side probes before the first turn
+
+The agent's confinement does not limit what the engine itself reads while
+composing the prompt. Before the agent's first turn, for an item with a PR, the
+engine (not the agent) runs a fixed set of bounded probes and renders each
+result, or its failure, under "Engine evidence probes". They run with the
+engine's own credentials, outside the worker allowlist:
+
+- `gh pr view <url> --json baseRefName,baseRefOid,headRefOid,statusCheckRollup`
+  for the current head and check rollup.
+- `gh api repos/<owner>/<repo>/git/ref/heads/<branch>` for the live tip of the
+  PR's base branch (the PR's recorded base commit is only its fork point).
+- A GraphQL `defaultBranchRef.target.history(first: 10)` query for recent
+  check outcomes on the default branch, run only when a check is failing.
+- For merge-conflict items, a blob-less scratch fetch of the two commits into a
+  temporary directory created beside (not inside)
+  `boss-progression-scratch/<execution id>` and removed when the probe ends.
+  It fetches from the product's configured remote, falling back to the PR's
+  repository over HTTPS, with `GIT_TERMINAL_PROMPT=0` so missing credentials
+  fail the probe instead of waiting on a prompt.
+- A CI log tail for each failing check whose stored attempt is not already for
+  the current head.
+
+Each probe has a finite time bound (120 seconds for `gh`, 300 seconds for the
+conflict fetch). A probe that fails or times out is rendered as such and the
+agent treats that evidence as unknown.
+
 ## Validation
 
 The worker-bin Bazel tests put a stale checkleft ahead of the composed PATH

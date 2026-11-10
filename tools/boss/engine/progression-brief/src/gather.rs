@@ -16,10 +16,16 @@ use crate::packet::{
 /// caller falls back, rather than rendering the gap as an empty section.
 pub fn gather_progression_brief(db: &WorkDb, work_item_id: &str) -> Result<ProgressionBriefPacket> {
     let item = task_from_work_item(db, work_item_id)?;
-    let product_name = db
-        .get_product(&item.product_id)?
-        .map(|product| product.name)
+    let product = db.get_product(&item.product_id)?;
+    let product_name = product
+        .as_ref()
+        .map(|product| product.name.clone())
         .unwrap_or_else(|| item.product_id.clone());
+    let repo_remote_url = item
+        .repo_remote_url
+        .clone()
+        .or_else(|| product.as_ref().and_then(|product| product.repo_remote_url.clone()))
+        .filter(|url| !url.trim().is_empty());
     let project_name = match item.project_id.as_deref() {
         Some(project_id) => Some(db.get_project(project_id).context("load project")?.name),
         None => None,
@@ -29,7 +35,7 @@ pub fn gather_progression_brief(db: &WorkDb, work_item_id: &str) -> Result<Progr
     let stuck_kind = clauses
         .as_ref()
         .and_then(|row| row.stuck_kind.clone())
-        .unwrap_or_else(|| fallback_stuck_kind(&item));
+        .unwrap_or_else(fallback_stuck_kind);
     let stuck_since = clauses.as_ref().map(|row| row.stuck_since);
 
     let ledger = db.list_recent_status_audit(work_item_id, 3)?;
@@ -71,6 +77,7 @@ pub fn gather_progression_brief(db: &WorkDb, work_item_id: &str) -> Result<Progr
     let snapshot = db.get_pr_status_snapshot(&pr_source.id)?;
     let conflict_attempts = db.list_conflict_resolutions(None, &[], Some(&pr_source.id), None)?;
     let ci_attempts = db.list_ci_remediations(None, &[], Some(&pr_source.id), None)?;
+    let latest_review = db.latest_review_verdict(&pr_source.id)?;
     let other_pr_ci = db.list_product_pr_ci_snapshots(&item.product_id, &pr_source.id)?;
 
     let prior_progression = executions
@@ -144,6 +151,11 @@ pub fn gather_progression_brief(db: &WorkDb, work_item_id: &str) -> Result<Progr
         ci_required_state: pr_source.ci_required_state.clone(),
         ci_required_detail: pr_source.ci_required_detail.clone(),
         review_required_state: pr_source.review_required_state.clone(),
+        ai_review_state: pr_source.ai_review_state.clone(),
+        ai_review_stage: pr_source.ai_review_stage.clone(),
+        review_cycle: pr_source.review_cycle,
+        latest_review,
+        repo_remote_url,
         conflict_attempts,
         ci_attempts,
         other_pr_ci,
@@ -301,23 +313,11 @@ pub(crate) fn declared_blocker_from(
     }))
 }
 
-/// The candidate view's label when the item still has one. An item that has
-/// left the view is not classified: the raw reason stays on its own line and
+/// Stuck-kind for an item the candidate view no longer classifies. The raw
+/// `blocked_reason` and `dispatch_failed_reason` render on their own lines, and
 /// the sentinel keeps the fingerprint from hashing a label the view never emits.
-fn fallback_stuck_kind(item: &Task) -> String {
-    let label = match (item.dispatch_failed_reason.as_deref(), item.blocked_reason.as_deref()) {
-        (Some("churn_guard"), _) => Some("S2_churn_guard"),
-        (Some("deliberate_park"), _) => Some("S3_deliberate_park"),
-        (Some(_), _) => Some("S1_dispatch_failure"),
-        (None, Some("worker_failed")) => Some("S7_worker_failed"),
-        (None, Some("execution_recovery_failed")) => Some("S9_execution_recovery"),
-        (None, Some("spawning_attempt_retired_unsuccessfully")) => Some("S10_retired_attempt"),
-        (None, Some("merge_conflict")) => Some("S5_merge_conflict"),
-        (None, Some("ci_failure" | "ci_failure_exhausted")) => Some("S6_ci_failure"),
-        (None, Some("pr_binding_unresolved")) => Some("S11_pr_binding"),
-        _ => None,
-    };
-    label.unwrap_or(NO_LONGER_CLASSIFIED).to_owned()
+fn fallback_stuck_kind() -> String {
+    NO_LONGER_CLASSIFIED.to_owned()
 }
 
 /// Stuck-kind sentinel for an item the candidate view no longer classifies.

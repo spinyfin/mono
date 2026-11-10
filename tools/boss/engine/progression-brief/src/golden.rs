@@ -51,6 +51,12 @@ Churn-window terminal count (1h, excluding progression): 0
 - ci_required_state: (unobserved)
 - review_required_state: (unobserved)
 
+### AI review
+
+- ai_review_state: not_reviewed
+- review_cycle: 0
+- latest verdict: (none recorded; unknown, not clean)
+
 ### Conflict resolutions
 
 (none)
@@ -576,6 +582,12 @@ Parent PR (owned by chain root task_ID); this item is a revision.
 - ci_required_state: success
 - review_required_state: (unobserved)
 
+### AI review
+
+- ai_review_state: (none)
+- review_cycle: 0
+- latest verdict: (none recorded; unknown, not clean)
+
 ### Conflict resolutions
 
 (none)
@@ -662,11 +674,18 @@ Churn-window terminal count (1h, excluding progression): 0
 - ci_required_state: fail
 - review_required_state: (unobserved)
 
+### AI review
+
+- ai_review_state: (none)
+- review_cycle: 0
+- latest verdict: (none recorded; unknown, not clean)
+
 ### Conflict resolutions
 
 - crz_ID status=pending failure=(none) class=registry
   diagnosis:
   STALE: stored for head bbb222; the PR head is now ccc333
+  base at trigger: aaa111 (the PR's recorded base then, not the live target tip; see Engine evidence probes for the current-tip result)
   - src/lib.rs (content)
 
 ### CI remediations
@@ -916,6 +935,12 @@ Churn-window terminal count (1h, excluding progression): 0
 - ci_required_state: fail
 - review_required_state: (unobserved)
 
+### AI review
+
+- ai_review_state: (none)
+- review_cycle: 0
+- latest verdict: (none recorded; unknown, not clean)
+
 ### Conflict resolutions
 
 (none)
@@ -932,8 +957,8 @@ FAIL: tools/boss/engine/core/src/lib.rs unused import
 
 Stored cross-PR observations follow. Engine probes below supply recent main-branch outcomes before spawn; missing observations remain unknown.
 
-- `bazel-test` failed on this PR and on 1 other open/recent PRs (Sibling PR) → likely unrelated or flaky.
-- `checkleft` failed on this PR and on 1 other open/recent PRs (Sibling PR) → likely unrelated or flaky.
+- `bazel-test` failed on this PR and on 1 other open/recent PRs (Sibling PR) → likely unrelated or flaky. Not failing on 0 other PRs; unobserved on 0.
+- `checkleft` failed on this PR and on 1 other open/recent PRs (Sibling PR) → likely unrelated or flaky. Not failing on 0 other PRs; unobserved on 0.
 
 ## Open attentions
 

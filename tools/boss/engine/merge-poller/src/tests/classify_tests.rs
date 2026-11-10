@@ -553,7 +553,7 @@ fn trunk_queue_check_failure_ignores_non_failing_and_absent_leaves() {
 }
 
 /// The eviction predicate is deliberately *narrower* than the CI failure set
-/// [`super::is_failure_conclusion`], which the Trunk lane must not inherit.
+/// [`boss_github::is_failure_conclusion`], which the Trunk lane must not inherit.
 ///
 /// `CANCELLED` is the one that matters: a human cancelling the queue entry
 /// they just created is a decision, not a failure (the Trunk lane says so

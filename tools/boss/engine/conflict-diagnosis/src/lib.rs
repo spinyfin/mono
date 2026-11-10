@@ -131,6 +131,8 @@ async fn run_git(args: &[&str], workspace_path: &Path, git_dir: &Path) -> std::i
         .args(args)
         .current_dir(workspace_path)
         .env("GIT_DIR", git_dir)
+        // A probe must fail fast on missing credentials, never wait on a prompt.
+        .env("GIT_TERMINAL_PROMPT", "0")
         .kill_on_drop(true)
         .output()
         .await
