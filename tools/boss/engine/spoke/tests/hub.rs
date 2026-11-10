@@ -24,7 +24,7 @@ use tonic::{
     transport::{Certificate, Identity, Server, ServerTlsConfig},
 };
 
-pub const STEP: Duration = Duration::from_secs(20);
+pub const STEP: Duration = Duration::from_secs(60);
 
 pub struct Connection {
     pub hello: v1::Hello,

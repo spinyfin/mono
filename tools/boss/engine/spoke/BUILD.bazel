@@ -20,7 +20,7 @@ rust_binary(
 
 rust_test(
     name = "spoke_test",
-    size = "small",
+    size = "medium",
     srcs = glob(
         ["tests/**/*.rs"],
         exclude = ["tests/supervisor.rs"],
