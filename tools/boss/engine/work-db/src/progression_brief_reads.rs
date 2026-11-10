@@ -63,9 +63,23 @@ pub struct ProgressionCreateBudget {
 impl WorkDb {
     /// Persist the episode at first composition. Retries cannot rewrite the
     /// original fingerprint or the stuck-kind provenance of a redispatch.
+    ///
+    /// The values live in the metadata key-value table, keyed by execution id,
+    /// because they are only ever read back per execution. Rows whose execution
+    /// no longer exists (retention removed it) are pruned on every write, so the
+    /// key set is bounded by the retained progression executions.
     pub fn record_progression_episode(&self, execution: &str, fingerprint: &str, stuck_kind: &str) -> Result<()> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for field in ["fingerprint", "stuck_kind"] {
+            let prefix = format!("progression.{field}.");
+            tx.execute(
+                "DELETE FROM metadata
+                 WHERE substr(key, 1, length(?1)) = ?1
+                   AND substr(key, length(?1) + 1) NOT IN (SELECT id FROM work_executions)",
+                params![prefix],
+            )?;
+        }
         for (field, value) in [("fingerprint", fingerprint), ("stuck_kind", stuck_kind)] {
             tx.execute(
                 "INSERT OR IGNORE INTO metadata(key, value)

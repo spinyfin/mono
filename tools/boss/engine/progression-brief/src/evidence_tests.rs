@@ -7,23 +7,58 @@ use serde_json::{Value, json};
 use crate::evidence::{EvidenceProvider, gather_evidence};
 use crate::{ProgressionBriefPacket, gather_progression_brief};
 
+#[derive(bon::Builder)]
 struct Probe {
     main: Value,
+    #[builder(default)]
     conflicts: AtomicUsize,
+    #[builder(default)]
     logs: AtomicUsize,
+    #[builder(default)]
     fail: bool,
+    /// Live tip of the target branch (independent of the PR's recorded base).
+    #[builder(default = "base".to_owned())]
+    tip: String,
+    #[builder(default)]
+    tip_fail: bool,
+    #[builder(default = "base".to_owned())]
+    recorded_base: String,
+    #[builder(default = "FAILURE".to_owned())]
+    conclusion: String,
+    #[builder(default)]
+    hang: bool,
+    #[builder(default)]
+    hang_conflict: bool,
+    #[builder(default)]
+    conflict_bases: std::sync::Mutex<Vec<String>>,
 }
 
 impl EvidenceProvider for Probe {
     async fn pr(&self, _: &str) -> Result<Value> {
-        Ok(json!({"baseRefOid":"base", "headRefOid":"head", "statusCheckRollup":[
-            {"name":"build", "conclusion":"FAILURE", "detailsUrl":"https://github.com/o/r/actions/runs/1/job/2"}]}))
+        if self.hang {
+            std::future::pending::<()>().await;
+        }
+        Ok(
+            json!({"baseRefName":"main", "baseRefOid":self.recorded_base, "headRefOid":"head", "statusCheckRollup":[
+            {"name":"build", "conclusion":self.conclusion, "detailsUrl":"https://github.com/o/r/actions/runs/1/job/2"}]}),
+        )
+    }
+    async fn base_tip(&self, repo: &str, branch: &str) -> Result<String> {
+        assert_eq!((repo, branch), ("o/r", "main"));
+        if self.tip_fail {
+            bail!("ref lookup unavailable");
+        }
+        Ok(self.tip.clone())
     }
     async fn main_checks(&self, _: &str) -> Result<Value> {
         Ok(self.main.clone())
     }
     async fn conflict(&self, base: &str, head: &str, _: &str) -> Result<String> {
         self.conflicts.fetch_add(1, Ordering::SeqCst);
+        if self.hang_conflict {
+            std::future::pending::<()>().await;
+        }
+        self.conflict_bases.lock().unwrap().push(base.to_owned());
         if self.fail {
             bail!("conflict service unavailable");
         }
@@ -48,15 +83,14 @@ fn packet() -> (tempfile::TempDir, boss_work_db::WorkDb, ProgressionBriefPacket)
 }
 
 fn probe(outcome: &str) -> Probe {
-    Probe {
-        main: json!({"data":{"repository":{"defaultBranchRef":{"name":"main","target":{"history":{"nodes":[
-            {"oid":"main-sha","committedDate":"2026-11-10T12:00:00Z","statusCheckRollup":{"contexts":{"nodes":[
-                {"context":"build","state":outcome,"createdAt":"2026-11-10T12:01:00Z"}]}}}
-        ]}}}}}}),
-        conflicts: AtomicUsize::new(0),
-        logs: AtomicUsize::new(0),
-        fail: false,
-    }
+    Probe::builder()
+        .main(
+            json!({"data":{"repository":{"defaultBranchRef":{"name":"main","target":{"history":{"nodes":[
+                {"oid":"main-sha","committedDate":"2026-11-10T12:00:00Z","statusCheckRollup":{"contexts":{"nodes":[
+                    {"context":"build","state":outcome,"createdAt":"2026-11-10T12:01:00Z"}]}}}
+            ]}}}}}}),
+        )
+        .build()
 }
 
 #[tokio::test]
@@ -173,4 +207,155 @@ async fn probe_errors_are_visible() {
     assert!(text.contains("Conflict probe failed: conflict service unavailable"));
     assert!(text.contains("Log probe failed for `build` at head head: log service unavailable"));
     assert!(text.contains("attribution unknown"));
+}
+
+#[tokio::test]
+async fn advanced_target_branch_rejects_stored_diagnosis_even_when_recorded_base_is_unchanged() {
+    let (_dir, db, mut packet) = packet();
+    db.insert_conflict_resolution(
+        boss_work_db::ConflictResolutionInsertInput::builder()
+            .product_id(&packet.item.product_id)
+            .work_item_id(&packet.item.id)
+            .pr_url("https://github.com/o/r/pull/1")
+            .pr_number(1)
+            .head_branch("feature")
+            .base_branch("main")
+            .base_sha_at_trigger("old")
+            .head_sha_before("head")
+            .build(),
+    )
+    .unwrap()
+    .unwrap();
+    packet.conflict_attempts = db
+        .list_conflict_resolutions(None, &[], Some(&packet.item.id), None)
+        .unwrap();
+    // Stored diagnosis matches the PR's fixed recorded base and unchanged head.
+    packet.conflict_attempts[0].conflict_diagnosis =
+        Some(json!({"base_sha":"old","head_sha":"head","files":[]}).to_string());
+    let mut provider = probe("SUCCESS");
+    provider.recorded_base = "old".into();
+    provider.tip = "new-tip".into();
+    let text = gather_evidence(&packet, &provider).await;
+    assert_eq!(*provider.conflict_bases.lock().unwrap(), ["new-tip"]);
+    assert!(text.contains("Live tip of base branch `main` = new-tip"), "{text}");
+    assert!(text.contains("fresh.rs"), "{text}");
+}
+
+#[tokio::test]
+async fn unresolvable_base_tip_makes_conflict_evidence_unknown_not_recorded_base() {
+    let (_dir, _db, packet) = packet();
+    let mut provider = probe("SUCCESS");
+    provider.tip_fail = true;
+    let text = gather_evidence(&packet, &provider).await;
+    assert_eq!(provider.conflicts.load(Ordering::SeqCst), 0);
+    assert!(
+        text.contains("Base branch tip probe failed: ref lookup unavailable"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Conflict probe skipped: current base tip unknown"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_and_stale_checks_get_log_and_main_history_probes() {
+    for conclusion in ["CANCELLED", "STALE"] {
+        let (_dir, _db, packet) = packet();
+        let mut provider = probe("FAILURE");
+        provider.conclusion = conclusion.into();
+        let text = gather_evidence(&packet, &provider).await;
+        assert_eq!(provider.logs.load(Ordering::SeqCst), 1, "{conclusion}: {text}");
+        assert!(text.contains("fresh failing log"), "{conclusion}: {text}");
+        assert!(text.contains("Recent outcomes on main"), "{conclusion}: {text}");
+
+        let mut failing = probe("FAILURE");
+        failing.conclusion = conclusion.into();
+        failing.fail = true;
+        let text = gather_evidence(&packet, &failing).await;
+        assert!(text.contains("Log probe failed for `build`"), "{conclusion}: {text}");
+    }
+}
+
+fn history(outcomes: &[&str]) -> Value {
+    let nodes: Vec<Value> = outcomes
+        .iter()
+        .enumerate()
+        .map(|(i, outcome)| {
+            json!({"oid":format!("c{i}"),"committedDate":"2026-11-10T12:00:00Z","statusCheckRollup":{"contexts":{"nodes":[
+                {"context":"build","state":outcome,"createdAt":"2026-11-10T12:01:00Z"}]}}})
+        })
+        .collect();
+    json!({"data":{"repository":{"defaultBranchRef":{"name":"main","target":{"history":{"nodes":nodes}}}}}})
+}
+
+#[tokio::test]
+async fn main_attribution_follows_the_newest_completed_observation() {
+    let (_dir, _db, packet) = packet();
+    let mut provider = probe("SUCCESS");
+    // Newest first: green now, red nine commits ago.
+    provider.main = history(&["SUCCESS", "SUCCESS", "FAILURE"]);
+    let text = gather_evidence(&packet, &provider).await;
+    assert!(text.contains("green at its tip: fixed on main"), "{text}");
+    assert!(!text.contains("likely unrelated or flaky"), "{text}");
+
+    provider.main = history(&["FAILURE", "SUCCESS"]);
+    assert!(
+        gather_evidence(&packet, &provider)
+            .await
+            .contains("main also red: likely unrelated or flaky")
+    );
+
+    provider.main = history(&["PENDING", "SUCCESS"]);
+    let text = gather_evidence(&packet, &provider).await;
+    assert!(text.contains("observed main green"), "{text}");
+
+    provider.main = history(&["PENDING"]);
+    assert!(
+        gather_evidence(&packet, &provider)
+            .await
+            .contains("main unobserved: attribution unknown")
+    );
+}
+
+#[tokio::test]
+async fn pr_base_commit_outcome_is_named_when_sampled() {
+    let (_dir, _db, packet) = packet();
+    let mut provider = probe("SUCCESS");
+    provider.recorded_base = "c1".into();
+    provider.main = history(&["SUCCESS", "FAILURE"]);
+    let text = gather_evidence(&packet, &provider).await;
+    assert!(text.contains("at the PR's base commit c1: FAILURE"), "{text}");
+}
+
+#[tokio::test]
+async fn hung_providers_yield_timeout_lines_instead_of_hanging() {
+    use crate::evidence::{ProbeLimits, gather_evidence_with};
+    let (_dir, _db, packet) = packet();
+    let mut provider = probe("SUCCESS");
+    provider.hang = true;
+    let limits = ProbeLimits {
+        gh: std::time::Duration::from_millis(50),
+        conflict: std::time::Duration::from_millis(50),
+    };
+    let text = gather_evidence_with(&packet, &provider, limits).await;
+    assert!(text.contains("PR probe failed: probe timed out"), "{text}");
+}
+
+#[tokio::test]
+async fn hung_conflict_probe_is_reported_and_later_probes_still_run() {
+    use crate::evidence::{ProbeLimits, gather_evidence_with};
+    let (_dir, _db, packet) = packet();
+    let mut provider = probe("FAILURE");
+    provider.hang_conflict = true;
+    let limits = ProbeLimits {
+        gh: std::time::Duration::from_secs(30),
+        conflict: std::time::Duration::from_millis(50),
+    };
+    let text = gather_evidence_with(&packet, &provider, limits).await;
+    assert!(
+        text.contains("Conflict probe failed: probe timed out after 50ms"),
+        "{text}"
+    );
+    assert!(text.contains("fresh failing log"), "{text}");
 }

@@ -429,7 +429,11 @@ fn render_history(out: &mut String, packet: &ProgressionBriefPacket) {
             }
         }
     }
-    out.push_str("Prior fingerprint actions: see applied proposals above.\n\n");
+    if packet.prior_progression.iter().any(|run| !run.actions.is_empty()) {
+        out.push_str("Prior fingerprint actions: listed per run above.\n\n");
+    } else {
+        out.push_str("Prior fingerprint actions: none recorded.\n\n");
+    }
 }
 
 fn line(out: &mut String, key: &str, value: &str) {

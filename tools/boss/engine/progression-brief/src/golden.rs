@@ -79,7 +79,7 @@ Stored cross-PR observations follow. Engine probes below supply recent main-bran
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: see applied proposals above.
+Prior fingerprint actions: none recorded.
 
 "#;
 
@@ -149,7 +149,7 @@ Churn-window terminal count (1h, excluding progression): 0
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: see applied proposals above.
+Prior fingerprint actions: none recorded.
 
 "#;
 
@@ -234,7 +234,7 @@ Should the API return 404 or 410 for retired ids? I need the owner to pick.
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: see applied proposals above.
+Prior fingerprint actions: none recorded.
 
 "#;
 
@@ -306,7 +306,7 @@ Churn-window terminal count (1h, excluding progression): 0
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: see applied proposals above.
+Prior fingerprint actions: none recorded.
 
 "#;
 
@@ -376,7 +376,7 @@ Churn-window terminal count (1h, excluding progression): 0
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: see applied proposals above.
+Prior fingerprint actions: none recorded.
 
 "#;
 
@@ -446,7 +446,7 @@ Churn-window terminal count (1h, excluding progression): 0
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: see applied proposals above.
+Prior fingerprint actions: none recorded.
 
 "#;
 
@@ -518,7 +518,7 @@ Churn-window terminal count (1h, excluding progression): 0
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: see applied proposals above.
+Prior fingerprint actions: none recorded.
 
 "#;
 
@@ -607,7 +607,7 @@ Stored cross-PR observations follow. Engine probes below supply recent main-bran
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: see applied proposals above.
+Prior fingerprint actions: none recorded.
 
 "#;
 
@@ -692,7 +692,7 @@ Stored cross-PR observations follow. Engine probes below supply recent main-bran
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: see applied proposals above.
+Prior fingerprint actions: none recorded.
 
 "#;
 
@@ -779,7 +779,7 @@ need a decision on the retry budget
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: see applied proposals above.
+Prior fingerprint actions: none recorded.
 
 "#;
 
@@ -861,7 +861,7 @@ nudge loop bounded after silence
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: see applied proposals above.
+Prior fingerprint actions: none recorded.
 
 "#;
 
@@ -948,7 +948,7 @@ Stored cross-PR observations follow. Engine probes below supply recent main-bran
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: see applied proposals above.
+Prior fingerprint actions: none recorded.
 
 "#;
 
@@ -1018,7 +1018,7 @@ Churn-window terminal count (1h, excluding progression): 0
 Current fingerprint: `<FINGERPRINT>`
 
 Prior progression runs: (none)
-Prior fingerprint actions: see applied proposals above.
+Prior fingerprint actions: none recorded.
 
 "#;
 

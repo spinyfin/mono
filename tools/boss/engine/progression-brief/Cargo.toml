@@ -16,9 +16,10 @@ boss-work-db = { path = "../work-db" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
 boss-work-db = { path = "../work-db", features = ["test-support"] }
 regex = { workspace = true }
-tempfile = { workspace = true }

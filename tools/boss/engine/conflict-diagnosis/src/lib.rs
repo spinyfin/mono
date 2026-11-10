@@ -131,6 +131,7 @@ async fn run_git(args: &[&str], workspace_path: &Path, git_dir: &Path) -> std::i
         .args(args)
         .current_dir(workspace_path)
         .env("GIT_DIR", git_dir)
+        .kill_on_drop(true)
         .output()
         .await
 }
@@ -255,6 +256,7 @@ pub async fn collect_remote(
     let init = Command::new("git")
         .args(["init", "--bare"])
         .arg(&git_dir)
+        .kill_on_drop(true)
         .output()
         .await?;
     if !init.status.success() {
@@ -264,8 +266,22 @@ pub async fn collect_remote(
             format!("scratch git init failed: {}", String::from_utf8_lossy(&init.stderr)),
         ));
     }
+    // Blob-less partial fetch: commits and trees for both endpoints, with the
+    // few blobs `merge-tree` needs for conflicting paths fetched lazily. A full
+    // fetch would download close to the whole repository on every probe.
+    let remote_add = run_git(&["remote", "add", "origin", "--", remote], scratch, &git_dir).await?;
+    if !remote_add.status.success() {
+        return Ok(ConflictDiagnosis::errored(
+            base_sha,
+            head_sha,
+            format!(
+                "scratch remote setup failed: {}",
+                String::from_utf8_lossy(&remote_add.stderr)
+            ),
+        ));
+    }
     let fetch = run_git(
-        &["fetch", "--no-tags", "--", remote, base_sha, head_sha],
+        &["fetch", "--no-tags", "--filter=blob:none", "origin", base_sha, head_sha],
         scratch,
         &git_dir,
     )

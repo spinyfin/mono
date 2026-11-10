@@ -31,7 +31,7 @@ const REQUIRED_SECTIONS: &[&str] = &[
     "## Operator questions",
     "## Progression history",
     "Current fingerprint:",
-    "Prior fingerprint actions: see applied proposals above",
+    "Prior fingerprint actions: ",
     "Remaining redispatch allowance: 1.",
     "## Verb catalogue",
     "## When you may ask the owner",
@@ -945,4 +945,32 @@ fn declared_blocker_ignores_parent_sibling_and_answered_questions() {
     .unwrap();
     assert_eq!(blocker.verbatim, "newest own question\n\nexplanation");
     assert_ne!(blocker.sweep_note.as_deref(), Some(blocker.verbatim.as_str()));
+}
+
+#[test]
+fn episode_metadata_for_removed_executions_is_pruned_on_next_write() {
+    let f = fixture();
+    let id = f.chore("Episode pruning");
+    f.db.set_metadata("progression.fingerprint.removed", "old").unwrap();
+    f.db.set_metadata("progression.stuck_kind.removed", "S7_worker_failed")
+        .unwrap();
+    let execution =
+        f.db.create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&id)
+                .kind(ExecutionKind::Progression)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    f.db.record_progression_episode(&execution.id, "kept", "S7_worker_failed")
+        .unwrap();
+    assert_eq!(f.db.get_metadata("progression.fingerprint.removed").unwrap(), None);
+    assert_eq!(f.db.get_metadata("progression.stuck_kind.removed").unwrap(), None);
+    assert_eq!(
+        f.db.get_metadata(&format!("progression.fingerprint.{}", execution.id))
+            .unwrap()
+            .as_deref(),
+        Some("kept")
+    );
 }
