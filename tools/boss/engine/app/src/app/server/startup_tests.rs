@@ -289,51 +289,6 @@ mod hub_startup_tests {
     use std::{path::PathBuf, sync::Arc, time::Duration};
 
     #[tokio::test]
-    async fn cancelled_listener_clears_the_published_stream_handle() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let root = tempfile::tempdir().unwrap();
-        let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let cert = root.path().join("cert.pem");
-        let key = root.path().join("key.pem");
-        std::fs::write(&cert, identity.cert.pem()).unwrap();
-        std::fs::write(&key, identity.signing_key.serialize_pem()).unwrap();
-        let hub = HubConfig::builder()
-            .listen("127.0.0.1:0")
-            .credentials_dir(root.path().join("credentials"))
-            .tls_cert(cert)
-            .tls_key(key)
-            .build();
-        let cfg = Arc::new(RuntimeConfig::from_parts(
-            WorkConfig::builder()
-                .cwd(root.path().to_path_buf())
-                .db_path(root.path().join("state.db"))
-                .build(),
-            None,
-        ));
-        let state = crate::app::ServerState::new_arc_with_app_pid_and_merge_probe(
-            cfg,
-            None,
-            None,
-            crate::app::ServerStateOverrides::default(),
-        )
-        .unwrap();
-        let bound = boss_engine_runtime::hub::bind_hub_listener(&hub, (*state.work_db).clone())
-            .await
-            .unwrap()
-            .unwrap();
-        state.set_hub_stream(Some(bound.stream.clone()));
-        let guard = super::super::HubStreamGuard(state.clone());
-        let listener = tokio::spawn(async move {
-            let _guard = guard;
-            bound.serve().await
-        });
-        assert!(state.hub_stream().is_some());
-        listener.abort();
-        assert!(listener.await.unwrap_err().is_cancelled());
-        assert!(state.hub_stream().is_none());
-    }
-
-    #[tokio::test]
     async fn serve_binds_private_hub_and_rejects_inherited_identity() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         for (private_listen, private_identity) in [(true, true), (true, false), (false, true)] {

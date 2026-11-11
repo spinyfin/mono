@@ -1954,12 +1954,35 @@ impl std::error::Error for UnownedOccupants {}
 /// The execution keeps its assignment and workspace and a retry reuses the
 /// same command, so nothing starts twice. Coordinators treat it like an
 /// unconfirmed abort and do not release the workspace.
+///
+/// `settled` is false while the spawn command is unanswered (safe to wait
+/// and retry the same id). It is true when the host already stored a
+/// non-Ok/Rejected/Absent result: a retry would only re-read that result,
+/// so the coordinator must observe the pane and park rather than spin.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("spawn outcome unknown on host {host_id} (command {command_id}): {reason}")]
 pub struct SpawnOutcomeUncertain {
     pub host_id: String,
     pub command_id: String,
     pub reason: String,
+    pub settled: bool,
+}
+
+/// A workspace lease whose outcome is unknown: the host may have granted it.
+/// A retry reuses the current `lease-<run>-…` attempt while that command is
+/// unanswered, or starts a new recorded attempt when a settled-uncertain
+/// result named no lease. Coordinators must not key a wait on the sticky
+/// assignment `in_doubt` flag.
+///
+/// `settled` is false while the current attempt is unanswered. It is true
+/// when the host stored an uncertain result with no lease to bind.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("lease outcome uncertain on host {host_id} (command {command_id}): {reason}")]
+pub struct LeaseOutcomeUncertain {
+    pub host_id: String,
+    pub command_id: String,
+    pub reason: String,
+    pub settled: bool,
 }
 
 /// Outcome of [`HostAdapter::collect_structured_output`]. See that method's

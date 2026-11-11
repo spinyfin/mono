@@ -15,16 +15,16 @@ use boss_engine_recovery::execution_bookmark::{
     WorkspaceTipSource,
 };
 use boss_execution_contracts::{
-    CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
+    CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus, LeaseOutcomeUncertain,
 };
 use boss_protocol_spoke::v1::{
     Bookmark, ResultCode, WorkspaceKind as Kind, WorkspaceOp, WorkspaceResult, command, command_result,
 };
-use boss_work_db::SpokeAssignment;
+use boss_work_db::{SpokeAssignment, host_command_lease_id, host_command_spawn_id};
 use prost::Message;
 use serde::de::DeserializeOwned;
 
-use crate::{SpokeHostAdapter, expect_ok, request_digest, run_of};
+use crate::{HostCallError, SpokeHostAdapter, expect_ok, request_digest, run_of};
 
 /// Keep a task label within what the host accepts without dropping its start.
 fn clip(text: &str, max: usize) -> String {
@@ -200,11 +200,7 @@ impl SpokeHostAdapter {
             .hub
             .current_attempt(
                 self.host_name(),
-                &format!(
-                    "lease-{}-{:016x}",
-                    assignment.run_id,
-                    request_digest(&op.encode_to_vec())
-                ),
+                &host_command_lease_id(&assignment.run_id, request_digest(&op.encode_to_vec())),
                 lease_attempt_is_spent,
             )
             .await?;
@@ -220,8 +216,17 @@ impl SpokeHostAdapter {
                 self.hub.config.command_deadline,
             )
             .await;
+        let uncertain = |reason: String, settled: bool| {
+            anyhow::Error::new(LeaseOutcomeUncertain {
+                host_id: self.host_name().to_owned(),
+                command_id: id.clone(),
+                reason,
+                settled,
+            })
+        };
         let result = match sent {
             Ok(result) => result,
+            Err(HostCallError::Uncertain { reason, .. }) => return Err(uncertain(reason, false)),
             Err(error) => {
                 // A command that was never stored cannot have leased anything.
                 if self.hub_command_unknown(&id).await? {
@@ -242,6 +247,15 @@ impl SpokeHostAdapter {
         let result = if recovered {
             tracing::warn!(host = self.host_name(), run = %assignment.run_id, "recovered an interrupted lease; setup completion is unknown");
             result
+        } else if code == ResultCode::OutcomeUncertain {
+            return Err(uncertain(
+                if result.reason.is_empty() {
+                    "the host reported an uncertain outcome".to_owned()
+                } else {
+                    result.reason
+                },
+                true,
+            ));
         } else {
             expect_ok(self.host_name(), "lease", result)?
         };
@@ -260,6 +274,7 @@ impl SpokeHostAdapter {
         );
         self.db(move |db| db.bind_spoke_lease(&execution, generation, &workspace, &lease_id, &path))
             .await?;
+        self.set_doubt(&assignment, false).await?;
         Ok(lease)
     }
 
@@ -278,7 +293,7 @@ impl SpokeHostAdapter {
     /// Whether this run has a spawn that may have started a worker: stored and
     /// either unanswered or answered with an uncertain outcome.
     pub(crate) async fn spawn_in_doubt(&self, assignment: &SpokeAssignment) -> Result<bool> {
-        let (host, id) = (self.host_name().to_owned(), format!("spawn-{}", assignment.run_id));
+        let (host, id) = (self.host_name().to_owned(), host_command_spawn_id(&assignment.run_id));
         let stored = self
             .db(move |db| Ok((db.host_command_wire(&host, &id)?, db.host_command_result(&host, &id)?)))
             .await?;

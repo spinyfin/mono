@@ -17,7 +17,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use boss_execution_contracts::{
-    ControlOutcome, RunOutcome, SpawnOutcomeUncertain, WorkerInputKind, WorkerLife, WorkerPane,
+    ControlOutcome, RunOutcome, RunWaitState, SpawnOutcomeUncertain, WorkerInputKind, WorkerLife, WorkerPane,
 };
 use boss_protocol::{WorkExecution, WorkItem};
 use boss_protocol_spoke::{
@@ -28,7 +28,7 @@ use boss_protocol_spoke::{
         command_result,
     },
 };
-use boss_work_db::SpokeAssignment;
+use boss_work_db::{SpokeAssignment, host_command_spawn_id, host_command_stop_id};
 use prost::Message;
 
 use crate::{HostCallError, SpokeHostAdapter, expect_ok, run_of};
@@ -123,7 +123,7 @@ impl SpokeHostAdapter {
                 "execution records lease {recorded} but its assignment holds {lease_id}"
             );
         }
-        let id = format!("spawn-{}", assignment.run_id);
+        let id = host_command_spawn_id(&assignment.run_id);
 
         // The first stored spawn is the spawn: a retry sends exactly that command.
         let (host, stored_id) = (self.host_name().to_owned(), id.clone());
@@ -176,11 +176,12 @@ impl SpokeHostAdapter {
             .hub
             .send_command(self.host_name(), "spawn", command, self.hub.config.spawn_deadline)
             .await;
-        let uncertain = |reason: String| {
+        let uncertain = |reason: String, settled: bool| {
             anyhow::Error::new(SpawnOutcomeUncertain {
                 host_id: self.host_name().to_owned(),
                 command_id: id.clone(),
                 reason,
+                settled,
             })
         };
         let result = match sent {
@@ -193,7 +194,7 @@ impl SpokeHostAdapter {
             }
             // An earlier attempt may have been delivered: do not call this a failure.
             Err(HostCallError::NotSent { reason, .. } | HostCallError::Uncertain { reason, .. }) => {
-                return Err(uncertain(reason));
+                return Err(uncertain(reason, false));
             }
             Err(other) => return Err(other.into()),
         };
@@ -205,7 +206,11 @@ impl SpokeHostAdapter {
                 self.host_name(),
                 result.reason
             ),
-            _ => return Err(uncertain(result.reason)),
+            _ => {
+                return self
+                    .finish_settled_uncertain_spawn(&assignment, &id, result.reason, template)
+                    .await;
+            }
         }
         let pane = pane_in(&result).context("the host reported a spawn without the worker's pane")?;
         match pane.life {
@@ -220,7 +225,14 @@ impl SpokeHostAdapter {
                 pane.exit_code
             ),
             WorkerLife::Missing | WorkerLife::Indeterminate => {
-                return Err(uncertain("the host could not confirm the worker's session".to_owned()));
+                return self
+                    .finish_settled_uncertain_spawn(
+                        &assignment,
+                        &id,
+                        "the host could not confirm the worker's session".to_owned(),
+                        template,
+                    )
+                    .await;
             }
         }
         if let Some(pid) = pane.pid {
@@ -258,14 +270,15 @@ impl SpokeHostAdapter {
             match stopped {
                 Some(Ok(ControlOutcome::Delivered(_))) => return Err(error),
                 other => {
-                    return Err(uncertain(format!(
-                        "{error:#}; worker stop was not confirmed: {other:?}"
-                    )));
+                    return Err(uncertain(
+                        format!("{error:#}; worker stop was not confirmed: {other:?}"),
+                        false,
+                    ));
                 }
             }
         }
         let mut outcome = template.unwrap_or(RunOutcome {
-            wait_state: boss_execution_contracts::RunWaitState::WorkerPaneAlive,
+            wait_state: RunWaitState::WorkerPaneAlive,
             result_summary: None,
             attention: None,
             slot_id: None,
@@ -278,6 +291,63 @@ impl SpokeHostAdapter {
             pane.session
         ));
         Ok(outcome)
+    }
+
+    /// A spawn command that already settled as uncertain is not unanswered:
+    /// re-sending it only replays the stored result. Adopt the pane instead.
+    /// Alive means the worker launched; Missing/Absent is a definite failure;
+    /// anything else stays uncertain so the coordinator can park.
+    async fn finish_settled_uncertain_spawn(
+        &self,
+        assignment: &SpokeAssignment,
+        command_id: &str,
+        reason: String,
+        template: Option<RunOutcome>,
+    ) -> Result<RunOutcome> {
+        match self.ctl_observe(&assignment.execution_id).await {
+            Ok(Some(pane)) if pane.life == WorkerLife::Alive => {
+                if let Some(pid) = pane.pid {
+                    let (run_execution, generation, run_id) = (
+                        assignment.execution_id.clone(),
+                        assignment.assignment_generation,
+                        assignment.execution_id.clone(),
+                    );
+                    if let Err(error) = self
+                        .db(move |db| {
+                            db.record_spoke_pane_pid(&run_execution, generation, pid as i64)?;
+                            db.set_run_remote_pid_for_execution(&run_id, pid as i64)?;
+                            Ok(())
+                        })
+                        .await
+                    {
+                        tracing::warn!(error = %format!("{error:#}"), "could not record the worker's pane pid");
+                    }
+                }
+                Ok(template.unwrap_or(RunOutcome {
+                    wait_state: RunWaitState::WorkerPaneAlive,
+                    result_summary: None,
+                    attention: None,
+                    slot_id: None,
+                    spawn_config: None,
+                }))
+            }
+            Ok(None)
+            | Ok(Some(WorkerPane {
+                life: WorkerLife::Missing | WorkerLife::Exited,
+                ..
+            })) => {
+                bail!(
+                    "the worker's session on host {} was gone when spawn settled as uncertain: {reason}",
+                    self.host_name()
+                )
+            }
+            _ => Err(anyhow::Error::new(SpawnOutcomeUncertain {
+                host_id: self.host_name().to_owned(),
+                command_id: command_id.to_owned(),
+                reason,
+                settled: true,
+            })),
+        }
     }
 
     // ── Control ─────────────────────────────────────────────────────────────
@@ -423,7 +493,7 @@ impl SpokeHostAdapter {
                     "stop",
                     deadline,
                     command::Body::Stop(Stop { grace_ms }),
-                    ControlId::StableUntilOk(format!("stop-{grace_ms}")),
+                    ControlId::StableUntilOk(host_command_stop_id(grace_ms)),
                 )
                 .await?
             {

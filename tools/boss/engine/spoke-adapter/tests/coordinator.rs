@@ -3,7 +3,7 @@ use super::{short, support::*};
 use boss_engine_runtime::{coordinator::ExecutionCoordinator, lifecycle_adapter::CoreLifecycleServices};
 use boss_execution_contracts::{NoopExecutionPublisher, WorkerPool};
 use boss_protocol::{AutomationTrigger, CreateProductInput, ExecutionStatus};
-use boss_protocol_spoke::v1::{Command, CommandResult, PaneLife, WorkspaceKind, command};
+use boss_protocol_spoke::v1::{Command, CommandResult, PaneLife, ResultCode, WorkspaceKind, command};
 use boss_work_db::CreateAutomationInput;
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
@@ -189,4 +189,190 @@ async fn uncertain_command(hold_spawn: bool) {
         1
     );
     assert_eq!(fx.db.list_executions(None).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn two_in_doubt_spoke_leases_release_the_per_repo_permit() {
+    let fx = Fixture::with(short(400)).await;
+    let (coordinator, product_id) = {
+        fx.db.add_host(HOST, "worker@host", 1, &[]).unwrap();
+        fx.db
+            .connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO host_capabilities (host_id, capability, source) VALUES (?1, 'driver=claude', 'auto')",
+                [HOST],
+            )
+            .unwrap();
+        fx.ready(HOST);
+        let product = fx
+            .db
+            .create_product(
+                CreateProductInput::builder()
+                    .name("spoke dispatch")
+                    .repo_remote_url("https://github.com/acme/widget")
+                    .build(),
+            )
+            .unwrap();
+        let local = fx.provider_adapter(HOST).await;
+        let mut coordinator = ExecutionCoordinator::with_host_adapter_and_publisher(
+            fx.db.clone(),
+            WorkerPool::new(2),
+            local,
+            Arc::new(NoopExecutionPublisher),
+            CoreLifecycleServices::new(fx.db.clone()),
+        );
+        coordinator.set_host_adapter_provider(fx.provider.clone());
+        coordinator.set_automation_pool(WorkerPool::new_automation(2));
+        (Arc::new(coordinator), product.id)
+    };
+    let repo = "https://github.com/acme/widget";
+    let mut executions = Vec::new();
+    for name in ["first", "second"] {
+        let automation = fx
+            .db
+            .create_automation(CreateAutomationInput {
+                product_id: product_id.clone(),
+                name: name.into(),
+                repo_remote_url: None,
+                trigger: AutomationTrigger::Schedule {
+                    cron: "0 2 * * *".into(),
+                    timezone: "UTC".into(),
+                },
+                standing_instruction: "audit the repo".into(),
+                open_task_limit: 1,
+                catch_up_window_secs: None,
+                enabled: true,
+                created_via: None,
+            })
+            .unwrap();
+        executions.push(fx.db.create_automation_triage_execution(&automation.id, repo).unwrap());
+    }
+    let _peer = fx
+        .spoke(
+            Box::new(|command| {
+                if matches!(&command.body, Some(command::Body::Workspace(op)) if op.kind == i32::from(WorkspaceKind::Lease))
+                {
+                    None
+                } else {
+                    answer(command)
+                }
+            }),
+            None,
+            0,
+        )
+        .await;
+    coordinator.kick();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if coordinator.repo_lease_limiter().in_flight(repo) == 0
+                && executions
+                    .iter()
+                    .all(|execution| fx.db.spoke_execution_in_doubt(&execution.id).unwrap_or(false))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("both spoke leases must release the per-repo permit while in doubt");
+    assert_eq!(coordinator.repo_lease_limiter().in_flight(repo), 0);
+    assert!(
+        coordinator
+            .repo_lease_limiter()
+            .try_begin(repo, "local-lease")
+            .is_some(),
+        "a local lease for the same repo must still proceed"
+    );
+}
+
+#[tokio::test]
+async fn settled_uncertain_spawn_terminates_and_surfaces_attention() {
+    let fx = Fixture::with(short(400)).await;
+    fx.db.add_host(HOST, "worker@host", 1, &[]).unwrap();
+    fx.db
+        .connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO host_capabilities (host_id, capability, source) VALUES (?1, 'driver=claude', 'auto')",
+            [HOST],
+        )
+        .unwrap();
+    fx.ready(HOST);
+    let product = fx
+        .db
+        .create_product(
+            CreateProductInput::builder()
+                .name("spoke dispatch")
+                .repo_remote_url("https://github.com/acme/widget")
+                .build(),
+        )
+        .unwrap();
+    let automation = fx
+        .db
+        .create_automation(CreateAutomationInput {
+            product_id: product.id.clone(),
+            name: "dispatch over the stream".into(),
+            repo_remote_url: None,
+            trigger: AutomationTrigger::Schedule {
+                cron: "0 2 * * *".into(),
+                timezone: "UTC".into(),
+            },
+            standing_instruction: "audit the repo".into(),
+            open_task_limit: 1,
+            catch_up_window_secs: None,
+            enabled: true,
+            created_via: None,
+        })
+        .unwrap();
+    let local = fx.provider_adapter(HOST).await;
+    let mut coordinator = ExecutionCoordinator::with_host_adapter_and_publisher(
+        fx.db.clone(),
+        WorkerPool::new(1),
+        local,
+        Arc::new(NoopExecutionPublisher),
+        CoreLifecycleServices::new(fx.db.clone()),
+    );
+    coordinator.set_host_adapter_provider(fx.provider.clone());
+    coordinator.set_automation_pool(WorkerPool::new_automation(1));
+    let coordinator = Arc::new(coordinator);
+    let execution = fx
+        .db
+        .create_automation_triage_execution(&automation.id, "https://github.com/acme/widget")
+        .unwrap();
+    let _peer = fx
+        .spoke(
+            Box::new(|command| match &command.body {
+                Some(command::Body::Spawn(_)) => {
+                    Some(refused(command, ResultCode::OutcomeUncertain, "interrupted launch"))
+                }
+                Some(command::Body::Adopt(_)) => Some(refused(command, ResultCode::OutcomeUncertain, "no session")),
+                _ => answer(command),
+            }),
+            None,
+            0,
+        )
+        .await;
+    coordinator.kick();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let row = fx.db.get_execution(&execution.id).unwrap();
+            if row.status.is_terminal() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("settled uncertain spawn must terminate the coordinator loop");
+    let row = fx.db.get_execution(&execution.id).unwrap();
+    assert_eq!(row.status, ExecutionStatus::Failed);
+    let attention = fx.db.list_attention_items(&execution.id).unwrap();
+    assert!(
+        attention
+            .iter()
+            .any(|item| item.kind.contains("spawn") || item.title.contains("spawn")),
+        "{attention:?}"
+    );
 }

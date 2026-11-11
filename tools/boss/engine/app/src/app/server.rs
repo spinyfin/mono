@@ -413,17 +413,6 @@ impl Drop for CapabilityDiscoveryPendingGuard {
     }
 }
 
-/// Clear the published handle on completion, cancellation, or unwinding.
-#[cfg(test)]
-struct HubStreamGuard(Arc<ServerState>);
-
-#[cfg(test)]
-impl Drop for HubStreamGuard {
-    fn drop(&mut self) {
-        self.0.set_hub_stream(None);
-    }
-}
-
 /// Same as [`serve`], but accepts an optional `MergeProbe` override, plumbed
 /// straight through to [`ServerState`]. Production callers (and most tests)
 /// go through `serve` and get the real `CommandMergeProbe`; tests that need

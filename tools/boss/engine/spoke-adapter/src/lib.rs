@@ -979,6 +979,21 @@ impl HostAdapter for SpokeHostAdapter {
     async fn observe_worker(&self, execution_id: &str) -> Result<Option<WorkerPane>> {
         self.ctl_observe(execution_id).await
     }
+
+    async fn cleanup_legacy_store(
+        &self,
+        repo: &Path,
+        published_heads: &[String],
+    ) -> Result<boss_engine_recovery::execution_bookmark::LegacyCleanupReport> {
+        self.legacy_adapter("legacy store cleanup")
+            .await?
+            .cleanup_legacy_store(repo, published_heads)
+            .await
+    }
+
+    async fn gc_cube_repo(&self, repo_id: &str) -> Result<()> {
+        self.legacy_adapter("cube repo gc").await?.gc_cube_repo(repo_id).await
+    }
 }
 
 /// Routes hosts whose transport is the spoke to [`SpokeHostAdapter`] and every

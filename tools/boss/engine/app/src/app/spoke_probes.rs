@@ -38,20 +38,35 @@ pub(super) async fn dispatch(state: &Arc<ServerState>, run: &str) -> Option<Prob
                 ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Abandoned)
             })
         }
-        other => {
-            // A successful host write does not prove consumption. Keep the
-            // reservation for the reply boundary, including transport errors
-            // whose side effects cannot be established by this caller.
-            let (delivery, detail) = match other {
-                Ok(ControlOutcome::Delivered(_)) => (ProbeDeliveryState::Buffered, None),
-                Ok(ControlOutcome::Uncertain(reason)) => (ProbeDeliveryState::Unconfirmed, Some(reason)),
-                Err(error) => (ProbeDeliveryState::Unconfirmed, Some(format!("{error:#}"))),
-                _ => unreachable!(),
-            };
-            state.set_probe_lifecycle_detail(&probe.probe_id, delivery, detail);
-            Some(ProbeDispatchOutcome::Dispatched(delivery))
+        // A successful host write does not prove consumption. Keep the
+        // reservation for the reply boundary, including transport errors
+        // whose side effects cannot be established by this caller.
+        Ok(ControlOutcome::Delivered(_)) => {
+            state.set_probe_lifecycle_detail(&probe.probe_id, ProbeDeliveryState::Buffered, None);
+            Some(ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Buffered))
+        }
+        Ok(ControlOutcome::Uncertain(reason)) => {
+            state.set_probe_lifecycle_detail(&probe.probe_id, ProbeDeliveryState::Unconfirmed, Some(reason));
+            Some(ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Unconfirmed))
+        }
+        Err(error) => {
+            state.set_probe_lifecycle_detail(
+                &probe.probe_id,
+                ProbeDeliveryState::Unconfirmed,
+                Some(format!("{error:#}")),
+            );
+            Some(ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Unconfirmed))
         }
     }
+}
+
+/// Spoke ingress does not yet report worker activity, so mid-turn delivery
+/// is allowed only when a local slot is mapped and already parked.
+pub(super) fn spoke_parked_for_delivery(state: &ServerState, run: &str) -> bool {
+    let Some(slot_id) = state.worker_registry.slot_for_run(run) else {
+        return false;
+    };
+    state.pane_input_posture_for_run(run, slot_id) == super::pane_delivery::PaneInputPosture::Parked
 }
 
 impl ServerState {

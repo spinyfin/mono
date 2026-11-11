@@ -120,7 +120,14 @@ impl ExecutionCoordinator {
         // so both outcomes below record against the same key.
         let streak_key = self.pre_start_streak_key(&execution, &worker_id);
 
+        let mut unsettled_retries = 0_u32;
         let run_outcome = loop {
+            if super::execution::execution_no_longer_runnable(&self.work_db, &execution.id) {
+                break Err(anyhow::anyhow!(
+                    "execution {} was cancelled or became terminal while waiting for a spoke spawn",
+                    execution.id
+                ));
+            }
             let outcome = adapter
                 .spawn_worker(
                     &worker_id,
@@ -130,17 +137,37 @@ impl ExecutionCoordinator {
                     change.as_ref().map(|c| c.change_id.as_str()),
                 )
                 .await;
-            if let Err(error) = &outcome
-                && error
+            let uncertain = outcome.as_ref().err().and_then(|error| {
+                error
                     .chain()
-                    .any(|cause| cause.is::<boss_execution_contracts::SpawnOutcomeUncertain>())
-            {
-                tracing::warn!(execution_id = %execution.id, error = %format!("{error:#}"),
-                    "spoke spawn unresolved; retaining ownership and reconciling the stored command");
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
+                    .find_map(|cause| cause.downcast_ref::<SpawnOutcomeUncertain>())
+            });
+            match uncertain {
+                Some(uncertain) if !uncertain.settled && unsettled_retries < SPOKE_UNSETTLED_RETRY_LIMIT => {
+                    unsettled_retries += 1;
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        command_id = %uncertain.command_id,
+                        attempt = unsettled_retries,
+                        error = %format!("{}", outcome.as_ref().unwrap_err()),
+                        "spoke spawn unanswered; reconciling the stored command"
+                    );
+                    tokio::time::sleep(SPOKE_UNSETTLED_RETRY_SLEEP).await;
+                    continue;
+                }
+                Some(uncertain) => {
+                    tracing::error!(
+                        execution_id = %execution.id,
+                        command_id = %uncertain.command_id,
+                        settled = uncertain.settled,
+                        error = %format!("{}", outcome.as_ref().unwrap_err()),
+                        "spoke spawn settled as uncertain or went unanswered past the bound; \
+                         parking for operator reconciliation"
+                    );
+                    break outcome;
+                }
+                None => break outcome,
             }
-            break outcome;
         };
         drop(heartbeat);
 
@@ -441,7 +468,8 @@ impl ExecutionCoordinator {
                 // A rejected viewer may already have a running tmux process.
                 // If verified teardown failed, preserve its workspace and driver
                 // state for recovery rather than leasing them to another worker.
-                abort_unconfirmed = self.lifecycle.is_unconfirmed_spawn_abort(&err);
+                abort_unconfirmed = self.lifecycle.is_unconfirmed_spawn_abort(&err)
+                    || err.chain().any(|cause| cause.is::<SpawnOutcomeUncertain>());
                 let released = if abort_unconfirmed {
                     false
                 } else {

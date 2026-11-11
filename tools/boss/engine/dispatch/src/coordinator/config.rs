@@ -155,7 +155,6 @@ impl ExecutionCoordinator {
         &self.requested_host_ids
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub fn repo_lease_limiter(&self) -> &lease_limiter::RepoLeaseLimiter {
         &self.repo_lease_limiter
     }

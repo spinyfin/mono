@@ -33,8 +33,17 @@ use crate::work::{
     CreateAttentionItemInput, DispatchClaimOutcome, DispatchClass, FinishExecutionRunInput, PreStartFailureOutcome,
     WorkDb, WorkExecution, WorkItem, WorkRun,
 };
-use boss_execution_contracts::{HostAdapter, HostAdapterProvider, LocalHostAdapterProvider};
-use boss_execution_contracts::{RunOutcome, RunWaitState};
+use boss_execution_contracts::{
+    HostAdapter, HostAdapterProvider, LeaseOutcomeUncertain, LocalHostAdapterProvider, RunOutcome, RunWaitState,
+    SpawnOutcomeUncertain,
+};
+
+/// Extra attempts at an unanswered spoke lease or spawn after the first
+/// command deadline. Each sleeps [`SPOKE_UNSETTLED_RETRY_SLEEP`]. A settled
+/// spawn parks after one observe; a settled lease without a bindable
+/// workspace can spend this budget on a new recorded attempt.
+const SPOKE_UNSETTLED_RETRY_LIMIT: u32 = 3;
+const SPOKE_UNSETTLED_RETRY_SLEEP: Duration = Duration::from_secs(5);
 
 // Phase-3 counter handles for the cube workspace lease boundary.
 boss_metrics::register_counter!(

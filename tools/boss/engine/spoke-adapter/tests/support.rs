@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
-use boss_engine_recovery::execution_bookmark::{ExecutionBookmark, PreservedScope, PreservedTip};
+use boss_engine_recovery::execution_bookmark::{ExecutionBookmark, LegacyCleanupReport, PreservedScope, PreservedTip};
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_execution_contracts::{
     CollectOutcome, CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
@@ -280,6 +280,20 @@ impl HostAdapter for LegacyAdapter {
         self.legacy
             .record(&format!("forget_preserved_references:{}", record.execution_id));
         Ok(vec![])
+    }
+    async fn cleanup_legacy_store(&self, _: &Path, _: &[String]) -> anyhow::Result<LegacyCleanupReport> {
+        self.legacy.record("cleanup_legacy_store");
+        Ok(LegacyCleanupReport {
+            found: 0,
+            archived: vec![],
+            forgotten: 0,
+            kept: vec![],
+            operations: 0,
+        })
+    }
+    async fn gc_cube_repo(&self, repo_id: &str) -> anyhow::Result<()> {
+        self.legacy.record(&format!("gc_cube_repo:{repo_id}"));
+        Ok(())
     }
 }
 

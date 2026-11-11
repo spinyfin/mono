@@ -29,6 +29,28 @@ pub const SETTLED_HOST_COMMAND_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// Newest settled commands per host that retention never removes.
 pub const MIN_RETAINED_SETTLED_HOST_COMMANDS: u32 = 256;
 
+/// Stable command-id prefixes the adapter formats and retention protects.
+/// Keep these in this crate so a rename cannot silently drop lease/spawn/stop
+/// rows that `current_attempt` and in-doubt retry still need.
+pub const HOST_COMMAND_LEASE_PREFIX: &str = "lease-";
+pub const HOST_COMMAND_SPAWN_PREFIX: &str = "spawn-";
+pub const HOST_COMMAND_STOP_PREFIX: &str = "stop-";
+
+/// `lease-{run_id}-{digest}` for the current attempt at a workspace lease.
+pub fn host_command_lease_id(run_id: &str, digest: u64) -> String {
+    format!("{HOST_COMMAND_LEASE_PREFIX}{run_id}-{digest:016x}")
+}
+
+/// `spawn-{run_id}` for the one launch command of a run.
+pub fn host_command_spawn_id(run_id: &str) -> String {
+    format!("{HOST_COMMAND_SPAWN_PREFIX}{run_id}")
+}
+
+/// `stop-{grace_ms}` for a stop request with that grace.
+pub fn host_command_stop_id(grace_ms: u32) -> String {
+    format!("{HOST_COMMAND_STOP_PREFIX}{grace_ms}")
+}
+
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS spoke_assignments (
@@ -1076,6 +1098,9 @@ impl WorkDb {
             .optional()?
             .unwrap_or(0);
         let highest = highest_sequence(&tx, host_id)? as i64;
+        let lease_glob = format!("{HOST_COMMAND_LEASE_PREFIX}*");
+        let spawn_glob = format!("{HOST_COMMAND_SPAWN_PREFIX}*");
+        let stop_glob = format!("{HOST_COMMAND_STOP_PREFIX}*");
         let removed = tx.execute(
             "DELETE FROM host_commands
              WHERE host_id = ?1 AND result IS NOT NULL AND settled_at_ms < ?2
@@ -1085,13 +1110,22 @@ impl WorkDb {
                      WHERE a.execution_id = host_commands.run_execution_id
                        AND a.assignment_generation = host_commands.run_generation
                        AND a.resolved_at_ms IS NULL
-                       AND (command_id GLOB 'lease-*' OR command_id GLOB 'spawn-*'
-                            OR command_id GLOB 'stop-*')))
+                       AND (command_id GLOB ?6 OR command_id GLOB ?7
+                            OR command_id GLOB ?8)))
                AND command_id NOT IN (
                     SELECT command_id FROM host_commands
                      WHERE host_id = ?1 AND result IS NOT NULL
                      ORDER BY settled_at_ms DESC, created_at_ms DESC, command_id DESC LIMIT ?5)",
-            params![host_id, settled_before_ms, received, highest, keep_recent as i64],
+            params![
+                host_id,
+                settled_before_ms,
+                received,
+                highest,
+                keep_recent as i64,
+                lease_glob,
+                spawn_glob,
+                stop_glob
+            ],
         )?;
         tx.commit()?;
         Ok(removed)
@@ -1286,6 +1320,15 @@ mod tests {
                 (execution_id, host, lease),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn host_command_ids_use_the_retention_prefixes() {
+        assert!(host_command_lease_id("run", 1).starts_with(HOST_COMMAND_LEASE_PREFIX));
+        assert!(host_command_spawn_id("run").starts_with(HOST_COMMAND_SPAWN_PREFIX));
+        assert!(host_command_stop_id(250).starts_with(HOST_COMMAND_STOP_PREFIX));
+        assert_eq!(host_command_spawn_id("exec_1-g1"), "spawn-exec_1-g1");
+        assert_eq!(host_command_stop_id(0), "stop-0");
     }
 
     fn held_by(error: &anyhow::Error) -> Option<String> {

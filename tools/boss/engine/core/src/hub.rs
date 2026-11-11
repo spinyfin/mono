@@ -29,6 +29,8 @@ pub const TLS_KEY_ENV: &str = "BOSS_HUB_TLS_KEY";
 pub const HUB_ID_ENV: &str = "BOSS_HUB_ID";
 /// Environment override for the authority generation carried in `Welcome`.
 pub const AUTHORITY_GENERATION_ENV: &str = "BOSS_HUB_AUTHORITY_GENERATION";
+/// Environment override for the per-host spoke launch-path JSON file.
+pub const SPOKE_HUB_CONFIG_ENV: &str = "BOSS_SPOKE_HUB_CONFIG";
 
 /// Default [`HubConfig::hub_id`] when `BOSS_HUB_ID` is unset.
 pub const DEFAULT_HUB_ID: &str = "hub";
@@ -51,6 +53,10 @@ pub struct HubConfig {
     pub hub_id: String,
     #[builder(default = DEFAULT_HUB_AUTHORITY_GENERATION.to_owned())]
     pub authority_generation: String,
+    /// Per-host spoke launch paths (`events_socket`, `bazel_workspace`).
+    /// Loaded through the same env lookup as the rest of hub config so
+    /// fixtures isolate it with the TLS identity.
+    pub spoke_hub_config: Option<PathBuf>,
 }
 
 impl Default for HubConfig {
@@ -62,6 +68,7 @@ impl Default for HubConfig {
             tls_key: None,
             hub_id: DEFAULT_HUB_ID.to_owned(),
             authority_generation: DEFAULT_HUB_AUTHORITY_GENERATION.to_owned(),
+            spoke_hub_config: None,
         }
     }
 }
@@ -114,6 +121,7 @@ impl HubConfig {
             hub_id: nonempty(HUB_ID_ENV).unwrap_or_else(|| DEFAULT_HUB_ID.to_owned()),
             authority_generation: nonempty(AUTHORITY_GENERATION_ENV)
                 .unwrap_or_else(|| DEFAULT_HUB_AUTHORITY_GENERATION.to_owned()),
+            spoke_hub_config: path(SPOKE_HUB_CONFIG_ENV),
         };
         let _ = config.listener_plan()?;
         Ok(config)
@@ -132,6 +140,7 @@ impl HubConfig {
             tls_key,
             hub_id,
             authority_generation,
+            spoke_hub_config,
         } = self;
         let listen = listen.filter(|addr| fixture_safe_listen(addr));
         let tls_cert = tls_cert.filter(|path| {
@@ -140,6 +149,11 @@ impl HubConfig {
                 .is_some_and(|root| fixture_owned_path(path, root))
         });
         let tls_key = tls_key.filter(|path| {
+            derived_credentials_dir
+                .as_ref()
+                .is_some_and(|root| fixture_owned_path(path, root))
+        });
+        let spoke_hub_config = spoke_hub_config.filter(|path| {
             derived_credentials_dir
                 .as_ref()
                 .is_some_and(|root| fixture_owned_path(path, root))
@@ -153,6 +167,7 @@ impl HubConfig {
                 tls_key,
                 hub_id,
                 authority_generation,
+                spoke_hub_config,
             }
         } else {
             Self {
@@ -162,6 +177,7 @@ impl HubConfig {
                 tls_key: None,
                 hub_id,
                 authority_generation,
+                spoke_hub_config: None,
             }
         }
     }
@@ -204,11 +220,6 @@ impl HubConfig {
 /// Bind the hub listener when [`HubConfig::listener_plan`] is ready. Does not
 /// spawn the serve task: the caller holds [`BoundHub::stream`] as the shared
 /// manager handle and serves on its own task scope.
-pub async fn bind_hub_listener(config: &HubConfig, db: WorkDb) -> Result<Option<BoundHub>> {
-    bind_hub_listener_sync(config, db)
-}
-
-/// Bind during synchronous provider composition, before dispatch is exposed.
 pub fn bind_hub_listener_sync(config: &HubConfig, db: WorkDb) -> Result<Option<BoundHub>> {
     let Some(plan) = config.listener_plan()? else {
         return Ok(None);
@@ -384,8 +395,7 @@ mod tests {
             .tls_key(key)
             .build();
         let db = WorkDb::open(root.path().join("state.db")).unwrap();
-        let error = bind_hub_listener(&config, db)
-            .await
+        let error = bind_hub_listener_sync(&config, db)
             .err()
             .expect("invalid key rejected at bind");
         assert!(
@@ -417,6 +427,7 @@ mod tests {
             (TLS_KEY_ENV, "/tmp/hub.key"),
             (HUB_ID_ENV, "test-hub"),
             (AUTHORITY_GENERATION_ENV, "gen-9"),
+            (SPOKE_HUB_CONFIG_ENV, "/tmp/spoke-hosts.json"),
         ]))
         .unwrap();
         let plan = config.listener_plan().unwrap().unwrap();
@@ -424,6 +435,10 @@ mod tests {
         assert_eq!(plan.credentials_dir, PathBuf::from("/tmp/hub-credentials"));
         assert_eq!(config.hub_id, "test-hub");
         assert_eq!(config.authority_generation, "gen-9");
+        assert_eq!(
+            config.spoke_hub_config.as_deref(),
+            Some(std::path::Path::new("/tmp/spoke-hosts.json"))
+        );
     }
 
     #[test]
@@ -438,6 +453,7 @@ mod tests {
             tls_key: production.tls_key.clone(),
             hub_id: "hub".into(),
             authority_generation: "1".into(),
+            spoke_hub_config: None,
         };
         let isolated = configured.isolate_for_fixture(true, Some(derived.clone()));
         assert!(isolated.listener_plan().unwrap().is_none());
@@ -463,6 +479,7 @@ mod tests {
             tls_key: Some(key),
             hub_id: "hub".into(),
             authority_generation: "1".into(),
+            spoke_hub_config: None,
         };
         let isolated = configured.isolate_for_fixture(true, Some(derived.clone()));
         let plan = isolated.listener_plan().unwrap().expect("fixture hub should start");
@@ -482,6 +499,7 @@ mod tests {
             tls_key: production.tls_key.clone(),
             hub_id: "hub".into(),
             authority_generation: "1".into(),
+            spoke_hub_config: None,
         };
         let kept = configured
             .clone()
@@ -559,11 +577,11 @@ mod tests {
             .expect("dial")
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn bind_hub_listener_is_inert_when_unconfigured() {
+    #[test]
+    fn bind_hub_listener_is_inert_when_unconfigured() {
         let dir = tempfile::tempdir().unwrap();
         let db = WorkDb::open(dir.path().join("state.db")).unwrap();
-        let bound = bind_hub_listener(&HubConfig::default(), db).await.unwrap();
+        let bound = bind_hub_listener_sync(&HubConfig::default(), db).unwrap();
         assert!(bound.is_none());
     }
 
@@ -586,9 +604,9 @@ mod tests {
             tls_key: Some(key_path),
             hub_id: "hub".into(),
             authority_generation: "1".into(),
+            spoke_hub_config: None,
         };
-        let bound = bind_hub_listener(&config, db)
-            .await
+        let bound = bind_hub_listener_sync(&config, db)
             .unwrap()
             .expect("listener should start");
         let addr = bound.local_addr;
