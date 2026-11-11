@@ -1,5 +1,9 @@
 //! Token-identified tmux worker sessions: Spawn, Adopt, Deliver, Stop.
 
+#[path = "worker_paths.rs"]
+mod worker_paths;
+use worker_paths::{hex_token, outputs_root};
+
 use crate::{
     cube::{self, CubeJsonTransport},
     homes, input,
@@ -1235,10 +1239,6 @@ fn prune_stale_outputs(homes_root: &Path, retention: Duration, records: &[Execut
     }
 }
 
-fn outputs_root(homes_root: &Path, spawn_token: &str) -> PathBuf {
-    homes_root.join(format!("outputs-{}", hex_token(spawn_token)))
-}
-
 /// Output locations are allocated on the execution host beside its private homes.
 fn insert_output_environment(
     environment: &mut BTreeMap<String, String>,
@@ -1300,14 +1300,6 @@ fn pane_command(plan: &SpawnPlan) -> String {
 
 fn pane_life(pane: &PaneState) -> PaneLife {
     PaneLife::try_from(pane.life).unwrap_or_default()
-}
-
-fn hex_token(spawn_token: &str) -> String {
-    spawn_token
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 fn outcome(command: &Command, code: ResultCode, reason: impl Into<String>, pane: Option<PaneState>) -> CommandResult {
