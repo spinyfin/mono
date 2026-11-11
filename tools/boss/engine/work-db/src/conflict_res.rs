@@ -1293,11 +1293,12 @@ impl WorkDb {
     }
 }
 
-/// Shared query behind [`WorkDb::open_ci_fix_revisions_of_ended_attempts`]
-/// and [`WorkDb::open_conflict_revisions_of_ended_attempts`]. `table` and
-/// `attempt_filter` are compile-time literals from those two callers (never
-/// user input); `attempt_filter` may reference the attempt row as `a`.
-fn open_revisions_of_ended_attempts(
+/// Shared query behind [`WorkDb::open_ci_fix_revisions_of_ended_attempts`],
+/// [`WorkDb::open_conflict_revisions_of_ended_attempts`], and the ended-attempt
+/// sweep in `signal_retirement`. `table` and `attempt_filter` are compile-time
+/// literals from those callers (never user input); `attempt_filter` may
+/// reference the attempt row as `a`.
+pub(crate) fn open_revisions_of_ended_attempts(
     conn: &Connection,
     table: &str,
     created_via_prefix: &str,

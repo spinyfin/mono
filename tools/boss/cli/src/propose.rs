@@ -208,8 +208,9 @@ pub(crate) enum ProposeCommand {
     ///
     /// Example: `boss propose archive-revision task_0123abcd --reason "dead; parent is green"`
     ArchiveRevision(ArchiveRevisionArgs),
-    /// Progression agents only: move this item `blocked -> todo` once its block
-    /// reason is cleared.
+    /// Progression agents only: move this item `blocked -> todo` (or
+    /// `in_review` when it already owns a bound PR) once its block reason is
+    /// cleared.
     ///
     /// Example: `boss propose unblock`
     Unblock(UnblockArgs),
@@ -1735,6 +1736,31 @@ mod tests {
             }
             other => panic!("expected FollowupTask, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn followup_task_catalogue_shape_parses_and_brief_is_not_a_flag() {
+        // The progression verb catalogue teaches this invocation; clap must
+        // accept it so a progression agent following its brief does not get a
+        // usage error.
+        assert!(
+            Cli::try_parse_from([
+                "boss",
+                "propose",
+                "followup-task",
+                "--name",
+                "n",
+                "--description",
+                "d",
+                "--rationale",
+                "r",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["boss", "propose", "followup-task", "--name", "n", "--brief", "d"]).is_err(),
+            "followup-task takes --description, not --brief"
+        );
     }
 
     #[test]
