@@ -301,6 +301,16 @@ pub struct ConflictResolution {
     /// row that is not an ended deferral.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deferral_end_reason: Option<String>,
+
+    /// Ordered JSON tier decisions, including retries, with outcome and reason.
+    /// Absent on historical attempts whose routing was only logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ladder_outcomes: Option<String>,
+
+    /// Latest mechanical outcome or fall-through reason, preserved when an
+    /// agent is scheduled. For direct worker routing, the scheduling reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ladder_reason: Option<String>,
 }
 
 fn default_review_watch_event_source() -> String {

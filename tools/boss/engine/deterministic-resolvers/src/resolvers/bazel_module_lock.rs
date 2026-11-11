@@ -38,8 +38,8 @@ impl BazelModuleLockResolver {
         self
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_runner(runner: Arc<dyn CommandRunner>) -> Self {
+    /// Supply command execution for an embedded host or a hermetic ladder fixture.
+    pub fn with_runner(runner: Arc<dyn CommandRunner>) -> Self {
         Self {
             runner,
             base_revision: None,

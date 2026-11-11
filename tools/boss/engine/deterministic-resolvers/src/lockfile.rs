@@ -45,37 +45,26 @@ pub(crate) async fn regenerate_lockfile(
         };
     }
 
-    if let Some(revision) = base_revision {
-        // Restore only the generated file, leaving the merged manifests intact.
-        // A failed base read must never be mistaken for an absent lockfile.
-        let args = ["file", "show", "-r", revision, "--", file.path.as_str()].map(std::ffi::OsString::from);
-        let jj = std::env::var_os("BOSS_JJ_BIN")
-            .map(std::path::PathBuf::from)
-            .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
-            .unwrap_or_else(|| "jj".into());
-        let output = match runner.run(&jj, &args, Some(workspace_path)).await {
-            Ok(output) if output.success => output,
-            result => {
-                return ResolveOutcome::Failed {
-                    reason: format!("cannot read {} from PR base {revision}: {result:?}", file.path),
-                };
-            }
-        };
-        if let Err(err) = std::fs::write(&lock_path, output.stdout) {
+    let seed = match base_revision {
+        Some(revision) => match base_lockfile(runner, workspace_path, file, revision).await {
+            Ok(seed) => seed,
+            Err(outcome) => return outcome,
+        },
+        None => None,
+    };
+    if let Some(seed) = seed {
+        if let Err(err) = std::fs::write(&lock_path, seed) {
             return ResolveOutcome::Failed {
                 reason: format!("cannot seed {} from PR base: {err}", file.path),
             };
         }
     } else {
-        // The conflicted lockfile still has merge markers in it; discard it so
-        // the regeneration tool writes fresh content instead of tripping over
-        // invalid syntax (or, worse, silently trusting stale entries). Rung 1's
-        // engine-direct rebase may have already removed it, so a missing file
-        // isn't itself an error.
+        // No base lockfile (or no base supplied): regenerate from the merged
+        // manifest. This is not a resolution until the owner command succeeds.
         if let Err(e) = std::fs::remove_file(&lock_path)
             && e.kind() != std::io::ErrorKind::NotFound
         {
-            return ResolveOutcome::Declined {
+            return ResolveOutcome::Failed {
                 reason: format!("failed to remove conflicted {}: {e}", file.path),
             };
         }
@@ -98,6 +87,42 @@ pub(crate) async fn regenerate_lockfile(
     ResolveOutcome::Resolved {
         summary: format!("regenerated {} via `{program} {}`", file.path, args.join(" ")),
     }
+}
+
+/// A failed read does not prove absence: verify it against the same base
+/// revision before removing the conflicted file. Missing revisions, transport
+/// failures and unreadable existing files remain failures, with their evidence.
+async fn base_lockfile(
+    runner: &dyn CommandRunner,
+    workspace: &Path,
+    file: &ConflictedFile,
+    revision: &str,
+) -> Result<Option<String>, ResolveOutcome> {
+    let jj = std::env::var_os("BOSS_JJ_BIN")
+        .map(std::path::PathBuf::from)
+        .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+        .unwrap_or_else(|| "jj".into());
+    let args = ["file", "show", "-r", revision, "--", file.path.as_str()].map(std::ffi::OsString::from);
+    let read = runner.run(&jj, &args, Some(workspace)).await;
+    if let Ok(output) = &read
+        && output.success
+    {
+        return Ok(Some(output.stdout.clone()));
+    }
+    let args = ["file", "list", "-r", revision, "--", file.path.as_str()].map(std::ffi::OsString::from);
+    let listing = runner.run(&jj, &args, Some(workspace)).await;
+    if let Ok(output) = &listing
+        && output.success
+        && output.stdout.trim().is_empty()
+    {
+        return Ok(None);
+    }
+    Err(ResolveOutcome::Failed {
+        reason: format!(
+            "cannot read {} from PR base {revision}: {read:?}; absence check: {listing:?}",
+            file.path
+        ),
+    })
 }
 
 #[cfg(test)]

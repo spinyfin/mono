@@ -458,6 +458,8 @@ fn conflict_resolution_roundtrips_with_all_fields() {
         mismatch_exit_barred: false,
         deferral_arm: Some("control".into()),
         deferral_end_reason: None,
+        ladder_outcomes: None,
+        ladder_reason: None,
     };
     let raw = serde_json::to_value(&attempt).unwrap();
     let back: ConflictResolution = serde_json::from_value(raw).unwrap();
@@ -494,6 +496,8 @@ fn conflict_resolution_pending_skips_optional_fields_on_encode() {
         mismatch_exit_barred: false,
         deferral_arm: None,
         deferral_end_reason: None,
+        ladder_outcomes: None,
+        ladder_reason: None,
     };
     let encoded = serde_json::to_value(&attempt).unwrap();
     let obj = encoded.as_object().unwrap();
@@ -513,6 +517,8 @@ fn conflict_resolution_pending_skips_optional_fields_on_encode() {
         "mechanical_rung_in_flight",
         "deferral_arm",
         "deferral_end_reason",
+        "ladder_outcomes",
+        "ladder_reason",
     ] {
         assert!(!obj.contains_key(absent), "expected {absent} omitted on encode",);
     }

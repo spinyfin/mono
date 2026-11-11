@@ -6,7 +6,7 @@ use crate::app::errors::CubeError;
 
 /// Write an executable fake `checkleft` at `<root>/bin/checkleft` that
 /// prints `stdout` and exits with `exit_code`.
-fn write_fake_checkleft(root: &std::path::Path, exit_code: i32, stdout: &str) {
+pub(super) fn write_fake_checkleft(root: &std::path::Path, exit_code: i32, stdout: &str) {
     use std::os::unix::fs::PermissionsExt;
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).unwrap();

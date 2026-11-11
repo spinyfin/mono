@@ -27,6 +27,7 @@ mod resolvers;
 use std::path::Path;
 
 use async_trait::async_trait;
+pub use boss_command_runner::{CommandOutput, CommandRunner};
 pub use boss_conflict_diagnosis::ConflictedFile;
 
 pub use recipe_config::{ConflictRecipe, ConflictRecipesStore};

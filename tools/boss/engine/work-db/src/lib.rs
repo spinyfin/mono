@@ -854,6 +854,7 @@ pub use conflict_deferral::{
     CONFLICT_DEFERRAL_ARM_DEFERRED, CONFLICT_STATUS_DEFERRAL_ENDED, CONFLICT_STATUS_DEFERRED, ConflictDeferralEnd,
     ConflictDeferralRecord, ConflictDeferralState,
 };
+mod conflict_ladder_telemetry;
 mod conflict_mismatch;
 mod conflict_res;
 mod coordinator_guidance_cache;
