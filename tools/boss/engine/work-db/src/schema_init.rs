@@ -854,6 +854,13 @@ mod floor_tests {
                 Box::new(|c| super::super::conflict_deferral::migrate(c).unwrap()),
             ),
             (
+                "20261112_0001_conflict_ladder_outcomes",
+                Box::new(|c| {
+                    c.execute_batch("ALTER TABLE conflict_resolutions ADD COLUMN ladder_outcomes TEXT; ALTER TABLE conflict_resolutions ADD COLUMN ladder_reason TEXT;")
+                        .unwrap();
+                }),
+            ),
+            (
                 "20261029_1430_critical_requests",
                 Box::new(|c| super::super::critical_requests::migrate(c).unwrap()),
             ),

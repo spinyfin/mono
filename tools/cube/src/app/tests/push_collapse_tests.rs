@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
 
-use super::checkleft_tests::CheckleftEnvGuard;
+use super::checkleft_tests::{CheckleftEnvGuard, write_fake_checkleft};
 use super::pr_bookmarks_tests::DeclaredJj;
 use super::support::ENV_MUTEX;
 use crate::app::errors::{CubeError, Result};
@@ -193,14 +193,21 @@ fn add_origin_and_publish(repo: &Repo, branches: &[&str]) -> String {
 }
 
 #[test]
-fn resolved_lockfile_child_pushes_after_ancestor_collapse() {
+fn resolved_lockfile_child_with_legacy_pr_pointer_pushes_only_after_gate_passes() {
     let repo = Repo::new();
     repo.divergent_lockfile_pr();
     repo.jj(
         &repo.root,
         &["bookmark", "create", "boss-recovery/exec_x", "-r", "boss/exec_x"],
     );
+    // Older cube versions maintained this local-only pointer. It is not a
+    // published branch or a stacked PR boundary, but follows the rebase.
+    repo.jj(&repo.root, &["bookmark", "create", "pr/9", "-r", "boss/exec_x"]);
     let origin = add_origin_and_publish(&repo, &["main", "boss/exec_x"]);
+    let remote_before = repo.jj(
+        &repo.root,
+        &["log", "-r", "boss/exec_x@origin", "--no-graph", "-T", "commit_id"],
+    );
     repo.rebase_pr_and_resolve_at_working_copy(None);
     assert!(
         !repo.conflicted("main..@").trim().is_empty(),
@@ -217,7 +224,26 @@ fn resolved_lockfile_child_pushes_after_ancestor_collapse() {
         origin,
     };
     let _lock = ENV_MUTEX.lock().unwrap();
-    let _env = CheckleftEnvGuard::with_gate_disabled();
+    let _env = CheckleftEnvGuard {
+        orig_path: std::env::var_os("PATH"),
+        orig_cube_bin: std::env::var_os("CUBE_CHECKLEFT_BIN"),
+    };
+    let gate_root = repo._dir.path().join("gate");
+    write_fake_checkleft(&gate_root, 1, "resolution gate refused");
+    unsafe {
+        std::env::set_var("CUBE_CHECKLEFT_BIN", gate_root.join("bin/checkleft"));
+    }
+    let refused = workspace_push_at(repo.root.clone(), None, &runner, Some("boss/exec_x".into()), Some(9))
+        .expect_err("a failed gate must prevent the push");
+    assert!(refused.to_string().contains("resolution gate refused"), "{refused}");
+    assert_eq!(
+        repo.jj(
+            &repo.root,
+            &["log", "-r", "boss/exec_x@origin", "--no-graph", "-T", "commit_id"]
+        ),
+        remote_before
+    );
+    write_fake_checkleft(&gate_root, 0, "resolution gate passed");
     let result = workspace_push_at(repo.root.clone(), None, &runner, Some("boss/exec_x".into()), Some(9))
         .expect("resolved history must push");
     assert_eq!(result.payload["status"], "pushed");
@@ -262,15 +288,15 @@ fn resolved_lockfile_child_pushes_after_ancestor_collapse() {
 }
 
 #[test]
-fn published_pr_bookmark_on_conflicted_ancestor_blocks_collapse() {
+fn published_branch_on_conflicted_ancestor_blocks_collapse() {
     let repo = Repo::new();
-    repo.lockfile_conflict_with_resolved_child(Some("pr/9"));
+    repo.lockfile_conflict_with_resolved_child(Some("stacked-feature"));
 
     let outcome = collapse_resolved_ancestors(&ctx(&repo), "boss/exec_x").expect("decline is not an error");
     assert_eq!(
         outcome,
         LinearizeOutcome::Declined(LinearizeDecline::BookmarkedAncestor),
-        "a published pr/ bookmark must be what blocked the collapse"
+        "a published branch bookmark must be what blocked the collapse"
     );
     assert!(
         !repo.conflicted("main..@").trim().is_empty(),
@@ -279,7 +305,7 @@ fn published_pr_bookmark_on_conflicted_ancestor_blocks_collapse() {
 }
 
 #[test]
-fn recovery_bookmark_is_not_a_stack_boundary_but_a_published_pr_bookmark_is() {
+fn bookkeeping_pointers_are_not_stack_boundaries_but_a_published_branch_is() {
     let recovery_repo = Repo::new();
     recovery_repo.lockfile_conflict_with_resolved_child(Some("boss-recovery/x"));
     let recovery_ctx = ctx(&recovery_repo);
@@ -291,13 +317,23 @@ fn recovery_bookmark_is_not_a_stack_boundary_but_a_published_pr_bookmark_is() {
     );
 
     let published_repo = Repo::new();
-    published_repo.lockfile_conflict_with_resolved_child(Some("pr/9"));
+    published_repo.lockfile_conflict_with_resolved_child(Some("stacked-feature"));
     let published_ctx = ctx(&published_repo);
     let conflicted = published_repo.conflicted("main..@");
     let ancestor = conflicted.lines().next().expect("conflicted ancestor").trim();
     assert!(
         commit_has_blocking_bookmark(&published_ctx, ancestor, BookmarkPolicy::PushBranch("boss/exec_x")).unwrap(),
-        "a published pr/ bookmark on a conflicted ancestor is a stack boundary"
+        "a published branch bookmark on a conflicted ancestor is a stack boundary"
+    );
+
+    let legacy_repo = Repo::new();
+    legacy_repo.lockfile_conflict_with_resolved_child(Some("pr/9"));
+    let legacy_ctx = ctx(&legacy_repo);
+    let conflicted = legacy_repo.conflicted("main..@");
+    let ancestor = conflicted.lines().next().expect("conflicted ancestor").trim();
+    assert!(
+        !commit_has_blocking_bookmark(&legacy_ctx, ancestor, BookmarkPolicy::PushBranch("boss/exec_x")).unwrap(),
+        "obsolete pr/<n> aliases are local bookkeeping, never published branches"
     );
 
     let preserved_repo = Repo::new();

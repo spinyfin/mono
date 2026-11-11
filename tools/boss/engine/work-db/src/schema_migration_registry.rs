@@ -269,6 +269,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: conflict_deferral::migrate,
         },
         Migration {
+            id: "20261112_0001_conflict_ladder_outcomes".into(),
+            legacy_version: None,
+            apply: conflict_ladder_telemetry::migrate,
+        },
+        Migration {
             id: "20261029_1430_critical_requests".into(),
             legacy_version: None,
             apply: critical_requests::migrate,

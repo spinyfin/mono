@@ -504,8 +504,8 @@ pub(super) enum BookmarkPolicy<'a> {
     /// Any bookmark blocks the collapse (the rebase path).
     Strict,
     /// The push path: the branch about to be advanced to `@` and the engine's
-    /// own pointer namespaces are not stack boundaries. Anything else still
-    /// blocks.
+    /// own pointer namespaces (including obsolete local-only `pr/<n>` aliases)
+    /// are not stack boundaries. Actual branch bookmarks still block.
     PushBranch(&'a str),
 }
 
@@ -521,6 +521,9 @@ pub(super) fn commit_has_blocking_bookmark(
     Ok(out.lines().map(str::trim).any(|name| {
         !name.is_empty()
             && name != branch
+            // These aliases were never publishable and have not been maintained
+            // since mono#3511. A leftover alias is not another PR's branch.
+            && !git_utils::pr_bookmark::is_pr_bookmark(name)
             && !ENGINE_POINTER_BOOKMARK_PREFIXES
                 .iter()
                 .any(|prefix| name.starts_with(prefix))

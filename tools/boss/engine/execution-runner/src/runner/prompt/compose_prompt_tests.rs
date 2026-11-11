@@ -1117,6 +1117,8 @@ pub(super) fn sample_conflict_attempt() -> crate::work::ConflictResolution {
         mismatch_exit_barred: false,
         deferral_arm: None,
         deferral_end_reason: None,
+        ladder_outcomes: None,
+        ladder_reason: None,
     }
 }
 
