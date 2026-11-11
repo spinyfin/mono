@@ -15,14 +15,20 @@ pub(super) fn read_report(conn: &Connection) -> Result<Option<ProgressionCalibra
     let json: Option<String> = conn
         .query_row("SELECT value FROM metadata WHERE key = ?1", [REPORT_KEY], |r| r.get(0))
         .optional()?;
-    Ok(json.map(|json| serde_json::from_str(&json)).transpose()?)
+    Ok(json.and_then(|json| match serde_json::from_str(&json) {
+        Ok(report) => Some(report),
+        Err(error) => {
+            tracing::warn!(?error, "invalid progression calibration report; ignoring");
+            None
+        }
+    }))
 }
 
 #[work_db_boundary::instrument]
 impl WorkDb {
-    /// Publish configuration presence before the first daily sample. Restarting
-    /// with different overrides recomputes immediately, even within the same day.
-    pub fn configure_progression_calibration(&self, settings: &ProgressionSettings, now: i64) -> Result<()> {
+    /// Publish configuration and fallbacks without measuring history.
+    /// Unchanged configuration preserves the calibrated values.
+    pub fn configure_progression_calibration(&self, settings: &ProgressionSettings, _now: i64) -> Result<()> {
         let json = serde_json::to_string(settings)?;
         if self.get_metadata(CONFIG_KEY)?.as_deref() != Some(&json) {
             let mut conn = self.connect()?;
@@ -33,15 +39,31 @@ impl WorkDb {
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 params![CONFIG_KEY, json],
             )?;
+            for (key, value) in CALIBRATED_KEYS.iter().zip(settings.calibration_values()) {
+                if let Some(value) = value {
+                    conn.execute(
+                        "INSERT INTO metadata(key,value) VALUES (?1,?2)
+                        ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        params![format!("progression.{key}"), value.to_string()],
+                    )?;
+                } else {
+                    conn.execute("DELETE FROM metadata WHERE key=?1", [format!("progression.{key}")])?;
+                }
+            }
+            conn.execute(
+                "INSERT INTO metadata(key,value) VALUES ('progression.max_creates_window_secs',?1)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [settings.max_creates_window_secs.to_string()],
+            )?;
             conn.commit()?;
         }
-        self.calibrate_progression(now)?;
         Ok(())
     }
 
     pub fn calibrate_progression(&self, now: i64) -> Result<ProgressionCalibration> {
-        let mut conn = self.connect()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let reader = self.reader()?;
+        let mut conn = reader.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
         if let Some(report) = read_report(&tx)?
             && report.computed_at.div_euclid(DAY) == now.div_euclid(DAY)
         {
@@ -51,7 +73,8 @@ impl WorkDb {
             .query_row("SELECT value FROM metadata WHERE key = ?1", [CONFIG_KEY], |r| r.get(0))
             .optional()?;
         let settings: ProgressionSettings = config
-            .map(|s| serde_json::from_str(&s))
+            .as_deref()
+            .map(serde_json::from_str)
             .transpose()?
             .unwrap_or_default();
         let mut report = super::progression_calibration_data::measure(&tx, now, settings.max_creates_window_secs)?;
@@ -76,7 +99,7 @@ impl WorkDb {
             triple("revision_to_review_max_secs"),
             triple("remediation_attempts_p99"),
             triple("run_duration_p99_secs"),
-            triple("answer_latency_p99_secs"),
+            None,
             measurement("progression_questions")
                 .zip(measurement("engine_ladder_questions"))
                 .filter(|(p, l)| p + l > 0)
@@ -85,11 +108,11 @@ impl WorkDb {
         let bases = [
             "ceil(peak daily candidates * mean run seconds / 86400) * 3",
             "10 * p99 ledger interval",
-            "3 * longest legitimate automatic transition pause",
+            "3 * p99 automatic remediation scheduling pause",
             "3 * longest progression revision time to first review",
             "3 * p99 per-item remediation attempts in a create-budget window",
             "3 * p99 completed progression run duration",
-            "3 * p99 answered question latency",
+            "fixed reminder cadence; answer latency is diagnostic only",
             "ceil((progression + ladder questions) * 7 / 28); alarm only",
         ];
         for (index, key) in CALIBRATED_KEYS.iter().enumerate() {
@@ -106,12 +129,34 @@ impl WorkDb {
                 (
                     defaults[index],
                     "fallback",
-                    if enough {
+                    if index == 6 {
+                        bases[index].to_owned()
+                    } else if enough {
                         "no eligible measurement samples".to_owned()
                     } else {
                         format!("{} daily snapshots; need {MINIMUM_DAYS}", report.snapshot_days)
                     },
                 )
+            };
+            // Diagnostic bounds expose extreme computed values without hiding
+            // the measurement or overriding explicit configuration.
+            let sanity_bounds = [
+                64,
+                3600,
+                DAY as u64,
+                7 * DAY as u64,
+                100,
+                DAY as u64,
+                3 * DAY as u64,
+                100,
+            ];
+            let basis = if source == "computed" && value.is_some_and(|v| v > sanity_bounds[index]) {
+                format!(
+                    "{basis}; WARNING: computed value exceeds sanity bound {}",
+                    sanity_bounds[index]
+                )
+            } else {
+                basis
             };
             let ceiling = match *key {
                 "pool_size" => boss_engine_storage_values::pool_policy::MAX_PROGRESSION_POOL_SIZE as u64,
@@ -132,6 +177,17 @@ impl WorkDb {
                 },
             );
         }
+        tx.commit()?;
+        drop(conn);
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_config: Option<String> = tx
+            .query_row("SELECT value FROM metadata WHERE key=?1", [CONFIG_KEY], |r| r.get(0))
+            .optional()?;
+        anyhow::ensure!(
+            current_config == config,
+            "progression configuration changed during measurement"
+        );
         for (key, limit) in &report.limits {
             if let Some(value) = limit.value {
                 tx.execute(

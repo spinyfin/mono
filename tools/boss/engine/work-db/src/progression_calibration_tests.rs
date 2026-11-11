@@ -119,9 +119,15 @@ fn seed(db: &WorkDb) {
     for index in 0..4 {
         conn.execute(
             "INSERT INTO ci_remediations(id,product_id,work_item_id,pr_url,pr_number,head_branch,head_sha_at_trigger,
-            attempt_kind,consumes_budget,failed_checks,status,created_at)
-            VALUES (?1,?2,?3,'https://example.com/pr',1,'branch',?1,'fix',1,'[]','completed',?4)",
-            params![format!("remediation{index}"), product, task, start + index],
+            attempt_kind,consumes_budget,failed_checks,status,created_at,finished_at)
+            VALUES (?1,?2,?3,'https://example.com/pr',1,'branch',?1,'fix',1,'[]','completed',?4,?5)",
+            params![
+                format!("remediation{index}"),
+                product,
+                task,
+                start + index * 11000,
+                start + index * 11000 + 1000
+            ],
         )
         .unwrap();
     }
@@ -168,13 +174,16 @@ fn seeded_ledger_computes_formulas_publishes_report_and_caches_the_day() {
         ("cooldown_secs", 60000),
         ("max_creates_per_item_window", 12),
         ("run_timeout_secs", 32400),
-        ("remind_after_secs", 12 * DAY as u64),
         ("expected_questions_per_week", 2),
     ] {
         assert_eq!(value(&report, key), Some(expected), "{key}");
         assert_eq!(report.limits[key].source, "computed", "{key}");
         assert_eq!(db.progression_limit(key, 0).unwrap(), expected);
     }
+    assert_eq!(value(&report, "remind_after_secs"), Some(3 * DAY as u64));
+    assert_eq!(report.limits["remind_after_secs"].source, "fallback");
+    assert!(report.limits["sweep_interval_secs"].basis.contains("WARNING"));
+    assert_eq!(report.inputs["automatic_pause_max_secs"], 10000);
     assert_eq!(report.inputs["engine_ladder_questions"], 2);
     assert_eq!(report.inputs["progression_questions"], 3);
     assert_eq!(
@@ -220,4 +229,120 @@ fn explicit_override_even_equal_to_placeholder_wins_and_restart_can_remove_it() 
         db.calibrate_progression(NOW).unwrap().limits["pool_size"].source,
         "computed"
     );
+}
+
+#[test]
+fn coding_merge_and_execution_human_waits_do_not_inflate_automatic_pauses() {
+    let db = db();
+    seed(&db);
+    let baseline = super::super::progression_calibration_data::measure(&db.connect().unwrap(), NOW, 7 * DAY).unwrap();
+    let product = create_test_product(&db).id;
+    let item = create_test_chore_manual(&db, &product, "human waits").id;
+    let run = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&item)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    let start = NOW - 20 * DAY;
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE work_executions SET created_at=?2, started_at=?2, finished_at=?3 WHERE id=?1",
+        params![run.id, start, NOW - 1],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO execution_wait_history(execution_id,changed_at) VALUES (?1,?2)",
+        params![run.id, start + DAY],
+    )
+    .unwrap();
+    for (stamp, old, new) in [
+        (start, "backlog", "active"),
+        (start + DAY, "active", "in_review"),
+        (NOW - 1, "in_review", "done"),
+    ] {
+        conn.execute(
+            "INSERT INTO task_status_audit(work_item_id,property,old_value,new_value,actor,changed_at,basis)
+            VALUES (?1,'status',?2,?3,'engine',?4,'observed')",
+            params![item, old, new, stamp],
+        )
+        .unwrap();
+    }
+    for index in 0..2 {
+        conn.execute(
+            "INSERT INTO ci_remediations(id,product_id,work_item_id,pr_url,pr_number,head_branch,
+            head_sha_at_trigger,attempt_kind,consumes_budget,failed_checks,status,created_at,finished_at)
+            VALUES (?1,?2,?3,'https://example.com/pr',1,'branch',?1,'fix',1,'[]','completed',?4,?5)",
+            params![
+                format!("human-remediation{index}"),
+                product,
+                item,
+                start + index * 10 * DAY,
+                start + index * 10 * DAY + 1000
+            ],
+        )
+        .unwrap();
+    }
+    drop(conn);
+    let report = db.calibrate_progression(NOW).unwrap();
+    assert_eq!(
+        report.inputs["automatic_pause_samples"],
+        baseline.inputs["automatic_pause_samples"]
+    );
+    assert_eq!(
+        report.inputs["automatic_pause_max_secs"],
+        baseline.inputs["automatic_pause_max_secs"]
+    );
+    assert_eq!(value(&report, "stuck_after_secs"), Some(30000));
+}
+
+#[test]
+fn configuration_and_snapshots_survive_measurement_and_metadata_errors() {
+    let db = db();
+    db.set_metadata(REPORT_KEY, "corrupt json").unwrap();
+    assert!(
+        db.stuck_report(0, NOW, &|_| false)
+            .unwrap()
+            .progression_calibration
+            .is_none()
+    );
+    db.configure_progression_calibration(&ProgressionSettings::default(), NOW)
+        .unwrap();
+    db.set_metadata(CONFIG_KEY, "invalid config").unwrap();
+    assert!(db.calibrate_progression(NOW).is_err());
+    assert_eq!(db.progression_limit("stuck_after_secs", 0).unwrap(), 7200);
+    let snapshot = db.stuck_daily_snapshot(NOW, &|_| false).unwrap();
+    assert!(snapshot.progression_calibration.is_none());
+}
+
+#[test]
+fn daily_snapshot_omits_calibration_while_live_report_includes_it() {
+    let db = db();
+    seed(&db);
+    db.calibrate_progression(NOW).unwrap();
+    assert!(
+        db.stuck_report(0, NOW, &|_| false)
+            .unwrap()
+            .progression_calibration
+            .is_some()
+    );
+    assert!(
+        db.stuck_daily_snapshot(NOW, &|_| false)
+            .unwrap()
+            .progression_calibration
+            .is_none()
+    );
+    let json: String = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT report_json FROM task_stuck_daily_snapshots WHERE day=?1",
+            [NOW / DAY],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!json.contains("fingerprint_changes_per_item"));
 }

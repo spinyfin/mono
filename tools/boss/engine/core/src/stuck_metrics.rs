@@ -102,7 +102,9 @@ where
 
 fn sample(db: &WorkDb, now: i64) -> anyhow::Result<StuckReport> {
     let report = db.stuck_daily_snapshot(now, &|pid| crate::durable_liveness::probe_recorded_pid(pid).is_alive())?;
-    db.calibrate_progression(now)?;
+    if let Err(error) = db.calibrate_progression(now) {
+        tracing::warn!(?error, "daily progression calibration failed");
+    }
     Ok(report)
 }
 
@@ -149,6 +151,17 @@ mod tests {
             .classification("c")
             .last_ledger_basis("b")
             .build()
+    }
+
+    #[test]
+    fn calibration_failure_does_not_fail_snapshot_sampling() {
+        let (_dir, db) = crate::test_support::open_db();
+        db.set_metadata("progression.calibration_config", "invalid json")
+            .unwrap();
+        let report = sample(&db, 20_000 * 86400).unwrap();
+        let registry = Registry::new();
+        register_metrics(&registry);
+        record(&registry, &report);
     }
 
     #[test]

@@ -1,5 +1,5 @@
-//! Measurements from completed UTC days; no production database access is
-//! needed outside the engine. Missing samples stay missing, never zero-filled.
+//! Calibration inputs measured over completed UTC days in the rolling window.
+//! Absent samples stay missing, never zero-filled.
 use super::progression_calibration::{DAY, empty_report};
 use super::*;
 use boss_protocol::{ProgressionCalibration, StuckBucket, StuckReport};
@@ -78,33 +78,34 @@ pub(super) fn measure(conn: &Connection, now: i64, create_window_secs: i64) -> R
     if let Some(p99) = percentile(&mut intervals) {
         report.inputs.insert("ledger_interval_p99_secs".into(), p99);
     }
-    // Restrict to adjacent status transitions through automatic states.
-    // Human, parked, backlog and dependency waits cannot inflate the grace.
-    let pauses = samples(
+    // Completed remediation to next remediation measures scheduling lag.
+    // Coding and merge waits are not pauses. Wait history records starts only,
+    // so conservatively exclude overlapping lifetimes that contain a human wait.
+    let mut pauses = samples(
         conn,
-        "WITH transitions AS (
-        SELECT work_item_id, actor, old_value, new_value, age_is_lower_bound,
-        CAST(changed_at AS INTEGER) AS stamp,
-        LAG(CAST(changed_at AS INTEGER)) OVER (PARTITION BY work_item_id ORDER BY id) AS prior,
-        LAG(actor) OVER (PARTITION BY work_item_id ORDER BY id) AS prior_actor,
-        LAG(age_is_lower_bound) OVER (PARTITION BY work_item_id ORDER BY id) AS prior_lower
-        FROM task_status_audit WHERE property='status'
-        AND CAST(changed_at AS INTEGER)>=?1 AND CAST(changed_at AS INTEGER)<?2)
-        SELECT stamp-prior FROM transitions WHERE prior IS NOT NULL AND age_is_lower_bound=0 AND prior_lower=0
-        AND actor='engine' AND prior_actor='engine'
-        AND old_value IN ('active','in_review') AND new_value IN ('active','in_review','done')
+        "WITH steps AS (
+        SELECT work_item_id, CAST(created_at AS INTEGER) AS stamp,
+        LAG(CAST(finished_at AS INTEGER)) OVER (PARTITION BY work_item_id ORDER BY CAST(created_at AS INTEGER), id) AS prior
+        FROM ci_remediations WHERE status='completed'
+        AND CAST(created_at AS INTEGER)>=?1 AND CAST(created_at AS INTEGER)<?2)
+        SELECT stamp-prior FROM steps WHERE prior IS NOT NULL AND stamp>=prior
         AND NOT EXISTS (SELECT 1 FROM task_status_audit hold
-            WHERE hold.work_item_id=transitions.work_item_id
-            AND CAST(hold.changed_at AS INTEGER) >= prior AND CAST(hold.changed_at AS INTEGER) <= stamp
-            AND hold.property IN ('parked_at','autostart'))",
+            WHERE hold.work_item_id=steps.work_item_id
+            AND CAST(hold.changed_at AS INTEGER)>=prior AND CAST(hold.changed_at AS INTEGER)<=stamp
+            AND hold.property IN ('parked_at','autostart'))
+        AND NOT EXISTS (SELECT 1 FROM work_executions e
+            JOIN execution_wait_history h ON h.execution_id=e.id
+            WHERE e.work_item_id=steps.work_item_id AND h.changed_at<=stamp
+            AND (e.finished_at IS NULL OR CAST(e.finished_at AS INTEGER)>=prior))",
         start,
         end,
     )?;
     report
         .inputs
         .insert("automatic_pause_samples".into(), pauses.len() as u64);
-    if let Some(max) = pauses.into_iter().max() {
-        report.inputs.insert("automatic_pause_max_secs".into(), max);
+    if let Some(p99) = percentile(&mut pauses) {
+        // Historical report key retained for readers; the statistic is p99.
+        report.inputs.insert("automatic_pause_max_secs".into(), p99);
     }
     let revisions = samples(
         conn,
@@ -238,4 +239,14 @@ fn fingerprints(conn: &Connection, start: i64, end: i64, report: &mut Progressio
         )
     };
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn p99_does_not_follow_a_single_extreme_pause() {
+        let mut pauses = vec![100; 100];
+        pauses.push(20 * 86400);
+        assert_eq!(super::percentile(&mut pauses), Some(100));
+    }
 }
