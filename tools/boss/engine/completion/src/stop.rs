@@ -854,7 +854,7 @@ impl WorkerCompletionHandler {
                          declaration yet; declaration remains required — deferring staged \
                          finalization",
                     );
-                    return self.await_run_done_declaration(&execution, &staged_url).await;
+                    return self.await_run_done_declaration(&execution, &staged_url, true).await;
                 }
                 return self
                     .finalize_pr_transition(
@@ -1284,7 +1284,7 @@ impl WorkerCompletionHandler {
                     return outcome;
                 }
                 if awaiting_declaration {
-                    return self.await_run_done_declaration(&execution, &pr_url).await;
+                    return self.await_run_done_declaration(&execution, &pr_url, true).await;
                 }
                 tracing::info!(
                     execution_id,
@@ -1409,7 +1409,7 @@ impl WorkerCompletionHandler {
                         return outcome;
                     }
                     if awaiting_declaration {
-                        return self.await_run_done_declaration(&execution, &bound_pr_url).await;
+                        return self.await_run_done_declaration(&execution, &bound_pr_url, true).await;
                     }
                     tracing::warn!(
                         execution_id, %bound_pr_url,

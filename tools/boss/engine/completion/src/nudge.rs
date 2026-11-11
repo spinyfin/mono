@@ -26,6 +26,9 @@ impl WorkerCompletionHandler {
     ///   tripped — `max_unproductive_nudges` consecutive nudges fired
     ///   with no state change).
     ///
+    /// Declaration questions instead park for human direction without
+    /// entering worker-failure teardown.
+    ///
     /// This is the single choke point for the nudge loop: bounding it
     /// here makes the breaker generic to *every* auto-nudge, not just
     /// the "produce a PR" one. It is also the suppression point for
@@ -276,6 +279,11 @@ impl WorkerCompletionHandler {
                 );
             }
         }
+        if matches!(proceed_outcome, StopOutcome::AwaitingRunDoneDeclaration { .. })
+            && !self.probe_queuer.can_queue_turn_boundary_probe(&execution.id)
+        {
+            return proceed_outcome;
+        }
         let outcome = match self.nudge_breaker.record(
             &execution.id,
             fingerprint,
@@ -290,7 +298,18 @@ impl WorkerCompletionHandler {
                     "auto-nudge: queueing probe (under circuit-breaker cap)"
                 );
                 self.publish_awaiting_pr(execution).await;
-                self.probe_queuer.queue_probe(&execution.id, probe_text);
+                if matches!(proceed_outcome, StopOutcome::AwaitingRunDoneDeclaration { .. }) {
+                    if !self
+                        .probe_queuer
+                        .queue_probe_at_turn_boundary(&execution.id, probe_text)
+                    {
+                        self.nudge_breaker.revert_undelivered(&execution.id);
+                        return StopOutcome::NudgeDebounced;
+                    }
+                    RUN_DONE_BACKSTOP_ASKED.inc(&self.metrics);
+                } else {
+                    self.probe_queuer.queue_probe(&execution.id, probe_text);
+                }
                 proceed_outcome.clone()
             }
             NudgeDecision::TooSoon { since_last } => {
@@ -314,8 +333,17 @@ impl WorkerCompletionHandler {
                 StopOutcome::NudgeDebounced
             }
             NudgeDecision::Trip { count } => {
-                self.fail_for_unproductive_nudges(execution, count, bound_pr_url, "no new commit, PR, or state change")
+                if matches!(proceed_outcome, StopOutcome::AwaitingRunDoneDeclaration { .. }) {
+                    self.park_undeclared_run(execution, count).await
+                } else {
+                    self.fail_for_unproductive_nudges(
+                        execution,
+                        count,
+                        bound_pr_url,
+                        "no new commit, PR, or state change",
+                    )
                     .await
+                }
             }
         };
         // A debounced Stop carries no evidence the worker resumed — the
@@ -391,6 +419,19 @@ impl WorkerCompletionHandler {
     /// no-PR nudges. Returns `None` when the execution has moved on.
     pub(crate) async fn recheck_background_nudge(&self, execution_id: &str) -> Option<StopOutcome> {
         let intent = self.background_children_tracker.intent(execution_id)?;
+        // Declaration questions must re-enter their silence and Stop gate;
+        // replaying a held generic nudge would bypass both and interrupt.
+        if matches!(intent.proceed_outcome, StopOutcome::AwaitingRunDoneDeclaration { .. }) {
+            let execution = self.work_db.get_execution(execution_id).ok()?;
+            if !execution.status.is_live() {
+                self.background_children_tracker.forget(execution_id);
+                return None;
+            }
+            return Some(
+                self.await_run_done_declaration(&execution, intent.bound_pr_url.as_deref()?, false)
+                    .await,
+            );
+        }
         // Did the worker run a tool since this intent was recorded? Only a
         // POSITIVE answer counts: both the recorded and the current
         // watermark must be present and differ. A current watermark of

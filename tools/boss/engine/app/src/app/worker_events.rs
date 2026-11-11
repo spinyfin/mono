@@ -1660,7 +1660,7 @@ async fn dispatch_probe_on_stop_inner(
     // falls through to `deliver_probe_via_pane_write`, whose claim then
     // fails and reports `RacedToEmpty` — an anomaly-shaped outcome for what
     // is, on this path, the routine case.
-    if server_state.has_in_flight_probe(run_id) {
+    if server_state.probe_delivery_slot_blocked(run_id) {
         tracing::debug!(
             run_id,
             queued,
@@ -2046,6 +2046,10 @@ pub(super) async fn dispatch_probe_on_post_tool_use(
         return ProbeDispatchOutcome::NoRunId;
     };
 
+    if server_state.next_probe_requires_turn_boundary(run_id) {
+        return ProbeDispatchOutcome::NotADeliveryBoundary;
+    }
+
     // Fast no-op when nothing is queued for this run.
     if !server_state.has_pending_probe(run_id) {
         return ProbeDispatchOutcome::NothingQueued;
@@ -2360,6 +2364,14 @@ fn revert_undelivered_nudge_if_needed(server_state: &ServerState, run_id: &str, 
 }
 
 async fn dispatch_probe_now_inner(server_state: &Arc<ServerState>, run_id: &str) -> ProbeDispatchOutcome {
+    if server_state.next_probe_requires_turn_boundary(run_id)
+        && !server_state
+            .live_worker_states
+            .declaration_activity_for_run(run_id)
+            .is_some_and(|activity| activity.at_turn_boundary)
+    {
+        return ProbeDispatchOutcome::NotADeliveryBoundary;
+    }
     let queued = server_state.pending_probe_count(run_id);
     if queued == 0 {
         tracing::debug!(run_id, "probe-now: nothing queued for this run");
@@ -2374,7 +2386,7 @@ async fn dispatch_probe_now_inner(server_state: &Arc<ServerState>, run_id: &str)
         );
         return ProbeDispatchOutcome::NoSlotMapping;
     };
-    if server_state.has_in_flight_probe(run_id) {
+    if server_state.probe_delivery_slot_blocked(run_id) {
         tracing::debug!(
             run_id,
             queued,

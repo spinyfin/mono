@@ -42,11 +42,12 @@
 //! health) or enters the auto-nudge loop, which re-probes on essentially
 //! every Stop until the circuit breaker trips. [`decide`] instead:
 //!
-//! 1. **Holds quietly** while the worker shows any sign of life — live
-//!    descendant processes (a subagent still running, the exact state the
-//!    md5 incident was in when it was killed) or build-wait narration. No
-//!    probe, no breaker consumption, no finalize. The silence clock is
-//!    reset, because a working worker is not a silent one.
+//! 1. **Holds quietly** while hook/driver activity refreshes the silence
+//!    clock, or delegated work is still live. An open turn or tool in flight
+//!    always defers asking until Stop, even when the clock expires. A sweep
+//!    may ask a worker already at its Stop boundary; it cannot create that
+//!    boundary by interrupting the worker. No probe or breaker consumption
+//!    happens while the worker is active.
 //! 2. **Holds quietly** for the whole [`declaration_horizon_secs`] window
 //!    even without those signals. A worker between turns, thinking, or
 //!    reading a large file looks identical to a stalled one at any single
@@ -65,7 +66,8 @@
 //!
 //! Safety property preserved: nothing here reaps a worker. Step 1 is the
 //! explicit guard for "alive and working", and steps 3–4 route through
-//! `nudge_or_park`, which is not a reap path.
+//! the declaration-specific arm of `nudge_or_park`, which parks without
+//! entering the generic worker-failure teardown path.
 
 use std::sync::Arc;
 
@@ -75,11 +77,10 @@ use boss_protocol::ExecutionKind;
 /// How long the engine waits, in continuous silence at Stop boundaries,
 /// before asking an undeclared run whether it is finished.
 ///
-/// 20 minutes. The number is chosen against what it is discriminating, not
-/// against the nudge breaker's cadence: a worker doing real work emits Stop
-/// boundaries every few minutes at most, and each of those either declares
-/// (ending the wait) or shows life (resetting the clock). Twenty minutes of
-/// neither, from a worker whose process tree is idle, is a real signal.
+/// 20 minutes without hook or driver activity. A worker can stay in one turn
+/// for hours; tool completions, polls and model output refresh this clock
+/// without requiring any Stop. Stop itself permits delivery but does not
+/// reset the quiet stretch that led to it.
 ///
 /// It is deliberately shorter than `stale_worker_sweep`'s 30-minute
 /// wedge threshold so the *ask* — the cheap, recoverable action — always
@@ -144,6 +145,8 @@ pub fn declaration_horizon_secs(kind: &ExecutionKind) -> i64 {
 /// What [`decide`] concluded about an undeclared run at this Stop boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackstopDecision {
+    /// Silence can expire mid-turn, but a question must wait for Stop.
+    HoldingUntilStop,
     /// The worker is demonstrably still working — live descendant
     /// processes. Hold silently; the silence clock has been reset.
     /// `descendant_count` is what the process-tree probe found.
@@ -157,10 +160,18 @@ pub enum BackstopDecision {
     Ask { waited_secs: i64, horizon_secs: i64 },
 }
 
+#[derive(Default)]
+pub struct BackstopActivity {
+    pub descendant_count: usize,
+    pub last_activity_epoch: Option<i64>,
+    pub at_turn_boundary: bool,
+    pub tool_in_flight: bool,
+}
+
 /// Decide what to do about `execution_id`, which has stopped without
 /// declaring itself done.
 ///
-/// `descendant_count` is the caller's process-tree reading (0 when the
+/// `activity.descendant_count` is the caller's process-tree reading (0 when the
 /// probe found nothing, including on platforms where it cannot look).
 /// `now_epoch_secs` is passed in rather than read here so the caller — and
 /// tests — control the clock.
@@ -172,9 +183,10 @@ pub fn decide(
     tracker: &BuildWaitTracker,
     execution_id: &str,
     kind: &ExecutionKind,
-    descendant_count: usize,
+    activity: BackstopActivity,
     now_epoch_secs: i64,
 ) -> BackstopDecision {
+    let descendant_count = activity.descendant_count;
     if descendant_count > 0 {
         // A worker waiting on its own subagent is working, not stalled —
         // and the clock restarts, because the next quiet stretch should be
@@ -184,7 +196,18 @@ pub fn decide(
         return BackstopDecision::HoldingWorkerActive { descendant_count };
     }
     let horizon_secs = declaration_horizon_secs(kind);
-    match tracker.record(execution_id, now_epoch_secs, horizon_secs) {
+    // A long-running tool can legitimately emit no hooks until it returns.
+    // That whole interval is work, never silence charged to the next Stop.
+    let last_activity_epoch = if activity.tool_in_flight {
+        Some(now_epoch_secs)
+    } else {
+        activity.last_activity_epoch
+    };
+    let elapsed = tracker.record_since(execution_id, now_epoch_secs, horizon_secs, last_activity_epoch);
+    if !activity.at_turn_boundary || activity.tool_in_flight {
+        return BackstopDecision::HoldingUntilStop;
+    }
+    match elapsed {
         BuildWaitDecision::Suppress { waited_secs } => BackstopDecision::HoldingWithinHorizon {
             waited_secs,
             horizon_secs,
@@ -203,8 +226,10 @@ pub fn decide(
 /// harm as terminalizing it.
 pub const PROBE_DECLARE_DONE: &str = "You have not declared this run finished. If you are done, run \
 `boss propose done --outcome <delivered|no-changes-needed|blocked> --summary \"<one line>\"` — that \
-declaration, not the PR's state, is what ends the run. If you are still working, say so and carry \
-on; nothing is being taken away from you.";
+declaration, not the PR's state, is what ends the run. If you are still working or waiting on a \
+job, run `boss propose wait --reason \"<what remains>\" --duration <bound>` (for example `30m`) \
+and carry on. Do not reply in prose — prose is not a signal the engine can act on. An unexpired \
+wait suppresses these asks and their circuit-breaker strikes.";
 
 /// Type-erased handle to the backstop's silence tracker, so the completion
 /// handler can hold one without depending on the concrete tracker type
@@ -215,6 +240,15 @@ pub type DeclarationSilenceTracker = Arc<BuildWaitTracker>;
 mod tests {
     use super::*;
 
+    fn activity(descendant_count: usize) -> BackstopActivity {
+        BackstopActivity {
+            descendant_count,
+            at_turn_boundary: true,
+            last_activity_epoch: None,
+            tool_in_flight: false,
+        }
+    }
+
     #[test]
     fn a_worker_with_live_subagents_is_held_not_asked() {
         let tracker = BuildWaitTracker::new();
@@ -224,7 +258,7 @@ mod tests {
             &tracker,
             "exec_1",
             &ExecutionKind::RevisionImplementation,
-            2,
+            activity(2),
             10_000_000,
         );
         assert_eq!(decision, BackstopDecision::HoldingWorkerActive { descendant_count: 2 });
@@ -233,7 +267,13 @@ mod tests {
     #[test]
     fn silence_inside_the_horizon_holds_quietly() {
         let tracker = BuildWaitTracker::new();
-        let first = decide(&tracker, "exec_1", &ExecutionKind::ChoreImplementation, 0, 1_000);
+        let first = decide(
+            &tracker,
+            "exec_1",
+            &ExecutionKind::ChoreImplementation,
+            activity(0),
+            1_000,
+        );
         assert_eq!(
             first,
             BackstopDecision::HoldingWithinHorizon {
@@ -241,7 +281,13 @@ mod tests {
                 horizon_secs: DEFAULT_DECLARATION_HORIZON_SECS,
             }
         );
-        let later = decide(&tracker, "exec_1", &ExecutionKind::ChoreImplementation, 0, 1_060);
+        let later = decide(
+            &tracker,
+            "exec_1",
+            &ExecutionKind::ChoreImplementation,
+            activity(0),
+            1_060,
+        );
         assert_eq!(
             later,
             BackstopDecision::HoldingWithinHorizon {
@@ -254,12 +300,18 @@ mod tests {
     #[test]
     fn silence_past_the_horizon_asks() {
         let tracker = BuildWaitTracker::new();
-        decide(&tracker, "exec_1", &ExecutionKind::ChoreImplementation, 0, 1_000);
+        decide(
+            &tracker,
+            "exec_1",
+            &ExecutionKind::ChoreImplementation,
+            activity(0),
+            1_000,
+        );
         let decision = decide(
             &tracker,
             "exec_1",
             &ExecutionKind::ChoreImplementation,
-            0,
+            activity(0),
             1_000 + DEFAULT_DECLARATION_HORIZON_SECS,
         );
         assert_eq!(
@@ -278,9 +330,27 @@ mod tests {
     #[test]
     fn background_activity_restarts_the_silence_clock() {
         let tracker = BuildWaitTracker::new();
-        decide(&tracker, "exec_1", &ExecutionKind::ChoreImplementation, 0, 1_000);
-        decide(&tracker, "exec_1", &ExecutionKind::ChoreImplementation, 1, 2_000);
-        let after = decide(&tracker, "exec_1", &ExecutionKind::ChoreImplementation, 0, 2_100);
+        decide(
+            &tracker,
+            "exec_1",
+            &ExecutionKind::ChoreImplementation,
+            activity(0),
+            1_000,
+        );
+        decide(
+            &tracker,
+            "exec_1",
+            &ExecutionKind::ChoreImplementation,
+            activity(1),
+            2_000,
+        );
+        let after = decide(
+            &tracker,
+            "exec_1",
+            &ExecutionKind::ChoreImplementation,
+            activity(0),
+            2_100,
+        );
         assert_eq!(
             after,
             BackstopDecision::HoldingWithinHorizon {
@@ -298,5 +368,95 @@ mod tests {
                 > declaration_horizon_secs(&ExecutionKind::ChoreImplementation),
             "revisions have less observable state of their own; they get more patience"
         );
+    }
+
+    #[test]
+    fn time_inside_a_long_tool_is_not_silence_at_the_next_stop() {
+        let tracker = BuildWaitTracker::new();
+        let kind = ExecutionKind::TaskImplementation;
+        decide(&tracker, "run", &kind, activity(0), 1_000);
+        let now = 1_000 + DEFAULT_DECLARATION_HORIZON_SECS * 3;
+        assert_eq!(
+            decide(
+                &tracker,
+                "run",
+                &kind,
+                BackstopActivity {
+                    tool_in_flight: true,
+                    ..Default::default()
+                },
+                now
+            ),
+            BackstopDecision::HoldingUntilStop
+        );
+        assert!(matches!(
+            decide(&tracker, "run", &kind, activity(0), now + 1),
+            BackstopDecision::HoldingWithinHorizon { waited_secs: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn continuous_activity_for_an_hour_resets_silence_without_any_stop() {
+        let tracker = BuildWaitTracker::new();
+        let kind = ExecutionKind::TaskImplementation;
+        for now in (1_000..=4_600).step_by(5) {
+            assert_eq!(
+                decide(
+                    &tracker,
+                    "run",
+                    &kind,
+                    BackstopActivity {
+                        descendant_count: 0,
+                        last_activity_epoch: Some(now),
+                        at_turn_boundary: false,
+                        tool_in_flight: false,
+                    },
+                    now
+                ),
+                BackstopDecision::HoldingUntilStop
+            );
+        }
+        let last_activity_epoch = Some(4_600);
+        assert!(matches!(
+            decide(
+                &tracker,
+                "run",
+                &kind,
+                BackstopActivity {
+                    last_activity_epoch,
+                    at_turn_boundary: true,
+                    ..Default::default()
+                },
+                4_601
+            ),
+            BackstopDecision::HoldingWithinHorizon { waited_secs: 1, .. }
+        ));
+        assert_eq!(
+            decide(
+                &tracker,
+                "run",
+                &kind,
+                BackstopActivity {
+                    last_activity_epoch,
+                    ..Default::default()
+                },
+                6_000
+            ),
+            BackstopDecision::HoldingUntilStop
+        );
+        assert!(matches!(
+            decide(
+                &tracker,
+                "run",
+                &kind,
+                BackstopActivity {
+                    last_activity_epoch,
+                    at_turn_boundary: true,
+                    ..Default::default()
+                },
+                6_001
+            ),
+            BackstopDecision::Ask { waited_secs: 1401, .. }
+        ));
     }
 }

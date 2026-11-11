@@ -405,6 +405,11 @@ pub struct RecordingProbeQueuer {
 }
 
 impl ProbeQueuer for RecordingProbeQueuer {
+    fn queue_probe_at_turn_boundary(&self, run_id: &str, text: &str) -> bool {
+        self.queue_probe(run_id, text);
+        true
+    }
+
     fn queue_probe(&self, run_id: &str, text: &str) {
         self.calls
             .lock()
@@ -2078,6 +2083,8 @@ mod conflict_delivery;
 mod local_teardown;
 #[cfg(test)]
 mod revision_delivery;
+#[cfg(test)]
+mod run_done_backstop;
 #[cfg(test)]
 mod status_ledger;
 #[cfg(test)]

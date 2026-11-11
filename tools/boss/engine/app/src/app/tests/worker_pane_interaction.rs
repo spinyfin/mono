@@ -1104,3 +1104,128 @@ async fn engine_nudge_queued_while_parked_interrupts_if_the_worker_went_busy() {
     assert!(pasted.contains("act now"));
     assert_eq!(server_state.pending_probe_count(&run_id), 0);
 }
+
+#[tokio::test(start_paused = true)]
+async fn declaration_ask_waits_for_stop_without_interrupting_a_tool_or_open_turn() {
+    use boss_engine_completion::ProbeQueuer;
+    use boss_protocol::{StopReason, WorkerEvent};
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_idle_worker_with_driver(&server_state, 6, None);
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 6, "boss-6");
+    let queuer = crate::app::probes::ServerStateProbeQueuer::default();
+    queuer.set_server_state(Arc::downgrade(&server_state));
+    let stop = WorkerEvent::Stop {
+        session_id: "session".into(),
+        stop_reason: StopReason::Completed,
+        stop_hook_active: false,
+    };
+    server_state.live_worker_states.apply_event(6, &stop);
+    assert!(queuer.can_queue_turn_boundary_probe(&run_id));
+    assert!(queuer.queue_probe_at_turn_boundary(&run_id, "declare completion"));
+    // The turn resumes after queueing but before the delivery task runs.
+    resume_into_long_tool_call(&server_state, 6);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(runner.escape_presses(), 0);
+    assert!(!runner.wrote_text());
+    assert!(!queuer.can_queue_turn_boundary_probe(&run_id));
+    let post_tool = WorkerEvent::PostToolUse {
+        session_id: "session".into(),
+        tool_name: "Bash".into(),
+        tool_input: serde_json::json!({}),
+        tool_response: serde_json::json!({}),
+    };
+    server_state.live_worker_states.apply_event(6, &post_tool);
+    let hook = boss_engine_runtime::events_socket::IncomingHookEvent::for_test(post_tool, Some(run_id.clone()), None);
+    dispatch_probe_on_post_tool_use(&server_state, &hook).await;
+    assert_eq!(runner.escape_presses(), 0);
+    assert!(!runner.wrote_text());
+    assert_eq!(server_state.pending_probe_count(&run_id), 1);
+    assert!(!server_state.has_in_flight_probe(&run_id));
+    server_state.live_worker_states.apply_event(6, &stop);
+    let hook = boss_engine_runtime::events_socket::IncomingHookEvent::for_test(stop, Some(run_id.clone()), None);
+    dispatch_probe_on_stop(&server_state, &hook).await;
+    assert_eq!(runner.escape_presses(), 0);
+    assert!(runner.wrote_text());
+    assert_eq!(server_state.pending_probe_count(&run_id), 0);
+    // No reply, new hook, or new Stop: an already-delivered declaration
+    // question must not block the remaining bounded asks forever.
+    for _ in 0..2 {
+        assert!(queuer.can_queue_turn_boundary_probe(&run_id));
+        assert!(queuer.queue_probe_at_turn_boundary(&run_id, "declare completion"));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(server_state.pending_probe_count(&run_id), 0);
+    }
+    assert_eq!(runner.escape_presses(), 0);
+    assert_eq!(
+        runner
+            .calls()
+            .iter()
+            .filter(|call| {
+                call.iter().any(|arg| arg == "send-keys")
+                    && call.iter().any(|arg| arg == "-l")
+                    && call.iter().any(|arg| arg.contains("declare completion"))
+            })
+            .count(),
+        3
+    );
+    let replies = server_state.in_flight_probes.lock().unwrap();
+    assert!(
+        replies
+            .get(&run_id)
+            .unwrap()
+            .previous_reply
+            .as_ref()
+            .unwrap()
+            .previous_reply
+            .is_some()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn declared_wait_cancels_a_queued_completion_ask_but_preserves_human_probes() {
+    use boss_engine_completion::ProbeQueuer;
+    use boss_protocol::{StopReason, WorkerEvent};
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_idle_worker_with_driver(&server_state, 6, None);
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 6, "boss-6");
+    server_state.live_worker_states.apply_event(
+        6,
+        &WorkerEvent::Stop {
+            session_id: "session".into(),
+            stop_reason: StopReason::Completed,
+            stop_hook_active: false,
+        },
+    );
+    let queuer = crate::app::probes::ServerStateProbeQueuer::default();
+    queuer.set_server_state(Arc::downgrade(&server_state));
+    assert!(queuer.queue_probe_at_turn_boundary(&run_id, "declare completion"));
+    let ask = server_state.pending_probes.lock().unwrap()[&run_id][0].probe_id.clone();
+    let human = server_state.queue_probe(run_id.clone(), "status question".into(), false);
+    server_state
+        .wait_registry
+        .declare(
+            &run_id,
+            "validation running".into(),
+            None,
+            1800,
+            boss_engine_utils::epoch_time::now_epoch_secs(),
+        )
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!runner.wrote_text());
+    assert_eq!(runner.escape_presses(), 0);
+    queuer.clear_pending_turn_boundary_probes(&run_id, "worker answered with a declared wait");
+    assert_eq!(
+        server_state.probe_lifecycle_state(&ask),
+        Some(ProbeDeliveryState::Dropped)
+    );
+    assert_eq!(
+        server_state.probe_lifecycle_state(&human),
+        Some(ProbeDeliveryState::Queued)
+    );
+    assert_eq!(server_state.pending_probe_count(&run_id), 1);
+    dispatch_probe_now(&server_state, &run_id).await;
+    assert!(runner.wrote_text());
+    assert_eq!(runner.escape_presses(), 0);
+    assert_eq!(server_state.pending_probe_count(&run_id), 0);
+}

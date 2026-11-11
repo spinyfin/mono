@@ -87,10 +87,25 @@ impl BuildWaitTracker {
     /// any more legitimate by continuing; only [`Self::forget`] (real
     /// progress, or the execution being finalized) starts a fresh cycle.
     pub fn record(&self, execution_id: &str, now_epoch_secs: i64, horizon_secs: i64) -> BuildWaitDecision {
+        self.record_since(execution_id, now_epoch_secs, horizon_secs, None)
+    }
+
+    /// Measure a quiet stretch, advancing its start when new worker activity
+    /// has been observed. Repeated reads of the same activity do not extend it.
+    pub fn record_since(
+        &self,
+        execution_id: &str,
+        now_epoch_secs: i64,
+        horizon_secs: i64,
+        activity_at: Option<i64>,
+    ) -> BuildWaitDecision {
         let mut guard = self.inner.lock().expect("BuildWaitTracker mutex poisoned");
         let entry = guard.entry(execution_id.to_owned()).or_insert(BuildWaitRecord {
             first_seen_epoch: now_epoch_secs,
         });
+        if let Some(activity_at) = activity_at {
+            entry.first_seen_epoch = entry.first_seen_epoch.max(activity_at);
+        }
         let waited_secs = (now_epoch_secs - entry.first_seen_epoch).max(0);
         if waited_secs >= horizon_secs {
             BuildWaitDecision::Expired { waited_secs }
