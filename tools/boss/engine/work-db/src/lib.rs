@@ -818,6 +818,7 @@ pub use schema_init::table_exists;
 use schema_init::table_has_column;
 mod execution_wait_history;
 mod progression_brief_reads;
+mod prompt_confirmation;
 mod semantic_progress;
 mod spoke_hub;
 mod spoke_ingress;

@@ -799,6 +799,9 @@ mod floor_tests {
         super::super::spoke_hub::migrate_legacy_destinations(&expected).unwrap();
         legacy_store_cleanup::migrate(&expected).unwrap();
         super::super::progression_verbs::migrate_actions(&expected).unwrap();
+        expected
+            .execute_batch("ALTER TABLE work_runs ADD COLUMN prompt_confirmed INTEGER")
+            .unwrap();
         let before = capture(&expected);
         drop(expected);
         let upgrade = |version: i32| {

@@ -226,6 +226,7 @@ struct FailureWindowConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpawnFailureClass {
+    PromptNotAccepted,
     /// No shell ever came up for the pane: a dispatch-level spawn timeout or a pane
     /// death before any proof of life. The engine's tmux pane-spawn path is
     /// the thing to look at.
@@ -241,6 +242,7 @@ impl SpawnFailureClass {
     /// Stable, greppable label.
     pub fn as_str(self) -> &'static str {
         match self {
+            SpawnFailureClass::PromptNotAccepted => "prompt_not_accepted",
             SpawnFailureClass::NoShell => "no_shell",
             SpawnFailureClass::ShellWithoutDriverSignal => "shell_without_driver_signal",
         }
@@ -249,6 +251,7 @@ impl SpawnFailureClass {
     /// One clause describing what this class of failure actually observed.
     pub fn observed(self) -> &'static str {
         match self {
+            SpawnFailureClass::PromptNotAccepted => "the driver never accepted its initial prompt",
             SpawnFailureClass::NoShell => "no shell ever came up for the pane",
             SpawnFailureClass::ShellWithoutDriverSignal => {
                 "a pane and shell came up but no driver-originated signal was observed within the \
@@ -290,6 +293,7 @@ pub struct SpawnFailureEvidence {
 /// pause reason and attention item that say what was observed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailureComposition {
+    pub prompt_not_accepted: usize,
     pub no_shell: usize,
     pub shell_without_driver_signal: usize,
     /// True when every `ShellWithoutDriverSignal` row had `shell_pid > 0`.
@@ -309,6 +313,7 @@ pub struct TranscriptCauses {
 impl FailureComposition {
     pub fn of(evidence: &[SpawnFailureEvidence]) -> Self {
         let mut composition = Self {
+            prompt_not_accepted: 0,
             no_shell: 0,
             shell_without_driver_signal: 0,
             every_driver_start_had_a_shell: true,
@@ -316,6 +321,7 @@ impl FailureComposition {
         };
         for entry in evidence {
             match entry.class {
+                SpawnFailureClass::PromptNotAccepted => composition.prompt_not_accepted += 1,
                 SpawnFailureClass::NoShell => composition.no_shell += 1,
                 SpawnFailureClass::ShellWithoutDriverSignal => {
                     composition.shell_without_driver_signal += 1;
@@ -334,6 +340,13 @@ impl FailureComposition {
     /// `2 spawns with no shell (...) and 1 driver-start timeout (...)`.
     pub fn describe(&self) -> String {
         let mut parts = Vec::new();
+        if self.prompt_not_accepted > 0 {
+            parts.push(format!(
+                "{} prompt confirmation failure(s) ({})",
+                self.prompt_not_accepted,
+                SpawnFailureClass::PromptNotAccepted.observed()
+            ));
+        }
         if self.no_shell > 0 {
             parts.push(format!(
                 "{} spawn(s) with no shell ({})",
@@ -362,6 +375,9 @@ impl FailureComposition {
 
     /// Where the operator should look first, given what was observed.
     pub fn diagnosis_hint(&self) -> &'static str {
+        if self.prompt_not_accepted > 0 {
+            return "Some workers never accepted their initial prompt. Check launcher delivery logs and current-run turn evidence alongside any other spawn failures.";
+        }
         match (self.no_shell, self.with_transcript.driver_start_timeouts) {
             (0, n) if n > 0 && self.every_driver_start_had_a_shell => {
                 "Every failure in the window had a working pane and shell, so tmux session \
@@ -1186,6 +1202,7 @@ pub async fn trip_spawn_capability_circuit(
         )
     };
     let title = match (composition.no_shell, composition.shell_without_driver_signal) {
+        _ if composition.prompt_not_accepted > 0 => "Worker prompt confirmation failed; dispatch breaker tripped",
         (0, n) if n > 0 => "Worker spawns produced panes but no driver signal; dispatch breaker tripped",
         (n, 0) if n > 0 => "Worker-pane spawn capability is unhealthy (no shell came up)",
         _ => "Worker spawn failures (no shell and no driver signal); dispatch breaker tripped",
@@ -1219,6 +1236,7 @@ pub async fn trip_spawn_capability_circuit(
                     "rule": rule,
                     "threshold": threshold,
                     "failure_classes": {
+                        "prompt_not_accepted": composition.prompt_not_accepted,
                         "no_shell": composition.no_shell,
                         "shell_without_driver_signal": composition.shell_without_driver_signal,
                     },
@@ -2087,6 +2105,7 @@ mod tests {
             .epoch_secs(epoch_secs)
             .class(class)
             .cause(match class {
+                SpawnFailureClass::PromptNotAccepted => "prompt_not_accepted",
                 SpawnFailureClass::NoShell => "driver_start_timeout",
                 SpawnFailureClass::ShellWithoutDriverSignal => "driver_start_timeout",
             })
@@ -2115,6 +2134,7 @@ mod tests {
         assert_eq!(
             composition,
             FailureComposition {
+                prompt_not_accepted: 0,
                 no_shell: 0,
                 shell_without_driver_signal: 4,
                 every_driver_start_had_a_shell: true,

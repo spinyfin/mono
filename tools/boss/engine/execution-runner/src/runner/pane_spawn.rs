@@ -1340,6 +1340,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             .tmux_worker_host(slot_id, &execution.id)
             .context("local dispatch requires a tmux worker host")?;
 
+        self.work_db.begin_prompt_confirmation(&execution.id)?;
         let started = spawner
             .start_worker(
                 StartWorkerInput::builder()
@@ -1489,6 +1490,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                         &execution.id,
                         workspace_path,
                         self.prompt_submit_policy(driver.as_ref()),
+                        &self.work_db,
                     )
                     .await
                 }
@@ -1528,6 +1530,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         // dispatcher, on the driver's awaiting-input signal — and is cleared
         // when the worker resumes. See `RunWaitState::WorkerPaneAlive` and
         // `tools/boss/docs/worker-liveness-contract.md`.
+        self.work_db.finish_prompt_confirmation(&execution.id)?;
         let wait_state = RunWaitState::WorkerPaneAlive;
         let result_summary = format!(
             "Spawned tmux worker in slot {} (shell pid {}). Hook events from this run will surface on the engine events socket.",
@@ -1641,6 +1644,7 @@ async fn confirm_prompt_after_late_start(
     run_id: &str,
     workspace_path: &Path,
     prompt: PromptSubmitPolicy,
+    work_db: &WorkDb,
 ) -> Result<()> {
     let Some(signals) = signals else {
         return Ok(());
@@ -1654,7 +1658,10 @@ async fn confirm_prompt_after_late_start(
         run_id,
         &home,
         prompt,
-        &last_capture,
+        PromptPhaseContext {
+            last_capture: &last_capture,
+            work_db,
+        },
     )
     .await;
     log_delivery_steps(run_id, driver.descriptor().name, &home);
@@ -1668,6 +1675,11 @@ async fn confirm_prompt_after_late_start(
 /// Wait for the driver to take its prompt, re-sending Return (never the
 /// paste) a bounded number of times. The pane's text is kept in `last_capture`
 /// on failure as the best account of why.
+struct PromptPhaseContext<'a> {
+    last_capture: &'a std::sync::Mutex<String>,
+    work_db: &'a WorkDb,
+}
+
 async fn confirm_prompt_phase(
     tmux_host: &TmuxWorkerHost,
     driver_name: &str,
@@ -1675,8 +1687,9 @@ async fn confirm_prompt_phase(
     run_id: &str,
     home: &Path,
     prompt: PromptSubmitPolicy,
-    last_capture: &std::sync::Mutex<String>,
+    context: PromptPhaseContext<'_>,
 ) -> Result<()> {
+    let PromptPhaseContext { last_capture, work_db } = context;
     let result = super::spawn_confirmation::confirm_prompt_submitted(
         driver_name,
         run_id,
@@ -1685,10 +1698,18 @@ async fn confirm_prompt_phase(
         || async { crate::driver::initial_prompt::delivery_state(home) },
         // Return alone: the launcher pasted the brief, and it is never pasted again.
         || async { tmux_host.tmux().send_key(tmux_host.session_name(), "C-m").await },
+        || {
+            work_db
+                .get_execution(run_id)
+                .is_ok_and(|exec| exec.status.is_terminal())
+        },
     )
     .await;
     // A stalled capture must not hold up the reap.
     if result.is_err()
+        && !work_db
+            .get_execution(run_id)
+            .is_ok_and(|exec| exec.status.is_terminal())
         && let Ok(Ok(visible)) = tokio::time::timeout(
             prompt.confirm_timeout,
             tmux_host.tmux().capture_pane(tmux_host.session_name()),
@@ -1783,7 +1804,10 @@ async fn confirm_local_spawn(
             run_id,
             &home,
             bounds.prompt,
-            &last_capture,
+            PromptPhaseContext {
+                last_capture: &last_capture,
+                work_db,
+            },
         )
         .await;
     }

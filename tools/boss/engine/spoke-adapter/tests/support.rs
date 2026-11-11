@@ -309,6 +309,7 @@ impl SpawnComposer for Composer {
 #[derive(bon::Builder)]
 pub struct Fixture {
     pub db: Arc<WorkDb>,
+    pub signals: Arc<PromptSignals>,
     pub provider: SpokeHostAdapterProvider,
     pub manager: StreamManager,
     legacy: Arc<Legacy>,
@@ -394,14 +395,17 @@ impl Fixture {
             .tls_config(tls)
             .unwrap();
         let legacy = Arc::new(Legacy::default());
+        let signals = Arc::new(PromptSignals(std::sync::atomic::AtomicBool::new(true)));
         let provider = SpokeHostAdapterProvider::new(
             Arc::new(LegacyProvider(Arc::clone(&legacy))),
             manager.clone(),
             Arc::clone(&db),
             Arc::new(Composer),
             config,
+            signals.clone(),
         );
         Self::builder()
+            .signals(signals)
             .db(db)
             .provider(provider)
             .manager(manager)
@@ -726,4 +730,23 @@ pub fn work_item() -> WorkItem {
             .updated_at("2026-01-01T00:00:00Z")
             .build(),
     )
+}
+
+pub struct PromptSignals(pub std::sync::atomic::AtomicBool);
+impl boss_execution_contracts::DriverSignals for PromptSignals {
+    fn has_driver_signal_for_run(&self, _: &str) -> bool {
+        true
+    }
+    fn first_hook_event_for_run(&self, _: &str) -> Option<String> {
+        Some("session_start".into())
+    }
+    fn has_prompt_accepted_for_run(&self, _: &str) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn commit_never_started_reap(&self, _: u8, _: &str) -> boss_execution_contracts::NeverStartedReap {
+        panic!("spoke confirmation must not use driver-start evidence")
+    }
+    fn commit_unsubmitted_reap(&self, _: u8, _: &str) -> boss_execution_contracts::UnsubmittedReap {
+        panic!("spoke confirmation stops through the host")
+    }
 }

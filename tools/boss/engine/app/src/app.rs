@@ -434,6 +434,24 @@ impl boss_engine_runtime::stale_worker_sweep::StaleWorkerReaper for ServerState 
 
 #[async_trait]
 impl boss_engine_runtime::spawn_ack_sweep::SpawnAckReaper for ServerState {
+    async fn resubmit_prompt(&self, execution_id: &str) -> anyhow::Result<()> {
+        let identity = self
+            .work_db
+            .tmux_identity_for_execution(execution_id)?
+            .ok_or_else(|| anyhow::anyhow!("no recorded tmux identity"))?;
+        let tmux = self.tmux_for_pane_delivery(execution_id)?;
+        let token = boss_engine_runtime::tmux_adoption::session_spawn_token(&tmux, &identity.session_name).await?;
+        anyhow::ensure!(
+            token.as_deref() == Some(identity.spawn_token.as_str()),
+            "worker session token changed"
+        );
+        anyhow::ensure!(
+            !self.work_db.get_execution(execution_id)?.status.is_terminal(),
+            "execution is terminal"
+        );
+        tmux.send_key(&identity.session_name, "C-m").await
+    }
+
     /// Route the driver-start-timeout reap through the same
     /// `release_worker_pane` tmux teardown as the stale-worker sweep:
     /// verifies and kills the recorded tmux session, signals the

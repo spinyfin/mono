@@ -60,8 +60,11 @@ pub struct SpokeAdapterConfig {
     pub command_deadline: Duration,
     /// How long a caller waits for a spawn: the supervisor waits for the
     /// initial brief to reach the driver before it answers.
-    #[builder(default = Duration::from_secs(120))]
+    #[builder(default = Duration::from_secs(360))]
     pub spawn_deadline: Duration,
+    /// Bound for turn evidence after the host reports delivery.
+    #[builder(default = Duration::from_secs(180))]
+    pub prompt_timeout: Duration,
     /// How long a stored command stays executable. A spoke that was offline
     /// longer rejects it, durably and in order, rather than acting late.
     #[builder(default = Duration::from_secs(600))]
@@ -105,6 +108,7 @@ pub(crate) struct Hub {
     pub(crate) db: Arc<WorkDb>,
     pub(crate) outbox: WorkDbOutbox,
     pub(crate) composer: Arc<dyn SpawnComposer>,
+    pub(crate) signals: Arc<dyn boss_execution_contracts::DriverSignals>,
     pub(crate) config: SpokeAdapterConfig,
     #[builder(skip)]
     nonce: AtomicU64,
@@ -978,6 +982,7 @@ impl SpokeHostAdapterProvider {
         db: Arc<WorkDb>,
         composer: Arc<dyn SpawnComposer>,
         config: SpokeAdapterConfig,
+        signals: Arc<dyn boss_execution_contracts::DriverSignals>,
     ) -> Self {
         Self {
             inner,
@@ -987,6 +992,7 @@ impl SpokeHostAdapterProvider {
                     .outbox(WorkDbOutbox::new(Arc::clone(&db)))
                     .db(db)
                     .composer(composer)
+                    .signals(signals)
                     .config(config)
                     .build(),
             ),
