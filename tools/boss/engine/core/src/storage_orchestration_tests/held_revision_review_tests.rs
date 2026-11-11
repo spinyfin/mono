@@ -245,7 +245,7 @@ fn a_verdict_releases_every_revision_held_for_its_head() {
 
 /// A batch admitted for one head resolves the deferred marker of the revisions
 /// awaiting that head only. A revision whose review is deferred at a different
-/// head keeps its marker, so the operator still sees it held.
+/// head keeps its marker, because its own push is still waiting to be admitted.
 #[test]
 fn a_batch_leaves_the_marker_of_a_revision_awaiting_another_head() {
     let (_dir, db) = open_db();
