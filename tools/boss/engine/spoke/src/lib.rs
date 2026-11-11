@@ -222,6 +222,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn truncated_hooks_journal_a_gap_with_the_event() {
+        for (name, extra) in [
+            ("Stop", serde_json::json!({"stop_hook_active": true})),
+            ("UserPromptSubmit", serde_json::json!({"prompt": "bounded prefix"})),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let execution = execution(root.path());
+            let journal = journal(root.path(), limits());
+            let mut payload: serde_json::Value = serde_json::from_slice(&hook(None)).unwrap();
+            payload["hook_event_name"] = name.into();
+            payload["_boss_payload_truncated"] = true.into();
+            for (key, value) in extra.as_object().unwrap() {
+                payload[key] = value.clone();
+            }
+            hooks::ingest(
+                &journal,
+                &execution,
+                &serde_json::to_vec(&payload).unwrap(),
+                &stamp().unwrap(),
+            )
+            .await
+            .unwrap();
+            let captured = records(&journal);
+            assert_eq!(captured.len(), 2, "{name}");
+            assert!(
+                matches!(&captured[0].body, Some(record::Body::Gap(g)) if g.resource.starts_with("hook:")),
+                "{name}"
+            );
+            let Some(record::Body::Event(event)) = &captured[1].body else {
+                panic!("missing event");
+            };
+            match &event.event {
+                Some(boss_protocol_spoke::v1::worker_event::Event::Stop(stop)) => assert!(stop.stop_hook_active),
+                Some(boss_protocol_spoke::v1::worker_event::Event::UserPrompt(prompt)) => {
+                    assert_eq!(prompt, "bounded prefix")
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_discovery_failure_leaves_terminal_run_undrained_for_retry() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut execution = execution(root.path());
+        execution.driver_id = "codex".into();
+        let directory = root.path().join("sessions");
+        std::fs::create_dir(&directory).unwrap();
+        execution.observation.as_mut().unwrap().file = Some((
+            boss_engine_driver::AgentJsonlFileIngress {
+                directory: directory.clone(),
+                filename_prefix: "rollout-".into(),
+                filename_suffix: ".jsonl".into(),
+                workspace_path: root.path().into(),
+            },
+            Vec::new(),
+        ));
+        let meta = serde_json::json!({"type":"session_meta", "payload":{"id":"session", "cwd":root.path()}});
+        std::fs::write(directory.join("rollout-example-session.jsonl"), format!("{meta}\n")).unwrap();
+        execution.phase = Phase::Terminal;
+        let journal = journal(root.path(), limits());
+        // An unreadable directory makes listing fail with an I/O error that a
+        // later poll can recover from.
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let failed = transcripts::poll(&journal, &execution, &stamp().unwrap()).await;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(failed.is_err(), "transient discovery failure must surface for retry");
+        let run = run_identity(&execution);
+        assert!(journal.lock().unwrap().source(&run, "drained").unwrap().is_none());
+        assert!(records(&journal).is_empty(), "no gap for a transient failure");
+        transcripts::poll(&journal, &execution, &stamp().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            records(&journal)
+                .iter()
+                .any(|r| matches!(&r.body, Some(record::Body::Transcript(t)) if !t.data.is_empty()))
+        );
+    }
+
+    #[tokio::test]
     async fn terminal_ambiguous_and_unsafe_sources_drain_only_after_pending_hooks() {
         for ambiguous in [false, true] {
             let root = tempfile::tempdir().unwrap();

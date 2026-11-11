@@ -106,4 +106,11 @@ fn spoke_replaces_hub_forwarders_without_removing_policy() {
             .to_string()
             .contains("this would start Boss itself")
     );
+    let first = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    assert!(
+        first.contains("/spoke/bin/boss-event") && first.contains("spoke-run"),
+        "spoke forwarder must stay ahead of the policy guards: {first}"
+    );
 }

@@ -96,7 +96,15 @@ pub async fn poll(journal: &SharedJournal, execution: &ExecutionRecord, stamp: &
         && let Some(observation) = &execution.observation
         && !crate::hooks::has_pending(&observation.pending)?
     {
-        return finish_gap(journal, &crate::run_identity(execution), stamp, error.to_string());
+        let checkpoint = current_checkpoint(journal, &crate::run_identity(execution))?;
+        return finish_gap(
+            journal,
+            &crate::run_identity(execution),
+            stamp,
+            gap_resource(&checkpoint),
+            checkpoint.cursor.offset,
+            error.to_string(),
+        );
     }
     result
 }
@@ -126,11 +134,17 @@ async fn poll_source(journal: &SharedJournal, execution: &ExecutionRecord, stamp
         let ingress = ingress.clone();
         let baseline = baseline.iter().cloned().collect();
         let scan = tokio::task::spawn_blocking(move || {
-            let prepared = discovery::PreparedSource::with_baseline(ingress, baseline)?;
-            discovery::scan_once(&prepared)
+            let prepared = discovery::PreparedSource::with_baseline(ingress, baseline)
+                .map_err(discovery::ScanFailure::Permanent)?;
+            discovery::scan_once_classified(&prepared)
         })
         .await?
-        .map_err(SourceFailure)?;
+        .map_err(|failure| match failure {
+            // Listing I/O can fail transiently (EMFILE, a racing entry);
+            // leave the run undrained so a later poll retries.
+            discovery::ScanFailure::Transient(message) => anyhow::anyhow!(message),
+            discovery::ScanFailure::Permanent(message) => anyhow::Error::from(SourceFailure(message)),
+        })?;
         // Keep following an attached file when another candidate appears.
         // Before attachment, ambiguity must never pick a run by recency.
         if scan.matched.iter().any(|c| c.path == checkpoint.path) {
@@ -337,13 +351,43 @@ fn finish_missing(
     } else {
         "attached transcript disappeared before final drain; final size unknown"
     };
-    finish_gap(journal, run, stamp, reason.into())
+    finish_gap(
+        journal,
+        run,
+        stamp,
+        gap_resource(checkpoint),
+        checkpoint.cursor.offset,
+        reason.into(),
+    )
+}
+
+/// Names the generation that stopped short once a transcript was attached;
+/// a plain `transcript` otherwise (never attached).
+fn gap_resource(checkpoint: &Checkpoint) -> String {
+    if checkpoint.path.as_os_str().is_empty() {
+        "transcript".into()
+    } else {
+        format!("transcript:{}-{}", checkpoint.incarnation, checkpoint.cursor.generation)
+    }
+}
+
+fn current_checkpoint(journal: &SharedJournal, run: &boss_protocol_spoke::v1::Run) -> Result<Checkpoint> {
+    let saved = journal
+        .lock()
+        .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
+        .source(run, "transcript")?;
+    Ok(saved
+        .map(|b| serde_json::from_slice(&b))
+        .transpose()?
+        .unwrap_or_default())
 }
 
 fn finish_gap(
     journal: &SharedJournal,
     run: &boss_protocol_spoke::v1::Run,
     stamp: &Stamp,
+    resource: String,
+    offset: u64,
     reason: String,
 ) -> Result<()> {
     let mut journal = journal
@@ -362,9 +406,10 @@ fn finish_gap(
                 observed: Some(stamp.clone()),
                 run: Some(run.clone()),
                 body: Some(record::Body::Gap(Gap {
-                    resource: "transcript".into(),
+                    resource,
+                    from_offset: offset,
+                    through_offset: offset,
                     reason,
-                    ..Default::default()
                 })),
                 ..Default::default()
             },

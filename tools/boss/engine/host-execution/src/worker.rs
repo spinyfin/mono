@@ -1721,8 +1721,13 @@ mod tests {
             )
             .unwrap();
         let settings: Value = serde_json::from_slice(&spawn.settings_json).unwrap();
-        assert_eq!(settings["hooks"]["PreToolUse"][0], original);
-        assert!(settings["hooks"]["PreToolUse"].as_array().unwrap().len() > 1);
+        assert!(
+            settings["hooks"]["PreToolUse"][0]
+                .to_string()
+                .contains("/test/boss-event"),
+            "forwarder stays ahead of policy guards"
+        );
+        assert!(settings["hooks"]["PreToolUse"].as_array().unwrap().contains(&original));
         assert!(settings["hooks"]["Stop"].to_string().contains("/test/boss-event"));
         let observation = record.observation.as_ref().unwrap();
         assert!(observation.file.is_none());

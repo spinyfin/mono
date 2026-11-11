@@ -648,8 +648,31 @@ pub struct DiscoveryScan {
 /// whole scan — the file may simply have vanished between `read_dir` and
 /// `open`, and the other files still deserve a verdict.
 pub fn scan_once(prepared: &PreparedSource) -> Result<DiscoveryScan, String> {
-    prepared.root.revalidate()?;
-    let paths = scan_matching_paths(&prepared.root, &prepared.ingress)?;
+    scan_once_classified(prepared).map_err(ScanFailure::into_message)
+}
+
+/// Why a whole-directory scan failed, split by whether a later retry can
+/// change the answer. I/O errors while listing (`EMFILE`, a failed directory
+/// entry read) are transient; a root that changed identity or a tree beyond
+/// the discovery bounds is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanFailure {
+    Transient(String),
+    Permanent(String),
+}
+
+impl ScanFailure {
+    pub fn into_message(self) -> String {
+        match self {
+            Self::Transient(message) | Self::Permanent(message) => message,
+        }
+    }
+}
+
+/// [`scan_once`] that keeps the transient/permanent distinction.
+pub fn scan_once_classified(prepared: &PreparedSource) -> Result<DiscoveryScan, ScanFailure> {
+    prepared.root.revalidate().map_err(ScanFailure::Permanent)?;
+    let paths = scan_matching_paths_classified(&prepared.root, &prepared.ingress)?;
     let file_progress = matching_file_shows_progress(prepared, &paths);
     let mut paths: Vec<PathBuf> = paths.into_iter().collect();
     paths.sort();
@@ -1016,22 +1039,29 @@ async fn wait_for_next_poll(halt: &mut watch::Receiver<StreamHalt>, poll: Durati
 /// Bounded in directories visited and files matched so a hostile or runaway
 /// tree cannot turn a 100 ms poll into an unbounded walk.
 pub fn scan_matching_paths(root: &VerifiedRoot, ingress: &AgentJsonlFileIngress) -> Result<HashSet<PathBuf>, String> {
-    root.revalidate()?;
+    scan_matching_paths_classified(root, ingress).map_err(ScanFailure::into_message)
+}
+
+fn scan_matching_paths_classified(
+    root: &VerifiedRoot,
+    ingress: &AgentJsonlFileIngress,
+) -> Result<HashSet<PathBuf>, ScanFailure> {
+    root.revalidate().map_err(ScanFailure::Permanent)?;
     let mut stack = vec![root.canonical.clone()];
     let mut visited_dirs = 0usize;
     let mut matches = HashSet::new();
     while let Some(dir) = stack.pop() {
         visited_dirs += 1;
         if visited_dirs > MAX_DISCOVERY_DIRS {
-            return Err(format!(
+            return Err(ScanFailure::Permanent(format!(
                 "rollout discovery exceeded {MAX_DISCOVERY_DIRS} directories under {}",
                 root.path.display()
-            ));
+            )));
         }
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(format!("read {}: {err}", dir.display())),
+            Err(err) => return Err(ScanFailure::Transient(format!("read {}: {err}", dir.display()))),
         };
         // NOTE: every error branch below that is not `NotFound` returns
         // `Err`, failing the whole scan, rather than `continue`-ing past the
@@ -1044,10 +1074,12 @@ pub fn scan_matching_paths(root: &VerifiedRoot, ingress: &AgentJsonlFileIngress)
         // `scan_once`'s callers already turn a whole-scan `Err` into
         // `Undeterminable`, which is the honest answer here.
         for entry in entries {
-            let entry = entry.map_err(|err| format!("read a directory entry under {}: {err}", dir.display()))?;
+            let entry = entry.map_err(|err| {
+                ScanFailure::Transient(format!("read a directory entry under {}: {err}", dir.display()))
+            })?;
             let file_type = entry
                 .file_type()
-                .map_err(|err| format!("file type of {}: {err}", entry.path().display()))?;
+                .map_err(|err| ScanFailure::Transient(format!("file type of {}: {err}", entry.path().display())))?;
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
@@ -1064,10 +1096,10 @@ pub fn scan_matching_paths(root: &VerifiedRoot, ingress: &AgentJsonlFileIngress)
                 if name_shaped {
                     matches.insert(path);
                     if matches.len() > MAX_DISCOVERY_MATCHES {
-                        return Err(format!(
+                        return Err(ScanFailure::Permanent(format!(
                             "rollout discovery exceeded {MAX_DISCOVERY_MATCHES} matching files under {}",
                             root.path.display()
-                        ));
+                        )));
                     }
                 }
                 continue;
@@ -1078,7 +1110,12 @@ pub fn scan_matching_paths(root: &VerifiedRoot, ingress: &AgentJsonlFileIngress)
                     // Raced away between `read_dir` and `canonicalize` —
                     // legitimately gone, not an inspection failure.
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(err) => return Err(format!("canonicalize {}: {err}", path.display())),
+                    Err(err) => {
+                        return Err(ScanFailure::Transient(format!(
+                            "canonicalize {}: {err}",
+                            path.display()
+                        )));
+                    }
                 };
                 if canonical.starts_with(&root.canonical) {
                     stack.push(canonical);
@@ -1091,15 +1128,20 @@ pub fn scan_matching_paths(root: &VerifiedRoot, ingress: &AgentJsonlFileIngress)
             let canonical = match fs::canonicalize(&path) {
                 Ok(canonical) => canonical,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(format!("canonicalize {}: {err}", path.display())),
+                Err(err) => {
+                    return Err(ScanFailure::Transient(format!(
+                        "canonicalize {}: {err}",
+                        path.display()
+                    )));
+                }
             };
             if canonical.starts_with(&root.canonical) {
                 matches.insert(canonical);
                 if matches.len() > MAX_DISCOVERY_MATCHES {
-                    return Err(format!(
+                    return Err(ScanFailure::Permanent(format!(
                         "rollout discovery exceeded {MAX_DISCOVERY_MATCHES} matching files under {}",
                         root.path.display()
-                    ));
+                    )));
                 }
             }
         }

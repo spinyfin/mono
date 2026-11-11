@@ -139,6 +139,23 @@ pub async fn ingest(journal: &SharedJournal, execution: &ExecutionRecord, bytes:
                 )),
             }
         }
+        if raw["_boss_payload_truncated"].as_bool() == Some(true) {
+            observations.push((
+                Record {
+                    observed: Some(observed.clone()),
+                    run: Some(run.clone()),
+                    body: Some(record::Body::Gap(Gap {
+                        resource: format!("hook:{id}:{sequence}"),
+                        reason:
+                            "oversized hook payload truncated by the forwarder; fields beyond the bound are unavailable"
+                                .into(),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+                Admission::Lifecycle,
+            ));
+        }
         observations.push((
             Record {
                 observed: Some(observed),

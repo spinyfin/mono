@@ -12,6 +12,37 @@ impl Drop for UnlinkOnDrop {
     }
 }
 
+const MAX_FIELD: usize = 8192;
+
+/// Bounds each field of an oversized hook without discarding the small
+/// lifecycle fields (`stop_hook_active`, `source`, `model`, `reason`, ...) that
+/// change how the event is interpreted. Tool payloads become markers; other
+/// large strings keep a bounded prefix and large nested values are dropped.
+fn bound_fields(object: &mut serde_json::Map<String, serde_json::Value>) {
+    use serde_json::Value;
+    object.retain(|key, value| {
+        let size = serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len());
+        if size <= MAX_FIELD {
+            return true;
+        }
+        match value {
+            Value::String(text) if !matches!(key.as_str(), "tool_input" | "tool_response") => {
+                let mut end = MAX_FIELD.min(text.len());
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+                true
+            }
+            _ if matches!(key.as_str(), "tool_input" | "tool_response") => {
+                *value = serde_json::json!({"_boss_truncated": true});
+                true
+            }
+            _ => false,
+        }
+    });
+}
+
 pub fn deliver(directory: &Path, socket: &str, payload: &[u8], deadline: Instant) -> Result<()> {
     let metadata = std::fs::symlink_metadata(directory)?;
     anyhow::ensure!(
@@ -22,20 +53,7 @@ pub fn deliver(directory: &Path, socket: &str, payload: &[u8], deadline: Instant
     // Leave room for producer metadata before enforcing the ingress envelope bound.
     if payload.len() > 255 * 1024 {
         let object = value.as_object_mut().ok_or_else(|| anyhow!("hook is not an object"))?;
-        object.retain(|key, value| {
-            matches!(
-                key.as_str(),
-                "hook_event_name"
-                    | "session_id"
-                    | "tool_name"
-                    | "agent_id"
-                    | "transcript_path"
-                    | "_boss_run_id"
-                    | "_boss_lease_id"
-            ) && value.as_str().is_some_and(|text| text.len() <= 8192)
-        });
-        object.insert("tool_input".into(), serde_json::json!({"_boss_truncated": true}));
-        object.insert("tool_response".into(), serde_json::json!({"_boss_truncated": true}));
+        bound_fields(object);
         object.insert("_boss_payload_truncated".into(), true.into());
     }
     let payload_size = serde_json::to_vec(&value)?.len();
@@ -155,6 +173,51 @@ mod tests {
         assert_eq!(saved["tool_response"]["_boss_truncated"], true);
         assert_eq!(saved["_boss_producer_sequence"], 1);
         assert_eq!(saved["_boss_producer_id"].as_str().unwrap().len(), 32);
+    }
+
+    fn deliver_oversized(payload: serde_json::Value) -> serde_json::Value {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        deliver(
+            root.path(),
+            "/tmp/boss-event-missing.sock",
+            &serde_json::to_vec(&payload).unwrap(),
+            Instant::now(),
+        )
+        .unwrap();
+        let path = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|extension| extension == "json"))
+            .unwrap();
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn oversized_stop_keeps_continuation_flag() {
+        let saved = deliver_oversized(serde_json::json!({
+            "hook_event_name": "Stop", "session_id": "session", "_boss_run_id": "run",
+            "stop_hook_active": true, "reason": "r",
+            "last_assistant_message": "x".repeat(1024 * 1024),
+            "extra": {"nested": "y".repeat(1024 * 1024)},
+        }));
+        assert_eq!(saved["stop_hook_active"], true);
+        assert_eq!(saved["reason"], "r");
+        assert_eq!(saved["_boss_payload_truncated"], true);
+        assert!(saved["last_assistant_message"].as_str().unwrap().len() <= MAX_FIELD);
+        assert!(saved.get("extra").is_none());
+        assert!(saved.get("tool_input").is_none());
+    }
+
+    #[test]
+    fn oversized_user_prompt_keeps_bounded_prefix() {
+        let saved = deliver_oversized(serde_json::json!({
+            "hook_event_name": "UserPromptSubmit", "session_id": "session", "_boss_run_id": "run",
+            "prompt": format!("start{}", "é".repeat(1024 * 1024)),
+        }));
+        let prompt = saved["prompt"].as_str().unwrap();
+        assert!(prompt.starts_with("start") && prompt.len() <= MAX_FIELD);
+        assert_eq!(saved["_boss_payload_truncated"], true);
     }
 
     #[test]
