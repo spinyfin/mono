@@ -88,6 +88,20 @@ pub enum RepoCommand {
         #[arg(long)]
         purge_workspaces: bool,
     },
+    /// Record the oldest jj release that shares a repo's store.
+    ///
+    /// Store upkeep refuses to collect with a `jj` newer than this, because a
+    /// newer jj omits legacy predecessor commits from its index, prunes them,
+    /// and leaves older clients unable to rebuild the store. The default is
+    /// 0.26. Run this once, after every client sharing the store (workers,
+    /// the engine, human shells) has been upgraded. The declaration is kept
+    /// with the repo, so it applies to every collector however it is started.
+    DeclareOldestJj {
+        /// Stable repo identifier such as `mono`.
+        repo: String,
+        /// Oldest jj release still in use, as `major.minor` (for example `0.32`).
+        version: String,
+    },
     /// Bound the shared jj store's operation log: abandon operations older
     /// than the keep window and collect what no operation references.
     ///

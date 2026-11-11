@@ -26,7 +26,7 @@ class ArchiveTest(unittest.TestCase):
         jj_pin = JJ_PIN.read_text()
         variants = [
             ("generator", generator + "\n# changed generator\n", jj_pin),
-            ("jj_version", generator, jj_pin.replace("v" + original["jj_version"], "v999.0.0")),
+            ("jj_version", generator, jj_pin.replace('"' + original["jj_version"] + '"', '"999.0.0"')),
             ("jj_sha256", generator, jj_pin.replace(next(iter(original["jj_archives"].values())), "0" * 64)),
         ]
         for key, changed_generator, changed_jj in variants:

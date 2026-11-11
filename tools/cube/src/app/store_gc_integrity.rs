@@ -36,37 +36,55 @@ use crate::command_runner::{CommandRunner, JJ_GATE_HELD_ENV, RealCommandRunner};
 /// collector must not be newer: see the module doc.
 pub(super) const OLDEST_SHARED_CLIENT_JJ: (u64, u64) = (0, 26);
 
-/// Environment override for [`OLDEST_SHARED_CLIENT_JJ`], as `major.minor`,
-/// set once every client sharing the stores has been upgraded.
-pub(super) const OLDEST_CLIENT_ENV: &str = "CUBE_OLDEST_JJ_CLIENT";
-
 #[cfg(test)]
 thread_local! {
     pub(super) static OLDEST_CLIENT_OVERRIDE: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
 }
 
-fn parse_major_minor(text: &str) -> Option<(u64, u64)> {
+pub(super) fn parse_major_minor(text: &str) -> Option<(u64, u64)> {
     let mut parts = text.split(['.', '-', '+']);
     Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
-fn oldest_shared_client() -> (u64, u64) {
+/// Pool-metadata key holding the oldest jj (`major * 1000 + minor`) known to
+/// share `repo`'s store. It is a fact about the whole fleet, so it is stored
+/// with the repo and set by `cube repo declare-oldest-jj`, never read from the
+/// environment of whichever process happens to run the collection.
+pub(super) fn oldest_client_key(repo: &str) -> String {
+    format!("store_gc_oldest_jj_client:{repo}")
+}
+
+pub(super) fn encode_major_minor((major, minor): (u64, u64)) -> i64 {
+    (major * 1000 + minor) as i64
+}
+
+/// The oldest jj client declared for `repo`'s store, or
+/// [`OLDEST_SHARED_CLIENT_JJ`] when none was.
+pub(super) fn oldest_shared_client(database_path: Option<&Path>, repo: &str) -> Result<(u64, u64)> {
     #[cfg(test)]
     if let Some(oldest) = OLDEST_CLIENT_OVERRIDE.with(std::cell::Cell::get) {
-        return oldest;
+        return Ok(oldest);
     }
-    std::env::var(OLDEST_CLIENT_ENV)
-        .ok()
-        .and_then(|value| parse_major_minor(value.trim()))
-        .unwrap_or(OLDEST_SHARED_CLIENT_JJ)
+    let store = match database_path {
+        Some(path) => crate::store::Store::open_at(path)?,
+        None => crate::store::Store::open_default()?,
+    };
+    Ok(store
+        .get_pool_metadata_i(&oldest_client_key(repo))?
+        .and_then(|value| u64::try_from(value).ok())
+        .map_or(OLDEST_SHARED_CLIENT_JJ, |value| (value / 1000, value % 1000)))
 }
 
 /// The collector's `jj --version` output, refused when it is newer than the
 /// oldest client sharing the stores.
-pub(super) fn collector_version(runner: &dyn CommandRunner, source: &Path) -> Result<String> {
+pub(super) fn collector_version(
+    runner: &dyn CommandRunner,
+    source: &Path,
+    repo: &str,
+    oldest: (u64, u64),
+) -> Result<String> {
     let output = runner.run(&RealCommandRunner::invocation(source, "jj", &["--version"]))?;
     let version = output.trim().to_owned();
-    let oldest = oldest_shared_client();
     let found = version
         .split_whitespace()
         .find(|word| word.starts_with(|c: char| c.is_ascii_digit()))
@@ -75,9 +93,9 @@ pub(super) fn collector_version(runner: &dyn CommandRunner, source: &Path) -> Re
         Some(found) if found <= oldest => Ok(version),
         _ => Err(CubeError::InvalidArgument(format!(
             "the `jj` on PATH (`{version}`) is not known to be at most {}.{}, the oldest client sharing \
-             these stores; collecting with a newer jj can prune history older clients still need. \
-             Put the oldest client's jj first on PATH, or set {OLDEST_CLIENT_ENV} once every client \
-             has been upgraded",
+             the stores of repo `{repo}`; collecting with a newer jj can prune history older clients still need. \
+             Put the oldest client's jj first on PATH, or, once every client has been upgraded, record that with \
+             `cube repo declare-oldest-jj {repo} <major.minor>`",
             oldest.0, oldest.1
         ))),
     }
@@ -168,6 +186,14 @@ impl Drop for GcIndex {
     }
 }
 
+/// Most operations the ancestry walk visits before giving up. A head built on
+/// a store's pre-abandon history (tens of thousands of operations on mono)
+/// ends here rather than at the root operation.
+pub(super) const MAX_ANCESTRY_OPERATIONS: usize = 4096;
+
+/// Wall-clock bound on the whole ancestry walk.
+const ANCESTRY_WALK_BUDGET: Duration = Duration::from_secs(60);
+
 /// Require every parent branch to reach the checked head, accepting benign
 /// concurrent merges but refusing abandoned ancestry. Bound both work and time;
 /// unknown debug output fails closed, so it cannot authorize collection.
@@ -179,14 +205,18 @@ pub(super) fn require_safe_progress(
 ) -> Result<()> {
     let mut pending = vec![head.to_owned()];
     let mut seen = std::collections::HashSet::new();
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    let mut unsafe_history = false;
+    let deadline = std::time::Instant::now() + ANCESTRY_WALK_BUDGET;
+    let mut failure = None;
     while let Some(current) = pending.pop() {
         if current == ancestor || !seen.insert(current.clone()) {
             continue;
         }
-        if seen.len() > 4096 || std::time::Instant::now() >= deadline {
-            unsafe_history = true;
+        if seen.len() > MAX_ANCESTRY_OPERATIONS || std::time::Instant::now() >= deadline {
+            failure = Some(format!(
+                "the walk exceeded {MAX_ANCESTRY_OPERATIONS} operations / {} seconds without reaching {ancestor}, \
+                 so the head is presumed to descend from unverified history",
+                ANCESTRY_WALK_BUDGET.as_secs()
+            ));
             break;
         }
         let output = runner.run_with_timeout(
@@ -217,16 +247,19 @@ pub(super) fn require_safe_progress(
                 .iter()
                 .any(|id| id.len() != 128 || !id.bytes().all(|b| b.is_ascii_hexdigit()))
         {
-            unsafe_history = true;
+            failure = Some(format!(
+                "the walk reached an operation with no readable parents without finding {ancestor}; \
+                 abandoned or unverified ancestry was found"
+            ));
             break;
         }
         pending.extend(ids.into_iter().map(str::to_owned));
     }
-    if !unsafe_history {
+    let Some(failure) = failure else {
         return Ok(());
-    }
+    };
     Err(CubeError::InvalidArgument(format!(
-        "unsafe operation heads in {}: {head} does not descend safely from {ancestor}; abandoned or unverified ancestry was found",
+        "unsafe operation heads in {}: {head} does not descend safely from {ancestor}: {failure}",
         source.display()
     )))
 }

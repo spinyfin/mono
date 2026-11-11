@@ -28,6 +28,7 @@ mod release_tests;
 mod remove_tests;
 mod repo_tests;
 mod setup_tests;
+mod store_gc_head_tests;
 mod store_gc_integrity_tests;
 mod store_gc_marker_tests;
 mod store_gc_tests;

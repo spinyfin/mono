@@ -101,6 +101,31 @@ pub(super) fn run_repo(
                 }),
             )
         }
+        RepoCommand::DeclareOldestJj { repo, version } => {
+            use crate::app::store_gc_integrity::{encode_major_minor, oldest_client_key, parse_major_minor};
+            let record = store
+                .get_repo(&repo)?
+                .ok_or_else(|| CubeError::RepoNotFound(repo.clone()))?;
+            let oldest = parse_major_minor(version.trim())
+                .filter(|_| version.trim().split('.').count() == 2)
+                .ok_or_else(|| CubeError::InvalidArgument(format!("`{version}` is not a `major.minor` jj version")))?;
+            let previous = store.get_pool_metadata_i(&oldest_client_key(&record.repo))?;
+            store.set_pool_metadata_i(&oldest_client_key(&record.repo), encode_major_minor(oldest))?;
+            audit!(
+                database_path,
+                "repo.oldest_jj_declared",
+                repo = record.repo,
+                oldest_jj = format!("{}.{}", oldest.0, oldest.1),
+                previous_encoded = previous,
+            );
+            RunResult::new(
+                format!(
+                    "Recorded jj {}.{} as the oldest client sharing `{repo}`'s store; store upkeep may now collect with jj up to that version.",
+                    oldest.0, oldest.1
+                ),
+                json!({ "repo": record.repo, "oldest_jj": format!("{}.{}", oldest.0, oldest.1) }),
+            )
+        }
         RepoCommand::Gc {
             repo,
             keep_hours,

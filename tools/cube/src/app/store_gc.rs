@@ -103,7 +103,7 @@ use crate::store::Store;
 
 use crate::app::errors::{CubeError, Result};
 use crate::app::jj::run_jj;
-use crate::app::store_gc_integrity::{GcIndex, collector_version};
+use crate::app::store_gc_integrity::{GcIndex, collector_version, oldest_shared_client};
 
 /// Operations newer than this are never abandoned. Three days of history
 /// keeps `jj op undo` useful while the log stays bounded.
@@ -351,28 +351,43 @@ pub(crate) fn count_op_heads(source: &Path) -> Result<usize> {
 
 /// The operation head ids in the store at `source`, one directory entry each.
 fn op_heads(source: &Path) -> Result<Vec<String>> {
-    std::fs::read_dir(source.join(".jj/repo/op_heads/heads"))
+    let mut heads: Vec<String> = std::fs::read_dir(source.join(".jj/repo/op_heads/heads"))
         .map_err(CubeError::Io)?
         .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
         .collect::<std::io::Result<_>>()
-        .map_err(CubeError::Io)
+        .map_err(CubeError::Io)?;
+    // Directory order is arbitrary; sorted heads give a stable verification order.
+    heads.sort();
+    Ok(heads)
 }
 
-/// Stop the pass unless the store holds exactly one operation head. A second
-/// head means a jj command raced the abandon: the next jj command merges the
-/// heads against an empty base, so nothing may be collected.
-fn require_single_op_head(record: &RepoRecord, source: &Path, when: &str) -> Result<String> {
+/// Stop the pass unless the store holds exactly one operation head. After an
+/// abandon, a second head means a jj command raced it: the next jj command
+/// merges the heads against an empty base, so nothing may be collected.
+/// Without an abandon in this pass, a second head is an ordinary concurrent
+/// operation that jj merges on its next load; the pass stops, rewrites
+/// nothing and the next pass retries. The message says which one it is,
+/// because it is the only diagnosis the audit row carries.
+fn require_single_op_head(record: &RepoRecord, source: &Path, when: &str, abandoned: bool) -> Result<String> {
     let mut heads = op_heads(source)?;
     if heads.len() == 1 {
         return Ok(heads.remove(0));
     }
+    let detail = if abandoned {
+        format!(
+            "operations were abandoned in this pass but no files were collected, and a command raced the \
+             abandon. Repair the operation heads in {} before allowing commands to merge abandoned ancestry",
+            source.display()
+        )
+    } else {
+        "a concurrent jj operation is in flight. Nothing was abandoned or collected in this pass; no repair \
+         is needed, and the next pass retries"
+            .to_owned()
+    };
     Err(CubeError::InvalidArgument(format!(
-        "repo `{}`: the store holds {} operation heads {when} (expected 1); \
-         the rewrite is unsafe, so nothing was collected. Repair the operation heads in {} \
-         before allowing commands to merge abandoned ancestry",
+        "repo `{}`: the store holds {} operation heads {when} (expected 1); {detail}",
         record.repo,
         heads.len(),
-        source.display()
     )))
 }
 
@@ -541,9 +556,9 @@ pub(super) fn gc_repo_store(
     let started = Instant::now();
     let mut collector_jj = None;
     let probe = match (dry_run, record.source.as_deref()) {
-        (false, Some(source)) if source.join(".jj/repo").is_dir() => {
-            collector_version(runner, source).map(|version| collector_jj = Some(version))
-        }
+        (false, Some(source)) if source.join(".jj/repo").is_dir() => oldest_shared_client(database_path, &record.repo)
+            .and_then(|oldest| collector_version(runner, source, &record.repo, oldest))
+            .map(|version| collector_jj = Some(version)),
         _ => Ok(()),
     };
     probe
@@ -661,8 +676,20 @@ pub(super) fn gc_repo_store_with_deadline(
         let index = {
             let _reader = JjGate::shared_for_database(database_path)?;
             let index = GcIndex::new(&source)?;
-            let head = require_single_op_head(record, &source, "before the abandon")?;
-            index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "before abandon", &head)?;
+            // Only the shared gate is held and the host need not be quiet, so
+            // a second head is an ordinary concurrent operation that jj
+            // merges on its next load, not damage. Verify every head.
+            let heads = op_heads(&source)?;
+            if heads.is_empty() {
+                return Err(CubeError::InvalidArgument(format!(
+                    "repo `{}`: the store at {} has no operation heads before the abandon; nothing was abandoned or collected",
+                    record.repo,
+                    source.display()
+                )));
+            }
+            for head in &heads {
+                index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "before abandon", head)?;
+            }
             index
         };
         let mut rewritten_head = None;
@@ -702,7 +729,7 @@ pub(super) fn gc_repo_store_with_deadline(
                     &gated_jj_invocation(&source, &["--ignore-working-copy", "op", "abandon", &range]),
                     exclusive_timeout,
                 );
-                rewritten_head = Some(require_single_op_head(record, &source, "after the abandon")?);
+                rewritten_head = Some(require_single_op_head(record, &source, "after the abandon", true)?);
                 active_gate.clear_quarantine(&source)?;
                 abandon?;
             } else {
@@ -768,7 +795,12 @@ pub(super) fn gc_repo_store_with_deadline(
             // come after it, immediately before `util gc`, so neither goes
             // stale.
             let collection_started = Instant::now();
-            let head = require_single_op_head(record, &source, "before the collection rebuild")?;
+            let head = require_single_op_head(
+                record,
+                &source,
+                "before the collection rebuild",
+                rewritten_head.is_some(),
+            )?;
             if let Some(ref rewritten) = rewritten_head {
                 super::store_gc_integrity::require_safe_progress(runner, &source, rewritten, &head)?;
             }
@@ -778,7 +810,7 @@ pub(super) fn gc_repo_store_with_deadline(
             // loaded an older head and may have committed on it since; that
             // head only shows up now, on both the immediate and deferred
             // paths.
-            let current = require_single_op_head(record, &source, "before the collection")?;
+            let current = require_single_op_head(record, &source, "before the collection", rewritten_head.is_some())?;
             super::store_gc_integrity::require_safe_progress(runner, &source, &head, &current)?;
             if quiet {
                 gc_args.extend(["--expire", "now"]);
@@ -789,9 +821,31 @@ pub(super) fn gc_repo_store_with_deadline(
             // Collection is a reader: leases proceed, but another rewrite
             // cannot invalidate the head this collector loaded.
             index.run(runner, &gc_args, MAINTENANCE_CMD_TIMEOUT)?;
-            let collected = require_single_op_head(record, &source, "after the collection")?;
-            super::store_gc_integrity::require_safe_progress(runner, &source, &current, &collected)?;
-            index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "after collection", &collected)?;
+            // Collection has already run, so every head that exists now is
+            // checked rather than refused: a concurrent worker operation is
+            // benign when it descends from the head collected against, and
+            // each head must still rebuild a fresh index.
+            let collected_heads = op_heads(&source)?;
+            if collected_heads.is_empty() {
+                return Err(CubeError::InvalidArgument(format!(
+                    "repo `{}`: collection completed but the store at {} has no operation heads afterwards; \
+                     fresh-index verification was not performed",
+                    record.repo,
+                    source.display()
+                )));
+            }
+            for collected in &collected_heads {
+                super::store_gc_integrity::require_safe_progress(runner, &source, &current, collected).map_err(
+                    |error| {
+                        CubeError::InvalidArgument(format!(
+                            "repo `{}`: collection completed, but a head published afterwards does not descend \
+                             from the head collected against, so fresh-index verification was not performed: {error}",
+                            record.repo
+                        ))
+                    },
+                )?;
+                index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "after collection", collected)?;
+            }
             collection_ms = collection_started.elapsed().as_millis();
         }
     }

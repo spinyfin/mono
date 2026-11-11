@@ -54,7 +54,9 @@ It is a manual procedure, not an automatic fallback during collection.
    alternates. Preserve predecessor metadata, operation heads, and indexes.
 3. Use jj 0.32.0 for every client sharing the store, including cube's `jj` on
    `PATH`, engine processes, and worker shells (after upgrading, declare it with
-   `CUBE_OLDEST_JJ_CLIENT=0.32` so the collector is not refused as too new). Verify `jj --version` in each
+   `cube repo declare-oldest-jj <repo> 0.32` so the collector is not refused as too
+   new; the declaration is stored with the repo in cube's database and audited as
+   `repo.oldest_jj_declared`, so it applies to every collector however it is started). Verify `jj --version` in each
    launch environment. Do not mix upgraded collectors with older readers.
 4. On the independent copy, run
    `jj --ignore-working-copy --repository <copy> debug reindex`.

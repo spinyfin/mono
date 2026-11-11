@@ -95,11 +95,24 @@ codex_probe_runtime_repository(name = "codex_probe_runtime")
 
 jj_test_repository = use_repo_rule("//tools/boss/engine/recovery:jj_repository.bzl", "jj_test_repository")
 
-jj_test_repository(name = "jj_test_tools")
+jj_test_repository(
+    name = "jj_test_tools",
+    visible_to = [
+        "@@//tools/boss/engine/recovery:__pkg__",
+        "@@//tools/boss/engine/test-git:__pkg__",
+        "@@//tools/boss/engine/app:__pkg__",
+        "@@//tools/boss/engine/core:__pkg__",
+        "@@//tools/boss/engine/work-db:__pkg__",
+        "@@//tools/cube:__pkg__",
+    ],
+)
 
-jj_newer_repository = use_repo_rule("//tools/cube:testdata/jj_newer_repository.bzl", "jj_newer_repository")
-
-jj_newer_repository(name = "cube_jj_newer")
+# A newer jj, used only by cube's GC tests.
+jj_test_repository(
+    name = "cube_jj_newer",
+    version = "0.32.0",
+    visible_to = ["@@//tools/cube:__pkg__"],
+)
 
 worker_zsh_repository = use_repo_rule(
     "//tools/boss/engine/worker-bin:host_shell.bzl",
