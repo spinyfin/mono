@@ -106,13 +106,18 @@ pub(super) fn unresolved_gate_text(conflict_resolution: bool, worker_signal_seam
     let (heading, scope) = if conflict_resolution {
         (
             "Pre-push gate for conflict resolution (build system unresolved) — discover, then merge correctness",
-            "The gate you MUST clear before pushing is **merge correctness** after you have identified the build system. If Bazel markers are present, compile the touched/upstream targets with `bazel build` and regenerate invalidated lockfiles. If they are not, run the repo's documented compile, type-check and test commands and regenerate lockfiles with the owning package manager. Report each command and its real exit code.",
+            "The gate you MUST clear before pushing is **merge correctness** after you have identified the build system. If Bazel markers are present, compile the touched/upstream targets with `bazel build`, regenerate invalidated lockfiles, and run the tests for the targets affected by the files that had conflicts (not the whole suite). If they are not, run the repo's documented compile, type-check and test commands and regenerate lockfiles with the owning package manager. Report each command and its real exit code.",
         )
     } else {
         (
             "Pre-push build gate (build system unresolved)",
             "Before you push a branch or update a PR with code changes, you MUST identify the build system on this execution host and run the matching gate. If Bazel markers are present, run `bazel build` and `bazel test` of the touched targets. If they are not, run the repo's documented compile, type-check and test commands. \"I think it should work\" is NOT a substitute for running the commands.",
         )
+    };
+    let bazel_bullet = if conflict_resolution {
+        "- If any of those Bazel markers is present, run `bazel build` of the touched/upstream targets, regenerate invalidated lockfiles (e.g. `MODULE.bazel.lock` via `bazel mod deps --lockfile_mode=update`), and then run the tests for the targets affected by the files that had conflicts — NOT the whole suite. Resolve them with `bazel query 'kind(\".*_test rule\", rdeps(//..., set(<conflicted source files>)))'`, run `bazel test` on that set, and report the exact command and its exit code. Lockfiles regenerated deterministically (e.g. `MODULE.bazel.lock`, `Cargo.lock`) do NOT on their own select tests; leave them out of the query set, and if no source file conflicted there is no affected-test set to run. If the affected-test query itself fails, report the failing command and its output and stop as blocked; do NOT skip the tests. Do NOT run the full `bazel test //...` suite in this gate."
+    } else {
+        "- If any of those Bazel markers is present, apply the full Bazel policy: `bazel build` and `bazel test` of the touched targets."
     };
     format!(
         "\n## {heading}\n\
@@ -123,7 +128,7 @@ pub(super) fn unresolved_gate_text(conflict_resolution: bool, worker_signal_seam
          \n\
          Required BEFORE you push:\n\
          - On this session's cwd, look for `MODULE.bazel`, `WORKSPACE`, `WORKSPACE.bazel`, or `BUILD.bazel` at the workspace root.\n\
-         - If any of those Bazel markers is present, apply the full Bazel policy for this kind of run (build, and tests except where a conflict-resolution compile-only gate applies).\n\
+         {bazel_bullet}\n\
          - If none is present, discover the repo's documented compile, type-check and test commands from `AGENTS.md` / `CLAUDE.md`, the README, package-manager manifests, and CI workflows, then run those. Prefer the commands CI runs.\n\
          - Run them in the FOREGROUND, read each exit code directly, and report the commands and their exit codes in your Validation section. Do not wrap them in a shell `timeout`.\n\
          - Every required command must exit 0 before you push.\n\
@@ -134,7 +139,7 @@ pub(super) fn unresolved_gate_text(conflict_resolution: bool, worker_signal_seam
 /// Rebase-only exception wording when the build system is unresolved.
 pub(super) fn unresolved_rebase_clause(conflict_resolution: bool) -> &'static str {
     if conflict_resolution {
-        "Rebase-only exception (VCS only — not a build-gate skip): if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces NO diff whatsoever (zero changed files), it is valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change. IMPORTANT: this exception covers VCS mechanics only — whether to add a new commit. It does NOT exempt you from the merge-correctness gate above. Any rebase, merge, or conflict resolution MUST identify the build system on this execution host and run the matching merge-correctness commands (Bazel compile if markers are present; otherwise the repo's documented compile, type-check and test commands) before pushing, even when the rebase appeared clean.\n"
+        "Rebase-only exception (VCS only — not a build-gate skip): if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces NO diff whatsoever (zero changed files), it is valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change. IMPORTANT: this exception covers VCS mechanics only — whether to add a new commit. It does NOT exempt you from the merge-correctness gate above. Any rebase, merge, or conflict resolution MUST identify the build system on this execution host and run the matching merge-correctness commands (if Bazel markers are present: `bazel build` of the touched/upstream targets AND `bazel test` of the test targets affected by the conflicted source files, per the gate above, blocking if the affected-test query fails; otherwise the repo's documented compile, type-check and test commands) before pushing, even when the rebase appeared clean.\n"
     } else {
         "Rebase-only exception (VCS only — not a build-gate skip): if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces NO diff whatsoever (zero changed files), it is valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change. IMPORTANT: this exception covers VCS mechanics only — whether to add a new commit. It does NOT exempt you from the pre-push build gate above. Any revision that involves a rebase, merge, or conflict resolution MUST identify the build system on this execution host and run the matching gate (Bazel build+test if markers are present; otherwise the repo's documented compile, type-check and test commands) before pushing, even when the rebase appeared clean.\n"
     }
