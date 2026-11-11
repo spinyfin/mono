@@ -8,6 +8,8 @@ The coordinator system prompt is generic across products, but product-specific c
 
 It is deliberately distinct from `AGENTS.md` / `CLAUDE.md`, which every worker reads. Coordinator vocabulary (work items, probes, engine state, dispatch) does not belong in a worker's context, so coordinator rules never go in those files, and worker rules never go here.
 
+Worker rules that are specific to running under Boss have their own file, `BOSS.md`, injected into coding workers' prompts by the same GitHub read, size cap and last-known-good cache described below. See [repo-boss-guidance.md](repo-boss-guidance.md) for what goes in which of `BOSS.md`, `BOSS_COORDINATOR.md`, the product dispatch preamble and `CLAUDE.md` / `AGENTS.md`.
+
 The seed for `spinyfin/mono` is the repo's own [`BOSS_COORDINATOR.md`](../../../BOSS_COORDINATOR.md).
 
 ## How it is loaded

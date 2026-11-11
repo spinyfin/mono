@@ -416,6 +416,10 @@ pub struct SshHostAdapter {
     /// `register_remote_worker_slot`; `None` in unit tests that never
     /// stand up the registry.
     live_worker_states: Option<Arc<crate::live_worker_state::LiveWorkerStateRegistry>>,
+    /// Where the shared prompt composer reads the repo's `BOSS.md` from, so a
+    /// remote coding worker gets the same guidance block as a local one.
+    /// `None` composes no block.
+    repo_guidance: Option<Arc<dyn boss_execution_runner::repo_guidance::RepoGuidanceSource>>,
 }
 
 impl SshHostAdapter {
@@ -435,7 +439,17 @@ impl SshHostAdapter {
             non_opus_auto_mode,
             events_socket_path,
             live_worker_states,
+            repo_guidance: None,
         }
+    }
+
+    /// Supply the `BOSS.md` source used when composing remote worker prompts.
+    pub fn with_repo_guidance(
+        mut self,
+        repo_guidance: Arc<dyn boss_execution_runner::repo_guidance::RepoGuidanceSource>,
+    ) -> Self {
+        self.repo_guidance = Some(repo_guidance);
+        self
     }
 
     pub fn transport(&self) -> &SshTransport {
@@ -595,11 +609,16 @@ pub(crate) fn map_remote_bazel_probe_output(result: Result<SshOutput>, host_id: 
 
 /// Options for composing a worker prompt on the remote spawn path. Kept as one
 /// function so the merge-review policy wiring is covered by a test.
-fn remote_spawn_opts(max_embed_diff_lines: u64, bazel_workspace: Option<bool>) -> WorkerSpawnOpts {
+fn remote_spawn_opts(
+    max_embed_diff_lines: u64,
+    bazel_workspace: Option<bool>,
+    repo_guidance: Option<Arc<dyn boss_execution_runner::repo_guidance::RepoGuidanceSource>>,
+) -> WorkerSpawnOpts {
     WorkerSpawnOpts::builder()
         .review_signal_checks(crate::merge_poller::review_signal_checks_for_owner)
         .max_embed_diff_lines(max_embed_diff_lines)
         .maybe_bazel_workspace(bazel_workspace)
+        .maybe_repo_guidance(repo_guidance)
         .build()
 }
 
@@ -989,7 +1008,15 @@ impl HostAdapter for SshHostAdapter {
         //    criterion, effort addendum, product preamble).
         // Keep prompt and generated-rules feature gates on the same values.
         let bazel_workspace = self.probe_remote_bazel_workspace(&workspace).await;
-        let spawn_opts = remote_spawn_opts(self.cfg.work.max_review_embed_diff_lines, bazel_workspace);
+        let spawn_opts = remote_spawn_opts(
+            self.cfg.work.max_review_embed_diff_lines,
+            bazel_workspace,
+            self.repo_guidance.clone(),
+        );
+        // `spawn_opts` is consumed by the composer below; the worker-setup
+        // input further down reads these two gates from the same value.
+        let run_done_proposals_seam_enabled = spawn_opts.run_done_proposals_seam_enabled;
+        let worker_signal_proposals_seam_enabled = spawn_opts.worker_signal_proposals_seam_enabled;
         let ComposedWorkerSpawn {
             mut prompt_text,
             spawn_config,
@@ -1100,8 +1127,8 @@ impl HostAdapter for SshHostAdapter {
             // so a reviewer/triage/answer-agent dispatched remotely still gets
             // its reduced surface instead of silently becoming Standard.
             .worker_kind(crate::worker_setup::worker_kind_for_execution(&execution.kind))
-            .run_done_proposals_seam_enabled(spawn_opts.run_done_proposals_seam_enabled)
-            .worker_signal_proposals_seam_enabled(spawn_opts.worker_signal_proposals_seam_enabled)
+            .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
+            .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
             .is_review_supervisor(is_review_supervisor)
             .is_post_merge_reviewer(is_post_merge_reviewer)
             // Mirrors `WorkerSpawnOpts` above: a remotely dispatched triage
@@ -1655,6 +1682,9 @@ pub struct SshHostAdapterProvider {
     /// Live-state registry forwarded into each `SshHostAdapter` so remote
     /// turn-start waits on the same driver-signal predicate as local spawn.
     live_worker_states: Option<Arc<crate::live_worker_state::LiveWorkerStateRegistry>>,
+    /// `BOSS.md` source handed to each built [`SshHostAdapter`]; `None` means
+    /// remote prompts carry no such block.
+    repo_guidance: Option<Arc<dyn boss_execution_runner::repo_guidance::RepoGuidanceSource>>,
     /// Lazily-built remote adapters, one per host id.
     #[builder(default = Mutex::new(HashMap::new()))]
     cache: Mutex<HashMap<String, Arc<dyn HostAdapter>>>,
@@ -1678,8 +1708,18 @@ impl SshHostAdapterProvider {
             events_socket_path,
             control_socket_dir,
             live_worker_states,
+            repo_guidance: None,
             cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Supply the `BOSS.md` source remote adapters use when composing prompts.
+    pub fn with_repo_guidance(
+        mut self,
+        repo_guidance: Arc<dyn boss_execution_runner::repo_guidance::RepoGuidanceSource>,
+    ) -> Self {
+        self.repo_guidance = Some(repo_guidance);
+        self
     }
 }
 
@@ -1704,14 +1744,18 @@ impl HostAdapterProvider for SshHostAdapterProvider {
             .open_control_master()
             .await
             .with_context(|| format!("opening ControlMaster to host '{}'", host.id))?;
-        let adapter: Arc<dyn HostAdapter> = Arc::new(SshHostAdapter::new(
+        let mut ssh_adapter = SshHostAdapter::new(
             transport,
             Arc::clone(&self.work_db),
             Arc::clone(&self.cfg),
             self.non_opus_auto_mode,
             self.events_socket_path.clone(),
             self.live_worker_states.clone(),
-        ));
+        );
+        if let Some(repo_guidance) = &self.repo_guidance {
+            ssh_adapter = ssh_adapter.with_repo_guidance(Arc::clone(repo_guidance));
+        }
+        let adapter: Arc<dyn HostAdapter> = Arc::new(ssh_adapter);
         cache.insert(host.id.clone(), Arc::clone(&adapter));
         Ok(adapter)
     }
@@ -1858,7 +1902,7 @@ mod tests {
 
     #[test]
     fn remote_spawn_opts_carry_the_merge_review_policy() {
-        let opts = remote_spawn_opts(0, None);
+        let opts = remote_spawn_opts(0, None, None);
         let owner = "linkedin-multiproduct";
         let expected = crate::merge_poller::review_signal_checks_for_owner(owner);
         assert!(!expected.is_empty(), "fixture owner must have human-gated checks");

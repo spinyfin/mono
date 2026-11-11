@@ -510,6 +510,13 @@ pub trait WorkerSpawner: Send + Sync {
         None
     }
 
+    /// The GitHub-backed design-docs service, which also reads a repo's
+    /// `BOSS.md` for coding workers' prompts. `None` in tests that never
+    /// compose a worker prompt; those prompts simply carry no such block.
+    fn design_docs(&self) -> Option<Arc<boss_engine_design_docs::DesignDocsService>> {
+        None
+    }
+
     /// Engine's live per-slot state registry. Implementations return
     /// `None` from in-process tests that don't care about the live
     /// state surface; the spawn flow then skips the registration

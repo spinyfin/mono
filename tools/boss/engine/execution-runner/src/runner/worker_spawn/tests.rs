@@ -1793,3 +1793,236 @@ mod compose_worker_spawn_tests {
         }
     }
 }
+
+mod repo_guidance_prompt_tests {
+    //! The repo `BOSS.md` block as it appears in the composed worker prompt:
+    //! which executions get it, where it sits relative to the product dispatch
+    //! preamble, and that a source that has nothing to say changes nothing.
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::repo_guidance::RepoGuidanceSource;
+    use crate::test_support::{create_test_chore_manual, create_test_product_named};
+    use async_trait::async_trait;
+    use boss_protocol::{CoordinatorGuidanceState, CoordinatorGuidanceView, ExecutionKind, ExecutionStatus, Product};
+
+    const SHA: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+    /// Always answers with one fixed state, counting how often it is asked.
+    #[derive(Debug)]
+    struct FixedSource {
+        state: CoordinatorGuidanceState,
+        reads: AtomicUsize,
+    }
+
+    impl FixedSource {
+        fn new(state: CoordinatorGuidanceState) -> Arc<Self> {
+            Arc::new(Self {
+                state,
+                reads: AtomicUsize::new(0),
+            })
+        }
+
+        fn loaded(markdown: &str) -> Arc<Self> {
+            Self::new(CoordinatorGuidanceState::Loaded {
+                git_ref: SHA.to_owned(),
+                bytes: markdown.len() as u64,
+                markdown: markdown.to_owned(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl RepoGuidanceSource for FixedSource {
+        async fn read(&self, product: &Product) -> CoordinatorGuidanceView {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            CoordinatorGuidanceView::builder()
+                .product_id(product.id.clone())
+                .fetched_at("2026-11-10T00:00:00Z")
+                .path(boss_protocol::REPO_BOSS_GUIDANCE_PATH)
+                .product_name(product.name.clone())
+                .state(self.state.clone())
+                .owner_repo("acme/widget")
+                .build()
+        }
+    }
+
+    fn execution(kind: ExecutionKind, work_item_id: &str) -> WorkExecution {
+        WorkExecution::builder()
+            .id("exec_guidance_01")
+            .work_item_id(work_item_id)
+            .kind(kind)
+            .status(ExecutionStatus::Running)
+            .repo_remote_url("git@github.com:acme/widget.git")
+            .workspace_path("/tmp/workspace")
+            .created_at("2026-11-10T00:00:00Z")
+            .build()
+    }
+
+    /// A chore under a product with the given dispatch preamble.
+    fn chore_setup(db: &WorkDb, preamble: Option<&str>) -> (Product, WorkItem) {
+        let product = create_test_product_named(db, "Widget");
+        if let Some(preamble) = preamble {
+            db.update_product(
+                &product.id,
+                crate::work::WorkItemPatch::builder()
+                    .dispatch_preamble(preamble)
+                    .build(),
+                "human",
+            )
+            .unwrap();
+        }
+        let task = create_test_chore_manual(db, product.id.clone(), "Guidance chore");
+        let item = db.get_work_item(&task.id).unwrap();
+        (db.get_product(&product.id).unwrap().unwrap(), item)
+    }
+
+    async fn compose(
+        db: &WorkDb,
+        execution: &WorkExecution,
+        item: &WorkItem,
+        source: Option<Arc<FixedSource>>,
+    ) -> String {
+        // A fixed path: the workspace path is rendered into the prompt, and the
+        // tests below compare whole prompts.
+        compose_worker_spawn(
+            db,
+            "worker-1",
+            execution,
+            item,
+            std::path::Path::new("/tmp/repo-guidance-workspace"),
+            None,
+            WorkerSpawnOpts::builder()
+                .review_signal_checks(|_| &[])
+                .maybe_repo_guidance(source.map(|s| s as Arc<dyn RepoGuidanceSource>))
+                .build(),
+        )
+        .await
+        .unwrap()
+        .prompt_text
+    }
+
+    #[tokio::test]
+    async fn the_block_sits_between_the_dispatch_preamble_and_the_task_prompt() {
+        let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
+        let (_product, item) = chore_setup(&db, Some("house style: terse commits"));
+        let execution = execution(ExecutionKind::ChoreImplementation, item.primary_id());
+        let source = FixedSource::loaded("- attach screenshots with `boss attach`\n");
+
+        let prompt = compose(&db, &execution, &item, Some(source.clone())).await;
+
+        let preamble_end = prompt.find("[/product-preamble]").expect("preamble kept");
+        let open = prompt
+            .find(&format!("[repo-boss-guidance repo=acme/widget sha={SHA}]"))
+            .expect("block present");
+        let rule = prompt.find("- attach screenshots with `boss attach`").unwrap();
+        let close = prompt.find("[/repo-boss-guidance]").unwrap();
+        let task = prompt.find("You are a reusable worker").expect("task prompt kept");
+        assert!(prompt.starts_with("[product-preamble]\nhouse style: terse commits\n[/product-preamble]"));
+        assert!(
+            preamble_end < open && open < rule && rule < close && close < task,
+            "order must be preamble, block, task:\n{prompt}"
+        );
+        assert_eq!(source.reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn without_a_preamble_the_block_leads_the_prompt() {
+        let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
+        let (_product, item) = chore_setup(&db, None);
+        let execution = execution(ExecutionKind::ChoreImplementation, item.primary_id());
+        let prompt = compose(&db, &execution, &item, Some(FixedSource::loaded("- a rule\n"))).await;
+        assert!(prompt.starts_with("[repo-boss-guidance "), "{prompt}");
+        assert!(!prompt.contains("[product-preamble]"));
+    }
+
+    #[tokio::test]
+    async fn every_coding_kind_gets_the_block_and_the_others_never_read_the_file() {
+        let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
+        let (_product, item) = chore_setup(&db, None);
+        for (kind, expected) in [
+            (ExecutionKind::ChoreImplementation, true),
+            (ExecutionKind::TaskImplementation, true),
+            (ExecutionKind::RevisionImplementation, true),
+            (ExecutionKind::ConflictResolution, true),
+            (ExecutionKind::CiRemediation, true),
+            (ExecutionKind::InvestigationImplementation, false),
+        ] {
+            let source = FixedSource::loaded("- a rule\n");
+            let prompt = compose(
+                &db,
+                &execution(kind.clone(), item.primary_id()),
+                &item,
+                Some(source.clone()),
+            )
+            .await;
+            assert_eq!(prompt.contains("[repo-boss-guidance "), expected, "{kind}: {prompt}");
+            assert_eq!(
+                source.reads.load(Ordering::SeqCst),
+                usize::from(expected),
+                "{kind}: a kind that gets nothing must not cost a GitHub read"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_design_execution_does_not_get_the_block() {
+        let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
+        let product = create_test_product_named(&db, "Widget");
+        let item = WorkItem::Product(product.clone());
+        let source = FixedSource::loaded("- a rule\n");
+        let prompt = compose(
+            &db,
+            &execution(ExecutionKind::ProductDesign, &product.id),
+            &item,
+            Some(source.clone()),
+        )
+        .await;
+        assert!(!prompt.contains("repo-boss-guidance"), "{prompt}");
+        assert_eq!(source.reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn no_source_composes_exactly_the_prompt_it_always_did() {
+        let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
+        let (_product, item) = chore_setup(&db, Some("house style: terse commits"));
+        let execution = execution(ExecutionKind::ChoreImplementation, item.primary_id());
+        let with_none = compose(&db, &execution, &item, None).await;
+        let missing_file = compose(
+            &db,
+            &execution,
+            &item,
+            Some(FixedSource::new(CoordinatorGuidanceState::Missing {
+                git_ref: SHA.to_owned(),
+            })),
+        )
+        .await;
+        assert!(!with_none.contains("repo-boss-guidance"));
+        assert_eq!(
+            with_none, missing_file,
+            "a repo without BOSS.md gets no block and no note"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_with_no_cache_still_composes_with_a_visible_note() {
+        let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
+        let (_product, item) = chore_setup(&db, None);
+        let execution = execution(ExecutionKind::ChoreImplementation, item.primary_id());
+        let source = FixedSource::new(CoordinatorGuidanceState::Failed {
+            reason: "could not reach GitHub".to_owned(),
+        });
+        let prompt = compose(&db, &execution, &item, Some(source)).await;
+        assert!(prompt.contains("[repo-boss-guidance repo=acme/widget]"), "{prompt}");
+        assert!(
+            prompt.contains("could not be loaded (could not reach GitHub)"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("You are a reusable worker"),
+            "dispatch must proceed: {prompt}"
+        );
+    }
+}

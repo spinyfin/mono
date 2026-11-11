@@ -71,7 +71,7 @@ pub struct ComposedWorkerSpawn {
 /// separately via `crate::worker_setup::WorkerSetupInput` — see
 /// `runner::pane_spawn`'s spawn call site for where both are computed from
 /// the same flag read).
-#[derive(Debug, Clone, Copy, bon::Builder)]
+#[derive(Debug, Clone, bon::Builder)]
 #[builder(on(String, into))]
 pub struct WorkerSpawnOpts {
     pub review_signal_checks: fn(&str) -> &'static [&'static str],
@@ -101,6 +101,10 @@ pub struct WorkerSpawnOpts {
     /// not treat a missing path as non-Bazel). Remote (SSH) spawns set this
     /// from a marker probe on the execution host before composing.
     pub bazel_workspace: Option<bool>,
+    /// Where the composer reads the repo's `BOSS.md` from, for the execution
+    /// kinds that receive it (see [`crate::repo_guidance`]). `None` composes
+    /// no block, which is also what happens for an unsupplied source in tests.
+    pub repo_guidance: Option<std::sync::Arc<dyn crate::repo_guidance::RepoGuidanceSource>>,
 }
 
 /// Fetch authoritative PR metadata for a reviewer worker's initial prompt.
@@ -577,6 +581,7 @@ pub async fn compose_worker_spawn(
         review_batch_fanout_enabled,
         run_done_proposals_seam_enabled,
         bazel_workspace,
+        repo_guidance,
     } = editorial_opts;
     // For any project-scoped task (the synthetic `kind = 'design'`
     // task and ordinary `project_task` rows alike), the richer
@@ -1325,6 +1330,22 @@ pub async fn compose_worker_spawn(
     // level); this is the single prepend gate.
     let prompt_text = match prompt_addendum_to_prepend(&execution.kind, spawn_config.prompt_addendum) {
         Some(addendum) => format!("{}\n\n{}", addendum, prompt_text),
+        None => prompt_text,
+    };
+
+    // The repo's own `BOSS.md`, for coding executions only, sits directly
+    // under the product dispatch preamble below. It is resolved here, after
+    // every fallible step above, so that a slow or failing GitHub read
+    // cannot be the reason a spawn is refused: `resolve_block` never errors.
+    let prompt_text = match crate::repo_guidance::resolve_block(
+        repo_guidance.as_deref(),
+        &execution.kind,
+        product.as_ref(),
+        &execution.id,
+    )
+    .await
+    {
+        Some(block) => crate::repo_guidance::prepend_to_prompt(&block, &prompt_text),
         None => prompt_text,
     };
 

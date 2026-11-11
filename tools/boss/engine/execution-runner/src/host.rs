@@ -54,6 +54,11 @@ pub trait RunnerHost: Send + Sync {
         has_source_automation: bool,
     ) -> boss_protocol::LiveWorkerMetadata;
     fn attributed_pool_label(&self, execution: &WorkExecution, has_source_automation: bool) -> &'static str;
+    /// Where the prompt composer reads a repo's `BOSS.md` from. `None` (the
+    /// default) composes prompts without it.
+    fn repo_guidance(&self) -> Option<Arc<dyn crate::repo_guidance::RepoGuidanceSource>> {
+        None
+    }
 }
 
 pub trait TmuxSpawnStore: Send + Sync {

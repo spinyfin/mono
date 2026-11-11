@@ -305,6 +305,10 @@ impl boss_engine_runtime::spawn_flow::WorkerSpawner for ServerState {
         Some(&self.work_db)
     }
 
+    fn design_docs(&self) -> Option<Arc<boss_engine_design_docs::DesignDocsService>> {
+        Some(self.design_docs.clone())
+    }
+
     async fn reap_worker_pane(&self, run_id: &str) {
         // Delegate to the inherent reaper, discarding the outcome — the
         // spawn-completion path already knows the worker came up (it just
@@ -1559,6 +1563,13 @@ impl ServerState {
         // so merge-triggered cancellation and ordinary dispatch share one
         // timeline sink.
         let dispatch_event_root: PathBuf = state_root.clone();
+        // Shared by `ServerState` and by the remote-host adapter provider, so
+        // a remote worker's `BOSS.md` read hits the same sha-keyed body cache.
+        let design_docs = design_docs_override.unwrap_or_else(|| {
+            Arc::new(boss_engine_design_docs::DesignDocsService::new(
+                state_root.join(boss_engine_design_docs::BODY_CACHE_DIR_NAME),
+            ))
+        });
         let dispatch_events: Arc<dyn boss_dispatch_events::DispatchEventSink> =
             Arc::new(boss_dispatch_events::JsonlFileSink::new(dispatch_event_root.clone()));
         let metrics_for_state = metrics_registry.clone();
@@ -1738,6 +1749,8 @@ impl ServerState {
         // dir, and a config handle. Resolved out here so the move-closure
         // below can consume them.
         let cfg_for_provider = cfg.clone();
+        let design_docs_for_provider = design_docs.clone();
+        let design_docs_for_state = design_docs;
         let remote_non_opus_auto_mode = settings.is_enabled("workers.non_opus_permission_mode");
         // The socket this engine actually bound (stamped on the config by
         // `serve`), not a fresh read of `$BOSS_EVENTS_SOCKET` — an isolated
@@ -1812,7 +1825,13 @@ impl ServerState {
                         provider_events_socket,
                         control_dir,
                         Some(live_worker_states_for_coordinator.clone()),
-                    ),
+                    )
+                    .with_repo_guidance(Arc::new(
+                        boss_engine_runtime::repo_boss_guidance::RepoBossGuidanceLoader::new(
+                            design_docs_for_provider.clone(),
+                            work_db.clone(),
+                        ),
+                    )),
                 ));
             }
             execution_coordinator_inner.set_remote_pane_releaser(remote_pane_releaser);
@@ -1867,11 +1886,7 @@ impl ServerState {
                 .maybe_live_read_admission(live_read_admission_override)
                 .maybe_guidance_fetches(guidance_fetches_override)
                 .maybe_org_recheck(org_recheck_override)
-                .design_docs(design_docs_override.unwrap_or_else(|| {
-                    Arc::new(boss_engine_design_docs::DesignDocsService::new(
-                        state_root.join(boss_engine_design_docs::BODY_CACHE_DIR_NAME),
-                    ))
-                }))
+                .design_docs(design_docs_for_state)
                 .staged_pr_urls(staged_pr_urls)
                 .staged_revision_pushes(staged_revision_pushes)
                 .staged_proposal_channel_errors(staged_proposal_channel_errors)

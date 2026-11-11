@@ -72,6 +72,11 @@ root-cause rule as the section below.
   repo's root: coordinator-only rules, how the engine loads them from
   GitHub, and why they never go in `AGENTS.md`):
   [`tools/boss/docs/coordinator-product-guidance.md`](tools/boss/docs/coordinator-product-guidance.md)
+- Per-repo worker guidance (`BOSS.md` at a product repo's root: Boss-specific
+  rules injected into coding workers' prompts, which executions get it, what
+  the prompt carries when GitHub is down, and when to use it instead of
+  `CLAUDE.md` / `AGENTS.md`, `BOSS_COORDINATOR.md` or the dispatch preamble):
+  [`tools/boss/docs/repo-boss-guidance.md`](tools/boss/docs/repo-boss-guidance.md)
 - Worker tool environment (why bare `checkleft` resolves to the repo's
   Bazel build in a worker, how the composed `PATH` is sealed across
   driver tool shells, and what that seal does not cover):

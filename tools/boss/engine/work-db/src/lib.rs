@@ -839,7 +839,9 @@ mod workitems;
 // reaches for the in-tx variant; every other caller uses the public,
 // tx-owning `WorkDb::create_attention`.
 pub use attention_filing::reraise_open_work_item_attention;
-pub use coordinator_guidance_cache::CachedGuidance;
+pub use coordinator_guidance_cache::{
+    COORDINATOR_GUIDANCE_CACHE_NAMESPACE, CachedGuidance, REPO_BOSS_GUIDANCE_CACHE_NAMESPACE,
+};
 pub use coordinator_handoff_store::HANDOFF_METADATA_KEY;
 pub use coordinator_tmux::CoordinatorTmuxRecord;
 // Exported for core's attention_lifecycle; its references to this helper

@@ -170,6 +170,7 @@ pub mod remote_lease_reconcile;
 pub mod remote_reattach;
 pub mod remote_transcript;
 pub mod remote_wrapper;
+pub mod repo_boss_guidance;
 pub mod repo_slug;
 pub mod resolution_signal_capture;
 pub mod review_guide_validation;
