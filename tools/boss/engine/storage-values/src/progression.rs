@@ -29,6 +29,18 @@ pub const CREATED_VIA_PROGRESSION_SWEEP: &str = "progression_sweep";
 /// `metadata` key holding the published `progression.stuck_after` grace.
 pub const METADATA_KEY_STUCK_AFTER_SECS: &str = "progression.stuck_after_secs";
 
+/// `metadata` key holding the published `progression.pool_size`.
+pub const METADATA_KEY_POOL_SIZE: &str = "progression.pool_size";
+
+/// `metadata` key holding the published `progression.sweep_interval`.
+pub const METADATA_KEY_SWEEP_INTERVAL_SECS: &str = "progression.sweep_interval_secs";
+
+/// `metadata` key holding the published `progression.remind_after`.
+pub const METADATA_KEY_REMIND_AFTER_SECS: &str = "progression.remind_after_secs";
+
+/// `metadata` key holding the published `progression.expected_questions_per_week`.
+pub const METADATA_KEY_EXPECTED_QUESTIONS_PER_WEEK: &str = "progression.expected_questions_per_week";
+
 /// `metadata` key holding the published `progression.cooldown`.
 pub const METADATA_KEY_COOLDOWN_SECS: &str = "progression.cooldown_secs";
 
@@ -98,7 +110,7 @@ pub struct ProgressionSettings {
     /// delayed either way.
     pub expected_questions_per_week: Option<u32>,
     /// Reminder interval, with the existing three-day notification floor.
-    #[builder(default = 3 * 86400)]
+    #[builder(default = DEFAULT_REMIND_AFTER_SECS as u64)]
     pub remind_after_secs: u64,
     /// Presence bits in `CALIBRATED_KEYS` order; an explicitly configured
     /// placeholder is still an override, not permission to calibrate it.
@@ -130,6 +142,9 @@ pub const DEFAULT_COOLDOWN_SECS: i64 = 6 * 60 * 60;
 pub const DEFAULT_MAX_CREATES_PER_ITEM_WINDOW: u32 = 3;
 /// Placeholder window for `progression.max_creates_per_item_window` (7 days).
 pub const DEFAULT_MAX_CREATES_WINDOW_SECS: i64 = 7 * 24 * 60 * 60;
+/// Placeholder `progression.remind_after` (3 days); a ceiling for the
+/// calibrated value.
+pub const DEFAULT_REMIND_AFTER_SECS: u32 = 3 * 86400;
 /// Placeholder `progression.run_timeout` (30 minutes).
 pub const DEFAULT_RUN_TIMEOUT_SECS: u64 = 30 * 60;
 

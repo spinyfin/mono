@@ -84,54 +84,103 @@ impl WorkDb {
         let m = &report.inputs;
         let measurement = |key: &str| m.get(key).copied();
         let triple = |key: &str| measurement(key).map(|v| v.saturating_mul(3));
-        let computed = [
-            measurement("peak_candidates_per_day")
-                .zip(measurement("mean_run_seconds"))
-                .map(|(count, seconds)| {
-                    count
-                        .saturating_mul(seconds)
-                        .div_ceil(DAY as u64)
-                        .saturating_mul(3)
-                        .max(1)
-                }),
-            measurement("ledger_interval_p99_secs").map(|v| v.saturating_mul(10)),
-            triple("automatic_pause_p99_secs"),
-            triple("revision_to_review_max_secs"),
-            triple("remediation_attempts_p99"),
-            triple("run_duration_p99_secs"),
-            None,
-            measurement("progression_questions")
-                .zip(measurement("engine_ladder_questions"))
-                .filter(|(p, l)| p + l > 0)
-                .map(|(p, l)| (p + l).saturating_mul(7).div_ceil(WINDOW_DAYS as u64)),
+        // One descriptor per published key: formula, basis and sanity bound
+        // travel together and are matched to the settings by key name.
+        let remind_default = u64::from(boss_engine_storage_values::progression::DEFAULT_REMIND_AFTER_SECS);
+        let descriptors = [
+            Descriptor::new(
+                "pool_size",
+                measurement("peak_candidates_per_day")
+                    .zip(measurement("mean_run_seconds"))
+                    .map(|(count, seconds)| {
+                        count
+                            .saturating_mul(seconds)
+                            .div_ceil(DAY as u64)
+                            .saturating_mul(3)
+                            .max(1)
+                    }),
+                "ceil(peak daily candidates * mean run seconds / 86400) * 3",
+                64,
+            ),
+            Descriptor::new(
+                "sweep_interval_secs",
+                measurement("ledger_interval_p99_secs").map(|v| v.saturating_mul(10)),
+                "10 * p99 ledger interval",
+                3600,
+            ),
+            Descriptor::new(
+                "stuck_after_secs",
+                triple("automatic_pause_p99_secs"),
+                "3 * p99 automatic remediation scheduling pause",
+                DAY as u64,
+            ),
+            Descriptor::new(
+                "cooldown_secs",
+                triple("revision_to_review_max_secs"),
+                "3 * longest progression revision time to first review",
+                7 * DAY as u64,
+            ),
+            Descriptor::new(
+                "max_creates_per_item_window",
+                triple("remediation_attempts_p99"),
+                "3 * outlier-trimmed p99 per-item remediation attempts in a create-budget window",
+                100,
+            ),
+            Descriptor::new(
+                "run_timeout_secs",
+                triple("run_duration_p99_secs"),
+                "3 * p99 completed progression run duration",
+                DAY as u64,
+            ),
+            // The placeholder is a ceiling: reminders may only get more
+            // frequent than the default when people answer faster, never
+            // less frequent when answers slow down.
+            Descriptor::new(
+                "remind_after_secs",
+                measurement("answer_latency_p75_secs").map(|v| v.clamp(MIN_REMIND_SECS, remind_default)),
+                "p75 observed answer latency, at least 1 hour and at most the 3-day placeholder",
+                remind_default,
+            )
+            .ceiling_at_default(),
+            Descriptor::new(
+                "expected_questions_per_week",
+                measurement("progression_questions")
+                    .zip(measurement("engine_ladder_questions"))
+                    .filter(|(p, l)| p + l > 0)
+                    .map(|(p, l)| (p + l).saturating_mul(7).div_ceil(WINDOW_DAYS as u64)),
+                "ceil((progression + ladder questions) * 7 / 28); alarm only",
+                100,
+            ),
         ];
-        let bases = [
-            "ceil(peak daily candidates * mean run seconds / 86400) * 3",
-            "10 * p99 ledger interval",
-            "3 * p99 automatic remediation scheduling pause",
-            "3 * longest progression revision time to first review",
-            "3 * p99 per-item remediation attempts in a create-budget window",
-            "3 * p99 completed progression run duration",
-            "fixed reminder cadence; answer latency is diagnostic only",
-            "ceil((progression + ladder questions) * 7 / 28); alarm only",
-        ];
-        for (index, key) in CALIBRATED_KEYS.iter().enumerate() {
+        for key in CALIBRATED_KEYS.iter() {
+            let index = CALIBRATED_KEYS
+                .iter()
+                .position(|candidate| candidate == key)
+                .expect("key comes from CALIBRATED_KEYS");
+            let descriptor = descriptors
+                .iter()
+                .find(|descriptor| descriptor.key == *key)
+                .expect("every calibrated key has a descriptor");
             let overridden = settings.explicit_overrides & (1 << index) != 0 || configured[index] != defaults[index];
             let (value, source, basis) = if overridden {
                 (configured[index], "overridden", "explicit configuration".to_owned())
-            } else if enough && computed[index].is_some() {
+            } else if enough && descriptor.computed.is_some() {
                 (
-                    computed[index].map(|v| v.max(defaults[index].unwrap_or(0))),
+                    descriptor.computed.map(|v| {
+                        if descriptor.default_is_ceiling {
+                            v.min(defaults[index].unwrap_or(u64::MAX))
+                        } else {
+                            v.max(defaults[index].unwrap_or(0))
+                        }
+                    }),
                     "computed",
-                    bases[index].to_owned(),
+                    descriptor.basis.to_owned(),
                 )
             } else {
                 (
                     defaults[index],
                     "fallback",
-                    if index == 6 {
-                        bases[index].to_owned()
-                    } else if enough {
+                    if enough {
                         "no eligible measurement samples".to_owned()
                     } else {
                         format!("{} daily snapshots; need {MINIMUM_DAYS}", report.snapshot_days)
@@ -140,20 +189,10 @@ impl WorkDb {
             };
             // Diagnostic bounds expose extreme computed values without hiding
             // the measurement or overriding explicit configuration.
-            let sanity_bounds = [
-                64,
-                3600,
-                DAY as u64,
-                7 * DAY as u64,
-                100,
-                DAY as u64,
-                3 * DAY as u64,
-                100,
-            ];
-            let basis = if source == "computed" && value.is_some_and(|v| v > sanity_bounds[index]) {
+            let basis = if source == "computed" && value.is_some_and(|v| v > descriptor.sanity_bound) {
                 format!(
                     "{basis}; WARNING: computed value exceeds sanity bound {}",
-                    sanity_bounds[index]
+                    descriptor.sanity_bound
                 )
             } else {
                 basis
@@ -214,11 +253,42 @@ impl WorkDb {
         Ok(report)
     }
 
-    pub fn progression_limit(&self, key: &str, fallback: u64) -> Result<u64> {
+    /// Read a published progression limit by its full `METADATA_KEY_*` key.
+    pub fn progression_limit(&self, metadata_key: &str, fallback: u64) -> Result<u64> {
         Ok(self
-            .get_metadata(&format!("progression.{key}"))?
+            .get_metadata(metadata_key)?
             .and_then(|value| value.parse().ok())
             .unwrap_or(fallback))
+    }
+}
+
+/// Minimum computed reminder interval.
+const MIN_REMIND_SECS: u64 = 3600;
+
+/// How one published key is calibrated.
+struct Descriptor {
+    key: &'static str,
+    computed: Option<u64>,
+    basis: &'static str,
+    sanity_bound: u64,
+    /// The placeholder caps the computed value instead of flooring it.
+    default_is_ceiling: bool,
+}
+
+impl Descriptor {
+    fn new(key: &'static str, computed: Option<u64>, basis: &'static str, sanity_bound: u64) -> Self {
+        Self {
+            key,
+            computed,
+            basis,
+            sanity_bound,
+            default_is_ceiling: false,
+        }
+    }
+
+    fn ceiling_at_default(mut self) -> Self {
+        self.default_is_ceiling = true;
+        self
     }
 }
 

@@ -1,12 +1,14 @@
 //! Compact global decision feed. Reuses the work mutation publishers so
 //! every question producer and every withdrawal path share the same channel.
 use super::*;
+use boss_engine_storage_values::progression::{DEFAULT_REMIND_AFTER_SECS, METADATA_KEY_REMIND_AFTER_SECS};
 use boss_protocol::OperatorDecisionNotification;
 
 pub(super) const TOPIC: &str = "work.decisions";
 
 fn snapshot(db: &WorkDb) -> anyhow::Result<Vec<OperatorDecisionNotification>> {
-    let remind_after_secs = db.progression_limit("remind_after_secs", 3 * 86400)?;
+    let remind_after_secs =
+        db.progression_limit(METADATA_KEY_REMIND_AFTER_SECS, u64::from(DEFAULT_REMIND_AFTER_SECS))?;
     let conn = db.connect()?;
     let mut stmt = conn.prepare(
         "SELECT q.id, json_extract(q.question_json, '$.text'), t.id, t.product_id,

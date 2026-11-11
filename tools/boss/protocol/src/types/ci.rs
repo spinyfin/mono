@@ -75,7 +75,9 @@ pub struct CiBudgetSnapshot {
 /// merge-queue rebounce this is the PR head attributed to the dequeue event;
 /// `before_commit_sha` separately stores the synthetic merged-result commit.
 /// `head_sha_after` brackets the worker's push (`None` on failure
-/// or for re-trigger-only attempts).
+/// or for re-trigger-only attempts); on an attempt abandoned because a newer
+/// head superseded it, it instead records that superseding head (which may be
+/// a human push or rebase).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct CiRemediation {

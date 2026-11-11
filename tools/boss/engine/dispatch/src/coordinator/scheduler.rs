@@ -1950,7 +1950,7 @@ impl ExecutionCoordinator {
             // fair game.
             let calibrated_size = if self.execution_targets_progression_pool(&execution) {
                 self.work_db
-                    .get_metadata("progression.pool_size")
+                    .get_metadata(boss_engine_storage_values::progression::METADATA_KEY_POOL_SIZE)
                     .unwrap_or_else(|error| {
                         tracing::warn!(?error, "failed to read progression pool size");
                         None
