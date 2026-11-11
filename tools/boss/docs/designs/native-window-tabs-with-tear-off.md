@@ -264,7 +264,7 @@ Reveal keeps its existing completion contract (acknowledge only when the viewpor
 
 ### Flag and rollout
 
-- **Flag:** `boss.ui.nativeWorkspaceTabs` in `BossDefaults`, default off, toggled in the Feature Flags viewer beside `boss.ui.standardSearch`. Read once at launch; changing it requires a relaunch. The scene and window setup is never hot-switched.
+- **Flag:** `boss.ui.nativeWorkspaceTabs` in `BossDefaults`, default off, toggled in the Feature Flags viewer beside the other app-local flags. Read once at launch; changing it requires a relaunch. The scene and window setup is never hot-switched.
 - **Flag off:** no New Tab commands, no Open Agents in New Tab, no workspace tab identifier or titles change, restoration stays disabled, and no saved multi-workspace layout is applied. Window tabbing is left exactly as AppKit provides it today. A second window opened with ⌘N is still possible, as it is today; after the state and terminal tasks it behaves correctly instead of colliding.
 - **Flag on:** the full feature.
 - **Ships inert.** Every task before the native-tabs task changes structure, not workflow. The native-tabs task ships the feature dark. Anyone with the app can enable it in the Feature Flags viewer and relaunch.

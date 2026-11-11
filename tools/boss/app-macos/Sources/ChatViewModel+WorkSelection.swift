@@ -49,6 +49,9 @@ extension ChatViewModel {
         }
         navigationMode = mode
         defaults.set(mode.rawValue, forKey: navigationModeDefaultsKey)
+        if mode != .work {
+            workSearchText = ""
+        }
         if mode == .work && refreshWorkOnEntry {
             refreshWork()
         }
