@@ -48,6 +48,8 @@ const SHORT_WINDOW: Duration = Duration::from_secs(1);
 #[tokio::test]
 async fn teardown_detaches_a_real_viewer_and_preserves_other_sessions() -> Result<()> {
     let dir = tempfile::tempdir()?;
+    let _home = boss_engine::driver::test_support::home_override(dir.path());
+    let _shell = boss_engine::driver::test_support::shell_override(Path::new("/bin/bash"));
     let socket = dir.path().join("detach.sock");
     let program = declared_tmux_binary()?;
     let _guard = TmuxServerGuard::new(program.clone(), socket.clone());
@@ -68,7 +70,11 @@ async fn teardown_detaches_a_real_viewer_and_preserves_other_sessions() -> Resul
     for name in ["survivor", "viewed"] {
         tmux.new_session(&boss_tmux::NewSession {
             name: name.to_owned(),
-            environment: [("BOSS_SPAWN_TOKEN".to_owned(), "token".to_owned())].into(),
+            environment: [(
+                "BOSS_SPAWN_TOKEN".to_owned(),
+                format!("{}-{name}", dir.path().display()),
+            )]
+            .into(),
             working_directory: dir.path().to_path_buf(),
             command: "sleep 60".to_owned(),
         })
@@ -103,7 +109,8 @@ async fn teardown_detaches_a_real_viewer_and_preserves_other_sessions() -> Resul
     // count can already be zero here, but its tty/session must remain valid.
     assert_eq!(unsafe { libc::kill(viewer_pid, libc::SIGSTOP) }, 0);
     let reaper_tmux = tmux.clone();
-    let reaper = tokio::spawn(async move { reaper_tmux.kill_session_verified("viewed", "token").await });
+    let viewed_token = format!("{}-viewed", dir.path().display());
+    let reaper = tokio::spawn(async move { reaper_tmux.kill_session_verified("viewed", &viewed_token).await });
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(
         !reaper.is_finished(),
@@ -122,6 +129,56 @@ async fn teardown_detaches_a_real_viewer_and_preserves_other_sessions() -> Resul
     let remaining = tmux.list_sessions().await?;
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].name, "survivor");
+    Ok(())
+}
+
+#[tokio::test]
+async fn reap_removes_a_reparented_background_shell_before_returning() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let _home = boss_engine::driver::test_support::home_override(dir.path());
+    let _shell = boss_engine::driver::test_support::shell_override(Path::new("/bin/bash"));
+    let socket = dir.path().join("background.sock");
+    let program = declared_tmux_binary()?;
+    let _guard = TmuxServerGuard::new(program.clone(), socket.clone());
+    let tmux = Tmux::from_path_with_socket(&program, socket)?;
+    tmux.start_private_server().await?;
+    let pid_file = dir.path().join("background.pid");
+    let background = format!(
+        "echo $$ > {}; while :; do sleep 1; done",
+        boss_tmux::quote_for_shell(&pid_file.to_string_lossy())
+    );
+    let launcher = format!(
+        "import subprocess; subprocess.Popen(['/bin/bash', '-c', {}], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)",
+        serde_json::to_string(&background)?
+    );
+    let token = dir.path().to_string_lossy().to_string();
+    tmux.new_session(&boss_tmux::NewSession {
+        name: "background".to_owned(),
+        environment: [("BOSS_SPAWN_TOKEN".to_owned(), token.clone())].into(),
+        working_directory: dir.path().to_path_buf(),
+        command: format!("python3 -c {}", boss_tmux::quote_for_shell(&launcher)),
+    })
+    .await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&pid_file).is_ok_and(|pid| !pid.trim().is_empty())
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if !pid_file.exists() {
+        bail!(
+            "detached shell did not start: {}",
+            tmux.capture_pane_with_history("background").await?
+        );
+    }
+    let pid: i32 = std::fs::read_to_string(&pid_file)?.trim().parse()?;
+    let started = std::time::Instant::now();
+    tmux.kill_session_verified("background", &token).await?;
+    assert!(matches!(
+        boss_engine::dead_pid_sweep::probe_pid(pid),
+        boss_engine::dead_pid_sweep::PidStatus::Dead
+    ));
+    println!("detached tmux cleanup elapsed_ms={}", started.elapsed().as_millis());
     Ok(())
 }
 

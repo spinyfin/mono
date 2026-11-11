@@ -778,7 +778,10 @@ async fn occupied_workspace_is_not_preserved() {
         "an occupied workspace must not be bookmarked: {bookmarks}"
     );
     assert!(db.preserved_tip(&execution.id).unwrap().is_none());
-    assert!(open_kinds(&db, &execution.id).is_empty());
+    assert_eq!(
+        open_kinds(&db, &execution.id),
+        vec![LEASE_UNRELEASED_ATTENTION_KIND.to_owned()]
+    );
 }
 
 #[test]

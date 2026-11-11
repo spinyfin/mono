@@ -40,6 +40,7 @@ boss-github = { path = "../../../github" }
 boss-github-tracker = { path = "../../../github_tracker" }
 boss-transcript-markdown = { path = "../../transcript-markdown" }
 boss-tmux = { path = "../../../tmux" }
+boss-worker-processes = { path = "../../../worker-processes" }
 boss-engine-automation-schedule = { path = "../../automation-schedule" }
 async-trait = { workspace = true }
 bon = { workspace = true }

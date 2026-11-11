@@ -31,8 +31,8 @@ const TMUX_SPAWN_TOKEN_ENV: &str = "BOSS_SPAWN_TOKEN";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TmuxTeardownOutcome {
     /// The session's live token matched (or the session was already gone),
-    /// the process group was signalled when applicable, the session was
-    /// destroyed, and the identity columns were cleared.
+    /// owned processes exited, the session was destroyed, and the identity
+    /// columns were cleared.
     Reaped,
     /// The session's live token did not match the durably-recorded one, or
     /// a `tmux` invocation failed outright. Refused to touch the session;
@@ -171,7 +171,13 @@ impl ServerState {
                         current_command: None,
                     },
                 );
-                return self.finish_tmux_reap(execution_id, identity);
+                return match reap_worker_process_tree(tmux, &identity.spawn_token).await {
+                    Ok(_) => self.finish_tmux_reap(execution_id, identity),
+                    Err(err) => {
+                        tracing::error!(execution_id, %err, "detached worker cleanup failed; retaining identity");
+                        TmuxTeardownOutcome::Refused
+                    }
+                };
             }
             Err(err) => {
                 tracing::warn!(
@@ -222,16 +228,8 @@ impl ServerState {
             &observation,
         );
 
-        // Verified match: safe to signal the recorded pane pid's process
-        // group. Node-based agents commonly ignore the SIGHUP a pty
-        // teardown delivers, so retain the TERM/KILL escalation ladder.
-        if let Some(pane_pid) = identity
-            .pane_pid
-            .and_then(|pid| i32::try_from(pid).ok())
-            .filter(|pid| *pid > 0)
-        {
-            reap_worker_process_tree(pane_pid, Duration::from_secs(5));
-        }
+        // The shared tmux teardown waits for token-owned processes, including
+        // detached children, before clearing identity or releasing the lease.
 
         match tmux
             .kill_session_verified(&identity.session_name, &identity.spawn_token)

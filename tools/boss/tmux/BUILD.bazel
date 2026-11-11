@@ -15,6 +15,7 @@ rust_library(
         "//tools/boss/command-runner",
         "//tools/boss/log-files",
         "//tools/boss/shell-quote",
+        "//tools/boss/worker-processes",
     ] + all_crate_deps(normal = True),
 )
 
@@ -31,6 +32,7 @@ rust_test(
         "//tools/boss/command-runner",
         "//tools/boss/log-files",
         "//tools/boss/shell-quote",
+        "//tools/boss/worker-processes",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,

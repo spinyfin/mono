@@ -20,6 +20,7 @@ use crate::work::WorkDb;
 use boss_execution_contracts::CubeClient;
 
 pub use boss_engine_completion::workspace_lease_release::*;
+use boss_engine_storage_values::attention_kinds::UNOWNED_OCCUPANTS_RELEASED_ATTENTION_KIND;
 
 /// Cadence for the leftover-lease sweep. Fires on boot so leases left by a
 /// previous engine process return to the pool without waiting a day.
@@ -29,6 +30,71 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 pub struct HostOccupancy;
 
 impl WorkspaceOccupancy for HostOccupancy {
+    fn cleanup<'a>(
+        &'a self,
+        db: &'a WorkDb,
+        execution: &'a WorkExecution,
+    ) -> Option<std::pin::Pin<Box<dyn Future<Output = Result<Occupancy>> + Send + 'a>>> {
+        Some(Box::pin(async move {
+            let workspace = execution
+                .workspace_path
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("workspace path missing"))?;
+            let mut result = boss_worker_processes::cleanup("BOSS_RUN_ID", &execution.id, workspace).await?;
+            // Older occupants are eligible only with durable terminal status
+            // and proof that their recorded shell is gone: the PID is absent,
+            // or it now belongs to a process without that run's identity (a
+            // reused PID). Unknown identities and terminal rows whose worker
+            // is still alive are never signalled.
+            for owner in result.owners.keys() {
+                if owner != &execution.id
+                    && let Ok(old) = db.get_execution(owner)
+                    && old.status.is_terminal()
+                    && db
+                        .execution_host_id(owner)
+                        .is_ok_and(|host| host.is_none_or(|host| host == "local"))
+                    && let Ok(Some(pid)) = db.latest_local_shell_pid_for_execution(owner)
+                    && let Ok(pid) = u32::try_from(pid)
+                    && !boss_worker_processes::shell_alive("BOSS_RUN_ID", owner, pid).await?
+                {
+                    boss_worker_processes::cleanup("BOSS_RUN_ID", owner, workspace).await?;
+                }
+            }
+            if !result.owners.is_empty() {
+                result = boss_worker_processes::cleanup("BOSS_RUN_ID", "", workspace).await?;
+            }
+            if result.stray_only() && settled_for(execution, UNOWNED_OCCUPANT_BOUND_SECS) {
+                // Nothing in the registry owns these and they are not safe to
+                // signal. Holding the lease forever strands a 10-20 GiB
+                // workspace, so return it loudly, naming the PIDs.
+                tracing::error!(
+                    execution_id = %execution.id,
+                    occupants = ?result.occupants,
+                    "releasing workspace lease with unowned processes still in it"
+                );
+                raise_attention(
+                    db,
+                    execution,
+                    UNOWNED_OCCUPANTS_RELEASED_ATTENTION_KIND,
+                    "Workspace lease released with unowned processes inside",
+                    &format!(
+                        "Processes {:?} were still running in {workspace} more than {UNOWNED_OCCUPANT_BOUND_SECS} seconds after this run ended. No live run claims them, so the engine did not signal them, and the lease was returned rather than held indefinitely. Inspect them on the engine host and stop them if they are stale.",
+                        result.occupants
+                    ),
+                );
+                return Ok(Occupancy::Empty);
+            }
+            anyhow::ensure!(
+                result.empty(),
+                "workspace occupants {:?} (owners {:?}); unreadable processes {:?}",
+                result.occupants,
+                result.owners,
+                result.unknown
+            );
+            Ok(Occupancy::Empty)
+        }))
+    }
+
     fn occupancy(&self, workspace_path: &Path) -> Occupancy {
         occupancy_of(workspace_path)
     }
@@ -75,13 +141,9 @@ pub async fn release_lease_after_inferred_death_with(
             },
         };
     }
-    let snapshot;
     let occupancy: &dyn WorkspaceOccupancy = match occupancy {
         Some(probe) => probe,
-        None => {
-            snapshot = ProcessSnapshot::capture_async().await;
-            &snapshot
-        }
+        None => &HostOccupancy,
     };
     let plain = DbPreservation::new(work_db, adapter);
     let with_cube = cube.map(|cube| DbPreservation::new(work_db, adapter).with_cube(cube));
@@ -130,33 +192,6 @@ impl ProcessSnapshot {
             snapshot = Self::capture_once();
         }
         snapshot
-    }
-
-    /// [`Self::capture`] for async callers: every enumeration runs on a
-    /// blocking thread and the retry delay yields instead of parking a
-    /// runtime worker.
-    async fn capture_async() -> Self {
-        let mut snapshot = Self::capture_once_blocking().await;
-        for _ in 1..CAPTURE_ATTEMPTS {
-            if snapshot.complete {
-                break;
-            }
-            tokio::time::sleep(CAPTURE_RETRY_DELAY).await;
-            snapshot = Self::capture_once_blocking().await;
-        }
-        snapshot
-    }
-
-    async fn capture_once_blocking() -> Self {
-        tokio::task::spawn_blocking(Self::capture_once)
-            .await
-            .unwrap_or_else(|err| {
-                tracing::warn!(error = %err, "workspace occupancy enumeration task failed");
-                Self {
-                    cwds: Vec::new(),
-                    complete: false,
-                }
-            })
     }
 
     fn capture_once() -> Self {
@@ -240,7 +275,7 @@ fn process_cwds(snapshot: &mut ProcessSnapshot) -> std::io::Result<()> {
     {
         for entry in std::fs::read_dir("/proc")? {
             let entry = entry?;
-            let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else {
+            let Some(pid) = linux_occupancy_pid(&entry.file_name()) else {
                 continue;
             };
             // A zombie or exiting process has no cwd and cannot occupy anything,
@@ -273,6 +308,16 @@ fn process_cwds(snapshot: &mut ProcessSnapshot) -> std::io::Result<()> {
         let _ = snapshot;
         Err(std::io::Error::other("unsupported occupancy probe"))
     }
+}
+
+/// Linux `/proc` names the occupancy enumerator considers. PID 0 and 1 are
+/// never workers: namespace init predates launched processes and can refuse
+/// its cwd to a same-uid scanner, which would otherwise make occupancy
+/// Unknown. Matches the Python scanner's `pid > 1` filter.
+#[cfg(any(target_os = "linux", test))]
+fn linux_occupancy_pid(name: &std::ffi::OsStr) -> Option<u32> {
+    let pid: u32 = name.to_str()?.parse().ok()?;
+    (pid > 1).then_some(pid)
 }
 
 /// `State:` of `/proc/<pid>/status` is a zombie (`Z`) or dead (`X`).
@@ -377,7 +422,7 @@ pub async fn run_one_pass(
     cube_client: &dyn CubeClient,
     live_states: &LiveWorkerStateRegistry,
 ) -> EndedRunLeaseSweepOutcome {
-    run_one_pass_with_occupancy(work_db, cube_client, live_states, ProcessSnapshot::capture_async).await
+    run_one_pass_with_occupancy(work_db, cube_client, live_states, || async { HostOccupancy }).await
 }
 
 async fn run_one_pass_with_occupancy<O: WorkspaceOccupancy, Fut: Future<Output = O>>(
@@ -404,6 +449,21 @@ async fn run_one_pass_with_occupancy<O: WorkspaceOccupancy, Fut: Future<Output =
         // registry is not proof after a restart. Require durable pid death.
         let pane = sweep_pane_status(work_db, live_states, &execution);
         if pane == PaneStatus::Present {
+            if !live_states.snapshot().iter().any(|state| state.run_id == execution.id) {
+                raise_attention(
+                    work_db,
+                    &execution,
+                    LEASE_UNRELEASED_ATTENTION_KIND,
+                    "Terminal worker still holds its workspace",
+                    &format!(
+                        "Lease {lease_id} cannot be preserved safely: recorded shell PID {:?} has no live execution registration and death is unconfirmed. Inspect this PID on the owning host and retry recovery; the workspace has not been reset.",
+                        work_db
+                            .latest_local_shell_pid_for_execution(&execution.id)
+                            .ok()
+                            .flatten()
+                    ),
+                );
+            }
             outcome.held += 1;
             continue;
         }

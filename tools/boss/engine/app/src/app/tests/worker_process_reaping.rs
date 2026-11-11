@@ -1,34 +1,13 @@
-use super::super::process_signals::process_group_signal_target;
 use super::tmux_stub::{fake_tmux, ok};
 use super::*;
-use boss_engine_runtime::test_support::spawn_group_leader_sleeper;
 
-#[test]
-fn process_group_signal_target_negates_pgid_for_live_pid() {
-    // Our own pid is alive and has a valid process group, so the
-    // reaper signals the whole group (negated pgid).
-    let me = std::process::id() as libc::pid_t;
-    let pgid = unsafe { libc::getpgid(me) };
-    assert!(pgid > 0, "own pgid should resolve");
-    assert_eq!(process_group_signal_target(me), -pgid);
-}
-
-#[test]
-fn process_group_signal_target_falls_back_to_bare_pid_when_gone() {
-    // A pid that cannot exist has no process group; `getpgid` fails
-    // and we fall back to signalling the bare pid rather than the
-    // group (negating would otherwise target an unrelated group).
-    let bogus: libc::pid_t = i32::MAX;
-    assert_eq!(process_group_signal_target(bogus), bogus);
-}
-
-#[test]
-fn reap_worker_process_tree_noop_for_unreported_pid() {
-    // `shell_pid <= 0` means the app never reported a pid; the
-    // reaper must early-return (no signal, no `tokio::spawn`, so no
-    // runtime required) rather than signal pid 0 / a negative pid.
-    reap_worker_process_tree(0, Duration::from_secs(5));
-    reap_worker_process_tree(-1, Duration::from_secs(5));
+#[tokio::test]
+async fn reap_worker_process_tree_noop_without_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let tmux =
+        boss_tmux::Tmux::from_path_with_socket(std::env::current_exe().unwrap(), dir.path().join("tmux.sock")).unwrap();
+    // Missing identity must not authorize signalling any process.
+    reap_worker_process_tree(&tmux, "").await.unwrap();
 }
 
 /// **`bossctl` must be able to stop a worker it can see in a pane.**
@@ -273,7 +252,24 @@ async fn release_worker_pane_refuses_to_reap_from_a_pid_outside_the_trust_window
 
 #[tokio::test]
 async fn reap_worker_process_tree_kills_orphan_child() {
-    let mut child = spawn_group_leader_sleeper();
+    use std::io::BufRead;
+    let dir = tempfile::tempdir().unwrap();
+    let token = dir.path().to_string_lossy().to_string();
+    let mut child = std::process::Command::new("python3")
+        .args([
+            "-u",
+            "-c",
+            "import os,time; os.setsid(); print('ready'); time.sleep(60)",
+        ])
+        .env("BOSS_SPAWN_TOKEN", &token)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut ready = String::new();
+    std::io::BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert_eq!(ready.trim(), "ready");
     let pid = child.id() as i32;
     assert!(
         matches!(
@@ -283,13 +279,13 @@ async fn reap_worker_process_tree_kills_orphan_child() {
         "child should be alive before reap",
     );
 
-    // SIGTERM fires synchronously; the SIGKILL escalation is
-    // detached. `sleep` terminates on SIGTERM, so the child dies
-    // either way.
-    reap_worker_process_tree(pid, Duration::from_millis(50));
+    // No tmux subprocess is needed to reap an already-missing pane. This
+    // real handle exercises the shared owning-host cleanup with a detached PID.
+    let tmux =
+        boss_tmux::Tmux::from_path_with_socket(std::env::current_exe().unwrap(), dir.path().join("tmux.sock")).unwrap();
+    reap_worker_process_tree(&tmux, &token).await.unwrap();
 
-    // Block on the child's exit on a blocking thread so the detached
-    // escalation task keeps running on the test runtime.
+    // Cleanup must finish before the caller can preserve the workspace.
     let status = tokio::task::spawn_blocking(move || child.wait())
         .await
         .expect("join wait task")

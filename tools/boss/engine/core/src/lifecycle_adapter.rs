@@ -117,6 +117,27 @@ impl LifecycleServices for CoreLifecycleServices {
         cause: TerminalCause,
         adapter: &dyn HostAdapter,
     ) -> LeaseReleaseOutcome {
+        let remote_occupancy;
+        let occupancy: &dyn crate::workspace_lease_release::WorkspaceOccupancy = if adapter.host_id() == "local" {
+            &crate::workspace_lease_release::HostOccupancy
+        } else {
+            remote_occupancy =
+                crate::workspace_lease_release::OwningHostOccupancy(match execution.workspace_path.as_deref() {
+                    Some(path) => crate::workspace_lease_release::bound_unowned_occupants(
+                        &self.work_db,
+                        execution,
+                        adapter
+                            .cleanup_execution_processes(&execution.id, std::path::Path::new(path))
+                            .await,
+                    )
+                    .unwrap_or_else(|err| {
+                            tracing::error!(execution_id = %execution.id, host_id = adapter.host_id(), error = %err, "remote process cleanup failed before workspace release");
+                            crate::workspace_lease_release::Occupancy::Unknown
+                        }),
+                    None => crate::workspace_lease_release::Occupancy::Unknown,
+                });
+            &remote_occupancy
+        };
         crate::workspace_lease_release::apply_release_choosing(
             &self.work_db,
             execution,
@@ -124,7 +145,7 @@ impl LifecycleServices for CoreLifecycleServices {
             crate::workspace_lease_release::ReleaseEvidence {
                 cause,
                 pane: PaneStatus::Gone,
-                occupancy: &crate::workspace_lease_release::EmptyOccupancy,
+                occupancy,
                 preservation: &crate::workspace_lease_release::DbPreservation::new(&self.work_db, Some(adapter)),
             },
             move |preserved| async move {
@@ -314,12 +335,73 @@ mod tests {
         }
     } }
 
+    struct RemoteCleanup {
+        cleanups: std::sync::Mutex<Vec<String>>,
+        releases: std::sync::Mutex<u32>,
+        fail: bool,
+    }
+    crate::stub_host_adapter! { RemoteCleanup {
+        fn host_id(&self) -> &str { "remote" }
+        async fn release_workspace(&self, _: &str) -> Result<()> {
+            *self.releases.lock().unwrap() += 1;
+            Ok(())
+        }
+        async fn release_workspace_with_reset(&self, _: &str) -> Result<()> {
+            *self.releases.lock().unwrap() += 1;
+            Ok(())
+        }
+        async fn cleanup_execution_processes(&self, execution_id: &str, _: &std::path::Path) -> Result<crate::workspace_lease_release::Occupancy> {
+            self.cleanups.lock().unwrap().push(execution_id.to_owned());
+            if self.fail { anyhow::bail!("host unreachable"); }
+            Ok(crate::workspace_lease_release::Occupancy::Empty)
+        }
+    } }
+
+    #[tokio::test]
+    async fn remote_release_stops_owned_processes_first_and_keeps_the_lease_when_that_fails() {
+        use crate::test_support::{create_test_chore, create_test_product};
+        use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus};
+        for fail in [true, false] {
+            let (dir, db) = open_db_arc();
+            let product = create_test_product(&db);
+            let chore = create_test_chore(&db, product.id, "Remote release");
+            let execution = db
+                .create_execution(
+                    CreateExecutionInput::builder()
+                        .work_item_id(chore.id)
+                        .kind(ExecutionKind::ChoreImplementation)
+                        .status(ExecutionStatus::Completed)
+                        .cube_lease_id("lease")
+                        .workspace_path(dir.path().join("workspace").to_string_lossy())
+                        .build(),
+                )
+                .unwrap();
+            let adapter = RemoteCleanup {
+                cleanups: Default::default(),
+                releases: Default::default(),
+                fail,
+            };
+            let result = CoreLifecycleServices::new(db.clone())
+                .apply_proven_workspace_release(&execution, "lease", TerminalCause::ProvenCompleted, &adapter)
+                .await;
+            assert_eq!(*adapter.cleanups.lock().unwrap(), [execution.id.clone()]);
+            if fail {
+                assert!(matches!(result, LeaseReleaseOutcome::Kept { .. }), "{result:?}");
+                assert_eq!(*adapter.releases.lock().unwrap(), 0);
+                assert!(db.get_execution(&execution.id).unwrap().cube_lease_id.is_some());
+            } else {
+                assert_eq!(result, LeaseReleaseOutcome::Released);
+                assert_eq!(*adapter.releases.lock().unwrap(), 1);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn proven_release_forces_reset_only_after_preservation_succeeds() {
         use crate::test_support::{create_test_chore, create_test_product};
         use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus};
         for preserved in [false, true] {
-            let (_dir, db) = open_db_arc();
+            let (dir, db) = open_db_arc();
             let product = create_test_product(&db);
             let chore = create_test_chore(&db, product.id, "Proven release");
             let execution = db
@@ -329,11 +411,12 @@ mod tests {
                         .kind(ExecutionKind::ChoreImplementation)
                         .status(ExecutionStatus::Completed)
                         .cube_lease_id("lease")
+                        .workspace_path(dir.path().join("workspace").to_string_lossy())
                         .build(),
                 )
                 .unwrap();
             if !preserved {
-                // A positioned execution without a workspace path cannot be preserved.
+                // A positioned execution with an unavailable store cannot be preserved.
                 db.record_execution_bookmark(&boss_engine_recovery::execution_bookmark::ExecutionBookmark {
                     execution_id: execution.id.clone(),
                     repo_path: "/tmp/unavailable".into(),

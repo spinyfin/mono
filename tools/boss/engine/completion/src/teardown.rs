@@ -103,15 +103,29 @@ impl WorkerCompletionHandler {
             .ok()
     }
 
-    /// True when `execution_id` is not a remote run, or its remote worker
-    /// process is provably gone (`kill -0` on the owning host reports no such
-    /// process). A terminal status is NOT that proof: a cancelled remote
-    /// worker keeps running, and `HostAdapter` has no stop capability. A
-    /// missing pid, an unreachable host, or an unavailable adapter is
-    /// inconclusive and returns `false`, preserving the lease and live state
-    /// until `remote_lease_reconcile` sees positive death. That
-    /// reconciler separately bounds terminal persona retention.
-    pub async fn remote_worker_proven_gone(&self, execution_id: &str) -> bool {
+    /// Raise durable, actionable evidence that a remote worker's lease is being
+    /// kept, so a recovery successor is not held on a silent failure. The
+    /// workspace stays protected; the item is lowered when the lease returns.
+    fn keep_remote_lease(&self, execution_id: &str, host_id: Option<&str>, reason: &str) {
+        if let Ok(execution) = self.work_db.get_execution(execution_id) {
+            crate::workspace_lease_release::raise_attention(
+                &self.work_db,
+                &execution,
+                crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND,
+                "Remote worker could not be confirmed gone",
+                &format!(
+                    "Host {}: {reason}. The workspace lease stays held. Restore connectivity or inspect the worker on that host, then retry recovery.",
+                    host_id.unwrap_or("(unrecorded)")
+                ),
+            );
+        }
+    }
+
+    /// Stop owned remote processes during teardown, then confirm the recorded
+    /// worker is gone before releasing its slot or inputs. Missing identity,
+    /// an unreachable host, or failed cleanup retains the lease for recovery
+    /// and raises an attention item saying why.
+    pub async fn stop_and_confirm_remote_worker_gone(&self, execution_id: &str) -> bool {
         let handle = match self.work_db.latest_remote_run_for_execution(execution_id) {
             Ok(None) => return true,
             Ok(Some(handle)) => handle,
@@ -124,7 +138,9 @@ impl WorkerCompletionHandler {
                 return false;
             }
         };
+        let host = Some(handle.host_id.as_str());
         let Some(remote_pid) = handle.remote_pid else {
+            self.keep_remote_lease(execution_id, host, "the worker's process id was never recorded");
             return false;
         };
         let provider = self
@@ -133,20 +149,35 @@ impl WorkerCompletionHandler {
             .expect("host adapter provider lock poisoned")
             .clone();
         let Some(provider) = provider else {
+            self.keep_remote_lease(execution_id, host, "no host adapter is available");
             return false;
         };
-        let Ok(adapter) =
-            crate::remote_host::resolve_host_adapter(&self.work_db, provider.as_ref(), &handle.host_id).await
-        else {
+        let adapter =
+            match crate::remote_host::resolve_host_adapter(&self.work_db, provider.as_ref(), &handle.host_id).await {
+                Ok(adapter) => adapter,
+                Err(error) => {
+                    self.keep_remote_lease(execution_id, host, &format!("host unreachable: {error:#}"));
+                    return false;
+                }
+            };
+        if let Ok(execution) = self.work_db.get_execution(execution_id)
+            && let Some(workspace) = execution.workspace_path.as_deref()
+            && let Err(error) = adapter
+                .cleanup_execution_processes(execution_id, Path::new(workspace))
+                .await
+        {
+            self.keep_remote_lease(execution_id, host, &format!("process cleanup failed: {error:#}"));
             return false;
-        };
+        }
         if !matches!(adapter.probe_remote_worker_alive(remote_pid).await, Ok(Some(false))) {
+            self.keep_remote_lease(execution_id, host, "the worker's liveness could not be confirmed");
             return false;
         }
         if let Err(error) =
             crate::remote_host::cleanup_execution_inputs(&self.work_db, adapter.as_ref(), execution_id).await
         {
             tracing::warn!(?error, "remote input cleanup failed; retaining lease for retry");
+            self.keep_remote_lease(execution_id, host, &format!("input cleanup failed: {error:#}"));
             return false;
         }
         true
@@ -259,9 +290,8 @@ impl WorkerCompletionHandler {
             match self.work_db.get_execution(execution_id) {
                 Ok(execution) => {
                     let outcome = if let Some(cube) = remote {
-                        // A remote worker cannot be stopped from here, so a
-                        // finished turn is not proof its workspace is idle:
-                        // gate on the owning host's occupancy and recovery.
+                        // A finished turn is not proof the workspace is idle:
+                        // confirm owning-host cleanup before preserving and releasing.
                         match remote_host {
                             Some(host) => {
                                 crate::workspace_lease_release::release_remote_lease(
@@ -297,7 +327,7 @@ impl WorkerCompletionHandler {
                             crate::workspace_lease_release::ReleaseEvidence {
                                 cause: crate::workspace_lease_release::TerminalCause::ProvenCompleted,
                                 pane: pane_status,
-                                occupancy: &crate::workspace_lease_release::EmptyOccupancy,
+                                occupancy: self.collaborators.workspace_occupancy.as_ref(),
                                 preservation: &crate::workspace_lease_release::DbPreservation::new(&self.work_db, None),
                             },
                             timed,

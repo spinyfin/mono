@@ -297,6 +297,10 @@ pub const LEASE_UNRELEASED_ATTENTION_KIND: &str = "workspace_lease_unreleased";
 /// is what lets the leftover-lease sweep retry a row that recorded no pid.
 pub const LEASE_RELEASE_FAILED_ATTENTION_KIND: &str = "workspace_lease_release_failed";
 
+/// Attention kind filed when a lease is released although processes owned by
+/// no live run were still running in the workspace after the bounded wait.
+pub const UNOWNED_OCCUPANTS_RELEASED_ATTENTION_KIND: &str = "workspace_unowned_occupants_released";
+
 /// `work_attention_items.kind` filed once a candidate's auto-create attempts
 /// have failed `ESCALATE_AFTER_CONSECUTIVE_FAILURES` times in a row.
 pub const ATTENTION_KIND_ABANDONED_BRANCH_NO_PR: &str = "abandoned_branch_no_pr";

@@ -456,6 +456,24 @@ async fn reap_dead_remote_execution(
     true
 }
 
+/// Durable evidence that a terminal remote run's lease is being kept, so a
+/// recovery successor fails with a reason once its bounded wait ends instead of
+/// holding forever. Lowered by the release path when the lease returns.
+fn keep_terminal_remote_lease(work_db: &WorkDb, handle: &RemoteRunHandle, reason: &str) {
+    if let Ok(execution) = work_db.get_execution(&handle.execution_id) {
+        crate::workspace_lease_release::raise_attention(
+            work_db,
+            &execution,
+            crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND,
+            "Remote worker could not be confirmed gone",
+            &format!(
+                "Host {}: {reason}. The workspace lease stays held until the worker is proven gone or cube's TTL returns it. Restore connectivity or inspect the worker on that host.",
+                handle.host_id
+            ),
+        );
+    }
+}
+
 /// Release a terminal remote execution's persona, live state and cube lease
 /// once its worker process is provably gone. An inconclusive probe
 /// (unreachable host, `Ok(None)`) leaves the slot and lease held for a later
@@ -476,6 +494,7 @@ async fn release_terminal_remote_resources(
         // (the cube lease does), so free its roster name rather than
         // leaking it permanently; the cube TTL reclaims the lease.
         release_persona_only(work_db, pane_releaser, &handle.execution_id).await;
+        keep_terminal_remote_lease(work_db, handle, "the worker's process id was never recorded");
         return;
     };
     // Persona names have no TTL. Bound their retention independently of the
@@ -500,10 +519,15 @@ async fn release_terminal_remote_resources(
     if expired || matches!(work_db.get_host(&handle.host_id), Ok(None)) {
         release_persona_only(work_db, pane_releaser, &handle.execution_id).await;
     }
-    let Ok(adapter) = crate::host_adapter::resolve_host_adapter(work_db, provider, &handle.host_id).await else {
-        return;
+    let adapter = match crate::host_adapter::resolve_host_adapter(work_db, provider, &handle.host_id).await {
+        Ok(adapter) => adapter,
+        Err(error) => {
+            keep_terminal_remote_lease(work_db, handle, &format!("host unreachable: {error:#}"));
+            return;
+        }
     };
     if !matches!(adapter.probe_remote_worker_alive(remote_pid).await, Ok(Some(false))) {
+        keep_terminal_remote_lease(work_db, handle, "the worker's liveness could not be confirmed");
         return;
     }
     release_dead_remote_slot_and_persona(work_db, pane_releaser, &handle.execution_id).await;

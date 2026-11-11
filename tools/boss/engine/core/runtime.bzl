@@ -188,6 +188,7 @@ def runtime_libraries():
             "//tools/boss/protocol",
             "//tools/boss/protocol-spoke",
             "//tools/boss/tmux",
+            "//tools/boss/worker-processes",
         ] + all_crate_deps(package_name = "tools/boss/engine/core/runtime", normal = True),
     )
     rust_library(name = "runtime", **attrs)

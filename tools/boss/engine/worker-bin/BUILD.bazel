@@ -17,7 +17,7 @@ rust_library(
         "//tools/boss/engine/execution-runner:__pkg__",
         "//tools/boss/engine/observation-contracts:__pkg__",
     ],
-    deps = all_crate_deps(normal = True),
+    deps = ["//tools/boss/worker-processes"] + all_crate_deps(normal = True),
 )
 
 rust_test(
@@ -33,7 +33,7 @@ rust_test(
         proc_macro = True,
         proc_macro_dev = True,
     ),
-    deps = all_crate_deps(
+    deps = ["//tools/boss/worker-processes"] + all_crate_deps(
         normal = True,
         normal_dev = True,
     ),

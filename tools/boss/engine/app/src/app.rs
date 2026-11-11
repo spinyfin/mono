@@ -2175,7 +2175,12 @@ impl ServerState {
                 .is_some_and(|host| host != "local")
             && matches!(self.work_db.tmux_identity_for_execution(run_id), Ok(None))
         {
-            if !remote_proven_dead && !self.completion_handler.remote_worker_proven_gone(run_id).await {
+            if !remote_proven_dead
+                && !self
+                    .completion_handler
+                    .stop_and_confirm_remote_worker_gone(run_id)
+                    .await
+            {
                 return PaneReleaseOutcome::NoLiveWorker;
             }
             self.worker_registry.take_slot_for_run(run_id);

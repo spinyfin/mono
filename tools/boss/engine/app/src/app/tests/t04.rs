@@ -1540,17 +1540,20 @@ fn stamp_newest_run_tmux_identity(server: &ServerState, execution_id: &str, slot
                  ORDER BY created_at DESC, id DESC
                  LIMIT 1
              )",
-            rusqlite::params![boss_tmux::SERVER_LABEL, session, token, pane_pid, execution_id],
+            rusqlite::params![boss_tmux::TEST_SOCKET_PATH, session, token, pane_pid, execution_id],
         )
         .unwrap();
     let env = format!("BOSS_SPAWN_TOKEN={token}\n");
-    let (tmux, _) = super::tmux_stub::fake_tmux([
+    let (tmux, runner) = super::tmux_stub::fake_tmux([
         super::tmux_stub::ok(&env),
         super::tmux_stub::ok("0"),
         super::tmux_stub::ok(&env),
         super::tmux_stub::ok(""),
         super::tmux_stub::ok(""),
     ]);
+    if pane_pid > 1 && unsafe { libc::getpgid(pane_pid as i32) } > 0 {
+        runner.own_process(pane_pid, &token);
+    }
     server.set_tmux_override_for_test(tmux);
     corroborate_slot_tmux_adopted(server, execution_id, slot_id);
 }

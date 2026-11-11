@@ -43,6 +43,10 @@ impl boss_execution_contracts::HostAdapterProvider for Provider {
 }
 
 fn remote_fixture() -> (TempDir, Arc<WorkDb>, String) {
+    remote_fixture_with_pid(Some(4242))
+}
+
+fn remote_fixture_with_pid(pid: Option<i64>) -> (TempDir, Arc<WorkDb>, String) {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     db.add_host("remote", "user@remote", 4, &[]).unwrap();
@@ -60,7 +64,9 @@ fn remote_fixture() -> (TempDir, Arc<WorkDb>, String) {
     )
     .unwrap();
     crate::test_support::record_remote_test_recovery(&db, &execution.id, "remote");
-    db.set_run_remote_pid_for_execution(&execution.id, 4242).unwrap();
+    if let Some(pid) = pid {
+        db.set_run_remote_pid_for_execution(&execution.id, pid).unwrap();
+    }
     db.cancel_running_execution(&execution.id).unwrap();
     (dir, db, execution.id)
 }
@@ -251,4 +257,153 @@ async fn completion_teardown_holds_a_remote_lease_while_the_workspace_is_occupie
             "{occupancy:?}"
         );
     }
+}
+
+/// Reports a fixed cleanup result and a dead worker.
+struct CleaningAdapter {
+    cleanups: std::sync::Mutex<Vec<String>>,
+    cleanup_error: Option<&'static str>,
+    alive: Option<bool>,
+}
+
+crate::stub_host_adapter! { CleaningAdapter {
+    fn host_id(&self) -> &str { "remote" }
+    async fn probe_remote_worker_alive(&self, _remote_pid: i64) -> Result<Option<bool>> {
+        Ok(self.alive)
+    }
+    async fn cleanup_execution_processes(&self, execution_id: &str, _: &std::path::Path) -> Result<crate::workspace_lease_release::Occupancy> {
+        self.cleanups.lock().unwrap().push(execution_id.to_owned());
+        match self.cleanup_error {
+            Some(error) => anyhow::bail!(error),
+            None => Ok(crate::workspace_lease_release::Occupancy::Empty),
+        }
+    }
+} }
+
+struct CleaningProvider(Arc<CleaningAdapter>);
+
+#[async_trait]
+impl boss_execution_contracts::HostAdapterProvider for CleaningProvider {
+    async fn adapter_for(
+        &self,
+        _: &boss_engine_storage_values::Host,
+    ) -> Result<Arc<dyn boss_execution_contracts::HostAdapter>> {
+        Ok(self.0.clone())
+    }
+}
+
+fn lease_attention(db: &WorkDb, id: &str) -> Vec<String> {
+    db.list_attention_items(id)
+        .unwrap()
+        .into_iter()
+        .filter(|item| {
+            item.status == "open" && item.kind == crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND
+        })
+        .map(|item| item.body_markdown)
+        .collect()
+}
+
+#[tokio::test]
+async fn remote_worker_is_stopped_then_proven_gone() {
+    let (_dir, db, id) = remote_fixture();
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let adapter = Arc::new(CleaningAdapter {
+        cleanups: Default::default(),
+        cleanup_error: None,
+        alive: Some(false),
+    });
+    handler.set_host_adapter_provider(Arc::new(CleaningProvider(adapter.clone())));
+    assert!(handler.stop_and_confirm_remote_worker_gone(&id).await);
+    assert_eq!(*adapter.cleanups.lock().unwrap(), [id.clone()]);
+    assert!(lease_attention(&db, &id).is_empty());
+}
+
+#[tokio::test]
+async fn remote_cleanup_failure_keeps_the_lease_and_raises_attention() {
+    let (_dir, db, id) = remote_fixture();
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let adapter = Arc::new(CleaningAdapter {
+        cleanups: Default::default(),
+        cleanup_error: Some("ssh timed out"),
+        alive: Some(false),
+    });
+    handler.set_host_adapter_provider(Arc::new(CleaningProvider(adapter)));
+    assert!(!handler.stop_and_confirm_remote_worker_gone(&id).await);
+    let attention = lease_attention(&db, &id);
+    assert_eq!(attention.len(), 1);
+    assert!(attention[0].contains("ssh timed out"), "{attention:?}");
+}
+
+#[tokio::test]
+async fn inconclusive_remote_liveness_keeps_the_lease_and_raises_attention() {
+    let (_dir, db, id) = remote_fixture();
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let adapter = Arc::new(CleaningAdapter {
+        cleanups: Default::default(),
+        cleanup_error: None,
+        alive: None,
+    });
+    handler.set_host_adapter_provider(Arc::new(CleaningProvider(adapter)));
+    assert!(!handler.stop_and_confirm_remote_worker_gone(&id).await);
+    assert!(lease_attention(&db, &id)[0].contains("liveness could not be confirmed"));
+}
+
+#[tokio::test]
+async fn remote_run_without_a_recorded_pid_keeps_the_lease_and_raises_attention() {
+    let (_dir, db, id) = remote_fixture_with_pid(None);
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let adapter = Arc::new(CleaningAdapter {
+        cleanups: Default::default(),
+        cleanup_error: None,
+        alive: Some(false),
+    });
+    handler.set_host_adapter_provider(Arc::new(CleaningProvider(adapter.clone())));
+    assert!(!handler.stop_and_confirm_remote_worker_gone(&id).await);
+    assert!(adapter.cleanups.lock().unwrap().is_empty());
+    assert!(lease_attention(&db, &id)[0].contains("process id was never recorded"));
+}
+
+#[test]
+fn unowned_remote_occupants_are_released_only_after_the_bound_and_owned_ones_never() {
+    use crate::workspace_lease_release::{Occupancy, UNOWNED_OCCUPANT_BOUND_SECS, bound_unowned_occupants};
+    let (_dir, db, id) = remote_fixture();
+    let set_finished_ago = |secs: i64| {
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET finished_at = ?2 WHERE id = ?1",
+                rusqlite::params![id, (boss_engine_utils::epoch_time::now_epoch_secs() - secs).to_string()],
+            )
+            .unwrap();
+        db.get_execution(&id).unwrap()
+    };
+    let unowned =
+        || -> Result<Occupancy> { Err(boss_execution_contracts::UnownedOccupants { occupants: vec![7] }.into()) };
+
+    let fresh = set_finished_ago(5);
+    assert!(
+        bound_unowned_occupants(&db, &fresh, unowned()).is_err(),
+        "inside the bound"
+    );
+
+    let settled = set_finished_ago(UNOWNED_OCCUPANT_BOUND_SECS + 5);
+    assert_eq!(
+        bound_unowned_occupants(&db, &settled, unowned()).unwrap(),
+        Occupancy::Empty
+    );
+    assert!(
+        db.list_attention_items(&id)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind
+                == boss_engine_storage_values::attention_kinds::UNOWNED_OCCUPANTS_RELEASED_ATTENTION_KIND),
+        "the release is loud"
+    );
+    let owned: Result<Occupancy> = Err(anyhow::anyhow!(
+        "workspace occupants [7] (owners {{\"exec_live\": [7]}})"
+    ));
+    assert!(
+        bound_unowned_occupants(&db, &settled, owned).is_err(),
+        "owned occupants keep the lease"
+    );
 }

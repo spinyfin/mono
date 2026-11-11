@@ -653,6 +653,7 @@ dependencies = [
  "boss-trunk-auth",
  "boss-trunk-client",
  "boss-work-db",
+ "boss-worker-processes",
  "chrono",
  "fs4",
  "libc",
@@ -1135,6 +1136,7 @@ dependencies = [
  "boss-transcript-markdown",
  "boss-transcript-tail",
  "boss-work-db",
+ "boss-worker-processes",
  "chrono",
  "clap",
  "git-utils",
@@ -1235,6 +1237,7 @@ dependencies = [
 name = "boss-engine-worker-bin"
 version = "0.1.0"
 dependencies = [
+ "boss-worker-processes",
  "serde",
  "tempfile",
  "toml",
@@ -1863,6 +1866,7 @@ dependencies = [
  "boss-command-runner",
  "boss-log-files",
  "boss-shell-quote",
+ "boss-worker-processes",
  "tokio",
  "which",
 ]
@@ -1961,6 +1965,18 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "boss-worker-processes"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bon",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

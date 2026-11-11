@@ -21,7 +21,12 @@ use crate::{attentions_detector, design_detector, review_guide_validation};
 /// The collaborators a production completion handler is built with.
 pub fn completion_collaborators() -> CompletionCollaborators {
     let detection = Arc::new(CoreDocDetection);
-    CompletionCollaborators::new(detection.clone(), detection, Arc::new(CoreReviewGuideValidation))
+    CompletionCollaborators::new(
+        detection.clone(),
+        detection,
+        Arc::new(CoreReviewGuideValidation),
+        Arc::new(crate::workspace_lease_release::HostOccupancy),
+    )
 }
 
 /// Design-doc pointer maintenance and attention extraction, delegated to the

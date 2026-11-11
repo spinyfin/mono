@@ -308,6 +308,80 @@ async fn resume_preserves_the_stalled_runs_work_and_returns_its_lease_before_the
 }
 
 #[tokio::test]
+async fn orphan_cleanup_preserves_work_and_unblocks_the_successor() {
+    use std::io::BufRead;
+    let s = Stalled::new(true).await;
+    s.db().mark_execution_orphaned(&s.stalled_id, "worker gone").unwrap();
+    let successor = s
+        .db()
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(s.stalled().work_item_id)
+                .build(),
+        )
+        .unwrap();
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Child(
+        std::process::Command::new("python3")
+            .args([
+                "-u",
+                "-c",
+                "import os,time; os.setsid(); print('ready'); time.sleep(600)",
+            ])
+            .env("BOSS_RUN_ID", &s.stalled_id)
+            .current_dir(&s.repo.worker)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut ready = String::new();
+    std::io::BufReader::new(child.0.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert_eq!(ready.trim(), "ready");
+    assert!(s.db().recovery_predecessor_holding_lease(&successor).unwrap().is_some());
+    let started = std::time::Instant::now();
+    let result = apply_release(
+        s.db(),
+        &s.stalled(),
+        "lease-old",
+        ReleaseEvidence {
+            cause: TerminalCause::Inferred,
+            pane: PaneStatus::Gone,
+            occupancy: &crate::workspace_lease_release::HostOccupancy,
+            preservation: &DbPreservation::new(s.db(), None).with_cube(s.cube.as_ref()),
+        },
+        s.cube.force_release_lease("lease-old", Some("orphan cleanup")),
+    )
+    .await;
+    println!(
+        "orphan cleanup and preservation elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
+    assert_eq!(
+        result,
+        LeaseReleaseOutcome::Released,
+        "{:?}",
+        s.db().list_attention_items(&s.stalled_id).unwrap()
+    );
+    assert!(child.0.try_wait().unwrap().is_some());
+    assert!(s.db().preserved_tip(&s.stalled_id).unwrap().is_some());
+    assert!(s.db().recovery_predecessor_holding_lease(&successor).unwrap().is_none());
+    s.coordinator.drain_ready_queue_for_test().await;
+    wait_for_execution_status(s.db(), &successor.id, ExecutionStatus::Running).await;
+    assert_eq!(
+        std::fs::read_to_string(s.repo.replacement.join("fix")).unwrap(),
+        "unpublished fix"
+    );
+}
+
+#[tokio::test]
 async fn successor_is_held_until_a_later_sweep_releases_the_lease_then_restores_the_work() {
     let s = Stalled::new(true).await;
 
@@ -426,7 +500,7 @@ async fn failed_preservation_raises_an_attention_item_carrying_the_error_before_
 }
 
 #[tokio::test]
-async fn inline_reconcile_keeps_successor_held_until_preservation_finishes() {
+async fn inline_reconcile_fails_loudly_when_preservation_cannot_proceed_then_allows_retry() {
     let s = Stalled::new(true).await;
     // A missing recorded path makes occupancy unconfirmable. The durable
     // start time and absent pane pid still prove the pane never attached.
@@ -470,9 +544,58 @@ async fn inline_reconcile_keeps_successor_held_until_preservation_finishes() {
     assert!(s.stalled().status.is_terminal());
     assert_eq!(s.stalled().cube_lease_id.as_deref(), Some("lease-old"));
     assert!(s.db().preserved_tip(&s.stalled_id).unwrap().is_none());
+    // The kept lease raised an attention item, but one fresh item is not
+    // proof the problem is permanent: the sweeps retry, so the row only waits.
+    assert!(
+        s.db()
+            .list_attention_items(&s.stalled_id)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == boss_engine_storage_values::attention_kinds::LEASE_UNRELEASED_ATTENTION_KIND)
+    );
     assert_eq!(s.db().get_execution(&next.id).unwrap().status, ExecutionStatus::Ready);
     assert_eq!(s.wait_reason(&next.id).as_deref(), Some(HOLD_REASON));
     assert!(s.cube.lease_calls.lock().await.is_empty());
+
+    // Once the predecessor has stayed unreleased past the bound the successor
+    // fails loudly, naming the predecessor's recorded cleanup problem.
+    age_predecessor(&s);
+    let err = s
+        .coordinator
+        .force_dispatch(&next.id, DispatchAdmission::OperatorForced)
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("Recovery cannot start"), "{err:#}");
+    assert_eq!(s.db().get_execution(&next.id).unwrap().status, ExecutionStatus::Failed);
+    assert_eq!(
+        s.wait_reason(&next.id),
+        None,
+        "a successor that waited and then failed through force-dispatch keeps no wait reason"
+    );
+    let next = s
+        .db()
+        .create_execution(
+            boss_protocol::CreateExecutionInput::builder()
+                .work_item_id(s.stalled().work_item_id)
+                .kind(s.stalled().kind)
+                .status(ExecutionStatus::Ready)
+                .repo_remote_url(s.stalled().repo_remote_url)
+                .build(),
+        )
+        .unwrap();
+    // A successor created after the problem was already old has not yet had
+    // the sweeps' full bound under its own clock: it waits before it can fail.
+    s.coordinator.drain_ready_queue_for_test().await;
+    assert_eq!(s.db().get_execution(&next.id).unwrap().status, ExecutionStatus::Ready);
+    assert_eq!(s.wait_reason(&next.id).as_deref(), Some(HOLD_REASON));
+    age_waits(&s);
+    s.coordinator.drain_ready_queue_for_test().await;
+    assert_eq!(s.db().get_execution(&next.id).unwrap().status, ExecutionStatus::Failed);
+    assert_eq!(
+        s.wait_reason(&next.id),
+        None,
+        "a row that waited and then failed through the scheduler keeps no wait reason"
+    );
 
     s.db()
         .connect()
@@ -483,12 +606,209 @@ async fn inline_reconcile_keeps_successor_held_until_preservation_finishes() {
         )
         .unwrap();
     assert_eq!(s.release_like_a_later_sweep().await, LeaseReleaseOutcome::Released);
+    let next = s
+        .db()
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(s.stalled().work_item_id)
+                .build(),
+        )
+        .unwrap();
     s.coordinator.drain_ready_queue_for_test().await;
     wait_for_execution_status(s.db(), &next.id, ExecutionStatus::Running).await;
     assert_eq!(
         std::fs::read_to_string(s.repo.replacement.join("fix")).unwrap(),
         "unpublished fix"
     );
+}
+
+/// Make the stalled predecessor look like it ended an hour ago, and any
+/// kept-lease attention item look like it was filed then.
+fn age_predecessor(s: &Stalled) {
+    let hour_ago = (boss_engine_utils::epoch_time::now_epoch_secs() - 3600).to_string();
+    {
+        let conn = s.db().connect().unwrap();
+        conn.execute(
+            "UPDATE work_executions SET finished_at = ?2 WHERE id = ?1",
+            rusqlite::params![s.stalled_id, hour_ago],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE work_attention_items SET created_at = ?2 WHERE execution_id = ?1",
+            rusqlite::params![s.stalled_id, hour_ago],
+        )
+        .unwrap();
+    }
+    age_waits(s);
+}
+
+/// Make every successor's hold look like it began an hour ago.
+fn age_waits(s: &Stalled) {
+    let hour_ago = (boss_engine_utils::epoch_time::now_epoch_secs() - 3600).to_string();
+    s.db()
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET dispatch_wait_since = ?1 WHERE dispatch_wait_reason IS NOT NULL",
+            [&hour_ago],
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn terminal_remote_predecessor_with_no_cleanup_item_fails_the_successor_after_the_bound() {
+    // A remote predecessor that was never probed leaves no attention item; the
+    // gate itself must still end the wait. A local one with no item has simply
+    // not been swept yet and keeps waiting however long ago it ended.
+    let s = Stalled::new(true).await;
+    s.db().mark_execution_orphaned(&s.stalled_id, "worker gone").unwrap();
+    let successor = s
+        .db()
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(s.stalled().work_item_id)
+                .build(),
+        )
+        .unwrap();
+    age_predecessor(&s);
+    s.coordinator.drain_ready_queue_for_test().await;
+    assert_eq!(
+        s.db().get_execution(&successor.id).unwrap().status,
+        ExecutionStatus::Ready,
+        "an unswept local predecessor is waited for"
+    );
+    assert_eq!(s.wait_reason(&successor.id).as_deref(), Some(HOLD_REASON));
+
+    s.db().add_host("remote", "user@remote", 4, &[]).unwrap();
+    s.db()
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET host_id = 'remote' WHERE execution_id = ?1",
+            [&s.stalled_id],
+        )
+        .unwrap();
+    // The remote evidence is old, but this successor's own hold only just began.
+    s.coordinator.drain_ready_queue_for_test().await;
+    assert_eq!(
+        s.db().get_execution(&successor.id).unwrap().status,
+        ExecutionStatus::Ready
+    );
+
+    // A freshly filed release failure is still being retried: it keeps the
+    // successor waiting however old the remote evidence and its hold are.
+    age_waits(&s);
+    crate::workspace_lease_release::raise_attention(
+        s.db(),
+        &s.stalled(),
+        boss_engine_storage_values::attention_kinds::LEASE_RELEASE_FAILED_ATTENTION_KIND,
+        "Workspace lease release failed",
+        "remote unavailable",
+    );
+    s.coordinator.drain_ready_queue_for_test().await;
+    assert_eq!(
+        s.db().get_execution(&successor.id).unwrap().status,
+        ExecutionStatus::Ready,
+        "a freshly filed release failure keeps the successor waiting"
+    );
+    s.db()
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_attention_items SET status = 'resolved' WHERE execution_id = ?1",
+            [&s.stalled_id],
+        )
+        .unwrap();
+
+    s.coordinator.drain_ready_queue_for_test().await;
+    assert_eq!(
+        s.db().get_execution(&successor.id).unwrap().status,
+        ExecutionStatus::Failed
+    );
+    assert_eq!(s.wait_reason(&successor.id), None);
+}
+
+#[tokio::test]
+async fn local_predecessor_cube_release_failure_fails_the_successor_after_the_bound() {
+    let s = Stalled::new(true).await;
+    s.db().mark_execution_orphaned(&s.stalled_id, "worker gone").unwrap();
+    let successor = s
+        .db()
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(s.stalled().work_item_id)
+                .build(),
+        )
+        .unwrap();
+
+    assert!(
+        matches!(fail_cube_release(&s).await, LeaseReleaseOutcome::CubeFailed { .. }),
+        "{:?}",
+        s.db().list_attention_items(&s.stalled_id).unwrap()
+    );
+    assert_eq!(s.stalled().cube_lease_id.as_deref(), Some("lease-old"));
+    assert!(s.db().preserved_tip(&s.stalled_id).unwrap().is_some());
+    assert!(s.db().list_attention_items(&s.stalled_id).unwrap().iter().any(|item| {
+        item.kind == boss_engine_storage_values::attention_kinds::LEASE_RELEASE_FAILED_ATTENTION_KIND
+            && item.status == "open"
+    }));
+
+    s.coordinator.drain_ready_queue_for_test().await;
+    assert_eq!(
+        s.db().get_execution(&successor.id).unwrap().status,
+        ExecutionStatus::Ready
+    );
+    assert_eq!(s.wait_reason(&successor.id).as_deref(), Some(HOLD_REASON));
+
+    // The leftover-lease sweep keeps retrying cube while the successor waits.
+    assert!(matches!(
+        fail_cube_release(&s).await,
+        LeaseReleaseOutcome::CubeFailed { .. }
+    ));
+    s.coordinator.drain_ready_queue_for_test().await;
+    assert_eq!(
+        s.db().get_execution(&successor.id).unwrap().status,
+        ExecutionStatus::Ready,
+        "a fresh cube-release failure is retried, not a successor failure"
+    );
+
+    age_predecessor(&s);
+    let err = s
+        .coordinator
+        .force_dispatch(&successor.id, DispatchAdmission::OperatorForced)
+        .await
+        .unwrap_err();
+    let err = format!("{err:#}");
+    assert!(err.contains("Recovery cannot start"), "{err}");
+    assert!(err.contains("cube workspace release failed"), "{err}");
+    assert_eq!(
+        s.db().get_execution(&successor.id).unwrap().status,
+        ExecutionStatus::Failed
+    );
+    assert_eq!(s.wait_reason(&successor.id), None);
+    assert_eq!(s.stalled().cube_lease_id.as_deref(), Some("lease-old"));
+    assert!(
+        matches!(fail_cube_release(&s).await, LeaseReleaseOutcome::CubeFailed { .. }),
+        "sweeps keep retrying cube after the successor has failed"
+    );
+}
+
+async fn fail_cube_release(s: &Stalled) -> LeaseReleaseOutcome {
+    let stalled = s.stalled();
+    let preservation = DbPreservation::new(s.db(), None).with_cube(s.cube.as_ref());
+    apply_release(
+        s.db(),
+        &stalled,
+        "lease-old",
+        ReleaseEvidence {
+            cause: TerminalCause::Inferred,
+            pane: PaneStatus::Gone,
+            occupancy: &EmptyOccupancy,
+            preservation: &preservation,
+        },
+        async { Err(anyhow::anyhow!("cube workspace release failed")) },
+    )
+    .await
 }
 
 /// Every run in these tests is local, so no host adapter is ever requested.

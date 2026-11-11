@@ -667,6 +667,94 @@ async fn a_stop_that_settled_uncertain_is_asked_again() {
 }
 
 #[tokio::test]
+async fn process_cleanup_on_a_spoke_succeeds_only_when_the_host_confirms_the_stop() {
+    let fx = Fixture::new().await;
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let mut answers = vec![
+        Some((ResultCode::Rejected, "worker not running")),
+        Some((ResultCode::OutcomeUncertain, "daemon restarted mid-stop")),
+        None,
+    ]
+    .into_iter();
+    let _peer = fx
+        .spoke(
+            Box::new(move |c| match &c.body {
+                Some(command::Body::Stop(_)) => match answers.next().flatten() {
+                    Some((code, reason)) => Some(refused(c, code, reason)),
+                    None => Some(ok(c, Some(pane(PaneLife::Exited)))),
+                },
+                _ => standard(c),
+            }),
+            None,
+            0,
+        )
+        .await;
+    lease(&adapter).await;
+    spawn(&adapter).await.unwrap();
+    let workspace = Path::new(PATH);
+    let rejected = adapter
+        .cleanup_execution_processes("exec_1", workspace)
+        .await
+        .unwrap_err();
+    assert!(format!("{rejected:#}").contains("could not confirm"), "{rejected:#}");
+    let uncertain = adapter
+        .cleanup_execution_processes("exec_1", workspace)
+        .await
+        .unwrap_err();
+    assert!(format!("{uncertain:#}").contains("Uncertain"), "{uncertain:#}");
+    assert_eq!(
+        adapter.cleanup_execution_processes("exec_1", workspace).await.unwrap(),
+        boss_execution_contracts::Occupancy::Empty
+    );
+}
+
+#[tokio::test]
+async fn a_spoke_reporting_only_unowned_occupants_yields_the_typed_report() {
+    let fx = Fixture::new().await;
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let mut answers = vec![
+        "unowned workspace occupants [4242, 4243]",
+        "workspace occupants [4242] (owners {\"exec_9\": [4242]}); unreadable processes []",
+    ]
+    .into_iter();
+    let _peer = fx
+        .spoke(
+            Box::new(move |c| match &c.body {
+                Some(command::Body::Stop(_)) => Some(refused(c, ResultCode::Rejected, answers.next().unwrap())),
+                _ => standard(c),
+            }),
+            None,
+            0,
+        )
+        .await;
+    lease(&adapter).await;
+    spawn(&adapter).await.unwrap();
+    let workspace = Path::new(PATH);
+    let stray = adapter
+        .cleanup_execution_processes("exec_1", workspace)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        stray.downcast_ref::<boss_execution_contracts::UnownedOccupants>(),
+        Some(&boss_execution_contracts::UnownedOccupants {
+            occupants: vec![4242, 4243]
+        })
+    );
+    let owned = adapter
+        .cleanup_execution_processes("exec_1", workspace)
+        .await
+        .unwrap_err();
+    assert!(
+        owned
+            .downcast_ref::<boss_execution_contracts::UnownedOccupants>()
+            .is_none(),
+        "an owned occupant must keep the lease: {owned:#}"
+    );
+}
+
+#[tokio::test]
 async fn a_replacement_stop_is_reused_until_it_settles() {
     let fx = Fixture::with(short(400)).await;
     fx.ready(HOST);

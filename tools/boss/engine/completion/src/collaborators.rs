@@ -32,6 +32,7 @@ pub struct CompletionCollaborators {
     pub design_detection: Arc<dyn DesignDetection>,
     pub attentions_detection: Arc<dyn AttentionsDetection>,
     pub review_guide_validation: Arc<dyn ReviewGuideValidation>,
+    pub workspace_occupancy: Arc<dyn crate::workspace_lease_release::WorkspaceOccupancy>,
 }
 
 impl CompletionCollaborators {
@@ -39,11 +40,13 @@ impl CompletionCollaborators {
         design_detection: Arc<dyn DesignDetection>,
         attentions_detection: Arc<dyn AttentionsDetection>,
         review_guide_validation: Arc<dyn ReviewGuideValidation>,
+        workspace_occupancy: Arc<dyn crate::workspace_lease_release::WorkspaceOccupancy>,
     ) -> Self {
         Self {
             design_detection,
             attentions_detection,
             review_guide_validation,
+            workspace_occupancy,
         }
     }
 
@@ -69,6 +72,7 @@ impl CompletionCollaborators {
             design_detection: detection.clone(),
             attentions_detection: detection,
             review_guide_validation: Arc::new(RefuseGuides),
+            workspace_occupancy: Arc::new(crate::workspace_lease_release::EmptyOccupancy),
         }
     }
 }

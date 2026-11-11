@@ -36,11 +36,12 @@ impl WorkerCompletionHandler {
         // lease stays held; the in-flight `run_execution` reaps the
         // worker once its spawn settles and releases the lease then.
         //
-        // A remote worker is not reaped by `release_pane` (the engine cannot
-        // stop it), and a cancelled status does not mean its process exited.
-        // Hold the lease, persona and live state until a pid probe proves it
-        // gone; `remote_lease_reconcile` releases them once it does.
-        if !self.remote_worker_proven_gone(execution_id).await {
+        // A remote worker is not reaped by `release_pane`; the engine stops
+        // its owned processes through the owning host's adapter instead, and
+        // a cancelled status does not mean the worker exited. Hold the lease,
+        // persona and live state until a pid probe proves it gone;
+        // `remote_lease_reconcile` releases them once it does.
+        if !self.stop_and_confirm_remote_worker_gone(execution_id).await {
             tracing::info!(
                 execution_id,
                 "force_release: remote worker not proven gone; leaving the lease, persona and live state held \
@@ -84,8 +85,8 @@ impl WorkerCompletionHandler {
                 let Some(lease_id) = execution.cube_lease_id.clone() else {
                     return ForceReleaseOutcome::NoLeaseHeld;
                 };
-                // The recorded pid is gone, but this engine cannot stop a
-                // remote worker, so a child may still occupy the workspace.
+                // The recorded pid is gone, but a detached child may still
+                // occupy the workspace.
                 // Release through the same owning-host gates as the
                 // reconciler: bookmark confirmation plus an occupancy probe.
                 let outcome = match self.recovery_adapter(execution_id).await {
@@ -154,7 +155,7 @@ impl WorkerCompletionHandler {
             crate::workspace_lease_release::ReleaseEvidence {
                 cause,
                 pane: crate::workspace_lease_release::PaneStatus::Gone,
-                occupancy: &crate::workspace_lease_release::EmptyOccupancy,
+                occupancy: self.collaborators.workspace_occupancy.as_ref(),
                 preservation: &crate::workspace_lease_release::DbPreservation::new(&self.work_db, None),
             },
             |preserved| async move {

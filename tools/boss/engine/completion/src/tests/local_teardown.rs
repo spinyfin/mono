@@ -20,13 +20,15 @@ async fn local_teardown_forces_reset_only_after_preservation_succeeds() {
         let TestHarness { mut handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
         let cube = Arc::new(ReleaseCube(Default::default()));
         handler.cube_client = cube.clone();
+        let missing_repository = tempdir().unwrap();
         if !preserved {
-            // Retain the recorded store but make workspace lookup fail.
+            // Occupancy is known, but the recorded path cannot be preserved
+            // because it is not a jj workspace.
             db.connect()
                 .unwrap()
                 .execute(
-                    "UPDATE work_executions SET workspace_path = NULL WHERE id = ?1",
-                    [&execution],
+                    "UPDATE work_executions SET workspace_path = ?2 WHERE id = ?1",
+                    rusqlite::params![&execution, missing_repository.path().to_str().unwrap()],
                 )
                 .unwrap();
         }

@@ -520,6 +520,10 @@ macro_rules! stub_host_adapter {
         $crate::stub_host_adapter!(@munch $ty [$($acc)*] @done $($rest)*);
     };
 
+    (@munch $ty:ty [$($acc:tt)*] @done async fn cleanup_execution_processes $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn cleanup_execution_processes $a -> $r $b] @done $($rest)*);
+    };
+
     (@munch $ty:ty [$($acc:tt)*] @done async fn restore_preserved_work $a:tt -> $r:ty $b:block $($rest:tt)*) => {
         $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn restore_preserved_work $a -> $r $b] @done $($rest)*);
     };

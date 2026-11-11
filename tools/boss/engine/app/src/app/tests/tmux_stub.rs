@@ -19,6 +19,7 @@ pub(crate) struct StubRunner {
     outcomes: StdMutex<VecDeque<CommandOutput>>,
     calls: StdMutex<Vec<Vec<String>>>,
     pause: StdMutex<Option<Arc<ProbePause>>>,
+    real_processes: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -33,11 +34,24 @@ impl StubRunner {
             outcomes: StdMutex::new(replies.into_iter().collect()),
             calls: StdMutex::new(Vec::new()),
             pause: StdMutex::new(None),
+            real_processes: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     pub(crate) fn calls(&self) -> Vec<Vec<String>> {
         self.calls.lock().unwrap().clone()
+    }
+
+    /// Keep tmux scripted while exercising actual ownership registration and
+    /// TERM/KILL for a child created by this fixture.
+    pub(crate) fn own_process(&self, pid: i64, token: &str) {
+        let output = std::process::Command::new("python3")
+            .args(["-c", boss_worker_processes::SCRIPT, "--register", &pid.to_string()])
+            .env("BOSS_SPAWN_TOKEN", token)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        self.real_processes.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(crate) fn pause_next(&self) -> Arc<ProbePause> {
@@ -49,6 +63,10 @@ impl StubRunner {
 
 #[async_trait::async_trait]
 impl CommandRunner for StubRunner {
+    fn manages_host_processes(&self) -> bool {
+        self.real_processes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     async fn run(&self, _program: &Path, args: &[OsString], cwd: Option<&Path>) -> std::io::Result<CommandOutput> {
         assert!(cwd.is_none());
         let pause = self.pause.lock().unwrap().take();
@@ -380,15 +398,23 @@ pub(super) fn install_teardown(server: &super::ServerState, execution_id: &str, 
     }
     let token = format!("token-{execution_id}");
     assert!(
-        db.record_tmux_spawn_intent_for_execution(execution_id, boss_tmux::SERVER_LABEL, "boss-test-worker", &token)
-            .unwrap()
+        db.record_tmux_spawn_intent_for_execution(
+            execution_id,
+            boss_tmux::TEST_SOCKET_PATH,
+            "boss-test-worker",
+            &token
+        )
+        .unwrap()
     );
     assert!(
         db.record_tmux_session_created_for_execution(execution_id, &token, pane_pid)
             .unwrap()
     );
     let env = format!("BOSS_SPAWN_TOKEN={token}\n");
-    let (tmux, _) = fake_tmux([ok(&env), ok("0"), ok(&env), ok(""), ok("")]);
+    let (tmux, runner) = fake_tmux([ok(&env), ok("0"), ok(&env), ok(""), ok("")]);
+    if pane_pid > 1 && unsafe { libc::getpgid(pane_pid as i32) } > 0 {
+        runner.own_process(pane_pid, &token);
+    }
     server.set_tmux_override_for_test(tmux);
 }
 

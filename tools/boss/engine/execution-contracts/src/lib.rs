@@ -1773,6 +1773,12 @@ pub trait HostAdapter: Send + Sync {
         Ok(Occupancy::Unknown)
     }
 
+    /// Called during authorized teardown or after worker death. Implementations
+    /// signal exact inherited identifiers on the owning host, never cwd matches.
+    async fn cleanup_execution_processes(&self, _execution_id: &str, workspace: &Path) -> Result<Occupancy> {
+        self.probe_workspace_occupancy(workspace).await
+    }
+
     /// Read the tail of the worker's own stdout/stderr log for the run in
     /// `workspace_path` — the remote wrapper tees it to
     /// `<workspace>/.boss/worker.log`.
@@ -1909,6 +1915,40 @@ pub enum ControlOutcome {
     /// The host performed the request and reports the pane it then saw.
     Delivered(WorkerPane),
 }
+
+/// A workspace's only remaining occupants are processes no run owns: none
+/// carries a run identity, none survived signalling and none was unreadable.
+/// Hosts report this distinctly from an owned or unreadable occupant so the
+/// hub may apply the bounded release for unowned occupants to remote
+/// workspaces as it does to local ones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnownedOccupants {
+    pub occupants: Vec<u32>,
+}
+
+impl UnownedOccupants {
+    const PREFIX: &'static str = "unowned workspace occupants [";
+
+    /// Recover the report from an error message that crossed a process
+    /// boundary (a spoke's stop failure), or `None` for any other message.
+    pub fn from_message(message: &str) -> Option<Self> {
+        let rest = &message[message.find(Self::PREFIX)? + Self::PREFIX.len()..];
+        let list = &rest[..rest.find(']')?];
+        let occupants = list
+            .split(',')
+            .map(|pid| pid.trim().parse().ok())
+            .collect::<Option<Vec<u32>>>()?;
+        (!occupants.is_empty()).then_some(Self { occupants })
+    }
+}
+
+impl std::fmt::Display for UnownedOccupants {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unowned workspace occupants {:?}", self.occupants)
+    }
+}
+
+impl std::error::Error for UnownedOccupants {}
 
 /// A spawn whose outcome is unknown: the host may have started the worker.
 /// The execution keeps its assignment and workspace and a retry reuses the
