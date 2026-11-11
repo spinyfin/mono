@@ -266,31 +266,6 @@ struct WorkSidebarFilterRow: View {
     }
 }
 
-struct WorkProjectFilterToolbarButton: View {
-    @ObservedObject var model: ChatViewModel
-    @State private var isShowingPopover = false
-
-    var body: some View {
-        Button {
-            isShowingPopover.toggle()
-        } label: {
-            Image(systemName: "square.stack.3d.up")
-                .overlay(alignment: .topTrailing) {
-                    if model.hasProjectFilters {
-                        Circle()
-                            .fill(Color.accentColor)
-                            .frame(width: 6, height: 6)
-                            .offset(x: 3, y: -3)
-                    }
-                }
-        }
-        .help("Project filter")
-        .popover(isPresented: $isShowingPopover, arrowEdge: .bottom) {
-            ProjectFilterPopover(model: model)
-        }
-    }
-}
-
 struct WorkGroupToolbarMenu: View {
     @ObservedObject var model: ChatViewModel
 
@@ -369,75 +344,6 @@ private struct SearchTextField: View {
         .onChange(of: isFocused) { _, focused in
             if !focused { onFocusLost() }
         }
-    }
-}
-
-private struct ProjectFilterPopover: View {
-    @ObservedObject var model: ChatViewModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            let allSelected = !model.hasProjectFilters
-            Button {
-                model.clearProjectFilters()
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: allSelected ? "checkmark.square.fill" : "square")
-                        .foregroundStyle(allSelected ? Color.accentColor : .secondary)
-                        .font(.system(size: 14, weight: .medium))
-                        .frame(width: 15)
-                    Text("All Projects")
-                        .font(.body.weight(allSelected ? .semibold : .regular))
-                    Spacer()
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-
-            Divider()
-
-            Toggle("Show parked", isOn: Binding(
-                get: { model.showParked },
-                set: { model.setShowParked($0) }
-            ))
-            .help("Add parked tasks and projects' tasks back to the board.")
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-
-            Divider()
-
-            ForEach(model.projectsForSelectedProduct) { project in
-                let isOn = model.selectedProjectFilterIDs.contains(project.id)
-                Button {
-                    model.toggleProjectFilter(project.id)
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: isOn ? "checkmark.square.fill" : "square")
-                            .foregroundStyle(isOn ? Color.accentColor : .secondary)
-                            .font(.system(size: 14, weight: .medium))
-                            .frame(width: 15)
-                        Text(project.name)
-                            .font(.body.weight(isOn ? .semibold : .regular))
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                        if let id = project.shortID {
-                            Text("P" + String(id))
-                                .font(.system(.caption2, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .frame(minWidth: 200, maxWidth: 280)
-        .padding(.vertical, 4)
     }
 }
 

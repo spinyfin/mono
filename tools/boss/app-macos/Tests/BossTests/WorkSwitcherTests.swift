@@ -175,6 +175,30 @@ final class WorkSwitcherTests: XCTestCase {
         }
     }
 
+    func testSwitcherReachesAllProjectsArchivedAndParkedToggle() {
+        withDefaults { defaults in
+            let model = model(defaults)
+            model.products = [product("Alpha")]
+            model.selectWorkProduct("Alpha")
+            var projects = (0..<10).map { project("P\($0)") }
+            var archived = project("Old")
+            archived.status = "archived"
+            projects.append(archived)
+            model.projectsByProductID["Alpha"] = projects
+            XCTAssertEqual(model.recentWorkProjects.count, 7)
+            XCTAssertEqual(model.moreWorkProjects.count, 3)
+            XCTAssertFalse(model.moreWorkProjects.contains { $0.id == "Old" })
+            model.setShowArchivedProjects(true)
+            XCTAssertEqual(model.moreWorkProjects.count, 4)
+            XCTAssertTrue(model.moreWorkProjects.contains { $0.id == "Old" })
+            XCTAssertFalse(model.showParked)
+            WorkSwitcherSelection.toggleParked.apply(to: model)
+            XCTAssertTrue(model.showParked)
+            WorkSwitcherSelection.toggleParked.apply(to: model)
+            XCTAssertFalse(model.showParked)
+        }
+    }
+
     func testArrowKeysAndReturnSelectFromRealMenu() {
         withDefaults { defaults in
             let model = model(defaults)

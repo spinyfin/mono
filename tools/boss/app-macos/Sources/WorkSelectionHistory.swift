@@ -94,6 +94,13 @@ extension ChatViewModel {
             .compactMap { id in fallback.first { $0.id == id } }
     }
 
+    /// Every project the sidebar would list (honouring Show archived) that
+    /// is not already in the recent list, so the switcher reaches them all.
+    var moreWorkProjects: [WorkProject] {
+        let recent = Set(recentWorkProjects.map(\.id))
+        return projectsForSelectedProduct.filter { !recent.contains($0.id) }
+    }
+
     var workSwitcherLabel: String {
         let product = selectedProduct?.name ?? "Choose product"
         return hasProjectFilters ? "\(product) · \(projectFilterDescription)" : product

@@ -32,12 +32,14 @@ enum WorkSwitcherSelection: Hashable {
     case product(String)
     case allProjects
     case project(String)
+    case toggleParked
 
     @MainActor func apply(to model: ChatViewModel) {
         switch self {
         case .product(let id): model.selectWorkProduct(id)
         case .allProjects: model.clearProjectFilters()
         case .project(let id): model.toggleProjectFilter(id)
+        case .toggleParked: model.setShowParked(!model.showParked)
         }
     }
 }
@@ -49,7 +51,8 @@ struct WorkSwitcherMenu: View {
 
     private var choices: [WorkSwitcherSelection] {
         model.recentWorkProducts.map { .product($0.id) }
-            + (model.selectedProduct == nil ? [] : [.allProjects] + model.recentWorkProjects.map { .project($0.id) })
+            + (model.selectedProduct == nil ? [] : [.allProjects] + model.recentWorkProjects.map { .project($0.id) }
+                + model.moreWorkProjects.map { .project($0.id) } + [.toggleParked])
     }
 
     var body: some View {
@@ -98,6 +101,14 @@ struct WorkSwitcherMenu: View {
                 ForEach(model.recentWorkProjects) { project in
                     row(project.name, choice: .project(project.id), selected: model.selectedProjectFilterIDs.contains(project.id))
                 }
+                if !model.moreWorkProjects.isEmpty {
+                    heading("More projects")
+                    ForEach(model.moreWorkProjects) { project in
+                        row(project.name, choice: .project(project.id), selected: model.selectedProjectFilterIDs.contains(project.id))
+                    }
+                }
+                Divider().padding(.vertical, 5)
+                row("Show parked", choice: .toggleParked, selected: model.showParked)
             }
         }
     }
