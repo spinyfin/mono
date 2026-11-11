@@ -80,7 +80,9 @@ pub(super) fn run_repo(
                 }),
             )
         }
-        RepoCommand::Reclone { repo } => super::repo_reclone::reclone(&store, runner, database_path, &repo),
+        RepoCommand::Reclone { repo, discard_dirty } => {
+            super::repo_reclone::reclone(&store, runner, database_path, &repo, discard_dirty)
+        }
         RepoCommand::List => {
             let repos = store.list_repos()?;
             let message = format_repo_list(&repos);
@@ -237,7 +239,7 @@ pub(super) fn run_repo(
                     }
                 }
                 for path in &paths {
-                    super::repo_reclone::remove_workspace_tree(path)?;
+                    super::fs_util::remove_workspace_tree(path)?;
                     purged_dirs.push(path.display().to_string());
                 }
             }
@@ -454,7 +456,7 @@ fn ensure_repo_core(
         }
         record.main_branch = branch;
     }
-    super::repo_reclone::stamp_registration(&record)?;
+    super::registration::stamp_registration(&record)?;
     store.upsert_repo(&record)
 }
 
@@ -595,6 +597,7 @@ pub(super) fn materialize_repo_source_if_missing(
         // The colocated clone already exposes the remote's branches as local
         // jj bookmarks, so there is nothing to promote here; we only need the
         // remote's default branch to record as the repo's `main_branch`.
+        super::registration::stamp_registration(record)?;
         Ok(detect_remote_default_branch(runner, source, &record.origin))
     } else {
         eprintln!("cube: using `jj git clone --colocate` for repo `{}`", record.repo);
@@ -613,6 +616,7 @@ pub(super) fn materialize_repo_source_if_missing(
             ],
             env: vec![],
         })?;
+        super::registration::stamp_registration(record)?;
         track_remote_bookmarks(runner, source, default_branch.as_deref())?;
         Ok(default_branch)
     }

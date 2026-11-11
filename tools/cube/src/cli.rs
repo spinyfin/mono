@@ -69,8 +69,15 @@ pub enum RepoCommand {
     /// Replace a damaged shared store, keeping a backup and repo configuration.
     ///
     /// Release all workspaces and stop processes using the store first.
+    /// All cube jj operations on the host are blocked until recovery finishes.
+    /// Dirty or quarantined workspaces require explicit discard authorization.
     /// Purges old workspaces; never deletes the old source store.
-    Reclone { repo: String },
+    Reclone {
+        repo: String,
+        /// Delete dirty or quarantined free workspaces, losing unsaved files.
+        #[arg(long)]
+        discard_dirty: bool,
+    },
     /// List known repo pools.
     List,
     /// Show repo pool configuration.

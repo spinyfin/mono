@@ -26,6 +26,7 @@ mod pr_head;
 mod provision;
 mod reclaim;
 mod reconcile;
+mod registration;
 mod release_bookmark_gc;
 mod repo;
 mod repo_reclone;

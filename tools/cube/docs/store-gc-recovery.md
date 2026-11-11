@@ -169,6 +169,8 @@ active store upkeep, concurrent cube jj operations, and processes detected by
 is a hard error, and a scan that exceeds its time limit is reported as such. Stop external tools before invoking recovery and keep them
 stopped until it finishes; external tools do not honor cube's advisory locks.
 
+Reclone holds the host-wide maintenance gate until recovery finishes, including the network clone and workspace purge. All cube jj operations and leases on the host are blocked during this window, including other repositories. It checks open files with a single host-wide lsof scan filtered to the source and workspace paths. Free workspaces marked dirty or quarantined cause a refusal naming their ids; preserve their work before retrying with `--discard-dirty` to explicitly authorize deletion of those directories.
+
 Recovery renames the source to a sibling named
 `<repo>.before-reclone-<epoch-seconds>-<unique-id>`, clones the recorded origin
 using the recorded clone command when configured, and retains the recorded main
