@@ -31,15 +31,28 @@ final class TranscriptViewTests: XCTestCase {
             "status": "failed",
             "started_at": "1794012548",
         ])
-        let raw = try XCTUnwrap(exec?.startedAt)
-        let expected = DateFormatter()
-        expected.dateStyle = .short
-        expected.timeStyle = .short
-        let want = expected.string(from: Date(timeIntervalSince1970: 1794012548))
-        XCTAssertEqual(ExecutionRow.formattedDate(raw), want)
-        XCTAssertNotEqual(ExecutionRow.formattedDate(raw), "1794012548")
-        XCTAssertEqual(ExecutionRow.formattedDate("2026-11-07T10:00:00Z"), ExecutionRow.formattedDate("2026-11-07T10:00:00.000Z"))
-        XCTAssertEqual(ExecutionRow.formattedDate("garbage"), "garbage")
+        let parsed = try XCTUnwrap(exec)
+        XCTAssertEqual(parsed.startedDate, Date(timeIntervalSince1970: 1794012548))
+        XCTAssertNil(parsed.endedDate)
+        let want = AttachmentDateFormatting.format(Date(timeIntervalSince1970: 1794012548))
+        let text = try XCTUnwrap(ExecutionRow(exec: parsed).startedText)
+        XCTAssertEqual(text, want)
+        XCTAssertNotEqual(text, "1794012548")
+
+        // ISO-8601 pins to an independently known instant (2026-11-07T10:00:00Z).
+        let iso = client.parseExecutionVM([
+            "id": "exec-iso", "work_item_id": "t", "kind": "task_implementation",
+            "status": "failed", "started_at": "2026-11-07T10:00:00Z",
+        ])
+        XCTAssertEqual(iso?.startedDate, Date(timeIntervalSince1970: 1_794_045_600))
+
+        // Unparseable input is shown verbatim; absent stays absent.
+        let bad = client.parseExecutionVM([
+            "id": "exec-bad", "work_item_id": "t", "kind": "task_implementation",
+            "status": "failed", "started_at": "garbage",
+        ])
+        XCTAssertNil(bad?.startedDate)
+        XCTAssertEqual(bad.map { ExecutionRow(exec: $0).startedText }, "garbage")
     }
 
     func testExecutionRuntimeDecodePreservesRecordedAndUnknownStates() {

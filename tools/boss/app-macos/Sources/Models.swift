@@ -728,6 +728,11 @@ struct ExecutionVM: Identifiable, Hashable, RevisionChainItem {
     let runId: String?
     let startedAt: String?
     let endedAt: String?
+    /// `startedAt` / `endedAt` parsed once at decode time. The engine stamps
+    /// epoch-seconds strings (ISO-8601 is also accepted); `nil` means absent
+    /// or unparseable, in which case consumers fall back to the raw string.
+    let startedDate: Date?
+    let endedDate: Date?
 }
 
 /// Resolved dependency row used by the card detail Dependencies

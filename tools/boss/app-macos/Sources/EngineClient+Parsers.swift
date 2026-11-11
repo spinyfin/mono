@@ -763,6 +763,8 @@ extension EngineClient {
         // -> root-task join and hands it back as `owning_task_id` so this
         // row still groups under the right task's transcript list.
         let owningTaskId = payload["owning_task_id"] as? String
+        let startedAt = payload["started_at"] as? String
+        let endedAt = payload["ended_at"] as? String
         return ExecutionVM(
             id: id,
             workItemId: owningTaskId ?? workItemId,
@@ -772,8 +774,10 @@ extension EngineClient {
             model: payload["model"] as? String,
             effortLevel: payload["effort_level"] as? String,
             runId: payload["run_id"] as? String,
-            startedAt: payload["started_at"] as? String,
-            endedAt: payload["ended_at"] as? String
+            startedAt: startedAt,
+            endedAt: endedAt,
+            startedDate: startedAt.flatMap(BackgroundWorkElapsed.parse),
+            endedDate: endedAt.flatMap(BackgroundWorkElapsed.parse)
         )
     }
 

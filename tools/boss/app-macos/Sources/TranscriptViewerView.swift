@@ -92,8 +92,8 @@ struct ExecutionRow: View {
             Text(runtimeLabel)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            if let start = exec.startedAt {
-                Text(Self.formattedDate(start))
+            if let start = startedText {
+                Text(start)
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
@@ -146,14 +146,11 @@ struct ExecutionRow: View {
         }
     }
 
-    /// The engine stamps executions as epoch-seconds strings; ISO-8601 is
-    /// also accepted. Unparseable input is shown verbatim.
-    static func formattedDate(_ raw: String) -> String {
-        guard let date = BackgroundWorkElapsed.parse(raw) else { return raw }
-        let display = DateFormatter()
-        display.dateStyle = .short
-        display.timeStyle = .short
-        return display.string(from: date)
+    /// The parsed start time (decoded once in `parseExecutionVM`) as a local
+    /// short date/time; an unparseable raw value is shown verbatim.
+    var startedText: String? {
+        if let date = exec.startedDate { return AttachmentDateFormatting.format(date) }
+        return exec.startedAt
     }
 }
 
