@@ -3,7 +3,7 @@ use super::*;
 use boss_protocol::{CreateRevisionInput, RequestExecutionInput};
 
 use crate::test_support::{
-    create_test_chore_manual, create_test_product, open_db, seed_daily_automation, seed_review_guide_series,
+    create_test_chore_manual, create_test_product, open_db, seed_daily_automation, seed_review_guide_series_for_pr,
 };
 use crate::work::{FakePrStateChecker, PrOpenState};
 
@@ -121,7 +121,7 @@ fn review_guide_run_resolves_the_comparison_to_its_root_task() {
     let root = create_test_chore_manual(&db, product.id.clone(), "Guided change");
     let requested = requested_execution(&db, &root.id);
     set_pr(&db, &root.id, PARENT_PR);
-    let (_series, comparison) = seed_review_guide_series(&db, &root.id);
+    let (_series, comparison) = seed_review_guide_series_for_pr(&db, &root.id, PARENT_PR, "base", "head");
     assert!(comparison.starts_with("prgc_"), "got {comparison}");
     let execution = relabelled(&requested, ExecutionKind::PrReviewGuide, &comparison);
 
@@ -133,6 +133,8 @@ fn review_guide_run_resolves_the_comparison_to_its_root_task() {
     assert_eq!(label.work_item_short_id, root.short_id);
     assert_eq!(label.pr_url.as_deref(), Some(PARENT_PR));
     assert_eq!(label.purpose.as_deref(), Some("Review guide"));
+    assert_eq!(label.product_name.as_deref(), Some(product.name.as_str()));
+    assert_eq!(label.project_name, None);
 }
 
 /// A deleted work item is its own status, carries no title or id, and never

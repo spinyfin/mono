@@ -628,6 +628,7 @@ extension EngineClient {
             workItemName: payload["work_item_name"] as? String,
             workItemShortId: (payload["work_item_short_id"] as? NSNumber)?.intValue,
             productId: payload["product_id"] as? String,
+            productName: payload["product_name"] as? String,
             prURL: payload["pr_url"] as? String
         )
     }

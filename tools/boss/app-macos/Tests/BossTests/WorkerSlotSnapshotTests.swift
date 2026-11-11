@@ -885,6 +885,34 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         XCTAssertEqual(links?.prLabel, "mono#3356")
     }
 
+    func testHeaderWorkLinksLeadWithProductAndProject() {
+        let live = Self.makeLiveState(
+            projectName: "ISEE practice: platform",
+            workItemId: "task_header",
+            workItemName: "Worker pane header",
+            workItemShortId: 11,
+            productId: "prod_isse",
+            productName: "isse",
+            prURL: "https://github.com/spinyfin/isse/pull/6"
+        )
+        let links = WorkerSlotSnapshot.build(slot: WorkerSlot(slotId: 1, runId: "exec-1"), liveState: live)
+            .headerWorkLinks
+        XCTAssertEqual(links?.productName, "isse")
+        XCTAssertEqual(links?.projectName, "ISEE practice: platform")
+        XCTAssertEqual(links?.shortIdLabel, "T11")
+        XCTAssertEqual(links?.prLabel, "isse#6")
+
+        // No project (a chore) and no PR yet: both parts are left out.
+        let chore = Self.makeLiveState(
+            workItemId: "task_chore", workItemShortId: 12, productId: "prod_isse", productName: "isse"
+        )
+        let choreLinks = WorkerSlotSnapshot.build(slot: WorkerSlot(slotId: 1, runId: "exec-1"), liveState: chore)
+            .headerWorkLinks
+        XCTAssertEqual(choreLinks?.productName, "isse")
+        XCTAssertNil(choreLinks?.projectName)
+        XCTAssertNil(choreLinks?.prLabel)
+    }
+
     func testHeaderWorkLinksOmitsPRWhenNone() {
         let live = Self.makeLiveState(
             workItemId: "task_header",
@@ -1067,6 +1095,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         workItemName: String? = nil,
         workItemShortId: Int? = nil,
         productId: String? = nil,
+        productName: String? = nil,
         prURL: String? = nil
     ) -> WorkerLiveState {
         WorkerLiveState(
@@ -1098,6 +1127,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             workItemName: workItemName,
             workItemShortId: workItemShortId,
             productId: productId,
+            productName: productName,
             prURL: prURL
         )
     }

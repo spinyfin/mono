@@ -405,11 +405,40 @@ struct WorkerSlotView: View, @MainActor Equatable {
         .help(slotTooltip)
     }
 
-    /// Compact third header line: `T<n>` · `repo#n`. Truncates as a
-    /// single line. Omitted entirely when the pane has no work item.
+    private var headerSeparator: some View {
+        Text("·")
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
+            .layoutPriority(2)
+    }
+
+    /// Compact third header line: product · project · `T<n>` · `repo#n`.
+    /// Single line; the project truncates before the task or PR. Omitted
+    /// entirely when the pane has no work item.
     @ViewBuilder
     private func slotWorkLinks(_ links: WorkerHeaderWorkLinks) -> some View {
         HStack(spacing: 4) {
+            // Product first (short ids are unique only within a product), then
+            // the project, which gives way first when the row is too long.
+            if let productName = links.productName {
+                Text(productName)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .layoutPriority(1)
+                    .accessibilityLabel("Product \(productName)")
+                headerSeparator
+            }
+            if let projectName = links.projectName {
+                Text(projectName)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .layoutPriority(0)
+                    .accessibilityLabel("Project \(projectName)")
+                headerSeparator
+            }
             Button {
                 if let productId = links.productId {
                     onRevealWorkItem?(links.workItemId, productId)
@@ -423,13 +452,12 @@ struct WorkerSlotView: View, @MainActor Equatable {
             .buttonStyle(.plain)
             .pointerStyle(.link)
             .disabled(links.productId == nil)
+            .layoutPriority(2)
             .help(links.title)
             .accessibilityLabel("ID \(links.shortIdLabel)")
 
             if let prURL = links.prURL, let prLabel = links.prLabel {
-                Text("·")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                headerSeparator
                 if let url = URL(string: prURL) {
                     Link(destination: url) {
                         Text(prLabel)
@@ -439,6 +467,7 @@ struct WorkerSlotView: View, @MainActor Equatable {
                     }
                     .buttonStyle(.plain)
                     .pointerStyle(.link)
+                    .layoutPriority(2)
                     .help(prURL)
                     .accessibilityLabel(prLabel)
                 }

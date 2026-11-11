@@ -6,12 +6,12 @@
 //! fields while the run was alive is dropped at release, so the label is
 //! rebuilt from the execution → work item → PR binding instead of being
 //! remembered by the frontend. The fields are derived by the same helper the
-//! live state uses ([`work_item_header_fields`]), so a pane reads identically
+//! live state uses ([`work_item_header`]), so a pane reads identically
 //! before and after the run finishes.
 
 use boss_protocol::{ExecutionKind, ExecutionLabelStatus, ExecutionWorkLabel};
 
-use crate::live_worker_metadata::work_item_header_fields;
+use crate::live_worker_metadata::work_item_header;
 use crate::runner::work_item_name;
 use crate::work::{WorkDb, WorkExecution};
 
@@ -50,17 +50,19 @@ pub fn label_for_execution(work_db: &WorkDb, execution: &WorkExecution) -> Execu
             return unbound_label(execution, purpose, &owning_id, &error);
         }
     };
-    let (product_id, work_item_short_id, pr_url) = work_item_header_fields(Some(&work_item), execution);
+    let header = work_item_header(work_db, execution, Some(&work_item));
     ExecutionWorkLabel::builder()
         .execution_id(execution.id.clone())
         .status(ExecutionLabelStatus::Resolved)
         .kind(execution.kind.as_str())
         .work_item_id(owning_id)
         .work_item_title(work_item_name(&work_item))
-        .maybe_product_id(product_id)
-        .maybe_pr_url(pr_url)
+        .maybe_product_id(header.product_id)
+        .maybe_product_name(header.product_name)
+        .maybe_project_name(header.project_name)
+        .maybe_pr_url(header.pr_url)
         .maybe_purpose(purpose)
-        .maybe_work_item_short_id(work_item_short_id)
+        .maybe_work_item_short_id(header.short_id)
         .build()
 }
 
