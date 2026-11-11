@@ -116,7 +116,10 @@ def pids():
     found = []
     for path in Path("/proc").iterdir():
         try:
-            if path.name.isdigit() and path.stat().st_uid == os.geteuid():
+            # The PID namespace's init predates launched workers and cannot be
+            # one of their descendants. Like Darwin's scan, exclude it: Linux
+            # containers can expose its uid while denying access to its cwd.
+            if path.name.isdigit() and int(path.name) > 1 and path.stat().st_uid == os.geteuid():
                 found.append(int(path.name))
         except FileNotFoundError:
             pass

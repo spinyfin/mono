@@ -118,6 +118,14 @@ os.environ["BOSS_PROCESS_ROOT"] = process_root.name
 
 
 class OwnershipTests(unittest.TestCase):
+    def test_linux_scan_excludes_namespace_init(self):
+        with tempfile.TemporaryDirectory() as directory:
+            entries = [Path(directory) / name for name in ("0", "1", "42", "self")]
+            for entry in entries:
+                entry.mkdir()
+            with patch("sys.platform", "linux"), patch.object(Path, "iterdir", return_value=iter(entries)):
+                self.assertEqual(pids(), [42])
+
     def test_disappearing_process_is_rechecked_without_ignoring_live_unknowns(self):
         with patch(__name__ + ".pids", return_value=[42]), patch(__name__ + ".inspect", side_effect=OSError(0, "proc_pidinfo")):
             with patch("os.kill", side_effect=ProcessLookupError(errno.ESRCH, "gone")) as probe:
