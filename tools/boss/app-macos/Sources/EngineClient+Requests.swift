@@ -270,6 +270,23 @@ extension EngineClient {
         ])
     }
 
+    /// Queue `text` for a worker as an explicit probe. Not an interrupt: it is
+    /// delivered at the worker's next boundary, so a probe from the read-only
+    /// pane viewer never cuts a turn short (the Interrupt button does that).
+    func sendProbeRun(runId: String, text: String) {
+        sendLine(["type": "probe_run", "run_id": runId, "text": text, "interrupt": false])
+    }
+
+    /// Press Esc in the worker's pane — the engine's explicit interrupt.
+    func sendInterruptWorkerPane(runId: String) {
+        sendLine(["type": "interrupt_worker_pane", "run_id": runId])
+    }
+
+    /// Tear down the worker's session and release its workspace.
+    func sendStopRun(runId: String) {
+        sendLine(["type": "stop_run", "run_id": runId])
+    }
+
     func sendUnsubscribe(topics: [String]) {
         sendLine([
             "type": "unsubscribe",

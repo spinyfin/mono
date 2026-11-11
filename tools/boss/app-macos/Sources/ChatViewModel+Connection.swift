@@ -20,6 +20,8 @@ extension ChatViewModel {
         // pane's Refresh button disabled for the rest of the session.
         isRefreshingDriverQuota = false
         engine.sendRegisterAppSession()
+        // Captures belong to the old session; ask again for what is still watched.
+        remotePaneViewer.connectionRestored()
         refreshWorkSubscriptions(refreshRemediation: false)
         // Re-subscribe any open markdown viewers' comment topics and reload
         // them; the engine dropped every subscription on the disconnect.

@@ -23,6 +23,7 @@ import SwiftUI
 struct WorkersDetailView: View, @MainActor Equatable {
     @ObservedObject var workspace: WorkersWorkspaceModel
     @ObservedObject var liveStates: LiveWorkerStateStore
+    @ObservedObject var remotePanes: RemotePaneViewerModel
     let isVisible: Bool
     let onRevealWorkItem: (String, String) -> Void
 
@@ -32,11 +33,13 @@ struct WorkersDetailView: View, @MainActor Equatable {
     init(
         workspace: WorkersWorkspaceModel,
         liveStates: LiveWorkerStateStore,
+        remotePanes: RemotePaneViewerModel,
         isVisible: Bool,
         onRevealWorkItem: @escaping (String, String) -> Void = { _, _ in }
     ) {
         self.workspace = workspace
         self.liveStates = liveStates
+        self.remotePanes = remotePanes
         self.isVisible = isVisible
         self.onRevealWorkItem = onRevealWorkItem
     }
@@ -44,6 +47,7 @@ struct WorkersDetailView: View, @MainActor Equatable {
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.workspace === rhs.workspace
             && lhs.liveStates === rhs.liveStates
+            && lhs.remotePanes === rhs.remotePanes
             && lhs.isVisible == rhs.isVisible
     }
 
@@ -52,6 +56,10 @@ struct WorkersDetailView: View, @MainActor Equatable {
             agentsHeader
             Divider()
             paneArea
+            if !remoteWorkers.isEmpty {
+                Divider()
+                RemoteWorkersPanel(model: remotePanes, workers: remoteWorkers, isVisible: isVisible)
+            }
         }
         .background(Color(nsColor: .separatorColor))
         .onAppear(perform: bindAndSync)
@@ -83,6 +91,14 @@ struct WorkersDetailView: View, @MainActor Equatable {
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEndLiveResizeNotification)) { _ in
             grid.liveResizeDidEnd()
         }
+    }
+
+    /// Workers on other hosts. They have no terminal here, so they are not in
+    /// the grid; the panel below it shows a read-only text view of one.
+    private var remoteWorkers: [WorkerLiveState] {
+        liveStates.byRunID.values
+            .filter { !$0.isLocalMember && $0.activity != .terminated && $0.activity != .errored }
+            .sorted { ($0.startedAt ?? "", $0.runId) < ($1.startedAt ?? "", $1.runId) }
     }
 
     private var agentsHeader: some View {

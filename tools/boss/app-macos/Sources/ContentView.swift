@@ -681,6 +681,7 @@ struct ContentView: View {
         WorkersDetailView(
             workspace: workersWorkspace,
             liveStates: model.liveWorkerStates,
+            remotePanes: model.remotePaneViewer,
             isVisible: model.navigationMode == .agents,
             onRevealWorkItem: { workItemId, productId in
                 model.revealWorkCard(workItemId, productID: productId)

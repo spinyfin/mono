@@ -110,6 +110,8 @@ mod live_status;
 mod metrics;
 mod pane_delivery;
 mod pane_ops;
+#[cfg(test)]
+mod pane_viewer_tests;
 mod pane_viewers;
 mod panes;
 mod panic_hook;
