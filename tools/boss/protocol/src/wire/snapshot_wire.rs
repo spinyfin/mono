@@ -7,6 +7,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Outcome of the live `getQueue` smoke check `boss engine trunk status`
+/// runs against a `trunk_queue`-mechanism product's queue, once one exists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrunkQueueCheckDto {
+    pub ok: bool,
+    pub detail: String,
+}
+
 /// An open operator decision, independent of the selected product or board filters.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OperatorDecisionNotification {

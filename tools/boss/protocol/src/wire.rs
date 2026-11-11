@@ -31,14 +31,6 @@ use crate::types::{
     WorkRun, WorkerContextBundle, WorkerProposal, WorkerTierDenial,
 };
 
-/// Outcome of the live `getQueue` smoke check `boss engine trunk status`
-/// runs against a `trunk_queue`-mechanism product's queue, once one exists.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrunkQueueCheckDto {
-    pub ok: bool,
-    pub detail: String,
-}
-
 mod topics;
 pub use topics::*;
 
@@ -807,14 +799,18 @@ pub enum FrontendRequest {
         attempt_id: String,
     },
 
-    /// Read-only: the stored coordinator session handoff (see
+    /// Read the stored coordinator session handoff (see
     /// [`CoordinatorHandoffView`]), or `None` when no coordinator session
     /// has ever written one. Backs `boss handoff show`. Replies with
     /// [`FrontendEvent::CoordinatorHandoffResult`]; a stored handoff that
     /// cannot be decoded is a [`FrontendEvent::WorkError`], never an empty
     /// success — "nothing stored" and "stored but unreadable" are
     /// different states and the caller must be able to tell them apart.
-    GetCoordinatorHandoff,
+    GetCoordinatorHandoff {
+        /// Explicitly request credential recovery through the main session inbox.
+        #[serde(default)]
+        redeliver: bool,
+    },
 
     /// Cost recorded in `[since_epoch_s, until_epoch_s)`, broken down
     /// by execution kind, model, reasoning mode, and effort level.
@@ -2943,8 +2939,8 @@ pub use invalidation::{InvalidationClass, MAX_RUNTIME_PATCH_ITEMS, WorkRuntimePa
 // `boss_protocol::{..}` paths are unchanged.
 mod snapshot_wire;
 pub use snapshot_wire::{
-    FeatureFlagSnapshot, OffsiteBackupSettings, OperatorDecisionNotification, SettingSnapshot, WorkerPoolClaimEntry,
-    WorkerPoolEntry, WorkspacePoolEntry,
+    FeatureFlagSnapshot, OffsiteBackupSettings, OperatorDecisionNotification, SettingSnapshot, TrunkQueueCheckDto,
+    WorkerPoolClaimEntry, WorkerPoolEntry, WorkspacePoolEntry,
 };
 
 // The topic-push payload enum lives in `topic_event_payload`; re-exported as

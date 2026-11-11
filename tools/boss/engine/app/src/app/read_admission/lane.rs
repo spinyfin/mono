@@ -64,7 +64,7 @@ pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
         | R::GetCiRemediation { .. }
         | R::GetConflictHotspots { .. }
         | R::GetConflictResolution { .. }
-        | R::GetCoordinatorHandoff
+        | R::GetCoordinatorHandoff { .. }
         | R::GetSolComparisonReport
         | R::GetCostWindowReport { .. }
         | R::GetDecision { .. }

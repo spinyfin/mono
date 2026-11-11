@@ -280,13 +280,58 @@ async fn coordinator_pid_refresh_works_without_app_and_clears_stale_pid() {
 }
 
 #[tokio::test]
+async fn handoff_show_only_reads_without_minting_or_delivering_authorization() {
+    let f = fixture(Duration::from_secs(1)).await;
+    f.state.set_boss_pid(std::process::id() as libc::pid_t);
+    f.state.work_db.clear_coordinator_handoff_authorization().unwrap();
+    f.state
+        .work_db
+        .set_coordinator_handoff("rolling brief", TOKEN, 1)
+        .unwrap();
+    for _ in 0..4 {
+        let mut ctx = dispatch(&f.state, &f.sink, "read-handoff");
+        ctx.peer_pid = Some(std::process::id() as libc::pid_t);
+        coordinator_handoff::handle_get_coordinator_handoff(
+            ctx,
+            FrontendRequest::GetCoordinatorHandoff { redeliver: false },
+        )
+        .await;
+        let (_, response) = next_event(&f.sink).await;
+        let FrontendEvent::CoordinatorHandoffResult {
+            handoff: Some(handoff),
+            authorization_delivery: None,
+        } = response
+        else {
+            panic!("expected a read without a delivery report, got {response:?}");
+        };
+        assert_eq!(handoff.body, "rolling brief");
+        assert!(f.state.work_db.coordinator_handoff_authorization().unwrap().is_none());
+        assert!(
+            f.runner.calls().is_empty(),
+            "a read must not call the delivery transport"
+        );
+        assert!(
+            f.state
+                .coordinator_authorization_delivery_pending
+                .lock()
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
 async fn handoff_show_recovers_authorization_only_through_main_session_inbox() {
     let f = fixture(Duration::from_secs(1)).await;
     f.state.set_boss_pid(std::process::id() as libc::pid_t);
     let authorization = f.state.work_db.coordinator_handoff_authorization().unwrap().unwrap();
     let mut ctx = dispatch(&f.state, &f.sink, "read-handoff");
     ctx.peer_pid = Some(std::process::id() as libc::pid_t);
-    coordinator_handoff::handle_get_coordinator_handoff(ctx, FrontendRequest::GetCoordinatorHandoff).await;
+    coordinator_handoff::handle_get_coordinator_handoff(
+        ctx,
+        FrontendRequest::GetCoordinatorHandoff { redeliver: true },
+    )
+    .await;
     let (_, response) = next_event(&f.sink).await;
     let FrontendEvent::CoordinatorHandoffResult {
         handoff: None,
@@ -481,7 +526,11 @@ async fn handoff_show_mints_authorization_for_a_surviving_pre_auth_coordinator()
     f.state.set_boss_pid(std::process::id() as libc::pid_t);
     let mut ctx = dispatch(&f.state, &f.sink, "read-handoff");
     ctx.peer_pid = Some(std::process::id() as libc::pid_t);
-    coordinator_handoff::handle_get_coordinator_handoff(ctx, FrontendRequest::GetCoordinatorHandoff).await;
+    coordinator_handoff::handle_get_coordinator_handoff(
+        ctx,
+        FrontendRequest::GetCoordinatorHandoff { redeliver: true },
+    )
+    .await;
     assert!(matches!(
         next_event(&f.sink).await.1,
         FrontendEvent::CoordinatorHandoffResult {
@@ -1052,7 +1101,7 @@ async fn reset_delivery_failure_names_the_failing_step_and_reason() {
     assert!(!message.contains("could not be minted"));
 }
 
-/// `boss handoff show` is the coordinator's on-demand credential path. Its
+/// `boss handoff show --redeliver` is the coordinator's on-demand credential path. Its
 /// response must say the redelivery failed and why, not silently log it, and
 /// a later attempt must be able to try again.
 #[tokio::test]
@@ -1067,7 +1116,11 @@ async fn handoff_show_reports_a_failed_credential_redelivery() {
     for attempt in 0..2 {
         let mut ctx = dispatch(&f.state, &f.sink, "read-handoff");
         ctx.peer_pid = Some(std::process::id() as libc::pid_t);
-        coordinator_handoff::handle_get_coordinator_handoff(ctx, FrontendRequest::GetCoordinatorHandoff).await;
+        coordinator_handoff::handle_get_coordinator_handoff(
+            ctx,
+            FrontendRequest::GetCoordinatorHandoff { redeliver: true },
+        )
+        .await;
         let (_, response) = next_event(&f.sink).await;
         let FrontendEvent::CoordinatorHandoffResult {
             handoff: None,
@@ -1099,7 +1152,11 @@ async fn handoff_show_reports_a_failed_credential_redelivery() {
     // A human terminal without coordinator ancestry gets no delivery report.
     let mut ctx = dispatch(&f.state, &f.sink, "read-handoff-human");
     ctx.peer_pid = None;
-    coordinator_handoff::handle_get_coordinator_handoff(ctx, FrontendRequest::GetCoordinatorHandoff).await;
+    coordinator_handoff::handle_get_coordinator_handoff(
+        ctx,
+        FrontendRequest::GetCoordinatorHandoff { redeliver: true },
+    )
+    .await;
     assert!(matches!(
         next_event(&f.sink).await.1,
         FrontendEvent::CoordinatorHandoffResult {
@@ -1120,7 +1177,10 @@ async fn a_pending_delivery_to_a_replaced_session_does_not_suppress_its_replacem
     let show = |request_id: &'static str| {
         let mut ctx = dispatch(&f.state, &f.sink, request_id);
         ctx.peer_pid = Some(std::process::id() as libc::pid_t);
-        coordinator_handoff::handle_get_coordinator_handoff(ctx, FrontendRequest::GetCoordinatorHandoff)
+        coordinator_handoff::handle_get_coordinator_handoff(
+            ctx,
+            FrontendRequest::GetCoordinatorHandoff { redeliver: true },
+        )
     };
     show("show-a").await;
     next_event(&f.sink).await;

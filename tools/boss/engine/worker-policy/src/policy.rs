@@ -543,7 +543,7 @@ fn worker_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         // is coordinator-facing by construction — it exists precisely so
         // coordinator vocabulary stays out of every worker's context.
         FrontendRequest::EngineResponse { .. }
-        | FrontendRequest::GetCoordinatorHandoff
+        | FrontendRequest::GetCoordinatorHandoff { .. }
         | FrontendRequest::ListCoordinatorGuidance { .. }
         | FrontendRequest::RecreateCoordinator { .. }
         | FrontendRequest::RegisterAppSession
