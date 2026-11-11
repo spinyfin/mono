@@ -63,8 +63,9 @@ bound. Result admission measures the encoded record with envelope overhead and
 replaces an oversized payload with a bounded diagnostic. Reads are rejected;
 operations that may have changed the host report uncertainty. A later negotiation
 too small for retained records or pending command identities is retried without
-discarding evidence. Schema 4 added execution ownership; schema 5 adds producer
-receipts and transcript checkpoints. Older readers refuse newer schemas.
+discarding evidence. Schema 4 added execution ownership; schema 5 added producer
+receipts and transcript checkpoints. Schema 6 returns pruned receipt and checkpoint
+bytes to spool accounting. Older readers refuse newer schemas.
 
 The daemon binds an owner-only `events.sock` inside its state directory. It
 authenticates hook peers by OS user, process ancestry, boot identity and the
@@ -103,3 +104,10 @@ about release, retry, and GitHub PR state.
 
 Run `bazel test //tools/boss/engine/spoke-journal/... //tools/boss/engine/spoke/...`
 for storage and real daemon/tonic fault tests.
+
+File progress uses the shared stdout-progress framer and normalizer. The spoke
+sets a 256 KiB progress-line limit because each durable source checkpoint is
+bounded to 512 KiB: base64 partial bytes use up to 342 KiB, leaving room for
+normalizer state and the raw cursor. Local ingress has no durable partial-byte
+checkpoint and keeps its default 1 MiB limit. An oversized spoke progress entry
+produces a Gap; its raw transcript bytes remain available in the journal.

@@ -18,8 +18,27 @@ pub fn deliver(directory: &Path, socket: &str, payload: &[u8], deadline: Instant
         metadata.is_dir() && metadata.permissions().mode() & 0o077 == 0,
         "hook spool must be a private directory"
     );
-    anyhow::ensure!(payload.len() <= 256 * 1024, "hook payload exceeds 256 KiB");
     let mut value: serde_json::Value = serde_json::from_slice(payload)?;
+    // Leave room for producer metadata before enforcing the ingress envelope bound.
+    if payload.len() > 255 * 1024 {
+        let object = value.as_object_mut().ok_or_else(|| anyhow!("hook is not an object"))?;
+        object.retain(|key, value| {
+            matches!(
+                key.as_str(),
+                "hook_event_name"
+                    | "session_id"
+                    | "tool_name"
+                    | "agent_id"
+                    | "transcript_path"
+                    | "_boss_run_id"
+                    | "_boss_lease_id"
+            ) && value.as_str().is_some_and(|text| text.len() <= 8192)
+        });
+        object.insert("tool_input".into(), serde_json::json!({"_boss_truncated": true}));
+        object.insert("tool_response".into(), serde_json::json!({"_boss_truncated": true}));
+        object.insert("_boss_payload_truncated".into(), true.into());
+    }
+    let payload_size = serde_json::to_vec(&value)?.len();
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -39,7 +58,7 @@ pub fn deliver(directory: &Path, socket: &str, payload: &[u8], deadline: Instant
         Ok::<_, io::Error>(total.saturating_add(entry?.metadata()?.len()))
     })?;
     anyhow::ensure!(
-        used.saturating_add(payload.len() as u64 + 1024) <= 64 * 1024 * 1024,
+        used.saturating_add(payload_size as u64 + 1024) <= 64 * 1024 * 1024,
         "pending hook spool full; existing events retained"
     );
     let next = sequence
@@ -103,6 +122,40 @@ pub fn deliver(directory: &Path, socket: &str, payload: &[u8], deadline: Instant
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn oversized_post_tool_use_is_durably_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let payload = serde_json::json!({
+            "hook_event_name": "PostToolUse", "session_id": "session",
+            "tool_name": "Write", "_boss_run_id": "run", "agent_id": "child",
+            "tool_input": {"content": "x".repeat(1024 * 1024)},
+            "tool_response": "x".repeat(1024 * 1024),
+        });
+        deliver(
+            root.path(),
+            "/tmp/boss-event-missing.sock",
+            &serde_json::to_vec(&payload).unwrap(),
+            Instant::now(),
+        )
+        .unwrap();
+        let path = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|extension| extension == "json"))
+            .unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        assert!(bytes.len() < 256 * 1024);
+        let saved: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        for key in ["hook_event_name", "session_id", "tool_name", "_boss_run_id", "agent_id"] {
+            assert_eq!(saved[key], payload[key]);
+        }
+        assert_eq!(saved["tool_input"]["_boss_truncated"], true);
+        assert_eq!(saved["tool_response"]["_boss_truncated"], true);
+        assert_eq!(saved["_boss_producer_sequence"], 1);
+        assert_eq!(saved["_boss_producer_id"].as_str().unwrap().len(), 32);
+    }
 
     #[test]
     fn full_spool_rejects_without_advancing_sequence() {

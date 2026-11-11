@@ -36,6 +36,7 @@ pub fn registered(journal: &SharedJournal) -> Result<Vec<ExecutionRecord>> {
 pub async fn observe(journal: SharedJournal, stamp: impl Fn() -> Result<Stamp>) -> Result<()> {
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut source_errors = std::collections::HashMap::new();
     loop {
         interval.tick().await;
         let records = match registered(&journal) {
@@ -45,6 +46,7 @@ pub async fn observe(journal: SharedJournal, stamp: impl Fn() -> Result<Stamp>) 
                 continue;
             }
         };
+        source_errors.retain(|run, _| records.iter().any(|record| &record.run_id == run && !record.reclaimed));
         for record in records {
             if record.observation.is_none() || record.reclaimed {
                 continue;
@@ -59,10 +61,17 @@ pub async fn observe(journal: SharedJournal, stamp: impl Fn() -> Result<Stamp>) 
             if let Err(error) = hooks::drain(&journal, &record, &stamp()?).await {
                 tracing::warn!(run = record.run_id, %error, "pending hooks retained");
             }
-            if let Err(error) = transcripts::poll(&journal, &record, &stamp()?).await
-                && !boss_spoke_journal::Fault::is_full(&error)
-            {
-                tracing::warn!(run = record.run_id, %error, "transcript source retained");
+            match transcripts::poll(&journal, &record, &stamp()?).await {
+                Err(error) if !boss_spoke_journal::Fault::is_full(&error) => {
+                    let message = error.to_string();
+                    if source_errors.insert(record.run_id.clone(), message.clone()).as_ref() != Some(&message) {
+                        tracing::warn!(run = record.run_id, %error, "transcript source retained");
+                    }
+                }
+                Ok(()) => {
+                    source_errors.remove(&record.run_id);
+                }
+                _ => {}
             }
         }
     }
@@ -183,6 +192,136 @@ mod tests {
         child.stdin.take().unwrap().write_all(payload).await.unwrap();
         let result = child.wait_with_output().await.unwrap();
         assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    }
+
+    #[tokio::test]
+    async fn subagent_tool_events_retain_origin_in_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let execution = execution(root.path());
+        let journal = journal(root.path(), limits());
+        let mut payload: serde_json::Value = serde_json::from_slice(&hook(None)).unwrap();
+        payload["agent_id"] = "child".into();
+        payload["hook_event_name"] = "PostToolUse".into();
+        payload["tool_name"] = "Write".into();
+        hooks::ingest(
+            &journal,
+            &execution,
+            &serde_json::to_vec(&payload).unwrap(),
+            &stamp().unwrap(),
+        )
+        .await
+        .unwrap();
+        let captured = records(&journal);
+        let Some(record::Body::Event(event)) = &captured[0].body else {
+            panic!("missing event");
+        };
+        assert!(event.from_subagent);
+        assert!(
+            matches!(&event.event, Some(boss_protocol_spoke::v1::worker_event::Event::PostToolUse(tool)) if tool.name == "Write")
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_ambiguous_and_unsafe_sources_drain_only_after_pending_hooks() {
+        for ambiguous in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut execution = execution(root.path());
+            let journal = journal(root.path(), limits());
+            if ambiguous {
+                execution.driver_id = "codex".into();
+                let directory = root.path().join("sessions");
+                std::fs::create_dir(&directory).unwrap();
+                execution.observation.as_mut().unwrap().file = Some((
+                    boss_engine_driver::AgentJsonlFileIngress {
+                        directory: directory.clone(),
+                        filename_prefix: "rollout-".into(),
+                        filename_suffix: ".jsonl".into(),
+                        workspace_path: root.path().into(),
+                    },
+                    Vec::new(),
+                ));
+                for id in ["one", "two"] {
+                    let meta = serde_json::json!({"type":"session_meta", "payload":{"id":id,"cwd":root.path()}});
+                    std::fs::write(directory.join(format!("rollout-{id}.jsonl")), format!("{meta}\n")).unwrap();
+                }
+            } else {
+                let target = root.path().join("actual.jsonl");
+                let link = root.path().join("link.jsonl");
+                std::fs::write(&target, b"{}").unwrap();
+                std::os::unix::fs::symlink(&target, &link).unwrap();
+                hooks::ingest(&journal, &execution, &hook(Some(&link)), &stamp().unwrap())
+                    .await
+                    .unwrap();
+            }
+            execution.phase = Phase::Terminal;
+            let pending = execution.observation.as_ref().unwrap().pending.join("unprocessed.json");
+            std::fs::write(&pending, b"{}").unwrap();
+            assert!(
+                transcripts::poll(&journal, &execution, &stamp().unwrap())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                journal
+                    .lock()
+                    .unwrap()
+                    .source(&run_identity(&execution), "drained")
+                    .unwrap()
+                    .is_none()
+            );
+            std::fs::remove_file(pending).unwrap();
+            transcripts::poll(&journal, &execution, &stamp().unwrap())
+                .await
+                .unwrap();
+            assert!(matches!(&records(&journal).last().unwrap().body,
+                Some(record::Body::Gap(gap)) if gap.resource == "transcript"));
+            assert!(
+                journal
+                    .lock()
+                    .unwrap()
+                    .source(&run_identity(&execution), "drained")
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_missing_and_invalid_sources_record_gap_and_drain() {
+        for path in [None, Some(Path::new("relative.jsonl"))] {
+            let root = tempfile::tempdir().unwrap();
+            let mut execution = execution(root.path());
+            let journal = journal(root.path(), limits());
+            if path.is_some() {
+                hooks::ingest(&journal, &execution, &hook(path), &stamp().unwrap())
+                    .await
+                    .unwrap();
+                assert!(
+                    transcripts::poll(&journal, &execution, &stamp().unwrap())
+                        .await
+                        .is_err()
+                );
+            }
+            execution.phase = Phase::Terminal;
+            transcripts::poll(&journal, &execution, &stamp().unwrap())
+                .await
+                .unwrap();
+            let count = records(&journal).len();
+            transcripts::poll(&journal, &execution, &stamp().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(records(&journal).len(), count);
+            assert!(matches!(&records(&journal).last().unwrap().body,
+                Some(record::Body::Gap(gap)) if gap.resource == "transcript"));
+            assert!(
+                journal
+                    .lock()
+                    .unwrap()
+                    .source(&run_identity(&execution), "drained")
+                    .unwrap()
+                    .is_some()
+            );
+        }
     }
 
     #[tokio::test]

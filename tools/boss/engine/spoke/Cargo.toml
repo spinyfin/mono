@@ -9,6 +9,7 @@ name = "boss_spoke_ingress"
 path = "src/lib.rs"
 
 [dependencies]
+boss-engine-stdout-progress = { path = "../stdout-progress" }
 base64 = { workspace = true }
 boss-engine-driver = { path = "../driver" }
 boss-transcript-tail = { path = "../transcript-tail" }

@@ -330,6 +330,7 @@ fn record_frame(sequence: u64, body: record::Body, run: Option<v1::Run>) -> v1::
 
 fn event_record(sequence: u64) -> v1::SpokeFrame {
     let event = v1::WorkerEvent {
+        from_subagent: false,
         session_id: "session-1".into(),
         event: Some(v1::worker_event::Event::Notification(format!("event {sequence}"))),
     };

@@ -102,6 +102,7 @@ rust_library(
         "//tools/boss/engine/host-execution",
         "//tools/boss/engine/spoke-journal",
         "//tools/boss/engine/spoke-outbound",
+        "//tools/boss/engine/stdout-progress",
         "//tools/boss/engine/transcript-tail",
         "//tools/boss/protocol-spoke",
     ] + all_crate_deps(normal = True),
@@ -124,6 +125,7 @@ rust_test(
         "//tools/boss/engine/host-execution",
         "//tools/boss/engine/spoke-journal",
         "//tools/boss/engine/spoke-outbound",
+        "//tools/boss/engine/stdout-progress",
         "//tools/boss/engine/transcript-tail",
         "//tools/boss/protocol-spoke",
     ] + all_crate_deps(

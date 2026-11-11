@@ -267,6 +267,7 @@ fn an_unknown_record_body_is_quarantined_not_applied() {
 #[test]
 fn a_known_body_from_a_newer_peer_still_validates() {
     let event = v1::WorkerEvent {
+        from_subagent: false,
         session_id: "s".into(),
         event: Some(v1::worker_event::Event::Notification("n".into())),
     };

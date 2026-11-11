@@ -91,15 +91,17 @@ pub fn to_wire(event: &Domain) -> v1::WorkerEvent {
         Domain::SessionEnd { session_id, reason } => (session_id, Event::SessionEnd(reason.clone())),
     };
     v1::WorkerEvent {
+        from_subagent: false,
         session_id: session_id.clone(),
         event: Some(event),
     }
 }
 
 /// Decodes a wire event, failing closed on a missing body, an empty session id
-/// or malformed tool JSON.
+/// or malformed tool JSON. Callers retain the wire envelope's `from_subagent`
+/// alongside the decoded event so subagent progress cannot finish a parent turn.
 pub fn from_wire(wire: v1::WorkerEvent) -> Result<Domain, ConversionError> {
-    let v1::WorkerEvent { session_id, event } = wire;
+    let v1::WorkerEvent { session_id, event, .. } = wire;
     if session_id.is_empty() {
         return Err(ConversionError::MissingSessionId);
     }
@@ -276,6 +278,7 @@ mod tests {
     fn unknown_stop_reasons_never_become_completion() {
         for raw in [0, 99, -1] {
             let wire = v1::WorkerEvent {
+                from_subagent: false,
                 session_id: "s".into(),
                 event: Some(Event::Stop(v1::TurnStop {
                     reason: raw,
@@ -293,6 +296,7 @@ mod tests {
     fn unknown_start_sources_decode_as_other() {
         for raw in [0, 99] {
             let wire = v1::WorkerEvent {
+                from_subagent: false,
                 session_id: "s".into(),
                 event: Some(Event::SessionStart(v1::SessionStart {
                     source: raw,
@@ -313,18 +317,21 @@ mod tests {
     #[test]
     fn malformed_events_are_errors() {
         let no_body = v1::WorkerEvent {
+            from_subagent: false,
             session_id: "s".into(),
             event: None,
         };
         assert_eq!(from_wire(no_body), Err(ConversionError::MissingEvent));
 
         let no_session = v1::WorkerEvent {
+            from_subagent: false,
             session_id: String::new(),
             event: Some(Event::UserPrompt("x".into())),
         };
         assert_eq!(from_wire(no_session), Err(ConversionError::MissingSessionId));
 
         let bad_json = v1::WorkerEvent {
+            from_subagent: false,
             session_id: "s".into(),
             event: Some(Event::PostToolUse(v1::ToolUse {
                 name: "Bash".into(),

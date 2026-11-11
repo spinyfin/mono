@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use boss_engine_driver::{DriverRegistry, ProgressSessionConfig, ProgressStreamSource, discovery};
 use boss_host_execution::worker::{ExecutionRecord, Phase};
 use boss_protocol_spoke::{
@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
+// A source checkpoint is limited to 512 KiB. Base64 for 256 KiB uses
+// 342 KiB, leaving room for the cursor and normalizer state. Raw transcript
+// bytes remain journaled even when this progress-only bound rejects a line.
 const MAX_PARTIAL: usize = 256 * 1024;
 
 #[derive(Default, Serialize, Deserialize)]
@@ -76,7 +79,29 @@ pub async fn watermark(
     ))
 }
 
+#[derive(Debug)]
+struct SourceFailure(String);
+impl std::fmt::Display for SourceFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for SourceFailure {}
+
 pub async fn poll(journal: &SharedJournal, execution: &ExecutionRecord, stamp: &Stamp) -> Result<()> {
+    let result = poll_source(journal, execution, stamp).await;
+    if let Err(error) = &result
+        && error.downcast_ref::<SourceFailure>().is_some()
+        && execution.phase == Phase::Terminal
+        && let Some(observation) = &execution.observation
+        && !crate::hooks::has_pending(&observation.pending)?
+    {
+        return finish_gap(journal, &crate::run_identity(execution), stamp, error.to_string());
+    }
+    result
+}
+
+async fn poll_source(journal: &SharedJournal, execution: &ExecutionRecord, stamp: &Stamp) -> Result<()> {
     let observation = execution
         .observation
         .as_ref()
@@ -105,13 +130,15 @@ pub async fn poll(journal: &SharedJournal, execution: &ExecutionRecord, stamp: &
             discovery::scan_once(&prepared)
         })
         .await?
-        .map_err(anyhow::Error::msg)?;
+        .map_err(SourceFailure)?;
         // Keep following an attached file when another candidate appears.
         // Before attachment, ambiguity must never pick a run by recency.
         if scan.matched.iter().any(|c| c.path == checkpoint.path) {
             Some(checkpoint.path.clone())
         } else {
-            ensure!(scan.matched.len() <= 1, "multiple correlated transcript candidates");
+            if scan.matched.len() > 1 {
+                return Err(SourceFailure("multiple correlated transcript candidates".into()).into());
+            }
             scan.matched.into_iter().next().map(|c| c.path)
         }
     } else {
@@ -125,7 +152,9 @@ pub async fn poll(journal: &SharedJournal, execution: &ExecutionRecord, stamp: &
         }
         return Ok(());
     };
-    ensure!(path.is_absolute(), "transcript path must be absolute");
+    if !path.is_absolute() {
+        return Err(SourceFailure("transcript path must be absolute".into()).into());
+    }
     let mut switched = None;
     if checkpoint.path != path {
         if !checkpoint.path.as_os_str().is_empty() {
@@ -167,7 +196,27 @@ pub async fn poll(journal: &SharedJournal, execution: &ExecutionRecord, stamp: &
         {
             return finish_missing(journal, &run, stamp, &checkpoint);
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => {
+            let permanent = match &error {
+                boss_transcript_tail::TailError::Io(io) => {
+                    io.raw_os_error() == Some(libc::ELOOP)
+                        || matches!(
+                            io.kind(),
+                            std::io::ErrorKind::NotFound
+                                | std::io::ErrorKind::NotADirectory
+                                | std::io::ErrorKind::PermissionDenied
+                                | std::io::ErrorKind::InvalidInput
+                                | std::io::ErrorKind::InvalidData
+                        )
+                }
+                _ => true,
+            };
+            return Err(if permanent {
+                SourceFailure(error.to_string()).into()
+            } else {
+                error.into()
+            });
+        }
     };
     let _ = credit?;
     if chunk.replaced {
@@ -209,79 +258,51 @@ pub async fn poll(journal: &SharedJournal, execution: &ExecutionRecord, stamp: &
     }
     if observation.file.is_some() {
         let driver = DriverRegistry::default().require(&execution.driver_id)?;
-        let mut session = driver
-            .progress_session(&ProgressSessionConfig {
-                run_id: Some(run.run_id.clone()),
-                source: ProgressStreamSource::AgentJsonlFile,
-                transcript_path: Some(checkpoint.path.clone()),
-                resume_state: checkpoint.progress.normalizer.clone(),
-                ..Default::default()
-            })
-            .context("file driver has no progress normalizer")?;
+        let mut session = driver.progress_session(&ProgressSessionConfig {
+            run_id: Some(run.run_id.clone()),
+            source: ProgressStreamSource::AgentJsonlFile,
+            transcript_path: Some(checkpoint.path.clone()),
+            resume_state: checkpoint.progress.normalizer.clone(),
+            ..Default::default()
+        });
+        let normalizer = session.as_mut().context("file driver has no progress normalizer")?;
         if let Some(state) = &checkpoint.progress.normalizer {
-            session.restore_resume_state(state).map_err(anyhow::Error::msg)?;
+            normalizer.restore_resume_state(state).map_err(anyhow::Error::msg)?;
         }
-        checkpoint.progress.partial.extend_from_slice(&chunk.data);
-        if execution.phase == Phase::Terminal
-            && chunk.eof
-            && !checkpoint.progress.partial.is_empty()
-            && checkpoint.progress.partial.last() != Some(&b'\n')
-        {
-            checkpoint.progress.partial.push(b'\n');
-        }
-        if checkpoint.progress.skip_until_newline {
-            if let Some(index) = checkpoint.progress.partial.iter().position(|&b| b == b'\n') {
-                checkpoint.progress.partial.drain(..=index);
-                checkpoint.progress.skip_until_newline = false;
-            } else {
-                checkpoint.progress.partial.clear();
+        use boss_engine_stdout_progress::{RawLine, ReaderConfig, ReaderStats, frame_chunk, normalize_line};
+        let config = ReaderConfig {
+            max_line_bytes: MAX_PARTIAL,
+        };
+        let frames = frame_chunk(
+            &mut checkpoint.progress.partial,
+            &mut checkpoint.progress.skip_until_newline,
+            &chunk.data,
+            execution.phase == Phase::Terminal && chunk.eof,
+            config,
+        );
+        let mut stats = ReaderStats::default();
+        for frame in frames {
+            if matches!(frame, RawLine::Oversized) {
+                records.push((
+                    make(record::Body::Gap(Gap {
+                        resource: format!("transcript:{generation}:entry"),
+                        from_offset: checkpoint.cursor.offset,
+                        through_offset: chunk.cursor.offset,
+                        reason: "transcript progress entry exceeds 256 KiB checkpoint bound; raw bytes retained".into(),
+                    })),
+                    Admission::Lifecycle,
+                ));
             }
-        }
-        let mut consumed = 0;
-        for (index, byte) in checkpoint.progress.partial.iter().enumerate() {
-            if *byte != b'\n' {
-                continue;
-            }
-            let line = &checkpoint.progress.partial[consumed..index];
-            consumed = index + 1;
-            let value: serde_json::Value = match serde_json::from_slice(line) {
-                Ok(value) => value,
-                Err(error) => {
-                    tracing::warn!(run = run.run_id, %error, "invalid transcript JSON retained in raw stream");
-                    continue;
+            for envelope in normalize_line(frame, driver.as_ref(), &mut session, config, &mut stats) {
+                let mut wire = worker_event::to_wire(&envelope.event);
+                if let Some(Event::Stop(stop)) = &mut wire.event {
+                    stop.transcript_generation = generation.clone();
+                    stop.transcript_through = chunk.cursor.offset;
                 }
-            };
-            match session.normalize_progress_events(&value) {
-                Ok(events) => {
-                    for event in events {
-                        let mut wire = worker_event::to_wire(&event);
-                        if let Some(Event::Stop(stop)) = &mut wire.event {
-                            stop.transcript_generation = generation.clone();
-                            stop.transcript_through = chunk.cursor.offset;
-                        }
-                        records.push((make(record::Body::Event(wire)), Admission::Lifecycle));
-                    }
-                }
-                // Match the shared JSONL reader: driver-rejected records do
-                // not stop the stream, and their original bytes remain evidence.
-                Err(error) => tracing::debug!(run = run.run_id, %error, "driver skipped transcript entry"),
+                records.push((make(record::Body::Event(wire)), Admission::Lifecycle));
             }
         }
-        checkpoint.progress.partial.drain(..consumed);
-        if checkpoint.progress.partial.len() > MAX_PARTIAL {
-            records.push((
-                make(record::Body::Gap(Gap {
-                    resource: format!("transcript:{generation}:entry"),
-                    from_offset: checkpoint.cursor.offset,
-                    through_offset: chunk.cursor.offset,
-                    reason: "unterminated transcript entry exceeds 256 KiB; skipped until the next newline".into(),
-                })),
-                Admission::Lifecycle,
-            ));
-            checkpoint.progress.skip_until_newline = true;
-            checkpoint.progress.partial.clear();
-        }
-        checkpoint.progress.normalizer = session.resume_state();
+        checkpoint.progress.normalizer = session.as_ref().and_then(|session| session.resume_state());
     }
     checkpoint.cursor = chunk.cursor;
     checkpoint.eof = chunk.eof;
@@ -311,27 +332,44 @@ fn finish_missing(
     stamp: &Stamp,
     checkpoint: &Checkpoint,
 ) -> Result<()> {
-    let records = if checkpoint.path.as_os_str().is_empty() {
-        Vec::new()
+    let reason = if checkpoint.path.as_os_str().is_empty() {
+        "terminal run never attached a transcript source"
     } else {
+        "attached transcript disappeared before final drain; final size unknown"
+    };
+    finish_gap(journal, run, stamp, reason.into())
+}
+
+fn finish_gap(
+    journal: &SharedJournal,
+    run: &boss_protocol_spoke::v1::Run,
+    stamp: &Stamp,
+    reason: String,
+) -> Result<()> {
+    let mut journal = journal
+        .lock()
+        .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
+    if journal.source(run, "drained")?.is_some() {
+        return Ok(());
+    }
+    journal.commit_source(
+        run,
+        "drained",
+        None,
+        b"true",
         vec![(
             Record {
                 observed: Some(stamp.clone()),
                 run: Some(run.clone()),
                 body: Some(record::Body::Gap(Gap {
-                    resource: format!("transcript:{}-{}", checkpoint.incarnation, checkpoint.cursor.generation),
-                    from_offset: checkpoint.cursor.offset,
-                    through_offset: checkpoint.cursor.offset,
-                    reason: "attached transcript disappeared before final drain; final size unknown".into(),
+                    resource: "transcript".into(),
+                    reason,
+                    ..Default::default()
                 })),
                 ..Default::default()
             },
             Admission::Lifecycle,
-        )]
-    };
-    journal
-        .lock()
-        .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
-        .commit_source(run, "drained", None, b"true", records)?;
+        )],
+    )?;
     Ok(())
 }

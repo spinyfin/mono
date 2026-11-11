@@ -1647,6 +1647,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "boss-engine-driver",
+ "boss-engine-stdout-progress",
  "boss-host-enrollment",
  "boss-host-execution",
  "boss-protocol-spoke",

@@ -66,3 +66,44 @@ fn remote_settings_drop_data_dir_sandbox_but_keep_hooks_and_static_denies() {
     // the remote variant is the one dropping it.
     assert!(render_settings_json(&input, &ClaudeDriver).contains("boss-path-guard.py"));
 }
+
+#[test]
+fn spoke_replaces_hub_forwarders_without_removing_policy() {
+    use boss_engine_driver::{ProgressIngress, ProgressObservationConfig, hook_settings};
+    let input = sample_input();
+    let mut settings: serde_json::Value =
+        serde_json::from_str(&render_remote_settings_json(&input, &ClaudeDriver)).unwrap();
+    let policy = settings["permissions"].clone();
+    let config = ProgressObservationConfig {
+        events_socket_path: "/tmp/spoke.sock".into(),
+        forwarder_binary: "/spoke/bin/boss-event".into(),
+        run_id: "spoke-run".into(),
+        lease_id: "lease".into(),
+        workspace_path: "/workspace".into(),
+    };
+    for _ in 0..2 {
+        let ProgressIngress::HookCallback(wiring) = ClaudeDriver.progress_observation_wiring(&config) else {
+            panic!("expected hooks");
+        };
+        hook_settings::replace_forwarders(&mut settings, wiring.hooks, &config.forwarder_binary).unwrap();
+    }
+    assert_eq!(settings["permissions"], policy);
+    for entries in settings["hooks"].as_object().unwrap().values() {
+        let forwarders: Vec<_> = entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|entry| entry["hooks"].as_array().unwrap())
+            .filter_map(|hook| hook["command"].as_str())
+            .filter(|command| command.contains("boss-event"))
+            .collect();
+        assert_eq!(forwarders.len(), 1);
+        assert!(forwarders[0].contains("spoke-run"));
+        assert!(forwarders[0].contains("/tmp/spoke.sock"));
+    }
+    assert!(
+        settings["hooks"]["PreToolUse"]
+            .to_string()
+            .contains("this would start Boss itself")
+    );
+}

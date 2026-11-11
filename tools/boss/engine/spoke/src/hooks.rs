@@ -108,13 +108,15 @@ pub async fn ingest(journal: &SharedJournal, execution: &ExecutionRecord, bytes:
     let file_ingress = execution.observation.as_ref().is_some_and(|o| o.file.is_some());
     // The driver's selected source is authoritative. Codex hooks carry policy
     // observations; its rollout is the progress feed, so never emit both.
-    let observations = if file_ingress || subagent {
+    let observations = if file_ingress {
         Vec::new()
     } else {
         let event = driver.normalize_progress_event(&raw)?;
         let mut wire = worker_event::to_wire(&event);
+        wire.from_subagent = subagent;
         let mut observations = Vec::new();
         if let Some(boss_protocol_spoke::v1::worker_event::Event::Stop(stop)) = &mut wire.event
+            && !subagent
             && let Some(path) = &path
         {
             match crate::transcripts::watermark(journal, execution, path).await {
