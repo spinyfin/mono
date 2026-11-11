@@ -602,6 +602,33 @@ fn wait_until_occupied(path: &Path) -> Occupancy {
 }
 
 #[test]
+fn linux_occupancy_scan_skips_namespace_init() {
+    use std::ffi::OsStr;
+    assert_eq!(linux_occupancy_pid(OsStr::new("0")), None);
+    assert_eq!(linux_occupancy_pid(OsStr::new("1")), None);
+    assert_eq!(linux_occupancy_pid(OsStr::new("self")), None);
+    assert_eq!(linux_occupancy_pid(OsStr::new("42")), Some(42));
+
+    let dir = tempfile::TempDir::new().unwrap();
+    // A same-uid unreadable PID 1 is inconclusive if recorded, which is why
+    // the enumerator must skip it.
+    let mut recorded = ProcessSnapshot {
+        cwds: vec![],
+        complete: true,
+    };
+    recorded.record(1, Err(std::io::Error::from_raw_os_error(libc::EPERM)), || {
+        Some(unsafe { libc::geteuid() })
+    });
+    assert_eq!(recorded.occupancy(dir.path()), Occupancy::Unknown);
+
+    let skipped = ProcessSnapshot {
+        cwds: vec![],
+        complete: true,
+    };
+    assert_eq!(skipped.occupancy(dir.path()), Occupancy::Empty);
+}
+
+#[test]
 fn complete_snapshot_of_an_empty_unique_dir_is_empty() {
     let dir = tempfile::TempDir::new().unwrap();
     assert_eq!(

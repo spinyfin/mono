@@ -349,4 +349,24 @@ unittest.main(argv=["worker-processes"], verbosity=2)
         println!("{}", String::from_utf8_lossy(&output.stdout));
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     }
+
+    #[test]
+    fn stray_only_requires_that_no_occupant_has_an_owner() {
+        let stray = super::Cleanup {
+            terminated: vec![],
+            killed: vec![],
+            remaining: vec![],
+            occupants: vec![7],
+            unknown: vec![],
+            owners: Default::default(),
+            elapsed_ms: 0,
+        };
+        assert!(stray.stray_only());
+        let owned = super::Cleanup {
+            owners: [("run-a".into(), vec![7])].into(),
+            ..stray
+        };
+        assert!(!owned.stray_only());
+        assert!(!owned.empty());
+    }
 }

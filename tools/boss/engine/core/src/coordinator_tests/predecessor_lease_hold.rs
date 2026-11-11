@@ -695,7 +695,7 @@ async fn terminal_remote_predecessor_with_no_cleanup_item_fails_the_successor_af
         ExecutionStatus::Ready
     );
 
-    // A retryable release failure is still being worked on: it keeps the
+    // A freshly filed release failure is still being retried: it keeps the
     // successor waiting however old the remote evidence and its hold are.
     age_waits(&s);
     crate::workspace_lease_release::raise_attention(
@@ -709,7 +709,7 @@ async fn terminal_remote_predecessor_with_no_cleanup_item_fails_the_successor_af
     assert_eq!(
         s.db().get_execution(&successor.id).unwrap().status,
         ExecutionStatus::Ready,
-        "an open release failure never fails a successor"
+        "a freshly filed release failure keeps the successor waiting"
     );
     s.db()
         .connect()
@@ -726,6 +726,89 @@ async fn terminal_remote_predecessor_with_no_cleanup_item_fails_the_successor_af
         ExecutionStatus::Failed
     );
     assert_eq!(s.wait_reason(&successor.id), None);
+}
+
+#[tokio::test]
+async fn local_predecessor_cube_release_failure_fails_the_successor_after_the_bound() {
+    let s = Stalled::new(true).await;
+    s.db().mark_execution_orphaned(&s.stalled_id, "worker gone").unwrap();
+    let successor = s
+        .db()
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(s.stalled().work_item_id)
+                .build(),
+        )
+        .unwrap();
+
+    assert!(
+        matches!(fail_cube_release(&s).await, LeaseReleaseOutcome::CubeFailed { .. }),
+        "{:?}",
+        s.db().list_attention_items(&s.stalled_id).unwrap()
+    );
+    assert_eq!(s.stalled().cube_lease_id.as_deref(), Some("lease-old"));
+    assert!(s.db().preserved_tip(&s.stalled_id).unwrap().is_some());
+    assert!(s.db().list_attention_items(&s.stalled_id).unwrap().iter().any(|item| {
+        item.kind == boss_engine_storage_values::attention_kinds::LEASE_RELEASE_FAILED_ATTENTION_KIND
+            && item.status == "open"
+    }));
+
+    s.coordinator.drain_ready_queue_for_test().await;
+    assert_eq!(
+        s.db().get_execution(&successor.id).unwrap().status,
+        ExecutionStatus::Ready
+    );
+    assert_eq!(s.wait_reason(&successor.id).as_deref(), Some(HOLD_REASON));
+
+    // The leftover-lease sweep keeps retrying cube while the successor waits.
+    assert!(matches!(
+        fail_cube_release(&s).await,
+        LeaseReleaseOutcome::CubeFailed { .. }
+    ));
+    s.coordinator.drain_ready_queue_for_test().await;
+    assert_eq!(
+        s.db().get_execution(&successor.id).unwrap().status,
+        ExecutionStatus::Ready,
+        "a fresh cube-release failure is retried, not a successor failure"
+    );
+
+    age_predecessor(&s);
+    let err = s
+        .coordinator
+        .force_dispatch(&successor.id, DispatchAdmission::OperatorForced)
+        .await
+        .unwrap_err();
+    let err = format!("{err:#}");
+    assert!(err.contains("Recovery cannot start"), "{err}");
+    assert!(err.contains("cube workspace release failed"), "{err}");
+    assert_eq!(
+        s.db().get_execution(&successor.id).unwrap().status,
+        ExecutionStatus::Failed
+    );
+    assert_eq!(s.wait_reason(&successor.id), None);
+    assert_eq!(s.stalled().cube_lease_id.as_deref(), Some("lease-old"));
+    assert!(
+        matches!(fail_cube_release(&s).await, LeaseReleaseOutcome::CubeFailed { .. }),
+        "sweeps keep retrying cube after the successor has failed"
+    );
+}
+
+async fn fail_cube_release(s: &Stalled) -> LeaseReleaseOutcome {
+    let stalled = s.stalled();
+    let preservation = DbPreservation::new(s.db(), None).with_cube(s.cube.as_ref());
+    apply_release(
+        s.db(),
+        &stalled,
+        "lease-old",
+        ReleaseEvidence {
+            cause: TerminalCause::Inferred,
+            pane: PaneStatus::Gone,
+            occupancy: &EmptyOccupancy,
+            preservation: &preservation,
+        },
+        async { Err(anyhow::anyhow!("cube workspace release failed")) },
+    )
+    .await
 }
 
 /// Every run in these tests is local, so no host adapter is ever requested.

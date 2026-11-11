@@ -275,7 +275,7 @@ fn process_cwds(snapshot: &mut ProcessSnapshot) -> std::io::Result<()> {
     {
         for entry in std::fs::read_dir("/proc")? {
             let entry = entry?;
-            let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else {
+            let Some(pid) = linux_occupancy_pid(&entry.file_name()) else {
                 continue;
             };
             // A zombie or exiting process has no cwd and cannot occupy anything,
@@ -308,6 +308,16 @@ fn process_cwds(snapshot: &mut ProcessSnapshot) -> std::io::Result<()> {
         let _ = snapshot;
         Err(std::io::Error::other("unsupported occupancy probe"))
     }
+}
+
+/// Linux `/proc` names the occupancy enumerator considers. PID 0 and 1 are
+/// never workers: namespace init predates launched processes and can refuse
+/// its cwd to a same-uid scanner, which would otherwise make occupancy
+/// Unknown. Matches the Python scanner's `pid > 1` filter.
+#[cfg(any(target_os = "linux", test))]
+fn linux_occupancy_pid(name: &std::ffi::OsStr) -> Option<u32> {
+    let pid: u32 = name.to_str()?.parse().ok()?;
+    (pid > 1).then_some(pid)
 }
 
 /// `State:` of `/proc/<pid>/status` is a zombie (`Z`) or dead (`X`).

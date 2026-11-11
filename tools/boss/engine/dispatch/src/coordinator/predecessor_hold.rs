@@ -33,15 +33,16 @@ impl ExecutionCoordinator {
     ///
     /// The wait is bounded. A cleanup problem is often transient (an
     /// unreachable host, one failed probe) and the sweeps retry it, so a
-    /// fresh attention item never fails the successor. Only a kept-lease item
-    /// that has stayed open for [`PREDECESSOR_HOLD_BOUND_SECS`] does (the
-    /// sweeps have then had many passes), or, for a remote predecessor that
-    /// left no item at all, the same time since it ended. Either clock runs
-    /// from the later of that start and the successor's first hold, so a
-    /// successor created after the problem was already old still gets the
-    /// full bound. An open `workspace_lease_release_failed` item keeps the
-    /// wait going in every case. The check is
-    /// read-only; callers record the failure with [`Self::fail_predecessor_hold`].
+    /// fresh attention item never fails the successor. A kept-lease item or a
+    /// `workspace_lease_release_failed` item that has stayed open for
+    /// [`PREDECESSOR_HOLD_BOUND_SECS`] does (the sweeps have then had many
+    /// passes), or, for a remote predecessor that left no item at all, the
+    /// same time since it ended. Either clock runs from the later of that
+    /// start and the successor's first hold, so a successor created after the
+    /// problem was already old still gets the full bound. A fresh open
+    /// `workspace_lease_release_failed` item still blocks the missing-evidence
+    /// fallback so a remote cube retry is not mistaken for silence. The check
+    /// is read-only; callers record the failure with [`Self::fail_predecessor_hold`].
     pub(super) fn predecessor_lease_hold(&self, execution: &WorkExecution) -> Option<PredecessorHold> {
         match self.work_db.recovery_predecessor_holding_lease(execution) {
             Ok(None) => None,
@@ -69,11 +70,12 @@ impl ExecutionCoordinator {
                         now.saturating_sub(epoch.max(since)) >= PREDECESSOR_HOLD_BOUND_SECS
                     })
                 };
-                // `workspace_lease_release_failed` is retried by the sweeps by
-                // design and never fails a successor: while one is open the
-                // predecessor's cleanup is still being retried, so the
-                // missing-evidence fallback below must not fire either. A
-                // kept-lease item counts from when it was first filed.
+                // Both kept-lease and cube-release-failed items are retried by
+                // the sweeps. A fresh item never fails a successor. After the
+                // bound, occupancy-gated cube failures are the same deadlock
+                // as a kept lease: fail loudly with the item's text. While a
+                // release-failed item is open and still inside the bound, the
+                // missing-evidence fallback below must not fire either.
                 let items = self.work_db.list_attention_items(&predecessor.id).ok();
                 let open_of_kind = |kind: &str| {
                     items
@@ -81,10 +83,19 @@ impl ExecutionCoordinator {
                         .flatten()
                         .find(|item| item.status == "open" && item.kind == kind)
                 };
-                if open_of_kind(boss_engine_storage_values::attention_kinds::LEASE_RELEASE_FAILED_ATTENTION_KIND)
-                    .is_some()
-                {
-                    return Some(PredecessorHold::Waiting(detail));
+                let fail = |evidence: String| {
+                    PredecessorHold::Failed(format!(
+                        "Recovery cannot start: {detail} for more than {PREDECESSOR_HOLD_BOUND_SECS} seconds. {evidence}. Resolve the predecessor's workspace cleanup, then resume this execution. No workspace was reset."
+                    ))
+                };
+                let release_failed =
+                    open_of_kind(boss_engine_storage_values::attention_kinds::LEASE_RELEASE_FAILED_ATTENTION_KIND);
+                if let Some(item) = release_failed {
+                    return Some(if older_than_bound(item.created_at.parse::<i64>().ok()) {
+                        fail(item.body_markdown.clone())
+                    } else {
+                        PredecessorHold::Waiting(detail)
+                    });
                 }
                 let kept = open_of_kind(boss_engine_storage_values::attention_kinds::LEASE_UNRELEASED_ATTENTION_KIND);
                 // A remote predecessor can leave no item at all (its worker pid
@@ -102,9 +113,7 @@ impl ExecutionCoordinator {
                     }
                     _ => return Some(PredecessorHold::Waiting(detail)),
                 };
-                Some(PredecessorHold::Failed(format!(
-                    "Recovery cannot start: {detail} for more than {PREDECESSOR_HOLD_BOUND_SECS} seconds. {evidence}. Resolve the predecessor's workspace cleanup, then resume this execution. No workspace was reset."
-                )))
+                Some(fail(evidence))
             }
             Err(err) => Some(PredecessorHold::Waiting(format!(
                 "recovery predecessor could not be resolved: {err:#}"
