@@ -783,8 +783,13 @@ checkout and not aware of anything above jj:
    to 4,096 operations and 60 seconds and refuses unverified history; the
    error says whether the bound was exhausted or the walk reached an operation
    with no parents. A second head seen before any rewrite is ordinary
-   concurrency: every head is verified, or the pass stops with a message saying
-   nothing was abandoned or collected and the next pass retries. After the
+   concurrency: heads are re-read three times, 250 ms apart. If multiple heads
+   persist, the pass records collection `concurrent` on the `repo.store_gc`
+   audit row and persists `StoreGcOutcome::Concurrent` ("skipped: a concurrent
+   jj operation was in flight"), leaving `store_gc_consecutive_failures`
+   unchanged so the next pass can retry. Before a rewrite, heads are checked
+   again under the exclusive gate; a second head releases the gate and returns
+   the same concurrent outcome before quarantine or `op abandon`. After the
    collection, every head is checked rather than refused, and a failure says
    the collection completed and fresh-index verification was not performed.
    The collector
