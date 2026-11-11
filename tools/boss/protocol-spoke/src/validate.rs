@@ -365,6 +365,28 @@ impl Validate for v1::Spawn {
             });
         }
 
+        if let Some(mode) = &self.permission_mode
+            && !matches!(
+                mode.as_str(),
+                "dontAsk" | "default" | "acceptEdits" | "plan" | "auto" | "bypassPermissions"
+            )
+        {
+            return Err(ValidationError::Invalid {
+                field: "spawn.permission_mode",
+                reason: "unknown permission mode",
+            });
+        }
+        if (self.permission_mode.is_some() || self.agent_rules.is_some())
+            && !self
+                .required_features
+                .iter()
+                .any(|feature| feature.name == crate::negotiate::feature::SPAWN_WORKER_POSTURE && feature.revision == 1)
+        {
+            return Err(ValidationError::Invalid {
+                field: "spawn.required_features",
+                reason: "worker posture requires spawn-worker-posture/1",
+            });
+        }
         if self.prompt_utf8.is_empty() {
             return Err(ValidationError::Unset {
                 field: "spawn.prompt_utf8",
@@ -373,7 +395,7 @@ impl Validate for v1::Spawn {
         utf8("spawn.prompt_utf8", &self.prompt_utf8)?;
         bounded(
             "spawn.prompt_utf8+settings_json",
-            self.prompt_utf8.len() + self.settings_json.len(),
+            self.prompt_utf8.len() + self.settings_json.len() + self.agent_rules.as_ref().map_or(0, String::len),
             MAX_SPAWN_BYTES,
         )?;
         bounded("spawn.run_context_json", self.run_context_json.len(), MAX_PAYLOAD_BYTES)?;

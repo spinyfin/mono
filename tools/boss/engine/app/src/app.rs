@@ -1292,8 +1292,8 @@ impl ServerState {
         self.hub_stream.lock().expect("hub_stream lock").clone()
     }
 
-    fn set_hub_stream(&self, stream: boss_engine_runtime::hub::HubStream) {
-        *self.hub_stream.lock().expect("hub_stream lock") = Some(stream);
+    fn set_hub_stream(&self, stream: Option<boss_engine_runtime::hub::HubStream>) {
+        *self.hub_stream.lock().expect("hub_stream lock") = stream;
     }
 
     /// Construct `ServerState` with optional collaborator overrides.

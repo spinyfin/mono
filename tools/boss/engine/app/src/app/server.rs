@@ -413,6 +413,15 @@ impl Drop for CapabilityDiscoveryPendingGuard {
     }
 }
 
+/// Clear the published handle on completion, cancellation, or unwinding.
+struct HubStreamGuard(Arc<ServerState>);
+
+impl Drop for HubStreamGuard {
+    fn drop(&mut self) {
+        self.0.set_hub_stream(None);
+    }
+}
+
 /// Same as [`serve`], but accepts an optional `MergeProbe` override, plumbed
 /// straight through to [`ServerState`]. Production callers (and most tests)
 /// go through `serve` and get the real `CommandMergeProbe`; tests that need
@@ -957,13 +966,15 @@ async fn serve_scoped(
         .await
         .context("starting hub listener")?
     {
-        server_state.set_hub_stream(bound.stream.clone());
+        server_state.set_hub_stream(Some(bound.stream.clone()));
         tracing::info!(
             addr = %bound.local_addr,
             handle = server_state.hub_stream().is_some(),
             "hub listener serving"
         );
+        let hub_registration = HubStreamGuard(server_state.clone());
         boss_task_scope::spawn(async move {
+            let _registration = hub_registration;
             if let Err(err) = bound.serve().await {
                 tracing::error!(error = %err, "hub listener ended");
             }

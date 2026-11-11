@@ -230,6 +230,8 @@ message Spawn {
   optional string effort = 15;
   optional string structured_output_kind = 16;
   bool pr_url_output = 17;
+  optional string permission_mode = 18;
+  optional string agent_rules = 19;
 }
 message Env {
   string name = 1;

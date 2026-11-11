@@ -47,6 +47,7 @@ const CREDENTIAL_ENV: &[&str] = &[
 /// the cube identities the adapter already allocated; `workspace_path` is
 /// the remote path used in prompt text and is never probed on the hub filesystem. PR templates and manifest
 /// hints are explicitly empty; the worker discovers repository guidance on its host.
+/// Review guides are rejected because their prompts require a host-local git store.
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
 pub struct ComposeRemoteSpawn<'a> {
@@ -89,6 +90,9 @@ pub async fn compose_remote_spawn(request: ComposeRemoteSpawn<'_>) -> Result<Spa
         );
     }
 
+    if execution.kind == ExecutionKind::PrReviewGuide {
+        bail!("remote review-guide composition requires host-local git store resolution");
+    }
     opts.remote_workspace = true;
     let composed = compose_worker_spawn(
         db,
@@ -106,15 +110,22 @@ pub async fn compose_remote_spawn(request: ComposeRemoteSpawn<'_>) -> Result<Spa
         settings_json,
         structured_output_kind,
         pr_url_output,
-        ..
+        settings_input,
     } = prepare_remote_launch(
-        db,
-        execution,
-        item,
-        (&composed.spawn_config.driver, lease_id, host_id),
-        (workspace_path, events_socket_path, Path::new(REMOTE_BOSS_EVENT_BIN)),
-        opts,
-        (composed.prompt_text, composed.embedded_output_path.as_deref()),
+        RemoteLaunchInput::builder()
+            .db(db)
+            .execution(execution)
+            .item(item)
+            .driver_slug(&composed.spawn_config.driver)
+            .lease_id(lease_id)
+            .host(host_id)
+            .workspace_path(workspace_path)
+            .events_socket_path(events_socket_path)
+            .boss_event_path(Path::new(REMOTE_BOSS_EVENT_BIN))
+            .opts(opts)
+            .prompt_text(composed.prompt_text)
+            .maybe_embedded_output_path(composed.embedded_output_path.as_deref())
+            .build(),
     )?;
 
     let plan = driver.spawn_invocation(crate::driver::SpawnRequest {
@@ -122,7 +133,7 @@ pub async fn compose_remote_spawn(request: ComposeRemoteSpawn<'_>) -> Result<Spa
         effort: composed.spawn_config.effort_value,
         settings_path: None,
         non_opus_auto_mode: false,
-        permission_mode_override: None,
+        permission_mode_override: settings_input.worker_kind.forced_permission_mode(),
         run_id: Some(&execution.id),
     });
     let mut env = Vec::new();
@@ -156,6 +167,12 @@ pub async fn compose_remote_spawn(request: ComposeRemoteSpawn<'_>) -> Result<Spa
         effort: composed.spawn_config.effort_value.map(str::to_owned),
         structured_output_kind,
         pr_url_output,
+        permission_mode: settings_input.worker_kind.forced_permission_mode().map(str::to_owned),
+        agent_rules: Some(crate::worker_setup::render_claude_md(
+            &settings_input,
+            driver.agent_rules_preamble(),
+            driver.descriptor().config_dir,
+        )),
         ..Default::default()
     };
     require_launch_inputs(&mut spawn);
@@ -170,6 +187,12 @@ pub async fn compose_remote_spawn(request: ComposeRemoteSpawn<'_>) -> Result<Spa
 /// that depends on them is refused for those peers rather than silently
 /// degraded.
 fn require_launch_inputs(spawn: &mut Spawn) {
+    if spawn.permission_mode.is_some() || spawn.agent_rules.is_some() {
+        spawn.required_features.push(boss_protocol_spoke::v1::Feature {
+            name: boss_protocol_spoke::negotiate::feature::SPAWN_WORKER_POSTURE.to_owned(),
+            revision: 1,
+        });
+    }
     if spawn.effort.is_some() || spawn.structured_output_kind.is_some() || spawn.pr_url_output {
         spawn.required_features.push(boss_protocol_spoke::v1::Feature {
             name: boss_protocol_spoke::negotiate::feature::SPAWN_LAUNCH_INPUTS.to_owned(),
@@ -192,19 +215,40 @@ pub(crate) struct RemoteLaunch {
     pub pr_url_output: bool,
 }
 
+/// Named inputs shared by SSH and spoke launch composition.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+pub(crate) struct RemoteLaunchInput<'a> {
+    pub db: &'a WorkDb,
+    pub execution: &'a WorkExecution,
+    pub item: &'a WorkItem,
+    pub driver_slug: &'a str,
+    pub lease_id: &'a str,
+    pub host: &'a str,
+    pub workspace_path: &'a Path,
+    pub events_socket_path: &'a Path,
+    pub boss_event_path: &'a Path,
+    pub opts: WorkerSpawnOpts,
+    pub prompt_text: String,
+    pub embedded_output_path: Option<&'a str>,
+}
+
 /// Shared prompt relocation, remote eligibility and driver settings policy.
-pub(crate) fn prepare_remote_launch(
-    db: &WorkDb,
-    execution: &WorkExecution,
-    item: &WorkItem,
-    identity: (&str, &str, &str),
-    paths: (&Path, &Path, &Path),
-    opts: WorkerSpawnOpts,
-    prompt: (String, Option<&str>),
-) -> Result<RemoteLaunch> {
-    let (driver_slug, lease_id, host) = identity;
-    let (workspace_path, events_socket_path, boss_event_path) = paths;
-    let (prompt_text, embedded_output_path) = prompt;
+pub(crate) fn prepare_remote_launch(input: RemoteLaunchInput<'_>) -> Result<RemoteLaunch> {
+    let RemoteLaunchInput {
+        db,
+        execution,
+        item,
+        driver_slug,
+        lease_id,
+        host,
+        workspace_path,
+        events_socket_path,
+        boss_event_path,
+        opts,
+        prompt_text,
+        embedded_output_path,
+    } = input;
     let mut prompt_text = prompt_text;
     if let Some(local_path) = embedded_output_path {
         if !prompt_text.contains(local_path) {
@@ -322,6 +366,43 @@ mod tests {
             .review_signal_checks(|_| &[])
             .maybe_bazel_workspace(bazel_workspace)
             .build()
+    }
+
+    #[tokio::test]
+    async fn restricted_worker_posture_is_preserved_and_review_guides_reject_remote_paths() {
+        let workspace = Path::new("/remote/nonexistent/workspace");
+        let (db, mut execution, item) = chore_fixture(workspace);
+        for kind in [ExecutionKind::AnswerAgent, ExecutionKind::PrReviewGuide] {
+            execution.kind = kind;
+            let result = compose_remote_spawn(
+                ComposeRemoteSpawn::builder()
+                    .db(&db)
+                    .worker_id("worker")
+                    .host_id("spoke")
+                    .execution(&execution)
+                    .item(&item)
+                    .workspace_path(workspace)
+                    .events_socket_path(Path::new("/spoke/events.sock"))
+                    .lease_id("lease")
+                    .workspace_id("workspace")
+                    .opts(opts(Some(true)))
+                    .build(),
+            )
+            .await;
+            if execution.kind == ExecutionKind::PrReviewGuide {
+                assert!(result.unwrap_err().to_string().contains("host-local git store"));
+            } else {
+                let spawn = result.unwrap();
+                assert_eq!(spawn.permission_mode.as_deref(), Some("dontAsk"));
+                assert!(!spawn.agent_rules.as_deref().unwrap().is_empty());
+                assert!(
+                    spawn
+                        .required_features
+                        .iter()
+                        .any(|f| f.name == "spawn-worker-posture" && f.revision == 1)
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -485,10 +566,16 @@ mod tests {
         assert!(spawn.pr_url_output);
         assert_eq!(
             spawn.required_features,
-            vec![boss_protocol_spoke::v1::Feature {
-                name: "spawn-launch-inputs".into(),
-                revision: 1,
-            }]
+            vec![
+                boss_protocol_spoke::v1::Feature {
+                    name: "spawn-worker-posture".into(),
+                    revision: 1,
+                },
+                boss_protocol_spoke::v1::Feature {
+                    name: "spawn-launch-inputs".into(),
+                    revision: 1,
+                }
+            ]
         );
         assert!(!spawn.model.is_empty());
         assert!(!spawn.prompt_utf8.is_empty());

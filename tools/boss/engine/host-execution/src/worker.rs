@@ -226,6 +226,12 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                 ),
             });
         }
+        let mut output_environment = BTreeMap::new();
+        if let Err(error) =
+            insert_output_environment(&mut output_environment, spawn, &self.homes_root, &run.spawn_token)
+        {
+            return Ok(outcome(command, ResultCode::Rejected, error.to_string(), None));
+        }
         let mut record = ExecutionRecord {
             execution_id: run.execution_id.clone(),
             run_id: run.run_id.clone(),
@@ -292,7 +298,10 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         }
         record.phase = Phase::Launching;
         self.persist(&record)?;
-        if let Err(error) = self.launch(&record, spawn, driver.as_ref(), &workspace).await {
+        if let Err(error) = self
+            .launch(&record, spawn, driver.as_ref(), &workspace, output_environment)
+            .await
+        {
             return self.launch_failed(command, record, error).await;
         }
         let pane_id = self
@@ -364,7 +373,14 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         spawn: &Spawn,
         driver: &dyn boss_engine_driver::AgentDriver,
         workspace: &Path,
+        output_environment: BTreeMap<String, String>,
     ) -> Result<()> {
+        if let Some(rules) = &spawn.agent_rules {
+            initial_prompt::write_private(
+                &driver.agent_rules_destination(workspace, &record.run_id),
+                rules.as_bytes(),
+            )?;
+        }
         if let Some(path) = &record.settings_file {
             initial_prompt::write_private(path, &spawn.settings_json)?;
         }
@@ -373,7 +389,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             effort: spawn.effort.as_deref(),
             settings_path: record.settings_file.as_deref(),
             non_opus_auto_mode: false,
-            permission_mode_override: None,
+            permission_mode_override: spawn.permission_mode.as_deref(),
             run_id: Some(&record.run_id),
         });
         self.tmux.start_private_server().await?;
@@ -386,7 +402,10 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             }
             environment.insert(env.name.clone(), env.value.clone());
         }
-        insert_output_environment(&mut environment, spawn, &self.homes_root, &record.spawn_token)?;
+        for name in OUTPUT_ENV_NAMES {
+            environment.remove(*name);
+        }
+        environment.extend(output_environment);
         insert_color_environment(&mut environment);
         environment.insert(TMUX_SPAWN_TOKEN_ENV.to_owned(), record.spawn_token.clone());
         environment.insert(SESSION_SCHEMA_ENV.to_owned(), SESSION_SCHEMA.to_owned());
@@ -966,10 +985,10 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
     /// command on the same record, and works from persisted records so it also
     /// covers workers that exited while the daemon was down.
     pub async fn sweep(&self) -> Vec<(String, String)> {
-        prune_stale_outputs(&self.homes_root, OUTPUT_RETENTION);
         let Ok(records) = assigned_records(&self.store) else {
             return vec![("-".into(), "execution store unavailable".into())];
         };
+        prune_stale_outputs(&self.homes_root, OUTPUT_RETENTION, &records);
         let mut failures = Vec::new();
         for mut record in records {
             let pane = match record.phase {
@@ -1019,18 +1038,24 @@ const OUTPUT_ENV_NAMES: &[&str] = &[
     "BOSS_PR_URL_OUTPUT",
 ];
 
-/// How long a run's output files survive after the run last touched them.
+/// Minimum directory age for pruning outputs of reclaimed, unassigned runs.
 const OUTPUT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Remove `outputs-*` directories under `homes_root` untouched for longer than
-/// `retention`. Best effort: a directory that cannot be removed is retried by
+/// `retention`, excluding assigned or unreclaimed runs. Best effort: a directory that cannot be removed is retried by
 /// the next sweep.
-fn prune_stale_outputs(homes_root: &Path, retention: Duration) {
+fn prune_stale_outputs(homes_root: &Path, retention: Duration, records: &[ExecutionRecord]) {
+    let protected: std::collections::BTreeSet<_> = records
+        .iter()
+        .filter(|record| record.phase.assigned() || !record.reclaimed)
+        .map(|record| format!("outputs-{}", hex_token(&record.spawn_token)))
+        .collect();
     let Ok(entries) = std::fs::read_dir(homes_root) else {
         return;
     };
     for entry in entries.flatten() {
-        if !entry.file_name().to_string_lossy().starts_with("outputs-") {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("outputs-") || protected.contains(&name) {
             continue;
         }
         let stale = entry
@@ -2505,6 +2530,77 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn spawn_applies_forced_permission_mode_and_agent_rules() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeTmux::default());
+        let supervisor = supervisor(root.path(), fake.clone()).await;
+        let mut command = spawn_command();
+        let Some(command::Body::Spawn(spawn)) = &mut command.body else {
+            unreachable!()
+        };
+        spawn.permission_mode = Some("dontAsk".into());
+        spawn.agent_rules = Some("Read-only reviewer rules".into());
+        spawn.required_features.push(boss_protocol_spoke::v1::Feature {
+            name: "spawn-worker-posture".into(),
+            revision: 1,
+        });
+        let result = supervisor.execute(&command, false, 1).await;
+        assert_eq!(result.code, ResultCode::Ok as i32, "{}", result.reason);
+        let launches = fake.launches.lock().unwrap();
+        assert!(launches.iter().any(|launch| launch.contains("dontAsk")), "{launches:?}");
+        assert!(
+            launches
+                .iter()
+                .all(|launch| !launch.contains("dangerously-skip-permissions"))
+        );
+        let driver = DriverRegistry::default().require("claude").unwrap();
+        let rules = driver.agent_rules_destination(&root.path().join("worker"), "run-test");
+        assert_eq!(std::fs::read_to_string(rules).unwrap(), "Read-only reviewer rules");
+    }
+
+    #[tokio::test]
+    async fn unknown_output_kind_is_rejected_before_launch_intent() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeTmux::default());
+        let supervisor = supervisor(root.path(), fake.clone()).await;
+        let mut command = spawn_command();
+        let Some(command::Body::Spawn(spawn)) = &mut command.body else {
+            unreachable!()
+        };
+        spawn.structured_output_kind = Some("future-unknown-output".into());
+        let result = supervisor.execute(&command, false, 1).await;
+        assert_eq!(result.code, ResultCode::Rejected as i32, "{}", result.reason);
+        assert!(result.reason.contains("unknown structured output kind"));
+        assert!(fake.launches.lock().unwrap().is_empty());
+        assert!(supervisor.store.load("run-test", "token").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn pruning_preserves_assigned_and_unreclaimed_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let supervisor = grok_supervisor(root.path(), Arc::new(FakeTmux::default())).await;
+        seed(&supervisor.store, Phase::Alive);
+        let mut record = stored(&supervisor.store);
+        let dir = outputs_root(&supervisor.homes_root, &record.spawn_token);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("result.json"), "evidence").unwrap();
+        let old = std::time::SystemTime::now() - OUTPUT_RETENTION - Duration::from_secs(60);
+        std::fs::File::open(&dir)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        for phase in [Phase::Alive, Phase::Terminal] {
+            record.phase = phase;
+            record.reclaimed = false;
+            prune_stale_outputs(&supervisor.homes_root, OUTPUT_RETENTION, &[record.clone()]);
+            assert!(dir.join("result.json").exists());
+        }
+        record.reclaimed = true;
+        prune_stale_outputs(&supervisor.homes_root, OUTPUT_RETENTION, &[record]);
+        assert!(!dir.exists());
+    }
+
     #[test]
     fn output_paths_stay_under_the_outputs_directory_for_hostile_tokens() {
         let root = tempfile::tempdir().unwrap();
@@ -2546,12 +2642,12 @@ mod tests {
         supervisor.reclaim(&mut record);
         assert!(record.reclaimed, "{:?}", record.reclaim_error);
         assert_eq!(std::fs::read_to_string(dir.join("result.json")).unwrap(), "evidence");
-        prune_stale_outputs(&supervisor.homes_root, OUTPUT_RETENTION);
+        prune_stale_outputs(&supervisor.homes_root, OUTPUT_RETENTION, &[]);
         assert!(
             dir.join("result.json").exists(),
             "fresh output survives the retention sweep"
         );
-        prune_stale_outputs(&supervisor.homes_root, Duration::ZERO);
+        prune_stale_outputs(&supervisor.homes_root, Duration::ZERO, &[]);
         assert!(!dir.exists(), "output past retention is removed");
     }
 

@@ -149,8 +149,10 @@ reader behavior with unknown fields, enum values and variants.
   eight execution features are required (`execution`, `journal`, `workspace`,
   `worker-event`, `worker-api`, `proposal-json`, `transcript-delta`,
   `artifact`), `pane-capture`, `upgrade`, `workspace-reset-release` and
-  `spawn-launch-inputs` (the `Spawn` effort and output-environment fields) are
-  optional. `select` checks the
+  `spawn-launch-inputs` (the `Spawn` effort and output-environment fields), and
+  `spawn-worker-posture` (forced permission mode and generated agent rules) are
+  optional. A spawn carrying worker posture requires `spawn-worker-posture/1`;
+  peers without it cannot accept that spawn. `select` checks the
   epoch range before anything else in `Hello`, so a future-epoch peer is told to
   upgrade even if the rest of its `Hello` no longer parses; `confirm` lets the
   spoke check the hub's `Welcome`.
