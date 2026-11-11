@@ -134,6 +134,36 @@ final class OperatorQuestionCardRenderTests: XCTestCase {
 
     // MARK: - Helpers
 
+    func testInReviewAttentionRendersEngineLabelsAndLegacyFallback() throws {
+        let group = try JSONDecoder().decode(AttentionGroup.self, from: Data("""
+        {"id":"review_question","product_id":"product","kind":"question",
+         "source_kind":"task_transcript","grouping_key":"worker_question|execution",
+         "generation":0,"state":"open","created_at":"123"}
+        """.utf8))
+        var member = try JSONDecoder().decode(Attention.self, from: Data("""
+        {"id":"split_question","group_id":"review_question","ordinal":1,
+         "answer_state":"open","created_at":"123","question_type":"yes_no",
+         "prompt_text":"How should the change be delivered?","confidence_source":"structured","score":1}
+        """.utf8))
+        let model = ChatViewModel(socketPath: "/tmp/boss-attention-render-\(UUID().uuidString).sock")
+        func renderRow() throws -> Data? {
+            let row = AttentionMemberRow(group: group, member: member, promptDraft: .constant(""))
+                .environmentObject(model)
+            return try renderView(row, size: CGSize(width: 440, height: 140))
+                .representation(using: .png, properties: [:])
+        }
+        let legacy = try renderRow()
+        member.choiceOptions = "{\"yes\":\"Split\",\"no\":\"Bypass limit\"}"
+        let split = try renderRow()
+        member.choiceOptions = "{\"yes\":\"Land first\",\"no\":\"Keep one PR\"}"
+        let renamed = try renderRow()
+        XCTAssertNotNil(legacy)
+        XCTAssertNotEqual(legacy, split, "The attention picker must replace Yes/No with the engine's labels")
+        XCTAssertNotEqual(split, renamed, "The attention picker must render the supplied names")
+        member.choiceOptions = "not-json"
+        XCTAssertEqual(legacy, try renderRow(), "Invalid legacy labels fall back to Yes/No")
+    }
+
     private func presentation(
         text: String = "Approve bypass of the 30 max file limit (48 needed)?",
         explanation: String = "Sweeps 48 files.",

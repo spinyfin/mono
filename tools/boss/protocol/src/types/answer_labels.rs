@@ -35,7 +35,8 @@ impl AnswerOptionLabels {
     }
 
     /// Both labels must be valid, distinct option labels.
-    pub fn validate(&self) -> Result<(), String> {
+    #[cfg(test)]
+    fn validate(&self) -> Result<(), String> {
         OperatorAnswerType::validate_choices(&[self.yes.clone(), self.no.clone()])
     }
 

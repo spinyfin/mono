@@ -16,9 +16,12 @@ const REMAIN_BLOCKED: &str = "--explanation No: must name an actionable path the
 /// `validate_for` enforces it.
 pub(super) fn validate(raw: &str) -> Result<String, String> {
     let labels = AnswerOptionLabels::split_or_bypass();
+    let (yes, no) = labels.headings();
+    if raw.lines().any(|line| line.trim() == yes || line.trim() == no) {
+        return check(raw, &labelled_headings(&labels)).map_err(|_| EXPECTED_SPLIT.into());
+    }
     check(raw, &HEADINGS)
         .or_else(|_| check(raw, &CHOICE_HEADINGS))
-        .or_else(|_| check(raw, &labelled_headings(&labels)))
         .map_err(|_| EXPECTED.into())
 }
 
@@ -202,6 +205,39 @@ pub(super) mod tests {
 
     pub(crate) const VALID_CHOICE: &str =
         "Context:\nThe rollout needs a strategy.\nRecommendation:\nGradual, to limit risk.";
+
+    #[test]
+    fn clap_reports_split_headings_for_empty_split_sections() {
+        for text in [
+            VALID_SPLIT.replace("Land the first capability as its own PR, then finish the rest.", ""),
+            VALID_SPLIT.replace("Keep one PR with a one-time exception.", ""),
+        ] {
+            let error = Cli::try_parse_from([
+                "boss",
+                "propose",
+                "done",
+                "--outcome",
+                "blocked",
+                "--summary",
+                "Split needed",
+                "--answer-type",
+                "create-prerequisite-task",
+                "--prerequisite-name",
+                "First capability",
+                "--prerequisite-brief",
+                "Land the first capability",
+                "--file-count",
+                "48",
+                "--file-count-limit",
+                "30",
+                "--explanation",
+                &text,
+            ])
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(EXPECTED_SPLIT), "{error}");
+        }
+    }
 
     #[test]
     fn multiple_choice_requires_the_short_shape_and_rejects_yes_no() {

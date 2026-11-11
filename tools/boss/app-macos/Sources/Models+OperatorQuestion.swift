@@ -73,13 +73,8 @@ struct OperatorQuestion: Hashable {
             prerequisiteTask = PrerequisiteTaskProposal(name: name, brief: brief)
         }
         var optionLabels: AnswerOptionLabels? = nil
-        if answerType == .createPrerequisiteTask, let wire = answerTypeDict["option_labels"] as? [String: Any] {
-            // Two distinct, non-empty names or none at all: half a pair would
-            // leave one button unlabeled, so fall back to Yes / No.
-            if let yes = wire["yes"] as? String, let no = wire["no"] as? String,
-               !yes.isEmpty, !no.isEmpty, yes != no {
-                optionLabels = AnswerOptionLabels(yes: yes, no: no)
-            }
+        if answerType == .createPrerequisiteTask {
+            optionLabels = AnswerOptionLabels.parse(answerTypeDict["option_labels"])
         }
         var choices: [String] = []
         if answerType == .multipleChoice {
@@ -117,6 +112,14 @@ struct OperatorQuestion: Hashable {
 struct AnswerOptionLabels: Hashable {
     let yes: String
     let no: String
+
+    static func parse(_ value: Any?) -> AnswerOptionLabels? {
+        // Half a pair or indistinguishable names must fall back to Yes / No.
+        guard let wire = value as? [String: Any],
+              let yes = wire["yes"] as? String, let no = wire["no"] as? String,
+              !yes.isEmpty, !no.isEmpty, yes != no else { return nil }
+        return AnswerOptionLabels(yes: yes, no: no)
+    }
 }
 
 /// The task a blocked worker proposes as its prerequisite

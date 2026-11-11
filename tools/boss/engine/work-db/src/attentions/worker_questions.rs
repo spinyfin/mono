@@ -39,7 +39,14 @@ pub fn create_in_tx(
                     spec.files, spec.limit
                 ));
             }
-            ("yes_no", None)
+            (
+                "yes_no",
+                question
+                    .answer_type
+                    .option_labels()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+            )
         }
     };
     create_attention_in_tx(

@@ -380,6 +380,12 @@ async fn file_count_successor_for_kind(
         .work_db
         .answer_attention(&attention, Some("no".into()), false, false)
         .unwrap();
+    let members = state.work_db.list_attentions_for_group(&group.id).unwrap();
+    let wire = serde_json::to_value(&members[0]).unwrap();
+    assert_eq!(wire["question_type"], "yes_no");
+    let labels: Value = serde_json::from_str(wire["choice_options"].as_str().unwrap()).unwrap();
+    assert_eq!(labels, serde_json::json!({"yes": "Split", "no": "Bypass limit"}));
+    assert_eq!(wire["answer"], "no");
     let result = state
         .work_db
         .action_attention_group(
