@@ -27,7 +27,9 @@ impl WorkDb {
         let (mut report, probes) = {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
-            build(&tx, minimum_age_secs, now.saturating_sub(minimum_age_secs), now)?
+            let (mut report, probes) = build(&tx, minimum_age_secs, now.saturating_sub(minimum_age_secs), now)?;
+            report.progression_calibration = super::progression_calibration::read_report(&tx)?;
+            (report, probes)
         };
         apply_probes(&mut report, probes, pid_is_alive);
         Ok(report)

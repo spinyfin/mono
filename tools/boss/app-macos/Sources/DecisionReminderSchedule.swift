@@ -6,10 +6,12 @@ struct DecisionNotification: Codable, Equatable {
     let workItemID: String
     let productID: String
     let label: String
+    var remindAfterSecs: Double? = nil
 
     enum CodingKeys: String, CodingKey {
         case questionID = "question_id", text, workItemID = "work_item_id"
         case productID = "product_id", label
+        case remindAfterSecs = "remind_after_secs"
     }
 }
 
@@ -19,8 +21,10 @@ struct DecisionReminderSchedule {
     static let intervalKey = "progression.remind_after"
     // Placeholder default (3 days); override via progression.remind_after.
     static let defaultInterval: TimeInterval = 3 * 24 * 60 * 60
-    static func interval(_ value: Double) -> TimeInterval {
-        value.isFinite && value >= 1 ? value : defaultInterval
+    static func interval(_ value: Double, calibrated: Double? = nil) -> TimeInterval {
+        if value.isFinite && value >= 1 { return value }
+        if let calibrated, calibrated.isFinite && calibrated >= 1 { return calibrated }
+        return defaultInterval
     }
 
     private(set) var questions: [String: DecisionNotification] = [:]

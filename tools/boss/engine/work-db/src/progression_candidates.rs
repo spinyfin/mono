@@ -101,7 +101,7 @@
 //!
 //! `progression.stuck_after`, `progression.cooldown`, and the create-budget
 //! pair are read from the `metadata` table (the engine publishes them with
-//! [`WorkDb::publish_progression_limits`]); an absent key falls back to the
+//! [`WorkDb::configure_progression_calibration`]); an absent key falls back to the
 //! design's placeholder, so the views are usable by a process that never ran the
 //! engine, such as `bossctl` against a copied database.
 use std::collections::HashSet;
@@ -115,8 +115,8 @@ use boss_engine_storage_values::dispatch_wait::{
 use boss_engine_storage_values::progression::{
     CREATED_VIA_PROGRESSION_SWEEP, DEFAULT_COOLDOWN_SECS, DEFAULT_MAX_CREATES_PER_ITEM_WINDOW,
     DEFAULT_MAX_CREATES_WINDOW_SECS, DEFAULT_STUCK_AFTER_SECS, INFRASTRUCTURE_FAILURE_CAP, METADATA_KEY_COOLDOWN_SECS,
-    METADATA_KEY_MAX_CREATES_PER_ITEM_WINDOW, METADATA_KEY_MAX_CREATES_WINDOW_SECS, METADATA_KEY_RUN_TIMEOUT_SECS,
-    METADATA_KEY_STUCK_AFTER_SECS, NO_ACTION_COOLDOWN_MULTIPLIER, ProgressionSettings,
+    METADATA_KEY_MAX_CREATES_PER_ITEM_WINDOW, METADATA_KEY_MAX_CREATES_WINDOW_SECS, METADATA_KEY_STUCK_AFTER_SECS,
+    NO_ACTION_COOLDOWN_MULTIPLIER,
 };
 
 pub(super) const GRACE_COLUMN_MIGRATION_ID: &str = "20261106_1200_progression_grace_waived_at";
@@ -880,37 +880,6 @@ impl ProgressionClauses {
 
 #[work_db_boundary::instrument]
 impl WorkDb {
-    /// Publish the two limits the candidate views read, so every reader of the
-    /// views (the sweep, the stuck report, `bossctl dispatch diagnose` with the
-    /// engine down) applies the numbers this engine was started with.
-    pub fn publish_progression_limits(&self, settings: &ProgressionSettings) -> Result<()> {
-        let mut conn = self.connect()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for (key, value) in [
-            (METADATA_KEY_STUCK_AFTER_SECS, settings.stuck_after_secs),
-            (METADATA_KEY_COOLDOWN_SECS, settings.cooldown_secs),
-            (
-                METADATA_KEY_MAX_CREATES_PER_ITEM_WINDOW,
-                i64::from(settings.max_creates_per_item_window),
-            ),
-            (METADATA_KEY_MAX_CREATES_WINDOW_SECS, settings.max_creates_window_secs),
-            // Not read by the candidate views: the stale-worker sweep applies it
-            // to a live progression run.
-            (
-                METADATA_KEY_RUN_TIMEOUT_SECS,
-                i64::try_from(settings.run_timeout_secs).unwrap_or(i64::MAX),
-            ),
-        ] {
-            tx.execute(
-                "INSERT INTO metadata (key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![key, value.to_string()],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
     /// The progression candidates, oldest-stuck first. `limit` bounds how many
     /// are returned; `None` returns them all.
     pub fn list_progression_candidates(&self, limit: Option<usize>) -> Result<Vec<ProgressionCandidate>> {

@@ -832,6 +832,10 @@ async fn new_commit_all_inflight_abandons_stale_remediation_and_clears_badge() {
         "the stale remediation row must be abandoned, not left pending",
     );
 
+    let retired = db.get_ci_remediation(&prior_attempt.id).unwrap().unwrap();
+    assert_eq!(retired.failure_reason.as_deref(), Some("new_head_sha_inflight"));
+    assert_eq!(retired.head_sha_after.as_deref(), Some("head-B"));
+
     // `CiFailureCleared` must be emitted so the macOS badge clears.
     let typed = pub_.typed_events.lock().await.clone();
     assert!(

@@ -144,15 +144,57 @@ where
     Fut: Future<Output = O> + Send,
     F: FnMut() -> Fut + Send + 'static,
 {
+    spawn_adaptive_sweep_loop(
+        move || {
+            let pass = pass_fn();
+            async move { (pass.await, interval) }
+        },
+        || async { None },
+    )
+}
+
+/// Same sweep contract, with the next interval supplied by each pass.
+#[track_caller]
+pub(crate) fn spawn_adaptive_sweep_loop<O, Fut, F, C, CFut>(
+    mut pass_fn: F,
+    mut cadence: C,
+) -> tokio::task::JoinHandle<()>
+where
+    O: SweepOutcome + Send,
+    Fut: Future<Output = (O, Duration)> + Send,
+    F: FnMut() -> Fut + Send + 'static,
+    C: FnMut() -> CFut + Send + 'static,
+    CFut: Future<Output = Option<Duration>> + Send,
+{
     crate::work::db_diagnostics::spawn(async move {
         loop {
-            let outcome = pass_fn().await;
+            let (outcome, interval) = pass_fn().await;
             if outcome.has_activity() {
                 outcome.log();
             }
-            tokio::time::sleep(interval).await;
+            wait_for_cadence(interval, &mut cadence).await;
         }
     })
+}
+
+/// Re-read cadence at most once a minute, without running a nomination pass.
+/// Deadlines remain relative to the last pass, including after a cadence change.
+async fn wait_for_cadence<C, Fut>(mut interval: Duration, cadence: &mut C)
+where
+    C: FnMut() -> Fut,
+    Fut: Future<Output = Option<Duration>>,
+{
+    let started = tokio::time::Instant::now();
+    loop {
+        let deadline = started + interval;
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + Duration::from_secs(60))).await;
+        if let Some(current) = cadence().await {
+            interval = current.max(Duration::from_secs(1));
+        }
+    }
 }
 
 /// The future a [`spawn_work_sweep_loop`] pass returns. Boxed because the
@@ -420,5 +462,34 @@ mod tests {
         );
 
         handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod cadence_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn shorter_published_interval_advances_deadline_without_an_early_pass() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let seconds = Arc::new(AtomicU64::new(10 * 86400));
+        let current = seconds.clone();
+        let waiter = tokio::spawn(async move {
+            wait_for_cadence(Duration::from_secs(10 * 86400), &mut || {
+                let duration = Duration::from_secs(current.load(Ordering::SeqCst));
+                async move { Some(duration) }
+            })
+            .await;
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        seconds.store(300, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(239)).await;
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "no pass before the new deadline");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(waiter.is_finished(), "pass follows the shortened deadline");
+        waiter.await.unwrap();
     }
 }

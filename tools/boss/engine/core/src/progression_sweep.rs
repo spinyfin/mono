@@ -40,7 +40,7 @@
 //!
 //! The `progression_agents` feature flag (default off) is re-checked on every
 //! pass, so turning it off stops minting within one interval without a restart.
-//! The limits the view reads are published once at spawn, whatever the flag says,
+//! The limits the view reads are calibrated at startup and daily, whatever the flag says,
 //! so the report and `diagnose` apply this engine's numbers either way.
 use std::sync::Arc;
 use std::time::Duration;
@@ -89,29 +89,76 @@ pub fn spawn_loop(
     kick_fn: Arc<dyn Fn() + Send + Sync>,
     feature_flags: Arc<crate::feature_flags::FeatureFlagsStore>,
 ) -> tokio::task::JoinHandle<()> {
-    if let Err(error) = work_db.publish_progression_limits(&settings) {
-        // The views fall back to the design's placeholders, which are the
-        // defaults; a failed publish only matters when they were overridden.
-        tracing::warn!(
-            ?error,
-            "progression: failed to publish limits; the candidate views use their defaults"
-        );
-    }
-    crate::sweep_loop::spawn_sweep_loop(Duration::from_secs(settings.sweep_interval_secs.max(1)), move || {
-        let work_db = Arc::clone(&work_db);
-        let kick_fn = Arc::clone(&kick_fn);
-        let feature_flags = Arc::clone(&feature_flags);
-        async move {
-            if !feature_flags.is_enabled(PROGRESSION_AGENTS_FLAG) {
-                return ProgressionSweepOutcome::default();
+    let initialized = false;
+    let cadence_db = work_db.clone();
+    let initialized = Arc::new(std::sync::atomic::AtomicBool::new(initialized));
+    crate::sweep_loop::spawn_adaptive_sweep_loop(
+        move || {
+            let work_db = work_db.clone();
+            let feature_flags = feature_flags.clone();
+            let kick_fn = kick_fn.clone();
+            let initialized = initialized.clone();
+            async move {
+                use std::sync::atomic::Ordering;
+                if !initialized.load(Ordering::Relaxed) {
+                    let db = work_db.clone();
+                    let result =
+                        tokio::task::spawn_blocking(move || db.configure_progression_calibration(&settings)).await;
+                    match result {
+                        Ok(Ok(())) => {
+                            initialized.store(true, Ordering::Relaxed);
+                            let db = work_db.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if let Err(error) =
+                                    db.calibrate_progression(boss_engine_utils::epoch_time::now_epoch_secs())
+                                {
+                                    tracing::warn!(
+                                        ?error,
+                                        "initial progression measurement failed; using published limits"
+                                    );
+                                }
+                            });
+                        }
+                        error => {
+                            tracing::error!(?error, "progression configuration retry failed; skipping nominations")
+                        }
+                    }
+                }
+                let outcome =
+                    if initialized.load(Ordering::Relaxed) && feature_flags.is_enabled(PROGRESSION_AGENTS_FLAG) {
+                        run_one_pass(work_db.clone()).await
+                    } else {
+                        ProgressionSweepOutcome::default()
+                    };
+                if outcome.minted > 0 {
+                    kick_fn();
+                }
+                let interval = work_db
+                    .progression_limit("sweep_interval_secs", settings.sweep_interval_secs)
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(?error, "failed to read progression cadence");
+                        settings.sweep_interval_secs
+                    });
+                (outcome, Duration::from_secs(interval.max(1)))
             }
-            let outcome = run_one_pass(work_db).await;
-            if outcome.minted > 0 {
-                kick_fn();
+        },
+        move || {
+            let db = cadence_db.clone();
+            async move {
+                match tokio::task::spawn_blocking(move || {
+                    db.progression_limit("sweep_interval_secs", settings.sweep_interval_secs)
+                })
+                .await
+                {
+                    Ok(Ok(seconds)) => Some(Duration::from_secs(seconds.max(1))),
+                    error => {
+                        tracing::warn!(?error, "failed to refresh progression cadence");
+                        None
+                    }
+                }
             }
-            outcome
-        }
-    })
+        },
+    )
 }
 
 /// Run one pass: mint a `progression` execution for each current candidate,
@@ -363,6 +410,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn measurement_failure_does_not_disable_nominations() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db).id;
+        let id = stuck(&db, &product, "Stuck despite calibration failure", 3);
+        db.connect()
+            .unwrap()
+            .execute_batch("DROP TABLE task_stuck_daily_snapshots")
+            .unwrap();
+        let db = Arc::new(db);
+        let (_flags_dir, on) = flags(true);
+        let handle = spawn_loop(db.clone(), ProgressionSettings::default(), Arc::new(|| {}), on);
+        for _ in 0..100 {
+            if !progression_runs(&db, &id).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        handle.abort();
+        assert_eq!(progression_runs(&db, &id).len(), 1);
+    }
+
+    #[tokio::test]
     async fn spawning_publishes_the_limits_the_views_read_whatever_the_flag_says() {
         let (_dir, db) = open_db();
         let db = Arc::new(db);
@@ -372,6 +441,12 @@ mod tests {
             .build();
         let (_flags_dir, off) = flags(false);
         let handle = spawn_loop(db.clone(), settings, Arc::new(|| {}), off);
+        for _ in 0..100 {
+            if db.get_metadata(METADATA_KEY_COOLDOWN_SECS).unwrap().as_deref() == Some("39600") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         handle.abort();
         assert_eq!(
             db.get_metadata(METADATA_KEY_STUCK_AFTER_SECS).unwrap().as_deref(),
