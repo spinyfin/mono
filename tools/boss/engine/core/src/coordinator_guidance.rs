@@ -47,18 +47,22 @@ pub struct GuidanceFile {
     pub path: &'static str,
     /// Metadata-key namespace of this file's last-known-good entries.
     cache_namespace: &'static str,
+    /// On-demand command for this file, if one exists (takes `--product`).
+    retry_command: Option<&'static str>,
 }
 
 /// `BOSS_COORDINATOR.md`: coordinator-only rules.
 pub const COORDINATOR_FILE: GuidanceFile = GuidanceFile {
     path: COORDINATOR_GUIDANCE_PATH,
     cache_namespace: COORDINATOR_GUIDANCE_CACHE_NAMESPACE,
+    retry_command: Some("boss guidance show"),
 };
 
 /// `BOSS.md`: rules injected into Boss-dispatched coding workers.
 pub const REPO_BOSS_FILE: GuidanceFile = GuidanceFile {
     path: REPO_BOSS_GUIDANCE_PATH,
     cache_namespace: REPO_BOSS_GUIDANCE_CACHE_NAMESPACE,
+    retry_command: None,
 };
 
 /// Per-product bound on one guidance read at coordinator session start.
@@ -201,11 +205,12 @@ async fn load_one(
         Err(_elapsed) => (
             CoordinatorGuidanceState::Failed {
                 reason: format!(
-                    "reading `{}` from GitHub did not finish within {}s; run `boss guidance \
-                     show --product {}` to retry",
+                    "reading `{}` from GitHub did not finish within {}s{}",
                     file.path,
                     budget.as_secs(),
-                    product.id
+                    file.retry_command
+                        .map(|command| format!("; run `{command} --product {}` to retry", product.id))
+                        .unwrap_or_default()
                 ),
             },
             None,
@@ -280,7 +285,7 @@ fn settle_with_cache(
                         product_id = %product.id,
                         git_ref = %cached.git_ref,
                         fetch_error = %reason,
-                        "guidance: GitHub read failed; serving the cached last-known-good copy"
+                        "guidance: GitHub read failed; returning the cached last successful read result"
                     );
                     return CoordinatorGuidanceState::Cached {
                         git_ref: cached.git_ref,
@@ -1046,7 +1051,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_cached_missing_result_survives_an_outage_as_nothing() {
+        async fn a_cached_missing_result_leaves_a_visible_note_during_an_outage() {
             let db = open_db();
             let source = ScriptedSource::serving(SHA_OLD, "ignored");
             *source.blob.lock().unwrap() = Err(TreeApiError {
@@ -1062,7 +1067,36 @@ mod tests {
                 "{:?}",
                 view.state
             );
-            assert_eq!(render_block(&view), None, "last known: the repo has no BOSS.md");
+            let block = render_block(&view).unwrap();
+            assert!(block.contains("could not be loaded"), "{block}");
+            assert!(block.contains("error connecting to api.github.com"), "{block}");
+            assert!(block.contains("found no file"), "{block}");
+        }
+
+        #[tokio::test]
+        async fn a_worker_timeout_note_does_not_suggest_the_coordinator_command() {
+            let db = open_db();
+            let service = Arc::new(DesignDocsService::with_source(Arc::new(HangingSource {
+                head_calls: AtomicUsize::new(0),
+            })));
+            for cached in [false, true] {
+                if cached {
+                    loader(ScriptedSource::serving(SHA_OLD, "- rule"), &db)
+                        .read(&boss_product())
+                        .await;
+                }
+                let view =
+                    load_product_guidance_file(REPO_BOSS_FILE, &service, &db, &[boss_product()], Duration::ZERO, NOW)
+                        .await
+                        .remove(0);
+                assert_eq!(matches!(&view.state, CoordinatorGuidanceState::Cached { .. }), cached);
+                let block = render_block(&view).unwrap();
+                assert!(
+                    block.contains("reading `BOSS.md` from GitHub did not finish within 0s"),
+                    "{block}"
+                );
+                assert!(!block.contains("boss guidance show"), "{block}");
+            }
         }
 
         #[tokio::test]

@@ -100,7 +100,10 @@ fn log_outcome(view: &CoordinatorGuidanceView, execution_id: &str) {
             "repo BOSS.md injected into the worker prompt"
         ),
         CoordinatorGuidanceState::Cached {
-            fetch_error, read_at, ..
+            fetch_error,
+            read_at,
+            markdown: Some(_),
+            ..
         } => tracing::warn!(
             execution_id,
             product_id = %view.product_id,
@@ -109,6 +112,20 @@ fn log_outcome(view: &CoordinatorGuidanceView, execution_id: &str) {
             read_at,
             fetch_error,
             "repo BOSS.md could not be fetched; injecting the cached last-known-good copy"
+        ),
+        CoordinatorGuidanceState::Cached {
+            fetch_error,
+            read_at,
+            markdown: None,
+            ..
+        } => tracing::warn!(
+            execution_id,
+            product_id = %view.product_id,
+            owner_repo,
+            git_ref,
+            read_at,
+            fetch_error,
+            "repo BOSS.md could not be fetched; the cached read found no file, so the prompt carries a note"
         ),
         CoordinatorGuidanceState::OverCap { bytes, cap_bytes, .. } => tracing::warn!(
             execution_id,
@@ -147,7 +164,8 @@ fn log_outcome(view: &CoordinatorGuidanceView, execution_id: &str) {
 /// | cached, with a file                | the file, marked cached with sha + time |
 /// | over cap                           | a one-line note, no file text           |
 /// | failed (no cached copy)            | a one-line "could not be loaded" note   |
-/// | missing / cached-missing           | nothing                                 |
+/// | cached, without a file             | a one-line "could not be loaded" note   |
+/// | missing                            | nothing                                 |
 /// | no repo / not a GitHub remote      | nothing                                 |
 pub fn render_block(view: &CoordinatorGuidanceView) -> Option<String> {
     let repo = view.owner_repo.as_deref();
@@ -172,8 +190,20 @@ pub fn render_block(view: &CoordinatorGuidanceView) -> Option<String> {
                 markdown.trim_end()
             ),
         )),
-        // The last successful read found no file, so there is nothing to carry.
-        CoordinatorGuidanceState::Cached { markdown: None, .. } => None,
+        CoordinatorGuidanceState::Cached {
+            git_ref,
+            read_at,
+            fetch_error,
+            markdown: None,
+        } => Some(wrap(
+            &open_marker(repo, Some(git_ref), Some(read_at)),
+            &format!(
+                "NOTE: this repo's Boss guidance (`{path}`) could not be loaded ({}) and no earlier copy is \
+                 available; the last successful read at {read_at} (sha {git_ref}) found no file, so any rules it \
+                 holds are NOT in this prompt. Mention this in your final summary.",
+                one_line(fetch_error)
+            ),
+        )),
         CoordinatorGuidanceState::OverCap {
             git_ref,
             bytes,
@@ -342,16 +372,22 @@ mod tests {
     }
 
     #[test]
-    fn a_cached_missing_result_and_a_missing_file_inject_nothing() {
-        assert_eq!(
-            render_block(&view(CoordinatorGuidanceState::Cached {
-                git_ref: SHA.to_owned(),
-                read_at: "2026-11-09T08:00:00Z".to_owned(),
-                fetch_error: "offline".to_owned(),
-                markdown: None,
-            })),
-            None
+    fn a_cached_absence_leaves_a_failure_note_but_a_fresh_missing_file_is_silent() {
+        let block = render_block(&view(CoordinatorGuidanceState::Cached {
+            git_ref: SHA.to_owned(),
+            read_at: "2026-11-09T08:00:00Z".to_owned(),
+            fetch_error: "offline".to_owned(),
+            markdown: None,
+        }))
+        .unwrap();
+        assert!(block.contains("could not be loaded (offline)"), "{block}");
+        assert!(
+            block.contains("last successful read at 2026-11-09T08:00:00Z"),
+            "{block}"
         );
+        assert!(block.contains(&format!("sha {SHA}")), "{block}");
+        assert!(block.contains("found no file"), "{block}");
+        assert_eq!(block.lines().count(), 3, "{block}");
         assert_eq!(
             render_block(&view(CoordinatorGuidanceState::Missing {
                 git_ref: SHA.to_owned()

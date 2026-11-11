@@ -59,11 +59,11 @@ The markers record the source, so a transcript shows which version a worker was 
 | No `BOSS.md` in the repo                      | Nothing. No block, no note.                                                                                                                                                | `debug`                             |
 | Product has no repo / not a GitHub remote     | Nothing.                                                                                                                                                                   | `debug`                             |
 | File over 32 KiB                              | A block with a one-line note giving the size and the cap, and saying the guidance was **not** included. The text is withheld, never truncated.                             | `warn`: repo, sha, bytes, cap       |
-| GitHub unreachable, earlier read cached       | The cached text, marked `[repo-boss-guidance repo=… sha=… cached read_at=…]`, with a first line saying it is a cached copy, why the fetch failed and that it may be stale. | `warn`: sha, read time, fetch error |
+| GitHub unreachable, earlier file cached       | The cached text, marked `[repo-boss-guidance repo=… sha=… cached read_at=…]`, with a first line saying it is a cached copy, why the fetch failed and that it may be stale. | `warn`: sha, read time, fetch error |
 | GitHub unreachable, nothing cached            | A block with a one-line note that the repo's Boss guidance could not be loaded, with the reason. Dispatch proceeds.                                                        | `warn`: repo, reason                |
-| GitHub unreachable, cached read found no file | Nothing: the last known state is "no `BOSS.md`".                                                                                                                           | `warn`                              |
+| GitHub unreachable, cached read found no file | A block with a one-line "could not be loaded" note, the fetch error, and the sha and read time of the earlier absence.                                                     | `warn`                              |
 
-A GitHub problem never blocks dispatch and never silently drops the guidance: it is either served from the cache, or announced in the prompt. In the two note cases the worker is told to mention it in its final summary, so the gap reaches a human.
+A GitHub problem never blocks dispatch and never silently drops the guidance: it is either served from the cache, or announced in the prompt. In the three note cases the worker is told to mention it in its final summary, so the gap reaches a human.
 
 ### Cache
 
