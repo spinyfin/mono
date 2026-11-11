@@ -1,9 +1,10 @@
 # Antigravity (`agy`) as Boss's fourth driver: everything rides on a Boss-owned per-run `HOME`
 
 - **Date:** 2026-08-12
-- **Status:** design, pre-implementation. No `AgyDriver` code exists.
+- **Status:** design, pre-implementation. No `AgyDriver` code exists. Revised 2026-11-11 against the [pane viability study](../investigations/ghostty-agy-pane-viability.md) (its "Corrections to the design" table); where this document and the study disagree, the study's measurements win.
 - **Kind:** project design doc
-- **Subject CLI:** `agy` 1.1.12 (`~/.local/bin/agy`), Google Antigravity, OAuth against a personal Google account
+- **Subject CLI:** `agy` 1.5.5 (`~/.local/bin/agy`), Google Antigravity, OAuth against a personal Google account. Qualified against 1.5.5, not 1.1.12, which loses briefs submitted early (study, "Two versions, and why" and Q1). The binary self-updates, so this pin warns rather than gates (study, "Corrections to the design", and Negatives 10)
+- **Evidence:** [`ghostty-agy-pane-viability.md`](../investigations/ghostty-agy-pane-viability.md)
 - **Sibling designs:** [`grok-as-a-first-class-interactive-agent-driver.md`](./grok-as-a-first-class-interactive-agent-driver.md), [`codex-as-a-first-class-agent-driver.md`](./codex-as-a-first-class-agent-driver.md), [`agent-driver-abstraction-decouple-boss-from-claude-code-capabilities-oriented-mix-and-match.md`](./agent-driver-abstraction-decouple-boss-from-claude-code-capabilities-oriented-mix-and-match.md)
 - **Perishable status/ledger:** kept out of this doc deliberately — see the acceptance-ledger entry in the task breakdown
 
@@ -11,11 +12,11 @@
 
 **This driver has exactly one isolation mechanism, and no fallback: a Boss-owned per-run `HOME`.**
 
-`agy` exposes no config-directory override, no hooks-path flag, and no per-run permission flag other than a blanket allow-all. Per-run isolation, per-worker-kind permission posture, workspace trust, the conversation store, and the transcript location are _all_ reached by relocating `HOME`. A reviewer can reasonably object that this bets the whole integration on one undocumented behaviour of a closed-source binary that auto-updates. That objection is correct, and it is the thing to land on before any code is written: if scoped `HOME` is unsound inside a GhosttyKit pane, this project has no plan B and should stop rather than improvise one.
+`agy` exposes no config-directory override, no hooks-path flag (hooks are discovered from `$HOME/.gemini/config/hooks.json`, so the per-run `HOME` is also how they are wired), and no per-run permission flag other than a blanket allow-all. Per-run isolation, per-worker-kind permission posture, workspace trust, the conversation store, and the transcript location are _all_ reached by relocating `HOME`. A reviewer can reasonably object that this bets the whole integration on one undocumented behaviour of a closed-source binary that auto-updates. That objection is correct, and it is the thing to land on before any code is written: if scoped `HOME` is unsound inside a GhosttyKit pane, this project has no plan B and should stop rather than improvise one. The pane viability study has since answered this: scoped `HOME` holds up for a long-lived TUI and its tool children, given the login-keychain bridge (study, Q8).
 
 ## TL;DR / verdict
 
-Technically the integration looks tractable: `agy` has a Claude-shaped hook system with a real `Stop` hook, an interactive TUI suitable for a pane, and — verified in this pass — a state tree that relocates cleanly under a scoped `HOME`.
+Technically the integration looks tractable: `agy` has a Claude-shaped hook system with a real `Stop` hook, an interactive TUI suitable for a pane, and — verified in this pass and by the pane viability study (Q8) — a state tree that relocates cleanly under a scoped `HOME`.
 
 The initial operating state is a **pinned-only, zero-share driver** — reachable by explicit `--driver agy`, receiving no allocated traffic — as a behaviour-preserving rollout default, not an economic verdict. The operator has a paid Gemini subscription, but this pass did not establish its entitlement or an apples-to-apples quota comparison with `claude`, `codex`, or `grok`. Spend and quota accounting belongs in a separate, driver-neutral project; it is not an implementation gate for this driver.
 
@@ -42,11 +43,11 @@ The project brief arrived with substantial pre-work. Per its own instruction, lo
 
 ### Verified against the binary
 
-- `agy --help` flag surface, on 1.1.12: `-i` / `--prompt-interactive`, `--add-dir` (repeatable), `--effort low|medium|high`, `--model`, `--conversation`, `-c`/`--continue`, `--sandbox`, `--mode accept-edits|plan`, `--dangerously-skip-permissions`, `--json-schema`, `--print-timeout`, `--disable-slash-commands`, `--project` / `--new-project`. Subcommands: `agent(s)`, `models`, `plugin(s)`, `install`, `update`, `changelog`, `help`. There is **no** `--no-subagents` and **no** config-dir flag.
+- `agy --help` flag surface, on 1.1.12 (the pass predating the study; the effort ladder is wider on 1.5.5, see the table below): `-i` / `--prompt-interactive`, `--add-dir` (repeatable), `--effort low|medium|high`, `--model`, `--conversation`, `-c`/`--continue`, `--sandbox`, `--mode accept-edits|plan`, `--dangerously-skip-permissions`, `--json-schema`, `--print-timeout`, `--disable-slash-commands`, `--project` / `--new-project`. Subcommands: `agent(s)`, `models`, `plugin(s)`, `install`, `update`, `changelog`, `help`. There is **no** `--no-subagents` and **no** config-dir flag.
 - **No `AGY_HOME` equivalent exists.** A symbol sweep of the binary surfaces `AGY_ADC_AUTH`, `AGY_BUSINESS_PAYGO_TIER`, `AGY_CLI_DISABLE_AUTO_UPDATE`, `AGY_CLI_DISABLE_LATEX`, four `AGY_ONBOARDING_*` flags, and a set of `ANTIGRAVITY_*` names that are editor/sidecar/telemetry oriented. One name is worth a probe rather than a conclusion: `ANTIGRAVITY_EXECUTABLE_DATA_DIR`. Its semantics are unknown from strings alone.
 - **`HOME` relocation works, and is total.** Running `env HOME=<scratch> agy models` created `<scratch>/.gemini/config/{config.json,mcp_config.json,projects/}` and `<scratch>/.gemini/antigravity-cli/{conversation_summaries.db,brain/,conversations/,presence/,log/,cache/,knowledge/,updater/,installation_id,jetski_state.pbtxt}` — i.e. the entire mutable state surface named in Risk 2 followed `HOME`. It also created `<scratch>/Library/Caches/ms-playwright-go`, so the browser-subagent cache follows too.
-- **Scoped `HOME` fails closed on auth**, exiting non-zero with `Error: Please sign in to view available models.` The OAuth credential is `HOME`-scoped, so relocating `HOME` _breaks authentication_ unless the credential is deliberately delegated back. That is a feature for safety and a hard requirement for design.
-- **Permission and trust state are `HOME`-scoped files**, and there are two of them: `~/.gemini/settings.json` holds `security.auth.selectedType`, while `~/.gemini/antigravity-cli/settings.json` holds `trustedWorkspaces` (observed on the host with real entries), `colorScheme`, and `enableTelemetry`.
+- **Scoped `HOME` fails closed on auth**, exiting non-zero with `Error: Please sign in to view available models.` The credential is **not** a `HOME`-scoped file: it is an item in the macOS login keychain, read through `/usr/bin/security`, which cannot find the user's keychain under a scoped `HOME`. That is why a scoped `HOME` is signed out, and the remedy is the login-keychain bridge (a symlink to the real login keychain inside the scoped `HOME`), not credential-file links (study, Q8 "The credential is in the login keychain"). Failing closed is a feature for safety and a hard requirement for design.
+- **Permission and trust state are a `HOME`-scoped file.** `~/.gemini/antigravity-cli/settings.json` holds `trustedWorkspaces` (observed on the host with real entries), `colorScheme`, and `enableTelemetry`. `~/.gemini/settings.json` and `trustedFolders.json` are **not read** by `agy`; neither binary references them (study, "Corrections to the design" and Q8). The earlier belief that they held the auth type and a trust store was wrong.
 - **`.agents/` is discovered at the root of a workspace directory, not only the repo.** The binary documents `.agents/` (with `.agent/`, `_agents/`, `_agent/` accepted) "at the root of" a workspace path, alongside `GEMINI.md` / `AGENTS.md` / `.agents/rules/*.md` for rules, and states that for a hook "the working directory is set to the directory containing `hooks.json`". Since `--add-dir` adds a directory to the workspace, this is the mechanism that explains the brief's undocumented `--add-dir`-flips-hook-discovery finding — and it means Boss's hook config need not be written into the repo at all.
 
 ### Corrected from the brief
@@ -57,30 +58,30 @@ The project brief arrived with substantial pre-work. Per its own instruction, lo
 
 ### Still unconfirmed — and therefore gating
 
-Everything in the spike checklist below. In particular: whether hooks fire at all in interactive mode. The captured `Stop` payload is headless-only evidence, and the pane path is the only path that ships.
+The pane-level questions are now answered by the study: hooks fire in interactive mode (`SessionStart`, `PreInvocation`, `PostInvocation`, `PreToolUse`, `PostToolUse`, `Stop`), Esc fires no `Stop`, and mid-turn input is buffered (study, Q2, Q5, Q6). Still unconfirmed and gating are the characterisation tasks below: subagent `conversationId` attribution (untested by the study, see its "Limits of this study"), concurrency of credential refresh, permission key semantics, and `PostToolUse` exit status.
 
 ## What `agy` is, in Boss's vocabulary
 
-| Boss shape                                   | `agy` equivalent                                                                                                                                                                | Confidence                                  |
-| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
-| Pane `initial_input` runs an interactive TUI | `agy -i "<prompt>"`                                                                                                                                                             | Flag exists; auto-submit unverified         |
-| Turn boundary                                | `Stop` hook, `terminationReason` + `fullyIdle`                                                                                                                                  | Verified headless only                      |
-| Per-tool progress cadence                    | `PreToolUse` / `PostToolUse` hooks                                                                                                                                              | Verified headless only                      |
-| Model-invocation boundaries                  | `PreInvocation` / `PostInvocation` hooks                                                                                                                                        | Exists; semantics unmapped                  |
-| "Awaiting human input" signal                | _none observed_                                                                                                                                                                 | No `Notification`-shaped event in the set   |
-| Session identity                             | `conversationId` on every hook payload                                                                                                                                          | Verified in captured payload                |
-| Transcript                                   | `transcriptPath` stamped on the `Stop` payload, under `brain/<cid>/.system_generated/logs/transcript_full.jsonl`                                                                | Verified in captured payload                |
-| Per-run config isolation                     | scoped `HOME`                                                                                                                                                                   | Verified for state; unverified in a pane    |
-| Credential                                   | `$HOME/.gemini/oauth_creds.json` + `google_accounts.json`                                                                                                                       | Verified `HOME`-scoped                      |
-| Permission posture                           | `$HOME/.gemini/antigravity-cli/settings.json` (`toolPermission`, `permissions.allow`) plus `--sandbox` / `--mode`                                                               | File verified to exist; keys unverified     |
-| Workspace trust                              | `trustedWorkspaces` in the same file; `trustedFolders.json` in `~/.gemini/`                                                                                                     | Files verified; gating behaviour unverified |
-| Effort ladder                                | `--effort low\|medium\|high` — three rungs, same shape as Grok                                                                                                                  | Verified                                    |
-| Model menu                                   | `gemini-3.6-flash-{high,medium,low}`, `gemini-3.5-flash-{high,medium,low}`, `gemini-3.1-pro-{high,low}`, `claude-sonnet-4-6`, `claude-opus-4-6-thinking`, `gpt-oss-120b-medium` | From `agy models` (brief)                   |
-| Subagents                                    | `invoke_subagent` / `define_subagent` / `browser_subagent`, no disable flag                                                                                                     | Verified absent from `--help`               |
+| Boss shape                                   | `agy` equivalent                                                                                                                                                                                  | Confidence                                 |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
+| Pane `initial_input` runs an interactive TUI | The existing initial-brief launcher (not `agy -i`; `-i` auto-submits but runs behind the trust dialog and adds nothing; study, Q1)                                                                | Verified (study Q1: 50 KB brief delivered) |
+| Turn boundary                                | `Stop` hook with `fullyIdle=true` only; `fullyIdle=false` is a background task and the agent re-invokes itself                                                                                    | Verified in pane (study, Q7)               |
+| Per-tool progress cadence                    | `PreToolUse` / `PostToolUse` hooks                                                                                                                                                                | Verified in pane (study, Q2)               |
+| Model-invocation boundaries                  | `PreInvocation` / `PostInvocation` hooks                                                                                                                                                          | Exists; semantics unmapped                 |
+| "Awaiting human input" signal                | _none observed_                                                                                                                                                                                   | No `Notification`-shaped event in the set  |
+| Session identity                             | `SessionStart` (fires on 1.1.12 and 1.5.5) carrying `conversationId`, which is on every hook payload                                                                                              | Verified in pane (study, Q2)               |
+| Transcript                                   | `transcriptPath` stamped on the `Stop` payload, under `brain/<cid>/.system_generated/logs/transcript_full.jsonl`                                                                                  | Verified in captured payload               |
+| Per-run config isolation                     | scoped `HOME`                                                                                                                                                                                     | Verified in a pane (study, Q8)             |
+| Credential                                   | Login-keychain item (`go-keyring` via `/usr/bin/security`), delegated by the login-keychain bridge as the Grok driver does (`LOGIN_KEYCHAIN_LEAF`)                                                | Verified (study, Q8)                       |
+| Permission posture                           | `$HOME/.gemini/antigravity-cli/settings.json` (`toolPermission`, `permissions.allow`) plus `--sandbox` / `--mode`                                                                                 | File verified to exist; keys unverified    |
+| Workspace trust                              | `trustedWorkspaces` in `$HOME/.gemini/antigravity-cli/settings.json` only; `trustedFolders.json` and `~/.gemini/settings.json` are not read                                                       | Verified (study, Q4, Q8)                   |
+| Effort ladder                                | `--effort low\|medium\|high\|xhigh\|max` — five rungs on 1.5.5 (three on 1.1.12)                                                                                                                  | Verified (study, "Corrections")            |
+| Model menu                                   | 1.5.5 lists `gemini-4-carbon-*`, `gemini-4-argon-*`, `gemini-3.8-flash-*`, `claude-opus-5-5-*`, `claude-sonnet-5-5-*`, `gpt-oss-120b-medium`; the driver reads `agy models`, not a hardcoded list | From the study ("Corrections")             |
+| Subagents                                    | `invoke_subagent` / `define_subagent` / `browser_subagent`, no disable flag                                                                                                                       | Verified absent from `--help`              |
 
 ## Subscription and quota context
 
-The operator reports having a paid Gemini subscription. This pass did not identify the subscription tier or its Antigravity entitlement, so the fact that quota may be metered weekly across Antigravity surfaces does **not** establish that quota is restrictive for this account.
+The operator reports having a paid Gemini subscription. The study's banner capture reads `Google AI Ultra` for the tier, but this design still has no measured Antigravity entitlement, so the fact that quota may be metered weekly across Antigravity surfaces does **not** establish that quota is restrictive for this account.
 
 The earlier draft's token figures — 17,644 input tokens for a "reply PONG" run, an estimated 10–25k per-request overhead, and a 9.4k cached floor — came from the project brief, not from a measurement performed during this design pass. The brief included neither a capture nor the `agy` version that produced them, and this pass did not repeat the experiment on 1.1.12 or a later CLI. Their provenance and version therefore cannot be established, so this revision removes them as inputs to the verdict and makes no fleet-affordability inference from them.
 
@@ -120,7 +121,7 @@ Rejected, because the requirement it fails is a real one and not an artifact of 
 
 - **Per-worker-kind permission posture is a hard requirement with an exhaustive match behind it.** `worker_setup.rs` derives `WorkerKind` from `ExecutionKind` in a deliberately exhaustive match so a new kind must decide its posture, and `WorkerKind::forced_permission_mode` exists so a restricted kind's allowlist "cannot be silently downgraded". `agy` expresses posture in `settings.json` — **one file per `HOME`**. Under a shared `HOME`, a Reviewer and a Standard worker running concurrently cannot hold different postures. That is not a tidiness loss; it is the security property failing.
 - **The remaining state is process-global within a `HOME` regardless of project separation:** one `conversation_summaries.db` (SQLite, with `-wal`/`-shm` observed), one `presence/` lock directory, one `settings.json`, one updater. Sixteen concurrent writers to those is the correctness risk Risk 2 names.
-- The auth-delegation problem it avoids is real but small, and Grok has already solved the same problem shape (`GROK_AUTH_PATH` plus a wait on the CLI's own refresh lock).
+- The auth-delegation problem it avoids is real but small, and Boss already solves the same problem shape for Grok's keychain access with the login-keychain bridge (`LOGIN_KEYCHAIN_LEAF` in `grok/environment.rs`).
 
 ## Chosen approach
 
@@ -130,53 +131,63 @@ Not "each run gets its own `HOME`" — that is the container, and an implementat
 
 > **No two concurrent `agy` runs may share a mutable `agy` state artifact — the conversation DB, `settings.json`, the presence lock directory, `brain/`, `conversations/`, or the updater state — and the operator's own `~/.gemini` is never one of those artifacts for any run.**
 >
-> Exactly one artifact is deliberately shared, and it is shared because it is a credential rather than state: the OAuth credential file, plus whatever lock the CLI itself uses to serialise refreshes of it.
+> Exactly one artifact is deliberately shared, and it is shared because it is a credential rather than state: the login-keychain item holding the OAuth token, reached through the login-keychain bridge. Refresh serialisation is the keychain's and `agy`'s own, not a file lock Boss can take or wait on (study, Q8).
 
 A per-run `HOME` is the mechanism that satisfies this. The invariant is what tests and posture assertions must check.
 
 ### The equivalence to `GROK_HOME`, and the dimension it holds on
 
-Scoped `HOME` for `agy` is equivalent to `CODEX_HOME` / `GROK_HOME` **on the state-redirection dimension only**. It is _not_ equivalent on the auth dimension: Grok has `GROK_AUTH_PATH` to point the credential back out of the scope explicitly, and Codex has `boss_codex_auth` snapshotting. `agy` has neither, so the credential must be delegated by filesystem link into the scoped `HOME`, which is a different mechanism with a different failure mode (a link into a per-run tree that gets reclaimed, versus an env var that is simply wrong). Grok's `environment.rs` already documents why the filesystem form is load-bearing there too — its tool sandbox strips parent-process env vars — so the precedent transfers, but as _filesystem delegation_, not as _env-var delegation_.
+Scoped `HOME` for `agy` is equivalent to `CODEX_HOME` / `GROK_HOME` **on the state-redirection dimension only**. On the auth dimension `agy` has no `GROK_AUTH_PATH`-style override and no `boss_codex_auth`-style snapshot; its credential lives in the login keychain, so it is delegated with the **login-keychain bridge**: a symlink `<per-run home>/Library/Keychains/login.keychain-db` → the real login keychain, the same bridge `grok/environment.rs` provisions as `LOGIN_KEYCHAIN_LEAF`. With it, `security` works from the TUI and from tool children, and no keychain prompt appeared in the study (Q8). This is _filesystem delegation_ of one keychain file, not env-var delegation and not credential-file links.
 
 ### Topology
 
 ```
 GhosttyKit pane (what the operator reads: agy's own TUI)
-  └─ shell → agy -i "$(cat <control-dir>/initial-prompt.txt)" --add-dir <control-dir> --model … --effort …
-       env: HOME=<per-run home>   (+ host-tool delegation, per Grok's environment.rs)
+  └─ existing initial-brief launcher → agy --model … --effort …   (no -i, no --add-dir)
+       env: HOME=<per-run home>, AGY_CLI_DISABLE_AUTO_UPDATE=true
+            (+ host-tool delegation, per Grok's environment.rs)
+       submit key: Enter (engine change: C-m is not Return to agy)
 
-<per-run home>/.gemini/
-  ├─ settings.json                        ← Boss-written: auth type
-  ├─ oauth_creds.json                     ← link to the shared host credential
-  ├─ google_accounts.json                 ← link to the shared host file
-  └─ antigravity-cli/
-       ├─ settings.json                   ← Boss-written: toolPermission, permissions.allow,
-       │                                     trustedWorkspaces  → per-worker-kind posture
-       ├─ conversation_summaries.db       ← run-private
-       ├─ presence/, conversations/, brain/, log/, cache/
-       └─ brain/<cid>/.system_generated/logs/transcript_full.jsonl   ← TranscriptAccess (post-hoc)
+<per-run home>/
+  ├─ Library/Keychains/login.keychain-db  ← symlink to the real login keychain (credential bridge)
+  └─ .gemini/
+       ├─ config/
+       │    └─ hooks.json                 ← global-root hooks: boss-event forwarder +
+       │                                     PreToolUse guards behind the adapter
+       └─ antigravity-cli/
+            ├─ settings.json              ← Boss-written: trustedWorkspaces (pre-seeded) and the
+            │                                per-worker-kind permission keys the permission study settles
+            ├─ onboarding.json            ← pre-seeded (skips onboarding; not a consent answer)
+            ├─ conversation_summaries.db  ← run-private
+            ├─ presence/, conversations/, brain/, log/, cache/
+            └─ brain/<cid>/.system_generated/logs/transcript_full.jsonl   ← TranscriptAccess (post-hoc)
 
-<control-dir>/                            ← Boss-owned, OUTSIDE the repo, passed via --add-dir
-  ├─ .agents/hooks.json                   ← boss-event forwarder + PreToolUse guards behind the adapter
-  ├─ .agents/rules/boss-worker-rules.md   ← agent-rules, without touching the repo's tracked AGENTS.md
-  └─ initial-prompt.txt
+<control-dir>/                            ← Boss-owned, outside the repo and outside the agent's workspace
+  ├─ initial-prompt.txt                   ← consumed by the launcher
+  └─ agent rules, if placed here rather than in the per-run home (location open; see below)
+
+Not read by agy, so not written: ~/.gemini/settings.json, trustedFolders.json,
+oauth_creds.json, google_accounts.json.
 ```
 
 Two things this buys that are worth stating explicitly:
 
-- **Hook config never enters the repo.** The brief's finding that `--add-dir <workspace>` flips hook discovery on is explained by `.agents/` being resolved at the root of _any_ workspace directory. Putting Boss's control directory outside the repo and adding it means the worker's checkout stays clean — no `.agents/` to gitignore, no engine-written files in `jj status`. If the spike finds `.agents/` is only honoured in the primary cwd, the fallback is an in-repo `.agents/` with the trait's existing `config_dir_gitignore` (`"*\n"`) — a real fallback, but strictly worse, and the design prefers the control directory.
-- **Boss worker rules do not collide with the repo's tracked `AGENTS.md`.** `agy` reads `AGENTS.md`, `GEMINI.md`, and `.agents/rules/*.md`; mono has a tracked `AGENTS.md` at the root. This is exactly the collision Grok solved by writing Boss rules to `$GROK_HOME/AGENTS.md` at global scope, and the control directory's `rules/` is the `agy` equivalent.
+- **Hook config never enters the repo, or the agent's workspace.** The study measured both routes: a control directory outside the repo works with `--add-dir`, and `$HOME/.gemini/config/hooks.json` works with no flag, loading whether or not anything is trusted (Q3, Q4). The global root is chosen because it needs less and keeps the directory out of the agent's workspace. Nothing is written into the checkout — no `.agents/` to gitignore, no engine-written files in `jj status`. The `--add-dir` control directory is the fallback if the global root regresses on a later version.
+- **Boss worker rules do not collide with the repo's tracked `AGENTS.md`.** `agy` reads `AGENTS.md`, `GEMINI.md`, and `.agents/rules/*.md`; mono has a tracked `AGENTS.md` at the root. This is exactly the collision Grok solved by writing Boss rules to `$GROK_HOME/AGENTS.md` at global scope, and a Boss-owned rules location outside the repo is the `agy` equivalent. The study did not measure where rules are best placed once `--add-dir` is dropped; the provisioning task settles it (a global-root rules file under the per-run home, or `.agents/rules/` in the control directory added with `--add-dir` as the fallback).
 
 ### Ingress and turn boundary
 
-`ProgressIngress::HookCallback` with `HookWiringDestination::DriverOwned`, wired into the control directory's `.agents/hooks.json`. The `boss-event` shim is schema-agnostic transport — it splices `_boss_run_id` and forwards bytes — so it is reused unchanged, exactly as Claude and Grok reuse it, and the `agy` dialect is decoded engine-side by the driver's `normalize_progress_event` / `progress_session`.
+`ProgressIngress::HookCallback` with `HookWiringDestination::DriverOwned`, wired into the per-run home's global-root `$HOME/.gemini/config/hooks.json`. The `boss-event` shim is schema-agnostic transport — it splices `_boss_run_id` and forwards bytes — so it is reused unchanged, exactly as Claude and Grok reuse it, and the `agy` dialect is decoded engine-side by the driver's `normalize_progress_event` / `progress_session`.
 
-The events wired: `PreToolUse`, `PostToolUse`, `PreInvocation`, `PostInvocation`, `Stop`. Two gaps against Claude's set need explicit mapping decisions from characterisation rather than assumption:
+The events wired: `SessionStart`, `PreToolUse`, `PostToolUse`, `PreInvocation`, `PostInvocation`, `Stop`.
 
-- **No `SessionStart`.** The first `PreInvocation` is the candidate carrier for `WorkerEvent::SessionStart` and for claiming progress identity, since every payload carries `conversationId`. Unverified.
+- **`SessionStart` exists** on both 1.1.12 and 1.5.5 and carries `conversationId` (study, Q2). It is the carrier for `WorkerEvent::SessionStart` and for claiming progress identity; the first `PreInvocation` is not needed for that.
+- **`PreToolUse` reply contract.** The study found a `PreToolUse` reply of `{}`, a non-zero exit, or malformed output denies the tool; only empty stdout or an explicit `allow` lets it run (study, "What a `PreToolUse` reply does"). The progress forwarder must therefore stay silent on stdout, never print an empty object, and never exit non-zero. A delivery failure on `PreToolUse` blocks the tool it was reporting, so whether the forwarder fails open (swallow delivery errors) or closed on that event is an explicit decision for the hook-wiring task, not a default. Every payload also carries the whole prompt (a 50 KB brief is about 51 KB per event; Negatives 9), which the forwarder cost must account for.
 - **No `Notification`.** So `Capability::AwaitingInputSignal` is **not declared**, and its absence disposition stays the default `Degrade` — never `Synthesize`. An `agy` worker shows Working/Idle and never a fabricated `WaitingForInput`. This matches Grok's measured position.
 
-Turn boundary is `Stop` → `TurnEnd`. The `terminationReason` vocabulary must be enumerated empirically — the brief records that the docs and the binary disagree, and the binary wins.
+Turn boundary is `Stop` → `TurnEnd` **only when `fullyIdle=true`**. A `Stop` with `fullyIdle=false` means a command outlived the tool's wait and became a background task; the pane looks idle too, and the agent invokes itself again when the task ends, so treating it as a boundary would report a finished turn that is not (study, Q7 "`fullyIdle` decides whether a `Stop` is a boundary"). Observed `terminationReason` values are `NO_TOOL_CALL` (with `fullyIdle` true and false) and `TERMINAL_CUSTOM_HOOK` (1.5.5 only); `USER_CANCELED` exists in the enum and was never emitted. The binary, not the docs, remains the source of truth.
+
+**Esc fires no `Stop`.** A cancelled turn is silent: no hook and no transcript record, on either version (study, Q5; 4 of 4 interrupted turns). Interrupt recovery is therefore required, not conditional — see the turn-boundary task.
 
 ### Subagent attribution: mandatory identity filtering, because there is no flag
 
@@ -188,8 +199,8 @@ The seam already exists: `ProgressIdentityStore::claim_progress_identity(run_id,
 
 `write_permission_config` renders, into the per-run `HOME`:
 
-- `antigravity-cli/settings.json` — `toolPermission` level plus a `permissions.allow` allowlist, per `WorkerKind`, mirroring `grok/permissions.rs::permission_mode_for_worker_kind`'s shape (a driver-local mirror of `worker_setup::WorkerKind::forced_permission_mode`, not a second source of truth).
-- `trustedWorkspaces` pre-seeded with the workspace and the control directory, so the first-run trust prompt never blocks a pane.
+- `antigravity-cli/settings.json` (the only settings file `agy` reads) — `toolPermission` level plus a `permissions.allow` allowlist, per `WorkerKind`, mirroring `grok/permissions.rs::permission_mode_for_worker_kind`'s shape (a driver-local mirror of `worker_setup::WorkerKind::forced_permission_mode`, not a second source of truth).
+- `trustedWorkspaces` pre-seeded with the workspace, so the first-run trust prompt never blocks a pane. (The study found the trust dialog is not a barrier to an `-i` turn and gates discovery only for `<cwd>/.agents/`, so hooks load regardless; pre-seeding is for a clean pane, Q4.) `onboarding.json` is pre-seeded too; that skips the screen but does not answer the pre-checked data-collection consent it shows (Negatives 8), which is an operator decision.
 - `PermissionArtifacts::extra_args` for whatever the characterisation task finds is genuinely per-run: `--sandbox`, and `--mode plan` if it proves to be a real read-only posture for Reviewer.
 
 Which of `toolPermission: strict` + allowlist versus `--mode plan` versus `--sandbox` expresses Reviewer read-only is **an open choice**, and the characterisation task that answers it is a _choosing_ study, not a validating one — see the task entry, which says so explicitly.
@@ -233,27 +244,27 @@ Omitted, each with its reason:
 
 ## Risks / open questions
 
-**R1 — Hooks may not fire in interactive mode.** The whole boundary story is headless evidence. If interactive hooks do not fire, the pane constraint holds and the answer is transcript tailing or pane scraping, not a stream in the pane. This is the first question the spike answers, and a negative answer is a stop-shaped finding for the project, not a detour.
+**R1 — Hooks may not fire in interactive mode. Resolved: they fire.** The pane viability study measured `SessionStart`, `PreInvocation`, `PostInvocation`, `PreToolUse`, `PostToolUse` and `Stop` in interactive mode on both 1.1.12 and 1.5.5 (Q2). The residual hazard is that an Esc-cancelled turn fires none of them (see the turn-boundary task).
 
-**R2 — Scoped `HOME` may behave differently in a pane than in a one-shot command.** Verified for `agy models`; unverified for a long-lived TUI that spawns tool child processes and possibly a browser subagent. The playwright cache relocating under the scoped `HOME` also implies a per-run re-download cost unless it is delegated the way Grok delegates `XDG_CACHE_HOME` and the bazel roots.
+**R2 — Scoped `HOME` in a pane. Largely resolved.** The study found all state, hooks and tool children stay under the scoped `HOME` for a long-lived TUI, and the real `~/.gemini` was not touched (Q8). Still unexercised: a browser subagent. The Playwright cache relocation seen on 1.1.12 (`Library/Caches/ms-playwright-go` created on `agy models`) was not reproduced on 1.5.5, so the per-run re-download cost is a 1.1.12 observation until a browser subagent is run.
 
-**R3 — Credential delegation under concurrency.** Sixteen runs sharing one `oauth_creds.json` will contend on token refresh. Grok's answer was to wait on the CLI's own lock protocol without ever taking it. `agy`'s refresh and locking behaviour is unknown and must be characterised before the fleet is pointed at it.
+**R3 — Credential delegation under concurrency.** Sixteen runs share one login-keychain item and will contend on token refresh through it. The study saw two refreshers overlap by accident (one scoped, one in the real home) with nothing failing, but that is one observation, not a concurrency result (Q8, "Limits of this study"). Refresh serialisation is the keychain's and `agy`'s, so there is no file lock to wait on as Grok does; the behaviour under many concurrent refreshers must be characterised before the fleet is pointed at it.
 
 **R4 — Subagents may share the parent `conversationId`.** If so, ingress identity filtering cannot separate them and there is no `--no-subagents` to fall back on. This is the highest-severity uncharacterised risk after R1.
 
-**R5 — `agy` auto-updates.** Grok's design records that it "auto-updates itself on its own schedule", which is why its version pin warns rather than gates. `agy` has `--update` and an `updater/` state directory, so the same drift applies, and a scoped `HOME` may cause each run to re-check for updates. `AGY_CLI_DISABLE_AUTO_UPDATE` exists in the binary and is the obvious lever to probe.
+**R5 — `agy` auto-updates.** Grok's design records that it "auto-updates itself on its own schedule", which is why its version pin warns rather than gates. `agy` has `--update` and an `updater/` state directory, so the same drift applies. The study measured that a fresh `HOME` replaces the shared binary on first run, and that `AGY_CLI_DISABLE_AUTO_UPDATE` works **only as `=true`** (`=1` is ignored); provisioning must export it and use a binary location the updater cannot write (Negatives 7; "Corrections"). The version also moved during the study, so the 1.5.5 pin does not hold a self-updating binary still.
 
 **R6 — Quota exhaustion remains a runtime condition.** The paid subscription's entitlement is unknown, and this project deliberately does not build the missing cross-driver accounting mechanism. The driver must still classify quota exhaustion distinctly so recovery does not redispatch into the same exhausted account.
 
 **R7 — Terms of service are silent on programmatic driving, and silence is not permission.** No ToS text was located either permitting or prohibiting driving `agy` programmatically. The weak reading is "not prohibited, therefore allowed". The stronger and more likely reading is that **no decision was ever made** about this use — an unaddressed gap, not a granted allowance — and automated fleet use on a personal Google account is exactly the case a provider would address if it addressed any. This needs an operator call before the driver runs on real work, and it is in the questions manifest.
 
-**R8 — CI cannot authenticate.** `agy` requires a prior interactive login and caches the credential under `HOME`. Any live-CLI conformance gate (`BOSS_REQUIRE_AGY_CLI`) will therefore only be meaningful on a developer machine with a signed-in account, exactly as `BOSS_REQUIRE_GROK_CLI` is. Fixture-side pins carry the contract in CI.
+**R8 — CI cannot authenticate.** `agy` requires a prior interactive login and stores the credential in the login keychain. Any live-CLI conformance gate (`BOSS_REQUIRE_AGY_CLI`) will therefore only be meaningful on a developer machine with a signed-in account, exactly as `BOSS_REQUIRE_GROK_CLI` is. Fixture-side pins carry the contract in CI.
 
 **R9 — `ANTIGRAVITY_EXECUTABLE_DATA_DIR` may be an actual data-dir override.** If it is, part of the scoped-`HOME` machinery could be replaced by something narrower and better-behaved. Cheap to probe; worth probing before building the provisioning module.
 
 ## Proposed implementation task breakdown
 
-Breakdown size: 21 entries (19 in-scope, 2 deferred) — a new fourth driver reaching across four investigations (pane viability, isolation, hooks, permissions), a breaking protocol+DB+Swift split migration, a new driver module with ten distinct trait seams (skeleton, home provisioning, retention, spawn, hook wiring, guard adapter, progress normaliser, turn boundary, permission rendering, transcript), a soft-deny detector, and a conformance extension; each is its own reviewable PR, and the count sits below the 30 tasks the comparable Grok integration actually shipped.
+Breakdown size: 22 entries (20 in-scope, 2 deferred); the pane viability spike entry is complete (study merged) and the engine submit-key entry was added by the study — a new fourth driver reaching across four investigations (pane viability, isolation, hooks, permissions), a breaking protocol+DB+Swift split migration, a new driver module with ten distinct trait seams (skeleton, home provisioning, retention, spawn, hook wiring, guard adapter, progress normaliser, turn boundary, permission rendering, transcript), a soft-deny detector, and a conformance extension; each is its own reviewable PR, and the count sits below the 30 tasks the comparable Grok integration actually shipped.
 
 Parallelism is noted per entry. The depth-0 pane spike and traffic-split migration may run concurrently.
 
@@ -261,7 +272,7 @@ Every entry starts from the driver-neutral machinery named in Alternative B. New
 
 ### Ghostty pane viability spike for `agy`
 
-Run `agy` 1.1.12 as an interactive TUI inside a **real GhosttyKit-hosted pane** — not a standalone terminal, not a harness — and answer the nine-item checklist: does `-i "<prompt>"` auto-submit in a PTY; do hooks fire at all in interactive mode; is `--add-dir` required for `.agents/hooks.json` discovery and does a control directory _outside_ the repo work; does workspace trust independently gate discovery; does Esc emit `Stop` or skip it; is mid-turn pane input buffered or rejected; what `terminationReason` values does the binary actually emit; does scoped `HOME` hold up in a pane; and what are the banner / busy / prompt / starting strings for a `PaneMonitorSpec`. Model the artefact on `ghostty-grok-pane-viability.md`, including its hard apparatus rule. **This study is a gate, not a validation**: it can return "not viable", and that outcome stops the project rather than prompting a workaround. Deliverable: `tools/boss/docs/investigations/ghostty-agy-pane-viability.md` plus an artifacts directory. No driver code.
+**Done:** delivered as [`ghostty-agy-pane-viability.md`](../investigations/ghostty-agy-pane-viability.md) (verdict: viable, with the corrections folded into this document). The entry is kept because later entries depend on it. Original scope: run `agy` 1.1.12 as an interactive TUI inside a **real GhosttyKit-hosted pane** — not a standalone terminal, not a harness — and answer the nine-item checklist: does `-i "<prompt>"` auto-submit in a PTY; do hooks fire at all in interactive mode; is `--add-dir` required for `.agents/hooks.json` discovery and does a control directory _outside_ the repo work; does workspace trust independently gate discovery; does Esc emit `Stop` or skip it; is mid-turn pane input buffered or rejected; what `terminationReason` values does the binary actually emit; does scoped `HOME` hold up in a pane; and what are the banner / busy / prompt / starting strings for a `PaneMonitorSpec`. Model the artefact on `ghostty-grok-pane-viability.md`, including its hard apparatus rule. **This study is a gate, not a validation**: it can return "not viable", and that outcome stops the project rather than prompting a workaround. Deliverable: `tools/boss/docs/investigations/ghostty-agy-pane-viability.md` plus an artifacts directory. No driver code.
 
 - **Effort:** large
 - **Dependencies:** none
@@ -285,7 +296,7 @@ Create the acceptance ledger as a separate document from this design so status c
 
 ### Scoped-`HOME` isolation and credential delegation characterisation
 
-Characterise the load-bearing mechanism under realistic concurrency: sixteen concurrent scoped `HOME`s each running a real `agy` session; what breaks when `oauth_creds.json` and `google_accounts.json` are delegated by filesystem link to one shared host file; how `agy` refreshes and locks that credential and whether concurrent refreshes corrupt or serialise; whether host-tool delegation (`gh`, `cube`, `jj`, git, ssh, keychain, bazel/XDG caches — the full `grok/environment.rs` list) is needed and whether `agy`'s tool sandbox strips env vars the way Grok's does; the per-run cost of the relocated `ms-playwright-go` cache; whether `AGY_CLI_DISABLE_AUTO_UPDATE` suppresses per-run update checks; and whether `ANTIGRAVITY_EXECUTABLE_DATA_DIR` is a narrower override that would replace part of this machinery. **This study is validating the chosen approach, not choosing between options** — except for the `ANTIGRAVITY_EXECUTABLE_DATA_DIR` probe, which is genuinely a choice and must be reported as one. Deliverable: an investigation doc.
+Characterise the load-bearing mechanism under realistic concurrency: sixteen concurrent scoped `HOME`s each running a real `agy` session; what breaks when sixteen scoped homes reach the one login-keychain item through the login-keychain bridge; how concurrent token refreshes through the keychain behave and whether they corrupt or serialise; whether host-tool delegation (`gh`, `cube`, `jj`, git, ssh, keychain, bazel/XDG caches — the full `grok/environment.rs` list) is needed and whether `agy`'s tool sandbox strips env vars the way Grok's does; the per-run cost of the relocated `ms-playwright-go` cache; whether `AGY_CLI_DISABLE_AUTO_UPDATE=true` (the only form that works) suppresses per-run update checks; and whether `ANTIGRAVITY_EXECUTABLE_DATA_DIR` is a narrower override that would replace part of this machinery. **This study is validating the chosen approach, not choosing between options** — except for the `ANTIGRAVITY_EXECUTABLE_DATA_DIR` probe, which is genuinely a choice and must be reported as one. Deliverable: an investigation doc.
 
 - **Effort:** large
 - **Dependencies:** Ghostty pane viability spike for `agy`
@@ -301,7 +312,7 @@ Enumerate what the hook stream actually carries in interactive mode: the full `t
 
 ### Permission, trust, and soft-deny characterisation
 
-Determine how Boss's per-worker-kind posture is actually expressed: the real key names and accepted values for `toolPermission` and `permissions.allow` in `antigravity-cli/settings.json`; whether `permissions.allow`'s `command(git)` / `write_file(src/)` syntax is validated at parse time or silently ignored when malformed; whether `trustedWorkspaces` or `trustedFolders.json` (or both) gate trust, and whether pre-seeding suppresses the first-run prompt in a pane; and whether Reviewer read-only is best expressed as `toolPermission: strict` plus an allowlist, as `--mode plan`, or as `--sandbox`. **This study is choosing between those three options, and must return a recommendation with evidence** — not a note that the pre-selected one works. Separately, establish whether the interactive path soft-denies an ungranted tool while still reporting a clean turn boundary, as headless does. Deliverable: an investigation doc.
+Determine how Boss's per-worker-kind posture is actually expressed: the real key names and accepted values for `toolPermission` and `permissions.allow` in `antigravity-cli/settings.json`; whether `permissions.allow`'s `command(git)` / `write_file(src/)` syntax is validated at parse time or silently ignored when malformed; whether pre-seeding `trustedWorkspaces` (the only trust store `agy` reads) suppresses the first-run prompt in a pane; and whether Reviewer read-only is best expressed as `toolPermission: strict` plus an allowlist, as `--mode plan`, or as `--sandbox`. **This study is choosing between those three options, and must return a recommendation with evidence** — not a note that the pre-selected one works. Separately, establish whether the interactive path soft-denies an ungranted tool while still reporting a clean turn boundary, as headless does. Deliverable: an investigation doc.
 
 - **Effort:** medium
 - **Dependencies:** Scoped-`HOME` isolation and credential delegation characterisation
@@ -309,15 +320,23 @@ Determine how Boss's per-worker-kind posture is actually expressed: the real key
 
 ### `AgyDriver` skeleton: descriptor, capabilities, model menu, registry
 
-The seed changeset, modelled on the Grok skeleton PR: `DriverDescriptor` (slug `agy`, binary `agy`, config dir, agent-rules filename, initial-prompt filename), the `ModelMenu`'s seven function pointers over the `agy models` catalogue with the three-rung effort ladder, the `CapabilitySet` with every omission carrying its recorded reason, registration in `DriverRegistry::default()`, and the minimum trait implementations needed to compile and keep the conformance suite green — including a native-dialect transcript fixture in `conformance/native_transcript.rs` and a transcript normaliser sufficient to surface a `[blocked]` marker from it, since that suite fails closed on any registered slug without one. No spawn line, no provisioning, no hooks. Capability declarations must be justified from the phase-0 characterisation, not asserted.
+The seed changeset, modelled on the Grok skeleton PR: `DriverDescriptor` (slug `agy`, binary `agy`, config dir, agent-rules filename, initial-prompt filename), the `ModelMenu`'s seven function pointers over the `agy models` catalogue with the five-rung `low|medium|high|xhigh|max` effort ladder (1.5.5; the study's menu lists `gemini-4-carbon-*`, `gemini-4-argon-*`, `gemini-3.8-flash-*`, `claude-opus-5-5-*`, `claude-sonnet-5-5-*`, `gpt-oss-120b-medium`), the `CapabilitySet` with every omission carrying its recorded reason, registration in `DriverRegistry::default()`, and the minimum trait implementations needed to compile and keep the conformance suite green — including a native-dialect transcript fixture in `conformance/native_transcript.rs` and a transcript normaliser sufficient to surface a `[blocked]` marker from it, since that suite fails closed on any registered slug without one. No spawn line, no provisioning, no hooks. Capability declarations must be justified from the phase-0 characterisation, not asserted.
 
 - **Effort:** medium
 - **Dependencies:** Hook surface characterisation; Permission, trust, and soft-deny characterisation
 - Scope: in-scope
 
+### Engine: pane submit key `Enter` instead of `C-m`
+
+Under Boss's tmux options `send-keys C-m` reaches `agy` as `ESC [27;5;109~`, not Return, because `agy` requests xterm modifyOtherKeys mode 2; `send-keys Enter` arrives as `\r` and submits (study, "The submit key"). Boss ends a delivery with `C-m` in three places: `Tmux::send_keys` (`tmux/src/lib.rs`), spawn confirmation's Return retry (`pane_spawn.rs`), and the spawn-ack sweep's `resubmit_prompt` (`engine/app/src/app.rs`). Without a fix the first brief lands (the launcher writes a raw `\r`) and nothing the engine types afterwards is submitted: every probe, nudge, answer and Return-retry sits in the composer. Either send `Enter` at the three call sites after checking the three shipped drivers, or add a driver-declared submit key defaulting to `C-m`. Shared-code change outside the driver, with a test per call site.
+
+- **Effort:** medium
+- **Dependencies:** none
+- Scope: in-scope
+
 ### Per-run `HOME` provisioning and credential delegation
 
-The `agy/home.rs` + `agy/environment.rs` pair: allocate a per-run container, materialise `.gemini/settings.json` and the scoped `antigravity-cli/` tree, delegate the OAuth credential and account file to the shared host paths with whatever refresh-lock discipline characterisation established, delegate host-tool state (`gh`, `cube`, `jj`, git, ssh, caches) per the measured need, and assert the posture before spawn so a misconfigured home fails loudly rather than running against the operator's `~/.gemini`. The posture assertion checks **the invariant, not the container**: no mutable state artifact shared between concurrent runs, and the operator's `~/.gemini` never reachable.
+The `agy/home.rs` + `agy/environment.rs` pair: allocate a per-run container, materialise the scoped `antigravity-cli/` tree (`settings.json` with `trustedWorkspaces`, plus a pre-seeded `onboarding.json`), provision the login-keychain bridge symlink (`Library/Keychains/login.keychain-db`, as `grok/environment.rs` does), export `AGY_CLI_DISABLE_AUTO_UPDATE=true` and arrange a binary location the updater cannot write, write the global-root `.gemini/config/hooks.json`, set `AGY_CLI_HIDE_ACCOUNT_INFO=true` and a run-private `--log-file`, delegate host-tool state (`gh`, `cube`, `jj`, git, ssh, caches) per the measured need, and assert the posture before spawn so a misconfigured home fails loudly rather than running against the operator's `~/.gemini`. The posture assertion checks **the invariant, not the container**: no mutable state artifact shared between concurrent runs, and the operator's `~/.gemini` never reachable.
 
 - **Effort:** large
 - **Dependencies:** `AgyDriver` skeleton; Scoped-`HOME` isolation and credential delegation characterisation
@@ -333,15 +352,15 @@ Reclaim per-run `agy` homes on the same pattern as `grok_home_retention_sweep.rs
 
 ### Pane spawn invocation and `PaneMonitorSpec`
 
-Compose the interactive pane command — `agy -i "$(cat …/initial-prompt.txt)"` with `--add-dir <control-dir>`, `--model`, `--effort`, and the scoped-`HOME` env directives — and supply the `PaneMonitorSpec` agent / busy / starting / prompt markers captured from the real TUI in the spike, so the app's fallback status pill works before the first hook event arrives. Creates the Boss-owned control directory outside the repo and writes the initial prompt and agent-rules into it.
+Compose the interactive pane command as the existing initial-brief launcher running `agy` with `--model`, `--effort` and the scoped-`HOME` env directives — **not** `agy -i` and no `--add-dir` (the launcher delivered a 50 KB brief in the study, Q1; `-i` runs behind the trust dialog). Supply the `PaneMonitorSpec` agent / busy / starting / prompt markers from the study's "Proposed `PaneMonitorSpec`" section, so the app's fallback status pill works before the first hook event arrives. Creates the Boss-owned control directory outside the repo for the initial prompt, and writes agent-rules to whichever outside-the-repo location provisioning settled.
 
 - **Effort:** medium
 - **Dependencies:** Per-run `HOME` provisioning and credential delegation; Ghostty pane viability spike for `agy`
 - Scope: in-scope
 
-### Control directory hook wiring: `boss-event` progress forwarder
+### Global-root hook wiring: `boss-event` progress forwarder
 
-Write `.agents/hooks.json` into the control directory wiring `PreToolUse`, `PostToolUse`, `PreInvocation`, `PostInvocation`, and `Stop` to the unchanged `boss-event` shim with the same `BOSS_EVENTS_SOCKET` / `BOSS_LEASE_ID` / `BOSS_RUN_ID` / `BOSS_WORKSPACE` env prefix Claude and Grok use, and declare `ProgressIngress::HookCallback` with `HookWiringDestination::DriverOwned`. Raw payloads forward unchanged; decoding is the engine-side normaliser's job. Includes verifying discovery actually works from the out-of-repo control directory, with the in-repo `.agents/` fallback if it does not.
+Write `$HOME/.gemini/config/hooks.json` in the per-run home wiring `SessionStart`, `PreToolUse`, `PostToolUse`, `PreInvocation`, `PostInvocation`, and `Stop` to the unchanged `boss-event` shim with the same `BOSS_EVENTS_SOCKET` / `BOSS_LEASE_ID` / `BOSS_RUN_ID` / `BOSS_WORKSPACE` env prefix Claude and Grok use, and declare `ProgressIngress::HookCallback` with `HookWiringDestination::DriverOwned`. Raw payloads forward unchanged; decoding is the engine-side normaliser's job. The forwarder must honour the `PreToolUse` reply contract: silent stdout (never `{}`) and exit 0, because anything else denies the tool; the entry decides explicitly whether a delivery failure on `PreToolUse` should block the tool. Discovery from the global root is measured (study, Q3); the out-of-repo `--add-dir` control directory is the fallback.
 
 - **Effort:** medium
 - **Dependencies:** Pane spawn invocation and `PaneMonitorSpec`; Hook surface characterisation
@@ -352,20 +371,20 @@ Write `.agents/hooks.json` into the control directory wiring `PreToolUse`, `Post
 Add the canonicalisation adapter in front of Boss's five unchanged guard scripts: `agy` camelCase payload to canonical shape inbound, Boss `block`/`approve` to `agy` `deny`/`allow` outbound. **Fails closed by construction**: an unrecognised verdict, an unparseable payload, an adapter crash, or the `ask` / `force_ask` values all deny, with a test asserting each. This is the entry that makes `Capability::ToolUseInterception` real, and it is deliberately separated from the forwarder above so the security-critical translation is reviewed on its own rather than mixed with transport plumbing.
 
 - **Effort:** medium
-- **Dependencies:** Control directory hook wiring: `boss-event` progress forwarder
+- **Dependencies:** Global-root hook wiring: `boss-event` progress forwarder
 - Scope: in-scope
 
 ### Progress normaliser and conversation-identity filtering
 
-Implement `normalize_progress_event` / `progress_session` for the `agy` hook dialect into `WorkerEvent`, including the `PreInvocation`-to-`SessionStart` mapping characterisation settles. Claims the parent `conversationId` through `ProgressIdentityStore::claim_progress_identity` at the first event and **drops boundary-shaped events carrying any other `conversationId`**, which is the only available mitigation for `agy`'s undisableable subagents. If characterisation found subagents share the parent id, this entry instead records that finding as a blocking defect rather than shipping a filter that cannot work.
+Implement `normalize_progress_event` / `progress_session` for the `agy` hook dialect into `WorkerEvent`, mapping `SessionStart` to `WorkerEvent::SessionStart`. Claims the parent `conversationId` (carried by `SessionStart`) through `ProgressIdentityStore::claim_progress_identity` at the first event and **drops boundary-shaped events carrying any other `conversationId`**, which is the only available mitigation for `agy`'s undisableable subagents. If characterisation found subagents share the parent id, this entry instead records that finding as a blocking defect rather than shipping a filter that cannot work.
 
 - **Effort:** large
-- **Dependencies:** Control directory hook wiring: `boss-event` progress forwarder; Hook surface characterisation. Parallel with the guard adapter (separate modules).
+- **Dependencies:** Global-root hook wiring: `boss-event` progress forwarder; Hook surface characterisation. Parallel with the guard adapter (separate modules).
 - Scope: in-scope
 
 ### Turn boundary and interrupt recovery
 
-Map `Stop` to `TurnEnd` over the empirically enumerated `terminationReason` vocabulary and the `fullyIdle` flag, deciding continuation semantics explicitly rather than inheriting Claude's. If the spike found that Esc-cancelled turns skip `Stop` — the Grok trap — implement `prepare_interrupt_recovery` / `is_interrupt_recovery_turn_end` against a run-private artifact the way `grok/turn_end_recovery.rs` does; if Esc does emit `Stop`, record that measurement and leave both trait methods at their defaults.
+Map `Stop` to `TurnEnd` **only when `fullyIdle=true`**; a `Stop` with `fullyIdle=false` is a background task and not a boundary (study, Q7). Observed `terminationReason` values are `NO_TOOL_CALL` and `TERMINAL_CUSTOM_HOOK`; `USER_CANCELED` was never emitted. Interrupt recovery is **required**: the study found Esc fires no `Stop` on either version, leaving no hook and no transcript record (Q5), so implement `prepare_interrupt_recovery` / `is_interrupt_recovery_turn_end` against a run-private artifact the way `grok/turn_end_recovery.rs` does, keyed on the `--log-file` line or the pane text (study, follow-up 4).
 
 - **Effort:** medium
 - **Dependencies:** Progress normaliser and conversation-identity filtering
@@ -373,7 +392,7 @@ Map `Stop` to `TurnEnd` over the empirically enumerated `terminationReason` voca
 
 ### Permission config rendering per worker kind
 
-Implement `write_permission_config` to render, into the per-run `HOME`, the `toolPermission` level and `permissions.allow` allowlist for each `WorkerKind`, the structural deny set (bossctl / state-dir / rm / sudo), and pre-seeded `trustedWorkspaces` covering the workspace and control directory — returning any genuinely per-run flags as `PermissionArtifacts::extra_args`. Mirrors `WorkerKind::forced_permission_mode` in a driver-local function as `grok/permissions.rs` does, so the restricted kinds' posture cannot be silently downgraded, and uses whichever Reviewer read-only expression the permission characterisation recommended.
+Implement `write_permission_config` to render, into the per-run `HOME`, the `toolPermission` level and `permissions.allow` allowlist for each `WorkerKind`, the structural deny set (bossctl / state-dir / rm / sudo), and pre-seeded `trustedWorkspaces` covering the workspace — returning any genuinely per-run flags as `PermissionArtifacts::extra_args`. Mirrors `WorkerKind::forced_permission_mode` in a driver-local function as `grok/permissions.rs` does, so the restricted kinds' posture cannot be silently downgraded, and uses whichever Reviewer read-only expression the permission characterisation recommended.
 
 - **Effort:** large
 - **Dependencies:** Per-run `HOME` provisioning and credential delegation; Permission, trust, and soft-deny characterisation. **Co-edits `agy.rs`'s trait impl with the pane-spawn entry — land after it and forward-port its changes preservingly.**
@@ -389,7 +408,7 @@ Detect the Risk 3b failure — an ungranted tool soft-denied while the turn boun
 
 ### Control verbs and error classification
 
-Declare `probe` / `interrupt` / `stop` / `reap` / `mid_turn_pane_input` from what the spike measured, not from what seems likely — `MidTurnPaneInput` stays at the `Rejects` default unless mid-turn stdin consumption was proven, per the standard Grok set. Implement `classify_error` for the `agy`/Google error surface, with **quota exhaustion as a first-class class**: regardless of entitlement, a quota-exhausted worker misclassified as a generic failure would drive redispatch straight back into the same wall.
+Declare `probe` / `interrupt` / `stop` / `reap` / `mid_turn_pane_input` from what the spike measured, not from what seems likely, with every verb that types into the pane delivered via the submit-key change above — `MidTurnPaneInput` is `Buffers`: the study proved mid-turn pane input is held as a queued message and run when the turn ends, under the default queue setting (Q6). Implement `classify_error` for the `agy`/Google error surface, with **quota exhaustion as a first-class class**: regardless of entitlement, a quota-exhausted worker misclassified as a generic failure would drive redispatch straight back into the same wall.
 
 - **Effort:** medium
 - **Dependencies:** Pane spawn invocation and `PaneMonitorSpec`; Ghostty pane viability spike for `agy`. **Co-edits `agy.rs`'s trait impl — land after the permission-config entry and forward-port.**
