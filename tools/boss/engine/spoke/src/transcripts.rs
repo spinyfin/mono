@@ -111,6 +111,15 @@ const TRANSIENT_SOURCE: &str = "transient_since";
 pub async fn poll(journal: &SharedJournal, execution: &ExecutionRecord, stamp: &Stamp) -> Result<()> {
     let result = poll_source(journal, execution, stamp).await;
     let run = crate::run_identity(execution);
+    // Backpressure or any other non-source error means the source read itself
+    // succeeded, so the continuous-failure streak is over, whichever arm below
+    // handles the error. The original error is still returned unchanged.
+    if let Err(error) = &result
+        && error.downcast_ref::<TransientSource>().is_none()
+        && error.downcast_ref::<SourceFailure>().is_none()
+    {
+        clear_transient(journal, &run)?;
+    }
     match &result {
         Ok(()) => clear_transient(journal, &run)?,
         Err(error)
@@ -133,13 +142,7 @@ pub async fn poll(journal: &SharedJournal, execution: &ExecutionRecord, stamp: &
                 );
             }
         }
-        // Backpressure or another non-source error means the source read
-        // itself succeeded, so the continuous-failure streak is over.
-        Err(error) => {
-            if error.downcast_ref::<TransientSource>().is_none() {
-                clear_transient(journal, &run)?;
-            }
-        }
+        Err(_) => {}
     }
     result
 }

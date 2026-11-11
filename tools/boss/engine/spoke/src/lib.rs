@@ -458,11 +458,39 @@ mod tests {
         let journal = journal(root.path(), limits());
         let run = run_identity(&execution);
         let minute = 60 * 1_000_000_000u64;
+        // Saturate the bulk window without receipts so every later source read
+        // succeeds but is refused by backpressure.
+        let mut full = false;
+        for _ in 0..200 {
+            if let Err(error) = transcripts::poll(&journal, &execution, &stamp_at(0)).await {
+                assert!(Fault::is_full(&error), "{error}");
+                full = true;
+                break;
+            }
+        }
+        assert!(full, "the spool must fill");
+        let marker = |journal: &SharedJournal| {
+            journal
+                .lock()
+                .unwrap()
+                .source(&run, "transient_since")
+                .unwrap()
+                .map(|b| String::from_utf8(b).unwrap())
+        };
         inject_once(Point::Listing, &directory, libc::EIO);
         assert!(transcripts::poll(&journal, &execution, &stamp_at(1)).await.is_err());
+        assert!(marker(&journal).is_some_and(|m| m != "none"), "streak must start");
         // Successful source reads blocked by a full spool, for over the budget.
         for i in 1..=8u64 {
-            let _ = transcripts::poll(&journal, &execution, &stamp_at(i * minute)).await;
+            let error = transcripts::poll(&journal, &execution, &stamp_at(i * minute))
+                .await
+                .unwrap_err();
+            assert!(Fault::is_full(&error), "{error}");
+            assert_eq!(
+                marker(&journal).as_deref(),
+                Some("none"),
+                "backpressure ends the streak"
+            );
         }
         inject_once(Point::Listing, &directory, libc::EIO);
         assert!(
