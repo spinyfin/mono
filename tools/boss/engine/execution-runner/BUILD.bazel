@@ -47,6 +47,7 @@ rust_library(
     visibility = [
         "//tools/boss/engine/app:__pkg__",
         "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/spoke-adapter:__pkg__",
     ],
     deps = RUNNER_DEPS + all_crate_deps(normal = True),
 )

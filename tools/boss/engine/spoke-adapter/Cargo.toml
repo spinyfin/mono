@@ -5,6 +5,7 @@ edition.workspace = true
 workspace = "../../../.."
 
 [dependencies]
+boss-execution-runner = { path = "../execution-runner" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }

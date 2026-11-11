@@ -201,6 +201,10 @@ pub trait SpawnAckReaper: Send + Sync {
     /// `execution_id`. Idempotent: a slot with no real pane at all is a
     /// no-op.
     async fn reap_worker(&self, execution_id: &str);
+    /// Return alone, addressed to the recorded session and verified spawn token.
+    async fn resubmit_prompt(&self, _execution_id: &str) -> anyhow::Result<()> {
+        anyhow::bail!("prompt resubmission is unavailable")
+    }
 }
 
 /// Counts from one pass of the sweep; logged at `info` when a reap
@@ -444,6 +448,8 @@ pub async fn run_one_pass(
         }
     }
 
+    crate::adopted_prompt_confirmation::confirm_pending(&ctx).await;
+
     // Breaker half-open recovery: while dispatch is Breaker-paused, this is
     // the tick that periodically admits a single canary execution through
     // the pause. Runs every pass regardless of whether this pass reaped
@@ -478,6 +484,9 @@ pub(crate) struct SpawnReapCtx<'a> {
 /// Why a never-started spawn is being reaped. Selects the orphan reason text,
 /// the `[engine-reconcile]` audit note, and the dispatch stage emitted.
 pub(crate) enum ReapCause {
+    PromptNotAccepted {
+        reason: String,
+    },
     /// A pane came up — possibly with a live shell pid — and no
     /// driver-originated signal was observed within the window. That is
     /// what was seen; whether the driver never executed or its signal never
@@ -591,6 +600,7 @@ impl ReapCause {
     /// purely on the variant: a pid-less driver-start timeout is `NoShell`.
     pub(crate) fn failure_class(&self, shell_pid: i32) -> SpawnFailureClass {
         match self {
+            ReapCause::PromptNotAccepted { .. } => SpawnFailureClass::PromptNotAccepted,
             ReapCause::DriverStartTimeout { .. } => {
                 if shell_pid > 0 {
                     SpawnFailureClass::ShellWithoutDriverSignal
@@ -641,14 +651,9 @@ fn pane_observation(shell_pid: i32) -> &'static str {
     }
 }
 
-fn reap_narrative(
-    cause: &ReapCause,
-    execution_id: &str,
-    liveness: &TranscriptLiveness,
-    shell_pid: i32,
-) -> (String, String, Stage) {
+fn reap_narrative(cause: &ReapCause, execution_id: &str, liveness: &str, shell_pid: i32) -> (String, String, Stage) {
     let (reason, audit, stage) = reap_narrative_for_cause(cause, execution_id, shell_pid);
-    let summary = liveness.to_string();
+    let summary = liveness;
     (
         format!("{reason}; liveness probe: {summary}"),
         format!("{audit} Liveness probe before the reap: {summary}."),
@@ -658,6 +663,11 @@ fn reap_narrative(
 
 fn reap_narrative_for_cause(cause: &ReapCause, execution_id: &str, shell_pid: i32) -> (String, String, Stage) {
     match &cause {
+        ReapCause::PromptNotAccepted { reason } => (
+            reason.clone(),
+            format!("prompt confirmation failed after engine restart (exec {execution_id}): {reason}"),
+            Stage::SpawnFailed,
+        ),
         ReapCause::DriverStartTimeout {
             grace_secs,
             silent_secs,
@@ -884,9 +894,32 @@ pub(crate) async fn reap_never_started_spawn(
         }
     };
 
-    let liveness_summary = liveness.to_string();
+    finish_reap(
+        ctx,
+        execution,
+        slot_id,
+        shell_pid,
+        cause,
+        now_epoch_secs,
+        &liveness.to_string(),
+    )
+    .await
+}
 
-    let (orphan_reason, audit_note, stage) = reap_narrative(&cause, execution_id, &liveness, shell_pid);
+/// Shared terminalization and resource release after a confirmation-specific
+/// evidence fence has committed.
+pub(crate) async fn finish_reap(
+    ctx: &SpawnReapCtx<'_>,
+    execution: &WorkExecution,
+    slot_id: u8,
+    shell_pid: i32,
+    cause: ReapCause,
+    now_epoch_secs: i64,
+    liveness_summary: &str,
+) -> ReapOutcome {
+    let execution_id = execution.id.as_str();
+    let work_item_id = execution.work_item_id.as_str();
+    let (orphan_reason, audit_note, stage) = reap_narrative(&cause, execution_id, liveness_summary, shell_pid);
 
     let orphan_result = {
         #[cfg(test)]
@@ -986,6 +1019,9 @@ pub(crate) async fn reap_never_started_spawn(
         "shell_pid": shell_pid,
     });
     match &cause {
+        ReapCause::PromptNotAccepted { reason } => {
+            details["prompt_failure"] = serde_json::json!(reason);
+        }
         ReapCause::DriverStartTimeout {
             grace_secs,
             silent_secs,
@@ -1007,7 +1043,7 @@ pub(crate) async fn reap_never_started_spawn(
                 *silent_secs,
                 DriverStartEvidence {
                     file_ingress: file_ingress.as_ref(),
-                    liveness: &liveness_summary,
+                    liveness: liveness_summary,
                 },
             );
         }
@@ -1442,7 +1478,7 @@ mod tests {
                 file_ingress: Some(ingress),
             },
             "exec-1",
-            &TranscriptLiveness::Absent { checked: vec![] },
+            &TranscriptLiveness::Absent { checked: vec![] }.to_string(),
             4242,
         );
         assert_eq!(stage, Stage::DriverStartTimeout);
@@ -1467,7 +1503,7 @@ mod tests {
                 file_ingress: None,
             },
             "exec-2",
-            &TranscriptLiveness::Absent { checked: vec![] },
+            &TranscriptLiveness::Absent { checked: vec![] }.to_string(),
             4242,
         );
         assert!(reason.contains("most likely never started"), "{reason}");
@@ -1489,13 +1525,13 @@ mod tests {
         let absent = TranscriptLiveness::Absent {
             checked: vec!["probe stub".to_owned()],
         };
-        let (reason, audit, _) = reap_narrative(&cause, "exec-1", &absent, 4242);
+        let (reason, audit, _) = reap_narrative(&cause, "exec-1", &absent.to_string(), 4242);
         assert!(
             reason.contains("a pane and shell came up") && audit.contains("a pane and shell came up"),
             "a reported pid must still be narrated as a pane and shell coming up; got: {reason} / {audit}",
         );
 
-        let (reason, audit, _) = reap_narrative(&cause, "exec-1", &absent, 0);
+        let (reason, audit, _) = reap_narrative(&cause, "exec-1", &absent.to_string(), 0);
         assert!(
             !reason.contains("a pane and shell came up") && !audit.contains("a pane and shell came up"),
             "a zero pid must not be narrated as a shell coming up; got: {reason} / {audit}",

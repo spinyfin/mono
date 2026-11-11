@@ -2996,3 +2996,47 @@ fn actual_driver_spawn_prefix_pins_boss_and_cube_before_path_decoys() {
         assert_eq!(String::from_utf8_lossy(&output.stdout), expected, "{slug}: {assembled}");
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn an_ordinary_cancel_during_prompt_confirmation_never_presses_return() {
+    use std::sync::atomic::Ordering;
+    let workspace = TempDir::new().unwrap();
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    spawner.accept_prompt.store(false, Ordering::SeqCst);
+    spawner.auto_confirm_turn.store(true, Ordering::SeqCst);
+
+    *spawner.delivery_marker.lock().unwrap() = Some((
+        workspace.path().join(".claude"),
+        crate::driver::initial_prompt::DELIVERED_MARKER,
+    ));
+    let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
+    let chore = create_test_chore(&work_db, product.id.clone(), "Cancel during first confirmation");
+    let ready = create_ready_chore_execution(&work_db, chore.id.clone());
+    let (execution, _run) = work_db
+        .start_execution_run(
+            &ready.id,
+            "worker-1",
+            "foo",
+            "lease-1",
+            "foo-agent-001",
+            workspace.path().to_str().unwrap(),
+        )
+        .unwrap();
+    *spawner.cancel_on_capture.lock().unwrap() = Some((work_db.clone(), execution.id.clone()));
+    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    let runner = PaneSpawnRunner::new(cfg, work_db.clone(), flags);
+    bind_runner(&runner, weak, &spawner);
+    runner.set_skip_spawn_confirm(false);
+    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(500));
+    let chore_item = work_db.get_work_item(&chore.id).unwrap();
+    let outcome = runner
+        .run_execution("worker-1", &execution, &chore_item, workspace.path(), Some("change-1"))
+        .await
+        .expect("a cancel is not a spawn failure");
+    assert_eq!(outcome.wait_state, RunWaitState::CancelledDuringSpawn);
+    assert!(spawner.cancel_on_capture.lock().unwrap().is_none());
+    assert!(spawner.sent_keys().is_empty(), "{:?}", spawner.sent_keys());
+    assert_eq!(spawner.reaped_run_ids().as_slice(), [execution.id.as_str()]);
+}

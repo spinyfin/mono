@@ -242,6 +242,28 @@ impl SpokeHostAdapter {
                 tracing::warn!(error = %format!("{error:#}"), "could not record the worker's pane pid");
             }
         }
+        let mut stopped = None;
+        let confirmed = boss_execution_runner::spawn_confirmation::confirm_prompt_accepted_or_reap(
+            "spoke",
+            &execution.id,
+            self.hub.config.prompt_timeout,
+            Duration::from_millis(100),
+            || async { self.hub.signals.has_prompt_accepted_for_run(&execution.id) },
+            || async {
+                stopped = Some(self.ctl_stop(&execution.id, Duration::ZERO).await);
+            },
+        )
+        .await;
+        if let Err(error) = confirmed {
+            match stopped {
+                Some(Ok(ControlOutcome::Delivered(_))) => return Err(error),
+                other => {
+                    return Err(uncertain(format!(
+                        "{error:#}; worker stop was not confirmed: {other:?}"
+                    )));
+                }
+            }
+        }
         let mut outcome = template.unwrap_or(RunOutcome {
             wait_state: boss_execution_contracts::RunWaitState::WorkerPaneAlive,
             result_summary: None,

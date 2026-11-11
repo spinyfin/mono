@@ -120,3 +120,55 @@ fn notification_does_not_touch_a_previously_established_tool_condition() {
         "a Notification must not durably clear an in-flight tool",
     );
 }
+
+#[test]
+fn unfinished_prompt_confirmation_survives_restart_but_legacy_workers_are_exempt() {
+    let (_dir, path) = disk_db_path("prompt-confirmation-restart");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let legacy = started_execution(&db);
+    let pending = started_execution(&db);
+    assert!(!db.prompt_confirmation_pending(&legacy).unwrap());
+    db.begin_prompt_confirmation(&pending).unwrap();
+    db.record_semantic_progress(&pending, &session_start()).unwrap();
+    drop(db);
+    let db = WorkDb::open(path.clone()).unwrap();
+    assert!(!db.prompt_confirmation_pending(&legacy).unwrap());
+    assert!(db.prompt_confirmation_pending(&pending).unwrap());
+    assert!(!db.prompt_acceptance_recorded(&pending).unwrap());
+    db.record_semantic_progress(&pending, &pre_tool()).unwrap();
+    assert!(!db.prompt_confirmation_pending(&pending).unwrap());
+    assert!(db.prompt_acceptance_recorded(&pending).unwrap());
+}
+
+#[test]
+fn confirmation_success_is_durable_and_cannot_be_rearmed_by_a_spawn_retry() {
+    let (_dir, path) = disk_db_path("prompt-confirmation-success");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let execution = started_execution(&db);
+    db.begin_prompt_confirmation(&execution).unwrap();
+    db.finish_prompt_confirmation(&execution).unwrap();
+    drop(db);
+    let db = WorkDb::open(path.clone()).unwrap();
+    db.begin_prompt_confirmation(&execution).unwrap();
+    assert!(!db.prompt_confirmation_pending(&execution).unwrap());
+    assert!(db.prompt_acceptance_recorded(&execution).unwrap());
+}
+
+#[test]
+fn upgrading_existing_runs_does_not_arm_prompt_confirmation() {
+    let (_dir, path) = disk_db_path("prompt-confirmation-upgrade");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let execution = started_execution(&db);
+    db.record_semantic_progress(&execution, &session_start()).unwrap();
+    db.connect()
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE work_runs DROP COLUMN prompt_confirmed;
+         DELETE FROM schema_migrations WHERE id = '20261110_2300_prompt_confirmation';",
+        )
+        .unwrap();
+    drop(db);
+    let db = WorkDb::open(path.clone()).unwrap();
+    assert!(!db.prompt_confirmation_pending(&execution).unwrap());
+    assert!(!db.prompt_acceptance_recorded(&execution).unwrap());
+}

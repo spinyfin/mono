@@ -259,13 +259,14 @@ where
 /// a startup dialog, and only when a full `confirm_timeout` has passed with
 /// no turn. Re-sending is idempotent: the brief is pasted exactly once, by
 /// the launcher, and Return on an empty composer does nothing.
-pub(crate) async fn confirm_prompt_submitted<Accepted, AcceptedFut, Delivery, DeliveryFut, Resubmit, ResubmitFut>(
+pub async fn confirm_prompt_submitted<Accepted, AcceptedFut, Delivery, DeliveryFut, Resubmit, ResubmitFut, Cancelled>(
     driver_name: &str,
     run_id: &str,
     policy: PromptSubmitPolicy,
     mut accepted: Accepted,
     mut delivery: Delivery,
     mut resubmit: Resubmit,
+    mut cancelled: Cancelled,
 ) -> anyhow::Result<()>
 where
     Accepted: FnMut() -> AcceptedFut,
@@ -273,6 +274,7 @@ where
     Delivery: FnMut() -> DeliveryFut,
     DeliveryFut: std::future::Future<Output = DeliveryState>,
     Resubmit: FnMut() -> ResubmitFut,
+    Cancelled: FnMut() -> bool,
     ResubmitFut: std::future::Future<Output = anyhow::Result<()>>,
 {
     let started = tokio::time::Instant::now();
@@ -281,6 +283,9 @@ where
     // When Return last reached the driver: first the launcher's, then ours.
     let mut submitted_at = None;
     loop {
+        if cancelled() {
+            anyhow::bail!("execution cancelled during prompt confirmation");
+        }
         if accepted().await {
             tracing::info!(
                 run_id,
@@ -349,6 +354,9 @@ where
                         retries,
                         started.elapsed(),
                     ));
+                }
+                if cancelled() {
+                    anyhow::bail!("execution cancelled before prompt resubmission");
                 }
                 retries += 1;
                 let sent = tokio::time::timeout(policy.confirm_timeout, resubmit())
@@ -788,6 +796,7 @@ mod tests {
                 resubmits.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             },
+            || false,
         )
         .await;
         (
@@ -867,6 +876,7 @@ mod tests {
             || async { false },
             || async { DeliveryState::Submitted },
             || async { Err(anyhow::anyhow!("no such session")) },
+            || false,
         )
         .await
         .expect_err("must fail the spawn");

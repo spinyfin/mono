@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 pub use crate::cube::{DEFAULT_HEARTBEAT_INTERVAL as HEARTBEAT_INTERVAL, LEASE_TTL_SECS as HEARTBEAT_TTL_SECONDS};
-pub const BRIEF_DELIVERY_BUDGET: Duration = Duration::from_secs(35);
+pub const BRIEF_DELIVERY_BUDGET: Duration = Duration::from_secs(initial_prompt::DELIVERY_BUDGET.as_secs() + 30);
 /// How often the command loop looks for workers that exited since the last look.
 pub const EXIT_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const SESSION_SCHEMA: &str = "1";
@@ -773,6 +773,19 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                 _ => {}
             }
             if Instant::now() >= deadline {
+                let mut pane = pane;
+                if pane_life(&pane) == PaneLife::Alive && !delivered {
+                    pane.life = match self
+                        .tmux
+                        .kill_session_verified(&record.session, &record.spawn_token)
+                        .await
+                    {
+                        Ok(KillSessionOutcome::Killed | KillSessionOutcome::Absent) => {
+                            PaneLife::BriefNotDelivered.into()
+                        }
+                        _ => PaneLife::Indeterminate.into(),
+                    };
+                }
                 return pane;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1230,6 +1243,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeTmux {
+        delivered_home: Mutex<Option<PathBuf>>,
         sessions: Mutex<HashMap<String, String>>,
         pane_dead: Mutex<HashMap<String, (String, Option<i32>)>>,
         mismatch: Mutex<HashMap<String, String>>,
@@ -1296,6 +1310,9 @@ mod tests {
                         .filter(|pair| pair[0] == "-e")
                         .map(|pair| pair[1].clone())
                         .collect();
+                    if let Some(home) = self.delivered_home.lock().unwrap().as_ref() {
+                        std::fs::write(home.join(initial_prompt::DELIVERED_MARKER), "").unwrap();
+                    }
                     self.envs.lock().unwrap().insert(name.clone(), envs);
                     self.sessions.lock().unwrap().insert(name, token);
                     Ok(ok(""))
@@ -1907,6 +1924,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let fake = Arc::new(FakeTmux::default());
         let supervisor = grok_supervisor(root.path(), fake.clone()).await;
+        *fake.delivered_home.lock().unwrap() = Some(
+            homes::grok_root(&supervisor.homes_root)
+                .join("run-test")
+                .join("grok-home"),
+        );
         let _env = grok_env(&homes::grok_root(&supervisor.homes_root), root.path());
         let result = supervisor.execute(&grok_spawn_command(), false, 1).await;
         assert_eq!(result.code, ResultCode::Ok as i32, "{}", result.reason);
@@ -1956,6 +1978,25 @@ mod tests {
             started.elapsed() < Duration::from_secs(30),
             "the spawn waited out the brief budget instead of seeing the marker in the Grok home"
         );
+    }
+
+    #[test]
+    fn brief_budget_covers_every_launcher_stage_with_a_margin() {
+        assert_eq!(
+            BRIEF_DELIVERY_BUDGET,
+            initial_prompt::DELIVERY_BUDGET + Duration::from_secs(30)
+        );
+    }
+
+    #[tokio::test]
+    async fn live_pane_without_a_delivered_brief_is_not_a_successful_delivery() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeTmux::default());
+        live(&fake);
+        let supervisor = supervisor(root.path(), fake).await;
+        seed(&supervisor.store, Phase::Alive);
+        let pane = supervisor.wait_for_brief(&stored(&supervisor.store)).await;
+        assert_eq!(pane_life(&pane), PaneLife::BriefNotDelivered);
     }
 
     #[tokio::test]
@@ -2577,6 +2618,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let fake = Arc::new(FakeTmux::default());
         let supervisor = supervisor(root.path(), fake.clone()).await;
+        *fake.delivered_home.lock().unwrap() =
+            Some(boss_engine_driver::codex::codex_home_for_run("claude-run-test").unwrap());
         let mut command = spawn_command();
         if let Some(command::Body::Spawn(spawn)) = &mut command.body {
             spawn.settings_json = br#"{"hooks":{}}"#.to_vec();

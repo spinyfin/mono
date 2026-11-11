@@ -1675,6 +1675,7 @@ dependencies = [
  "boss-engine-recovery",
  "boss-engine-structured-output",
  "boss-execution-contracts",
+ "boss-execution-runner",
  "boss-host-enrollment",
  "boss-protocol",
  "boss-protocol-spoke",

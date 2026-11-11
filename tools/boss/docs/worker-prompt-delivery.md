@@ -113,7 +113,14 @@ A `paste_unverified` on every spawn of one driver means its composer no longer s
 
 A driver start that arrives only after the start wait expired rescues the spawn from that failure and nothing more: the prompt wait still runs, with its Return retries, and fails the spawn if no turn begins.
 
+## Engine restart and spoke workers
+
+New local launches durably mark prompt confirmation pending before creating the pane, and complete that marker after confirmation. The adoption sweep resumes the same bounded delivery and Return-only confirmation for pending launches. Persisted turn evidence also satisfies recovery if the engine stopped before writing success. A SessionStart alone does not. Legacy rows without the marker are exempt from prompt re-confirmation.
+
+Spoke supervisors budget the launcher's entire delivery window plus 30 seconds. The hub waits for current-run turn evidence after the host reports a live pane; a worker that never accepts its prompt is stopped and spawn fails. The spoke provider remains inactive until installed by the engine and enabled for a host.
+
+Cancellation is checked on every prompt-confirmation poll and immediately before a Return retry, including recovery after restart.
+
 ## What this does not cover
 
-- A worker adopted after an engine restart is not re-confirmed. Confirmation is the spawning engine's wait. A worker whose spawn the engine did not finish confirming is covered only by the driver-start sweep, which a `SessionStart` satisfies.
 - Claude Code attaches an image, and drops the line, when a pasted line names an image file that exists. A brief that quotes a real image path on its own line is therefore not delivered byte for byte. The engine does not rewrite briefs to avoid this.

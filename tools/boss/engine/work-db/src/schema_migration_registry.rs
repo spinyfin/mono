@@ -14,6 +14,16 @@ pub(super) fn all() -> Vec<Migration> {
         .collect();
     migrations.extend([
         Migration {
+            id: "20261110_2300_prompt_confirmation".into(),
+            legacy_version: None,
+            apply: |conn| {
+                if !table_has_column(conn, "work_runs", "prompt_confirmed")? {
+                    conn.execute_batch("ALTER TABLE work_runs ADD COLUMN prompt_confirmed INTEGER")?;
+                }
+                Ok(())
+            },
+        },
+        Migration {
             id: "20261109_0451_explicit_launch_focus".into(),
             legacy_version: None,
             apply: dispatch_focus::migrate_explicit_launch,

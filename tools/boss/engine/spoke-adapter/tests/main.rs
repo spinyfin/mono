@@ -48,6 +48,7 @@ fn short(deadline_ms: u64) -> SpokeAdapterConfig {
     SpokeAdapterConfig::builder()
         .command_deadline(Duration::from_millis(deadline_ms))
         .spawn_deadline(Duration::from_millis(deadline_ms))
+        .prompt_timeout(Duration::from_millis(deadline_ms))
         .build()
 }
 
@@ -574,4 +575,54 @@ fn host_call_errors_say_whether_anything_happened() {
         reason: "host unavailable".into(),
     };
     assert!(unsent.to_string().contains("nothing was sent"));
+}
+
+#[tokio::test]
+async fn session_start_without_a_turn_stops_the_spoke_worker_and_fails_spawn() {
+    let fx = Fixture::with(short(100)).await;
+    fx.signals.0.store(false, Ordering::SeqCst);
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let peer = fx
+        .spoke(
+            Box::new(|cmd| {
+                if matches!(cmd.body, Some(command::Body::Stop(_))) {
+                    Some(ok(cmd, Some(pane(PaneLife::Exited))))
+                } else {
+                    standard(cmd)
+                }
+            }),
+            None,
+            0,
+        )
+        .await;
+    lease(&adapter).await;
+    let error = spawn(&adapter).await.unwrap_err();
+    assert!(format!("{error:#}").contains("prompt"), "{error:#}");
+    assert!(
+        peer.commands()
+            .iter()
+            .any(|cmd| matches!(cmd.body, Some(command::Body::Stop(_))))
+    );
+}
+
+#[tokio::test]
+async fn spoke_spawn_waits_for_turn_evidence_after_the_host_reports_alive() {
+    let fx = Fixture::with(short(1000)).await;
+    fx.signals.0.store(false, Ordering::SeqCst);
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let peer = fx.spoke(Box::new(standard), None, 0).await;
+    lease(&adapter).await;
+    let waiting = tokio::spawn(async move { spawn(&adapter).await });
+    peer.wait_for_command(2).await;
+    assert!(
+        !waiting.is_finished(),
+        "a live pane and SessionStart cannot complete spawn"
+    );
+    fx.signals.0.store(true, Ordering::SeqCst);
+    assert_eq!(
+        waiting.await.unwrap().unwrap().wait_state,
+        RunWaitState::WorkerPaneAlive
+    );
 }
