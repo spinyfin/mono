@@ -2018,7 +2018,11 @@ pub async fn on_ci_in_flight_supersedes_failure(
                     "ci_watch: active remediation is for an old head SHA; \
                      abandoning stale row and superseding with current InFlight run",
                 );
-                if let Err(err) = work_db.mark_ci_remediation_abandoned(&active.id, "new_head_sha_inflight") {
+                if let Err(err) = work_db.mark_ci_remediation_abandoned_with_head(
+                    &active.id,
+                    "new_head_sha_inflight",
+                    current_head_sha,
+                ) {
                     tracing::warn!(
                         work_item_id = %candidate.work_item_id,
                         attempt_id = %active.id,

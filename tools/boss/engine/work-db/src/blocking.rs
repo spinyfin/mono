@@ -1908,6 +1908,16 @@ impl WorkDb {
     /// the budget-exhausted / opt-out / suppression paths — the
     /// engine declined to spawn, so the attempt row never ran.
     pub fn mark_ci_remediation_abandoned(&self, attempt_id: &str, reason: &str) -> Result<Option<CiRemediation>> {
+        self.mark_ci_remediation_abandoned_with_head(attempt_id, reason, None)
+    }
+
+    /// Record the superseding head for later failed-CI correlation.
+    pub fn mark_ci_remediation_abandoned_with_head(
+        &self,
+        attempt_id: &str,
+        reason: &str,
+        head_sha_after: Option<&str>,
+    ) -> Result<Option<CiRemediation>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
@@ -1915,10 +1925,11 @@ impl WorkDb {
             "UPDATE ci_remediations
                 SET status         = 'abandoned',
                     failure_reason = ?2,
+                    head_sha_after = ?4,
                     finished_at    = COALESCE(finished_at, ?3)
               WHERE id = ?1
                 AND status IN ('pending', 'running')",
-            params![attempt_id, reason, now],
+            params![attempt_id, reason, now, head_sha_after],
         )?;
         finish_attempt_update(tx, rows, attempt_id, query_ci_remediation)
     }

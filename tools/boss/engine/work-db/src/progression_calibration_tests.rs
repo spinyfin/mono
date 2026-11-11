@@ -116,20 +116,12 @@ fn seed(db: &WorkDb) {
             VALUES (?1,?2,?3,?4,'{}','answered',?5,?6)",
             params![format!("q{index}"),task,run_ids[0],proposal,start,start+4*DAY]).unwrap();
     }
+    drop(conn);
     for index in 0..4 {
-        conn.execute(
-            "INSERT INTO ci_remediations(id,product_id,work_item_id,pr_url,pr_number,head_branch,head_sha_at_trigger,
-            attempt_kind,consumes_budget,failed_checks,status,created_at,finished_at)
-            VALUES (?1,?2,?3,'https://example.com/pr',1,'branch',?1,'fix',1,'[]','failed',?4,?5)",
-            params![
-                format!("remediation{index}"),
-                product,
-                task,
-                start + index * 11000,
-                start + index * 11000 + 1000
-            ],
-        )
-        .unwrap();
+        let id = attempt(db, &product, &task, &format!("head{index}"), "fix", "pr_branch_ci");
+        db.mark_ci_remediation_abandoned_with_head(&id, "new_head_sha_inflight", Some(&format!("head{}", index + 1)))
+            .unwrap();
+        dates(db, &id, start + index * 11000, start + index * 11000 + 1000);
     }
 }
 
@@ -231,28 +223,38 @@ fn explicit_override_even_equal_to_placeholder_wins_and_restart_can_remove_it() 
     );
 }
 
-/// Insert production-shaped remediations for one item: `(created, finished,
-/// status, head_after)` with a distinct trigger head per row.
-fn remediations(db: &WorkDb, product: &str, item: &str, rows: &[(i64, i64, &str, Option<&str>)]) {
-    let conn = db.connect().unwrap();
-    for (index, (created, finished, status, after)) in rows.iter().enumerate() {
-        conn.execute(
-            "INSERT INTO ci_remediations(id,product_id,work_item_id,pr_url,pr_number,head_branch,
-            head_sha_at_trigger,head_sha_after,attempt_kind,consumes_budget,failed_checks,status,created_at,finished_at)
-            VALUES (?1,?2,?3,'https://example.com/pr',1,'branch',?4,?5,'fix',1,'[]',?6,?7,?8)",
-            params![
-                format!("{item}-r{index}"),
-                product,
-                item,
-                format!("head{index}"),
-                after,
-                status,
-                created,
-                finished
-            ],
+// Lifecycle transitions use production APIs; SQL only moves their clock.
+fn attempt(db: &WorkDb, product: &str, item: &str, head: &str, kind: &str, failure: &str) -> String {
+    db.insert_ci_remediation_with_queue_base(
+        CiRemediationInsertInput {
+            product_id: product.into(),
+            work_item_id: item.into(),
+            pr_url: "https://github.com/example/repo/pull/1".into(),
+            pr_number: 1,
+            head_branch: "branch".into(),
+            head_sha_at_trigger: head.into(),
+            attempt_kind: kind.into(),
+            consumes_budget: 1,
+            failed_checks: r#"[{"name":"test","conclusion":"failure"}]"#.into(),
+            failure_kind: failure.into(),
+            before_commit_sha: None,
+        },
+        (failure != "pr_branch_ci").then_some("queue-base"),
+    )
+    .unwrap()
+    .unwrap()
+    .id
+}
+
+fn dates(db: &WorkDb, id: &str, created: i64, finished: i64) {
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE ci_remediations SET created_at=?2,
+                finished_at=CASE WHEN status IN ('failed','abandoned','succeeded') THEN ?3 ELSE NULL END WHERE id=?1",
+            params![id, created, finished],
         )
         .unwrap();
-    }
 }
 
 fn pause_inputs(db: &WorkDb) -> ProgressionCalibration {
@@ -260,119 +262,229 @@ fn pause_inputs(db: &WorkDb) -> ProgressionCalibration {
 }
 
 #[test]
-fn production_shaped_history_yields_a_computed_stuck_after() {
-    let db = db();
-    seed(&db);
-    let report = db.calibrate_progression(NOW).unwrap();
-    assert_eq!(report.inputs["automatic_pause_samples"], 3);
-    assert_eq!(report.inputs["automatic_pause_p99_secs"], 10000);
-    assert_eq!(report.limits["stuck_after_secs"].source, "computed");
-    assert_eq!(value(&report, "stuck_after_secs"), Some(30000));
+fn red_episode_continuity_uses_production_lifecycle_facts() {
+    for (reason, next_head, queue, expected) in [
+        ("new_head_sha_inflight", "new", false, 1),
+        ("legacy_new_head", "new", false, 0),
+        ("new_head_sha_inflight", "mq:new", true, 0),
+        ("superseded_by_resolved_ci", "new", false, 0),
+        ("verified_requeue", "old", false, 0),
+        ("owner_abandon", "old", false, 0),
+        ("merge_queue_trigger_superseded", "old", false, 0),
+        ("superseded_by_conflict", "old", false, 0),
+        ("revision_create_failed", "old", false, 0),
+        ("failed", "external", false, 0),
+        ("failed", "old", false, 1),
+        ("succeeded", "new", false, 0),
+    ] {
+        let db = db();
+        let product = create_test_product(&db).id;
+        let item = create_test_chore_manual(&db, &product, "CI episode").id;
+        let start = NOW - 20 * DAY;
+        let first = attempt(&db, &product, &item, "old", "retrigger", "pr_branch_ci");
+        match reason {
+            "failed" => {
+                db.mark_ci_remediation_failed(&first, "fix_failed").unwrap();
+            }
+            "succeeded" => {
+                db.mark_ci_remediation_succeeded(&first, None).unwrap();
+            }
+            "superseded_by_resolved_ci" => {
+                db.abandon_active_ci_remediations_for_work_item(&item, reason, false)
+                    .unwrap();
+            }
+            "legacy_new_head" => {
+                db.mark_ci_remediation_abandoned(&first, "new_head_sha_inflight")
+                    .unwrap();
+            }
+            "new_head_sha_inflight" => {
+                db.mark_ci_remediation_abandoned_with_head(&first, reason, Some("new"))
+                    .unwrap();
+            }
+            _ => {
+                db.mark_ci_remediation_abandoned(&first, reason).unwrap();
+            }
+        }
+        dates(&db, &first, start, start + 10);
+        let next = attempt(
+            &db,
+            &product,
+            &item,
+            next_head,
+            "fix",
+            if queue { "merge_queue_rebounce" } else { "pr_branch_ci" },
+        );
+        dates(
+            &db,
+            &next,
+            start + if queue { 10 * DAY } else { 110 },
+            start + if queue { 10 * DAY + 120 } else { 120 },
+        );
+        assert_eq!(
+            pause_inputs(&db).inputs["automatic_pause_samples"],
+            expected,
+            "{reason}/{next_head}"
+        );
+    }
 }
 
 #[test]
-fn gaps_after_green_attempts_and_with_coding_runs_are_not_pauses() {
+fn resolved_ci_and_overlapping_work_invalidate_even_continuous_heads() {
+    for exclusion in [
+        "signal",
+        "status",
+        "reason",
+        "parent_run",
+        "revision_run",
+        "queued_run",
+        "human_wait",
+        "parking",
+        "autostart",
+        "trunk_queue",
+    ] {
+        let db = db();
+        let product = create_test_product(&db).id;
+        let item = create_test_chore_manual(&db, &product, "continuous head").id;
+        let start = NOW - 20 * DAY;
+        let first = attempt(&db, &product, &item, "old", "fix", "pr_branch_ci");
+        db.mark_ci_remediation_abandoned_with_head(&first, "new_head_sha_inflight", Some("new"))
+            .unwrap();
+        dates(&db, &first, start, start + 100);
+        let next = attempt(
+            &db,
+            &product,
+            &item,
+            "new",
+            "fix",
+            if exclusion == "trunk_queue" {
+                "trunk_queue_eviction"
+            } else {
+                "pr_branch_ci"
+            },
+        );
+        dates(&db, &next, start + 10 * DAY, start + 10 * DAY + 100);
+        match exclusion {
+            "signal" => {
+                db.connect()
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO task_blocked_signals(work_item_id,reason,created_at,cleared_at)
+                    VALUES (?1,'ci_failure',?2,?3)",
+                        params![item, start, start + DAY],
+                    )
+                    .unwrap();
+            }
+            "status" | "reason" | "parking" | "autostart" => {
+                let (property, old, new) = match exclusion {
+                    "status" => ("status", "blocked", "in_review"),
+                    "reason" => ("blocked_reason", "ci_failure", ""),
+                    "parking" => ("parked_at", "", "1"),
+                    _ => ("autostart", "1", "0"),
+                };
+                db.connect().unwrap().execute("INSERT INTO task_status_audit(work_item_id,property,old_value,new_value,actor,changed_at,basis)
+                    VALUES (?1,?2,?3,?4,'engine',?5,'observed')",
+                    params![item,property,old,new,start+DAY]).unwrap();
+            }
+            "trunk_queue" => {}
+            _ => {
+                let revision = create_test_chore_manual(&db, &product, "revision").id;
+                db.set_ci_remediation_revision_task_id(&first, &revision).unwrap();
+                let run = db
+                    .create_execution(
+                        CreateExecutionInput::builder()
+                            .work_item_id(if exclusion == "revision_run" { &revision } else { &item })
+                            .kind(if exclusion == "human_wait" {
+                                ExecutionKind::Progression
+                            } else {
+                                ExecutionKind::ChoreImplementation
+                            })
+                            .status(ExecutionStatus::Completed)
+                            .build(),
+                    )
+                    .unwrap();
+                db.connect()
+                    .unwrap()
+                    .execute(
+                        "UPDATE work_executions SET created_at=?2,started_at=?3,finished_at=?4 WHERE id=?1",
+                        params![
+                            run.id,
+                            start - 100,
+                            if exclusion == "queued_run" {
+                                start + DAY
+                            } else {
+                                start - 100
+                            },
+                            start + 2 * DAY
+                        ],
+                    )
+                    .unwrap();
+                if exclusion == "human_wait" {
+                    db.connect()
+                        .unwrap()
+                        .execute(
+                            "INSERT INTO execution_wait_history(execution_id,changed_at) VALUES (?1,?2)",
+                            params![run.id, start + DAY],
+                        )
+                        .unwrap();
+                }
+            }
+        }
+        assert_eq!(pause_inputs(&db).inputs["automatic_pause_samples"], 0, "{exclusion}");
+    }
+}
+
+#[test]
+fn abandoned_then_green_then_queue_rebounce_is_not_a_pause() {
     let db = db();
     let product = create_test_product(&db).id;
+    let item = create_test_chore_manual(&db, &product, "green before queue").id;
     let start = NOW - 20 * DAY;
-    // A succeeded attempt followed by a later, unrelated push: review/merge wait.
-    let green = create_test_chore_manual(&db, &product, "green then later push").id;
-    remediations(
-        &db,
-        &product,
-        &green,
-        &[
-            (start, start + 100, "succeeded", Some("pushed")),
-            (start + 10 * DAY, start + 10 * DAY + 100, "failed", None),
-        ],
-    );
-    assert_eq!(pause_inputs(&db).inputs["automatic_pause_samples"], 0);
-    // A failed attempt whose gap contains a coding run on the item: not scheduling lag.
-    let coded = create_test_chore_manual(&db, &product, "coding in gap").id;
-    remediations(
-        &db,
-        &product,
-        &coded,
-        &[
-            (start, start + 100, "failed", None),
-            (start + 10 * DAY, start + 10 * DAY + 100, "failed", None),
-        ],
-    );
-    let run = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(&coded)
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Completed)
-                .build(),
-        )
+    let first = attempt(&db, &product, &item, "old", "fix", "pr_branch_ci");
+    db.mark_ci_remediation_abandoned_with_head(&first, "new_head_sha_inflight", Some("new"))
         .unwrap();
+    db.abandon_active_ci_remediations_for_work_item(&item, "superseded_by_resolved_ci", false)
+        .unwrap();
+    dates(&db, &first, start, start + 100);
     db.connect()
         .unwrap()
         .execute(
-            "UPDATE work_executions SET created_at=?2, started_at=?2, finished_at=?3 WHERE id=?1",
-            params![run.id, start + DAY, start + 2 * DAY],
+            "UPDATE tasks SET status='in_review',pr_url='https://github.com/example/repo/pull/1' WHERE id=?1",
+            [&item],
         )
         .unwrap();
-    assert_eq!(pause_inputs(&db).inputs["automatic_pause_samples"], 0);
-    // A failed attempt whose revision task ran a human-waiting execution.
-    let waited = create_test_chore_manual(&db, &product, "human wait on revision").id;
-    let revision = create_test_chore_manual(&db, &product, "revision").id;
-    remediations(
-        &db,
-        &product,
-        &waited,
-        &[
-            (start, start + 100, "failed", None),
-            (start + 10 * DAY, start + 10 * DAY + 100, "failed", None),
-        ],
-    );
-    let run = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(&revision)
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Completed)
-                .build(),
+    db.mark_chore_blocked_ci_signal(
+        &item,
+        "https://github.com/example/repo/pull/1",
+        Some(&first),
+        "ci_failure",
+    )
+    .unwrap();
+    assert!(db.clear_ci_failure_signal_only(&item).unwrap());
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE task_blocked_signals SET created_at=?2,cleared_at=?3 WHERE work_item_id=?1",
+            params![item, start, start + DAY],
         )
         .unwrap();
-    let conn = db.connect().unwrap();
-    conn.execute(
-        "UPDATE ci_remediations SET revision_task_id=?1 WHERE id=?2",
-        params![revision, format!("{waited}-r0")],
-    )
-    .unwrap();
-    conn.execute(
-        "UPDATE work_executions SET created_at=?2, started_at=?2, finished_at=?3 WHERE id=?1",
-        params![run.id, start - DAY, start + 11 * DAY],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO execution_wait_history(execution_id,changed_at) VALUES (?1,?2)",
-        params![run.id, start + DAY],
-    )
-    .unwrap();
-    drop(conn);
+    let next = attempt(&db, &product, &item, "mq:new", "fix", "merge_queue_rebounce");
+    dates(&db, &next, start + 10 * DAY, start + 10 * DAY + 100);
     assert_eq!(pause_inputs(&db).inputs["automatic_pause_samples"], 0);
 }
 
 #[test]
-fn a_failed_gap_or_a_head_that_still_failed_is_a_pause_and_one_outlier_is_ignored() {
+fn continuous_red_pauses_drop_one_extreme_outlier() {
     let db = db();
     let product = create_test_product(&db).id;
     let item = create_test_chore_manual(&db, &product, "red gaps").id;
-    let start = NOW - 20 * DAY;
-    // Ten 100s gaps after failed attempts, a still-red succeeded attempt, and one 10-day outlier.
-    let mut rows = vec![];
-    let mut at = start;
-    for _ in 0..10 {
-        rows.push((at, at + 10, "failed", None));
-        at += 110;
+    let mut at = NOW - 20 * DAY;
+    for index in 0..13 {
+        let id = attempt(&db, &product, &item, &format!("head{index}"), "fix", "pr_branch_ci");
+        db.mark_ci_remediation_abandoned_with_head(&id, "new_head_sha_inflight", Some(&format!("head{}", index + 1)))
+            .unwrap();
+        dates(&db, &id, at, at + 10);
+        at += if index == 11 { 10 + 10 * DAY } else { 110 };
     }
-    rows.push((at, at + 10, "succeeded", Some("head11")));
-    rows.push((at + 110, at + 120, "failed", None));
-    rows.push((at + 120 + 10 * DAY, at + 130 + 10 * DAY, "failed", None));
-    remediations(&db, &product, &item, &rows);
     let report = pause_inputs(&db);
     assert_eq!(report.inputs["automatic_pause_samples"], 12);
     assert_eq!(report.inputs["automatic_pause_p99_secs"], 100);

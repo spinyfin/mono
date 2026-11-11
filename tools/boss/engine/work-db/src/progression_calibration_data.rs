@@ -101,32 +101,46 @@ pub(super) fn measure(conn: &Connection, now: i64, create_window_secs: i64) -> R
     if let Some(p99) = percentile(&mut intervals) {
         report.inputs.insert("ledger_interval_p99_secs".into(), p99);
     }
-    // Scheduling lag after a remediation that left CI red: the gap from a
-    // failed or abandoned attempt (or one whose pushed head still failed CI)
-    // to the next attempt. Gaps containing any other coding or review run on
-    // the item or its revision tasks, human waits, parking or autostart
-    // changes are excluded; so are gaps after an attempt that turned CI green,
-    // because the next attempt then follows an unrelated later push.
+    // Same-head red episodes only: a superseding head must be recorded at
+    // abandonment and observed failing by the next branch-CI attempt.
+    // Resolution and overlapping work invalidate the gap.
     let mut pauses = samples(
         conn,
         &format!(
             "WITH steps AS (
         SELECT work_item_id, head_sha_at_trigger AS head, CAST(created_at AS INTEGER) AS stamp,
         LAG(CAST(finished_at AS INTEGER)) OVER win AS prior,
+        failure_kind,
         LAG(status) OVER win AS prior_status,
+        LAG(failure_reason) OVER win AS prior_reason,
+        LAG(head_sha_at_trigger) OVER win AS prior_head,
+        LAG(failure_kind) OVER win AS prior_kind,
         LAG(head_sha_after) OVER win AS prior_after
         FROM ci_remediations
         WHERE CAST(created_at AS INTEGER)>=?1 AND CAST(created_at AS INTEGER)<?2
         WINDOW win AS (PARTITION BY work_item_id ORDER BY CAST(created_at AS INTEGER), id))
         SELECT stamp-prior FROM steps WHERE prior IS NOT NULL AND stamp>=prior
-        AND (prior_status IN ('failed','abandoned') OR (prior_after IS NOT NULL AND prior_after=head))
+        AND failure_kind='pr_branch_ci' AND prior_kind='pr_branch_ci'
+        AND ((prior_status='failed' AND COALESCE(prior_after,prior_head)=head)
+            OR (prior_status='abandoned' AND prior_reason='new_head_sha_inflight' AND prior_after=head))
+        AND NOT EXISTS (SELECT 1 FROM task_blocked_signals signal
+            WHERE signal.work_item_id=steps.work_item_id AND signal.reason IN ('ci_failure','ci_failure_exhausted')
+            AND CAST(signal.cleared_at AS INTEGER)>=prior AND CAST(signal.cleared_at AS INTEGER)<=stamp)
+        AND NOT EXISTS (SELECT 1 FROM task_status_audit resolved
+            WHERE resolved.work_item_id=steps.work_item_id
+            AND CAST(resolved.changed_at AS INTEGER)>=prior AND CAST(resolved.changed_at AS INTEGER)<=stamp
+            AND ((resolved.property='status' AND resolved.old_value='blocked'
+                AND resolved.new_value IS NOT 'blocked')
+                OR (resolved.property='blocked_reason' AND resolved.old_value IN ('ci_failure','ci_failure_exhausted')
+                    AND resolved.new_value IS NOT resolved.old_value)))
         AND NOT EXISTS (SELECT 1 FROM task_status_audit hold
             WHERE hold.work_item_id=steps.work_item_id
             AND CAST(hold.changed_at AS INTEGER)>=prior AND CAST(hold.changed_at AS INTEGER)<=stamp
             AND hold.property IN ('parked_at','autostart'))
         AND NOT EXISTS (SELECT 1 FROM work_executions e
             WHERE e.kind<>'progression' AND {ITEM_OR_REVISION}
-            AND CAST(e.created_at AS INTEGER)>=prior AND CAST(e.created_at AS INTEGER)<stamp)
+            AND (CAST(e.created_at AS INTEGER)<stamp OR CAST(e.started_at AS INTEGER)<stamp)
+            AND (e.finished_at IS NULL OR CAST(e.finished_at AS INTEGER)>=prior))
         AND NOT EXISTS (SELECT 1 FROM work_executions e
             JOIN execution_wait_history h ON h.execution_id=e.id
             WHERE {ITEM_OR_REVISION} AND h.changed_at<=stamp
