@@ -55,6 +55,14 @@ struct WorkersDetailView: View, @MainActor Equatable {
         }
         .background(Color(nsColor: .separatorColor))
         .onAppear(perform: bindAndSync)
+        .task(id: isVisible) {
+            guard isVisible else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                guard !Task.isCancelled else { return }
+                workspace.requestExecutionLabels(forReleasedRuns: releasedRunIds)
+            }
+        }
         .onChange(of: isVisible) { _, visible in
             if !visible { workspace.resetViewerAttachRequests() }
             syncGrid()

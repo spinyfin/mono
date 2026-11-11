@@ -1,5 +1,4 @@
-//! Topic names the engine publishes on. Split out of `wire.rs` to keep it
-//! under the repo's file-size limit; a pure move.
+//! Topic names the engine publishes on, re-exported from [`crate::wire`].
 
 pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
 

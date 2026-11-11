@@ -164,6 +164,61 @@ final class FinishedPaneLabelTests: XCTestCase {
         XCTAssertEqual(requested.count, 1, "a resolved run is not asked for again")
     }
 
+    func testUnansweredRequestExpiresWithoutAVisibilityChange() {
+        let workspace = WorkersWorkspaceModel()
+        var requested: [[String]] = []
+        workspace.onExecutionLabelsRequested = { requested.append($0) }
+        let start = Date()
+        workspace.requestExecutionLabels(forReleasedRuns: [runId], now: start)
+        workspace.requestExecutionLabels(forReleasedRuns: [runId], now: start.addingTimeInterval(5))
+        XCTAssertEqual(requested.count, 1)
+        workspace.requestExecutionLabels(forReleasedRuns: [runId], now: start.addingTimeInterval(11))
+        XCTAssertEqual(requested, [[runId], [runId]])
+    }
+
+    func testSessionRegistrationResendsAnUnansweredRequest() {
+        let workspace = WorkersWorkspaceModel()
+        let model = ChatViewModel(socketPath: "/tmp/label-reset-\(UUID().uuidString).sock")
+        var requested: [[String]] = []
+        workspace.onExecutionLabelsRequested = { requested.append($0) }
+        model.executionLabelsInvalidatedHandler = { workspace.invalidateExecutionLabels() }
+        workspace.requestExecutionLabels(forReleasedRuns: [runId])
+        model.applyEventForTest(.appSessionRegistered)
+        XCTAssertEqual(requested, [[runId], [runId]])
+    }
+
+    func testBoundWorkItemInvalidationRefreshesTheLabel() throws {
+        let workspace = WorkersWorkspaceModel()
+        let model = ChatViewModel(socketPath: "/tmp/label-update-\(UUID().uuidString).sock")
+        var requested: [[String]] = []
+        workspace.onExecutionLabelsRequested = { requested.append($0) }
+        model.executionLabelsInvalidatedHandler = { workspace.invalidateExecutionLabels() }
+        workspace.requestExecutionLabels(forReleasedRuns: [runId])
+        workspace.applyExecutionLabels([try resolvedLabel(purpose: nil)])
+        model.applyEventForTest(.workInvalidated(topic: "work.prod_boss", productId: "prod_boss", itemIds: ["task_abc"]))
+        XCTAssertEqual(requested, [[runId], [runId]])
+        workspace.applyExecutionLabels([try resolvedLabel(purpose: nil, title: "Renamed")])
+        XCTAssertEqual(workspace.executionLabelsByRunId[runId]?.workItemTitle, "Renamed")
+    }
+
+    func testUnresolvedDatabaseAnswerIsRetriedAfterExpiry() throws {
+        for status in ["work_item_deleted", "execution_unknown", "no_work_item"] {
+            let workspace = WorkersWorkspaceModel()
+            var requested: [[String]] = []
+            workspace.onExecutionLabelsRequested = { requested.append($0) }
+            let start = Date()
+            workspace.requestExecutionLabels(forReleasedRuns: [runId], now: start)
+            let unavailable = try label("{\"execution_id\":\"\(runId)\",\"status\":\"\(status)\"}")
+            workspace.applyExecutionLabels([unavailable])
+            workspace.requestExecutionLabels(forReleasedRuns: [runId], now: start.addingTimeInterval(5))
+            XCTAssertEqual(requested.count, 1)
+            workspace.requestExecutionLabels(forReleasedRuns: [runId], now: start.addingTimeInterval(11))
+            XCTAssertEqual(requested.count, 2)
+            workspace.applyExecutionLabels([try resolvedLabel(purpose: nil)])
+            XCTAssertEqual(workspace.executionLabelsByRunId[runId]?.status, .resolved)
+        }
+    }
+
     func testWorkspaceIgnoresLabelsItNeverAskedFor() throws {
         let workspace = WorkersWorkspaceModel()
         workspace.applyExecutionLabels([try resolvedLabel(purpose: nil)])

@@ -217,6 +217,9 @@ struct ContentView: View {
             workersWorkspace.onExecutionLabelsRequested = { [model] runIds in
                 model.requestExecutionLabels(runIds: runIds)
             }
+            model.executionLabelsInvalidatedHandler = { [workspace = workersWorkspace] in
+                workspace.invalidateExecutionLabels()
+            }
             model.executionLabelsHandler = { [workspace = workersWorkspace] labels in
                 workspace.applyExecutionLabels(labels)
             }

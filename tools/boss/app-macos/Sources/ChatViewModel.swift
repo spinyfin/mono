@@ -1166,8 +1166,9 @@ final class ChatViewModel: ObservableObject {
     /// `WorkersWorkspaceModel` and records the engine's desired coordinator model.
     /// Parameters: workerSlots, automationSlots, reviewSlots, coordinatorModel.
     var panePoolConfigHandler: ((Int, Int, Int, String) -> Void)?
-    /// Receives the engine's `ResolveExecutionLabels` reply; wired by
-    /// `ContentView` to `WorkersWorkspaceModel.applyExecutionLabels(_:)`.
+    /// Refresh finished labels after session registration or work-item changes.
+    var executionLabelsInvalidatedHandler: (() -> Void)?
+    /// Receives the engine's resolved labels for finished panes.
     var executionLabelsHandler: (([ExecutionWorkLabel]) -> Void)?
 
     /// The model the engine would use for the next coordinator creation.
