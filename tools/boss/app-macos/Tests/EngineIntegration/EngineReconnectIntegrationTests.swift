@@ -4,6 +4,65 @@ import os
 @testable import Boss
 
 final class EngineReconnectIntegrationTests: XCTestCase {
+    /// The fixture announces the bind on stdout. Startup is not part of the
+    /// slow-subscriber timing contract; Bazel bounds the whole test instead.
+    private func waitForEngineReady(socket: String, output: FileHandle) throws {
+        // Consume each available chunk: a fixed-length read can wait for more
+        // bytes even after the engine has announced readiness and gone quiet.
+        try waitForEngineReady(socket: socket) { output.availableData }
+    }
+
+    private func waitForEngineReady(socket: String, read: () throws -> Data) throws {
+        let ready = Data("boss-engine listening on \(socket)".utf8)
+        var pending = Data()
+        while true {
+            let chunk = try read()
+            guard !chunk.isEmpty else {
+                throw NSError(domain: "EngineFixture", code: 1, userInfo: [
+                    NSLocalizedDescriptionKey: "engine stdout closed before announcing \(socket)",
+                ])
+            }
+            pending.append(chunk)
+            while let newline = pending.firstIndex(of: 0x0A) {
+                if pending[..<newline] == ready { return }
+                pending.removeSubrange(...newline)
+            }
+        }
+    }
+
+    func testReadinessDoesNotWaitForStdoutToClose() throws {
+        let output = Pipe()
+        defer {
+            try? output.fileHandleForReading.close()
+            try? output.fileHandleForWriting.close()
+        }
+        try output.fileHandleForWriting.write(contentsOf: Data("boss-engine listening on /retry.sock\n".utf8))
+        try waitForEngineReady(socket: "/retry.sock", output: output.fileHandleForReading)
+    }
+
+    func testReadinessWaitsForCompleteAnnouncementForRequestedSocket() throws {
+        var chunks = [
+            Data("starting\nboss-engine listening on /other.sock\n".utf8),
+            Data("boss-engine listening on /retry.so".utf8),
+            Data("ck".utf8),
+            Data("\n".utf8),
+        ]
+        try waitForEngineReady(socket: "/retry.sock") {
+            chunks.isEmpty ? Data() : chunks.removeFirst()
+        }
+        XCTAssertTrue(chunks.isEmpty, "readiness requires the complete line, including its newline")
+    }
+
+    func testReadinessRejectsExitBeforeAnnouncement() throws {
+        let output = Pipe()
+        defer { try? output.fileHandleForReading.close() }
+        try output.fileHandleForWriting.write(contentsOf: Data("boss-engine listening on /other.sock\n".utf8))
+        try output.fileHandleForWriting.close()
+        XCTAssertThrowsError(try waitForEngineReady(socket: "/retry.sock", output: output.fileHandleForReading)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("stdout closed before announcing /retry.sock"))
+        }
+    }
+
     private func waitUntil(_ seconds: TimeInterval, _ predicate: () -> Bool) -> Bool {
         let deadline = Date().addingTimeInterval(seconds)
         while Date() < deadline {
@@ -23,20 +82,28 @@ final class EngineReconnectIntegrationTests: XCTestCase {
         let log = try FileHandle(forWritingTo: logURL)
         defer { try? log.close() }
         let process = Process()
+        let output = Pipe()
+        defer { try? output.fileHandleForReading.close() }
         process.executableURL = URL(fileURLWithPath: "\(runfiles)/_main/tools/boss/engine/core/engine_fixture_test")
         process.arguments = ["--socket-path", socket]
         var environment = env
         environment.removeValue(forKey: "BOSS_EVENTS_SOCKET")
         process.environment = environment
-        process.standardOutput = log
+        process.standardOutput = output
         process.standardError = log
         try process.run()
         defer {
             if process.isRunning { process.terminate() }
             process.waitUntilExit()
         }
-        _ = try XCTUnwrap(waitUntil(20) { FileManager.default.fileExists(atPath: socket) } ? true : nil,
-                      (try? String(contentsOf: logURL, encoding: .utf8)) ?? "engine did not start")
+        // Only the child owns the write end, so an early exit reaches EOF.
+        try output.fileHandleForWriting.close()
+        do {
+            try waitForEngineReady(socket: socket, output: output.fileHandleForReading)
+        } catch {
+            XCTFail("\(error): \((try? String(contentsOf: logURL, encoding: .utf8)) ?? "engine log unavailable")")
+            return
+        }
 
         let client = EngineClient(socketPath: socket, pendingDecodeByteLimit: 64 * 1024)
         let connections = OSAllocatedUnfairLock(initialState: 0)
