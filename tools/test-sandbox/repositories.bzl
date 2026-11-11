@@ -258,6 +258,28 @@ host_tmux_repository = repository_rule(
     local = True,
 )
 
+def _host_lsof_repository_impl(repository_ctx):
+    # Cube's macOS process-scan test declares its executable explicitly, just
+    # like the tmux integration tests; other tests do not receive this tool.
+    path = repository_ctx.path("/usr/sbin/lsof")
+    if repository_ctx.os.name == "mac os x" and path.exists:
+        repository_ctx.symlink(path.realpath, "lsof")
+    else:
+        repository_ctx.file(
+            "lsof",
+            content = "#!/bin/sh\nprintf '%s\\n' 'macOS lsof is unavailable' >&2\nexit 127\n",
+            executable = True,
+        )
+    repository_ctx.file(
+        "BUILD.bazel",
+        content = 'exports_files(["lsof"], visibility = ["@@//tools/cube:__pkg__"])\n',
+    )
+
+host_lsof_repository = repository_rule(
+    implementation = _host_lsof_repository_impl,
+    local = True,
+)
+
 def _host_claude_repository_impl(repository_ctx):
     # Only the explicitly selected inbox compatibility test receives this
     # executable; it is never added to the shared test runtime or PATH.

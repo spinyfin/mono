@@ -186,9 +186,9 @@ directories are copied recursively without replacing fresh tracked files.
 Git also enumerates untracked files, including ignored files, without reading
 jj's index. These are carried over too, covering inputs used inside setup
 scripts. If Git cannot enumerate them, recovery fails before moving the store;
-repair its Git index before retrying. An old `.cube/setup.yaml` is retained if
-the clone has none. Dynamic paths,
-shell expansions, and symlinks among the setup-declared inputs are rejected
+repair its Git index before retrying. An old `.cube/setup.yaml` is never planted into a clone that lacks it, even
+if Git lists it as untracked; fresh workspaces use the declaration from main. Dynamic paths,
+shell expansions, missing or special files, and symlinks anywhere inside the setup-declared inputs are rejected
 before anything is moved, with instructions to use regular files and literal
 paths. Other untracked symlinks (such as `bazel-bin`) and special files are
 skipped with a warning. Missing inputs
@@ -205,7 +205,9 @@ preserving their files and provisioning replacements. A workspace whose
 registration stamp is missing or differs from the source's is refused by a
 normal lease with an error instead of an empty successful setup report; the
 check looks only at the stamps, never at whether the source working copy has a
-`.cube/setup.yaml`, and an `--allow-dirty` recovery lease skips it so unpushed
+`.cube/setup.yaml`, and an `--allow-dirty --prefer <id>` recovery lease preserves the preferred
+workspace despite a stale or missing stamp (a wrong-store pointer is still
+quarantined) and skips the stamp check so unpushed
 work stays reachable. A lease whose setup cannot run for any reason other than
 a failed step releases its claim before the error is returned.
 

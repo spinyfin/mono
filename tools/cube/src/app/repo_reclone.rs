@@ -24,7 +24,7 @@ pub(super) fn remove_workspace_tree(path: &Path) -> Result<()> {
 }
 
 /// Scan actual open files and working directories, rather than process names.
-fn require_unused(runner: &dyn CommandRunner, path: &Path) -> Result<()> {
+pub(super) fn require_unused(runner: &dyn CommandRunner, path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
@@ -40,16 +40,18 @@ fn require_unused(runner: &dyn CommandRunner, path: &Path) -> Result<()> {
         ],
         env: vec![],
     };
-    match runner.run_with_timeout(&invocation, Duration::from_secs(120)) {
-        Err(CubeError::CommandFailed {
-            status: Some(1),
-            stderr,
-            ..
-        }) if stderr.trim().is_empty() => Ok(()),
-        Ok(output) if output.trim().is_empty() => Ok(()),
+    match runner.run_output_with_timeout(&invocation, Duration::from_secs(120)) {
+        Ok(output) if !output.stdout.is_empty() => Err(CubeError::InvalidArgument(format!(
+            "cannot reclone: processes are using {}; stop them and retry:\n{}",
+            path.display(),
+            output.stdout
+        ))),
+        Ok(output) if output.status == Some(1) => Ok(()),
         Ok(output) => Err(CubeError::InvalidArgument(format!(
-            "cannot reclone: processes are using {}; stop them and retry:\n{output}",
-            path.display()
+            "cannot verify that {} is unused: lsof exited {:?}: {}",
+            path.display(),
+            output.status,
+            output.stderr
         ))),
         Err(CubeError::CommandTimedOut { .. }) => Err(CubeError::InvalidArgument(format!(
             "lsof did not finish scanning {} within 120s (large build trees are slow to scan); prune build outputs or retry when the machine is idle",
@@ -177,7 +179,7 @@ pub(super) fn reclone(
     // Validate literal references before moving anything. A damaged index is
     // irrelevant: setup declarations and local secrets are ordinary files.
     for input in setup_inputs(source)? {
-        reject_symlink(source, &input)?;
+        validate_input(source, &input)?;
     }
     // Git's index can enumerate local files even when jj cannot rebuild its
     // own index. Include ignored files: secrets are commonly gitignored. This
@@ -204,10 +206,6 @@ pub(super) fn reclone(
             ],
             env: vec![],
         })?;
-        let setup = Path::new(crate::setup::SETUP_FILE_RELATIVE);
-        if !source.join(setup).exists() && backup.join(setup).exists() {
-            copy_input(&backup, source, setup)?;
-        }
         for input in &untracked {
             copy_input(&backup, source, input)?;
         }
@@ -354,6 +352,7 @@ pub(super) fn quarantine_obsolete(
     database: Option<&Path>,
     repo: &crate::metadata::RepoRecord,
     candidates: &mut Vec<crate::metadata::WorkspaceCandidate>,
+    recovery_target: Option<&str>,
 ) -> Result<()> {
     let Some(source) = &repo.source else {
         return Ok(());
@@ -382,7 +381,7 @@ pub(super) fn quarantine_obsolete(
             && expected
                 .as_ref()
                 .is_some_and(|expected| crate::lock::shared_repo_dir(path).ok().as_ref() != Some(expected));
-        if wrong_registration || wrong_store {
+        if wrong_store || (wrong_registration && recovery_target != Some(candidate.workspace_id.as_str())) {
             let quarantine = path.with_file_name(format!(
                 ".quarantine-{}-{}",
                 candidate.workspace_id,
@@ -457,6 +456,11 @@ fn setup_inputs(source: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn copy_input(old: &Path, new: &Path, relative: &Path) -> Result<()> {
+    // Setup declarations come only from the fresh clone, including when a
+    // declared directory or untracked tree contains the old declaration.
+    if relative == Path::new(crate::setup::SETUP_FILE_RELATIVE) {
+        return Ok(());
+    }
     let source = old.join(relative);
     let destination = new.join(relative);
     let fail = |detail: String| {
@@ -496,6 +500,27 @@ fn copy_input(old: &Path, new: &Path, relative: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Validate the complete declared tree before moving or cloning the store.
+fn validate_input(root: &Path, relative: &Path) -> Result<()> {
+    reject_symlink(root, relative)?;
+    let path = root.join(relative);
+    let fail = |detail| {
+        CubeError::InvalidArgument(format!(
+            "cannot preserve setup file {}: {detail}; restore this file in the base repo before retrying cube repo reclone",
+            path.display()
+        ))
+    };
+    let metadata = fs::symlink_metadata(&path).map_err(|e| fail(e.to_string()))?;
+    if metadata.is_dir() {
+        for entry in fs::read_dir(&path).map_err(CubeError::Io)? {
+            validate_input(root, &relative.join(entry.map_err(CubeError::Io)?.file_name()))?;
+        }
+    } else if !metadata.is_file() {
+        return Err(fail("not a regular file or directory".into()));
+    }
+    Ok(())
+}
+
 /// The first symlink on `root/relative` (including intermediate components).
 fn symlink_in_path(root: &Path, relative: &Path) -> Option<PathBuf> {
     let mut path = root.to_path_buf();
@@ -528,6 +553,9 @@ fn preservable_untracked(source: &Path, inputs: Vec<PathBuf>) -> Vec<PathBuf> {
     inputs
         .into_iter()
         .filter(|input| {
+            if input == Path::new(crate::setup::SETUP_FILE_RELATIVE) {
+                return false;
+            }
             if let Some(link) = symlink_in_path(source, input) {
                 eprintln!("cube: not preserving untracked symlink {}", link.display());
                 return false;

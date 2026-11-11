@@ -66,6 +66,7 @@ rust_test(
         "@cube_gc_store_tree//:cut",
         "@cube_gc_store_tree//:store",
         "@cube_jj_newer//:jj",
+        "@host_lsof//:lsof",
         "@jj_test_tools//:jj",
     ],
     env = {
@@ -74,6 +75,7 @@ rust_test(
         "CUBE_GC_STORE_CUT": "$(rootpath @cube_gc_store_tree//:cut)",
         "CUBE_NEWER_JJ_BIN": "$(rootpath @cube_jj_newer//:jj)",
         "CUBE_TEST_BIN": "$(rootpath :cube)",
+        "CUBE_TEST_LSOF": "$(rootpath @host_lsof//:lsof)",
     },
     proc_macro_deps = all_crate_deps(
         proc_macro = True,

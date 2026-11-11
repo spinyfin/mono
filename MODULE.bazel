@@ -79,6 +79,13 @@ host_tmux_repository = use_repo_rule(
 
 host_tmux_repository(name = "host_tmux")
 
+host_lsof_repository = use_repo_rule(
+    "//tools/test-sandbox:repositories.bzl",
+    "host_lsof_repository",
+)
+
+host_lsof_repository(name = "host_lsof")
+
 host_claude_repository = use_repo_rule(
     "//tools/test-sandbox:repositories.bzl",
     "host_claude_repository",
