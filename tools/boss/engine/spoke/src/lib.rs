@@ -36,6 +36,7 @@ pub fn registered(journal: &SharedJournal) -> Result<Vec<ExecutionRecord>> {
 pub async fn observe(journal: SharedJournal, stamp: impl Fn() -> Result<Stamp>) -> Result<()> {
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut source_errors = std::collections::HashMap::new();
     loop {
         interval.tick().await;
         let records = match registered(&journal) {
@@ -45,6 +46,7 @@ pub async fn observe(journal: SharedJournal, stamp: impl Fn() -> Result<Stamp>) 
                 continue;
             }
         };
+        source_errors.retain(|run, _| records.iter().any(|record| &record.run_id == run && !record.reclaimed));
         for record in records {
             if record.observation.is_none() || record.reclaimed {
                 continue;
@@ -59,10 +61,17 @@ pub async fn observe(journal: SharedJournal, stamp: impl Fn() -> Result<Stamp>) 
             if let Err(error) = hooks::drain(&journal, &record, &stamp()?).await {
                 tracing::warn!(run = record.run_id, %error, "pending hooks retained");
             }
-            if let Err(error) = transcripts::poll(&journal, &record, &stamp()?).await
-                && !boss_spoke_journal::Fault::is_full(&error)
-            {
-                tracing::warn!(run = record.run_id, %error, "transcript source retained");
+            match transcripts::poll(&journal, &record, &stamp()?).await {
+                Err(error) if !boss_spoke_journal::Fault::is_full(&error) => {
+                    let message = error.to_string();
+                    if source_errors.insert(record.run_id.clone(), message.clone()).as_ref() != Some(&message) {
+                        tracing::warn!(run = record.run_id, %error, "transcript source retained");
+                    }
+                }
+                Ok(()) => {
+                    source_errors.remove(&record.run_id);
+                }
+                _ => {}
             }
         }
     }
@@ -183,6 +192,313 @@ mod tests {
         child.stdin.take().unwrap().write_all(payload).await.unwrap();
         let result = child.wait_with_output().await.unwrap();
         assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    }
+
+    #[tokio::test]
+    async fn subagent_tool_events_retain_origin_in_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let execution = execution(root.path());
+        let journal = journal(root.path(), limits());
+        let mut payload: serde_json::Value = serde_json::from_slice(&hook(None)).unwrap();
+        payload["agent_id"] = "child".into();
+        payload["hook_event_name"] = "PostToolUse".into();
+        payload["tool_name"] = "Write".into();
+        hooks::ingest(
+            &journal,
+            &execution,
+            &serde_json::to_vec(&payload).unwrap(),
+            &stamp().unwrap(),
+        )
+        .await
+        .unwrap();
+        let captured = records(&journal);
+        let Some(record::Body::Event(event)) = &captured[0].body else {
+            panic!("missing event");
+        };
+        assert!(event.from_subagent);
+        assert!(
+            matches!(&event.event, Some(boss_protocol_spoke::v1::worker_event::Event::PostToolUse(tool)) if tool.name == "Write")
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_hooks_journal_a_gap_with_the_event() {
+        for (name, extra) in [
+            ("Stop", serde_json::json!({"stop_hook_active": true})),
+            ("UserPromptSubmit", serde_json::json!({"prompt": "bounded prefix"})),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let execution = execution(root.path());
+            let journal = journal(root.path(), limits());
+            let mut payload: serde_json::Value = serde_json::from_slice(&hook(None)).unwrap();
+            payload["hook_event_name"] = name.into();
+            payload["_boss_payload_truncated"] = true.into();
+            for (key, value) in extra.as_object().unwrap() {
+                payload[key] = value.clone();
+            }
+            hooks::ingest(
+                &journal,
+                &execution,
+                &serde_json::to_vec(&payload).unwrap(),
+                &stamp().unwrap(),
+            )
+            .await
+            .unwrap();
+            let captured = records(&journal);
+            assert_eq!(captured.len(), 2, "{name}");
+            assert!(
+                matches!(&captured[0].body, Some(record::Body::Gap(g)) if g.resource.starts_with("hook:")),
+                "{name}"
+            );
+            let Some(record::Body::Event(event)) = &captured[1].body else {
+                panic!("missing event");
+            };
+            match &event.event {
+                Some(boss_protocol_spoke::v1::worker_event::Event::Stop(stop)) => assert!(stop.stop_hook_active),
+                Some(boss_protocol_spoke::v1::worker_event::Event::UserPrompt(prompt)) => {
+                    assert_eq!(prompt, "bounded prefix")
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    /// A Terminal codex run whose rollout lives under a sessions directory.
+    fn terminal_file_run(root: &std::path::Path) -> (ExecutionRecord, std::path::PathBuf) {
+        let mut execution = execution(root);
+        execution.driver_id = "codex".into();
+        let directory = root.join("sessions");
+        std::fs::create_dir(&directory).unwrap();
+        execution.observation.as_mut().unwrap().file = Some((
+            boss_engine_driver::AgentJsonlFileIngress {
+                directory: directory.clone(),
+                filename_prefix: "rollout-".into(),
+                filename_suffix: ".jsonl".into(),
+                workspace_path: root.into(),
+            },
+            Vec::new(),
+        ));
+        let meta = serde_json::json!({"type":"session_meta", "payload":{"id":"session", "cwd":root}});
+        std::fs::write(directory.join("rollout-example-session.jsonl"), format!("{meta}\n")).unwrap();
+        execution.phase = Phase::Terminal;
+        (execution, directory)
+    }
+
+    #[tokio::test]
+    async fn transient_discovery_failures_leave_terminal_run_undrained_for_retry() {
+        use boss_engine_driver::discovery::fault::{Point, inject_once};
+        for point in [Point::Listing, Point::CandidateOpen, Point::Prepare] {
+            for errno in [libc::EMFILE, libc::EINTR] {
+                let root = tempfile::tempdir().unwrap();
+                let (execution, directory) = terminal_file_run(root.path());
+                let journal = journal(root.path(), limits());
+                inject_once(point, &directory, errno);
+                let failed = transcripts::poll(&journal, &execution, &stamp().unwrap()).await;
+                assert!(
+                    failed.is_err(),
+                    "{point:?}/{errno}: transient failure must surface for retry"
+                );
+                let run = run_identity(&execution);
+                assert!(
+                    journal.lock().unwrap().source(&run, "drained").unwrap().is_none(),
+                    "{point:?}/{errno}"
+                );
+                assert!(
+                    records(&journal).is_empty(),
+                    "{point:?}/{errno}: no gap for a transient failure"
+                );
+                transcripts::poll(&journal, &execution, &stamp().unwrap())
+                    .await
+                    .unwrap();
+                assert!(
+                    records(&journal)
+                        .iter()
+                        .any(|r| matches!(&r.body, Some(record::Body::Transcript(t)) if !t.data.is_empty())),
+                    "{point:?}/{errno}: next poll must journal the data"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_cwd_resolution_failure_does_not_drain_terminal_run() {
+        use boss_engine_driver::discovery::fault::{Point, inject_once};
+        let root = tempfile::tempdir().unwrap();
+        let (execution, _directory) = terminal_file_run(root.path());
+        let journal = journal(root.path(), limits());
+        inject_once(Point::Cwd, root.path(), libc::EMFILE);
+        assert!(
+            transcripts::poll(&journal, &execution, &stamp().unwrap())
+                .await
+                .is_err()
+        );
+        let run = run_identity(&execution);
+        assert!(journal.lock().unwrap().source(&run, "drained").unwrap().is_none());
+        assert!(
+            !records(&journal)
+                .iter()
+                .any(|r| matches!(&r.body, Some(record::Body::Gap(_))))
+        );
+        transcripts::poll(&journal, &execution, &stamp().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            records(&journal)
+                .iter()
+                .any(|r| matches!(&r.body, Some(record::Body::Transcript(t)) if !t.data.is_empty()))
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_unclassified_errno_drains_terminal_run_with_a_gap_after_budget() {
+        use boss_engine_driver::discovery::fault::{Point, inject_once};
+        let root = tempfile::tempdir().unwrap();
+        let (execution, directory) = terminal_file_run(root.path());
+        let journal = journal(root.path(), limits());
+        let run = run_identity(&execution);
+        let mut polls = 0;
+        while journal.lock().unwrap().source(&run, "drained").unwrap().is_none() {
+            assert!(polls < 100, "terminal run never drained on a persistent EIO");
+            inject_once(Point::Listing, &directory, libc::EIO);
+            let _ = transcripts::poll(&journal, &execution, &stamp().unwrap()).await;
+            polls += 1;
+        }
+        assert!(polls > 1, "a single EIO must be retried before draining");
+        assert!(records(&journal).iter().any(
+            |r| matches!(&r.body, Some(record::Body::Gap(g)) if g.reason.contains("Input/output error") || g.reason.contains("os error"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn permanent_discovery_failure_drains_terminal_run_with_a_gap() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let (execution, directory) = terminal_file_run(root.path());
+        let locked = directory.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let journal = journal(root.path(), limits());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = transcripts::poll(&journal, &execution, &stamp().unwrap()).await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        result.unwrap();
+        assert!(
+            journal
+                .lock()
+                .unwrap()
+                .source(&run_identity(&execution), "drained")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            records(&journal)
+                .iter()
+                .any(|r| matches!(&r.body, Some(record::Body::Gap(_))))
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_ambiguous_and_unsafe_sources_drain_only_after_pending_hooks() {
+        for ambiguous in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut execution = execution(root.path());
+            let journal = journal(root.path(), limits());
+            if ambiguous {
+                execution.driver_id = "codex".into();
+                let directory = root.path().join("sessions");
+                std::fs::create_dir(&directory).unwrap();
+                execution.observation.as_mut().unwrap().file = Some((
+                    boss_engine_driver::AgentJsonlFileIngress {
+                        directory: directory.clone(),
+                        filename_prefix: "rollout-".into(),
+                        filename_suffix: ".jsonl".into(),
+                        workspace_path: root.path().into(),
+                    },
+                    Vec::new(),
+                ));
+                for id in ["one", "two"] {
+                    let meta = serde_json::json!({"type":"session_meta", "payload":{"id":id,"cwd":root.path()}});
+                    std::fs::write(directory.join(format!("rollout-{id}.jsonl")), format!("{meta}\n")).unwrap();
+                }
+            } else {
+                let target = root.path().join("actual.jsonl");
+                let link = root.path().join("link.jsonl");
+                std::fs::write(&target, b"{}").unwrap();
+                std::os::unix::fs::symlink(&target, &link).unwrap();
+                hooks::ingest(&journal, &execution, &hook(Some(&link)), &stamp().unwrap())
+                    .await
+                    .unwrap();
+            }
+            execution.phase = Phase::Terminal;
+            let pending = execution.observation.as_ref().unwrap().pending.join("unprocessed.json");
+            std::fs::write(&pending, b"{}").unwrap();
+            assert!(
+                transcripts::poll(&journal, &execution, &stamp().unwrap())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                journal
+                    .lock()
+                    .unwrap()
+                    .source(&run_identity(&execution), "drained")
+                    .unwrap()
+                    .is_none()
+            );
+            std::fs::remove_file(pending).unwrap();
+            transcripts::poll(&journal, &execution, &stamp().unwrap())
+                .await
+                .unwrap();
+            assert!(matches!(&records(&journal).last().unwrap().body,
+                Some(record::Body::Gap(gap)) if gap.resource == "transcript"));
+            assert!(
+                journal
+                    .lock()
+                    .unwrap()
+                    .source(&run_identity(&execution), "drained")
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_missing_and_invalid_sources_record_gap_and_drain() {
+        for path in [None, Some(Path::new("relative.jsonl"))] {
+            let root = tempfile::tempdir().unwrap();
+            let mut execution = execution(root.path());
+            let journal = journal(root.path(), limits());
+            if path.is_some() {
+                hooks::ingest(&journal, &execution, &hook(path), &stamp().unwrap())
+                    .await
+                    .unwrap();
+                assert!(
+                    transcripts::poll(&journal, &execution, &stamp().unwrap())
+                        .await
+                        .is_err()
+                );
+            }
+            execution.phase = Phase::Terminal;
+            transcripts::poll(&journal, &execution, &stamp().unwrap())
+                .await
+                .unwrap();
+            let count = records(&journal).len();
+            transcripts::poll(&journal, &execution, &stamp().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(records(&journal).len(), count);
+            assert!(matches!(&records(&journal).last().unwrap().body,
+                Some(record::Body::Gap(gap)) if gap.resource == "transcript"));
+            assert!(
+                journal
+                    .lock()
+                    .unwrap()
+                    .source(&run_identity(&execution), "drained")
+                    .unwrap()
+                    .is_some()
+            );
+        }
     }
 
     #[tokio::test]

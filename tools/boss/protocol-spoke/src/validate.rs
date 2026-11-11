@@ -673,6 +673,7 @@ mod tests {
             observed: Some(stamp()),
             run: Some(run()),
             body: Some(record::Body::Event(v1::WorkerEvent {
+                from_subagent: false,
                 session_id: "s".into(),
                 event: Some(worker_event::Event::Notification("hi".into())),
             })),

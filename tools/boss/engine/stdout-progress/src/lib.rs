@@ -170,7 +170,7 @@ pub struct ReaderStats {
 }
 
 /// One framed line, or the reason there wasn't one.
-enum RawLine {
+pub enum RawLine {
     /// A newline-terminated line, terminator stripped.
     Complete(Vec<u8>),
     /// End of stream with unterminated bytes buffered — the writer closed
@@ -357,85 +357,17 @@ impl<R: AsyncRead + Unpin> StdoutJsonlProgressReader<R> {
                 return Some(envelope);
             }
 
-            let bytes = match self.next_raw_line().await {
-                RawLine::Complete(bytes) => {
-                    self.stats.lines_read += 1;
-                    bytes
-                }
-                RawLine::Trailing(bytes) => {
-                    self.stats.lines_read += 1;
-                    self.stats.unterminated_tails += 1;
-                    tracing::debug!(
-                        bytes = bytes.len(),
-                        "stdout progress: stream ended without a trailing newline; \
-                         parsing the residual fragment",
-                    );
-                    bytes
-                }
-                RawLine::Oversized => {
-                    self.stats.oversized_lines += 1;
-                    tracing::warn!(
-                        max_line_bytes = self.config.max_line_bytes,
-                        "stdout progress: discarded an over-long line; resynchronising at the next newline",
-                    );
-                    continue;
-                }
-                RawLine::Eof => return None,
-            };
-
-            // Lossy on purpose: invalid UTF-8 becomes replacement characters,
-            // which fail the JSON parse below and are skipped like any other
-            // non-JSON line. Erroring here would let one bad byte end a
-            // worker's entire progress stream.
-            let text = String::from_utf8_lossy(&bytes);
-            let text = text.trim();
-            if text.is_empty() {
-                self.stats.blank_lines += 1;
-                continue;
+            let line = self.next_raw_line().await;
+            if matches!(line, RawLine::Eof) {
+                return None;
             }
-
-            let raw: serde_json::Value = match serde_json::from_str(text) {
-                Ok(value) => value,
-                Err(err) => {
-                    self.stats.non_json_lines += 1;
-                    tracing::debug!(
-                        %err,
-                        "stdout progress: skipping a non-JSON line (interleaved worker output or a truncated fragment)",
-                    );
-                    continue;
-                }
-            };
-
-            let normalized = match self.progress_session.as_mut() {
-                Some(session) => session.normalize_progress_events(&raw),
-                None => self.driver.normalize_progress_event(&raw).map(|event| vec![event]),
-            };
-            match normalized {
-                Ok(events) => {
-                    let transcript_path = match self.progress_session.as_mut() {
-                        Some(session) => session.transcript_path_for_session(&raw),
-                        None => self.driver.transcript_path_for_session(&raw),
-                    };
-                    self.pending_events
-                        .extend(events.into_iter().map(|event| ProgressEnvelope {
-                            event,
-                            transcript_path: transcript_path.clone(),
-                        }));
-                    continue;
-                }
-                Err(err) => {
-                    // The expected steady state for a stream that mixes
-                    // progress envelopes with variants the driver has no
-                    // mapping for. Debug, not warn: an unrecognised variant is
-                    // this transport's normal case, not a fault.
-                    self.stats.unrecognised_envelopes += 1;
-                    tracing::debug!(
-                        %err,
-                        "stdout progress: driver declined an envelope; skipping",
-                    );
-                    continue;
-                }
-            }
+            self.pending_events.extend(normalize_line(
+                line,
+                self.driver.as_ref(),
+                &mut self.progress_session,
+                self.config,
+                &mut self.stats,
+            ));
         }
     }
 
@@ -445,67 +377,165 @@ impl<R: AsyncRead + Unpin> StdoutJsonlProgressReader<R> {
     /// fraction of a line), so a partial envelope is never handed on as if it
     /// were whole.
     async fn next_raw_line(&mut self) -> RawLine {
-        let mut line: Vec<u8> = Vec::new();
-        // Once a line has blown the ceiling we stop accumulating and just burn
-        // bytes until the newline, so the discard costs no memory either.
-        let mut overflowed = false;
-
+        let mut partial = Vec::new();
+        let mut skipping = false;
         loop {
-            // Copy the interesting slice out and end the borrow before
-            // `consume`, which needs the reader mutably again.
-            let (chunk, terminated) = {
-                let available = match self.reader.fill_buf().await {
-                    Ok(available) => available,
-                    Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-                    Err(err) => {
-                        self.stats.ended_with_io_error = true;
-                        tracing::warn!(
-                            %err,
-                            "stdout progress: read failed; ending the progress stream",
-                        );
-                        return RawLine::Eof;
-                    }
-                };
-                if available.is_empty() {
-                    return if overflowed {
-                        // The over-long line ran to end of stream. Nothing was
-                        // buffered and there is no next line to resync to.
-                        RawLine::Oversized
-                    } else if line.is_empty() {
-                        RawLine::Eof
-                    } else {
-                        RawLine::Trailing(line)
-                    };
+            let chunk = match self.reader.fill_buf().await {
+                Ok([]) => {
+                    return frame_chunk(&mut partial, &mut skipping, &[], true, self.config)
+                        .pop()
+                        .unwrap_or(RawLine::Eof);
                 }
-                match available.iter().position(|byte| *byte == b'\n') {
-                    Some(index) => (available[..=index].to_vec(), true),
-                    None => (available.to_vec(), false),
+                Ok(available) => {
+                    let count = available
+                        .iter()
+                        .position(|b| *b == b'\n')
+                        .map_or(available.len(), |index| index + 1);
+                    available[..count].to_vec()
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    self.stats.ended_with_io_error = true;
+                    tracing::warn!(%error, "stdout progress: read failed");
+                    return RawLine::Eof;
                 }
             };
             self.reader.consume(chunk.len());
             self.consumed_bytes += chunk.len() as u64;
-
-            if terminated {
-                // Drop the terminator; `\r` (if any) is handled by the trim in
-                // `next_event`.
-                let payload = &chunk[..chunk.len() - 1];
-                if overflowed || line.len() + payload.len() > self.config.max_line_bytes {
-                    return RawLine::Oversized;
-                }
-                line.extend_from_slice(payload);
-                return RawLine::Complete(line);
+            if let Some(line) = frame_chunk(&mut partial, &mut skipping, &chunk, false, self.config).pop() {
+                return line;
             }
+        }
+    }
+}
 
-            // Check before extending, so the ceiling bounds what is ever held
-            // rather than what is held after one more chunk.
-            if !overflowed {
-                if line.len() + chunk.len() > self.config.max_line_bytes {
-                    overflowed = true;
-                    line = Vec::new();
-                } else {
-                    line.extend_from_slice(&chunk);
-                }
+/// Synchronous framing with caller-owned checkpoint state. Oversized lines are
+/// discarded through their terminator, including when chunks straddle it.
+pub fn frame_chunk(
+    partial: &mut Vec<u8>,
+    skipping: &mut bool,
+    bytes: &[u8],
+    eof: bool,
+    config: ReaderConfig,
+) -> Vec<RawLine> {
+    let mut lines = Vec::new();
+    for piece in bytes.split_inclusive(|byte| *byte == b'\n') {
+        let terminated = piece.last() == Some(&b'\n');
+        let payload = if terminated { &piece[..piece.len() - 1] } else { piece };
+        if !*skipping {
+            if partial.len().saturating_add(payload.len()) > config.max_line_bytes {
+                partial.clear();
+                *skipping = true;
+            } else {
+                partial.extend_from_slice(payload);
             }
+        }
+        if terminated {
+            lines.push(if *skipping {
+                RawLine::Oversized
+            } else {
+                RawLine::Complete(std::mem::take(partial))
+            });
+            *skipping = false;
+        }
+    }
+    if eof {
+        if *skipping {
+            lines.push(RawLine::Oversized);
+        } else if !partial.is_empty() {
+            lines.push(RawLine::Trailing(std::mem::take(partial)));
+        }
+        *skipping = false;
+    }
+    lines
+}
+
+/// Shared normalization and anomaly accounting for stream and durable file ingress.
+pub fn normalize_line(
+    line: RawLine,
+    driver: &dyn AgentDriver,
+    progress_session: &mut Option<Box<dyn ProgressSessionNormalizer>>,
+    config: ReaderConfig,
+    stats: &mut ReaderStats,
+) -> Vec<ProgressEnvelope> {
+    let bytes = match line {
+        RawLine::Complete(bytes) => {
+            stats.lines_read += 1;
+            bytes
+        }
+        RawLine::Trailing(bytes) => {
+            stats.lines_read += 1;
+            stats.unterminated_tails += 1;
+            tracing::debug!(
+                bytes = bytes.len(),
+                "stdout progress: stream ended without a trailing newline; \
+                         parsing the residual fragment",
+            );
+            bytes
+        }
+        RawLine::Oversized => {
+            stats.oversized_lines += 1;
+            tracing::warn!(
+                max_line_bytes = config.max_line_bytes,
+                "stdout progress: discarded an over-long line; resynchronising at the next newline",
+            );
+            return Vec::new();
+        }
+        RawLine::Eof => return Vec::new(),
+    };
+
+    // Lossy on purpose: invalid UTF-8 becomes replacement characters,
+    // which fail the JSON parse below and are skipped like any other
+    // non-JSON line. Erroring here would let one bad byte end a
+    // worker's entire progress stream.
+    let text = String::from_utf8_lossy(&bytes);
+    let text = text.trim();
+    if text.is_empty() {
+        stats.blank_lines += 1;
+        return Vec::new();
+    }
+
+    let raw: serde_json::Value = match serde_json::from_str(text) {
+        Ok(value) => value,
+        Err(err) => {
+            stats.non_json_lines += 1;
+            tracing::debug!(
+                %err,
+                "stdout progress: skipping a non-JSON line (interleaved worker output or a truncated fragment)",
+            );
+            return Vec::new();
+        }
+    };
+
+    let normalized = match progress_session.as_mut() {
+        Some(session) => session.normalize_progress_events(&raw),
+        None => driver.normalize_progress_event(&raw).map(|event| vec![event]),
+    };
+    match normalized {
+        Ok(events) => {
+            let transcript_path = match progress_session.as_mut() {
+                Some(session) => session.transcript_path_for_session(&raw),
+                None => driver.transcript_path_for_session(&raw),
+            };
+            events
+                .into_iter()
+                .map(|event| ProgressEnvelope {
+                    event,
+                    transcript_path: transcript_path.clone(),
+                })
+                .collect()
+        }
+        Err(err) => {
+            // The expected steady state for a stream that mixes
+            // progress envelopes with variants the driver has no
+            // mapping for. Debug, not warn: an unrecognised variant is
+            // this transport's normal case, not a fault.
+            stats.unrecognised_envelopes += 1;
+            tracing::debug!(
+                %err,
+                "stdout progress: driver declined an envelope; skipping",
+            );
+            Vec::new()
         }
     }
 }

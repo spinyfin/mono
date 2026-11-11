@@ -108,13 +108,15 @@ pub async fn ingest(journal: &SharedJournal, execution: &ExecutionRecord, bytes:
     let file_ingress = execution.observation.as_ref().is_some_and(|o| o.file.is_some());
     // The driver's selected source is authoritative. Codex hooks carry policy
     // observations; its rollout is the progress feed, so never emit both.
-    let observations = if file_ingress || subagent {
+    let observations = if file_ingress {
         Vec::new()
     } else {
         let event = driver.normalize_progress_event(&raw)?;
         let mut wire = worker_event::to_wire(&event);
+        wire.from_subagent = subagent;
         let mut observations = Vec::new();
         if let Some(boss_protocol_spoke::v1::worker_event::Event::Stop(stop)) = &mut wire.event
+            && !subagent
             && let Some(path) = &path
         {
             match crate::transcripts::watermark(journal, execution, path).await {
@@ -136,6 +138,23 @@ pub async fn ingest(journal: &SharedJournal, execution: &ExecutionRecord, bytes:
                     Admission::Lifecycle,
                 )),
             }
+        }
+        if raw["_boss_payload_truncated"].as_bool() == Some(true) {
+            observations.push((
+                Record {
+                    observed: Some(observed.clone()),
+                    run: Some(run.clone()),
+                    body: Some(record::Body::Gap(Gap {
+                        resource: format!("hook:{id}:{sequence}"),
+                        reason:
+                            "oversized hook payload truncated by the forwarder; fields beyond the bound are unavailable"
+                                .into(),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+                Admission::Lifecycle,
+            ));
         }
         observations.push((
             Record {

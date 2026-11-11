@@ -22,6 +22,7 @@ use boss_protocol::{
 
 pub mod discovery;
 pub mod git_store_guard;
+pub mod hook_settings;
 pub mod initial_prompt;
 pub mod transcript_store;
 

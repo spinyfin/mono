@@ -398,6 +398,8 @@ message Capacity {
 // JSON bytes so plugin-specific objects survive unchanged.
 message WorkerEvent {
   string session_id = 1;
+  // Subagent events are progress evidence, never parent turn boundaries.
+  bool from_subagent = 2;
   oneof event {
     SessionStart session_start = 10;
     string user_prompt = 11;

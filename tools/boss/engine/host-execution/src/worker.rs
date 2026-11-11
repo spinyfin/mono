@@ -355,12 +355,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             .and_then(|text| text.parse().ok())
             .filter(|pid: &u64| *pid > 0);
         record.pane_id = pane_id;
-        record.pid = pid;
-        if let Some(observation) = &mut record.observation {
-            observation.pid_start = pid
-                .and_then(|pid| crate::process::process_snapshot(pid as i32).ok())
-                .map(|p| p.start);
-        }
+        adopt_pid(&mut record, pid);
         record.phase = Phase::Alive;
         self.persist(&record)?;
         let pane = self.wait_for_brief(&record).await;
@@ -428,26 +423,12 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                 } else {
                     serde_json::from_slice(&spawn.settings_json)?
                 };
-                let hooks = settings
-                    .as_object_mut()
-                    .context("settings must be an object")?
-                    .entry("hooks")
-                    .or_insert_with(|| serde_json::json!({}))
-                    .as_object_mut()
-                    .context("hooks must be an object")?;
-                for (name, entries) in wiring.hooks {
-                    hooks
-                        .entry(name)
-                        .or_insert_with(|| serde_json::json!([]))
-                        .as_array_mut()
-                        .context("hook entries must be an array")?
-                        .extend(
-                            entries
-                                .as_array()
-                                .context("driver hook entries must be an array")?
-                                .clone(),
-                        );
-                }
+                boss_engine_driver::hook_settings::replace_forwarders(
+                    &mut settings,
+                    wiring.hooks,
+                    &config.forwarder_binary,
+                )
+                .map_err(anyhow::Error::msg)?;
                 spawn.settings_json = serde_json::to_vec(&settings)?;
                 None
             }
@@ -554,13 +535,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             PaneLife::Alive | PaneLife::Exited | PaneLife::BriefNotDelivered => {
                 record.phase = Phase::Alive;
                 record.pane_id = (!pane.pane_id.is_empty()).then(|| pane.pane_id.clone());
-                record.pid = (pane.pid > 0).then_some(pane.pid);
-                if let Some(observation) = &mut record.observation {
-                    observation.pid_start = record
-                        .pid
-                        .and_then(|pid| crate::process::process_snapshot(pid as i32).ok())
-                        .map(|p| p.start);
-                }
+                adopt_pid(&mut record, (pane.pid > 0).then_some(pane.pid));
                 self.persist(&record)?;
                 Ok(outcome(command, ResultCode::Ok, error.to_string(), Some(pane)))
             }
@@ -603,13 +578,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                     PaneLife::Alive | PaneLife::Exited | PaneLife::BriefNotDelivered => {
                         record.phase = Phase::Alive;
                         record.pane_id = (!pane.pane_id.is_empty()).then(|| pane.pane_id.clone());
-                        record.pid = (pane.pid > 0).then_some(pane.pid);
-                        if let Some(observation) = &mut record.observation {
-                            observation.pid_start = record
-                                .pid
-                                .and_then(|pid| crate::process::process_snapshot(pid as i32).ok())
-                                .map(|p| p.start);
-                        }
+                        adopt_pid(&mut record, (pane.pid > 0).then_some(pane.pid));
                         self.persist(&record)?;
                         Ok(outcome(command, ResultCode::Ok, String::new(), Some(pane)))
                     }
@@ -1025,7 +994,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                 PaneLife::Alive | PaneLife::Exited | PaneLife::BriefNotDelivered => {
                     record.phase = Phase::Alive;
                     record.pane_id = (!pane.pane_id.is_empty()).then(|| pane.pane_id.clone());
-                    record.pid = (pane.pid > 0).then_some(pane.pid);
+                    adopt_pid(record, (pane.pid > 0).then_some(pane.pid));
                     self.persist(record)?;
                     Box::pin(self.settle(record, pane)).await
                 }
@@ -1304,6 +1273,15 @@ fn outcome(command: &Command, code: ResultCode, reason: impl Into<String>, pane:
         code: code.into(),
         reason: reason.into(),
         value: pane.map(command_result::Value::Pane),
+    }
+}
+
+fn adopt_pid(record: &mut ExecutionRecord, pid: Option<u64>) {
+    record.pid = pid;
+    if let Some(observation) = &mut record.observation {
+        observation.pid_start = pid
+            .and_then(|pid| crate::process::process_snapshot(pid as i32).ok())
+            .map(|process| process.start);
     }
 }
 
@@ -1681,6 +1659,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sweep_adoption_captures_process_start_for_hook_authentication() {
+        let root = tempfile::tempdir().unwrap();
+        let supervisor = supervisor(root.path(), Arc::new(FakeTmux::default())).await;
+        seed(&supervisor.store, Phase::Launching);
+        let mut record = stored(&supervisor.store);
+        record.observation = Some(ObservationConfig {
+            workspace: root.path().into(),
+            pending: root.path().join("pending"),
+            file: None,
+            pid_start: None,
+        });
+        let pid = std::process::id() as u64;
+        supervisor
+            .settle(
+                &mut record,
+                &PaneState {
+                    life: PaneLife::Alive as i32,
+                    pid,
+                    pane_id: "%1".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let saved = stored(&supervisor.store);
+        assert_eq!(saved.phase, Phase::Alive);
+        assert_eq!(saved.pid, Some(pid));
+        assert_eq!(
+            saved.observation.unwrap().pid_start,
+            Some(crate::process::process_snapshot(pid as i32).unwrap().start)
+        );
+    }
+
+    #[tokio::test]
     async fn observation_wiring_preserves_policy_and_retains_home_until_durable_drain() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
@@ -1709,8 +1721,13 @@ mod tests {
             )
             .unwrap();
         let settings: Value = serde_json::from_slice(&spawn.settings_json).unwrap();
-        assert_eq!(settings["hooks"]["PreToolUse"][0], original);
-        assert!(settings["hooks"]["PreToolUse"].as_array().unwrap().len() > 1);
+        assert!(
+            settings["hooks"]["PreToolUse"][0]
+                .to_string()
+                .contains("/test/boss-event"),
+            "forwarder stays ahead of policy guards"
+        );
+        assert!(settings["hooks"]["PreToolUse"].as_array().unwrap().contains(&original));
         assert!(settings["hooks"]["Stop"].to_string().contains("/test/boss-event"));
         let observation = record.observation.as_ref().unwrap();
         assert!(observation.file.is_none());
@@ -2955,7 +2972,8 @@ mod tests {
         assert!(envs.contains(&"KEEP_ME=yes".to_owned()), "{envs:?}");
         assert!(envs.iter().filter(|e| e.contains("forged")).count() == 0, "{envs:?}");
         assert!(!workspace.join(".boss-spoke-settings.json").exists());
-        let record = decode(&supervisor.store.load(&run_id, "token").unwrap().unwrap()).unwrap();
+        let run = command.run.as_ref().unwrap();
+        let record = decode(&supervisor.store.load(&run.run_id, &run.spawn_token).unwrap().unwrap()).unwrap();
         let settings = record.settings_file.expect("settings recorded");
         assert!(settings.starts_with(shared_homes()));
         use std::os::unix::fs::PermissionsExt;
@@ -2965,7 +2983,7 @@ mod tests {
         );
         // Stop removes it with the home.
         let mut stop = stop_command();
-        stop.run.as_mut().unwrap().run_id = run_id;
+        stop.run = command.run.clone();
         let stopped = supervisor.execute(&stop, false, 1).await;
         assert_eq!(stopped.code, ResultCode::Ok as i32, "{}", stopped.reason);
         assert!(!settings.exists());
