@@ -519,6 +519,16 @@ mod tests {
             })
             .sum();
         assert_eq!(shipped, body.len());
+        assert!(
+            journal.lock().unwrap().source(&run, "drained").unwrap().is_some(),
+            "the run must drain once receipts resume"
+        );
+        assert!(
+            !records(&journal)
+                .iter()
+                .any(|r| matches!(&r.body, Some(record::Body::Gap(_)))),
+            "no gap may be written during recovery"
+        );
     }
 
     #[tokio::test]
