@@ -346,6 +346,82 @@ fn classification_statements_do_not_grow_with_the_cards_classified() {
     }
 }
 
+/// An operator pause that leaves reviews running: the state where idle active
+/// cards pile up, because the pause stops the orphan sweep redispatching them.
+fn operator_new_work_pause(conn: &Connection) {
+    conn.execute(
+        "INSERT INTO metadata(key, value) VALUES ('dispatch_paused', '1'), ('dispatch_paused_origin', 'operator'),
+         ('dispatch_paused_scope', 'new_work')",
+        [],
+    )
+    .unwrap();
+}
+
+/// Under an operator pause the pause's exemptions are read for the whole set
+/// of redispatchable idle cards together: half the cards and all of them run
+/// the same statements, with both exempt (critical main-pool) and held
+/// candidates in each, and the same ones are held as the per-item rule holds.
+#[test]
+fn pause_exemptions_are_read_for_the_whole_set() {
+    let (_dir, db) = open_seeded("wait-scale-pause");
+    let conn = db.connect().unwrap();
+    // 6469 and 6477 are redispatchable idle active cards in the first half;
+    // one is exempt as critical work, the other is held.
+    conn.execute("UPDATE tasks SET priority = 'critical' WHERE id = 'task_ws06469'", [])
+        .unwrap();
+    operator_new_work_pause(&conn);
+    let tasks: Vec<Task> = all_tasks(&conn)
+        .into_iter()
+        .filter(|task| task.product_id == PRODUCT)
+        .collect();
+    let whole: Vec<&Task> = tasks.iter().collect();
+    let half: Vec<&Task> = tasks.iter().filter(|task| in_first_half_of_its_group(task)).collect();
+    let (whole_cost, half_cost) = (classify_cost(&conn, &whole), classify_cost(&conn, &half));
+    println!("wait-scale paused classify whole={whole_cost:?} half={half_cost:?}");
+    assert_eq!(
+        whole_cost.idle_active.statements, half_cost.idle_active.statements,
+        "idle active: statements must not grow with the cards under a pause"
+    );
+    // The unpaused count plus three metadata reads and the two set reads.
+    assert_eq!(whole_cost.idle_active.statements, 9 + 4);
+    let reasons = |tasks: &[&Task]| -> BTreeMap<String, String> {
+        let ids: Vec<&str> = tasks.iter().map(|task| task.id.as_str()).collect();
+        let latest = latest_execution_statuses(&conn, &ids).unwrap();
+        let candidates: Vec<Candidate<'_>> = tasks
+            .iter()
+            .map(|task| Candidate {
+                task,
+                latest: latest.get(&task.id),
+            })
+            .collect();
+        let (classified, _) = unscheduled_wait::classify(&conn, &candidates, None).unwrap();
+        classified
+            .into_iter()
+            .filter_map(|(id, wait)| wait.reason.map(|reason| (id, reason)))
+            .collect()
+    };
+    let reasons = reasons(&whole);
+    assert_eq!(
+        reasons["task_ws06469"], "awaiting_redispatch",
+        "critical work is exempt"
+    );
+    assert_eq!(reasons["task_ws06477"], "dispatch_paused", "other work is held");
+
+    // The set-based read holds exactly what the per-item rule holds.
+    let pause = crate::dispatch_admission::PersistedPause::load(&conn).unwrap().unwrap();
+    let held = pause.held_among(&conn, &whole).unwrap();
+    // (The per-item rule errors on a tombstoned card; those are never swept.)
+    for task in whole.iter().filter(|task| task.deleted_at.is_none()) {
+        assert_eq!(
+            held.contains(&task.id),
+            pause.holds(&conn, &task.id).unwrap(),
+            "{}",
+            task.id
+        );
+    }
+    assert!(held.contains("task_ws06477") && !held.contains("task_ws06469"));
+}
+
 fn plan_of(conn: &Connection, sql: &str) -> Vec<String> {
     let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
     let values: Vec<String> = (1..=2)

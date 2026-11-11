@@ -457,18 +457,12 @@ pub(crate) fn dispatch_admission_facts_on(conn: &Connection, work_item_id: &str)
     } else {
         Vec::new()
     };
-    let exempt_from_operator_pause = raw.kind == Some(ExecutionKind::PrReview);
-    let targets_main_pool = match raw.kind {
-        Some(kind) => {
-            kind != ExecutionKind::PrReview
-                && kind != ExecutionKind::AutomationTriage
-                && !matches!(
-                    super::automations::source_automation_id_on(conn, &raw.resolved_work_item_id),
-                    Ok(Some(_))
-                )
-        }
-        None => false,
-    };
+    let (exempt_from_operator_pause, targets_main_pool) = pause_exemption_facts(raw.kind, || {
+        matches!(
+            super::automations::source_automation_id_on(conn, &raw.resolved_work_item_id),
+            Ok(Some(_))
+        )
+    });
     Ok(DispatchAdmissionFacts::builder()
         .resolved_work_item_id(raw.resolved_work_item_id)
         .maybe_ineligible_reason(raw.ineligible_reason)
@@ -480,6 +474,19 @@ pub(crate) fn dispatch_admission_facts_on(conn: &Connection, work_item_id: &str)
         .is_critical(raw.is_critical)
         .exempt_from_operator_pause(exempt_from_operator_pause)
         .build())
+}
+
+/// `(exempt_from_operator_pause, targets_main_pool)` for an item whose
+/// governing execution kind is `kind`. The single decision both the per-item
+/// admission facts and the set-based [`PersistedPause::held_among`] use, so
+/// the two cannot drift. `from_automation` is only asked when it matters.
+fn pause_exemption_facts(kind: Option<ExecutionKind>, from_automation: impl FnOnce() -> bool) -> (bool, bool) {
+    let exempt = kind == Some(ExecutionKind::PrReview);
+    let targets_main_pool = match kind {
+        Some(kind) => kind != ExecutionKind::PrReview && kind != ExecutionKind::AutomationTriage && !from_automation(),
+        None => false,
+    };
+    (exempt, targets_main_pool)
 }
 
 /// The persisted dispatch pause, read once for any number of items.
@@ -510,8 +517,8 @@ impl PersistedPause {
     }
 
     /// Whether this pause holds `id`, with the same exemptions as coordinator
-    /// admission. Only an overridable pause exempts anything, so only then
-    /// are the item's admission facts read.
+    /// admission. The per-item reference [`Self::held_among`] is tested against.
+    #[cfg(test)]
     pub(crate) fn holds(&self, conn: &Connection, id: &str) -> Result<bool> {
         use boss_engine_storage_values::dispatch_pause::exempts_work;
         if !self.overridable {
@@ -523,6 +530,76 @@ impl PersistedPause {
             facts.exempt_from_operator_pause,
             facts.targets_main_pool && facts.is_critical,
         ))
+    }
+
+    /// The ids of `tasks` this pause holds: [`Self::holds`] for each, from a
+    /// fixed number of statements however many there are. Only an overridable
+    /// pause exempts anything, so only then are the governing execution kinds
+    /// and automation sources read, once for the whole set.
+    pub(crate) fn held_among(&self, conn: &Connection, tasks: &[&Task]) -> Result<HashSet<String>> {
+        use boss_engine_storage_values::dispatch_pause::exempts_work;
+        if !self.overridable || tasks.is_empty() {
+            return Ok(tasks.iter().map(|task| task.id.clone()).collect());
+        }
+        let ids: Vec<&str> = tasks.iter().map(|task| task.id.as_str()).collect();
+        let ids_json = super::query_ensure::id_array(&ids);
+
+        // The governing execution of `dispatch_admission_facts_on`: the
+        // newest live run, else the newest run if it is not terminal.
+        let mut stmt = conn.prepare(
+            "SELECT e.work_item_id, e.kind, e.status
+             FROM json_each(?1) item
+             JOIN work_executions e ON e.work_item_id = item.value
+             WHERE e.kind <> 'progression'
+             ORDER BY e.work_item_id, e.created_at DESC, e.id DESC",
+        )?;
+        let mut live: HashMap<String, ExecutionKind> = HashMap::new();
+        let mut latest: HashMap<String, (ExecutionKind, ExecutionStatus)> = HashMap::new();
+        let mut rows = stmt.query([&ids_json])?;
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let kind_raw: String = row.get(1)?;
+            let kind = kind_raw.parse::<ExecutionKind>().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let status_raw: String = row.get(2)?;
+            let status = status_raw
+                .parse::<ExecutionStatus>()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if status.is_live() {
+                live.entry(id.clone()).or_insert(kind.clone());
+            }
+            latest.entry(id).or_insert((kind, status));
+        }
+        let mut stmt = conn.prepare(
+            "SELECT t.id FROM json_each(?1) item
+             JOIN tasks t ON t.id = item.value
+             WHERE t.deleted_at IS NULL AND t.source_automation_id IS NOT NULL",
+        )?;
+        let from_automation: HashSet<String> = stmt
+            .query_map([&ids_json], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+
+        Ok(tasks
+            .iter()
+            .filter(|task| {
+                let governing = live.get(&task.id).or_else(|| {
+                    latest
+                        .get(&task.id)
+                        .filter(|(_, status)| !status.is_terminal())
+                        .map(|(k, _)| k)
+                });
+                let kind = match governing {
+                    Some(kind) => kind.clone(),
+                    None => super::exec_status_helpers::execution_kind_for_task_kind(&task.kind),
+                };
+                let (review, targets_main) = pause_exemption_facts(Some(kind), || from_automation.contains(&task.id));
+                !exempts_work(
+                    self.overridable,
+                    review,
+                    targets_main && critical_priority::is_critical(&task.priority),
+                )
+            })
+            .map(|task| task.id.clone())
+            .collect())
     }
 }
 

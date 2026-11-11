@@ -471,16 +471,26 @@ fn classify_idle_active(conn: &Connection, tasks: &[&Task], waits: &mut HashMap<
     let review_recovery: HashSet<String> = stmt
         .query_map([id_array(&ids)], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<_>>()?;
-    // Read at most once, and only when the sweep would redispatch something.
-    let mut pause: Option<Option<super::dispatch_admission::PersistedPause>> = None;
+    // Read at most once, and only when the sweep would redispatch something;
+    // the pause's exemptions are then read for all of those items together.
+    let redispatchable: Vec<&Task> = rest
+        .iter()
+        .copied()
+        .filter(|task| sweepable.contains(&task.id) && !review_owned.contains(&task.id))
+        .collect();
+    let paused = match redispatchable.is_empty() {
+        true => HashSet::new(),
+        false => match super::dispatch_admission::PersistedPause::load(conn)? {
+            Some(pause) => pause.held_among(conn, &redispatchable)?,
+            None => HashSet::new(),
+        },
+    };
     for task in rest {
         let code = if sweepable.contains(&task.id) && !review_owned.contains(&task.id) {
-            if pause.is_none() {
-                pause = Some(super::dispatch_admission::PersistedPause::load(conn)?);
-            }
-            match pause.as_ref().and_then(Option::as_ref) {
-                Some(pause) if pause.holds(conn, &task.id)? => DISPATCH_WAIT_REASON_DISPATCH_PAUSED,
-                _ => DISPATCH_WAIT_REASON_AWAITING_REDISPATCH,
+            if paused.contains(&task.id) {
+                DISPATCH_WAIT_REASON_DISPATCH_PAUSED
+            } else {
+                DISPATCH_WAIT_REASON_AWAITING_REDISPATCH
             }
         } else if review_owned.contains(&task.id) || review_recovery.contains(&task.id) {
             DISPATCH_WAIT_REASON_AWAITING_REVIEW
