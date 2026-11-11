@@ -1,6 +1,28 @@
 use super::*;
 
 #[test]
+fn conflict_prompt_uses_the_diagnosed_tip_independently_of_the_recorded_base() {
+    let mut attempt = sample_conflict_attempt();
+    let mut diagnosis: crate::conflict_diagnosis::ConflictDiagnosis =
+        serde_json::from_str(attempt.conflict_diagnosis.as_deref().unwrap()).unwrap();
+    diagnosis.schema_version = 2;
+    diagnosis.base_sha = "fetched-tip".into();
+    attempt.conflict_diagnosis = Some(serde_json::to_string(&diagnosis).unwrap());
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&revision_task_with_created_via(None, "merge-conflict:crz_frag_01"))
+            .workspace_path(Path::new("/tmp/workspace"))
+            .conflict_attempt(&attempt)
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(prompt.contains("Schema v2. Base sha `fetched-tip`"), "{prompt}");
+    assert!(prompt.contains("`src/lib.rs`"));
+}
+
+#[test]
 fn every_revision_rebases_before_edits_and_preserves_the_existing_gate() {
     for bazel in [true, false] {
         for recovered in [true, false] {

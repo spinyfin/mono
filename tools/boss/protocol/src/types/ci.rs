@@ -296,7 +296,8 @@ fn default_review_watch_event_source() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConflictHotspotReport {
     pub product_id: String,
-    /// Number of `conflict_resolutions` rows scanned for this product.
+    /// Number of fetched-base diagnoses included for this product.
+    /// Historical diagnoses without a fetched base tip are excluded.
     pub total_events: u64,
     /// Per-file conflict frequency, most-frequent first, capped to the
     /// requested top-N.

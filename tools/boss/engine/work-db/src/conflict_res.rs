@@ -823,9 +823,9 @@ impl WorkDb {
     /// meaningful within one repo). `top_n` caps each ranked list
     /// (file/pair frequency) to its highest-count entries; class
     /// counts are never truncated since there are only a handful of
-    /// classes. Rows with no `conflict_diagnosis` still count toward
-    /// `total_events` and `class_counts` (via the `conflict_class`
-    /// column) but contribute nothing to file/pair frequency.
+    /// classes. Only version 2 diagnoses (fetched base tip) are included.
+    /// Historical diagnoses remain stored but are excluded from every count
+    /// because the recorded PR base could produce a trivially clean merge.
     pub fn conflict_hotspots(&self, product_id: &str, top_n: usize) -> Result<ConflictHotspotReport> {
         let conn = self.connect()?;
         let mut stmt =
@@ -843,15 +843,18 @@ impl WorkDb {
 
         for row in rows {
             let (diagnosis_json, conflict_class) = row?;
+            let Some(json) = diagnosis_json else { continue };
+            let Ok(diagnosis) = serde_json::from_str::<boss_conflict_diagnosis::ConflictDiagnosis>(&json) else {
+                continue;
+            };
+            if diagnosis.schema_version != 2 {
+                continue;
+            }
             total_events += 1;
             *class_counts
                 .entry(conflict_class.unwrap_or_else(|| "unknown".to_owned()))
                 .or_insert(0) += 1;
 
-            let Some(json) = diagnosis_json else { continue };
-            let Ok(diagnosis) = serde_json::from_str::<boss_conflict_diagnosis::ConflictDiagnosis>(&json) else {
-                continue;
-            };
             let mut paths: Vec<String> = diagnosis.files.into_iter().map(|f| f.path).collect();
             paths.sort();
             paths.dedup();

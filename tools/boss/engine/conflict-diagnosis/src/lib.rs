@@ -16,8 +16,9 @@
 //! prompt composer (`runner::compose_execution_prompt`) renders the
 //! markdown surface.
 //!
-//! The collector is intentionally *pure-ish*: it shells out to `git`
-//! but doesn't mutate working state. A failed probe (git missing,
+//! The collector shells out to `git` without changing the checkout.
+//! The current-base entry point fetches into a temporary private ref.
+//! A failed probe (git missing,
 //! refs unresolvable, no conflicts after all) returns a populated
 //! `ConflictDiagnosis` with `files = []` and an `error` field so the
 //! worker prompt can still render something sensible — better than
@@ -38,6 +39,8 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 mod classify;
+mod current_base;
+pub use current_base::collect_current_base;
 #[cfg(test)]
 mod ssh_tests;
 pub use classify::classify_conflict_class;
@@ -46,8 +49,8 @@ pub use classify::classify_conflict_class;
 /// and stored in `conflict_resolutions.conflict_diagnosis`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConflictDiagnosis {
-    /// Schema version. Bump when fields are added/removed; consumers
-    /// can refuse to render unknown versions.
+    /// Version 1 probes caller-supplied endpoints. Version 2 has the same
+    /// fields but guarantees `base_sha` is the freshly fetched branch tip.
     pub schema_version: u32,
     /// Sha of the base ref (`main` at probe time).
     pub base_sha: String,

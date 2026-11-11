@@ -73,7 +73,7 @@ async fn actual_daemon_drains_pending_hook_without_another_peer_connection() {
     }
     assert!(!source.exists(), "daemon independently drained the pending event");
     drop(daemon);
-    let journal = Journal::open(&hub.root(), "host", Limits::default()).unwrap();
+    let journal = open_after_daemon_exit(&hub.root());
     assert!(
         journal
             .source(

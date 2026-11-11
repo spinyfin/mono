@@ -867,8 +867,8 @@ impl ExecutionCoordinator {
     /// resolve the `conflict_resolutions` row a merge-conflict revision was
     /// spawned from (via `created_via = "merge-conflict:<crz_id>"`) and
     /// collect its diagnosis. No-op when the revision's provenance is not a
-    /// merge conflict (e.g. operator/CI-fix revisions), or when a diagnosis
-    /// is already stored (a respawn).
+    /// merge conflict (e.g. operator/CI-fix revisions). Respawns probe again:
+    /// the base branch may have advanced since the previous diagnosis.
     async fn collect_revision_conflict_diagnosis_pre_spawn(
         &self,
         execution: &WorkExecution,
@@ -902,17 +902,10 @@ impl ExecutionCoordinator {
                 return;
             }
         };
-        if attempt.conflict_diagnosis.is_some() {
-            tracing::debug!(
-                attempt_id = %attempt.id,
-                "collect_conflict_diagnosis: diagnosis already present on linked attempt; skipping",
-            );
-            return;
-        }
         self.collect_conflict_diagnosis_for_attempt(&attempt, lease).await;
     }
 
-    /// Run `conflict_diagnosis::collect` in the leased workspace and persist
+    /// Fetch the base branch and collect a diagnosis in the leased workspace; persist
     /// the result on `attempt`. Shared by the bespoke `conflict_resolution`
     /// path and the Phase 3 merge-conflict revision path. Best-effort —
     /// failures are logged but never propagate.
@@ -921,28 +914,29 @@ impl ExecutionCoordinator {
         attempt: &crate::work::ConflictResolution,
         lease: &CubeWorkspaceLease,
     ) {
-        let base_sha = attempt.base_sha_at_trigger.as_deref().unwrap_or("");
         let head_sha = attempt.head_sha_before.as_deref().unwrap_or("");
-        if base_sha.is_empty() || head_sha.is_empty() {
+        if attempt.base_branch.is_empty() || head_sha.is_empty() {
             tracing::debug!(
                 attempt_id = %attempt.id,
-                "collect_conflict_diagnosis: missing base/head sha; skipping",
+                "collect_conflict_diagnosis: missing base branch/head sha; skipping",
             );
             return;
         }
 
-        let diagnosis = match conflict_diagnosis::collect(&lease.workspace_path, base_sha, head_sha).await {
-            Ok(d) => d,
-            Err(err) => {
-                tracing::warn!(
-                    attempt_id = %attempt.id,
-                    workspace_path = %lease.workspace_path.display(),
-                    ?err,
-                    "collect_conflict_diagnosis: git spawn failed; using errored diagnosis",
-                );
-                conflict_diagnosis::ConflictDiagnosis::errored(base_sha, head_sha, format!("git spawn failed: {err}"))
-            }
-        };
+        let diagnosis =
+            match conflict_diagnosis::collect_current_base(&lease.workspace_path, &attempt.base_branch, head_sha).await
+            {
+                Ok(d) => d,
+                Err(err) => {
+                    tracing::warn!(
+                        attempt_id = %attempt.id,
+                        workspace_path = %lease.workspace_path.display(),
+                        ?err,
+                        "collect_conflict_diagnosis: git spawn failed; using errored diagnosis",
+                    );
+                    conflict_diagnosis::ConflictDiagnosis::errored("", head_sha, format!("git spawn failed: {err}"))
+                }
+            };
 
         let json = match serde_json::to_string(&diagnosis) {
             Ok(j) => j,
