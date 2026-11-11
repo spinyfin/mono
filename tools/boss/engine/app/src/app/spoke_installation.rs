@@ -107,7 +107,11 @@ impl Prepared {
         self.bound.stream.clone()
     }
 
-    pub(super) fn install(self, inner: Arc<dyn HostAdapterProvider>) -> Arc<dyn HostAdapterProvider> {
+    pub(super) fn install(
+        self,
+        inner: Arc<dyn HostAdapterProvider>,
+        signals: Arc<dyn boss_execution_contracts::DriverSignals>,
+    ) -> Arc<dyn HostAdapterProvider> {
         let Self { db, bound, hosts } = self;
         let provider = Arc::new(SpokeHostAdapterProvider::new(
             inner,
@@ -115,6 +119,7 @@ impl Prepared {
             Arc::new(db.clone()),
             Arc::new(Composer { db, hosts }),
             SpokeAdapterConfig::builder().build(),
+            signals,
         ));
         boss_task_scope::spawn(async move {
             if let Err(error) = bound.serve().await {

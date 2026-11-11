@@ -1877,9 +1877,10 @@ impl ServerState {
                 ));
             }
             if let Some(installation) = spoke_installation {
-                execution_coordinator_inner.set_host_adapter_provider(
-                    installation.install(execution_coordinator_inner.host_adapter_provider()),
-                );
+                execution_coordinator_inner.set_host_adapter_provider(installation.install(
+                    execution_coordinator_inner.host_adapter_provider(),
+                    live_worker_states.clone(),
+                ));
             }
             if let Some(provider) = host_adapter_provider_override {
                 execution_coordinator_inner.set_host_adapter_provider(provider);

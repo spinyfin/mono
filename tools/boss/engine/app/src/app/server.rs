@@ -417,6 +417,7 @@ impl Drop for CapabilityDiscoveryPendingGuard {
 #[cfg(test)]
 struct HubStreamGuard(Arc<ServerState>);
 
+#[cfg(test)]
 impl Drop for HubStreamGuard {
     fn drop(&mut self) {
         self.0.set_hub_stream(None);
