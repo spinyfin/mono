@@ -43,6 +43,8 @@ pub const HOST_ENV_DENY: &[&str] = &[
     "TMUX",
     "TMUX_TMPDIR",
     "BOSS_CONTROL_SOCKET",
+    "BOSS_SOCKET_PATH",
+    "BOSS_BIN",
     "BOSS_EVENTS_SOCKET",
     EVENT_SPOOL_ENV,
 ];
@@ -115,6 +117,9 @@ pub struct ExecutionRecord {
     pub reclaim_error: Option<String>,
     #[serde(default)]
     pub observation: Option<ObservationConfig>,
+    #[serde(default)]
+    #[builder(default)]
+    pub worker_outputs: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +135,9 @@ pub trait ExecutionStore: Send + Sync {
     fn save(&self, run_id: &str, spawn_token: &str, bytes: &[u8]) -> Result<()>;
     fn assigned(&self) -> Result<Vec<Vec<u8>>>;
     fn observation_paths(&self) -> Option<(PathBuf, PathBuf)> {
+        None
+    }
+    fn worker_api_paths(&self) -> Option<(PathBuf, PathBuf)> {
         None
     }
     fn observations_drained(&self, _record: &ExecutionRecord) -> Result<bool> {
@@ -274,6 +282,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             reclaimed: false,
             reclaim_error: None,
             observation: None,
+            worker_outputs: output_environment.clone(),
         };
         self.persist(&record)?;
         if interrupted {
@@ -492,6 +501,10 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             environment.remove(*name);
         }
         environment.extend(output_environment);
+        if let Some((socket, binary)) = self.store.worker_api_paths() {
+            environment.insert("BOSS_SOCKET_PATH".into(), socket.display().to_string());
+            environment.insert("BOSS_BIN".into(), binary.display().to_string());
+        }
         insert_color_environment(&mut environment);
         environment.insert(TMUX_SPAWN_TOKEN_ENV.to_owned(), record.spawn_token.clone());
         environment.insert(SESSION_SCHEMA_ENV.to_owned(), SESSION_SCHEMA.to_owned());

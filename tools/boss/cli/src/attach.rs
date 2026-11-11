@@ -91,6 +91,9 @@ async fn run_attach_submit(ctx: &RunContext, path: PathBuf, caption: Option<Stri
         })?;
 
     match response {
+        FrontendEvent::WorkerGatewayResult { status, value } => {
+            crate::propose::print_gateway_result(ctx, &status, &value)
+        }
         FrontendEvent::AttachmentStored {
             attachment,
             already_stored,
@@ -158,6 +161,9 @@ async fn run_attach_list(ctx: &RunContext) -> Result<(), CliError> {
         })?;
 
     match response {
+        FrontendEvent::WorkerGatewayResult { status, value } => {
+            crate::propose::print_gateway_result(ctx, &status, &value)
+        }
         FrontendEvent::AttachmentsList {
             work_item_id,
             attachments,

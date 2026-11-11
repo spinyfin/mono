@@ -44,6 +44,7 @@ members = [
   "tools/boss/engine/spoke-preflight",
   "tools/boss/engine/spoke-outbound",
   "tools/boss/engine/spoke",
+  "tools/boss/engine/spoke-worker-api",
   "tools/boss/engine/host-execution",
   "tools/boss/engine/core",
   "tools/boss/engine/core/runtime",

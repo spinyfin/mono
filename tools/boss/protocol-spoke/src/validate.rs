@@ -586,6 +586,7 @@ impl Validate for v1::TranscriptDelta {
 impl Validate for v1::ArtifactChunk {
     fn validate(&self) -> Check {
         nonempty("artifact.artifact_id", &self.artifact_id)?;
+        bounded("artifact.metadata_json", self.metadata_json.len(), MAX_PAYLOAD_BYTES)?;
         specified::<v1::ArtifactKind>("artifact.kind", self.kind)?;
         bounded("artifact.data", self.data.len(), MAX_CHUNK_BYTES)?;
         digest("artifact.sha256", &self.sha256)?;

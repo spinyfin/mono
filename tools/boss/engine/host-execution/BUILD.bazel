@@ -20,6 +20,7 @@ rust_library(
         "//tools/boss/engine/spoke:__pkg__",
         "//tools/boss/engine/spoke-adapter:__pkg__",
         "//tools/boss/engine/spoke-preflight:__pkg__",
+        "//tools/boss/engine/spoke-worker-api:__pkg__",
         "//tools/boss/engine/work-db:__pkg__",
     ],
     deps = [

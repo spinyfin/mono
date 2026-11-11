@@ -14,6 +14,7 @@ rust_library(
         "//tools/boss/bossctl:__pkg__",
         "//tools/boss/engine/app:__pkg__",
         "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/spoke-worker-api:__pkg__",
         "//tools/boss/engine/work-db:__pkg__",
     ],
     deps = all_crate_deps(normal = True) + [

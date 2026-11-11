@@ -38,6 +38,7 @@ rust_library(
         "//tools/boss/engine/spoke-journal:__pkg__",
         "//tools/boss/engine/spoke-outbound:__pkg__",
         "//tools/boss/engine/spoke-stream:__pkg__",
+        "//tools/boss/engine/spoke-worker-api:__pkg__",
         "//tools/boss/engine/work-db:__pkg__",
         "//tools/boss/spoke-credentials:__pkg__",
     ],

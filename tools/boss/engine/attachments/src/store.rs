@@ -31,8 +31,33 @@ use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use boss_protocol::ProposalSubmissionError;
 use boss_protocol::{ATTACHMENT_MAX_BYTES, ATTACHMENT_MAX_PIXELS_PER_SIDE, AttachmentMediaType, ProposalFieldError};
 use sha2::{Digest, Sha256};
+
+const MAX_CAPTION_CHARS: usize = 240;
+
+/// Validate the worker-supplied caption. Absent is fine; blank is normalised
+/// to absent; overlong is a refusal rather than a silent trim, on the same
+/// principle as every other cap here — the worker should know what got
+/// stored.
+pub fn validate_caption(caption: Option<&str>) -> std::result::Result<String, ProposalSubmissionError> {
+    let Some(caption) = caption else {
+        return Ok(String::new());
+    };
+    let trimmed = caption.trim();
+    if trimmed.chars().count() > MAX_CAPTION_CHARS {
+        return Err(ProposalSubmissionError::validation(vec![ProposalFieldError::new(
+            "caption",
+            format!(
+                "caption is {} characters; the cap is {MAX_CAPTION_CHARS}. Say what the image \
+                 shows in one line and put the detail in the PR body.",
+                trimmed.chars().count()
+            ),
+        )]));
+    }
+    Ok(trimmed.to_owned())
+}
 
 use crate::image::{self, HEADER_SCAN_BYTES};
 

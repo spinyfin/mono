@@ -1657,6 +1657,7 @@ dependencies = [
  "boss-spoke-journal",
  "boss-spoke-outbound",
  "boss-spoke-preflight",
+ "boss-spoke-worker-api",
  "boss-tmux",
  "boss-transcript-tail",
  "clap",
@@ -1829,6 +1830,28 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+]
+
+[[package]]
+name = "boss-spoke-worker-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "boss-engine-attachments",
+ "boss-engine-proposal-validation",
+ "boss-host-execution",
+ "boss-protocol",
+ "boss-protocol-spoke",
+ "boss-spoke-journal",
+ "libc",
+ "prost",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

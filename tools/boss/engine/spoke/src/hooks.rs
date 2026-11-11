@@ -1,9 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use boss_engine_driver::DriverRegistry;
-use boss_host_execution::{
-    process::process_snapshot,
-    worker::{ExecutionRecord, Phase},
-};
+use boss_host_execution::worker::ExecutionRecord;
 use boss_protocol_spoke::{
     v1::{Gap, Record, Stamp, record},
     worker_event,
@@ -37,28 +34,7 @@ fn digest_hex(bytes: &[u8]) -> String {
     })
 }
 
-pub fn authenticate(records: &[ExecutionRecord], peer: i32, uid: u32, boot: &str) -> Result<ExecutionRecord> {
-    // SAFETY: geteuid has no preconditions.
-    ensure!(uid == unsafe { libc::geteuid() }, "foreign hook user");
-    let mut pid = peer;
-    for _ in 0..64 {
-        let process = process_snapshot(pid)?;
-        for record in records {
-            if record.boot_id == boot
-                && record.phase != Phase::Terminal
-                && record.pid == Some(pid as u64)
-                && record.observation.as_ref().and_then(|o| o.pid_start) == Some(process.start)
-            {
-                return Ok(record.clone());
-            }
-        }
-        let Some(parent) = process.ppid.filter(|p| *p > 1 && *p != pid) else {
-            break;
-        };
-        pid = parent;
-    }
-    anyhow::bail!("hook peer is not descended from an assigned worker")
-}
+pub use boss_spoke_worker_api::authenticate;
 
 pub async fn ingest(journal: &SharedJournal, execution: &ExecutionRecord, bytes: &[u8], stamp: &Stamp) -> Result<()> {
     ensure!(bytes.len() <= MAX_HOOK, "hook exceeds payload limit");

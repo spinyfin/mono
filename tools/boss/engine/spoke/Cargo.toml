@@ -10,6 +10,7 @@ path = "src/lib.rs"
 
 [dependencies]
 boss-engine-stdout-progress = { path = "../stdout-progress" }
+boss-spoke-worker-api = { path = "../spoke-worker-api" }
 base64 = { workspace = true }
 boss-engine-driver = { path = "../driver" }
 boss-transcript-tail = { path = "../transcript-tail" }

@@ -1094,6 +1094,11 @@ pub enum FrontendEvent {
     ///
     /// Every row lands in `state: proposed` today: the apply pipeline is a
     /// later task, so nothing observes these rows yet.
+    /// Spoke-local receipt or revisioned cached read. Never implies hub acceptance.
+    WorkerGatewayResult {
+        status: String,
+        value: serde_json::Value,
+    },
     ProposalSubmitted {
         proposal: WorkerProposal,
         already_submitted: bool,

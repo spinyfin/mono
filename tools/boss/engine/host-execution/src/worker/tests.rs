@@ -372,6 +372,7 @@ fn seed(store: &MemoryStore, phase: Phase) {
         reclaimed: false,
         reclaim_error: None,
         observation: None,
+        worker_outputs: BTreeMap::new(),
     };
     store
         .save(

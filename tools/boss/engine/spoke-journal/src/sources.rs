@@ -73,7 +73,12 @@ impl Journal {
                 None => checkpoint.len() + LATEST_HOOK_SOURCE.len() + 128,
             };
         }
-        records::admit(&tx, added as u64, Admission::Lifecycle, self.limits)?;
+        let admission = if source.starts_with("worker-blob:") {
+            Admission::Bulk
+        } else {
+            Admission::Lifecycle
+        };
+        records::admit(&tx, added as u64, admission, self.limits)?;
         tx.execute(
             "INSERT INTO sources VALUES(?1,?2,?3,?4) ON CONFLICT(run_id,spawn_token,source) DO UPDATE SET checkpoint=excluded.checkpoint",
             params![run.run_id, run.spawn_token, source, checkpoint],
@@ -111,7 +116,7 @@ impl Journal {
     pub fn prune_sources(&mut self, run: &Run) -> Result<()> {
         let tx = self.db.transaction()?;
         tx.execute(
-            "DELETE FROM sources WHERE run_id=?1 AND spawn_token=?2 AND source!='drained'",
+            "DELETE FROM sources WHERE run_id=?1 AND spawn_token=?2 AND source!='drained' AND source NOT LIKE 'worker-%'",
             params![run.run_id, run.spawn_token],
         )?;
         tx.commit()?;
