@@ -12,6 +12,9 @@ enum BossAttachmentViewerCapture {
     static func start(path: String) {
         guard BossCaptureArgs.shared.isCaptureMode, BossEnginePaths.isIsolatedInstance else { return }
         do {
+            if CommandLine.arguments.contains("--capture-tall-fixture") {
+                try writeTallFixture()
+            }
             let model = ChatViewModel(paths: BossEnginePaths.production())
             let taskID = "attachment-viewer-capture"
             let attachments = try BossReviewGuideAttachmentCapture.attachments(
@@ -32,7 +35,10 @@ enum BossAttachmentViewerCapture {
             DispatchQueue.main.asyncAfter(deadline: .now() + BossCaptureArgs.shared.captureAfter + 0.5) {
                 do {
                     try BossWindowCapture.captureWindow(captureWindow, to: path)
-                    if CommandLine.arguments.contains("--capture-viewer-resize") {
+                    if CommandLine.arguments.contains("--capture-viewer-zoom") {
+                        try captureZoomStates(captureWindow, path: path)
+                        NSApp.terminate(nil)
+                    } else if CommandLine.arguments.contains("--capture-viewer-resize") {
                         captureWindow.setContentSize(NSSize(width: 760, height: 480))
                         captureResized(captureWindow, path: path)
                     } else {
@@ -47,6 +53,50 @@ enum BossAttachmentViewerCapture {
             fputs("attachment viewer fixture failed: \(error)\n", stderr)
             exit(1)
         }
+    }
+
+    private static func captureZoomStates(_ window: NSWindow, path: String) throws {
+        func find(_ view: NSView?) -> AttachmentZoomScrollView? {
+            guard let view else { return nil }
+            return (view as? AttachmentZoomScrollView) ?? view.subviews.lazy.compactMap { find($0) }.first
+        }
+        guard let viewer = find(window.contentView) else {
+            throw NSError(domain: "AttachmentViewerCapture", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "Zoom viewer was not mounted"])
+        }
+        viewer.apply(.width)
+        try BossWindowCapture.captureWindow(window, to: path + ".width.png")
+        viewer.apply(.actual)
+        viewer.apply(.in)
+        viewer.apply(.in)
+        viewer.apply(.in)
+        viewer.apply(.in)
+        try BossWindowCapture.captureWindow(window, to: path + ".zoom.png")
+    }
+
+    private static func writeTallFixture() throws {
+        guard let path = CommandLine.arguments.first(where: { $0.hasPrefix("--capture-attachment-image=") })
+            .map({ String($0.dropFirst("--capture-attachment-image=".count)) }) else { return }
+        guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 390, pixelsHigh: 6245,
+                                           bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                           isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
+              let context = NSGraphicsContext(bitmapImageRep: bitmap) else { return }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        NSColor.white.setFill()
+        NSRect(x: 0, y: 0, width: 390, height: 6245).fill()
+        for index in 0..<25 {
+            let y = CGFloat(6245 - (index + 1) * 245)
+            NSColor(calibratedRed: 0.9, green: 0.94, blue: 0.98, alpha: 1).setFill()
+            NSRect(x: 12, y: y, width: 366, height: 230).fill()
+            let text = "Fidelity notes · Section \(index + 1)\n\nMobile capture at 390px\nReview the layout and spacing.\nEach section should be readable."
+            (text as NSString).draw(in: NSRect(x: 24, y: y + 20, width: 342, height: 190),
+                                   withAttributes: [.font: NSFont.systemFont(ofSize: 17),
+                                                    .foregroundColor: NSColor.black])
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        guard let png = bitmap.representation(using: .png, properties: [:]) else { return }
+        try png.write(to: URL(fileURLWithPath: path))
     }
 
     private static func captureResized(_ window: NSWindow, path: String) {

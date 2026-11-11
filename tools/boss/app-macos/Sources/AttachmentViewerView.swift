@@ -286,17 +286,11 @@ struct AttachmentDetailView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if let image = loadedImage {
-            GeometryReader { geometry in
-                let size = AttachmentImageSizing.fit(native: image.size, available: geometry.size)
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: size.width, height: size.height)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-            .frame(minHeight: 120)
-            .background(Color.black.opacity(0.05))
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            AttachmentZoomView(image: image)
+                .id(attachment.id)
+                .frame(minHeight: 120)
+                .background(Color.black.opacity(0.05))
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         } else {
             ContentUnavailableView {
                 Label("Screenshot Unavailable", systemImage: "photo.badge.exclamationmark")
