@@ -1454,12 +1454,6 @@ impl ExecutionRunner for PaneSpawnRunner {
                 },
             )
             .await;
-            if let Some(cancelled) = self
-                .take_cancelled_during_spawn(spawner.as_ref(), &execution.id, worker_id, &started, &spawn_config)
-                .await
-            {
-                return Ok(cancelled);
-            }
             // A driver start that lands just after the start wait gave up
             // rescues the spawn from that failure only. Its brief still has to
             // be taken, so the prompt wait runs now, with its retries and its
@@ -1484,6 +1478,14 @@ impl ExecutionRunner for PaneSpawnRunner {
                 }
                 other => other,
             };
+            // Re-check cancellation only after the late-start prompt wait,
+            // which can run for minutes after the first confirmation returned.
+            if let Some(cancelled) = self
+                .take_cancelled_during_spawn(spawner.as_ref(), &execution.id, worker_id, &started, &spawn_config)
+                .await
+            {
+                return Ok(cancelled);
+            }
             if let Err(err) = confirm
                 && !reap_vetoed_by_late_evidence(spawner.driver_signals(), started.slot_id, &execution.id, &err)
             {

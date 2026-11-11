@@ -84,6 +84,9 @@ struct CapturingSpawner {
     hook_before_registration: std::sync::atomic::AtomicBool,
     /// Cancel exactly when confirmation first observes the pane.
     cancel_on_capture: StdMutex<Option<(Arc<WorkDb>, String)>>,
+    /// Cancels the execution when the engine first sends a key to the pane,
+    /// which only happens in the prompt wait after a driver start.
+    cancel_on_send_keys: StdMutex<Option<(Arc<WorkDb>, String)>>,
     /// When true (the default), the stand-in worker takes its prompt: a
     /// `UserPromptSubmit` is recorded wherever the pane is launched or read.
     /// False models the driver that starts and then sits at its composer.
@@ -163,6 +166,7 @@ impl CapturingSpawner {
             capture_log: StdMutex::new(Vec::new()),
             hook_before_registration: std::sync::atomic::AtomicBool::new(false),
             cancel_on_capture: StdMutex::new(None),
+            cancel_on_send_keys: StdMutex::new(None),
             accept_prompt: std::sync::atomic::AtomicBool::new(true),
             accept_prompt_on_resubmit: std::sync::atomic::AtomicBool::new(false),
             delivery_marker: StdMutex::new(None),
@@ -289,6 +293,9 @@ impl CommandRunner for CapturingSpawner {
             }
             Some("send-keys") => {
                 self.sent_keys.lock().unwrap().push(args.last().unwrap().clone());
+                if let Some((db, execution_id)) = self.cancel_on_send_keys.lock().unwrap().take() {
+                    db.cancel_running_execution(&execution_id).unwrap();
+                }
                 if self.accept_prompt_on_resubmit.load(std::sync::atomic::Ordering::SeqCst) {
                     for state in self.live_states.snapshot() {
                         self.record_prompt_accepted(&state.run_id);
@@ -2392,6 +2399,51 @@ async fn a_late_session_start_does_not_skip_the_prompt_confirmation() {
         "fixture: the late start arrived"
     );
     assert_eq!(spawner.reaped_run_ids(), vec![run_id]);
+}
+
+/// A cancel that lands while the late-start prompt wait is retrying Return
+/// must still be reconciled as a mid-spawn cancel, not reported as a spawn
+/// failure.
+#[tokio::test(start_paused = true)]
+async fn a_cancel_during_the_late_start_prompt_wait_is_reconciled() {
+    use std::sync::atomic::Ordering;
+    let workspace = TempDir::new().unwrap();
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    spawner.accept_prompt.store(false, Ordering::SeqCst);
+    spawner.late_session_start.store(true, Ordering::SeqCst);
+    *spawner.delivery_marker.lock().unwrap() = Some((
+        workspace.path().join(".claude"),
+        crate::driver::initial_prompt::DELIVERED_MARKER,
+    ));
+    let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
+    let chore = create_test_chore(&work_db, product.id.clone(), "Cancel during late prompt wait");
+    let ready = create_ready_chore_execution(&work_db, chore.id.clone());
+    let (execution, _run) = work_db
+        .start_execution_run(
+            &ready.id,
+            "worker-1",
+            "foo",
+            "lease-1",
+            "foo-agent-001",
+            workspace.path().to_str().unwrap(),
+        )
+        .unwrap();
+    *spawner.cancel_on_send_keys.lock().unwrap() = Some((work_db.clone(), execution.id.clone()));
+    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    let runner = PaneSpawnRunner::new(cfg, work_db.clone(), flags);
+    bind_runner(&runner, weak, &spawner);
+    runner.set_skip_spawn_confirm(false);
+    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(60));
+    let chore_item = work_db.get_work_item(&chore.id).unwrap();
+    let outcome = runner
+        .run_execution("worker-1", &execution, &chore_item, workspace.path(), Some("change-1"))
+        .await
+        .expect("a cancel is not a spawn failure");
+    assert_eq!(outcome.wait_state, RunWaitState::CancelledDuringSpawn);
+    assert!(spawner.cancel_on_send_keys.lock().unwrap().is_none());
+    assert_eq!(spawner.reaped_run_ids().as_slice(), [execution.id.as_str()]);
 }
 
 #[tokio::test(start_paused = true)]
