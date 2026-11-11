@@ -27,6 +27,7 @@ mod reclaim;
 mod reconcile;
 mod release_bookmark_gc;
 mod repo;
+mod repo_reclone;
 mod reset;
 mod salvage;
 mod stage;

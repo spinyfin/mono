@@ -132,19 +132,19 @@ pub(super) const OP_LOG_TEMPLATE: &str = r#"id ++ " " ++ time.end().format("%s")
 pub(super) const PR_BOOKMARK_NAMES_TEMPLATE: &str = r#"name ++ "\n""#;
 
 /// Pool-metadata key stamped when the periodic pass last ran for `repo`.
-pub(super) fn store_gc_last_at_key(repo: &str) -> String {
+pub(crate) fn store_gc_last_at_key(repo: &str) -> String {
     format!("last_store_gc_at:{repo}")
 }
 
 /// Pool-metadata key for the outcome of the last `cube repo gc` run for
 /// `repo`; see [`StoreGcOutcome`].
-pub(super) fn store_gc_outcome_key(repo: &str) -> String {
+pub(crate) fn store_gc_outcome_key(repo: &str) -> String {
     format!("store_gc_last_outcome:{repo}")
 }
 
 /// Pool-metadata key counting `repo`'s consecutive upkeep runs that did not
 /// maintain the store (skipped or failed).
-pub(super) fn store_gc_failures_key(repo: &str) -> String {
+pub(crate) fn store_gc_failures_key(repo: &str) -> String {
     format!("store_gc_consecutive_failures:{repo}")
 }
 

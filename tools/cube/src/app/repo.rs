@@ -1,8 +1,8 @@
 //! `cube repo` — registering repositories, materialising their shared object
 //! store on demand, and resolving origin URLs to a stable repo id.
 
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::{fs, io};
 
 use console::{Style, style};
 use git_utils::repo_slug::{
@@ -80,6 +80,7 @@ pub(super) fn run_repo(
                 }),
             )
         }
+        RepoCommand::Reclone { repo } => super::repo_reclone::reclone(&store, runner, database_path, &repo),
         RepoCommand::List => {
             let repos = store.list_repos()?;
             let message = format_repo_list(&repos);
@@ -198,6 +199,11 @@ pub(super) fn run_repo(
             };
 
             let _lock = RepoLock::acquire(&repo_lock_path(&repo, database_path)?)?;
+            let _upkeep = RepoLock::try_acquire(&store_gc_lock_path(&repo, database_path)?)?.ok_or_else(|| {
+                CubeError::InvalidArgument(format!(
+                    "repo `{repo}` upkeep is running; retry removal after it finishes"
+                ))
+            })?;
 
             // Collect workspace info before deletion (needed for lease check + purge).
             let workspaces = store.list_workspaces(&repo)?;
@@ -221,23 +227,21 @@ pub(super) fn run_repo(
             let workspace_paths: Vec<PathBuf> = workspaces.iter().map(|w| w.workspace_path.clone()).collect();
             let workspace_count = workspaces.len();
 
-            // Delete the repo row; FK cascades remove workspaces, workspace_setup,
-            // and changes rows automatically.
-            store.delete_repo(&repo)?;
-
-            // Optionally remove on-disk workspace directories.
+            // Preserve the registration on cleanup failure so a retry can finish.
             let mut purged_dirs: Vec<String> = Vec::new();
             if purge_workspaces {
-                for path in &workspace_paths {
-                    match fs::remove_dir_all(path) {
-                        Ok(()) => purged_dirs.push(path.display().to_string()),
-                        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                        Err(err) => {
-                            eprintln!("warning: failed to remove workspace dir {}: {err}", path.display());
-                        }
+                let mut paths = workspace_paths;
+                for candidate in super::provision::discover_workspaces(&record)? {
+                    if !paths.contains(&candidate.workspace_path) {
+                        paths.push(candidate.workspace_path);
                     }
                 }
+                for path in &paths {
+                    super::repo_reclone::remove_workspace_tree(path)?;
+                    purged_dirs.push(path.display().to_string());
+                }
             }
+            store.delete_repo(&repo)?;
 
             audit!(
                 database_path,
@@ -450,6 +454,7 @@ fn ensure_repo_core(
         }
         record.main_branch = branch;
     }
+    super::repo_reclone::stamp_registration(&record)?;
     store.upsert_repo(&record)
 }
 

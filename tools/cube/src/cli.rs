@@ -66,6 +66,11 @@ pub enum RepoCommand {
         #[arg(long, conflicts_with = "reponame")]
         origin: Option<String>,
     },
+    /// Replace a damaged shared store, keeping a backup and repo configuration.
+    ///
+    /// Release all workspaces and stop processes using the store first.
+    /// Purges old workspaces; never deletes the old source store.
+    Reclone { repo: String },
     /// List known repo pools.
     List,
     /// Show repo pool configuration.

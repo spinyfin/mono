@@ -285,6 +285,7 @@ pub(super) fn run_workspace(
                     prior_lease_expires_at_epoch_s = swept.lease_expires_at_epoch_s,
                 );
             }
+            super::repo_reclone::quarantine_obsolete(&store, database_path, &repo_record, &mut candidates)?;
             let expired_ids: Vec<String> = expired.iter().map(|e| e.workspace_id.clone()).collect();
             let expired_by_workspace_id: std::collections::HashMap<&str, &crate::store::ExpiredLease> =
                 expired.iter().map(|e| (e.workspace_id.as_str(), e)).collect();
@@ -1240,6 +1241,7 @@ pub(super) fn run_workspace(
 
                 let retry_lock = RepoLock::acquire(&repo_lock_path(&repo, database_path)?)?;
                 let mut retry_candidates = discover_workspaces(&repo_record)?;
+                super::repo_reclone::quarantine_obsolete(&store, database_path, &repo_record, &mut retry_candidates)?;
                 store.sync_workspaces(&repo, &retry_candidates)?;
                 let new_candidate = auto_create_workspace(runner, database_path, &repo_record, &retry_candidates)?;
                 let new_id = new_candidate.workspace_id.clone();

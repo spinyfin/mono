@@ -156,3 +156,49 @@ Both clones therefore rebuild successfully with jj 0.26, including its
 legacy predecessor traversal. No missing predecessor objects were observed
 in these snapshots; this supports current rebuildability for both stores,
 including `appoint`, without using it to reconstruct the historical failure.
+
+# Replacing a damaged store
+
+Use `cube repo reclone <repo>` when the shared store cannot be repaired. Invoke
+it from outside the source and workspace trees: your shell's working directory
+also counts as in use. First
+release every workspace for the repo and stop tools with open files or working
+directories in its source or workspace trees. The command refuses leased pools,
+active store upkeep, concurrent cube jj operations, and processes detected by
+`lsof` in those trees. Install `lsof` if it is missing; an unsuccessful inspection
+is a hard error. Stop external tools before invoking recovery and keep them
+stopped until it finishes; external tools do not honor cube's advisory locks.
+
+Recovery renames the source to a sibling named
+`<repo>.before-reclone-<epoch-seconds>-<unique-id>`, clones the recorded origin
+using the recorded clone command when configured, and retains the recorded main
+branch, workspace root/prefix, and declared oldest jj version. It purges old
+workspaces, including read-only Bazel directories, and clears their setup records
+so newly provisioned workspaces run setup. Save any workspace files you need
+before recovery. The backup store is never deleted. The start, completion, and
+failure are recorded in cube's audit log.
+
+Literal setup references such as
+`cp "$CUBE_BASE_REPO/backend/config-secrets.toml" .` and
+`cp "${CUBE_BASE_REPO}/backend/config-secrets.toml" .` retain missing files from
+the backup, including untracked secrets and their permissions. Referenced
+directories are copied recursively without replacing fresh tracked files.
+Git also enumerates untracked files, including ignored files, without reading
+jj's index. These are carried over too, covering inputs used inside setup
+scripts. If Git cannot enumerate them, recovery fails before moving the store;
+repair its Git index before retrying. An old `.cube/setup.yaml` is retained if
+the clone has none. Dynamic paths,
+shell expansions, and symlinks are rejected with instructions to use regular
+files and literal paths. Missing inputs
+produce an error naming the file to restore before retrying. If cloning or
+input preservation fails, the original store path is restored and the failed
+clone is kept as a separate `failed-reclone` sibling for inspection.
+
+`cube repo remove --purge-workspaces` also handles read-only workspace trees.
+It fails if any directory cannot be removed, retaining the registration for a
+retry. Removing a repo resets its store upkeep history. Re-registering a repo
+gives its workspaces a new registration identity: lease quarantines directories
+from an older registration or another jj store under `.quarantine-*` names,
+preserving their files and provisioning replacements. A missing setup
+declaration in a checkout when the source has one is an error, never an empty
+successful setup report.
