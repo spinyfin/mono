@@ -812,7 +812,7 @@ struct ServerState {
     coordinator_reset_in_flight: Arc<AtomicBool>,
     /// The handoff credential delivery to the coordinator's main inbox that
     /// awaits confirmation, keyed to the session it targets, so adoption and
-    /// `boss handoff show` do not queue the same credential twice for one
+    /// `boss handoff show --redeliver` do not queue the same credential twice for one
     /// session but a replacement session is never suppressed.
     #[builder(default)]
     coordinator_authorization_delivery_pending:
@@ -2769,7 +2769,7 @@ async fn handle_frontend_connection(
         {
             let handoff_authorization = match &request {
                 FrontendRequest::SetCoordinatorHandoff { authorization, .. } => Some(authorization.as_str()),
-                FrontendRequest::GetCoordinatorHandoff => Some(""),
+                FrontendRequest::GetCoordinatorHandoff { .. } => Some(""),
                 _ => None,
             };
             if let Some(authorization) = handoff_authorization {

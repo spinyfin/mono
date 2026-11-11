@@ -353,7 +353,8 @@ fn coordinator_verbs_stay_closed() {
             expected_spawn_token: "token".into(),
             reason: CoordinatorRecreateReason::OperatorReset,
         },
-        FrontendRequest::GetCoordinatorHandoff,
+        FrontendRequest::GetCoordinatorHandoff { redeliver: false },
+        FrontendRequest::GetCoordinatorHandoff { redeliver: true },
         FrontendRequest::SetCoordinatorHandoff {
             authorization: String::new(),
             body: "- greyarea is down".into(),

@@ -50,8 +50,11 @@ async fn sole_response(sink: &SessionSink) -> FrontendEvent {
 
 async fn get(state: &Arc<ServerState>) -> FrontendEvent {
     let sink = make_session_sink();
-    coordinator_handoff::handle_get_coordinator_handoff(dispatch(state, &sink), FrontendRequest::GetCoordinatorHandoff)
-        .await;
+    coordinator_handoff::handle_get_coordinator_handoff(
+        dispatch(state, &sink),
+        FrontendRequest::GetCoordinatorHandoff { redeliver: false },
+    )
+    .await;
     sole_response(&sink).await
 }
 
@@ -365,7 +368,11 @@ async fn human_terminal_can_read_without_a_coordinator_pid() {
     let sink = make_session_sink();
     let mut ctx = dispatch(&state, &sink);
     ctx.peer_pid = Some(1);
-    coordinator_handoff::handle_get_coordinator_handoff(ctx, FrontendRequest::GetCoordinatorHandoff).await;
+    coordinator_handoff::handle_get_coordinator_handoff(
+        ctx,
+        FrontendRequest::GetCoordinatorHandoff { redeliver: false },
+    )
+    .await;
     assert_eq!(
         result_view(sole_response(&sink).await).unwrap().body,
         "operator context"

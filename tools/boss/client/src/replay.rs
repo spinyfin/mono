@@ -134,7 +134,7 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::GetCiRemediation { .. }
         | FrontendRequest::GetConflictHotspots { .. }
         | FrontendRequest::GetConflictResolution { .. }
-        | FrontendRequest::GetCoordinatorHandoff
+        | FrontendRequest::GetCoordinatorHandoff { redeliver: false }
         | FrontendRequest::GetSolComparisonReport
         | FrontendRequest::GetCostWindowReport { .. }
         | FrontendRequest::GetDecision { .. }
@@ -245,7 +245,8 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::WorkerPoolSummary
         | FrontendRequest::WorkspacePoolSummary => ReplaySafety::Always,
 
-        FrontendRequest::AcceptDeferredScopeAttention { .. }
+        FrontendRequest::GetCoordinatorHandoff { redeliver: true }
+        | FrontendRequest::AcceptDeferredScopeAttention { .. }
         | FrontendRequest::ActionAttentionGroup { .. }
         | FrontendRequest::AddHost { .. }
         | FrontendRequest::AddHostTag { .. }
@@ -366,6 +367,18 @@ mod tests {
                 .force_duplicate(force)
                 .build(),
         }
+    }
+
+    #[test]
+    fn handoff_redelivery_is_not_automatically_replayed() {
+        assert_eq!(
+            replay_safety(&FrontendRequest::GetCoordinatorHandoff { redeliver: false }),
+            ReplaySafety::Always
+        );
+        assert_eq!(
+            replay_safety(&FrontendRequest::GetCoordinatorHandoff { redeliver: true }),
+            ReplaySafety::Never
+        );
     }
 
     #[test]

@@ -28,7 +28,11 @@ pub(crate) enum HandoffCommand {
     /// and whether the current coordinator session wrote it. Says
     /// explicitly when none has ever been written; a stored-but-unreadable
     /// handoff is an error, never an empty result.
-    Show,
+    Show {
+        /// Redeliver the private write credential to the main session inbox.
+        #[arg(long)]
+        redeliver: bool,
+    },
 }
 
 #[derive(Debug, Clone, Args)]
@@ -43,7 +47,7 @@ pub(crate) struct HandoffWriteArgs {
 pub(crate) async fn run_handoff_command(command: HandoffCommand, ctx: &RunContext) -> Result<(), CliError> {
     match command {
         HandoffCommand::Write(args) => run_write(ctx, args).await,
-        HandoffCommand::Show => run_show(ctx).await,
+        HandoffCommand::Show { redeliver } => run_show(ctx, redeliver).await,
     }
 }
 
@@ -81,14 +85,14 @@ async fn run_write(ctx: &RunContext, args: HandoffWriteArgs) -> Result<(), CliEr
     })
 }
 
-async fn run_show(ctx: &RunContext) -> Result<(), CliError> {
+async fn run_show(ctx: &RunContext, redeliver: bool) -> Result<(), CliError> {
     let mut client = connect_for_work(ctx).await?;
     let (handoff, authorization_delivery): (
         Option<CoordinatorHandoffView>,
         Option<CoordinatorHandoffAuthorizationDelivery>,
     ) = rpc_call!(
         client,
-        FrontendRequest::GetCoordinatorHandoff,
+        FrontendRequest::GetCoordinatorHandoff { redeliver },
         "handoff show",
         FrontendEvent::CoordinatorHandoffResult { handoff, authorization_delivery } => (handoff, authorization_delivery),
     )?;
@@ -105,13 +109,13 @@ async fn run_show(ctx: &RunContext) -> Result<(), CliError> {
     )
 }
 
-/// The credential line a coordinator-ancestry `show` prints: where the
+/// The credential line a coordinator-ancestry `show --redeliver` prints: where the
 /// credential now is, or which step failed. The credential itself is never
 /// in the response.
 fn describe_authorization_delivery(delivery: &CoordinatorHandoffAuthorizationDelivery) -> String {
     if delivery.requested {
         format!(
-            "Handoff write credential: redelivery requested — {}. Wait for it there; do not retry `boss handoff show` in a loop.",
+            "Handoff write credential: redelivery requested — {}. Wait for it there; do not retry `boss handoff show --redeliver` in a loop.",
             delivery.detail
         )
     } else {
@@ -157,6 +161,33 @@ fn print_handoff(handoff: &Option<CoordinatorHandoffView>) {
 mod tests {
     use super::HandoffCommand;
     use clap::Parser;
+
+    #[test]
+    fn legacy_handoff_read_does_not_request_redelivery() {
+        let request: boss_protocol::FrontendRequest =
+            serde_json::from_str(r#"{"type":"get_coordinator_handoff"}"#).unwrap();
+        assert!(matches!(
+            request,
+            boss_protocol::FrontendRequest::GetCoordinatorHandoff { redeliver: false }
+        ));
+    }
+
+    #[test]
+    fn show_requires_explicit_redelivery() {
+        for (arguments, expected) in [
+            (vec!["boss", "handoff", "show"], false),
+            (vec!["boss", "handoff", "show", "--redeliver"], true),
+        ] {
+            let parsed = crate::Cli::try_parse_from(arguments).unwrap();
+            let crate::Commands::Handoff {
+                command: HandoffCommand::Show { redeliver },
+            } = parsed.command
+            else {
+                panic!("expected handoff show");
+            };
+            assert_eq!(redeliver, expected);
+        }
+    }
 
     #[test]
     fn show_names_the_credential_outcome_without_the_credential() {

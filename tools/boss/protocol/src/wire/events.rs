@@ -1193,7 +1193,7 @@ pub enum FrontendEvent {
     /// `None` only when no coordinator session has ever written one; a
     /// stored-but-undecodable handoff is reported as `WorkError` instead.
     /// `authorization_delivery` is present only for a caller with
-    /// coordinator ancestry, whose read also asks the engine to redeliver
+    /// coordinator ancestry who explicitly asks the engine to redeliver
     /// the handoff write credential to the main session's inbox; it
     /// reports whether that redelivery was accepted or which step failed.
     CoordinatorHandoffResult {

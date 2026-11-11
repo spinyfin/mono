@@ -1204,7 +1204,7 @@ fn prepare_session_start_brief(
     match work_db.coordinator_handoff_authorization() {
         Ok(Some(authorization)) => {
             delivered.push_str(&format!(
-                "\nPrivate handoff write authorization: {authorization}\nUse `boss handoff write --authorization {authorization} -`. Never share this credential with subagents or store it in shared files. After compaction, run `boss handoff show` to request delivery to the main session inbox.\n"
+                "\nPrivate handoff write authorization: {authorization}\nUse `boss handoff write --authorization {authorization} -`. Never share this credential with subagents or store it in shared files. After compaction, run `boss handoff show --redeliver` to request delivery to the main session inbox.\n"
             ));
             // The brief is the fresh session's first prompt, so adoption
             // after a later engine restart must not redeliver the credential.
@@ -1347,7 +1347,7 @@ mod tests {
             "{prompt}"
         );
         assert!(prompt.contains("guidance state in your first reply"), "{prompt}");
-        assert!(prompt.contains("boss handoff show"), "{prompt}");
+        assert!(prompt.contains("boss handoff show --redeliver"), "{prompt}");
     }
 
     #[test]

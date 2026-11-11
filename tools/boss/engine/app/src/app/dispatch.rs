@@ -148,7 +148,7 @@ async fn dispatch_attributed(mut ctx: Dispatch, request: FrontendRequest, bulk_r
         r @ FrontendRequest::GetConflictResolution { .. } => {
             Box::pin(conflict_resolution::handle_get_conflict_resolution(ctx, r))
         }
-        r @ FrontendRequest::GetCoordinatorHandoff => {
+        r @ FrontendRequest::GetCoordinatorHandoff { .. } => {
             Box::pin(coordinator_handoff::handle_get_coordinator_handoff(ctx, r))
         }
         r @ FrontendRequest::GetCostWindowReport { .. } => Box::pin(cost::handle_get_cost_window_report(ctx, r)),

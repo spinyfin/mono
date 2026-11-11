@@ -39,7 +39,7 @@ pub(super) async fn handle_get_coordinator_handoff(ctx: Dispatch, req: FrontendR
         peer_pid,
         ..
     } = ctx;
-    let FrontendRequest::GetCoordinatorHandoff = req else {
+    let FrontendRequest::GetCoordinatorHandoff { redeliver } = req else {
         unreachable!()
     };
     if server_state.classify_peer(peer_pid).is_agent() {
@@ -58,10 +58,10 @@ pub(super) async fn handle_get_coordinator_handoff(ctx: Dispatch, req: FrontendR
             "coordinator handoff is unavailable to agents".to_owned(),
         );
     }
-    // A coordinator-ancestry read doubles as the on-demand credential path:
+    // Only an explicit coordinator-ancestry request recovers the credential:
     // the response says whether the main session's inbox accepted the
     // redelivery (or which step failed), never the credential itself.
-    let authorization_delivery = if coordinator_peer(&server_state, peer_pid) {
+    let authorization_delivery = if redeliver && coordinator_peer(&server_state, peer_pid) {
         Some(deliver_authorization(server_state.clone(), "handoff_show").await)
     } else {
         None
