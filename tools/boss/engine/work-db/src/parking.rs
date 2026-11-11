@@ -731,7 +731,7 @@ impl WorkDb {
 
 /// Park or un-park one task. An un-park returns the rows it released (the
 /// task and the revisions that inherited its stamp); a park returns none.
-fn set_task_parked(
+pub(crate) fn set_task_parked(
     tx: &Connection,
     pending: &mut PendingEvents,
     id: &str,

@@ -783,6 +783,8 @@ mod floor_tests {
         super::super::parking::migrate(&expected).unwrap();
         super::super::parking_reconcile::migrate(&expected).unwrap();
         super::super::progression_candidates::migrate_execution_provenance(&expected).unwrap();
+        // The candidate views read this table, so it exists before they do.
+        super::super::progression_ladder::migrate(&expected).unwrap();
         super::super::progression_candidates::migrate_views(&expected).unwrap();
         super::super::spoke_hub::migrate(&expected).unwrap();
         super::super::parking::migrate_membership(&expected).unwrap();

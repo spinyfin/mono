@@ -4,27 +4,6 @@ use boss_protocol::{
     CiRemediation, ConflictResolution, DependencyEdge, OperatorQuestionRecord, Task, WorkAttentionItem,
 };
 use boss_work_db::{ExecutionDiagnosis, ProductPrCiSnapshot, ProgressionCreateBudget, ReviewVerdict, StatusAuditRow};
-use sha2::{Digest, Sha256};
-
-/// Fingerprint of the current stuck episode (design 2.5):
-/// `hash(stuck_kind, blocked_reason, pr_head_sha or NULL, latest terminal execution id)`.
-pub fn compute_stuck_fingerprint(
-    stuck_kind: &str,
-    blocked_reason: Option<&str>,
-    pr_head_sha: Option<&str>,
-    latest_terminal_execution_id: Option<&str>,
-) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(stuck_kind.as_bytes());
-    hasher.update(b"|");
-    hasher.update(blocked_reason.unwrap_or("").as_bytes());
-    hasher.update(b"|");
-    hasher.update(pr_head_sha.unwrap_or("").as_bytes());
-    hasher.update(b"|");
-    hasher.update(latest_terminal_execution_id.unwrap_or("").as_bytes());
-    let digest = hasher.finalize();
-    digest.iter().take(8).map(|byte| format!("{byte:02x}")).collect()
-}
 
 /// One neighbour on a dependency edge, with any live execution the packet names.
 #[derive(Debug, Clone)]

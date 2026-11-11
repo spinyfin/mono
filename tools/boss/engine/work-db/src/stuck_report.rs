@@ -75,6 +75,11 @@ pub(super) fn build(
     // Likewise the dependency rule: one pass over the view, not one per item.
     let shared = super::progression_candidates::shared_clauses(conn)?;
     let progressing_prerequisite = |id: &str| shared.get(id).is_some_and(|clauses| clauses.dependency_held);
+    // Items the engine asked the owner about because progression ran out of
+    // attempts: waiting on a human, but reported as `progression_failing` so the
+    // end-state claim can tell "nobody is allowed to decide" from "progression
+    // gave up".
+    let ladder_asked = super::progression_ladder::items_with_open_ladder_question(conn)?;
     let mut rows = Vec::new();
     let mut unconverted = 0;
     for id in ids {
@@ -175,6 +180,8 @@ pub(super) fn build(
         let dependency = task.blocked_reason.as_deref() == Some("dependency") && progressing_prerequisite(&id);
         let bucket = if parked_holder.is_some() {
             StuckBucket::Parked
+        } else if ladder_asked.contains(&id) {
+            StuckBucket::ProgressionFailing
         } else if human || matches!(classification.as_str(), "S18_pr_behind" | "awaiting_merge") {
             StuckBucket::WaitingOnHuman
         } else if task.blocked_reason.as_deref() == Some("dependency")
@@ -189,8 +196,10 @@ pub(super) fn build(
             StuckBucket::WaitingOnDependency
         } else if progression.infrastructure_failing {
             // Progression could not unstick the item: its last runs ended in
-            // infrastructure failure, so the sweep no longer nominates it. The
-            // engine has admitted defeat; this counts as waiting on a human.
+            // infrastructure failure, so the sweep no longer nominates it, and
+            // the engine is about to ask the owner (the pass after this one files
+            // the question). The engine has admitted defeat; this counts as
+            // waiting on a human.
             StuckBucket::ProgressionFailing
         } else if progression.live || progression.in_completed_cooldown {
             // An agent is working the item, or has just finished and the item is
@@ -220,6 +229,11 @@ pub(super) fn build(
             .map(|(_, pid)| pid);
             probes.push((id.clone(), pid));
         }
+        let progression_note = if bucket == StuckBucket::ProgressionInFlight {
+            no_action_note(conn, &id)?
+        } else {
+            None
+        };
         rows.push(
             StuckRow::builder()
                 .work_item_id(id)
@@ -232,6 +246,7 @@ pub(super) fn build(
                 .maybe_failure_basis(failure_basis.filter(|_| task.blocked_reason.as_deref() == Some("worker_failed")))
                 .maybe_wait_reason(item_wait.reason)
                 .maybe_wait_label(item_wait.label)
+                .maybe_progression_note(progression_note)
                 .build(),
         );
     }
@@ -255,6 +270,31 @@ pub(super) fn build(
         .unconverted_declared_blockers(unconverted)
         .build();
     Ok((report, probes))
+}
+
+/// The reason the item's latest finished progression run gave for judging it
+/// not stuck (`no_action`), so the report can say why the item is being left
+/// alone for the longer cooldown. `None` when that run did something else, or
+/// stated nothing.
+fn no_action_note(conn: &Connection, item_id: &str) -> Result<Option<String>> {
+    let latest: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT x.progression_disposition,
+                    (SELECT json_extract(p.payload_json, '$.summary') FROM worker_proposals p
+                     WHERE p.execution_id = x.id AND p.kind = 'run_done' AND p.state = 'applied'
+                     ORDER BY p.created_at DESC, p.id DESC LIMIT 1)
+             FROM work_executions x
+             WHERE x.work_item_id = ?1 AND x.kind = 'progression' AND x.status = 'completed'
+             ORDER BY x.created_at DESC, x.id DESC LIMIT 1",
+            [item_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(latest
+        .filter(|(disposition, _)| disposition.as_deref() == Some("no_action"))
+        .and_then(|(_, summary)| summary)
+        .map(|summary| summary.trim().to_owned())
+        .filter(|summary| !summary.is_empty()))
 }
 
 /// An owned host observation; no callback runs under the apply connection lock.

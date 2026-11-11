@@ -76,7 +76,9 @@
 //!    that state (`tasks.progression_grace_waived_at`).
 //! 6. **Cooldown and budget.** No progression run within `progression.cooldown`
 //!    (four times that after a `no_changes_needed` run), the last
-//!    [`INFRASTRUCTURE_FAILURE_CAP`] runs were not all infrastructure failures,
+//!    [`INFRASTRUCTURE_FAILURE_CAP`] runs since the owner's last "keep trying"
+//!    were not all infrastructure failures (the engine asks the owner about such
+//!    an item: `progression_ladder`),
 //!    and the item's create budget (`progression.max_creates_per_item_window`
 //!    revisions-plus-precursors in the rolling window) is not exhausted. A run
 //!    that is already in flight still sees the same cap at the verbs (exhaustion
@@ -575,7 +577,9 @@ fn in_cooldown_sql(a: &str, cooldown: &str, completed_only: bool) -> String {
 }
 
 /// Whether the item's last [`INFRASTRUCTURE_FAILURE_CAP`] progression runs all
-/// ended in infrastructure failure, so the sweep stops nominating it.
+/// ended in infrastructure failure, so the sweep stops nominating it (and the
+/// engine asks the owner: `progression_ladder`). Runs from before the owner's
+/// last "keep trying" answer (`progression_ladder.reset_at`) do not count.
 fn infrastructure_failing_sql(a: &str) -> String {
     (0..INFRASTRUCTURE_FAILURE_CAP)
         .map(|offset| {
@@ -583,6 +587,15 @@ fn infrastructure_failing_sql(a: &str) -> String {
                 "COALESCE((SELECT fx.status FROM work_executions fx
                            WHERE fx.work_item_id = {a}.id AND fx.kind = 'progression' AND fx.status <> 'cancelled'
                              AND NOT (fx.status = 'abandoned' AND fx.started_at IS NULL)
+                             AND (CAST(fx.created_at AS INTEGER) >
+                                  COALESCE((SELECT l.reset_at FROM progression_ladder l
+                                            WHERE l.work_item_id = {a}.id), 0)
+                                  OR (CAST(fx.created_at AS INTEGER) =
+                                      COALESCE((SELECT l.reset_at FROM progression_ladder l
+                                                WHERE l.work_item_id = {a}.id), 0)
+                                      AND fx.rowid >
+                                      COALESCE((SELECT l.reset_rowid FROM progression_ladder l
+                                                WHERE l.work_item_id = {a}.id), 0)))
                            ORDER BY fx.created_at DESC, fx.id DESC LIMIT 1 OFFSET {offset})
                           IN {INFRASTRUCTURE_FAILED}, 0)"
             )
@@ -951,7 +964,10 @@ impl WorkDb {
     /// held for one evaluation of the predicate rather than one per item. A
     /// freshly minted `ready` run is live work on that family: later candidates
     /// that share its `family_key` are skipped so one pass never gives two
-    /// writers to the same PR family. An item whose execution cannot be inserted
+    /// writers to the same PR family. Before any run is minted the escalation
+    /// ladder (`progression_ladder`) is asked about every candidate: one whose
+    /// attempts have run out is asked about, not given another run, and is
+    /// reported in [`ProgressionMint::asked`]. An item whose execution cannot be inserted
     /// (for example its repository cannot be resolved) is skipped and reported;
     /// it does not stop the rest.
     pub fn mint_progression_executions(&self) -> Result<ProgressionMint> {
@@ -969,8 +985,14 @@ impl WorkDb {
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut mint = ProgressionMint::default();
+        let mut pending = PendingEvents::new();
+        // The ladder first: an item whose attempts have run out is asked about
+        // (and parked on the question) instead of being given another run.
+        let pass = crate::progression_ladder::run_pass(&mut tx, &mut pending, candidates)?;
+        mint.asked = pass.asked;
+        mint.ladder_failed = pass.failed;
         let mut minted_families = HashSet::new();
-        for (candidate, family_key) in candidates {
+        for (candidate, family_key) in pass.mintable {
             if minted_families.contains(&family_key) {
                 continue;
             }
@@ -989,7 +1011,7 @@ impl WorkDb {
                 }
             }
         }
-        tx.commit()?;
+        commit_and_publish(tx, pending, self.event_bus())?;
         Ok(mint)
     }
 }
@@ -1002,6 +1024,13 @@ pub struct ProgressionMint {
     pub minted: Vec<(ProgressionCandidate, WorkExecution)>,
     /// Candidates the insert failed for, with the reason.
     pub failed: Vec<(ProgressionCandidate, String)>,
+    /// Items the escalation ladder asked the owner about instead of minting a
+    /// run for (`progression_ladder`).
+    pub asked: Vec<crate::progression_ladder::LadderQuestion>,
+    /// Items the ladder meant to ask about and could not (the question could
+    /// not be filed), with the reason. They are not minted a run either: that
+    /// would be the attempt the ladder ruled out. The next pass tries again.
+    pub ladder_failed: Vec<(String, String)>,
 }
 
 fn read_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProgressionCandidate> {

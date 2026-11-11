@@ -9,8 +9,9 @@ pub use evidence::{EngineEvidence, EvidenceProvider, gather_evidence};
 mod packet;
 mod render;
 
+pub use boss_work_db::compute_stuck_fingerprint;
 pub use gather::gather_progression_brief;
-pub use packet::{ProgressionBriefPacket, compute_stuck_fingerprint};
+pub use packet::ProgressionBriefPacket;
 pub use render::render_progression_brief;
 
 #[cfg(test)]

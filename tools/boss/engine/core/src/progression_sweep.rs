@@ -10,10 +10,21 @@
 //! item from the view (clause 2), so a second pass cannot mint a second run for
 //! an item that already has one.
 //!
+//! ## The escalation ladder
+//!
+//! Before minting, a pass asks the escalation ladder (`progression_ladder` in
+//! work-db) about every candidate, and about every item the view stopped
+//! nominating because its last two runs died. An item whose attempts have run
+//! out is **not** given another run: the engine files a multiple-choice question
+//! ("Park it, archive it, or keep trying?") on it, parks it
+//! `awaiting_operator_answer`, and the pass counts it as `asked`. The question
+//! is the escalation, so a pass never gives up silently and never loops.
+//!
 //! ## What the sweep does not do
 //!
 //! - **It does not decide anything.** Whether an item is a candidate is the
-//!   view's business; the sweep neither filters nor second-guesses it.
+//!   view's business, and whether its attempts have run out is the ladder's; the
+//!   sweep neither filters nor second-guesses either.
 //! - **It does not spawn anything.** Minting a row only queues it. The dispatcher
 //!   routes it to the progression pool (`progression.pool_size` slots, invisible
 //!   to the interactive cap and to Lower Decks spillover) and holds it behind both
@@ -45,17 +56,21 @@ pub struct ProgressionSweepOutcome {
     pub minted: usize,
     /// Candidates the mint failed for; logged, and retried on the next pass.
     pub failed: usize,
+    /// Items the escalation ladder asked the owner about instead of minting a
+    /// run for.
+    pub asked: usize,
 }
 
 impl crate::sweep_loop::SweepOutcome for ProgressionSweepOutcome {
     fn has_activity(&self) -> bool {
-        self.minted > 0 || self.failed > 0
+        self.minted > 0 || self.failed > 0 || self.asked > 0
     }
 
     fn log(&self) {
         tracing::info!(
             minted = self.minted,
             failed = self.failed,
+            asked = self.asked,
             "progression sweep: pass complete",
         );
     }
@@ -135,6 +150,23 @@ fn run_one_pass_blocking(work_db: &WorkDb) -> ProgressionSweepOutcome {
             "progression sweep: queued a progression run",
         );
     }
+    for question in &mint.asked {
+        outcome.asked += 1;
+        tracing::info!(
+            work_item_id = %question.work_item_id,
+            question_id = %question.question_id,
+            reason = question.reason.as_str(),
+            "progression sweep: the ladder ran out; asked the owner instead of queueing another run",
+        );
+    }
+    for (item, reason) in &mint.ladder_failed {
+        outcome.failed += 1;
+        tracing::warn!(
+            work_item_id = %item,
+            %reason,
+            "progression sweep: failed to ask the owner about an item the ladder ruled out; will retry",
+        );
+    }
     for (candidate, reason) in &mint.failed {
         outcome.failed += 1;
         tracing::warn!(
@@ -202,7 +234,13 @@ mod tests {
         let db = Arc::new(db);
 
         let outcome = run_one_pass(db.clone()).await;
-        assert_eq!(outcome, ProgressionSweepOutcome { minted: 2, failed: 0 });
+        assert_eq!(
+            outcome,
+            ProgressionSweepOutcome {
+                minted: 2,
+                ..Default::default()
+            }
+        );
         for id in [&oldest, &newest] {
             let runs = progression_runs(&db, id);
             assert_eq!(runs.len(), 1, "{id}");
@@ -235,6 +273,55 @@ mod tests {
             assert_eq!(run_one_pass(db.clone()).await.minted, 0, "{status}");
         }
         assert_eq!(progression_runs(&db, &oldest).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pass_asks_the_owner_instead_of_queueing_a_run_the_ladder_has_ruled_out() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db).id;
+        let spent = stuck(&db, &product, "Two attempts spent", 30);
+        let fresh = stuck(&db, &product, "Not yet tried", 3);
+        for ago in [20 * 3600, 10 * 3600] {
+            let run = db
+                .create_execution(
+                    boss_protocol::CreateExecutionInput::builder()
+                        .work_item_id(&spent)
+                        .kind(ExecutionKind::Progression)
+                        .status(ExecutionStatus::Completed)
+                        .build(),
+                )
+                .unwrap();
+            db.connect()
+                .unwrap()
+                .execute(
+                    "UPDATE work_executions SET progression_disposition = 'progressed', started_at = ?2,
+                        created_at = ?2, finished_at = ?2 WHERE id = ?1",
+                    rusqlite::params![run.id, boss_engine_utils::epoch_time::now_epoch_secs() - ago],
+                )
+                .unwrap();
+        }
+        let db = Arc::new(db);
+
+        let outcome = run_one_pass(db.clone()).await;
+
+        // The item with nothing left to try is asked about; the other gets its first run.
+        assert_eq!(
+            outcome,
+            ProgressionSweepOutcome {
+                minted: 1,
+                asked: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(progression_runs(&db, &spent).len(), 2, "no third run");
+        assert_eq!(progression_runs(&db, &fresh).len(), 1);
+        let task = db.get_work_item(&spent).unwrap();
+        let boss_protocol::WorkItem::Chore(task) = task else {
+            panic!("a chore");
+        };
+        assert_eq!(task.blocked_reason.as_deref(), Some("awaiting_operator_answer"));
+        // A pass is idempotent: the open question is the hold.
+        assert_eq!(run_one_pass(db).await.asked, 0);
     }
 
     #[tokio::test]

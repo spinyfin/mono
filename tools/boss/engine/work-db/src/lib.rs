@@ -745,11 +745,13 @@ mod executions_runs;
 mod feedback_target;
 mod github_api_usage_db;
 mod github_merge_intents;
+mod operator_answer_outcome;
 pub mod parking;
 pub mod parking_reconcile;
 pub mod personas;
 mod progression_candidates;
 mod progression_done;
+mod progression_ladder;
 mod progression_scope;
 mod progression_verbs;
 mod project_postmortem;
@@ -892,6 +894,10 @@ pub use pr_flow::insert_question;
 #[cfg(test)]
 pub use products_design::resolve_task_doc_pointer;
 pub use progression_candidates::{ProgressionCandidate, ProgressionClauses, ProgressionMint};
+pub use progression_ladder::{
+    ARCHIVE_IT, KEEP_TRYING, LADDER_ATTEMPT_CAP, LadderQuestion, LadderReason, LadderRun, LadderState,
+    NO_ACTION_STREAK_CAP, PARK_IT, QUESTION_TEXT, compute_stuck_fingerprint,
+};
 pub use progression_verbs::ProgressionVerbRefusal;
 pub use proposal_apply::*;
 pub use query_ensure::*;
