@@ -1,0 +1,189 @@
+What a pane shows before the composer is usable
+================================================
+
+1. First run in a fresh HOME (agy 1.5.5, 80x24): onboarding, three screens. Captured by hand in the
+   exploratory session, not by a scenario.
+
+  screen 1: colour scheme
+    | Welcome to Antigravity CLI!
+    | Choose your color scheme:        ╭─────────────────────────────────────────────╮
+    |                                  │ > you: add a greeting function		│
+    |   > terminal                     │                                             │
+    |     light                        │   Here's the change:                        │
+    |     solarized light              │                                             │
+    |     colorblind-friendly light    │   3     import "fmt"                        │
+    |     dark                         │   4                                         │
+    |     solarized dark               │   5  -  func main() {			│
+    |     colorblind-friendly dark     │   5  +  func greet(name string) {           │
+    |     tokyo night                  │   6  +      fmt.Printf("Hello, %s!\n", name)│
+    |                                  │   7     }                                   │
+    |                                  │                                             │
+    |                                  │   ▾ Thought Process                         │
+    |                                  │     I need to add a greeting function. I'll │
+    |                                  │   ⚙ tool: write_file main.go			│
+    |                                  │   ◉ task: Implementing greeting             │
+    |                                  ╰─────────────────────────────────────────────╯
+    |     [Next]
+    |   ↑/↓ Navigate · enter Confirm
+    |                                                         Gemini 4 Carbon · medium
+
+  screen 2: terms and data use (box is pre-checked)
+    | Terms of Service & Data Use
+    | AI coding agents are known to have certain security risks, including autonomous
+    | code execution, data exfiltration, prompt injection and supply chain risks.
+    | Ensure that you monitor and verify all actions taken by the agent.
+    | --------------------------------------------------------------------------------
+    |   > [x] Yes, I agree to help improve Antigravity CLI by allowing
+    |       Google to collect and use my Interactions data,
+    |       subject to the Google Antigravity CLI Terms of Service
+    |       and Google Privacy Policy. I understand I can
+    |       choose to opt out later whenever I want via my
+    |       settings.
+    |       Links:
+    |       - Terms of Service: https://antigravity.google/terms
+    |       - Privacy Policy: https://policies.google.com/privacy
+    |     [Previous]      [Done]
+    |   ↑/↓ Navigate · enter Toggle
+    |                                                         Gemini 4 Carbon · medium
+
+  screen 3: workspace trust
+    | Accessing workspace:
+    | <spike…>
+    | <…spike>
+    | Do you trust the contents of this project?
+    | Antigravity CLI requires permission to read, edit, and execute files here.
+    | > Yes, I trust this folder
+    |   No, exit
+    |   ↑/↓ Navigate · enter Confirm
+    |                                                         Gemini 4 Carbon · medium
+
+  State written by completing onboarding and trusting the folder:
+    $HOME/.gemini/antigravity-cli/cache/onboarding.json
+      {"consumerOnboardingComplete": true, "enterpriseOnboardingComplete": false, "onboardingComplete": true}
+    $HOME/.gemini/antigravity-cli/settings.json
+      {"trustedWorkspaces": ["<absolute, symlink-resolved workspace path>"]}
+
+  Writing those two files into a fresh scoped HOME before launch skips both (every scenario below does).
+
+2. agy 1.1.12: scoped HOME with no credential (no keychain bridge), onboarding and trust pre-seeded (scenario signin)
+    |      ▄▀▀▄
+    |     ▀▀▀▀▀▀
+    |    ▀▀▀▀▀▀▀▀
+    |   ▄▀▀    ▀▀▄
+    |  ▄▀▀      ▀▀▄
+    |  Welcome to the Antigravity CLI. You are currently not signed in.
+    |  Select login method:
+    |  > 1. Google OAuth
+    |    2. Use a Google Cloud project
+    |  [Use arrow keys to navigate, Enter to select]
+
+2. agy 1.5.5: scoped HOME with no credential (no keychain bridge), onboarding and trust pre-seeded (scenario signin)
+    |      ▄▀▀▄
+    |     ▀▀▀▀▀▀
+    |    ▀▀▀▀▀▀▀▀
+    |   ▄▀▀    ▀▀▄
+    |  ▄▀▀      ▀▀▄
+    |  Welcome to the Antigravity CLI. You are currently not signed in.
+    |  Select login method:
+    |  > 1. Google OAuth
+    |    2. Use a Google Cloud project
+    |    ↑/↓ Navigate · enter Select
+
+3. Signed-in start-up, frame by frame (tmux capture-pane every 200 ms; scenario launcher small)
+
+  agy 1.1.12
+    04:21:20.876
+    |  Welcome to the Antigravity CLI. You are currently not signed in.
+    |  ⣷  Signing in...
+    04:21:21.544
+    |   Antigravity CLI 1.1.12
+    |   <account-email>
+    |   Gemini 3.8 Flash (Low)
+    |   <spike…>
+    | ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | ? for shortcuts                                                                                       Gemini 3
+    04:21:22.456
+    |   Antigravity CLI 1.1.12
+    |   <account-email> (Google AI Ultra)
+    |   Gemini 3.8 Flash (Low)
+    |   <spike…>
+    | ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | ? for shortcuts                                                                                       Gemini 3
+    04:21:22.672
+    |   The rest of this message is filler that stands in for a multi-line worker brief; ignore it.
+    |   - filler line 001: the quick brown fox jumps over the lazy dog
+    |   - filler line 002: the quick brown fox jumps over the lazy dog
+    |   - filler line 003: the quick brown fox jumps over the lazy dog
+    |   - filler line 004: the quick brown fox jumps over the lazy dog
+    |   - filler line 005: the quick brown fox jumps over the lazy dog
+    |   - filler line 006: the quick brown fox jumps over the lazy dog
+    |   - filler line 007: the quick brown fox jumps over the lazy dog
+    |   - filler line 008: the quick brown fox jumps over the lazy dog
+
+    launcher steps for this run:
+      04:21:22.585  ready  {"wait_ms": 1953}
+      04:21:22.586  paste_sent  {"bytes": 2076, "write_ms": 56}
+      04:21:22.594  paste_landed  {"evidence": "repaint", "wait_ms": 7}
+      04:21:22.594  submit_sent  {}
+
+  agy 1.5.5
+    03:58:30.435
+    |  Welcome to the Antigravity CLI. You are currently not signed in.
+    |  ⣷  Signing in...
+    03:58:31.152
+    |   Antigravity CLI 1.5.5
+    |   <account-email>
+    |   Gemini 3.8 Flash (Low)
+    |   <spike…>
+    | ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | ? for shortcuts                                                                                       Gemini 3
+    03:58:31.606
+    |   The rest of this message is filler that stands in for a multi-line worker brief; ignore it.
+    |   - filler line 001: the quick brown fox jumps over the lazy dog
+    |   - filler line 002: the quick brown fox jumps over the lazy dog
+    |   - filler line 003: the quick brown fox jumps over the lazy dog
+    |   - filler line 004: the quick brown fox jumps over the lazy dog
+    |   - filler line 005: the quick brown fox jumps over the lazy dog
+    |   - filler line 006: the quick brown fox jumps over the lazy dog
+    |   - filler line 007: the quick brown fox jumps over the lazy dog
+    |   - filler line 008: the quick brown fox jumps over the lazy dog
+    03:58:33.551
+    |   - filler line 001: the quick brown fox jumps over the lazy dog
+    |   - filler line 002: the quick brown fox jumps over the lazy dog
+    |   - filler line 003: the quick brown fox jumps over the lazy dog
+    |   - filler line 004: the quick brown fox jumps over the lazy dog
+    |   - filler line 005: the quick brown fox jumps over the lazy dog
+    |   - filler line 006: the quick brown fox jumps over the lazy dog
+    |   - filler line 007: the quick brown fox jumps over the lazy dog
+    |   - filler line 008: the quick brown fox jumps over the lazy dog
+    |   - filler line 009: the quick brown fox jumps over the lazy dog
+
+    launcher steps for this run:
+      03:58:31.397  ready  {"wait_ms": 2694}
+      03:58:31.398  paste_sent  {"bytes": 2076, "write_ms": 60}
+      03:58:31.408  paste_landed  {"evidence": "repaint", "wait_ms": 10}
+      03:58:31.409  submit_sent  {}
+
+4. agy 1.5.5 with AGY_CLI_HIDE_ACCOUNT_INFO=true exported in the pane shell (scenario hideaccount)
+    |       ▄▀▀▄
+    |      ▀▀▀▀▀▀
+    |     ▀▀▀▀▀▀▀▀
+    |    ▄▀▀    ▀▀▄
+    |   ▄▀▀      ▀▀▄
+    |   Antigravity CLI 1.5.5
+    |   Gemini 3.8 Flash (Low)
+    |   <spike…>
+    |  ┃ Introducing Gemini 4 Carbon
+    |  ┃ Our most advanced model yet!
+    |  ┃ esc to dismiss
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────
+    | ? for shortcuts                                                                                     
+    lines containing @: 0

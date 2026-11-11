@@ -1,0 +1,8 @@
+#!/bin/bash
+# The spike's private tmux server. Never the default server, never Boss's.
+# The socket is addressed relative to a short-lived cwd because the absolute
+# path of a scratch directory can be longer than a unix socket path may be.
+root="${SPIKE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+mkdir -p "$root/tmx" && cd "$root/tmx" || exit 1
+unset TMUX TMUX_PANE
+exec "${TMUX_BIN:-tmux}" -S s "$@"

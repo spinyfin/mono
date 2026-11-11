@@ -1,0 +1,107 @@
+What a hook's reply does
+========================
+
+PreToolUse, scenario hookreply: agy launched with --dangerously-skip-permissions; the brief asks for one shell
+command, `echo ran > hookreply_canary.txt`. Global hooks.json under the scoped HOME.
+
+agy 1.1.12
+  mode=allow version=1.1.12 | canary=written | pre_tool_hooks=1 post_tool_hooks=1
+      model said: HOOKREPLY_DONE
+      hooks: SessionStart PreInvocation PreToolUse PostToolUse PostInvocation PreInvocation PostInvocation Stop
+      pane tool row: ● Bash(echo ran > hookreply_canary.txt) (ctrl+o to expand)
+  mode=empty-object version=1.1.12 | canary=absent | pre_tool_hooks=1 post_tool_hooks=0
+      model said: HOOKREPLY_DONE
+      hooks: SessionStart PreInvocation PreToolUse PostInvocation PreInvocation PostInvocation Stop
+      pane tool row: ● Bash(echo ran > hookreply_canary.txt) (ctrl+o to expand)
+  mode=no-output version=1.1.12 | canary=written | pre_tool_hooks=1 post_tool_hooks=1
+      model said: HOOKREPLY_DONE
+      hooks: SessionStart PreInvocation PreToolUse PostToolUse PostInvocation PreInvocation PostInvocation Stop
+      pane tool row: ● Bash(echo ran > hookreply_canary.txt) (ctrl+o to expand)
+  mode=malformed version=1.1.12 | canary=absent | pre_tool_hooks=1 post_tool_hooks=0
+      model said: HOOKREPLY_DONE
+      hooks: SessionStart PreInvocation PreToolUse PostInvocation PreInvocation PostInvocation Stop
+      pane tool row: ● Bash(echo ran > hookreply_canary.txt) (ctrl+o to expand)
+  mode=exit-1 version=1.1.12 | canary=absent | pre_tool_hooks=1 post_tool_hooks=0
+      model said: HOOKREPLY_DONE
+      hooks: SessionStart PreInvocation PreToolUse PostInvocation PreInvocation PostInvocation Stop
+      pane tool row: ● Bash(echo ran > hookreply_canary.txt) (ctrl+o to expand)
+  mode=exit-2 version=1.1.12 | canary=absent | pre_tool_hooks=1 post_tool_hooks=0
+      model said: HOOKREPLY_DONE
+      hooks: SessionStart PreInvocation PreToolUse PostInvocation PreInvocation PostInvocation Stop
+      pane tool row: ● Bash(echo ran > hookreply_canary.txt) (ctrl+o to expand)
+
+agy 1.5.5
+  mode=allow version=1.5.5 | canary=written | pre_tool_hooks=1 post_tool_hooks=1
+      model said: HOOKREPLY_DONE
+      hooks: SessionStart PreInvocation PreToolUse PostToolUse PostInvocation PreInvocation PostInvocation Stop
+      pane tool row: ● Ran (echo ran > hookreply_canary.txt) (ctrl+o to expand)
+  mode=empty-object version=1.5.5 | canary=absent | pre_tool_hooks=1 post_tool_hooks=0
+      step error: tool call denied by pre-tool hook: 
+      model said: HOOKREPLY_DONE
+      hooks: SessionStart PreInvocation PreToolUse PostInvocation PreInvocation PostInvocation Stop
+      pane tool row: ● Ran (echo ran > hookreply_canary.txt) failed (ctrl+o to expand)
+  mode=no-output version=1.5.5 | canary=written | pre_tool_hooks=1 post_tool_hooks=1
+      model said: HOOKREPLY_DONE
+      hooks: SessionStart PreInvocation PreToolUse PostToolUse PostInvocation PreInvocation PostInvocation Stop
+      pane tool row: ● Ran (echo ran > hookreply_canary.txt) (ctrl+o to expand)
+  mode=malformed version=1.5.5 | canary=absent | pre_tool_hooks=1 post_tool_hooks=0
+      step error: failed to unmarshal result from hook jsonhook__spike-dump_PreToolUse_0_0 via protojson: NOT JSON: proto: syntax error (line 1:1): invalid value NOT
+      model said: HOOKREPLY_DONE
+      hooks: SessionStart PreInvocation PreToolUse PostInvocation PreInvocation PostInvocation Stop
+      pane tool row: ● Ran (echo ran > hookreply_canary.txt) failed (ctrl+o to expand)
+  mode=exit-1 version=1.5.5 | canary=absent | pre_tool_hooks=1 post_tool_hooks=0
+      step error: JSON hook "jsonhook__spike-dump_PreToolUse_0_0" failed: command failed: exit status 1, stderr: 
+      model said: HOOKREPLY_DONE
+      hooks: SessionStart PreInvocation PreToolUse PostInvocation PreInvocation PostInvocation Stop
+      pane tool row: ● Ran (echo ran > hookreply_canary.txt) failed (ctrl+o to expand)
+  mode=exit-2 version=1.5.5 | canary=absent | pre_tool_hooks=1 post_tool_hooks=0
+      step error: JSON hook "jsonhook__spike-dump_PreToolUse_0_0" failed: command failed: exit status 2, stderr: 
+      model said: HOOKREPLY_DONE
+      hooks: SessionStart PreInvocation PreToolUse PostInvocation PreInvocation PostInvocation Stop
+      pane tool row: ● Ran (echo ran > hookreply_canary.txt) failed (ctrl+o to expand)
+
+PreInvocation replying {"injectSteps":[{"errorMessage":{…}}],"terminationBehavior":"terminate"} (scenario hookterm)
+
+  agy 1.1.12
+    1794392460589 SessionStart   conversationId='545e18d4'
+    1794392460638 PreInvocation  conversationId='545e18d4' invocationNum=0
+    1794392462788 PostInvocation conversationId='545e18d4' invocationNum=0
+    1794392462830 Stop           conversationId='545e18d4' executionNum=0 terminationReason='NO_TOOL_CALL' fullyIdle=True error=''
+    |   - filler line 030: the quick brown fox jumps over the lazy dog
+    |   LAUNCH_OK_SMALL
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | ? for shortcuts                                                                                       Gemini 3.8 Flash ·
+
+  agy 1.5.5
+    1794391781454 SessionStart   conversationId='f677cd22' lastUserInput='Reply with exactly the single token LAUNCH_OK_SM'
+    1794391781512 PreInvocation  conversationId='f677cd22' invocationNum=0 lastUserInput='Reply with exactly the single token LAUNCH_OK_SM'
+    1794391781571 Stop           conversationId='f677cd22' executionNum=0 terminationReason='TERMINAL_CUSTOM_HOOK' fullyIdle=True error='' lastUserInput='Reply with exactly the single token LAUNCH_OK_SM'
+    |   - filler line 030: the quick brown fox jumps over the lazy dog
+    | ⚠ spike: PreInvocation hook terminated this turn
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | ? for shortcuts                                                                                       Gemini 3.8 Flash ·
+
+Malformed replies on the other events (agy 1.5.5, exploratory session; the dump hook then had a bug and printed `{\}`)
+The turns ran normally; agy logged one error per hook call and carried on:
+
+    failed to call custom session start hook jsonhook__spike-dump_SessionStart_0_0: failed to unmarshal result from hook jsonhook__spike-dump_SessionStart_0_0 via protojson: {\}: proto: syntax e
+    pre-invocation hook "jsonhook__spike-dump_PreInvocation_0_0" failed: failed to unmarshal result from hook jsonhook__spike-dump_PreInvocation_0_0 via protojson: {\}: prot
+    failed to call custom post-invocation hook jsonhook__spike-dump_PostInvocation_0_0: failed to unmarshal result from hook jsonhook__spike-dump_PostInvocation_0_0 via protojson: {\}: proto: synt
+    failed to call custom stop hook jsonhook__spike-dump_Stop_0_0: failed to unmarshal result from hook jsonhook__spike-dump_Stop_0_0 via protojson: {\}: proto: syntax error (line 1:2):
+
+Default permission mode (no --dangerously-skip-permissions) with PreToolUse replying {"decision":"allow"}: the
+ordinary approval dialog still appears (agy 1.5.5, exploratory session):
+
+    | Requesting permission for:
+    |    sleep 3 && echo PERM_PROBE3
+    | Run this command?
+    | > 1. Yes, run command
+    |   2. Yes, and always allow in this conversation for commands that start with 'sleep'
+    |   3. Yes, and always allow for commands that start with 'sleep' (Persist to settings.json)
+    |   4. No, cancel
+    |   ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command
+    | esc to cancel                                                                                         Gemini 3.8 Flash · low

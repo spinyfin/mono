@@ -1,0 +1,198 @@
+Interrupting a turn with `tmux send-keys Escape`
+================================================
+
+agy 1.1.12, Escape during a shell tool call (sleep 60)
+    04:17:18.389  script  new-session (launcher)
+    04:17:21.592  script  viewer attached
+    04:17:25.190  agy log input_loop.go: HandleUserInput called with text: "Use your shell command tool to run exactly thi…
+    04:17:25.254  script  launcher: delivered
+    04:17:25.313  hook    SessionStart
+    04:17:25.452  hook    PreInvocation invocationNum=0
+    04:17:34.908  hook    PreToolUse tool=run_command
+    04:17:35.062  script  hook PreToolUse count>=1
+    04:17:39.400  agy log conversation_manager.go: Cancelling in-progress response for conversation 9476903e-615e-4a03-b5b5-ea82733cc97b
+    04:17:39.400  agy log server.go: Cancelling conversation 9476903e-615e-4a03-b5b5-ea82733cc97b (killBackgroundTasks=false)
+    04:17:39.424  script  Escape press #1 sent (tmux send-keys Escape)
+    04:17:40.263  script  after Escape: ended=pane_idle presses=1 stop_hooks=0
+    04:17:44.307  script  submit: Reply with exactly the single token AFTER_ESC_OK. Do not use tools.
+    04:17:47.054  agy log input_loop.go: HandleUserInput called with text: "Reply with exactly the single token AFTER_ESC_…
+    04:17:47.302  hook    PreInvocation invocationNum=0
+    04:17:49.467  hook    PostInvocation invocationNum=0
+    04:17:49.825  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    04:17:50.303  script  hook Stop count>=1
+
+  ended=pane_idle presses=1 stop_hooks_from_cancelled_turn=0 sleep_child_before=1 sleep_child_after=0
+  hooks: SessionStart PreInvocation PreToolUse PreInvocation PostInvocation Stop
+
+  pane just before Escape:
+    | ○ Bash(sleep 60) (ctrl+o to expand)
+    | ⢿  Running...
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | esc to cancel                                                                                         Gemini 3.8 Flash · low
+  pane 2 s after Escape:
+    | ● Bash(sleep 60) (ctrl+o to expand)
+    |   ⎿  Interrupted · What should Antigravity CLI do instead?
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | ? for shortcuts                                                                                       Gemini 3.8 Flash · low
+  GhosttyKit viewport 2 s after Escape:
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | ? for shortcuts                                                                                       Gemini 3.8 Flash · low
+
+  transcript_full.jsonl rows (no row records the cancellation):
+    step_index=0 type=USER_INPUT status=DONE content='<USER_REQUEST> Use your shell command tool to run exactly th'
+    step_index=1 type=CHECKPOINT status=DONE content='# Resuming from a compaction  You are continuing work on the'
+    step_index=2 type=PLANNER_RESPONSE status=DONE tool_calls=run_command
+    step_index=4 type=USER_INPUT status=DONE content='<USER_REQUEST> Reply with exactly the single token AFTER_ESC'
+    step_index=5 type=PLANNER_RESPONSE status=DONE content='AFTER_ESC_OK'
+
+agy 1.1.12, Escape while the model is writing a long answer
+    04:18:00.800  script  new-session (launcher)
+    04:18:02.115  script  viewer attached
+    04:18:04.522  agy log input_loop.go: HandleUserInput called with text: "Do not use any tools.\n\nWrite the integers fr…
+    04:18:04.806  script  launcher: delivered
+    04:18:04.968  hook    SessionStart
+    04:18:05.211  hook    PreInvocation invocationNum=0
+    04:18:05.470  script  hook PreInvocation count>=1
+    04:18:10.067  script  Escape press #1 sent (tmux send-keys Escape)
+    04:18:10.113  agy log conversation_manager.go: Cancelling in-progress response for conversation 30dedab2-dc3a-4990-8b2c-53e481e66031
+    04:18:10.113  agy log server.go: Cancelling conversation 30dedab2-dc3a-4990-8b2c-53e481e66031 (killBackgroundTasks=false)
+    04:18:10.795  script  after Escape: ended=pane_idle presses=1 stop_hooks=0
+    04:18:13.163  script  submit: Reply with exactly the single token AFTER_ESC_OK. Do not use tools.
+    04:18:13.651  agy log input_loop.go: HandleUserInput called with text: "Reply with exactly the single token AFTER_ESC_…
+    04:18:13.792  hook    PreInvocation invocationNum=0
+    04:18:15.397  hook    PostInvocation invocationNum=0
+    04:18:15.601  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    04:18:15.801  script  hook Stop count>=1
+
+  ended=pane_idle presses=1 stop_hooks_from_cancelled_turn=0
+  hooks: SessionStart PreInvocation PreInvocation PostInvocation Stop
+
+  pane just before Escape:
+    | ⣽  Generating...
+    | └ Tip: Use @ to mention files and give the model more context.
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | esc to cancel                                                                                         Gemini 3.8 Flash · low
+  pane 2 s after Escape:
+    |   244
+    |   ⎿  Interrupted · What should Antigravity CLI do instead?
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | ? for shortcuts                                                                                       Gemini 3.8 Flash · low
+  GhosttyKit viewport 2 s after Escape:
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | ? for shortcuts                                                                                       Gemini 3.8 Flash · low
+
+  transcript_full.jsonl rows (no row records the cancellation):
+    step_index=0 type=USER_INPUT status=DONE content='<USER_REQUEST> Do not use any tools.  Write the integers fro'
+    step_index=1 type=CHECKPOINT status=DONE content='# Resuming from a compaction  You are continuing work on the'
+    step_index=2 type=PLANNER_RESPONSE status=DONE content='1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 '
+    step_index=3 type=USER_INPUT status=DONE content='<USER_REQUEST> Reply with exactly the single token AFTER_ESC'
+    step_index=4 type=PLANNER_RESPONSE status=DONE content='AFTER_ESC_OK'
+
+agy 1.5.5, Escape during a shell tool call (sleep 60)
+    04:05:07.669  script  new-session (launcher)
+    04:05:07.837  script  viewer attached
+    04:05:09.045  agy log input_loop.go: HandleUserInput called with text: "Use your shell command tool to run exactly thi…
+    04:05:09.136  script  launcher: delivered
+    04:05:09.521  hook    SessionStart
+    04:05:09.584  hook    PreInvocation invocationNum=0
+    04:05:12.437  hook    PreToolUse tool=run_command
+    04:05:12.495  script  hook PreToolUse count>=1
+    04:05:15.789  script  Escape press #1 sent (tmux send-keys Escape)
+    04:05:15.818  agy log conversation_manager.go: Cancelling in-progress response for conversation 6d880857-92d5-48d0-a059-ee9d0c314125
+    04:05:15.818  agy log server.go: Cancelling conversation 6d880857-92d5-48d0-a059-ee9d0c314125 (killBackgroundTasks=false)
+    04:05:16.109  script  after Escape: ended=pane_idle presses=1 stop_hooks=0
+    04:05:18.236  script  submit: Reply with exactly the single token AFTER_ESC_OK. Do not use tools.
+    04:05:18.335  agy log input_loop.go: HandleUserInput called with text: "Reply with exactly the single token AFTER_ESC_…
+    04:05:18.382  hook    PreInvocation invocationNum=0
+    04:05:19.777  hook    PostInvocation invocationNum=0
+    04:05:19.822  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    04:05:19.885  script  hook Stop count>=1
+
+  ended=pane_idle presses=1 stop_hooks_from_cancelled_turn=0 sleep_child_before=1 sleep_child_after=0
+  hooks: SessionStart PreInvocation PreToolUse PreInvocation PostInvocation Stop
+
+  pane just before Escape:
+    | ● Running (sleep 60) (ctrl+o to expand)
+    | ⣷  Running command...
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | esc to cancel                                                                                         Gemini 3.8 Flash · low
+  pane 2 s after Escape:
+    | ● Ran (sleep 60) (ctrl+o to expand)
+    |   ⎿  Interrupted · What should Antigravity CLI do instead?
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | ? for shortcuts                                                                                       Gemini 3.8 Flash · low
+  GhosttyKit viewport 2 s after Escape:
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | > Reply with exactly the single token AFTER_ES
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    |                                                                                                       Gemini 3.8 Flash · low
+
+  transcript_full.jsonl rows (no row records the cancellation):
+    step_index=0 type=USER_INPUT status=DONE content='<USER_REQUEST> Use your shell command tool to run exactly th'
+    step_index=1 type=PLANNER_RESPONSE status=DONE tool_calls=run_command
+    step_index=3 type=USER_INPUT status=DONE content='<USER_REQUEST> Reply with exactly the single token AFTER_ESC'
+    step_index=4 type=PLANNER_RESPONSE status=DONE content='AFTER_ESC_OK'
+
+agy 1.5.5, Escape while the model is writing a long answer
+    04:05:35.204  script  new-session (launcher)
+    04:05:35.520  script  viewer attached
+    04:05:36.462  agy log input_loop.go: HandleUserInput called with text: "Do not use any tools.\n\nWrite the integers fr…
+    04:05:36.640  script  launcher: delivered
+    04:05:36.956  hook    SessionStart
+    04:05:37.003  hook    PreInvocation invocationNum=0
+    04:05:37.165  script  hook PreInvocation count>=1
+    04:05:39.839  script  Escape press #1 sent (tmux send-keys Escape)
+    04:05:39.871  agy log conversation_manager.go: Cancelling in-progress response for conversation a6117698-e4e7-4f0f-98c2-fc06b4643883
+    04:05:39.871  agy log server.go: Cancelling conversation a6117698-e4e7-4f0f-98c2-fc06b4643883 (killBackgroundTasks=false)
+    04:05:40.129  script  after Escape: ended=pane_idle presses=1 stop_hooks=0
+    04:05:42.281  script  submit: Reply with exactly the single token AFTER_ESC_OK. Do not use tools.
+    04:05:42.402  agy log input_loop.go: HandleUserInput called with text: "Reply with exactly the single token AFTER_ESC_…
+    04:05:42.452  hook    PreInvocation invocationNum=0
+    04:05:43.963  hook    PostInvocation invocationNum=0
+    04:05:44.014  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    04:05:44.197  script  hook Stop count>=1
+
+  ended=pane_idle presses=1 stop_hooks_from_cancelled_turn=0
+  hooks: SessionStart PreInvocation PreInvocation PostInvocation Stop
+
+  pane just before Escape:
+    | ⣷  Generating...
+    | └ Tip: Use /skills to browse and manage agent skills.
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | esc to cancel                                                                                         Gemini 3.8 Flash · low
+  pane 2 s after Escape:
+    |   163
+    |   ⎿  Interrupted · What should Antigravity CLI do instead?
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | ? for shortcuts                                                                                       Gemini 3.8 Flash · low
+  GhosttyKit viewport 2 s after Escape:
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | ? for shortcuts                                                                                       Gemini 3.8 Flash · low
+
+  transcript_full.jsonl rows (no row records the cancellation):
+    step_index=0 type=USER_INPUT status=DONE content='<USER_REQUEST> Do not use any tools.  Write the integers fro'
+    step_index=1 type=PLANNER_RESPONSE status=DONE content='1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 '
+    step_index=2 type=USER_INPUT status=DONE content='<USER_REQUEST> Reply with exactly the single token AFTER_ESC'
+    step_index=3 type=PLANNER_RESPONSE status=DONE content='AFTER_ESC_OK'

@@ -1,0 +1,197 @@
+Brief delivery by Boss's unmodified launcher (engine/driver/src/initial_prompt.py)
+================================================================================
+
+Launcher sha256 at the time of the run: c1b85af9ff6c6f5d700fdc0d9fcd57c61eb2da168a664c0cd81639bd13410aec
+
+initial-prompt.json used for agy 1.1.12:
+    {
+      "agent_markers": [
+        "(Google AI"
+      ],
+      "starting_markers": [
+        "Welcome to Antigravity CLI!",
+        "Choose your color scheme",
+        "Terms of Service",
+        "Accessing workspace:",
+        "Do you trust the contents of this project?",
+        "Signing in...",
+        "You are currently not signed in"
+      ],
+      "paste_landed_markers": []
+    }
+
+initial-prompt.json used for agy 1.5.5:
+    {
+      "agent_markers": [
+        "? for shortcuts"
+      ],
+      "starting_markers": [
+        "Welcome to Antigravity CLI!",
+        "Choose your color scheme",
+        "Terms of Service",
+        "Accessing workspace:",
+        "Do you trust the contents of this project?"
+      ],
+      "paste_landed_markers": []
+    }
+
+agy 1.1.12, brief 'small' (2076 bytes, 34 lines)
+    04:21:20.566  script  new-session (launcher)
+    04:21:20.744  script  viewer attached
+    04:21:22.606  agy log input_loop.go: HandleUserInput called with text: "Reply with exactly the single token LAUNCH_OK_…
+    04:21:22.680  hook    SessionStart
+    04:21:22.682  script  launcher: delivered
+    04:21:22.722  hook    PreInvocation invocationNum=0
+    04:21:25.451  hook    PostInvocation invocationNum=0
+    04:21:25.626  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    04:21:25.711  script  hook Stop count>=1
+    04:21:26.894  script  submit: Reply with exactly the single token PROBE_AFTER_BRIEF_OK. Do not use tools.
+    04:21:27.397  agy log input_loop.go: HandleUserInput called with text: "Reply with exactly the single token PROBE_AFTE…
+    04:21:27.516  hook    PreInvocation invocationNum=0
+    04:21:29.076  hook    PostInvocation invocationNum=0
+    04:21:29.149  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    04:21:29.212  script  hook Stop count>=2
+
+  launcher's own record (initial-prompt.delivery.jsonl):
+    04:21:22.585  ready  {"wait_ms": 1953}
+    04:21:22.586  paste_sent  {"bytes": 2076, "write_ms": 56}
+    04:21:22.594  paste_landed  {"evidence": "repaint", "wait_ms": 7}
+    04:21:22.594  submit_sent  {}
+  first model row in transcript_full.jsonl: content='LAUNCH_OK_SMALL' (this version's rows carry no token counts)
+  hooks: SessionStart PreInvocation PostInvocation Stop PreInvocation PostInvocation Stop
+  end: dead=1 status=0 pid= size=124x37 cmd=export alt=0 cursor=0,36
+
+agy 1.1.12, brief 'big' (49782 bytes, 458 lines)
+    04:13:47.238  script  new-session (launcher)
+    04:13:47.648  script  viewer attached
+    04:13:49.698  agy log input_loop.go: HandleUserInput called with text: "Reply with exactly the single token LAUNCH_OK_…
+    04:13:49.804  hook    SessionStart
+    04:13:49.890  hook    PreInvocation invocationNum=0
+    04:13:49.943  script  launcher: delivered
+    04:13:52.726  hook    PostInvocation invocationNum=0
+    04:13:52.856  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    04:13:53.006  script  hook Stop count>=1
+    04:13:54.330  script  submit: Reply with exactly the single token PROBE_AFTER_BRIEF_OK. Do not use tools.
+    04:13:55.045  agy log input_loop.go: HandleUserInput called with text: "Reply with exactly the single token PROBE_AFTE…
+    04:13:55.158  hook    PreInvocation invocationNum=0
+    04:13:56.895  hook    PostInvocation invocationNum=0
+    04:13:57.108  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    04:13:57.176  script  hook Stop count>=2
+
+  launcher's own record (initial-prompt.delivery.jsonl):
+    04:13:49.658  ready  {"wait_ms": 2250}
+    04:13:49.673  paste_sent  {"bytes": 49782, "write_ms": 68}
+    04:13:49.689  paste_landed  {"evidence": "repaint", "wait_ms": 16}
+    04:13:49.691  submit_sent  {}
+  first model row in transcript_full.jsonl: content='LAUNCH_OK_BIG' (this version's rows carry no token counts)
+  hooks: SessionStart PreInvocation PostInvocation Stop PreInvocation PostInvocation Stop
+  end: dead=1 status=0 pid= size=124x37 cmd=export alt=0 cursor=0,36
+
+agy 1.5.5, brief 'small' (2076 bytes, 34 lines)
+    03:58:28.521  script  new-session (launcher)
+    03:58:29.802  script  viewer attached
+    03:58:31.410  agy log input_loop.go: HandleUserInput called with text: "Reply with exactly the single token LAUNCH_OK_…
+    03:58:31.615  script  launcher: delivered
+    03:58:31.844  hook    SessionStart
+    03:58:31.994  hook    PreInvocation invocationNum=0
+    03:58:33.473  hook    PostInvocation invocationNum=0
+    03:58:33.599  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    03:58:33.806  script  hook Stop count>=1
+    03:58:34.936  script  submit: Reply with exactly the single token PROBE_AFTER_BRIEF_OK. Do not use tools.
+    03:58:35.272  agy log input_loop.go: HandleUserInput called with text: "Reply with exactly the single token PROBE_AFTE…
+    03:58:35.511  hook    PreInvocation invocationNum=0
+    03:58:36.986  hook    PostInvocation invocationNum=0
+    03:58:37.136  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    03:58:37.308  script  hook Stop count>=2
+
+  launcher's own record (initial-prompt.delivery.jsonl):
+    03:58:31.397  ready  {"wait_ms": 2694}
+    03:58:31.398  paste_sent  {"bytes": 2076, "write_ms": 60}
+    03:58:31.408  paste_landed  {"evidence": "repaint", "wait_ms": 10}
+    03:58:31.409  submit_sent  {}
+  lastUserInput in the first Stop payload: 2075 characters; payload file 3253 bytes
+  first model row in transcript_full.jsonl: input_tokens=9469 cache_read_tokens=0 output_tokens=5 content='LAUNCH_OK_SMALL'
+  hooks: SessionStart PreInvocation PostInvocation Stop PreInvocation PostInvocation Stop
+  end: dead=1 status=0 pid= size=124x37 cmd=export alt=0 cursor=0,36
+
+agy 1.5.5, brief 'big' (49782 bytes, 458 lines)
+    03:58:51.671  script  new-session (launcher)
+    03:58:52.437  script  viewer attached
+    03:58:54.651  agy log input_loop.go: HandleUserInput called with text: "Reply with exactly the single token LAUNCH_OK_…
+    03:58:54.888  script  launcher: delivered
+    03:58:55.273  hook    SessionStart
+    03:58:55.563  hook    PreInvocation invocationNum=0
+    03:58:57.287  hook    PostInvocation invocationNum=0
+    03:58:57.419  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    03:58:57.600  script  hook Stop count>=1
+    03:58:58.815  script  submit: Reply with exactly the single token PROBE_AFTER_BRIEF_OK. Do not use tools.
+    03:58:59.139  agy log input_loop.go: HandleUserInput called with text: "Reply with exactly the single token PROBE_AFTE…
+    03:58:59.400  hook    PreInvocation invocationNum=0
+    03:59:01.024  hook    PostInvocation invocationNum=0
+    03:59:01.166  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    03:59:01.403  script  hook Stop count>=2
+
+  launcher's own record (initial-prompt.delivery.jsonl):
+    03:58:54.583  ready  {"wait_ms": 2698}
+    03:58:54.625  paste_sent  {"bytes": 49782, "write_ms": 102}
+    03:58:54.643  paste_landed  {"evidence": "repaint", "wait_ms": 18}
+    03:58:54.650  submit_sent  {}
+  lastUserInput in the first Stop payload: 49781 characters; payload file 51375 bytes
+  first model row in transcript_full.jsonl: input_tokens=20210 cache_read_tokens=0 output_tokens=5 content='LAUNCH_OK_BIG'
+  hooks: SessionStart PreInvocation PostInvocation Stop PreInvocation PostInvocation Stop
+  end: dead=1 status=0 pid= size=124x37 cmd=export alt=0 cursor=0,36
+
+agy 1.1.12 with the readiness marker the composer alone would suggest ('? for shortcuts'): the brief is lost
+
+  initial-prompt.json for this run: { "agent_markers": [ "? for shortcuts" ], "starting_markers": [ "Welcome to Antigravity CLI!", "Choose your color scheme", "Terms of Service", "Accessing workspace:", "Do you trust the contents of this project?" ], "paste_landed_markers": [] }
+
+  launcher's own record:
+    04:10:31.675  ready  {"wait_ms": 1015}
+    04:10:31.675  paste_sent  {"bytes": 2076, "write_ms": 53}
+    04:10:31.688  paste_landed  {"evidence": "repaint", "wait_ms": 13}
+    04:10:31.689  submit_sent  {}
+
+  agy's log for the same seconds:
+    77:CLI ready for user input
+    88:I1111 04:10:30.827878       1 analytics.go:147] CLI startup completed (took 110.042666ms)
+    106:I1111 04:10:30.930024      89 auth.go:147] ChainedAuth: authenticated via keyring (effective: keyring)
+    114:I1111 04:10:31.251471     332 http_helpers.go:232] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist
+    127:I1111 04:10:31.691106     215 input_loop.go:35] HandleUserInput called with text: "Reply with exactly the single token LAUN…
+    128:I1111 04:10:31.936618     344 http_helpers.go:232] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist
+    129:I1111 04:10:32.228787     344 http_helpers.go:232] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist
+    151:I1111 04:10:32.743675     450 http_helpers.go:232] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist
+
+  pane afterwards (composer empty, no turn, no hook ever fired; launch dir holds initial-prompt.delivered):
+    |   Gemini 3.8 Flash (Low)
+    |   <spike…>
+    | ⚠ Verifying your account...
+    |   ⎿  We're finishing verifying your account eligibility.
+    |      This usually takes a moment. Please try again shortly.
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | ? for shortcuts                                                                                       Gemini 3.8 Flash ·
+
+  The string 'verifying your account eligibility' is in the 1.1.12 binary and absent from the 1.5.5 binary.
+
+agy 1.1.12: the launcher against an untrusted workspace (scenario launcher-untrusted)
+    04:16:39.527  script  new-session (launcher)
+    04:16:40.101  script  viewer attached
+    04:16:43.538  script  pane shows /Do you trust/
+    04:17:10.314  script  launcher: UNDELIVERED
+
+  {"step": "failed", "at_ms": 1794392229739, "reason": "driver did not become ready for initial brief within 30s"}
+  launch dir: initial-prompt.delivery.jsonl initial-prompt.json initial-prompt.py initial-prompt.txt initial-prompt.undelivered worker.pid
+  delivered_rc=1 hooks=
+  dead=1 status=64 pid= size=124x37 cmd=export alt=1 cursor=0,36
+
+agy 1.5.5: the launcher against an untrusted workspace (scenario launcher-untrusted)
+    04:03:59.223  script  new-session (launcher)
+    04:03:59.630  script  viewer attached
+    04:04:00.714  script  pane shows /Do you trust/
+    04:04:29.523  script  launcher: UNDELIVERED
+
+  {"step": "failed", "at_ms": 1794391469427, "reason": "driver did not become ready for initial brief within 30s"}
+  launch dir: initial-prompt.delivery.jsonl initial-prompt.json initial-prompt.py initial-prompt.txt initial-prompt.undelivered worker.pid
+  delivered_rc=1 hooks=
+  dead=1 status=64 pid= size=124x37 cmd=export alt=1 cursor=0,36

@@ -1,0 +1,271 @@
+hooks.json discovery x workspace trust x --add-dir
+==================================================
+
+Each cell: fresh scoped HOME, onboarding pre-seeded, `agy -i "Reply with exactly ..."` as the tmux session command,
+GhosttyKit viewer attached. 'trust' is what settings.json trustedWorkspaces held before launch.
+
+agy 1.1.12
+  hooks.json at: ws/repo/.agents
+  cell=d1 hooks=cwd trust=cwd add-dir=no version=1.1.12
+  dialog=no prompt_ran=yes stop_hooks=1
+  hooks: SessionStart PreInvocation PostInvocation Stop 
+     1 loaded 0 named hooks from 0 hooks.json file(s)
+     1 loaded 1 named hooks from 1 hooks.json file(s)
+  workspaceDirs=[$RUN/ws/repo]
+  settings.json after: {"trustedWorkspaces":["$RUN/ws/repo"]}
+
+  hooks.json at: ws/repo/.agents
+  cell=d2 hooks=cwd trust=none add-dir=no version=1.1.12
+  dialog=yes prompt_ran=yes stop_hooks=0
+  hooks: 
+     1 loaded 0 named hooks from 0 hooks.json file(s)
+     1 loaded 1 named hooks from 1 hooks.json file(s)
+  workspaceDirs=[$RUN/ws/repo]
+  settings.json after: {"trustedWorkspaces":["$RUN/ws/repo"]}
+
+  hooks.json at: ws/control/.agents
+  cell=d3 hooks=control trust=cwd add-dir=yes version=1.1.12
+  dialog=no prompt_ran=yes stop_hooks=1
+  hooks: SessionStart PreInvocation PostInvocation Stop 
+     2 loaded 1 named hooks from 1 hooks.json file(s)
+  workspaceDirs=[$RUN/ws/repo $RUN/ws/control]
+  settings.json after: {"trustedWorkspaces":["$RUN/ws/repo"]}
+
+  hooks.json at: ws/control/.agents
+  cell=d4 hooks=control trust=both add-dir=yes version=1.1.12
+  dialog=no prompt_ran=yes stop_hooks=1
+  hooks: SessionStart PreInvocation PostInvocation Stop 
+     2 loaded 1 named hooks from 1 hooks.json file(s)
+  workspaceDirs=[$RUN/ws/repo $RUN/ws/control]
+  settings.json after: {"trustedWorkspaces":["$RUN/ws/repo","$RUN/ws/control"]}
+
+  hooks.json at: ws/control/.agents
+  cell=d5 hooks=control trust=both add-dir=no version=1.1.12
+  dialog=no prompt_ran=yes stop_hooks=0
+  hooks: 
+     2 loaded 0 named hooks from 0 hooks.json file(s)
+  workspaceDirs=[$RUN/ws/repo]
+  settings.json after: {"trustedWorkspaces":["$RUN/ws/repo","$RUN/ws/control"]}
+
+  hooks.json at: home/.gemini/config
+  cell=d6 hooks=global trust=cwd add-dir=no version=1.1.12
+  dialog=no prompt_ran=yes stop_hooks=1
+  hooks: SessionStart PreInvocation PostInvocation Stop 
+     2 loaded 1 named hooks from 1 hooks.json file(s)
+  workspaceDirs=[$RUN/ws/repo]
+  settings.json after: {"trustedWorkspaces":["$RUN/ws/repo"]}
+
+  hooks.json at: home/.gemini/config
+  cell=d7 hooks=global trust=none add-dir=no version=1.1.12
+  dialog=yes prompt_ran=yes stop_hooks=1
+  hooks: SessionStart PreInvocation PostInvocation Stop 
+     2 loaded 1 named hooks from 1 hooks.json file(s)
+  workspaceDirs=[$RUN/ws/repo]
+  settings.json after: {"trustedWorkspaces":["$RUN/ws/repo"]}
+
+  hooks.json at: ws/control/.agents
+  cell=d8 hooks=control trust=control add-dir=yes version=1.1.12
+  dialog=yes prompt_ran=yes stop_hooks=1
+  hooks: SessionStart PreInvocation PostInvocation Stop 
+     2 loaded 1 named hooks from 1 hooks.json file(s)
+  workspaceDirs=[$RUN/ws/repo $RUN/ws/control]
+  settings.json after: {"trustedWorkspaces":["$RUN/ws/control","$RUN/ws/repo"]}
+
+
+agy 1.5.5
+  hooks.json at: ws/repo/.agents
+  cell=d1 hooks=cwd trust=cwd add-dir=no version=1.5.5
+  dialog=no prompt_ran=yes stop_hooks=1
+  hooks: SessionStart PreInvocation PostInvocation Stop 
+     2 loaded 1 named hooks from 1 hooks.json file(s)
+  workspaceDirs=[$RUN/ws/repo]
+  settings.json after: {"trustedWorkspaces":["$RUN/ws/repo"]}
+
+  hooks.json at: ws/repo/.agents
+  cell=d2 hooks=cwd trust=none add-dir=no version=1.5.5
+  dialog=yes prompt_ran=yes stop_hooks=0
+  hooks: 
+     1 loaded 0 named hooks from 0 hooks.json file(s)
+     1 loaded 1 named hooks from 1 hooks.json file(s)
+  workspaceDirs=[$RUN/ws/repo]
+  settings.json after: {"trustedWorkspaces":["$RUN/ws/repo"]}
+
+  hooks.json at: ws/control/.agents
+  cell=d3 hooks=control trust=cwd add-dir=yes version=1.5.5
+  dialog=no prompt_ran=yes stop_hooks=1
+  hooks: SessionStart PreInvocation PostInvocation Stop 
+     2 loaded 1 named hooks from 1 hooks.json file(s)
+  workspaceDirs=[$RUN/ws/repo $RUN/ws/control]
+  settings.json after: {"trustedWorkspaces":["$RUN/ws/repo"]}
+
+  hooks.json at: ws/control/.agents
+  cell=d4 hooks=control trust=both add-dir=yes version=1.5.5
+  dialog=no prompt_ran=yes stop_hooks=1
+  hooks: SessionStart PreInvocation PostInvocation Stop 
+     2 loaded 1 named hooks from 1 hooks.json file(s)
+  workspaceDirs=[$RUN/ws/repo $RUN/ws/control]
+  settings.json after: {"trustedWorkspaces":["$RUN/ws/repo","$RUN/ws/control"]}
+
+  hooks.json at: ws/control/.agents
+  cell=d5 hooks=control trust=both add-dir=no version=1.5.5
+  dialog=no prompt_ran=yes stop_hooks=0
+  hooks: 
+     2 loaded 0 named hooks from 0 hooks.json file(s)
+  workspaceDirs=[$RUN/ws/repo]
+  settings.json after: {"trustedWorkspaces":["$RUN/ws/repo","$RUN/ws/control"]}
+
+  hooks.json at: home/.gemini/config
+  cell=d6 hooks=global trust=cwd add-dir=no version=1.5.5
+  dialog=no prompt_ran=yes stop_hooks=1
+  hooks: SessionStart PreInvocation PostInvocation Stop 
+     2 loaded 1 named hooks from 1 hooks.json file(s)
+  workspaceDirs=[$RUN/ws/repo]
+  settings.json after: {"trustedWorkspaces":["$RUN/ws/repo"]}
+
+  hooks.json at: home/.gemini/config
+  cell=d7 hooks=global trust=none add-dir=no version=1.5.5
+  dialog=yes prompt_ran=yes stop_hooks=1
+  hooks: SessionStart PreInvocation PostInvocation Stop 
+     2 loaded 1 named hooks from 1 hooks.json file(s)
+  workspaceDirs=[$RUN/ws/repo]
+  settings.json after: {"trustedWorkspaces":["$RUN/ws/repo"]}
+
+  hooks.json at: ws/control/.agents
+  cell=d8 hooks=control trust=control add-dir=yes version=1.5.5
+  dialog=yes prompt_ran=yes stop_hooks=1
+  hooks: SessionStart PreInvocation PostInvocation Stop 
+     2 loaded 1 named hooks from 1 hooks.json file(s)
+  workspaceDirs=[$RUN/ws/repo $RUN/ws/control]
+  settings.json after: {"trustedWorkspaces":["$RUN/ws/control","$RUN/ws/repo"]}
+
+
+Order of events in the cells that showed the trust dialog
+
+agy 1.1.12 cell d2: cell=d2 hooks=cwd trust=none add-dir=no version=1.1.12
+    04:14:47.951  script  new-session (direct)
+    04:14:48.463  script  viewer attached
+    04:14:48.465  agy log hooks_manager.go: loaded 0 named hooks from 0 hooks.json file(s)
+    04:14:49.387  agy log server.go: Created conversation 9b789632-58a0-452d-b0d4-f980dbac04ea
+    04:14:49.465  script  trust dialog shown; hooks loaded so far: 1
+    04:14:52.536  agy log hooks_manager.go: loaded 1 named hooks from 1 hooks.json file(s)
+    04:14:52.579  script  accepted trust with Enter
+
+agy 1.1.12 cell d7: cell=d7 hooks=global trust=none add-dir=no version=1.1.12
+    04:15:52.369  script  new-session (direct)
+    04:15:53.011  script  viewer attached
+    04:15:53.083  agy log hooks_manager.go: loaded 1 named hooks from 1 hooks.json file(s)
+    04:15:54.013  agy log server.go: Created conversation 2e3e8f0f-ba53-4e08-a568-2b5126a910f4
+    04:15:54.096  script  trust dialog shown; hooks loaded so far: 1
+    04:15:54.211  hook    SessionStart
+    04:15:54.320  hook    PreInvocation invocationNum=0
+    04:15:57.248  hook    PostInvocation invocationNum=0
+    04:15:57.296  agy log hooks_manager.go: loaded 1 named hooks from 1 hooks.json file(s)
+    04:15:57.332  script  accepted trust with Enter
+    04:15:57.341  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+
+agy 1.1.12 cell d8: cell=d8 hooks=control trust=control add-dir=yes version=1.1.12
+    04:16:06.495  script  new-session (direct)
+    04:16:06.934  script  viewer attached
+    04:16:06.984  agy log hooks_manager.go: loaded 1 named hooks from 1 hooks.json file(s)
+    04:16:07.911  agy log server.go: Created conversation aea99a41-0735-4635-ae80-572d5711fcb7
+    04:16:08.016  hook    SessionStart
+    04:16:08.135  hook    PreInvocation invocationNum=0
+    04:16:08.841  script  trust dialog shown; hooks loaded so far: 1
+    04:16:10.517  hook    PostInvocation invocationNum=0
+    04:16:10.617  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    04:16:12.051  agy log hooks_manager.go: loaded 1 named hooks from 1 hooks.json file(s)
+    04:16:12.116  script  accepted trust with Enter
+
+agy 1.5.5 cell d2: cell=d2 hooks=cwd trust=none add-dir=no version=1.5.5
+    04:00:49.647  script  new-session (direct)
+    04:00:50.157  script  viewer attached
+    04:00:50.717  agy log hooks_manager.go: loaded 0 named hooks from 0 hooks.json file(s)
+    04:00:51.641  agy log server.go: Created conversation 292012c2-91c9-4c58-a783-004ff2818a3a (backend=BACKEND_TYPE_UNSPECIFIED)
+    04:00:51.795  script  trust dialog shown; hooks loaded so far: 1
+    04:00:54.959  agy log hooks_manager.go: loaded 1 named hooks from 1 hooks.json file(s)
+    04:00:55.058  script  accepted trust with Enter
+
+agy 1.5.5 cell d7: cell=d7 hooks=global trust=none add-dir=no version=1.5.5
+    04:02:45.462  script  new-session (direct)
+    04:02:45.890  script  viewer attached
+    04:02:46.486  agy log hooks_manager.go: loaded 1 named hooks from 1 hooks.json file(s)
+    04:02:47.181  agy log server.go: Created conversation 160c5765-7079-4d20-b699-ebcbc592d50c (backend=BACKEND_TYPE_UNSPECIFIED)
+    04:02:47.347  script  trust dialog shown; hooks loaded so far: 1
+    04:02:47.837  hook    SessionStart
+    04:02:47.977  hook    PreInvocation invocationNum=0
+    04:02:49.829  hook    PostInvocation invocationNum=0
+    04:02:49.908  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    04:02:50.431  agy log hooks_manager.go: loaded 1 named hooks from 1 hooks.json file(s)
+    04:02:50.457  script  accepted trust with Enter
+
+agy 1.5.5 cell d8: cell=d8 hooks=control trust=control add-dir=yes version=1.5.5
+    04:02:58.905  script  new-session (direct)
+    04:03:00.822  script  viewer attached
+    04:03:01.512  agy log hooks_manager.go: loaded 1 named hooks from 1 hooks.json file(s)
+    04:03:02.458  agy log server.go: Created conversation cc5fd53d-1bce-4618-a938-8d889a9da424 (backend=BACKEND_TYPE_UNSPECIFIED)
+    04:03:02.696  script  trust dialog shown; hooks loaded so far: 1
+    04:03:03.542  hook    SessionStart
+    04:03:03.995  hook    PreInvocation invocationNum=0
+    04:03:05.660  hook    PostInvocation invocationNum=0
+    04:03:05.838  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    04:03:05.899  agy log hooks_manager.go: loaded 1 named hooks from 1 hooks.json file(s)
+    04:03:05.965  script  accepted trust with Enter
+
+agy 1.1.12: tool call behind an unanswered trust dialog (scenario trust-tool)
+  command: export HOME=<run:trust-tool-1.1.12>/home; export AGY_CLI_DISABLE_AUTO_UPDATE=true; exec <spike>/bin-1.1.12/agy --log-file <run:trust-tool-1.1.12>/cli.log --model gemini-3.8-flash-low --dangerously-skip-permissions -i Use\ your\ shell\ command\ tool\ to\ run\ exactly:\ echo\ behind-dialog\ \>\ <run:trust-tool-1.1.12>/ws/repo/CANARY_WRITTEN_BEHIND_TRUST_DIALOG.txt\ \;\ then\ reply\ with\ exactly\ TRUST_TOOL_DONE.
+    04:16:17.828  script  new-session (direct)
+    04:16:18.000  script  viewer attached
+    04:16:18.964  script  pane shows /Do you trust/
+    04:16:19.012  hook    SessionStart
+    04:16:19.176  hook    PreInvocation invocationNum=0
+    04:16:28.433  hook    PreToolUse tool=run_command
+    04:16:28.653  hook    PostToolUse tool=run_command error=''
+    04:16:28.794  hook    PostInvocation invocationNum=0
+    04:16:28.891  hook    PreInvocation invocationNum=1
+    04:16:30.313  hook    PostInvocation invocationNum=1
+    04:16:30.515  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    04:16:32.250  script  CANARY EXISTS: tool ran behind the trust dialog
+
+  dialog_still_up=1 canary=present hooks=SessionStart PreInvocation PreToolUse PostToolUse PostInvocation PreInvocation PostInvocation Stop 
+  settings.json after: {}
+  after selecting 'No, exit': dead=1 status=0 pid= size=124x37 cmd=export alt=0 cursor=0,36
+
+  pane while the tool ran:
+    | Accessing workspace:
+    | <spike…>
+    | Do you trust the contents of this project?
+    | Antigravity CLI requires permission to read, edit, and execute files here.
+    | > Yes, I trust this folder
+    |   No, exit
+    |   ↑/↓ Navigate · enter Confirm
+    |                                                                                                       Gemini 3.8 Flash ·
+
+agy 1.5.5: tool call behind an unanswered trust dialog (scenario trust-tool)
+  command: export HOME=<run:trust-tool-1.5.5>/home; export AGY_CLI_DISABLE_AUTO_UPDATE=true; exec <spike>/bin-1.5.5/agy --log-file <run:trust-tool-1.5.5>/cli.log --model gemini-3.8-flash-low --dangerously-skip-permissions -i Use\ your\ shell\ command\ tool\ to\ run\ exactly:\ echo\ behind-dialog\ \>\ <run:trust-tool-1.5.5>/ws/repo/CANARY_WRITTEN_BEHIND_TRUST_DIALOG.txt\ \;\ then\ reply\ with\ exactly\ TRUST_TOOL_DONE.
+    04:03:47.781  script  new-session (direct)
+    04:03:47.962  script  viewer attached
+    04:03:48.777  script  pane shows /Do you trust/
+    04:03:49.375  hook    SessionStart
+    04:03:49.416  hook    PreInvocation invocationNum=0
+    04:03:52.119  hook    PreToolUse tool=run_command
+    04:03:52.176  hook    PostToolUse tool=run_command error=''
+    04:03:52.219  hook    PostInvocation invocationNum=0
+    04:03:52.259  hook    PreInvocation invocationNum=1
+    04:03:53.839  hook    PostInvocation invocationNum=1
+    04:03:53.883  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    04:03:55.125  script  CANARY EXISTS: tool ran behind the trust dialog
+
+  dialog_still_up=1 canary=present hooks=SessionStart PreInvocation PreToolUse PostToolUse PostInvocation PreInvocation PostInvocation Stop 
+  settings.json after: {}
+  after selecting 'No, exit': dead=1 status=0 pid= size=124x37 cmd=export alt=0 cursor=0,36
+
+  pane while the tool ran:
+    | Accessing workspace:
+    | <spike…>
+    | <…spike>
+    | Do you trust the contents of this project?
+    | Antigravity CLI requires permission to read, edit, and execute files here.
+    | > Yes, I trust this folder
+    |   No, exit
+    |   ↑/↓ Navigate · enter Confirm
+    |                                                                                                       Gemini 3.8 Flash ·

@@ -1,0 +1,288 @@
+{
+  "agy 1.1.12": {
+    "SessionStart": {
+      "from_scenario": "home",
+      "payload": {
+        "artifactDirectoryPath": "<run:home-1.1.12>/home/.gemini/antigravity-cli/brain/fe3e4849-fd3e-4df3-a9aa-568f1b2b3641",
+        "conversationId": "fe3e4849-fd3e-4df3-a9aa-568f1b2b3641",
+        "modelName": "gemini-3.8-flash-low",
+        "transcriptPath": "<run:home-1.1.12>/home/.gemini/antigravity-cli/brain/fe3e4849-fd3e-4df3-a9aa-568f1b2b3641/.system_generated/logs/transcript_full.jsonl",
+        "workspacePaths": ["<run:home-1.1.12>/ws/repo"]
+      }
+    },
+    "PreInvocation": {
+      "from_scenario": "home",
+      "payload": {
+        "artifactDirectoryPath": "<run:home-1.1.12>/home/.gemini/antigravity-cli/brain/fe3e4849-fd3e-4df3-a9aa-568f1b2b3641",
+        "conversationId": "fe3e4849-fd3e-4df3-a9aa-568f1b2b3641",
+        "initialNumSteps": 1,
+        "invocationNum": 0,
+        "modelName": "gemini-3.8-flash-low",
+        "transcriptPath": "<run:home-1.1.12>/home/.gemini/antigravity-cli/brain/fe3e4849-fd3e-4df3-a9aa-568f1b2b3641/.system_generated/logs/transcript_full.jsonl",
+        "workspacePaths": ["<run:home-1.1.12>/ws/repo"]
+      }
+    },
+    "PreToolUse": {
+      "from_scenario": "home",
+      "payload": {
+        "artifactDirectoryPath": "<run:home-1.1.12>/home/.gemini/antigravity-cli/brain/fe3e4849-fd3e-4df3-a9aa-568f1b2b3641",
+        "conversationId": "fe3e4849-fd3e-4df3-a9aa-568f1b2b3641",
+        "modelName": "gemini-3.8-flash-low",
+        "stepIdx": 3,
+        "toolCall": {
+          "args": {
+            "CommandLine": "{ echo \"HOME=$HOME\"; echo \"USER=$(id -un)\"; echo \"PWD=$(pwd)\"; echo \"SPIKE_CANARY=${SPIKE_CANARY:-unset}\"; echo \"TERM=$T…",
+            "Cwd": "<run:home-1.1.12>/ws/repo",
+            "WaitMsBeforeAsync": 5000,
+            "toolAction": "Running environment probe command",
+            "toolSummary": "Run environment probe command"
+          },
+          "name": "run_command"
+        },
+        "transcriptPath": "<run:home-1.1.12>/home/.gemini/antigravity-cli/brain/fe3e4849-fd3e-4df3-a9aa-568f1b2b3641/.system_generated/logs/transcript_full.jsonl",
+        "workspacePaths": ["<run:home-1.1.12>/ws/repo"]
+      }
+    },
+    "PostToolUse": {
+      "from_scenario": "home",
+      "payload": {
+        "artifactDirectoryPath": "<run:home-1.1.12>/home/.gemini/antigravity-cli/brain/fe3e4849-fd3e-4df3-a9aa-568f1b2b3641",
+        "conversationId": "fe3e4849-fd3e-4df3-a9aa-568f1b2b3641",
+        "error": "",
+        "modelName": "gemini-3.8-flash-low",
+        "stepIdx": 3,
+        "toolCall": {
+          "args": {
+            "CommandLine": "{ echo \"HOME=$HOME\"; echo \"USER=$(id -un)\"; echo \"PWD=$(pwd)\"; echo \"SPIKE_CANARY=${SPIKE_CANARY:-unset}\"; echo \"TERM=$T…",
+            "Cwd": "<run:home-1.1.12>/ws/repo",
+            "WaitMsBeforeAsync": 5000,
+            "toolAction": "Running environment probe command",
+            "toolSummary": "Run environment probe command"
+          },
+          "name": "run_command"
+        },
+        "transcriptPath": "<run:home-1.1.12>/home/.gemini/antigravity-cli/brain/fe3e4849-fd3e-4df3-a9aa-568f1b2b3641/.system_generated/logs/transcript_full.jsonl",
+        "workspacePaths": ["<run:home-1.1.12>/ws/repo"]
+      }
+    },
+    "PostInvocation": {
+      "from_scenario": "home",
+      "payload": {
+        "artifactDirectoryPath": "<run:home-1.1.12>/home/.gemini/antigravity-cli/brain/fe3e4849-fd3e-4df3-a9aa-568f1b2b3641",
+        "conversationId": "fe3e4849-fd3e-4df3-a9aa-568f1b2b3641",
+        "initialNumSteps": 1,
+        "invocationNum": 0,
+        "modelName": "gemini-3.8-flash-low",
+        "transcriptPath": "<run:home-1.1.12>/home/.gemini/antigravity-cli/brain/fe3e4849-fd3e-4df3-a9aa-568f1b2b3641/.system_generated/logs/transcript_full.jsonl",
+        "workspacePaths": ["<run:home-1.1.12>/ws/repo"]
+      }
+    },
+    "Stop": {
+      "from_scenario": "home",
+      "payload": {
+        "artifactDirectoryPath": "<run:home-1.1.12>/home/.gemini/antigravity-cli/brain/fe3e4849-fd3e-4df3-a9aa-568f1b2b3641",
+        "conversationId": "fe3e4849-fd3e-4df3-a9aa-568f1b2b3641",
+        "error": "",
+        "executionNum": 0,
+        "fullyIdle": true,
+        "modelName": "gemini-3.8-flash-low",
+        "terminationReason": "NO_TOOL_CALL",
+        "transcriptPath": "<run:home-1.1.12>/home/.gemini/antigravity-cli/brain/fe3e4849-fd3e-4df3-a9aa-568f1b2b3641/.system_generated/logs/transcript_full.jsonl",
+        "workspacePaths": ["<run:home-1.1.12>/ws/repo"]
+      },
+      "hook_process": [
+        "event=Stop",
+        "pwd=<run:home-1.1.12>/home/.gemini/config",
+        "HOME=<run:home-1.1.12>/home",
+        "AGY_CLI_DISABLE_AUTO_UPDATE=true",
+        "ANTIGRAVITY_CONVERSATION_ID=fe3e4849-fd3e-4df3-a9aa-568f1b2b3641",
+        "PWD=<run:home-1.1.12>/home/.gemini/config",
+        "TERM=tmux-256color",
+        "TMUX_PANE=%52",
+        "TMUX=s,57779,52"
+      ]
+    },
+    "Stop_with_background_task_running": {
+      "from_scenario": "bg",
+      "payload": {
+        "artifactDirectoryPath": "<run:bg-1.1.12>/home/.gemini/antigravity-cli/brain/0c1d5ad1-62db-4aab-9c11-c78afa15168f",
+        "conversationId": "0c1d5ad1-62db-4aab-9c11-c78afa15168f",
+        "error": "",
+        "executionNum": 0,
+        "fullyIdle": false,
+        "modelName": "gemini-3.8-flash-low",
+        "terminationReason": "NO_TOOL_CALL",
+        "transcriptPath": "<run:bg-1.1.12>/home/.gemini/antigravity-cli/brain/0c1d5ad1-62db-4aab-9c11-c78afa15168f/.system_generated/logs/transcript_full.jsonl",
+        "workspacePaths": ["<run:bg-1.1.12>/ws/repo"]
+      }
+    },
+    "Stop_after_PreInvocation_hook_terminate": {
+      "from_scenario": "hookterm",
+      "payload": {
+        "artifactDirectoryPath": "<run:hookterm-1.1.12>/home/.gemini/antigravity-cli/brain/545e18d4-3821-4ce9-83bd-5c4ca68c37a7",
+        "conversationId": "545e18d4-3821-4ce9-83bd-5c4ca68c37a7",
+        "error": "",
+        "executionNum": 0,
+        "fullyIdle": true,
+        "modelName": "gemini-3.8-flash-low",
+        "terminationReason": "NO_TOOL_CALL",
+        "transcriptPath": "<run:hookterm-1.1.12>/home/.gemini/antigravity-cli/brain/545e18d4-3821-4ce9-83bd-5c4ca68c37a7/.system_generated/logs/transcript_full.jsonl",
+        "workspacePaths": ["<run:hookterm-1.1.12>/ws/repo"]
+      }
+    }
+  },
+  "agy 1.5.5": {
+    "SessionStart": {
+      "from_scenario": "home",
+      "payload": {
+        "artifactDirectoryPath": "<run:home-1.5.5>/home/.gemini/antigravity-cli/brain/ee51fade-a19c-42d1-bf36-e96a9c531813",
+        "conversationId": "ee51fade-a19c-42d1-bf36-e96a9c531813",
+        "cwd": "<run:home-1.5.5>/ws/repo",
+        "hookEventName": "SessionStart",
+        "lastUserInput": "Use your shell command tool to run exactly this one command, then reply with exactly the single token HOME_PROBE_DONE:\n\n    { echo \"HOME=$HOME\"; echo \"USER=$(id… <501 characters in all>",
+        "modelName": "gemini-3.8-flash-low",
+        "transcriptPath": "<run:home-1.5.5>/home/.gemini/antigravity-cli/brain/ee51fade-a19c-42d1-bf36-e96a9c531813/.system_generated/logs/transcript_full.jsonl",
+        "workspacePaths": ["<run:home-1.5.5>/ws/repo"]
+      }
+    },
+    "PreInvocation": {
+      "from_scenario": "home",
+      "payload": {
+        "artifactDirectoryPath": "<run:home-1.5.5>/home/.gemini/antigravity-cli/brain/ee51fade-a19c-42d1-bf36-e96a9c531813",
+        "conversationId": "ee51fade-a19c-42d1-bf36-e96a9c531813",
+        "cwd": "<run:home-1.5.5>/ws/repo",
+        "hookEventName": "PreInvocation",
+        "initialNumSteps": 1,
+        "invocationNum": 0,
+        "lastUserInput": "Use your shell command tool to run exactly this one command, then reply with exactly the single token HOME_PROBE_DONE:\n\n    { echo \"HOME=$HOME\"; echo \"USER=$(id… <501 characters in all>",
+        "modelName": "gemini-3.8-flash-low",
+        "transcriptPath": "<run:home-1.5.5>/home/.gemini/antigravity-cli/brain/ee51fade-a19c-42d1-bf36-e96a9c531813/.system_generated/logs/transcript_full.jsonl",
+        "workspacePaths": ["<run:home-1.5.5>/ws/repo"]
+      }
+    },
+    "PreToolUse": {
+      "from_scenario": "home",
+      "payload": {
+        "artifactDirectoryPath": "<run:home-1.5.5>/home/.gemini/antigravity-cli/brain/ee51fade-a19c-42d1-bf36-e96a9c531813",
+        "conversationId": "ee51fade-a19c-42d1-bf36-e96a9c531813",
+        "cwd": "<run:home-1.5.5>/ws/repo",
+        "hookEventName": "PreToolUse",
+        "lastUserInput": "Use your shell command tool to run exactly this one command, then reply with exactly the single token HOME_PROBE_DONE:\n\n    { echo \"HOME=$HOME\"; echo \"USER=$(id… <501 characters in all>",
+        "modelName": "gemini-3.8-flash-low",
+        "stepIdx": 2,
+        "toolCall": {
+          "args": {
+            "CommandLine": "{ echo \"HOME=$HOME\"; echo \"USER=$(id -un)\"; echo \"PWD=$(pwd)\"; echo \"SPIKE_CANARY=${SPIKE_CANARY:-unset}\"; echo \"TERM=$T…",
+            "WaitMsBeforeAsync": 5000,
+            "toolSummary": "Run environment probe"
+          },
+          "id": "call_11038061015641962774",
+          "name": "run_command"
+        },
+        "transcriptPath": "<run:home-1.5.5>/home/.gemini/antigravity-cli/brain/ee51fade-a19c-42d1-bf36-e96a9c531813/.system_generated/logs/transcript_full.jsonl",
+        "workspacePaths": ["<run:home-1.5.5>/ws/repo"]
+      }
+    },
+    "PostToolUse": {
+      "from_scenario": "home",
+      "payload": {
+        "artifactDirectoryPath": "<run:home-1.5.5>/home/.gemini/antigravity-cli/brain/ee51fade-a19c-42d1-bf36-e96a9c531813",
+        "conversationId": "ee51fade-a19c-42d1-bf36-e96a9c531813",
+        "cwd": "<run:home-1.5.5>/ws/repo",
+        "error": "",
+        "hookEventName": "PostToolUse",
+        "lastUserInput": "Use your shell command tool to run exactly this one command, then reply with exactly the single token HOME_PROBE_DONE:\n\n    { echo \"HOME=$HOME\"; echo \"USER=$(id… <501 characters in all>",
+        "modelName": "gemini-3.8-flash-low",
+        "stepIdx": 2,
+        "toolCall": {
+          "args": {
+            "CommandLine": "{ echo \"HOME=$HOME\"; echo \"USER=$(id -un)\"; echo \"PWD=$(pwd)\"; echo \"SPIKE_CANARY=${SPIKE_CANARY:-unset}\"; echo \"TERM=$T…",
+            "WaitMsBeforeAsync": 5000,
+            "toolSummary": "Run environment probe"
+          },
+          "id": "call_11038061015641962774",
+          "name": "run_command"
+        },
+        "transcriptPath": "<run:home-1.5.5>/home/.gemini/antigravity-cli/brain/ee51fade-a19c-42d1-bf36-e96a9c531813/.system_generated/logs/transcript_full.jsonl",
+        "workspacePaths": ["<run:home-1.5.5>/ws/repo"]
+      }
+    },
+    "PostInvocation": {
+      "from_scenario": "home",
+      "payload": {
+        "artifactDirectoryPath": "<run:home-1.5.5>/home/.gemini/antigravity-cli/brain/ee51fade-a19c-42d1-bf36-e96a9c531813",
+        "conversationId": "ee51fade-a19c-42d1-bf36-e96a9c531813",
+        "cwd": "<run:home-1.5.5>/ws/repo",
+        "hookEventName": "PostInvocation",
+        "initialNumSteps": 1,
+        "invocationNum": 0,
+        "lastUserInput": "Use your shell command tool to run exactly this one command, then reply with exactly the single token HOME_PROBE_DONE:\n\n    { echo \"HOME=$HOME\"; echo \"USER=$(id… <501 characters in all>",
+        "modelName": "gemini-3.8-flash-low",
+        "transcriptPath": "<run:home-1.5.5>/home/.gemini/antigravity-cli/brain/ee51fade-a19c-42d1-bf36-e96a9c531813/.system_generated/logs/transcript_full.jsonl",
+        "workspacePaths": ["<run:home-1.5.5>/ws/repo"]
+      }
+    },
+    "Stop": {
+      "from_scenario": "home",
+      "payload": {
+        "artifactDirectoryPath": "<run:home-1.5.5>/home/.gemini/antigravity-cli/brain/ee51fade-a19c-42d1-bf36-e96a9c531813",
+        "conversationId": "ee51fade-a19c-42d1-bf36-e96a9c531813",
+        "cwd": "<run:home-1.5.5>/ws/repo",
+        "error": "",
+        "executionNum": 0,
+        "fullyIdle": true,
+        "hookEventName": "Stop",
+        "lastUserInput": "Use your shell command tool to run exactly this one command, then reply with exactly the single token HOME_PROBE_DONE:\n\n    { echo \"HOME=$HOME\"; echo \"USER=$(id… <501 characters in all>",
+        "modelName": "gemini-3.8-flash-low",
+        "terminationReason": "NO_TOOL_CALL",
+        "transcriptPath": "<run:home-1.5.5>/home/.gemini/antigravity-cli/brain/ee51fade-a19c-42d1-bf36-e96a9c531813/.system_generated/logs/transcript_full.jsonl",
+        "workspacePaths": ["<run:home-1.5.5>/ws/repo"]
+      },
+      "hook_process": [
+        "event=Stop",
+        "pwd=<run:home-1.5.5>/home/.gemini/config",
+        "HOME=<run:home-1.5.5>/home",
+        "AGY_CLI_DISABLE_AUTO_UPDATE=true",
+        "ANTIGRAVITY_CONVERSATION_ID=ee51fade-a19c-42d1-bf36-e96a9c531813",
+        "PWD=<run:home-1.5.5>/home/.gemini/config",
+        "TERM=tmux-256color",
+        "TMUX_PANE=%25",
+        "TMUX=s,57779,25"
+      ]
+    },
+    "Stop_with_background_task_running": {
+      "from_scenario": "bg",
+      "payload": {
+        "artifactDirectoryPath": "<run:bg-1.5.5>/home/.gemini/antigravity-cli/brain/53ed4e6c-de71-4717-bab1-5f84bdf730c0",
+        "conversationId": "53ed4e6c-de71-4717-bab1-5f84bdf730c0",
+        "cwd": "<run:bg-1.5.5>/ws/repo",
+        "error": "",
+        "executionNum": 0,
+        "fullyIdle": false,
+        "hookEventName": "Stop",
+        "lastUserInput": "Use your shell command tool to run exactly this command, in …",
+        "modelName": "gemini-3.8-flash-low",
+        "terminationReason": "NO_TOOL_CALL",
+        "transcriptPath": "<run:bg-1.5.5>/home/.gemini/antigravity-cli/brain/53ed4e6c-de71-4717-bab1-5f84bdf730c0/.system_generated/logs/transcript_full.jsonl",
+        "workspacePaths": ["<run:bg-1.5.5>/ws/repo"]
+      }
+    },
+    "Stop_after_PreInvocation_hook_terminate": {
+      "from_scenario": "hookterm",
+      "payload": {
+        "artifactDirectoryPath": "<run:hookterm-1.5.5>/home/.gemini/antigravity-cli/brain/f677cd22-f92a-4e76-80d7-4a5b3d20ec47",
+        "conversationId": "f677cd22-f92a-4e76-80d7-4a5b3d20ec47",
+        "cwd": "<run:hookterm-1.5.5>/ws/repo",
+        "error": "",
+        "executionNum": 0,
+        "fullyIdle": true,
+        "hookEventName": "Stop",
+        "lastUserInput": "Reply with exactly the single token LAUNCH_OK_SMALL and noth…",
+        "modelName": "gemini-3.8-flash-low",
+        "terminationReason": "TERMINAL_CUSTOM_HOOK",
+        "transcriptPath": "<run:hookterm-1.5.5>/home/.gemini/antigravity-cli/brain/f677cd22-f92a-4e76-80d7-4a5b3d20ec47/.system_generated/logs/transcript_full.jsonl",
+        "workspacePaths": ["<run:hookterm-1.5.5>/ws/repo"]
+      }
+    }
+  }
+}
