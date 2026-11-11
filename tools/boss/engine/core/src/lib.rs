@@ -117,6 +117,8 @@ pub mod host_provisioning;
 pub mod host_reconcile;
 pub mod host_registry;
 pub mod host_scheduling;
+pub mod hub;
+pub mod hub_spawn;
 pub mod husk_pane_sweep;
 pub mod interrupt_recovery;
 pub mod ipc_log;

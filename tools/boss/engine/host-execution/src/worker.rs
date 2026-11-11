@@ -35,7 +35,7 @@ const SESSION_SCHEMA: &str = "1";
 const SESSION_SCHEMA_ENV: &str = "BOSS_SESSION_SCHEMA";
 const RUN_ID_ENV: &str = "BOSS_RUN_ID";
 const SPAWN_TOKEN_OPTION: &str = "@boss_spawn_token";
-const HOST_ENV_DENY: &[&str] = &[
+pub const HOST_ENV_DENY: &[&str] = &[
     "BOSS_CODEX_HOMES_DIR",
     "BOSS_GROK_HOMES_DIR",
     "HOME",
@@ -370,7 +370,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         }
         let plan = driver.spawn_invocation(SpawnRequest {
             model: &spawn.model,
-            effort: None,
+            effort: spawn.effort.as_deref(),
             settings_path: record.settings_file.as_deref(),
             non_opus_auto_mode: false,
             permission_mode_override: None,
@@ -386,6 +386,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             }
             environment.insert(env.name.clone(), env.value.clone());
         }
+        insert_output_environment(&mut environment, spawn, &self.homes_root, &record.spawn_token)?;
         insert_color_environment(&mut environment);
         environment.insert(TMUX_SPAWN_TOKEN_ENV.to_owned(), record.spawn_token.clone());
         environment.insert(SESSION_SCHEMA_ENV.to_owned(), SESSION_SCHEMA.to_owned());
@@ -921,7 +922,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         }
     }
 
-    /// Remove the run's input home and settings file. The outcome is recorded
+    /// Remove the run's input home and settings file; the outputs directory is retained (see below). The outcome is recorded
     /// on the record: `reclaimed` once clean, otherwise the error to retry.
     fn reclaim(&self, record: &mut ExecutionRecord) {
         if record.reclaimed {
@@ -934,6 +935,10 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         {
             errors.push(format!("settings file: {error}"));
         }
+        // The outputs directory is deliberately kept: it holds the files the
+        // worker wrote through the output variables, which are completion
+        // evidence until the hub has finalized the run. `prune_stale_outputs`
+        // removes it once the retention window has passed.
         let home = if let Some(state) = &record.runtime_state {
             // Provisioning wrote files somewhere; a state naming no home the
             // spoke recognises cannot be cleaned up, so it never counts as done.
@@ -961,6 +966,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
     /// command on the same record, and works from persisted records so it also
     /// covers workers that exited while the daemon was down.
     pub async fn sweep(&self) -> Vec<(String, String)> {
+        prune_stale_outputs(&self.homes_root, OUTPUT_RETENTION);
         let Ok(records) = assigned_records(&self.store) else {
             return vec![("-".into(), "execution store unavailable".into())];
         };
@@ -1005,6 +1011,93 @@ pub async fn heartbeat_leases<T: CubeJsonTransport>(cube: &T, store: &impl Execu
         }
     }
     failures
+}
+
+const OUTPUT_ENV_NAMES: &[&str] = &[
+    "BOSS_STRUCTURED_OUTPUT",
+    "BOSS_STRUCTURED_OUTPUT_KIND",
+    "BOSS_PR_URL_OUTPUT",
+];
+
+/// How long a run's output files survive after the run last touched them.
+const OUTPUT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Remove `outputs-*` directories under `homes_root` untouched for longer than
+/// `retention`. Best effort: a directory that cannot be removed is retried by
+/// the next sweep.
+fn prune_stale_outputs(homes_root: &Path, retention: Duration) {
+    let Ok(entries) = std::fs::read_dir(homes_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with("outputs-") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > retention);
+        if stale {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+fn outputs_root(homes_root: &Path, spawn_token: &str) -> PathBuf {
+    homes_root.join(format!("outputs-{}", hex_token(spawn_token)))
+}
+
+/// Output locations are allocated on the execution host beside its private homes.
+fn insert_output_environment(
+    environment: &mut BTreeMap<String, String>,
+    spawn: &Spawn,
+    homes_root: &Path,
+    spawn_token: &str,
+) -> Result<()> {
+    let root = outputs_root(homes_root, spawn_token);
+    // The supervisor alone decides the output contract; caller values for these
+    // names must never reach the worker.
+    for name in OUTPUT_ENV_NAMES {
+        environment.remove(*name);
+    }
+    if spawn.structured_output_kind.is_some() || spawn.pr_url_output {
+        std::fs::create_dir_all(&root)?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+    }
+    use boss_engine_driver::{StructuredOutputRequest, default_structured_output_wiring};
+    use boss_engine_structured_output::{StructuredOutputKind, prepare};
+    let designated = spawn
+        .structured_output_kind
+        .as_deref()
+        .map(|slug| {
+            StructuredOutputKind::all()
+                .find(|kind| kind.slug() == slug && *kind != StructuredOutputKind::PrUrl)
+                .with_context(|| format!("unknown structured output kind: {slug}"))
+        })
+        .transpose()?;
+    for kind in designated
+        .into_iter()
+        .chain(spawn.pr_url_output.then_some(StructuredOutputKind::PrUrl))
+    {
+        // The identifier is the hex token, never the raw token: the raw
+        // value can hold `/` or `..` and would escape the private directory.
+        let path = prepare(&root, &hex_token(spawn_token), kind)?;
+        environment.extend(
+            default_structured_output_wiring(&StructuredOutputRequest {
+                kind,
+                result_path: &path,
+                schema: None,
+            })
+            .env,
+        );
+    }
+    if let Some(kind) = designated {
+        environment.insert("BOSS_STRUCTURED_OUTPUT_KIND".into(), kind.slug().into());
+    }
+    Ok(())
 }
 
 fn pane_command(plan: &SpawnPlan) -> String {
@@ -1146,6 +1239,7 @@ mod tests {
         kill_error: Mutex<bool>,
         sent: Mutex<Vec<Vec<String>>>,
         envs: Mutex<HashMap<String, Vec<String>>>,
+        launches: Mutex<Vec<String>>,
     }
 
     fn ok(stdout: &str) -> CommandOutput {
@@ -1185,6 +1279,7 @@ mod tests {
             };
             match verb {
                 "new-session" => {
+                    self.launches.lock().unwrap().push(rest.last().unwrap().clone());
                     let name = rest
                         .iter()
                         .position(|arg| arg == "-s")
@@ -2410,6 +2505,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn output_paths_stay_under_the_outputs_directory_for_hostile_tokens() {
+        let root = tempfile::tempdir().unwrap();
+        let homes = root.path().join("homes");
+        std::fs::create_dir_all(&homes).unwrap();
+        let outside = root.path().join("outside.txt");
+        std::fs::write(&outside, "keep").unwrap();
+        for token in [
+            format!("{}/outside", root.path().display()),
+            "../outside".to_owned(),
+            "a/b/c".to_owned(),
+        ] {
+            let spawn = Spawn {
+                structured_output_kind: Some("review-result".into()),
+                pr_url_output: true,
+                ..Default::default()
+            };
+            let mut env = BTreeMap::new();
+            insert_output_environment(&mut env, &spawn, &homes, &token).unwrap();
+            let dir = outputs_root(&homes, &token);
+            assert!(dir.starts_with(&homes) && dir.is_dir(), "{token}");
+            for name in ["BOSS_STRUCTURED_OUTPUT", "BOSS_PR_URL_OUTPUT"] {
+                assert!(Path::new(&env[name]).starts_with(&dir), "{token}: {name}={}", env[name]);
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+    }
+
+    #[tokio::test]
+    async fn terminal_settle_keeps_an_already_written_output_file() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeTmux::default());
+        let supervisor = supervisor(root.path(), fake.clone()).await;
+        seed(&supervisor.store, Phase::Alive);
+        let mut record = stored(&supervisor.store);
+        let dir = outputs_root(&supervisor.homes_root, &record.spawn_token);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("result.json"), "evidence").unwrap();
+        supervisor.reclaim(&mut record);
+        assert!(record.reclaimed, "{:?}", record.reclaim_error);
+        assert_eq!(std::fs::read_to_string(dir.join("result.json")).unwrap(), "evidence");
+        prune_stale_outputs(&supervisor.homes_root, OUTPUT_RETENTION);
+        assert!(
+            dir.join("result.json").exists(),
+            "fresh output survives the retention sweep"
+        );
+        prune_stale_outputs(&supervisor.homes_root, Duration::ZERO);
+        assert!(!dir.exists(), "output past retention is removed");
+    }
+
+    #[test]
+    fn caller_cannot_set_output_variables_when_no_output_is_designated() {
+        let root = tempfile::tempdir().unwrap();
+        let mut env: BTreeMap<String, String> = [
+            ("BOSS_STRUCTURED_OUTPUT", "/etc/passwd"),
+            ("BOSS_STRUCTURED_OUTPUT_KIND", "forged"),
+            ("BOSS_PR_URL_OUTPUT", "/etc/passwd"),
+            ("KEEP_ME", "yes"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        insert_output_environment(&mut env, &Spawn::default(), root.path(), "token").unwrap();
+        assert_eq!(env.keys().map(String::as_str).collect::<Vec<_>>(), ["KEEP_ME"]);
+        assert!(!outputs_root(root.path(), "token").exists());
+    }
+
     #[tokio::test]
     async fn spawn_stamps_identity_last_and_keeps_settings_out_of_the_workspace() {
         let root = tempfile::tempdir().unwrap();
@@ -2418,6 +2580,9 @@ mod tests {
         let mut command = spawn_command();
         if let Some(command::Body::Spawn(spawn)) = &mut command.body {
             spawn.settings_json = br#"{"hooks":{}}"#.to_vec();
+            spawn.effort = Some("medium".into());
+            spawn.structured_output_kind = Some("review-result".into());
+            spawn.pr_url_output = true;
             for (name, value) in [
                 ("BOSS_SPAWN_TOKEN", "forged"),
                 ("BOSS_RUN_ID", "forged"),
@@ -2440,6 +2605,15 @@ mod tests {
             envs.contains(&format!("BOSS_SESSION_SCHEMA={SESSION_SCHEMA}")),
             "{envs:?}"
         );
+        assert!(fake.launches.lock().unwrap()[0].contains("--effort medium"));
+        let output = envs
+            .iter()
+            .find_map(|env| env.strip_prefix("BOSS_STRUCTURED_OUTPUT="))
+            .unwrap();
+        assert!(Path::new(output).is_absolute());
+        assert!(Path::new(output).starts_with(shared_homes()));
+        assert!(envs.contains(&"BOSS_STRUCTURED_OUTPUT_KIND=review-result".into()));
+        assert!(envs.iter().any(|env| env.starts_with("BOSS_PR_URL_OUTPUT=")));
         assert!(envs.contains(&"KEEP_ME=yes".to_owned()), "{envs:?}");
         assert!(envs.iter().filter(|e| e.contains("forged")).count() == 0, "{envs:?}");
         assert!(!workspace.join(".boss-spoke-settings.json").exists());

@@ -279,3 +279,70 @@ mod tmux_operator_prefix_tests {
         );
     }
 }
+
+mod hub_startup_tests {
+    use super::super::{ServeOverrides, serve_with_overrides};
+    use boss_engine_runtime::{
+        config::{RuntimeConfig, WorkConfig},
+        hub::HubConfig,
+    };
+    use std::{path::PathBuf, sync::Arc, time::Duration};
+
+    #[tokio::test]
+    async fn serve_binds_private_hub_and_rejects_inherited_identity() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for private in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let socket = root.path().join("engine.sock");
+            let isolation = crate::app::isolation::IsolationPaths::derive(&socket.to_string_lossy());
+            let credentials = isolation.scoped_path("hub-credentials").unwrap();
+            std::fs::create_dir_all(&credentials).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let cert = credentials.join("server.pem");
+            let key = credentials.join("key.pem");
+            std::fs::write(&cert, identity.cert.pem()).unwrap();
+            std::fs::write(&key, identity.signing_key.serialize_pem()).unwrap();
+            let hub = HubConfig::builder()
+                .listen(if private { "127.0.0.1:0" } else { "127.0.0.1:8443" })
+                .credentials_dir(PathBuf::from("/custom/production-identity"))
+                .tls_cert(if private {
+                    cert
+                } else {
+                    PathBuf::from("/custom/server.pem")
+                })
+                .tls_key(if private { key } else { PathBuf::from("/custom/key.pem") })
+                .build();
+            let work = WorkConfig::builder()
+                .cwd(root.path().to_path_buf())
+                .db_path(root.path().join("state.db"))
+                .hub(hub)
+                .build();
+            let cfg = Arc::new(RuntimeConfig::from_parts(work, None));
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(serve_with_overrides(
+                cfg,
+                socket,
+                None,
+                None,
+                None,
+                None,
+                ServeOverrides {
+                    hub_listener_ready: Some(tx),
+                    ..Default::default()
+                },
+            ));
+            let state = match tokio::time::timeout(Duration::from_secs(60), rx)
+                .await
+                .expect("startup timed out")
+            {
+                Ok(state) => state,
+                Err(_) => panic!("startup exited before hub binding: {:?}", task.await),
+            };
+            assert_eq!(state, private);
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}

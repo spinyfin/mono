@@ -29,6 +29,108 @@ async fn spawn_cannot_require_an_unnegotiated_feature() {
     assert!(fx.store.outbox.lock().unwrap().commands.is_empty());
 }
 
+fn launch_input_spawn() -> Command {
+    let mut spawn = command("spawn");
+    spawn.body = Some(command::Body::Spawn(Spawn {
+        lease_id: "lease".into(),
+        workspace_id: "workspace".into(),
+        driver_id: "driver".into(),
+        prompt_utf8: b"prompt".to_vec(),
+        effort: Some("high".into()),
+        pr_url_output: true,
+        required_features: vec![Feature {
+            name: "spawn-launch-inputs".into(),
+            revision: 1,
+        }],
+        ..Default::default()
+    }));
+    spawn
+}
+
+#[tokio::test]
+async fn spawn_with_launch_inputs_is_rejected_for_a_peer_that_predates_them() {
+    let fx = Fixture::new().await;
+    let mut old = hello();
+    old.features.retain(|feature| feature.name != "spawn-launch-inputs");
+    let mut peer = fx.connect(old).await.unwrap();
+    peer.welcome().await;
+    assert_eq!(
+        fx.manager
+            .command("host", CommandAdmission::Start, launch_input_spawn(), STEP)
+            .await,
+        Err(CommandOutcome::Invalid)
+    );
+    assert!(fx.store.outbox.lock().unwrap().commands.is_empty());
+}
+
+#[tokio::test]
+async fn spawn_with_launch_inputs_is_admitted_for_an_updated_peer() {
+    let fx = Fixture::new().await;
+    let mut peer = fx.connect(hello()).await.unwrap();
+    peer.welcome().await;
+    let manager = fx.manager.clone();
+    let waiting = tokio::spawn(async move {
+        manager
+            .command("host", CommandAdmission::Start, launch_input_spawn(), STEP)
+            .await
+    });
+    peer.next().await.expect("the command is delivered");
+    waiting.abort();
+    assert_eq!(fx.store.outbox.lock().unwrap().commands.len(), 1);
+}
+
+/// A hub and Hello built from the production spoke's contracts, not the
+/// synthetic first-release set.
+fn production_hello() -> Hello {
+    let mut hello = hello();
+    hello.features = boss_spoke_outbound::execution_contracts().features;
+    hello
+}
+
+#[tokio::test]
+async fn production_spoke_hello_negotiates_and_admits_launch_input_spawn() {
+    let fx = Fixture::with_contracts(boss_spoke_outbound::execution_contracts()).await;
+    let mut peer = fx.connect(production_hello()).await.unwrap();
+    peer.welcome().await;
+    let manager = fx.manager.clone();
+    let waiting = tokio::spawn(async move {
+        manager
+            .command("host", CommandAdmission::Start, launch_input_spawn(), STEP)
+            .await
+    });
+    peer.next().await.expect("the command is delivered");
+    waiting.abort();
+    assert_eq!(fx.store.outbox.lock().unwrap().commands.len(), 1);
+}
+
+#[tokio::test]
+async fn production_hub_still_refuses_launch_inputs_for_a_peer_without_the_feature() {
+    let fx = Fixture::with_contracts(boss_spoke_outbound::execution_contracts()).await;
+    let mut old = production_hello();
+    old.features.retain(|feature| feature.name != "spawn-launch-inputs");
+    let mut peer = fx.connect(old).await.unwrap();
+    peer.welcome().await;
+    assert_eq!(
+        fx.manager
+            .command("host", CommandAdmission::Start, launch_input_spawn(), STEP)
+            .await,
+        Err(CommandOutcome::Invalid)
+    );
+    assert!(fx.store.outbox.lock().unwrap().commands.is_empty());
+}
+
+#[test]
+fn production_spoke_offers_launch_inputs_as_optional_only() {
+    let contracts = boss_spoke_outbound::execution_contracts();
+    assert!(
+        contracts
+            .features
+            .iter()
+            .any(|f| f.name == "spawn-launch-inputs" && f.revision == 1)
+    );
+    assert!(!contracts.required.iter().any(|name| name == "spawn-launch-inputs"));
+}
+
 #[tokio::test]
 async fn old_peer_refuses_reset_submission_and_skips_reset_replay_without_losing_controls() {
     use boss_protocol_spoke::negotiate::feature;

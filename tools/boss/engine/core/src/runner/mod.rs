@@ -90,6 +90,7 @@ pub fn engine_events_socket_path() -> PathBuf {
     boss_log_files::default_events_socket_path().unwrap_or_default()
 }
 
+pub use super::hub_spawn::{ComposeRemoteSpawn, compose_remote_spawn};
 pub use super::runner_adapter::compose_worker_spawn;
 #[cfg(test)]
 #[path = "pane_spawn/pane_spawn_tests.rs"]

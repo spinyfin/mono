@@ -105,6 +105,9 @@ pub struct WorkerSpawnOpts {
     /// kinds that receive it (see [`crate::repo_guidance`]). `None` composes
     /// no block, which is also what happens for an unsupplied source in tests.
     pub repo_guidance: Option<std::sync::Arc<dyn crate::repo_guidance::RepoGuidanceSource>>,
+    /// Use explicit empty PR templates and manifest hints instead of probing local disk.
+    #[builder(default)]
+    pub remote_workspace: bool,
 }
 
 /// Fetch authoritative PR metadata for a reviewer worker's initial prompt.
@@ -582,6 +585,7 @@ pub async fn compose_worker_spawn(
         run_done_proposals_seam_enabled,
         bazel_workspace,
         repo_guidance,
+        remote_workspace,
     } = editorial_opts;
     // For any project-scoped task (the synthetic `kind = 'design'`
     // task and ordinary `project_task` rows alike), the richer
@@ -717,7 +721,11 @@ pub async fn compose_worker_spawn(
     // always loading an empty one.
     let pr_template_product_id = work_item.product_id();
     let pr_template_lease_id = execution.cube_lease_id.as_deref().unwrap_or("");
-    let pr_template_set = crate::pr_template::load(pr_template_product_id, pr_template_lease_id, workspace_path);
+    let pr_template_set = if remote_workspace {
+        crate::pr_template::PrTemplateSet::default()
+    } else {
+        crate::pr_template::load(pr_template_product_id, pr_template_lease_id, workspace_path)
+    };
     // An `automation_triage` execution renders the triage
     // preamble (decision-marker contract + "do not do the work / do not
     // open a PR" guardrails) instead of the ordinary implementer prompt.
@@ -822,6 +830,7 @@ pub async fn compose_worker_spawn(
                         .followup_proposals_seam_enabled(followup_proposals_seam_enabled)
                         .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
                         .maybe_bazel_workspace(bazel_workspace)
+                        .remote_workspace(remote_workspace)
                         .build(),
                 )
             }
@@ -856,6 +865,8 @@ pub async fn compose_worker_spawn(
                     .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
                     .followup_proposals_seam_enabled(followup_proposals_seam_enabled)
                     .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
+                    .maybe_bazel_workspace(bazel_workspace)
+                    .remote_workspace(remote_workspace)
                     .build(),
             )
         } else {
@@ -1130,6 +1141,7 @@ pub async fn compose_worker_spawn(
                 .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
                 .merge_order_preservation(&merge_order_preservation)
                 .maybe_bazel_workspace(bazel_workspace)
+                .remote_workspace(remote_workspace)
                 .build(),
         )
     };

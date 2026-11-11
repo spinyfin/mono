@@ -17,6 +17,7 @@ rust_library(
         "//tools/boss/engine/effort:__pkg__",
         "//tools/boss/engine/execution-contracts:__pkg__",
         "//tools/boss/engine/execution-runner:__pkg__",
+        "//tools/boss/engine/host-execution:__pkg__",
         "//tools/boss/engine/pr-review:__pkg__",
         "//tools/boss/engine/spoke-adapter:__pkg__",
         "//tools/boss/engine/stdout-progress:__pkg__",

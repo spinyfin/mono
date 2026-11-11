@@ -623,6 +623,12 @@ struct ServerState {
     live_read_admission: Arc<read_admission::ReadAdmission>,
 
     work_db: Arc<WorkDb>,
+    /// Shared hub stream manager handle. `None` when the hub listener is
+    /// inert (listen/credentials/TLS not all configured, or a fixture
+    /// refused production identity). No host adapter routes dispatch
+    /// through it.
+    #[builder(default)]
+    hub_stream: StdMutex<Option<boss_engine_runtime::hub::HubStream>>,
     /// Socket this engine's tmux handle must target. Resolved once from
     /// [`boss_engine_runtime::config::WorkConfig`] (and isolation) so no downstream call
     /// re-derives it from the environment.
@@ -1278,6 +1284,16 @@ impl ServerState {
             .get()
             .copied()
             .map(boss_engine_attachments::http::base_url)
+    }
+
+    /// Shared hub stream manager handle; `None` when the hub listener is
+    /// inert. No host adapter routes dispatch through it.
+    pub(crate) fn hub_stream(&self) -> Option<boss_engine_runtime::hub::HubStream> {
+        self.hub_stream.lock().expect("hub_stream lock").clone()
+    }
+
+    fn set_hub_stream(&self, stream: boss_engine_runtime::hub::HubStream) {
+        *self.hub_stream.lock().expect("hub_stream lock") = Some(stream);
     }
 
     /// Construct `ServerState` with optional collaborator overrides.

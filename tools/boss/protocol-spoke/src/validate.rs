@@ -352,6 +352,19 @@ impl Validate for v1::Spawn {
         nonempty("spawn.lease_id", &self.lease_id)?;
         nonempty("spawn.workspace_id", &self.workspace_id)?;
         nonempty("spawn.driver_id", &self.driver_id)?;
+        if let Some(effort) = &self.effort
+            && (effort.is_empty()
+                || effort.len() > 64
+                || !effort
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+        {
+            return Err(ValidationError::Invalid {
+                field: "spawn.effort",
+                reason: "must be a single effort token",
+            });
+        }
+
         if self.prompt_utf8.is_empty() {
             return Err(ValidationError::Unset {
                 field: "spawn.prompt_utf8",
@@ -725,6 +738,20 @@ mod tests {
             ..Default::default()
         };
         spawn().validate().expect("valid");
+        for effort in ["medium", "high", "xhigh"] {
+            let mut valid = spawn();
+            valid.effort = Some(effort.into());
+            valid.validate().expect("effort token");
+        }
+        let mut bad = spawn();
+        bad.effort = Some("high; injected".into());
+        assert!(matches!(
+            bad.validate(),
+            Err(ValidationError::Invalid {
+                field: "spawn.effort",
+                ..
+            })
+        ));
 
         let mut bad = spawn();
         bad.prompt_utf8 = vec![0xff, 0xfe];

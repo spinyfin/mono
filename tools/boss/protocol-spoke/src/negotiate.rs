@@ -34,6 +34,10 @@ pub mod feature {
     pub const PANE_CAPTURE: &str = "pane-capture";
     pub const UPGRADE: &str = "upgrade";
     pub const WORKSPACE_RESET_RELEASE: &str = "workspace-reset-release";
+    /// `Spawn.effort`, `structured_output_kind` and `pr_url_output`. A peer
+    /// that predates them ignores the fields, so a `Spawn` that depends on
+    /// them lists this feature in `required_features`.
+    pub const SPAWN_LAUNCH_INPUTS: &str = "spawn-launch-inputs";
 }
 
 /// Features without which no execution traffic is possible. A peer missing one
@@ -51,10 +55,11 @@ pub const REQUIRED_FEATURES: [&str; 8] = [
 
 /// Negotiated per connection when both sides offer them; a mixed-version
 /// connection keeps execution without them.
-pub const OPTIONAL_FEATURES: [&str; 3] = [
+pub const OPTIONAL_FEATURES: [&str; 4] = [
     feature::PANE_CAPTURE,
     feature::UPGRADE,
     feature::WORKSPACE_RESET_RELEASE,
+    feature::SPAWN_LAUNCH_INPUTS,
 ];
 
 /// `Reject.code` values.
@@ -289,6 +294,8 @@ mod tests {
             .expect("required features suffice");
         assert!(!selection.has(feature::PANE_CAPTURE));
         assert!(!selection.has(feature::UPGRADE));
+        assert!(!selection.has(feature::WORKSPACE_RESET_RELEASE));
+        assert!(!selection.has(feature::SPAWN_LAUNCH_INPUTS));
         assert!(selection.has(feature::EXECUTION));
     }
 
