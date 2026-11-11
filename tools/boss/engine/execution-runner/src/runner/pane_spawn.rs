@@ -968,6 +968,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 .automation_outcome_proposals_seam_enabled(automation_outcome_proposals_seam_enabled)
                 .review_batch_fanout_enabled(review_batch_fanout_enabled)
                 .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
+                .maybe_repo_guidance(spawner.repo_guidance())
                 .build(),
         )
         .await

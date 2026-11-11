@@ -163,6 +163,13 @@ impl RunnerHost for EngineRunnerHost {
     fn attributed_pool_label(&self, execution: &WorkExecution, automation: bool) -> &'static str {
         crate::live_worker_state::attributed_pool_label(execution.kind.clone(), automation)
     }
+    fn repo_guidance(&self) -> Option<Arc<dyn boss_execution_runner::repo_guidance::RepoGuidanceSource>> {
+        let design_docs = self.spawner.design_docs()?;
+        Some(Arc::new(crate::repo_boss_guidance::RepoBossGuidanceLoader::new(
+            design_docs,
+            self.work_db.clone(),
+        )))
+    }
 }
 
 pub async fn compose_worker_spawn(

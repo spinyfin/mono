@@ -13,6 +13,14 @@ use serde::{Deserialize, Serialize};
 /// Repo-relative path of the per-product coordinator guidance file.
 pub const COORDINATOR_GUIDANCE_PATH: &str = "BOSS_COORDINATOR.md";
 
+/// Repo-relative path of the per-repo worker guidance file: `BOSS.md`,
+/// injected into the prompts of Boss-dispatched coding workers. It is read
+/// with the same GitHub path, cap and last-known-good cache as
+/// [`COORDINATOR_GUIDANCE_PATH`], and reported with the same
+/// [`CoordinatorGuidanceState`] vocabulary. See
+/// `tools/boss/docs/repo-boss-guidance.md`.
+pub const REPO_BOSS_GUIDANCE_PATH: &str = "BOSS.md";
+
 /// What the engine could determine about one product's guidance file.
 ///
 /// Every outcome is explicit on purpose: a missing file, an over-cap

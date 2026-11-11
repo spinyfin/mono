@@ -107,6 +107,9 @@ struct CapturingSpawner {
     /// Keeps the per-run homes root pointed inside the test's workspace for
     /// as long as the spawner lives. See [`HomesPin`].
     homes_pin: StdMutex<Option<HomesPin>>,
+    /// The GitHub-backed docs service handed to the prompt composer; `None`
+    /// (the default) composes prompts without a repo `BOSS.md` block.
+    design_docs: StdMutex<Option<Arc<boss_engine_design_docs::DesignDocsService>>>,
 }
 
 /// Pins `BOSS_CODEX_HOMES_DIR` to a directory inside the test's own workspace.
@@ -174,6 +177,7 @@ impl CapturingSpawner {
             late_session_start: std::sync::atomic::AtomicBool::new(false),
             capture_seen: std::sync::atomic::AtomicBool::new(false),
             homes_pin: StdMutex::new(None),
+            design_docs: StdMutex::new(None),
         }
     }
 
@@ -230,6 +234,10 @@ impl crate::spawn_flow::WorkerSpawner for CapturingSpawner {
 
     fn worker_registry(&self) -> &WorkerRegistry {
         &self.registry
+    }
+
+    fn design_docs(&self) -> Option<Arc<boss_engine_design_docs::DesignDocsService>> {
+        self.design_docs.lock().unwrap().clone()
     }
 
     async fn reap_worker_pane(&self, run_id: &str) {
@@ -566,6 +574,93 @@ async fn writes_initial_prompt_to_workspace_dot_claude() {
         prompt.contains("## Summary"),
         "prompt missing required output section header"
     );
+}
+
+/// A GitHub that serves one fixed `BOSS.md` at one fixed sha.
+struct FixedBossMd {
+    sha: &'static str,
+    body: &'static str,
+}
+
+#[async_trait]
+impl boss_engine_design_docs::GitHubTreeSource for FixedBossMd {
+    async fn default_branch(&self, _owner: &str, _repo: &str) -> Result<String, boss_github::trees::TreeApiError> {
+        Ok("main".to_owned())
+    }
+    async fn head_sha(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        _git_ref: &str,
+    ) -> Result<String, boss_github::trees::TreeApiError> {
+        Ok(self.sha.to_owned())
+    }
+    async fn markdown_tree(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        _sha: &str,
+    ) -> Result<boss_github::trees::RepoTree, boss_github::trees::TreeApiError> {
+        unreachable!("BOSS.md is read by path, never by listing the tree")
+    }
+    async fn fetch_blob(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        path: &str,
+        _git_ref: &str,
+        _etag: Option<&str>,
+    ) -> Result<boss_github::trees::BlobFetch, boss_github::trees::TreeApiError> {
+        assert_eq!(path, "BOSS.md");
+        Ok(boss_github::trees::BlobFetch::Content {
+            text: self.body.to_owned(),
+            etag: None,
+            rate_limit_remaining: None,
+        })
+    }
+}
+
+/// The whole local path: `run_execution` binds a host from the spawner, the
+/// host supplies the engine's `BOSS.md` loader, and the prompt written to the
+/// worker's workspace carries the block, sha-stamped, under the preamble.
+#[tokio::test]
+async fn a_coding_worker_prompt_carries_the_repo_boss_guidance_block() {
+    const SHA: &str = "1234567890abcdef1234567890abcdef12345678";
+    let workspace = TempDir::new().unwrap();
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    *spawner.design_docs.lock().unwrap() = Some(Arc::new(boss_engine_design_docs::DesignDocsService::with_source(
+        Arc::new(FixedBossMd {
+            sha: SHA,
+            body: "- Attach screenshots of visual changes with `boss attach`.\n",
+        }),
+    )));
+    let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    let runner = PaneSpawnRunner::new(cfg, work_db.clone(), flags);
+    bind_runner(&runner, weak, &spawner);
+    let execution = sample_execution(workspace.path());
+    // The fixture's stored chore belongs to a real product row (the item
+    // `sample_chore()` points at a product that does not exist).
+    let stored = work_db.get_execution(&execution.id).unwrap();
+    let work_item = work_db.get_work_item(&stored.work_item_id).unwrap();
+
+    runner
+        .run_execution("worker-1", &execution, &work_item, workspace.path(), Some("change-1"))
+        .await
+        .unwrap();
+
+    let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
+    assert!(
+        prompt.starts_with(&format!("[repo-boss-guidance repo=spinyfin/mono sha={SHA}]\n")),
+        "{prompt}"
+    );
+    let rule = prompt
+        .find("Attach screenshots of visual changes with `boss attach`.")
+        .unwrap();
+    let close = prompt.find("[/repo-boss-guidance]").unwrap();
+    let task = prompt.find("You are a reusable worker").unwrap();
+    assert!(rule < close && close < task, "{prompt}");
 }
 
 #[tokio::test]
