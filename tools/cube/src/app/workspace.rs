@@ -284,7 +284,7 @@ pub(super) fn run_workspace(
                     prior_lease_expires_at_epoch_s = swept.lease_expires_at_epoch_s,
                 );
             }
-            super::repo_reclone::quarantine_obsolete(
+            super::registration::quarantine_obsolete(
                 &store,
                 database_path,
                 &repo_record,
@@ -1252,7 +1252,7 @@ pub(super) fn run_workspace(
 
                 let retry_lock = RepoLock::acquire(&repo_lock_path(&repo, database_path)?)?;
                 let mut retry_candidates = discover_workspaces(&repo_record)?;
-                super::repo_reclone::quarantine_obsolete(
+                super::registration::quarantine_obsolete(
                     &store,
                     database_path,
                     &repo_record,
@@ -1883,7 +1883,7 @@ pub(super) fn run_workspace(
             store.forget_workspace(&record.repo, &record.workspace_id)?;
 
             if expunge {
-                super::repo_reclone::remove_workspace_tree(&record.workspace_path)?;
+                super::fs_util::remove_workspace_tree(&record.workspace_path)?;
 
                 // Probe the repo's canonical source checkout — a stable,
                 // always-present bazel workspace cube never tears down —

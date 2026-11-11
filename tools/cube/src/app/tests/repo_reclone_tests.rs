@@ -11,13 +11,13 @@ use crate::store::Store;
 use super::support::{ExpectedCommand, FakeRunner, audit_events, seed_mono_repo, with_database_path, write_setup_yaml};
 use crate::app::dispatch::run_with_dependencies;
 use crate::app::errors::{CubeError, Result};
-use crate::app::repo_reclone::{quarantine_obsolete, stamp_registration, stamp_workspace};
+use crate::app::registration::{quarantine_obsolete, stamp_registration, stamp_workspace};
 
 const SETUP: &str = "version: 1\nsteps:\n  - id: secrets\n    command: cp \"$CUBE_BASE_REPO/backend/config-secrets.toml\" .\n    run_when: on-create\n";
 
-struct ScriptedScan(&'static str);
+struct ScriptedScan<'a>(&'a str);
 
-impl CommandRunner for ScriptedScan {
+impl CommandRunner for ScriptedScan<'_> {
     fn run(&self, _: &CommandInvocation) -> Result<String> {
         panic!("scan must retain stdout on unsuccessful exits")
     }
@@ -39,26 +39,17 @@ impl CommandRunner for ScriptedScan {
 }
 
 #[test]
-fn lsof_requires_status_one_and_empty_stdout_regardless_of_stderr() {
+fn lsof_filters_global_scan_by_path_components() {
     let temp = tempfile::tempdir().unwrap();
-    for (script, unused) in [
-        ("exit 1", true),
-        ("echo warning >&2; exit 1", true),
-        ("printf 'p123\\ncworker\\nnstore/index\\n'; exit 1", false),
-        ("echo p123; echo warning >&2; exit 1", false),
-        ("echo p123; exit 0", false),
-        ("echo p123; echo warning >&2; exit 0", false),
-        ("exit 0", false),
-        ("echo warning >&2; exit 0", false),
-        ("exit 2", false),
-        ("echo warning >&2; exit 2", false),
-        ("echo p123; exit 2", false),
-        ("echo p123; echo warning >&2; exit 2", false),
-    ] {
-        let result = crate::app::repo_reclone::require_unused(&ScriptedScan(script), temp.path());
-        assert_eq!(result.is_ok(), unused, "{script}: {result:?}");
-        if script.contains("p123") {
-            assert!(result.unwrap_err().to_string().contains("processes are using"));
+    let root = temp.path().canonicalize().unwrap();
+    for status in [0, 1, 2] {
+        for (name, unused) in [
+            (root.join("index"), false),
+            (root.with_extension("unrelated").join("index"), status != 2),
+        ] {
+            let script = format!("printf 'p123\\ncworker\\nn{}\\n'; exit {status}", name.display());
+            let result = crate::app::repo_reclone::require_unused(&ScriptedScan(&script), std::slice::from_ref(&root));
+            assert_eq!(result.is_ok(), unused, "{result:?}");
         }
     }
 }
@@ -115,9 +106,12 @@ impl CommandRunner for CloneRunner {
     fn run(&self, cmd: &CommandInvocation) -> Result<String> {
         match (cmd.program.as_str(), cmd.args.first().map(String::as_str)) {
             ("lsof", _) => {
-                assert!(cmd.args.contains(&"+D".into()));
+                assert_eq!(cmd.args, ["-w", "-nP", "-Fpcn"]);
                 if self.busy {
-                    Ok("p123\ncworker\nnstore/index\n".into())
+                    Ok(format!(
+                        "p123\ncworker\nn{}/index\n",
+                        self.source.canonicalize().unwrap().display()
+                    ))
                 } else {
                     Err(CubeError::CommandFailed {
                         program: "lsof".into(),
@@ -777,50 +771,110 @@ fn unsupported_shell_expansion_does_not_silently_drop_setup_inputs() {
 
 #[test]
 fn expired_obsolete_workspace_is_quarantined_before_health_probe_and_id_is_reserved() {
-    let (_temp, database, mut store, clone_runner, workspace) = fixture();
-    let repo = store.get_repo("mono").unwrap().unwrap();
-    stamp_registration(&repo).unwrap();
-    stamp_workspace(&repo, &workspace.workspace_path).unwrap();
-    stamp_registration(&repo).unwrap();
-    fs::remove_file(clone_runner.source.join(".cube/setup.yaml")).unwrap();
-    store
-        .claim_workspace("mono", "old-worker", "old work", "old-lease", 1, Some(2), None)
-        .unwrap()
+    for replace_source in [false, true] {
+        let (_temp, database, mut store, clone_runner, workspace) = fixture();
+        let repo = store.get_repo("mono").unwrap().unwrap();
+        stamp_registration(&repo).unwrap();
+        stamp_workspace(&repo, &workspace.workspace_path).unwrap();
+        if replace_source {
+            fs::remove_dir_all(&clone_runner.source).unwrap();
+            run_with_dependencies(
+                Cli::parse_from(["cube", "repo", "ensure", "mono"]),
+                Some(&database),
+                &clone_runner,
+            )
+            .unwrap();
+        } else {
+            stamp_registration(&repo).unwrap();
+        }
+        fs::remove_file(clone_runner.source.join(".cube/setup.yaml")).unwrap();
+        store
+            .claim_workspace("mono", "old-worker", "old work", "old-lease", 1, Some(2), None)
+            .unwrap()
+            .unwrap();
+        let path = repo.workspace_root.join("mono-agent-002");
+        let staging = repo.workspace_root.join(".incoming-mono-agent-002");
+        let runner = SetupOnReset(FakeRunner::new(vec![
+            ExpectedCommand::workspace_add_mono(&repo.workspace_root, &staging),
+            ExpectedCommand::ok(path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(
+                path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
+            ExpectedCommand::ok(path.clone(), "jj", &["new", "main@origin"], ""),
+            ExpectedCommand::ok(
+                path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "fresh",
+            ),
+            ExpectedCommand::ok(path.clone(), "sh", &["-c", "echo setup"], ""),
+        ]));
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "new work"]),
+            Some(&database),
+            &runner,
+        )
         .unwrap();
-    let path = repo.workspace_root.join("mono-agent-002");
-    let staging = repo.workspace_root.join(".incoming-mono-agent-002");
-    let runner = FakeRunner::new(vec![
-        ExpectedCommand::workspace_add_mono(&repo.workspace_root, &staging),
-        ExpectedCommand::ok(path.clone(), "jj", &["git", "fetch"], ""),
-        ExpectedCommand::ok(
-            path.clone(),
-            "jj",
-            &["git", "remote", "list"],
-            "origin\tgit@github.com:spinyfin/mono.git\n",
-        ),
-        ExpectedCommand::ok(
-            path.clone(),
-            "jj",
-            &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
-            "",
-        ),
-        ExpectedCommand::ok(path.clone(), "jj", &["new", "main@origin"], ""),
-        ExpectedCommand::ok(
-            path.clone(),
-            "jj",
-            &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
-            "fresh",
-        ),
-    ]);
-    let result = run_with_dependencies(
-        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "new work"]),
-        Some(&database),
-        &runner,
-    )
-    .unwrap();
-    assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-002");
-    assert!(!workspace.workspace_path.exists());
-    runner.assert_exhausted();
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-002");
+        assert!(!workspace.workspace_path.exists());
+        runner.0.assert_exhausted();
+    }
+}
+
+/// Simulate the setup declaration checked out by jj in a newly created workspace.
+struct SetupOnReset(FakeRunner);
+
+impl CommandRunner for SetupOnReset {
+    fn run(&self, command: &CommandInvocation) -> Result<String> {
+        let output = self.0.run(command)?;
+        if command.program == "jj" && command.args == ["new", "main@origin"] {
+            write_setup_yaml(
+                &command.cwd,
+                "version: 1\nsteps:\n  - id: fresh\n    command: echo setup\n    run_when: on-create\n",
+            );
+        }
+        Ok(output)
+    }
+}
+
+#[test]
+fn reclone_refuses_dirty_and_quarantined_free_workspaces() {
+    for health in [
+        crate::metadata::WorkspaceHealth::Dirty,
+        crate::metadata::WorkspaceHealth::Quarantined,
+    ] {
+        let (_temp, database, store, runner, workspace) = fixture();
+        store
+            .update_workspace_health("mono", &workspace.workspace_id, health)
+            .unwrap();
+        let error = run_with_dependencies(
+            Cli::parse_from(["cube", "repo", "reclone", "mono"]),
+            Some(&database),
+            &FakeRunner::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(&workspace.workspace_id));
+        assert!(error.to_string().contains("dirty or quarantined"));
+        assert!(runner.source.join(".jj/repo/damaged-index").exists());
+        assert!(workspace.workspace_path.exists());
+        run_with_dependencies(
+            Cli::parse_from(["cube", "repo", "reclone", "mono", "--discard-dirty"]),
+            Some(&database),
+            &runner,
+        )
+        .unwrap();
+        assert!(!workspace.workspace_path.exists());
+        assert!(store.list_workspaces("mono").unwrap().is_empty());
+    }
 }
 
 #[test]

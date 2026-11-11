@@ -38,3 +38,11 @@ pub(super) fn remove_tree_writable(path: &Path) -> io::Result<()> {
         other => other,
     }
 }
+
+/// Remove read-only build trees without following symlinks outside the workspace.
+pub(super) fn remove_workspace_tree(path: &Path) -> super::errors::Result<()> {
+    remove_tree_writable(path).map_err(|source| super::errors::CubeError::WorkspaceDirRemove {
+        path: path.into(),
+        source,
+    })
+}

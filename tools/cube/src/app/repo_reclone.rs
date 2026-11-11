@@ -13,55 +13,47 @@ use crate::metadata::WorkspaceState;
 use crate::store::Store;
 
 use super::errors::{CubeError, Result, RunResult};
+use super::fs_util::remove_workspace_tree;
+use super::registration::stamp_registration;
 use super::repo::materialize_repo_source_if_missing;
 
-/// Remove read-only build trees without following symlinks outside the workspace.
-pub(super) fn remove_workspace_tree(path: &Path) -> Result<()> {
-    super::fs_util::remove_tree_writable(path).map_err(|source| CubeError::WorkspaceDirRemove {
-        path: path.into(),
-        source,
-    })
-}
-
 /// Scan actual open files and working directories, rather than process names.
-pub(super) fn require_unused(runner: &dyn CommandRunner, path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
+pub(super) fn require_unused(runner: &dyn CommandRunner, paths: &[PathBuf]) -> Result<()> {
+    let paths: Vec<_> = paths
+        .iter()
+        .filter(|p| p.exists())
+        .map(|p| fs::canonicalize(p).map_err(CubeError::Io))
+        .collect::<Result<_>>()?;
+    let output = runner.run_output_with_timeout(
+        &CommandInvocation {
+            cwd: PathBuf::from("/"),
+            program: "lsof".into(),
+            args: vec!["-w".into(), "-nP".into(), "-Fpcn".into()],
+            env: vec![],
+        },
+        Duration::from_secs(120),
+    )?;
+    let mut process = String::new();
+    for line in output.stdout.lines() {
+        if line.starts_with('p') {
+            process = line.to_string();
+        } else if line.starts_with('c') {
+            process.push_str(&format!(" {line}"));
+        } else if let Some(name) = line.strip_prefix('n')
+            && paths.iter().any(|path| Path::new(name).starts_with(path))
+        {
+            return Err(CubeError::InvalidArgument(format!(
+                "cannot reclone: processes are using {name}; stop them and retry: {process}"
+            )));
+        }
     }
-    let invocation = CommandInvocation {
-        cwd: path.parent().unwrap_or(path).into(),
-        program: "lsof".into(),
-        args: vec![
-            "-w".into(),
-            "-nP".into(),
-            "-Fpcn".into(),
-            "+D".into(),
-            path.display().to_string(),
-        ],
-        env: vec![],
-    };
-    match runner.run_output_with_timeout(&invocation, Duration::from_secs(120)) {
-        Ok(output) if !output.stdout.is_empty() => Err(CubeError::InvalidArgument(format!(
-            "cannot reclone: processes are using {}; stop them and retry:\n{}",
-            path.display(),
-            output.stdout
-        ))),
-        Ok(output) if output.status == Some(1) => Ok(()),
-        Ok(output) => Err(CubeError::InvalidArgument(format!(
-            "cannot verify that {} is unused: lsof exited {:?}: {}",
-            path.display(),
-            output.status,
-            output.stderr
-        ))),
-        Err(CubeError::CommandTimedOut { .. }) => Err(CubeError::InvalidArgument(format!(
-            "lsof did not finish scanning {} within 120s (large build trees are slow to scan); prune build outputs or retry when the machine is idle",
-            path.display()
-        ))),
-        Err(err) => Err(CubeError::InvalidArgument(format!(
-            "cannot verify that {} is unused: {err}; install lsof and ensure it can inspect the store before retrying",
-            path.display()
-        ))),
+    if !matches!(output.status, Some(0 | 1)) {
+        return Err(CubeError::InvalidArgument(format!(
+            "cannot verify stores are unused: lsof exited {:?}: {}",
+            output.status, output.stderr
+        )));
     }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -123,6 +115,7 @@ pub(super) fn reclone(
     runner: &dyn CommandRunner,
     database: Option<&Path>,
     repo: &str,
+    discard_dirty: bool,
 ) -> Result<RunResult> {
     let data_dir = database
         .and_then(Path::parent)
@@ -166,16 +159,31 @@ pub(super) fn reclone(
             leased.join(", ")
         )));
     }
+    let dirty: Vec<_> = workspaces
+        .iter()
+        .filter(|w| {
+            matches!(
+                w.health_status,
+                Some(crate::metadata::WorkspaceHealth::Dirty | crate::metadata::WorkspaceHealth::Quarantined)
+            )
+        })
+        .map(|w| w.workspace_id.as_str())
+        .collect();
+    if !dirty.is_empty() && !discard_dirty {
+        return Err(CubeError::InvalidArgument(format!(
+            "repo {repo} has dirty or quarantined workspaces ({}); preserve their work, then pass --discard-dirty to authorize deletion",
+            dirty.join(", ")
+        )));
+    }
     let mut paths: Vec<_> = workspaces.iter().map(|w| w.workspace_path.clone()).collect();
     for candidate in super::provision::discover_workspaces(&record)? {
         if !paths.contains(&candidate.workspace_path) {
             paths.push(candidate.workspace_path);
         }
     }
-    require_unused(runner, source)?;
-    for path in &paths {
-        require_unused(runner, path)?;
-    }
+    let mut scan_paths = paths.clone();
+    scan_paths.push(source.clone());
+    require_unused(runner, &scan_paths)?;
     // Validate literal references before moving anything. A damaged index is
     // irrelevant: setup declarations and local secrets are ordinary files.
     for input in setup_inputs(source)? {
@@ -286,127 +294,6 @@ fn backup_path(source: &Path, kind: &str) -> Result<PathBuf> {
         name.to_string_lossy(),
         uuid::Uuid::new_v4()
     )))
-}
-
-const REGISTRATION: &str = ".jj/cube-registration";
-
-/// Keep quarantined jj registrations reachable for recovery, and avoid minting
-/// another working copy with the same store-side name after remove + ensure.
-pub(super) fn quarantined_workspace_ids(repo: &crate::metadata::RepoRecord) -> Result<Vec<String>> {
-    if !repo.workspace_root.is_dir() {
-        return Ok(vec![]);
-    }
-    let mut ids = Vec::new();
-    for entry in fs::read_dir(&repo.workspace_root).map_err(CubeError::Io)? {
-        let name = entry.map_err(CubeError::Io)?.file_name();
-        let name = name.to_string_lossy();
-        if let Some(suffix) = name
-            .strip_prefix(".quarantine-")
-            .and_then(|s| s.strip_prefix(&repo.workspace_prefix))
-            && let Some((number, _)) = suffix.split_once('-')
-            && number.parse::<u32>().is_ok()
-        {
-            ids.push(format!("{}{number}", repo.workspace_prefix));
-        }
-    }
-    Ok(ids)
-}
-
-pub(super) fn stamp_registration(repo: &crate::metadata::RepoRecord) -> Result<()> {
-    if let Some(source) = &repo.source
-        && source.join(".jj").is_dir()
-    {
-        fs::write(source.join(REGISTRATION), uuid::Uuid::new_v4().to_string()).map_err(CubeError::Io)?;
-    }
-    Ok(())
-}
-
-pub(super) fn stamp_workspace(repo: &crate::metadata::RepoRecord, workspace: &Path) -> Result<()> {
-    if let Some(source) = &repo.source
-        && source.join(REGISTRATION).is_file()
-    {
-        fs::create_dir_all(workspace.join(".jj")).map_err(CubeError::Io)?;
-        fs::copy(source.join(REGISTRATION), workspace.join(REGISTRATION)).map_err(CubeError::Io)?;
-    }
-    Ok(())
-}
-
-/// Whether `workspace` carries the repo's current registration stamp. Repos
-/// without a stamp (never reclone/ensure-stamped) match every workspace.
-pub(super) fn registration_matches(repo: &crate::metadata::RepoRecord, workspace: &Path) -> Result<bool> {
-    let Some(source) = &repo.source else {
-        return Ok(true);
-    };
-    let generation = match fs::read(source.join(REGISTRATION)) {
-        Ok(generation) => generation,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-        Err(error) => return Err(CubeError::Io(error)),
-    };
-    Ok(fs::read(workspace.join(REGISTRATION)).ok().as_ref() == Some(&generation))
-}
-
-/// A name matching the pool prefix is insufficient evidence of store identity.
-/// Quarantine preserves local files while preventing reuse of old working copies.
-pub(super) fn quarantine_obsolete(
-    store: &Store,
-    database: Option<&Path>,
-    repo: &crate::metadata::RepoRecord,
-    candidates: &mut Vec<crate::metadata::WorkspaceCandidate>,
-    recovery_target: Option<&str>,
-) -> Result<()> {
-    let Some(source) = &repo.source else {
-        return Ok(());
-    };
-    let generation = match fs::read(source.join(REGISTRATION)) {
-        Ok(generation) => Some(generation),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(CubeError::Io(error)),
-    };
-    let expected = crate::lock::shared_repo_dir(source).ok();
-    let workspaces = store.list_workspaces(&repo.repo)?;
-    let mut keep = Vec::new();
-    for candidate in candidates.iter() {
-        if workspaces
-            .iter()
-            .any(|w| w.workspace_id == candidate.workspace_id && w.state == WorkspaceState::Leased)
-        {
-            keep.push(candidate.clone());
-            continue;
-        }
-        let path = &candidate.workspace_path;
-        let wrong_registration = generation
-            .as_ref()
-            .is_some_and(|g| fs::read(path.join(REGISTRATION)).ok().as_ref() != Some(g));
-        let wrong_store = path.join(".jj/repo").exists()
-            && expected
-                .as_ref()
-                .is_some_and(|expected| crate::lock::shared_repo_dir(path).ok().as_ref() != Some(expected));
-        if wrong_store || (wrong_registration && recovery_target != Some(candidate.workspace_id.as_str())) {
-            let quarantine = path.with_file_name(format!(
-                ".quarantine-{}-{}",
-                candidate.workspace_id,
-                uuid::Uuid::new_v4()
-            ));
-            fs::rename(path, &quarantine).map_err(CubeError::Io)?;
-            store.forget_workspace(&repo.repo, &candidate.workspace_id)?;
-            audit!(
-                database,
-                "workspace.obsolete_quarantined",
-                repo = repo.repo,
-                workspace_id = candidate.workspace_id,
-                quarantine = quarantine.display().to_string()
-            );
-            eprintln!(
-                "cube: preserved obsolete workspace {} at {}; provisioning a workspace for the current registration",
-                path.display(),
-                quarantine.display()
-            );
-        } else {
-            keep.push(candidate.clone());
-        }
-    }
-    *candidates = keep;
-    Ok(())
 }
 
 /// Shell expansion is deliberately not executed. Reject dynamic paths rather
