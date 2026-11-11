@@ -498,8 +498,8 @@ impl ExecutionCoordinator {
         // a row before claiming a slot; this is the chokepoint backstop for
         // `force_dispatch` and for a lease that came back between that check
         // and this call. Starting from trunk here would strand the work, so it
-        // refuses rather than guess. Not a spawn failure: the claim is handed
-        // back and the row stays `ready`.
+        // refuses rather than guess. A pending preservation leaves the row
+        // ready; a recorded cleanup failure terminalizes it with a retry reason.
         if let Some(detail) = self.predecessor_lease_hold_detail(execution) {
             tracing::warn!(
                 execution_id = %execution.id,
@@ -520,7 +520,7 @@ impl ExecutionCoordinator {
                 .set_dispatch_wait_reason(&execution.id, DISPATCH_WAIT_REASON_AWAITING_PREDECESSOR_PRESERVATION)?;
             return Err(anyhow!(
                 "execution {} is held ({DISPATCH_WAIT_REASON_AWAITING_PREDECESSOR_PRESERVATION}): {detail}; \
-                 it stays `ready` and dispatches once that lease is released and its work preserved",
+                 inspect the execution's status and the predecessor's cleanup attention before retrying",
                 execution.id
             ));
         }

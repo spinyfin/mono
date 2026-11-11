@@ -65,6 +65,20 @@ fn proven_stopped_keeps_when_pane_present() {
 }
 
 #[test]
+fn completed_and_stopped_runs_still_require_an_empty_workspace() {
+    for cause in [TerminalCause::ProvenCompleted, TerminalCause::ProvenStopped] {
+        assert_eq!(
+            decide(cause, PaneStatus::Gone, Occupancy::Occupied),
+            LeaseReleaseDecision::Keep(KeepReason::ProcessInWorkspace)
+        );
+        assert_eq!(
+            decide(cause, PaneStatus::Gone, Occupancy::Unknown),
+            LeaseReleaseDecision::Keep(KeepReason::OccupancyUnconfirmed)
+        );
+    }
+}
+
+#[test]
 fn inferred_releases_when_pane_gone_and_empty() {
     assert_eq!(decide_release(TerminalCause::Inferred), LeaseReleaseDecision::Release);
 }
@@ -359,10 +373,10 @@ async fn preservation_does_not_run_while_a_gate_keeps_the_lease() {
             reason: KeepReason::ProcessInWorkspace
         }
     );
-    assert!(
-        db.list_attention_items(&execution.id).unwrap().is_empty(),
-        "preservation snapshots the working copy, so it waits for the pane and occupancy verdicts"
-    );
+    let items = db.list_attention_items(&execution.id).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].kind, LEASE_UNRELEASED_ATTENTION_KIND);
+    assert!(!items[0].body_markdown.contains("must not be attempted"));
 }
 
 #[tokio::test]

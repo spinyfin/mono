@@ -9,6 +9,7 @@ anyhow = { workspace = true }
 boss-command-runner = { path = "../command-runner" }
 boss-log-files = { path = "../log-files" }
 boss-shell-quote = { path = "../shell-quote" }
+boss-worker-processes = { path = "../worker-processes" }
 tokio = { workspace = true, features = ["process", "time"] }
 which = { workspace = true }
 

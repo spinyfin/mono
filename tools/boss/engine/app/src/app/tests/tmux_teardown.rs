@@ -124,6 +124,7 @@ async fn matched_token_signals_kills_and_clears_identity() {
         ok(""),
         ok(""),
     ]);
+    runner.own_process(i64::from(pid), "tok-match");
     let outcome = server_state
         .reap_tmux_worker_with(&tmux, &execution_id, &identity)
         .await;
@@ -216,7 +217,7 @@ async fn matched_token_persists_dead_pane_observation_and_logs_at_info() {
     let pid = child.id() as i32;
     let execution_id = seed_tmux_run(db, &work_item_id, "boss-1-dead", "tok-dead", i64::from(pid));
     let identity = read_back_identity(db, &execution_id);
-    let (tmux, _runner) = fake_tmux([
+    let (tmux, runner) = fake_tmux([
         ok("BOSS_SPAWN_TOKEN=tok-dead\n"),
         ok("1"),
         ok("7"),
@@ -224,6 +225,7 @@ async fn matched_token_persists_dead_pane_observation_and_logs_at_info() {
         ok(""),
         ok(""),
     ]);
+    runner.own_process(i64::from(pid), "tok-dead");
 
     assert_eq!(
         server_state

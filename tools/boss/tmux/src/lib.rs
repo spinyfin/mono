@@ -455,10 +455,16 @@ impl Tmux {
         for (name, value) in &session.environment {
             args.extend(["-e".into(), format!("{name}={value}").into()]);
         }
+        let command = if self.runner.is_real() {
+            let script = quote_for_shell(&boss_worker_processes::install().await?);
+            format!("python3 {script} --exec-file {}", quote_for_shell(&session.command))
+        } else {
+            session.command.clone()
+        };
         args.extend([
             "-c".into(),
             session.working_directory.clone().into_os_string(),
-            session.command.clone().into(),
+            command.into(),
         ]);
         self.invoke(args).await.map(|_| ())
     }
@@ -726,15 +732,23 @@ impl Tmux {
         validate_value("session name", session)?;
         validate_value("expected token", expected_token)?;
         match self.show_environment(session, BOSS_SPAWN_TOKEN_ENV).await? {
-            None => Ok(KillSessionOutcome::Absent),
+            None => {
+                self.cleanup_worker_processes(expected_token).await?;
+                Ok(KillSessionOutcome::Absent)
+            }
             Some(actual) if actual == expected_token => {
+                if self.runner.is_real() {
+                    boss_worker_processes::capture(BOSS_SPAWN_TOKEN_ENV, expected_token).await?;
+                }
                 // The session can still die on its own between the token
                 // read above and this call — the ordinary worker-completion
                 // race. Treat a kill that fails because the session is
                 // already gone as Absent, not a hard error, so this window
                 // doesn't leak the identity columns the way an unclassified
                 // Refused would.
-                if self.kill_session_unchecked(session).await? {
+                let killed = self.kill_session_unchecked(session).await?;
+                self.cleanup_worker_processes(expected_token).await?;
+                if killed {
                     Ok(KillSessionOutcome::Killed)
                 } else {
                     Ok(KillSessionOutcome::Absent)
@@ -746,6 +760,30 @@ impl Tmux {
                 actual,
             }),
         }
+    }
+
+    /// Detached shells retain the spawn token even after setsid and reparenting.
+    /// Await their exit before callers preserve files or return the lease.
+    pub async fn cleanup_worker_processes(&self, token: &str) -> Result<()> {
+        if self.runner.is_real() {
+            boss_worker_processes::cleanup(BOSS_SPAWN_TOKEN_ENV, token, "").await?;
+        }
+        Ok(())
+    }
+
+    /// A stopped remote worker must also prove that no unrelated process still
+    /// occupies its lease before the hub can preserve and release it.
+    pub async fn verify_workspace_quiescent(&self, workspace: &Path) -> Result<()> {
+        if self.runner.is_real() {
+            let result = boss_worker_processes::cleanup("BOSS_RUN_ID", "", &workspace.to_string_lossy()).await?;
+            anyhow::ensure!(
+                result.empty(),
+                "workspace occupants {:?}; unreadable processes {:?}",
+                result.occupants,
+                result.unknown
+            );
+        }
+        Ok(())
     }
 
     /// Private teardown primitive; `kill_session_verified` is the public entry point.

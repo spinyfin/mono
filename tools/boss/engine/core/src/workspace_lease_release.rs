@@ -29,6 +29,51 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 pub struct HostOccupancy;
 
 impl WorkspaceOccupancy for HostOccupancy {
+    fn cleanup<'a>(
+        &'a self,
+        db: &'a WorkDb,
+        execution: &'a WorkExecution,
+    ) -> Option<std::pin::Pin<Box<dyn Future<Output = Result<Occupancy>> + Send + 'a>>> {
+        Some(Box::pin(async move {
+            let workspace = execution
+                .workspace_path
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("workspace path missing"))?;
+            let mut result = boss_worker_processes::cleanup("BOSS_RUN_ID", &execution.id, workspace).await?;
+            // Older occupants are eligible only with durable terminal status
+            // and a dead recorded shell on this host. Unknown identities and
+            // terminal rows whose worker is still alive are never signalled.
+            for owner in result.owners.keys() {
+                if owner != &execution.id
+                    && let Ok(old) = db.get_execution(owner)
+                    && old.status.is_terminal()
+                    && db
+                        .execution_host_id(owner)
+                        .is_ok_and(|host| host.is_none_or(|host| host == "local"))
+                    && let Ok(Some(pid)) = db.latest_local_shell_pid_for_execution(owner)
+                    && i32::try_from(pid).ok().is_some_and(|pid| {
+                        matches!(
+                            crate::dead_pid_sweep::probe_pid(pid),
+                            crate::dead_pid_sweep::PidStatus::Dead
+                        )
+                    })
+                {
+                    boss_worker_processes::cleanup("BOSS_RUN_ID", owner, workspace).await?;
+                }
+            }
+            if !result.owners.is_empty() {
+                result = boss_worker_processes::cleanup("BOSS_RUN_ID", "", workspace).await?;
+            }
+            anyhow::ensure!(
+                result.empty(),
+                "workspace occupants {:?}; unreadable processes {:?}",
+                result.occupants,
+                result.unknown
+            );
+            Ok(Occupancy::Empty)
+        }))
+    }
+
     fn occupancy(&self, workspace_path: &Path) -> Occupancy {
         occupancy_of(workspace_path)
     }
@@ -75,13 +120,9 @@ pub async fn release_lease_after_inferred_death_with(
             },
         };
     }
-    let snapshot;
     let occupancy: &dyn WorkspaceOccupancy = match occupancy {
         Some(probe) => probe,
-        None => {
-            snapshot = ProcessSnapshot::capture_async().await;
-            &snapshot
-        }
+        None => &HostOccupancy,
     };
     let plain = DbPreservation::new(work_db, adapter);
     let with_cube = cube.map(|cube| DbPreservation::new(work_db, adapter).with_cube(cube));
@@ -130,33 +171,6 @@ impl ProcessSnapshot {
             snapshot = Self::capture_once();
         }
         snapshot
-    }
-
-    /// [`Self::capture`] for async callers: every enumeration runs on a
-    /// blocking thread and the retry delay yields instead of parking a
-    /// runtime worker.
-    async fn capture_async() -> Self {
-        let mut snapshot = Self::capture_once_blocking().await;
-        for _ in 1..CAPTURE_ATTEMPTS {
-            if snapshot.complete {
-                break;
-            }
-            tokio::time::sleep(CAPTURE_RETRY_DELAY).await;
-            snapshot = Self::capture_once_blocking().await;
-        }
-        snapshot
-    }
-
-    async fn capture_once_blocking() -> Self {
-        tokio::task::spawn_blocking(Self::capture_once)
-            .await
-            .unwrap_or_else(|err| {
-                tracing::warn!(error = %err, "workspace occupancy enumeration task failed");
-                Self {
-                    cwds: Vec::new(),
-                    complete: false,
-                }
-            })
     }
 
     fn capture_once() -> Self {
@@ -377,7 +391,7 @@ pub async fn run_one_pass(
     cube_client: &dyn CubeClient,
     live_states: &LiveWorkerStateRegistry,
 ) -> EndedRunLeaseSweepOutcome {
-    run_one_pass_with_occupancy(work_db, cube_client, live_states, ProcessSnapshot::capture_async).await
+    run_one_pass_with_occupancy(work_db, cube_client, live_states, || async { HostOccupancy }).await
 }
 
 async fn run_one_pass_with_occupancy<O: WorkspaceOccupancy, Fut: Future<Output = O>>(
@@ -404,6 +418,21 @@ async fn run_one_pass_with_occupancy<O: WorkspaceOccupancy, Fut: Future<Output =
         // registry is not proof after a restart. Require durable pid death.
         let pane = sweep_pane_status(work_db, live_states, &execution);
         if pane == PaneStatus::Present {
+            if !live_states.snapshot().iter().any(|state| state.run_id == execution.id) {
+                raise_attention(
+                    work_db,
+                    &execution,
+                    LEASE_UNRELEASED_ATTENTION_KIND,
+                    "Terminal worker still holds its workspace",
+                    &format!(
+                        "Lease {lease_id} cannot be preserved safely: recorded shell PID {:?} has no live execution registration and death is unconfirmed. Inspect this PID on the owning host and retry recovery; the workspace has not been reset.",
+                        work_db
+                            .latest_local_shell_pid_for_execution(&execution.id)
+                            .ok()
+                            .flatten()
+                    ),
+                );
+            }
             outcome.held += 1;
             continue;
         }

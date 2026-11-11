@@ -895,11 +895,37 @@ impl ExecutionCoordinator {
     pub(super) fn predecessor_lease_hold_detail(&self, execution: &WorkExecution) -> Option<String> {
         match self.work_db.recovery_predecessor_holding_lease(execution) {
             Ok(None) => None,
-            Ok(Some(predecessor)) => Some(format!(
-                "recovery predecessor {} still holds cube lease {}",
-                predecessor.id,
-                predecessor.cube_lease_id.as_deref().unwrap_or("(unrecorded)"),
-            )),
+            Ok(Some(predecessor)) => {
+                let detail = format!(
+                    "recovery predecessor {} still holds cube lease {}",
+                    predecessor.id,
+                    predecessor.cube_lease_id.as_deref().unwrap_or("(unrecorded)")
+                );
+                if predecessor.status.is_terminal()
+                    && let Ok(items) = self.work_db.list_attention_items(&predecessor.id)
+                    && let Some(failure) =
+                        items.iter().find(|item| {
+                            item.status == "open"
+                                && matches!(item.kind.as_str(),
+                        boss_engine_storage_values::attention_kinds::LEASE_UNRELEASED_ATTENTION_KIND
+                        | boss_engine_storage_values::attention_kinds::LEASE_RELEASE_FAILED_ATTENTION_KIND)
+                        })
+                {
+                    let error = format!(
+                        "Recovery cannot start: {detail}. {}. Resolve the predecessor's workspace cleanup, then resume this execution. No workspace was reset.",
+                        failure.body_markdown
+                    );
+                    if let Err(err) = self
+                        .work_db
+                        .fail_execution_start(&execution.id, "recovery", None, &error)
+                    {
+                        tracing::error!(execution_id = %execution.id, %err, "could not record recovery failure");
+                    }
+                    tracing::error!(execution_id = %execution.id, %error, "recovery predecessor release failed");
+                    return Some(error);
+                }
+                Some(detail)
+            }
             Err(err) => Some(format!("recovery predecessor could not be resolved: {err:#}")),
         }
     }

@@ -39,6 +39,16 @@ pub use boss_execution_contracts::{
 pub trait WorkspaceOccupancy: Send + Sync {
     fn occupancy(&self, workspace_path: &Path) -> Occupancy;
 
+    /// Clean detached processes only after pane death is proven. A cwd alone
+    /// never authorizes signalling a process.
+    fn cleanup<'a>(
+        &'a self,
+        _db: &'a WorkDb,
+        _execution: &'a WorkExecution,
+    ) -> Option<std::pin::Pin<Box<dyn Future<Output = Result<Occupancy>> + Send + 'a>>> {
+        None
+    }
+
     /// True when the verdict was established on the host that owns a
     /// non-local row's workspace. A probe that only sees the engine host
     /// must not vouch for a remote workspace.
@@ -74,10 +84,8 @@ pub fn decide(cause: TerminalCause, pane: PaneStatus, occupancy: Occupancy) -> L
         return LeaseReleaseDecision::Keep(KeepReason::PaneStillPresent);
     }
     match cause {
-        TerminalCause::ProvenCompleted | TerminalCause::ProvenNeverStarted | TerminalCause::ProvenStopped => {
-            LeaseReleaseDecision::Release
-        }
-        TerminalCause::Inferred => match occupancy {
+        TerminalCause::ProvenNeverStarted => LeaseReleaseDecision::Release,
+        TerminalCause::Inferred | TerminalCause::ProvenCompleted | TerminalCause::ProvenStopped => match occupancy {
             Occupancy::Empty => LeaseReleaseDecision::Release,
             Occupancy::Occupied => LeaseReleaseDecision::Keep(KeepReason::ProcessInWorkspace),
             Occupancy::Unknown => LeaseReleaseDecision::Keep(KeepReason::OccupancyUnconfirmed),
@@ -353,16 +361,37 @@ pub async fn apply_release_choosing<Fut: Future<Output = Result<()>>>(
     } = evidence;
     let local = matches!(db.execution_host_id(&execution.id), Ok(None))
         || matches!(db.execution_host_id(&execution.id), Ok(Some(host)) if host == "local");
-    let occupancy_status = match cause {
-        TerminalCause::Inferred if !local && !occupancy.probes_owning_host() => Occupancy::Unknown,
-        TerminalCause::Inferred => match execution.workspace_path.as_deref() {
-            Some(path) => occupancy.occupancy(Path::new(path)),
-            None => Occupancy::Unknown,
-        },
-        _ => Occupancy::Empty,
+    let occupancy_status = if pane == PaneStatus::Present || cause == TerminalCause::ProvenNeverStarted {
+        Occupancy::Empty // Neither case may start cleanup; decide still gates on the pane.
+    } else if !local && !occupancy.probes_owning_host() {
+        Occupancy::Unknown
+    } else if local && let Some(cleanup) = occupancy.cleanup(db, execution) {
+        cleanup.await.unwrap_or_else(|err| {
+            raise_attention(db, execution, LEASE_UNRELEASED_ATTENTION_KIND,
+                "Workspace recovery needs process cleanup", &format!("Lease {lease_id}: {err:#}. Inspect the named processes on the owning host, then retry recovery. The workspace remains protected."));
+            tracing::error!(execution_id = %execution.id, lease_id, error = %err, "workspace process cleanup failed");
+            Occupancy::Unknown
+        })
+    } else {
+        execution
+            .workspace_path
+            .as_deref()
+            .map_or(Occupancy::Unknown, |path| occupancy.occupancy(Path::new(path)))
     };
     match decide(cause, pane, occupancy_status) {
         LeaseReleaseDecision::Keep(reason) => {
+            if pane == PaneStatus::Gone {
+                raise_attention(
+                    db,
+                    execution,
+                    LEASE_UNRELEASED_ATTENTION_KIND,
+                    "Workspace recovery could not release its lease",
+                    &format!(
+                        "Lease {lease_id} remains held: {}. Inspect the owning host's worker process cleanup log for PIDs and retry recovery after resolving the occupants or host connectivity.",
+                        reason.label()
+                    ),
+                );
+            }
             tracing::info!(
                 execution_id = %execution.id,
                 lease_id,
@@ -681,10 +710,12 @@ pub async fn release_remote_lease<Fut: std::future::Future<Output = anyhow::Resu
         return LeaseReleaseOutcome::NoLease;
     };
     let occupancy = match execution.workspace_path.as_deref() {
-        Some(path) => host
-            .probe_workspace_occupancy(std::path::Path::new(path))
+        Some(path) if pane == PaneStatus::Gone => host
+            .cleanup_execution_processes(execution_id, std::path::Path::new(path))
             .await
             .unwrap_or_else(|err| {
+                raise_attention(work_db, &execution, LEASE_UNRELEASED_ATTENTION_KIND,
+                    "Remote workspace recovery needs process cleanup", &format!("Lease {lease_id} on {}: {err:#}. Inspect the named processes or restore host connectivity, then retry recovery.", host.host_id()));
                 tracing::debug!(
                     execution_id,
                     host_id = host.host_id(),
@@ -693,7 +724,7 @@ pub async fn release_remote_lease<Fut: std::future::Future<Output = anyhow::Resu
                 );
                 Occupancy::Unknown
             }),
-        None => Occupancy::Unknown,
+        _ => Occupancy::Unknown,
     };
     apply_release(
         work_db,

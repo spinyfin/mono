@@ -755,6 +755,18 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
     }
 
     async fn stop(&self, command: &Command, run: &Run, stop: &Stop, interrupted: bool) -> Result<CommandResult> {
+        let result = self.stop_inner(command, run, stop, interrupted).await?;
+        if result.code == ResultCode::Ok as i32
+            && self.tmux.runner().is_real()
+            && let Some(record) = self.loaded(run)?
+        {
+            let workspace = self.workspace_path(&record.workspace_id, &record.lease_id).await?;
+            self.tmux.verify_workspace_quiescent(&workspace).await?;
+        }
+        Ok(result)
+    }
+
+    async fn stop_inner(&self, command: &Command, run: &Run, stop: &Stop, interrupted: bool) -> Result<CommandResult> {
         let Some(mut record) = self.loaded(run)? else {
             return Ok(outcome(command, ResultCode::Absent, "no execution record", None));
         };
@@ -986,6 +998,12 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
     /// records are settled once the session is Missing, or once an
     /// Exited/BriefNotDelivered pane's session has been killed.
     async fn settle(&self, record: &mut ExecutionRecord, pane: &PaneState) -> Result<()> {
+        if matches!(
+            pane_life(pane),
+            PaneLife::Exited | PaneLife::BriefNotDelivered | PaneLife::Missing
+        ) {
+            self.tmux.cleanup_worker_processes(&record.spawn_token).await?;
+        }
         match record.phase {
             // An uncertain launch leaves the record here. Whatever the pane
             // shows now decides it: a session that exists is a launched

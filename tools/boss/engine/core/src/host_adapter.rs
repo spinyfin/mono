@@ -734,7 +734,14 @@ fn stage_local_file(run_id: &str, label: &str, contents: &str) -> Result<StagedF
         .join("boss-remote-input")
         .join(crate::ssh_transport::sanitize_for_path(run_id));
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
-    let nonce = boss_engine_utils::epoch_time::now_epoch_nanos();
+    // Clock resolution can repeat across concurrent transfers in one process.
+    // Each guard must own a distinct path so one drop cannot unlink another.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nonce = format!(
+        "{}-{}",
+        boss_engine_utils::epoch_time::now_epoch_nanos(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let path = dir.join(format!("boss-remote-{label}.{}.{}.tmp", std::process::id(), nonce));
     let staged = StagedFile(path);
     crate::driver::initial_prompt::write_private(staged.path(), contents.as_bytes())?;
@@ -1397,6 +1404,35 @@ impl HostAdapter for SshHostAdapter {
             "OCCUPIED" => Occupancy::Occupied,
             _ => Occupancy::Unknown,
         })
+    }
+
+    async fn cleanup_execution_processes(
+        &self,
+        execution_id: &str,
+        workspace: &Path,
+    ) -> Result<crate::workspace_lease_release::Occupancy> {
+        let output = self
+            .transport
+            .run(&[
+                "python3",
+                "-c",
+                boss_worker_processes::SCRIPT,
+                "BOSS_RUN_ID",
+                execution_id,
+                workspace.to_str().context("workspace is not UTF-8")?,
+            ])
+            .await?;
+        anyhow::ensure!(output.success(), "remote process cleanup failed: {}", output.stderr);
+        let result: boss_worker_processes::Cleanup = serde_json::from_str(&output.stdout)?;
+        result.report(execution_id);
+        anyhow::ensure!(
+            result.empty(),
+            "remote workspace occupants {:?}; surviving owned processes {:?}; unreadable processes {:?}",
+            result.occupants,
+            result.remaining,
+            result.unknown
+        );
+        Ok(crate::workspace_lease_release::Occupancy::Empty)
     }
 
     async fn probe_remote_worker_alive(&self, remote_pid: i64) -> Result<Option<bool>> {
@@ -2062,6 +2098,30 @@ mod tests {
             file_name.contains("mylabel"),
             "filename {file_name:?} should embed the label",
         );
+    }
+
+    #[test]
+    fn concurrent_staging_guards_keep_independent_contents() {
+        let guards = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..32)
+                .map(|index| {
+                    scope.spawn(move || {
+                        let content = index.to_string();
+                        (
+                            stage_local_file("concurrent-staging", "input", &content).unwrap(),
+                            content,
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for (guard, content) in guards {
+            assert_eq!(std::fs::read_to_string(guard.path()).unwrap(), content);
+        }
     }
 
     #[test]

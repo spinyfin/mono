@@ -24,7 +24,7 @@ fn seed_tmux_hosted_execution(db: &WorkDb, work_item_id: &str, pane_pid: i64) ->
     )
     .unwrap();
     assert!(
-        db.record_tmux_spawn_intent_for_execution(&execution_id, boss_tmux::SERVER_LABEL, SESSION, TOKEN)
+        db.record_tmux_spawn_intent_for_execution(&execution_id, boss_tmux::TEST_SOCKET_PATH, SESSION, TOKEN)
             .unwrap(),
         "intent write must find the just-started run row",
     );
@@ -259,6 +259,7 @@ async fn release_worker_pane_still_reaps_a_tmux_hosted_worker() {
         ok(""),
         ok(""),
     ]);
+    runner.own_process(i64::from(pid), TOKEN);
     server_state.set_tmux_override_for_test(tmux);
 
     let outcome = server_state.release_worker_pane(&execution_id).await;

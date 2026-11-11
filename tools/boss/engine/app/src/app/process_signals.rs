@@ -131,71 +131,10 @@ pub(super) fn current_parent_pid() -> Option<libc::pid_t> {
         .filter(|&pid| pid > 1)
 }
 
-/// Send `SIGTERM` to every pid in `pids`, sleep `grace`, then send
-/// `SIGKILL` to anything still alive. Used as the shutdown fallback
-/// when the app teardown path didn't release the worker shell — and
-/// from the panic hook, where we must not touch the runtime. The
-/// loop keeps going past `EPERM` / `ESRCH` because the worker may
-/// already be dead (good) or owned by another uid (we can't help).
-/// Engine-side reap of a worker's OS process tree on tmux pane release
-/// ([`crate::app::tmux_teardown`]). Signalling the pane pid's process
-/// group directly is required in addition to `tmux kill-session`:
-/// node-based agents commonly ignore the `SIGHUP` a pty teardown
-/// delivers, so the session can be gone while the worker process
-/// tree survives it — the leak in #975, where `bossctl agents stop`
-/// cleared the slot but left the OS process alive.
-///
-/// Fires `SIGTERM` at the *process group* of `shell_pid` synchronously
-/// (so a `claude` and anything it spawned — e.g. an MCP stdio child —
-/// go too), then escalates to `SIGKILL` on a detached task after
-/// `grace` if the lead pid is still alive. A non-positive pid is a
-/// no-op so callers need not branch on "pid not reported yet".
-///
-/// Synchronous SIGTERM + detached SIGKILL (rather than a blocking
-/// ladder) keeps the release path — and the `bossctl agents stop`
-/// round-trip behind it — prompt: by the time it returns the worker
-/// has at minimum been asked to exit. Mirrors the `signal_shell_pids`
-/// shutdown fallback.
-pub(super) fn reap_worker_process_tree(shell_pid: i32, grace: Duration) {
-    if shell_pid <= 0 {
-        return;
-    }
-    let pid = shell_pid as libc::pid_t;
-    let target = process_group_signal_target(pid);
-    // SAFETY: `pid` was recorded by us at spawn; a failed kill is not
-    // fatal (the process may already have exited).
-    let rc = unsafe { libc::kill(target, libc::SIGTERM) };
-    tracing::debug!(pid, target, rc, "reap_worker_process_tree: SIGTERM");
-    boss_task_scope::spawn(async move {
-        if grace > Duration::from_secs(0) {
-            tokio::time::sleep(grace).await;
-        }
-        if matches!(
-            boss_engine_runtime::dead_pid_sweep::probe_pid(pid),
-            boss_engine_runtime::dead_pid_sweep::PidStatus::Dead
-        ) {
-            tracing::debug!(pid, "reap_worker_process_tree: exited after SIGTERM");
-            return;
-        }
-        // SAFETY: same as above.
-        let rc = unsafe { libc::kill(target, libc::SIGKILL) };
-        tracing::info!(
-            pid,
-            target,
-            rc,
-            "reap_worker_process_tree: process survived SIGTERM grace; escalated to SIGKILL",
-        );
-    });
-}
-
-/// Resolve the `kill(2)` target for `pid`: the negated process group id
-/// when `getpgid` succeeds (so the whole group is signalled, reaching
-/// descendants), falling back to the bare pid when `getpgid` reports
-/// the process is already gone.
-pub(super) fn process_group_signal_target(pid: libc::pid_t) -> libc::pid_t {
-    // SAFETY: `getpgid` only reads kernel state for `pid`.
-    let pgid = unsafe { libc::getpgid(pid) };
-    if pgid > 0 { -pgid } else { pid }
+/// Await cleanup of the execution's registered and inherited process identities.
+/// Session absence is not process absence: detached shells outlive the pane.
+pub(super) async fn reap_worker_process_tree(tmux: &boss_tmux::Tmux, token: &str) -> anyhow::Result<()> {
+    tmux.cleanup_worker_processes(token).await
 }
 
 pub(super) fn signal_shell_pids(pids: &[libc::pid_t], grace: Duration) {

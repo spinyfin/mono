@@ -1773,6 +1773,12 @@ pub trait HostAdapter: Send + Sync {
         Ok(Occupancy::Unknown)
     }
 
+    /// Called during authorized teardown or after worker death. Implementations
+    /// signal exact inherited identifiers on the owning host, never cwd matches.
+    async fn cleanup_execution_processes(&self, _execution_id: &str, workspace: &Path) -> Result<Occupancy> {
+        self.probe_workspace_occupancy(workspace).await
+    }
+
     /// Read the tail of the worker's own stdout/stderr log for the run in
     /// `workspace_path` — the remote wrapper tees it to
     /// `<workspace>/.boss/worker.log`.

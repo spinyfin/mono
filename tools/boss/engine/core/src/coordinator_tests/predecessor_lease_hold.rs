@@ -308,6 +308,80 @@ async fn resume_preserves_the_stalled_runs_work_and_returns_its_lease_before_the
 }
 
 #[tokio::test]
+async fn orphan_cleanup_preserves_work_and_unblocks_the_successor() {
+    use std::io::BufRead;
+    let s = Stalled::new(true).await;
+    s.db().mark_execution_orphaned(&s.stalled_id, "worker gone").unwrap();
+    let successor = s
+        .db()
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(s.stalled().work_item_id)
+                .build(),
+        )
+        .unwrap();
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Child(
+        std::process::Command::new("python3")
+            .args([
+                "-u",
+                "-c",
+                "import os,time; os.setsid(); print('ready'); time.sleep(600)",
+            ])
+            .env("BOSS_RUN_ID", &s.stalled_id)
+            .current_dir(&s.repo.worker)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut ready = String::new();
+    std::io::BufReader::new(child.0.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert_eq!(ready.trim(), "ready");
+    assert!(s.db().recovery_predecessor_holding_lease(&successor).unwrap().is_some());
+    let started = std::time::Instant::now();
+    let result = apply_release(
+        s.db(),
+        &s.stalled(),
+        "lease-old",
+        ReleaseEvidence {
+            cause: TerminalCause::Inferred,
+            pane: PaneStatus::Gone,
+            occupancy: &crate::workspace_lease_release::HostOccupancy,
+            preservation: &DbPreservation::new(s.db(), None).with_cube(s.cube.as_ref()),
+        },
+        s.cube.force_release_lease("lease-old", Some("orphan cleanup")),
+    )
+    .await;
+    println!(
+        "orphan cleanup and preservation elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
+    assert_eq!(
+        result,
+        LeaseReleaseOutcome::Released,
+        "{:?}",
+        s.db().list_attention_items(&s.stalled_id).unwrap()
+    );
+    assert!(child.0.try_wait().unwrap().is_some());
+    assert!(s.db().preserved_tip(&s.stalled_id).unwrap().is_some());
+    assert!(s.db().recovery_predecessor_holding_lease(&successor).unwrap().is_none());
+    s.coordinator.drain_ready_queue_for_test().await;
+    wait_for_execution_status(s.db(), &successor.id, ExecutionStatus::Running).await;
+    assert_eq!(
+        std::fs::read_to_string(s.repo.replacement.join("fix")).unwrap(),
+        "unpublished fix"
+    );
+}
+
+#[tokio::test]
 async fn successor_is_held_until_a_later_sweep_releases_the_lease_then_restores_the_work() {
     let s = Stalled::new(true).await;
 
@@ -426,7 +500,7 @@ async fn failed_preservation_raises_an_attention_item_carrying_the_error_before_
 }
 
 #[tokio::test]
-async fn inline_reconcile_keeps_successor_held_until_preservation_finishes() {
+async fn inline_reconcile_fails_loudly_when_preservation_cannot_proceed_then_allows_retry() {
     let s = Stalled::new(true).await;
     // A missing recorded path makes occupancy unconfirmable. The durable
     // start time and absent pane pid still prove the pane never attached.
@@ -470,7 +544,7 @@ async fn inline_reconcile_keeps_successor_held_until_preservation_finishes() {
     assert!(s.stalled().status.is_terminal());
     assert_eq!(s.stalled().cube_lease_id.as_deref(), Some("lease-old"));
     assert!(s.db().preserved_tip(&s.stalled_id).unwrap().is_none());
-    assert_eq!(s.db().get_execution(&next.id).unwrap().status, ExecutionStatus::Ready);
+    assert_eq!(s.db().get_execution(&next.id).unwrap().status, ExecutionStatus::Failed);
     assert_eq!(s.wait_reason(&next.id).as_deref(), Some(HOLD_REASON));
     assert!(s.cube.lease_calls.lock().await.is_empty());
 
@@ -483,6 +557,14 @@ async fn inline_reconcile_keeps_successor_held_until_preservation_finishes() {
         )
         .unwrap();
     assert_eq!(s.release_like_a_later_sweep().await, LeaseReleaseOutcome::Released);
+    let next = s
+        .db()
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(s.stalled().work_item_id)
+                .build(),
+        )
+        .unwrap();
     s.coordinator.drain_ready_queue_for_test().await;
     wait_for_execution_status(s.db(), &next.id, ExecutionStatus::Running).await;
     assert_eq!(

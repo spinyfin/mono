@@ -117,11 +117,19 @@ fn toml_declares_tool(text: &str, name: &str) -> bool {
 pub fn write_shell_environment(bin_dir: &Path) -> io::Result<PathBuf> {
     let dir = environment_dir(bin_dir);
     std::fs::create_dir_all(&dir)?;
-    write_launcher(&dir, "bash-env", &format!("{PATH_RESTORE}{PATH_DEBUG_TRAP}"))?;
+    let registration = format!(
+        "if [ -n \"${{BOSS_RUN_ID:-}}${{BOSS_SPAWN_TOKEN:-}}\" ]; then python3 -c {} --register \"$$\" || exit 125; fi\n",
+        sh_quote(boss_worker_processes::SCRIPT)
+    );
+    write_launcher(
+        &dir,
+        "bash-env",
+        &format!("{PATH_RESTORE}{registration}{PATH_DEBUG_TRAP}"),
+    )?;
     write_launcher(
         &dir,
         ".zshenv",
-        &format!("{PATH_RESTORE}unsetopt RCS GLOBAL_RCS\nsetopt DEBUG_BEFORE_CMD\n{PATH_DEBUG_TRAP}"),
+        &format!("{PATH_RESTORE}{registration}unsetopt RCS GLOBAL_RCS\nsetopt DEBUG_BEFORE_CMD\n{PATH_DEBUG_TRAP}"),
     )?;
     Ok(dir)
 }

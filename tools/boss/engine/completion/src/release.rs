@@ -154,7 +154,7 @@ impl WorkerCompletionHandler {
             crate::workspace_lease_release::ReleaseEvidence {
                 cause,
                 pane: crate::workspace_lease_release::PaneStatus::Gone,
-                occupancy: &crate::workspace_lease_release::EmptyOccupancy,
+                occupancy: self.collaborators.workspace_occupancy.as_ref(),
                 preservation: &crate::workspace_lease_release::DbPreservation::new(&self.work_db, None),
             },
             |preserved| async move {

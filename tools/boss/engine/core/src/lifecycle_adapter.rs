@@ -117,6 +117,23 @@ impl LifecycleServices for CoreLifecycleServices {
         cause: TerminalCause,
         adapter: &dyn HostAdapter,
     ) -> LeaseReleaseOutcome {
+        let remote_occupancy;
+        let occupancy: &dyn crate::workspace_lease_release::WorkspaceOccupancy = if adapter.host_id() == "local" {
+            &crate::workspace_lease_release::HostOccupancy
+        } else {
+            remote_occupancy =
+                crate::workspace_lease_release::OwningHostOccupancy(match execution.workspace_path.as_deref() {
+                    Some(path) => adapter
+                        .cleanup_execution_processes(&execution.id, std::path::Path::new(path))
+                        .await
+                        .unwrap_or_else(|err| {
+                            tracing::error!(execution_id = %execution.id, host_id = adapter.host_id(), error = %err, "remote process cleanup failed before workspace release");
+                            crate::workspace_lease_release::Occupancy::Unknown
+                        }),
+                    None => crate::workspace_lease_release::Occupancy::Unknown,
+                });
+            &remote_occupancy
+        };
         crate::workspace_lease_release::apply_release_choosing(
             &self.work_db,
             execution,
@@ -124,7 +141,7 @@ impl LifecycleServices for CoreLifecycleServices {
             crate::workspace_lease_release::ReleaseEvidence {
                 cause,
                 pane: PaneStatus::Gone,
-                occupancy: &crate::workspace_lease_release::EmptyOccupancy,
+                occupancy,
                 preservation: &crate::workspace_lease_release::DbPreservation::new(&self.work_db, Some(adapter)),
             },
             move |preserved| async move {
@@ -319,7 +336,7 @@ mod tests {
         use crate::test_support::{create_test_chore, create_test_product};
         use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus};
         for preserved in [false, true] {
-            let (_dir, db) = open_db_arc();
+            let (dir, db) = open_db_arc();
             let product = create_test_product(&db);
             let chore = create_test_chore(&db, product.id, "Proven release");
             let execution = db
@@ -329,11 +346,12 @@ mod tests {
                         .kind(ExecutionKind::ChoreImplementation)
                         .status(ExecutionStatus::Completed)
                         .cube_lease_id("lease")
+                        .workspace_path(dir.path().join("workspace").to_string_lossy())
                         .build(),
                 )
                 .unwrap();
             if !preserved {
-                // A positioned execution without a workspace path cannot be preserved.
+                // A positioned execution with an unavailable store cannot be preserved.
                 db.record_execution_bookmark(&boss_engine_recovery::execution_bookmark::ExecutionBookmark {
                     execution_id: execution.id.clone(),
                     repo_path: "/tmp/unavailable".into(),
