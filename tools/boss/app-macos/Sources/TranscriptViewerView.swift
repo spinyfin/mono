@@ -92,8 +92,8 @@ struct ExecutionRow: View {
             Text(runtimeLabel)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            if let start = exec.startedAt {
-                Text(formattedDate(start))
+            if let start = startedText {
+                Text(start)
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
@@ -146,24 +146,11 @@ struct ExecutionRow: View {
         }
     }
 
-    private func formattedDate(_ iso: String) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = formatter.date(from: iso) {
-            let display = DateFormatter()
-            display.dateStyle = .short
-            display.timeStyle = .short
-            return display.string(from: date)
-        }
-        // Fall back without fractional seconds
-        let formatter2 = ISO8601DateFormatter()
-        if let date = formatter2.date(from: iso) {
-            let display = DateFormatter()
-            display.dateStyle = .short
-            display.timeStyle = .short
-            return display.string(from: date)
-        }
-        return iso
+    /// The parsed start time (decoded once in `parseExecutionVM`) as a local
+    /// short date/time; an unparseable raw value is shown verbatim.
+    var startedText: String? {
+        if let date = exec.startedDate { return AttachmentDateFormatting.format(date) }
+        return exec.startedAt
     }
 }
 

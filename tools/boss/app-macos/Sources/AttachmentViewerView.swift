@@ -234,10 +234,14 @@ struct AttachmentThumbnail: View {
 enum AttachmentDateFormatting {
     static func format(_ epochSecondsString: String, style: DateFormatter.Style = .short) -> String {
         guard let epoch = TimeInterval(epochSecondsString) else { return epochSecondsString }
+        return format(Date(timeIntervalSince1970: epoch), style: style)
+    }
+
+    static func format(_ date: Date, style: DateFormatter.Style = .short) -> String {
         let display = DateFormatter()
         display.dateStyle = style
         display.timeStyle = style
-        return display.string(from: Date(timeIntervalSince1970: epoch))
+        return display.string(from: date)
     }
 }
 
