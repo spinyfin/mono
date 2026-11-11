@@ -315,20 +315,26 @@ async fn stop_is_token_verified_and_leaves_siblings() {
 /// from the hermetic test environment and ignores the session environment, so
 /// the fixture lives in the private home's `.nix-profile/bin`, which that
 /// `PATH` starts with. `FIXTURE_MODE=exit` makes it quit without reading the
-/// brief; otherwise it satisfies the relay's readiness markers and appends
-/// every byte it then receives to `$FIXTURE_OUT`.
+/// brief; otherwise it satisfies the relay's readiness markers, shows the
+/// paste placeholder once it has read a whole paste (the relay sends Return
+/// only then), and appends every byte it receives to `$FIXTURE_OUT`.
 const FIXTURE_CLAUDE: &str = r#"#!/bin/sh
 [ "$FIXTURE_MODE" = exit ] && exit 0
 exec python3 -c '
 import os, tty
 tty.setraw(0)
 os.write(1, b"\x1b[?2004hClaude Code")
+tail = b""
 while True:
     data = os.read(0, 4096)
     if not data:
         break
     with open(os.environ["FIXTURE_OUT"], "ab") as out:
         out.write(data)
+    tail = (tail + data)[-4096:]
+    if b"\x1b[201~" in tail:
+        tail = b""
+        os.write(1, b"\r\n[Pasted text #1 +1 lines]")
 '
 "#;
 

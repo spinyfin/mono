@@ -20,7 +20,7 @@ pub struct RunnerConfig {
     pub review_signal_checks: fn(&str) -> &'static [&'static str],
 }
 
-pub use boss_execution_contracts::{DriverSignals, NeverStartedReap};
+pub use boss_execution_contracts::{DriverSignals, NeverStartedReap, UnsubmittedReap};
 
 pub struct GuardScripts {
     pub settings_dir: PathBuf,

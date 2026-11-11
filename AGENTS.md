@@ -45,6 +45,10 @@ root-cause rule as the section below.
 - Worker liveness contract (what the agent indicator derives from; how the
   engine converges when it has lost track of a live worker):
   [`tools/boss/docs/worker-liveness-contract.md`](tools/boss/docs/worker-liveness-contract.md)
+- Worker prompt delivery (how a brief is pasted and submitted, what proves
+  the driver accepted it, when the engine presses Return again, and where
+  each step is logged):
+  [`tools/boss/docs/worker-prompt-delivery.md`](tools/boss/docs/worker-prompt-delivery.md)
 - Failure-signal lifecycle (what raises an attention item / the card's
   "Failed to start" banner, and what specifically lowers it again):
   [`tools/boss/docs/attention-lifecycle.md`](tools/boss/docs/attention-lifecycle.md)

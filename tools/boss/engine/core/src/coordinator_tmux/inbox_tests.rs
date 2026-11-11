@@ -332,11 +332,16 @@ from pathlib import Path
 sessions = Path({sessions:?})
 # Complete the launcher's readiness and brief-delivery handshake, as the real
 # agent does, so the launcher's fixed readiness deadline never fires.
-marker = json.loads(Path({config:?}).read_text())["agent_markers"][0]
+config = json.loads(Path({config:?}).read_text())
 tty.setraw(0)
-sys.stdout.write("\x1b[?2004h" + marker)
+sys.stdout.write("\x1b[?2004h" + config["agent_markers"][0])
 sys.stdout.flush()
 received = b""
+while not received.endswith(b"\x1b[201~"):
+    received += os.read(0, 4096)
+# The launcher sends Return once the composer shows the pasted brief.
+sys.stdout.write("\r\n" + config["paste_landed_markers"][0])
+sys.stdout.flush()
 while not received.endswith(b"\r"):
     received += os.read(0, 4096)
 if os.fork() == 0:

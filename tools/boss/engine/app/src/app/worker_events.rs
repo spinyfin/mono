@@ -605,6 +605,11 @@ pub(super) async fn dispatch_live_worker_state(
     server_state
         .record_driver_signal(run_id, DriverSignalKind::HookEvent)
         .await;
+    // A started driver is not yet a working one: only turn events prove
+    // the prompt was accepted, which spawn confirmation waits for.
+    server_state
+        .live_worker_states
+        .record_turn_evidence(run_id, &incoming.event);
     // Resolve any outstanding pane-injection delivery waiter for this
     // run. A `UserPromptSubmit` hook is the CLI's own confirmation
     // that it enqueued *something* as the next prompt; when a probe
@@ -760,6 +765,9 @@ pub(super) async fn dispatch_live_worker_state(
     server_state
         .record_driver_signal(run_id, DriverSignalKind::HookEvent)
         .await;
+    server_state
+        .live_worker_states
+        .record_turn_evidence(run_id, &incoming.event);
     let prior_activity = server_state.live_worker_states.get(slot_id).map(|s| s.activity);
     // Applied in the worker's emission order (`ingress_seq`), so a `Stop`
     // whose ingress task was slower than the next turn's `PreToolUse`

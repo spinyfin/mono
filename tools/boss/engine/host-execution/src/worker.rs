@@ -1834,7 +1834,7 @@ mod tests {
     async fn grok_spawn_stops_waiting_once_the_delivered_marker_appears() {
         let root = tempfile::tempdir().unwrap();
         let fake = Arc::new(FakeTmux::default());
-        let mut supervisor = grok_supervisor(root.path(), fake).await;
+        let mut supervisor = grok_supervisor(root.path(), fake.clone()).await;
         supervisor.brief_budget = Duration::from_secs(60);
         let grok_home = homes::grok_root(&supervisor.homes_root)
             .join("run-test")
@@ -1844,14 +1844,17 @@ mod tests {
         let started = Instant::now();
         let command = grok_spawn_command();
         let (result, ()) = tokio::join!(supervisor.execute(&command, false, 1), async {
+            // The launcher writes its marker from inside the pane, so only
+            // after the session exists. Provisioning clears any marker an
+            // earlier attempt left in the home.
             for _ in 0..500 {
-                if grok_home.join("config.toml").exists() {
+                if !fake.sessions.lock().unwrap().is_empty() {
                     std::fs::write(&marker, "").unwrap();
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            panic!("grok home was never provisioned");
+            panic!("the pane was never started");
         });
         assert_eq!(result.code, ResultCode::Ok as i32, "{}", result.reason);
         assert!(

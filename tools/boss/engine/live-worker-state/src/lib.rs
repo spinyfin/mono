@@ -27,8 +27,10 @@ use crate::semantic_progress::{
 use boss_engine_driver::ProgressFidelity;
 
 mod never_started_reap;
+mod prompt_acceptance;
 pub mod semantic_progress;
 pub use never_started_reap::NeverStartedReapCommit;
+pub use prompt_acceptance::turn_evidence_kind;
 
 /// Attributed worker-pool label for a live run (`"main"`, `"automation"`,
 /// `"review"`, or `"progression"`). Matches
@@ -222,6 +224,8 @@ pub struct TestHooks {
 #[derive(Default)]
 struct PendingHooks {
     driver_signal_at: Option<i64>,
+    /// See `SlotMeta::prompt_accepted_at`.
+    prompt_accepted_at: Option<i64>,
     /// First driver hook event kind seen before the slot was registered.
     /// Buffered here while the run is armed, then transferred into
     /// `SlotMeta::first_hook_event` (and removed from this buffer) at
@@ -364,6 +368,10 @@ struct SlotMeta {
     /// pid as evidence of a working worker is what the 2026-07-30
     /// incident walked through untouched.
     driver_signal_at: Option<i64>,
+    /// Epoch seconds of the first event only a turn can produce: proof the
+    /// driver accepted its prompt, which `driver_signal_at` is not. Written
+    /// only by [`LiveWorkerStateRegistry::record_turn_evidence`].
+    prompt_accepted_at: Option<i64>,
     /// Event kind of the first driver hook received for this registration's
     /// run. Diagnostic-only (it appears in spawn-confirmation failure logs):
     /// first-write-wins, keyed by `run_id`, and reset whenever the slot is
@@ -791,6 +799,7 @@ impl LiveWorkerStateRegistry {
                 );
             }
             meta.driver_signal_at = pending.driver_signal_at;
+            meta.prompt_accepted_at = pending.prompt_accepted_at;
             meta.first_hook_event = pending.first_hook_event;
         }
         let displaced = guard
@@ -2473,6 +2482,14 @@ impl boss_execution_contracts::DriverSignals for LiveWorkerStateRegistry {
             NeverStartedReapCommit::SlotGone => NeverStartedReap::SlotGone,
             NeverStartedReapCommit::AlreadyCommitted => NeverStartedReap::AlreadyCommitted,
         }
+    }
+
+    fn has_prompt_accepted_for_run(&self, run_id: &str) -> bool {
+        LiveWorkerStateRegistry::has_prompt_accepted_for_run(self, run_id)
+    }
+
+    fn commit_unsubmitted_reap(&self, slot_id: u8, run_id: &str) -> boss_execution_contracts::UnsubmittedReap {
+        self.confirm_unsubmitted_reap(slot_id, run_id)
     }
 }
 

@@ -36,6 +36,15 @@ fn pane_spawn_failed_attention_body(
                  and the pane was reaped."
             )
         }
+        Some(
+            boss_execution_contracts::SpawnConfirmationError::PromptNotSubmitted { .. }
+            | boss_execution_contracts::SpawnConfirmationError::PromptNotDelivered { .. },
+        ) => {
+            format!(
+                "Execution `{exec_id}` leased workspace `{workspace_id}` and the driver started, \
+                 but it never began working on its prompt, so the pane was reaped."
+            )
+        }
         None => {
             format!("Execution `{exec_id}` leased workspace `{workspace_id}` but the worker pane never came up.")
         }
@@ -1232,8 +1241,26 @@ impl ExecutionCoordinator {
 #[cfg(test)]
 mod pane_spawn_failed_attention_body_tests {
     use super::pane_spawn_failed_attention_body;
-    use boss_execution_contracts::{composer_not_ready_error, turn_did_not_start_error};
+    use boss_execution_contracts::{
+        composer_not_ready_error, prompt_not_delivered_error, prompt_not_submitted_error, turn_did_not_start_error,
+    };
     use std::time::Duration;
+
+    #[test]
+    fn an_unsubmitted_prompt_says_the_driver_started_but_never_began_work() {
+        let unsubmitted = prompt_not_submitted_error("claude", "exec-1", 2, Duration::from_secs(90));
+        let undelivered = prompt_not_delivered_error("claude", "exec-1", "the launcher reported a failure");
+        for (err, detail) in [
+            (unsubmitted, "Return re-sent 2 time(s)"),
+            (undelivered, "the launcher reported a failure"),
+        ] {
+            let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, true, false);
+            assert!(body.contains("never began working on its prompt"), "{body}");
+            assert!(body.contains("the pane was reaped"), "{body}");
+            assert!(!body.contains("never came up"), "{body}");
+            assert!(body.contains(detail), "{body}");
+        }
+    }
 
     #[test]
     fn composer_timeout_uses_neutral_wording() {
