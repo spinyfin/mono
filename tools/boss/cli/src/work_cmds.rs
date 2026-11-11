@@ -1498,6 +1498,10 @@ pub(crate) async fn run_comment_reply(ctx: &RunContext, args: CommentReplyArgs) 
         FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
             Err(CliError::application(message))
         }
+        FrontendEvent::WorkerGatewayResult { status, value } => {
+            crate::propose::print_gateway_result(ctx, &status, &value)
+        }
+        FrontendEvent::ProposalRejected { error } => Err(CliError::application(error.message)),
         other => Err(unexpected_event("comment reply", &other)),
     }
 }

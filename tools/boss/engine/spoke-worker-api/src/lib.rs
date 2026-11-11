@@ -1,34 +1,59 @@
 //! Restricted worker IPC. Durable receipt never confers hub work authority.
 //!
-//! Command inventory: `execution-runner/src/runner/prompt.rs`, `prompt/`,
-//! `prompt_fragments.rs`, `review_prompt.rs`, `review_guide_prompt.rs` and
-//! `progression_prompt.rs` compose context, PR status/body, attachment,
-//! proposal and guide-outcome instructions. `worker-api/1` accepts those bound
-//! reads, attachment registration/listing, the existing validated proposal
-//! kinds (including done, wait, review reports/verdicts, blocked questions,
-//! followups and PR-created) and `boss comment guide-outcome`, a run-scoped
-//! mutation queued as a validated `guide-outcome/1` record bound to the
-//! claimed run. Listing returns this assignment's local receipts, explicitly
-//! labeled as such. Context uses Spawn's sanitized bundle and context
-//! revision. Cache misses and explicit refreshes emit WorkerRequest on the
-//! journal stream; absence of a reply is hub_unavailable. Cached reads retain
-//! observation time.
+//! Command inventory. Every prompt source was searched for the commands a
+//! worker is told to run: `execution-runner/src/runner/prompt.rs`, `prompt/`
+//! and `prompt_fragments.rs` (including the CI-remediation, conflict-resolution
+//! and progression fragments), `worker_setup.rs`, `review_prompt.rs`,
+//! `review_guide_prompt.rs`, `progression_prompt.rs`, `answer_agent*.rs`,
+//! `automation_triage.rs`, `ci_failure.rs` and `operator_question.rs`.
 //!
-//! Prompt paths for progression supervision also mention arbitrary task reads
-//! (`task show`), design-doc commands (`project design-doc`,
+//! `worker-api/1` accepts, as bound reads: context, PR status and PR body. It
+//! accepts attachment registration and listing, and the existing validated
+//! proposal kinds (done, wait, review reports/verdicts, blocked questions,
+//! followups and PR-created). The run-scoped writes below are validated and
+//! queued as records bound to the claimed run; the hub applies the same
+//! ownership checks the local engine does, and none spends the proposal budget:
+//! - `boss comment guide-outcome` (`guide-outcome/1`), one live outcome per
+//!   comment;
+//! - `boss comment reply` (`answer-reply/1`), the answer agent's one reply;
+//! - `boss engine conflicts record-producer` (`conflict-producer/1`), in every
+//!   worker's rules;
+//! - `boss engine conflicts mark-failed` (`conflict-mark-failed/1`);
+//! - `boss engine ci mark-failed` (`ci-mark-failed/1`).
+//!
+//! Listing returns this assignment's local receipts, explicitly labeled as
+//! such. Context uses Spawn's sanitized bundle and context revision. Cache
+//! misses and explicit refreshes emit WorkerRequest on the journal stream;
+//! absence of a reply is hub_unavailable, and a reply that arrives after the
+//! wait still fills the cache. Cached reads retain observation time.
+//!
+//! Commands that need an answer the hub must compute synchronously, or that are
+//! administration verbs, are denied (as is every general app/board/control
+//! method), so the execution kinds that depend on them are not composed for
+//! remote dispatch (`compose_remote_spawn` rejects them): CI remediation needs
+//! `engine ci mark-noop` (live-CI verdict), `mark-retriggered`, `classify` and
+//! `mark-succeeded-via-rebase`; automation triage needs
+//! `task create --automation`; progression supervision also uses arbitrary task
+//! reads (`task show`), design-doc commands (`project design-doc`,
 //! `project set-design-doc`), stuck reports (`propose unreachable`) and
-//! merge/CI recovery (`resolved merge`, `engine ci`), which are engine
-//! administration verbs. These are denied, as are every general
-//! app/board/control method. Enabling such execution kinds remotely requires
-//! their own run-scoped contracts.
+//! `resolved merge`. Enabling such kinds remotely requires their own run-scoped
+//! contracts.
 //! Cube publication and gh remain host-local commands using host credentials.
 //! The host-allocated PR/structured-output files are captured into durable
 //! artifact sources and chunked over the same stream, including after restart.
 //!
-//! Spool lifecycle: staged artifact bytes move into numbered records chunk by
-//! chunk in one transaction, so they are never counted twice. Request/reply
-//! rows are deleted once consumed, and every remaining `worker-*` row is
-//! released when the run is reclaimed and its artifacts are fully streamed.
+//! Spool lifecycle: registering an artifact stages its bytes plus a reserve for
+//! the chunk records' overhead, so acceptance proves it can reach EOF. Each
+//! emitted prefix moves into a numbered record in one transaction (the staged
+//! blob is trimmed or released at the same time), so bytes are never counted
+//! twice, even when bulk credit is smaller than a chunk. Request/reply rows are
+//! deleted once consumed, and every remaining `worker-*` row is released when
+//! the run is reclaimed and its artifacts are fully streamed.
+//!
+//! Output capture: at done, at an observed turn Stop and at exit, the host-
+//! allocated output files are captured. A transient failure leaves a durable
+//! pending marker that every tick retries (then an explicit gap), and reclaim
+//! waits for the exit capture to conclude.
 //!
 //! Proposal receipts permit a worker to finish its turn and park. Decisions
 //! arrive separately through ProposalDecision; only hub commands may stop or
@@ -42,6 +67,17 @@ mod artifacts {
     const CHUNK: usize = 64 * 1024;
     /// Chunks emitted per run in one observe tick, while bulk credit lasts.
     const PUMP_BURST: usize = 8;
+    /// Upper bound on what one chunk record carries beyond its data: run
+    /// identity, artifact id, digest and offsets (the metadata is added to it).
+    const RECORD_OVERHEAD: usize = 1024;
+    /// Chunk records an artifact may need per staged chunk when bulk credit is
+    /// smaller than a chunk and a chunk is emitted in more than one piece.
+    const RECORDS_PER_CHUNK: usize = 2;
+    /// A source checkpoint may not exceed 512 KiB.
+    const MAX_RESERVE: usize = 400_000;
+    /// Retries (one per observe tick) before an output that cannot be staged
+    /// is reported to the hub as unavailable.
+    const MAX_CAPTURE_ATTEMPTS: u32 = 120;
 
     #[derive(Serialize, Deserialize)]
     pub(super) struct Artifact {
@@ -54,6 +90,13 @@ mod artifacts {
 
     fn blob_key(id: &str, index: usize) -> String {
         format!("worker-blob:{id}:{index}")
+    }
+
+    /// Spool space set aside at registration for the chunk records' own
+    /// overhead, so an accepted artifact never stalls for lack of room to
+    /// describe its bytes. Each emitted record draws it down.
+    fn reserve_key(id: &str) -> String {
+        format!("worker-blob:{id}:reserve")
     }
 
     /// How one host-allocated output file resolved at a capture boundary.
@@ -142,19 +185,28 @@ mod artifacts {
                 "artifact kind per-run cap reached"
             );
             // Staging is spool-accounted bulk data, without allocating outbound
-            // sequences ahead of lifecycle records. The pump moves each staged
-            // chunk into a record atomically, so the footprint never doubles.
-            // A failed registration releases whatever it staged.
+            // sequences ahead of lifecycle records. It includes a reserve for
+            // the chunk records' own overhead, so admission here proves the
+            // whole artifact can be emitted. The pump moves each staged prefix
+            // into a record atomically, so the footprint never doubles. A
+            // failed registration releases whatever it staged.
+            metadata["registered_unix_ms"] = stamp.wall_unix_ms.into();
+            let record_overhead = RECORD_OVERHEAD + serde_json::to_vec(&metadata)?.len();
+            let reserve = (bytes.len().div_ceil(CHUNK) * RECORDS_PER_CHUNK * record_overhead).min(MAX_RESERVE);
             let mut staged = Vec::new();
-            for (index, chunk) in bytes.chunks(CHUNK).enumerate() {
-                let key = blob_key(&id, index);
-                if let Err(error) = journal.commit_source(&run, &key, None, chunk, vec![]) {
+            let reserved = std::iter::once((reserve_key(&id), vec![0u8; reserve])).chain(
+                bytes
+                    .chunks(CHUNK)
+                    .enumerate()
+                    .map(|(index, chunk)| (blob_key(&id, index), chunk.to_vec())),
+            );
+            for (key, value) in reserved {
+                if let Err(error) = journal.commit_source(&run, &key, None, &value, vec![]) {
                     let _ = journal.delete_sources(&run, &staged);
                     return Err(error);
                 }
                 staged.push(key);
             }
-            metadata["registered_unix_ms"] = stamp.wall_unix_ms.into();
             state.artifacts.push(Artifact {
                 id,
                 kind: kind as i32,
@@ -230,9 +282,11 @@ mod artifacts {
             }
         }
 
-        /// Record that an output name has reached its final outcome, so it is
-        /// captured once: one slot per output name, never one per rewrite. An
-        /// invalid output also leaves a lifecycle gap the hub can classify.
+        /// Record that an output name has reached its final outcome for the
+        /// current completion boundary: one slot per output name, never one per
+        /// rewrite. An invalid output also leaves a lifecycle gap the hub can
+        /// classify. A rejected completion reopens the slot (see
+        /// [`Gateway::apply`]), so a corrected file is captured again.
         fn conclude_output(
             &self,
             execution: &ExecutionRecord,
@@ -243,43 +297,29 @@ mod artifacts {
             let run = identity(execution);
             let mut journal = lock(&self.journal)?;
             let (old, mut state) = state(&journal, &run)?;
-            if state.captured.iter().any(|n| n == name) {
+            if state.capture.captured.iter().any(|n| n == name) {
                 return Ok(());
             }
-            state.captured.push(name.to_owned());
+            state.capture.captured.push(name.to_owned());
             let observations = gap
-                .map(|reason| {
-                    vec![(
-                        v1::Record {
-                            run: Some(run.clone()),
-                            observed: Some(stamp.clone()),
-                            body: Some(record::Body::Gap(v1::Gap {
-                                resource: format!("output:{name}"),
-                                reason,
-                                ..Default::default()
-                            })),
-                            ..Default::default()
-                        },
-                        Admission::Lifecycle,
-                    )]
-                })
+                .map(|reason| vec![gap_record(&run, stamp, format!("output:{name}"), reason)])
                 .unwrap_or_default();
             journal.commit_source(&run, STATE, old.as_deref(), &serde_json::to_vec(&state)?, observations)
         }
 
         /// Capture host-allocated output paths recorded before launching the
         /// worker. Worker-supplied paths and symlinks never become output
-        /// authority. Called at completion boundaries (done, stop, exit), so a
-        /// file rewritten while the worker runs is one artifact, not many.
-        /// Output problems never fail the caller: they become retries or an
-        /// explicit gap marker. Only journal faults are returned.
-        pub fn capture_outputs(&self, execution: &ExecutionRecord, stamp: &v1::Stamp) -> Result<()> {
+        /// authority. Output problems never fail the caller: they become an
+        /// explicit gap marker, or `Ok(true)` when something must be retried
+        /// because the spool had no room. Only journal faults are returned.
+        pub fn capture_outputs(&self, execution: &ExecutionRecord, stamp: &v1::Stamp) -> Result<bool> {
             let run = identity(execution);
+            let mut retry = false;
             for (name, path) in &execution.worker_outputs {
                 if !matches!(name.as_str(), "BOSS_PR_URL_OUTPUT" | "BOSS_STRUCTURED_OUTPUT") {
                     continue;
                 }
-                if state(&*lock(&self.journal)?, &run)?.1.captured.contains(name) {
+                if state(&*lock(&self.journal)?, &run)?.1.capture.captured.contains(name) {
                     continue;
                 }
                 match self.read_output(execution, name, path, stamp) {
@@ -287,11 +327,54 @@ mod artifacts {
                     Captured::Absent => {}
                     Captured::Transient(error) => {
                         tracing::warn!(run = execution.run_id, output = name, %error, "worker output retained for retry");
+                        retry = true;
                     }
                     Captured::Invalid(reason) => self.conclude_output(execution, name, Some(reason), stamp)?,
                 }
             }
-            Ok(())
+            Ok(retry)
+        }
+
+        /// A completion boundary (done, turn Stop, exit): capture, and persist
+        /// whether anything is still owed. A pending marker is retried on every
+        /// upkeep tick independent of phase; after [`MAX_CAPTURE_ATTEMPTS`] the
+        /// hub gets an explicit unavailable gap instead of silence. At exit the
+        /// outcome also gates reclaim (see [`captures_concluded`]).
+        pub(super) fn capture_boundary(
+            &self,
+            execution: &ExecutionRecord,
+            stamp: &v1::Stamp,
+            terminal: bool,
+        ) -> Result<()> {
+            let retry = self.capture_outputs(execution, stamp)?;
+            let run = identity(execution);
+            let mut journal = lock(&self.journal)?;
+            let (old, mut state) = state(&journal, &run)?;
+            let mut observations = Vec::new();
+            if retry {
+                state.capture.attempts += 1;
+                if state.capture.attempts >= MAX_CAPTURE_ATTEMPTS {
+                    observations.push(gap_record(
+                        &run,
+                        stamp,
+                        "output:capture".into(),
+                        format!(
+                            "worker output unavailable: the spool had no room after {} attempts",
+                            state.capture.attempts
+                        ),
+                    ));
+                    state.capture.pending = false;
+                    state.capture.attempts = 0;
+                    state.capture.exited |= terminal;
+                } else {
+                    state.capture.pending = true;
+                }
+            } else {
+                state.capture.pending = false;
+                state.capture.attempts = 0;
+                state.capture.exited |= terminal;
+            }
+            journal.commit_source(&run, STATE, old.as_deref(), &serde_json::to_vec(&state)?, observations)
         }
 
         /// Emit credited chunks for the run's first unfinished artifact, a
@@ -317,27 +400,44 @@ mod artifacts {
                 return Ok(false);
             };
             let credit = journal.bulk_credit()?;
-            let chunk_index = artifact.offset / CHUNK;
-            let key = blob_key(&artifact.id, chunk_index);
+            // The staged blob for this chunk always holds exactly the bytes not
+            // yet emitted, so the unemitted tail is the whole source.
+            let key = blob_key(&artifact.id, artifact.offset / CHUNK);
             let source = journal.source(run, &key)?.context("artifact source missing")?;
-            let start = artifact.offset % CHUNK;
-            let data = source[start..].iter().copied().take(credit).collect::<Vec<_>>();
+            let take = source.len().min(credit);
+            let data = source[..take].to_vec();
+            let metadata_json = serde_json::to_vec(&artifact.metadata)?;
+            let overhead = RECORD_OVERHEAD + metadata_json.len();
+            let finished = artifact.offset + take == artifact.size;
             let chunk = v1::ArtifactChunk {
                 artifact_id: artifact.id.clone(),
                 kind: artifact.kind,
                 offset: artifact.offset as u64,
                 sha256: Sha256::digest(&data).to_vec(),
-                eof: artifact.offset + data.len() == artifact.size,
+                eof: finished,
                 total_bytes: artifact.size as u64,
-                metadata_json: serde_json::to_vec(&artifact.metadata)?,
+                metadata_json,
                 data,
             };
-            artifact.offset += chunk.data.len();
-            let released = if artifact.offset % CHUNK == 0 || artifact.offset == artifact.size {
-                vec![key]
+            let reserve_key = reserve_key(&artifact.id);
+            let reserve = journal.source(run, &reserve_key)?;
+            artifact.offset += take;
+            // One transaction moves the emitted prefix out of staging: a fully
+            // emitted blob is released, a partly emitted one is trimmed to its
+            // tail, and the record's overhead is paid from the reserve.
+            let (mut released, mut trimmed) = (Vec::new(), Vec::new());
+            if take == source.len() {
+                released.push(key);
             } else {
-                vec![]
-            };
+                trimmed.push((key, source[take..].to_vec()));
+            }
+            if let Some(reserve) = reserve {
+                if finished {
+                    released.push(reserve_key);
+                } else {
+                    trimmed.push((reserve_key, vec![0u8; reserve.len().saturating_sub(overhead)]));
+                }
+            }
             journal.commit_source_releasing(
                 run,
                 STATE,
@@ -352,7 +452,10 @@ mod artifacts {
                     },
                     Admission::Bulk,
                 )],
-                &released,
+                boss_spoke_journal::Staging {
+                    released: &released,
+                    trimmed: &trimmed,
+                },
             )?;
             Ok(true)
         }
@@ -410,9 +513,84 @@ const MAX_REQUEST: u64 = 256 * 1024;
 const STATE: &str = "worker-api";
 /// Concurrent worker exchanges; further clients wait in the listen backlog.
 const MAX_CONNECTIONS: usize = 16;
-const GUIDE_OUTCOME_CONTRACT: &str = "guide-outcome/1";
-const GUIDE_OUTCOME_KIND: &str = "guide_outcome";
 const MAX_GUIDE_BODY_BYTES: usize = 64 * 1024;
+const MAX_WRITE_BODY_BYTES: usize = 64 * 1024;
+/// Runaway bound on a run's run-scoped writes, far above any realistic count.
+/// Guide outcomes are further bounded to one live outcome per comment.
+const RUN_WRITE_CAP: usize = 512;
+const MAX_CONFLICTED_FILES: usize = 500;
+
+/// The run-scoped writes the gateway queues. Each is bound to the claimed run;
+/// the hub applies the same ownership checks the local engine does. They are
+/// bounded separately from proposals and never spend the proposal budget.
+#[derive(Clone, Copy, PartialEq)]
+enum RunWriteKind {
+    GuideOutcome,
+    AnswerReply,
+    ConflictProducer,
+    ConflictMarkFailed,
+    CiMarkFailed,
+}
+
+impl RunWriteKind {
+    const ALL: [Self; 5] = [
+        Self::GuideOutcome,
+        Self::AnswerReply,
+        Self::ConflictProducer,
+        Self::ConflictMarkFailed,
+        Self::CiMarkFailed,
+    ];
+
+    /// The receipt label, which also tells listings what the receipt is.
+    fn label(self) -> &'static str {
+        match self {
+            Self::GuideOutcome => "guide_outcome",
+            Self::AnswerReply => "answer_reply",
+            Self::ConflictProducer => "conflict_producer",
+            Self::ConflictMarkFailed => "conflict_mark_failed",
+            Self::CiMarkFailed => "ci_mark_failed",
+        }
+    }
+
+    fn contract(self) -> &'static str {
+        match self {
+            Self::GuideOutcome => "guide-outcome/1",
+            Self::AnswerReply => "answer-reply/1",
+            Self::ConflictProducer => "conflict-producer/1",
+            Self::ConflictMarkFailed => "conflict-mark-failed/1",
+            Self::CiMarkFailed => "ci-mark-failed/1",
+        }
+    }
+
+    /// How many distinct receipts of this kind one run may hold. Guide outcomes
+    /// are bounded per comment instead (see [`Self::supersedes`]).
+    fn max_distinct(self) -> usize {
+        match self {
+            Self::GuideOutcome => RUN_WRITE_CAP,
+            Self::AnswerReply => 1,
+            Self::ConflictProducer => 64,
+            Self::ConflictMarkFailed | Self::CiMarkFailed => 8,
+        }
+    }
+
+    /// A later write with the same scope replaces the earlier one.
+    fn supersedes(self) -> bool {
+        self == Self::GuideOutcome
+    }
+}
+
+fn is_run_write(label: &str) -> bool {
+    RunWriteKind::ALL.iter().any(|kind| kind.label() == label)
+}
+
+/// A run-scoped write awaiting validation and queueing.
+struct RunWrite {
+    kind: RunWriteKind,
+    /// Distinguishes writes of one kind (a comment or attempt id).
+    scope: String,
+    fields: Vec<ProposalFieldError>,
+    canonical: Value,
+}
 
 #[derive(Clone)]
 pub struct Gateway {
@@ -425,9 +603,22 @@ pub struct Gateway {
 struct State {
     proposals: Vec<Receipt>,
     artifacts: Vec<artifacts::Artifact>,
-    /// Output names whose capture reached a final outcome.
     #[serde(default)]
+    capture: CaptureState,
+}
+
+/// Where a run's output capture stands.
+#[derive(Default, Serialize, Deserialize)]
+struct CaptureState {
+    /// Output names whose capture reached a final outcome at the current
+    /// completion boundary. A rejected done reopens them.
     captured: Vec<String>,
+    /// A capture is owed (a turn ended or done was submitted) and must be
+    /// retried on every upkeep tick until it concludes, whatever the phase.
+    pending: bool,
+    attempts: u32,
+    /// The exit-time capture concluded. Reclaim waits for it.
+    exited: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -467,6 +658,44 @@ fn response(status: &str, value: Value) -> FrontendEvent {
         status: status.into(),
         value,
     }
+}
+
+fn gap_record(run: &v1::Run, stamp: &v1::Stamp, resource: String, reason: String) -> (v1::Record, Admission) {
+    (
+        v1::Record {
+            run: Some(run.clone()),
+            observed: Some(stamp.clone()),
+            body: Some(record::Body::Gap(v1::Gap {
+                resource,
+                reason,
+                ..Default::default()
+            })),
+            ..Default::default()
+        },
+        Admission::Lifecycle,
+    )
+}
+
+/// A turn ended without `propose done` (a Stop observed by hook or transcript
+/// ingestion). A worker may have written its outputs and parked, so the capture
+/// is owed from here on and is retried until it concludes.
+pub fn note_turn_stop(journal: &SharedJournal, run: &v1::Run) -> Result<()> {
+    let mut journal = lock(journal)?;
+    let (old, mut state) = state(&journal, run)?;
+    if state.capture.pending {
+        return Ok(());
+    }
+    state.capture.pending = true;
+    journal.commit_source(run, STATE, old.as_deref(), &serde_json::to_vec(&state)?, vec![])
+}
+
+/// Whether the gateway has finished capturing this run's outputs: nothing is
+/// pending and, once the worker has exited, the exit-time capture concluded.
+/// Reclaim must wait for this, or a drain that completes between two gateway
+/// ticks would discard output files that were never read.
+pub fn captures_concluded(journal: &SharedJournal, record: &ExecutionRecord) -> Result<bool> {
+    let (_, state) = state(&*lock(journal)?, &identity(record))?;
+    Ok(!state.capture.pending && (record.phase != Phase::Terminal || state.capture.exited))
 }
 
 pub fn authenticate(records: &[ExecutionRecord], peer: i32, uid: u32, boot: &str) -> Result<ExecutionRecord> {
@@ -522,26 +751,41 @@ impl Gateway {
                         continue;
                     }
                 };
-                let run = identity(&execution);
-                // Outputs are captured at exit, never while the worker may still
-                // rewrite them, and never for a run whose rows were released.
-                if matches!(execution.phase, Phase::Stopping | Phase::Terminal)
-                    && !execution.reclaimed
-                    && let Err(error) = self.capture_outputs(&execution, &stamp)
-                {
-                    tracing::warn!(run = execution.run_id, %error, "worker output capture failed");
-                }
-                if let Err(error) = self.pump(&run, &stamp)
-                    && !boss_spoke_journal::Fault::is_full(&error)
-                {
-                    tracing::warn!(run = execution.run_id, %error, "worker artifact retained for retry");
-                }
-                if execution.reclaimed
-                    && let Err(error) = self.release_if_done(&run)
-                {
-                    tracing::warn!(run = execution.run_id, %error, "worker gateway release retained for retry");
-                }
+                self.upkeep(&execution, &stamp);
             }
+        }
+    }
+
+    /// One run's share of a tick: capture owed outputs, stream artifacts and
+    /// release a reclaimed run's rows. Faults are logged and retried next tick.
+    fn upkeep(&self, execution: &ExecutionRecord, stamp: &v1::Stamp) {
+        let run = identity(execution);
+        // Reclaim waits for the exit capture, so an unreclaimed run is the only
+        // one that can still owe output.
+        if !execution.reclaimed {
+            let exiting = matches!(execution.phase, Phase::Stopping | Phase::Terminal);
+            let owed = lock(&self.journal)
+                .and_then(|journal| state(&journal, &run))
+                .map(|(_, state)| state.capture.pending || (exiting && !state.capture.exited));
+            match owed {
+                Ok(true) => {
+                    if let Err(error) = self.capture_boundary(execution, stamp, execution.phase == Phase::Terminal) {
+                        tracing::warn!(run = execution.run_id, %error, "worker output capture failed");
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => tracing::warn!(run = execution.run_id, %error, "worker output state unreadable"),
+            }
+        }
+        if let Err(error) = self.pump(&run, stamp)
+            && !boss_spoke_journal::Fault::is_full(&error)
+        {
+            tracing::warn!(run = execution.run_id, %error, "worker artifact retained for retry");
+        }
+        if execution.reclaimed
+            && let Err(error) = self.release_if_done(&run)
+        {
+            tracing::warn!(run = execution.run_id, %error, "worker gateway release retained for retry");
         }
     }
 
@@ -583,13 +827,21 @@ impl Gateway {
         match command.body.as_ref().context("missing command")? {
             command::Body::WorkerReply(reply) => {
                 let key = format!("worker-request:{}", reply.request_id);
-                // A request is deleted once its reply is consumed or its wait
-                // timed out, so a replayed or late reply has nothing to update.
-                let Some(request) = journal.source(run, &key)? else {
-                    tracing::debug!(request = reply.request_id, "worker reply for a closed request ignored");
-                    return Ok(());
+                // A request row is deleted once its reply is consumed. One whose
+                // wait timed out leaves a per-method tombstone instead, so the
+                // reply that arrives later still fills the cache; a replayed
+                // reply, or one for an unknown request, has nothing to update.
+                let open = journal.source(run, &key)?;
+                let (method, late) = match &open {
+                    Some(request) => (serde_json::from_slice::<i32>(request)?, None),
+                    None => match late_method(&journal, run, &reply.request_id)? {
+                        Some(found) => found,
+                        None => {
+                            tracing::debug!(request = reply.request_id, "worker reply for a closed request ignored");
+                            return Ok(());
+                        }
+                    },
                 };
-                let method: i32 = serde_json::from_slice(&request)?;
                 let source = format!("worker-reply:{}", reply.request_id);
                 let bytes = serde_json::to_vec(&json!({"code": reply.code, "reason": reply.reason,
                     "revision": reply.revision, "observed_unix_ms": reply.observed_unix_ms,
@@ -622,16 +874,28 @@ impl Gateway {
                     };
                     journal.commit_source(run, &cache_key, old.as_deref(), &serde_json::to_vec(&cached)?, vec![])?;
                 }
+                if let Some(tombstone) = late {
+                    // Nobody is waiting: the cache holds the answer.
+                    journal.delete_sources(run, &[tombstone])?;
+                    return Ok(());
+                }
                 let old = journal.source(run, &source)?;
                 ensure!(old.as_ref().is_none_or(|old| old == &bytes), "worker reply changed");
                 journal.commit_source(run, &source, old.as_deref(), &bytes, vec![])?;
             }
             command::Body::ProposalDecision(decision) => {
-                let (_, state) = state(&journal, run)?;
-                ensure!(
-                    state.proposals.iter().any(|p| p.id == decision.proposal_id),
-                    "unknown proposal"
-                );
+                let (state_bytes, mut state) = state(&journal, run)?;
+                let receipt = state
+                    .proposals
+                    .iter()
+                    .find(|p| p.id == decision.proposal_id)
+                    .context("unknown proposal")?;
+                // A rejected done ends that completion boundary. The worker will
+                // correct its outputs and finish again, and the corrected files
+                // must be captured, not shadowed by the rejected attempt.
+                let reopens = receipt.kind == ProposalKind::RunDone.as_str()
+                    && decision.code != v1::ResultCode::Ok as i32
+                    && !state.capture.captured.is_empty();
                 let value = json!({"code": decision.code, "reason": decision.reason,
                     "result": serde_json::from_slice::<Value>(&decision.result_json).unwrap_or(Value::Null)});
                 let key = decision_key(&decision.proposal_id);
@@ -642,6 +906,10 @@ impl Gateway {
                     "proposal decision changed"
                 );
                 journal.commit_source(run, &key, old.as_deref(), &bytes, vec![])?;
+                if reopens {
+                    state.capture.captured.clear();
+                    journal.commit_source(run, STATE, state_bytes.as_deref(), &serde_json::to_vec(&state)?, vec![])?;
+                }
             }
             _ => anyhow::bail!("unsupported worker command"),
         }
@@ -695,11 +963,18 @@ impl Gateway {
 
     async fn exchange(&self, stream: UnixStream, stamp: v1::Stamp) -> Result<()> {
         let credentials = stream.peer_cred()?;
+        // One undecodable row must not deny every other worker its RPC.
         let records = lock(&self.journal)?
             .list_executions()?
             .into_iter()
-            .map(|bytes| serde_json::from_slice(&bytes))
-            .collect::<std::result::Result<Vec<ExecutionRecord>, _>>()?;
+            .filter_map(|bytes| match serde_json::from_slice::<ExecutionRecord>(&bytes) {
+                Ok(record) => Some(record),
+                Err(error) => {
+                    tracing::warn!(%error, "worker gateway skipped an undecodable execution row");
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
         let attributed = authenticate(
             &records,
             credentials.pid().context("missing peer pid")?,
@@ -745,7 +1020,14 @@ impl Gateway {
             | FrontendRequest::ListProposals { run_id, .. }
             | FrontendRequest::SubmitAttachment { run_id, .. }
             | FrontendRequest::CommentsRecordGuideOutcome { run_id, .. }
+            | FrontendRequest::CommentsPostAnswer { run_id, .. }
             | FrontendRequest::ListAttachments { run_id } => run_id,
+            FrontendRequest::RecordProducerSideConflict { execution_id, .. } => execution_id,
+            // Attempt outcomes name an attempt, not a run: the caller is the
+            // attributed process, and the hub checks the attempt is its own.
+            FrontendRequest::MarkCiRemediationFailed { .. } | FrontendRequest::MarkConflictResolutionFailed { .. } => {
+                &execution.execution_id
+            }
             _ => anyhow::bail!("worker_method_denied: method is outside worker-api/1"),
         };
         // BOSS_RUN_ID is historically the execution id in worker CLI calls.
@@ -762,9 +1044,10 @@ impl Gateway {
                 ..
             } => {
                 if kind == boss_protocol::ProposalKind::RunDone
-                    && let Err(error) = self.capture_outputs(execution, stamp)
+                    && let Err(error) = self.capture_boundary(execution, stamp, false)
                 {
-                    // Lifecycle records outrank bulk data: done is queued regardless.
+                    // Lifecycle records outrank bulk data: done is queued regardless,
+                    // and a pending marker keeps the capture owed.
                     tracing::warn!(run = execution.run_id, %error, "worker output capture failed at done");
                 }
                 self.submit(execution, kind, payload, idempotency_key, stamp).await
@@ -776,6 +1059,37 @@ impl Gateway {
                 request_regeneration,
                 ..
             } => self.submit_guide_outcome(execution, comment_id, disposition, body, request_regeneration, stamp),
+            FrontendRequest::CommentsPostAnswer { body, .. } => self.submit_answer_reply(execution, body, stamp),
+            FrontendRequest::RecordProducerSideConflict {
+                head_branch,
+                base_branch,
+                conflicted_files,
+                ..
+            } => self.submit_producer_conflict(execution, head_branch, base_branch, conflicted_files, stamp),
+            FrontendRequest::MarkConflictResolutionFailed {
+                attempt_id,
+                reason,
+                evidence,
+            } => self.submit_attempt_failure(
+                execution,
+                RunWriteKind::ConflictMarkFailed,
+                attempt_id,
+                reason,
+                json!({"evidence": evidence}),
+                stamp,
+            ),
+            FrontendRequest::MarkCiRemediationFailed {
+                attempt_id,
+                reason,
+                queue_ci_evidence,
+            } => self.submit_attempt_failure(
+                execution,
+                RunWriteKind::CiMarkFailed,
+                attempt_id,
+                reason,
+                json!({"queue_ci_evidence": queue_ci_evidence}),
+                stamp,
+            ),
             FrontendRequest::ListProposals {
                 kind, state: filter, ..
             } => {
@@ -867,8 +1181,13 @@ impl Gateway {
                 return Ok(response("hub", value));
             }
             if tokio::time::Instant::now() >= deadline {
-                // The wait is over; a reply that arrives later finds no request.
-                lock(&self.journal)?.delete_sources(run, &[key])?;
+                // The wait is over, but a reply that arrives later is still worth
+                // caching. One tombstone per method bounds what this leaves behind.
+                let mut journal = lock(&self.journal)?;
+                let tombstone = late_key(method);
+                let previous = journal.source(run, &tombstone)?;
+                journal.commit_source(run, &tombstone, previous.as_deref(), id.as_bytes(), vec![])?;
+                journal.delete_sources(run, &[key])?;
                 anyhow::bail!("hub_unavailable: no current hub reply; request {id}");
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -892,9 +1211,11 @@ struct Receipt {
 struct Queued {
     id: String,
     label: String,
-    wire_kind: v1::ProposalKind,
-    contract: &'static str,
+    /// The wire kind and payload contract the hub dispatches on.
+    wire: (v1::ProposalKind, &'static str),
     canonical: Vec<u8>,
+    /// Receipts whose id starts with this are replaced by this one.
+    supersedes: Option<String>,
 }
 
 impl Gateway {
@@ -944,18 +1265,20 @@ impl Gateway {
         let queued = Queued {
             id,
             label: kind.as_str().to_owned(),
-            wire_kind: wire_kind(kind),
-            contract: "proposal-json/1",
+            wire: (wire_kind(kind), "proposal-json/1"),
             canonical,
+            supersedes: None,
         };
         self.enqueue(
             execution,
             queued,
             |state| {
+                // Run-scoped writes have their own bounds; they never spend the
+                // proposal budget.
                 validation::check_rate_caps(
                     kind,
                     ProposalCounts {
-                        total: state.proposals.len(),
+                        total: state.proposals.iter().filter(|p| !is_run_write(&p.kind)).count(),
                         for_kind: state.proposals.iter().filter(|p| p.kind == kind.as_str()).count(),
                     },
                 )
@@ -968,6 +1291,7 @@ impl Gateway {
     /// `boss comment guide-outcome`: a run-scoped mutation. It is queued as a
     /// validated record bound to the claimed run; the hub performs the same
     /// revision-ownership checks the local engine does when it applies it.
+    /// Re-recording a comment supersedes its earlier outcome.
     fn submit_guide_outcome(
         &self,
         execution: &ExecutionRecord,
@@ -993,36 +1317,175 @@ impl Gateway {
                 "comment id must be non-empty and at most 256 bytes",
             ));
         }
-        if !fields.is_empty() {
+        self.submit_run_write(
+            execution,
+            RunWrite {
+                kind: RunWriteKind::GuideOutcome,
+                scope: comment_id.clone(),
+                fields,
+                canonical: json!({
+                    "run_id": execution.execution_id, "comment_id": comment_id, "disposition": disposition,
+                    "body": body, "request_regeneration": request_regeneration,
+                }),
+            },
+            stamp,
+        )
+    }
+
+    /// `boss comment reply`: the answer agent's one write. The hub binds it to
+    /// the run's own comment, as the local engine does.
+    fn submit_answer_reply(
+        &self,
+        execution: &ExecutionRecord,
+        body: String,
+        stamp: &v1::Stamp,
+    ) -> Result<FrontendEvent> {
+        let mut fields = Vec::new();
+        if body.trim().is_empty() {
+            fields.push(ProposalFieldError::new("body", "reply body may not be empty"));
+        }
+        if body.len() > MAX_WRITE_BODY_BYTES {
+            fields.push(ProposalFieldError::new(
+                "body",
+                format!("reply body is over the {MAX_WRITE_BODY_BYTES}-byte limit"),
+            ));
+        }
+        self.submit_run_write(
+            execution,
+            RunWrite {
+                kind: RunWriteKind::AnswerReply,
+                scope: String::new(),
+                fields,
+                canonical: json!({"run_id": execution.execution_id, "body": body}),
+            },
+            stamp,
+        )
+    }
+
+    /// `boss engine conflicts record-producer`: telemetry about a conflict the
+    /// worker already resolved inline.
+    fn submit_producer_conflict(
+        &self,
+        execution: &ExecutionRecord,
+        head_branch: String,
+        base_branch: String,
+        conflicted_files: Vec<String>,
+        stamp: &v1::Stamp,
+    ) -> Result<FrontendEvent> {
+        let mut fields = Vec::new();
+        for (name, value) in [("head_branch", &head_branch), ("base_branch", &base_branch)] {
+            if value.trim().is_empty() || value.len() > 512 {
+                fields.push(ProposalFieldError::new(
+                    name,
+                    "branch must be non-empty and at most 512 bytes",
+                ));
+            }
+        }
+        if conflicted_files.len() > MAX_CONFLICTED_FILES || conflicted_files.iter().any(|f| f.len() > 1024) {
+            fields.push(ProposalFieldError::new(
+                "conflicted_files",
+                format!("at most {MAX_CONFLICTED_FILES} paths of at most 1024 bytes"),
+            ));
+        }
+        self.submit_run_write(
+            execution,
+            RunWrite {
+                kind: RunWriteKind::ConflictProducer,
+                scope: String::new(),
+                fields,
+                canonical: json!({
+                    "execution_id": execution.execution_id, "head_branch": head_branch,
+                    "base_branch": base_branch, "conflicted_files": conflicted_files,
+                }),
+            },
+            stamp,
+        )
+    }
+
+    /// `boss engine conflicts mark-failed` and `boss engine ci mark-failed`:
+    /// a terminal outcome for an attempt. The hub resolves the attempt and
+    /// accepts it only if it belongs to this run.
+    fn submit_attempt_failure(
+        &self,
+        execution: &ExecutionRecord,
+        kind: RunWriteKind,
+        attempt_id: String,
+        reason: String,
+        extra: Value,
+        stamp: &v1::Stamp,
+    ) -> Result<FrontendEvent> {
+        let mut fields = Vec::new();
+        if attempt_id.trim().is_empty() || attempt_id.len() > 256 {
+            fields.push(ProposalFieldError::new(
+                "attempt_id",
+                "attempt id must be non-empty and at most 256 bytes",
+            ));
+        }
+        if reason.trim().is_empty() || reason.len() > 1024 {
+            fields.push(ProposalFieldError::new(
+                "reason",
+                "reason must be non-empty and at most 1024 bytes",
+            ));
+        }
+        if kind == RunWriteKind::ConflictMarkFailed
+            && let Err(message) = boss_protocol::validate_conflict_mark_failed_reason(&reason)
+        {
+            fields.push(ProposalFieldError::new("reason", message));
+        }
+        self.submit_run_write(
+            execution,
+            RunWrite {
+                kind,
+                scope: attempt_id.clone(),
+                fields,
+                canonical: json!({
+                    "run_id": execution.execution_id, "attempt_id": attempt_id, "reason": reason, "extra": extra,
+                }),
+            },
+            stamp,
+        )
+    }
+
+    /// Validate and queue one run-scoped write as a durable record bound to the
+    /// claimed run. Identical retries replay; none of it spends the proposal
+    /// budget.
+    fn submit_run_write(
+        &self,
+        execution: &ExecutionRecord,
+        write: RunWrite,
+        stamp: &v1::Stamp,
+    ) -> Result<FrontendEvent> {
+        if !write.fields.is_empty() {
             return Ok(FrontendEvent::ProposalRejected {
-                error: ProposalSubmissionError::validation(fields),
+                error: ProposalSubmissionError::validation(write.fields),
             });
         }
-        let canonical = serde_json::to_vec(&json!({
-            "run_id": execution.execution_id, "comment_id": comment_id, "disposition": disposition,
-            "body": body, "request_regeneration": request_regeneration,
-        }))?;
+        let canonical = serde_json::to_vec(&write.canonical)?;
         let digest = boss_engine_attachments::store::digest_hex(&canonical);
-        // Re-recording the same comment with new content is a new record that
-        // supersedes the old one; an identical retry replays.
+        // Hashed so one scope can never be a prefix of another.
+        let label = write.kind.label();
+        let stem = format!(
+            "{label}:{}:",
+            &boss_engine_attachments::store::digest_hex(write.scope.as_bytes())[..16]
+        );
         let queued = Queued {
-            id: format!("guide-outcome:{comment_id}:{}", &digest[..16]),
-            label: GUIDE_OUTCOME_KIND.into(),
-            wire_kind: v1::ProposalKind::OtherValidated,
-            contract: GUIDE_OUTCOME_CONTRACT,
+            id: format!("{stem}{}", &digest[..16]),
+            label: label.into(),
+            wire: (v1::ProposalKind::OtherValidated, write.kind.contract()),
             canonical,
+            supersedes: write.kind.supersedes().then(|| stem.clone()),
         };
+        let limit = write.kind.max_distinct();
         self.enqueue(
             execution,
             queued,
-            |state| {
-                let for_kind = state.proposals.iter().filter(|p| p.kind == GUIDE_OUTCOME_KIND).count();
-                if state.proposals.len() >= boss_protocol::PROPOSAL_CAP_TOTAL_PER_EXECUTION
-                    || for_kind >= boss_protocol::PROPOSAL_CAP_PER_KIND_PER_EXECUTION
-                {
+            move |state| {
+                let for_label = state.proposals.iter().filter(|p| p.kind == label).count();
+                let total = state.proposals.iter().filter(|p| is_run_write(&p.kind)).count();
+                if for_label >= limit || total >= RUN_WRITE_CAP {
                     return Err(ProposalSubmissionError::new(
                         ProposalErrorCode::RateLimited,
-                        "this execution has reached its guide outcome submission cap",
+                        format!("this execution has reached its {label} submission cap"),
                     ));
                 }
                 Ok(())
@@ -1061,6 +1524,9 @@ impl Gateway {
                 .transpose()?;
             return Ok(receipt_event(&receipt, true));
         }
+        if let Some(stem) = &queued.supersedes {
+            state.proposals.retain(|p| !p.id.starts_with(stem.as_str()));
+        }
         if let Err(error) = caps(&state) {
             return Ok(FrontendEvent::ProposalRejected { error });
         }
@@ -1087,8 +1553,8 @@ impl Gateway {
         };
         let proposal = v1::Proposal {
             proposal_id: queued.id.clone(),
-            kind: queued.wire_kind as i32,
-            payload_contract: queued.contract.into(),
+            kind: queued.wire.0 as i32,
+            payload_contract: queued.wire.1.into(),
             canonical_json: queued.canonical,
             transcript_generation,
             transcript_through,
@@ -1112,6 +1578,29 @@ impl Gateway {
         journal.commit_source(&run, STATE, old.as_deref(), &serde_json::to_vec(&state)?, observations)?;
         Ok(receipt_event(state.proposals.last().context("missing receipt")?, false))
     }
+}
+
+const READ_METHODS: [v1::WorkerMethod; 3] = [
+    v1::WorkerMethod::RunContext,
+    v1::WorkerMethod::PrStatus,
+    v1::WorkerMethod::PrBody,
+];
+
+/// Names the request whose wait timed out, per method.
+fn late_key(method: v1::WorkerMethod) -> String {
+    format!("worker-late:{}", method as i32)
+}
+
+/// The method of a timed-out request and its tombstone row, if `request_id` is
+/// the one still remembered for that method.
+fn late_method(journal: &Journal, run: &v1::Run, request_id: &str) -> Result<Option<(i32, Option<String>)>> {
+    for method in READ_METHODS {
+        let key = late_key(method);
+        if journal.source(run, &key)?.as_deref() == Some(request_id.as_bytes()) {
+            return Ok(Some((method as i32, Some(key))));
+        }
+    }
+    Ok(None)
 }
 
 fn decision_key(id: &str) -> String {
@@ -1145,896 +1634,4 @@ fn wire_kind(kind: ProposalKind) -> v1::ProposalKind {
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::{Gateway, identity};
-    use boss_host_execution::{
-        process::process_snapshot,
-        worker::{ExecutionRecord, ObservationConfig, Phase},
-    };
-    use boss_protocol::{
-        FrontendEvent, PrBodyView, Product, Task, TaskKind, TaskStatus, WorkItemDependencyDetail, WorkerContextBundle,
-    };
-    use boss_protocol_spoke::v1::{self, command, record};
-    use boss_spoke_journal::{Journal, Limits};
-    use prost::Message;
-    use serde_json::Value;
-    use std::{
-        path::Path,
-        sync::{Arc, Mutex},
-        time::Duration,
-    };
-    use tokio::net::UnixListener;
-
-    fn stamp() -> anyhow::Result<v1::Stamp> {
-        Ok(v1::Stamp {
-            boot_id: "boot".into(),
-            wall_unix_ms: 1234,
-            awake_ns: 1,
-            elapsed_ns: 1,
-        })
-    }
-
-    /// Reports the size of `<root>/transcript.log` as the observed source, or
-    /// that no transcript exists, independent of anything ingested.
-    fn probe(root: &Path) -> crate::TranscriptProbe {
-        let path = root.join("transcript.log");
-        Arc::new(move |_| {
-            let path = path.clone();
-            Box::pin(async move { Ok(("1-0".to_owned(), std::fs::metadata(path)?.len())) })
-        })
-    }
-
-    fn open_with(root: &Path, limits: Limits) -> Gateway {
-        Gateway {
-            journal: Arc::new(Mutex::new(Journal::open(&root.join("state"), "host", limits).unwrap())),
-            state_dir: root.join("state"),
-            probe: probe(root),
-        }
-    }
-
-    fn open(root: &Path) -> Gateway {
-        open_with(root, Limits::default())
-    }
-
-    fn execution(root: &Path) -> ExecutionRecord {
-        ExecutionRecord::builder()
-            .execution_id("execution")
-            .run_id("run")
-            .spawn_token("token")
-            .assignment_generation(1)
-            .lease_id("lease")
-            .workspace_id("workspace")
-            .session("session")
-            .phase(Phase::Alive)
-            .boot_id("boot")
-            .pid(std::process::id() as u64)
-            .driver_id("claude")
-            .observation(ObservationConfig {
-                workspace: root.into(),
-                pending: root.into(),
-                file: None,
-                pid_start: Some(process_snapshot(std::process::id() as i32).unwrap().start),
-            })
-            .build()
-    }
-
-    fn save(gateway: &Gateway, execution: &ExecutionRecord) {
-        gateway
-            .journal
-            .lock()
-            .unwrap()
-            .save_execution(
-                &execution.run_id,
-                &execution.spawn_token,
-                &serde_json::to_vec(execution).unwrap(),
-            )
-            .unwrap();
-    }
-
-    fn records(gateway: &Gateway) -> Vec<v1::Record> {
-        let journal = gateway.journal.lock().unwrap();
-        let mut result = Vec::new();
-        let mut after = 0;
-        while let Some(record) = journal.next_record(after).unwrap() {
-            after = record.sequence;
-            result.push(v1::Record::decode(record.bytes.as_slice()).unwrap());
-        }
-        result
-    }
-
-    async fn cli(socket: &Path, run: &str, args: &[&str]) -> std::process::Output {
-        let bin = std::env::current_dir()
-            .unwrap()
-            .join(std::env::var("BOSS_TEST_CLI").unwrap());
-        tokio::process::Command::new(bin)
-            .env("BOSS_SOCKET_PATH", socket)
-            .env("BOSS_RUN_ID", run)
-            .args(args)
-            .arg("--json")
-            .output()
-            .await
-            .unwrap()
-    }
-
-    fn success(output: std::process::Output) -> Value {
-        assert!(
-            output.status.success(),
-            "stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        serde_json::from_slice(&output.stdout).unwrap()
-    }
-
-    fn server(gateway: &Gateway, socket: &Path) -> tokio::task::JoinHandle<anyhow::Result<()>> {
-        let listener = UnixListener::bind(socket).unwrap();
-        let gateway = gateway.clone();
-        tokio::spawn(async move { gateway.serve(listener, stamp).await })
-    }
-
-    fn command(run: &v1::Run, body: command::Body) -> v1::Command {
-        v1::Command {
-            sequence: 1,
-            command_id: "command".into(),
-            run: Some(run.clone()),
-            not_after_unix_ms: 99999,
-            body: Some(body),
-        }
-    }
-
-    #[tokio::test]
-    async fn actual_cli_queues_done_preserves_assignment_and_replays_after_restart() {
-        let root = tempfile::tempdir().unwrap();
-        let mut execution = execution(root.path());
-        let output = root.path().join("pr-url.json");
-        std::fs::write(&output, br#"{"pr_url":"https://github.com/spinyfin/mono/pull/123"}"#).unwrap();
-        execution
-            .worker_outputs
-            .insert("BOSS_PR_URL_OUTPUT".into(), output.display().to_string());
-        let gateway = open(root.path());
-        save(&gateway, &execution);
-        let socket = root.path().join("worker.sock");
-        let task = server(&gateway, &socket);
-        let args = [
-            "propose",
-            "done",
-            "--outcome",
-            "delivered",
-            "--summary",
-            "Implemented the gateway",
-        ];
-        let first = success(cli(&socket, "execution", &args).await);
-        assert_eq!(first["status"], "queued");
-        assert_eq!(first["value"]["already_submitted"], false);
-        let id = first["value"]["receipt"]["id"].as_str().unwrap().to_owned();
-        let second = success(cli(&socket, "execution", &args).await);
-        assert_eq!(second["value"]["already_submitted"], true);
-        assert_eq!(
-            records(&gateway)
-                .iter()
-                .filter(|r| matches!(r.body, Some(record::Body::Proposal(_))))
-                .count(),
-            1
-        );
-        let stored: ExecutionRecord = serde_json::from_slice(
-            &gateway
-                .journal
-                .lock()
-                .unwrap()
-                .load_execution("run", "token")
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(stored.phase, Phase::Alive);
-        assert!(!stored.reclaimed);
-        assert_eq!(stored.lease_id, "lease");
-        task.abort();
-        let _ = task.await;
-        drop(gateway);
-        std::fs::remove_file(&socket).unwrap();
-        std::fs::remove_file(&output).unwrap();
-        let gateway = open(root.path());
-        gateway.pump(&identity(&execution), &stamp().unwrap()).unwrap();
-        assert!(records(&gateway).iter().any(|r| matches!(&r.body, Some(record::Body::Artifact(a)) if a.kind == v1::ArtifactKind::PrUrl as i32 && a.eof && String::from_utf8_lossy(&a.data).contains("/pull/123"))));
-        let task = server(&gateway, &socket);
-        let replay = success(cli(&socket, "execution", &args).await);
-        assert_eq!(replay["value"]["receipt"]["id"], id);
-        assert_eq!(replay["value"]["already_submitted"], true);
-        let decision = command(
-            &identity(&execution),
-            command::Body::ProposalDecision(v1::ProposalDecision {
-                proposal_id: id,
-                code: v1::ResultCode::Rejected as i32,
-                reason: "validation evidence missing".into(),
-                result_json: b"{}".to_vec(),
-            }),
-        );
-        gateway.apply(&decision).unwrap();
-        gateway.apply(&decision).unwrap();
-        let rejected = cli(&socket, "execution", &args).await;
-        assert!(!rejected.status.success());
-        assert!(String::from_utf8_lossy(&rejected.stderr).contains("validation evidence missing"));
-        task.abort();
-        let _ = task.await;
-    }
-
-    #[tokio::test]
-    async fn peer_attribution_validators_and_default_deny_survive_real_cli_calls() {
-        let root = tempfile::tempdir().unwrap();
-        let execution = execution(root.path());
-        let gateway = open(root.path());
-        save(&gateway, &execution);
-        let socket = root.path().join("worker.sock");
-        let task = server(&gateway, &socket);
-        let denied = cli(
-            &socket,
-            "sibling",
-            &["propose", "done", "--outcome", "delivered", "--summary", "wrong run"],
-        )
-        .await;
-        assert!(!denied.status.success());
-        assert!(String::from_utf8_lossy(&denied.stderr).contains("worker_attribution_mismatch"));
-        let denied = cli(&socket, "execution", &["pr", "status"]).await;
-        assert!(!denied.status.success());
-        assert!(String::from_utf8_lossy(&denied.stderr).contains("hub_unavailable"));
-        let invalid = cli(
-            &socket,
-            "execution",
-            &["propose", "pr-created", "--url", "https://example.com/invalid"],
-        )
-        .await;
-        assert!(!invalid.status.success());
-        assert!(
-            !records(&gateway)
-                .iter()
-                .any(|r| matches!(r.body, Some(record::Body::Proposal(_))))
-        );
-        let denied = cli(&socket, "execution", &["product", "list"]).await;
-        assert!(!denied.status.success());
-        // Direct protocol client exercises the default deny even if CLI spelling evolves.
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
-        let mut bytes = serde_json::to_vec(&boss_protocol::FrontendRequestEnvelope {
-            request_id: "deny".into(),
-            payload: boss_protocol::FrontendRequest::ListProducts,
-        })
-        .unwrap();
-        bytes.push(b'\n');
-        stream.write_all(&bytes).await.unwrap();
-        let mut reply = String::new();
-        stream.read_to_string(&mut reply).await.unwrap();
-        assert!(reply.contains("worker_method_denied"));
-        // A matching environment variable cannot replace ancestry and incarnation.
-        let mut recycled = execution.clone();
-        recycled.observation.as_mut().unwrap().pid_start = Some(0);
-        save(&gateway, &recycled);
-        let denied = cli(&socket, "execution", &["pr", "body"]).await;
-        assert!(!denied.status.success());
-        assert!(String::from_utf8_lossy(&denied.stderr).contains("worker_attribution_denied"));
-        task.abort();
-        let _ = task.await;
-    }
-
-    #[tokio::test]
-    async fn context_snapshot_and_hub_reply_keep_revision_and_observation_time() {
-        let root = tempfile::tempdir().unwrap();
-        let execution = execution(root.path());
-        let gateway = open(root.path());
-        save(&gateway, &execution);
-        let bundle = WorkerContextBundle {
-            task: Task::builder()
-                .id("task")
-                .product_id("product")
-                .created_at("1")
-                .description("Build gateway")
-                .kind(TaskKind::Task)
-                .name("Gateway")
-                .status(TaskStatus::Todo)
-                .updated_at("1")
-                .build(),
-            product: Product::builder()
-                .id("product")
-                .created_at("1")
-                .description("Workers")
-                .name("Boss")
-                .slug("boss")
-                .status("active")
-                .updated_at("1")
-                .build(),
-            project: None,
-            sibling_tasks: vec![],
-            attention_groups: vec![],
-            proposals: vec![],
-            own_dependencies: WorkItemDependencyDetail {
-                work_item_id: "task".into(),
-                dependents: vec![],
-                prerequisites: vec![],
-            },
-        };
-        gateway
-            .provision(
-                &command(
-                    &identity(&execution),
-                    command::Body::Spawn(v1::Spawn {
-                        run_context_json: serde_json::to_vec(&bundle).unwrap(),
-                        context_revision: "snapshot-7".into(),
-                        ..Default::default()
-                    }),
-                ),
-                &stamp().unwrap(),
-            )
-            .unwrap();
-        let socket = root.path().join("worker.sock");
-        let task = server(&gateway, &socket);
-        let cached = cli(&socket, "execution", &["context"]).await;
-        let freshness = String::from_utf8_lossy(&cached.stderr);
-        assert!(freshness.contains("cached") && freshness.contains("snapshot-7") && freshness.contains("1234"));
-        assert_eq!(success(cached)["task"]["name"], "Gateway");
-        let fetch = tokio::spawn({
-            let socket = socket.clone();
-            async move { cli(&socket, "execution", &["pr", "body"]).await }
-        });
-        let request = tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if let Some(request) = records(&gateway).into_iter().find_map(|r| match r.body {
-                    Some(record::Body::Request(r)) => Some(r),
-                    _ => None,
-                }) {
-                    break request;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-        let reply = command(
-            &identity(&execution),
-            command::Body::WorkerReply(v1::WorkerReply {
-                request_id: request.request_id,
-                code: v1::ResultCode::Ok as i32,
-                result_json: serde_json::to_vec(&FrontendEvent::PrBodyResult {
-                    body: PrBodyView {
-                        pr_url: None,
-                        title: Some("Gateway".into()),
-                        body: Some("Evidence".into()),
-                    },
-                })
-                .unwrap(),
-                revision: "hub-8".into(),
-                observed_unix_ms: 4567,
-                reason: String::new(),
-            }),
-        );
-        let mut foreign = reply.clone();
-        foreign.run.as_mut().unwrap().spawn_token = "foreign".into();
-        assert!(gateway.apply(&foreign).is_err());
-        foreign = reply.clone();
-        foreign.run.as_mut().unwrap().assignment_generation += 1;
-        assert!(gateway.apply(&foreign).is_err());
-        gateway.apply(&reply).unwrap();
-        let live = fetch.await.unwrap();
-        assert!(String::from_utf8_lossy(&live.stderr).contains("hub-8"));
-        assert_eq!(success(live)["body"], "Evidence");
-        let cached = cli(&socket, "execution", &["pr", "body"]).await;
-        let freshness = String::from_utf8_lossy(&cached.stderr);
-        assert!(freshness.contains("cached") && freshness.contains("4567"));
-        assert_eq!(success(cached)["title"], "Gateway");
-        task.abort();
-        let _ = task.await;
-    }
-
-    #[tokio::test]
-    async fn artifacts_are_validated_durable_and_chunked_without_losing_metadata() {
-        let root = tempfile::tempdir().unwrap();
-        let execution = execution(root.path());
-        let gateway = open(root.path());
-        save(&gateway, &execution);
-        let socket = root.path().join("worker.sock");
-        let task = server(&gateway, &socket);
-        let path = root.path().join("image.png");
-        // The existing image validator reads the PNG signature and IHDR dimensions.
-        let mut bytes = vec![
-            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0,
-        ];
-        bytes.resize(150_000, 0);
-        std::fs::write(&path, &bytes).unwrap();
-        let args = ["attach", path.to_str().unwrap(), "--caption", "gateway evidence"];
-        let attached = success(cli(&socket, "execution", &args).await);
-        assert_eq!(attached["status"], "queued");
-        assert_eq!(
-            success(cli(&socket, "execution", &args).await)["value"]["already_registered"],
-            true
-        );
-        assert!(
-            records(&gateway).is_empty(),
-            "registration does not preallocate bulk sequences"
-        );
-        std::fs::remove_file(&path).unwrap();
-        for _ in 0..3 {
-            gateway.pump(&identity(&execution), &stamp().unwrap()).unwrap();
-        }
-        let chunks: Vec<_> = records(&gateway)
-            .into_iter()
-            .filter_map(|r| match r.body {
-                Some(record::Body::Artifact(a)) => Some(a),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(chunks.len(), 3);
-        assert!(chunks.last().unwrap().eof);
-        assert_eq!(chunks.iter().flat_map(|c| c.data.clone()).collect::<Vec<_>>(), bytes);
-        assert_eq!(
-            serde_json::from_slice::<Value>(&chunks[0].metadata_json).unwrap()["caption"],
-            "gateway evidence"
-        );
-        for suffix in 1..boss_protocol::ATTACHMENT_CAP_PER_EXECUTION {
-            bytes[100] = suffix as u8;
-            std::fs::write(&path, &bytes).unwrap();
-            success(cli(&socket, "execution", &args).await);
-        }
-        bytes[100] = 255;
-        std::fs::write(&path, &bytes).unwrap();
-        assert!(!cli(&socket, "execution", &args).await.status.success());
-        // Filling the attachment allowance must not prevent capturing a PR.
-        let output = root.path().join("pr-url.json");
-        std::fs::write(&output, br#"{"pr_url":"https://github.com/spinyfin/mono/pull/123"}"#).unwrap();
-        let mut execution = execution.clone();
-        execution
-            .worker_outputs
-            .insert("BOSS_PR_URL_OUTPUT".into(), output.display().to_string());
-        gateway.capture_outputs(&execution, &stamp().unwrap()).unwrap();
-        let malformed = root.path().join("invalid.png");
-        std::fs::write(&malformed, b"not an image").unwrap();
-        assert!(
-            !cli(&socket, "execution", &["attach", malformed.to_str().unwrap()])
-                .await
-                .status
-                .success()
-        );
-        assert!(
-            !cli(
-                &socket,
-                "execution",
-                &["attach", malformed.to_str().unwrap(), "--caption", &"x".repeat(241)]
-            )
-            .await
-            .status
-            .success()
-        );
-        task.abort();
-        let _ = task.await;
-    }
-
-    #[tokio::test]
-    async fn failed_durable_commit_never_returns_a_queued_receipt() {
-        let root = tempfile::tempdir().unwrap();
-        let gateway = open_with(
-            root.path(),
-            Limits {
-                spool_bytes: 4096,
-                lifecycle_reserve: 1024,
-            },
-        );
-        let execution = execution(root.path());
-        save(&gateway, &execution);
-        let socket = root.path().join("worker.sock");
-        let task = server(&gateway, &socket);
-        let output = cli(
-            &socket,
-            "execution",
-            &["propose", "wait", "--reason", &"r".repeat(4000), "--duration", "1m"],
-        )
-        .await;
-        assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("spool full"));
-        assert!(records(&gateway).is_empty());
-        assert!(
-            gateway
-                .journal
-                .lock()
-                .unwrap()
-                .source(&identity(&execution), crate::STATE)
-                .unwrap()
-                .is_none()
-        );
-        task.abort();
-        let _ = task.await;
-    }
-
-    fn proposals(gateway: &Gateway) -> Vec<v1::Proposal> {
-        records(gateway)
-            .into_iter()
-            .filter_map(|r| match r.body {
-                Some(record::Body::Proposal(p)) => Some(p),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn keyless_wait_renews_while_keyed_and_other_proposals_replay() {
-        let root = tempfile::tempdir().unwrap();
-        let gateway = open(root.path());
-        save(&gateway, &execution(root.path()));
-        let socket = root.path().join("worker.sock");
-        let task = server(&gateway, &socket);
-        let wait = ["propose", "wait", "--reason", "CI is running", "--duration", "1m"];
-        let first = success(cli(&socket, "execution", &wait).await);
-        let second = success(cli(&socket, "execution", &wait).await);
-        assert_eq!(first["value"]["already_submitted"], false);
-        assert_eq!(second["value"]["already_submitted"], false);
-        assert_ne!(first["value"]["receipt"]["id"], second["value"]["receipt"]["id"]);
-        assert_eq!(proposals(&gateway).len(), 2);
-        let keyed = [
-            "propose",
-            "wait",
-            "--reason",
-            "CI is running",
-            "--duration",
-            "1m",
-            "--idempotency-key",
-            "wait-1",
-        ];
-        success(cli(&socket, "execution", &keyed).await);
-        let again = success(cli(&socket, "execution", &keyed).await);
-        assert_eq!(again["value"]["already_submitted"], true);
-        assert_eq!(proposals(&gateway).len(), 3);
-        task.abort();
-        let _ = task.await;
-    }
-
-    #[tokio::test]
-    async fn guide_outcome_is_a_queued_run_scoped_mutation() {
-        let root = tempfile::tempdir().unwrap();
-        let gateway = open(root.path());
-        save(&gateway, &execution(root.path()));
-        let socket = root.path().join("worker.sock");
-        let task = server(&gateway, &socket);
-        let args = [
-            "comment",
-            "guide-outcome",
-            "--comment-id",
-            "cmt_1",
-            "--disposition",
-            "answered",
-            "--body",
-            "The guide already covers this",
-        ];
-        let queued = success(cli(&socket, "execution", &args).await);
-        assert_eq!(queued["status"], "queued");
-        assert_eq!(queued["value"]["receipt"]["kind"], "guide_outcome");
-        let repeat = success(cli(&socket, "execution", &args).await);
-        assert_eq!(repeat["value"]["already_submitted"], true);
-        let stored = proposals(&gateway);
-        assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].payload_contract, "guide-outcome/1");
-        let payload: Value = serde_json::from_slice(&stored[0].canonical_json).unwrap();
-        assert_eq!(payload["run_id"], "execution");
-        assert_eq!(payload["comment_id"], "cmt_1");
-        assert_eq!(payload["disposition"], "answered");
-        // Bound to the caller's own run, and body is required.
-        let foreign = cli(&socket, "sibling", &args).await;
-        assert!(!foreign.status.success());
-        assert!(String::from_utf8_lossy(&foreign.stderr).contains("worker_attribution_mismatch"));
-        let empty = cli(
-            &socket,
-            "execution",
-            &[
-                "comment",
-                "guide-outcome",
-                "--comment-id",
-                "cmt_1",
-                "--disposition",
-                "no_change",
-                "--body",
-                "   ",
-            ],
-        )
-        .await;
-        assert!(!empty.status.success());
-        assert_eq!(proposals(&gateway).len(), 1);
-        task.abort();
-        let _ = task.await;
-    }
-
-    #[tokio::test]
-    async fn done_watermark_is_the_observed_source_not_the_ingested_cursor() {
-        let root = tempfile::tempdir().unwrap();
-        let execution = execution(root.path());
-        let gateway = open(root.path());
-        save(&gateway, &execution);
-        let socket = root.path().join("worker.sock");
-        let task = server(&gateway, &socket);
-        let done = ["propose", "done", "--outcome", "delivered", "--summary", "Done"];
-        // The ingestion cursor stands at 100 bytes while the file has 5000.
-        gateway
-            .journal
-            .lock()
-            .unwrap()
-            .commit_source(
-                &identity(&execution),
-                "transcript",
-                None,
-                br#"{"incarnation":1,"cursor":{"generation":0,"offset":100}}"#,
-                vec![],
-            )
-            .unwrap();
-        std::fs::write(root.path().join("transcript.log"), vec![b'x'; 5000]).unwrap();
-        success(cli(&socket, "execution", &done).await);
-        let stored = proposals(&gateway);
-        assert_eq!(stored[0].transcript_through, 5000);
-        assert_eq!(stored[0].transcript_generation, "1-0");
-        // An unresolvable source is explicit evidence, never a silent zero.
-        std::fs::remove_file(root.path().join("transcript.log")).unwrap();
-        success(
-            cli(
-                &socket,
-                "execution",
-                &["propose", "wait", "--reason", "x", "--duration", "1m"],
-            )
-            .await,
-        );
-        assert!(records(&gateway).iter().any(|r| matches!(
-            &r.body,
-            Some(record::Body::Gap(g)) if g.resource == "transcript" && g.reason.contains("unavailable")
-        )));
-        task.abort();
-        let _ = task.await;
-    }
-
-    #[tokio::test]
-    async fn done_is_queued_even_when_output_capture_fails() {
-        let root = tempfile::tempdir().unwrap();
-        let mut first = execution(root.path());
-        let structured = root.path().join("structured.json");
-        std::fs::write(&structured, b"this is not json").unwrap();
-        first
-            .worker_outputs
-            .insert("BOSS_STRUCTURED_OUTPUT".into(), structured.display().to_string());
-        let gateway = open(root.path());
-        save(&gateway, &first);
-        let socket = root.path().join("worker.sock");
-        let task = server(&gateway, &socket);
-        let done = ["propose", "done", "--outcome", "delivered", "--summary", "Done"];
-        let queued = success(cli(&socket, "execution", &done).await);
-        assert_eq!(queued["status"], "queued");
-        assert!(records(&gateway).iter().any(|r| matches!(
-            &r.body,
-            Some(record::Body::Gap(g)) if g.resource == "output:BOSS_STRUCTURED_OUTPUT" && g.reason.contains("not JSON")
-        )));
-        task.abort();
-        let _ = task.await;
-
-        // A nearly full bulk allowance cannot stop done either.
-        let root = tempfile::tempdir().unwrap();
-        let mut execution = execution(root.path());
-        let output = root.path().join("pr-url.json");
-        std::fs::write(&output, br#"{"pr_url":"https://github.com/spinyfin/mono/pull/123"}"#).unwrap();
-        execution
-            .worker_outputs
-            .insert("BOSS_PR_URL_OUTPUT".into(), output.display().to_string());
-        let gateway = open_with(
-            root.path(),
-            Limits {
-                spool_bytes: 6000,
-                lifecycle_reserve: 2500,
-            },
-        );
-        save(&gateway, &execution);
-        gateway
-            .journal
-            .lock()
-            .unwrap()
-            .commit_source(
-                &identity(&execution),
-                "worker-blob:filler:0",
-                None,
-                &[7u8; 3000],
-                vec![],
-            )
-            .unwrap();
-        let socket = root.path().join("worker.sock");
-        let task = server(&gateway, &socket);
-        let queued = success(cli(&socket, "execution", &done).await);
-        assert_eq!(queued["status"], "queued");
-        assert_eq!(proposals(&gateway).len(), 1);
-        task.abort();
-        let _ = task.await;
-    }
-
-    fn png(size: usize) -> Vec<u8> {
-        let mut bytes = vec![
-            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0,
-        ];
-        bytes.resize(size, 0);
-        bytes
-    }
-
-    fn chunks(gateway: &Gateway) -> Vec<v1::ArtifactChunk> {
-        records(gateway)
-            .into_iter()
-            .filter_map(|r| match r.body {
-                Some(record::Body::Artifact(a)) => Some(a),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn staged_artifact_bytes_move_into_records_and_are_released_with_the_run() {
-        let root = tempfile::tempdir().unwrap();
-        let mut execution = execution(root.path());
-        let gateway = open(root.path());
-        save(&gateway, &execution);
-        let baseline = gateway.journal.lock().unwrap().bytes().unwrap();
-        let path = root.path().join("image.png");
-        let bytes = png(150_000);
-        std::fs::write(&path, &bytes).unwrap();
-        let socket = root.path().join("worker.sock");
-        let task = server(&gateway, &socket);
-        success(cli(&socket, "execution", &["attach", path.to_str().unwrap()]).await);
-        task.abort();
-        let _ = task.await;
-        let staged = gateway.journal.lock().unwrap().bytes().unwrap();
-        assert!(staged >= baseline + 150_000);
-        // Not streamed yet, so a reclaim must keep the staged bytes.
-        execution.reclaimed = true;
-        gateway.release_if_done(&identity(&execution)).unwrap();
-        assert!(
-            gateway
-                .journal
-                .lock()
-                .unwrap()
-                .source(&identity(&execution), crate::STATE)
-                .unwrap()
-                .is_some()
-        );
-        gateway.pump(&identity(&execution), &stamp().unwrap()).unwrap();
-        let streamed = gateway.journal.lock().unwrap().bytes().unwrap();
-        // Records carry the bytes now; staging no longer counts them a second time.
-        assert!(
-            streamed < staged + 16 * 1024,
-            "streaming must not double the footprint: {staged} -> {streamed}"
-        );
-        assert_eq!(
-            chunks(&gateway).iter().flat_map(|c| c.data.clone()).collect::<Vec<_>>(),
-            bytes
-        );
-        gateway.release_if_done(&identity(&execution)).unwrap();
-        let journal = gateway.journal.lock().unwrap();
-        for source in [crate::STATE, "worker-blob:3"] {
-            assert!(journal.source(&identity(&execution), source).unwrap().is_none());
-        }
-        let released = journal.bytes().unwrap();
-        assert!(
-            released < streamed,
-            "gateway rows are released: {streamed} -> {released}"
-        );
-        assert!(released > baseline, "numbered records remain until receipted");
-    }
-
-    #[tokio::test]
-    async fn an_accepted_artifact_reaches_eof_on_a_small_spool() {
-        let root = tempfile::tempdir().unwrap();
-        let execution = execution(root.path());
-        let gateway = open_with(
-            root.path(),
-            Limits {
-                spool_bytes: 500_000,
-                lifecycle_reserve: 50_000,
-            },
-        );
-        save(&gateway, &execution);
-        let path = root.path().join("image.png");
-        let bytes = png(220_000);
-        std::fs::write(&path, &bytes).unwrap();
-        let socket = root.path().join("worker.sock");
-        let task = server(&gateway, &socket);
-        success(cli(&socket, "execution", &["attach", path.to_str().unwrap()]).await);
-        task.abort();
-        let _ = task.await;
-        for _ in 0..8 {
-            gateway.pump(&identity(&execution), &stamp().unwrap()).unwrap();
-        }
-        let chunks = chunks(&gateway);
-        assert!(chunks.last().unwrap().eof);
-        assert_eq!(chunks.iter().flat_map(|c| c.data.clone()).collect::<Vec<_>>(), bytes);
-    }
-
-    #[tokio::test]
-    async fn a_failed_registration_releases_what_it_staged() {
-        let root = tempfile::tempdir().unwrap();
-        let execution = execution(root.path());
-        let gateway = open_with(
-            root.path(),
-            Limits {
-                spool_bytes: 200_000,
-                lifecycle_reserve: 20_000,
-            },
-        );
-        save(&gateway, &execution);
-        let baseline = gateway.journal.lock().unwrap().bytes().unwrap();
-        let path = root.path().join("image.png");
-        std::fs::write(&path, png(400_000)).unwrap();
-        let socket = root.path().join("worker.sock");
-        let task = server(&gateway, &socket);
-        assert!(
-            !cli(&socket, "execution", &["attach", path.to_str().unwrap()])
-                .await
-                .status
-                .success()
-        );
-        task.abort();
-        let _ = task.await;
-        assert_eq!(gateway.journal.lock().unwrap().bytes().unwrap(), baseline);
-    }
-
-    #[tokio::test]
-    async fn one_stalled_client_does_not_block_other_workers() {
-        let root = tempfile::tempdir().unwrap();
-        let gateway = open(root.path());
-        save(&gateway, &execution(root.path()));
-        let socket = root.path().join("worker.sock");
-        let task = server(&gateway, &socket);
-        // Connects and says nothing for the whole exchange deadline.
-        let _idle = tokio::net::UnixStream::connect(&socket).await.unwrap();
-        let started = std::time::Instant::now();
-        success(
-            cli(
-                &socket,
-                "execution",
-                &["propose", "wait", "--reason", "x", "--duration", "1m"],
-            )
-            .await,
-        );
-        assert!(started.elapsed() < Duration::from_secs(4), "{:?}", started.elapsed());
-        task.abort();
-        let _ = task.await;
-    }
-
-    #[tokio::test]
-    async fn consumed_and_expired_requests_leave_no_rows_behind() {
-        let root = tempfile::tempdir().unwrap();
-        let execution = execution(root.path());
-        let gateway = open(root.path());
-        save(&gateway, &execution);
-        let socket = root.path().join("worker.sock");
-        let task = server(&gateway, &socket);
-        // No hub reply: the wait times out and its request row is deleted.
-        let timed_out = cli(&socket, "execution", &["pr", "body"]).await;
-        assert!(String::from_utf8_lossy(&timed_out.stderr).contains("hub_unavailable"));
-        // Only the numbered request record remains, not a worker-request row.
-        let request_id = records(&gateway)
-            .into_iter()
-            .find_map(|r| match r.body {
-                Some(record::Body::Request(request)) => Some(request.request_id),
-                _ => None,
-            })
-            .unwrap();
-        assert!(
-            gateway
-                .journal
-                .lock()
-                .unwrap()
-                .source(&identity(&execution), &format!("worker-request:{request_id}"))
-                .unwrap()
-                .is_none()
-        );
-        // A late reply for the closed request is ignored rather than refused.
-        let late = command(
-            &identity(&execution),
-            command::Body::WorkerReply(v1::WorkerReply {
-                request_id,
-                code: v1::ResultCode::Ok as i32,
-                result_json: b"{}".to_vec(),
-                revision: "hub-9".into(),
-                observed_unix_ms: 99,
-                reason: String::new(),
-            }),
-        );
-        gateway.apply(&late).unwrap();
-        task.abort();
-        let _ = task.await;
-    }
-}
+mod tests;

@@ -8,6 +8,14 @@ use crate::{Admission, Fault, Journal, records};
 /// Primary-key receipt for the most recently accepted hook of a run.
 pub const LATEST_HOOK_SOURCE: &str = "hook";
 
+/// Staged sources that move out of the spool in the same transaction as a
+/// commit: released outright, or trimmed to a shorter value.
+#[derive(Default, Clone, Copy)]
+pub struct Staging<'a> {
+    pub released: &'a [String],
+    pub trimmed: &'a [(String, Vec<u8>)],
+}
+
 impl Journal {
     pub fn latest_source(&self, run: &Run) -> Result<Option<Vec<u8>>> {
         self.source(run, LATEST_HOOK_SOURCE)
@@ -34,13 +42,15 @@ impl Journal {
         checkpoint: &[u8],
         observations: Vec<(Record, Admission)>,
     ) -> Result<()> {
-        self.commit_source_releasing(run, source, expected, checkpoint, observations, &[])
+        self.commit_source_releasing(run, source, expected, checkpoint, observations, Staging::default())
     }
 
     /// [`Self::commit_source`] that also deletes `released` sources in the same
-    /// transaction, before admission is measured. Moving staged bytes into a
-    /// numbered record therefore never counts them twice, and a crash can
-    /// neither lose the bytes nor keep both copies.
+    /// transaction, before admission is measured, and rewrites existing sources
+    /// to a shorter value in the same transaction ([`Staging`]). Moving staged bytes
+    /// into a numbered record therefore never counts them twice, even when only
+    /// a prefix of a staged blob fits, and a crash can neither lose the bytes
+    /// nor keep both copies.
     pub fn commit_source_releasing(
         &mut self,
         run: &Run,
@@ -48,8 +58,9 @@ impl Journal {
         expected: Option<&[u8]>,
         checkpoint: &[u8],
         observations: Vec<(Record, Admission)>,
-        released: &[String],
+        staging: Staging<'_>,
     ) -> Result<()> {
+        let Staging { released, trimmed } = staging;
         ensure!(!source.is_empty() && source.len() <= 1024, "invalid producer identity");
         ensure!(checkpoint.len() <= 512 * 1024, "source checkpoint too large");
         let tx = self.db.transaction()?;
@@ -70,6 +81,23 @@ impl Journal {
             tx.execute(
                 "DELETE FROM sources WHERE run_id=?1 AND spawn_token=?2 AND source=?3",
                 params![run.run_id, run.spawn_token, released],
+            )?;
+        }
+        for (name, value) in trimmed {
+            let current: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT checkpoint FROM sources WHERE run_id=?1 AND spawn_token=?2 AND source=?3",
+                    params![run.run_id, run.spawn_token, name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            ensure!(
+                current.as_ref().is_some_and(|c| value.len() <= c.len()),
+                "a trimmed source must exist and may only shrink"
+            );
+            tx.execute(
+                "UPDATE sources SET checkpoint=?4 WHERE run_id=?1 AND spawn_token=?2 AND source=?3",
+                params![run.run_id, run.spawn_token, name, value],
             )?;
         }
         let mirror_latest = source.starts_with("hook:");

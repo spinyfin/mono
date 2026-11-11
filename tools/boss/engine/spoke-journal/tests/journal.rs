@@ -447,7 +447,10 @@ fn released_sources_leave_the_same_transaction_that_charges_their_replacement() 
             None,
             &state,
             Vec::new(),
-            &["worker-blob:a:0".to_owned()],
+            boss_spoke_journal::Staging {
+                released: &["worker-blob:a:0".to_owned()],
+                ..Default::default()
+            },
         )
         .unwrap();
     assert!(journal.source(&run, "worker-blob:a:0").unwrap().is_none());

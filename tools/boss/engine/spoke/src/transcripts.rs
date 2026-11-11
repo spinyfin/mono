@@ -395,6 +395,7 @@ async fn poll_source(journal: &SharedJournal, execution: &ExecutionRecord, stamp
             Admission::Bulk,
         ));
     }
+    let mut turn_stopped = false;
     if observation.file.is_some() {
         let driver = DriverRegistry::default().require(&execution.driver_id)?;
         let mut session = driver.progress_session(&ProgressSessionConfig {
@@ -435,6 +436,7 @@ async fn poll_source(journal: &SharedJournal, execution: &ExecutionRecord, stamp
             for envelope in normalize_line(frame, driver.as_ref(), &mut session, config, &mut stats) {
                 let mut wire = worker_event::to_wire(&envelope.event);
                 if let Some(Event::Stop(stop)) = &mut wire.event {
+                    turn_stopped = true;
                     stop.transcript_generation = generation.clone();
                     stop.transcript_through = chunk.cursor.offset;
                 }
@@ -445,6 +447,7 @@ async fn poll_source(journal: &SharedJournal, execution: &ExecutionRecord, stamp
     }
     checkpoint.cursor = chunk.cursor;
     checkpoint.eof = chunk.eof;
+    let shared = journal;
     let mut journal = journal
         .lock()
         .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
@@ -461,6 +464,11 @@ async fn poll_source(journal: &SharedJournal, execution: &ExecutionRecord, stamp
         && !crate::hooks::has_pending(&observation.pending)?
     {
         journal.commit_source(&run, "drained", None, b"true", Vec::new())?;
+    }
+    drop(journal);
+    // A turn ended: the worker may have written its outputs and parked.
+    if turn_stopped {
+        boss_spoke_worker_api::note_turn_stop(shared, &run)?;
     }
     Ok(())
 }

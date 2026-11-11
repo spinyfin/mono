@@ -26,12 +26,15 @@ mod commands {
         }
         fn observations_drained(&self, record: &worker::ExecutionRecord) -> Result<bool> {
             let run = boss_spoke_ingress::run_identity(record);
-            Ok(self
+            let drained = self
                 .0
                 .lock()
                 .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
                 .source(&run, "drained")?
-                .is_some())
+                .is_some();
+            // Output files are read by the gateway, which may not have ticked
+            // since the worker exited. Reclaiming first would lose them.
+            Ok(drained && boss_spoke_worker_api::captures_concluded(&self.0, record)?)
         }
         fn prune_observation_sources(&self, record: &worker::ExecutionRecord) -> Result<()> {
             self.0

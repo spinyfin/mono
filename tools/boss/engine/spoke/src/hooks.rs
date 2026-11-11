@@ -143,6 +143,8 @@ pub async fn ingest(journal: &SharedJournal, execution: &ExecutionRecord, bytes:
         ));
         observations
     };
+    let turn_stop = !subagent && raw["hook_event_name"].as_str() == Some("Stop");
+    let shared = journal;
     let mut journal = journal
         .lock()
         .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
@@ -159,7 +161,13 @@ pub async fn ingest(journal: &SharedJournal, execution: &ExecutionRecord, bytes:
         None,
         &serde_json::to_vec(&Receipt { digest, path })?,
         observations,
-    )
+    )?;
+    drop(journal);
+    // A turn ended: the worker may have written its outputs and parked.
+    if turn_stop {
+        boss_spoke_worker_api::note_turn_stop(shared, &run)?;
+    }
+    Ok(())
 }
 
 pub async fn drain(journal: &SharedJournal, execution: &ExecutionRecord, stamp: &Stamp) -> Result<()> {

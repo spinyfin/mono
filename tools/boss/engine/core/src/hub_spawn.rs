@@ -65,6 +65,41 @@ pub struct ComposeRemoteSpawn<'a> {
     pub opts: WorkerSpawnOpts,
 }
 
+/// Why an execution kind cannot yet run on a spoke. The kinds listed here are
+/// told, by their prompts, to run commands that the spoke worker gateway
+/// (`boss_spoke_worker_api`) denies: it queues only run-scoped writes bound to
+/// the claimed run, and cannot answer a synchronous hub verdict or perform
+/// engine administration. Composing them remotely would let the run start and
+/// then fail at the command that records its outcome.
+fn remote_unsupported(kind: &ExecutionKind) -> Option<&'static str> {
+    match kind {
+        ExecutionKind::PrReviewGuide => {
+            Some("remote review-guide composition requires host-local git store resolution")
+        }
+        ExecutionKind::CiRemediation => Some(
+            "remote CI remediation needs engine ci mark-noop (a live-CI verdict), mark-retriggered, classify and \
+             mark-succeeded-via-rebase, which the spoke worker gateway does not carry",
+        ),
+        ExecutionKind::AutomationTriage => Some(
+            "remote automation triage needs task create --automation, which the spoke worker gateway does not carry",
+        ),
+        ExecutionKind::Progression => Some(
+            "remote progression supervision needs task reads, design-doc commands, stuck reports and merge recovery \
+             verbs, which the spoke worker gateway does not carry",
+        ),
+        ExecutionKind::ProductDesign | ExecutionKind::ProjectDesign => {
+            Some("remote design runs need project set-design-doc, which the spoke worker gateway does not carry")
+        }
+        ExecutionKind::AnswerAgent
+        | ExecutionKind::ChoreImplementation
+        | ExecutionKind::ConflictResolution
+        | ExecutionKind::InvestigationImplementation
+        | ExecutionKind::PrReview
+        | ExecutionKind::RevisionImplementation
+        | ExecutionKind::TaskImplementation => None,
+    }
+}
+
 /// Compose a validated spoke [`Spawn`] from the shared worker-spawn policy.
 pub async fn compose_remote_spawn(request: ComposeRemoteSpawn<'_>) -> Result<Spawn> {
     let ComposeRemoteSpawn {
@@ -90,8 +125,8 @@ pub async fn compose_remote_spawn(request: ComposeRemoteSpawn<'_>) -> Result<Spa
         );
     }
 
-    if execution.kind == ExecutionKind::PrReviewGuide {
-        bail!("remote review-guide composition requires host-local git store resolution");
+    if let Some(reason) = remote_unsupported(&execution.kind) {
+        bail!("{reason}");
     }
     opts.remote_workspace = true;
     let composed = compose_worker_spawn(
@@ -369,11 +404,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restricted_worker_posture_is_preserved_and_review_guides_reject_remote_paths() {
+    async fn restricted_worker_posture_is_preserved_and_kinds_needing_denied_commands_reject_remote_paths() {
         let workspace = Path::new("/remote/nonexistent/workspace");
         let (db, mut execution, item) = chore_fixture(workspace);
-        for kind in [ExecutionKind::AnswerAgent, ExecutionKind::PrReviewGuide] {
-            execution.kind = kind;
+        for (kind, rejection) in [
+            (ExecutionKind::AnswerAgent, None),
+            (ExecutionKind::PrReviewGuide, Some("host-local git store")),
+            (ExecutionKind::CiRemediation, Some("mark-noop")),
+            (ExecutionKind::AutomationTriage, Some("task create --automation")),
+            (ExecutionKind::Progression, Some("progression supervision")),
+            (ExecutionKind::ProjectDesign, Some("set-design-doc")),
+        ] {
+            execution.kind = kind.clone();
             let result = compose_remote_spawn(
                 ComposeRemoteSpawn::builder()
                     .db(&db)
@@ -389,18 +431,19 @@ mod tests {
                     .build(),
             )
             .await;
-            if execution.kind == ExecutionKind::PrReviewGuide {
-                assert!(result.unwrap_err().to_string().contains("host-local git store"));
-            } else {
-                let spawn = result.unwrap();
-                assert_eq!(spawn.permission_mode.as_deref(), Some("dontAsk"));
-                assert!(!spawn.agent_rules.as_deref().unwrap().is_empty());
-                assert!(
-                    spawn
-                        .required_features
-                        .iter()
-                        .any(|f| f.name == "spawn-worker-posture" && f.revision == 1)
-                );
+            match rejection {
+                Some(text) => assert!(result.unwrap_err().to_string().contains(text), "{kind:?}"),
+                None => {
+                    let spawn = result.unwrap();
+                    assert_eq!(spawn.permission_mode.as_deref(), Some("dontAsk"));
+                    assert!(!spawn.agent_rules.as_deref().unwrap().is_empty());
+                    assert!(
+                        spawn
+                            .required_features
+                            .iter()
+                            .any(|f| f.name == "spawn-worker-posture" && f.revision == 1)
+                    );
+                }
             }
         }
     }
