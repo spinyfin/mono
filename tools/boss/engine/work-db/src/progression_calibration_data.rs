@@ -187,7 +187,8 @@ pub(super) fn measure(conn: &Connection, now: i64, create_window_secs: i64) -> R
             SELECT 1 FROM work_executions e
             WHERE e.work_item_id=ci_remediations.revision_task_id AND e.started_at IS NOT NULL))
         UNION ALL SELECT work_item_id, CAST(created_at AS INTEGER) FROM conflict_resolutions
-        WHERE COALESCE(failure_reason,'') <> 'superseded_stale_head'
+        WHERE COALESCE(failure_reason,'') NOT IN
+            ('superseded_stale_head','retry_abandoned_still_conflicting')
           AND (started_at IS NOT NULL OR EXISTS (
             SELECT 1 FROM work_executions e
             WHERE e.work_item_id=conflict_resolutions.revision_task_id AND e.started_at IS NOT NULL))),

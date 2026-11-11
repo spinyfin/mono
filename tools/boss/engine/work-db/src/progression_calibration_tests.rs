@@ -121,7 +121,10 @@ fn seed(db: &WorkDb) {
             params![format!("q{index}"),task,run_ids[0],proposal,start,start+4*DAY]).unwrap();
     }
     drop(conn);
-    // Low-churn items: the high-churn item above must not set the budget.
+    // Low-churn items with genuine attempts. The four abandoned
+    // new-head rows seeded below are superseded and never started, so they
+    // are excluded from the population; the real outlier case is covered by
+    // `high_churn_outlier_does_not_set_the_create_budget`.
     for other in 0..3 {
         let item = create_test_chore_manual(db, &product, format!("quiet{other}")).id;
         for index in 0..2 {
@@ -581,6 +584,39 @@ fn remind_after_follows_fast_answers_and_never_exceeds_the_placeholder() {
     assert_eq!(value(&report, "remind_after_secs"), Some(7200));
     assert_eq!(report.limits["remind_after_secs"].source, "computed");
     assert_eq!(report.inputs["remediation_attempts_p99"], 2);
+}
+
+#[test]
+fn high_churn_outlier_does_not_set_the_create_budget() {
+    let db = db();
+    snapshots(&db, 7);
+    let product = create_test_product(&db).id;
+    let start = NOW - 10 * DAY;
+    // Three quiet items with two genuine attempts each, one item with fifteen,
+    // all started via a linked revision execution (started_at stays NULL).
+    for (name, count) in [("quiet0", 2), ("quiet1", 2), ("quiet2", 2), ("noisy", 15)] {
+        let item = create_test_chore_manual(&db, &product, name).id;
+        for index in 0..count {
+            let id = attempt(
+                &db,
+                &product,
+                &item,
+                &format!("{name}h{index}"),
+                "fix",
+                "merge_queue_rebounce",
+            );
+            let revision = revision_execution(&db, &product, true);
+            db.set_ci_remediation_revision_task_id(&id, &revision).unwrap();
+            db.mark_ci_remediation_failed(&id, "fix_failed").unwrap();
+            dates(&db, &id, start + index * 100, start + index * 100 + 50);
+        }
+    }
+    let report = pause_inputs(&db);
+    assert_eq!(report.inputs["remediation_item_samples"], 4);
+    // A raw percentile would give 15 attempts and a budget of 45.
+    assert_eq!(report.inputs["remediation_attempts_p99"], 2);
+    let calibrated = db.calibrate_progression(NOW).unwrap();
+    assert_eq!(value(&calibrated, "max_creates_per_item_window"), Some(6));
 }
 
 // Revision-backed attempts keep their ledger start unset in production.
