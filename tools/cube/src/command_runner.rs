@@ -42,6 +42,13 @@ pub trait CommandRunner {
 
     fn run(&self, invocation: &CommandInvocation) -> Result<String, CubeError>;
 
+    /// Like [`CommandRunner::run`] but returns stdout untouched: no trimming
+    /// and no lossy UTF-8 decoding. Use for NUL-delimited output carrying
+    /// arbitrary file names. Test doubles inherit the `run` result.
+    fn run_raw(&self, invocation: &CommandInvocation) -> Result<Vec<u8>, CubeError> {
+        self.run(invocation).map(String::into_bytes)
+    }
+
     /// Cleanup runs in an isolated group and retains both output streams.
     fn run_cleanup(&self, invocation: &CommandInvocation, timeout: Duration) -> Result<String, CubeError> {
         self.run_with_timeout(invocation, timeout)
@@ -414,6 +421,27 @@ impl CommandRunner for RealCommandRunner {
 
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        } else {
+            Err(CubeError::CommandFailed {
+                program: invocation.program.clone(),
+                args: invocation.args.clone(),
+                status: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            })
+        }
+    }
+
+    fn run_raw(&self, invocation: &CommandInvocation) -> Result<Vec<u8>, CubeError> {
+        let _gate = jj_gate(invocation, JJ_GATE_WAIT)?;
+        let mut cmd = Command::new(&invocation.program);
+        cmd.args(&invocation.args).current_dir(&invocation.cwd);
+        Self::configure_env(&mut cmd);
+        for (k, v) in &invocation.env {
+            cmd.env(k, v);
+        }
+        let output = cmd.output().map_err(CubeError::Io)?;
+        if output.status.success() {
+            Ok(output.stdout)
         } else {
             Err(CubeError::CommandFailed {
                 program: invocation.program.clone(),

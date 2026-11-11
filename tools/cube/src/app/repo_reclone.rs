@@ -17,30 +17,10 @@ use super::repo::materialize_repo_source_if_missing;
 
 /// Remove read-only build trees without following symlinks outside the workspace.
 pub(super) fn remove_workspace_tree(path: &Path) -> Result<()> {
-    fn writable_dirs(path: &Path) -> std::io::Result<()> {
-        let meta = fs::symlink_metadata(path)?;
-        if !meta.is_dir() || meta.is_symlink() {
-            return Ok(());
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(meta.permissions().mode() | 0o700))?;
-        }
-        for entry in fs::read_dir(path)? {
-            writable_dirs(&entry?.path())?;
-        }
-        Ok(())
-    }
-    let result = writable_dirs(path).and_then(|()| fs::remove_dir_all(path));
-    match result {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !path.exists() => Ok(()),
-        Err(source) => Err(CubeError::WorkspaceDirRemove {
-            path: path.into(),
-            source,
-        }),
-    }
+    super::fs_util::remove_tree_writable(path).map_err(|source| CubeError::WorkspaceDirRemove {
+        path: path.into(),
+        source,
+    })
 }
 
 /// Scan actual open files and working directories, rather than process names.
@@ -51,7 +31,7 @@ fn require_unused(runner: &dyn CommandRunner, path: &Path) -> Result<()> {
     let invocation = CommandInvocation {
         cwd: path.parent().unwrap_or(path).into(),
         program: "lsof".into(),
-        args: vec!["-nP".into(), "-Fpcn".into(), "+D".into(), path.display().to_string()],
+        args: vec!["-w".into(), "-nP".into(), "-Fpcn".into(), "+D".into(), path.display().to_string()],
         env: vec![],
     };
     match runner.run_with_timeout(&invocation, Duration::from_secs(120)) {
@@ -65,6 +45,10 @@ fn require_unused(runner: &dyn CommandRunner, path: &Path) -> Result<()> {
             "cannot reclone: processes are using {}; stop them and retry:\n{output}",
             path.display()
         ))),
+        Err(CubeError::CommandTimedOut { .. }) => Err(CubeError::InvalidArgument(format!(
+            "lsof did not finish scanning {} within 120s (large build trees are slow to scan); prune build outputs or retry when the machine is idle",
+            path.display()
+        ))),
         Err(err) => Err(CubeError::InvalidArgument(format!(
             "cannot verify that {} is unused: {err}; install lsof and ensure it can inspect the store before retrying",
             path.display()
@@ -72,9 +56,20 @@ fn require_unused(runner: &dyn CommandRunner, path: &Path) -> Result<()> {
     }
 }
 
+#[cfg(unix)]
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+}
+
+#[cfg(not(unix))]
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+}
+
 /// Enumerate local inputs through Git without reading jj's damaged index.
 pub(super) fn untracked_inputs(runner: &dyn CommandRunner, source: &Path) -> Result<Vec<PathBuf>> {
-    let output = runner.run(&CommandInvocation {
+    let output = runner.run_raw(&CommandInvocation {
         cwd: source.into(),
         program: "git".into(),
         args: ["ls-files", "--others", "-z", "--", ".", ":(exclude).jj", ":(exclude).git"]
@@ -84,9 +79,9 @@ pub(super) fn untracked_inputs(runner: &dyn CommandRunner, source: &Path) -> Res
         "cannot enumerate untracked setup files in {}: {error}; repair the Git index before recloning so local setup inputs can be preserved", source.display()
     )))?;
     let inputs: Vec<PathBuf> = output
-        .split('\0')
+        .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
+        .map(path_from_bytes)
         .collect();
     for path in &inputs {
         if path.components().any(|c| !matches!(c, Component::Normal(_)))
@@ -175,11 +170,13 @@ pub(super) fn reclone(
     }
     // Validate literal references before moving anything. A damaged index is
     // irrelevant: setup declarations and local secrets are ordinary files.
-    setup_inputs(source)?;
+    for input in setup_inputs(source)? {
+        reject_symlink(source, &input)?;
+    }
     // Git's index can enumerate local files even when jj cannot rebuild its
     // own index. Include ignored files: secrets are commonly gitignored. This
     // also covers inputs used inside scripts rather than named in setup.yaml.
-    let untracked = untracked_inputs(runner, source)?;
+    let untracked = preservable_untracked(source, untracked_inputs(runner, source)?);
     let backup = backup_path(source, "before-reclone")?;
     fs::rename(source, &backup).map_err(CubeError::Io)?;
     audit!(
@@ -233,7 +230,15 @@ pub(super) fn reclone(
         // Keep the failed clone too; restore the original path so surviving
         // workspace pointers still resolve. No recovery artifact is deleted.
         if source.exists() {
-            fs::rename(source, backup_path(source, "failed-reclone")?).map_err(CubeError::Io)?;
+            let failed = backup_path(source, "failed-reclone")?;
+            fs::rename(source, &failed).map_err(|rename| {
+                CubeError::InvalidArgument(format!(
+                    "reclone failed: {error}; cannot move the failed clone {} to {}: {rename}; the original store remains intact in the backup {}",
+                    source.display(),
+                    failed.display(),
+                    backup.display()
+                ))
+            })?;
         }
         fs::rename(&backup, source).map_err(|restore| {
             CubeError::InvalidArgument(format!(
@@ -322,6 +327,20 @@ pub(super) fn stamp_workspace(repo: &crate::metadata::RepoRecord, workspace: &Pa
     Ok(())
 }
 
+/// Whether `workspace` carries the repo's current registration stamp. Repos
+/// without a stamp (never reclone/ensure-stamped) match every workspace.
+pub(super) fn registration_matches(repo: &crate::metadata::RepoRecord, workspace: &Path) -> Result<bool> {
+    let Some(source) = &repo.source else {
+        return Ok(true);
+    };
+    let generation = match fs::read(source.join(REGISTRATION)) {
+        Ok(generation) => generation,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(CubeError::Io(error)),
+    };
+    Ok(fs::read(workspace.join(REGISTRATION)).ok().as_ref() == Some(&generation))
+}
+
 /// A name matching the pool prefix is insufficient evidence of store identity.
 /// Quarantine preserves local files while preventing reuse of old working copies.
 pub(super) fn quarantine_obsolete(
@@ -338,7 +357,7 @@ pub(super) fn quarantine_obsolete(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(CubeError::Io(error)),
     };
-    let expected = fs::canonicalize(source.join(".jj/repo")).ok();
+    let expected = crate::lock::shared_repo_dir(source).ok();
     let workspaces = store.list_workspaces(&repo.repo)?;
     let mut keep = Vec::new();
     for candidate in candidates.iter() {
@@ -442,15 +461,11 @@ fn copy_input(old: &Path, new: &Path, relative: &Path) -> Result<()> {
     };
     // Never traverse a symlink in either tree (including intermediate paths).
     for root in [old, new] {
-        let mut path = root.to_path_buf();
-        for component in relative.components() {
-            path.push(component);
-            if fs::symlink_metadata(&path).is_ok_and(|m| m.is_symlink()) {
-                return Err(fail(format!(
-                    "{} is a symlink; replace it with a regular file",
-                    path.display()
-                )));
-            }
+        if let Some(link) = symlink_in_path(root, relative) {
+            return Err(fail(format!(
+                "{} is a symlink; replace it with a regular file",
+                link.display()
+            )));
         }
     }
     if destination.is_file() {
@@ -473,4 +488,49 @@ fn copy_input(old: &Path, new: &Path, relative: &Path) -> Result<()> {
         return Err(fail("not a regular file or directory".into()));
     }
     Ok(())
+}
+
+/// The first symlink on `root/relative` (including intermediate components).
+fn symlink_in_path(root: &Path, relative: &Path) -> Option<PathBuf> {
+    let mut path = root.to_path_buf();
+    for component in relative.components() {
+        path.push(component);
+        if fs::symlink_metadata(&path).is_ok_and(|m| m.is_symlink()) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Fail early, before anything is moved, on a setup-declared input that is a symlink.
+fn reject_symlink(root: &Path, relative: &Path) -> Result<()> {
+    match symlink_in_path(root, relative) {
+        Some(link) => Err(CubeError::InvalidArgument(format!(
+            "cannot preserve setup file {}: {} is a symlink; replace it with a regular file; restore this file in the base repo before retrying cube repo reclone",
+            root.join(relative).display(),
+            link.display()
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Incidental untracked entries (build-output links such as `bazel-bin`,
+/// `node_modules/.bin/*`, sockets) cannot be copied faithfully. Skip them with
+/// a warning instead of failing the whole reclone; files declared by setup are
+/// validated separately and still refuse symlinks.
+fn preservable_untracked(source: &Path, inputs: Vec<PathBuf>) -> Vec<PathBuf> {
+    inputs
+        .into_iter()
+        .filter(|input| {
+            if let Some(link) = symlink_in_path(source, input) {
+                eprintln!("cube: not preserving untracked symlink {}", link.display());
+                return false;
+            }
+            let regular = fs::symlink_metadata(source.join(input)).is_ok_and(|m| m.is_file() || m.is_dir());
+            if !regular {
+                eprintln!("cube: not preserving untracked non-regular file {}", source.join(input).display());
+            }
+            regular
+        })
+        .collect()
 }

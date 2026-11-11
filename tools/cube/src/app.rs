@@ -14,6 +14,7 @@ mod dispatch;
 mod display;
 mod errors;
 mod excludes;
+mod fs_util;
 mod gc;
 mod gh_pr;
 mod health;

@@ -53,7 +53,9 @@ impl CommandRunner for CloneRunner {
                 if self.fail_clone {
                     return Err(CubeError::InvalidArgument("clone interrupted".into()));
                 }
-                write_setup_yaml(&self.source, self.setup);
+                if !self.setup.is_empty() {
+                    write_setup_yaml(&self.source, self.setup);
+                }
                 fs::write(self.source.join("fresh"), "fresh clone").unwrap();
                 Ok(String::new())
             }
@@ -354,11 +356,106 @@ fn remove_ensure_invalidates_old_workspace_and_setup_runs_for_new_registration()
 }
 
 #[test]
-fn missing_workspace_setup_cannot_report_empty_success() {
+fn workspace_from_previous_registration_cannot_report_empty_success() {
     let (_temp, _database, store, _runner, workspace) = fixture();
+    let repo = store.get_repo("mono").unwrap().unwrap();
+    stamp_registration(&repo).unwrap();
     let record = store.get_workspace_by_path(&workspace.workspace_path).unwrap().unwrap();
     let error = crate::app::provision::run_setup_for_workspace(&store, &FakeRunner::default(), &record).unwrap_err();
-    assert!(error.to_string().contains("missing .cube/setup.yaml"));
+    assert!(error.to_string().contains("previous registration"));
+    assert!(!error.to_string().contains("remove and recreate"));
+    // A recovery lease must still reach the workspace holding unpushed work.
+    crate::app::provision::run_setup_for_lease(&store, &FakeRunner::default(), &record, false).unwrap();
+}
+
+#[test]
+fn source_setup_file_absent_from_main_does_not_fail_new_workspaces() {
+    let (_temp, database, mut store, mut runner, workspace) = fixture();
+    // Fresh main has no setup.yaml, so reclone plants the old one in the source only.
+    runner.setup = "";
+    run_with_dependencies(
+        Cli::parse_from(["cube", "repo", "reclone", "mono"]),
+        Some(&database),
+        &runner,
+    )
+    .unwrap();
+    let repo = store.get_repo("mono").unwrap().unwrap();
+    assert!(runner.source.join(".cube/setup.yaml").exists());
+    fs::create_dir_all(workspace.workspace_path.join(".jj")).unwrap();
+    stamp_workspace(&repo, &workspace.workspace_path).unwrap();
+    store.sync_workspaces("mono", std::slice::from_ref(&workspace)).unwrap();
+    let record = store.get_workspace_by_path(&workspace.workspace_path).unwrap().unwrap();
+    let report = crate::app::provision::run_setup_for_workspace(&store, &FakeRunner::default(), &record).unwrap();
+    assert_eq!(report.ran_count(), 0);
+}
+
+#[test]
+fn setup_error_after_claim_releases_the_lease() {
+    let (_temp, database, mut store, _runner, workspace) = fixture();
+    let claimed = store
+        .claim_workspace("mono", "worker", "work", "lease-x", 100, None, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.workspace_id, workspace.workspace_id);
+    let result: Result<()> = crate::app::workspace::release_if_setup_not_run(
+        &store,
+        Some(&database),
+        &claimed,
+        "lease-x",
+        Err(CubeError::InvalidArgument("setup declaration unreadable".into())),
+    );
+    assert!(result.is_err());
+    assert!(
+        store
+            .list_workspaces("mono")
+            .unwrap()
+            .iter()
+            .all(|w| w.state != crate::metadata::WorkspaceState::Leased)
+    );
+    // A successful setup keeps the claim.
+    let claimed = store
+        .claim_workspace("mono", "worker", "work", "lease-y", 100, None, None)
+        .unwrap()
+        .unwrap();
+    crate::app::workspace::release_if_setup_not_run(&store, Some(&database), &claimed, "lease-y", Ok(())).unwrap();
+    assert_eq!(
+        store.list_workspaces("mono").unwrap()[0].state,
+        crate::metadata::WorkspaceState::Leased
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn incidental_untracked_symlinks_are_skipped_before_the_store_moves() {
+    let (_temp, database, _store, mut runner, _) = fixture();
+    std::os::unix::fs::symlink("/nonexistent/output", runner.source.join("bazel-bin")).unwrap();
+    runner.untracked.push("bazel-bin".into());
+    runner.untracked.push(" leading-space".into());
+    fs::write(runner.source.join(" leading-space"), "kept").unwrap();
+    run_with_dependencies(
+        Cli::parse_from(["cube", "repo", "reclone", "mono"]),
+        Some(&database),
+        &runner,
+    )
+    .unwrap();
+    assert!(fs::symlink_metadata(runner.source.join("bazel-bin")).is_err());
+    assert_eq!(fs::read_to_string(runner.source.join(" leading-space")).unwrap(), "kept");
+}
+
+#[test]
+fn pointer_file_source_does_not_quarantine_matching_workspaces() {
+    let (temp, database, store, _runner, workspace) = fixture();
+    let mut repo = store.get_repo("mono").unwrap().unwrap();
+    let primary = temp.path().join("primary/.jj/repo");
+    fs::create_dir_all(&primary).unwrap();
+    let source = temp.path().join("secondary-source");
+    fs::create_dir_all(source.join(".jj")).unwrap();
+    fs::write(source.join(".jj/repo"), primary.display().to_string()).unwrap();
+    repo.source = Some(source);
+    fs::write(workspace.workspace_path.join(".jj/repo"), primary.display().to_string()).unwrap();
+    let mut candidates = vec![workspace];
+    quarantine_obsolete(&store, Some(&database), &repo, &mut candidates).unwrap();
+    assert_eq!(candidates.len(), 1);
 }
 
 #[test]

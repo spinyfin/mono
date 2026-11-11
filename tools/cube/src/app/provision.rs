@@ -234,17 +234,32 @@ pub(super) fn run_setup_for_workspace(
     runner: &dyn CommandRunner,
     workspace: &WorkspaceRecord,
 ) -> Result<SetupReport> {
+    run_setup_for_lease(store, runner, workspace, true)
+}
+
+/// Run setup for a workspace. With `enforce_registration`, a workspace
+/// provisioned under a previous repo registration (its registration stamp is
+/// missing or differs from the source's) is refused rather than reporting an
+/// empty success. Recovery leases (`--allow-dirty`) skip the check so work in
+/// an older workspace stays reachable. The decision uses only the stamps, never
+/// the contents of the source working copy, which need not match main.
+pub(super) fn run_setup_for_lease(
+    store: &Store,
+    runner: &dyn CommandRunner,
+    workspace: &WorkspaceRecord,
+    enforce_registration: bool,
+) -> Result<SetupReport> {
+    if enforce_registration
+        && let Some(repo) = store.get_repo(&workspace.repo)?
+        && !super::repo_reclone::registration_matches(&repo, &workspace.workspace_path)?
+    {
+        return Err(CubeError::InvalidArgument(format!(
+            "workspace {} was provisioned under a previous registration of repo `{}`, so its setup cannot be trusted; release the lease and lease again so cube replaces it (the old directory is preserved, not deleted)",
+            workspace.workspace_path.display(),
+            workspace.repo
+        )));
+    }
     let Some(config) = setup::read_setup_config(&workspace.workspace_path)? else {
-        if let Some(repo) = store.get_repo(&workspace.repo)?
-            && let Some(source) = repo.source
-            && source.join(setup::SETUP_FILE_RELATIVE).exists()
-        {
-            return Err(CubeError::InvalidArgument(format!(
-                "workspace {} is missing {}; remove and recreate it so setup runs for the current repo registration",
-                workspace.workspace_path.display(),
-                setup::SETUP_FILE_RELATIVE
-            )));
-        }
         return Ok(SetupReport::empty());
     };
     let now = current_epoch_s()?;
