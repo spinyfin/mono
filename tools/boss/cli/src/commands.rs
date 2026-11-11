@@ -472,12 +472,19 @@ pub(crate) enum ProjectCommand {
 pub(crate) struct TaskAnswerArgs {
     #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub id: String,
+    /// Answer a genuine yes/no question Yes. On a question whose answers have
+    /// names (for example Split / Bypass limit) this still works and means the
+    /// first option, so existing scripts and older clients keep answering.
     #[arg(long)]
     pub yes: bool,
+    /// Answer a genuine yes/no question No. On a question whose answers have
+    /// names this still works and means the second option.
     #[arg(long)]
     pub no: bool,
-    /// Answer a multiple-choice question with this option, spelled exactly
-    /// as the question lists it (`boss task show` prints the options).
+    /// Answer with a named option, spelled exactly as the question lists it
+    /// (`boss task show` prints the options), for example
+    /// `--choice "Bypass limit"`. Works for multiple-choice questions and for
+    /// questions whose two answers are named actions.
     #[arg(long, value_name = "OPTION")]
     pub choice: Option<String>,
 }

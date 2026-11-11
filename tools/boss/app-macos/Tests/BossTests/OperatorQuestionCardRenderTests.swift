@@ -45,6 +45,18 @@ final class OperatorQuestionCardRenderTests: XCTestCase {
         )
     }
 
+    func testButtonsAreNamedForTheEnginesOptionLabels() throws {
+        let yesNo = try render(presentation())
+        let named = try render(presentation(optionLabels: AnswerOptionLabels(yes: "Split", no: "Bypass limit")))
+        let renamed = try render(presentation(optionLabels: AnswerOptionLabels(yes: "Land first", no: "Keep one PR")))
+        guard !isUniformlyBlank(yesNo) else {
+            throw XCTSkip("render came back uniformly blank; host does not support offscreen SwiftUI rendering")
+        }
+        let png = { (rep: NSBitmapImageRep) in rep.representation(using: .png, properties: [:]) }
+        XCTAssertNotEqual(png(yesNo), png(named), "named options must replace the Yes / No labels")
+        XCTAssertNotEqual(png(named), png(renamed), "the card shows whatever names the engine sent")
+    }
+
     func testRefusalTextIsRenderedUnderTheButtons() throws {
         let plain = fittingHeight(of: presentation())
         let refused = fittingHeight(of: presentation(error: "This question no longer exists."))
@@ -126,7 +138,8 @@ final class OperatorQuestionCardRenderTests: XCTestCase {
         text: String = "Approve bypass of the 30 max file limit (48 needed)?",
         explanation: String = "Sweeps 48 files.",
         answerInFlight: Bool = false,
-        error: String? = nil
+        error: String? = nil,
+        optionLabels: AnswerOptionLabels? = nil
     ) -> OperatorQuestionPresentation {
         OperatorQuestionPresentation(
             questionID: "oq_1",
@@ -134,7 +147,8 @@ final class OperatorQuestionCardRenderTests: XCTestCase {
             explanation: explanation,
             askedAt: "1790000000",
             answerInFlight: answerInFlight,
-            errorMessage: error
+            errorMessage: error,
+            optionLabels: optionLabels
         )
     }
 

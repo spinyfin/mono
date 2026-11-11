@@ -419,10 +419,11 @@ async fn file_count_successor_for_kind(
     }
     assert!(description.contains("**Answer:** no"));
     assert!(description.contains("Repo owner approval"));
-    assert!(description.contains("No — keep this change in one PR"));
+    assert!(description.contains("Bypass limit — keep this change in one PR"));
     assert!(description.contains("change/file-count for this PR only, up to 48 files"));
     assert!(
-        description.contains("BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered No by the repo owner on ")
+        description
+            .contains("BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered Bypass limit by the repo owner on ")
     );
     assert!(description.contains("one-PR exception for this PR only"));
     assert!(description.contains("Checkleft does not enforce the approved count"));

@@ -14,6 +14,7 @@
 //! `boss_engine::app::proposals` / `boss_engine_proposal_validation`, and
 //! the auto-apply pipeline in `boss_engine::work::proposal_apply`.
 
+use super::answer_labels::AnswerOptionLabels;
 use super::common::EffortLevel;
 use serde::{Deserialize, Serialize};
 
@@ -1014,13 +1015,19 @@ pub struct ReviewGuideProposalPayload {
 
 /// Body of a labelled `No:` section, stopping at `Recommendation:`.
 pub fn explanation_no_section(explanation: &str) -> Option<String> {
-    let mut in_no = false;
+    explanation_section(explanation, "No:")
+}
+
+/// Body of the section introduced by `heading` (for example `Bypass limit:`),
+/// stopping at `Recommendation:`.
+pub fn explanation_section(explanation: &str, heading: &str) -> Option<String> {
+    let mut in_section = false;
     let mut body = Vec::new();
     for line in explanation.lines() {
         let trimmed = line.trim();
-        if !in_no {
-            if trimmed == "No:" {
-                in_no = true;
+        if !in_section {
+            if trimmed == heading {
+                in_section = true;
             }
             continue;
         }
@@ -1047,7 +1054,8 @@ pub struct OperatorQuestion {
 
 /// Counts that turn a `create_prerequisite_task` question into split-vs-bypass.
 ///
-/// Yes still creates `name`. No authorizes a `change/file-count` exception for
+/// The affirmative answer (`Split`) still creates `name`. The other
+/// (`Bypass limit`) authorizes a `change/file-count` exception for
 /// this PR only, and redispatches so the next worker
 /// finishes in one PR. Absent on ordinary prerequisite questions, whose No
 /// records the declined path and redispatches with no authorization.
@@ -1101,6 +1109,13 @@ pub enum OperatorAnswerType {
         brief: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         file_count_bypass: Option<FileCountBypassSpec>,
+        /// Names for the two answers when they are distinct actions rather than
+        /// a genuine Yes/No (see [`AnswerOptionLabels`]). The stored answer is
+        /// still [`OperatorAnswer::YesNo`]. Absent on ordinary prerequisite
+        /// questions and on every question stored before labels existed, which
+        /// keep Yes / No.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        option_labels: Option<AnswerOptionLabels>,
     },
     /// One of `choices` is selected; the answer is
     /// [`OperatorAnswer::MultipleChoice`] carrying the chosen string verbatim.
@@ -1175,6 +1190,15 @@ impl OperatorAnswerType {
             (Self::MultipleChoice { .. }, OperatorAnswer::YesNo { .. }) => {
                 Err("this question is answered by choosing one of its options, not Yes/No".into())
             }
+            (Self::CreatePrerequisiteTask { .. }, OperatorAnswer::MultipleChoice { .. })
+                if self.option_labels().is_some() =>
+            {
+                let labels = self.option_labels().expect("guarded by is_some");
+                Err(format!(
+                    "this question is answered by choosing `{}` or `{}`",
+                    labels.yes, labels.no
+                ))
+            }
             (Self::YesNo | Self::CreatePrerequisiteTask { .. }, OperatorAnswer::MultipleChoice { .. }) => {
                 Err("this question is answered Yes or No, not by choosing an option".into())
             }
@@ -1189,10 +1213,10 @@ impl OperatorAnswerType {
 
     /// The question wording for a split-vs-file-count-bypass proposal. States
     /// the projected upper-bound file count, the repository limit, and the
-    /// first PR's name.
+    /// first PR's name, and names both paths as the buttons do.
     pub fn file_count_split_question_text(name: &str, spec: FileCountBypassSpec) -> String {
         format!(
-            "Split this {}-file change (limit {}) by landing '{name}' first, or keep it in one PR?",
+            "Split this {}-file change (limit {}) by landing '{name}' first, or bypass the limit and keep it in one PR?",
             spec.files, spec.limit
         )
     }
@@ -1331,6 +1355,7 @@ mod tests {
             name: "Fix fixture race".into(),
             brief: "Stand-alone brief".into(),
             file_count_bypass: None,
+            option_labels: None,
         };
         let json = serde_json::to_value(&prerequisite).unwrap();
         assert_eq!(
@@ -1345,6 +1370,7 @@ mod tests {
             name: "Extract the first PR".into(),
             brief: "Stand-alone brief".into(),
             file_count_bypass: Some(super::FileCountBypassSpec { files: 48, limit: 30 }),
+            option_labels: None,
         };
         let json = serde_json::to_value(&split).unwrap();
         assert_eq!(
@@ -1378,7 +1404,7 @@ mod tests {
                 "Extract the first PR",
                 super::FileCountBypassSpec { files: 48, limit: 30 }
             ),
-            "Split this 48-file change (limit 30) by landing 'Extract the first PR' first, or keep it in one PR?"
+            "Split this 48-file change (limit 30) by landing 'Extract the first PR' first, or bypass the limit and keep it in one PR?"
         );
         let old: super::RunDoneProposalPayload =
             serde_json::from_str(r#"{"outcome":"blocked","summary":"Waiting"}"#).unwrap();
@@ -1453,6 +1479,7 @@ mod tests {
             name: "n".into(),
             brief: "b".into(),
             file_count_bypass: None,
+            option_labels: None,
         };
         assert!(prerequisite.check_answer(&yes).is_ok());
         assert!(prerequisite.check_answer(&choose("n")).is_err());
@@ -1476,5 +1503,12 @@ mod explanation_tests {
             Some("Ship the smaller change. Keep the rest.".into())
         );
         assert_eq!(super::explanation_no_section("Context:\nNo answer section"), None);
+        assert_eq!(
+            super::explanation_section(
+                "Context:\nC\nSplit:\nLand the first PR.\nBypass limit:\n Keep one PR.\nRecommendation:\nBypass limit",
+                "Bypass limit:"
+            ),
+            Some("Keep one PR.".into())
+        );
     }
 }

@@ -694,6 +694,7 @@ impl<'a> PayloadReader<'a> {
             name,
             brief,
             file_count_bypass,
+            option_labels: _,
         } = question.answer_type
         {
             let name = self.text_from(
@@ -721,10 +722,14 @@ impl<'a> PayloadReader<'a> {
                 Some(spec) => boss_protocol::OperatorAnswerType::file_count_split_question_text(&name, spec),
                 None => boss_protocol::OperatorAnswerType::prerequisite_question_text(&name),
             };
+            // The engine also owns the option names: a split-vs-bypass question
+            // names its two actions, an ordinary prerequisite stays Yes/No, and
+            // whatever labels the worker sent are replaced.
             question.answer_type = boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
                 name,
                 brief,
                 file_count_bypass,
+                option_labels: file_count_bypass.map(|_| boss_protocol::AnswerOptionLabels::split_or_bypass()),
             };
         } else {
             if let boss_protocol::OperatorAnswerType::MultipleChoice { choices } = &question.answer_type
@@ -1042,6 +1047,7 @@ mod operator_question_tests {
                 name: "Fix the retention-cleanup fixture race".into(),
                 brief: "A stand-alone brief.".into(),
                 file_count_bypass: None,
+                option_labels: None,
             }
         );
         assert_eq!(
@@ -1101,7 +1107,7 @@ mod operator_question_tests {
         let question = parsed.question.unwrap();
         assert_eq!(
             question.text,
-            "Split this 48-file change (limit 30) by landing 'Extract the first capability' first, or keep it in one PR?"
+            "Split this 48-file change (limit 30) by landing 'Extract the first capability' first, or bypass the limit and keep it in one PR?"
         );
         assert_eq!(
             question.answer_type,
@@ -1109,8 +1115,20 @@ mod operator_question_tests {
                 name: "Extract the first capability".into(),
                 brief: "Land the first PR.".into(),
                 file_count_bypass: Some(boss_protocol::FileCountBypassSpec { files: 48, limit: 30 }),
+                option_labels: Some(boss_protocol::AnswerOptionLabels::split_or_bypass()),
             }
         );
+        // The engine owns the option names: labels a worker sends are replaced,
+        // and an ordinary prerequisite question never gains any.
+        let mut spoofed = payload.clone();
+        spoofed["question"]["answer_type"]["option_labels"] = json!({"yes": "Approve", "no": "Reject"});
+        let canonical = validate_payload(ProposalKind::RunDone, &spoofed).unwrap();
+        assert!(canonical.canonical_json.contains("\"Bypass limit\""));
+        assert!(!canonical.canonical_json.contains("Approve"));
+        let mut ordinary = prerequisite_payload();
+        ordinary["question"]["answer_type"]["option_labels"] = json!({"yes": "Approve", "no": "Reject"});
+        let canonical = validate_payload(ProposalKind::RunDone, &ordinary).unwrap();
+        assert!(!canonical.canonical_json.contains("option_labels"));
         for spec in [
             json!({"files":30,"limit":30}),
             json!({"files":0,"limit":30}),

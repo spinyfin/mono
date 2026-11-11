@@ -2515,6 +2515,9 @@ impl WorkDb {
             )
             .optional()?
             .ok_or(OperatorQuestionError::NotFound)?;
+        // An option named by its label ("Bypass limit") is the same answer as
+        // the Yes/No it stands for, so a retry under either spelling is idempotent.
+        let answer = question.question.answer_type.canonical_answer(answer);
         let task = query_task(&tx, &question.work_item_id)?
             .filter(|task| task.deleted_at.is_none())
             .ok_or(OperatorQuestionError::NotFound)?;
@@ -2728,14 +2731,20 @@ pub(super) fn restart_after_answer(
 /// No on a plain yes-no or ordinary prerequisite question: record the
 /// declined path and grant nothing, matching [`choice_block`].
 fn declined_block(question: &OperatorQuestionView, timestamp: &str) -> String {
+    let no_label = question.answer_type.option_labels().map(|labels| labels.no.as_str());
     let mut lines = format!(
         "\n\n---\n\n## Recorded answer ({timestamp})\n\n\
 - **Question the previous worker asked:** {}\n\
-- **Answer:** No\n",
-        question.text
+- **Answer:** {}\n",
+        question.text,
+        no_label.unwrap_or("No")
     );
-    if let Some(no_path) = boss_protocol::explanation_no_section(&question.explanation) {
-        lines.push_str(&format!("- **The worker's No path:** {no_path}\n"));
+    let no_heading = format!("{}:", no_label.unwrap_or("No"));
+    if let Some(no_path) = boss_protocol::explanation_section(&question.explanation, &no_heading) {
+        lines.push_str(&format!(
+            "- **The worker's {} path:** {no_path}\n",
+            no_label.unwrap_or("No")
+        ));
     }
     lines.push_str(&format!(
         "- **The worker's explanation:** {}\n\
@@ -2780,21 +2789,27 @@ The repo owner recorded this answer. It is explicit, human-granted approval for 
     )
 }
 
-/// No on a split-vs-file-count-bypass question: keep this change in one PR,
-/// recording the approved file count separately from the free-form bypass reason.
+/// The bypass answer to a split-vs-file-count-bypass question: keep this change
+/// in one PR, recording the approved file count separately from the free-form
+/// bypass reason.
 pub(super) fn file_count_bypass_authorization_block(
     question: &OperatorQuestionView,
     spec: boss_protocol::FileCountBypassSpec,
     timestamp: &str,
 ) -> String {
+    // A question asked before options were named records the plain "No".
+    let answer = question
+        .answer_type
+        .option_labels()
+        .map_or("No", |labels| labels.no.as_str());
     format!(
         "\n\n---\n\n## Repo owner approval ({timestamp})\n\n\
 - **Question the previous worker asked:** {}\n\
-- **Answer:** No — keep this change in one PR\n\
+- **Answer:** {answer} — keep this change in one PR\n\
 - **Authorized exception:** change/file-count for this PR only, up to {} files (repository limit {})\n\
 - **The worker's explanation:** {}\n\
 - **Asked by run:** `{}`\n\n\
-The repo owner recorded this answer. It is explicit, human-granted approval to finish this change as a single PR by declaring `BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered No by the repo owner on {timestamp}; one-PR exception for this PR only` in the commit description. Checkleft does not enforce the approved count. Before pushing, compare the non-deleted file count from `jj diff --stat` against the PR base with the approved bound above and ask again if it is over. It does not authorize bypassing any other check, raising any other limit, or using the exception on a different PR. State in the PR body that this file-count exception was approved by the repo owner on the date above.\n",
+The repo owner recorded this answer. It is explicit, human-granted approval to finish this change as a single PR by declaring `BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered {answer} by the repo owner on {timestamp}; one-PR exception for this PR only` in the commit description. Checkleft does not enforce the approved count. Before pushing, compare the non-deleted file count from `jj diff --stat` against the PR base with the approved bound above and ask again if it is over. It does not authorize bypassing any other check, raising any other limit, or using the exception on a different PR. State in the PR body that this file-count exception was approved by the repo owner on the date above.\n",
         question.text, spec.files, spec.limit, question.explanation, question.execution_id
     )
 }
@@ -2828,6 +2843,7 @@ mod tests {
                 name: "Extract the first PR".into(),
                 brief: "Land the first capability as its own PR.".into(),
                 file_count_bypass: Some(boss_protocol::FileCountBypassSpec { files: 48, limit: 30 }),
+                option_labels: Some(boss_protocol::AnswerOptionLabels::split_or_bypass()),
             })
             .explanation("The change is 48 files against a limit of 30.")
             .asked_at("2026-10-23")
@@ -2843,8 +2859,29 @@ mod tests {
         assert!(text.contains("change/file-count for this PR only, up to 48 files (repository limit 30)"));
         assert!(text.contains("Checkleft does not enforce the approved count"));
         assert!(text.contains("ask again if it is over"));
-        assert!(text.contains("BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered No by the repo owner on 2026-10-23; one-PR exception for this PR only"));
+        assert!(text.contains("- **Answer:** Bypass limit — keep this change in one PR"));
+        assert!(text.contains("BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered Bypass limit by the repo owner on 2026-10-23; one-PR exception for this PR only"));
         assert!(text.contains("It does not authorize bypassing any other check"));
+    }
+
+    #[test]
+    fn declined_answer_names_the_option_that_was_chosen() {
+        let question = boss_protocol::OperatorQuestionView::builder()
+            .id("question-1")
+            .text("Split this 48-file change?")
+            .answer_type(boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
+                name: "Extract the first PR".into(),
+                brief: "Land the first capability.".into(),
+                file_count_bypass: None,
+                option_labels: Some(boss_protocol::AnswerOptionLabels::split_or_bypass()),
+            })
+            .explanation("Context:\nToo big.\nSplit:\nLand the first PR.\nBypass limit:\nKeep one PR.\nRecommendation:\nBypass limit")
+            .asked_at("2026-10-23")
+            .execution_id("exec_example")
+            .build();
+        let text = super::declined_block(&question, "2026-10-23");
+        assert!(text.contains("- **Answer:** Bypass limit\n"));
+        assert!(text.contains("- **The worker's Bypass limit path:** Keep one PR.\n"));
     }
 
     #[test]

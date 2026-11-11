@@ -1063,10 +1063,20 @@ fn operator_question_from_flags(
     prerequisite_brief: Option<String>,
     file_count_bypass: Option<boss_protocol::FileCountBypassSpec>,
 ) -> Result<Option<boss_protocol::OperatorQuestion>, CliError> {
+    // A split-vs-bypass question names its two actions, so its explanation
+    // sections and the card's buttons say Split / Bypass limit, not Yes / No.
+    let option_labels = (answer_type == Some("create-prerequisite-task") && file_count_bypass.is_some())
+        .then(boss_protocol::AnswerOptionLabels::split_or_bypass);
     let explanation = match answer_type {
         None => explanation.unwrap_or_default(),
-        Some(kind) => explanation::validate_for(&explanation.unwrap_or_default(), kind == "multiple-choice")
-            .map_err(CliError::usage)?,
+        Some(kind) => {
+            let shape = match (kind, &option_labels) {
+                ("multiple-choice", _) => explanation::Shape::MultipleChoice,
+                (_, Some(labels)) => explanation::Shape::Labelled(labels),
+                _ => explanation::Shape::YesNo,
+            };
+            explanation::validate_for(&explanation.unwrap_or_default(), shape).map_err(CliError::usage)?
+        }
     };
     if answer_type != Some("multiple-choice") && !choices.is_empty() {
         return Err(CliError::usage(
@@ -1121,6 +1131,7 @@ fn operator_question_from_flags(
                     name,
                     brief: prerequisite_brief.unwrap_or_default(),
                     file_count_bypass,
+                    option_labels,
                 },
                 explanation,
             }))
@@ -1350,7 +1361,7 @@ mod tests {
     use clap::Parser;
 
     use super::*;
-    use crate::{Cli, Commands};
+    use crate::{Cli, Commands, commands::TaskCommand};
 
     #[test]
     fn operator_question_flags_require_a_complete_question_and_typed_answer() {
@@ -1484,6 +1495,17 @@ mod tests {
             assert!(Cli::try_parse_from(["boss", "task", "answer", "oq_example"].into_iter().chain(flag)).is_ok());
         }
         assert!(Cli::try_parse_from(["boss", "task", "answer", "oq_example", "--yes", "--choice", "a"]).is_err());
+        // A named option answers a question whose answers are named actions.
+        let Commands::Task {
+            command: TaskCommand::Answer(args),
+        } = Cli::try_parse_from(["boss", "task", "answer", "oq_example", "--choice", "Bypass limit"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected task answer")
+        };
+        assert_eq!(args.choice.as_deref(), Some("Bypass limit"));
+        assert!(!args.yes && !args.no);
     }
 
     #[test]
@@ -1567,7 +1589,7 @@ mod tests {
             "--answer-type",
             "create-prerequisite-task",
             "--explanation",
-            explanation::tests::VALID,
+            explanation::tests::VALID_SPLIT,
             "--prerequisite-name",
             "Extract the first PR",
             "--prerequisite-brief",
@@ -1585,8 +1607,43 @@ mod tests {
         assert_eq!(answer_type["file_count_bypass"]["limit"], 30);
         assert_eq!(
             payload["question"]["text"],
-            "Split this 48-file change (limit 30) by landing 'Extract the first PR' first, or keep it in one PR?"
+            "Split this 48-file change (limit 30) by landing 'Extract the first PR' first, or bypass the limit and keep it in one PR?"
         );
+        // The question names its two actions; the engine and the card render these.
+        assert_eq!(
+            answer_type["option_labels"],
+            serde_json::json!({"yes": "Split", "no": "Bypass limit"})
+        );
+        // A split question is explained in terms of its options, never Yes/No.
+        let explained_as = |text: &'static str| -> Vec<&'static str> {
+            base.iter()
+                .map(|arg| {
+                    if *arg == explanation::tests::VALID_SPLIT {
+                        text
+                    } else {
+                        *arg
+                    }
+                })
+                .collect()
+        };
+        let Commands::Propose(args) =
+            Cli::try_parse_from(explained_as(explanation::tests::VALID).into_iter().chain(flags))
+                .unwrap()
+                .command
+        else {
+            panic!("expected propose")
+        };
+        let error = payload_for(args.command.unwrap()).unwrap_err().to_string();
+        assert!(error.contains("Split:") && error.contains("Bypass limit:"), "{error}");
+        // An ordinary prerequisite stays a Yes/No question with no option names.
+        let Commands::Propose(args) = Cli::try_parse_from(explained_as(explanation::tests::VALID))
+            .unwrap()
+            .command
+        else {
+            panic!("expected propose")
+        };
+        let (_, ordinary, _) = payload_for(args.command.unwrap()).unwrap();
+        assert!(ordinary["question"]["answer_type"].get("option_labels").is_none());
         for bad in [
             ["--file-count", "30", "--file-count-limit", "30"],
             ["--file-count", "0", "--file-count-limit", "30"],

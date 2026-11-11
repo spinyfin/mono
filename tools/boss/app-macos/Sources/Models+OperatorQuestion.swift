@@ -9,8 +9,9 @@ import Foundation
 /// cards at the top of the Doing column's Queued section.
 struct OperatorQuestion: Hashable {
     /// How the user answers. Mirrors `OperatorAnswerType`. The yes/no and
-    /// prerequisite kinds are answered with Yes/No buttons, a multiple-choice
-    /// question with one button per option; a payload carrying any other kind
+    /// prerequisite kinds are answered with two buttons (named by
+    /// [[optionLabels]] when the engine sent names, Yes / No otherwise), a
+    /// multiple-choice question with one button per option; a payload carrying any other kind
     /// is not decoded (see [[parse(_:)]]) because the card has no UI to answer it.
     enum AnswerType: String, Hashable {
         case yesNo = "yes_no"
@@ -37,6 +38,11 @@ struct OperatorQuestion: Hashable {
     /// The options of a `.multipleChoice` question, in the worker's order;
     /// empty for every other answer type.
     var choices: [String] = []
+    /// What the engine calls the two answers of a prerequisite question whose
+    /// answers are distinct actions (Split / Bypass limit). `nil` for a genuine
+    /// Yes/No question and for any question stored before options were named,
+    /// which keep Yes / No. The card shows exactly what the engine sent.
+    var optionLabels: AnswerOptionLabels? = nil
 
     /// How many options the engine accepts on a multiple-choice question
     /// (`OperatorAnswerType::MIN_CHOICES` / `MAX_CHOICES`).
@@ -66,6 +72,15 @@ struct OperatorQuestion: Hashable {
             else { return nil }
             prerequisiteTask = PrerequisiteTaskProposal(name: name, brief: brief)
         }
+        var optionLabels: AnswerOptionLabels? = nil
+        if answerType == .createPrerequisiteTask, let wire = answerTypeDict["option_labels"] as? [String: Any] {
+            // Two distinct, non-empty names or none at all: half a pair would
+            // leave one button unlabeled, so fall back to Yes / No.
+            if let yes = wire["yes"] as? String, let no = wire["no"] as? String,
+               !yes.isEmpty, !no.isEmpty, yes != no {
+                optionLabels = AnswerOptionLabels(yes: yes, no: no)
+            }
+        }
         var choices: [String] = []
         if answerType == .multipleChoice {
             // Options the card cannot render as distinct buttons make a
@@ -89,9 +104,19 @@ struct OperatorQuestion: Hashable {
             executionID: (dict["execution_id"] as? String) ?? "",
             runSummary: dict["run_summary"] as? String,
             prerequisiteTask: prerequisiteTask,
-            choices: choices
+            choices: choices,
+            optionLabels: optionLabels
         )
     }
+}
+
+/// What the engine calls the two answers of a two-path question
+/// (`AnswerOptionLabels` on the wire). The card renders these verbatim.
+/// `yes` is the button that answers [[OperatorAnswer.yesNo]]`(true)`, `no` the
+/// one that answers `false`; the app attaches no meaning to the words.
+struct AnswerOptionLabels: Hashable {
+    let yes: String
+    let no: String
 }
 
 /// The task a blocked worker proposes as its prerequisite
@@ -141,6 +166,9 @@ struct OperatorQuestionPresentation: Equatable {
     /// The options of a multiple-choice question, one button each; empty for
     /// a Yes/No question, which keeps its Yes / No buttons.
     var choices: [String] = []
+    /// Names for the two buttons of a prerequisite question whose answers are
+    /// distinct actions; `nil` keeps Yes / No.
+    var optionLabels: AnswerOptionLabels? = nil
 
     /// The inline question is capped here; the popover shows the whole text.
     static let inlineLineLimit = 3

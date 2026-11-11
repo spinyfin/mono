@@ -158,6 +158,51 @@ final class OperatorQuestionKanbanTests: XCTestCase {
         XCTAssertEqual(OperatorAnswer.yesNo(true).wirePayload["kind"] as? String, "yes_no")
     }
 
+    /// The engine names the two answers of a split-vs-bypass question; the app
+    /// carries those names to the card verbatim and attaches no meaning to them.
+    func testParseTaskCarriesTheEnginesOptionNamesToTheCard() throws {
+        let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        func parsed(labels: Any?) throws -> WorkTask {
+            var answerType: [String: Any] = [
+                "kind": "create_prerequisite_task",
+                "name": "Extract the first capability",
+                "brief": "Land the first capability as its own PR.",
+                "file_count_bypass": ["files": 48, "limit": 30],
+            ]
+            if let labels { answerType["option_labels"] = labels }
+            var payload = basePayload()
+            payload["status"] = "blocked"
+            payload["blocked_reason"] = "awaiting_operator_answer"
+            payload["operator_question"] = [
+                "id": "oq_split",
+                "text": "Split this 48-file change (limit 30) by landing 'Extract the first capability' first, or bypass the limit and keep it in one PR?",
+                "answer_type": answerType,
+                "explanation": "Context:\nToo big.\nSplit:\nLand the first PR.\nBypass limit:\nKeep one PR.\nRecommendation:\nI recommend Bypass limit because it is one unit.",
+                "asked_at": "1790000000",
+                "execution_id": "exec_1",
+            ] as [String: Any]
+            return try XCTUnwrap(client.parseTask(payload))
+        }
+
+        let named = try XCTUnwrap(parsed(labels: ["yes": "Split", "no": "Bypass limit"]).operatorQuestion)
+        XCTAssertEqual(named.optionLabels, AnswerOptionLabels(yes: "Split", no: "Bypass limit"))
+        let snapshot = WorkCardSnapshot.build(
+            task: try parsed(labels: ["yes": "Split", "no": "Bypass limit"]),
+            context: WorkCardSnapshotContext(column: .doing)
+        )
+        XCTAssertEqual(snapshot.operatorQuestion?.optionLabels, AnswerOptionLabels(yes: "Split", no: "Bypass limit"))
+
+        // A question stored before options were named keeps Yes / No, and so
+        // does one whose names are unusable; both stay answerable.
+        for labels: Any? in [nil, ["yes": "Split"], ["yes": "Same", "no": "Same"], ["yes": "", "no": "No"], "Split"] {
+            let question = try XCTUnwrap(parsed(labels: labels).operatorQuestion)
+            XCTAssertNil(question.optionLabels, "\(String(describing: labels))")
+            XCTAssertEqual(question.answerType, .createPrerequisiteTask)
+        }
+        // Both buttons answer with the same wire object a Yes/No question uses.
+        XCTAssertEqual(OperatorAnswer.yesNo(false).wirePayload["value"] as? Bool, false)
+    }
+
     /// A proposal with no name or brief cannot be displayed behind
     /// "Why?", so it falls back to the plain blocked card.
     func testParseTaskDropsPrerequisiteQuestionMissingItsProposal() throws {

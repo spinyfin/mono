@@ -40,14 +40,52 @@ enum BossOperatorQuestionCapture {
             runSummary: "The rollout strategy needs a decision.",
             choices: ["Gradual, one product at a time", "All at once", "Behind a flag"]
         )
+        // A split-vs-bypass question as it was asked before the engine named its
+        // options: stored without option names, so it keeps Yes / No.
+        let legacySplit = OperatorQuestionPresentation(
+            questionID: "capture-split-legacy",
+            text: "Split this 75-file change (limit 30) by landing 'Untangle the worker-launch code from the rest of the engine' first, or keep it in one PR?",
+            explanation: """
+            Context:
+            The change touches 75 files and the repository allows 30 per PR.
+            Yes:
+            Land the worker-launch cleanup as its own PR first, then finish the rest on top of it.
+            No:
+            Keep everything in one PR under a one-time file-count exception.
+            Recommendation:
+            I recommend No because the change only makes sense as one unit.
+            """,
+            askedAt: "2026-10-14T12:00:00Z", answerInFlight: false, errorMessage: nil,
+            runSummary: "The change is over the file-count limit."
+        )
+        // The same question with the options the engine now names.
+        let namedSplit = OperatorQuestionPresentation(
+            questionID: "capture-split-named",
+            text: "Split this 75-file change (limit 30) by landing 'Untangle the worker-launch code from the rest of the engine' first, or bypass the limit and keep it in one PR?",
+            explanation: """
+            Context:
+            The change touches 75 files and the repository allows 30 per PR.
+            Split:
+            Land the worker-launch cleanup as its own PR first, then finish the rest on top of it.
+            Bypass limit:
+            Keep everything in one PR under a one-time file-count exception.
+            Recommendation:
+            I recommend Bypass limit because the change only makes sense as one unit.
+            """,
+            askedAt: "2026-10-14T12:00:00Z", answerInFlight: false, errorMessage: nil,
+            runSummary: "The change is over the file-count limit.",
+            optionLabels: AnswerOptionLabels(yes: "Split", no: "Bypass limit")
+        )
         let view = HStack(alignment: .top, spacing: 32) {
             VStack(alignment: .leading) {
                 CollapsibleWorkBoardSection(
                     sectionID: "doing-needs-attention", title: "Needs Attention",
-                    count: 2, defaultExpanded: true, countLabel: "2 decisions waiting"
+                    count: 4, defaultExpanded: true, countLabel: "4 decisions waiting"
                 ) {
                     WorkBoardCardOperatorQuestion(slice: .init(presentation: question))
                     WorkBoardCardOperatorQuestion(slice: .init(presentation: choiceQuestion))
+                    WorkBoardCardOperatorQuestion(slice: .init(presentation: legacySplit))
+                    WorkBoardCardOperatorQuestion(slice: .init(presentation: namedSplit))
                 }
             }.frame(width: 300)
             VStack(alignment: .leading) {
@@ -61,7 +99,7 @@ enum BossOperatorQuestionCapture {
         }
         .padding(24)
         let captureWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1120, height: 780),
+            contentRect: NSRect(x: 0, y: 0, width: 1120, height: 1500),
             styleMask: [.titled], backing: .buffered, defer: false
         )
         captureWindow.title = "Boss [agent capture]"
