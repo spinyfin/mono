@@ -1,6 +1,6 @@
 //! Phase-accurate head and ancestry-walk failures in the audited GC pass.
 use super::store_gc_tests::{
-    gc_index_command, mono_record, op_log, op_log_command, ps_command, seed_store_files, source_of,
+    gc_index_command, mono_record, op_log, op_log_command, pr_ref_commands, ps_command, seed_store_files, source_of,
 };
 use super::support::{ExpectedCommand, FakeRunner, audit_events, seed_mono_repo, with_database_path};
 use crate::app::dispatch::run_with_dependencies;
@@ -69,40 +69,82 @@ fn the_ancestry_walk_reports_budget_exhaustion_differently_from_reaching_the_roo
     assert!(!text.contains("exceeded"), "{text}");
 }
 
-#[test]
-fn two_heads_before_any_rewrite_are_a_retryable_concurrency_not_a_repair_request() {
+/// Run the repo's gc pass through the CLI so the persisted outcome is the
+/// one `cube workspace list` would show.
+fn gc_with_concurrent_head(abandonable: bool) -> (tempfile::TempDir, std::path::PathBuf, Result<(), CubeError>) {
     let (tempdir, database) = with_database_path();
     seed_mono_repo(&tempdir.path().join("workspaces"), &database);
     let source = seed_store_files(&source_of(&database));
     std::fs::write(source.join(".jj/repo/op_heads/heads/raced"), b"").unwrap();
     let verify = |head: &str| gc_index_command(&source, &["--at-operation", head, "debug", "reindex"]);
-    // Nothing is old enough to abandon, so the pass reaches the collection
-    // rebuild with both heads still there. Each head is verified first.
     let now = crate::app::util::current_epoch_s().unwrap();
-    let fake = FakeRunner::new(vec![
-        op_log_command(&source, &format!("{} {now}\n", "a".repeat(64))),
-        verify("head"),
-        verify("raced"),
-    ]);
-    let error = run_with_dependencies(Cli::parse_from(["cube", "repo", "gc", "mono"]), Some(&database), &fake)
-        .expect_err("concurrent heads stop the pass");
+    let mut expected = if abandonable {
+        // An abandonable log: the pass waits for a quiet host, takes the
+        // exclusive gate and must re-read the heads before rewriting.
+        vec![
+            op_log_command(&source, &op_log(now)),
+            verify("head"),
+            verify("raced"),
+            ps_command(&source, ""),
+            ps_command(&source, ""),
+        ]
+    } else {
+        // Nothing is old enough to abandon, so the pass reaches the
+        // collection rebuild with both heads still there.
+        vec![
+            op_log_command(&source, &format!("{} {now}\n", "a".repeat(64))),
+            verify("head"),
+            verify("raced"),
+        ]
+    };
+    expected.extend(pr_ref_commands(&source, "", ""));
+    let fake = FakeRunner::new(expected);
+    let result =
+        run_with_dependencies(Cli::parse_from(["cube", "repo", "gc", "mono"]), Some(&database), &fake).map(|_| ());
     fake.assert_exhausted();
-    let audited = audit_events(&tempdir)
-        .iter()
-        .find(|row| row["event"] == "repo.store_gc")
-        .unwrap()["error"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    for text in [error.to_string(), audited] {
-        assert!(
-            text.contains("2 operation heads before the collection rebuild"),
-            "{text}"
-        );
-        assert!(text.contains("concurrent jj operation is in flight"), "{text}");
-        assert!(text.contains("Nothing was abandoned or collected"), "{text}");
-        assert!(!text.contains("Repair"), "{text}");
-    }
+    (tempdir, database, result)
+}
+
+fn assert_retryable_skip(tempdir: &tempfile::TempDir, database: &std::path::Path) {
+    let rows = audit_events(tempdir);
+    let row = rows.iter().find(|row| row["event"] == "repo.store_gc").unwrap();
+    assert_eq!(row["collection"], "concurrent", "{row}");
+    assert!(!rows.iter().any(|row| row["outcome"] == "failed"));
+    assert!(!row.to_string().contains("Repair"), "{row}");
+    // The persisted outcome is a skip that leaves the failure streak alone.
+    let store = crate::store::Store::open_at(database).unwrap();
+    assert_eq!(
+        store
+            .get_pool_metadata_i(&crate::app::store_gc::store_gc_outcome_key("mono"))
+            .unwrap(),
+        Some(3)
+    );
+    assert_eq!(
+        store
+            .get_pool_metadata_i(&crate::app::store_gc::store_gc_failures_key("mono"))
+            .unwrap()
+            .unwrap_or(0),
+        0
+    );
+    // No quarantine marker was left behind.
+    let gate = crate::command_runner::JjGate::path(database.parent().unwrap());
+    assert!(!crate::command_runner::JjGate::quarantine_path(&gate).exists());
+}
+
+#[test]
+fn two_heads_before_any_rewrite_are_a_retryable_skip_not_a_failure() {
+    let (tempdir, database, result) = gc_with_concurrent_head(false);
+    result.expect("a concurrent head is a skip, not an error");
+    assert_retryable_skip(&tempdir, &database);
+}
+
+#[test]
+fn a_preexisting_second_head_stops_an_abandonable_pass_before_op_abandon() {
+    // The FakeRunner has no `op abandon` expectation, so running one fails
+    // the test; the pass must also not blame a race or ask for a repair.
+    let (tempdir, database, result) = gc_with_concurrent_head(true);
+    result.expect("a pre-existing second head is a skip, not an error");
+    assert_retryable_skip(&tempdir, &database);
 }
 
 /// A pass whose collection is followed by a second head published by a
@@ -222,7 +264,16 @@ fn the_oldest_client_declaration_is_stored_per_repo() {
 
     // A malformed declaration is rejected and changes nothing.
     let fake = FakeRunner::default();
-    for bad in ["0", "0.34.1", "latest"] {
+    for bad in [
+        "0",
+        "0.34.1",
+        "latest",
+        "0.34-rc1",
+        "0.1000",
+        "0.-1",
+        "99999999999999999999.0",
+        "0.34+x",
+    ] {
         run_with_dependencies(
             Cli::parse_from(["cube", "repo", "declare-oldest-jj", "mono", bad]),
             Some(&database),

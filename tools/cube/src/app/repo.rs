@@ -102,21 +102,27 @@ pub(super) fn run_repo(
             )
         }
         RepoCommand::DeclareOldestJj { repo, version } => {
-            use crate::app::store_gc_integrity::{encode_major_minor, oldest_client_key, parse_major_minor};
+            use crate::app::store_gc_integrity::{
+                decode_major_minor, encode_major_minor, oldest_client_key, parse_declared_version,
+            };
             let record = store
                 .get_repo(&repo)?
                 .ok_or_else(|| CubeError::RepoNotFound(repo.clone()))?;
-            let oldest = parse_major_minor(version.trim())
-                .filter(|_| version.trim().split('.').count() == 2)
-                .ok_or_else(|| CubeError::InvalidArgument(format!("`{version}` is not a `major.minor` jj version")))?;
-            let previous = store.get_pool_metadata_i(&oldest_client_key(&record.repo))?;
-            store.set_pool_metadata_i(&oldest_client_key(&record.repo), encode_major_minor(oldest))?;
+            let not_a_version =
+                || CubeError::InvalidArgument(format!("`{version}` is not a `major.minor` jj version (e.g. 0.34)"));
+            let oldest = parse_declared_version(version.trim()).ok_or_else(not_a_version)?;
+            let encoded = encode_major_minor(oldest).ok_or_else(not_a_version)?;
+            let previous = store
+                .get_pool_metadata_i(&oldest_client_key(&record.repo))?
+                .and_then(decode_major_minor)
+                .map(|(major, minor)| format!("{major}.{minor}"));
+            store.set_pool_metadata_i(&oldest_client_key(&record.repo), encoded)?;
             audit!(
                 database_path,
                 "repo.oldest_jj_declared",
                 repo = record.repo,
                 oldest_jj = format!("{}.{}", oldest.0, oldest.1),
-                previous_encoded = previous,
+                previous_oldest_jj = previous,
             );
             RunResult::new(
                 format!(
@@ -161,6 +167,7 @@ pub(super) fn run_repo(
                 use crate::app::store_gc::{Collection, StoreGcOutcome, record_store_gc_outcome};
                 let outcome = match &result {
                     Ok(report) if report.collection == Collection::Skipped => StoreGcOutcome::Skipped,
+                    Ok(report) if report.collection == Collection::Concurrent => StoreGcOutcome::Concurrent,
                     Ok(_) => StoreGcOutcome::Maintained,
                     Err(_) => StoreGcOutcome::Failed,
                 };

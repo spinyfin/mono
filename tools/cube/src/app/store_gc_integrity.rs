@@ -54,8 +54,29 @@ pub(super) fn oldest_client_key(repo: &str) -> String {
     format!("store_gc_oldest_jj_client:{repo}")
 }
 
-pub(super) fn encode_major_minor((major, minor): (u64, u64)) -> i64 {
-    (major * 1000 + minor) as i64
+/// A declared `major.minor`: exactly two all-digit components with a minor
+/// below 1000 (the encoding's radix) and a bounded major. Anything else, such
+/// as `0.34-rc1` or `0.1000`, is refused rather than encoded into another
+/// version.
+pub(super) fn parse_declared_version(text: &str) -> Option<(u64, u64)> {
+    let (major, minor) = text.split_once('.')?;
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    if !digits(major) || !digits(minor) || minor.len() > 3 || major.len() > 6 {
+        return None;
+    }
+    Some((major.parse().ok()?, minor.parse().ok()?)).filter(|&(_, minor)| minor < 1000)
+}
+
+pub(super) fn encode_major_minor((major, minor): (u64, u64)) -> Option<i64> {
+    major
+        .checked_mul(1000)?
+        .checked_add(minor)
+        .and_then(|v| i64::try_from(v).ok())
+}
+
+/// The `major.minor` a stored oldest-client value encodes, if it is one.
+pub(super) fn decode_major_minor(value: i64) -> Option<(u64, u64)> {
+    u64::try_from(value).ok().map(|value| (value / 1000, value % 1000))
 }
 
 /// The oldest jj client declared for `repo`'s store, or
@@ -71,8 +92,8 @@ pub(super) fn oldest_shared_client(database_path: Option<&Path>, repo: &str) -> 
     };
     Ok(store
         .get_pool_metadata_i(&oldest_client_key(repo))?
-        .and_then(|value| u64::try_from(value).ok())
-        .map_or(OLDEST_SHARED_CLIENT_JJ, |value| (value / 1000, value % 1000)))
+        .and_then(decode_major_minor)
+        .unwrap_or(OLDEST_SHARED_CLIENT_JJ))
 }
 
 /// The collector's `jj --version` output, refused when it is newer than the

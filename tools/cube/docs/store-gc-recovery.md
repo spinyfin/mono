@@ -82,3 +82,37 @@ restoring them to the live store. Predecessor metadata and cached indexes do not
 contain enough information to recreate arbitrary lost Git objects. Repointing
 an operation head at an old cached index only restores temporary readability;
 it does not repair the missing objects.
+
+## Verification record: mono and appoint stores, 2026-11-10
+
+Taken on the host that runs the stores, after the pass that abandoned and
+collected `mono` (audit row `2026-11-11T00:01:08Z`, 20955 -> 7258 operations).
+The stores were cloned with `cp -cR` (APFS copy-on-write) into a scratch
+directory and every command ran against the clone, never the live store.
+`mono` is 12 GB and was being written while the clone ran, so its first clone
+was missing a freshly written `store/extra` segment and `debug reindex` failed
+with `Failed to load table segment`. That failure was an artifact of cloning a
+live store, not damage: after copying the missing `store/extra` and `op_store`
+files from the live store (`cp -cRn`), the clone reindexed.
+
+Commands and results:
+
+- Whether retained history was re-parented onto the root operation. For each
+  repo, `jj --ignore-working-copy --at-operation <oldest retained op> op log
+--no-graph -T 'id.short(12) ++ " " ++ time.start()'` lists exactly the oldest
+  retained operation and then the all-zero root, so the oldest retained
+  operation's only ancestor is the root: `mono` `d8e5065c299a` (2026-11-07
+  18:36 -06:00), 7325 operations in total, and `appoint` `ded45bdbdfbf`
+  (2026-11-07 13:08 -06:00), 10 operations. This is what `jj op abandon ..<cut>`
+  does by design (descendants of the abandoned range are re-parented onto the
+  root), not evidence of lost retained history.
+- Whether the stores can still be rebuilt. `jj --ignore-working-copy debug
+reindex` on a consistent clone of `appoint` printed `Finished indexing 3663
+commits.` and on `mono` printed `Finished indexing 66479 commits.`, both exit 0. Neither store is missing predecessor objects today.
+- The cube audit log (`~/.local/share/cube/audit`) has no `repo.store_gc` row
+  with `outcome: failed` for `mono` or `appoint` through 2026-11-11.
+
+Not determined: whether the 2026-11-10 `mono` collection failure that prompted
+this work was this predecessor-pruning bug, a precursor of it, or unrelated.
+The cube audit log holds no failure row for it, so there is no error text to
+classify, and a store that reindexes cleanly today cannot show which it was.
