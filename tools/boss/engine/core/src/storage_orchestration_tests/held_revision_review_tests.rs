@@ -242,3 +242,40 @@ fn a_verdict_releases_every_revision_held_for_its_head() {
         assert_eq!(read_task(&db, revision_id).status, TaskStatus::InReview);
     }
 }
+
+/// A batch admitted for one head resolves the deferred marker of the revisions
+/// awaiting that head only. A revision whose review is deferred at a different
+/// head keeps its marker, so the operator still sees it held.
+#[test]
+fn a_batch_leaves_the_marker_of_a_revision_awaiting_another_head() {
+    let (_dir, db) = open_db();
+    let root_id = out_of_focus_root(&db);
+    let matching = hold_revision(&db, &root_id, false);
+    let other = hold_revision(&db, &root_id, false);
+
+    assert!(matches!(
+        admit_for_revision(&db, &root_id, &matching),
+        ReviewBatchDispatch::AdmissionDeferred
+    ));
+    let mut later = batch_input(root_id.clone(), "later-head-sha");
+    later.legacy_task_id = Some(other.clone());
+    assert!(matches!(
+        db.create_pre_merge_review_batch(later, REPO).unwrap(),
+        ReviewBatchDispatch::AdmissionDeferred
+    ));
+    db.file_admission_deferred_attention(&matching, PR_URL).unwrap();
+    db.file_admission_deferred_attention(&other, PR_URL).unwrap();
+
+    let ReviewBatchDispatch::Created { .. } = db
+        .request_pre_merge_review_batch_for_pool(batch_input(root_id.clone(), HEAD), 16)
+        .unwrap()
+    else {
+        panic!("an explicit review start must be admitted");
+    };
+
+    assert_eq!(
+        open_deferred_markers(&db),
+        vec![other],
+        "only the revision awaiting a different head stays marked"
+    );
+}

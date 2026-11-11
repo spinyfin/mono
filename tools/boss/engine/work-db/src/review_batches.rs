@@ -976,19 +976,42 @@ fn record_awaited_review_head_in_tx(tx: &Transaction<'_>, revision_id: &str, tar
     Ok(())
 }
 
-/// Resolve the review-admission-deferred marker on `cycle_root_id` and on
-/// every revision in its chain.
+/// Resolve the review-admission-deferred marker on `cycle_root_id` and on the
+/// revisions of its chain that the batch at `target_sha` covers.
 ///
-/// The marker says a review of this PR is waiting to be admitted. Once a
-/// batch exists that is no longer true for any row of the cycle, whoever the
-/// batch was admitted for: an explicit `bossctl review start` is admitted
-/// against the root while the marker sits on the revision that was deferred.
-fn resolve_admission_deferred_attention_for_cycle_in_tx(tx: &Transaction<'_>, cycle_root_id: &str) -> Result<()> {
-    let mut ids = super::chain_helpers::collect_chain_revision_ids_including_deleted(tx, cycle_root_id)?;
-    ids.push(cycle_root_id.to_owned());
+/// The marker says a review of this PR is waiting to be admitted. A batch at
+/// `target_sha` settles that for the root and for every revision awaiting that
+/// head. A revision whose latest completed run records a different awaited
+/// head (see [`record_awaited_review_head_in_tx`]) pushed something this batch
+/// did not review, so its review is still deferred and its marker stays. A
+/// revision with no recorded head is resolved too: an explicit
+/// `bossctl review start` is admitted against the root while the marker sits
+/// on a revision admission never got to stamp.
+fn resolve_admission_deferred_attention_for_cycle_in_tx(
+    tx: &Transaction<'_>,
+    cycle_root_id: &str,
+    target_sha: &str,
+) -> Result<()> {
+    let ids = super::chain_helpers::collect_chain_revision_ids_including_deleted(tx, cycle_root_id)?;
     for id in ids {
-        super::resolve_attention_kind_in_tx(tx, &id, PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND)?;
+        let awaited: Option<String> = tx
+            .query_row(
+                "SELECT revision_stop_contributed_head FROM work_executions
+                 WHERE work_item_id = ?1 AND kind = 'revision_implementation' AND status = 'completed'
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if awaited
+            .as_deref()
+            .is_none_or(|head| head.is_empty() || head == target_sha)
+        {
+            super::resolve_attention_kind_in_tx(tx, &id, PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND)?;
+        }
     }
+    super::resolve_attention_kind_in_tx(tx, cycle_root_id, PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND)?;
     Ok(())
 }
 
@@ -1223,9 +1246,10 @@ fn fail_review_batch_with_attention(
             .body_markdown(body_markdown)
             .build(),
     )?;
-    // A batch failure is a terminal review decision too. Release only the
-    // revision whose newest producing execution contributed this immutable
-    // target; an older push must never release a newer held revision.
+    // A batch failure is a terminal review decision too. Release every
+    // revision held `active` for exactly this immutable target. A revision
+    // that admission later re-pointed at a newer head (see
+    // `record_awaited_review_head_in_tx`) is not matched and stays held.
     release_held_revision_after_terminal_batch_in_tx(tx, &batch.cycle_root_id, &batch.target_sha, now)?;
     Ok(())
 }
@@ -1885,7 +1909,7 @@ impl WorkDb {
             .collect::<Vec<_>>();
         let members = leaf_member_inputs(&input.classification, &execution_ids)?;
         let (batch, _) = create_review_batch_in_tx(&tx, input, &members, generation, explicit)?;
-        resolve_admission_deferred_attention_for_cycle_in_tx(&tx, &batch.cycle_root_id)?;
+        resolve_admission_deferred_attention_for_cycle_in_tx(&tx, &batch.cycle_root_id, &batch.target_sha)?;
         if explicit {
             super::resolve_attention_kind_in_tx(&tx, &batch.cycle_root_id, super::CHURN_GUARD_PARKED_ATTENTION_KIND)?;
         }

@@ -980,8 +980,8 @@ fn advance_cycle_root_to_in_review_in_tx(
     Ok(())
 }
 
-/// Advance the one `revision` task under `cycle_root_id` that is held
-/// `active` pending exactly the push this batch reviewed, to `in_review`.
+/// Advance every `revision` task under `cycle_root_id` that is held `active`
+/// pending exactly the push this batch reviewed, to `in_review`.
 ///
 /// A revision never opens its own PR: `pr_flow.rs`'s `PendingReview`
 /// completion target holds it in whatever status it was already in (with
@@ -997,7 +997,11 @@ fn advance_cycle_root_to_in_review_in_tx(
 /// this batch reviewed. A revision already superseded by a later push
 /// before this verdict landed has a different contributed head and is
 /// correctly left alone — a verdict for its own (later) push will advance
-/// it instead. A no-op (not an error) when no such revision exists: most
+/// it instead. Admission can also record a later head on a superseded
+/// revision (see `review_batches::record_awaited_review_head_in_tx`), which
+/// re-points it at that later push. Several revisions can be held for the
+/// same head, and all of them advance. A no-op (not an error) when no such
+/// revision exists: most
 /// batches review a chain root's own push, with no revision involved at
 /// all.
 pub fn advance_held_revision_after_verdict_in_tx(
