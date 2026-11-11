@@ -1330,6 +1330,8 @@ fn readoption_of_a_tracked_run_backfills_missing_metadata_without_overwriting() 
             host_id: Some("local".to_owned()),
             started_at: Some("2026-10-09T00:00:00Z".to_owned()),
             product_id: Some("prod_1".to_owned()),
+            owning_work_item_id: Some("task_owner".to_owned()),
+            owning_work_item_title: Some("Owner".to_owned()),
             work_item_short_id: Some(42),
             pr_url: Some("https://github.com/spinyfin/mono/pull/12".to_owned()),
             ..LiveWorkerMetadata::default()
@@ -1348,6 +1350,8 @@ fn readoption_of_a_tracked_run_backfills_missing_metadata_without_overwriting() 
     assert_eq!(state.host_id.as_deref(), Some("local"));
     assert_eq!(state.started_at.as_deref(), Some("2026-10-09T00:00:00Z"));
     assert_eq!(state.product_id.as_deref(), Some("prod_1"));
+    assert_eq!(state.owning_work_item_id.as_deref(), Some("task_owner"));
+    assert_eq!(state.owning_work_item_title.as_deref(), Some("Owner"));
     assert_eq!(state.work_item_short_id, Some(42));
     assert_eq!(
         state.pr_url.as_deref(),

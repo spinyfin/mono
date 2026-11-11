@@ -47,7 +47,7 @@ pub fn label_for_execution(work_db: &WorkDb, execution: &WorkExecution) -> Execu
     let work_item = match work_db.get_work_item(&owning_id) {
         Ok(item) => item,
         Err(error) => {
-            return unbound_label(execution, purpose, &owning_id, &error);
+            return unbound_label(work_db, execution, purpose, &owning_id, &error);
         }
     };
     let header = work_item_header(work_db, execution, Some(&work_item));
@@ -69,6 +69,7 @@ pub fn label_for_execution(work_db: &WorkDb, execution: &WorkExecution) -> Execu
 /// No work-item row backs the execution. Kinds that are never bound to a work
 /// item are not "deleted"; everything else lost its item.
 fn unbound_label(
+    work_db: &WorkDb,
     execution: &WorkExecution,
     purpose: Option<String>,
     owning_id: &str,
@@ -76,7 +77,7 @@ fn unbound_label(
 ) -> ExecutionWorkLabel {
     let status = if matches!(
         execution.kind,
-        ExecutionKind::AnswerAgent | ExecutionKind::AutomationTriage
+        ExecutionKind::AnswerAgent | ExecutionKind::AutomationTriage | ExecutionKind::PrReviewGuide
     ) {
         ExecutionLabelStatus::NoWorkItem
     } else {
@@ -93,7 +94,7 @@ fn unbound_label(
         .execution_id(execution.id.clone())
         .status(status)
         .kind(execution.kind.as_str())
-        .maybe_pr_url(execution.pr_url.clone().filter(|url| !url.trim().is_empty()))
+        .maybe_pr_url(work_item_header(work_db, execution, None).pr_url)
         .maybe_purpose(purpose)
         .build()
 }

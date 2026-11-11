@@ -138,6 +138,8 @@ pub fn resolve_with_automation(
         product_id: header.product_id,
         product_name: header.product_name,
         work_item_short_id: header.short_id,
+        owning_work_item_id: header.owning_work_item_id,
+        owning_work_item_title: header.owning_work_item_title,
         pr_url: header.pr_url,
     }
 }
@@ -158,6 +160,8 @@ pub(crate) fn owning_work_item(work_db: &WorkDb, execution: &WorkExecution) -> O
 #[derive(Debug, Default, PartialEq, Eq, bon::Builder)]
 #[builder(on(String, into))]
 pub(crate) struct WorkItemHeader {
+    pub owning_work_item_id: Option<String>,
+    pub owning_work_item_title: Option<String>,
     pub product_id: Option<String>,
     pub product_name: Option<String>,
     pub project_id: Option<String>,
@@ -210,6 +214,8 @@ pub(crate) fn work_item_header(
         .or_else(|| non_empty_pr_url(execution.pr_url.as_deref()));
     let (project_id, project_name) = project_attribution(work_db, work_item);
     WorkItemHeader::builder()
+        .maybe_owning_work_item_id(work_item.map(|_| work_db.owning_work_item_id(&execution.work_item_id)))
+        .maybe_owning_work_item_title(work_item.map(|item| crate::runner::work_item_name(item).to_owned()))
         .maybe_product_id(product_id)
         .maybe_product_name(product_name)
         .maybe_project_id(project_id)
