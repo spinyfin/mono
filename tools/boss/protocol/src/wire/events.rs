@@ -688,6 +688,12 @@ pub enum FrontendEvent {
     ProjectDesignDocResolved {
         output: ResolveProjectDesignDocOutput,
     },
+    /// Response to [`FrontendRequest::ResolveExecutionLabels`]: one
+    /// [`crate::ExecutionWorkLabel`] per requested execution id, in request
+    /// order.
+    ExecutionLabelsResolved {
+        labels: Vec<crate::ExecutionWorkLabel>,
+    },
     /// Response to [`FrontendRequest::ListProductDesignDocs`]: the
     /// markdown listing at HEAD of the product's repo, or the
     /// classified reason there isn't one. `product_id` is echoed so a

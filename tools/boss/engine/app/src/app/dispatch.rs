@@ -300,6 +300,9 @@ async fn dispatch_attributed(mut ctx: Dispatch, request: FrontendRequest, bulk_r
         r @ FrontendRequest::RequestWorkerPaneAttach { .. } => {
             Box::pin(panes::handle_request_worker_pane_attach(ctx, r))
         }
+        r @ FrontendRequest::ResolveExecutionLabels { .. } => {
+            Box::pin(executions::handle_resolve_execution_labels(ctx, r))
+        }
         r @ FrontendRequest::ResolveProjectDesignDoc { .. } => {
             Box::pin(projects::handle_resolve_project_design_doc(ctx, r))
         }

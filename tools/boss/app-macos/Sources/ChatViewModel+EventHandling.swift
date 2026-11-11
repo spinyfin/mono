@@ -420,6 +420,8 @@ extension ChatViewModel {
             engineMetrics = entries
         case .projectDesignDocResolved(let output):
             applyResolvedProjectDesignDoc(output)
+        case .executionLabelsResolved(let labels):
+            executionLabelsHandler?(labels)
         case .dispatchAdmissionEvaluated(let admission):
             handleDispatchAdmissionEvaluated(admission)
         case .productDesignDocsList(let productID, let state):

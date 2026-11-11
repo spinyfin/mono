@@ -9,6 +9,76 @@ import PaneLayout
 // live-state tick) invalidates the parent.
 // ===========================================================================
 
+/// How the engine resolved an execution's label. Mirrors
+/// `boss_protocol::ExecutionLabelStatus`.
+enum ExecutionLabelStatus: String, Codable, Hashable {
+    /// The work item the run was bound to still exists.
+    case resolved
+    /// The run was bound to a work item that has since been deleted.
+    case workItemDeleted = "work_item_deleted"
+    /// The run's kind is not bound to a work item (answer agent, automation
+    /// triage); `purpose` still says what it was.
+    case noWorkItem = "no_work_item"
+    /// The engine has no execution row with this id.
+    case executionUnknown = "execution_unknown"
+}
+
+/// The engine-resolved label of one execution: the work item it ran for, that
+/// item's PR, and what the run was for. Mirrors
+/// `boss_protocol::ExecutionWorkLabel`, answered by `ResolveExecutionLabels`
+/// from the durable execution → work item → PR binding.
+///
+/// This is the only source of a finished pane's title and PR. The app does not
+/// keep its own copy of a work item's name; it asks the engine again whenever
+/// the Agents view comes into sight (see
+/// `WorkersWorkspaceModel.refreshExecutionLabels`).
+struct ExecutionWorkLabel: Codable, Hashable {
+    var executionId: String
+    var status: ExecutionLabelStatus
+    var kind: String?
+    var productId: String?
+    var prURL: String?
+    var purpose: String?
+    var workItemId: String?
+    var workItemShortId: Int?
+    var workItemTitle: String?
+
+    enum CodingKeys: String, CodingKey {
+        case executionId = "execution_id"
+        case status
+        case kind
+        case productId = "product_id"
+        case prURL = "pr_url"
+        case purpose
+        case workItemId = "work_item_id"
+        case workItemShortId = "work_item_short_id"
+        case workItemTitle = "work_item_title"
+    }
+}
+
+extension ExecutionWorkLabel {
+    /// The one line that names the work in a finished pane's header, always in
+    /// words. A resolved label reads `<purpose>: <title>` (just the title for
+    /// a plain implementation run); every unresolved state says so plainly.
+    /// The execution id is never part of it.
+    var headline: String {
+        switch status {
+        case .resolved:
+            let title = (workItemTitle ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let name = title.isEmpty ? "Untitled work item" : title
+            guard let purpose, !purpose.isEmpty else { return name }
+            return "\(purpose): \(name)"
+        case .workItemDeleted:
+            return "Work item deleted"
+        case .noWorkItem:
+            if let purpose, !purpose.isEmpty { return "\(purpose) run" }
+            return "No work item"
+        case .executionUnknown:
+            return "Run record unavailable"
+        }
+    }
+}
+
 /// Compact Agents-header row: the bound work item's short id and, when a
 /// PR exists, `repo#n`. Clicking the id reveals the Work card; clicking
 /// the PR opens it in the browser.
@@ -121,11 +191,27 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
     /// The app-side reason wins over the engine's: it is the more specific
     /// half of the same failed exchange.
     let viewerAttachFailure: String?
+    /// The engine's label for a released run: its work item's short id, title
+    /// and PR, resolved from the durable execution record (the live state that
+    /// carried them is gone). `nil` until the engine has answered, and always
+    /// `nil` for a live run. Never a locally remembered copy of the title.
+    var finishedLabel: ExecutionWorkLabel?
 
     var displayName: String {
         if let cachedPersona, !cachedPersona.isEmpty { return cachedPersona }
+        // A finished pane that never saw its persona must not print the raw
+        // run id as a name.
+        if isPlaceholder, (live?.name ?? "").isEmpty { return "Worker" }
         let runId = runId ?? ""
         return WorkerLiveState.displayName(name: live?.name, runId: runId)
+    }
+
+    /// Second titlebar line of a finished pane, and the body caption under
+    /// "<name> finished": the work item's title (with what the run was for),
+    /// or plain words when the engine could not resolve one. Never the run
+    /// id; while the engine's answer is in flight it says so.
+    var finishedSubtitle: String {
+        finishedLabel?.headline ?? "Loading work item…"
     }
 
     var badgeType: AgentType { live?.badgeType ?? .unknown }
@@ -226,6 +312,7 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
     /// `nil` when the pane has no work item (ad-hoc) or the engine has
     /// not yet assigned a short id.
     var headerWorkLinks: WorkerHeaderWorkLinks? {
+        if isPlaceholder { return finishedWorkLinks }
         guard let live,
               let workItemId = live.workItemId, !workItemId.isEmpty,
               let shortId = live.workItemShortId
@@ -236,6 +323,24 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
             productId: live.productId.flatMap { $0.isEmpty ? nil : $0 },
             shortIdLabel: Self.shortIdLabel(workItemId: workItemId, shortId: shortId),
             title: live.workItemName ?? "",
+            prURL: prURL,
+            prLabel: prURL.flatMap(Self.pullRequestCompactLabel(from:))
+        )
+    }
+
+    /// The same id-and-PR row a live pane shows, built from the engine's
+    /// durable label. `nil` when the work item is gone or unresolved.
+    private var finishedWorkLinks: WorkerHeaderWorkLinks? {
+        guard let label = finishedLabel, label.status == .resolved,
+              let workItemId = label.workItemId, !workItemId.isEmpty,
+              let shortId = label.workItemShortId
+        else { return nil }
+        let prURL = label.prURL.flatMap { $0.isEmpty ? nil : $0 }
+        return WorkerHeaderWorkLinks(
+            workItemId: workItemId,
+            productId: label.productId.flatMap { $0.isEmpty ? nil : $0 },
+            shortIdLabel: Self.shortIdLabel(workItemId: workItemId, shortId: shortId),
+            title: label.workItemTitle ?? "",
             prURL: prURL,
             prLabel: prURL.flatMap(Self.pullRequestCompactLabel(from:))
         )
@@ -263,6 +368,7 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
             && lhs.isPlaceholder == rhs.isPlaceholder
             && lhs.cachedPersona == rhs.cachedPersona
             && lhs.viewerAttachFailure == rhs.viewerAttachFailure
+            && lhs.finishedLabel == rhs.finishedLabel
     }
 
     static func build(
@@ -270,7 +376,8 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
         liveState: WorkerLiveState?,
         isPlaceholder: Bool = false,
         cachedPersona: String? = nil,
-        viewerAttachFailure: String? = nil
+        viewerAttachFailure: String? = nil,
+        finishedLabel: ExecutionWorkLabel? = nil
     ) -> WorkerSlotSnapshot {
         WorkerSlotSnapshot(
             slotId: slot.slotId,
@@ -281,7 +388,8 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
             live: liveState.map(WorkerSlotLiveSlice.init),
             isPlaceholder: isPlaceholder,
             cachedPersona: cachedPersona,
-            viewerAttachFailure: viewerAttachFailure
+            viewerAttachFailure: viewerAttachFailure,
+            finishedLabel: finishedLabel
         )
     }
 
@@ -305,7 +413,8 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
         viewer: WorkerSlot?,
         liveState: WorkerLiveState?,
         cachedPersona: String?,
-        viewerAttachFailure: String? = nil
+        viewerAttachFailure: String? = nil,
+        finishedLabel: ExecutionWorkLabel? = nil
     ) -> WorkerSlotSnapshot {
         let slotId = viewer?.slotId ?? liveState?.slotId ?? 0
         let slot = viewer ?? WorkerSlot(slotId: slotId, runId: runId, summary: nil, taskTitle: nil)
@@ -314,7 +423,8 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
             liveState: liveState,
             isPlaceholder: liveState == nil,
             cachedPersona: cachedPersona,
-            viewerAttachFailure: viewerAttachFailure
+            viewerAttachFailure: viewerAttachFailure,
+            finishedLabel: liveState == nil ? finishedLabel : nil
         )
     }
 }

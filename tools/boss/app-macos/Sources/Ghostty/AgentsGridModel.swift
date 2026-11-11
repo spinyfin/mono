@@ -402,7 +402,16 @@ extension AgentsGridModel {
             viewer: workspace.viewersByRunId[runId],
             liveState: liveStates.byRunID[runId],
             cachedPersona: personaName(for: runId),
-            viewerAttachFailure: workspace.viewerAttachFailuresByRunId[runId]
+            viewerAttachFailure: workspace.viewerAttachFailuresByRunId[runId],
+            finishedLabel: workspace.executionLabelsByRunId[runId]
         )
+    }
+
+    /// Runs the render rule draws as finished — mounted but absent from the
+    /// engine's live snapshot. Their title and PR come from the engine's
+    /// durable execution record, so the view asks for labels for exactly
+    /// these.
+    func releasedRunIds(attached: some Collection<String>, liveStates: LiveWorkerStateStore) -> [String] {
+        renderRunIds(attached: attached).filter { liveStates.byRunID[$0] == nil }
     }
 }

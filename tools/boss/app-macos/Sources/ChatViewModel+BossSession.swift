@@ -146,6 +146,15 @@ extension ChatViewModel {
         engine.sendSpawnCapabilityRestored()
     }
 
+    /// Called by the Agents view for runs the engine has released: asks the
+    /// engine for each run's work-item label (title, PR, purpose). The run id
+    /// is the execution id. Queued while disconnected, answered by
+    /// `executionLabelsHandler`.
+    func requestExecutionLabels(runIds: [String]) {
+        guard !runIds.isEmpty else { return }
+        engine.sendResolveExecutionLabels(executionIds: runIds)
+    }
+
     /// Called by the Agents view when a live local worker on a visible
     /// page has no viewer. Asks the engine to send `AttachWorkerPane` for
     /// that run again. Dropped while no app session is registered: the

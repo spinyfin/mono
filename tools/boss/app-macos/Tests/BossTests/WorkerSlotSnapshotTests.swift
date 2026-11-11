@@ -782,11 +782,12 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         XCTAssertEqual(detached.statusPillLabel, "Finished")
         XCTAssertEqual(detached.slotId, 0)
 
-        // Persona cache already gone: still finished, never "is working".
+        // Persona cache already gone: still finished, never "is working", and
+        // never named after the raw run id.
         let anonymous = WorkerSlotSnapshot.render(
             runId: "exec-1", viewer: nil, liveState: nil, cachedPersona: nil
         )
-        XCTAssertEqual(anonymous.headerTitle, "Worker exec-1 finished")
+        XCTAssertEqual(anonymous.headerTitle, "Worker finished")
         XCTAssertNil(anonymous.headerBadge)
 
         // A listed run without a viewer is the viewer-missing card with its

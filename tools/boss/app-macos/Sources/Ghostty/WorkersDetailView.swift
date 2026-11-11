@@ -58,6 +58,9 @@ struct WorkersDetailView: View, @MainActor Equatable {
         .onChange(of: isVisible) { _, visible in
             if !visible { workspace.resetViewerAttachRequests() }
             syncGrid()
+            if visible {
+                workspace.refreshExecutionLabels(forReleasedRuns: releasedRunIds)
+            }
         }
         .onChange(of: liveStates.byRunID) { _, _ in syncGrid() }
         .onChange(of: liveStates.feedUnavailable) { _, _ in syncGrid() }
@@ -192,6 +195,13 @@ struct WorkersDetailView: View, @MainActor Equatable {
     /// thing visibility gates is what is drawn.
     private func syncGrid() {
         Self.applyMembership(grid: grid, workspace: workspace, liveStates: liveStates, isVisible: isVisible)
+        workspace.requestExecutionLabels(forReleasedRuns: releasedRunIds)
+    }
+
+    /// Runs drawn as finished. Their work item is named by the engine's
+    /// durable record, not by live state the engine has dropped.
+    private var releasedRunIds: [String] {
+        grid.releasedRunIds(attached: workspace.viewersByRunId.keys, liveStates: liveStates)
     }
 
     private static func applyMembership(
@@ -279,6 +289,14 @@ struct WorkerSlotView: View, @MainActor Equatable {
             Text("\(snapshot.displayName) finished")
                 .font(.callout.weight(.medium))
                 .foregroundStyle(Color.white.opacity(0.7))
+            // The same work item label the header shows, resolved by the
+            // engine from the durable execution record.
+            Text(snapshot.finishedSubtitle)
+                .font(.callout)
+                .foregroundStyle(Color.white.opacity(0.55))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 16)
+                .lineLimit(3)
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -471,13 +489,23 @@ struct WorkerSlotView: View, @MainActor Equatable {
     /// Second line in the titlebar — the engine's real-time
     /// live-status sentence (refreshed by the summarizer in
     /// `engine/src/live_status.rs`). When no live status is
-    /// available we fall through to the run id and then to "idle"
-    /// so the line still anchors the pane visually. The static
+    /// available we fall through to the activity label and then to "idle"
+    /// so the line still anchors the pane visually. A finished pane shows
+    /// its work item's title instead. The static
     /// pane-summary gerund is rendered on the first line via
     /// `slotTaskLine` and intentionally not duplicated here.
     @ViewBuilder
     private var slotSubtitle: some View {
-        if snapshot.live?.activity == .terminated {
+        if snapshot.isPlaceholder {
+            // A released run has no live state; the engine names its work
+            // item from the durable record. Never the run id.
+            Text(snapshot.finishedSubtitle)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .help(snapshot.finishedSubtitle)
+                .accessibilityLabel(snapshot.finishedSubtitle)
+        } else if snapshot.live?.activity == .terminated {
             Text("Exited")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -530,12 +558,13 @@ struct WorkerSlotView: View, @MainActor Equatable {
                     .help(snapshot.runId ?? "")
                     .accessibilityLabel("Live status: \(live)")
             }
-        } else if let runId = snapshot.runId {
-            Text(runId)
+        } else if snapshot.runId != nil {
+            // No live-status sentence yet: say what the worker is doing in
+            // words rather than printing the run id.
+            Text(snapshot.live?.activity.agentsPaneLabel ?? "Starting")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
-                .help(runId)
         } else {
             Text("idle")
                 .font(.caption2)

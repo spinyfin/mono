@@ -105,6 +105,7 @@ pub mod engine_control;
 pub mod envelope_watch;
 pub use work::event_publish;
 pub mod events_socket;
+pub mod execution_label;
 pub mod execution_liveness;
 pub mod execution_retention_sweep;
 pub mod external_tracker;

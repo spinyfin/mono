@@ -54,8 +54,63 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// bringing it back asks again.
     private var requestedViewerRunIds: Set<String> = []
 
+    /// The engine's work-item labels for runs it has released, keyed by run id
+    /// (the execution id). A released run has no live state, so its finished
+    /// pane resolves its title and PR here instead; this is only the engine's
+    /// last answer, re-requested whenever the Agents view comes into sight so
+    /// a renamed work item or a newly bound PR is picked up.
+    @Published private(set) var executionLabelsByRunId: [String: ExecutionWorkLabel] = [:]
+    /// Asks the engine to resolve labels for runs. Wired by `ContentView` to
+    /// `ChatViewModel.requestExecutionLabels(runIds:)`; `nil` in builds
+    /// without an engine connection (tests).
+    var onExecutionLabelsRequested: (([String]) -> Void)?
+    /// Runs whose label is on its way. One request per run until the reply
+    /// lands or the view is hidden, so a burst of membership changes does not
+    /// send the same ids repeatedly.
+    private var requestedLabelRunIds: Set<String> = []
+
     init() {
         self.runtime = GhosttyRuntime.shared
+    }
+
+    /// Ask the engine for the label of every released run in `runIds` that has
+    /// neither a label nor an outstanding request. Also drops labels for runs
+    /// no longer rendered, so the map is bounded by what is on screen.
+    func requestExecutionLabels(forReleasedRuns runIds: [String]) {
+        let wanted = Set(runIds)
+        if executionLabelsByRunId.keys.contains(where: { !wanted.contains($0) }) {
+            executionLabelsByRunId = executionLabelsByRunId.filter { wanted.contains($0.key) }
+        }
+        requestedLabelRunIds.formIntersection(wanted)
+        let missing = runIds.filter {
+            executionLabelsByRunId[$0] == nil && !requestedLabelRunIds.contains($0)
+        }
+        guard !missing.isEmpty else { return }
+        requestedLabelRunIds.formUnion(missing)
+        onExecutionLabelsRequested?(missing)
+    }
+
+    /// The Agents view came into sight: ask again for every released run so a
+    /// title or PR that changed since the last answer is picked up. The
+    /// previous labels stay on screen until the new ones arrive.
+    func refreshExecutionLabels(forReleasedRuns runIds: [String]) {
+        requestedLabelRunIds = Set(runIds)
+        guard !runIds.isEmpty else { return }
+        onExecutionLabelsRequested?(runIds)
+    }
+
+    /// Store the engine's answer. Only runs this model asked about are kept,
+    /// so a late reply for a run that has since left the view cannot grow the
+    /// map.
+    func applyExecutionLabels(_ labels: [ExecutionWorkLabel]) {
+        var next = executionLabelsByRunId
+        for label in labels where requestedLabelRunIds.contains(label.executionId) {
+            next[label.executionId] = label
+        }
+        requestedLabelRunIds.subtract(labels.map(\.executionId))
+        if next != executionLabelsByRunId {
+            executionLabelsByRunId = next
+        }
     }
 
     /// Request the engine re-attach viewers for live members the Agents
