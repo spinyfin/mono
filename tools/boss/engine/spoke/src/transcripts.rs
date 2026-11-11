@@ -120,7 +120,7 @@ pub async fn poll(journal: &SharedJournal, execution: &ExecutionRecord, stamp: &
         {
             let exhausted = error.downcast_ref::<SourceFailure>().is_some()
                 || (error.downcast_ref::<TransientSource>().is_some()
-                    && note_transient(journal, &run, stamp.awake_ns)? >= TERMINAL_TRANSIENT_BUDGET_NS);
+                    && note_transient(journal, &run, stamp)? >= TERMINAL_TRANSIENT_BUDGET_NS);
             if exhausted {
                 let checkpoint = current_checkpoint(journal, &run)?;
                 return finish_gap(
@@ -133,38 +133,52 @@ pub async fn poll(journal: &SharedJournal, execution: &ExecutionRecord, stamp: &
                 );
             }
         }
-        Err(_) => {}
+        // Backpressure or another non-source error means the source read
+        // itself succeeded, so the continuous-failure streak is over.
+        Err(error) => {
+            if error.downcast_ref::<TransientSource>().is_none() {
+                clear_transient(journal, &run)?;
+            }
+        }
     }
     result
 }
 
-fn transient_since(
-    journal: &boss_spoke_journal::Journal,
-    run: &boss_protocol_spoke::v1::Run,
-) -> Result<(Option<Vec<u8>>, Option<u64>)> {
+type Streak = (Option<Vec<u8>>, Option<(String, u64)>);
+
+/// The streak start, recorded with the boot it was measured in: `awake_ns`
+/// counters are only comparable within one boot.
+fn transient_since(journal: &boss_spoke_journal::Journal, run: &boss_protocol_spoke::v1::Run) -> Result<Streak> {
     let old = journal.source(run, TRANSIENT_SOURCE)?;
+    // Legacy bare-counter values and "none" fail to parse and so restart the
+    // streak.
     let since = old
         .as_deref()
         .and_then(|b| std::str::from_utf8(b).ok())
-        .and_then(|s| s.parse::<u64>().ok());
+        .and_then(|s| s.rsplit_once(':'))
+        .and_then(|(boot, ns)| Some((boot.to_string(), ns.parse::<u64>().ok()?)));
     Ok((old, since))
 }
 
 /// Durably record the first awake instant of the current failure streak and
-/// return how long it has lasted.
-fn note_transient(journal: &SharedJournal, run: &boss_protocol_spoke::v1::Run, now: u64) -> Result<u64> {
+/// return how long it has lasted. A streak from another boot, or whose counter
+/// went backwards, restarts at the current stamp.
+fn note_transient(journal: &SharedJournal, run: &boss_protocol_spoke::v1::Run, stamp: &Stamp) -> Result<u64> {
     let mut journal = journal
         .lock()
         .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
     let (old, since) = transient_since(&journal, run)?;
-    if let Some(since) = since {
-        return Ok(now.saturating_sub(since));
+    if let Some((boot, since)) = &since
+        && *boot == stamp.boot_id
+        && stamp.awake_ns >= *since
+    {
+        return Ok(stamp.awake_ns - since);
     }
     journal.commit_source(
         run,
         TRANSIENT_SOURCE,
         old.as_deref(),
-        now.to_string().as_bytes(),
+        format!("{}:{}", stamp.boot_id, stamp.awake_ns).as_bytes(),
         Vec::new(),
     )?;
     Ok(0)
