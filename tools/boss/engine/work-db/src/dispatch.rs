@@ -917,7 +917,7 @@ impl WorkDb {
     pub fn list_orphan_active_candidates(&self, min_age_secs: i64) -> Result<Vec<String>> {
         let conn = self.connect()?;
         let now_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
-        orphan_active_candidates(&conn, now_secs - min_age_secs, None)
+        orphan_active_candidates::<&str>(&conn, now_secs - min_age_secs, None)
     }
 
     /// Return every non-terminal, non-deleted work item with an open PR
@@ -1997,21 +1997,40 @@ pub(crate) fn parent_review_command(conn: &Connection, root: &str, pr_url: Optio
     Ok(format!("bossctl agents launch {root}"))
 }
 
-/// Whether a live review batch still covers this producer head.
-pub(crate) fn live_pre_merge_batch_holds(conn: &Connection, id: &str) -> Result<bool> {
-    let root = chain_root(conn, id)?;
-    Ok(conn.query_row(
-        r#"SELECT EXISTS (
-            SELECT 1 FROM pr_review_batches b
-            WHERE b.cycle_root_id = ?2 AND b.phase = 'pre_merge'
-              AND b.status NOT IN ('completed', 'failed')
-              AND (SELECT COALESCE(NULLIF(we.pr_head_after, ''), b.target_sha)
-                   FROM work_executions we WHERE we.work_item_id = ?1 AND we.kind != 'pr_review'
-                   ORDER BY we.finished_at DESC, we.id DESC LIMIT 1) = b.target_sha
-        )"#,
-        params![id, root],
-        |row| row.get(0),
-    )?)
+/// The members of `ids` whose head a live pre-merge review batch still
+/// covers, read with one statement. `roots` maps each id to its chain root
+/// (see [`chain_roots`]); an id absent from it is its own root.
+pub(crate) fn live_pre_merge_batch_holds_among<S: AsRef<str>>(
+    conn: &Connection,
+    ids: &[S],
+    roots: &HashMap<String, String>,
+) -> Result<HashSet<String>> {
+    if ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let pairs: Vec<[&str; 2]> = ids
+        .iter()
+        .map(|id| {
+            let id = id.as_ref();
+            [id, roots.get(id).map_or(id, String::as_str)]
+        })
+        .collect();
+    let mut stmt = conn.prepare(
+        r#"SELECT pair.value ->> 0 FROM json_each(?1) pair
+           WHERE EXISTS (
+               SELECT 1 FROM pr_review_batches b
+               WHERE b.cycle_root_id = pair.value ->> 1 AND b.phase = 'pre_merge'
+                 AND b.status NOT IN ('completed', 'failed')
+                 AND (SELECT COALESCE(NULLIF(we.pr_head_after, ''), b.target_sha)
+                      FROM work_executions we
+                      WHERE we.work_item_id = pair.value ->> 0 AND we.kind != 'pr_review'
+                      ORDER BY we.finished_at DESC, we.id DESC LIMIT 1) = b.target_sha
+           )"#,
+    )?;
+    let held = stmt
+        .query_map([serde_json::to_string(&pairs)?], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(held)
 }
 
 /// Latest review attempts owned by review recovery, shared with wait classification.
@@ -2037,11 +2056,41 @@ pub(crate) fn review_recovery_holds_sql(item: &str) -> String {
     )
 }
 
-/// The orphan sweep's candidate walk: `active` items older than `cutoff`
-/// (epoch seconds) with no run pending or live, minus the holds the sweep
-/// leaves alone. `only` restricts the walk to one item. See
-/// [`WorkDb::list_orphan_active_candidates`] for each exclusion.
-pub(crate) fn orphan_active_candidates(conn: &Connection, cutoff: i64, only: Option<&str>) -> Result<Vec<String>> {
+/// The members of `ids` that review handling owns rather than the orphan
+/// sweep: a delivered primary PR ([`primary_pr_awaits_review`]), a completed
+/// revision ([`revision_implementation_completed`]) or a live review batch
+/// ([`live_pre_merge_batch_holds_among`]). Three statements however many ids.
+pub(crate) fn review_handling_holds<S: AsRef<str>>(conn: &Connection, ids: &[S]) -> Result<HashSet<String>> {
+    if ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut held = super::dispatch_admission::delivered_or_completed_among(conn, ids)?;
+    let roots = chain_roots(conn, ids)?;
+    held.extend(live_pre_merge_batch_holds_among(conn, ids, &roots)?);
+    Ok(held)
+}
+
+/// The SQL half of the orphan sweep's candidate walk: everything
+/// [`orphan_active_candidates`] decides except the review-handling holds.
+/// `only` restricts the walk to the named items and drives it from them.
+pub(crate) fn orphan_active_sql_candidates<S: AsRef<str>>(
+    conn: &Connection,
+    cutoff: i64,
+    only: Option<&[S]>,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&orphan_active_candidates_sql(only.is_some()))?;
+    let id = |row: &Row<'_>| row.get::<_, String>(0);
+    let rows = match only {
+        Some(ids) => stmt.query_map(params![cutoff, id_array(ids)], id)?,
+        None => stmt.query_map(params![cutoff], id)?,
+    };
+    collect_rows(rows)
+}
+
+/// Production SQL for [`orphan_active_sql_candidates`]: `?1` is the cutoff
+/// and, when `scoped`, `?2` the JSON array of item ids. Exposed so the
+/// query-plan test can `EXPLAIN` it.
+pub(crate) fn orphan_active_candidates_sql(scoped: bool) -> String {
     // The recovery-escalation exclusion: once the transient-recovery
     // sweep has raised an open attention item because a worker's API
     // error is non-retryable (permanent/unrecognised) or the retry
@@ -2064,13 +2113,21 @@ pub(crate) fn orphan_active_candidates(conn: &Connection, cutoff: i64, only: Opt
     // legitimately picks the work item up on the pass after that.
     let review_recovery = review_recovery_holds_sql("t.id");
     let upkeep = super::parking::upkeep_eligible_task_sql("t");
-    let stmt_sql = format!(
+    // A named set is an `IN` over the ids so the walk seeks each row by
+    // primary key. Folded into one statement with `?2 IS NULL OR ...` it
+    // left SQLite no usable term and the walk scanned every task.
+    let scope = if scoped {
+        "AND t.id IN (SELECT value FROM json_each(?2))"
+    } else {
+        ""
+    };
+    format!(
         "SELECT t.id FROM tasks t
          WHERE t.status = 'active'
            AND t.deleted_at IS NULL
            AND {upkeep}
            AND CAST(t.updated_at AS INTEGER) < ?1
-           AND (?2 IS NULL OR t.id = ?2)
+           {scope}
            AND NOT EXISTS (
                SELECT 1 FROM work_executions we
                WHERE we.work_item_id = t.id
@@ -2087,22 +2144,23 @@ pub(crate) fn orphan_active_candidates(conn: &Connection, cutoff: i64, only: Opt
         upkeep = upkeep,
         permanent = ATTENTION_KIND_RECOVERY_PERMANENT,
         exhausted = ATTENTION_KIND_RECOVERY_EXHAUSTED,
-    );
-    let mut stmt = conn.prepare(&stmt_sql)?;
-    let rows = stmt.query_map(params![cutoff, only], |row| row.get::<_, String>(0))?;
-    let mut out = Vec::new();
-    for row in rows {
-        let id = row?;
-        // A completed producer waiting for review admission is not
-        // an orphan. Review recovery owns it, even without a batch.
-        if !primary_pr_awaits_review(conn, &id)?
-            && !revision_implementation_completed(conn, &id)?
-            && !live_pre_merge_batch_holds(conn, &id)?
-        {
-            out.push(id);
-        }
-    }
-    Ok(out)
+    )
+}
+
+/// The orphan sweep's candidate walk: `active` items older than `cutoff`
+/// (epoch seconds) with no run pending or live, minus the holds the sweep
+/// leaves alone. `only` restricts the walk to the named items. See
+/// [`WorkDb::list_orphan_active_candidates`] for each exclusion.
+pub(crate) fn orphan_active_candidates<S: AsRef<str>>(
+    conn: &Connection,
+    cutoff: i64,
+    only: Option<&[S]>,
+) -> Result<Vec<String>> {
+    let candidates = orphan_active_sql_candidates(conn, cutoff, only)?;
+    // A completed producer waiting for review admission is not
+    // an orphan. Review recovery owns it, even without a batch.
+    let held = review_handling_holds(conn, &candidates)?;
+    Ok(candidates.into_iter().filter(|id| !held.contains(id)).collect())
 }
 
 #[cfg(test)]

@@ -15,7 +15,7 @@ pub(crate) fn collect_rows<T>(
 /// than silently dropping the value. Used by the `map_*` row mappers for
 /// enum/string columns whose value set is enforced in engine code, not by
 /// SQL: an out-of-set value is data corruption that must fail the read.
-fn parse_text_column<T>(col: usize, raw: &str) -> rusqlite::Result<T>
+pub(crate) fn parse_text_column<T>(col: usize, raw: &str) -> rusqlite::Result<T>
 where
     T: std::str::FromStr,
     T::Err: Into<Box<dyn std::error::Error + Send + Sync>>,

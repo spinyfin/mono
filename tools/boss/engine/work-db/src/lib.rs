@@ -755,6 +755,7 @@ mod remediation_state;
 pub mod remote_input_cleanup;
 mod revision_ai_review;
 pub mod sweep_handles;
+mod unscheduled_wait;
 pub mod work_dependencies;
 pub use feedback_target::FeedbackTarget;
 mod connection_wait;

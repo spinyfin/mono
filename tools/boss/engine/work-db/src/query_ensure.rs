@@ -31,6 +31,14 @@ pub(crate) fn row_exists(conn: &Connection, sql: &str, params: &[&dyn rusqlite::
     Ok(exists != 0)
 }
 
+/// `ids` as the single JSON array parameter a statement reads back with
+/// `json_each`, so a set of any size binds to one fixed statement text and
+/// the statement is driven from the ids rather than from a table walk.
+pub(crate) fn id_array<S: AsRef<str>>(ids: &[S]) -> String {
+    let ids: Vec<&str> = ids.iter().map(AsRef::as_ref).collect();
+    serde_json::to_string(&ids).expect("a list of strings always serializes")
+}
+
 /// Resolve the worker branch-name prefix for a new execution from its
 /// owning product's `worker_branch_prefix`. Returns `None` (→ engine
 /// default `boss/`) when the product carries no override. The stored
@@ -99,16 +107,31 @@ pub fn query_project(conn: &Connection, id: &str) -> Result<Option<Project>> {
     .map_err(Into::into)
 }
 
+/// Column list `map_task_with_parent_provenance_and_archived_reason` reads,
+/// for a statement whose `FROM` names `tasks` without an alias.
+pub(crate) const TASK_COLUMNS: &str = "id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, parent_task_id, origin_task_short_id, origin_pr_number, completed_at, archived_by, archived_at, archived_reason, dispatch_failed_reason, dispatch_failed_error, dispatch_failed_at, blocked_detail, deferred, tags, human_driven, completion_summary, effort_matched_rule, effort_reasons, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, source_automation_id, design_reasoning_effort_xhigh, critical_set_by, critical_set_at, parked_at, parked_by, parked_reason, parked_via, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question";
+
 pub fn query_task(conn: &Connection, id: &str) -> Result<Option<Task>> {
     conn.query_row(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, parent_task_id, origin_task_short_id, origin_pr_number, completed_at, archived_by, archived_at, archived_reason, dispatch_failed_reason, dispatch_failed_error, dispatch_failed_at, blocked_detail, deferred, tags, human_driven, completion_summary, effort_matched_rule, effort_reasons, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, source_automation_id, design_reasoning_effort_xhigh, critical_set_by, critical_set_at, parked_at, parked_by, parked_reason, parked_via, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
-         FROM tasks
-         WHERE id = ?1",
+        &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"),
         [id],
         map_task_with_parent_provenance_and_archived_reason,
     )
     .optional()
     .map_err(Into::into)
+}
+
+/// [`query_task`] for every id in `ids`, read with one statement. Ids with no
+/// row are absent from the result; the order is unspecified.
+pub(crate) fn query_tasks<S: AsRef<str>>(conn: &Connection, ids: &[S]) -> Result<Vec<Task>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {TASK_COLUMNS} FROM tasks WHERE id IN (SELECT value FROM json_each(?1))"
+    ))?;
+    let rows = stmt.query_map([id_array(ids)], map_task_with_parent_provenance_and_archived_reason)?;
+    collect_rows(rows)
 }
 
 pub(crate) fn query_execution(conn: &Connection, id: &str) -> Result<Option<WorkExecution>> {

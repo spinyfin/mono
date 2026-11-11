@@ -170,3 +170,89 @@ With badge resolution cached, the review-guide lookup became the largest remaini
 ### Single-item diagnostics
 
 Every `attach_task_derived_projections` invocation emits `single_item.total` duration to the existing engine population timing log. The request ID is `single-item:{invocation}:{caller}`, where `caller` is the trigger label already known to the mutation path (`update_task`, `set_task_doc`, `answer_operator_question`, …) or `get_work_item` on the read path. Group by that label for attribution; it is not a Rust source location, which collapsed every `WorkItemUpdated` derivation onto the wrapper. `items` records the loaded chain size; `single_item.ai_review_state` records review duration, eligible cards (`rows`), and executed review statements (`db_queries`). Count total records per interval for frequency. Failed derivations still emit total duration, while a failed review stage emits duration without a misleading successful query count.
+
+## Wait classification
+
+A board assembly names the wait of every card that has nothing pending: a queued card, an `active` card with no run pending or live, a card in review (see [dispatch wait reasons](dispatch-wait-reasons.md)). The runtime cache cannot hold that answer, so it is asked again on every full assembly and on every scheduler heartbeat. As first shipped (mono#3510, extended by mono#3517) it was asked one card at a time, and three of its statements walked whole tables each time. This section records what that cost, what replaced it, and how to measure it again.
+
+### Fixture
+
+`engine/work-db/src/tests/wait_scale_fixture.rs` seeds, from plain SQL, one product of 6,535 cards (4,200 in the tasks lane, 2,335 chores) and a 270-card control product: 7,305 task rows with 3 KiB descriptions, 14,986 executions, 14,898 runs, 2,871 attention items, 694 review batches and 1,633 verdicts. On the large board 277 cards have nothing pending (87 queued, 60 idle `active`, 130 in review) and 60 wait on a dependency, which the runtime cache never holds.
+
+```sh
+bazel test //tools/boss/engine/work-db:work_db_test --test_filter=wait_scale --test_output=all --test_arg=--nocapture --test_arg=--test-threads=1 --test_env=BOSS_BENCH_SAMPLES=5
+```
+
+### What was slow
+
+A per-statement SQLite profile of the per-card classification over the large board (debug-built test binary): 1,717 statements, 1,252 ms of statement time, of which three statements took 1,190 ms.
+
+| Statement, restricted to one item            | Calls | ms each | ms total | Plan                                                                                     |
+| -------------------------------------------- | ----: | ------: | -------: | ---------------------------------------------------------------------------------------- |
+| Review-admission candidates (mono#3510)      |    60 |    7.95 |      477 | `SEARCH t USING INDEX tasks_pr_url_idx (pr_url>?)`: every PR-bearing task                |
+| Family revision / reviewer probe (mono#3517) |    39 |   11.28 |      440 | `SCAN t` and `SCAN e USING COVERING INDEX work_executions_item_kind_status_finished_idx` |
+| Orphan-sweep candidates (mono#3510)          |    30 |    9.10 |      273 | `SCAN t`                                                                                 |
+| Current-head verdict of one owner            |   130 |    0.33 |       43 | seeks, plus `SCAN rv` over the verdicts                                                  |
+| The other 14 statements                      | 1,458 |  ≤ 0.03 |       19 | primary-key and index seeks                                                              |
+
+The first and third were existing walks scoped to one item with `?2 IS NULL OR t.id = ?2`, which leaves the planner no indexable term. The second let the planner choose to walk `tasks` and `work_executions` and probe the materialised family. Each costs time in proportion to the database, and was paid once per in-review or idle card.
+
+The trace hook that mono#3517 installed per card to count statements was not a factor: installing and removing it 6,535 times took 0.36 ms.
+
+### What replaced it
+
+Items with nothing pending are named as a set, with a fixed number of statements per branch, each driven from the item ids (`engine/work-db/src/unscheduled_wait.rs`). The same statements now seek:
+
+| Statement, for a set of ids | Plan                                                                                                                                                                     |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Review-admission candidates | `SCAN json_each`, `SEARCH t USING INDEX sqlite_autoindex_tasks_1 (id=?)`; then from the walked rows to `tasks` and `products` by primary key                             |
+| Family revision / reviewer  | `SEARCH tasks USING INDEX sqlite_autoindex_tasks_1 (id=?)`, `SCAN f`, `SEARCH t USING INDEX sqlite_autoindex_tasks_1 (id=?)`, `SEARCH e ... (work_item_id=? AND kind=?)` |
+| Orphan-sweep candidates     | `SCAN json_each`, `SEARCH t USING INDEX sqlite_autoindex_tasks_1 (id=?)`                                                                                                 |
+
+The planner chooses differently once the database has statistics, and the engine analyzes its database at startup. With `sqlite_stat1` present, the admission statement's outer join started from `products` and visited every task of the product (`SCAN p`, `SEARCH t USING INDEX tasks_product_idx (product_id=?)`), and the family's owner lookup scanned `tasks`: a fixed 20 ms per assembly on this fixture however few cards were in review. Both join orders are now fixed with `CROSS JOIN`, and `classification_statements_seek_instead_of_scanning` checks every plan with and without `ANALYZE`.
+
+### Result on the fixture
+
+Debug-built test binary, plain seed, five samples, on a host shared with other builds:
+
+| Measure                                  |                    Per card |                  As a set |
+| ---------------------------------------- | --------------------------: | ------------------------: |
+| Warm assembly, `db.task_runtimes`        |                    1,410 ms |                   50.6 ms |
+| Warm assembly, statements                |                       1,898 |                       203 |
+| of which naming waits                    |           1,717 in 1,553 ms |              22 in 8.6 ms |
+| First assembly on a cold cache           | 2,012 ms, 20,766 statements | 292 ms, 19,071 statements |
+| Control product, warm `db.task_runtimes` |      234 ms, 141 statements |      2.6 ms, 9 statements |
+| Scheduler heartbeat read                 |  1,654 ms, 2,606 statements |     37 ms, 292 statements |
+
+The 203 statements of a warm assembly are the epoch read, three point queries for each of the 60 cards waiting on a dependency, and the 22 that name 277 cards. Statements are counted as the segment always counted them, so the figures compare with earlier engine builds.
+
+### Isolated engine, before and after
+
+The unmodified `main` build and this change, both optimised, each started as a test fixture on a fresh copy of the same seeded database (46.6 MB) with no worker, automation or review slots. A driver fetched the board over the frontend socket with `delta: true`, rewriting one project row with its own values before each fetch so that every fetch assembled the whole tree, as a change to an attention item, project or review batch does in production. The figures are the engine's own population-timing records.
+
+| Measure                                             |                           Before |                            After |
+| --------------------------------------------------- | -------------------------------: | -------------------------------: |
+| **Start burst**, 24 fetches from engine start       |                                  |                                  |
+| Engine total, p50 / p90                             |                 2,350 / 3,816 ms |                     213 / 350 ms |
+| `db.task_runtimes`, p50                             |                         2,137 ms |                          21.5 ms |
+| Statements per fetch, p50 (first fetch)             |                   1,647 (20,590) |                     198 (19,141) |
+| **Steady state**, 30 fetches from 10.5 min on       |                                  |                                  |
+| Engine total, p50 / p90                             |                 2,598 / 3,482 ms |                     218 / 248 ms |
+| `db.task_runtimes`, p50                             |                         2,379 ms |                          19.8 ms |
+| Statements per fetch                                |                            1,647 |                              198 |
+| **Control product**, 270 cards, steady state        |                                  |                                  |
+| Engine total, p50                                   |                           363 ms |                          19.6 ms |
+| `db.task_runtimes`, p50 / statements                |                     330 ms / 141 |                       1.1 ms / 9 |
+| **Scheduler heartbeat read**, every 15 s            |                                  |                                  |
+| Duration, p50 / p90 / max                           |         2,794 / 3,893 / 5,592 ms |             18.0 / 33.0 / 112 ms |
+| Time holding the engine's connection, whole run     |             131.8 s in 44 passes |               1.1 s in 47 passes |
+| Statements                                          |        not counted by that build |                              387 |
+| Waits of 100 ms or more for the engine's connection | 28, 22.2 s in all, longest 3.8 s | 20, 2.8 s in all, longest 0.26 s |
+
+The segments this change does not touch show the two runs saw the same load: steady-state `db.tasks` 72 ms before and 67 ms after, `db.chores` 32 ms and 33 ms, `db.ai_review_state` 14.5 ms both. An earlier run of the unmodified build on a busier host measured 4,041 / 5,327 ms for the start burst and 2,371 / 3,326 ms at steady state.
+
+The heartbeat reads through the engine's one shared connection, so its duration is time every other caller waits. Its "before" durations are the connection-hold warnings of the unmodified build, which logs holds of 100 ms or more; its 387 statements after are 188 pending executions projected one by one plus 17 statements that name 194 items.
+
+The engine reconciles the seeded board at startup (it mints `ready` runs for idle `active` cards, for one), so its cards differ from the plain seed's: 232 cards with nothing pending and 17 naming statements, against 277 and 22 in the test.
+
+After the change `db.task_runtimes` splits, at steady-state p50, into 11.7 ms for the epoch read and cache probe, 4.1 ms for the 60 cards the cache cannot hold and 2.8 ms for naming 232 cards. Before mono#3510 there was no naming at all, so that build's equivalent on this board is the first two: about 16 ms. That is derived from the split, not measured: the earlier build was not run against this fixture.

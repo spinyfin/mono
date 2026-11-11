@@ -141,10 +141,11 @@ pub fn work_item_is_deliberately_parked(conn: &Connection, work_item_id: &str) -
     // atomically. Do not give their declarations or attention items park semantics.
     let latest: Option<(String, Option<String>, String)> = conn
         .query_row(
-            "SELECT id, run_done_outcome, status FROM work_executions
-             WHERE work_item_id = ?1
-             ORDER BY created_at DESC, id DESC
-             LIMIT 1",
+            &format!(
+                "SELECT id, run_done_outcome, status FROM work_executions
+                 WHERE id = {}",
+                latest_execution_id_sql("?1")
+            ),
             params![work_item_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -152,13 +153,74 @@ pub fn work_item_is_deliberately_parked(conn: &Connection, work_item_id: &str) -
     let Some((latest_execution_id, latest_outcome, status)) = latest else {
         return Ok(false);
     };
+    deliberate_park(&status, latest_outcome.as_deref(), || {
+        has_open_execution_attention_of_kind_on(conn, &latest_execution_id, DELIBERATE_PARK_ATTENTION_KINDS)
+    })
+}
+
+/// SQL scalar: the id of `item`'s latest execution, the row
+/// [`work_item_is_deliberately_parked`] keys on.
+fn latest_execution_id_sql(item: &str) -> String {
+    format!(
+        "(SELECT latest.id FROM work_executions latest
+          WHERE latest.work_item_id = {item}
+          ORDER BY latest.created_at DESC, latest.id DESC
+          LIMIT 1)"
+    )
+}
+
+/// The park decision over an item's latest execution. `park_attention` is
+/// only consulted when the row's own columns do not settle it.
+fn deliberate_park(
+    status: &str,
+    run_done_outcome: Option<&str>,
+    park_attention: impl FnOnce() -> Result<bool>,
+) -> Result<bool> {
     if status == "failed" {
         return Ok(false);
     }
-    if latest_outcome.as_deref() == Some(boss_protocol::RunDoneOutcome::Blocked.as_str()) {
+    if run_done_outcome == Some(boss_protocol::RunDoneOutcome::Blocked.as_str()) {
         return Ok(true);
     }
-    has_open_execution_attention_of_kind_on(conn, &latest_execution_id, DELIBERATE_PARK_ATTENTION_KINDS)
+    park_attention()
+}
+
+/// The members of `ids` for which [`work_item_is_deliberately_parked`] is
+/// true, read with one statement.
+pub(crate) fn deliberately_parked_among<S: AsRef<str>>(conn: &Connection, ids: &[S]) -> Result<HashSet<String>> {
+    if ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let kinds = DELIBERATE_PARK_ATTENTION_KINDS
+        .iter()
+        .map(|kind| format!("'{kind}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT item.value, e.status, e.run_done_outcome,
+                EXISTS(SELECT 1 FROM work_attention_items a
+                       WHERE a.execution_id = e.id AND a.status = 'open' AND a.kind IN ({kinds}))
+         FROM json_each(?1) item
+         JOIN work_executions e ON e.id = {latest}",
+        latest = latest_execution_id_sql("item.value"),
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([id_array(ids)], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, bool>(3)?,
+        ))
+    })?;
+    let mut parked = HashSet::new();
+    for row in rows {
+        let (id, status, outcome, park_attention) = row?;
+        if deliberate_park(&status, outcome.as_deref(), || Ok(park_attention))? {
+            parked.insert(id);
+        }
+    }
+    Ok(parked)
 }
 
 /// Explicit dispatch acknowledges parks on prior executions in the same transaction.
@@ -178,25 +240,67 @@ pub(crate) fn resolve_deliberate_park_attention(conn: &Connection, work_item_id:
 /// deferred review admission leaves its owner in `active`.
 /// Revisions intentionally resume their parent's PR and are not owners.
 pub(crate) fn primary_pr_awaits_review(conn: &Connection, work_item_id: &str) -> Result<bool> {
-    Ok(query_task(conn, work_item_id)?.is_some_and(|task| {
-        task.kind != TaskKind::Revision && task.pr_url.as_deref().is_some_and(|url| !url.trim().is_empty())
-    }))
+    Ok(query_task(conn, work_item_id)?.is_some_and(|task| owns_delivered_pr(&task.kind, task.pr_url.as_deref())))
+}
+
+/// The row-level rule behind [`primary_pr_awaits_review`].
+fn owns_delivered_pr(kind: &TaskKind, pr_url: Option<&str>) -> bool {
+    *kind != TaskKind::Revision && pr_url.is_some_and(|url| !url.trim().is_empty())
+}
+
+/// SQL scalar: the status of `item`'s latest `revision_implementation`
+/// execution when `item` is a revision, else NULL.
+fn latest_revision_implementation_status_sql(item: &str) -> String {
+    format!(
+        "(SELECT e.status FROM work_executions e JOIN tasks t ON t.id = e.work_item_id
+          WHERE e.work_item_id = {item} AND t.kind = 'revision' AND e.kind = 'revision_implementation'
+          ORDER BY e.created_at DESC, e.id DESC LIMIT 1)"
+    )
 }
 
 /// Completed revision work belongs to completion/review handling. A review
 /// execution (including one on the chain root) must not hide that completion.
 /// Explicit starts create a newer implementation and remain allowed.
 pub(crate) fn revision_implementation_completed(conn: &Connection, work_item_id: &str) -> Result<bool> {
-    let status: Option<String> = conn
-        .query_row(
-            "SELECT e.status FROM work_executions e JOIN tasks t ON t.id = e.work_item_id
-         WHERE e.work_item_id = ?1 AND t.kind = 'revision' AND e.kind = 'revision_implementation'
-         ORDER BY e.created_at DESC, e.id DESC LIMIT 1",
-            [work_item_id],
-            |row| row.get(0),
-        )
-        .optional()?;
+    let status: Option<String> = conn.query_row(
+        &format!("SELECT {}", latest_revision_implementation_status_sql("?1")),
+        [work_item_id],
+        |row| row.get(0),
+    )?;
     Ok(status.as_deref() == Some("completed"))
+}
+
+/// The members of `ids` for which [`primary_pr_awaits_review`] or
+/// [`revision_implementation_completed`] is true, read with one statement.
+pub(crate) fn delivered_or_completed_among<S: AsRef<str>>(conn: &Connection, ids: &[S]) -> Result<HashSet<String>> {
+    if ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let sql = format!(
+        "SELECT item.id, item.kind, item.pr_url, {}
+         FROM tasks item WHERE item.id IN (SELECT value FROM json_each(?1))",
+        latest_revision_implementation_status_sql("item.id")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([id_array(ids)], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+    let mut held = HashSet::new();
+    for row in rows {
+        let (id, kind, pr_url, revision_status) = row?;
+        let kind: TaskKind = kind
+            .parse()
+            .map_err(|_| anyhow::anyhow!("unknown task kind in DB row {id}: {kind}"))?;
+        if owns_delivered_pr(&kind, pr_url.as_deref()) || revision_status.as_deref() == Some("completed") {
+            held.insert(id);
+        }
+    }
+    Ok(held)
 }
 
 #[work_db_boundary::instrument]
@@ -353,18 +457,12 @@ pub(crate) fn dispatch_admission_facts_on(conn: &Connection, work_item_id: &str)
     } else {
         Vec::new()
     };
-    let exempt_from_operator_pause = raw.kind == Some(ExecutionKind::PrReview);
-    let targets_main_pool = match raw.kind {
-        Some(kind) => {
-            kind != ExecutionKind::PrReview
-                && kind != ExecutionKind::AutomationTriage
-                && !matches!(
-                    super::automations::source_automation_id_on(conn, &raw.resolved_work_item_id),
-                    Ok(Some(_))
-                )
-        }
-        None => false,
-    };
+    let (exempt_from_operator_pause, targets_main_pool) = pause_exemption_facts(raw.kind, || {
+        matches!(
+            super::automations::source_automation_id_on(conn, &raw.resolved_work_item_id),
+            Ok(Some(_))
+        )
+    });
     Ok(DispatchAdmissionFacts::builder()
         .resolved_work_item_id(raw.resolved_work_item_id)
         .maybe_ineligible_reason(raw.ineligible_reason)
@@ -378,27 +476,131 @@ pub(crate) fn dispatch_admission_facts_on(conn: &Connection, work_item_id: &str)
         .build())
 }
 
-/// The persisted pause, with the same exemptions as coordinator admission.
-pub(crate) fn pause_holds_on(conn: &Connection, id: &str) -> Result<bool> {
-    use boss_engine_storage_values::dispatch_pause::*;
-    let metadata = |key: &str| -> Result<Option<String>> {
-        Ok(conn
-            .query_row("SELECT value FROM metadata WHERE key = ?1", [key], |r| r.get(0))
-            .optional()?)
+/// `(exempt_from_operator_pause, targets_main_pool)` for an item whose
+/// governing execution kind is `kind`. The single decision both the per-item
+/// admission facts and the set-based [`PersistedPause::held_among`] use, so
+/// the two cannot drift. `from_automation` is only asked when it matters.
+fn pause_exemption_facts(kind: Option<ExecutionKind>, from_automation: impl FnOnce() -> bool) -> (bool, bool) {
+    let exempt = kind == Some(ExecutionKind::PrReview);
+    let targets_main_pool = match kind {
+        Some(kind) => kind != ExecutionKind::PrReview && kind != ExecutionKind::AutomationTriage && !from_automation(),
+        None => false,
     };
-    if metadata(METADATA_KEY_DISPATCH_PAUSED)?.as_deref() != Some("1") {
-        return Ok(false);
+    (exempt, targets_main_pool)
+}
+
+/// The persisted dispatch pause, read once for any number of items.
+pub(crate) struct PersistedPause {
+    /// An operator pause whose scope leaves reviews running: the only pause
+    /// coordinator admission exempts any work from.
+    overridable: bool,
+}
+
+impl PersistedPause {
+    /// The pause in force, or `None` when dispatch is running.
+    pub(crate) fn load(conn: &Connection) -> Result<Option<Self>> {
+        use boss_engine_storage_values::dispatch_pause::*;
+        let metadata = |key: &str| -> Result<Option<String>> {
+            Ok(conn
+                .query_row("SELECT value FROM metadata WHERE key = ?1", [key], |r| r.get(0))
+                .optional()?)
+        };
+        if metadata(METADATA_KEY_DISPATCH_PAUSED)?.as_deref() != Some("1") {
+            return Ok(None);
+        }
+        let origin = metadata(METADATA_KEY_DISPATCH_PAUSE_ORIGIN)?;
+        let scope = metadata(METADATA_KEY_DISPATCH_PAUSE_SCOPE)?;
+        Ok(Some(Self {
+            overridable: persisted_origin_is_operator(origin.as_deref())
+                && !resolve_persisted_pause_scope(scope.as_deref(), origin.as_deref()).holds_reviews(),
+        }))
     }
-    let origin = metadata(METADATA_KEY_DISPATCH_PAUSE_ORIGIN)?;
-    let scope = metadata(METADATA_KEY_DISPATCH_PAUSE_SCOPE)?;
-    let overridable = persisted_origin_is_operator(origin.as_deref())
-        && !resolve_persisted_pause_scope(scope.as_deref(), origin.as_deref()).holds_reviews();
-    let facts = dispatch_admission_facts_on(conn, id)?;
-    Ok(!exempts_work(
-        overridable,
-        facts.exempt_from_operator_pause,
-        facts.targets_main_pool && facts.is_critical,
-    ))
+
+    /// Whether this pause holds `id`, with the same exemptions as coordinator
+    /// admission. The per-item reference [`Self::held_among`] is tested against.
+    #[cfg(test)]
+    pub(crate) fn holds(&self, conn: &Connection, id: &str) -> Result<bool> {
+        use boss_engine_storage_values::dispatch_pause::exempts_work;
+        if !self.overridable {
+            return Ok(true);
+        }
+        let facts = dispatch_admission_facts_on(conn, id)?;
+        Ok(!exempts_work(
+            self.overridable,
+            facts.exempt_from_operator_pause,
+            facts.targets_main_pool && facts.is_critical,
+        ))
+    }
+
+    /// The ids of `tasks` this pause holds: [`Self::holds`] for each, from a
+    /// fixed number of statements however many there are. Only an overridable
+    /// pause exempts anything, so only then are the governing execution kinds
+    /// and automation sources read, once for the whole set.
+    pub(crate) fn held_among(&self, conn: &Connection, tasks: &[&Task]) -> Result<HashSet<String>> {
+        use boss_engine_storage_values::dispatch_pause::exempts_work;
+        if !self.overridable || tasks.is_empty() {
+            return Ok(tasks.iter().map(|task| task.id.clone()).collect());
+        }
+        let ids: Vec<&str> = tasks.iter().map(|task| task.id.as_str()).collect();
+        let ids_json = super::query_ensure::id_array(&ids);
+
+        // The governing execution of `dispatch_admission_facts_on`: the
+        // newest live run, else the newest run if it is not terminal.
+        let mut stmt = conn.prepare(
+            "SELECT e.work_item_id, e.kind, e.status
+             FROM json_each(?1) item
+             JOIN work_executions e ON e.work_item_id = item.value
+             WHERE e.kind <> 'progression'
+             ORDER BY e.work_item_id, e.created_at DESC, e.id DESC",
+        )?;
+        let mut live: HashMap<String, ExecutionKind> = HashMap::new();
+        let mut latest: HashMap<String, (ExecutionKind, ExecutionStatus)> = HashMap::new();
+        let mut rows = stmt.query([&ids_json])?;
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let kind_raw: String = row.get(1)?;
+            let kind = kind_raw.parse::<ExecutionKind>().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let status_raw: String = row.get(2)?;
+            let status = status_raw
+                .parse::<ExecutionStatus>()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if status.is_live() {
+                live.entry(id.clone()).or_insert(kind.clone());
+            }
+            latest.entry(id).or_insert((kind, status));
+        }
+        let mut stmt = conn.prepare(
+            "SELECT t.id FROM json_each(?1) item
+             JOIN tasks t ON t.id = item.value
+             WHERE t.deleted_at IS NULL AND t.source_automation_id IS NOT NULL",
+        )?;
+        let from_automation: HashSet<String> = stmt
+            .query_map([&ids_json], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+
+        Ok(tasks
+            .iter()
+            .filter(|task| {
+                let governing = live.get(&task.id).or_else(|| {
+                    latest
+                        .get(&task.id)
+                        .filter(|(_, status)| !status.is_terminal())
+                        .map(|(k, _)| k)
+                });
+                let kind = match governing {
+                    Some(kind) => kind.clone(),
+                    None => super::exec_status_helpers::execution_kind_for_task_kind(&task.kind),
+                };
+                let (review, targets_main) = pause_exemption_facts(Some(kind), || from_automation.contains(&task.id));
+                !exempts_work(
+                    self.overridable,
+                    review,
+                    targets_main && critical_priority::is_critical(&task.priority),
+                )
+            })
+            .map(|task| task.id.clone())
+            .collect())
+    }
 }
 
 #[cfg(test)]

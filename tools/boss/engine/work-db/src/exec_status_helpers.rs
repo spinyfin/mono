@@ -442,12 +442,18 @@ pub fn resolve_repo_for_work_item(conn: &Connection, work_item_id: &str) -> Resu
 
     let product = query_product(conn, &product_id)?
         .with_context(|| format!("orphan task {work_item_id}: parent product {product_id} missing"))?;
+    Ok(resolve_repo_from_product(&kind, &product))
+}
+
+/// The product layer of [`resolve_repo_for_work_item`]: the repo a task of
+/// `kind` with no row override resolves to under `product`.
+pub(crate) fn resolve_repo_from_product(kind: &TaskKind, product: &Product) -> Option<String> {
     match kind {
         // A postmortem edits the project's existing design doc, which lives
         // in the same repo a `design` task's doc would — same resolution.
         TaskKind::Design | TaskKind::DesignPostmortem => {
             if let Some(url) = product.design_repo.as_deref().filter(|s| !s.is_empty()) {
-                return Ok(Some(url.to_owned()));
+                return Some(url.to_owned());
             }
         }
         TaskKind::Investigation => {
@@ -457,18 +463,58 @@ pub fn resolve_repo_for_work_item(conn: &Connection, work_item_id: &str) -> Resu
             // intentional: the dispatcher's repo-unresolved attention item
             // path surfaces it to the coordinator for manual correction.
             if let Some(url) = product.docs_repo.as_deref().filter(|s| !s.is_empty()) {
-                return Ok(Some(url.to_owned()));
+                return Some(url.to_owned());
             }
             if let Ok(user_docs) = std::env::var("BOSS_USER_DOCS_REPO")
                 && !user_docs.is_empty()
             {
-                return Ok(Some(user_docs));
+                return Some(user_docs);
             }
         }
         // All other kinds use the product's default code repo.
         TaskKind::Chore | TaskKind::Followup | TaskKind::ProjectTask | TaskKind::Revision | TaskKind::Task => {}
     }
-    Ok(product.repo_remote_url)
+    product.repo_remote_url.clone()
+}
+
+/// The members of `ids` for which [`resolve_repo_for_work_item`] finds no
+/// repo, read with one statement for the rows plus one per distinct product
+/// that has to be consulted.
+pub(crate) fn repo_unresolved_among<S: AsRef<str>>(conn: &Connection, ids: &[S]) -> Result<HashSet<String>> {
+    let mut unresolved: HashSet<String> = ids.iter().map(|id| id.as_ref().to_owned()).collect();
+    if ids.is_empty() {
+        return Ok(unresolved);
+    }
+    let rows: Vec<(String, Option<String>, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, repo_remote_url, product_id, kind FROM tasks
+             WHERE id IN (SELECT value FROM json_each(?1))",
+        )?;
+        let rows = stmt.query_map([id_array(ids)], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        collect_rows(rows)?
+    };
+    let mut products: HashMap<String, Product> = HashMap::new();
+    for (id, override_repo, product_id, kind_str) in rows {
+        let kind: TaskKind = kind_str
+            .parse()
+            .map_err(|_| anyhow::anyhow!("unknown task kind in DB row {id}: {kind_str}"))?;
+        let resolved = if override_repo.as_deref().is_some_and(|url| !url.is_empty()) {
+            true
+        } else {
+            if !products.contains_key(&product_id) {
+                let product = query_product(conn, &product_id)?
+                    .with_context(|| format!("orphan task {id}: parent product {product_id} missing"))?;
+                products.insert(product_id.clone(), product);
+            }
+            resolve_repo_from_product(&kind, &products[&product_id]).is_some()
+        };
+        if resolved {
+            unresolved.remove(&id);
+        }
+    }
+    Ok(unresolved)
 }
 
 pub(crate) fn resolve_execution_repo_remote_url(

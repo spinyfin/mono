@@ -69,6 +69,26 @@ Before promising `awaiting_redispatch`, the classifier applies admission's share
 
 Board projection triggers invalidate review-batch and pause changes. Attention writes already invalidate the projection; parking writes update the task/project rows already journaled. Wait annotation is recomputed even on runtime-cache hits.
 
+## What classification costs
+
+The board runtime cache cannot hold the reason of an item with nothing pending. It comes from the task row, its revision chain, review batches and attention items, and no runtime epoch versions those. Every full board assembly and every scheduler heartbeat therefore asks again for every queued card, idle `active` item and item in review.
+
+So these items are named as a set (`engine/work-db/src/unscheduled_wait.rs`). Each of the three branches loads what it decides on with a fixed number of statements, each driven from the item ids through one bound JSON array, and decides in memory:
+
+| Branch              |                                                                                                 Statements | Also grows with                                                                                                                                                                                                                                 |
+| ------------------- | ---------------------------------------------------------------------------------------------------------: | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Queued cards        |                                                                                                    up to 4 | one read per product whose default repository has to be consulted                                                                                                                                                                               |
+| Idle `active` items | 9 while dispatch runs, 11 under a pause that exempts nothing, 13 under an operator pause that exempts work | nothing: a pause adds two metadata reads, and an operator pause that exempts work adds one read of the governing executions and one of the automation sources for the whole set of redispatchable items, sharing admission's exemption decision |
+| Items in review     |                                                                                                    up to 8 | nothing                                                                                                                                                                                                                                         |
+
+Cards do not add statements. One item is classified by passing one item, so the board, `bossctl dispatch stuck`, `bossctl dispatch diagnose` and the heartbeat share one implementation and cannot disagree.
+
+Each predicate is the one the dispatch machinery uses, read through a set-reading sibling (`orphan_active_sql_candidates`, `review_handling_holds`, `deliberately_parked_among`, `pre_merge_review_admission_candidates_in`, `repo_unresolved_among`) or its shared SQL fragment.
+
+A new condition has to keep that shape: read it for the whole set with one statement whose outer loop is the id list, and check the plan. Scoping an existing table walk to one item with `?N IS NULL OR t.id = ?N` leaves SQLite no indexable term. That form made every in-review and idle card walk every task, and the family probe walked every task and every execution; see [the measurement](work-tree-scale-measurement.md#wait-classification). Two tests in `engine/work-db/src/tests/wait_scale_tests.rs` guard it: `classification_statements_do_not_grow_with_the_cards_classified` and `classification_statements_seek_instead_of_scanning`.
+
+The engine population timing log splits `db.task_runtimes` into `.cache`, `.compute` and `.annotation`, and the annotation into `.queued`, `.idle_active` and `.review`. Each sub-segment carries its duration, its card count (`rows`) and its statements (`db_queries`). The heartbeat's read logs its duration, statements and item counts at `debug` (`boss_work_db::queued_wait`).
+
 ## When the engine cannot name a wait
 
 `unclassified` is not a reason. It marks a wait that none of the conditions above explains, which is a defect in the engine's state model.
@@ -83,7 +103,7 @@ A hold recorded under a code that has no phrase is also reported as `unclassifie
 ## Adding a hold
 
 1. Add the code and its phrase to `DISPATCH_WAIT_REASON_CODES` in `dispatch_wait.rs`.
-2. Produce it in the scheduler (`record_dispatch_wait_reason`) or in `queued_wait.rs`.
+2. Produce it in the scheduler (`record_dispatch_wait_reason`), in `queued_wait.rs` for a pending execution, or in `unscheduled_wait.rs` for an item with nothing pending (see [What classification costs](#what-classification-costs)).
 3. Add the state to `every_waiting_state_yields_a_named_reason` in `engine/work-db/src/tests/queued_wait_tests.rs`. That test fails while a code in the vocabulary has no state that produces it.
 
 No client change is needed: the phrase reaches every surface through `dispatch_wait_label`.

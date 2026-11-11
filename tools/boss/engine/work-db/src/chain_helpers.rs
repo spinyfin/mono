@@ -132,6 +132,32 @@ pub fn chain_root(conn: &Connection, task_id: &str) -> Result<String> {
     Ok(last_resolved)
 }
 
+/// [`chain_root`] for every id in `ids`, read with one statement. The walk is
+/// [`cycle_root_walk_cte`]'s, which follows the same parent links to the same
+/// depth; an id with no task row resolves to itself, as [`chain_root`] does.
+pub(crate) fn chain_roots<S: AsRef<str>>(conn: &Connection, ids: &[S]) -> Result<HashMap<String, String>> {
+    let mut roots: HashMap<String, String> = ids
+        .iter()
+        .map(|id| (id.as_ref().to_owned(), id.as_ref().to_owned()))
+        .collect();
+    if ids.is_empty() {
+        return Ok(roots);
+    }
+    let sql = format!(
+        "{} SELECT task_id, cycle_root_id FROM roots",
+        cycle_root_walk_cte("t.id IN (SELECT value FROM json_each(?1))")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([id_array(ids)], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (id, root) = row?;
+        roots.insert(id, root);
+    }
+    Ok(roots)
+}
+
 /// Flip every `in_review` revision whose chain root is `chain_root_id`
 /// to `done`.  Called from `mark_chore_pr_merged` so that when the
 /// parent PR merges all in-review revisions finish in the same

@@ -271,15 +271,28 @@ pub(super) fn read_cards(
     tasks.sort_by(boss_board_projection::task_order);
     chores.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
     let mut queries = 0u64;
-    let mut runtimes = HashMap::new();
     let mut validity = HashMap::new();
+    let mut computed = Vec::with_capacity(tasks.len() + chores.len());
     for task in tasks.iter().chain(chores.iter()) {
-        let computed = dispatch_helpers::compute_task_runtime(conn, &task.id, &mut queries, now)?;
-        let mut runtime = computed.runtime;
-        super::queued_wait::annotate_unscheduled(conn, task, &mut runtime)?;
-        validity.insert(task.id.clone(), (computed.cacheable, computed.expires_at));
-        runtimes.insert(task.id.clone(), runtime);
+        let result = dispatch_helpers::compute_task_runtime(
+            conn,
+            &task.id,
+            &mut queries,
+            now,
+            super::queued_wait::ReviewNaming::Deferred,
+        )?;
+        validity.insert(task.id.clone(), (result.cacheable, result.expires_at));
+        computed.push(result.runtime);
     }
+    super::queued_wait::annotate_unscheduled_many(
+        conn,
+        tasks.iter().chain(chores.iter()).zip(computed.iter_mut()),
+        None,
+    )?;
+    let mut runtimes: HashMap<String, TaskRuntime> = computed
+        .into_iter()
+        .map(|runtime| (runtime.work_item_id.clone(), runtime))
+        .collect();
 
     let mut trace = PopulationTrace::disabled();
     // A patch names a few chains; recomputing their owners is cheaper
