@@ -195,31 +195,6 @@ impl<'a> BazelUserRootCache<'a> {
     }
 }
 
-/// Recursively restore the owner-write bit on every directory under (and
-/// including) `root`, without following symlinks. Bazel marks output-tree
-/// directories read-only; `fs::remove_dir_all` cannot unlink entries inside a
-/// directory it cannot write to, and fails part-way through with `Permission
-/// denied` on a populated output base (verified against a real one — see
-/// `remove_output_base`'s doc comment).
-fn make_dirs_writable(root: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let meta = fs::symlink_metadata(root)?;
-    if meta.file_type().is_symlink() || !meta.is_dir() {
-        return Ok(());
-    }
-    let mut perms = meta.permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(root, perms)?;
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            make_dirs_writable(&entry.path())?;
-        }
-    }
-    Ok(())
-}
-
 /// Remove one bazel output base, handling bazel's read-only directory
 /// permissions. Returns `Ok(true)` if something was removed, `Ok(false)` if
 /// nothing was there to begin with (not an error — the common case for a
@@ -230,7 +205,7 @@ fn make_dirs_writable(root: &Path) -> io::Result<()> {
 /// contains directories such as
 /// `execroot/_main/bazel-out/darwin_arm64-opt/bin/external/rules_rust++crate+*`
 /// mode `0500` (read+execute, no write) — a plain `remove_dir_all` on that
-/// tree fails with `Permission denied`; this function's `make_dirs_writable`
+/// tree fails with `Permission denied`; this function's `fs_util::make_dirs_writable`
 /// pass clears it first, and the same tree then removes cleanly.
 pub(super) fn remove_output_base(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
@@ -243,11 +218,7 @@ pub(super) fn remove_output_base(path: &Path) -> Result<bool> {
             });
         }
     }
-    make_dirs_writable(path).map_err(|source| CubeError::BazelOutputBaseRemove {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    fs::remove_dir_all(path).map_err(|source| CubeError::BazelOutputBaseRemove {
+    super::fs_util::remove_tree_writable(path).map_err(|source| CubeError::BazelOutputBaseRemove {
         path: path.to_path_buf(),
         source,
     })?;

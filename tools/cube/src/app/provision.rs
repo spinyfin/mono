@@ -51,7 +51,8 @@ pub(super) fn auto_create_workspace(
     repo_record: &RepoRecord,
     existing: &[crate::metadata::WorkspaceCandidate],
 ) -> Result<crate::metadata::WorkspaceCandidate> {
-    let existing_ids: Vec<String> = existing.iter().map(|c| c.workspace_id.clone()).collect();
+    let mut existing_ids: Vec<String> = existing.iter().map(|c| c.workspace_id.clone()).collect();
+    existing_ids.extend(super::repo_reclone::quarantined_workspace_ids(repo_record)?);
     let workspace_id = next_workspace_id(&repo_record.workspace_prefix, &existing_ids);
     let workspace_path = repo_record.workspace_root.join(&workspace_id);
 
@@ -156,6 +157,8 @@ pub(super) fn auto_create_workspace(
     // established once by `materialize_repo_source_if_missing` at ensure time. Every
     // attached workspace sees them, so the lease's later `jj new main` resolves.
 
+    super::repo_reclone::stamp_workspace(repo_record, &staging_path)?;
+
     // Publish atomically. Staging and final live under the same workspace_root
     // (one filesystem), so the rename is atomic and the final path appears
     // only when the attach is complete.
@@ -231,6 +234,31 @@ pub(super) fn run_setup_for_workspace(
     runner: &dyn CommandRunner,
     workspace: &WorkspaceRecord,
 ) -> Result<SetupReport> {
+    run_setup_for_lease(store, runner, workspace, true)
+}
+
+/// Run setup for a workspace. With `enforce_registration`, a workspace
+/// provisioned under a previous repo registration (its registration stamp is
+/// missing or differs from the source's) is refused rather than reporting an
+/// empty success. Recovery leases (`--allow-dirty`) skip the check so work in
+/// an older workspace stays reachable. The decision uses only the stamps, never
+/// the contents of the source working copy, which need not match main.
+pub(super) fn run_setup_for_lease(
+    store: &Store,
+    runner: &dyn CommandRunner,
+    workspace: &WorkspaceRecord,
+    enforce_registration: bool,
+) -> Result<SetupReport> {
+    if enforce_registration
+        && let Some(repo) = store.get_repo(&workspace.repo)?
+        && !super::repo_reclone::registration_matches(&repo, &workspace.workspace_path)?
+    {
+        return Err(CubeError::InvalidArgument(format!(
+            "workspace {} was provisioned under a previous registration of repo `{}`, so its setup cannot be trusted; release the lease and lease again so cube replaces it (the old directory is preserved, not deleted)",
+            workspace.workspace_path.display(),
+            workspace.repo
+        )));
+    }
     let Some(config) = setup::read_setup_config(&workspace.workspace_path)? else {
         return Ok(SetupReport::empty());
     };

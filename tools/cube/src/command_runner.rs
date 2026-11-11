@@ -20,6 +20,12 @@ pub struct CommandInvocation {
     pub env: Vec<(String, String)>,
 }
 
+pub struct CommandOutput {
+    pub status: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
 pub trait CommandRunner {
     /// Export command output without stripping whitespace or decoding bytes.
     fn run_to_file(
@@ -41,6 +47,34 @@ pub trait CommandRunner {
     }
 
     fn run(&self, invocation: &CommandInvocation) -> Result<String, CubeError>;
+
+    /// Like [`CommandRunner::run`] but returns stdout untouched: no trimming
+    /// and no lossy UTF-8 decoding. Use for NUL-delimited output carrying
+    /// arbitrary file names. Test doubles inherit the `run` result.
+    fn run_raw(&self, invocation: &CommandInvocation) -> Result<Vec<u8>, CubeError> {
+        self.run(invocation).map(String::into_bytes)
+    }
+
+    /// Retain both streams and status, including unsuccessful exits.
+    fn run_output_with_timeout(
+        &self,
+        invocation: &CommandInvocation,
+        timeout: Duration,
+    ) -> Result<CommandOutput, CubeError> {
+        match self.run_with_timeout(invocation, timeout) {
+            Ok(stdout) => Ok(CommandOutput {
+                status: Some(0),
+                stdout,
+                stderr: String::new(),
+            }),
+            Err(CubeError::CommandFailed { status, stderr, .. }) => Ok(CommandOutput {
+                status,
+                stdout: String::new(),
+                stderr,
+            }),
+            Err(error) => Err(error),
+        }
+    }
 
     /// Cleanup runs in an isolated group and retains both output streams.
     fn run_cleanup(&self, invocation: &CommandInvocation, timeout: Duration) -> Result<String, CubeError> {
@@ -402,6 +436,11 @@ impl CommandRunner for RealCommandRunner {
         std::fs::write(destination, output.stdout).map_err(CubeError::Io)
     }
     fn run(&self, invocation: &CommandInvocation) -> Result<String, CubeError> {
+        self.run_raw(invocation)
+            .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+    }
+
+    fn run_raw(&self, invocation: &CommandInvocation) -> Result<Vec<u8>, CubeError> {
         let _gate = jj_gate(invocation, JJ_GATE_WAIT)?;
         let mut cmd = Command::new(&invocation.program);
         cmd.args(&invocation.args).current_dir(&invocation.cwd);
@@ -409,11 +448,9 @@ impl CommandRunner for RealCommandRunner {
         for (k, v) in &invocation.env {
             cmd.env(k, v);
         }
-
         let output = cmd.output().map_err(CubeError::Io)?;
-
         if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            Ok(output.stdout)
         } else {
             Err(CubeError::CommandFailed {
                 program: invocation.program.clone(),
@@ -422,6 +459,25 @@ impl CommandRunner for RealCommandRunner {
                 stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
             })
         }
+    }
+
+    fn run_output_with_timeout(
+        &self,
+        invocation: &CommandInvocation,
+        timeout: Duration,
+    ) -> Result<CommandOutput, CubeError> {
+        let output = self
+            .run_with_timeout_capturing_output(invocation, &[], timeout)?
+            .ok_or_else(|| CubeError::CommandTimedOut {
+                program: invocation.program.clone(),
+                args: invocation.args.clone(),
+                timeout_secs: timeout.as_secs(),
+            })?;
+        Ok(CommandOutput {
+            status: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
     }
 
     fn run_cleanup(&self, invocation: &CommandInvocation, timeout: Duration) -> Result<String, CubeError> {

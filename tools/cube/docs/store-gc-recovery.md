@@ -156,3 +156,63 @@ Both clones therefore rebuild successfully with jj 0.26, including its
 legacy predecessor traversal. No missing predecessor objects were observed
 in these snapshots; this supports current rebuildability for both stores,
 including `appoint`, without using it to reconstruct the historical failure.
+
+# Replacing a damaged store
+
+Use `cube repo reclone <repo>` when the shared store cannot be repaired. Invoke
+it from outside the source and workspace trees: your shell's working directory
+also counts as in use. First
+release every workspace for the repo and stop tools with open files or working
+directories in its source or workspace trees. The command refuses leased pools,
+active store upkeep, concurrent cube jj operations, and processes detected by
+`lsof` in those trees. Install `lsof` if it is missing; an unsuccessful inspection
+is a hard error, and a scan that exceeds its time limit is reported as such. Stop external tools before invoking recovery and keep them
+stopped until it finishes; external tools do not honor cube's advisory locks.
+
+Recovery renames the source to a sibling named
+`<repo>.before-reclone-<epoch-seconds>-<unique-id>`, clones the recorded origin
+using the recorded clone command when configured, and retains the recorded main
+branch, workspace root/prefix, and declared oldest jj version. It purges old
+workspaces, including read-only Bazel directories, and clears their setup records
+so newly provisioned workspaces run setup. Save any workspace files you need
+before recovery. The backup store is never deleted. The start, completion, and
+failure are recorded in cube's audit log.
+
+Literal setup references such as
+`cp "$CUBE_BASE_REPO/backend/config-secrets.toml" .` and
+`cp "${CUBE_BASE_REPO}/backend/config-secrets.toml" .` retain missing files from
+the backup, including untracked secrets and their permissions. Referenced
+directories are copied recursively without replacing fresh tracked files.
+Git also enumerates untracked files, including ignored files, without reading
+jj's index. These are carried over too, covering inputs used inside setup
+scripts. If Git cannot enumerate them, recovery fails before moving the store;
+repair its Git index before retrying. An old `.cube/setup.yaml` is never planted into a clone that lacks it, even
+if Git lists it as untracked; fresh workspaces use the declaration from main. Dynamic paths,
+shell expansions, missing or special files, and symlinks anywhere inside the setup-declared inputs are rejected
+before anything is moved, with instructions to use regular files and literal
+paths. Other untracked symlinks (such as `bazel-bin`) and special files are
+skipped with a warning. Missing inputs
+produce an error naming the file to restore before retrying. If cloning or
+input preservation fails, the original store path is restored and the failed
+clone is kept as a separate `failed-reclone` sibling for inspection.
+
+`cube repo remove --purge-workspaces` also handles read-only workspace trees.
+It fails if any directory cannot be removed, retaining the registration for a
+retry. Removing a repo resets its store upkeep history. Re-registering a repo
+gives its workspaces a new registration identity: lease quarantines directories
+from an older registration or another jj store under `.quarantine-*` names,
+preserving their files and provisioning replacements. A workspace whose
+registration stamp is missing or differs from the source's is refused by a
+normal lease with an error instead of an empty successful setup report; the
+check looks only at the stamps, never at whether the source working copy has a
+`.cube/setup.yaml`, and an `--allow-dirty --prefer <id>` recovery lease preserves the preferred
+workspace despite a stale or missing stamp (a wrong-store pointer is still
+quarantined) and skips the stamp check so unpushed
+work stays reachable. A lease whose setup cannot run for any reason other than
+a failed step releases its claim before the error is returned.
+
+Quarantined directories (`.quarantine-<workspace-id>-<unique-id>`) and their
+Bazel output bases are never deleted automatically, because they may hold
+unpushed work. Once you have confirmed nothing in one is needed, remove it with
+`chmod -R u+w <dir> && rm -rf <dir>`, and remove its Bazel output base by hand
+under Bazel's output user root.

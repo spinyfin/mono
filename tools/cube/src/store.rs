@@ -834,11 +834,25 @@ impl Store {
     /// `PRAGMA foreign_keys = ON` is enforced by [`Store::migrate`] on every
     /// connection, so the cascade always fires.
     pub fn delete_repo(&self, repo: &str) -> Result<bool, CubeError> {
+        self.reset_store_upkeep(repo)?;
         let count = self
             .connection
             .execute("DELETE FROM repos WHERE repo = ?1", params![repo])
             .map_err(CubeError::Storage)?;
         Ok(count > 0)
+    }
+
+    pub(crate) fn reset_store_upkeep(&self, repo: &str) -> Result<(), CubeError> {
+        for key in [
+            crate::app::store_gc::store_gc_last_at_key(repo),
+            crate::app::store_gc::store_gc_outcome_key(repo),
+            crate::app::store_gc::store_gc_failures_key(repo),
+        ] {
+            self.connection
+                .execute("DELETE FROM pool_metadata WHERE key = ?1", params![key])
+                .map_err(CubeError::Storage)?;
+        }
+        Ok(())
     }
 
     pub fn forget_workspace(&self, repo: &str, workspace_id: &str) -> Result<(), CubeError> {

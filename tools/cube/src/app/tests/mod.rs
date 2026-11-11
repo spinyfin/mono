@@ -26,6 +26,7 @@ mod reclaim_tests;
 mod reconcile_tests;
 mod release_tests;
 mod remove_tests;
+mod repo_reclone_tests;
 mod repo_tests;
 mod setup_tests;
 mod store_gc_head_tests;

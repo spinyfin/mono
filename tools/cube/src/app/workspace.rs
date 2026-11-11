@@ -3,7 +3,6 @@
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use std::{fs, io};
 
 use serde_json::json;
 use uuid::Uuid;
@@ -38,7 +37,7 @@ use crate::app::lease_reclaim::{
 };
 use crate::app::provision::{
     auto_create_workspace, discover_workspaces, find_workspace_record, format_lease_message, format_setup_message,
-    gc_broken_empty_workspace, run_setup_for_workspace,
+    gc_broken_empty_workspace, run_setup_for_lease, run_setup_for_workspace,
 };
 use crate::app::reclaim::relieve_disk_pressure;
 use crate::app::reconcile::{
@@ -285,6 +284,13 @@ pub(super) fn run_workspace(
                     prior_lease_expires_at_epoch_s = swept.lease_expires_at_epoch_s,
                 );
             }
+            super::repo_reclone::quarantine_obsolete(
+                &store,
+                database_path,
+                &repo_record,
+                &mut candidates,
+                if allow_dirty { prefer.as_deref() } else { None },
+            )?;
             let expired_ids: Vec<String> = expired.iter().map(|e| e.workspace_id.clone()).collect();
             let expired_by_workspace_id: std::collections::HashMap<&str, &crate::store::ExpiredLease> =
                 expired.iter().map(|e| (e.workspace_id.as_str(), e)).collect();
@@ -453,7 +459,13 @@ pub(super) fn run_workspace(
                     dirty_probe_error = dirty_probe_error.as_deref(),
                 );
 
-                let setup_report = run_setup_for_workspace(&store, runner, &workspace)?;
+                let setup_report = release_if_setup_not_run(
+                    &store,
+                    database_path,
+                    &workspace,
+                    &lease_id,
+                    run_setup_for_lease(&store, runner, &workspace, false),
+                )?;
 
                 let lease_message = format!(
                     "Reclaimed {} (dirty) at {}.",
@@ -1240,6 +1252,13 @@ pub(super) fn run_workspace(
 
                 let retry_lock = RepoLock::acquire(&repo_lock_path(&repo, database_path)?)?;
                 let mut retry_candidates = discover_workspaces(&repo_record)?;
+                super::repo_reclone::quarantine_obsolete(
+                    &store,
+                    database_path,
+                    &repo_record,
+                    &mut retry_candidates,
+                    None,
+                )?;
                 store.sync_workspaces(&repo, &retry_candidates)?;
                 let new_candidate = auto_create_workspace(runner, database_path, &repo_record, &retry_candidates)?;
                 let new_id = new_candidate.workspace_id.clone();
@@ -1306,7 +1325,13 @@ pub(super) fn run_workspace(
             // that drops such a file is already covered.
             ensure_boss_infra_excluded(&workspace.workspace_path, &workspace.workspace_id);
 
-            let setup_report = run_setup_for_workspace(&store, runner, &workspace)?;
+            let setup_report = release_if_setup_not_run(
+                &store,
+                database_path,
+                &workspace,
+                &lease_id,
+                run_setup_for_lease(&store, runner, &workspace, true),
+            )?;
 
             let lease_message = format!(
                 "Leased {} at {}.",
@@ -1858,16 +1883,7 @@ pub(super) fn run_workspace(
             store.forget_workspace(&record.repo, &record.workspace_id)?;
 
             if expunge {
-                match fs::remove_dir_all(&record.workspace_path) {
-                    Ok(()) => {}
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                    Err(err) => {
-                        return Err(CubeError::WorkspaceDirRemove {
-                            path: record.workspace_path.clone(),
-                            source: err,
-                        });
-                    }
-                }
+                super::repo_reclone::remove_workspace_tree(&record.workspace_path)?;
 
                 // Probe the repo's canonical source checkout — a stable,
                 // always-present bazel workspace cube never tears down —
@@ -2203,4 +2219,31 @@ pub(super) fn run_workspace(
         }
         WorkspaceCommand::Push { bookmark, pr } => workspace_push(database_path, runner, bookmark, pr),
     }
+}
+
+/// A setup error that is not a failed step (an unreadable declaration, a stale
+/// registration) returns before the caller learns the lease id. Hand the claim
+/// back so the workspace is not stranded as leased, then surface the error.
+pub(super) fn release_if_setup_not_run<T>(
+    store: &Store,
+    database_path: Option<&Path>,
+    workspace: &WorkspaceRecord,
+    lease_id: &str,
+    result: Result<T>,
+) -> Result<T> {
+    if result.is_err() {
+        match store.force_release_lease(lease_id, Some("setup_failed")) {
+            Ok(_) => audit!(
+                database_path,
+                "lease.released_on_setup_error",
+                repo = workspace.repo,
+                workspace_id = workspace.workspace_id,
+                lease_id = lease_id,
+            ),
+            Err(release_err) => {
+                eprintln!("warning: failed to release lease {lease_id} after setup could not run: {release_err}")
+            }
+        }
+    }
+    result
 }
