@@ -167,6 +167,7 @@ pub mod proposal_expiry_sweep;
 #[cfg(test)]
 pub(crate) use boss_prose_vocabulary as prose_vocabulary;
 mod adopted_prompt_confirmation;
+mod adopted_prompt_transcript;
 pub mod protocol;
 pub mod remote_input_lifecycle;
 pub mod remote_lease_reconcile;

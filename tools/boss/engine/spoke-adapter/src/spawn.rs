@@ -243,7 +243,7 @@ impl SpokeHostAdapter {
             }
         }
         let mut stopped = None;
-        let confirmed = boss_execution_runner::spawn_confirmation::confirm_prompt_accepted_or_reap(
+        let confirmed = boss_execution_contracts::confirm_prompt_accepted_or_reap(
             "spoke",
             &execution.id,
             self.hub.config.prompt_timeout,

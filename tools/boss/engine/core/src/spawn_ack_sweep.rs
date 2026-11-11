@@ -262,7 +262,20 @@ pub fn spawn_loop(
     interval: Duration,
     driver_start_grace_secs: i64,
 ) -> tokio::task::JoinHandle<()> {
+    let services = Arc::new(
+        crate::adopted_prompt_confirmation::ConfirmationServices::builder()
+            .work_db(work_db.clone())
+            .live_states(live_states.clone())
+            .coordinator(coordinator.clone())
+            .dispatch_events(dispatch_events.clone())
+            .reaper(reaper.clone())
+            .spawn_health(spawn_health.clone())
+            .cube_client(cube_client.clone())
+            .build(),
+    );
+    let mut confirmations = crate::adopted_prompt_confirmation::Confirmations::default();
     crate::sweep_loop::spawn_sweep_loop(interval, move || {
+        confirmations.schedule(services.clone());
         let work_db = Arc::clone(&work_db);
         let live_states = Arc::clone(&live_states);
         let coordinator = Arc::clone(&coordinator);
@@ -447,8 +460,6 @@ pub async fn run_one_pass(
             ReapOutcome::Skipped => {}
         }
     }
-
-    crate::adopted_prompt_confirmation::confirm_pending(&ctx).await;
 
     // Breaker half-open recovery: while dispatch is Breaker-paused, this is
     // the tick that periodically admits a single canary execution through

@@ -39,8 +39,9 @@ use std::time::Duration;
 use boss_protocol::PaneMonitorSpec;
 
 pub use boss_execution_contracts::{
-    SpawnConfirmationError, composer_not_ready_error, prompt_not_delivered_error, prompt_not_submitted_error,
-    remote_prompt_not_submitted_error, spawn_confirmation_error, turn_did_not_start_error,
+    SpawnConfirmationError, composer_not_ready_error, confirm_prompt_accepted_or_reap, prompt_not_delivered_error,
+    prompt_not_submitted_error, remote_prompt_not_submitted_error, spawn_confirmation_error, turn_did_not_start_error,
+    wait_until,
 };
 
 use crate::driver::initial_prompt::{DELIVERY_BUDGET, DeliveryState};
@@ -183,26 +184,6 @@ pub fn current_run_has_turn_start_evidence(
         .ok()
         .flatten()
         .is_some_and(|path| !path.is_empty())
-}
-
-/// Poll `ready` until it returns true or `timeout` elapses.
-pub(crate) async fn wait_until<F, Fut>(timeout: Duration, poll: Duration, mut ready: F) -> bool
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if tokio::time::timeout_at(deadline, ready()).await.unwrap_or(false) {
-            return true;
-        }
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            return false;
-        }
-        let remaining = deadline - now;
-        tokio::time::sleep(poll.min(remaining)).await;
-    }
 }
 
 /// Run the two spawn-time waits against injected predicates so production
@@ -400,46 +381,6 @@ where
     }
     reap().await;
     Err(turn_did_not_start_error(driver_name, run_id, timeout))
-}
-
-/// Remote prompt-accepted wait, then `reap` when no turn begins.
-///
-/// The engine cannot press Return in a remote worker's terminal, so there is
-/// no retry here: the launcher's own Return, sent once the composer shows the
-/// brief, is the only submit. A worker that still has not begun a turn after
-/// `timeout` is reaped and its spawn failed rather than left idle.
-pub async fn confirm_prompt_accepted_or_reap<Accepted, AcceptedFut, Reap, ReapFut>(
-    driver_name: &str,
-    run_id: &str,
-    timeout: Duration,
-    poll: Duration,
-    accepted: Accepted,
-    reap: Reap,
-) -> anyhow::Result<()>
-where
-    Accepted: FnMut() -> AcceptedFut,
-    AcceptedFut: std::future::Future<Output = bool>,
-    Reap: FnOnce() -> ReapFut,
-    ReapFut: std::future::Future<Output = ()>,
-{
-    let started = tokio::time::Instant::now();
-    if wait_until(timeout, poll, accepted).await {
-        tracing::info!(
-            run_id,
-            driver = driver_name,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "prompt submit confirmed: the driver started a turn",
-        );
-        return Ok(());
-    }
-    tracing::warn!(
-        run_id,
-        driver = driver_name,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "prompt submit failed: the remote driver started but reported no turn",
-    );
-    reap().await;
-    Err(remote_prompt_not_submitted_error(driver_name, run_id, timeout))
 }
 
 #[cfg(test)]
