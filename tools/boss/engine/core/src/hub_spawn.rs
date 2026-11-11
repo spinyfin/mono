@@ -90,8 +90,16 @@ pub async fn compose_remote_spawn(request: ComposeRemoteSpawn<'_>) -> Result<Spa
     }
 
     opts.remote_workspace = true;
-    let composed =
-        compose_worker_spawn(db, worker_id, execution, item, workspace_path, cube_change_id, opts.clone()).await?;
+    let composed = compose_worker_spawn(
+        db,
+        worker_id,
+        execution,
+        item,
+        workspace_path,
+        cube_change_id,
+        opts.clone(),
+    )
+    .await?;
     let RemoteLaunch {
         prompt_text,
         driver,
