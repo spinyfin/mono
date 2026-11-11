@@ -83,7 +83,6 @@ mod tests {
     use crate::ssh_spawn::WORKER_EXIT_STATUS_PREFIX;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
-    use std::time::Duration;
 
     #[test]
     fn placeholder_present_in_source() {
@@ -200,7 +199,10 @@ mod tests {
             bin_dir.display(),
             std::env::var("PATH").unwrap_or_default()
         );
+        // Keep stdout open in the detached driver so output() waits for the
+        // PID marker as well as the launch handshake, regardless of load.
         let output = Command::new("/bin/sh")
+            .args(["-c", "exec 3>&1; exec /bin/sh \"$1\"", "pid-handshake-test"])
             .arg(&wrapper)
             .env("PATH", path)
             .env("CLAUDE_PID_FILE", &claude_pid)
@@ -221,16 +223,6 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let handshake_pid = crate::ssh_spawn::parse_remote_pid(&String::from_utf8_lossy(&output.stderr)).unwrap();
-        // The wrapper has successfully received the direct child PID at this
-        // point, but a loaded CI shard can still delay the child before it
-        // writes its test marker. Wait long enough to observe that asynchronous
-        // handoff instead of treating scheduler latency as a bad PID.
-        for _ in 0..1_000 {
-            if claude_pid.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
         let direct_claude_pid = std::fs::read_to_string(&claude_pid)
             .unwrap_or_else(|error| {
                 panic!(
