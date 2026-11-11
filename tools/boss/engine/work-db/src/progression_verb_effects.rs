@@ -10,7 +10,7 @@
 //! | `redispatch` | `request_execution_in_tx_with_live_check` (an explicit start), or the review restart for an `in_review` item |
 //! | `clear-signal` | the merge poller's retire writes (`clear_blocked_*_in_tx`) |
 //! | `archive-revision` | `archive_revision_task_as_actor` plus the dependent cascade |
-//! | `unblock` | the `blocked -> todo` move |
+//! | `unblock` | the `blocked -> todo` (or `in_review`, when the item already owns a bound PR) move |
 //!
 //! Every write is made as `progression`, so the row's `last_status_actor` and the
 //! ledger read as the agent's decision and the dependency cascade treats a
@@ -635,7 +635,7 @@ pub(super) fn unblock(conn: &Connection, pending: &mut PendingEvents, ctx: &Verb
     };
     if item.status != TaskStatus::Blocked {
         return Err(precondition(format!(
-            "{} is `{}`; the verb moves only a `blocked` item to `todo`",
+            "{} is `{}`; the verb moves only a `blocked` item to `todo` or `in_review`",
             item.id, item.status
         )));
     }
@@ -678,23 +678,49 @@ pub(super) fn unblock(conn: &Connection, pending: &mut PendingEvents, ctx: &Verb
     }
     ctx.refuse_live_work(conn, verb)?;
     ctx.refuse_repeat(conn, verb, "")?;
-    let rows = crate::task_status_audit::execute(
-        conn,
-        "progression_unblock",
-        PROGRESSION,
-        "UPDATE tasks
-         SET status = 'todo', blocked_reason = NULL, blocked_detail = NULL, blocked_attempt_id = NULL,
-             last_status_actor = ?3, updated_at = ?2
-         WHERE id = ?1 AND status = 'blocked' AND deleted_at IS NULL",
-        params![item.id, now_string(), PROGRESSION],
-    )?;
-    if rows == 0 {
-        return Err(precondition(format!(
-            "{} changed underneath the unblock; nothing was written",
-            item.id
-        )));
+    // A primary item that already owns a bound PR cannot rest in `todo`:
+    // `insert_fresh` skips minting and an explicit start bails with "use a
+    // revision". The dependency helper already picks `in_review` vs `todo`
+    // and reconciles a waiting execution; a cleared-reason unblock does the
+    // same rest-state pick so the item is not stranded.
+    if item.blocked_reason.as_deref() == Some("dependency") {
+        let lifted = crate::dep_helpers::maybe_engine_unblock_dependent_as_actor(
+            pending,
+            conn,
+            &item.id,
+            &now_string(),
+            PROGRESSION,
+        )?;
+        if !lifted {
+            return Err(precondition(format!(
+                "{} changed underneath the unblock; nothing was written",
+                item.id
+            )));
+        }
+    } else {
+        let rest = if crate::dispatch_admission::primary_pr_awaits_review(conn, &item.id)? {
+            "in_review"
+        } else {
+            "todo"
+        };
+        let rows = crate::task_status_audit::execute(
+            conn,
+            "progression_unblock",
+            PROGRESSION,
+            "UPDATE tasks
+             SET status = ?4, blocked_reason = NULL, blocked_detail = NULL, blocked_attempt_id = NULL,
+                 last_status_actor = ?3, updated_at = ?2
+             WHERE id = ?1 AND status = 'blocked' AND deleted_at IS NULL",
+            params![item.id, now_string(), PROGRESSION, rest],
+        )?;
+        if rows == 0 {
+            return Err(precondition(format!(
+                "{} changed underneath the unblock; nothing was written",
+                item.id
+            )));
+        }
+        stage_task_board_change(pending, conn, &item.id)?;
     }
-    stage_task_board_change(pending, conn, &item.id)?;
     Ok(Applied {
         subject: String::new(),
         result_ref: Some(item.id.clone()),

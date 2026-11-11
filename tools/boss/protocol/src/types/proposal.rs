@@ -60,7 +60,8 @@ pub enum ProposalKind {
     ClearSignal,
     /// Archive a dead revision of the item's chain.
     ArchiveRevision,
-    /// Move the item `blocked -> todo` once its block reason is cleared.
+    /// Move the item `blocked -> todo` (or `in_review` when it already owns a
+    /// bound PR) once its block reason is cleared.
     Unblock,
 }
 
@@ -656,7 +657,8 @@ pub struct ArchiveRevisionProposalPayload {
 }
 
 /// Payload for [`ProposalKind::Unblock`]. It carries nothing: the verb names
-/// the stuck item and moves it `blocked -> todo`.
+/// the stuck item and moves it `blocked -> todo`, or `in_review` when the item
+/// already owns a bound PR.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UnblockProposalPayload {}
 

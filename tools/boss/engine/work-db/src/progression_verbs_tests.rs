@@ -649,8 +649,28 @@ fn redispatch_is_bounded_across_fingerprints_until_a_work_run_completes() {
     assert!(bound.contains("redispatch bound") && bound.contains(&first), "{bound}");
     assert_eq!(fx.actions(&item).len(), 1, "a refusal records nothing");
 
-    // Parking and un-parking, a progression run ending, and a different stuck kind
-    // do not reset it; the bound is per stuck kind.
+    // Parking and un-parking, and a progression run ending, do not reset the
+    // bound (design 2.5). A further redispatch under a new fingerprint of the
+    // same stuck kind is still refused.
+    fx.db
+        .park_work_item_as_actor(&item, true, Some("not now"), "human")
+        .unwrap();
+    fx.db.park_work_item_as_actor(&item, false, None, "human").unwrap();
+    done(
+        &fx,
+        &second,
+        json!({"outcome": "delivered", "summary": "Looked; bound still spent."}),
+        "end-second",
+    );
+    fx.db.finish_progression_declared(&second).unwrap().expect("finished");
+    let after_end = fx.run(&item, "fp-2b", STUCK);
+    let still_bound = fx.refused(&after_end, ProposalKind::Redispatch, json!({}));
+    assert!(
+        still_bound.contains("redispatch bound") && still_bound.contains(&first),
+        "{still_bound}"
+    );
+
+    // A different stuck kind has its own bound; that is not a reset of this one.
     let other_kind = fx.run(&item, "fp-3", "S2_churn_guard");
     fx.sql(&format!(
         "UPDATE tasks SET dispatch_failed_reason = 'churn_guard', status = 'todo', blocked_reason = NULL WHERE id = '{item}'"
@@ -905,6 +925,43 @@ fn unblock_moves_a_blocked_item_to_todo_once_nothing_holds_it() {
     assert_eq!(task.blocked_reason, None);
     assert_eq!(fx.actor(&item), LAST_STATUS_ACTOR_PROGRESSION);
     assert!(fx.refused(&run, ProposalKind::Unblock, json!({})).contains("is `todo`"));
+}
+
+#[test]
+fn unblock_returns_a_pr_bound_item_to_in_review_when_its_dependency_block_is_stale() {
+    let fx = fx();
+    let item = fx.pr_item("Stale dep on a reviewed PR", "success");
+    fx.sql(&format!(
+        "UPDATE tasks SET status = 'blocked', blocked_reason = 'dependency' WHERE id = '{item}'"
+    ));
+    let run = fx.run(&item, FINGERPRINT, "S4_dependency");
+
+    fx.applied(&run, ProposalKind::Unblock, json!({}));
+
+    let task = fx.task(&item);
+    assert_eq!(task.status, TaskStatus::InReview);
+    assert_eq!(task.blocked_reason, None);
+    assert_eq!(fx.actor(&item), LAST_STATUS_ACTOR_PROGRESSION);
+    assert!(
+        fx.executions(&item).is_empty(),
+        "a bound PR must not mint a fresh implementation"
+    );
+}
+
+#[test]
+fn unblock_returns_a_pr_bound_item_to_in_review_when_the_block_reason_is_already_cleared() {
+    let fx = fx();
+    let item = fx.pr_item("Cleared block on a reviewed PR", "success");
+    fx.sql(&format!(
+        "UPDATE tasks SET status = 'blocked', blocked_reason = NULL, last_status_actor = 'engine' WHERE id = '{item}'"
+    ));
+    let run = fx.run(&item, FINGERPRINT, STUCK);
+
+    fx.applied(&run, ProposalKind::Unblock, json!({}));
+
+    let task = fx.task(&item);
+    assert_eq!(task.status, TaskStatus::InReview);
+    assert_eq!(task.blocked_reason, None);
 }
 
 #[test]

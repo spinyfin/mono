@@ -53,8 +53,8 @@ pub fn render_progression_claude_md(scratch_dir: &str, boss: &str) -> String {
      - `{boss} propose clear-signal --reason <merge_conflict|ci_failure|ci_failure_exhausted>`:\n\
        clear a block whose PR probe is already clear.\n\
      - `{boss} propose archive-revision <id> --reason '<why>'`: retire a dead revision.\n\
-     - `{boss} propose unblock`: move the item `blocked` to `todo` once nothing holds it.\n\
-     - `{boss} propose followup-task`: a non-blocking follow-up.\n\
+     - `{boss} propose unblock`: move the item `blocked` to `todo`, or `in_review` when it already owns a bound PR, once nothing holds it.\n\
+     - `{boss} propose followup-task --name '<name>' --description '<text>' --rationale '<why>'`: a non-blocking follow-up.\n\
      \n\
      You cannot write files, so pass text inline in single quotes. A long brief\n\
      can be piped as a heredoc to `--brief-file /dev/stdin`.\n\
@@ -150,9 +150,12 @@ mod tests {
         assert!(md.contains("`no disposition`"));
         assert!(md.contains("--criterion 1|2|3|4"));
         assert!(md.contains("A bare `blocked` is refused"));
-        // `done` is enabled for this tier: the old "may be refused, do not retry" carve-out is gone.
+        // `done` is enabled for this tier, so the rules must not tell the agent
+        // its declaration may be refused.
         assert!(!md.contains("may refuse"));
         assert!(md.contains("Do not retry a refused call"));
+        // followup-task takes --description and --rationale, matching the CLI.
+        assert!(md.contains("followup-task --name '<name>' --description '<text>' --rationale '<why>'"));
         // The agent cannot write files, so briefs go inline.
         assert!(md.contains("pass text inline in single quotes"));
     }

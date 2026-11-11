@@ -101,11 +101,14 @@ pub(crate) fn clear_resolved_signal_in_tx(
         // lives on a synthetic merge-queue commit, not the PR head. Head-branch
         // CI is green by construction for those kinds, so treating a clean head
         // probe as "the failure is gone" flip-flops the parent between
-        // `blocked` and `in_review` on every sweep. The historical
-        // `in_review | done` gate on the spawned revision is the evidence that
-        // the queue-side fix actually landed while the PR is still open. Until
-        // that revision comes to rest, refuse — the same outcome the poller
-        // records as `queue_failure_not_cleared_by_head_ci_clean`.
+        // `blocked` and `in_review` on every sweep. The spawned revision is the
+        // evidence that the queue-side fix actually landed while the PR is still
+        // open: `in_review` is the only rest state a revision reaches while the
+        // parent PR is open (requiring `done` would wait on the merge this
+        // resubmit causes; see mono#2673); `archived` means the revision was
+        // withdrawn, not that a fix landed. Until that revision comes to rest,
+        // refuse — the same outcome the poller records as
+        // `queue_failure_not_cleared_by_head_ci_clean`.
         let concluded = attempt
             .as_ref()
             .is_some_and(|a| a.failure_kind.as_deref() == Some("trunk_queue_eviction"))
@@ -185,15 +188,15 @@ pub(crate) fn clear_resolved_signal_in_tx(
     }
     // Ended attempts can also leave behind revisions that are now moot.
     // The sweep covers succeeded and abandoned rows this pass just wrote,
-    // and failed attempts whose revisions were never closed.
-    let prefix = if ci { "ci-fix:%" } else { "merge-conflict:%" };
-    let revisions: Vec<String> = conn
-        .prepare(&format!(
-            "SELECT t.id FROM tasks t JOIN {table} a ON a.revision_task_id = t.id
-         WHERE a.work_item_id = ?1 AND a.status NOT IN ('pending','running') AND t.created_via LIKE ?2"
-        ))?
-        .query_map(params![item, prefix], |row| row.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
+    // and failed attempts whose revisions were never closed. Same query as
+    // the CI/conflict poller's open-revision listing, so the two cannot
+    // diverge on what "open revision of an ended attempt" means.
+    let prefix = if ci {
+        CREATED_VIA_CI_FIX_PREFIX
+    } else {
+        CREATED_VIA_MERGE_CONFLICT_PREFIX
+    };
+    let revisions = crate::conflict_res::open_revisions_of_ended_attempts(conn, table, prefix, "", item)?;
     for id in revisions {
         close_revision(conn, pending, &id, actor)?;
     }

@@ -26,8 +26,8 @@ pub fn render_verb_catalogue(budget: &VerbBudget) -> String {
          - `redispatch [--brief-addendum '<text>']` — explicit start. Clears `churn_guard`, `deliberate_park` (and its attention), and non-operator-No `worker_failed`. Refused with a live execution, `awaiting_operator_answer`, or operator-No `worker_failed`.\n\
          - `clear-signal --reason <r>` — clear a `blocked_reason` whose probe is already clear (for example `merge_conflict` while GitHub reports MERGEABLE). Refused when the probe disagrees.\n\
          - `archive-revision <id> --reason …` — archive a hidden revision of this chain that has no live execution and whose parent PR is green. Never the item itself.\n\
-         - `unblock` — move the item `blocked → todo` after its block reason is cleared. No other status transition.\n\
-         - `followup-task --name … --brief '<text>'` — existing non-blocking follow-up.\n\
+         - `unblock` — move the item `blocked → todo`, or `in_review` when it already owns a bound PR, after its block reason is cleared.\n\
+         - `followup-task --name … --description '<text>' --rationale '<why>'` — existing non-blocking follow-up.\n\
          - `done --outcome blocked --question …` — ask the owner. Required `--criterion`. A bare `blocked` without a question is refused. Ends the run as `asked`.\n\
          - `done --outcome delivered|no-changes-needed --summary …` — end the run as `progressed` or `no_action`. There is no PR to resolve. A run with no declaration fails as `no disposition`.\n\
          \n\
@@ -50,4 +50,33 @@ pub fn render_question_criteria() -> &'static str {
      4. The evidence contradicts itself in a way that changes product behaviour (two dependents want incompatible things; a precursor's purpose no longer matches the item), so any direct action would be a guess.\n\
      \n\
      Do not ask to confirm an action you may take directly. Do not ask \"should I keep trying\" (the engine files that question after two attempts). Do not restate a worker's free-text blocker as a question without first classifying it. `no-changes-needed` is refused for a declared-blocker item: either redispatch with the evidence the blocker is stale, or ask a specific question.\n"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn budget() -> VerbBudget {
+        VerbBudget {
+            create_used: 0,
+            create_max: 2,
+            create_window_secs: 3600,
+            redispatch_remaining: 1,
+        }
+    }
+
+    #[test]
+    fn followup_task_line_names_the_cli_flags() {
+        let catalogue = render_verb_catalogue(&budget());
+        let line = catalogue
+            .lines()
+            .find(|line| line.contains("`followup-task"))
+            .expect("catalogue teaches followup-task");
+        assert!(line.contains("--description"), "{line}");
+        assert!(line.contains("--rationale"), "{line}");
+        assert!(
+            !line.contains("--brief"),
+            "followup-task takes --description, not --brief: {line}"
+        );
+    }
 }
