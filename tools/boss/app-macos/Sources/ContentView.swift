@@ -320,7 +320,6 @@ struct ContentView: View {
 
             ToolbarItemGroup(placement: .primaryAction) {
                 if model.navigationMode == .work {
-                    WorkProjectFilterToolbarButton(model: model)
                     WorkGroupToolbarMenu(model: model)
                     if !useStandardSearch {
                         WorkSearchToolbarItem(
