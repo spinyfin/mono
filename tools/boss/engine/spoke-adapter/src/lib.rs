@@ -927,7 +927,14 @@ impl HostAdapter for SpokeHostAdapter {
             Route::Legacy(legacy) => legacy.cleanup_execution_processes(execution_id, workspace).await,
             Route::Spoke(_) => match self.ctl_stop(execution_id, Duration::ZERO).await? {
                 ControlOutcome::Delivered(_) => Ok(Occupancy::Empty),
-                outcome => anyhow::bail!("owning host could not confirm process cleanup: {outcome:?}"),
+                outcome => {
+                    let reason = format!("{outcome:?}");
+                    // Only unowned processes remain: let the hub bound the wait.
+                    if let Some(unowned) = boss_execution_contracts::UnownedOccupants::from_message(&reason) {
+                        return Err(unowned.into());
+                    }
+                    anyhow::bail!("owning host could not confirm process cleanup: {reason}")
+                }
             },
         }
     }

@@ -36,7 +36,11 @@ impl ExecutionCoordinator {
     /// fresh attention item never fails the successor. Only a kept-lease item
     /// that has stayed open for [`PREDECESSOR_HOLD_BOUND_SECS`] does (the
     /// sweeps have then had many passes), or, for a remote predecessor that
-    /// left no item at all, the same time since it ended. The check is
+    /// left no item at all, the same time since it ended. Either clock runs
+    /// from the later of that start and the successor's first hold, so a
+    /// successor created after the problem was already old still gets the
+    /// full bound. An open `workspace_lease_release_failed` item keeps the
+    /// wait going in every case. The check is
     /// read-only; callers record the failure with [`Self::fail_predecessor_hold`].
     pub(super) fn predecessor_lease_hold(&self, execution: &WorkExecution) -> Option<PredecessorHold> {
         match self.work_db.recovery_predecessor_holding_lease(execution) {
@@ -51,24 +55,38 @@ impl ExecutionCoordinator {
                     return Some(PredecessorHold::Waiting(detail));
                 }
                 let now = boss_engine_utils::epoch_time::now_epoch_secs();
+                // The bound runs from the later of the problem's own start and
+                // the moment this successor first began waiting on it, so a
+                // successor created after the problem was already old gets the
+                // sweeps' full bound under the current cleanup code rather
+                // than failing on its first check.
+                let waiting_since = (execution.dispatch_wait_reason.as_deref()
+                    == Some(DISPATCH_WAIT_REASON_AWAITING_PREDECESSOR_PRESERVATION))
+                .then(|| execution.dispatch_wait_since.as_deref()?.parse::<i64>().ok())
+                .flatten();
                 let older_than_bound = |epoch: Option<i64>| {
-                    epoch.is_some_and(|epoch| now.saturating_sub(epoch) >= PREDECESSOR_HOLD_BOUND_SECS)
+                    epoch.zip(waiting_since).is_some_and(|(epoch, since)| {
+                        now.saturating_sub(epoch.max(since)) >= PREDECESSOR_HOLD_BOUND_SECS
+                    })
                 };
                 // `workspace_lease_release_failed` is retried by the sweeps by
-                // design and never fails a successor. A kept-lease item counts
-                // from when it was first filed, so a predecessor orphaned long
-                // before the engine could sweep it is not failed unswept.
-                let kept = self
-                    .work_db
-                    .list_attention_items(&predecessor.id)
-                    .ok()
-                    .and_then(|items| {
-                        items.into_iter().find(|item| {
-                            item.status == "open"
-                                && item.kind
-                                    == boss_engine_storage_values::attention_kinds::LEASE_UNRELEASED_ATTENTION_KIND
-                        })
-                    });
+                // design and never fails a successor: while one is open the
+                // predecessor's cleanup is still being retried, so the
+                // missing-evidence fallback below must not fire either. A
+                // kept-lease item counts from when it was first filed.
+                let items = self.work_db.list_attention_items(&predecessor.id).ok();
+                let open_of_kind = |kind: &str| {
+                    items
+                        .iter()
+                        .flatten()
+                        .find(|item| item.status == "open" && item.kind == kind)
+                };
+                if open_of_kind(boss_engine_storage_values::attention_kinds::LEASE_RELEASE_FAILED_ATTENTION_KIND)
+                    .is_some()
+                {
+                    return Some(PredecessorHold::Waiting(detail));
+                }
+                let kept = open_of_kind(boss_engine_storage_values::attention_kinds::LEASE_UNRELEASED_ATTENTION_KIND);
                 // A remote predecessor can leave no item at all (its worker pid
                 // was never recorded, or the host was never probed). Nothing
                 // would ever end that wait, so it is bounded by how long ago
@@ -78,7 +96,7 @@ impl ExecutionCoordinator {
                     Ok(Some(host)) if host != "local"
                 );
                 let evidence = match kept {
-                    Some(item) if older_than_bound(item.created_at.parse::<i64>().ok()) => item.body_markdown,
+                    Some(item) if older_than_bound(item.created_at.parse::<i64>().ok()) => item.body_markdown.clone(),
                     None if remote && older_than_bound(predecessor.finished_epoch()) => {
                         "No cleanup result was recorded for its remote worker".to_owned()
                     }
@@ -95,7 +113,8 @@ impl ExecutionCoordinator {
     }
 
     /// Terminalize a row whose predecessor hold outlasted its bound. Never
-    /// stamps the hold wait reason: the row is no longer waiting.
+    /// stamps the hold wait reason, and the terminalizing transaction clears
+    /// any reason recorded while it waited: the row is no longer waiting.
     pub(super) fn fail_predecessor_hold(&self, execution: &WorkExecution, error: &str) {
         if let Err(err) = self
             .work_db

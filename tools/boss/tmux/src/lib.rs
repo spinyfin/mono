@@ -786,10 +786,20 @@ impl Tmux {
     pub async fn verify_workspace_quiescent(&self, workspace: &Path) -> Result<()> {
         if self.runner.manages_host_processes() {
             let result = boss_worker_processes::cleanup("BOSS_RUN_ID", "", &workspace.to_string_lossy()).await?;
+            // Unowned-only occupants are worded as the hub's
+            // `UnownedOccupants` report so it can apply its bounded release
+            // across the stop result; any owned or unreadable occupant keeps
+            // the plain message and the lease.
+            anyhow::ensure!(
+                !result.stray_only(),
+                "unowned workspace occupants {:?}",
+                result.occupants
+            );
             anyhow::ensure!(
                 result.empty(),
-                "workspace occupants {:?}; unreadable processes {:?}",
+                "workspace occupants {:?} (owners {:?}); unreadable processes {:?}",
                 result.occupants,
+                result.owners,
                 result.unknown
             );
         }

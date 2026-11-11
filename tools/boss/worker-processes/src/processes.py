@@ -87,12 +87,26 @@ def install(source):
     if original_bash_env:
         original = shlex.quote(original_bash_env)
         bash_env += f'if [ -r {original} ]; then . {original}; fi\n'
-    # Hand startup back to the user's own zsh files: restore ZDOTDIR before zsh
-    # looks for .zprofile/.zshrc/.zlogin, then run the user's .zshenv.
+    # zsh re-reads ZDOTDIR before every startup file, so ZDOTDIR stays on this
+    # hook directory for the whole session: a zsh launched from the shell
+    # (including a detached one that outlives it) reads the hook's .zshenv and
+    # registers too. Each user file is sourced with ZDOTDIR handed back to the
+    # caller's value, so it runs in its original context, then the hook
+    # directory is put back.
+    hook = shlex.quote(str(root))
+    original = f'export ZDOTDIR={shlex.quote(original_zdotdir)}\n' if original_zdotdir else 'unset ZDOTDIR\n'
+    def user_file(name):
+        return (original + f'if [ -r "${{ZDOTDIR:-$HOME}}/{name}" ]; then . "${{ZDOTDIR:-$HOME}}/{name}"; fi\n'
+                + f'export ZDOTDIR={hook}\n')
+    # System startup files run before the user's own and derive the history
+    # file from ZDOTDIR, so pin it to the user's directory first.
+    user_dir = shlex.quote(original_zdotdir) if original_zdotdir else '"$HOME"'
     zshenv = register_line
-    zshenv += f'ZDOTDIR={shlex.quote(original_zdotdir)}\n' if original_zdotdir else 'unset ZDOTDIR\n'
-    zshenv += 'if [ -r "${ZDOTDIR:-$HOME}/.zshenv" ]; then . "${ZDOTDIR:-$HOME}/.zshenv"; fi\n'
-    for name, startup in (("bash-env", bash_env), (".zshenv", zshenv)):
+    zshenv += f'if [ -z "$HISTFILE" ]; then HISTFILE={user_dir}/.zsh_history; fi\n'
+    zshenv += user_file(".zshenv")
+    startups = [("bash-env", bash_env), (".zshenv", zshenv)]
+    startups += [(name, user_file(name)) for name in (".zprofile", ".zshrc", ".zlogin", ".zlogout")]
+    for name, startup in startups:
         with tempfile.NamedTemporaryFile(mode="w", dir=root, delete=False) as output:
             output.write(startup)
         os.replace(output.name, root / name)

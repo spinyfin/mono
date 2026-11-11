@@ -362,3 +362,48 @@ async fn remote_run_without_a_recorded_pid_keeps_the_lease_and_raises_attention(
     assert!(adapter.cleanups.lock().unwrap().is_empty());
     assert!(lease_attention(&db, &id)[0].contains("process id was never recorded"));
 }
+
+#[test]
+fn unowned_remote_occupants_are_released_only_after_the_bound_and_owned_ones_never() {
+    use crate::workspace_lease_release::{Occupancy, UNOWNED_OCCUPANT_BOUND_SECS, bound_unowned_occupants};
+    let (_dir, db, id) = remote_fixture();
+    let set_finished_ago = |secs: i64| {
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET finished_at = ?2 WHERE id = ?1",
+                rusqlite::params![id, (boss_engine_utils::epoch_time::now_epoch_secs() - secs).to_string()],
+            )
+            .unwrap();
+        db.get_execution(&id).unwrap()
+    };
+    let unowned =
+        || -> Result<Occupancy> { Err(boss_execution_contracts::UnownedOccupants { occupants: vec![7] }.into()) };
+
+    let fresh = set_finished_ago(5);
+    assert!(
+        bound_unowned_occupants(&db, &fresh, unowned()).is_err(),
+        "inside the bound"
+    );
+
+    let settled = set_finished_ago(UNOWNED_OCCUPANT_BOUND_SECS + 5);
+    assert_eq!(
+        bound_unowned_occupants(&db, &settled, unowned()).unwrap(),
+        Occupancy::Empty
+    );
+    assert!(
+        db.list_attention_items(&id)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind
+                == boss_engine_storage_values::attention_kinds::UNOWNED_OCCUPANTS_RELEASED_ATTENTION_KIND),
+        "the release is loud"
+    );
+    let owned: Result<Occupancy> = Err(anyhow::anyhow!(
+        "workspace occupants [7] (owners {{\"exec_live\": [7]}})"
+    ));
+    assert!(
+        bound_unowned_occupants(&db, &settled, owned).is_err(),
+        "owned occupants keep the lease"
+    );
+}

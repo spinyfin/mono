@@ -76,6 +76,14 @@ impl Cleanup {
         self.remaining.is_empty() && self.occupants.is_empty() && self.unknown.is_empty()
     }
 
+    /// Only unowned processes remain in the workspace: none survived
+    /// signalling, none has an unreadable identity and none carries any run's
+    /// identity, live or terminal. An owned occupant is never "stray", so a
+    /// running run's processes can never be mistaken for abandoned ones.
+    pub fn stray_only(&self) -> bool {
+        self.remaining.is_empty() && self.unknown.is_empty() && self.owners.is_empty() && !self.occupants.is_empty()
+    }
+
     pub fn report(&self, owner: &str) {
         tracing::info!(owner, ?self.terminated, ?self.killed, ?self.remaining,
             ?self.occupants, ?self.unknown, self.elapsed_ms, "worker process cleanup");
@@ -213,8 +221,37 @@ class OwnershipTests(unittest.TestCase):
                 capture_output=True, text=True, stdin=subprocess.DEVNULL,
                 env={**base, **hooks, "HOME": home, "BOSS_RUN_ID": "zsh-run"})
             pid, *seen = result.stdout.split()
-            self.assertEqual(seen, ["zshenv", "zprofile", "zshrc", "unset"], result.stderr)
+            self.assertEqual(seen[:3], ["zshenv", "zprofile", "zshrc"], result.stderr)
+            self.assertEqual(seen[3], hooks["ZDOTDIR"], "the hook stays installed for nested shells")
             self.assertTrue((registry() / f"{pid}.json").exists())
+
+    def test_nested_detached_zsh_registers_and_is_cleaned_up(self):
+        if not Path("/bin/zsh").exists():
+            self.skipTest("zsh unavailable")
+        owner = str(uuid.uuid4())
+        with tempfile.TemporaryDirectory() as home:
+            Path(home, ".zprofile").write_text("export BOSS_TEST_PROFILE=zprofile\n")
+            marker = Path(home, "child.pid")
+            base = {key: value for key, value in os.environ.items() if key not in ("ZDOTDIR", "BASH_ENV")}
+            hooks = install(SOURCE)
+            # The child outlives its registered parent, which exits at once.
+            command = f'/bin/zsh -c \'echo $$ > {marker}; sleep 60\' >/dev/null 2>&1 </dev/null & sleep 1'
+            result = subprocess.run(
+                ["/bin/zsh", "-l", "-i", "-c", command],
+                capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                env={**base, **hooks, "HOME": home, "BOSS_RUN_ID": owner})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            pid = int(marker.read_text())
+            try:
+                self.assertTrue((registry() / f"{pid}.json").exists(), "the nested zsh registered itself")
+                cleaned = run("BOSS_RUN_ID", owner, "")
+                self.assertIn(pid, cleaned["terminated"] + cleaned["killed"])
+                self.assertEqual(cleaned["remaining"], [])
+            finally:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     def test_reused_pid_without_the_identity_is_not_the_shell(self):
         owner = str(uuid.uuid4())

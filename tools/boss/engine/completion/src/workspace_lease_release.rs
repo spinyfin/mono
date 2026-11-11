@@ -687,6 +687,59 @@ pub fn resolve_unreleased_attention(db: &WorkDb, execution_id: &str) {
     }
 }
 
+/// How long after a run ended unowned occupants may keep its lease. Owned
+/// processes are TERM/KILLed within one cleanup pass (grace 5 s, measured at
+/// tens of milliseconds for a TERM-able child) and the sweep retries every
+/// minute, so a process that survives ten sweeps is not a registration race: it
+/// has no owner that will ever claim it.
+pub const UNOWNED_OCCUPANT_BOUND_SECS: i64 = 10 * 60;
+
+/// The run ended at least `secs` ago. A row with no end time is never settled.
+pub fn settled_for(execution: &WorkExecution, secs: i64) -> bool {
+    execution.finished_epoch().is_some_and(|finished| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .is_ok_and(|now| i64::try_from(now.as_secs()).is_ok_and(|now| now - finished >= secs))
+    })
+}
+
+/// Apply the bounded release for unowned occupants to an owning host's cleanup
+/// report. `result` is what the host adapter returned: when it failed only
+/// because unowned processes remain (see [`boss_execution_contracts::UnownedOccupants`])
+/// and the run ended more than [`UNOWNED_OCCUPANT_BOUND_SECS`] ago, the lease
+/// is returned loudly instead of pinned forever. Any other error, and any
+/// owned or unreadable occupant, passes through unchanged and keeps the lease.
+pub fn bound_unowned_occupants(db: &WorkDb, execution: &WorkExecution, result: Result<Occupancy>) -> Result<Occupancy> {
+    let Err(err) = result else { return result };
+    let Some(unowned) = err
+        .downcast_ref::<boss_execution_contracts::UnownedOccupants>()
+        .cloned()
+        .or_else(|| boss_execution_contracts::UnownedOccupants::from_message(&format!("{err:#}")))
+    else {
+        return Err(err);
+    };
+    if !settled_for(execution, UNOWNED_OCCUPANT_BOUND_SECS) {
+        return Err(err);
+    }
+    let workspace = execution.workspace_path.as_deref().unwrap_or("(unrecorded)");
+    tracing::error!(
+        execution_id = %execution.id,
+        occupants = ?unowned.occupants,
+        "releasing remote workspace lease with unowned processes still in it"
+    );
+    raise_attention(
+        db,
+        execution,
+        boss_engine_storage_values::attention_kinds::UNOWNED_OCCUPANTS_RELEASED_ATTENTION_KIND,
+        "Workspace lease released with unowned processes inside",
+        &format!(
+            "Processes {:?} were still running in {workspace} more than {UNOWNED_OCCUPANT_BOUND_SECS} seconds after this run ended. No run claims them, so the engine did not signal them, and the lease was returned rather than held indefinitely. Inspect them on the owning host and stop them if they are stale.",
+            unowned.occupants
+        ),
+    );
+    Ok(Occupancy::Empty)
+}
+
 /// Release a remote worker's lease through the claimed release policy, for
 /// every path that releases on the strength of a recorded pid or a finished
 /// turn rather than a confirmed stop. The owning host first stops the
@@ -711,10 +764,13 @@ pub async fn release_remote_lease<Fut: std::future::Future<Output = anyhow::Resu
         return LeaseReleaseOutcome::NoLease;
     };
     let occupancy = match execution.workspace_path.as_deref() {
-        Some(path) if pane == PaneStatus::Gone => host
-            .cleanup_execution_processes(execution_id, std::path::Path::new(path))
-            .await
-            .unwrap_or_else(|err| {
+        Some(path) if pane == PaneStatus::Gone => bound_unowned_occupants(
+            work_db,
+            &execution,
+            host.cleanup_execution_processes(execution_id, std::path::Path::new(path))
+                .await,
+        )
+        .unwrap_or_else(|err| {
                 raise_attention(work_db, &execution, LEASE_UNRELEASED_ATTENTION_KIND,
                     "Remote workspace recovery needs process cleanup", &format!("Lease {lease_id} on {}: {err:#}. Inspect the named processes or restore host connectivity, then retry recovery.", host.host_id()));
                 tracing::debug!(

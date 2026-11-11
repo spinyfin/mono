@@ -1732,7 +1732,9 @@ impl WorkDb {
             "UPDATE work_executions
              SET status = 'failed',
                  cube_repo_id = COALESCE(?2, cube_repo_id),
-                 finished_at = ?3
+                 finished_at = ?3,
+                 dispatch_wait_reason = NULL,
+                 dispatch_wait_since = NULL
              WHERE id = ?1",
             params![execution_id, cube_repo_id, now],
         )?;

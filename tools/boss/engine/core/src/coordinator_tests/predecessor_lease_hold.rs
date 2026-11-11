@@ -567,6 +567,11 @@ async fn inline_reconcile_fails_loudly_when_preservation_cannot_proceed_then_all
         .unwrap_err();
     assert!(format!("{err:#}").contains("Recovery cannot start"), "{err:#}");
     assert_eq!(s.db().get_execution(&next.id).unwrap().status, ExecutionStatus::Failed);
+    assert_eq!(
+        s.wait_reason(&next.id),
+        None,
+        "a successor that waited and then failed through force-dispatch keeps no wait reason"
+    );
     let next = s
         .db()
         .create_execution(
@@ -578,12 +583,18 @@ async fn inline_reconcile_fails_loudly_when_preservation_cannot_proceed_then_all
                 .build(),
         )
         .unwrap();
+    // A successor created after the problem was already old has not yet had
+    // the sweeps' full bound under its own clock: it waits before it can fail.
+    s.coordinator.drain_ready_queue_for_test().await;
+    assert_eq!(s.db().get_execution(&next.id).unwrap().status, ExecutionStatus::Ready);
+    assert_eq!(s.wait_reason(&next.id).as_deref(), Some(HOLD_REASON));
+    age_waits(&s);
     s.coordinator.drain_ready_queue_for_test().await;
     assert_eq!(s.db().get_execution(&next.id).unwrap().status, ExecutionStatus::Failed);
     assert_eq!(
         s.wait_reason(&next.id),
         None,
-        "a row that failed is not also stamped as waiting"
+        "a row that waited and then failed through the scheduler keeps no wait reason"
     );
 
     s.db()
@@ -615,17 +626,33 @@ async fn inline_reconcile_fails_loudly_when_preservation_cannot_proceed_then_all
 /// kept-lease attention item look like it was filed then.
 fn age_predecessor(s: &Stalled) {
     let hour_ago = (boss_engine_utils::epoch_time::now_epoch_secs() - 3600).to_string();
-    let conn = s.db().connect().unwrap();
-    conn.execute(
-        "UPDATE work_executions SET finished_at = ?2 WHERE id = ?1",
-        rusqlite::params![s.stalled_id, hour_ago],
-    )
-    .unwrap();
-    conn.execute(
-        "UPDATE work_attention_items SET created_at = ?2 WHERE execution_id = ?1",
-        rusqlite::params![s.stalled_id, hour_ago],
-    )
-    .unwrap();
+    {
+        let conn = s.db().connect().unwrap();
+        conn.execute(
+            "UPDATE work_executions SET finished_at = ?2 WHERE id = ?1",
+            rusqlite::params![s.stalled_id, hour_ago],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE work_attention_items SET created_at = ?2 WHERE execution_id = ?1",
+            rusqlite::params![s.stalled_id, hour_ago],
+        )
+        .unwrap();
+    }
+    age_waits(s);
+}
+
+/// Make every successor's hold look like it began an hour ago.
+fn age_waits(s: &Stalled) {
+    let hour_ago = (boss_engine_utils::epoch_time::now_epoch_secs() - 3600).to_string();
+    s.db()
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET dispatch_wait_since = ?1 WHERE dispatch_wait_reason IS NOT NULL",
+            [&hour_ago],
+        )
+        .unwrap();
 }
 
 #[tokio::test]
@@ -661,11 +688,44 @@ async fn terminal_remote_predecessor_with_no_cleanup_item_fails_the_successor_af
             [&s.stalled_id],
         )
         .unwrap();
+    // The remote evidence is old, but this successor's own hold only just began.
+    s.coordinator.drain_ready_queue_for_test().await;
+    assert_eq!(
+        s.db().get_execution(&successor.id).unwrap().status,
+        ExecutionStatus::Ready
+    );
+
+    // A retryable release failure is still being worked on: it keeps the
+    // successor waiting however old the remote evidence and its hold are.
+    age_waits(&s);
+    crate::workspace_lease_release::raise_attention(
+        s.db(),
+        &s.stalled(),
+        boss_engine_storage_values::attention_kinds::LEASE_RELEASE_FAILED_ATTENTION_KIND,
+        "Workspace lease release failed",
+        "remote unavailable",
+    );
+    s.coordinator.drain_ready_queue_for_test().await;
+    assert_eq!(
+        s.db().get_execution(&successor.id).unwrap().status,
+        ExecutionStatus::Ready,
+        "an open release failure never fails a successor"
+    );
+    s.db()
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_attention_items SET status = 'resolved' WHERE execution_id = ?1",
+            [&s.stalled_id],
+        )
+        .unwrap();
+
     s.coordinator.drain_ready_queue_for_test().await;
     assert_eq!(
         s.db().get_execution(&successor.id).unwrap().status,
         ExecutionStatus::Failed
     );
+    assert_eq!(s.wait_reason(&successor.id), None);
 }
 
 /// Every run in these tests is local, so no host adapter is ever requested.

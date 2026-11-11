@@ -26,28 +26,6 @@ use boss_engine_storage_values::attention_kinds::UNOWNED_OCCUPANTS_RELEASED_ATTE
 /// previous engine process return to the pool without waiting a day.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 
-/// How long after a run ended unowned occupants may keep its lease. Owned
-/// processes are TERM/KILLed within one cleanup pass (grace 5 s, measured at
-/// tens of milliseconds for a TERM-able child) and the sweep retries every
-/// [`DEFAULT_INTERVAL`], so a process that survives ten sweeps is not a
-/// registration race: it has no owner that will ever claim it.
-pub const UNOWNED_OCCUPANT_BOUND_SECS: i64 = 10 * 60;
-
-/// Only unowned processes inside the workspace remain: none survived signalling
-/// and none had an unreadable identity.
-fn stray_only(result: &boss_worker_processes::Cleanup) -> bool {
-    result.remaining.is_empty() && result.unknown.is_empty() && !result.occupants.is_empty()
-}
-
-/// The run ended at least `secs` ago. A row with no end time is never settled.
-fn settled_for(execution: &WorkExecution, secs: i64) -> bool {
-    execution.finished_epoch().is_some_and(|finished| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .is_ok_and(|now| i64::try_from(now.as_secs()).is_ok_and(|now| now - finished >= secs))
-    })
-}
-
 /// Scan local processes for a cwd inside the workspace.
 pub struct HostOccupancy;
 
@@ -85,7 +63,7 @@ impl WorkspaceOccupancy for HostOccupancy {
             if !result.owners.is_empty() {
                 result = boss_worker_processes::cleanup("BOSS_RUN_ID", "", workspace).await?;
             }
-            if stray_only(&result) && settled_for(execution, UNOWNED_OCCUPANT_BOUND_SECS) {
+            if result.stray_only() && settled_for(execution, UNOWNED_OCCUPANT_BOUND_SECS) {
                 // Nothing in the registry owns these and they are not safe to
                 // signal. Holding the lease forever strands a 10-20 GiB
                 // workspace, so return it loudly, naming the PIDs.
@@ -108,8 +86,9 @@ impl WorkspaceOccupancy for HostOccupancy {
             }
             anyhow::ensure!(
                 result.empty(),
-                "workspace occupants {:?}; unreadable processes {:?}",
+                "workspace occupants {:?} (owners {:?}); unreadable processes {:?}",
                 result.occupants,
+                result.owners,
                 result.unknown
             );
             Ok(Occupancy::Empty)

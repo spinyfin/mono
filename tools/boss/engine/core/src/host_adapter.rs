@@ -574,10 +574,6 @@ impl SshHostAdapter {
     }
 }
 
-/// Map a remote Bazel-marker `test -f A -o -f B -o -f C` result onto the
-/// composer's tri-state. `test` exits 0 (found) or 1 (not found); any
-/// other status means the markers were never evaluated (ssh 255, shell
-/// 126/127, signal termination).
 /// Interpret the owning host's cleanup report: only a report with no surviving
 /// owned process, no unowned occupant and no unreadable process proves the
 /// workspace empty.
@@ -585,6 +581,12 @@ fn occupancy_from_cleanup(execution_id: &str, output: &SshOutput) -> Result<crat
     anyhow::ensure!(output.success(), "remote process cleanup failed: {}", output.stderr);
     let result: boss_worker_processes::Cleanup = serde_json::from_str(&output.stdout)?;
     result.report(execution_id);
+    if result.stray_only() {
+        return Err(boss_execution_contracts::UnownedOccupants {
+            occupants: result.occupants,
+        }
+        .into());
+    }
     anyhow::ensure!(
         result.empty(),
         "remote workspace occupants {:?}; surviving owned processes {:?}; unreadable processes {:?}",
@@ -595,6 +597,10 @@ fn occupancy_from_cleanup(execution_id: &str, output: &SshOutput) -> Result<crat
     Ok(crate::workspace_lease_release::Occupancy::Empty)
 }
 
+/// Map a remote Bazel-marker `test -f A -o -f B -o -f C` result onto the
+/// composer's tri-state. `test` exits 0 (found) or 1 (not found); any
+/// other status means the markers were never evaluated (ssh 255, shell
+/// 126/127, signal termination).
 pub(crate) fn map_remote_bazel_probe_output(result: Result<SshOutput>, host_id: &str) -> Option<bool> {
     match result {
         Ok(out) if out.status == 0 => Some(true),
@@ -2180,6 +2186,34 @@ mod tests {
             let error = occupancy_from_cleanup("exec", &report).unwrap_err();
             assert!(format!("{error:#}").contains(label), "{field}: {error:#}");
         }
+    }
+
+    #[test]
+    fn remote_cleanup_report_with_only_unowned_occupants_is_typed_and_owned_ones_are_not() {
+        let mut stray = cleanup_report("");
+        stray.stdout = stray.stdout.replace("\"occupants\":[]", "\"occupants\":[7]");
+        let error = occupancy_from_cleanup("exec", &stray).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<boss_execution_contracts::UnownedOccupants>(),
+            Some(&boss_execution_contracts::UnownedOccupants { occupants: vec![7] })
+        );
+        let mut owned = stray.stdout.clone();
+        owned = owned.replace("\"owners\":{}", "\"owners\":{\"exec_live\":[7]}");
+        let error = occupancy_from_cleanup(
+            "exec",
+            &SshOutput {
+                status: 0,
+                stdout: owned,
+                stderr: String::new(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<boss_execution_contracts::UnownedOccupants>()
+                .is_none(),
+            "{error:#}"
+        );
     }
 
     #[test]

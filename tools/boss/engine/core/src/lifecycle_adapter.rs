@@ -123,10 +123,14 @@ impl LifecycleServices for CoreLifecycleServices {
         } else {
             remote_occupancy =
                 crate::workspace_lease_release::OwningHostOccupancy(match execution.workspace_path.as_deref() {
-                    Some(path) => adapter
-                        .cleanup_execution_processes(&execution.id, std::path::Path::new(path))
-                        .await
-                        .unwrap_or_else(|err| {
+                    Some(path) => crate::workspace_lease_release::bound_unowned_occupants(
+                        &self.work_db,
+                        execution,
+                        adapter
+                            .cleanup_execution_processes(&execution.id, std::path::Path::new(path))
+                            .await,
+                    )
+                    .unwrap_or_else(|err| {
                             tracing::error!(execution_id = %execution.id, host_id = adapter.host_id(), error = %err, "remote process cleanup failed before workspace release");
                             crate::workspace_lease_release::Occupancy::Unknown
                         }),

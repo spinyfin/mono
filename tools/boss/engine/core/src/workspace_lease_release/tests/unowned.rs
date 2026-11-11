@@ -148,3 +148,38 @@ async fn reused_shell_pid_does_not_protect_an_old_owners_orphans() {
     );
     assert!(orphan.wait().is_ok(), "the old owner's detached process was stopped");
 }
+
+#[tokio::test]
+async fn a_running_runs_process_keeps_the_lease_past_the_unowned_bound() {
+    let (_dir, db) = open_db();
+    let workspace = tempfile::TempDir::new().unwrap();
+    let current = orphaned(&db, workspace.path(), "lease-current");
+
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "live-owner");
+    let live = create_ready_chore_execution(&db, chore.id);
+    db.start_execution_run(&live.id, "worker", "mono", "lease-live", "ws-live", "/tmp/ws-live")
+        .unwrap();
+    let mut owned = spawn_detached(workspace.path(), Some(&live.id));
+
+    set_finished_ago(&db, &current.id, UNOWNED_OCCUPANT_BOUND_SECS + 5);
+    let outcome = release_with_host_occupancy(&db, &current).await;
+    assert!(matches!(outcome, LeaseReleaseOutcome::Kept { .. }), "{outcome:?}");
+    assert_eq!(
+        db.get_execution(&current.id).unwrap().cube_lease_id.as_deref(),
+        Some("lease-current"),
+        "the lease must not be returned while a live run's process is inside"
+    );
+    assert!(
+        owned.try_wait().unwrap().is_none(),
+        "a live run's process is never signalled"
+    );
+    assert!(
+        !db.list_attention_items(&current.id)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == UNOWNED_OCCUPANTS_RELEASED_ATTENTION_KIND)
+    );
+    let _ = owned.kill();
+    let _ = owned.wait();
+}

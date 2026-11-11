@@ -1916,6 +1916,40 @@ pub enum ControlOutcome {
     Delivered(WorkerPane),
 }
 
+/// A workspace's only remaining occupants are processes no run owns: none
+/// carries a run identity, none survived signalling and none was unreadable.
+/// Hosts report this distinctly from an owned or unreadable occupant so the
+/// hub may apply the bounded release for unowned occupants to remote
+/// workspaces as it does to local ones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnownedOccupants {
+    pub occupants: Vec<u32>,
+}
+
+impl UnownedOccupants {
+    const PREFIX: &'static str = "unowned workspace occupants [";
+
+    /// Recover the report from an error message that crossed a process
+    /// boundary (a spoke's stop failure), or `None` for any other message.
+    pub fn from_message(message: &str) -> Option<Self> {
+        let rest = &message[message.find(Self::PREFIX)? + Self::PREFIX.len()..];
+        let list = &rest[..rest.find(']')?];
+        let occupants = list
+            .split(',')
+            .map(|pid| pid.trim().parse().ok())
+            .collect::<Option<Vec<u32>>>()?;
+        (!occupants.is_empty()).then_some(Self { occupants })
+    }
+}
+
+impl std::fmt::Display for UnownedOccupants {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unowned workspace occupants {:?}", self.occupants)
+    }
+}
+
+impl std::error::Error for UnownedOccupants {}
+
 /// A spawn whose outcome is unknown: the host may have started the worker.
 /// The execution keeps its assignment and workspace and a retry reuses the
 /// same command, so nothing starts twice. Coordinators treat it like an
