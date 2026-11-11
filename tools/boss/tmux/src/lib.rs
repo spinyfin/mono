@@ -186,6 +186,18 @@ impl std::fmt::Debug for Tmux {
     }
 }
 
+/// The tmux key name for "press Return" in a pane application's composer.
+///
+/// This is `Enter`, not `C-m`. Boss's tmux server runs with
+/// `extended-keys on`, so once an application requests xterm
+/// modifyOtherKeys mode 2 (`CSI > 4 ; 2 m`), `send-keys C-m` reaches it as
+/// the modified key `ESC [27;5;109~` rather than Return, while `send-keys
+/// Enter` still arrives as `\r` in every mode measured (see
+/// `tools/boss/docs/investigations/ghostty-agy-pane-viability.md`, "The
+/// submit key"). Outside that mode the two are the same byte, so `Enter` is
+/// never worse than `C-m`.
+pub const SUBMIT_KEY: &str = "Enter";
+
 impl Tmux {
     /// Resolves tmux once to a canonical absolute path, scoped to `socket_path`.
     pub fn resolve(socket_path: impl Into<PathBuf>) -> Result<Self> {
@@ -627,7 +639,7 @@ impl Tmux {
         } else {
             self.send_literal_chunks(session, text).await?;
         }
-        self.send_key(session, "C-m").await
+        self.send_submit(session).await
     }
 
     async fn send_literal_chunks(&self, session: &str, text: &str) -> Result<()> {
@@ -658,6 +670,14 @@ impl Tmux {
         let mut args = self.server_args();
         args.extend(["send-keys".into(), "-t".into(), session.into(), key.into()]);
         self.invoke(args).await.map(|_| ())
+    }
+
+    /// Presses the key that submits a pane application's composer.
+    ///
+    /// Sends [`SUBMIT_KEY`], never `C-m`: see that constant for why. Every
+    /// engine path that ends a delivery with Return goes through here.
+    pub async fn send_submit(&self, session: &str) -> Result<()> {
+        self.send_key(session, SUBMIT_KEY).await
     }
 
     /// Captures the visible text of a detached session's pane.

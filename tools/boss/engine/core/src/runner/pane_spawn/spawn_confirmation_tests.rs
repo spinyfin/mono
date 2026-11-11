@@ -282,7 +282,7 @@ async fn spawn_confirmation_fails_a_started_driver_that_never_takes_its_prompt()
     assert!(msg.contains("never started a turn"), "{msg}");
     assert!(msg.contains("Return re-sent 2 time(s)"), "{msg}");
     assert!(msg.contains("failed spawn"), "{msg}");
-    assert_eq!(spawner.sent_keys(), ["C-m", "C-m"]);
+    assert_eq!(spawner.sent_keys(), ["Enter", "Enter"]);
     let run_id = spawner.pending_run_id.lock().unwrap().clone();
     assert!(
         spawner.live_states.has_driver_signal_for_run(&run_id),
@@ -324,7 +324,7 @@ async fn a_late_session_start_does_not_skip_the_prompt_confirmation() {
         .expect_err("a late SessionStart with no turn must not count as a live worker");
     let msg = err.to_string();
     assert!(msg.contains("never started a turn"), "{msg}");
-    assert_eq!(spawner.sent_keys(), ["C-m", "C-m"]);
+    assert_eq!(spawner.sent_keys(), ["Enter", "Enter"]);
     let run_id = spawner.pending_run_id.lock().unwrap().clone();
     assert!(
         spawner.live_states.has_driver_signal_for_run(&run_id),
@@ -428,7 +428,7 @@ async fn spawn_confirmation_resubmits_once_and_passes_when_the_turn_then_starts(
     let (outcome, spawner) =
         confirm_with_an_unsubmitted_prompt(Some(crate::driver::initial_prompt::DELIVERED_MARKER), true).await;
     outcome.expect("a re-sent Return that starts the turn must complete the spawn");
-    assert_eq!(spawner.sent_keys(), ["C-m"]);
+    assert_eq!(spawner.sent_keys(), ["Enter"]);
     assert!(spawner.reaped_run_ids().is_empty());
 }
 
