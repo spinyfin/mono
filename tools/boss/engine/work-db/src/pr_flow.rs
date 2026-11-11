@@ -2560,8 +2560,17 @@ impl WorkDb {
         let mut prerequisite_work_item_id = None;
         let mut touched_work_item_ids = Vec::new();
         let mut dispatch_work_item_id = None;
+        let mut archive_work_item_id = None;
+        let ladder_question = crate::progression_ladder::is_ladder_question(&tx, &question.question.id)?;
         let mismatch_attempt = super::conflict_mismatch::attempt_for_question(&tx, &question.question.id)?;
         match (answer, &question.question.answer_type) {
+            // The engine's own question when progression ran out of attempts.
+            (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. })
+                if ladder_question =>
+            {
+                let effect = crate::progression_ladder::answer_in_tx(&mut pending, &tx, &task, &value, &now)?;
+                archive_work_item_id = effect.archive.then(|| task.id.clone());
+            }
             (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. })
                 if mismatch_attempt.is_some() =>
             {
@@ -2627,47 +2636,18 @@ impl WorkDb {
         let mut updated = query_task(&tx, &task.id).require("task", &task.id)?;
         project_for_work_item_updated(&tx, &mut updated, "answer_operator_question");
         commit_and_publish(tx, pending, &self.event_bus)?;
-        Ok(OperatorAnswerOutcome {
-            item: task_to_item(updated),
-            minted_execution,
-            prerequisite_work_item_id,
-            touched_work_item_ids,
-            dispatch_work_item_id,
-        })
+        Ok(OperatorAnswerOutcome::builder()
+            .item(task_to_item(updated))
+            .minted_execution(minted_execution)
+            .maybe_prerequisite_work_item_id(prerequisite_work_item_id)
+            .touched_work_item_ids(touched_work_item_ids)
+            .maybe_dispatch_work_item_id(dispatch_work_item_id)
+            .maybe_archive_work_item_id(archive_work_item_id)
+            .build())
     }
 }
 
-/// What [`WorkDb::answer_operator_question`] did, for the RPC layer.
-#[derive(Debug)]
-pub struct OperatorAnswerOutcome {
-    /// The answered task as it stands after the answer.
-    pub item: WorkItem,
-    /// See [`WorkDb::answer_operator_question`].
-    pub minted_execution: bool,
-    /// The prerequisite task a Yes created or linked, so the RPC layer can
-    /// invalidate it alongside the answered task.
-    pub prerequisite_work_item_id: Option<String>,
-    /// Other tasks the answer created, changed or retired (a port revision and
-    /// the conflict revision it replaced), so the RPC layer can invalidate them.
-    pub touched_work_item_ids: Vec<String>,
-    /// The task whose ready execution the answer wants dispatched immediately,
-    /// like `bossctl agents launch`: through the global dispatch pause and
-    /// focus mode. Set only where the answer *creates* the work (an
-    /// architectural-mismatch answer), never for an ordinary resume.
-    pub dispatch_work_item_id: Option<String>,
-}
-
-impl OperatorAnswerOutcome {
-    fn unchanged(item: WorkItem) -> Self {
-        Self {
-            item,
-            minted_execution: false,
-            prerequisite_work_item_id: None,
-            touched_work_item_ids: Vec::new(),
-            dispatch_work_item_id: None,
-        }
-    }
-}
+pub use crate::operator_answer_outcome::OperatorAnswerOutcome;
 
 /// Move the answered task back to Todo with `block` appended to its brief and
 /// carry the answer to the next worker. Returns `true` when a ready execution

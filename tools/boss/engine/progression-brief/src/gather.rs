@@ -7,9 +7,7 @@ use boss_protocol::{
 };
 use boss_work_db::{CHURN_GUARD_WINDOW_SECS, ExecutionDiagnosis, ExecutionKind, WorkDb};
 
-use crate::packet::{
-    DeclaredBlocker, Neighbour, PriorProgressionRun, ProgressionBriefPacket, VerbBudget, compute_stuck_fingerprint,
-};
+use crate::packet::{DeclaredBlocker, Neighbour, PriorProgressionRun, ProgressionBriefPacket, VerbBudget};
 
 /// Load the diagnosis packet for `work_item_id`. All reads are stored state;
 /// nothing talks to git or GitHub. A failed read fails the whole gather so the
@@ -109,20 +107,10 @@ pub fn gather_progression_brief(db: &WorkDb, work_item_id: &str) -> Result<Progr
         .collect::<Result<Vec<_>>>()?;
 
     // The fingerprint must not move because a progression run ended: only work
-    // runs count as "something happened since".
-    let latest_terminal = executions
-        .iter()
-        .rev()
-        .filter(|row| row.kind != ExecutionKind::Progression.as_str())
-        .find(|row| is_terminal_status(&row.status))
-        .map(|row| row.id.as_str());
+    // runs count as "something happened since". The escalation ladder compares
+    // runs by this same value, so there is one definition (in work-db).
     let pr_head_sha = snapshot.as_ref().and_then(|row| row.head_sha.clone());
-    let fingerprint = compute_stuck_fingerprint(
-        &stuck_kind,
-        item.blocked_reason.as_deref(),
-        pr_head_sha.as_deref(),
-        latest_terminal,
-    );
+    let fingerprint = db.current_progression_fingerprint(work_item_id, &stuck_kind)?;
 
     let create_budget = db.progression_create_budget(work_item_id)?;
     let budget = VerbBudget {

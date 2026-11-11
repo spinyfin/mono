@@ -42,7 +42,7 @@ pub fn render(report: &StuckReport) -> String {
         for row in rows {
             writeln!(
                 out,
-                "  {}  {}{}s  {}  basis={}{}  {}",
+                "  {}  {}{}s  {}  basis={}{}  {}{}",
                 row.work_item_id,
                 if row.age_is_lower_bound { ">=" } else { "" },
                 row.age_in_state_secs,
@@ -52,7 +52,11 @@ pub fn render(report: &StuckReport) -> String {
                     .as_deref()
                     .map(|reason| format!("  waiting={reason}"))
                     .unwrap_or_default(),
-                row.name
+                row.name,
+                row.progression_note
+                    .as_deref()
+                    .map(|note| format!("  note={}", note.replace('\n', " ")))
+                    .unwrap_or_default()
             )
             .unwrap();
         }
@@ -86,6 +90,31 @@ pub fn render(report: &StuckReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renders_the_reason_a_progression_run_left_the_item_alone() {
+        let report = StuckReport::builder()
+            .generated_at_epoch_s(1)
+            .minimum_age_secs(60)
+            .rows(vec![
+                boss_protocol::StuckRow::builder()
+                    .work_item_id("task_b")
+                    .name("Left alone")
+                    .age_in_state_secs(10)
+                    .bucket(boss_protocol::StuckBucket::ProgressionInFlight)
+                    .classification("S5_merge_conflict")
+                    .last_ledger_basis("merge_conflict")
+                    .age_is_lower_bound(false)
+                    .progression_note("Waiting on the vendor")
+                    .build(),
+            ])
+            .questions_filed(0)
+            .unconverted_declared_blockers(0)
+            .build();
+        assert!(render(&report).contains(
+            "task_b  10s  S5_merge_conflict  basis=merge_conflict  Left alone  note=Waiting on the vendor\n"
+        ));
+    }
 
     #[test]
     fn validates_window_and_prints_zero_buckets_and_question_count() {

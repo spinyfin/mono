@@ -16,8 +16,12 @@ pub enum StuckBucket {
     /// A progression agent is live or pending for the item, or the item is
     /// inside the cooldown that follows a progression run. Being handled.
     ProgressionInFlight,
-    /// Progression could not unstick the item: its last two progression runs
-    /// ended in infrastructure failure, so the sweep no longer nominates it.
+    /// Progression could not unstick the item, and the engine has said so: its
+    /// last two progression runs ended in infrastructure failure, or the
+    /// escalation ladder ran out and the engine asked the owner whether to park,
+    /// archive or keep trying. The sweep no longer nominates it. This counts as
+    /// waiting on a human; it is a separate bucket so the report can tell an
+    /// item progression gave up on from one that was always the owner's call.
     ProgressionFailing,
     EngineStuck,
 }
@@ -59,6 +63,11 @@ pub struct StuckRow {
     /// The phrase for `wait_reason`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_label: Option<String>,
+    /// What the item's last progression run said when it judged the item not
+    /// stuck (`no_action`): the stated reason the item is being left alone while
+    /// it waits out the longer cooldown. `None` for any other item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progression_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]

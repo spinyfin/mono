@@ -151,9 +151,21 @@ fn park_item_on_question(conn: &Connection, execution: &WorkExecution) -> Result
         // Superseded or withdrawn: there is nothing for the item to wait on.
         return Ok(true);
     };
+    park_awaiting_answer(conn, &execution.work_item_id, &question, "progression_question")?;
+    Ok(false)
+}
+
+/// Move `item_id` to `blocked: awaiting_operator_answer` with `question` as its
+/// detail, superseding the halt it was stuck in: a dispatch-failure stamp is
+/// cleared and a `deliberate_park` attention is resolved, because the question
+/// is the one hold. Shared by the question a progression run asks and the one
+/// the engine files when the escalation ladder runs out
+/// (`progression_ladder`), so both park an item the same way. `basis` is the
+/// ledger basis recorded on the write.
+pub(crate) fn park_awaiting_answer(conn: &Connection, item_id: &str, question: &str, basis: &str) -> Result<()> {
     crate::task_status_audit::execute(
         conn,
-        "progression_question",
+        basis,
         boss_protocol::LAST_STATUS_ACTOR_PROGRESSION,
         "UPDATE tasks
          SET status = 'blocked', blocked_reason = 'awaiting_operator_answer', blocked_detail = ?2,
@@ -162,14 +174,14 @@ fn park_item_on_question(conn: &Connection, execution: &WorkExecution) -> Result
              last_status_actor = ?4, updated_at = ?3
          WHERE id = ?1 AND deleted_at IS NULL AND status NOT IN ('done', 'archived')",
         params![
-            execution.work_item_id,
+            item_id,
             question,
             now_string(),
             boss_protocol::LAST_STATUS_ACTOR_PROGRESSION
         ],
     )?;
-    crate::dispatch_admission::resolve_deliberate_park_attention(conn, &execution.work_item_id)?;
-    Ok(false)
+    crate::dispatch_admission::resolve_deliberate_park_attention(conn, item_id)?;
+    Ok(())
 }
 
 #[work_db_boundary::instrument]

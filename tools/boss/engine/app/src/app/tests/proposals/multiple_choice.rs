@@ -200,3 +200,65 @@ async fn unparkable_multiple_choice_retains_answerable_options() {
     let members = state.work_db.list_attentions_for_group(&group.id).unwrap();
     assert_eq!(members[0].answer.as_deref(), Some("Gradual"));
 }
+
+/// The engine's own question, filed when progression ran out of attempts on a
+/// stuck chore. "Archive it" is answered here, where the handler runs the
+/// archive after the answer commits.
+#[tokio::test]
+async fn archive_it_archives_the_item_progression_could_not_unstick() {
+    let (state, _dir, _, task_id) = parked_task_with_question(multiple_choice_payload()).await;
+    let product = question_task(&state, &task_id).product_id;
+    let chore =
+        boss_engine_runtime::test_support::create_test_chore_manual(&state.work_db, &product, "Stuck for good").id;
+    let sql = |sql: String| state.work_db.connect().unwrap().execute_batch(&sql).unwrap();
+    sql(format!(
+        "UPDATE tasks SET status = 'blocked', blocked_reason = 'merge_conflict' WHERE id = '{chore}';
+         UPDATE task_status_audit SET changed_at = CAST(changed_at AS INTEGER) - 10800 WHERE work_item_id = '{chore}'"
+    ));
+    for hours in [20, 10] {
+        let run = state
+            .work_db
+            .create_execution(
+                boss_protocol::CreateExecutionInput::builder()
+                    .work_item_id(&chore)
+                    .kind(boss_protocol::ExecutionKind::Progression)
+                    .status(boss_protocol::ExecutionStatus::Completed)
+                    .build(),
+            )
+            .unwrap();
+        sql(format!(
+            "UPDATE work_executions SET progression_disposition = 'progressed',
+                 created_at = CAST(strftime('%s','now') AS INTEGER) - {hours} * 3600,
+                 started_at = CAST(strftime('%s','now') AS INTEGER) - {hours} * 3600,
+                 finished_at = CAST(strftime('%s','now') AS INTEGER) - {hours} * 3600 WHERE id = '{}'",
+            run.id
+        ));
+    }
+    let mint = state.work_db.mint_progression_executions().unwrap();
+    assert_eq!((mint.asked.len(), mint.minted.len()), (1, 0));
+    let question = state
+        .work_db
+        .list_operator_questions(&chore)
+        .unwrap()
+        .remove(0)
+        .question;
+
+    let answer = choose(&state, &question.id, boss_work_db::ARCHIVE_IT).await;
+
+    let FrontendEvent::WorkItemUpdated { item } = answer else {
+        panic!("expected the updated item: {answer:?}");
+    };
+    let (boss_work_db::WorkItem::Chore(task) | boss_work_db::WorkItem::Task(task)) = item else {
+        panic!("expected a chore");
+    };
+    assert_eq!(task.status, boss_protocol::TaskStatus::Archived);
+    assert_eq!(
+        task.archived_reason.as_deref(),
+        Some("progression could not unstick it; the owner chose to archive it")
+    );
+    assert_eq!(
+        task.archived_by.as_deref(),
+        Some("manual_status_change"),
+        "archived as the owner"
+    );
+}

@@ -81,7 +81,7 @@ impl ProgressionDiagnosis {
         } else if clauses.infrastructure_failing {
             lines.push(
                 "  the last progression runs ended in infrastructure failure, so the sweep no longer \
-                 nominates this item"
+                 nominates this item; the engine asks the owner whether to park it, archive it or keep trying"
                     .to_owned(),
             );
         } else if clauses.in_cooldown {
