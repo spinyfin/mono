@@ -1,3 +1,4 @@
+use super::worker_paths::outputs_root;
 use super::*;
 use crate::cube::CubeJsonTransport;
 use async_trait::async_trait;

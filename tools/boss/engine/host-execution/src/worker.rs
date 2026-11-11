@@ -2,7 +2,7 @@
 
 #[path = "worker_paths.rs"]
 mod worker_paths;
-use worker_paths::{hex_token, outputs_root};
+use worker_paths::{OUTPUT_ENV_NAMES, hex_token, insert_output_environment};
 
 use crate::{
     cube::{self, CubeJsonTransport},
@@ -1201,12 +1201,6 @@ pub async fn heartbeat_leases<T: CubeJsonTransport>(cube: &T, store: &impl Execu
     failures
 }
 
-const OUTPUT_ENV_NAMES: &[&str] = &[
-    "BOSS_STRUCTURED_OUTPUT",
-    "BOSS_STRUCTURED_OUTPUT_KIND",
-    "BOSS_PR_URL_OUTPUT",
-];
-
 /// Minimum directory age for pruning outputs of reclaimed, unassigned runs.
 const OUTPUT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
@@ -1237,57 +1231,6 @@ fn prune_stale_outputs(homes_root: &Path, retention: Duration, records: &[Execut
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
-}
-
-/// Output locations are allocated on the execution host beside its private homes.
-fn insert_output_environment(
-    environment: &mut BTreeMap<String, String>,
-    spawn: &Spawn,
-    homes_root: &Path,
-    spawn_token: &str,
-) -> Result<()> {
-    let root = outputs_root(homes_root, spawn_token);
-    // The supervisor alone decides the output contract; caller values for these
-    // names must never reach the worker.
-    for name in OUTPUT_ENV_NAMES {
-        environment.remove(*name);
-    }
-    if spawn.structured_output_kind.is_some() || spawn.pr_url_output {
-        std::fs::create_dir_all(&root)?;
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
-    }
-    use boss_engine_driver::{StructuredOutputRequest, default_structured_output_wiring};
-    use boss_engine_structured_output::{StructuredOutputKind, prepare};
-    let designated = spawn
-        .structured_output_kind
-        .as_deref()
-        .map(|slug| {
-            StructuredOutputKind::all()
-                .find(|kind| kind.slug() == slug && *kind != StructuredOutputKind::PrUrl)
-                .with_context(|| format!("unknown structured output kind: {slug}"))
-        })
-        .transpose()?;
-    for kind in designated
-        .into_iter()
-        .chain(spawn.pr_url_output.then_some(StructuredOutputKind::PrUrl))
-    {
-        // The identifier is the hex token, never the raw token: the raw
-        // value can hold `/` or `..` and would escape the private directory.
-        let path = prepare(&root, &hex_token(spawn_token), kind)?;
-        environment.extend(
-            default_structured_output_wiring(&StructuredOutputRequest {
-                kind,
-                result_path: &path,
-                schema: None,
-            })
-            .env,
-        );
-    }
-    if let Some(kind) = designated {
-        environment.insert("BOSS_STRUCTURED_OUTPUT_KIND".into(), kind.slug().into());
-    }
-    Ok(())
 }
 
 fn pane_command(plan: &SpawnPlan) -> String {
