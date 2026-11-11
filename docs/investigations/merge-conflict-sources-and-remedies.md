@@ -28,7 +28,7 @@ Ranked recommendations, quick wins first:
 1. Fix the diagnosis base so the engine sees the real conflict (small change, unblocks everything that depends on classification).
 2. Make lockfile-only conflicts actually retire in the deterministic tier, and record on each ledger row why the ladder fell through.
 3. Remove the two shared append points left in the schema migration chain, and break up the five giant wrapped import lists.
-4. Trial a reproducible `crate.from_cargo` extension with a separate, stripped Cargo lockfile. This removes the extension's record from `MODULE.bazel.lock`; measure the conflicts moved to cargo-bazel's JSON before adopting it. Stripping alone leaves manifest conflicts.
+4. Keep the current `crate.from_cargo` configuration after the [initial lockfile trial](#executed-lockfile-trial): reproducibility moves the two observed conflicts into cargo-bazel's JSON, and repinning is not consistently cheaper. Stripping alone leaves manifest conflicts.
 5. Resolve conflicts just in time: stop re-resolving PRs that are not about to merge, and give long-stale PRs a close-or-rewrite decision.
 6. Add a keep-both resolver for same-spot insertions, and trial a syntax-aware merge tool as a tier between the engine rebase and an agent.
 
@@ -301,7 +301,7 @@ Each idea lists the measured source it addresses, expected impact, cost, risk an
 
 #### S1. Evaluating external-only Cargo lockfiles
 
-**Verdict:** use the built-in stripping flag in a trial combined with an explicit cargo-bazel JSON `lockfile`. Retain `from_cargo` and the Cargo manifests. Stripping by itself addresses too little of mono's measured conflict surface to replace deterministic resolution. The combination removes that surface from `MODULE.bazel.lock`, but it does not demonstrate fewer conflicts across all files: the JSON still contains a shared checksum and workspace dependency maps.
+**Verdict:** retain the current configuration. The [executed four-pair trial](#executed-lockfile-trial) below found two unresolved lockfile conflicts under each configuration and no consistent repin speedup. The combination removes the crate extension's record from `MODULE.bazel.lock`, but the JSON still contains a shared checksum and workspace dependency maps. Stripping by itself leaves manifest conflicts. The following source analysis explains the configurations tested; it is not an adoption recommendation.
 
 The [BazelCon slides](https://static.sched.com/hosted_files/bazelcon2025/54/Hofbauer%20Zipline%20CargoSplicing.pdf), pages 5–7, propose feeding `Cargo.bazel.lock`, containing only external dependencies, to `from_cargo`. [rules_rust #3699](https://github.com/bazelbuild/rules_rust/pull/3699), merged November 10, 2025, replaces the separate stripping hook with `strip_internal_dependencies_from_cargo_lockfile`. Mono already pins 0.70.0, which contains the flag; no rules_rust upgrade is needed. This section evaluates that pinned implementation, not a newer release.
 
@@ -330,13 +330,13 @@ Only **20 states** have `MODULE.bazel.lock` conflict text consisting solely of t
 
 The flag acts later, at [`generate.rs:224–255`](https://github.com/bazelbuild/rules_rust/blob/0.70.0/crate_universe/src/cli/generate.rs#L224-L255): after writing the JSON context, it filters Cargo lockfile packages to those with `source.is_some()` and writes the result back. Thus “internal” means source-less/path packages, not an ownership classification. Leave `skip_cargo_lockfile_overwrite` false: setting it true skips the write containing the filter. There is no need for the talk's pre-commit hook. The normal `Cargo.lock` remains separate and is not kept synchronized by writes to `Cargo.bazel.lock`.
 
-**Alternatives and combinations.** [code] [estimate] Costs below are engineering estimates; none of these configurations was deployed or replayed for build timing here. The actual API is `crate.from_specs` (plural), called “from_spec” in the talk.
+**Alternatives and combinations.** [code] [estimate] Costs below are engineering estimates from the source analysis. The executed trial below measures the two stripping configurations; the other alternatives remain untested. The actual API is `crate.from_specs` (plural), called “from_spec” in the talk.
 
 | Configuration                                                                  | Lines removed from `MODULE.bazel.lock`                                                                                                                    | Remaining/new conflict point and mechanical resolution                                                                                                                                                                        | Effect on 126-manifest extraction trend; cost                                                                                                                                                                                                               |
 | ------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `from_cargo` + stripped `Cargo.bazel.lock`, no JSON `lockfile`                 | Original `Cargo.lock` input becomes the external-only lockfile input; first-party-only hash churn shrinks. Manifest inputs and generated output remain.   | New `Cargo.bazel.lock`, sorted Cargo package records; merge disjoint packages or regenerate from merged manifests and reviewed external pins. Third-party conflicts still require version intent.                             | Removes first-party lockfile churn, not manifest or generated-map churn; small configuration change, medium integration cost for two lockfiles and their consumers.                                                                                         |
 | `from_cargo` + JSON `lockfile`, existing `Cargo.lock`                          | Entire crate extension record, including both input kinds and embedded generated output. Other extensions and registry hashes remain.                     | New `cargo-bazel-lock.json`; one checksum plus structured crate/workspace maps. Maps can merge, but the checksum cannot be unioned: regenerate from merged inputs. Existing `Cargo.lock` still changes for first-party edits. | Extraction still changes the JSON context/checksum; moves the hotspot rather than removing its cause. Medium cost including deterministic regeneration support.                                                                                             |
-| `from_cargo` + JSON `lockfile` + stripped `Cargo.bazel.lock`                   | Same whole-record removal as the previous row; stripping adds no further removal there.                                                                   | Both new files. Stripping stabilizes external Cargo pins for first-party-only changes; JSON checksum/maps still need regeneration.                                                                                            | Preserves manifest-derived helpers and removes first-party changes from one lockfile, while JSON still tracks workspace growth. Medium cost; recommended trial.                                                                                             |
+| `from_cargo` + JSON `lockfile` + stripped `Cargo.bazel.lock`                   | Same whole-record removal as the previous row; stripping adds no further removal there.                                                                   | Both new files. Stripping stabilizes external Cargo pins for first-party-only changes; JSON checksum/maps still need regeneration.                                                                                            | Preserves manifest-derived helpers and removes first-party changes from one lockfile, while JSON still tracks workspace growth. Medium cost; tested below.                                                                                                  |
 | External `crate.spec` entries + `from_specs`, separate Cargo lockfile, no JSON | Both first-party Cargo input kinds disappear because neither is read; the new external Cargo lockfile input and extension/generated-output record remain. | Specs in `MODULE.bazel`, external Cargo lockfile, and `MODULE.bazel.lock` on third-party changes. Merge specs first, then resolve/regenerate pins and extension output.                                                       | Pure first-party extraction no longer changes dependency inputs, assuming specs are external and independently maintained. Large migration cost: duplicate Cargo/Bazel dependency declarations, feature/platform parity and replace manifest-based helpers. |
 | External specs + `from_specs` + both lockfiles                                 | Entire crate extension record.                                                                                                                            | Specs plus external Cargo lockfile and JSON checksum/maps, now driven by third-party specs rather than the first-party workspace. Regenerate after merging specs/pins.                                                        | Strongest separation from crate extraction; same large migration cost, plus JSON maintenance. Stripping is largely redundant without source-less packages; adding path specs restores tracking of those paths.                                              |
 
@@ -348,7 +348,7 @@ An explicit JSON lockfile also changes the update workflow: [`determine_repin`](
 
 The earlier alternative of refreshing `MODULE.bazel.lock` only on `main` creates no new file but retains a shared generated file, a stale interval and a post-merge writer. It needs CI ownership and offers no source-backed advantage over the reproducible-extension trial. Keep other extensions' lockfile records committed.
 
-**Concrete recommended configuration for the trial.** Retain the existing annotations and `use_extension`; replace only the existing `from_cargo` call with this, preserving all eight supported platforms:
+**Configuration tested in the trial.** Retain the existing annotations and `use_extension`; replace only the existing `from_cargo` call with this, preserving all eight supported platforms:
 
 ```starlark
 crate.from_cargo(
@@ -375,7 +375,7 @@ use_repo(crate, "mono_crates")
 
 Regeneration is mechanical **after dependency intent is merged**, not permission to discard one side's version changes. Merge manifests/specs and external pins first, regenerate JSON with the pinned Bazel/rules_rust toolchain, and require a second evaluation to leave all lockfiles unchanged. The engine currently recognizes `Cargo.lock` and `MODULE.bazel.lock` by basename (`deterministic-resolvers/src/resolvers/generated_lock.rs:33–38`), not these two proposed names; extend its existing resolver before claiming automatic resolution. Do not deploy the configuration merely to move conflicts into a file the ladder cannot handle.
 
-**Decision criterion:** trial the combination against stripping-only and the current configuration on the same replayed crate-extraction and third-party-update pairs. Count conflicts across **all** lockfiles, time repinning with normal caches, check dependency/helper parity, and verify repeat evaluations are stable. Prefer the combination only if it reduces total unresolved conflicts or makes regeneration reliably cheaper. Its net savings and splicing timings are unmeasured. This writeup changes no build configuration; adopting it requires a configuration-and-resolver change by a repository maintainer.
+**Decision criterion:** compare the combination against stripping-only and the current configuration on the same replayed crate-extraction and third-party-update pairs. Count conflicts across **all** lockfiles, time repinning with normal caches, check dependency/helper parity, and verify repeat evaluations are stable. Prefer the combination only if it reduces total unresolved conflicts or makes regeneration reliably cheaper. The [executed trial](#executed-lockfile-trial) did not meet either criterion, so this change records the results and retains the existing build configuration and resolver.
 
 **S2. Remove the shared append points in the schema migration chain.**
 
@@ -473,7 +473,7 @@ Regeneration is mechanical **after dependency intent is merged**, not permission
 **E7. Overlap-aware scheduling: keep it narrow.**
 
 - **Evidence:** [measured] of 31,663 pairs where one PR merged while another was open, 5,044 shared a file, and at most 1,164 of those (23%) were involved in a conflict. Holding back work on any shared file would delay about three harmless pairs for each conflict avoided.
-- **Verdict:** serialising dispatch on file overlap is not supported by the data, which agrees with the earlier design's rejection. The files where overlap nearly guarantees a conflict (yield above 0.6) are exactly the ones S1 and S2 fix at the source.
+- **Verdict:** serialising dispatch on file overlap is not supported by the data, which agrees with the earlier design's rejection. The files where overlap nearly guarantees a conflict (yield above 0.6) contain the shared inputs targeted by S1 and S2; S1's subsequent trial did not demonstrate a net reduction.
 
 **E8. Rebasing earlier or more often: no.** [measured] 73% of conflicts come from a single merge and the branch is a median of 6 commits behind. An earlier rebase finds the same conflict sooner and adds a CI run. The default-off speculative pass predicts conflicts but cannot prevent them.
 
@@ -515,20 +515,20 @@ Regeneration is mechanical **after dependency intent is merged**, not permission
 
 ## Ranked recommendation
 
-| #   | Change                                                        | Addresses (share of conflict states)                         | Cost   | Confidence                                     |
-| --- | ------------------------------------------------------------- | ------------------------------------------------------------ | ------ | ---------------------------------------------- |
-| 1   | E1: diagnose against current `main`                           | Enables the rest; 88% of diagnoses empty                     | Small  | High: reproduced on every row                  |
-| 2   | E2: record ladder outcomes, make lockfile-only retire         | 16% (30% in November)                                        | Small  | High on the gap, unknown on the cause          |
-| 3   | S2: schema chain append points                                | 8% sole cause                                                | Small  | High: the metrics precedent cut yield by 2/3   |
-| 4   | S3: five import lists                                         | 5% sole cause, 12% touched                                   | Small  | High                                           |
-| 5   | S1: trial reproducible `from_cargo` + stripped Cargo lockfile | Cargo input hunks in 255 states; JSON conflicts replace some | Medium | High on removed record; net benefit unmeasured |
-| 6   | E5: stale-PR decision                                         | Up to 19% of resolution work                                 | Small  | Medium: needs a decision per PR                |
-| 7   | E4: just-in-time resolution                                   | Up to 58% of resolutions (upper bound)                       | Medium | Medium: depends on the readiness signal        |
-| 8   | E3: keep-both resolver                                        | 13% to 29%                                                   | Medium | Medium: needs the replay experiment            |
-| 9   | N1: syntax-aware merge tier                                   | 13% plus an unmeasured part of the hard 55%                  | Small  | Unknown until tested                           |
-| 10  | E10 and S6: shorter-lived, smaller PRs                        | The underlying rate                                          | Varies | High on the effect, unknown on the means       |
+| #   | Change                                                           | Addresses (share of conflict states)                         | Cost   | Confidence                                   |
+| --- | ---------------------------------------------------------------- | ------------------------------------------------------------ | ------ | -------------------------------------------- |
+| 1   | E1: diagnose against current `main`                              | Enables the rest; 88% of diagnoses empty                     | Small  | High: reproduced on every row                |
+| 2   | E2: record ladder outcomes, make lockfile-only retire            | 16% (30% in November)                                        | Small  | High on the gap, unknown on the cause        |
+| 3   | S2: schema chain append points                                   | 8% sole cause                                                | Small  | High: the metrics precedent cut yield by 2/3 |
+| 4   | S3: five import lists                                            | 5% sole cause, 12% touched                                   | Small  | High                                         |
+| 5   | S1: evaluate reproducible `from_cargo` + stripped Cargo lockfile | Cargo input hunks in 255 states; JSON conflicts replace some | Medium | Four-pair trial: no demonstrated net benefit |
+| 6   | E5: stale-PR decision                                            | Up to 19% of resolution work                                 | Small  | Medium: needs a decision per PR              |
+| 7   | E4: just-in-time resolution                                      | Up to 58% of resolutions (upper bound)                       | Medium | Medium: depends on the readiness signal      |
+| 8   | E3: keep-both resolver                                           | 13% to 29%                                                   | Medium | Medium: needs the replay experiment          |
+| 9   | N1: syntax-aware merge tier                                      | 13% plus an unmeasured part of the hard 55%                  | Small  | Unknown until tested                         |
+| 10  | E10 and S6: shorter-lived, smaller PRs                           | The underlying rate                                          | Varies | High on the effect, unknown on the means     |
 
-Items 1 to 4 are independent and small. Together they address about 30% of today's conflict states (the lockfile, schema chain and import-list sole causes) and add the instrumentation needed to steer the rest. The cost of item 2 is small for the recording and unknown for the fixes until the reasons are visible. Item 5 now has a concrete source-backed configuration and moves ahead of the broader merge-tool trial, but remains an experiment rather than a claim to eliminate 16%. Items 2 and 5 overlap: reuse the deterministic tier for the proposed files and measure total unresolved conflicts. Stripping alone is a small adjunct; `from_specs` is a larger dependency-model migration and is not justified by these measurements alone.
+Items 1 to 4 are independent and small. Together they address about 30% of today's conflict states (the lockfile, schema chain and import-list sole causes) and add the instrumentation needed to steer the rest. The cost of item 2 is small for the recording and unknown for the fixes until the reasons are visible. Item 5 has now been tried on four pairs without meeting its adoption criterion; keep the current configuration. Any later adoption must integrate the deterministic tier for both proposed files and demonstrate a net benefit across all lockfiles. Stripping alone is a small adjunct; `from_specs` is a larger dependency-model migration and is not justified by these measurements alone.
 
 Not recommended: `.gitattributes` merge drivers (S7), more frequent rebasing (E8), general file-overlap serialisation (E7), and a change of merge queue for conflict reasons (E9).
 
@@ -539,7 +539,7 @@ Not recommended: `.gitattributes` merge drivers (S7), more frequent rebasing (E8
 3. **Offline merge-tool replay.** Rebuild the corpus (see the appendix), extract base, ours and theirs for the 1,860 content-conflicted file rows, and run the candidate resolver on each: first a keep-both union for E3, then Mergiraf for N1. Report the share of files and of whole conflict states resolved, then build and test a sample of 50 resolved states. This needs no production change.
 4. **Schema chain and import lists.** After S2 and S3, track conflict states per `main` commit touching those files. Baselines: 0.84 for the schema chain; 180 import-list hunks in six months. Expect a drop of at least half over the next 30 touches, as the metrics change showed.
 5. **Just-in-time resolution.** Split PRs by number parity for two weeks. Compare resolutions per merged PR, time from merge request to merge, and how often a deferred conflict needed a human.
-6. **Lockfile spike.** Compare the current configuration, stripping alone, and S1's reproducible-plus-stripping configuration on the same crate-extraction and third-party-update pairs. Report changed files, unresolved conflicts across all lockfiles, repin duration with normal caches, dependency/helper parity, and stability on a second evaluation. The baseline is 255 states with Cargo input conflicts, not 255 states known to disappear. Validate the existing resolver's extension to both new filenames before adoption.
+6. **Lockfile spike — four-pair trial completed.** The [results below](#executed-lockfile-trial) compare the current configuration, stripping alone, and S1's reproducible-plus-stripping configuration on identical crate-extraction and third-party-update pairs. They report changed files, unresolved conflicts across all lockfiles, repin duration with normal caches, dependency/helper parity, and repeat-evaluation stability. The baseline is 255 states with Cargo input conflicts, not 255 states known to disappear. The trial did not justify adoption; the existing resolver and configuration remain unchanged.
 7. **Where PR lifetime goes.** From engine state, split lifetime into waiting for CI, automated review, human review and merge. This decides whether E10 is tractable.
 
 ## Follow-up code changes
@@ -564,4 +564,85 @@ These are for separate PRs; none was made here.
 
 The scripts were run from a scratch directory and are not part of this change.
 
-**S1 recount method.** Select the earliest conflicted row for each `(pr, head)` from `replay_L.jsonl`, yielding 1,233 states; select its 260 `MODULE.bazel.lock` rows. Read each stored result tree's lockfile blob and parse every diff3 marker block without truncating long generated-output lines. Within each block, parse `FILE:@@//<path> <digest>` entries on ours/base/theirs and count a path when its value or presence differs. Group paths into root `Cargo.lock`, any `Cargo.toml`, and other inputs; count both hunks and distinct states, retaining overlaps. Separately compare non-input lines and count embedded `defs.bzl` entries. The earlier `replay2.json` contains 259 matching `(main, head)` pairs, including the 254-state Cargo-input subset; the final corpus adds the state on #3544. Reading retained merge-result objects suffices for these counts; no merge or resolution was rerun. The hypothetical external graph and resulting mergeability under S1 were not measured.
+**S1 recount method.** Select the earliest conflicted row for each `(pr, head)` from `replay_L.jsonl`, yielding 1,233 states; select its 260 `MODULE.bazel.lock` rows. Read each stored result tree's lockfile blob and parse every diff3 marker block without truncating long generated-output lines. Within each block, parse `FILE:@@//<path> <digest>` entries on ours/base/theirs and count a path when its value or presence differs. Group paths into root `Cargo.lock`, any `Cargo.toml`, and other inputs; count both hunks and distinct states, retaining overlaps. Separately compare non-input lines and count embedded `defs.bzl` entries. The earlier `replay2.json` contains 259 matching `(main, head)` pairs, including the 254-state Cargo-input subset; the final corpus adds the state on #3544. Reading retained merge-result objects suffices for these counts; no merge or resolution was rerun. That recount did not measure a hypothetical external graph or its mergeability; the subsequent S1 trial below does so for four pairs.
+
+## Executed lockfile trial
+
+### Method and inputs
+
+[measured] The November 11–12, 2026 trial uses four recorded review-conflict pairs: crate extraction in [#3430](https://github.com/spinyfin/mono/pull/3430) and [#3438](https://github.com/spinyfin/mono/pull/3438), and concurrent branches crossing the external dependency changes in [#3091](https://github.com/spinyfin/mono/pull/3091) and [#3262](https://github.com/spinyfin/mono/pull/3262). The latter pairs use the recorded heads of [#3050](https://github.com/spinyfin/mono/pull/3050) and [#3257](https://github.com/spinyfin/mono/pull/3257). This is a four-pair sample, not a rerun of the entire 260-state corpus. Each configuration uses the same merge base, PR head and main revision:
+
+| Pair          | Merge base                                 | PR head                                    | Main at detection                          |
+| ------------- | ------------------------------------------ | ------------------------------------------ | ------------------------------------------ |
+| #3430         | `8d559994b81ef9b46349e1ecc3ed24f7a82e00f1` | `c60e927b968814b72dfcbfad5279cad08b7e9674` | `fd5f0e8459d498858545821d5e2b0ecadd354710` |
+| #3438         | `99287d1e8cfcd7b139ce669bf330f4f9ac3e086e` | `950032f5c20f0ad9c5163b7239fad5d31ec37c01` | `148dbb76f75ec377ea5fd43d5172590fa69591ad` |
+| #3050 / #3091 | `ab6355744cfaa5c31cd7c7999963273aed094473` | `f434dcf24e36476c33c8ae506d319f4f8cd307e6` | `a06c56a0435f7065274d88e903df9dfea83ad745` |
+| #3257 / #3262 | `bc27dd4ee14922238a1f1e77662dab40370bba8a` | `4a4816402281e853b62531dcc56e7e5c3e846a95` | `8b04af4d1bb6d3e900760ad938d5b760d1b04600` |
+
+The heads come from the conflict ledger; main is the latest ancestor by committer timestamp at detection (Unix seconds 1793580455, 1793659656, 1791333848 and 1792720436 respectively). The merge base is the common ancestor of that pair. These are fixed replay inputs, not a claim to recover an unrecorded exact GitHub check timestamp. Where a historical head was unavailable in the scratch clone, its complete `jj diff --git` from the merge base was applied to that base.
+
+All 12 revision endpoints were evaluated under each of these configurations, for 36 evaluations:
+
+| Configuration               | `cargo_lockfile`      | `lockfile`                 | Stripping | Files changed relative to the reviewed endpoint                             |
+| --------------------------- | --------------------- | -------------------------- | --------- | --------------------------------------------------------------------------- |
+| A: current                  | `//:Cargo.lock`       | absent                     | false     | None on ordinary evaluation                                                 |
+| B: stripping only           | `//:Cargo.bazel.lock` | absent                     | true      | `MODULE.bazel`, `BUILD.bazel`, `MODULE.bazel.lock`; adds `Cargo.bazel.lock` |
+| C: reproducible + stripping | `//:Cargo.bazel.lock` | `//:cargo-bazel-lock.json` | true      | B's files; also adds `cargo-bazel-lock.json`                                |
+
+The historical rules_rust 0.70.0 pin, annotations and all eight supported platform triples were retained. `skip_cargo_lockfile_overwrite` remained false. B and C seed the Cargo-format file from that endpoint's reviewed `Cargo.lock`; root BUILD exports use `visibility = ["//:__pkg__"]`. C starts with an empty JSON file and initializes it using `CARGO_BAZEL_REPIN=true bazel mod deps --lockfile_mode=update`. A and B initially use ordinary `bazel mod deps --lockfile_mode=update`; B automatically invokes the generator because its configuration changed. C then evaluates with the repin variable unset. Every endpoint has a further ordinary evaluation and `bazel query @mono_crates//:all` to materialize the generated helpers. All commands use normal Bazel caches.
+
+For each pair and configuration, the four lockfile paths (`Cargo.lock`, `MODULE.bazel.lock`, `Cargo.bazel.lock`, `cargo-bazel-lock.json`) are copied into a separate jj repository. Base is committed first; head and main are separate children of base; `jj new <head> <main>` and `jj resolve --list` measure unresolved files. No conflicted file is replaced with one side, and no dependency choice is made during the merge. Only `Cargo.lock` and `MODULE.bazel.lock` changed among existing lockfiles in these reviewed pairs. This measures jj 0.26.0's merge result, whereas the original corpus used Git merge-tree. Replaying the original lockfiles with jj leaves a lockfile conflict in two pairs; the other two serve as controls.
+
+### Conflict results
+
+| Pair                               | A: unresolved lockfiles  | B: unresolved lockfiles  | C: unresolved lockfiles  |
+| ---------------------------------- | ------------------------ | ------------------------ | ------------------------ |
+| #3430 extraction                   | `MODULE.bazel.lock`      | `MODULE.bazel.lock`      | `cargo-bazel-lock.json`  |
+| #3438 extraction                   | None                     | None                     | None                     |
+| #3050 / #3091 dependency update    | `MODULE.bazel.lock`      | `MODULE.bazel.lock`      | `cargo-bazel-lock.json`  |
+| #3257 / #3262 dependency additions | None                     | None                     | None                     |
+| **Total**                          | **2 files in 2/4 pairs** | **2 files in 2/4 pairs** | **2 files in 2/4 pairs** |
+
+C removes the crate extension's entire committed MODULE record, but both unresolved conflicts move into its JSON context. In #3430 both sides change the JSON checksum and crate map; the extraction also changes workspace members. In #3050 both sides change the checksum and crate map, and main changes direct dependencies. B retains manifest hash conflicts. Neither `Cargo.lock` nor `Cargo.bazel.lock` conflicts in this sample; the total conflict count does not fall.
+
+### Dependency parity and stability
+
+All 36 endpoints preserve the complete external package records from their reviewed `Cargo.lock`, including source, checksum and dependency arrays. Package counts for base/head/main are 541/541/541 for each extraction pair, 491/491/492 for #3050, and 492/492/533 for #3257. This retains the dependency updates on main as well as the historical head's pins. B and C contain no source-less packages in `Cargo.bazel.lock`; the ordinary `Cargo.lock` stays byte-identical.
+
+At every endpoint, B and C's generated `defs.bzl` and hub `BUILD.bazel` are byte-identical to A's. Comparing the whole helper file covers `all_crate_deps`, its workspace-package maps and platform conditions, rather than checking only one consumer. This is dependency/helper parity, not a claim to have built every historical platform.
+
+| Configuration | Byte-stable second ordinary evaluation              | Second ordinary evaluation wall time |
+| ------------- | --------------------------------------------------- | ------------------------------------ |
+| A             | 12/12                                               | 0.077–0.901 s                        |
+| B             | 0/12 immediately after initial stripping            | 22.252–915.598 s                     |
+| C             | 12/12, after repin and an unset-variable evaluation | 0.125–0.946 s                        |
+
+B's initial generation rewrites its watched Cargo input by stripping workspace packages. The next evaluation updates the recorded input digest, so two evaluations are insufficient for byte stability from the initial full-lockfile seed. A third evaluation of #3430's base completed in 0.154 s and changed no files. C's stability measurement begins after removing the repin environment variable; it is not evidence that an explicit repin itself is byte-stable. A's short times are cached evaluations, not repin timings.
+
+### Repin measurements
+
+The initial runs exposed the generator's default 600-second subprocess timeout: an unchanged A configuration completed one explicit repin in 572.423 s, then failed its second at 604.789 s with `cargo-bazel splice: Timed out`; B's first #3430-base generation similarly failed at 605.248 s. Stripping happens after splicing, and the unchanged configuration reproduces the failure. A diagnostic retry with `CARGO_BAZEL_DEBUG=true CARGO_BAZEL_TIMEOUT=7200` allowed B to complete; the original failed observations are retained here. C's first #3430-base initialization took 993.236 s with that subprocess limit. No shell timeout or cache override was used, and no repository timeout/check setting was changed.
+
+The remaining initial B automatic regenerations took 30.185–72.285 s, and the remaining C initializations took 33.737–107.129 s. Those are different workflows, run as caches warmed, so their medians are not a controlled speed comparison. A's original evaluations mostly reused its committed extension record.
+
+For a comparable measurement, each historical PR head was restored with its already-initialized A, B or C files, then explicitly repinned twice. Every repin ran `CARGO_BAZEL_REPIN=true bazel mod deps --lockfile_mode=update`, followed by the same command with that variable unset. All configurations used the same diagnostic settings (`CARGO_BAZEL_DEBUG=true`, `CARGO_BAZEL_TIMEOUT=7200`), Bazel 9.1.0, one scratch checkout and normal caches on the same macOS host. Configuration order rotated A/B/C, B/C/A, C/A/B, A/B/C across the four heads. Complete external-pin equality was checked after each repin/evaluation pair.
+
+All 24 explicit repins and their 24 subsequent ordinary evaluations exited 0. Wall times in seconds, with both repin observations shown:
+
+| PR head                               | A: current       | B: stripping only | C: reproducible + stripping |
+| ------------------------------------- | ---------------- | ----------------- | --------------------------- |
+| #3430                                 | 18.040 / 37.305  | 22.716 / 20.853   | 18.761 / 18.968             |
+| #3438                                 | 29.920 / 35.339  | 23.465 / 42.730   | 31.843 / 54.080             |
+| #3050                                 | 19.003 / 17.039  | 27.748 / 30.356   | 26.823 / 31.963             |
+| #3257                                 | 30.775 / 116.649 | 52.986 / 34.962   | 42.536 / 42.237             |
+| **Median of eight repins**            | **30.348**       | **29.052**        | **31.903**                  |
+| Repin range                           | 17.039–116.649   | 20.853–52.986     | 18.761–54.080               |
+| Subsequent ordinary-evaluation median | 24.815           | 35.823            | 0.573                       |
+
+C avoids another splice when the repin variable is removed, but its repin itself is not consistently faster. The extra A evaluation in this benchmark is induced by changing the repin environment: normal A regeneration can use ordinary `bazel mod deps` without that toggle. Its cached ordinary evaluations were already below one second. Thus the faster post-repin C evaluation is not a demonstrated reduction in the cost of the existing resolver's ordinary regeneration path. These are wall times on one host with network and cache warming effects, not a controlled CPU benchmark or a prediction of CI latency.
+
+### Decision
+
+**Do not adopt C on this evidence.** It leaves the same total unresolved lockfile conflicts as A and B, moves both observed conflicts to the JSON file, and does not make repinning reliably cheaper. It does preserve dependency/helper parity and produces a stable ordinary evaluation after repinning. Those properties establish feasibility, but do not satisfy the adoption criterion.
+
+`MODULE.bazel`, root BUILD exports, production lockfiles and the generated-lock resolver remain unchanged. `Cargo.lock` continues serving the release script, checkleft metadata and toolchain coherence test. No new lockfile is introduced that the current resolver cannot regenerate, and neither side of an external version change is discarded. This conclusion applies to the four measured pairs; it does not estimate an elimination rate for the full historical corpus.
