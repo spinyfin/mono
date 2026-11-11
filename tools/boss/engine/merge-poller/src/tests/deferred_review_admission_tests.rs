@@ -22,7 +22,11 @@ impl ReviewBatchEnqueuer for FixedHeadEnqueuer {
         pr_url: &str,
         review_pool_size: usize,
     ) -> Result<ReviewBatchDispatch> {
-        let input = batch_input(work_db.review_cycle_root_id(work_item_id), pr_url, self.head);
+        // As the production enqueuer builds it: keyed on the cycle root, and
+        // naming the candidate when that is a revision of the root.
+        let root_id = work_db.review_cycle_root_id(work_item_id);
+        let mut input = batch_input(root_id.clone(), pr_url, self.head);
+        input.legacy_task_id = (work_item_id != root_id).then(|| work_item_id.to_owned());
         work_db.create_pre_merge_review_batch_for_pool(input, repo_remote_url, review_pool_size)
     }
 }
@@ -313,4 +317,174 @@ async fn focus_held_settled_review_advances_and_resolves_deferred_attention() {
                 .is_empty()
         );
     }
+}
+
+// ── a revision held on a root that is outside dispatch focus ───────────────
+
+/// A revision of `root_id` whose implementation run finished without
+/// stamping a contributed head (it ended by declaring delivery), held
+/// `active` with the root's PR stamped on it and an open deferred marker.
+fn held_revision(db: &WorkDb, root_id: &str, launched: bool) -> String {
+    let revision_id = "task_held_revision";
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at,
+                                parent_task_id, pr_url, explicitly_launched)
+             SELECT ?1, product_id, 'revision', 'Fix review findings', '', 'active', '1', '1', ?2, ?3, ?4
+             FROM tasks WHERE id = ?2",
+            rusqlite::params![revision_id, root_id, PR_URL, launched],
+        )
+        .unwrap();
+    let implementation = db
+        .create_execution(
+            boss_protocol::CreateExecutionInput::builder()
+                .work_item_id(revision_id)
+                .kind(ExecutionKind::RevisionImplementation)
+                .build(),
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'completed', finished_at = '2' WHERE id = ?1",
+            [&implementation.id],
+        )
+        .unwrap();
+    db.file_admission_deferred_attention(revision_id, PR_URL).unwrap();
+    revision_id.to_owned()
+}
+
+fn focus_elsewhere(db: &WorkDb) -> boss_protocol::DispatchFocus {
+    let mut focus = boss_protocol::DispatchFocus::default();
+    focus.insert(
+        boss_protocol::DispatchFocusTargetKind::Project,
+        "proj_elsewhere".to_owned(),
+    );
+    db.save_dispatch_focus(&focus).unwrap();
+    focus
+}
+
+fn task_status(db: &WorkDb, task_id: &str) -> boss_protocol::TaskStatus {
+    match db.get_work_item(task_id).unwrap() {
+        boss_protocol::WorkItem::Task(task) | boss_protocol::WorkItem::Chore(task) => task.status,
+        other => panic!("expected a task, got {other:?}"),
+    }
+}
+
+fn open_deferred_markers(db: &WorkDb) -> Vec<String> {
+    db.list_open_attention_items_of_kind(crate::work::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND)
+        .unwrap()
+        .into_iter()
+        .filter_map(|item| item.work_item_id)
+        .collect()
+}
+
+/// The root that owns the PR is outside focus and was never launched. A
+/// revision that was explicitly launched has its push reviewed anyway; one
+/// that was not stays deferred, without a PR fetch.
+#[tokio::test]
+async fn sweep_admits_the_review_of_a_launched_revisions_push_through_focus() {
+    for launched in [true, false] {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let root_id = in_review_root(&db);
+        let revision_id = held_revision(&db, &root_id, launched);
+        let focus = focus_elsewhere(&db);
+        let publisher = RecordingPublisher::default();
+        let mut outcome = SweepOutcome::default();
+
+        if launched {
+            outcome = sweep(&db, &publisher, "head-a").await;
+        } else {
+            super::super::deferred_review_admission::sweep_deferred_review_admission_with(
+                &db,
+                &publisher,
+                &PanicEnqueuer,
+                None,
+                16,
+                &mut outcome,
+            )
+            .await;
+        }
+
+        let batches = db.review_batches_for_cycle_root(&root_id).unwrap();
+        if !launched {
+            assert_eq!(outcome.review_admission_still_deferred, 1);
+            assert!(batches.is_empty());
+            assert_eq!(open_deferred_markers(&db), vec![revision_id]);
+            continue;
+        }
+        assert_eq!(outcome.review_admission_recovered, 1, "{outcome:?}");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].producing_work_item_id.as_deref(), Some(revision_id.as_str()));
+        let members = db.list_executions(Some(&root_id)).unwrap();
+        assert_eq!(members.len(), 2);
+        assert!(
+            db.executions_outside_dispatch_focus(&members, &focus)
+                .unwrap()
+                .is_empty(),
+            "the admitted reviewers must be able to dispatch"
+        );
+        assert!(open_deferred_markers(&db).is_empty());
+        assert_eq!(
+            task_status(&db, &revision_id),
+            boss_protocol::TaskStatus::Active,
+            "the revision stays held while its review runs"
+        );
+    }
+}
+
+/// The revision's review was deferred, then run by a batch admitted against
+/// the root (`bossctl review start`). That batch is settled at the head the
+/// PR still has, so the revision leaves its hold and its marker is cleared.
+#[tokio::test]
+async fn sweep_releases_a_revision_whose_head_was_reviewed_under_its_root() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let root_id = in_review_root(&db);
+    let revision_id = held_revision(&db, &root_id, false);
+    let (batch, executions) = settled_batch(&db, &root_id, "head-a");
+    // The batch's one verdict is recorded against the root, on its newest
+    // reviewer execution.
+    let reviewer = executions.iter().max_by_key(|e| (&e.created_at, &e.id)).unwrap();
+    {
+        let conn = db.connect().unwrap();
+        // An explicit start records its launch on the root it is admitted for.
+        conn.execute("UPDATE tasks SET explicitly_launched = 1 WHERE id = ?1", [&root_id])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO pr_review_verdicts
+                (id, execution_id, work_item_id, head_sha, findings_count,
+                 revision_warranted, gate_outcome, created_at, batch_id)
+             VALUES (?1, ?1, ?2, 'head-a', 0, 0, ?3, '1', ?4)",
+            rusqlite::params![
+                reviewer.id,
+                root_id,
+                crate::work::REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
+                batch.id
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE pr_review_batches SET status = 'completed' WHERE id = ?1",
+            [&batch.id],
+        )
+        .unwrap();
+    }
+    focus_elsewhere(&db);
+    // The marker a deferral left behind, as rows deferred before admission
+    // cleared it for the whole cycle still carry.
+    db.file_admission_deferred_attention(&revision_id, PR_URL).unwrap();
+
+    let outcome = sweep(&db, &RecordingPublisher::default(), "head-a").await;
+
+    assert_eq!(outcome.reviewer_fallback_advanced, 1, "{outcome:?}");
+    assert_eq!(task_status(&db, &revision_id), boss_protocol::TaskStatus::InReview);
+    assert!(open_deferred_markers(&db).is_empty());
+    assert_eq!(
+        db.review_batches_for_cycle_root(&root_id).unwrap().len(),
+        1,
+        "a settled head is not reviewed again"
+    );
 }
