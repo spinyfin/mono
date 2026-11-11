@@ -23,6 +23,24 @@ What drives recovery:
 - When the Agents tab, or the page holding the worker, comes into view, the app asks the engine once per viewer-less worker (`request_worker_pane_attach`) for that worker's `AttachWorkerPane` again. Hiding and re-showing the tab asks again. Declined requests publish a reason; requests for released runs refresh membership so their stale cards disappear. Executions that have ended show a cleanup-pending reason until the engine releases them.
 - A successful attach clears any recorded reason on both sides; a detach for the run clears the app-side reason too.
 
+## Finished panes keep their work item
+
+A released run leaves a dim "finished" placeholder. Its header and body keep the label the pane had while the run was live — the work item's short id and title, the PR as `repo#n`, and for review, review-guide and revision runs what the run was for (`Review: …`, `Review guide: …`, `Revision: …`). The engine's live-worker state is dropped at release, so this label is **not** read from it. The app asks the engine (`ResolveExecutionLabels`, answered by `ExecutionLabelsResolved`) for the label of every run it is drawing as finished, and the engine rebuilds it from the durable execution → work item → PR binding (`engine/core/src/execution_label.rs`, sharing the header-field helper the live state uses). A review-guide run points at a comparison, so its label is the comparison series' root task.
+
+The app does not keep its own copy of the title: the last answer is held only for the runs currently drawn, and the app asks again whenever the Agents view comes back into sight, so a renamed work item or a newly bound PR shows up.
+
+When the label cannot be a title it says so in words, and never prints the run id:
+
+| Engine status                                    | Pane text                                                                                                 |
+| ------------------------------------------------ | --------------------------------------------------------------------------------------------------------- |
+| `resolved`                                       | `<purpose>: <title>` (just the title for a plain implementation run), with the `T<n>` / `P<n>` and PR row |
+| `work_item_deleted`                              | Work item deleted (the engine logs a warning)                                                             |
+| `no_work_item` (answer agent, automation triage) | `<purpose> run`                                                                                           |
+| `execution_unknown`                              | Run record unavailable (the engine logs a warning)                                                        |
+| reply not yet received                           | Loading work item…                                                                                        |
+
+A finished pane that never saw its worker's persona is titled "Worker finished", not "Worker <run id>".
+
 ## Filters
 
 The header has two multi-select menus, **Project** and **Type**.

@@ -151,7 +151,7 @@ pub fn resolve_with_automation(
 /// that column NULL; their bound PR lives on [`WorkExecution::pr_url`]
 /// (stamped from the chain root at dispatch). Fall back to a non-empty
 /// execution URL so revision workers show the PR they are updating.
-fn work_item_header_fields(
+pub(crate) fn work_item_header_fields(
     work_item: Option<&WorkItem>,
     execution: &WorkExecution,
 ) -> (Option<String>, Option<i64>, Option<String>) {

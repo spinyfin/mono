@@ -960,3 +960,57 @@ pub struct WorkRun {
     pub started_at: Option<String>,
     pub transcript_path: Option<String>,
 }
+
+// ── Execution labels ─────────────────────────────────────────────────────────
+//
+// The human label of an execution (the work item it ran for, that item's PR
+// and what the run was for), resolved by the engine from the durable
+// execution → work item → PR binding via `ResolveExecutionLabels`. A frontend
+// must not keep its own copy: a raw execution id is never an acceptable label.
+
+/// How an execution's label resolved. `Resolved` is the only state in which
+/// the work-item fields are filled; every other state is rendered as words
+/// by the frontend (never as the execution id).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionLabelStatus {
+    /// The work item the run was bound to still exists.
+    Resolved,
+    /// The run is bound to a work item that has since been deleted (or whose
+    /// row can no longer be read).
+    WorkItemDeleted,
+    /// The execution kind is not bound to a work item at all (an answer
+    /// agent or an automation triage run). `purpose` still says what it was.
+    NoWorkItem,
+    /// The engine has no execution row with this id.
+    ExecutionUnknown,
+}
+
+/// The engine-resolved label for one execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct ExecutionWorkLabel {
+    pub execution_id: String,
+    pub status: ExecutionLabelStatus,
+    /// [`crate::ExecutionKind::as_str`] of the run, when the execution row
+    /// exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Product that owns the work item, so the frontend can reveal its card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
+    /// PR bound to the work item (or, for a revision, to its chain root).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_url: Option<String>,
+    /// What the run was for, for the runs where the work-item title alone
+    /// would not say: `"Review"`, `"Review guide"`, `"Revision"`, … `None`
+    /// for plain implementation runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_short_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_title: Option<String>,
+}

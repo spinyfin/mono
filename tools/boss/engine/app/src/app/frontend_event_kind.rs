@@ -93,6 +93,7 @@ pub(super) fn kind(event: &FrontendEvent) -> &'static str {
         FrontendEvent::LiveStatusDisabledSlotsList { .. } => "LiveStatusDisabledSlotsList",
         FrontendEvent::LiveStatusDebugReportEvent { .. } => "LiveStatusDebugReportEvent",
         FrontendEvent::ProjectDesignDocResolved { .. } => "ProjectDesignDocResolved",
+        FrontendEvent::ExecutionLabelsResolved { .. } => "ExecutionLabelsResolved",
         FrontendEvent::ProductDesignDocsList { .. } => "ProductDesignDocsList",
         FrontendEvent::ProductDesignDocContent { .. } => "ProductDesignDocContent",
         FrontendEvent::ConflictResolutionMarkedFailed { .. } => "ConflictResolutionMarkedFailed",

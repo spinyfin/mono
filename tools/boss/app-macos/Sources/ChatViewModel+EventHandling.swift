@@ -49,6 +49,7 @@ extension ChatViewModel {
         case .resyncRequired:
             handleResyncRequired() // socket never went down; see ChatViewModel+ResyncRefetch.swift
         case .appSessionRegistered:
+            executionLabelsInvalidatedHandler?()
             isAppSessionRegistered = true
             engine.sendRegisterCapabilities(capabilityIds: CapabilityRegistry.shared.all)
             // The engine drops the recorded selection on every app-session
@@ -115,6 +116,7 @@ extension ChatViewModel {
             bounceUnparkedDrags(message: nil, includeMovesWithoutCheck: false)
             scheduleConnectionLostBannerCheck()
         case .workInvalidated(let topic, let productId, let itemIDs, let invalidationClass):
+            executionLabelsInvalidatedHandler?()
             if CommentEngineBridge.isCommentTopic(topic) {
                 // A comment row on an open viewer's artifact changed elsewhere;
                 // the bridge reloads the bound layer(s). Invalidation-not-patch.
@@ -192,12 +194,14 @@ extension ChatViewModel {
             handleCreatedWorkItemsBatch(items)
         case .workItemUpdated(let item, let revision):
             noteBoardRevision(revision, item: item)
+            executionLabelsInvalidatedHandler?()
             handleUpdatedWorkItem(item)
         case .projectTasksReordered(let projectId, _):
             if let productID = project(withID: projectId)?.productID {
                 scheduleWorkTreeRefetch(productID: productID, flow: .itemRefetch)
             }
         case .workItemDeleted(let id):
+            executionLabelsInvalidatedHandler?()
             let deletedTask = task(withID: id)
             if selectedTask?.id == id {
                 selectedWorkCardID = nil
@@ -420,6 +424,8 @@ extension ChatViewModel {
             engineMetrics = entries
         case .projectDesignDocResolved(let output):
             applyResolvedProjectDesignDoc(output)
+        case .executionLabelsResolved(let labels):
+            executionLabelsHandler?(labels)
         case .dispatchAdmissionEvaluated(let admission):
             handleDispatchAdmissionEvaluated(admission)
         case .productDesignDocsList(let productID, let state):

@@ -1122,6 +1122,19 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "project_design_doc_resolved",
         },
         TagCase {
+            label: "ExecutionLabelsResolved",
+            event: FrontendEvent::ExecutionLabelsResolved {
+                labels: vec![
+                    crate::ExecutionWorkLabel::builder()
+                        .execution_id("exec_1")
+                        .status(crate::ExecutionLabelStatus::Resolved)
+                        .work_item_title("Fix fencer scraping")
+                        .build(),
+                ],
+            },
+            expected_tag: "execution_labels_resolved",
+        },
+        TagCase {
             label: "ProductDesignDocsList",
             event: FrontendEvent::ProductDesignDocsList {
                 product_id: "prod_1".into(),
@@ -2352,6 +2365,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::LiveStatusDisabledSlotsList { .. }
         | FrontendEvent::LiveStatusDebugReportEvent { .. }
         | FrontendEvent::ProjectDesignDocResolved { .. }
+        | FrontendEvent::ExecutionLabelsResolved { .. }
         | FrontendEvent::ProductDesignDocsList { .. }
         | FrontendEvent::ProductDesignDocContent { .. }
         | FrontendEvent::ConflictResolutionMarkedFailed { .. }
@@ -2730,4 +2744,35 @@ fn unknown_invalidation_class_is_structural() {
             ..
         }
     ));
+}
+
+/// The app hand-decodes this shape: pin the documented field names and the
+/// snake_case status values.
+#[test]
+fn execution_label_wire_shape_is_pinned() {
+    let label = crate::ExecutionWorkLabel::builder()
+        .execution_id("exec_1")
+        .status(crate::ExecutionLabelStatus::WorkItemDeleted)
+        .kind("pr_review")
+        .purpose("Review")
+        .build();
+    let json = serde_json::to_value(&label).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "execution_id": "exec_1",
+            "status": "work_item_deleted",
+            "kind": "pr_review",
+            "purpose": "Review",
+        })
+    );
+
+    let request = serde_json::to_value(FrontendRequest::ResolveExecutionLabels {
+        execution_ids: vec!["exec_1".into()],
+    })
+    .unwrap();
+    assert_eq!(
+        request,
+        serde_json::json!({"type": "resolve_execution_labels", "execution_ids": ["exec_1"]})
+    );
 }

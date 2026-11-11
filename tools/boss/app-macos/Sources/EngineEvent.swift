@@ -102,6 +102,10 @@ enum EngineEvent {
     /// per-project `ProjectDesignDocState` the kanban consumes to
     /// pick the right icon affordance and open dispatch.
     case projectDesignDocResolved(output: ResolveProjectDesignDocOutput)
+    /// Engine reply to `ResolveExecutionLabels`: one label per requested
+    /// execution id, in request order. Names the work item (and PR) of a run
+    /// the engine has already released.
+    case executionLabelsResolved(labels: [ExecutionWorkLabel])
     /// Engine-owned live supplement returned by GetReviewGuideSummary.
     /// `seriesId` is the summary's series id; the app caches findings by
     /// that id so a late reply for another series cannot hide or replace

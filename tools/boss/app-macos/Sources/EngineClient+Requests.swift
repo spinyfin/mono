@@ -1140,6 +1140,17 @@ extension EngineClient {
         ], queueIfDisconnected: true)
     }
 
+    /// Resolve the work-item label (short id, title, PR, what the run was for)
+    /// of each execution from the engine's durable bindings. The Agents view
+    /// sends the ids of runs the engine has released, whose live state is
+    /// gone. Engine replies with `execution_labels_resolved`. Read-only.
+    func sendResolveExecutionLabels(executionIds: [String]) {
+        sendLine([
+            "type": "resolve_execution_labels",
+            "execution_ids": executionIds,
+        ], queueIfDisconnected: true)
+    }
+
     /// Fetch one immutable review-guide version's full Markdown. Engine
     /// replies with `review_guide_content` carrying a
     /// `ReviewGuideVersionContent` (`content: nil` when the version id is

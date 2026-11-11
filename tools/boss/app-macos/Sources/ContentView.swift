@@ -212,6 +212,17 @@ struct ContentView: View {
             workersWorkspace.onViewerAttachRequested = { [model] runId in
                 model.requestWorkerPaneAttach(runId: runId)
             }
+            // Finished Agents panes name their work item from the engine's
+            // durable execution → work item → PR binding, not live state.
+            workersWorkspace.onExecutionLabelsRequested = { [model] runIds in
+                model.requestExecutionLabels(runIds: runIds)
+            }
+            model.executionLabelsInvalidatedHandler = { [workspace = workersWorkspace] in
+                workspace.invalidateExecutionLabels()
+            }
+            model.executionLabelsHandler = { [workspace = workersWorkspace] labels in
+                workspace.applyExecutionLabels(labels)
+            }
             // Forward pool-config pushes from the engine so WorkersWorkspaceModel
             // always uses the engine's live pool sizes rather than independently-
             // maintained constants that drift when pool sizes change.

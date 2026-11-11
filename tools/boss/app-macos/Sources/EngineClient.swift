@@ -1100,6 +1100,15 @@ final class EngineClient: @unchecked Sendable {
                 break
             }
             emit(.projectDesignDocResolved(output: output))
+        case "execution_labels_resolved":
+            guard let labelPayloads = payload["labels"] as? [[String: Any]],
+                  let labelData = try? JSONSerialization.data(withJSONObject: labelPayloads),
+                  let labels = try? JSONDecoder().decode([ExecutionWorkLabel].self, from: labelData)
+            else {
+                emit(.error(message: "received invalid execution_labels_resolved payload"))
+                break
+            }
+            emit(.executionLabelsResolved(labels: labels))
         case "review_guide_summary":
             if let summary = payload["summary"] as? [String: Any],
                let rootTaskId = summary["root_task_id"] as? String,

@@ -341,6 +341,22 @@ pub(super) async fn handle_get_execution(ctx: Dispatch, req: FrontendRequest) {
     }
 }
 
+/// `ResolveExecutionLabels`: the work-item label of each requested execution,
+/// resolved from durable rows so a released run keeps its title and PR.
+pub(super) async fn handle_resolve_execution_labels(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::ResolveExecutionLabels { execution_ids } = req else {
+        unreachable!()
+    };
+    let labels = boss_engine_runtime::execution_label::resolve_execution_labels(&work_db, &execution_ids);
+    send_response(&sink, &request_id, FrontendEvent::ExecutionLabelsResolved { labels });
+}
+
 pub(super) async fn handle_create_run(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         work_db,

@@ -550,6 +550,7 @@ fn worker_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::RegisterCapabilities { .. }
         | FrontendRequest::ReportSelectedProduct { .. }
         | FrontendRequest::RequestWorkerPaneAttach { .. }
+        | FrontendRequest::ResolveExecutionLabels { .. }
         | FrontendRequest::SetCoordinatorHandoff { .. }
         | FrontendRequest::Shutdown { .. }
         | FrontendRequest::SpawnCapabilityRestored => coordinator(variant_name(request)),
