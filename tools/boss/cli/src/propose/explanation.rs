@@ -17,7 +17,12 @@ const REMAIN_BLOCKED: &str = "--explanation No: must name an actionable path the
 pub(super) fn validate(raw: &str) -> Result<String, String> {
     let labels = AnswerOptionLabels::split_or_bypass();
     let (yes, no) = labels.headings();
-    if raw.lines().any(|line| line.trim() == yes || line.trim() == no) {
+    // Details is verbatim evidence: only the structural lines before it pick the shape.
+    let structural = raw.lines().take_while(|line| line.trim() != "Details:");
+    if structural
+        .into_iter()
+        .any(|line| line.trim() == yes || line.trim() == no)
+    {
         return check(raw, &labelled_headings(&labels)).map_err(|_| EXPECTED_SPLIT.into());
     }
     check(raw, &HEADINGS)
@@ -236,6 +241,40 @@ pub(super) mod tests {
             .unwrap_err()
             .to_string();
             assert!(error.contains(EXPECTED_SPLIT), "{error}");
+        }
+    }
+
+    #[test]
+    fn details_quoting_split_headings_do_not_change_the_shape() {
+        let quoted = "\nDetails:\nQuoted question:\nSplit:\nLand the first PR.\nBypass limit:\nKeep one PR.";
+        for (text, extra) in [
+            (format!("{VALID}{quoted}"), vec!["--question", "Approve the fix?"]),
+            (
+                format!("{VALID_CHOICE}{quoted}"),
+                vec!["--choices", "Gradual", "All at once", "--question", "Which rollout?"],
+            ),
+        ] {
+            assert_eq!(validate(&text).unwrap(), text);
+            let kind = if extra.contains(&"--choices") {
+                "multiple-choice"
+            } else {
+                "yes-no"
+            };
+            let mut args = vec![
+                "boss",
+                "propose",
+                "done",
+                "--outcome",
+                "blocked",
+                "--summary",
+                "Blocked",
+                "--answer-type",
+                kind,
+                "--explanation",
+                &text,
+            ];
+            args.extend(extra);
+            Cli::try_parse_from(args).unwrap();
         }
     }
 
