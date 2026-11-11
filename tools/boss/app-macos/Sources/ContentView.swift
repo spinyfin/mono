@@ -25,14 +25,12 @@ struct ContentView: View {
     @StateObject private var bossPane = BossPaneModel()
     #endif
     @StateObject private var updateQuitRequest = UpdateQuitRequest()
-    @State private var isSearchExpanded: Bool = false
     private var workColumnVisibility: Binding<NavigationSplitViewVisibility> {
         Binding(get: { model.isWorkSidebarHidden ? .detailOnly : .all },
                 set: { model.isWorkSidebarHidden = $0 == .detailOnly })
     }
     @State private var showCoordinatorResetConfirmFromBanner = false
     @Environment(\.openWindow) private var openWindow
-    @AppStorage("boss.ui.standardSearch", store: BossDefaults.store) private var useStandardSearch: Bool = false
     @AppStorage(KanbanBoardStyle.storageKey, store: BossDefaults.store) private var kanbanBoardStyle: KanbanBoardStyle = .productDefault
 
     private var navigationContent: some View {
@@ -63,40 +61,25 @@ struct ContentView: View {
         // needs to sit above it goes in the titlebar accessory slot
         // (`windowTitlebarAccessory` below), never in a wrapping VStack.
         ZStack {
-            // boss.ui.standardSearch OFF (default): custom WorkSearchToolbarItem below.
-            // boss.ui.standardSearch ON: SwiftUI .searchable() owns placement/focus/clear.
-            // Both branches keep the same opacity/hitTesting treatment so navigation-mode
-            // switching never tears down NSViews in agentsView (see comment above).
-            if useStandardSearch {
-                NavigationSplitView(columnVisibility: workColumnVisibility) {
-                    sidebar
-                } detail: {
-                    detail
-                }
-                // Remove the system sidebarToggle only on non-Work tabs. On the Work
-                // tab, the system-provided toggle handles both expanded and collapsed
-                // states natively, giving exactly one toggle button in either state
-                // without a state-conditional custom button (suppressing one button
-                // in one collapse state always left the other button visible in the
-                // opposite state).
-                .toolbar(removing: model.navigationMode == .work ? nil : .sidebarToggle)
-                .opacity(model.navigationMode == .work ? 1 : 0)
-                .allowsHitTesting(model.navigationMode == .work)
-                .searchable(
-                    text: $model.workSearchText,
-                    placement: .toolbar,
-                    prompt: "Search tasks…"
-                )
-            } else {
-                NavigationSplitView(columnVisibility: workColumnVisibility) {
-                    sidebar
-                } detail: {
-                    detail
-                }
-                .toolbar(removing: model.navigationMode == .work ? nil : .sidebarToggle)
-                .opacity(model.navigationMode == .work ? 1 : 0)
-                .allowsHitTesting(model.navigationMode == .work)
+            NavigationSplitView(columnVisibility: workColumnVisibility) {
+                sidebar
+            } detail: {
+                detail
             }
+            // Remove the system sidebarToggle only on non-Work tabs. On the Work
+            // tab, the system-provided toggle handles both expanded and collapsed
+            // states natively, giving exactly one toggle button in either state
+            // without a state-conditional custom button (suppressing one button
+            // in one collapse state always left the other button visible in the
+            // opposite state).
+            .toolbar(removing: model.navigationMode == .work ? nil : .sidebarToggle)
+            .opacity(model.navigationMode == .work ? 1 : 0)
+            .allowsHitTesting(model.navigationMode == .work)
+            .searchable(
+                text: $model.workSearchText,
+                placement: .toolbar,
+                prompt: "Search tasks…"
+            )
 
             agentsView
                 .opacity(model.navigationMode == .agents ? 1 : 0)
@@ -255,9 +238,6 @@ struct ContentView: View {
             model.reviewTerminalOpener = { [openWindow] in
                 openWindow(id: "review-terminal")
             }
-            // Register capabilities compiled into this build so the engine can
-            // detect flag ↔ capability mismatches and surface a warning badge.
-            CapabilityRegistry.shared.register("toolbar_search_standard")
             model.startIfNeeded()
         }
         .toolbar {
@@ -332,12 +312,6 @@ struct ContentView: View {
             ToolbarItemGroup(placement: .primaryAction) {
                 if model.navigationMode == .work {
                     WorkGroupToolbarMenu(model: model)
-                    if !useStandardSearch {
-                        WorkSearchToolbarItem(
-                            model: model,
-                            isExpanded: $isSearchExpanded
-                        )
-                    }
                 }
             }
 
@@ -361,12 +335,6 @@ struct ContentView: View {
 
     var body: some View {
         configuredContent
-        .onChange(of: model.navigationMode) { _, newMode in
-            isSearchExpanded = false
-            if useStandardSearch && newMode != .work {
-                model.workSearchText = ""
-            }
-        }
         // `model.workErrorMessage` is deliberately NOT an `.alert` here: it
         // renders as the passive `WorkNoticeBanner` in `chromeBanners`
         // below. The two alerts that remain are decisions about an action
@@ -953,7 +921,6 @@ struct ContentView: View {
                     if let query = model.activeWorkSearchQuery {
                         WorkFilterBanner(query: query) {
                             model.workSearchText = ""
-                            isSearchExpanded = false
                         }
                     }
                     switch boardMainPresentation(isBoardLoaded: model.isBoardLoaded(product.id)) {

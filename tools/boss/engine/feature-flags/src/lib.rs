@@ -162,17 +162,6 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         capability_id: None,
     },
     FeatureFlagSpec {
-        name: "toolbar_search_standard",
-        description: "Use SwiftUI's platform-standard .searchable() for the work-board toolbar instead \
-             of the custom WorkSearchToolbarItem. Requires the macOS app to be built with \
-             standard-search support (capability: toolbar_search_standard). DEFAULT OFF — \
-             flip ON to validate the standard search path; the capability-present badge in the \
-             debug pane confirms the implementation is compiled into this build.",
-        category: "ui",
-        default_enabled: false,
-        capability_id: Some("toolbar_search_standard"),
-    },
-    FeatureFlagSpec {
         name: "notification_dedup",
         description: "Run LLM near-duplicate detection when persisting an Attention item \
              (creation path) and on startup (sweep). Off by default — enable to \
@@ -1042,10 +1031,10 @@ mod tests {
         // directly via the snapshot logic's building blocks.
         let reg = CapabilityRegistry::new();
         // A capability that is absent.
-        assert!(!reg.is_present("toolbar_search_standard"));
+        assert!(!reg.is_present("example_capability"));
         // Register it.
-        reg.register("toolbar_search_standard");
-        assert!(reg.is_present("toolbar_search_standard"));
+        reg.register("example_capability");
+        assert!(reg.is_present("example_capability"));
         // A different one is still absent.
         assert!(!reg.is_present("other_cap"));
     }

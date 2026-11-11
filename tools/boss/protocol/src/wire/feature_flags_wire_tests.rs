@@ -63,8 +63,8 @@ fn feature_flags_list_event_round_trips() {
 #[test]
 fn feature_flags_list_event_round_trips_with_capability_present() {
     let snap = FeatureFlagSnapshot {
-        name: "toolbar_search_standard".into(),
-        description: "Standard SwiftUI search in toolbar".into(),
+        name: "example_capability_flag".into(),
+        description: "Example flag with a capability_present field".into(),
         category: "search".into(),
         default_enabled: false,
         enabled: true,
@@ -88,15 +88,15 @@ fn feature_flag_snapshot_capability_present_defaults_to_none_on_old_payload() {
 #[test]
 fn register_capabilities_request_round_trips() {
     let original = FrontendRequest::RegisterCapabilities {
-        capability_ids: vec!["toolbar_search_standard".into(), "other_cap".into()],
+        capability_ids: vec!["example_capability".into(), "other_cap".into()],
     };
     let json = serde_json::to_string(&original).unwrap();
     assert!(json.contains("register_capabilities"));
-    assert!(json.contains("toolbar_search_standard"));
+    assert!(json.contains("example_capability"));
     let parsed: FrontendRequest = serde_json::from_str(&json).unwrap();
     match parsed {
         FrontendRequest::RegisterCapabilities { capability_ids } => {
-            assert_eq!(capability_ids, &["toolbar_search_standard", "other_cap"]);
+            assert_eq!(capability_ids, &["example_capability", "other_cap"]);
         }
         other => panic!("unexpected variant: {other:?}"),
     }
