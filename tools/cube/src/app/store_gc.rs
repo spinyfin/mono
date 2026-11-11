@@ -103,7 +103,7 @@ use crate::store::Store;
 
 use crate::app::errors::{CubeError, Result};
 use crate::app::jj::run_jj;
-use crate::app::store_gc_integrity::{GcIndex, collector_version};
+use crate::app::store_gc_integrity::{GcIndex, collector_version, oldest_shared_client};
 
 /// Operations newer than this are never abandoned. Three days of history
 /// keeps `jj op undo` useful while the log stays bounded.
@@ -158,8 +158,12 @@ pub(super) enum StoreGcOutcome {
     Maintained,
     /// The host never went quiet, so nothing was abandoned or collected.
     Skipped,
-    /// The pass failed, including a racing operation head.
+    /// The pass failed, including a racing operation head after an abandon.
     Failed,
+    /// A concurrent jj operation was in flight before anything was
+    /// rewritten; nothing was abandoned or collected and the next pass
+    /// retries. Neither counts as a failure nor resets the failure streak.
+    Concurrent,
 }
 
 impl StoreGcOutcome {
@@ -168,6 +172,7 @@ impl StoreGcOutcome {
             Self::Maintained => 0,
             Self::Skipped => 1,
             Self::Failed => 2,
+            Self::Concurrent => 3,
         }
     }
 
@@ -176,6 +181,7 @@ impl StoreGcOutcome {
             0 => Some(Self::Maintained),
             1 => Some(Self::Skipped),
             2 => Some(Self::Failed),
+            3 => Some(Self::Concurrent),
             _ => None,
         }
     }
@@ -185,6 +191,7 @@ impl StoreGcOutcome {
             Self::Maintained => "maintained",
             Self::Skipped => "skipped: jj never went quiet",
             Self::Failed => "failed",
+            Self::Concurrent => "skipped: a concurrent jj operation was in flight",
         }
     }
 }
@@ -195,6 +202,8 @@ pub(super) fn record_store_gc_outcome(store: &Store, repo: &str, outcome: StoreG
     store.set_pool_metadata_i(&store_gc_outcome_key(repo), outcome.code())?;
     let failures = if outcome == StoreGcOutcome::Maintained {
         0
+    } else if outcome == StoreGcOutcome::Concurrent {
+        store.get_pool_metadata_i(&store_gc_failures_key(repo))?.unwrap_or(0)
     } else {
         store
             .get_pool_metadata_i(&store_gc_failures_key(repo))?
@@ -351,29 +360,67 @@ pub(crate) fn count_op_heads(source: &Path) -> Result<usize> {
 
 /// The operation head ids in the store at `source`, one directory entry each.
 fn op_heads(source: &Path) -> Result<Vec<String>> {
-    std::fs::read_dir(source.join(".jj/repo/op_heads/heads"))
+    let mut heads: Vec<String> = std::fs::read_dir(source.join(".jj/repo/op_heads/heads"))
         .map_err(CubeError::Io)?
         .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
         .collect::<std::io::Result<_>>()
-        .map_err(CubeError::Io)
+        .map_err(CubeError::Io)?;
+    // Directory order is arbitrary; sorted heads give a stable verification order.
+    heads.sort();
+    Ok(heads)
 }
 
-/// Stop the pass unless the store holds exactly one operation head. A second
-/// head means a jj command raced the abandon: the next jj command merges the
-/// heads against an empty base, so nothing may be collected.
+/// Stop the pass unless the store holds exactly one operation head. Used
+/// once this pass has abandoned operations: a second head then means a jj
+/// command raced the abandon, and the next jj command merges the heads
+/// against an empty base, so nothing may be collected.
 fn require_single_op_head(record: &RepoRecord, source: &Path, when: &str) -> Result<String> {
     let mut heads = op_heads(source)?;
     if heads.len() == 1 {
         return Ok(heads.remove(0));
     }
     Err(CubeError::InvalidArgument(format!(
-        "repo `{}`: the store holds {} operation heads {when} (expected 1); \
-         the rewrite is unsafe, so nothing was collected. Repair the operation heads in {} \
+        "repo `{}`: the store holds {} operation heads {when} (expected 1); operations were abandoned in this \
+         pass but no files were collected, and a command raced the abandon. Repair the operation heads in {} \
          before allowing commands to merge abandoned ancestry",
         record.repo,
         heads.len(),
         source.display()
     )))
+}
+
+/// The single operation head before this pass has rewritten anything, or
+/// `None` when a second head persists. Another head here is an ordinary
+/// concurrent operation that jj merges on its next load, not damage: the
+/// heads are re-read a few times in case that merge is imminent, and if they
+/// persist the pass stops with nothing abandoned or collected, which is a
+/// retryable skip rather than a failure.
+fn single_op_head_before_rewrite(source: &Path) -> Result<Option<String>> {
+    for attempt in 0..CONCURRENT_HEAD_READS {
+        if attempt > 0 {
+            std::thread::sleep(CONCURRENT_HEAD_WAIT);
+        }
+        let mut heads = op_heads(source)?;
+        if heads.len() == 1 {
+            return Ok(Some(heads.remove(0)));
+        }
+    }
+    Ok(None)
+}
+
+/// How many times the heads are read, and the wait between reads, before a
+/// second head is treated as a concurrent operation that stops the pass.
+const CONCURRENT_HEAD_READS: usize = 3;
+const CONCURRENT_HEAD_WAIT: Duration = Duration::from_millis(250);
+
+/// The single head at a collection checkpoint: a hard error after an abandon
+/// in this pass, `None` (a retryable skip) when nothing was rewritten.
+fn head_at_checkpoint(record: &RepoRecord, source: &Path, when: &str, abandoned: bool) -> Result<Option<String>> {
+    if abandoned {
+        require_single_op_head(record, source, when).map(Some)
+    } else {
+        single_op_head_before_rewrite(source)
+    }
 }
 
 fn gate_data_dir(database_path: Option<&Path>) -> Result<PathBuf> {
@@ -469,6 +516,10 @@ pub(super) enum Collection {
     /// The host never went quiet before the abandon, so neither the
     /// abandon nor the collection ran.
     Skipped,
+    /// A second operation head from a concurrent jj command was present
+    /// before anything was rewritten, so nothing was abandoned or collected;
+    /// the next pass retries.
+    Concurrent,
     /// `jj util gc --expire now`, after an instant with no jj process.
     Immediate,
     /// `jj util gc` with jj's two-week threshold: the host never went
@@ -501,13 +552,18 @@ impl StoreGcReport {
     pub(super) fn summary(&self) -> String {
         let verb = if self.dry_run { "would abandon" } else { "abandoned" };
         let cut = match &self.abandoned_through {
-            None if self.collection == Collection::Skipped => "no operations abandoned".to_owned(),
+            None if matches!(self.collection, Collection::Skipped | Collection::Concurrent) => {
+                "no operations abandoned".to_owned()
+            }
             Some(id) => format!("{verb} operations through {}", &id[..12.min(id.len())]),
             None => "nothing older than the keep window to abandon".to_owned(),
         };
         let collected = match self.collection {
             Collection::None => "",
             Collection::Skipped => "; skipped (jj never went quiet, nothing was abandoned or collected)",
+            Collection::Concurrent => {
+                "; skipped (a concurrent jj operation was in flight, nothing was abandoned or collected)"
+            }
             Collection::Immediate => "; collected immediately",
             Collection::Deferred => "; collection deferred to jj's two-week threshold (jj never went quiet)",
         };
@@ -541,9 +597,9 @@ pub(super) fn gc_repo_store(
     let started = Instant::now();
     let mut collector_jj = None;
     let probe = match (dry_run, record.source.as_deref()) {
-        (false, Some(source)) if source.join(".jj/repo").is_dir() => {
-            collector_version(runner, source).map(|version| collector_jj = Some(version))
-        }
+        (false, Some(source)) if source.join(".jj/repo").is_dir() => oldest_shared_client(database_path, &record.repo)
+            .and_then(|oldest| collector_version(runner, source, &record.repo, oldest))
+            .map(|version| collector_jj = Some(version)),
         _ => Ok(()),
     };
     probe
@@ -661,8 +717,20 @@ pub(super) fn gc_repo_store_with_deadline(
         let index = {
             let _reader = JjGate::shared_for_database(database_path)?;
             let index = GcIndex::new(&source)?;
-            let head = require_single_op_head(record, &source, "before the abandon")?;
-            index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "before abandon", &head)?;
+            // Only the shared gate is held and the host need not be quiet, so
+            // a second head is an ordinary concurrent operation that jj
+            // merges on its next load, not damage. Verify every head.
+            let heads = op_heads(&source)?;
+            if heads.is_empty() {
+                return Err(CubeError::InvalidArgument(format!(
+                    "repo `{}`: the store at {} has no operation heads before the abandon; nothing was abandoned or collected",
+                    record.repo,
+                    source.display()
+                )));
+            }
+            for head in &heads {
+                index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "before abandon", head)?;
+            }
             index
         };
         let mut rewritten_head = None;
@@ -695,7 +763,15 @@ pub(super) fn gc_repo_store_with_deadline(
                     gate = Some(candidate);
                 }
             }
-            if let Some(active_gate) = gate.as_ref() {
+            if gate.is_some() && op_heads(&source)?.len() != 1 {
+                // A concurrent head that predates the abandon: the abandon
+                // would rewrite every head and the after-abandon check
+                // would mistake it for a race. Rewrite nothing instead.
+                drop(gate.take());
+                exclusive_started = None;
+                abandoned_through = None;
+                collection = Collection::Concurrent;
+            } else if let Some(active_gate) = gate.as_ref() {
                 let range = format!("..{cut}");
                 active_gate.quarantine(&source)?;
                 let abandon = runner.run_with_timeout(
@@ -711,7 +787,10 @@ pub(super) fn gc_repo_store_with_deadline(
                 collection = Collection::Skipped;
             }
         }
-        if collection != Collection::Skipped {
+        'collect: {
+            if matches!(collection, Collection::Skipped | Collection::Concurrent) {
+                break 'collect;
+            }
             // The observation that makes `--expire now` safe has to come
             // after the abandon: it is the commands that loaded the store
             // before the rewrite that must have finished.
@@ -768,7 +847,16 @@ pub(super) fn gc_repo_store_with_deadline(
             // come after it, immediately before `util gc`, so neither goes
             // stale.
             let collection_started = Instant::now();
-            let head = require_single_op_head(record, &source, "before the collection rebuild")?;
+            let Some(head) = head_at_checkpoint(
+                record,
+                &source,
+                "before the collection rebuild",
+                rewritten_head.is_some(),
+            )?
+            else {
+                collection = Collection::Concurrent;
+                break 'collect;
+            };
             if let Some(ref rewritten) = rewritten_head {
                 super::store_gc_integrity::require_safe_progress(runner, &source, rewritten, &head)?;
             }
@@ -778,7 +866,11 @@ pub(super) fn gc_repo_store_with_deadline(
             // loaded an older head and may have committed on it since; that
             // head only shows up now, on both the immediate and deferred
             // paths.
-            let current = require_single_op_head(record, &source, "before the collection")?;
+            let Some(current) = head_at_checkpoint(record, &source, "before the collection", rewritten_head.is_some())?
+            else {
+                collection = Collection::Concurrent;
+                break 'collect;
+            };
             super::store_gc_integrity::require_safe_progress(runner, &source, &head, &current)?;
             if quiet {
                 gc_args.extend(["--expire", "now"]);
@@ -789,9 +881,32 @@ pub(super) fn gc_repo_store_with_deadline(
             // Collection is a reader: leases proceed, but another rewrite
             // cannot invalidate the head this collector loaded.
             index.run(runner, &gc_args, MAINTENANCE_CMD_TIMEOUT)?;
-            let collected = require_single_op_head(record, &source, "after the collection")?;
-            super::store_gc_integrity::require_safe_progress(runner, &source, &current, &collected)?;
-            index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "after collection", &collected)?;
+            // Collection has already run, so every head that exists now is
+            // checked rather than refused: a concurrent worker operation is
+            // benign when it descends from the head collected against, and
+            // each head must still rebuild a fresh index.
+            let collected_heads = op_heads(&source)?;
+            if collected_heads.is_empty() {
+                return Err(CubeError::InvalidArgument(format!(
+                    "repo `{}`: collection completed but the store at {} has no operation heads afterwards; \
+                     fresh-index verification was not performed",
+                    record.repo,
+                    source.display()
+                )));
+            }
+            for collected in &collected_heads {
+                super::store_gc_integrity::require_safe_progress(runner, &source, &current, collected).map_err(
+                    |error| {
+                        CubeError::InvalidArgument(format!(
+                            "repo `{}`: collection completed, but a head published afterwards could not be \
+                             verified to descend from the head collected against, so fresh-index verification \
+                             was not performed: {error}",
+                            record.repo
+                        ))
+                    },
+                )?;
+                index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "after collection", collected)?;
+            }
             collection_ms = collection_started.elapsed().as_millis();
         }
     }

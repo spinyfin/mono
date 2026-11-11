@@ -54,7 +54,9 @@ It is a manual procedure, not an automatic fallback during collection.
    alternates. Preserve predecessor metadata, operation heads, and indexes.
 3. Use jj 0.32.0 for every client sharing the store, including cube's `jj` on
    `PATH`, engine processes, and worker shells (after upgrading, declare it with
-   `CUBE_OLDEST_JJ_CLIENT=0.32` so the collector is not refused as too new). Verify `jj --version` in each
+   `cube repo declare-oldest-jj <repo> 0.32` so the collector is not refused as too
+   new; the declaration is stored with the repo in cube's database and audited as
+   `repo.oldest_jj_declared`, so it applies to every collector however it is started). Verify `jj --version` in each
    launch environment. Do not mix upgraded collectors with older readers.
 4. On the independent copy, run
    `jj --ignore-working-copy --repository <copy> debug reindex`.
@@ -80,3 +82,77 @@ restoring them to the live store. Predecessor metadata and cached indexes do not
 contain enough information to recreate arbitrary lost Git objects. Repointing
 an operation head at an old cached index only restores temporary readability;
 it does not repair the missing objects.
+
+## Verification record: mono and appoint stores, 2026-11-10
+
+Taken on the host that runs the stores, after the pass that abandoned and
+collected `mono` (audit row `2026-11-11T00:01:08Z`, 20955 -> 7258 operations).
+The stores were cloned with `cp -cR` (APFS copy-on-write) into a scratch
+directory and every command ran against the clone, never the live store.
+`mono` is 12 GB and was being written while the clone ran, so its first clone
+was missing a freshly written `store/extra` segment and `debug reindex` failed
+with `Failed to load table segment`. That failure was an artifact of cloning a
+live store, not damage: after copying the missing `store/extra` and `op_store`
+files from the live store (`cp -cRn`), the clone reindexed.
+
+Commands and results:
+
+- Whether retained history was re-parented onto the root operation. For each
+  repo, `jj --ignore-working-copy --at-operation <oldest retained op> op log
+--no-graph -T 'id.short(12) ++ " " ++ time.start()'` lists exactly the oldest
+  retained operation and then the all-zero root, so the oldest retained
+  operation's only ancestor is the root: `mono` `d8e5065c299a` (2026-11-07
+  18:36 -06:00), 7325 operations in total, and `appoint` `ded45bdbdfbf`
+  (2026-11-07 13:08 -06:00), 10 operations. This is what `jj op abandon ..<cut>`
+  does by design (descendants of the abandoned range are re-parented onto the
+  root), not evidence of lost retained history.
+- Whether the stores can still be rebuilt with the oldest supported client.
+  The original unversioned reindex results (3663 commits for `appoint`,
+  66479 for `mono`) did not establish jj 0.26 compatibility. The repeat
+  verification below uses the pinned binary rather than `jj` on PATH.
+- The cube audit log (`~/.local/share/cube/audit/audit-2026-11-09.log`) has
+  no failed `repo.store_gc` or `repo.store_gc.index_warmup` row for this
+  incident. Its later successful collection row at `2026-11-11T00:01:08Z`
+  is a separate pass, not evidence that the earlier pass collected anything.
+
+### Incident verdict
+
+The 2026-11-10 `mono` failure was unrelated to predecessor pruning in that
+pass: a too-short warm-up deadline followed by a correct refusal of a
+concurrent operation head stopped the pass before collection.
+The source is the incident description accompanying the
+[store-GC investigation](https://github.com/spinyfin/mono/pull/3523):
+warm-up timed out at 19 seconds, then a second operation head made collection
+refuse. The single-head guard runs before `util gc`, so that sequence means
+no objects were collected in the refused pass. It is not a missing-predecessor
+rebuild error. The absence of a failed audit row does not negate the reported
+sequence; it limits independent audit corroboration. This verdict does not
+attribute any inherited index to a particular writer or claim that earlier
+passes could never have pruned objects.
+
+### Pinned jj 0.26 verification, 2026-11-10
+
+The preserved scratch clones were copied with `cp -cR` into
+`/tmp/cube-3525-jj026-verification/{mono,appoint}`. Their Git targets are
+relative to each clone and their Git object databases have no alternates;
+neither reindex uses the live stores.
+
+Both commands use this exact executable, resolved from
+`bazel cquery @jj_test_tools//:jj --output=files` and the Bazel output base:
+
+```text
+/Users/brianduff/Library/Caches/bazel/_bazel_brianduff/d27ff1eedd7051db828c671d70cb8dcf/external/+jj_test_repository+jj_test_tools/jj
+```
+
+Running that executable with `--version` printed
+`jj 0.26.0-613742dfbbd89324b25672a75ef8ce9e671ae0d3` (exit 0).
+For each clone, the invocation is
+`<executable> --ignore-working-copy --repository <clone> debug reindex`.
+
+- `appoint`: `Finished indexing 3663 commits.`, exit 0.
+- `mono`: `Finished indexing 66479 commits.`, exit 0.
+
+Both clones therefore rebuild successfully with jj 0.26, including its
+legacy predecessor traversal. No missing predecessor objects were observed
+in these snapshots; this supports current rebuildability for both stores,
+including `appoint`, without using it to reconstruct the historical failure.

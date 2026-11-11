@@ -26,14 +26,18 @@ def sha256(path):
 
 def inputs(generator, jj_pin):
     text = jj_pin.read_text()
-    archives = re.search(r"_ARCHIVES = (\{.*?\})", text, re.S)
-    version = re.search(r"releases/download/v([\d.]+)/", text)
-    if not archives or not version:
+    default = re.search(r'_DEFAULT_VERSION = "([\d.]+)"', text)
+    releases = re.search(r"_JJ_RELEASES = (\{.*?\n\})", text, re.S)
+    if not default or not releases:
         raise ValueError("Cannot read the pinned jj version and archive checksums")
+    version = default[1]
+    archives = ast.literal_eval(releases[1]).get(version)
+    if archives is None:
+        raise ValueError(f"No jj archive checksums are pinned for version {version}")
     return {
         "generator_sha256": sha256(generator),
-        "jj_version": version[1],
-        "jj_archives": ast.literal_eval(archives[1]),
+        "jj_version": version,
+        "jj_archives": archives,
     }
 
 

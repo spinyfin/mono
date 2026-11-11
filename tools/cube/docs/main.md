@@ -780,13 +780,26 @@ checkout and not aware of anything above jj:
    only when every branch reaches the previously checked head. A merge that
    restores abandoned ancestry fails the pass and writes a failed audit row,
    including when it appears during `util gc`. The ancestry walk is bounded
-   to 4,096 operations and 60 seconds and refuses unverified history.
+   to 4,096 operations and 60 seconds and refuses unverified history; the
+   error says whether the bound was exhausted or the walk reached an operation
+   with no parents. A second head seen before any rewrite is ordinary
+   concurrency: heads are re-read three times, 250 ms apart. If multiple heads
+   persist, the pass records collection `concurrent` on the `repo.store_gc`
+   audit row and persists `StoreGcOutcome::Concurrent` ("skipped: a concurrent
+   jj operation was in flight"), leaving `store_gc_consecutive_failures`
+   unchanged so the next pass can retry. Before a rewrite, heads are checked
+   again under the exclusive gate; a second head releases the gate and returns
+   the same concurrent outcome before quarantine or `op abandon`. After the
+   collection, every head is checked rather than refused, and a failure says
+   the collection completed and fresh-index verification was not performed.
    The collector
    must also be the oldest client sharing the store: a newer `jj` omits legacy
    predecessors from its index, prunes them, and still passes its own
-   verifications. The `jj` on `PATH` is therefore refused when newer than 0.26
-   (override with `CUBE_OLDEST_JJ_CLIENT=<major.minor>` once every client is
-   upgraded), and its `jj --version` is recorded on the `repo.store_gc` and
+   verifications. The `jj` on `PATH` is therefore refused when newer than the
+   repo's declared oldest client (0.26 until `cube repo declare-oldest-jj <repo>
+<major.minor>` records otherwise once every client is upgraded; the declaration
+   is stored with the repo and audited as `repo.oldest_jj_declared`, never read
+   from a process environment), and its `jj --version` is recorded on the `repo.store_gc` and
    `repo.store_gc.index_warmup` audit rows. Neither jj 0.26 nor 0.32's `util gc` prunes
    the default index store, so skipping the live `.jj/repo/index` loses no
    reclamation.

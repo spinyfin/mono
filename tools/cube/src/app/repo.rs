@@ -101,6 +101,37 @@ pub(super) fn run_repo(
                 }),
             )
         }
+        RepoCommand::DeclareOldestJj { repo, version } => {
+            use crate::app::store_gc_integrity::{
+                decode_major_minor, encode_major_minor, oldest_client_key, parse_declared_version,
+            };
+            let record = store
+                .get_repo(&repo)?
+                .ok_or_else(|| CubeError::RepoNotFound(repo.clone()))?;
+            let not_a_version =
+                || CubeError::InvalidArgument(format!("`{version}` is not a `major.minor` jj version (e.g. 0.34)"));
+            let oldest = parse_declared_version(version.trim()).ok_or_else(not_a_version)?;
+            let encoded = encode_major_minor(oldest).ok_or_else(not_a_version)?;
+            let previous = store
+                .get_pool_metadata_i(&oldest_client_key(&record.repo))?
+                .and_then(decode_major_minor)
+                .map(|(major, minor)| format!("{major}.{minor}"));
+            store.set_pool_metadata_i(&oldest_client_key(&record.repo), encoded)?;
+            audit!(
+                database_path,
+                "repo.oldest_jj_declared",
+                repo = record.repo,
+                oldest_jj = format!("{}.{}", oldest.0, oldest.1),
+                previous_oldest_jj = previous,
+            );
+            RunResult::new(
+                format!(
+                    "Recorded jj {}.{} as the oldest client sharing `{repo}`'s store; store upkeep may now collect with jj up to that version.",
+                    oldest.0, oldest.1
+                ),
+                json!({ "repo": record.repo, "oldest_jj": format!("{}.{}", oldest.0, oldest.1) }),
+            )
+        }
         RepoCommand::Gc {
             repo,
             keep_hours,
@@ -136,6 +167,7 @@ pub(super) fn run_repo(
                 use crate::app::store_gc::{Collection, StoreGcOutcome, record_store_gc_outcome};
                 let outcome = match &result {
                     Ok(report) if report.collection == Collection::Skipped => StoreGcOutcome::Skipped,
+                    Ok(report) if report.collection == Collection::Concurrent => StoreGcOutcome::Concurrent,
                     Ok(_) => StoreGcOutcome::Maintained,
                     Err(_) => StoreGcOutcome::Failed,
                 };
