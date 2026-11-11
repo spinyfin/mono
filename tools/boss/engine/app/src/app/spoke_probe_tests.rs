@@ -84,42 +84,58 @@ impl HostAdapter for Remote {
 
 #[tokio::test]
 async fn queued_probe_uses_host_without_local_slot_and_never_duplicates_uncertain_input() {
-    for (outcome, expected) in [
-        (
-            ControlOutcome::Uncertain("reply lost".into()),
-            ProbeDeliveryState::Unconfirmed,
-        ),
-        (
-            ControlOutcome::Delivered(WorkerPane {
-                life: WorkerLife::Alive,
-                session: "worker".into(),
-                pane_id: "%1".into(),
-                pid: Some(42),
-                exit_code: None,
-            }),
-            ProbeDeliveryState::Buffered,
-        ),
-    ] {
-        let remote = Arc::new(Remote {
-            outcome,
-            calls: Mutex::new(vec![]),
-        });
-        let (state, _dir) = test_server_state_with_overrides(ServerStateOverrides {
-            host_adapter_provider: Some(Arc::new(Provider(remote.clone()))),
-            ..Default::default()
-        });
-        state.work_db.add_host("spoke", "worker@spoke", 1, &[]).unwrap();
-        state
-            .work_db
-            .set_host_transport("spoke", boss_work_db::HostTransport::SpokeReady)
-            .unwrap();
-        state.work_db.reserve_spoke_assignment("execution", "spoke").unwrap();
-        let probe = state.queue_probe("execution".into(), "continue".into(), false);
-        dispatch_probe_now(&state, "execution").await;
-        assert_eq!(state.probe_lifecycle_state(&probe), Some(expected));
-        dispatch_probe_now(&state, "execution").await;
-        assert_eq!(remote.calls.lock().unwrap().as_slice(), &[WorkerInputKind::Probe]);
-        assert!(state.has_in_flight_probe("execution"));
+    for turn_boundary in [false, true] {
+        for (outcome, expected) in [
+            (
+                ControlOutcome::Uncertain("reply lost".into()),
+                ProbeDeliveryState::Unconfirmed,
+            ),
+            (
+                ControlOutcome::Delivered(WorkerPane {
+                    life: WorkerLife::Alive,
+                    session: "worker".into(),
+                    pane_id: "%1".into(),
+                    pid: Some(42),
+                    exit_code: None,
+                }),
+                ProbeDeliveryState::Buffered,
+            ),
+        ] {
+            let remote = Arc::new(Remote {
+                outcome,
+                calls: Mutex::new(vec![]),
+            });
+            let (state, _dir) = test_server_state_with_overrides(ServerStateOverrides {
+                host_adapter_provider: Some(Arc::new(Provider(remote.clone()))),
+                ..Default::default()
+            });
+            state.work_db.add_host("spoke", "worker@spoke", 1, &[]).unwrap();
+            state
+                .work_db
+                .set_host_transport("spoke", boss_work_db::HostTransport::SpokeReady)
+                .unwrap();
+            state.work_db.reserve_spoke_assignment("execution", "spoke").unwrap();
+            let probe = state.queue_probe("execution".into(), "continue".into(), false);
+            assert!(state.worker_registry.slot_for_run("execution").is_none());
+            if turn_boundary {
+                let stop = boss_engine_runtime::events_socket::IncomingHookEvent::for_test(
+                    boss_protocol::WorkerEvent::Stop {
+                        session_id: "remote-session".into(),
+                        stop_hook_active: false,
+                        stop_reason: boss_protocol::StopReason::Completed,
+                    },
+                    Some("execution".into()),
+                    None,
+                );
+                super::worker_events::dispatch_probe_on_stop(&state, &stop).await;
+            } else {
+                dispatch_probe_now(&state, "execution").await;
+            }
+            assert_eq!(state.probe_lifecycle_state(&probe), Some(expected));
+            dispatch_probe_now(&state, "execution").await;
+            assert_eq!(remote.calls.lock().unwrap().as_slice(), &[WorkerInputKind::Probe]);
+            assert!(state.has_in_flight_probe("execution"));
+        }
     }
 }
 

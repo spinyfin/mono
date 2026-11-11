@@ -71,23 +71,3 @@ rust_test(
         normal_dev = True,
     ),
 )
-
-rust_library(
-    name = "spoke_hub_test_support",
-    testonly = True,
-    srcs = glob(["src/**/*.rs"]),
-    aliases = {
-        "//tools/boss/engine/work-db:work_db_test_support": "boss_work_db",
-    },
-    crate_name = "boss_spoke_hub",
-    crate_root = "src/lib.rs",
-    edition = "2024",
-    proc_macro_deps = all_crate_deps(proc_macro = True),
-    visibility = ["//tools/boss/engine/app:__pkg__"],
-    deps = [
-        "//tools/boss/engine/host-enrollment",
-        "//tools/boss/engine/spoke-stream",
-        "//tools/boss/engine/work-db:work_db_test_support",
-        "//tools/boss/protocol-spoke",
-    ] + all_crate_deps(normal = True),
-)

@@ -1,21 +1,14 @@
 # Optional spoke hub listener
 
-The engine installs its spoke host provider when `BOSS_SPOKE_HUB_CONFIG` names a JSON configuration file. Without that setting it uses the existing local and SSH providers. If the work database already records spoke history or a ready spoke host, missing configuration stops startup instead of routing a spoke-owned workspace through SSH.
+The engine installs its spoke host provider on the shared hub listener configured with `BOSS_HUB_LISTEN`, `BOSS_HUB_CREDENTIALS_DIR`, `BOSS_HUB_TLS_CERT`, and `BOSS_HUB_TLS_KEY`. `BOSS_SPOKE_HUB_CONFIG` names a JSON file supplying remote launch paths. Without listener configuration it uses the existing local and SSH providers. If the work database already records spoke history or a ready spoke host, missing configuration stops startup instead of routing a spoke-owned workspace through SSH.
 
 The listener is **off by default**. An operator supplies the server identity and configuration; enrollment must authorize the host, and the host transport must reach `spoke_ready` before new executions use it. Loading this file does not enroll hosts, change readiness, or migrate local workers. Existing SSH executions retain their recorded transport.
 
 ```json
 {
-  "listen": "192.0.2.10:7443",
-  "hub_id": "hub",
-  "authority_generation": "authority-generation",
-  "credentials_dir": "/private/boss/host-credentials",
-  "certificate": "/private/boss/server.pem",
-  "private_key": "/private/boss/server.key",
   "hosts": {
     "worker-host": {
       "events_socket": "/private/boss-spoke/events.sock",
-      "boss_event": "/opt/boss/bin/boss-event",
       "bazel_workspace": true
     }
   }
@@ -28,4 +21,4 @@ The listener mounts enrollment and authenticated spoke streams together. Dispatc
 
 Lease and spawn timeouts retain execution ownership and reconcile the stored command every five seconds. They do not count as pre-start failures or release the worker's lease or persona. Probes use the host adapter even without a local pane slot. A delivered probe is buffered until its reply; an uncertain delivery remains in flight and is not automatically duplicated. A release-time Stop waits at most one second for a reply, while subsequent attempts reuse its durable command identity.
 
-The composer refuses worker kinds requiring structured-output custody that the spoke adapter cannot collect. This fails before spawning rather than embedding a hub-local artifact path in a remote prompt. End-to-end availability also requires the provisioned host's event-ingress service and readiness checks; the listener setting alone is not a readiness assertion.
+The shared remote composer supplies effort, environment and host-side output paths and requires the corresponding launch-input protocol feature. It never embeds hub-local artifact paths in remote prompts. End-to-end availability also requires the provisioned host's event-ingress service and readiness checks; the listener setting alone is not a readiness assertion.

@@ -1799,7 +1799,8 @@ impl ServerState {
         let provider_events_socket = boss_engine_runtime::runner::bound_events_socket_path(&cfg);
         let provider_control_dir = boss_ssh_transport::default_control_socket_dir();
         let remote_pane_releaser = pane_releaser.clone();
-        let spoke_installation = spoke_installation::prepare(work_db.as_ref().clone())?;
+        let spoke_installation = spoke_installation::prepare(work_db.as_ref().clone(), &cfg.work.hub)?;
+        let hub_stream = spoke_installation.as_ref().map(|prepared| prepared.stream());
         let server_state = Arc::new_cyclic(move |weak_self: &Weak<ServerState>| {
             let mut execution_coordinator_inner = ExecutionCoordinator::with_host_adapter_and_publisher(
                 work_db.clone(),
@@ -2104,6 +2105,9 @@ impl ServerState {
         timeline.mark("coordinator_and_subsystems");
         timeline.finish();
 
+        if let Some(stream) = hub_stream {
+            server_state.set_hub_stream(Some(stream));
+        }
         Ok(server_state)
     }
 

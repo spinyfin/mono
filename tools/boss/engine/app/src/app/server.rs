@@ -414,6 +414,7 @@ impl Drop for CapabilityDiscoveryPendingGuard {
 }
 
 /// Clear the published handle on completion, cancellation, or unwinding.
+#[cfg(test)]
 struct HubStreamGuard(Arc<ServerState>);
 
 impl Drop for HubStreamGuard {
@@ -961,25 +962,6 @@ async fn serve_scoped(
     }
 
     pre_bind.mark("planner_run_recovery");
-
-    if let Some(bound) = boss_engine_runtime::hub::bind_hub_listener(&cfg.work.hub, (*server_state.work_db).clone())
-        .await
-        .context("starting hub listener")?
-    {
-        server_state.set_hub_stream(Some(bound.stream.clone()));
-        tracing::info!(
-            addr = %bound.local_addr,
-            handle = server_state.hub_stream().is_some(),
-            "hub listener serving"
-        );
-        let hub_registration = HubStreamGuard(server_state.clone());
-        boss_task_scope::spawn(async move {
-            let _registration = hub_registration;
-            if let Err(err) = bound.serve().await {
-                tracing::error!(error = %err, "hub listener ended");
-            }
-        });
-    }
 
     if let Some(observer) = overrides.hub_listener_ready {
         let _ = observer.send(server_state.hub_stream().is_some());

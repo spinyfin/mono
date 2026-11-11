@@ -205,6 +205,11 @@ impl HubConfig {
 /// spawn the serve task: the caller holds [`BoundHub::stream`] as the shared
 /// manager handle and serves on its own task scope.
 pub async fn bind_hub_listener(config: &HubConfig, db: WorkDb) -> Result<Option<BoundHub>> {
+    bind_hub_listener_sync(config, db)
+}
+
+/// Bind during synchronous provider composition, before dispatch is exposed.
+pub fn bind_hub_listener_sync(config: &HubConfig, db: WorkDb) -> Result<Option<BoundHub>> {
     let Some(plan) = config.listener_plan()? else {
         return Ok(None);
     };
@@ -222,9 +227,10 @@ pub async fn bind_hub_listener(config: &HubConfig, db: WorkDb) -> Result<Option<
     tonic::transport::Server::builder()
         .tls_config(boss_spoke_hub::server_tls(identity.clone(), &credentials)?)
         .context("validating hub TLS identity")?;
-    let incoming = TcpListener::bind(plan.listen)
-        .await
-        .with_context(|| format!("binding hub listener on {}", plan.listen))?;
+    let incoming =
+        std::net::TcpListener::bind(plan.listen).with_context(|| format!("binding hub listener on {}", plan.listen))?;
+    incoming.set_nonblocking(true)?;
+    let incoming = TcpListener::from_std(incoming)?;
     let local_addr = incoming.local_addr().context("hub listener local address")?;
     let stream = HubStream::with_identity(
         config.hub_id.clone(),
