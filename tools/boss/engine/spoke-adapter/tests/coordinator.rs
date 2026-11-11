@@ -1,14 +1,28 @@
 //! The real dispatch coordinator against the authenticated scripted spoke.
 use super::{short, support::*};
-use boss_engine_runtime::{coordinator::ExecutionCoordinator, lifecycle_adapter::CoreLifecycleServices};
+use boss_engine_runtime::{
+    coordinator::{ExecutionCoordinator, SpokeInDoubtTiming},
+    lifecycle_adapter::CoreLifecycleServices,
+};
 use boss_execution_contracts::{NoopExecutionPublisher, WorkerPool};
-use boss_protocol::{AutomationTrigger, CreateProductInput, ExecutionStatus};
+use boss_protocol::{AutomationTrigger, CreateProductInput, ExecutionStatus, WorkExecution};
 use boss_protocol_spoke::v1::{Command, CommandResult, PaneLife, ResultCode, WorkspaceKind, command};
-use boss_work_db::CreateAutomationInput;
+use boss_work_db::{CancelExecutionOpts, CreateAutomationInput};
 use serde_json::json;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 fn answer(command: &Command) -> Option<CommandResult> {
+    answer_as(command, lease_json())
+}
+
+/// The scripted host's answer, with `lease` as the workspace a lease grants.
+fn answer_as(command: &Command, lease: serde_json::Value) -> Option<CommandResult> {
     if matches!(command.body, Some(command::Body::Spawn(_))) {
         return Some(ok(command, Some(pane(PaneLife::Alive))));
     }
@@ -17,7 +31,7 @@ fn answer(command: &Command) -> Option<CommandResult> {
     };
     let value = match WorkspaceKind::try_from(op.kind).unwrap() {
         WorkspaceKind::EnsureRepo => json!({"repo_id":"repo"}),
-        WorkspaceKind::Lease => lease_json(),
+        WorkspaceKind::Lease => lease,
         WorkspaceKind::CreateChange => json!({"change_id":"change"}),
         WorkspaceKind::PositionedParent => json!("a".repeat(40)),
         WorkspaceKind::ListRepos | WorkspaceKind::ListWorkspaces => json!([]),
@@ -42,26 +56,25 @@ fn answer(command: &Command) -> Option<CommandResult> {
     ))
 }
 
-#[tokio::test]
-async fn spawn_timeout_retains_execution_until_late_result_without_replacement_or_release() {
-    uncertain_command(true).await;
-}
+const REPO: &str = "https://github.com/acme/widget";
+const IN_DOUBT: &str = "spoke_assignment_in_doubt";
 
-#[tokio::test]
-async fn lease_timeout_retains_execution_until_late_result_without_replacement_or_release() {
-    uncertain_command(false).await;
-}
-
-fn held(command: &Command, spawn: bool) -> bool {
-    if spawn {
-        matches!(command.body, Some(command::Body::Spawn(_)))
-    } else {
-        matches!(&command.body, Some(command::Body::Workspace(op)) if op.kind == i32::from(WorkspaceKind::Lease))
+fn quick() -> SpokeInDoubtTiming {
+    SpokeInDoubtTiming {
+        lease_park_delay: Duration::from_millis(100),
+        spawn_retry_sleep: Duration::from_millis(100),
+        attention_after: Duration::from_millis(200),
+        spawn_poll: Duration::from_millis(100),
     }
 }
 
-async fn uncertain_command(hold_spawn: bool) {
-    let fx = Fixture::with(short(500)).await;
+struct Env {
+    coordinator: Arc<ExecutionCoordinator>,
+    pool: WorkerPool,
+    product_id: String,
+}
+
+async fn env(fx: &Fixture, slots: usize) -> Env {
     fx.db.add_host(HOST, "worker@host", 1, &[]).unwrap();
     fx.db
         .connect()
@@ -77,15 +90,35 @@ async fn uncertain_command(hold_spawn: bool) {
         .create_product(
             CreateProductInput::builder()
                 .name("spoke dispatch")
-                .repo_remote_url("https://github.com/acme/widget")
+                .repo_remote_url(REPO)
                 .build(),
         )
         .unwrap();
+    let local = fx.provider_adapter(HOST).await;
+    let pool = WorkerPool::new_automation(slots);
+    let mut coordinator = ExecutionCoordinator::with_host_adapter_and_publisher(
+        fx.db.clone(),
+        WorkerPool::new(slots),
+        local,
+        Arc::new(NoopExecutionPublisher),
+        CoreLifecycleServices::new(fx.db.clone()),
+    );
+    coordinator.set_host_adapter_provider(fx.provider.clone());
+    coordinator.set_automation_pool(pool.clone());
+    coordinator.set_spoke_in_doubt_timing(quick());
+    Env {
+        coordinator: Arc::new(coordinator),
+        pool,
+        product_id: product.id,
+    }
+}
+
+fn triage(fx: &Fixture, env: &Env, name: &str) -> WorkExecution {
     let automation = fx
         .db
         .create_automation(CreateAutomationInput {
-            product_id: product.id.clone(),
-            name: "dispatch over the stream".into(),
+            product_id: env.product_id.clone(),
+            name: name.into(),
             repo_remote_url: None,
             trigger: AutomationTrigger::Schedule {
                 cron: "0 2 * * *".into(),
@@ -98,25 +131,54 @@ async fn uncertain_command(hold_spawn: bool) {
             created_via: None,
         })
         .unwrap();
-    let local = fx.provider_adapter(HOST).await;
-    let mut coordinator = ExecutionCoordinator::with_host_adapter_and_publisher(
-        fx.db.clone(),
-        WorkerPool::new(1),
-        local,
-        Arc::new(NoopExecutionPublisher),
-        CoreLifecycleServices::new(fx.db.clone()),
-    );
-    coordinator.set_host_adapter_provider(fx.provider.clone());
-    coordinator.set_automation_pool(WorkerPool::new_automation(1));
-    let coordinator = Arc::new(coordinator);
-    let execution = fx
-        .db
-        .create_automation_triage_execution(&automation.id, "https://github.com/acme/widget")
-        .unwrap();
+    fx.db.create_automation_triage_execution(&automation.id, REPO).unwrap()
+}
+
+async fn until(what: &str, mut ready: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !ready() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+
+fn attention_open(fx: &Fixture, execution_id: &str) -> bool {
+    fx.db
+        .list_attention_items(execution_id)
+        .unwrap()
+        .iter()
+        .any(|item| item.kind == IN_DOUBT && item.status == "open")
+}
+
+fn released(commands: &[Command]) -> bool {
+    commands.iter().any(|c| {
+        matches!(&c.body, Some(command::Body::Workspace(op))
+            if op.kind == i32::from(WorkspaceKind::Release) || op.kind == i32::from(WorkspaceKind::ForceRelease))
+    })
+}
+
+fn is_lease(command: &Command) -> bool {
+    matches!(&command.body, Some(command::Body::Workspace(op)) if op.kind == i32::from(WorkspaceKind::Lease))
+}
+
+fn assert_never_failed(fx: &Fixture, execution_id: &str) {
+    let row = fx.db.get_execution(execution_id).unwrap();
+    assert!(!row.status.is_terminal(), "{row:?}");
+    assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
+    assert_eq!(fx.db.list_executions(None).unwrap().len(), 1, "no second execution");
+}
+
+#[tokio::test]
+async fn an_unanswered_spawn_past_the_retry_bound_parks_and_a_late_result_reconciles() {
+    let fx = Fixture::with(short(300)).await;
+    let env = env(&fx, 1).await;
+    let execution = triage(&fx, &env, "unanswered spawn");
     let peer = fx
         .spoke(
-            Box::new(move |command| {
-                if held(command, hold_spawn) {
+            Box::new(|command| {
+                if matches!(command.body, Some(command::Body::Spawn(_))) {
                     None
                 } else {
                     answer(command)
@@ -126,61 +188,47 @@ async fn uncertain_command(hold_spawn: bool) {
             0,
         )
         .await;
-    coordinator.kick();
-    let spawn = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            if let Some(command) = peer.commands().into_iter().find(|c| held(c, hold_spawn)) {
-                break command;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    env.coordinator.kick();
+    until("the unanswered spawn to be parked", || {
+        attention_open(&fx, &execution.id)
     })
-    .await
-    .unwrap_or_else(|error| {
-        panic!(
-            "coordinator must reach spawn: {error}; execution={:?}; commands={:?}",
-            fx.db.get_execution(&execution.id),
-            peer.commands()
-        )
-    });
-    tokio::time::sleep(Duration::from_millis(750)).await;
+    .await;
+
+    // Parked, not failed: the execution is still running, still has its
+    // workspace, nothing was released, and the pool slot is free.
+    assert_never_failed(&fx, &execution.id);
     assert_eq!(
         fx.db.get_execution(&execution.id).unwrap().status,
-        if hold_spawn {
-            ExecutionStatus::Running
-        } else {
-            ExecutionStatus::Claimed
-        }
+        ExecutionStatus::Running
     );
-    assert_eq!(fx.db.list_executions(None).unwrap().len(), 1);
-    assert_eq!(fx.db.get_execution(&execution.id).unwrap().pre_start_failure_count, 0);
-    assert!(
-        !peer
-            .commands()
-            .iter()
-            .any(|c| matches!(&c.body, Some(command::Body::Workspace(op))
-        if op.kind == i32::from(WorkspaceKind::Release) || op.kind == i32::from(WorkspaceKind::ForceRelease)))
-    );
-    assert_eq!(
-        peer.commands()
-            .iter()
-            .filter(
-                |c| matches!(&c.body, Some(command::Body::Workspace(op)) if op.kind == i32::from(WorkspaceKind::Lease))
-            )
-            .count(),
-        1
-    );
-    peer.answer_late(&spawn, answer(&spawn).unwrap()).await;
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            if fx.db.open_spoke_assignment_for_pane_pid(HOST, 4242).unwrap().is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(fx.db.get_execution(&execution.id).unwrap().cube_lease_id.is_some());
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while env.pool.busy_count().await != 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("late spawn result must be reconciled");
+    .expect("the pool slot must be handed back while the spawn is in doubt");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_never_failed(&fx, &execution.id);
+    assert!(!released(&peer.commands()));
+
+    // The host finally answers, long after the retry bound.
+    let spawn = peer
+        .commands()
+        .into_iter()
+        .find(|c| matches!(c.body, Some(command::Body::Spawn(_))))
+        .unwrap();
+    peer.answer_late(&spawn, answer(&spawn).unwrap()).await;
+    until("the late spawn result to be reconciled", || {
+        fx.db.open_spoke_assignment_for_pane_pid(HOST, 4242).unwrap().is_some()
+    })
+    .await;
+    until("the in-doubt attention to resolve", || {
+        !attention_open(&fx, &execution.id)
+    })
+    .await;
+    assert_never_failed(&fx, &execution.id);
     assert_eq!(
         peer.commands()
             .iter()
@@ -188,160 +236,93 @@ async fn uncertain_command(hold_spawn: bool) {
             .count(),
         1
     );
-    assert_eq!(fx.db.list_executions(None).unwrap().len(), 1);
 }
 
 #[tokio::test]
-async fn two_in_doubt_spoke_leases_release_the_per_repo_permit() {
-    let fx = Fixture::with(short(400)).await;
-    let (coordinator, product_id) = {
-        fx.db.add_host(HOST, "worker@host", 1, &[]).unwrap();
-        fx.db
-            .connect()
-            .unwrap()
-            .execute(
-                "INSERT INTO host_capabilities (host_id, capability, source) VALUES (?1, 'driver=claude', 'auto')",
-                [HOST],
-            )
-            .unwrap();
-        fx.ready(HOST);
-        let product = fx
-            .db
-            .create_product(
-                CreateProductInput::builder()
-                    .name("spoke dispatch")
-                    .repo_remote_url("https://github.com/acme/widget")
-                    .build(),
-            )
-            .unwrap();
-        let local = fx.provider_adapter(HOST).await;
-        let mut coordinator = ExecutionCoordinator::with_host_adapter_and_publisher(
-            fx.db.clone(),
-            WorkerPool::new(2),
-            local,
-            Arc::new(NoopExecutionPublisher),
-            CoreLifecycleServices::new(fx.db.clone()),
-        );
-        coordinator.set_host_adapter_provider(fx.provider.clone());
-        coordinator.set_automation_pool(WorkerPool::new_automation(2));
-        (Arc::new(coordinator), product.id)
-    };
-    let repo = "https://github.com/acme/widget";
-    let mut executions = Vec::new();
-    for name in ["first", "second"] {
-        let automation = fx
-            .db
-            .create_automation(CreateAutomationInput {
-                product_id: product_id.clone(),
-                name: name.into(),
-                repo_remote_url: None,
-                trigger: AutomationTrigger::Schedule {
-                    cron: "0 2 * * *".into(),
-                    timezone: "UTC".into(),
-                },
-                standing_instruction: "audit the repo".into(),
-                open_task_limit: 1,
-                catch_up_window_secs: None,
-                enabled: true,
-                created_via: None,
-            })
-            .unwrap();
-        executions.push(fx.db.create_automation_triage_execution(&automation.id, repo).unwrap());
-    }
-    let _peer = fx
+async fn a_settled_indeterminate_spawn_parks_then_an_adopt_that_finds_it_alive_reconciles() {
+    let fx = Fixture::with(short(300)).await;
+    let env = env(&fx, 1).await;
+    let execution = triage(&fx, &env, "indeterminate spawn");
+    let alive = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&alive);
+    let peer = fx
         .spoke(
-            Box::new(|command| {
-                if matches!(&command.body, Some(command::Body::Workspace(op)) if op.kind == i32::from(WorkspaceKind::Lease))
-                {
-                    None
-                } else {
-                    answer(command)
+            Box::new(move |command| match &command.body {
+                Some(command::Body::Spawn(_)) => {
+                    Some(refused(command, ResultCode::OutcomeUncertain, "interrupted launch"))
                 }
+                Some(command::Body::Adopt(_)) if flag.load(Ordering::SeqCst) => {
+                    Some(ok(command, Some(pane(PaneLife::Alive))))
+                }
+                Some(command::Body::Adopt(_)) => Some(refused(command, ResultCode::OutcomeUncertain, "no session")),
+                _ => answer(command),
             }),
             None,
             0,
         )
         .await;
-    coordinator.kick();
-    tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            if coordinator.repo_lease_limiter().in_flight(repo) == 0
-                && executions
-                    .iter()
-                    .all(|execution| fx.db.spoke_execution_in_doubt(&execution.id).unwrap_or(false))
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+    env.coordinator.kick();
+    until("the indeterminate spawn to be parked", || {
+        attention_open(&fx, &execution.id)
     })
-    .await
-    .expect("both spoke leases must release the per-repo permit while in doubt");
-    assert_eq!(coordinator.repo_lease_limiter().in_flight(repo), 0);
-    assert!(
-        coordinator
-            .repo_lease_limiter()
-            .try_begin(repo, "local-lease")
-            .is_some(),
-        "a local lease for the same repo must still proceed"
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_never_failed(&fx, &execution.id);
+    assert!(fx.db.get_execution(&execution.id).unwrap().cube_lease_id.is_some());
+    assert!(!released(&peer.commands()));
+
+    alive.store(true, Ordering::SeqCst);
+    until("the adopt to find the worker", || {
+        fx.db.open_spoke_assignment_for_pane_pid(HOST, 4242).unwrap().is_some()
+    })
+    .await;
+    until("the in-doubt attention to resolve", || {
+        !attention_open(&fx, &execution.id)
+    })
+    .await;
+    assert_never_failed(&fx, &execution.id);
+    assert_eq!(
+        fx.db.get_execution(&execution.id).unwrap().status,
+        ExecutionStatus::Running
     );
 }
 
 #[tokio::test]
-async fn settled_uncertain_spawn_terminates_and_surfaces_attention() {
-    let fx = Fixture::with(short(400)).await;
-    fx.db.add_host(HOST, "worker@host", 1, &[]).unwrap();
-    fx.db
-        .connect()
-        .unwrap()
-        .execute(
-            "INSERT INTO host_capabilities (host_id, capability, source) VALUES (?1, 'driver=claude', 'auto')",
-            [HOST],
+async fn a_settled_uncertain_spawn_the_host_then_reports_absent_fails_and_releases_the_workspace() {
+    let fx = Fixture::with(short(300)).await;
+    let env = env(&fx, 1).await;
+    let execution = triage(&fx, &env, "absent after uncertain");
+    let peer = fx
+        .spoke(
+            Box::new(|command| match &command.body {
+                Some(command::Body::Spawn(_)) => {
+                    Some(refused(command, ResultCode::OutcomeUncertain, "interrupted launch"))
+                }
+                Some(command::Body::Adopt(_)) => Some(refused(command, ResultCode::Absent, "no session")),
+                _ => answer(command),
+            }),
+            None,
+            0,
         )
-        .unwrap();
-    fx.ready(HOST);
-    let product = fx
-        .db
-        .create_product(
-            CreateProductInput::builder()
-                .name("spoke dispatch")
-                .repo_remote_url("https://github.com/acme/widget")
-                .build(),
-        )
-        .unwrap();
-    let automation = fx
-        .db
-        .create_automation(CreateAutomationInput {
-            product_id: product.id.clone(),
-            name: "dispatch over the stream".into(),
-            repo_remote_url: None,
-            trigger: AutomationTrigger::Schedule {
-                cron: "0 2 * * *".into(),
-                timezone: "UTC".into(),
-            },
-            standing_instruction: "audit the repo".into(),
-            open_task_limit: 1,
-            catch_up_window_secs: None,
-            enabled: true,
-            created_via: None,
-        })
-        .unwrap();
-    let local = fx.provider_adapter(HOST).await;
-    let mut coordinator = ExecutionCoordinator::with_host_adapter_and_publisher(
-        fx.db.clone(),
-        WorkerPool::new(1),
-        local,
-        Arc::new(NoopExecutionPublisher),
-        CoreLifecycleServices::new(fx.db.clone()),
+        .await;
+    env.coordinator.kick();
+    until("definitive evidence to fail the execution", || {
+        fx.db.get_execution(&execution.id).unwrap().status.is_terminal()
+    })
+    .await;
+    assert_eq!(
+        fx.db.get_execution(&execution.id).unwrap().status,
+        ExecutionStatus::Failed
     );
-    coordinator.set_host_adapter_provider(fx.provider.clone());
-    coordinator.set_automation_pool(WorkerPool::new_automation(1));
-    let coordinator = Arc::new(coordinator);
-    let execution = fx
-        .db
-        .create_automation_triage_execution(&automation.id, "https://github.com/acme/widget")
-        .unwrap();
-    let _peer = fx
+    until("the workspace to be released", || released(&peer.commands())).await;
+}
+
+#[tokio::test]
+async fn cancelling_while_a_spawn_is_in_doubt_keeps_the_workspace_lease() {
+    let fx = Fixture::with(short(300)).await;
+    let env = env(&fx, 1).await;
+    let execution = triage(&fx, &env, "cancel in doubt");
+    let peer = fx
         .spoke(
             Box::new(|command| match &command.body {
                 Some(command::Body::Spawn(_)) => {
@@ -354,25 +335,87 @@ async fn settled_uncertain_spawn_terminates_and_surfaces_attention() {
             0,
         )
         .await;
-    coordinator.kick();
-    tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            let row = fx.db.get_execution(&execution.id).unwrap();
-            if row.status.is_terminal() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("settled uncertain spawn must terminate the coordinator loop");
-    let row = fx.db.get_execution(&execution.id).unwrap();
-    assert_eq!(row.status, ExecutionStatus::Failed);
-    let attention = fx.db.list_attention_items(&execution.id).unwrap();
-    assert!(
-        attention
-            .iter()
-            .any(|item| item.kind.contains("spawn") || item.title.contains("spawn")),
-        "{attention:?}"
+    env.coordinator.kick();
+    until("the spawn to be parked", || attention_open(&fx, &execution.id)).await;
+    fx.db
+        .cancel_execution_with(
+            &execution.id,
+            CancelExecutionOpts {
+                reason: Some("operator cancel".into()),
+                queued_only: false,
+                record_failure_reason: false,
+            },
+        )
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        fx.db.get_execution(&execution.id).unwrap().status,
+        ExecutionStatus::Cancelled
     );
+    assert!(
+        !released(&peer.commands()),
+        "the stored spawn may still run: no release may be sent"
+    );
+}
+
+#[tokio::test]
+async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_retry_budget() {
+    let fx = Fixture::with(short(300)).await;
+    let env = env(&fx, 2).await;
+    let executions = [triage(&fx, &env, "first"), triage(&fx, &env, "second")];
+    let peer = fx
+        .spoke(
+            Box::new(|command| if is_lease(command) { None } else { answer(command) }),
+            None,
+            0,
+        )
+        .await;
+    env.coordinator.kick();
+    until("both leases to be parked with attention", || {
+        executions.iter().all(|e| attention_open(&fx, &e.id))
+    })
+    .await;
+
+    // Several dispatch passes later (more than the pre-start retry budget),
+    // nothing has failed and nothing holds capacity.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    for execution in &executions {
+        let row = fx.db.get_execution(&execution.id).unwrap();
+        assert!(!row.status.is_terminal(), "{row:?}");
+        assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
+    }
+    assert_eq!(fx.db.list_executions(None).unwrap().len(), 2);
+    assert_eq!(
+        env.pool.busy_count().await,
+        0,
+        "no pool slot is held while a lease is in doubt"
+    );
+    assert_eq!(env.coordinator.repo_lease_limiter().in_flight(REPO), 0);
+    assert_eq!(
+        peer.commands().iter().filter(|c| is_lease(c)).count(),
+        2,
+        "each pass reuses the stored lease command"
+    );
+
+    // The hosts answer late: both executions proceed to spawn.
+    for (n, lease) in peer.commands().into_iter().filter(is_lease).enumerate() {
+        let granted = json!({
+            "workspace_id": format!("worker-{n}"),
+            "lease_id": format!("lease-{n}"),
+            "workspace_path": format!("/hosts/workspaces/worker-{n}"),
+        });
+        peer.answer_late(&lease, answer_as(&lease, granted).unwrap()).await;
+    }
+    until("both executions to spawn", || {
+        peer.commands()
+            .iter()
+            .filter(|c| matches!(c.body, Some(command::Body::Spawn(_))))
+            .count()
+            == 2
+    })
+    .await;
+    until("the in-doubt attention to resolve", || {
+        executions.iter().all(|e| !attention_open(&fx, &e.id))
+    })
+    .await;
 }

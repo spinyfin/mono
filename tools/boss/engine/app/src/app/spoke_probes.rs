@@ -60,16 +60,67 @@ pub(super) async fn dispatch(state: &Arc<ServerState>, run: &str) -> Option<Prob
     }
 }
 
-/// Spoke ingress does not yet report worker activity, so mid-turn delivery
-/// is allowed only when a local slot is mapped and already parked.
+/// Where a spoke-supervised worker is in its turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpokeTurn {
+    /// A turn event arrived after the last `Stop`.
+    Working,
+    /// The last turn event was a `Stop`: the composer is idle.
+    Parked,
+}
+
+/// The latest turn boundary seen for each spoke-supervised run. The host
+/// forwards the worker's hook events, which is the only activity evidence a
+/// run without a local slot has.
+#[derive(Default)]
+pub(super) struct SpokeTurns(std::sync::Mutex<std::collections::HashMap<String, SpokeTurn>>);
+
+impl SpokeTurns {
+    fn record(&self, run: &str, turn: SpokeTurn) {
+        if let Ok(mut turns) = self.0.lock() {
+            turns.insert(run.to_owned(), turn);
+        }
+    }
+
+    fn get(&self, run: &str) -> Option<SpokeTurn> {
+        self.0.lock().ok().and_then(|turns| turns.get(run).copied())
+    }
+
+    pub(super) fn forget(&self, run: &str) {
+        if let Ok(mut turns) = self.0.lock() {
+            turns.remove(run);
+        }
+    }
+}
+
+/// Mid-turn delivery to a spoke worker is allowed only once its host has
+/// reported the turn's `Stop` and nothing since. A worker that has reported
+/// no turn boundary yet is not known to be idle, so it is refused.
 pub(super) fn spoke_parked_for_delivery(state: &ServerState, run: &str) -> bool {
-    let Some(slot_id) = state.worker_registry.slot_for_run(run) else {
-        return false;
-    };
-    state.pane_input_posture_for_run(run, slot_id) == super::pane_delivery::PaneInputPosture::Parked
+    state.spoke_turns.get(run) == Some(SpokeTurn::Parked)
 }
 
 impl ServerState {
+    /// Note a turn boundary for a run no local slot tracks. Runs with a slot
+    /// are covered by the slot's own activity, so they are not recorded here.
+    pub(super) fn record_spoke_turn_event(&self, run: &str, event: &boss_protocol::WorkerEvent) {
+        use boss_protocol::WorkerEvent;
+        let turn = match event {
+            WorkerEvent::Stop { .. } => SpokeTurn::Parked,
+            WorkerEvent::UserPromptSubmit { .. }
+            | WorkerEvent::PreToolUse { .. }
+            | WorkerEvent::PostToolUse { .. }
+            | WorkerEvent::ToolPoll { .. }
+            | WorkerEvent::ModelProgress { .. } => SpokeTurn::Working,
+            WorkerEvent::SessionStart { .. } | WorkerEvent::Notification { .. } | WorkerEvent::SessionEnd { .. } => {
+                return;
+            }
+        };
+        if self.worker_registry.slot_for_run(run).is_none() && self.spoke_probe_owner_remains(run) {
+            self.spoke_turns.record(run, turn);
+        }
+    }
+
     /// A database read failure is not evidence that a remote worker vanished.
     pub(super) fn spoke_probe_owner_remains(&self, run: &str) -> bool {
         match self.work_db.spoke_assignment_for_execution(run) {

@@ -46,9 +46,11 @@ pub fn host_command_spawn_id(run_id: &str) -> String {
     format!("{HOST_COMMAND_SPAWN_PREFIX}{run_id}")
 }
 
-/// `stop-{grace_ms}` for a stop request with that grace.
-pub fn host_command_stop_id(grace_ms: u32) -> String {
-    format!("{HOST_COMMAND_STOP_PREFIX}{grace_ms}")
+/// `stop-{grace_ms}-{run_id}` for a stop request with that grace. This is the
+/// whole base id the adapter hands to `current_attempt`; the adapter adds no
+/// part of its own, so retention and the adapter cannot disagree about it.
+pub fn host_command_stop_id(grace_ms: u32, run_id: &str) -> String {
+    format!("{HOST_COMMAND_STOP_PREFIX}{grace_ms}-{run_id}")
 }
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
@@ -381,6 +383,22 @@ impl WorkDb {
             [execution_id],
             |row| row.get(0),
         )?)
+    }
+
+    /// How long the execution's open assignment has been held, in milliseconds.
+    /// `None` when it holds none. Durable, so a wait that spans engine restarts
+    /// and dispatch passes still measures from the first reservation.
+    pub fn spoke_assignment_age_ms(&self, execution_id: &str) -> Result<Option<i64>> {
+        Ok(self
+            .connect()?
+            .query_row(
+                "SELECT created_at_ms FROM spoke_assignments
+                 WHERE execution_id = ?1 AND resolved_at_ms IS NULL",
+                [execution_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|created| (now_ms() - created).max(0)))
     }
 
     /// Reserve `execution_id` for `host_id`, or return the reservation it already
@@ -1326,9 +1344,9 @@ mod tests {
     fn host_command_ids_use_the_retention_prefixes() {
         assert!(host_command_lease_id("run", 1).starts_with(HOST_COMMAND_LEASE_PREFIX));
         assert!(host_command_spawn_id("run").starts_with(HOST_COMMAND_SPAWN_PREFIX));
-        assert!(host_command_stop_id(250).starts_with(HOST_COMMAND_STOP_PREFIX));
+        assert!(host_command_stop_id(250, "run").starts_with(HOST_COMMAND_STOP_PREFIX));
         assert_eq!(host_command_spawn_id("exec_1-g1"), "spawn-exec_1-g1");
-        assert_eq!(host_command_stop_id(0), "stop-0");
+        assert_eq!(host_command_stop_id(0, "exec_1-g1"), "stop-0-exec_1-g1");
     }
 
     fn held_by(error: &anyhow::Error) -> Option<String> {
@@ -1988,6 +2006,28 @@ mod tests {
         db.record_host_command_receipt("h", &journal, 5).unwrap();
         assert_eq!(db.prune_settled_host_commands("h", i64::MAX, 0).unwrap(), 1);
         assert_eq!(ids(&db, "h", &names), ["lease-run", "spawn-run", "stop-run", "receipt"]);
+    }
+
+    #[test]
+    fn retention_keeps_every_id_the_helpers_format_for_an_unresolved_assignment() {
+        let db = spoke_db();
+        let assignment = db.reserve_spoke_assignment("exec_1", "h").unwrap();
+        let run = key(&assignment);
+        let lease = host_command_lease_id(&assignment.run_id, 7);
+        let spawn = host_command_spawn_id(&assignment.run_id);
+        let stop = host_command_stop_id(250, &assignment.run_id);
+        let names = [lease.as_str(), spawn.as_str(), stop.as_str(), "observe-x", "receipt"];
+        for name in names {
+            append(&db, "h", name, Some(&run), name.as_bytes()).unwrap();
+            db.settle_host_command("h", name, Some(&run), b"result").unwrap();
+        }
+        let (journal, _) = db.resume_host_command_journal("h", None).unwrap();
+        db.record_host_command_receipt("h", &journal, 5).unwrap();
+        assert_eq!(db.prune_settled_host_commands("h", i64::MAX, 0).unwrap(), 1);
+        assert_eq!(
+            ids(&db, "h", &names),
+            [lease.as_str(), spawn.as_str(), stop.as_str(), "receipt"]
+        );
     }
 
     #[test]

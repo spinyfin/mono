@@ -360,6 +360,14 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     ),
     // ── The producer owns resolution ────────────────────────────────────
     entry(
+        SPOKE_ASSIGNMENT_IN_DOUBT_ATTENTION_KIND,
+        ClearedBy::ProducerReconciles,
+        "Asserts a spoke lease or spawn could not be confirmed either way. Only the dispatcher sees the \
+         host's eventual answer (a bound lease, a settled spawn, or an Adopt of the worker's session), so \
+         it resolves the item itself; a run start for the item is not evidence, because the in-doubt \
+         worker may be the run that started.",
+    ),
+    entry(
         POOL_CLAIM_TEARDOWN_ATTENTION_KIND,
         ClearedBy::ProducerReconciles,
         "The pool-claim sweep retries process and viewer teardown and resolves this signal when both are confirmed.",

@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, Semaphore};
 use boss_engine_storage_values::Host;
 use boss_engine_storage_values::attention_kinds::{
     EXECUTION_BOOKMARK_CREATE_FAILED_ATTENTION_KIND as CREATE_FAILED,
-    EXECUTION_BOOKMARK_RECOVERY_FAILED_ATTENTION_KIND as RECOVERY_FAILED,
+    EXECUTION_BOOKMARK_RECOVERY_FAILED_ATTENTION_KIND as RECOVERY_FAILED, SPOKE_ASSIGNMENT_IN_DOUBT_ATTENTION_KIND,
 };
 use boss_execution_contracts::{
     ChoreRequirements, Eligibility, FailureEffect, HostSlot, IneligibilityReason, LeaseReleaseOutcome,
@@ -38,12 +38,43 @@ use boss_execution_contracts::{
     SpawnOutcomeUncertain,
 };
 
-/// Extra attempts at an unanswered spoke lease or spawn after the first
-/// command deadline. Each sleeps [`SPOKE_UNSETTLED_RETRY_SLEEP`]. A settled
-/// spawn parks after one observe; a settled lease without a bindable
-/// workspace can spend this budget on a new recorded attempt.
+/// Extra attempts at an unanswered spoke spawn after the first command
+/// deadline, before the execution is parked as in doubt. Each sleeps
+/// [`SpokeInDoubtTiming::spawn_retry_sleep`]. A spawn that settled as uncertain parks
+/// at once, since re-sending it only replays the stored result.
 const SPOKE_UNSETTLED_RETRY_LIMIT: u32 = 3;
 const SPOKE_UNSETTLED_RETRY_SLEEP: Duration = Duration::from_secs(5);
+
+/// Timing of the wait on a spoke host that has not said whether it granted a
+/// lease or started a worker. Neither wait holds dispatch capacity, spends the
+/// pre-start retry budget, or fails the execution: it keeps asking the host
+/// about the stored command until the host answers.
+#[derive(Debug, Clone, Copy)]
+pub struct SpokeInDoubtTiming {
+    /// How long a lease that the host has not answered is parked before the
+    /// stored lease command is asked about again.
+    pub lease_park_delay: Duration,
+    /// How long an unanswered spawn waits between asking the host about the
+    /// stored command, while it still holds its pool slot.
+    pub spawn_retry_sleep: Duration,
+    /// How long an assignment may stay in doubt before an attention item is
+    /// raised for the operator.
+    pub attention_after: Duration,
+    /// How often a parked spawn re-asks the host (replaying the stored spawn
+    /// and observing the worker's session).
+    pub spawn_poll: Duration,
+}
+
+impl Default for SpokeInDoubtTiming {
+    fn default() -> Self {
+        Self {
+            lease_park_delay: Duration::from_secs(15),
+            spawn_retry_sleep: SPOKE_UNSETTLED_RETRY_SLEEP,
+            attention_after: Duration::from_secs(60),
+            spawn_poll: Duration::from_secs(30),
+        }
+    }
+}
 
 // Phase-3 counter handles for the cube workspace lease boundary.
 boss_metrics::register_counter!(
@@ -605,6 +636,10 @@ pub struct ExecutionCoordinator {
     /// [`Self::with_pre_start_retry_delays`] to avoid real sleeps.
     #[builder(default = PRE_START_RETRY_DELAYS.to_vec())]
     pre_start_retry_delays: Vec<Duration>,
+    /// Timing of the wait on a spoke host that has not answered a lease or
+    /// spawn. See [`SpokeInDoubtTiming`].
+    #[builder(default)]
+    spoke_in_doubt_timing: SpokeInDoubtTiming,
     /// Bounded dispatch-stagger window (seconds) for the "later" side of a
     /// high-overlap `merge_order` sibling pair. `0` (the default) disables the
     /// stagger — the non-blocking `merge_order` relation still sequences merges,
@@ -843,6 +878,7 @@ mod preserved_work;
 mod progression_spawn;
 mod run;
 mod scheduler;
+mod spoke_in_doubt;
 mod unexplained_wait;
 use unexplained_wait::UnexplainedWaitWatch;
 

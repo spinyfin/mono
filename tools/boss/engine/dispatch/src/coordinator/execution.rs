@@ -1355,25 +1355,22 @@ impl ExecutionCoordinator {
             pr_number_for_workspace_goto(&self.work_db, execution, &work_item)
         };
 
-        let mut lease_result = self
+        let lease_result = self
             .lease_workspace_with_fallback(execution, worker_id, &repo, &task, &adapter)
             .await;
-        let mut permit_held = true;
-        if lease_result
-            .as_ref()
-            .err()
-            .is_some_and(|err| waitable_spoke_lease(err).is_some())
-        {
-            // The per-repo permit is shared across every host. Waiting for a
-            // spoke answer must not pin local/SSH leases of the same repo.
-            if self.repo_lease_limiter.release(&execution.id) {
-                self.kick();
+        // A spoke host that has not said whether it granted the lease is not a
+        // failed start. Hand back every claim this attempt holds (the per-repo
+        // permit, the dispatch slot and the pool slot are all released when
+        // this returns) and come back to the same stored lease command later.
+        let lease_result = match lease_result {
+            Err(err) if waitable_spoke_lease(&err).is_some() => {
+                if self.repo_lease_limiter.release(&execution.id) {
+                    self.kick();
+                }
+                return Err(self.park_in_doubt_spoke_lease(execution, err).await);
             }
-            permit_held = false;
-            lease_result = self
-                .reconcile_unsettled_spoke_lease(execution, worker_id, &repo, &task, &adapter, lease_result)
-                .await;
-        }
+            other => other,
+        };
         // The per-repo permit bounds concurrent lease calls, which contend on
         // cube's per-repo lock. Once the call has returned that contention is
         // over, so free the permit now rather than holding it through the
@@ -1381,7 +1378,7 @@ impl ExecutionCoordinator {
         if lease_result.is_ok() {
             self.pool_for_worker_id(worker_id).mark_working(worker_id).await;
         }
-        if permit_held && self.repo_lease_limiter.release(&execution.id) {
+        if self.repo_lease_limiter.release(&execution.id) {
             self.kick();
         }
         let lease = match lease_result {
@@ -1413,6 +1410,7 @@ impl ExecutionCoordinator {
         // Record the lease before any fallible work so a later cube-release
         // failure still leaves columns the leftover-lease sweep can retry.
         self.persist_acquired_lease(execution, &lease);
+        self.resolve_spoke_in_doubt_attention(&execution.id);
 
         // The answer-agent run is already bound to this execution before it
         // can reach the dispatcher. Stamp the lease immediately so comment
@@ -2979,46 +2977,6 @@ impl ExecutionCoordinator {
             }
         }
     }
-
-    /// Wait only while the current lease attempt is unanswered, or settled as
-    /// uncertain with no lease. Release already happened; a bound wait then
-    /// parks through the caller's `record_start_failure`.
-    async fn reconcile_unsettled_spoke_lease(
-        &self,
-        execution: &WorkExecution,
-        worker_id: &str,
-        repo: &CubeRepoHandle,
-        task: &str,
-        adapter: &Arc<dyn HostAdapter>,
-        first: Result<CubeWorkspaceLease>,
-    ) -> Result<CubeWorkspaceLease> {
-        let mut result = first;
-        for attempt in 0..SPOKE_UNSETTLED_RETRY_LIMIT {
-            if execution_no_longer_runnable(&self.work_db, &execution.id) {
-                return result.and_then(|_| {
-                    Err(anyhow!(
-                        "execution {} was cancelled or became terminal while waiting for a spoke lease",
-                        execution.id
-                    ))
-                });
-            }
-            let Some(uncertain) = result.as_ref().err().and_then(waitable_spoke_lease) else {
-                return result;
-            };
-            tracing::warn!(
-                execution_id = %execution.id,
-                command_id = %uncertain.command_id,
-                settled = uncertain.settled,
-                attempt,
-                "spoke lease unresolved; permit released, reconciling the stored command"
-            );
-            tokio::time::sleep(SPOKE_UNSETTLED_RETRY_SLEEP).await;
-            result = self
-                .lease_workspace_with_fallback(execution, worker_id, repo, task, adapter)
-                .await;
-        }
-        result
-    }
 }
 
 fn waitable_spoke_lease(err: &anyhow::Error) -> Option<&LeaseOutcomeUncertain> {
@@ -3026,11 +2984,11 @@ fn waitable_spoke_lease(err: &anyhow::Error) -> Option<&LeaseOutcomeUncertain> {
         .find_map(|cause| cause.downcast_ref::<LeaseOutcomeUncertain>())
 }
 
-pub(super) fn execution_no_longer_runnable(work_db: &WorkDb, execution_id: &str) -> bool {
-    work_db
-        .get_execution(execution_id)
-        .map(|row| row.status.is_terminal())
-        .unwrap_or(true)
+/// Whether the execution has been cancelled or finished. A failed read is not
+/// an answer: callers must not treat it as a cancellation, because that would
+/// release state a worker may still be using.
+pub(super) fn execution_no_longer_runnable(work_db: &WorkDb, execution_id: &str) -> Result<bool> {
+    Ok(work_db.get_execution(execution_id)?.status.is_terminal())
 }
 
 #[cfg(test)]

@@ -808,6 +808,7 @@ impl ServerState {
     /// probe was among the ones abandoned, without hand-copying this
     /// function's drain-and-log body.
     pub(super) async fn settle_probes_for_released_run(&self, run_id: &str) {
+        self.spoke_turns.forget(run_id);
         let abandoned = self.abandon_pending_probes_for_terminated_run(run_id, "worker pane released");
         self.surface_undelivered_probes(
             run_id,

@@ -16,6 +16,7 @@ use boss_engine_recovery::execution_bookmark::{
 };
 use boss_execution_contracts::{
     CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus, LeaseOutcomeUncertain,
+    WorkerLife,
 };
 use boss_protocol_spoke::v1::{
     Bookmark, ResultCode, WorkspaceKind as Kind, WorkspaceOp, WorkspaceResult, command, command_result,
@@ -290,9 +291,25 @@ impl SpokeHostAdapter {
         Ok(self.db(move |db| db.host_command_wire(&host, &id)).await?.is_none())
     }
 
-    /// Whether this run has a spawn that may have started a worker: stored and
-    /// either unanswered or answered with an uncertain outcome.
+    /// Whether this run has a spawn that may have started a worker. The spawn
+    /// command's own result is never rewritten, so a spawn that settled as
+    /// uncertain stays so forever; what ends the doubt is the host's present
+    /// answer. Adopt says whether the worker's session exists: gone (absent,
+    /// exited or missing) is definitive and the doubt is over, while alive,
+    /// indeterminate or no answer at all keeps it.
     pub(crate) async fn spawn_in_doubt(&self, assignment: &SpokeAssignment) -> Result<bool> {
+        if !self.spawn_command_in_doubt(assignment).await? {
+            return Ok(false);
+        }
+        Ok(match self.ctl_observe(&assignment.execution_id).await {
+            Ok(None) => false,
+            Ok(Some(pane)) => !matches!(pane.life, WorkerLife::Exited | WorkerLife::Missing),
+            Err(_) => true,
+        })
+    }
+
+    /// Whether the stored spawn is unanswered or answered with an uncertain outcome.
+    async fn spawn_command_in_doubt(&self, assignment: &SpokeAssignment) -> Result<bool> {
         let (host, id) = (self.host_name().to_owned(), host_command_spawn_id(&assignment.run_id));
         let stored = self
             .db(move |db| Ok((db.host_command_wire(&host, &id)?, db.host_command_result(&host, &id)?)))

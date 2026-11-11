@@ -120,13 +120,30 @@ impl ExecutionCoordinator {
         // so both outcomes below record against the same key.
         let streak_key = self.pre_start_streak_key(&execution, &worker_id);
 
+        let timing = self.spoke_in_doubt_timing;
         let mut unsettled_retries = 0_u32;
+        // Set once the spawn has been parked as in doubt: the pool slot was
+        // handed back then, so the tail below must not release it again.
+        let mut parked = false;
+        let mut last_uncertain: Option<SpawnOutcomeUncertain> = None;
         let run_outcome = loop {
-            if super::execution::execution_no_longer_runnable(&self.work_db, &execution.id) {
-                break Err(anyhow::anyhow!(
-                    "execution {} was cancelled or became terminal while waiting for a spoke spawn",
-                    execution.id
-                ));
+            // Only after a spawn has been sent can a cancellation leave a worker
+            // that may still start. A failed read is not a cancellation.
+            if let Some(uncertain) = last_uncertain.as_ref() {
+                match super::execution::execution_no_longer_runnable(&self.work_db, &execution.id) {
+                    Ok(true) => {
+                        break Err(anyhow::Error::new(uncertain.clone()).context(format!(
+                            "execution {} was cancelled or became terminal while its spoke spawn was in doubt",
+                            execution.id
+                        )));
+                    }
+                    Ok(false) => {}
+                    Err(error) => tracing::warn!(
+                        execution_id = %execution.id,
+                        error = %format!("{error:#}"),
+                        "could not read the execution while its spoke spawn is in doubt; treating it as still runnable"
+                    ),
+                }
             }
             let outcome = adapter
                 .spawn_worker(
@@ -137,38 +154,60 @@ impl ExecutionCoordinator {
                     change.as_ref().map(|c| c.change_id.as_str()),
                 )
                 .await;
-            let uncertain = outcome.as_ref().err().and_then(|error| {
-                error
-                    .chain()
-                    .find_map(|cause| cause.downcast_ref::<SpawnOutcomeUncertain>())
-            });
-            match uncertain {
-                Some(uncertain) if !uncertain.settled && unsettled_retries < SPOKE_UNSETTLED_RETRY_LIMIT => {
-                    unsettled_retries += 1;
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        command_id = %uncertain.command_id,
-                        attempt = unsettled_retries,
-                        error = %format!("{}", outcome.as_ref().unwrap_err()),
-                        "spoke spawn unanswered; reconciling the stored command"
-                    );
-                    tokio::time::sleep(SPOKE_UNSETTLED_RETRY_SLEEP).await;
-                    continue;
-                }
-                Some(uncertain) => {
-                    tracing::error!(
-                        execution_id = %execution.id,
-                        command_id = %uncertain.command_id,
-                        settled = uncertain.settled,
-                        error = %format!("{}", outcome.as_ref().unwrap_err()),
-                        "spoke spawn settled as uncertain or went unanswered past the bound; \
-                         parking for operator reconciliation"
-                    );
-                    break outcome;
-                }
-                None => break outcome,
+            let Some(uncertain) = outcome
+                .as_ref()
+                .err()
+                .and_then(|error| {
+                    error
+                        .chain()
+                        .find_map(|cause| cause.downcast_ref::<SpawnOutcomeUncertain>())
+                })
+                .cloned()
+            else {
+                break outcome;
+            };
+            let detail = format!("{:#}", outcome.as_ref().unwrap_err());
+            if !parked && !uncertain.settled && unsettled_retries < SPOKE_UNSETTLED_RETRY_LIMIT {
+                unsettled_retries += 1;
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    command_id = %uncertain.command_id,
+                    attempt = unsettled_retries,
+                    error = %detail,
+                    "spoke spawn unanswered; reconciling the stored command"
+                );
+                last_uncertain = Some(uncertain);
+                tokio::time::sleep(timing.spawn_retry_sleep).await;
+                continue;
             }
+            // The host has still not said whether the worker started. The
+            // execution is not failed and nothing is re-dispatched: it keeps
+            // its assignment, lease and persona, hands back only the local
+            // pool capacity, and keeps asking the host about the stored
+            // spawn until the host (or an Adopt of the session) answers.
+            if !parked {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    command_id = %uncertain.command_id,
+                    settled = uncertain.settled,
+                    error = %detail,
+                    "spoke spawn outcome unknown; parking the execution as in doubt"
+                );
+                self.park_in_doubt_spawn(&execution, &worker_id, outcome.as_ref().unwrap_err())
+                    .await;
+                parked = true;
+            }
+            last_uncertain = Some(uncertain);
+            tokio::time::sleep(timing.spawn_poll).await;
         };
+        let cancelled_in_doubt = run_outcome
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.chain().any(|cause| cause.is::<SpawnOutcomeUncertain>()));
+        if parked && !cancelled_in_doubt {
+            // The host answered, one way or the other.
+            self.resolve_spoke_in_doubt_attention(&execution.id);
+        }
         drop(heartbeat);
 
         // Pane-spawn runs hand the slot to a live tmux worker; the
@@ -383,6 +422,36 @@ impl ExecutionCoordinator {
                     )
                     .await;
             }
+            // Cancelled (or otherwise ended) while the host had still not said
+            // whether the worker started. The stored spawn may yet run, so the
+            // workspace lease and driver state stay with the assignment: only
+            // a confirmed stop of the worker may release them. The row is
+            // already terminal, so there is no failure to record.
+            Err(err) if cancelled_in_doubt => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    run_id = %run.id,
+                    worker_id = %worker_id,
+                    cube_lease_id = %lease.lease_id,
+                    error = %format!("{err:#}"),
+                    "spoke spawn still in doubt when the execution ended; keeping the workspace lease",
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::PaneSpawned, DispatchOutcome::Skipped, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(&worker_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_error(&err)
+                            .with_details(serde_json::json!({
+                                "run_id": run.id,
+                                "spawn_in_doubt": true,
+                                "released_workspace": false,
+                            })),
+                    )
+                    .await;
+            }
             Err(err) => {
                 // FIRST, before anything that can block or fail: say what
                 // went wrong, in the log and in the dispatch stream.
@@ -468,8 +537,7 @@ impl ExecutionCoordinator {
                 // A rejected viewer may already have a running tmux process.
                 // If verified teardown failed, preserve its workspace and driver
                 // state for recovery rather than leasing them to another worker.
-                abort_unconfirmed = self.lifecycle.is_unconfirmed_spawn_abort(&err)
-                    || err.chain().any(|cause| cause.is::<SpawnOutcomeUncertain>());
+                abort_unconfirmed = self.lifecycle.is_unconfirmed_spawn_abort(&err);
                 let released = if abort_unconfirmed {
                     false
                 } else {
@@ -906,10 +974,31 @@ impl ExecutionCoordinator {
                         tracing::error!(execution_id = %execution.id, %error, "could not release persona after runner cleanup");
                     }
                 }
-                self.release_worker_and_kick(&worker_id, Some(lease.workspace_id.as_str()))
-                    .await;
+                if parked {
+                    // The pool slot went back when the spawn was parked; it may
+                    // be another execution's by now.
+                    self.rescan_active_dispatch_after_release();
+                    self.kick();
+                } else {
+                    self.release_worker_and_kick(&worker_id, Some(lease.workspace_id.as_str()))
+                        .await;
+                }
             }
         }
+    }
+
+    /// Hand back the local capacity a spawn in doubt holds and say so. The
+    /// execution stays running, with its assignment, lease, persona and live
+    /// state, so nothing can be dispatched onto its workspace and the stored
+    /// spawn can still be reconciled; only the pool slot (and with it the
+    /// dispatch pass) is freed.
+    async fn park_in_doubt_spawn(self: &Arc<Self>, execution: &WorkExecution, worker_id: &str, err: &anyhow::Error) {
+        self.raise_spoke_in_doubt_attention(execution, "worker spawn", err, Duration::ZERO);
+        self.pool_for_worker_id(worker_id)
+            .release_worker_if_execution(worker_id, &execution.id, None)
+            .await;
+        self.rescan_active_dispatch_after_release();
+        self.kick();
     }
 
     /// Phase 3 cutover: for revision_implementation executions with merge-conflict

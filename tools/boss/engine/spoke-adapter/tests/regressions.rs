@@ -307,3 +307,153 @@ async fn settled_uncertain_release_uses_registry_evidence() {
         [Kind::Lease, Kind::Release, Kind::ListWorkspaces]
     );
 }
+
+fn interrupted_spawn(
+    adopt: impl Fn(&Command) -> Option<CommandResult> + Send + Sync + 'static,
+    stop: impl Fn(&Command) -> Option<CommandResult> + Send + Sync + 'static,
+) -> Script {
+    Box::new(move |c| match &c.body {
+        Some(command::Body::Spawn(_)) => Some(refused(c, ResultCode::OutcomeUncertain, "interrupted launch")),
+        Some(command::Body::Adopt(_)) => adopt(c),
+        Some(command::Body::Stop(_)) => stop(c),
+        _ => standard(c),
+    })
+}
+
+fn no_stop(_: &Command) -> Option<CommandResult> {
+    None
+}
+
+#[tokio::test]
+async fn an_interrupted_spawn_the_host_then_reports_absent_no_longer_blocks_release() {
+    let fx = Fixture::with(short(500)).await;
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let _peer = fx
+        .spoke(
+            interrupted_spawn(|c| Some(refused(c, ResultCode::Absent, "no session")), no_stop),
+            None,
+            0,
+        )
+        .await;
+    lease(&adapter).await;
+    let error = spawn(&adapter).await.unwrap_err();
+    assert!(error.downcast_ref::<SpawnOutcomeUncertain>().is_none(), "{error:#}");
+    assert!(format!("{error:#}").contains("was gone"), "{error:#}");
+    adapter.release_workspace("lease-1").await.unwrap();
+    assert!(
+        fx.db
+            .spoke_assignment_for_execution("exec_1")
+            .unwrap()
+            .unwrap()
+            .resolved
+    );
+}
+
+#[tokio::test]
+async fn an_adopted_alive_worker_keeps_the_lease_until_its_session_is_gone() {
+    let fx = Fixture::with(short(500)).await;
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let exited = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&exited);
+    let _peer = fx
+        .spoke(
+            interrupted_spawn(
+                move |c| {
+                    let life = if seen.load(Ordering::SeqCst) {
+                        PaneLife::Exited
+                    } else {
+                        PaneLife::Alive
+                    };
+                    Some(ok(c, Some(pane(life))))
+                },
+                no_stop,
+            ),
+            None,
+            0,
+        )
+        .await;
+    lease(&adapter).await;
+    let outcome = spawn(&adapter).await.expect("an alive adopted worker is launched");
+    assert_eq!(outcome.wait_state, RunWaitState::WorkerPaneAlive);
+    assert!(
+        outcome.result_summary.is_some(),
+        "the adopt path reports the same summary"
+    );
+    assert_eq!(
+        fx.db
+            .open_spoke_assignment_for_pane_pid(HOST, 4242)
+            .unwrap()
+            .map(|a| a.execution_id),
+        Some("exec_1".into())
+    );
+    let refused = adapter.release_workspace("lease-1").await.unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("may have started a worker"),
+        "{refused:#}"
+    );
+    exited.store(true, Ordering::SeqCst);
+    adapter.release_workspace("lease-1").await.unwrap();
+    assert!(
+        fx.db
+            .spoke_assignment_for_execution("exec_1")
+            .unwrap()
+            .unwrap()
+            .resolved
+    );
+}
+
+#[tokio::test]
+async fn an_adopted_alive_worker_that_never_accepted_its_brief_is_stopped_not_reported_running() {
+    let fx = Fixture::with(short(300)).await;
+    fx.ready(HOST);
+    fx.signals.0.store(false, Ordering::SeqCst);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let peer = fx
+        .spoke(
+            interrupted_spawn(
+                |c| Some(ok(c, Some(pane(PaneLife::Alive)))),
+                |c| Some(ok(c, Some(pane(PaneLife::Exited)))),
+            ),
+            None,
+            0,
+        )
+        .await;
+    lease(&adapter).await;
+    let error = spawn(&adapter).await.unwrap_err();
+    assert!(error.downcast_ref::<SpawnOutcomeUncertain>().is_none(), "{error:#}");
+    assert!(
+        peer.commands()
+            .iter()
+            .any(|c| matches!(c.body, Some(command::Body::Stop(_)))),
+        "the idle worker is stopped"
+    );
+}
+
+#[tokio::test]
+async fn a_launched_worker_whose_stop_is_not_confirmed_is_settled_uncertain() {
+    let fx = Fixture::with(short(300)).await;
+    fx.ready(HOST);
+    fx.signals.0.store(false, Ordering::SeqCst);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let _peer = fx
+        .spoke(
+            Box::new(|c| match &c.body {
+                Some(command::Body::Stop(_)) => Some(refused(c, ResultCode::OutcomeUncertain, "stop lost")),
+                _ => standard(c),
+            }),
+            None,
+            0,
+        )
+        .await;
+    lease(&adapter).await;
+    let error = spawn(&adapter).await.unwrap_err();
+    let uncertain = error
+        .downcast_ref::<SpawnOutcomeUncertain>()
+        .unwrap_or_else(|| panic!("{error:#}"));
+    assert!(
+        uncertain.settled,
+        "the spawn itself answered; replaying it cannot learn the stop"
+    );
+}

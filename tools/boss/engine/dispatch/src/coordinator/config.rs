@@ -70,6 +70,7 @@ impl ExecutionCoordinator {
             enable_dispatch_ready_bus: false,
             repo_cold_probe_seen: Mutex::new(HashSet::new()),
             pre_start_retry_delays: PRE_START_RETRY_DELAYS.to_vec(),
+            spoke_in_doubt_timing: SpokeInDoubtTiming::default(),
             merge_order_stagger_secs: 0,
             metrics: local_metrics,
             execution_started_hook: Arc::new(NoopExecutionStartedHook),
@@ -567,6 +568,18 @@ impl ExecutionCoordinator {
     pub fn with_pre_start_retry_delays(mut self, delays: Vec<Duration>) -> Self {
         self.pre_start_retry_delays = delays;
         self
+    }
+
+    /// Override how long a spoke lease or spawn waits for the host. Tests
+    /// shorten the intervals to avoid real sleeps.
+    pub fn with_spoke_in_doubt_timing(mut self, timing: SpokeInDoubtTiming) -> Self {
+        self.spoke_in_doubt_timing = timing;
+        self
+    }
+
+    /// In-place form of [`Self::with_spoke_in_doubt_timing`].
+    pub fn set_spoke_in_doubt_timing(&mut self, timing: SpokeInDoubtTiming) {
+        self.spoke_in_doubt_timing = timing;
     }
 
     /// Override the interactive-pool concurrency cap ceiling (default
