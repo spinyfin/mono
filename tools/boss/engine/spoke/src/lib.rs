@@ -349,24 +349,214 @@ mod tests {
         );
     }
 
+    fn stamp_at(awake_ns: u64) -> Stamp {
+        Stamp {
+            awake_ns,
+            ..stamp().unwrap()
+        }
+    }
+
     #[tokio::test]
-    async fn persistent_unclassified_errno_drains_terminal_run_with_a_gap_after_budget() {
+    async fn persistent_unclassified_errno_drains_terminal_run_with_a_gap_after_awake_budget() {
         use boss_engine_driver::discovery::fault::{Point, inject_once};
         let root = tempfile::tempdir().unwrap();
         let (execution, directory) = terminal_file_run(root.path());
         let journal = journal(root.path(), limits());
         let run = run_identity(&execution);
-        let mut polls = 0;
-        while journal.lock().unwrap().source(&run, "drained").unwrap().is_none() {
-            assert!(polls < 100, "terminal run never drained on a persistent EIO");
+        // A long burst of polls inside the budget never gives up.
+        for i in 0..50 {
             inject_once(Point::Listing, &directory, libc::EIO);
-            let _ = transcripts::poll(&journal, &execution, &stamp().unwrap()).await;
-            polls += 1;
+            let _ = transcripts::poll(&journal, &execution, &stamp_at(1 + i)).await;
         }
-        assert!(polls > 1, "a single EIO must be retried before draining");
+        assert!(journal.lock().unwrap().source(&run, "drained").unwrap().is_none());
+        assert!(records(&journal).is_empty());
+        inject_once(Point::Listing, &directory, libc::EIO);
+        let _ = transcripts::poll(&journal, &execution, &stamp_at(10 * 60 * 1_000_000_000)).await;
+        assert!(journal.lock().unwrap().source(&run, "drained").unwrap().is_some());
         assert!(records(&journal).iter().any(
             |r| matches!(&r.body, Some(record::Body::Gap(g)) if g.reason.contains("Input/output error") || g.reason.contains("os error"))
         ));
+    }
+
+    /// With no receipts the journal fills; polling must neither drain nor gap.
+    /// Once receipts flow, the whole transcript ships and the run drains.
+    async fn assert_backpressure_ships_everything(
+        execution: &ExecutionRecord,
+        journal: &SharedJournal,
+        expected_len: usize,
+    ) {
+        let run = run_identity(execution);
+        for _ in 0..30 {
+            let _ = transcripts::poll(journal, execution, &stamp().unwrap()).await;
+        }
+        assert!(journal.lock().unwrap().source(&run, "drained").unwrap().is_none());
+        assert!(
+            !records(journal)
+                .iter()
+                .any(|r| matches!(&r.body, Some(record::Body::Gap(_))))
+        );
+        for _ in 0..200 {
+            if journal.lock().unwrap().source(&run, "drained").unwrap().is_some() {
+                break;
+            }
+            let _ = transcripts::poll(journal, execution, &stamp().unwrap()).await;
+            receipt_through(journal);
+        }
+        assert!(journal.lock().unwrap().source(&run, "drained").unwrap().is_some());
+        let shipped: usize = records(journal)
+            .iter()
+            .filter_map(|r| match &r.body {
+                Some(record::Body::Transcript(t)) => Some(t.data.len()),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(shipped, expected_len, "the whole transcript must be journaled");
+    }
+
+    fn large_transcript(mut body: String) -> String {
+        let line = format!("{}\n", serde_json::json!({"type":"noise", "payload": "x".repeat(900)}));
+        for _ in 0..700 {
+            body.push_str(&line);
+        }
+        body
+    }
+
+    #[tokio::test]
+    async fn spool_backpressure_never_drains_or_gaps_a_terminal_codex_file_run() {
+        let root = tempfile::tempdir().unwrap();
+        let (execution, directory) = terminal_file_run(root.path());
+        let rollout = directory.join("rollout-example-session.jsonl");
+        let body = large_transcript(std::fs::read_to_string(&rollout).unwrap());
+        std::fs::write(&rollout, &body).unwrap();
+        let journal = journal(root.path(), limits());
+        assert_backpressure_ships_everything(&execution, &journal, body.len()).await;
+    }
+
+    #[tokio::test]
+    async fn spool_backpressure_never_drains_or_gaps_a_terminal_claude_hook_run() {
+        let root = tempfile::tempdir().unwrap();
+        let mut execution = execution(root.path());
+        let transcript = root.path().join("claude-transcript.jsonl");
+        let body = large_transcript(String::new());
+        std::fs::write(&transcript, &body).unwrap();
+        let journal = journal(root.path(), limits());
+        hooks::ingest(&journal, &execution, &hook(Some(&transcript)), &stamp().unwrap())
+            .await
+            .unwrap();
+        execution.phase = Phase::Terminal;
+        assert_backpressure_ships_everything(&execution, &journal, body.len()).await;
+    }
+
+    #[tokio::test]
+    async fn backpressure_between_transient_source_errors_ends_the_failure_streak() {
+        use boss_engine_driver::discovery::fault::{Point, inject_once};
+        let root = tempfile::tempdir().unwrap();
+        let (execution, directory) = terminal_file_run(root.path());
+        let rollout = directory.join("rollout-example-session.jsonl");
+        let body = large_transcript(std::fs::read_to_string(&rollout).unwrap());
+        std::fs::write(&rollout, &body).unwrap();
+        let journal = journal(root.path(), limits());
+        let run = run_identity(&execution);
+        let minute = 60 * 1_000_000_000u64;
+        // Saturate the bulk window without receipts so every later source read
+        // succeeds but is refused by backpressure.
+        let mut full = false;
+        for _ in 0..200 {
+            if let Err(error) = transcripts::poll(&journal, &execution, &stamp_at(0)).await {
+                assert!(Fault::is_full(&error), "{error}");
+                full = true;
+                break;
+            }
+        }
+        assert!(full, "the spool must fill");
+        let marker = |journal: &SharedJournal| {
+            journal
+                .lock()
+                .unwrap()
+                .source(&run, "transient_since")
+                .unwrap()
+                .map(|b| String::from_utf8(b).unwrap())
+        };
+        inject_once(Point::Listing, &directory, libc::EIO);
+        assert!(transcripts::poll(&journal, &execution, &stamp_at(1)).await.is_err());
+        assert!(marker(&journal).is_some_and(|m| m != "none"), "streak must start");
+        // Successful source reads blocked by a full spool, for over the budget.
+        for i in 1..=8u64 {
+            let error = transcripts::poll(&journal, &execution, &stamp_at(i * minute))
+                .await
+                .unwrap_err();
+            assert!(Fault::is_full(&error), "{error}");
+            assert_eq!(
+                marker(&journal).as_deref(),
+                Some("none"),
+                "backpressure ends the streak"
+            );
+        }
+        inject_once(Point::Listing, &directory, libc::EIO);
+        assert!(
+            transcripts::poll(&journal, &execution, &stamp_at(9 * minute))
+                .await
+                .is_err()
+        );
+        assert!(journal.lock().unwrap().source(&run, "drained").unwrap().is_none());
+        assert!(
+            !records(&journal)
+                .iter()
+                .any(|r| matches!(&r.body, Some(record::Body::Gap(_))))
+        );
+        for _ in 0..200 {
+            if journal.lock().unwrap().source(&run, "drained").unwrap().is_some() {
+                break;
+            }
+            let _ = transcripts::poll(&journal, &execution, &stamp_at(10 * minute)).await;
+            receipt_through(&journal);
+        }
+        let shipped: usize = records(&journal)
+            .iter()
+            .filter_map(|r| match &r.body {
+                Some(record::Body::Transcript(t)) => Some(t.data.len()),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(shipped, body.len());
+        assert!(
+            journal.lock().unwrap().source(&run, "drained").unwrap().is_some(),
+            "the run must drain once receipts resume"
+        );
+        assert!(
+            !records(&journal)
+                .iter()
+                .any(|r| matches!(&r.body, Some(record::Body::Gap(_)))),
+            "no gap may be written during recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_streak_restarts_when_the_boot_changes() {
+        use boss_engine_driver::discovery::fault::{Point, inject_once};
+        let minute = 60 * 1_000_000_000u64;
+        // (old-boot counter, new-boot counter): smaller and larger.
+        for (old, new) in [(100 * minute, 10 * minute), (10 * minute, 100 * minute)] {
+            let root = tempfile::tempdir().unwrap();
+            let (execution, directory) = terminal_file_run(root.path());
+            let journal = journal(root.path(), limits());
+            let run = run_identity(&execution);
+            inject_once(Point::Listing, &directory, libc::EIO);
+            let _ = transcripts::poll(&journal, &execution, &stamp_at(old)).await;
+            let mut next = stamp_at(new);
+            next.boot_id = "boot-2".into();
+            inject_once(Point::Listing, &directory, libc::EIO);
+            let _ = transcripts::poll(&journal, &execution, &next).await;
+            assert!(
+                journal.lock().unwrap().source(&run, "drained").unwrap().is_none(),
+                "{old}->{new}: a streak from another boot must not drain"
+            );
+            // Same new boot, past the budget since the restarted streak: drains.
+            next.awake_ns = new + 6 * minute;
+            inject_once(Point::Listing, &directory, libc::EIO);
+            let _ = transcripts::poll(&journal, &execution, &next).await;
+            assert!(journal.lock().unwrap().source(&run, "drained").unwrap().is_some());
+        }
     }
 
     #[tokio::test]

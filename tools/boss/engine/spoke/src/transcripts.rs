@@ -88,58 +88,115 @@ impl std::fmt::Display for SourceFailure {
 }
 impl std::error::Error for SourceFailure {}
 
-/// Consecutive-or-not failed polls of a Terminal run (no pending hooks) with a
-/// retryable error before the run is drained with a transcript gap. Without a
-/// bound, a persistent unclassified errno (EIO, ESTALE, ...) would block
-/// reclaim forever with nothing recorded.
-const TERMINAL_TRANSIENT_BUDGET: u64 = 20;
-const TRANSIENT_SOURCE: &str = "transient_failures";
+/// A classified, retryable source I/O failure (EMFILE, EIO, ESTALE, ...).
+/// Journal admission errors such as `Fault::Full` are backpressure, not source
+/// failures, and never carry this marker.
+#[derive(Debug)]
+struct TransientSource(String);
+impl std::fmt::Display for TransientSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for TransientSource {}
+
+/// Continuous awake time a Terminal run (no pending hooks) may fail with a
+/// classified transient source error before it is drained with a transcript
+/// gap. Without a bound, a persistent errno (EIO, ESTALE, ...) would block
+/// reclaim forever with nothing recorded. Awake time, not poll count, so a
+/// short burst never gives up unread bytes.
+const TERMINAL_TRANSIENT_BUDGET_NS: u64 = 5 * 60 * 1_000_000_000;
+const TRANSIENT_SOURCE: &str = "transient_since";
 
 pub async fn poll(journal: &SharedJournal, execution: &ExecutionRecord, stamp: &Stamp) -> Result<()> {
     let result = poll_source(journal, execution, stamp).await;
+    let run = crate::run_identity(execution);
+    // Backpressure or any other non-source error means the source read itself
+    // succeeded, so the continuous-failure streak is over, whichever arm below
+    // handles the error. The original error is still returned unchanged.
     if let Err(error) = &result
-        && execution.phase == Phase::Terminal
-        && let Some(observation) = &execution.observation
-        && !crate::hooks::has_pending(&observation.pending)?
+        && error.downcast_ref::<TransientSource>().is_none()
+        && error.downcast_ref::<SourceFailure>().is_none()
     {
-        let run = crate::run_identity(execution);
-        let exhausted = error.downcast_ref::<SourceFailure>().is_some()
-            || bump_transient_failures(journal, &run)? >= TERMINAL_TRANSIENT_BUDGET;
-        if exhausted {
-            let checkpoint = current_checkpoint(journal, &run)?;
-            return finish_gap(
-                journal,
-                &run,
-                stamp,
-                gap_resource(&checkpoint),
-                checkpoint.cursor.offset,
-                error.to_string(),
-            );
+        clear_transient(journal, &run)?;
+    }
+    match &result {
+        Ok(()) => clear_transient(journal, &run)?,
+        Err(error)
+            if execution.phase == Phase::Terminal
+                && let Some(observation) = &execution.observation
+                && !crate::hooks::has_pending(&observation.pending)? =>
+        {
+            let exhausted = error.downcast_ref::<SourceFailure>().is_some()
+                || (error.downcast_ref::<TransientSource>().is_some()
+                    && note_transient(journal, &run, stamp)? >= TERMINAL_TRANSIENT_BUDGET_NS);
+            if exhausted {
+                let checkpoint = current_checkpoint(journal, &run)?;
+                return finish_gap(
+                    journal,
+                    &run,
+                    stamp,
+                    gap_resource(&checkpoint),
+                    checkpoint.cursor.offset,
+                    error.to_string(),
+                );
+            }
         }
+        Err(_) => {}
     }
     result
 }
 
-/// Durably count a retryable failure against the Terminal budget.
-fn bump_transient_failures(journal: &SharedJournal, run: &boss_protocol_spoke::v1::Run) -> Result<u64> {
+type Streak = (Option<Vec<u8>>, Option<(String, u64)>);
+
+/// The streak start, recorded with the boot it was measured in: `awake_ns`
+/// counters are only comparable within one boot.
+fn transient_since(journal: &boss_spoke_journal::Journal, run: &boss_protocol_spoke::v1::Run) -> Result<Streak> {
+    let old = journal.source(run, TRANSIENT_SOURCE)?;
+    // Legacy bare-counter values and "none" fail to parse and so restart the
+    // streak.
+    let since = old
+        .as_deref()
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .and_then(|s| s.rsplit_once(':'))
+        .and_then(|(boot, ns)| Some((boot.to_string(), ns.parse::<u64>().ok()?)));
+    Ok((old, since))
+}
+
+/// Durably record the first awake instant of the current failure streak and
+/// return how long it has lasted. A streak from another boot, or whose counter
+/// went backwards, restarts at the current stamp.
+fn note_transient(journal: &SharedJournal, run: &boss_protocol_spoke::v1::Run, stamp: &Stamp) -> Result<u64> {
     let mut journal = journal
         .lock()
         .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
-    let old = journal.source(run, TRANSIENT_SOURCE)?;
-    let count = old
-        .as_deref()
-        .and_then(|b| std::str::from_utf8(b).ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0)
-        + 1;
+    let (old, since) = transient_since(&journal, run)?;
+    if let Some((boot, since)) = &since
+        && *boot == stamp.boot_id
+        && stamp.awake_ns >= *since
+    {
+        return Ok(stamp.awake_ns - since);
+    }
     journal.commit_source(
         run,
         TRANSIENT_SOURCE,
         old.as_deref(),
-        count.to_string().as_bytes(),
+        format!("{}:{}", stamp.boot_id, stamp.awake_ns).as_bytes(),
         Vec::new(),
     )?;
-    Ok(count)
+    Ok(0)
+}
+
+/// A successful poll ends the streak; the budget measures continuous failure.
+fn clear_transient(journal: &SharedJournal, run: &boss_protocol_spoke::v1::Run) -> Result<()> {
+    let mut journal = journal
+        .lock()
+        .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
+    let (old, since) = transient_since(&journal, run)?;
+    if since.is_some() {
+        journal.commit_source(run, TRANSIENT_SOURCE, old.as_deref(), b"none", Vec::new())?;
+    }
+    Ok(())
 }
 
 async fn poll_source(journal: &SharedJournal, execution: &ExecutionRecord, stamp: &Stamp) -> Result<()> {
@@ -175,7 +232,7 @@ async fn poll_source(journal: &SharedJournal, execution: &ExecutionRecord, stamp
             // Retryable I/O (EMFILE, EINTR, ...) in listing, candidate
             // validation or preparation leaves the run undrained so a later
             // poll retries; permanent failures become a source gap.
-            discovery::ScanFailure::Transient(message) => anyhow::anyhow!(message),
+            discovery::ScanFailure::Transient(message) => anyhow::Error::from(TransientSource(message)),
             discovery::ScanFailure::Permanent(message) => anyhow::Error::from(SourceFailure(message)),
         })?;
         // Keep following an attached file when another candidate appears.
@@ -251,7 +308,7 @@ async fn poll_source(journal: &SharedJournal, execution: &ExecutionRecord, stamp
             return Err(if permanent {
                 SourceFailure(error.to_string()).into()
             } else {
-                error.into()
+                TransientSource(error.to_string()).into()
             });
         }
     };
