@@ -728,7 +728,8 @@ pub(crate) fn bazel_prepush_gate_text(worker_signal_seam_enabled: bool, run_done
 /// The verify gate is NOT skipped: the merged code must COMPILE
 /// (`bazel build` of the touched/upstream targets) and any rebase-
 /// invalidated generated artifact (e.g. `MODULE.bazel.lock`) must be
-/// regenerated before pushing. Tests run post-push in CI.
+/// regenerated before pushing. The tests of targets affected by the
+/// conflicted files also run pre-push; the full suite runs post-push in CI.
 ///
 /// The conflict-resolution pre-push gate prompt block, independent of any
 /// filesystem probe. Remote composition selects it via the Bazel override
@@ -738,25 +739,28 @@ pub(crate) fn bazel_conflict_resolution_gate_text(seam_enabled: bool) -> String 
     let background_wait =
         crate::prompt_fragments::background_wait_declaration(boss_engine_worker_bin::WORKER_BOSS_INVOCATION);
     let failure_sentence = if seam_enabled {
-        "If `bazel build` fails or times out, do NOT push. A successful build is required before delivery. Deciding on your own that the run has gone on long enough is not a build failure, and is never a reason to stop short of a clean build. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; call `\"$BOSS_BIN\" propose blocked --reason \"...\"` naming the failure and stop.\n"
+        "If `bazel build` or the affected-test run fails or times out, do NOT push. A successful build and a passing affected-test run are required before delivery. Deciding on your own that the run has gone on long enough is not a build failure, and is never a reason to stop short of a clean build. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; call `\"$BOSS_BIN\" propose blocked --reason \"...\"` naming the failure and stop.\n"
     } else {
-        "If `bazel build` fails or times out, do NOT push. A successful build is required before delivery. Deciding on your own that the run has gone on long enough is not a build failure, and is never a reason to stop short of a clean build. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; emit a `[blocked] reason=\"...\"` marker naming the failure and stop.\n"
+        "If `bazel build` or the affected-test run fails or times out, do NOT push. A successful build and a passing affected-test run are required before delivery. Deciding on your own that the run has gone on long enough is not a build failure, and is never a reason to stop short of a clean build. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; emit a `[blocked] reason=\"...\"` marker naming the failure and stop.\n"
     };
     format!(
         "\n## Pre-push gate for conflict resolution (Bazel workspace) — merge correctness first, then push\n\
          \n\
-         This repository is a Bazel workspace. For a conflict-resolution revision the gate you MUST clear before pushing is **merge correctness**, not the full test suite.\n\
+         This repository is a Bazel workspace. For a conflict-resolution revision the gate you MUST clear before pushing is **merge correctness**: a clean build plus the tests of the targets affected by the conflicted files, not the full test suite.\n\
          \n\
          Required BEFORE you push (step 4):\n\
          - Regenerate any generated/lock artifact the rebase invalidated and include it in your commit. The common one is `MODULE.bazel.lock`: run `bazel mod deps --lockfile_mode=update` (or build any target, which refreshes it) and stage the result.\n\
          - `bazel build` the targets your resolution touched AND the targets the rebased-in upstream change touches. Use `bazel query` to resolve labels if unsure. The merged code MUST COMPILE — a conflict resolution that does not build is wrong and must not be pushed.\n\
          - Run the build in the FOREGROUND and read its exit code directly. Do not wrap `bazel build` in a shell `timeout`. {background_wait}\n\
          \n\
-         Then PUSH (step 4) as soon as the build is clean. Do NOT block the push on a full `bazel test //...`.\n\
+         - After the build is clean, run the tests for the targets affected by the files that had conflicts — NOT the whole suite. Resolve them with `bazel query 'kind(\".*_test rule\", rdeps(//..., set(<conflicted source files>)))'` (or the repo's equivalent), then run `bazel test` on that set and report the exact command and its exit code. Every source file that conflicted always selects its dependent tests, including tests of the upstream change you merged with (a merge that compiles can still violate an ordering or registry invariant that a fast unit test checks).\n\
+         - Lockfiles regenerated deterministically as part of the resolution (e.g. `MODULE.bazel.lock`, `Cargo.lock`) do NOT on their own select tests: their reverse dependencies are effectively everything. Leave them out of the query set. If no source file conflicted, there is no affected-test set to run.\n\
+         - If the affected-test query itself fails, report the failing command and its output and stop as blocked (see the failure handling below). Do NOT skip the tests.\n\
+         - Do NOT run the full `bazel test //...` suite in this gate, and do not disable or bypass Bazel caching.\n\
          \n\
-         Why push before the full test suite: making the PR mergeable again is the conflict-resolution step's deliverable. The PR's own CI runs the full `bazel test` suite on the branch you push — that is where test regressions are caught and remediated, NOT a precondition for landing the resolution. Stalling the push behind a long or flaky full-suite run is exactly how a correct resolution gets stranded and never reaches the PR.\n\
+         Then PUSH (step 4) once the build is clean and the affected tests pass. Do NOT block the push on a full `bazel test //...`.\n\
          \n\
-         After pushing you MAY run `bazel test` on the affected targets as a courtesy and report what you saw, but the push must not wait on it.\n\
+         Why only the affected tests: making the PR mergeable again is the conflict-resolution step's deliverable, and the PR's own CI runs the full `bazel test` suite on the branch you push. But the tests that cover the conflicted files are cheap and are exactly where a wrong merge shows up, so they must pass before the push. Stalling the push behind a long or flaky full-suite run is how a correct resolution gets stranded.\n\
          \n\
          {failure_sentence}"
     )
@@ -1087,7 +1091,7 @@ fn run_done_gate_exception(conflict_resolution: bool, bazel_workspace: Option<bo
              If `bazel build` fails or times out, do NOT push: the merged code MUST COMPILE. \
              A still-red compile is a reason to stop without delivery, not a reason to push, even if the \
              failure looks pre-existing or environmental. Only the full test suite is deferred to CI; \
-             a successful `bazel build` is a precondition for this push. Bazel \
+             a successful `bazel build` and a passing run of the tests affected by the conflicted files are preconditions for this push. Bazel \
              remains the source of truth: do not bypass or weaken checks, and still stop for required \
              approval to relax a check, missing credentials or authorization, genuine instruction \
              conflicts or contradictory requirements."
@@ -1900,7 +1904,7 @@ fn compose_revision_directive(
     out.push('\n');
     let rebase_gate_clause = match (bazel_workspace, is_conflict_resolution) {
         (Some(true), true) => {
-            "Rebase-only exception (VCS only — not a build-gate skip): if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces NO diff whatsoever (zero changed files), it is valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change. IMPORTANT: this exception covers VCS mechanics only — whether to add a new commit. It does NOT exempt you from the merge-correctness build gate. Any rebase, merge, or conflict resolution MUST run the `bazel build` merge-correctness gate (compile the touched/upstream targets, regenerate invalidated lockfiles) before pushing, even when the rebase appeared clean — a rebase merges upstream changes in and the resulting code is new and must compile. The full `bazel test` suite is NOT a precondition for this push; it runs in the PR's CI after you push (see the conflict-resolution gate above).\n"
+            "Rebase-only exception (VCS only — not a build-gate skip): if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces NO diff whatsoever (zero changed files), it is valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change. IMPORTANT: this exception covers VCS mechanics only — whether to add a new commit. It does NOT exempt you from the merge-correctness build gate. Any rebase, merge, or conflict resolution MUST run the `bazel build` merge-correctness gate (compile the touched/upstream targets, regenerate invalidated lockfiles) before pushing, even when the rebase appeared clean — a rebase merges upstream changes in and the resulting code is new and must compile. The full `bazel test` suite is NOT a precondition for this push; it runs in the PR's CI after you push. You MUST however run `bazel test` on the test targets affected by the conflicted source files (see the conflict-resolution gate above).\n"
         }
         (Some(true), false) => {
             "Rebase-only exception (VCS only — not a build-gate skip): if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces NO diff whatsoever (zero changed files), it is valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change. IMPORTANT: this exception covers VCS mechanics only — whether to add a new commit. It does NOT exempt you from the pre-push build gate. Any revision that involves a rebase, merge, or conflict resolution MUST run the full `bazel build` + `bazel test` gate before pushing, even when the rebase appeared clean. A rebase merges upstream changes into your branch — the resulting code is new and must be compiled and tested. This is exactly where compile errors get reintroduced.\n"
