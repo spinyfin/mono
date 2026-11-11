@@ -96,6 +96,12 @@ fn query_attention(conn: &Connection, id: &str) -> Result<Option<Attention>> {
     .map_err(Into::into)
 }
 
+pub(super) fn attention_with_group(conn: &Connection, id: &str) -> Result<(Attention, AttentionGroup)> {
+    let attention = query_attention(conn, id).require("attention", id)?;
+    let group = query_attention_group(conn, &attention.group_id).require("attention group", &attention.group_id)?;
+    Ok((attention, group))
+}
+
 /// Resolve a group reference to its row. Accepts the canonical `atg_…` id
 /// or an `A<n>` per-product short id. Because the lookup wire request
 /// carries no product, an `A<n>` is resolved across all products and is an
@@ -1335,6 +1341,22 @@ impl WorkDb {
 
         let mut pending = PendingEvents::new();
         let (produced_kind, produced_ref, produced_work_item_ids, successor) = match group.kind.as_str() {
+            "question" if group.grouping_key.starts_with(CONFLICT_INVENTORY_GROUP_PREFIX) => {
+                let ids = super::conflict_inventory::action_group(&mut pending, &tx, &members, pr_checker, actor)?;
+                let references: Vec<_> = ids
+                    .iter()
+                    .map(|id| {
+                        let task = query_task(&tx, id).require("task", id)?;
+                        Ok(serde_json::json!({"task_id": task.id, "short_id": task.short_id, "kind": task.kind}))
+                    })
+                    .collect::<Result<_>>()?;
+                (
+                    "conflict_decisions".into(),
+                    serde_json::json!({"tasks": references}).to_string(),
+                    ids,
+                    worker_questions::QuestionSuccessor::NoPr,
+                )
+            }
             "question" => action_question_group(&mut pending, &tx, &group, &members, pr_checker, actor)?,
             "followup" => {
                 let (kind, reference, ids) = action_followup_group(&tx, &group, &members, member_overrides)?;

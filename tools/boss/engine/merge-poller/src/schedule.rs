@@ -620,6 +620,9 @@ pub fn spawn_loop<C: CompletionRequests + 'static>(
             .await
             .unwrap_or_default();
             let last_run_at = Instant::now();
+            passes
+                .run_conflict_decisions(work_db.as_ref(), publisher.as_ref())
+                .await;
             record_sweep_metrics(&metrics, &outcome);
             if outcome.total_transitions() > 0 || outcome.pr_recheck_unresolved > 0 {
                 tracing::info!(

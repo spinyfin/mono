@@ -733,6 +733,7 @@ mod floor_tests {
         let expected = Connection::open_in_memory().unwrap();
         seed_released_schema(&expected);
         project_postmortem::migrate_project_postmortem_signals(&expected).unwrap();
+        super::super::conflict_inventory::migrate(&expected).unwrap();
         pr_flow::migrate_operator_questions(&expected).unwrap();
         expected.execute_batch("CREATE TABLE execution_restore_reports (execution_id TEXT PRIMARY KEY REFERENCES work_executions(id) ON DELETE CASCADE, report TEXT NOT NULL)").unwrap();
         personas::migrate(&expected).unwrap();

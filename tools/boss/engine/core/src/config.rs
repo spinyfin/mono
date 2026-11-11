@@ -466,6 +466,21 @@ fn lookup_u64(lookup: impl Fn(&str) -> Option<OsString>, name: &str) -> Result<O
     }
 }
 
+/// Lifetime limits for automatic conflict resolution. Invalid overrides stop
+/// automatic work rather than silently discarding the configured limit.
+pub(crate) fn conflict_inventory_limits(
+    lookup: impl Fn(&str) -> Option<OsString>,
+) -> Result<crate::work::ConflictInventoryLimits> {
+    let defaults = crate::work::ConflictInventoryLimits::default();
+    let resolutions = lookup_u64(&lookup, "BOSS_CONFLICT_MAX_RESOLUTIONS")?.unwrap_or(defaults.resolutions);
+    let days = lookup_u64(&lookup, "BOSS_CONFLICT_MAX_DAYS")?.unwrap_or(defaults.days);
+    anyhow::ensure!(
+        resolutions > 0 && days > 0,
+        "conflict inventory limits must be positive"
+    );
+    Ok(crate::work::ConflictInventoryLimits { resolutions, days })
+}
+
 fn lookup_string(lookup: impl Fn(&str) -> Option<OsString>, name: &str) -> Option<String> {
     lookup(name).map(|val| val.to_string_lossy().into_owned())
 }

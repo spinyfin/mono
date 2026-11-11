@@ -712,7 +712,11 @@ mod chain_helpers;
 mod ci_failure_identity;
 mod comment_thread_entries;
 mod comments;
+mod conflict_inventory;
 mod conflict_mismatch;
+pub use conflict_inventory::{
+    CONFLICT_INVENTORY_GROUP_PREFIX, CONFLICT_INVENTORY_STOP_REASON, ConflictInventoryLimits,
+};
 mod conflict_res;
 mod coordinator_guidance_cache;
 mod coordinator_handoff_store;

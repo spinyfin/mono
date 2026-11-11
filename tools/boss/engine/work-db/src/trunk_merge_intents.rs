@@ -134,33 +134,9 @@ impl WorkDb {
     pub fn insert_trunk_merge_intent(&self, input: TrunkMergeIntentInsertInput) -> Result<Option<TrunkMergeIntent>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let id = next_id("tmi");
-        let now = now_string();
-        let rows = tx.execute(
-            "INSERT OR IGNORE INTO trunk_merge_intents
-                (id, work_item_id, pr_url, pr_number, repo, target_branch, status, submit_count, created_at,
-                 adopted_at_head_sha, adopted_at_check_completed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 1, ?7, ?8, ?9)",
-            params![
-                id,
-                input.work_item_id,
-                input.pr_url,
-                input.pr_number,
-                input.repo,
-                input.target_branch,
-                now,
-                input.adopted_at_head_sha,
-                input.adopted_at_check_completed_at,
-            ],
-        )?;
-        if rows == 0 {
-            tx.commit()?;
-            return Ok(None);
-        }
-        let inserted = query_trunk_merge_intent(&tx, &id)?
-            .with_context(|| format!("unknown trunk_merge_intent after insert: {id}"))?;
+        let inserted = insert_intent_in_tx(&tx, input)?;
         tx.commit()?;
-        Ok(Some(inserted))
+        Ok(inserted)
     }
 
     /// The active `trunk_merge_intents` row for `work_item_id`, if any.
@@ -352,7 +328,10 @@ fn query_trunk_merge_intent(conn: &Connection, id: &str) -> Result<Option<TrunkM
     Ok(row)
 }
 
-fn query_active_trunk_merge_intent(conn: &Connection, work_item_id: &str) -> Result<Option<TrunkMergeIntent>> {
+pub(super) fn query_active_trunk_merge_intent(
+    conn: &Connection,
+    work_item_id: &str,
+) -> Result<Option<TrunkMergeIntent>> {
     let sql = format!(
         "SELECT {TRUNK_MERGE_INTENT_COLUMNS} FROM trunk_merge_intents \
          WHERE work_item_id = ?1 AND status = 'active'"
@@ -392,6 +371,38 @@ pub(crate) fn mark_active_trunk_intent_awaiting_resubmit_in_tx(
         return Ok(false);
     }
     record_trunk_merge_intent_state_in_tx(conn, &intent.id, TRUNK_INTENT_AWAITING_RESUBMIT)
+}
+
+/// Shared insertion for immediate submission and durable queued submission.
+pub(super) fn insert_intent_in_tx(
+    tx: &Connection,
+    input: TrunkMergeIntentInsertInput,
+) -> Result<Option<TrunkMergeIntent>> {
+    let id = next_id("tmi");
+    let now = now_string();
+    let rows = tx.execute(
+        "INSERT OR IGNORE INTO trunk_merge_intents
+                (id, work_item_id, pr_url, pr_number, repo, target_branch, status, submit_count, created_at,
+                 adopted_at_head_sha, adopted_at_check_completed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 1, ?7, ?8, ?9)",
+        params![
+            id,
+            input.work_item_id,
+            input.pr_url,
+            input.pr_number,
+            input.repo,
+            input.target_branch,
+            now,
+            input.adopted_at_head_sha,
+            input.adopted_at_check_completed_at,
+        ],
+    )?;
+    if rows == 0 {
+        return Ok(None);
+    }
+    let inserted =
+        query_trunk_merge_intent(tx, &id)?.with_context(|| format!("unknown trunk_merge_intent after insert: {id}"))?;
+    Ok(Some(inserted))
 }
 
 #[cfg(test)]

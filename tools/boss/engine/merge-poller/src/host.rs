@@ -117,6 +117,9 @@ pub trait PopulationRequests: Send + Sync {
 /// throttle schedule, so the loop owns one runner for its lifetime.
 #[async_trait]
 pub trait SweepPasses: Send {
+    /// Retry owner-approved conflict disposition actions, including after a restart.
+    async fn run_conflict_decisions(&mut self, _work_db: &WorkDb, _publisher: &dyn ExecutionPublisher) {}
+
     /// Predict conflicts for `candidates` (the caller has checked the feature flag).
     async fn run_speculative_pass(
         &mut self,

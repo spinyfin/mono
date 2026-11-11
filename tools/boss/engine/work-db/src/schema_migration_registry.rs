@@ -14,6 +14,11 @@ pub(super) fn all() -> Vec<Migration> {
         .collect();
     migrations.extend([
         Migration {
+            id: "20261112_0026_conflict_inventory_decisions".into(),
+            legacy_version: None,
+            apply: conflict_inventory::migrate,
+        },
+        Migration {
             id: "20261110_2300_prompt_confirmation".into(),
             legacy_version: None,
             apply: |conn| {

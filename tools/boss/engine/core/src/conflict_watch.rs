@@ -181,6 +181,47 @@ pub async fn on_conflict_detected_with(
     if auto_pr_maintenance_disabled(work_db, candidate, &probe.labels) {
         return false;
     }
+    let stopped = crate::config::conflict_inventory_limits(|key| std::env::var_os(key)).and_then(|limits| {
+        work_db.stop_long_conflicting_pr(
+            &ConflictResolutionInsertInput {
+                product_id: candidate.product_id.clone(),
+                work_item_id: candidate.work_item_id.clone(),
+                pr_url: candidate.pr_url.clone(),
+                pr_number: stored_pr_number(&candidate.pr_url).unwrap_or(0),
+                head_branch: probe.head_ref_name.clone().unwrap_or_default(),
+                base_branch: probe.base_ref_name.clone().unwrap_or_else(|| "main".into()),
+                base_sha_at_trigger: probe.base_ref_oid.clone(),
+                head_sha_before: probe.head_ref_oid.clone(),
+            },
+            limits,
+        )
+    });
+    match stopped {
+        Ok(Some((attention, group, created))) => {
+            if !created {
+                return false;
+            }
+            publisher
+                .publish_frontend_event_on_product(
+                    &candidate.product_id,
+                    FrontendEvent::AttentionCreated { attention, group },
+                )
+                .await;
+            publisher
+                .publish_work_item_changed(
+                    &candidate.product_id,
+                    &candidate.work_item_id,
+                    "conflict_inventory_stopped",
+                )
+                .await;
+            return true;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            tracing::error!(?err, pr_url = %candidate.pr_url, "conflict inventory guard failed; refusing automatic resolution");
+            return false;
+        }
+    }
     // Q7: when `auto-rebase-stacked-prs` is already chasing this PR,
     // step aside. Auto-rebase escalation owns the slot until it
     // hits a terminal status; the next conflict-watch sweep will

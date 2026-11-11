@@ -915,6 +915,17 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
+        let stopped: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM conflict_inventory_decisions d
+             JOIN conflict_resolutions cr ON cr.pr_url = d.pr_url
+             WHERE cr.id = ?1 AND (d.answer IS NULL OR d.answer = 'Close'))",
+            [attempt_id],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!(
+            !stopped,
+            "automatic resolution is stopped; answer the merge, close or rewrite decision"
+        );
         let rows = tx.execute(
             "UPDATE conflict_resolutions
                 SET status            = 'pending',
