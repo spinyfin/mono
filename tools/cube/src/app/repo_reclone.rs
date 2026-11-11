@@ -31,7 +31,13 @@ fn require_unused(runner: &dyn CommandRunner, path: &Path) -> Result<()> {
     let invocation = CommandInvocation {
         cwd: path.parent().unwrap_or(path).into(),
         program: "lsof".into(),
-        args: vec!["-w".into(), "-nP".into(), "-Fpcn".into(), "+D".into(), path.display().to_string()],
+        args: vec![
+            "-w".into(),
+            "-nP".into(),
+            "-Fpcn".into(),
+            "+D".into(),
+            path.display().to_string(),
+        ],
         env: vec![],
     };
     match runner.run_with_timeout(&invocation, Duration::from_secs(120)) {
@@ -528,7 +534,10 @@ fn preservable_untracked(source: &Path, inputs: Vec<PathBuf>) -> Vec<PathBuf> {
             }
             let regular = fs::symlink_metadata(source.join(input)).is_ok_and(|m| m.is_file() || m.is_dir());
             if !regular {
-                eprintln!("cube: not preserving untracked non-regular file {}", source.join(input).display());
+                eprintln!(
+                    "cube: not preserving untracked non-regular file {}",
+                    source.join(input).display()
+                );
             }
             regular
         })

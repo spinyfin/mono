@@ -439,7 +439,10 @@ fn incidental_untracked_symlinks_are_skipped_before_the_store_moves() {
     )
     .unwrap();
     assert!(fs::symlink_metadata(runner.source.join("bazel-bin")).is_err());
-    assert_eq!(fs::read_to_string(runner.source.join(" leading-space")).unwrap(), "kept");
+    assert_eq!(
+        fs::read_to_string(runner.source.join(" leading-space")).unwrap(),
+        "kept"
+    );
 }
 
 #[test]

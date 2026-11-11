@@ -2228,9 +2228,9 @@ pub(super) fn release_if_setup_not_run<T>(
                 workspace_id = workspace.workspace_id,
                 lease_id = lease_id,
             ),
-            Err(release_err) => eprintln!(
-                "warning: failed to release lease {lease_id} after setup could not run: {release_err}"
-            ),
+            Err(release_err) => {
+                eprintln!("warning: failed to release lease {lease_id} after setup could not run: {release_err}")
+            }
         }
     }
     result
