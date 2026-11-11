@@ -640,8 +640,8 @@ async fn the_breaker_recovery_probe_admits_nothing_when_every_ready_row_is_out_o
     assert!(events.events().await.is_empty());
 }
 
-fn pre_merge_batch(db: &WorkDb, root_id: &str, target_sha: &str) -> (String, Vec<String>) {
-    let input = ReviewBatchCreateInput::builder()
+fn pre_merge_batch_input(root_id: &str, target_sha: &str) -> ReviewBatchCreateInput {
+    ReviewBatchCreateInput::builder()
         .cycle_root_id(root_id)
         .base_sha("base-sha")
         .classification(
@@ -659,9 +659,15 @@ fn pre_merge_batch(db: &WorkDb, root_id: &str, target_sha: &str) -> (String, Vec
         .pr_number(42)
         .pr_url("https://github.com/example/repo/pull/42")
         .target_sha(target_sha)
-        .build();
+        .build()
+}
+
+fn pre_merge_batch(db: &WorkDb, root_id: &str, target_sha: &str) -> (String, Vec<String>) {
     match db
-        .create_pre_merge_review_batch(input, "https://github.com/example/repo")
+        .create_pre_merge_review_batch(
+            pre_merge_batch_input(root_id, target_sha),
+            "https://github.com/example/repo",
+        )
         .unwrap()
     {
         ReviewBatchDispatch::Created { batch, executions } => {

@@ -2032,6 +2032,9 @@ fn assert_post_merge_followup_membership(in_project: bool) {
 #[path = "review_guide_findings_tests.rs"]
 mod review_guide_findings_tests;
 
+#[path = "held_revision_review_tests.rs"]
+mod held_revision_review_tests;
+
 // ── stale-head verdicts ─────────────────────────────────────────────────────
 
 /// Stand up a cycle root held `active` pending review (the PendingReview

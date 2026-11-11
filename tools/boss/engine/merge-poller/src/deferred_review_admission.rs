@@ -108,7 +108,16 @@ pub(crate) async fn sweep_deferred_review_admission_with(
                     batch.status,
                     boss_protocol::ReviewBatchStatus::Completed | boss_protocol::ReviewBatchStatus::Failed
                 ) {
-                    match work_db.advance_pending_review_task_to_in_review(&candidate.task_id) {
+                    // A batch's verdict is keyed by the cycle root, which for
+                    // a revision is not the candidate itself. This arm is how
+                    // a revision leaves its hold when the head it waits on was
+                    // settled by a batch admitted for another row: a sibling
+                    // revision's later push, or an explicit review start,
+                    // which is always admitted against the root.
+                    match work_db.advance_pending_review_task_to_in_review_with_verdict_source(
+                        &candidate.task_id,
+                        &candidate.cycle_root_id,
+                    ) {
                         Ok(true) => {
                             tracing::info!(
                                 task_id = %candidate.task_id,

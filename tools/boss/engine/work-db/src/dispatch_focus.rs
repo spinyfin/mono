@@ -28,9 +28,21 @@
 //! answer-agent run to the task owning the commented document or review guide, an automation triage run
 //! to its product. A row that cannot be attributed to anything is out of
 //! scope: focus mode admits only what it can prove is in scope.
+//!
+//! # Reviews of a revision's push
+//!
+//! A pre-merge review is keyed on the review-cycle root, the task that owns
+//! the PR: the batch, its member `pr_review` executions and the review guide
+//! all name that root, not the revision whose push they review. Rule 4 walks
+//! up from an item, so a root reached that way never sees a launch recorded
+//! on one of its revisions. The review is therefore also attributed to the
+//! item that produced the reviewed head (`pr_review_batches.producing_work_item_id`):
+//! it is in scope when either the root or that producing item is. Explicitly
+//! launching a revision admits the review of what it pushes without admitting
+//! the root or the root's other revisions.
 
 use anyhow::Context;
-use boss_protocol::{DispatchFocus, DispatchFocusTarget, DispatchFocusTargetKind, TaskKind};
+use boss_protocol::{DispatchFocus, DispatchFocusTarget, DispatchFocusTargetKind, ExecutionKind, TaskKind};
 
 use super::products_design::resolve_doc_owner_on;
 use super::*;
@@ -77,6 +89,54 @@ impl<'a> ScopeResolver<'a> {
         Ok(verdict)
     }
 
+    /// Scope of one execution: its work item's, or, for a member of a
+    /// pre-merge review batch, that of the item whose push the batch reviews.
+    fn execution_in_scope(&mut self, execution: &WorkExecution) -> Result<bool> {
+        if self.in_scope(&execution.work_item_id)? {
+            return Ok(true);
+        }
+        if execution.kind != ExecutionKind::PrReview {
+            return Ok(false);
+        }
+        let producing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT b.producing_work_item_id
+                 FROM pr_review_batch_members m
+                 JOIN pr_review_batches b ON b.id = m.batch_id
+                 WHERE m.execution_id = ?1 AND b.phase = 'pre_merge'
+                   AND b.producing_work_item_id IS NOT NULL",
+                [&execution.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match producing {
+            Some(producing) => self.in_scope(&producing),
+            None => Ok(false),
+        }
+    }
+
+    /// Scope of a pre-merge review of `cycle_root_id`'s PR at `head_sha`,
+    /// through the items whose push a batch at that head reviews.
+    fn reviewed_head_in_scope(&mut self, cycle_root_id: &str, head_sha: &str, depth: usize) -> Result<bool> {
+        let producing: Vec<String> = {
+            let mut statement = self.conn.prepare(
+                "SELECT DISTINCT producing_work_item_id FROM pr_review_batches
+                 WHERE cycle_root_id = ?1 AND phase = 'pre_merge' AND target_sha = ?2
+                   AND producing_work_item_id IS NOT NULL",
+            )?;
+            statement
+                .query_map(params![cycle_root_id, head_sha], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        for producing in producing {
+            if self.resolve(&producing, depth + 1)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn resolve(&mut self, id: &str, depth: usize) -> Result<bool> {
         // Bounded like every other lineage walk: a cycle in corrupt data
         // resolves out of scope instead of looping.
@@ -101,18 +161,22 @@ impl<'a> ScopeResolver<'a> {
             };
         }
         if id.starts_with("prgc_") {
-            let root: Option<String> = self
+            let comparison: Option<(String, String)> = self
                 .conn
                 .query_row(
-                    "SELECT s.root_task_id FROM pr_review_guide_source_comparisons c
+                    "SELECT s.root_task_id, c.head_sha FROM pr_review_guide_source_comparisons c
                      JOIN pr_review_guide_source_series s ON s.id = c.series_id
                      WHERE c.id = ?1",
                     [id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
-            return match root {
-                Some(root_id) => self.resolve(&root_id, depth + 1),
+            return match comparison {
+                // The guide describes one head of the root's PR, so it
+                // follows the review of that head.
+                Some((root_id, head_sha)) => Ok(
+                    self.resolve(&root_id, depth + 1)? || self.reviewed_head_in_scope(&root_id, &head_sha, depth)?
+                ),
                 None => Ok(false),
             };
         }
@@ -247,6 +311,29 @@ pub(crate) fn work_item_in_dispatch_focus_on(
     ScopeResolver::new(conn, focus).in_scope(work_item_id)
 }
 
+/// Whether a pre-merge review of `cycle_root_id`'s PR is inside `focus`:
+/// the root is, or the item whose push is being reviewed is (see the module
+/// documentation). `producing_work_item_id` is `None` when the root itself
+/// produced the head. An inactive focus contains everything.
+pub(crate) fn pre_merge_review_in_dispatch_focus_on(
+    conn: &Connection,
+    cycle_root_id: &str,
+    producing_work_item_id: Option<&str>,
+    focus: &DispatchFocus,
+) -> Result<bool> {
+    if !focus.is_active() {
+        return Ok(true);
+    }
+    let mut resolver = ScopeResolver::new(conn, focus);
+    if resolver.in_scope(cycle_root_id)? {
+        return Ok(true);
+    }
+    match producing_work_item_id {
+        Some(producing) if producing != cycle_root_id => resolver.in_scope(producing),
+        _ => Ok(false),
+    }
+}
+
 #[work_db_boundary::instrument]
 impl WorkDb {
     /// The persisted focus set. Absent means no focus mode.
@@ -374,8 +461,9 @@ impl WorkDb {
     ///
     /// A `pr_review` execution is attributed to the task it reviews
     /// (`work_item_id`), resolved through its chain root exactly like an
-    /// implementation row; a review for an out-of-scope PR is held, never
-    /// dropped.
+    /// implementation row, and, as a member of a pre-merge batch, to the
+    /// item whose push that batch reviews; a review for an out-of-scope PR
+    /// is held, never dropped.
     pub fn executions_outside_dispatch_focus(
         &self,
         executions: &[WorkExecution],
@@ -388,7 +476,7 @@ impl WorkDb {
         let mut resolver = ScopeResolver::new(&conn, focus);
         let mut outside = HashSet::new();
         for execution in executions {
-            if !resolver.in_scope(&execution.work_item_id)? {
+            if !resolver.execution_in_scope(execution)? {
                 outside.insert(execution.id.clone());
             }
         }

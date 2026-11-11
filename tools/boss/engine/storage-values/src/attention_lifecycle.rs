@@ -393,9 +393,13 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     entry(
         PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
         ClearedBy::ProducerReconciles,
-        "The deferred-admission sweep re-tries create_pre_merge_review_batch every pass and resolves \
-         this item itself when a batch is admitted (or an existing live batch/legacy reviewer covers \
-         the target). A later unrelated run start does not mean a review slot opened.",
+        "Review admission resolves this item itself, for the cycle root and every revision held on \
+         it, in the transaction that creates the batch, whichever path admitted it (a completion, \
+         the deferred-admission sweep's retry, or an explicit review start, which is admitted \
+         against the root while the item sits on the deferred revision). The sweep also resolves it \
+         when an existing batch or legacy reviewer already covers the target, and releasing a held \
+         revision at its review's verdict resolves that revision's. A later unrelated run start \
+         does not mean a review slot opened.",
     ),
     entry(
         REVIEW_DESIGN_DOC_UNRESOLVED_ATTENTION_KIND,

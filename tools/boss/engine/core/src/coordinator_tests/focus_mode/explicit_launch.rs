@@ -150,3 +150,91 @@ async fn inherited_focus_admission_keeps_the_interactive_concurrency_cap() {
         capped.dispatch_wait_reason
     );
 }
+
+/// A PR-owning row that has finished its own work and sits in review, with a
+/// revision that pushed to its PR and is held `active` for review. Returns
+/// `(root, revision)`.
+fn root_with_held_revision(h: &Harness, name: &str, launched: bool) -> (String, String) {
+    const PR: &str = "https://github.com/example/repo/pull/42";
+    let (root, root_execution) = h.ready_loose_chore(&format!("PR owner {name}"));
+    // One statement per connection guard: the store hands out a single
+    // connection, so a guard is never held across another store call.
+    let sql = |statement: &str, params: [&str; 2]| {
+        h.db.connect().unwrap().execute(statement, params).unwrap();
+    };
+    let finish = |execution: &str| {
+        sql(
+            "UPDATE work_executions SET status = 'completed', finished_at = ?2 WHERE id = ?1",
+            [execution, "2"],
+        );
+    };
+    finish(&root_execution);
+    sql(
+        "UPDATE tasks SET status = 'in_review', pr_url = ?2 WHERE id = ?1",
+        [root.as_str(), PR],
+    );
+    let revision = h.revision_of(&root, &format!("task_revision_{name}"));
+    let implementation =
+        h.db.request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(&revision)
+                .force(launched)
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(implementation.kind, ExecutionKind::RevisionImplementation);
+    finish(&implementation.id);
+    sql(
+        "UPDATE tasks SET status = 'active', pr_url = ?2 WHERE id = ?1",
+        [revision.as_str(), PR],
+    );
+    (root, revision)
+}
+
+/// Review admission for `revision`'s push to `root`'s PR, as the revision's
+/// completion requests it.
+fn review_of_revision_push(h: &Harness, root: &str, revision: &str, head: &str) -> ReviewBatchDispatch {
+    let mut input = pre_merge_batch_input(root, head);
+    input.legacy_task_id = Some(revision.to_owned());
+    h.db.create_pre_merge_review_batch(input, "https://github.com/example/repo")
+        .unwrap()
+}
+
+/// A revision launched past focus pushes to a PR whose owning row is outside
+/// the focus set and was never launched. The review of that push is admitted
+/// and both reviewers dispatch. The same push from a revision that was not
+/// launched is deferred, and a reviewer queued on its root stays held.
+#[tokio::test]
+async fn a_launched_revisions_review_dispatches_though_the_row_owning_its_pr_is_out_of_focus() {
+    let h = harness();
+    for driver in ["claude", "codex"] {
+        crate::test_support::insert_host_capability(&h.db, "local", &format!("driver={driver}"), "auto");
+    }
+    let focused = h.project("Focused elsewhere");
+    let mut focus = DispatchFocus::default();
+    focus.insert(DispatchFocusTargetKind::Project, focused.id.clone());
+    h.db.save_dispatch_focus(&focus).unwrap();
+    h.focus_on(&[&focused]);
+
+    let (root, revision) = root_with_held_revision(&h, "launched", true);
+    let ReviewBatchDispatch::Created { batch, executions } =
+        review_of_revision_push(&h, &root, &revision, "head-launched")
+    else {
+        panic!("the launched revision's review must be admitted through focus");
+    };
+    assert_eq!(batch.cycle_root_id, root);
+    let reviewers: Vec<String> = executions.into_iter().map(|execution| execution.id).collect();
+    assert_eq!(reviewers.len(), 2);
+
+    let (other_root, other_revision) = root_with_held_revision(&h, "unlaunched", false);
+    assert!(matches!(
+        review_of_revision_push(&h, &other_root, &other_revision, "head-unlaunched"),
+        ReviewBatchDispatch::AdmissionDeferred
+    ));
+    let held = h.ready_execution(&other_root, ExecutionKind::PrReview);
+
+    h.drain_and_wait_for(&[&reviewers[0], &reviewers[1]]).await;
+
+    assert_eq!(h.dispatched().await, reviewers.into_iter().collect::<HashSet<_>>());
+    h.assert_held_by_focus(&held);
+}

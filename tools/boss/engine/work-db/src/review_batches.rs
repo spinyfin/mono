@@ -36,12 +36,19 @@ pub struct ReviewBatchCreateInput {
     pub pr_url: String,
     pub target_sha: String,
     pub merge_sha: Option<String>,
-    /// The originating task id, when it differs from `cycle_root_id` — set
-    /// for a revision task so the already-reviewed check in
-    /// [`WorkDb::create_pre_merge_review_batch_for_pool`] can also see a
-    /// legacy single-reviewer verdict keyed directly by the task (written
-    /// when `review_batch_fanout` was off, or before this task's chain had
-    /// a batch of its own).
+    /// The originating task id, when it differs from `cycle_root_id`: the
+    /// revision whose push is being reviewed. Persisted on the batch as
+    /// `producing_work_item_id`. Admission uses it to
+    ///
+    /// - resolve dispatch focus against the revision as well as the root
+    ///   (see [`pre_merge_dispatch_hold_on`]);
+    /// - record the head the held revision is waiting on, so the batch that
+    ///   settles that head can release it (see
+    ///   [`record_awaited_review_head_in_tx`]); and
+    /// - let the already-reviewed check also see a legacy single-reviewer
+    ///   verdict keyed directly by the task (written when
+    ///   `review_batch_fanout` was off, or before this task's chain had a
+    ///   batch of its own).
     pub legacy_task_id: Option<String>,
 }
 
@@ -842,14 +849,29 @@ fn load_focus_or_off(conn: &Connection) -> boss_protocol::DispatchFocus {
 
 /// Why a pre-merge batch for `cycle_root_id` must not occupy a reservation
 /// right now: an all-spawns pause holds reviews, or focus mode is on and
-/// the root is outside the set. `None` means admission may proceed to the
+/// the review is outside the set. `None` means admission may proceed to the
 /// pool-capacity check.
-fn pre_merge_dispatch_hold_on(conn: &Connection, cycle_root_id: &str) -> Result<Option<&'static str>> {
+///
+/// `producing_work_item_id` is the item whose push is being reviewed when
+/// that is not the root itself (a revision). Focus is resolved against both,
+/// so a revision that is in scope on its own account (it was explicitly
+/// launched) has its push reviewed even though the root that owns the PR is
+/// not: see `dispatch_focus`.
+fn pre_merge_dispatch_hold_on(
+    conn: &Connection,
+    cycle_root_id: &str,
+    producing_work_item_id: Option<&str>,
+) -> Result<Option<&'static str>> {
     if reviews_held_by_persisted_pause_on(conn)? {
         return Ok(Some("dispatch_paused"));
     }
     let focus = load_focus_or_off(conn);
-    if focus.is_active() && !super::dispatch_focus::work_item_in_dispatch_focus_on(conn, cycle_root_id, &focus)? {
+    if !super::dispatch_focus::pre_merge_review_in_dispatch_focus_on(
+        conn,
+        cycle_root_id,
+        producing_work_item_id,
+        &focus,
+    )? {
         return Ok(Some("focus_mode"));
     }
     Ok(None)
@@ -865,7 +887,7 @@ fn admission_deferred_attention_text(
     pr_url: &str,
 ) -> Result<(&'static str, String)> {
     let root = super::chain_helpers::chain_root(conn, work_item_id)?;
-    let (title, remediation) = match pre_merge_dispatch_hold_on(conn, &root)? {
+    let (title, remediation) = match pre_merge_dispatch_hold_on(conn, &root, Some(work_item_id))? {
         Some("focus_mode") => {
             let command = super::dispatch::parent_review_command(conn, &root, Some(pr_url))?;
             (
@@ -905,6 +927,69 @@ fn file_admission_deferred_attention_in_tx(tx: &Transaction<'_>, work_item_id: &
         title,
         &body,
     )
+}
+
+/// Record, on a revision held for review, the PR head that review is for.
+///
+/// A held revision is released by the batch that settles the head it pushed,
+/// matched on `work_executions.revision_stop_contributed_head` (see
+/// [`release_held_revision_after_terminal_batch_in_tx`] and
+/// `review_verdict_apply::advance_held_revision_after_verdict_in_tx`). A
+/// worker that reaches its Stop boundary stamps that column itself. One that
+/// ends its run by declaring delivery never reaches that boundary, and a
+/// deferred admission creates no batch to take the head from. Without this
+/// the column would stay empty, and no batch, however it was later started,
+/// could find the revision again.
+///
+/// Admission knows both halves: the revision it is asked to review for and
+/// the head it was handed, which contains everything that revision pushed.
+/// So it records that head here, on the same row the release reads (the
+/// revision's latest completed `revision_implementation` run). A retry after
+/// the PR has moved re-points it: the batch that will settle this revision's
+/// push is the one admitted at the head the PR has now, not at the head it
+/// had when the revision finished. Several revisions of one cycle can
+/// therefore be held for the same head, and the release takes all of them.
+///
+/// Nothing is written while the revision has a run that has not finished:
+/// that run stamps its own head at its Stop, and the older run before it is
+/// not the push under review. The column's other readers gate a live run on
+/// it and never read a finished one.
+fn record_awaited_review_head_in_tx(tx: &Transaction<'_>, revision_id: &str, target_sha: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE work_executions
+         SET revision_stop_contributed_head = ?2
+         WHERE id = (
+                 SELECT latest.id FROM work_executions latest
+                 WHERE latest.work_item_id = ?1
+                   AND latest.kind = 'revision_implementation'
+                   AND latest.status = 'completed'
+                 ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1
+               )
+           AND NOT EXISTS (
+                 SELECT 1 FROM work_executions unfinished
+                 WHERE unfinished.work_item_id = ?1
+                   AND unfinished.kind = 'revision_implementation'
+                   AND unfinished.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')
+               )",
+        params![revision_id, target_sha],
+    )?;
+    Ok(())
+}
+
+/// Resolve the review-admission-deferred marker on `cycle_root_id` and on
+/// every revision in its chain.
+///
+/// The marker says a review of this PR is waiting to be admitted. Once a
+/// batch exists that is no longer true for any row of the cycle, whoever the
+/// batch was admitted for: an explicit `bossctl review start` is admitted
+/// against the root while the marker sits on the revision that was deferred.
+fn resolve_admission_deferred_attention_for_cycle_in_tx(tx: &Transaction<'_>, cycle_root_id: &str) -> Result<()> {
+    let mut ids = super::chain_helpers::collect_chain_revision_ids_including_deleted(tx, cycle_root_id)?;
+    ids.push(cycle_root_id.to_owned());
+    for id in ids {
+        super::resolve_attention_kind_in_tx(tx, &id, PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND)?;
+    }
+    Ok(())
 }
 
 /// Drop never-started pre-merge batches whose members cannot dispatch under
@@ -955,7 +1040,14 @@ fn release_unstartable_pre_merge_review_reservations_in_tx(
     let now = now_string();
     let mut released = Vec::new();
     for (batch_id, cycle_root_id, pr_url, producing_work_item_id) in rows {
-        if !reviews_held && super::dispatch_focus::work_item_in_dispatch_focus_on(tx, &cycle_root_id, &focus)? {
+        if !reviews_held
+            && super::dispatch_focus::pre_merge_review_in_dispatch_focus_on(
+                tx,
+                &cycle_root_id,
+                producing_work_item_id.as_deref(),
+                &focus,
+            )?
+        {
             continue;
         }
         let member_execution_ids: Vec<(String, String)> = {
@@ -1152,6 +1244,8 @@ fn release_held_revision_after_terminal_batch_in_tx(
         .map(|(index, _)| format!("?{}", index + 1))
         .collect::<Vec<_>>()
         .join(", ");
+    // Every revision held for this head: admission can point more than one
+    // at it (see `record_awaited_review_head_in_tx`).
     let sql = format!(
         "SELECT t.id FROM tasks t
          JOIN work_executions we ON we.id = (
@@ -1163,14 +1257,23 @@ fn release_held_revision_after_terminal_batch_in_tx(
          )
          WHERE t.id IN ({placeholders}) AND t.kind = 'revision'
            AND t.status = 'active' AND t.deleted_at IS NULL
-           AND we.revision_stop_contributed_head = ?{} LIMIT 1",
+           AND we.revision_stop_contributed_head = ?{}
+         ORDER BY t.id",
         revision_ids.len() + 1,
     );
     let mut values: Vec<&dyn rusqlite::ToSql> = revision_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
     values.push(&target_sha);
-    let revision_id: Option<String> = tx.query_row(&sql, values.as_slice(), |row| row.get(0)).optional()?;
-    if let Some(revision_id) = revision_id {
-        WorkDb::advance_held_pending_review_task_to_in_review_in_tx(tx, &revision_id, now)?;
+    let held: Vec<String> = {
+        let mut statement = tx.prepare(&sql)?;
+        statement
+            .query_map(values.as_slice(), |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    for revision_id in held {
+        if WorkDb::advance_held_pending_review_task_to_in_review_in_tx(tx, &revision_id, now)? {
+            // The review this revision was held for has reached its decision.
+            super::resolve_attention_kind_in_tx(tx, &revision_id, PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND)?;
+        }
     }
     Ok(())
 }
@@ -1506,7 +1609,7 @@ impl WorkDb {
         work_item_id: &str,
     ) -> Result<Option<&'static str>> {
         let conn = self.connect()?;
-        let hold = pre_merge_dispatch_hold_on(&conn, cycle_root_id)?;
+        let hold = pre_merge_dispatch_hold_on(&conn, cycle_root_id, Some(work_item_id))?;
         if hold.is_none() {
             return Ok(None);
         }
@@ -1588,7 +1691,7 @@ impl WorkDb {
 
     fn dispatch_pre_merge_review_batch(
         &self,
-        input: ReviewBatchCreateInput,
+        mut input: ReviewBatchCreateInput,
         repo_remote_url: Option<&str>,
         review_pool_size: usize,
         explicit: bool,
@@ -1628,6 +1731,11 @@ impl WorkDb {
         }
         if explicit {
             super::dispatch_focus::record_explicit_launch_on(&tx, &input.cycle_root_id)?;
+        }
+        // Every outcome below that commits leaves the revision findable by
+        // the head it is held for, including a deferral that creates nothing.
+        if let Some(revision_id) = input.legacy_task_id.as_deref() {
+            record_awaited_review_head_in_tx(&tx, revision_id, &input.target_sha)?;
         }
         let mut generation = 1;
         if let Some(batch) = review_batch_for_target_in(&tx, &input.cycle_root_id, input.phase, &input.target_sha)? {
@@ -1669,6 +1777,13 @@ impl WorkDb {
                 return Ok(ReviewBatchDispatch::ExistingBatch { batch, executions });
             }
             generation = batch.generation + 1;
+            // The next generation reviews the same push. A re-mint requested
+            // for the root (the deferred-admission sweep's readmission arm, or
+            // an explicit start) names no revision, so carry the producer
+            // over: its focus admission and its brief still apply.
+            if input.legacy_task_id.is_none() {
+                input.legacy_task_id = batch.producing_work_item_id.clone();
+            }
         }
         if explicit && let Some(live) = super::query_live_execution_for_work_item(&tx, &input.cycle_root_id)? {
             bail!(
@@ -1726,7 +1841,9 @@ impl WorkDb {
         // Explicit starts skip the hold because admission records launch
         // intent, which lets their members dispatch through focus on their
         // own; the hold only defers automatic admission.
-        if !explicit && pre_merge_dispatch_hold_on(&tx, &input.cycle_root_id)?.is_some() {
+        if !explicit
+            && pre_merge_dispatch_hold_on(&tx, &input.cycle_root_id, input.legacy_task_id.as_deref())?.is_some()
+        {
             tx.commit()?;
             return Ok(ReviewBatchDispatch::AdmissionDeferred);
         }
@@ -1768,6 +1885,7 @@ impl WorkDb {
             .collect::<Vec<_>>();
         let members = leaf_member_inputs(&input.classification, &execution_ids)?;
         let (batch, _) = create_review_batch_in_tx(&tx, input, &members, generation, explicit)?;
+        resolve_admission_deferred_attention_for_cycle_in_tx(&tx, &batch.cycle_root_id)?;
         if explicit {
             super::resolve_attention_kind_in_tx(&tx, &batch.cycle_root_id, super::CHURN_GUARD_PARKED_ATTENTION_KIND)?;
         }

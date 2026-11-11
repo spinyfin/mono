@@ -1537,6 +1537,11 @@ impl WorkDb {
     /// `recheck_for_pr` as the exact-head recovery gate: it only finalizes when the
     /// current head matches this stamped value — not on any arbitrary head
     /// movement from a concurrently-active parent worker.
+    ///
+    /// The column is also what releases a revision held for review: the
+    /// batch that settles this head advances every revision whose latest
+    /// completed run carries it. Review admission records it on a finished
+    /// run for that purpose (see `review_batches::record_awaited_review_head_in_tx`).
     pub fn set_revision_stop_contributed_head(&self, execution_id: &str, sha: &str) -> Result<()> {
         if sha.is_empty() {
             bail!("set_revision_stop_contributed_head: sha must be non-empty");

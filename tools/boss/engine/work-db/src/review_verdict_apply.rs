@@ -1026,6 +1026,8 @@ pub fn advance_held_revision_after_verdict_in_tx(
         .map(|(index, _)| format!("?{}", index + 1))
         .collect::<Vec<_>>()
         .join(", ");
+    // Every revision held for this head: admission can point more than one
+    // at it (see `review_batches::record_awaited_review_head_in_tx`).
     let sql = format!(
         "SELECT t.id
          FROM tasks t
@@ -1044,27 +1046,36 @@ pub fn advance_held_revision_after_verdict_in_tx(
            AND we.kind = 'revision_implementation'
            AND we.status = 'completed'
            AND we.revision_stop_contributed_head = ?{}
-         LIMIT 1",
+         ORDER BY t.id",
         revision_ids.len() + 1,
     );
     let mut values: Vec<&dyn rusqlite::ToSql> = revision_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
     values.push(&target_sha);
-    let revision_id: Option<String> = tx.query_row(&sql, values.as_slice(), |row| row.get(0)).optional()?;
-    let Some(revision_id) = revision_id else {
-        return Ok(());
+    let held: Vec<String> = {
+        let mut statement = tx.prepare(&sql)?;
+        statement
+            .query_map(values.as_slice(), |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?
     };
-    let advanced = if require_gate_passing_verdict {
-        WorkDb::advance_pending_review_task_to_in_review_with_verdict_source_in_tx(
-            tx,
-            &revision_id,
-            cycle_root_id,
-            now,
-        )?
-    } else {
-        WorkDb::advance_held_pending_review_task_to_in_review_in_tx(tx, &revision_id, now)?
-    };
-    if advanced {
-        cascade_dependents_after_prereq_status_change(pending, tx, &revision_id, "in_review", now)?;
+    for revision_id in held {
+        let advanced = if require_gate_passing_verdict {
+            WorkDb::advance_pending_review_task_to_in_review_with_verdict_source_in_tx(
+                tx,
+                &revision_id,
+                cycle_root_id,
+                now,
+            )?
+        } else {
+            WorkDb::advance_held_pending_review_task_to_in_review_in_tx(tx, &revision_id, now)?
+        };
+        if advanced {
+            cascade_dependents_after_prereq_status_change(pending, tx, &revision_id, "in_review", now)?;
+            // The review this revision was held for has reached its verdict,
+            // so a marker saying its admission is still deferred is stale.
+            // Cleared with the release, in the same transaction, rather than
+            // on a later pass of the deferred-admission sweep.
+            super::resolve_attention_kind_in_tx(tx, &revision_id, super::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND)?;
+        }
     }
     Ok(())
 }
