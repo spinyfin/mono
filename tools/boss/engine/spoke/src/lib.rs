@@ -321,6 +321,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transient_cwd_resolution_failure_does_not_drain_terminal_run() {
+        use boss_engine_driver::discovery::fault::{Point, inject_once};
+        let root = tempfile::tempdir().unwrap();
+        let (execution, _directory) = terminal_file_run(root.path());
+        let journal = journal(root.path(), limits());
+        inject_once(Point::Cwd, root.path(), libc::EMFILE);
+        assert!(
+            transcripts::poll(&journal, &execution, &stamp().unwrap())
+                .await
+                .is_err()
+        );
+        let run = run_identity(&execution);
+        assert!(journal.lock().unwrap().source(&run, "drained").unwrap().is_none());
+        assert!(
+            !records(&journal)
+                .iter()
+                .any(|r| matches!(&r.body, Some(record::Body::Gap(_))))
+        );
+        transcripts::poll(&journal, &execution, &stamp().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            records(&journal)
+                .iter()
+                .any(|r| matches!(&r.body, Some(record::Body::Transcript(t)) if !t.data.is_empty()))
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_unclassified_errno_drains_terminal_run_with_a_gap_after_budget() {
+        use boss_engine_driver::discovery::fault::{Point, inject_once};
+        let root = tempfile::tempdir().unwrap();
+        let (execution, directory) = terminal_file_run(root.path());
+        let journal = journal(root.path(), limits());
+        let run = run_identity(&execution);
+        let mut polls = 0;
+        while journal.lock().unwrap().source(&run, "drained").unwrap().is_none() {
+            assert!(polls < 100, "terminal run never drained on a persistent EIO");
+            inject_once(Point::Listing, &directory, libc::EIO);
+            let _ = transcripts::poll(&journal, &execution, &stamp().unwrap()).await;
+            polls += 1;
+        }
+        assert!(polls > 1, "a single EIO must be retried before draining");
+        assert!(records(&journal).iter().any(
+            |r| matches!(&r.body, Some(record::Body::Gap(g)) if g.reason.contains("Input/output error") || g.reason.contains("os error"))
+        ));
+    }
+
+    #[tokio::test]
     async fn permanent_discovery_failure_drains_terminal_run_with_a_gap() {
         if unsafe { libc::geteuid() } == 0 {
             return;

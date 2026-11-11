@@ -635,8 +635,20 @@ fn session_meta_verdict(
         let Some(cwd) = payload.get("cwd").and_then(serde_json::Value::as_str) else {
             return Ok(Err(CandidateRejection::MissingCwd));
         };
-        let Ok(canonical_cwd) = fs::canonicalize(cwd) else {
-            return Ok(Err(CandidateRejection::CwdNotResolvable { cwd: cwd.to_owned() }));
+        let resolved = match fault::take(fault::Point::Cwd, Path::new(cwd)) {
+            Some(err) => Err(err),
+            None => fs::canonicalize(cwd),
+        };
+        let canonical_cwd = match resolved {
+            Ok(canonical) => canonical,
+            Err(err) => match io_failure(format!("canonicalize cwd {cwd}"), &err) {
+                // A retryable failure must not read as "this candidate does
+                // not match": the caller would conclude absence and drain.
+                failure @ ScanFailure::Transient(_) => return Err(failure),
+                ScanFailure::Permanent(_) => {
+                    return Ok(Err(CandidateRejection::CwdNotResolvable { cwd: cwd.to_owned() }));
+                }
+            },
         };
         if canonical_cwd != prepared.canonical_workspace {
             return Ok(Err(CandidateRejection::CwdMismatch {
@@ -668,18 +680,21 @@ pub struct DiscoveryScan {
 /// Walk the root once and validate every file with the rollout name shape.
 ///
 /// Blocking: call it from [`tokio::task::spawn_blocking`] or a plain thread.
-/// A validation I/O error on one file is recorded as
-/// [`CandidateRejection::Unreadable`] for that file rather than failing the
-/// whole scan — the file may simply have vanished between `read_dir` and
-/// `open`, and the other files still deserve a verdict.
+/// A permanent per-file I/O error (see [`io_error_is_transient`]) is recorded
+/// as [`CandidateRejection::Unreadable`] for that file — it may simply have
+/// vanished between `read_dir` and `open`, and the other files still deserve a
+/// verdict. A retryable one fails the whole scan so the caller retries
+/// instead of reading an empty match set as absence.
 pub fn scan_once(prepared: &PreparedSource) -> Result<DiscoveryScan, String> {
     scan_once_classified(prepared).map_err(ScanFailure::into_message)
 }
 
 /// Why a whole-directory scan failed, split by whether a later retry can
-/// change the answer. I/O errors while listing (`EMFILE`, a failed directory
-/// entry read) are transient; a root that changed identity or a tree beyond
-/// the discovery bounds is not.
+/// change the answer. I/O errors are split per errno by
+/// [`io_error_is_transient`]: resource exhaustion and interruption (`EMFILE`,
+/// `EINTR`, ...) are transient, while path-describing errors (`EACCES`,
+/// `ELOOP`, `ENOTDIR`, ...), a root that changed identity or a tree beyond
+/// the discovery bounds are permanent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScanFailure {
     Transient(String),
@@ -731,7 +746,11 @@ pub fn io_error_is_transient(err: &std::io::Error) -> bool {
     }
     match err.kind() {
         ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::OutOfMemory => true,
-        ErrorKind::PermissionDenied | ErrorKind::NotADirectory | ErrorKind::InvalidInput | ErrorKind::NotFound => false,
+        ErrorKind::PermissionDenied
+        | ErrorKind::NotADirectory
+        | ErrorKind::InvalidInput
+        | ErrorKind::InvalidData
+        | ErrorKind::NotFound => false,
         _ => true,
     }
 }
@@ -754,6 +773,8 @@ pub mod fault {
         CandidateOpen,
         /// Preparing the source (workspace canonicalization).
         Prepare,
+        /// Resolving a candidate's recorded working directory.
+        Cwd,
     }
 
     static ARMED: AtomicBool = AtomicBool::new(false);
@@ -780,6 +801,9 @@ pub mod fault {
             .iter()
             .position(|(p, under, _)| *p == point && path.starts_with(under))?;
         let (_, _, errno) = pending.remove(index);
+        if pending.is_empty() {
+            ARMED.store(false, Ordering::Release);
+        }
         Some(std::io::Error::from_raw_os_error(errno))
     }
 }

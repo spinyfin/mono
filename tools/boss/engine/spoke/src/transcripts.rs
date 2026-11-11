@@ -88,25 +88,58 @@ impl std::fmt::Display for SourceFailure {
 }
 impl std::error::Error for SourceFailure {}
 
+/// Consecutive-or-not failed polls of a Terminal run (no pending hooks) with a
+/// retryable error before the run is drained with a transcript gap. Without a
+/// bound, a persistent unclassified errno (EIO, ESTALE, ...) would block
+/// reclaim forever with nothing recorded.
+const TERMINAL_TRANSIENT_BUDGET: u64 = 20;
+const TRANSIENT_SOURCE: &str = "transient_failures";
+
 pub async fn poll(journal: &SharedJournal, execution: &ExecutionRecord, stamp: &Stamp) -> Result<()> {
     let result = poll_source(journal, execution, stamp).await;
     if let Err(error) = &result
-        && error.downcast_ref::<SourceFailure>().is_some()
         && execution.phase == Phase::Terminal
         && let Some(observation) = &execution.observation
         && !crate::hooks::has_pending(&observation.pending)?
     {
-        let checkpoint = current_checkpoint(journal, &crate::run_identity(execution))?;
-        return finish_gap(
-            journal,
-            &crate::run_identity(execution),
-            stamp,
-            gap_resource(&checkpoint),
-            checkpoint.cursor.offset,
-            error.to_string(),
-        );
+        let run = crate::run_identity(execution);
+        let exhausted = error.downcast_ref::<SourceFailure>().is_some()
+            || bump_transient_failures(journal, &run)? >= TERMINAL_TRANSIENT_BUDGET;
+        if exhausted {
+            let checkpoint = current_checkpoint(journal, &run)?;
+            return finish_gap(
+                journal,
+                &run,
+                stamp,
+                gap_resource(&checkpoint),
+                checkpoint.cursor.offset,
+                error.to_string(),
+            );
+        }
     }
     result
+}
+
+/// Durably count a retryable failure against the Terminal budget.
+fn bump_transient_failures(journal: &SharedJournal, run: &boss_protocol_spoke::v1::Run) -> Result<u64> {
+    let mut journal = journal
+        .lock()
+        .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
+    let old = journal.source(run, TRANSIENT_SOURCE)?;
+    let count = old
+        .as_deref()
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
+        + 1;
+    journal.commit_source(
+        run,
+        TRANSIENT_SOURCE,
+        old.as_deref(),
+        count.to_string().as_bytes(),
+        Vec::new(),
+    )?;
+    Ok(count)
 }
 
 async fn poll_source(journal: &SharedJournal, execution: &ExecutionRecord, stamp: &Stamp) -> Result<()> {
@@ -212,17 +245,7 @@ async fn poll_source(journal: &SharedJournal, execution: &ExecutionRecord, stamp
         }
         Err(error) => {
             let permanent = match &error {
-                boss_transcript_tail::TailError::Io(io) => {
-                    io.raw_os_error() == Some(libc::ELOOP)
-                        || matches!(
-                            io.kind(),
-                            std::io::ErrorKind::NotFound
-                                | std::io::ErrorKind::NotADirectory
-                                | std::io::ErrorKind::PermissionDenied
-                                | std::io::ErrorKind::InvalidInput
-                                | std::io::ErrorKind::InvalidData
-                        )
-                }
+                boss_transcript_tail::TailError::Io(io) => !discovery::io_error_is_transient(io),
                 _ => true,
             };
             return Err(if permanent {
