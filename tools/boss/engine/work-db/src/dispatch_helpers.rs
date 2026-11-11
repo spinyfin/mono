@@ -682,7 +682,7 @@ pub fn reconcile_work_item_execution(
     if query_task(conn, work_item_id)?.is_some_and(|task| {
         matches!(
             task.blocked_reason.as_deref(),
-            Some("worker_failed" | "awaiting_operator_answer")
+            Some("worker_failed" | "awaiting_operator_answer" | "workspace_positioning_refused")
         )
     }) {
         return Ok(());
@@ -1022,6 +1022,9 @@ pub fn reconcile_revision_execution(
     result: &mut ExecutionReconcileResult,
     task: &Task,
 ) -> Result<()> {
+    if task.blocked_reason.as_deref() == Some("workspace_positioning_refused") {
+        return Ok(());
+    }
     // Walk to the chain root.
     let chain_root_task = match get_chain_root_task(conn, &task.id)? {
         Some(t) => t,
@@ -1536,6 +1539,13 @@ pub(crate) fn request_execution_in_tx_as_actor<F: FnOnce(&str) -> bool>(
         );
     }
 
+    if !explicit_start
+        && query_task(conn, &work_item_id)?
+            .is_some_and(|task| task.blocked_reason.as_deref() == Some("workspace_positioning_refused"))
+    {
+        bail!("Workspace blocked: resolve the positioning refusal and launch manually");
+    }
+
     // Q8: explicit `RequestExecution` against a gated work item is
     // refused with a clear error rather than silently overridden. A
     // future `--force` may relax this; for v1, the user removes the
@@ -1625,13 +1635,14 @@ pub(crate) fn request_execution_in_tx_as_actor<F: FnOnce(&str) -> bool>(
         // retains the explanation, while the new attempt starts without a stale
         // failure blocker. Automatic reconciliation cannot reach this clear.
         super::pr_flow::withdraw_questions(conn, &work_item_id, "restarted_without_answer")?;
+        resolve_attention_kind_in_tx(conn, &work_item_id, "workspace_positioning_refused")?;
         crate::task_status_audit::execute(
             conn,
             "explicit_start_failure_clear",
             actor,
             "UPDATE tasks SET status = 'todo', blocked_reason = NULL, blocked_detail = NULL,
                  last_status_actor = ?3, updated_at = ?2
-             WHERE id = ?1 AND status = 'blocked' AND blocked_reason IN ('worker_failed', 'awaiting_operator_answer')",
+             WHERE id = ?1 AND status = 'blocked' AND blocked_reason IN ('worker_failed', 'awaiting_operator_answer', 'workspace_positioning_refused')",
             params![work_item_id, now, actor],
         )?;
 

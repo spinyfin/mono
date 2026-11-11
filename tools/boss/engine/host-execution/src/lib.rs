@@ -127,7 +127,7 @@ pub mod cube {
     /// The SSH adapter returns this error on nonzero exit. Lease failure events
     /// include its exit code and captured diagnostics, including setup failures
     /// after a lease has already been granted.
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     pub struct CubeCliError {
         /// Host the cube command ran on (`"local"` or a remote host id).
         pub host: String,
@@ -141,6 +141,16 @@ pub mod cube {
     }
 
     impl CubeCliError {
+        /// Only cube's explicit structured refusal suppresses positioning retries.
+        /// Older binaries, transport errors and malformed payloads remain retryable.
+        pub fn positioning_refused(&self) -> bool {
+            [&self.stderr, &self.stdout].into_iter().any(|output| {
+                serde_json::from_str::<serde_json::Value>(output).is_ok_and(|value| {
+                    value["error_kind"] == "workspace_positioning_refused" && value["retryable"] == false
+                })
+            })
+        }
+
         /// The single-line human detail: trimmed stderr, else trimmed stdout,
         /// else a synthetic exit-status clause. The SSH adapter uses the same
         /// detail in error messages and structured logs.
@@ -165,6 +175,40 @@ pub mod cube {
         pub fn clipped_stderr(&self, max: usize) -> String {
             let stderr = self.stderr.trim();
             boss_engine_utils::string_clip::clip_to_bytes_with_suffix(stderr, max, "… (clipped)")
+        }
+    }
+
+    #[cfg(test)]
+    mod positioning_error_tests {
+        use super::CubeCliError;
+
+        #[test]
+        fn only_structured_refusals_stop_retries_on_local_and_remote_hosts() {
+            for host in ["local", "remote-host"] {
+                for (payload, refused) in [
+                    (
+                        r#"{"error_kind":"workspace_positioning_refused","retryable":false,"error":"arbitrary diagnostic"}"#,
+                        true,
+                    ),
+                    (
+                        r#"{"error_kind":"workspace_positioning_refused","retryable":true}"#,
+                        false,
+                    ),
+                    (r#"{"error":"workspace_positioning_refused unpushed content"}"#, false),
+                    ("workspace_positioning_refused", false),
+                    (r#"{"retryable":false}"#, false),
+                ] {
+                    for stderr in [true, false] {
+                        let error = CubeCliError {
+                            host: host.into(),
+                            exit_code: Some(2),
+                            stderr: if stderr { payload.into() } else { String::new() },
+                            stdout: if stderr { String::new() } else { payload.into() },
+                        };
+                        assert_eq!(error.positioning_refused(), refused, "{error}");
+                    }
+                }
+            }
         }
     }
 
@@ -1615,6 +1659,19 @@ pub mod workspace {
                 Ok(Err(error)) => {
                     result.code = phase.failure().into();
                     result.reason = format!("workspace operation failed: {error:#}");
+                    if let Some(cube_error) = error.downcast_ref::<cube::CubeCliError>()
+                        && cube_error.positioning_refused()
+                    {
+                        // A cube refusal is definitive even after entering the effect phase.
+                        // Preserve the typed diagnostic across the spoke boundary.
+                        result.code = ResultCode::Rejected.into();
+                        let mut diagnostic = cube_error.clone();
+                        diagnostic.host = self.host_id.clone();
+                        result.value = Some(command_result::Value::Workspace(WorkspaceResult {
+                            cube_result_json: serde_json::to_vec(&diagnostic).expect("cube error is serializable"),
+                            ..Default::default()
+                        }));
+                    }
                 }
                 Err(_) => {
                     result.code = phase.failure().into();
@@ -2034,6 +2091,8 @@ mod tests {
         lost_reply: bool,
         #[builder(default)]
         lose_release_reply: bool,
+        #[builder(default)]
+        refuse_positioning: bool,
         root: PathBuf,
         path: PathBuf,
         #[builder(default)]
@@ -2084,6 +2143,15 @@ mod tests {
                     *self.owner.lock().unwrap() = None;
                     anyhow::bail!("reply lost after cube released lease");
                 }
+                ["--json", "workspace", "goto", ..] if self.refuse_positioning => Err(cube::CubeCliError {
+                    host: "local".into(),
+                    exit_code: Some(2),
+                    stdout: String::new(),
+                    stderr: json!({"error_kind":"workspace_positioning_refused",
+                            "retryable":false, "error":"preserve abc123 before positioning def456"})
+                    .to_string(),
+                }
+                .into()),
                 ["--json", "change", "create", ..] => Ok(json!({"change": {"change_id": "change"}})),
                 _ => Ok(json!({})),
             }
@@ -2384,6 +2452,30 @@ mod tests {
         let foreign = boss_protocol::DriverRuntimeState::new(json!({"initial_prompt_home": root.path()}));
         assert!(input::reclaim(&foreign).is_err());
         assert!(root.path().exists());
+    }
+
+    #[tokio::test]
+    async fn spoke_preserves_structured_positioning_refusal() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("worker")).unwrap();
+        let mut cube = Cube::new(root.path());
+        cube.refuse_positioning = true;
+        *cube.owner.lock().unwrap() = Some(workspace::lease_owner(&run()));
+        let executor = workspace::Executor {
+            cube,
+            host_id: "remote-host".into(),
+        };
+        let mut request = op(Kind::GotoPr);
+        request.pr_number = 42;
+        let result = executor.execute(&command(request), false, 1).await;
+        assert_eq!(result.code, v1::ResultCode::Rejected as i32);
+        let Some(command_result::Value::Workspace(value)) = result.value else {
+            panic!("missing structured refusal");
+        };
+        let error: cube::CubeCliError = serde_json::from_slice(&value.cube_result_json).unwrap();
+        assert!(error.positioning_refused());
+        assert_eq!(error.host, "remote-host");
+        assert!(error.detail().contains("abc123"));
     }
 
     #[tokio::test]

@@ -749,6 +749,7 @@ mod operator_answer_outcome;
 pub mod parking;
 pub mod parking_reconcile;
 pub mod personas;
+mod pre_start_failure;
 mod progression_candidates;
 mod progression_done;
 mod progression_ladder;

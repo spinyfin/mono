@@ -204,7 +204,7 @@ fn human_held_sql(a: &str) -> String {
     // must read as "not held", not poison the clause that negates it.
     format!(
         "COALESCE({a}.deferred = 1 OR {a}.human_driven = 1
-          OR {a}.blocked_reason IN ('awaiting_operator_answer', 'deletion_signoff')
+          OR {a}.blocked_reason IN ('awaiting_operator_answer', 'deletion_signoff', 'workspace_positioning_refused')
           OR EXISTS (SELECT 1 FROM operator_questions oq WHERE oq.work_item_id = {a}.id AND oq.status = 'open')
           OR EXISTS (SELECT 1 FROM work_executions hx WHERE hx.work_item_id = {a}.id AND hx.status = 'waiting_human')
           OR ({a}.blocked_reason = 'worker_failed' AND COALESCE(

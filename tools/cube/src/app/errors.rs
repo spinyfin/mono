@@ -30,6 +30,9 @@ impl RunResult {
 pub enum CubeError {
     #[error("shared-store maintenance is rewriting the operation log; retry shortly (temporary contention)")]
     MaintenanceBusy,
+    /// Repository state must change before positioning can succeed.
+    #[error("{0}")]
+    PositioningRefused(String),
     #[error(
         "jj maintenance recovery pending for {0}; retry shortly or run `cube repo gc <repo>` for the owning store; an unknown owner requires verified operator recovery"
     )]
@@ -199,9 +202,20 @@ pub(super) const JJ_NO_REMOTE_BOOKMARK_SIGNATURE: &str = "no such remote bookmar
 pub(super) const JJ_REVISION_DOESNT_EXIST_SIGNATURE: &str = "doesn't exist";
 
 impl CubeError {
+    /// Machine-readable classification; callers must never parse the diagnostic.
+    pub fn json_error(&self) -> Value {
+        serde_json::json!({
+            "error": self.to_string(),
+            "error_kind": if matches!(self, Self::PositioningRefused(_)) {
+                "workspace_positioning_refused"
+            } else { "command_failed" },
+            "retryable": !matches!(self, Self::PositioningRefused(_)),
+        })
+    }
+
     pub fn exit_code(&self) -> ExitCode {
         match self {
-            Self::InvalidArgument(_) | Self::NotImplemented(_) => ExitCode::from(2),
+            Self::InvalidArgument(_) | Self::NotImplemented(_) | Self::PositioningRefused(_) => ExitCode::from(2),
             Self::RepoNotFound(_) => ExitCode::from(3),
             Self::NoAvailableWorkspace(_) => ExitCode::from(4),
             Self::MaintenanceBusy | Self::MaintenanceQuarantined(_) => ExitCode::from(75),

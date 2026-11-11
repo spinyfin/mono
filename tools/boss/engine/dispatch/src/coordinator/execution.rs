@@ -2582,12 +2582,31 @@ impl ExecutionCoordinator {
         attention: (&str, &str),
         error: &anyhow::Error,
     ) -> Result<()> {
-        let (attention_kind, attention_title) = attention;
+        let positioning_refused = attention.0 == "cube_workspace_positioning_failed"
+            && error
+                .downcast_ref::<boss_host_execution::cube::CubeCliError>()
+                .is_some_and(|error| error.positioning_refused());
+        let (attention_kind, attention_title) = if positioning_refused {
+            (
+                "workspace_positioning_refused",
+                "Workspace blocked: positioning refused",
+            )
+        } else {
+            attention
+        };
         let error_text = format!("{error:#}");
-        let retry_delays = &self.pre_start_retry_delays;
-        let transition =
+        let retry_delays: &[std::time::Duration] = if positioning_refused {
+            &[]
+        } else {
+            &self.pre_start_retry_delays
+        };
+        let transition = if positioning_refused {
             self.work_db
-                .record_pre_start_failure(&execution.id, worker_id, cube_repo_id, &error_text, retry_delays);
+                .record_workspace_positioning_refusal(&execution.id, worker_id, cube_repo_id, &error_text)
+        } else {
+            self.work_db
+                .record_pre_start_failure(&execution.id, worker_id, cube_repo_id, &error_text, retry_delays)
+        };
         let (execution, run, outcome) = match transition {
             Ok(recorded) => recorded,
             Err(bookkeeping_error) => {
@@ -2631,7 +2650,7 @@ impl ExecutionCoordinator {
                 "reason": attention_kind,
                 "pre_start_failure_count": execution.pre_start_failure_count,
                 "will_retry": will_retry,
-                "decision": if will_retry { "retry" } else { "permanent" },
+                "decision": if positioning_refused { "blocked" } else if will_retry { "retry" } else { "permanent" },
                 "attempt": execution.pre_start_failure_count,
                 "max_attempts": retry_delays.len() + 1,
                 "attention_kind": attention_kind,
@@ -2709,15 +2728,23 @@ impl ExecutionCoordinator {
                     execution_id = execution.id,
                     attempts = execution.pre_start_failure_count,
                 );
-                if let Err(attention_err) = self.work_db.create_attention_item(CreateAttentionItemInput {
-                    execution_id: Some(execution.id.clone()),
-                    work_item_id: None,
-                    kind: attention_kind.to_owned(),
-                    status: None,
-                    title: attention_title.to_owned(),
-                    body_markdown: attention_body,
-                    resolved_at: None,
-                }) {
+                let attention_result = if positioning_refused && execution.work_item_id.starts_with("task_") {
+                    // The durable hold and deduplicated attention were committed together.
+                    Ok(())
+                } else {
+                    self.work_db
+                        .create_attention_item(CreateAttentionItemInput {
+                            execution_id: Some(execution.id.clone()),
+                            work_item_id: None,
+                            kind: attention_kind.to_owned(),
+                            status: None,
+                            title: attention_title.to_owned(),
+                            body_markdown: attention_body,
+                            resolved_at: None,
+                        })
+                        .map(|_| ())
+                };
+                if let Err(attention_err) = attention_result {
                     tracing::error!(
                         ?attention_err,
                         execution_id = %execution.id,
@@ -2741,7 +2768,7 @@ impl ExecutionCoordinator {
                 // A `progression` run is never the reason its item failed to
                 // dispatch: it only reads the item, so its own start failure
                 // must not move or stamp that item.
-                let bounced_result = if execution.kind.holds_cube_lease() {
+                let bounced_result = if !positioning_refused && execution.kind.holds_cube_lease() {
                     self.work_db
                         .bounce_dispatch_failed_to_backlog(&execution.work_item_id, attention_kind, &error_text)
                 } else {

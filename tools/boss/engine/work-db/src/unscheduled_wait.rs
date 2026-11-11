@@ -32,6 +32,7 @@ use boss_engine_storage_values::dispatch_wait::{
     DISPATCH_WAIT_REASON_PR_OPEN, DISPATCH_WAIT_REASON_RECOVERY_ATTENTION, DISPATCH_WAIT_REASON_REPO_UNRESOLVED,
     DISPATCH_WAIT_REASON_REVIEW_BATCH, DISPATCH_WAIT_REASON_REVIEW_COMPLETE, DISPATCH_WAIT_REASON_REVIEW_RESERVATION,
     DISPATCH_WAIT_REASON_REVISION_PENDING, DISPATCH_WAIT_REASON_RUN_ENDED, DISPATCH_WAIT_REASON_UNCLASSIFIED,
+    DISPATCH_WAIT_REASON_WORKSPACE_POSITIONING_REFUSED,
 };
 
 /// An item to classify: its row and the status of its most recent execution.
@@ -118,6 +119,15 @@ pub(super) fn classify(
     let mut waits = HashMap::new();
     let (mut queued, mut idle_active, mut review) = (Vec::new(), Vec::new(), Vec::new());
     for candidate in candidates {
+        if candidate.task.blocked_reason.as_deref() == Some(DISPATCH_WAIT_REASON_WORKSPACE_POSITIONING_REFUSED)
+            && candidate.task.status == TaskStatus::Blocked
+        {
+            let mut wait = DispatchWait::named(DISPATCH_WAIT_REASON_WORKSPACE_POSITIONING_REFUSED);
+            wait.label = candidate.task.blocked_detail.clone().or(wait.label);
+            wait.reads_other_items = true;
+            waits.insert(candidate.task.id.clone(), wait);
+            continue;
+        }
         match branch_of(candidate.task, candidate.latest) {
             Some(Branch::Queued) => queued.push(candidate),
             Some(Branch::IdleActive) => idle_active.push(candidate.task),

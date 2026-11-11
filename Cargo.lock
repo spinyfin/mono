@@ -1687,6 +1687,7 @@ dependencies = [
  "boss-engine-structured-output",
  "boss-execution-contracts",
  "boss-host-enrollment",
+ "boss-host-execution",
  "boss-protocol",
  "boss-protocol-spoke",
  "boss-spoke-stream",
