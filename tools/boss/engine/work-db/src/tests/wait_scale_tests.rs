@@ -6,6 +6,7 @@ use super::wait_scale_fixture::*;
 use super::*;
 use crate::board_caches::BoardCaches;
 use crate::db_diagnostics::StatementCounter;
+use crate::queued_wait::UnexplainedWaitCost;
 use crate::unscheduled_wait::{self, Candidate};
 use boss_metrics::population_timing::{PopulationTrace, segment};
 use std::collections::BTreeMap;
@@ -442,8 +443,10 @@ fn warm_board(db: &WorkDb, product: &str, caches: &BoardCaches) -> (i64, BTreeMa
 }
 
 /// Through the board and heartbeat entry points themselves, an operator pause
-/// adds a fixed four statements on the 6,535-card board (none on the 270-card
-/// one, which has nothing to hold), and the exempt and held cards get their reasons.
+/// adds the same fixed four statements on the 6,535-card board and on the
+/// 270-card one, once each card population has an exempt and a held card, and
+/// the heartbeat pass (every statement it runs, not only classification's)
+/// adds exactly those four for both products together.
 #[test]
 fn pause_cost_is_fixed_through_board_and_heartbeat() {
     let (_dir, db) = open_seeded("wait-scale-pause-entry");
@@ -451,40 +454,75 @@ fn pause_cost_is_fixed_through_board_and_heartbeat() {
     // below that take it themselves.
     {
         let conn = db.connect().unwrap();
-        conn.execute("UPDATE tasks SET priority = 'critical' WHERE id = 'task_ws06469'", [])
-            .unwrap();
+        conn.execute(
+            "UPDATE tasks SET priority = 'critical' WHERE id IN ('task_ws06469', 'task_wc00250')",
+            [],
+        )
+        .unwrap();
+        // The control product has no redispatchable idle card of its own: two
+        // of its running cards stop, one exempt (critical) and one to be held.
+        conn.execute(
+            "UPDATE work_executions SET status = 'failed', finished_at = '1760000500'
+             WHERE id IN ('exec_wc00250_i', 'exec_wc00251_i')",
+            [],
+        )
+        .unwrap();
     }
     let caches = BoardCaches::default();
     let unpaused: Vec<_> = [PRODUCT, CONTROL_PRODUCT]
         .iter()
         .map(|product| warm_board(&db, product, &caches).0)
         .collect();
-    let (_, heartbeat_before) = db.list_unexplained_dispatch_waits_measured().unwrap();
+    let (waits_before, heartbeat_before) = db.list_unexplained_dispatch_waits_measured().unwrap();
     operator_new_work_pause(&db.connect().unwrap());
     let mut deltas = Vec::new();
     for (product, before) in [PRODUCT, CONTROL_PRODUCT].iter().zip(&unpaused) {
         let (statements, reasons) = warm_board(&db, product, &caches);
         deltas.push(statements - before);
-        if *product == PRODUCT {
-            assert_eq!(
-                reasons["task_ws06469"], "awaiting_redispatch",
-                "critical work is exempt"
-            );
-            assert_eq!(reasons["task_ws06477"], "dispatch_paused", "other work is held");
-        }
+        let (exempt, held) = if *product == PRODUCT {
+            ("task_ws06469", "task_ws06477")
+        } else {
+            ("task_wc00250", "task_wc00251")
+        };
+        assert_eq!(
+            reasons[exempt], "awaiting_redispatch",
+            "{product}: critical work is exempt"
+        );
+        assert_eq!(reasons[held], "dispatch_paused", "{product}: other work is held");
     }
     println!("wait-scale paused board deltas {deltas:?}");
-    // The origin and scope reads and the two set reads for the 6,535-card
-    // board; the 270-card board has no redispatchable idle card, so reads none.
-    assert_eq!(deltas, [4, 0], "pause statements must not grow with the board");
-    let (_, heartbeat_after) = db.list_unexplained_dispatch_waits_measured().unwrap();
+    // The origin and scope reads and the two set reads, whatever the board's size.
+    assert_eq!(deltas, [4, 4], "pause statements must not grow with the board");
+
+    let (waits_after, heartbeat_after) = db.list_unexplained_dispatch_waits_measured().unwrap();
+    println!("wait-scale paused heartbeat before={heartbeat_before:?} after={heartbeat_after:?}");
+    // Held and exempt cards are both named (`dispatch_paused`, `awaiting_redispatch`),
+    // so the heartbeat reports neither, and the pause changes nothing it reports.
+    let reported = |waits: &[boss_engine_storage_values::dispatch_wait::UnexplainedWait]| -> Vec<(String, String)> {
+        waits
+            .iter()
+            .map(|wait| (wait.work_item_id.clone(), wait.reason.clone()))
+            .collect()
+    };
+    assert_eq!(reported(&waits_after), reported(&waits_before));
+    for id in ["task_ws06469", "task_ws06477", "task_wc00250", "task_wc00251"] {
+        assert!(
+            waits_after.iter().all(|wait| wait.work_item_id != id),
+            "{id} is explained"
+        );
+    }
     // The 88 pending executions are projected one by one either way.
     assert_eq!(heartbeat_after.pending_executions, heartbeat_before.pending_executions);
-    assert!(
-        heartbeat_after.classified.statements() <= heartbeat_before.classified.statements() + 4,
-        "{:?} vs {:?}",
-        heartbeat_before.classified,
-        heartbeat_after.classified
+    assert_eq!(heartbeat_after.unscheduled_items, heartbeat_before.unscheduled_items);
+    // The pause costs the heartbeat exactly its four statements, all inside the
+    // classification: a read of the pause anywhere else in the pass, or one per
+    // card, would move the whole-pass count off it.
+    let classified = |cost: &UnexplainedWaitCost| cost.classified.statements();
+    assert_eq!(classified(&heartbeat_after), classified(&heartbeat_before) + 4);
+    assert_eq!(
+        heartbeat_after.statements,
+        heartbeat_before.statements + 4,
+        "{heartbeat_before:?} vs {heartbeat_after:?}"
     );
 }
 
