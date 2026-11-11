@@ -22,6 +22,26 @@ final class TranscriptViewTests: XCTestCase {
 
     // MARK: - Wire decode
 
+    func testExecutionRowFormatsEpochSecondsStartedAt() throws {
+        let client = EngineClient(socketPath: "/tmp/boss-transcript-epoch-test.sock")
+        let exec = client.parseExecutionVM([
+            "id": "exec-epoch",
+            "work_item_id": "task-epoch",
+            "kind": "task_implementation",
+            "status": "failed",
+            "started_at": "1794012548",
+        ])
+        let raw = try XCTUnwrap(exec?.startedAt)
+        let expected = DateFormatter()
+        expected.dateStyle = .short
+        expected.timeStyle = .short
+        let want = expected.string(from: Date(timeIntervalSince1970: 1794012548))
+        XCTAssertEqual(ExecutionRow.formattedDate(raw), want)
+        XCTAssertNotEqual(ExecutionRow.formattedDate(raw), "1794012548")
+        XCTAssertEqual(ExecutionRow.formattedDate("2026-11-07T10:00:00Z"), ExecutionRow.formattedDate("2026-11-07T10:00:00.000Z"))
+        XCTAssertEqual(ExecutionRow.formattedDate("garbage"), "garbage")
+    }
+
     func testExecutionRuntimeDecodePreservesRecordedAndUnknownStates() {
         let client = EngineClient(socketPath: "/tmp/boss-transcript-runtime-test.sock")
         let recorded = client.parseExecutionVM([

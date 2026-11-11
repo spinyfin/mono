@@ -93,7 +93,7 @@ struct ExecutionRow: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             if let start = exec.startedAt {
-                Text(formattedDate(start))
+                Text(Self.formattedDate(start))
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
@@ -146,24 +146,14 @@ struct ExecutionRow: View {
         }
     }
 
-    private func formattedDate(_ iso: String) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = formatter.date(from: iso) {
-            let display = DateFormatter()
-            display.dateStyle = .short
-            display.timeStyle = .short
-            return display.string(from: date)
-        }
-        // Fall back without fractional seconds
-        let formatter2 = ISO8601DateFormatter()
-        if let date = formatter2.date(from: iso) {
-            let display = DateFormatter()
-            display.dateStyle = .short
-            display.timeStyle = .short
-            return display.string(from: date)
-        }
-        return iso
+    /// The engine stamps executions as epoch-seconds strings; ISO-8601 is
+    /// also accepted. Unparseable input is shown verbatim.
+    static func formattedDate(_ raw: String) -> String {
+        guard let date = BackgroundWorkElapsed.parse(raw) else { return raw }
+        let display = DateFormatter()
+        display.dateStyle = .short
+        display.timeStyle = .short
+        return display.string(from: date)
     }
 }
 
