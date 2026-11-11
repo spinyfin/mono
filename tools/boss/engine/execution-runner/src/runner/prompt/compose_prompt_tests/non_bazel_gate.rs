@@ -347,7 +347,38 @@ fn npm_merge_queue_ci_fix_requires_documented_invocation() {
 
 #[test]
 fn unresolved_conflict_revision_gets_discovery_gate() {
-    assert_unresolved_gate_neutral(&conflict_prompt(missing_path()));
+    let prompt = conflict_prompt(missing_path());
+    assert_unresolved_gate_neutral(&prompt);
+    for needle in [
+        "run the tests for the targets affected by the files that had conflicts",
+        "rdeps(//..., set(<conflicted source files>))",
+        "do NOT on their own select tests",
+        "stop as blocked",
+        "`bazel test` of the test targets affected by the conflicted source files",
+    ] {
+        assert!(
+            prompt.contains(needle),
+            "unresolved conflict prompt missing `{needle}`:\n{prompt}"
+        );
+    }
+    assert!(!prompt.contains("compile-only gate applies"), "{prompt}");
+    assert!(!prompt.contains("Bazel compile if markers are present"), "{prompt}");
+}
+
+#[test]
+fn confirmed_non_bazel_conflict_prompt_has_no_affected_test_step() {
+    let ws = npm_workspace();
+    let prompt = conflict_prompt(ws.path());
+    for needle in [
+        "targets affected by the files that had conflicts",
+        "rdeps(//..., set(",
+        "affected-test",
+    ] {
+        assert!(
+            !prompt.contains(needle),
+            "non-Bazel conflict prompt leaked `{needle}`:\n{prompt}"
+        );
+    }
 }
 
 #[test]

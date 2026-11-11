@@ -528,7 +528,7 @@ fn conflict_revision_keeps_absolute_compile_stop_when_run_done_seam_on() {
     );
     assert!(
         gate.contains(
-            "If `bazel build` fails or times out, do NOT push. A successful build is required before delivery."
+            "If `bazel build` or the affected-test run fails or times out, do NOT push. A successful build and a passing affected-test run are required before delivery."
         ),
         "run_done seam on: conflict gate's absolute do-NOT-push wording must be preserved verbatim:\n{gate}",
     );
@@ -672,4 +672,52 @@ fn revision_attempts_emit_check_prohibition_once() {
         );
         assert_eq!(prompt.matches("**Hard constraint").count(), 1);
     }
+}
+
+#[test]
+fn bazel_conflict_revision_requires_affected_tests_with_lockfile_carve_out() {
+    let ws = bazel_workspace();
+    let work_item = revision_task_with_created_via(None, "merge-conflict:crz_frag_01");
+    let attempt = sample_conflict_attempt();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(ws.path())
+            .conflict_attempt(&attempt)
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    for needle in [
+        "run the tests for the targets affected by the files that had conflicts",
+        "rdeps(//..., set(<conflicted source files>))",
+        "do NOT on their own select tests",
+        "stop as blocked",
+        "Do NOT run the full `bazel test //...` suite in this gate",
+        "You MUST however run `bazel test` on the test targets affected by the conflicted source files",
+    ] {
+        assert!(
+            prompt.contains(needle),
+            "bazel conflict prompt missing `{needle}`:\n{prompt}"
+        );
+    }
+}
+
+#[test]
+fn non_conflict_bazel_prompt_has_no_affected_test_step() {
+    let ws = bazel_workspace();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(ws.path())
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        !prompt.contains("targets affected by the files that had conflicts"),
+        "non-conflict prompt must not carry the conflict affected-test step:\n{prompt}",
+    );
 }
