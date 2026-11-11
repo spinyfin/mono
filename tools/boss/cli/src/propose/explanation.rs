@@ -18,11 +18,8 @@ pub(super) fn validate(raw: &str) -> Result<String, String> {
     let labels = AnswerOptionLabels::split_or_bypass();
     let (yes, no) = labels.headings();
     // Details is verbatim evidence: only the structural lines before it pick the shape.
-    let structural = raw.lines().take_while(|line| line.trim() != "Details:");
-    if structural
-        .into_iter()
-        .any(|line| line.trim() == yes || line.trim() == no)
-    {
+    let mut structural = raw.lines().take_while(|line| line.trim() != "Details:");
+    if structural.any(|line| line.trim() == yes || line.trim() == no) {
         return check(raw, &labelled_headings(&labels)).map_err(|_| EXPECTED_SPLIT.into());
     }
     check(raw, &HEADINGS)
