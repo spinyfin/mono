@@ -349,24 +349,74 @@ mod tests {
         );
     }
 
+    fn stamp_at(awake_ns: u64) -> Stamp {
+        Stamp {
+            awake_ns,
+            ..stamp().unwrap()
+        }
+    }
+
     #[tokio::test]
-    async fn persistent_unclassified_errno_drains_terminal_run_with_a_gap_after_budget() {
+    async fn persistent_unclassified_errno_drains_terminal_run_with_a_gap_after_awake_budget() {
         use boss_engine_driver::discovery::fault::{Point, inject_once};
         let root = tempfile::tempdir().unwrap();
         let (execution, directory) = terminal_file_run(root.path());
         let journal = journal(root.path(), limits());
         let run = run_identity(&execution);
-        let mut polls = 0;
-        while journal.lock().unwrap().source(&run, "drained").unwrap().is_none() {
-            assert!(polls < 100, "terminal run never drained on a persistent EIO");
+        // A long burst of polls inside the budget never gives up.
+        for i in 0..50 {
             inject_once(Point::Listing, &directory, libc::EIO);
-            let _ = transcripts::poll(&journal, &execution, &stamp().unwrap()).await;
-            polls += 1;
+            let _ = transcripts::poll(&journal, &execution, &stamp_at(1 + i)).await;
         }
-        assert!(polls > 1, "a single EIO must be retried before draining");
+        assert!(journal.lock().unwrap().source(&run, "drained").unwrap().is_none());
+        assert!(records(&journal).is_empty());
+        inject_once(Point::Listing, &directory, libc::EIO);
+        let _ = transcripts::poll(&journal, &execution, &stamp_at(10 * 60 * 1_000_000_000)).await;
+        assert!(journal.lock().unwrap().source(&run, "drained").unwrap().is_some());
         assert!(records(&journal).iter().any(
             |r| matches!(&r.body, Some(record::Body::Gap(g)) if g.reason.contains("Input/output error") || g.reason.contains("os error"))
         ));
+    }
+
+    #[tokio::test]
+    async fn spool_backpressure_never_drains_or_gaps_a_terminal_run() {
+        let root = tempfile::tempdir().unwrap();
+        let (execution, directory) = terminal_file_run(root.path());
+        let rollout = directory.join("rollout-example-session.jsonl");
+        let mut body = std::fs::read_to_string(&rollout).unwrap();
+        let line = format!("{}\n", serde_json::json!({"type":"noise", "payload": "x".repeat(900)}));
+        let total_lines = 700;
+        for _ in 0..total_lines {
+            body.push_str(&line);
+        }
+        std::fs::write(&rollout, &body).unwrap();
+        let journal = journal(root.path(), limits());
+        let run = run_identity(&execution);
+        for _ in 0..30 {
+            let _ = transcripts::poll(&journal, &execution, &stamp().unwrap()).await;
+        }
+        assert!(journal.lock().unwrap().source(&run, "drained").unwrap().is_none());
+        assert!(
+            !records(&journal)
+                .iter()
+                .any(|r| matches!(&r.body, Some(record::Body::Gap(_))))
+        );
+        for _ in 0..200 {
+            if journal.lock().unwrap().source(&run, "drained").unwrap().is_some() {
+                break;
+            }
+            let _ = transcripts::poll(&journal, &execution, &stamp().unwrap()).await;
+            receipt_through(&journal);
+        }
+        assert!(journal.lock().unwrap().source(&run, "drained").unwrap().is_some());
+        let shipped: usize = records(&journal)
+            .iter()
+            .filter_map(|r| match &r.body {
+                Some(record::Body::Transcript(t)) => Some(t.data.len()),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(shipped, body.len(), "the whole transcript must be journaled");
     }
 
     #[tokio::test]
