@@ -50,6 +50,7 @@ rust_binary(
         "//tools/boss/engine/core:engine_lib",
         "//tools/boss/engine/execution-contracts",
         "//tools/boss/engine/host-enrollment",
+        "//tools/boss/github",
         "//tools/boss/log-files",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
@@ -71,6 +72,7 @@ rust_test(
         "//tools/boss/engine/core:engine_lib",
         "//tools/boss/engine/execution-contracts",
         "//tools/boss/engine/host-enrollment",
+        "//tools/boss/github",
         "//tools/boss/log-files",
         "//tools/boss/protocol",
     ] + all_crate_deps(

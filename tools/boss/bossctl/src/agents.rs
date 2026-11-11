@@ -1904,10 +1904,10 @@ fn live_state_text(
     if let Some(recovery) = &state.recovery_status {
         outln!(out, "  recovery:      {recovery}");
     }
-    if let Some(id) = &state.work_item_id {
+    if let Some(id) = state.owning_work_item_id.as_ref().or(state.work_item_id.as_ref()) {
         outln!(out, "  work_item:     {id}");
     }
-    if let Some(name) = &state.work_item_name {
+    if let Some(name) = state.owning_work_item_title.as_ref().or(state.work_item_name.as_ref()) {
         outln!(out, "  work_item_name:{name}");
     }
     if let Some(product) = &state.product_name {
@@ -1975,7 +1975,12 @@ fn project_status_label(state: &LiveWorkerState) -> Option<String> {
 /// `T<n>` for tasks and chores, `P<n>` for projects; `None` without a short id.
 fn task_short_label(state: &LiveWorkerState) -> Option<String> {
     let short_id = state.work_item_short_id?;
-    let prefix = if state.work_item_id.as_deref().is_some_and(|id| id.starts_with("proj_")) {
+    let prefix = if state
+        .owning_work_item_id
+        .as_deref()
+        .or(state.work_item_id.as_deref())
+        .is_some_and(|id| id.starts_with("proj_"))
+    {
         'P'
     } else {
         'T'
@@ -1985,15 +1990,7 @@ fn task_short_label(state: &LiveWorkerState) -> Option<String> {
 
 /// `repo#n` from a GitHub `/pull/<n>` URL, dropping the owner.
 fn pr_compact_label(url: &str) -> Option<String> {
-    let rest = url.split_once("github.com/")?.1;
-    let mut parts = rest.split('/');
-    let _owner = parts.next()?;
-    let repo = parts.next().filter(|repo| !repo.is_empty())?;
-    if parts.next()? != "pull" {
-        return None;
-    }
-    let number = parts.next()?.parse::<u64>().ok()?;
-    Some(format!("{repo}#{number}"))
+    boss_github::pr_url::parse_pr_url_parts(url).map(|(_, repo, n)| format!("{repo}#{n}"))
 }
 
 fn print_live_state_short(state: &LiveWorkerState, tmux: TmuxListEvidence<'_>) {
@@ -2128,8 +2125,16 @@ fn hosted_pane_status_json(
 /// the pool + exec-kind columns without capturing stdout.
 fn format_live_state_short(state: &LiveWorkerState, tmux: TmuxListEvidence<'_>) -> String {
     let tool = state.current_tool.as_deref().unwrap_or("-");
-    let work_item = state.work_item_id.as_deref().unwrap_or("-");
-    let work_item_name = state.work_item_name.as_deref().unwrap_or("-");
+    let work_item = state
+        .owning_work_item_id
+        .as_deref()
+        .or(state.work_item_id.as_deref())
+        .unwrap_or("-");
+    let work_item_name = state
+        .owning_work_item_title
+        .as_deref()
+        .or(state.work_item_name.as_deref())
+        .unwrap_or("-");
     // `pool` / `kind` always print (as `-` when unset) so a glance at
     // `agents list` shows attributed routing even for test / direct-
     // launch spawns that never stamped them. Values match

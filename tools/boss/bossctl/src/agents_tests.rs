@@ -313,6 +313,8 @@ fn format_live_state_short_renders_product_task_and_pr() {
     state.kind = Some("pr_review_guide".to_owned());
     state.work_item_id = Some("prgc_1".to_owned());
     state.work_item_name = Some("Review guide: Add header".to_owned());
+    state.owning_work_item_id = Some("task_owner".to_owned());
+    state.owning_work_item_title = Some("Owning task".to_owned());
     state.product_name = Some("isse".to_owned());
     state.work_item_short_id = Some(11);
     state.pr_url = Some("https://github.com/spinyfin/isse/pull/6".to_owned());
@@ -321,12 +323,18 @@ fn format_live_state_short_renders_product_task_and_pr() {
         line.contains("product=\"isse\"  task=T11  pr=isse#6"),
         "expected product/task/pr columns: {line}"
     );
+    assert!(
+        line.contains("work_item=task_owner  work_item_name=\"Owning task\""),
+        "{line}"
+    );
     let bare = format_live_state_short(&worker(3, "run_d", "Riker"), TmuxListEvidence::Missing);
     assert!(
         bare.contains("product=\"-\"  task=-  pr=-"),
         "expected placeholders: {bare}"
     );
     assert_eq!(pr_compact_label("https://example.com/x/y/pull/1"), None);
+    assert_eq!(pr_compact_label("https://notgithub.com/x/y/pull/1"), None);
+    assert_eq!(pr_compact_label("https://github.com//y/pull/1"), None);
 }
 
 #[test]

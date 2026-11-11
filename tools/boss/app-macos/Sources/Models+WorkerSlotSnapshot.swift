@@ -128,6 +128,8 @@ struct WorkerSlotLiveSlice: Equatable {
     let viewerAttachError: String?
     let workItemId: String?
     let workItemName: String?
+    let owningWorkItemId: String?
+    let owningWorkItemTitle: String?
     let workItemShortId: Int?
     let productId: String?
     let productName: String?
@@ -151,6 +153,8 @@ struct WorkerSlotLiveSlice: Equatable {
         self.viewerAttachError = live.viewerAttachError
         self.workItemId = live.workItemId
         self.workItemName = live.workItemName
+        self.owningWorkItemId = live.owningWorkItemId
+        self.owningWorkItemTitle = live.owningWorkItemTitle
         self.workItemShortId = live.workItemShortId
         self.productId = live.productId
         self.productName = live.productName
@@ -323,7 +327,7 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
     var headerWorkLinks: WorkerHeaderWorkLinks? {
         if isPlaceholder { return finishedWorkLinks }
         guard let live,
-              let workItemId = live.workItemId, !workItemId.isEmpty,
+              let workItemId = live.owningWorkItemId ?? live.workItemId, !workItemId.isEmpty,
               let shortId = live.workItemShortId
         else { return nil }
         let prURL = live.prURL.flatMap { $0.isEmpty ? nil : $0 }
@@ -333,7 +337,7 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
             productName: Self.nonEmpty(live.productName),
             projectName: Self.nonEmpty(live.projectName),
             shortIdLabel: Self.shortIdLabel(workItemId: workItemId, shortId: shortId),
-            title: live.workItemName ?? "",
+            title: live.owningWorkItemTitle ?? live.workItemName ?? "",
             prURL: prURL,
             prLabel: prURL.flatMap(Self.pullRequestCompactLabel(from:))
         )
