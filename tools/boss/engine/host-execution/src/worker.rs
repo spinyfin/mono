@@ -2972,7 +2972,8 @@ mod tests {
         assert!(envs.contains(&"KEEP_ME=yes".to_owned()), "{envs:?}");
         assert!(envs.iter().filter(|e| e.contains("forged")).count() == 0, "{envs:?}");
         assert!(!workspace.join(".boss-spoke-settings.json").exists());
-        let record = decode(&supervisor.store.load(&run_id, "token").unwrap().unwrap()).unwrap();
+        let run = command.run.as_ref().unwrap();
+        let record = decode(&supervisor.store.load(&run.run_id, &run.spawn_token).unwrap().unwrap()).unwrap();
         let settings = record.settings_file.expect("settings recorded");
         assert!(settings.starts_with(shared_homes()));
         use std::os::unix::fs::PermissionsExt;
@@ -2982,7 +2983,7 @@ mod tests {
         );
         // Stop removes it with the home.
         let mut stop = stop_command();
-        stop.run.as_mut().unwrap().run_id = run_id;
+        stop.run = command.run.clone();
         let stopped = supervisor.execute(&stop, false, 1).await;
         assert_eq!(stopped.code, ResultCode::Ok as i32, "{}", stopped.reason);
         assert!(!settings.exists());
