@@ -263,45 +263,89 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn transient_discovery_failure_leaves_terminal_run_undrained_for_retry() {
-        if unsafe { libc::geteuid() } == 0 {
-            return;
-        }
-        let root = tempfile::tempdir().unwrap();
-        let mut execution = execution(root.path());
+    /// A Terminal codex run whose rollout lives under a sessions directory.
+    fn terminal_file_run(root: &std::path::Path) -> (ExecutionRecord, std::path::PathBuf) {
+        let mut execution = execution(root);
         execution.driver_id = "codex".into();
-        let directory = root.path().join("sessions");
+        let directory = root.join("sessions");
         std::fs::create_dir(&directory).unwrap();
         execution.observation.as_mut().unwrap().file = Some((
             boss_engine_driver::AgentJsonlFileIngress {
                 directory: directory.clone(),
                 filename_prefix: "rollout-".into(),
                 filename_suffix: ".jsonl".into(),
-                workspace_path: root.path().into(),
+                workspace_path: root.into(),
             },
             Vec::new(),
         ));
-        let meta = serde_json::json!({"type":"session_meta", "payload":{"id":"session", "cwd":root.path()}});
+        let meta = serde_json::json!({"type":"session_meta", "payload":{"id":"session", "cwd":root}});
         std::fs::write(directory.join("rollout-example-session.jsonl"), format!("{meta}\n")).unwrap();
         execution.phase = Phase::Terminal;
+        (execution, directory)
+    }
+
+    #[tokio::test]
+    async fn transient_discovery_failures_leave_terminal_run_undrained_for_retry() {
+        use boss_engine_driver::discovery::fault::{Point, inject_once};
+        for point in [Point::Listing, Point::CandidateOpen, Point::Prepare] {
+            for errno in [libc::EMFILE, libc::EINTR] {
+                let root = tempfile::tempdir().unwrap();
+                let (execution, directory) = terminal_file_run(root.path());
+                let journal = journal(root.path(), limits());
+                inject_once(point, &directory, errno);
+                let failed = transcripts::poll(&journal, &execution, &stamp().unwrap()).await;
+                assert!(
+                    failed.is_err(),
+                    "{point:?}/{errno}: transient failure must surface for retry"
+                );
+                let run = run_identity(&execution);
+                assert!(
+                    journal.lock().unwrap().source(&run, "drained").unwrap().is_none(),
+                    "{point:?}/{errno}"
+                );
+                assert!(
+                    records(&journal).is_empty(),
+                    "{point:?}/{errno}: no gap for a transient failure"
+                );
+                transcripts::poll(&journal, &execution, &stamp().unwrap())
+                    .await
+                    .unwrap();
+                assert!(
+                    records(&journal)
+                        .iter()
+                        .any(|r| matches!(&r.body, Some(record::Body::Transcript(t)) if !t.data.is_empty())),
+                    "{point:?}/{errno}: next poll must journal the data"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn permanent_discovery_failure_drains_terminal_run_with_a_gap() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let (execution, directory) = terminal_file_run(root.path());
+        let locked = directory.join("locked");
+        std::fs::create_dir(&locked).unwrap();
         let journal = journal(root.path(), limits());
-        // An unreadable directory makes listing fail with an I/O error that a
-        // later poll can recover from.
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let failed = transcripts::poll(&journal, &execution, &stamp().unwrap()).await;
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(failed.is_err(), "transient discovery failure must surface for retry");
-        let run = run_identity(&execution);
-        assert!(journal.lock().unwrap().source(&run, "drained").unwrap().is_none());
-        assert!(records(&journal).is_empty(), "no gap for a transient failure");
-        transcripts::poll(&journal, &execution, &stamp().unwrap())
-            .await
-            .unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = transcripts::poll(&journal, &execution, &stamp().unwrap()).await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        result.unwrap();
+        assert!(
+            journal
+                .lock()
+                .unwrap()
+                .source(&run_identity(&execution), "drained")
+                .unwrap()
+                .is_some()
+        );
         assert!(
             records(&journal)
                 .iter()
-                .any(|r| matches!(&r.body, Some(record::Body::Transcript(t)) if !t.data.is_empty()))
+                .any(|r| matches!(&r.body, Some(record::Body::Gap(_))))
         );
     }
 

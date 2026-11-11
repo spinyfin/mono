@@ -134,14 +134,14 @@ async fn poll_source(journal: &SharedJournal, execution: &ExecutionRecord, stamp
         let ingress = ingress.clone();
         let baseline = baseline.iter().cloned().collect();
         let scan = tokio::task::spawn_blocking(move || {
-            let prepared = discovery::PreparedSource::with_baseline(ingress, baseline)
-                .map_err(discovery::ScanFailure::Permanent)?;
+            let prepared = discovery::PreparedSource::with_baseline(ingress, baseline)?;
             discovery::scan_once_classified(&prepared)
         })
         .await?
         .map_err(|failure| match failure {
-            // Listing I/O can fail transiently (EMFILE, a racing entry);
-            // leave the run undrained so a later poll retries.
+            // Retryable I/O (EMFILE, EINTR, ...) in listing, candidate
+            // validation or preparation leaves the run undrained so a later
+            // poll retries; permanent failures become a source gap.
             discovery::ScanFailure::Transient(message) => anyhow::anyhow!(message),
             discovery::ScanFailure::Permanent(message) => anyhow::Error::from(SourceFailure(message)),
         })?;

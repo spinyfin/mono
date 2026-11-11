@@ -137,12 +137,17 @@ pub struct VerifiedRoot {
 }
 
 impl VerifiedRoot {
-    fn new(path: &Path) -> Result<Self, String> {
-        let metadata = fs::symlink_metadata(path).map_err(|err| format!("stat {}: {err}", path.display()))?;
+    fn new(path: &Path) -> Result<Self, ScanFailure> {
+        let metadata =
+            fs::symlink_metadata(path).map_err(|err| io_failure(format!("stat {}", path.display()), &err))?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(format!("{} is not a real directory", path.display()));
+            return Err(ScanFailure::Permanent(format!(
+                "{} is not a real directory",
+                path.display()
+            )));
         }
-        let canonical = fs::canonicalize(path).map_err(|err| format!("canonicalize {}: {err}", path.display()))?;
+        let canonical =
+            fs::canonicalize(path).map_err(|err| io_failure(format!("canonicalize {}", path.display()), &err))?;
         Ok(Self {
             path: path.to_owned(),
             canonical,
@@ -160,18 +165,21 @@ impl VerifiedRoot {
         self.revalidations.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub fn revalidate(&self) -> Result<(), String> {
+    pub fn revalidate(&self) -> Result<(), ScanFailure> {
         self.revalidations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let metadata =
-            fs::symlink_metadata(&self.path).map_err(|err| format!("stat {}: {err}", self.path.display()))?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_dir()
-            || file_identity(&metadata) != self.identity
-            || fs::canonicalize(&self.path).ok().as_ref() != Some(&self.canonical)
-        {
-            return Err(format!("JSONL root {} changed identity", self.path.display()));
+        let metadata = fs::symlink_metadata(&self.path)
+            .map_err(|err| io_failure(format!("stat {}", self.path.display()), &err))?;
+        let identity_changed =
+            || ScanFailure::Permanent(format!("JSONL root {} changed identity", self.path.display()));
+        if metadata.file_type().is_symlink() || !metadata.is_dir() || file_identity(&metadata) != self.identity {
+            return Err(identity_changed());
         }
-        Ok(())
+        match fs::canonicalize(&self.path) {
+            Ok(canonical) if canonical == self.canonical => Ok(()),
+            Ok(_) => Err(identity_changed()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(identity_changed()),
+            Err(err) => Err(io_failure(format!("canonicalize {}", self.path.display()), &err)),
+        }
     }
 }
 
@@ -250,7 +258,7 @@ impl PreparedSource {
     pub fn new(ingress: crate::AgentJsonlFileIngress) -> Result<Self, String> {
         let root = VerifiedRoot::new(&ingress.directory)?;
         let baseline = scan_matching_paths(&root, &ingress)?;
-        Self::with_baseline(ingress, baseline)
+        Ok(Self::with_baseline(ingress, baseline)?)
     }
 
     /// [`Self::new`] against a baseline that was captured earlier — the
@@ -258,10 +266,23 @@ impl PreparedSource {
     /// fresh snapshot on the readoption path would be worse than useless: the
     /// run's own rollout already exists by then, so it would be baselined away
     /// and discovery would wait out its timeout finding nothing.
-    pub fn with_baseline(ingress: crate::AgentJsonlFileIngress, baseline: HashSet<PathBuf>) -> Result<Self, String> {
+    pub fn with_baseline(
+        ingress: crate::AgentJsonlFileIngress,
+        baseline: HashSet<PathBuf>,
+    ) -> Result<Self, ScanFailure> {
         let root = VerifiedRoot::new(&ingress.directory)?;
-        let canonical_workspace = fs::canonicalize(&ingress.workspace_path)
-            .map_err(|err| format!("canonicalize workspace {}: {err}", ingress.workspace_path.display()))?;
+        if let Some(err) = fault::take(fault::Point::Prepare, &ingress.directory) {
+            return Err(io_failure(
+                format!("canonicalize workspace {}", ingress.workspace_path.display()),
+                &err,
+            ));
+        }
+        let canonical_workspace = fs::canonicalize(&ingress.workspace_path).map_err(|err| {
+            io_failure(
+                format!("canonicalize workspace {}", ingress.workspace_path.display()),
+                &err,
+            )
+        })?;
         let baseline_progress = snapshot_file_progress(&baseline);
         Ok(Self {
             ingress,
@@ -440,7 +461,7 @@ impl fmt::Display for CandidateRejection {
 /// the tail's rotation and resume paths, which only need to know whether the
 /// file still correlates.
 pub fn validate_candidate(prepared: &PreparedSource, path: &Path) -> Result<Option<Candidate>, String> {
-    validate_candidate_explained(prepared, path).map(Result::ok)
+    Ok(validate_candidate_explained(prepared, path)?.ok())
 }
 
 /// Open `path` and decide whether it is this run's rollout.
@@ -451,13 +472,14 @@ pub fn validate_candidate(prepared: &PreparedSource, path: &Path) -> Result<Opti
 pub fn validate_candidate_explained(
     prepared: &PreparedSource,
     path: &Path,
-) -> Result<Result<Candidate, CandidateRejection>, String> {
+) -> Result<Result<Candidate, CandidateRejection>, ScanFailure> {
     prepared.root.revalidate()?;
-    let metadata = fs::symlink_metadata(path).map_err(|err| format!("stat {}: {err}", path.display()))?;
+    let metadata = fs::symlink_metadata(path).map_err(|err| io_failure(format!("stat {}", path.display()), &err))?;
     if metadata.file_type().is_symlink() || !single_link_regular(&metadata) {
         return Ok(Err(CandidateRejection::NotSingleLinkRegularFile));
     }
-    let canonical = fs::canonicalize(path).map_err(|err| format!("canonicalize {}: {err}", path.display()))?;
+    let canonical =
+        fs::canonicalize(path).map_err(|err| io_failure(format!("canonicalize {}", path.display()), &err))?;
     if !canonical.starts_with(&prepared.root.canonical) {
         return Ok(Err(CandidateRejection::OutsideRoot));
     }
@@ -465,7 +487,7 @@ pub fn validate_candidate_explained(
     let mut file = open_no_follow(&canonical)?;
     let opened = file
         .metadata()
-        .map_err(|err| format!("metadata {}: {err}", canonical.display()))?;
+        .map_err(|err| io_failure(format!("metadata {}", canonical.display()), &err))?;
     let identity = file_identity(&opened);
     if !single_link_regular(&opened) || identity != file_identity(&metadata) {
         return Ok(Err(CandidateRejection::IdentityChanged));
@@ -485,7 +507,10 @@ pub fn validate_candidate_explained(
     }))
 }
 
-pub fn open_no_follow(path: &Path) -> Result<std::fs::File, String> {
+pub fn open_no_follow(path: &Path) -> Result<std::fs::File, ScanFailure> {
+    if let Some(err) = fault::take(fault::Point::CandidateOpen, path) {
+        return Err(io_failure(format!("open {}", path.display()), &err));
+    }
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -495,15 +520,15 @@ pub fn open_no_follow(path: &Path) -> Result<std::fs::File, String> {
     }
     options
         .open(path)
-        .map_err(|err| format!("open {}: {err}", path.display()))
+        .map_err(|err| io_failure(format!("open {}", path.display()), &err))
 }
 
-pub fn tracked_path_identity(prepared: &PreparedSource, path: &Path) -> Result<Option<FileIdentity>, String> {
+pub fn tracked_path_identity(prepared: &PreparedSource, path: &Path) -> Result<Option<FileIdentity>, ScanFailure> {
     prepared.root.revalidate()?;
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(format!("stat {}: {err}", path.display())),
+        Err(err) => return Err(io_failure(format!("stat {}", path.display()), &err)),
     };
     if metadata.file_type().is_symlink() || !single_link_regular(&metadata) {
         return Ok(None);
@@ -511,7 +536,7 @@ pub fn tracked_path_identity(prepared: &PreparedSource, path: &Path) -> Result<O
     let canonical = match fs::canonicalize(path) {
         Ok(canonical) => canonical,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(format!("canonicalize {}: {err}", path.display())),
+        Err(err) => return Err(io_failure(format!("canonicalize {}", path.display()), &err)),
     };
     if canonical != path || !canonical.starts_with(&prepared.root.canonical) {
         return Ok(None);
@@ -525,10 +550,10 @@ pub fn named_descriptor_matches(
     path: &Path,
     file: &std::fs::File,
     expected_identity: FileIdentity,
-) -> Result<bool, String> {
+) -> Result<bool, ScanFailure> {
     let opened_before = file
         .metadata()
-        .map_err(|err| format!("metadata {}: {err}", path.display()))?;
+        .map_err(|err| io_failure(format!("metadata {}", path.display()), &err))?;
     if !single_link_regular(&opened_before)
         || file_identity(&opened_before) != expected_identity
         || tracked_path_identity(prepared, path)? != Some(expected_identity)
@@ -538,7 +563,7 @@ pub fn named_descriptor_matches(
 
     let opened_after = file
         .metadata()
-        .map_err(|err| format!("metadata {}: {err}", path.display()))?;
+        .map_err(|err| io_failure(format!("metadata {}", path.display()), &err))?;
     if !single_link_regular(&opened_after)
         || file_identity(&opened_after) != expected_identity
         || tracked_path_identity(prepared, path)? != Some(expected_identity)
@@ -555,7 +580,7 @@ pub fn validated_session_meta(
     file: &mut std::fs::File,
     expected_session_id: Option<&str>,
 ) -> Result<Option<String>, String> {
-    session_meta_verdict(prepared, path, file, expected_session_id).map(Result::ok)
+    Ok(session_meta_verdict(prepared, path, file, expected_session_id)?.ok())
 }
 
 fn session_meta_verdict(
@@ -563,15 +588,15 @@ fn session_meta_verdict(
     path: &Path,
     file: &mut std::fs::File,
     expected_session_id: Option<&str>,
-) -> Result<Result<String, CandidateRejection>, String> {
+) -> Result<Result<String, CandidateRejection>, ScanFailure> {
     file.seek(SeekFrom::Start(0))
-        .map_err(|err| format!("seek session_meta {}: {err}", path.display()))?;
+        .map_err(|err| io_failure(format!("seek session_meta {}", path.display()), &err))?;
     let result = (|| {
         let mut first_line = Vec::new();
         let mut limited = std::io::BufReader::new((&mut *file).take(MAX_SESSION_META_BYTES));
         let bytes = limited
             .read_until(b'\n', &mut first_line)
-            .map_err(|err| format!("read session_meta {}: {err}", path.display()))?;
+            .map_err(|err| io_failure(format!("read session_meta {}", path.display()), &err))?;
         if bytes == 0 {
             return Ok(Err(CandidateRejection::Empty));
         }
@@ -586,7 +611,7 @@ fn session_meta_verdict(
             }));
         }
         let record: serde_json::Value = serde_json::from_slice(&first_line)
-            .map_err(|err| format!("parse session_meta {}: {err}", path.display()))?;
+            .map_err(|err| ScanFailure::Permanent(format!("parse session_meta {}: {err}", path.display())))?;
         let record_type = record.get("type").and_then(serde_json::Value::as_str);
         if record_type != Some("session_meta") {
             return Ok(Err(CandidateRejection::NotSessionMeta {
@@ -627,7 +652,7 @@ fn session_meta_verdict(
         Ok(Ok(session_id.to_owned()))
     })();
     file.seek(SeekFrom::Start(0))
-        .map_err(|err| format!("rewind validated rollout {}: {err}", path.display()))?;
+        .map_err(|err| io_failure(format!("rewind validated rollout {}", path.display()), &err))?;
     result
 }
 
@@ -669,9 +694,109 @@ impl ScanFailure {
     }
 }
 
+impl std::fmt::Display for ScanFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transient(message) | Self::Permanent(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<ScanFailure> for String {
+    fn from(failure: ScanFailure) -> Self {
+        failure.into_message()
+    }
+}
+
+/// Whether retrying the same filesystem operation later can change its
+/// answer. Resource exhaustion and interruption are transient; an error that
+/// describes the path itself (permissions, a loop, a non-directory, an
+/// over-long name, an invalid argument, a vanished entry) is permanent.
+/// Anything not recognised is treated as transient so unread bytes are never
+/// declared lost on an error nobody classified.
+pub fn io_error_is_transient(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    if let Some(errno) = err.raw_os_error() {
+        match errno {
+            libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::EINTR | libc::EAGAIN | libc::ETIMEDOUT => return true,
+            libc::EACCES
+            | libc::EPERM
+            | libc::ELOOP
+            | libc::ENOTDIR
+            | libc::ENAMETOOLONG
+            | libc::EINVAL
+            | libc::ENOENT => return false,
+            _ => {}
+        }
+    }
+    match err.kind() {
+        ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::OutOfMemory => true,
+        ErrorKind::PermissionDenied | ErrorKind::NotADirectory | ErrorKind::InvalidInput | ErrorKind::NotFound => false,
+        _ => true,
+    }
+}
+
+/// A fault seam: arms a one-shot errno at a named discovery step under a
+/// directory, so callers can exercise genuinely transient failures (`EMFILE`,
+/// `EINTR`) that cannot be produced portably with filesystem permissions.
+/// Armed faults are keyed by path so concurrent runs never consume each
+/// other's; the unarmed fast path is one relaxed atomic load.
+pub mod fault {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Point {
+        /// Listing a directory during a scan.
+        Listing,
+        /// Opening a candidate rollout during validation.
+        CandidateOpen,
+        /// Preparing the source (workspace canonicalization).
+        Prepare,
+    }
+
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    static PENDING: Mutex<Vec<(Point, PathBuf, i32)>> = Mutex::new(Vec::new());
+
+    /// Fail the next `point` operation at or under `under` with `errno`.
+    pub fn inject_once(point: Point, under: &Path, errno: i32) {
+        // Scans walk canonical paths, so key the fault by the canonical form.
+        let under = std::fs::canonicalize(under).unwrap_or_else(|_| under.to_owned());
+        PENDING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((point, under, errno));
+        ARMED.store(true, Ordering::Release);
+    }
+
+    pub(super) fn take(point: Point, path: &Path) -> Option<std::io::Error> {
+        if !ARMED.load(Ordering::Acquire) {
+            return None;
+        }
+        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+        let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        let index = pending
+            .iter()
+            .position(|(p, under, _)| *p == point && path.starts_with(under))?;
+        let (_, _, errno) = pending.remove(index);
+        Some(std::io::Error::from_raw_os_error(errno))
+    }
+}
+
+/// Classify an I/O failure into a [`ScanFailure`] with `context` prefixed.
+pub fn io_failure(context: String, err: &std::io::Error) -> ScanFailure {
+    let message = format!("{context}: {err}");
+    if io_error_is_transient(err) {
+        ScanFailure::Transient(message)
+    } else {
+        ScanFailure::Permanent(message)
+    }
+}
+
 /// [`scan_once`] that keeps the transient/permanent distinction.
 pub fn scan_once_classified(prepared: &PreparedSource) -> Result<DiscoveryScan, ScanFailure> {
-    prepared.root.revalidate().map_err(ScanFailure::Permanent)?;
+    prepared.root.revalidate()?;
     let paths = scan_matching_paths_classified(&prepared.root, &prepared.ingress)?;
     let file_progress = matching_file_shows_progress(prepared, &paths);
     let mut paths: Vec<PathBuf> = paths.into_iter().collect();
@@ -688,7 +813,11 @@ pub fn scan_once_classified(prepared: &PreparedSource) -> Result<DiscoveryScan, 
         match validate_candidate_explained(prepared, &path) {
             Ok(Ok(candidate)) => scan.matched.push(candidate),
             Ok(Err(rejection)) => scan.rejected.push((path, rejection)),
-            Err(err) => scan.rejected.push((path, CandidateRejection::Unreadable(err))),
+            // A retryable failure (EMFILE, EINTR, ...) says nothing about
+            // whether the file correlates; surface it so the caller retries
+            // instead of reading an empty match set as absence.
+            Err(err @ ScanFailure::Transient(_)) => return Err(err),
+            Err(ScanFailure::Permanent(err)) => scan.rejected.push((path, CandidateRejection::Unreadable(err))),
         }
     }
     Ok(scan)
@@ -1046,7 +1175,7 @@ fn scan_matching_paths_classified(
     root: &VerifiedRoot,
     ingress: &AgentJsonlFileIngress,
 ) -> Result<HashSet<PathBuf>, ScanFailure> {
-    root.revalidate().map_err(ScanFailure::Permanent)?;
+    root.revalidate()?;
     let mut stack = vec![root.canonical.clone()];
     let mut visited_dirs = 0usize;
     let mut matches = HashSet::new();
@@ -1058,10 +1187,14 @@ fn scan_matching_paths_classified(
                 root.path.display()
             )));
         }
-        let entries = match fs::read_dir(&dir) {
+        let listing = match fault::take(fault::Point::Listing, &dir) {
+            Some(err) => Err(err),
+            None => fs::read_dir(&dir),
+        };
+        let entries = match listing {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(ScanFailure::Transient(format!("read {}: {err}", dir.display()))),
+            Err(err) => return Err(io_failure(format!("read {}", dir.display()), &err)),
         };
         // NOTE: every error branch below that is not `NotFound` returns
         // `Err`, failing the whole scan, rather than `continue`-ing past the
@@ -1074,12 +1207,11 @@ fn scan_matching_paths_classified(
         // `scan_once`'s callers already turn a whole-scan `Err` into
         // `Undeterminable`, which is the honest answer here.
         for entry in entries {
-            let entry = entry.map_err(|err| {
-                ScanFailure::Transient(format!("read a directory entry under {}: {err}", dir.display()))
-            })?;
+            let entry =
+                entry.map_err(|err| io_failure(format!("read a directory entry under {}", dir.display()), &err))?;
             let file_type = entry
                 .file_type()
-                .map_err(|err| ScanFailure::Transient(format!("file type of {}: {err}", entry.path().display())))?;
+                .map_err(|err| io_failure(format!("file type of {}", entry.path().display()), &err))?;
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
@@ -1110,12 +1242,7 @@ fn scan_matching_paths_classified(
                     // Raced away between `read_dir` and `canonicalize` —
                     // legitimately gone, not an inspection failure.
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(err) => {
-                        return Err(ScanFailure::Transient(format!(
-                            "canonicalize {}: {err}",
-                            path.display()
-                        )));
-                    }
+                    Err(err) => return Err(io_failure(format!("canonicalize {}", path.display()), &err)),
                 };
                 if canonical.starts_with(&root.canonical) {
                     stack.push(canonical);
@@ -1128,12 +1255,7 @@ fn scan_matching_paths_classified(
             let canonical = match fs::canonicalize(&path) {
                 Ok(canonical) => canonical,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => {
-                    return Err(ScanFailure::Transient(format!(
-                        "canonicalize {}: {err}",
-                        path.display()
-                    )));
-                }
+                Err(err) => return Err(io_failure(format!("canonicalize {}", path.display()), &err)),
             };
             if canonical.starts_with(&root.canonical) {
                 matches.insert(canonical);

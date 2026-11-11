@@ -114,3 +114,47 @@ fn spoke_replaces_hub_forwarders_without_removing_policy() {
         "spoke forwarder must stay ahead of the policy guards: {first}"
     );
 }
+
+#[test]
+fn spoke_replaces_bare_hub_forwarder_for_bare_and_absolute_spoke_binaries() {
+    use boss_engine_driver::{ProgressIngress, ProgressObservationConfig, hook_settings};
+    let input = WorkerSetupInput {
+        boss_event_path: PathBuf::from(crate::hub_spawn::REMOTE_BOSS_EVENT_BIN),
+        ..sample_input()
+    };
+    for binary in ["boss-event", "/spoke/bin/boss-event"] {
+        let mut settings: serde_json::Value =
+            serde_json::from_str(&render_remote_settings_json(&input, &ClaudeDriver)).unwrap();
+        // A policy hook that merely mentions boss-event must survive.
+        settings["hooks"]["PreToolUse"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"hooks": [{"type": "command", "command": "echo audit boss-event"}]}));
+        let config = ProgressObservationConfig {
+            events_socket_path: "/tmp/spoke.sock".into(),
+            forwarder_binary: binary.into(),
+            run_id: "spoke-run".into(),
+            lease_id: "lease".into(),
+            workspace_path: "/workspace".into(),
+        };
+        let ProgressIngress::HookCallback(wiring) = ClaudeDriver.progress_observation_wiring(&config) else {
+            panic!("expected hooks");
+        };
+        hook_settings::replace_forwarders(&mut settings, wiring.hooks, &config.forwarder_binary).unwrap();
+        for (event, entries) in settings["hooks"].as_object().unwrap() {
+            let forwarders = entries
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|entry| entry["hooks"].as_array().unwrap())
+                .filter_map(|hook| hook["command"].as_str())
+                .filter(|c| c.contains("BOSS_RUN_ID="))
+                .collect::<Vec<_>>();
+            assert_eq!(forwarders.len(), 1, "{binary} {event}: {forwarders:?}");
+            assert!(forwarders[0].contains("spoke-run"), "{binary} {event}");
+        }
+        let pre = &settings["hooks"]["PreToolUse"];
+        assert!(pre[0]["hooks"][0]["command"].as_str().unwrap().contains("spoke-run"));
+        assert!(pre.to_string().contains("echo audit boss-event"));
+    }
+}

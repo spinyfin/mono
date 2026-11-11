@@ -56,15 +56,41 @@ pub fn replace_forwarders(
     Ok(())
 }
 
-/// A forwarder is the configured binary, or an engine-rendered hook command:
-/// it sets both `BOSS_EVENTS_SOCKET` and `BOSS_RUN_ID` and ends in a
-/// `boss-event` binary. Other commands that merely mention `boss-event` are
-/// policy and are kept.
+/// A forwarder is an engine-rendered hook command: it sets both
+/// `BOSS_EVENTS_SOCKET` and `BOSS_RUN_ID` and its final shell token names the
+/// configured forwarder binary or the stock `boss-event` shim, whether bare
+/// (the hub's remote composer) or an absolute path. Other commands that merely
+/// mention `boss-event` are policy and are kept.
 fn is_forwarder(command: &str, binary: &str) -> bool {
-    command.contains(binary)
-        || (command.contains("BOSS_EVENTS_SOCKET=")
-            && command.contains("BOSS_RUN_ID=")
-            && command
-                .trim_end_matches(|c: char| c == '\'' || c == '"' || c.is_whitespace())
-                .ends_with("/boss-event"))
+    if !command.contains("BOSS_EVENTS_SOCKET=") || !command.contains("BOSS_RUN_ID=") {
+        return false;
+    }
+    let is_sep = |c: char| c == '/' || c == '\'' || c == '"' || c.is_whitespace();
+    let last = |s: &str| {
+        s.trim_end_matches(is_sep)
+            .rsplit(is_sep)
+            .next()
+            .unwrap_or("")
+            .to_string()
+    };
+    let token = last(command);
+    !token.is_empty() && (token == "boss-event" || token == last(binary))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ENV: &str = "BOSS_EVENTS_SOCKET='/tmp/s.sock' BOSS_RUN_ID='r' ";
+
+    #[test]
+    fn matches_bare_and_absolute_forwarders_only() {
+        for binary in ["boss-event", "/spoke/bin/boss-event", "/opt/x/my-shim"] {
+            assert!(is_forwarder(&format!("{ENV}'boss-event'"), binary));
+            assert!(is_forwarder(&format!("{ENV}'/Users/a b/Boss/bin/boss-event'"), binary));
+            assert!(!is_forwarder("echo boss-event audit", binary));
+            assert!(!is_forwarder(&format!("{ENV}/usr/bin/other"), binary));
+        }
+        assert!(is_forwarder(&format!("{ENV}'/opt/x/my-shim'"), "/opt/x/my-shim"));
+    }
 }
