@@ -201,16 +201,22 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     entry(
         LEASE_UNRELEASED_ATTENTION_KIND,
         ClearedBy::ProducerReconciles,
-        "No longer raised: it was filed when an unconfirmed recovery bookmark kept the lease, and \
-         teardown preservation no longer keeps a lease. The release path still resolves items filed by \
-         earlier engines when it returns their workspace; a run starting elsewhere proves nothing about \
-         this lease.",
+        "A gate kept a finished run's lease after its pane was gone (process cleanup failed or left \
+         occupants, the owning host was unreachable, or a remote worker could not be confirmed gone). \
+         The release path resolves it when the lease returns; a run starting elsewhere proves nothing \
+         about this lease.",
     ),
     entry(
         LEASE_RELEASE_FAILED_ATTENTION_KIND,
         ClearedBy::ProducerReconciles,
         "Cube's release call failed after every gate passed. The leftover-lease sweep retries it and \
          the release path resolves the item once the lease is returned.",
+    ),
+    entry(
+        UNOWNED_OCCUPANTS_RELEASED_ATTENTION_KIND,
+        ClearedBy::HumanDecision,
+        "The lease was returned although processes owned by no live run were still in the workspace after \
+         the bounded wait. The item names the PIDs; a human decides whether they are stale.",
     ),
     // ── Cleared by work resuming ────────────────────────────────────────
     entry(

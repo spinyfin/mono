@@ -43,6 +43,22 @@ pub async fn capture(key: &str, owner: &str) -> Result<()> {
     Ok(())
 }
 
+/// False only when `pid` is proven not to be the shell that carried this
+/// execution's identity (gone, or reused by a process without it).
+pub async fn shell_alive(key: &str, owner: &str, pid: u32) -> Result<bool> {
+    let output = tokio::process::Command::new("python3")
+        .args(["-c", SCRIPT, "--alive", key, owner, &pid.to_string()])
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    ensure!(
+        output.status.success(),
+        "probing worker shell: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
 #[derive(Debug, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct Cleanup {
@@ -152,6 +168,60 @@ class OwnershipTests(unittest.TestCase):
                     print(shell, "reparented cleanup ms:", result["elapsed_ms"], flush=True)
                 finally:
                     run("BOSS_RUN_ID", owner, directory, grace=0.1)
+
+    def test_malformed_registry_record_is_treated_as_unregistered(self):
+        private_registry()
+        for index, text in enumerate(("{", "[]", "{\"birth\": [1, 2]}", "{\"birth\": [1, 2], \"identity\": 3}")):
+            (registry() / f"{900000 + index}.json").write_text(text)
+            self.assertEqual(registered_environment(900000 + index, (1, 2)), [])
+
+    def test_registration_failure_does_not_kill_the_shell(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory modes")
+        with tempfile.TemporaryDirectory() as directory:
+            hooks = install(SOURCE)
+            locked = Path(directory) / "locked"
+            locked.mkdir(mode=0o500)
+            try:
+                result = subprocess.run(["/bin/bash", "-c", "echo ran"], capture_output=True, text=True,
+                                        env={**os.environ, **hooks, "BOSS_RUN_ID": "run", "BOSS_PROCESS_ROOT": str(locked / "registry")})
+            finally:
+                locked.chmod(0o700)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("ran", result.stdout)
+            self.assertIn("registration failed", result.stderr)
+
+    def test_zsh_launch_keeps_user_startup_files_and_registers(self):
+        if not Path("/bin/zsh").exists():
+            self.skipTest("zsh unavailable")
+        with tempfile.TemporaryDirectory() as home:
+            Path(home, ".zshenv").write_text("export BOSS_TEST_ENV=zshenv\n")
+            Path(home, ".zprofile").write_text("export BOSS_TEST_PROFILE=zprofile\n")
+            Path(home, ".zshrc").write_text("export BOSS_TEST_RC=zshrc\n")
+            base = {key: value for key, value in os.environ.items() if key not in ("ZDOTDIR", "BASH_ENV")}
+            hooks = install(SOURCE)
+            result = subprocess.run(
+                ["/bin/zsh", "-l", "-i", "-c", "echo $$ $BOSS_TEST_ENV $BOSS_TEST_PROFILE $BOSS_TEST_RC ${ZDOTDIR:-unset}"],
+                capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                env={**base, **hooks, "HOME": home, "BOSS_RUN_ID": "zsh-run"})
+            pid, *seen = result.stdout.split()
+            self.assertEqual(seen, ["zshenv", "zprofile", "zshrc", "unset"], result.stderr)
+            self.assertTrue((registry() / f"{pid}.json").exists())
+
+    def test_reused_pid_without_the_identity_is_not_the_shell(self):
+        owner = str(uuid.uuid4())
+        idle = [sys.executable, "-c", "import time; time.sleep(60)"]
+        stranger = subprocess.Popen(idle, env={**os.environ, "BOSS_RUN_ID": "someone-else"})
+        carrier = subprocess.Popen(idle, env={**os.environ, "BOSS_RUN_ID": owner})
+        try:
+            time.sleep(0.1)
+            self.assertFalse(shell_alive("BOSS_RUN_ID", owner, stranger.pid))
+            self.assertTrue(shell_alive("BOSS_RUN_ID", owner, carrier.pid))
+        finally:
+            for child in (stranger, carrier):
+                child.kill()
+                child.wait()
+        self.assertFalse(shell_alive("BOSS_RUN_ID", owner, carrier.pid))
 
     def test_detached_child_and_other_execution(self):
         owner = str(uuid.uuid4())

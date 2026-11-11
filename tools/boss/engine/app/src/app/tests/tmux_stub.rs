@@ -63,7 +63,7 @@ impl StubRunner {
 
 #[async_trait::async_trait]
 impl CommandRunner for StubRunner {
-    fn is_real(&self) -> bool {
+    fn manages_host_processes(&self) -> bool {
         self.real_processes.load(std::sync::atomic::Ordering::Relaxed)
     }
 

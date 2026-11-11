@@ -38,7 +38,9 @@ def registered_environment(pid, birth):
         expected = list(birth) if isinstance(birth, tuple) else birth
         if record["birth"] == expected:
             return [os.fsencode(key + "=" + value) for key, value in record["identity"].items()]
-    except FileNotFoundError:
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        # Missing, truncated or foreign records mean "unregistered". One bad
+        # file must not fail every cleanup on the host.
         pass
     return []
 
@@ -61,16 +63,36 @@ def record_identity(pid, birth, identity):
     os.replace(output.name, root / f"{pid}.json")
 
 
+def original_startup(name):
+    """The caller's value, ignoring one of our own generated hooks (nested install)."""
+    value = os.environ.get(name, "")
+    return "" if value.startswith(str(registry()) + os.sep) else value
+
+
 def install(source):
-    root = private_registry() / hashlib.sha256(source.encode()).hexdigest()
+    original_zdotdir, original_bash_env = original_startup("ZDOTDIR"), original_startup("BASH_ENV")
+    key = "\0".join((source, original_zdotdir, original_bash_env))
+    root = private_registry() / hashlib.sha256(key.encode()).hexdigest()
     root.mkdir(mode=0o700, exist_ok=True)
     script = root / "processes.py"
     if not script.exists():
         with tempfile.NamedTemporaryFile(mode="w", dir=root, delete=False) as output:
             output.write(source)
         os.replace(output.name, script)
-    startup = f'python3 {shlex.quote(str(script))} --register "$$" || exit 125\n'
-    for name in ("bash-env", ".zshenv"):
+    # Registration failure must never stop the shell: an unregistered process
+    # inside the workspace is still an occupant that keeps its lease.
+    register_line = (f'python3 {shlex.quote(str(script))} --register "$$" || '
+                     'echo "boss: worker process registration failed; continuing unregistered" >&2\n')
+    bash_env = register_line
+    if original_bash_env:
+        original = shlex.quote(original_bash_env)
+        bash_env += f'if [ -r {original} ]; then . {original}; fi\n'
+    # Hand startup back to the user's own zsh files: restore ZDOTDIR before zsh
+    # looks for .zprofile/.zshrc/.zlogin, then run the user's .zshenv.
+    zshenv = register_line
+    zshenv += f'ZDOTDIR={shlex.quote(original_zdotdir)}\n' if original_zdotdir else 'unset ZDOTDIR\n'
+    zshenv += 'if [ -r "${ZDOTDIR:-$HOME}/.zshenv" ]; then . "${ZDOTDIR:-$HOME}/.zshenv"; fi\n'
+    for name, startup in (("bash-env", bash_env), (".zshenv", zshenv)):
         with tempfile.NamedTemporaryFile(mode="w", dir=root, delete=False) as output:
             output.write(startup)
         os.replace(output.name, root / name)
@@ -240,6 +262,28 @@ def signal_owned(owned, sig):
     return signalled
 
 
+def shell_alive(key, value, pid):
+    """True unless `pid` is provably not the shell that carried `key=value`.
+
+    A bare kill(0) cannot tell a dead shell from an unrelated process that
+    reused its PID. The exact identity (environment or birth-pinned
+    registration) can: a process without it is not that shell.
+    """
+    needle = os.fsencode(key + "=" + value)
+    try:
+        environment = [entry for entry in inspect(pid)[3] if entry]
+        # Platform binaries hide their environment: an empty one proves nothing.
+        return needle in environment or not environment
+    except OSError as error:
+        if error.errno in (errno.ESRCH, errno.ENOENT):
+            return False
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError):
+            return False  # gone, or another user's process: never our shell
+        return True  # present but unreadable: not proven dead
+
+
 def settled_snapshot(key, value, workspace):
     result = snapshot(key, value, workspace)
     # Match the existing host occupancy retry cadence for fork/exit races.
@@ -281,14 +325,24 @@ def run(key, value, workspace, grace=5.0):
 
 if __name__ == "__main__":
     if sys.argv[1] == "--register":
-        register(int(sys.argv[2]))
+        try:
+            register(int(sys.argv[2]))
+        except (OSError, ValueError) as error:
+            print(f"boss: worker process registration failed: {error}", file=sys.stderr)
+            sys.exit(1)
     elif sys.argv[1] == "--install":
         print(json.dumps(install(sys.argv[2])))
     elif sys.argv[1] in ("--exec", "--exec-file"):
         source, command = (sys.argv[2], sys.argv[3]) if sys.argv[1] == "--exec" else (Path(__file__).read_text(), sys.argv[2])
-        os.environ.update(install(source))
-        register(os.getpid())
+        try:
+            os.environ.update(install(source))
+            register(os.getpid())
+        except OSError as error:
+            # Launch without hooks rather than not at all (read-only sandbox, full /tmp).
+            print(f"boss: worker process registration unavailable: {error}", file=sys.stderr)
         os.execvpe("/bin/sh", ["/bin/sh", "-c", command], os.environ)
+    elif sys.argv[1] == "--alive":
+        print(json.dumps(shell_alive(sys.argv[2], sys.argv[3], int(sys.argv[4]))))
     elif sys.argv[1] == "--capture":
         snapshot(sys.argv[2], sys.argv[3], None)
     else:

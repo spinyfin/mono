@@ -118,7 +118,7 @@ pub fn write_shell_environment(bin_dir: &Path) -> io::Result<PathBuf> {
     let dir = environment_dir(bin_dir);
     std::fs::create_dir_all(&dir)?;
     let registration = format!(
-        "if [ -n \"${{BOSS_RUN_ID:-}}${{BOSS_SPAWN_TOKEN:-}}\" ]; then python3 -c {} --register \"$$\" || exit 125; fi\n",
+        "if [ -n \"${{BOSS_RUN_ID:-}}${{BOSS_SPAWN_TOKEN:-}}\" ]; then python3 -c {} --register \"$$\" || echo \"boss: worker process registration failed; continuing unregistered\" >&2; fi\n",
         sh_quote(boss_worker_processes::SCRIPT)
     );
     write_launcher(

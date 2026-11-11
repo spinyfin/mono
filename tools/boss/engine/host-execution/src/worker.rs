@@ -757,10 +757,13 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
     async fn stop(&self, command: &Command, run: &Run, stop: &Stop, interrupted: bool) -> Result<CommandResult> {
         let result = self.stop_inner(command, run, stop, interrupted).await?;
         if result.code == ResultCode::Ok as i32
-            && self.tmux.runner().is_real()
+            && self.tmux.runner().manages_host_processes()
             && let Some(record) = self.loaded(run)?
         {
             let workspace = self.workspace_path(&record.workspace_id, &record.lease_id).await?;
+            self.tmux
+                .cleanup_run_processes(&record.execution_id, &workspace)
+                .await?;
             self.tmux.verify_workspace_quiescent(&workspace).await?;
         }
         Ok(result)
@@ -1003,6 +1006,15 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             PaneLife::Exited | PaneLife::BriefNotDelivered | PaneLife::Missing
         ) {
             self.tmux.cleanup_worker_processes(&record.spawn_token).await?;
+            if self.tmux.runner().manages_host_processes() {
+                let workspace = self
+                    .workspace_path(&record.workspace_id, &record.lease_id)
+                    .await
+                    .unwrap_or_default();
+                self.tmux
+                    .cleanup_run_processes(&record.execution_id, &workspace)
+                    .await?;
+            }
         }
         match record.phase {
             // An uncertain launch leaves the record here. Whatever the pane
@@ -1418,6 +1430,7 @@ mod tests {
         sent: Mutex<Vec<Vec<String>>>,
         envs: Mutex<HashMap<String, Vec<String>>>,
         launches: Mutex<Vec<String>>,
+        manage_processes: std::sync::atomic::AtomicBool,
     }
 
     fn ok(stdout: &str) -> CommandOutput {
@@ -1449,6 +1462,10 @@ mod tests {
 
     #[async_trait]
     impl CommandRunner for FakeTmux {
+        fn manages_host_processes(&self) -> bool {
+            self.manage_processes.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
         async fn run(&self, _program: &Path, args: &[OsString], _cwd: Option<&Path>) -> std::io::Result<CommandOutput> {
             let args: Vec<String> = args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
             let rest = subcommand(&args);
@@ -2566,6 +2583,41 @@ mod tests {
         assert!(outside.exists());
         // A later sweep retries instead of forgetting.
         assert_eq!(supervisor.sweep().await.len(), 1);
+    }
+
+    /// Codex strips `*TOKEN*` from tool shells, so a reparented background
+    /// shell carries only the run id. Stop must still signal it.
+    #[tokio::test]
+    async fn stop_signals_a_reparented_shell_that_carries_only_the_run_id() {
+        use std::io::BufRead;
+        let root = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeTmux::default());
+        live(&fake);
+        fake.manage_processes.store(true, std::sync::atomic::Ordering::Relaxed);
+        let supervisor = supervisor(root.path(), fake).await;
+        seed(&supervisor.store, Phase::Alive);
+        let mut shell = std::process::Command::new("python3")
+            .args([
+                "-u",
+                "-c",
+                "import os,time; os.setsid(); print('ready'); time.sleep(600)",
+            ])
+            .current_dir(root.path().join("worker"))
+            .env("BOSS_RUN_ID", "exec_test")
+            .env_remove("BOSS_SPAWN_TOKEN")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(shell.stdout.as_mut().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        let result = supervisor.execute(&stop_command(), false, 1).await;
+        let exited = shell.try_wait().unwrap().is_some();
+        let _ = shell.kill();
+        let _ = shell.wait();
+        assert_eq!(result.code, ResultCode::Ok as i32, "{}", result.reason);
+        assert!(exited, "the run-id-only shell was signalled by stop");
     }
 
     #[tokio::test]

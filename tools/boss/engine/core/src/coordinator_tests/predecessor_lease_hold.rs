@@ -544,9 +544,47 @@ async fn inline_reconcile_fails_loudly_when_preservation_cannot_proceed_then_all
     assert!(s.stalled().status.is_terminal());
     assert_eq!(s.stalled().cube_lease_id.as_deref(), Some("lease-old"));
     assert!(s.db().preserved_tip(&s.stalled_id).unwrap().is_none());
-    assert_eq!(s.db().get_execution(&next.id).unwrap().status, ExecutionStatus::Failed);
+    // The kept lease raised an attention item, but one fresh item is not
+    // proof the problem is permanent: the sweeps retry, so the row only waits.
+    assert!(
+        s.db()
+            .list_attention_items(&s.stalled_id)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == boss_engine_storage_values::attention_kinds::LEASE_UNRELEASED_ATTENTION_KIND)
+    );
+    assert_eq!(s.db().get_execution(&next.id).unwrap().status, ExecutionStatus::Ready);
     assert_eq!(s.wait_reason(&next.id).as_deref(), Some(HOLD_REASON));
     assert!(s.cube.lease_calls.lock().await.is_empty());
+
+    // Once the predecessor has stayed unreleased past the bound the successor
+    // fails loudly, naming the predecessor's recorded cleanup problem.
+    age_predecessor(&s);
+    let err = s
+        .coordinator
+        .force_dispatch(&next.id, DispatchAdmission::OperatorForced)
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("Recovery cannot start"), "{err:#}");
+    assert_eq!(s.db().get_execution(&next.id).unwrap().status, ExecutionStatus::Failed);
+    let next = s
+        .db()
+        .create_execution(
+            boss_protocol::CreateExecutionInput::builder()
+                .work_item_id(s.stalled().work_item_id)
+                .kind(s.stalled().kind)
+                .status(ExecutionStatus::Ready)
+                .repo_remote_url(s.stalled().repo_remote_url)
+                .build(),
+        )
+        .unwrap();
+    s.coordinator.drain_ready_queue_for_test().await;
+    assert_eq!(s.db().get_execution(&next.id).unwrap().status, ExecutionStatus::Failed);
+    assert_eq!(
+        s.wait_reason(&next.id),
+        None,
+        "a row that failed is not also stamped as waiting"
+    );
 
     s.db()
         .connect()
@@ -570,6 +608,63 @@ async fn inline_reconcile_fails_loudly_when_preservation_cannot_proceed_then_all
     assert_eq!(
         std::fs::read_to_string(s.repo.replacement.join("fix")).unwrap(),
         "unpublished fix"
+    );
+}
+
+/// Make the stalled predecessor look like it ended an hour ago, and any
+/// kept-lease attention item look like it was filed then.
+fn age_predecessor(s: &Stalled) {
+    let hour_ago = (boss_engine_utils::epoch_time::now_epoch_secs() - 3600).to_string();
+    let conn = s.db().connect().unwrap();
+    conn.execute(
+        "UPDATE work_executions SET finished_at = ?2 WHERE id = ?1",
+        rusqlite::params![s.stalled_id, hour_ago],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE work_attention_items SET created_at = ?2 WHERE execution_id = ?1",
+        rusqlite::params![s.stalled_id, hour_ago],
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn terminal_remote_predecessor_with_no_cleanup_item_fails_the_successor_after_the_bound() {
+    // A remote predecessor that was never probed leaves no attention item; the
+    // gate itself must still end the wait. A local one with no item has simply
+    // not been swept yet and keeps waiting however long ago it ended.
+    let s = Stalled::new(true).await;
+    s.db().mark_execution_orphaned(&s.stalled_id, "worker gone").unwrap();
+    let successor = s
+        .db()
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(s.stalled().work_item_id)
+                .build(),
+        )
+        .unwrap();
+    age_predecessor(&s);
+    s.coordinator.drain_ready_queue_for_test().await;
+    assert_eq!(
+        s.db().get_execution(&successor.id).unwrap().status,
+        ExecutionStatus::Ready,
+        "an unswept local predecessor is waited for"
+    );
+    assert_eq!(s.wait_reason(&successor.id).as_deref(), Some(HOLD_REASON));
+
+    s.db().add_host("remote", "user@remote", 4, &[]).unwrap();
+    s.db()
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET host_id = 'remote' WHERE execution_id = ?1",
+            [&s.stalled_id],
+        )
+        .unwrap();
+    s.coordinator.drain_ready_queue_for_test().await;
+    assert_eq!(
+        s.db().get_execution(&successor.id).unwrap().status,
+        ExecutionStatus::Failed
     );
 }
 

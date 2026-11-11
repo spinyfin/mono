@@ -20,10 +20,33 @@ use crate::work::WorkDb;
 use boss_execution_contracts::CubeClient;
 
 pub use boss_engine_completion::workspace_lease_release::*;
+use boss_engine_storage_values::attention_kinds::UNOWNED_OCCUPANTS_RELEASED_ATTENTION_KIND;
 
 /// Cadence for the leftover-lease sweep. Fires on boot so leases left by a
 /// previous engine process return to the pool without waiting a day.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long after a run ended unowned occupants may keep its lease. Owned
+/// processes are TERM/KILLed within one cleanup pass (grace 5 s, measured at
+/// tens of milliseconds for a TERM-able child) and the sweep retries every
+/// [`DEFAULT_INTERVAL`], so a process that survives ten sweeps is not a
+/// registration race: it has no owner that will ever claim it.
+pub const UNOWNED_OCCUPANT_BOUND_SECS: i64 = 10 * 60;
+
+/// Only unowned processes inside the workspace remain: none survived signalling
+/// and none had an unreadable identity.
+fn stray_only(result: &boss_worker_processes::Cleanup) -> bool {
+    result.remaining.is_empty() && result.unknown.is_empty() && !result.occupants.is_empty()
+}
+
+/// The run ended at least `secs` ago. A row with no end time is never settled.
+fn settled_for(execution: &WorkExecution, secs: i64) -> bool {
+    execution.finished_epoch().is_some_and(|finished| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .is_ok_and(|now| i64::try_from(now.as_secs()).is_ok_and(|now| now - finished >= secs))
+    })
+}
 
 /// Scan local processes for a cwd inside the workspace.
 pub struct HostOccupancy;
@@ -41,8 +64,10 @@ impl WorkspaceOccupancy for HostOccupancy {
                 .ok_or_else(|| anyhow::anyhow!("workspace path missing"))?;
             let mut result = boss_worker_processes::cleanup("BOSS_RUN_ID", &execution.id, workspace).await?;
             // Older occupants are eligible only with durable terminal status
-            // and a dead recorded shell on this host. Unknown identities and
-            // terminal rows whose worker is still alive are never signalled.
+            // and proof that their recorded shell is gone: the PID is absent,
+            // or it now belongs to a process without that run's identity (a
+            // reused PID). Unknown identities and terminal rows whose worker
+            // is still alive are never signalled.
             for owner in result.owners.keys() {
                 if owner != &execution.id
                     && let Ok(old) = db.get_execution(owner)
@@ -51,18 +76,35 @@ impl WorkspaceOccupancy for HostOccupancy {
                         .execution_host_id(owner)
                         .is_ok_and(|host| host.is_none_or(|host| host == "local"))
                     && let Ok(Some(pid)) = db.latest_local_shell_pid_for_execution(owner)
-                    && i32::try_from(pid).ok().is_some_and(|pid| {
-                        matches!(
-                            crate::dead_pid_sweep::probe_pid(pid),
-                            crate::dead_pid_sweep::PidStatus::Dead
-                        )
-                    })
+                    && let Ok(pid) = u32::try_from(pid)
+                    && !boss_worker_processes::shell_alive("BOSS_RUN_ID", owner, pid).await?
                 {
                     boss_worker_processes::cleanup("BOSS_RUN_ID", owner, workspace).await?;
                 }
             }
             if !result.owners.is_empty() {
                 result = boss_worker_processes::cleanup("BOSS_RUN_ID", "", workspace).await?;
+            }
+            if stray_only(&result) && settled_for(execution, UNOWNED_OCCUPANT_BOUND_SECS) {
+                // Nothing in the registry owns these and they are not safe to
+                // signal. Holding the lease forever strands a 10-20 GiB
+                // workspace, so return it loudly, naming the PIDs.
+                tracing::error!(
+                    execution_id = %execution.id,
+                    occupants = ?result.occupants,
+                    "releasing workspace lease with unowned processes still in it"
+                );
+                raise_attention(
+                    db,
+                    execution,
+                    UNOWNED_OCCUPANTS_RELEASED_ATTENTION_KIND,
+                    "Workspace lease released with unowned processes inside",
+                    &format!(
+                        "Processes {:?} were still running in {workspace} more than {UNOWNED_OCCUPANT_BOUND_SECS} seconds after this run ended. No live run claims them, so the engine did not signal them, and the lease was returned rather than held indefinitely. Inspect them on the engine host and stop them if they are stale.",
+                        result.occupants
+                    ),
+                );
+                return Ok(Occupancy::Empty);
             }
             anyhow::ensure!(
                 result.empty(),

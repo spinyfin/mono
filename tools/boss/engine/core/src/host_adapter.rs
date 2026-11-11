@@ -578,6 +578,23 @@ impl SshHostAdapter {
 /// composer's tri-state. `test` exits 0 (found) or 1 (not found); any
 /// other status means the markers were never evaluated (ssh 255, shell
 /// 126/127, signal termination).
+/// Interpret the owning host's cleanup report: only a report with no surviving
+/// owned process, no unowned occupant and no unreadable process proves the
+/// workspace empty.
+fn occupancy_from_cleanup(execution_id: &str, output: &SshOutput) -> Result<crate::workspace_lease_release::Occupancy> {
+    anyhow::ensure!(output.success(), "remote process cleanup failed: {}", output.stderr);
+    let result: boss_worker_processes::Cleanup = serde_json::from_str(&output.stdout)?;
+    result.report(execution_id);
+    anyhow::ensure!(
+        result.empty(),
+        "remote workspace occupants {:?}; surviving owned processes {:?}; unreadable processes {:?}",
+        result.occupants,
+        result.remaining,
+        result.unknown
+    );
+    Ok(crate::workspace_lease_release::Occupancy::Empty)
+}
+
 pub(crate) fn map_remote_bazel_probe_output(result: Result<SshOutput>, host_id: &str) -> Option<bool> {
     match result {
         Ok(out) if out.status == 0 => Some(true),
@@ -1422,17 +1439,7 @@ impl HostAdapter for SshHostAdapter {
                 workspace.to_str().context("workspace is not UTF-8")?,
             ])
             .await?;
-        anyhow::ensure!(output.success(), "remote process cleanup failed: {}", output.stderr);
-        let result: boss_worker_processes::Cleanup = serde_json::from_str(&output.stdout)?;
-        result.report(execution_id);
-        anyhow::ensure!(
-            result.empty(),
-            "remote workspace occupants {:?}; surviving owned processes {:?}; unreadable processes {:?}",
-            result.occupants,
-            result.remaining,
-            result.unknown
-        );
-        Ok(crate::workspace_lease_release::Occupancy::Empty)
+        occupancy_from_cleanup(execution_id, &output)
     }
 
     async fn probe_remote_worker_alive(&self, remote_pid: i64) -> Result<Option<bool>> {
@@ -2137,6 +2144,58 @@ mod tests {
             !path.parent().unwrap().exists(),
             "the staging run directory must be reclaimed"
         );
+    }
+
+    // ── remote process cleanup report ────────────────────────────────────────
+
+    fn cleanup_report(body: &str) -> SshOutput {
+        SshOutput {
+            status: 0,
+            stdout: format!(
+                r#"{{"terminated":[],"killed":[],"remaining":[],"occupants":[],"unknown":[],"owners":{{}},"elapsed_ms":3{body}}}"#
+            ),
+            stderr: String::new(),
+        }
+    }
+
+    #[test]
+    fn remote_cleanup_report_with_nothing_left_proves_the_workspace_empty() {
+        assert_eq!(
+            occupancy_from_cleanup("exec", &cleanup_report("")).unwrap(),
+            crate::workspace_lease_release::Occupancy::Empty
+        );
+    }
+
+    #[test]
+    fn remote_cleanup_report_names_occupants_survivors_and_unreadable_processes() {
+        for (field, label) in [
+            ("occupants", "occupants [7]"),
+            ("remaining", "surviving owned processes [7]"),
+            ("unknown", "unreadable processes [7]"),
+        ] {
+            let mut report = cleanup_report("");
+            report.stdout = report
+                .stdout
+                .replace(&format!("\"{field}\":[]"), &format!("\"{field}\":[7]"));
+            let error = occupancy_from_cleanup("exec", &report).unwrap_err();
+            assert!(format!("{error:#}").contains(label), "{field}: {error:#}");
+        }
+    }
+
+    #[test]
+    fn remote_cleanup_failure_and_garbled_report_are_errors_not_proof() {
+        let failed = SshOutput {
+            status: 255,
+            stdout: String::new(),
+            stderr: "connection refused".into(),
+        };
+        assert!(format!("{:#}", occupancy_from_cleanup("exec", &failed).unwrap_err()).contains("connection refused"));
+        let garbled = SshOutput {
+            status: 0,
+            stdout: "not json".into(),
+            stderr: String::new(),
+        };
+        assert!(occupancy_from_cleanup("exec", &garbled).is_err());
     }
 
     // ── command_repr ─────────────────────────────────────────────────────────

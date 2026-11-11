@@ -1,6 +1,7 @@
 //! The dispatch scheduler loop: kick/heartbeat wakeups, the ready-queue
 //! drain, chain-serialization holds, and automation preemption. Part of the
 //! `coordinator` module split; see [`super`] for the struct and shared types.
+use super::predecessor_hold::PredecessorHold;
 use super::*;
 
 /// A queued answer agent older than this is unusual enough to require an
@@ -878,58 +879,6 @@ impl ExecutionCoordinator {
         }
     }
 
-    /// Why `execution` must not dispatch yet because the run it recovers from
-    /// has not given up its cube workspace lease, or `None` when nothing is
-    /// pending.
-    ///
-    /// A finished run's unpublished work is preserved as its lease is released,
-    /// so while the lease is still recorded dispatch cannot tell "no work to
-    /// restore" from "work not yet preserved". Dispatching anyway would start
-    /// the successor from trunk and strand that work with nothing to restore
-    /// it, so the row waits instead of guessing. A lookup that fails is held
-    /// the same way: a row admitted without proof of what it recovers from
-    /// would be the same guess. The lease holder's release (the lease-release
-    /// paths preserve before releasing, and raise an attention item carrying
-    /// the error if they cannot) is what ends the wait; neither this check nor
-    /// the pass that runs it releases anything itself.
-    pub(super) fn predecessor_lease_hold_detail(&self, execution: &WorkExecution) -> Option<String> {
-        match self.work_db.recovery_predecessor_holding_lease(execution) {
-            Ok(None) => None,
-            Ok(Some(predecessor)) => {
-                let detail = format!(
-                    "recovery predecessor {} still holds cube lease {}",
-                    predecessor.id,
-                    predecessor.cube_lease_id.as_deref().unwrap_or("(unrecorded)")
-                );
-                if predecessor.status.is_terminal()
-                    && let Ok(items) = self.work_db.list_attention_items(&predecessor.id)
-                    && let Some(failure) =
-                        items.iter().find(|item| {
-                            item.status == "open"
-                                && matches!(item.kind.as_str(),
-                        boss_engine_storage_values::attention_kinds::LEASE_UNRELEASED_ATTENTION_KIND
-                        | boss_engine_storage_values::attention_kinds::LEASE_RELEASE_FAILED_ATTENTION_KIND)
-                        })
-                {
-                    let error = format!(
-                        "Recovery cannot start: {detail}. {}. Resolve the predecessor's workspace cleanup, then resume this execution. No workspace was reset.",
-                        failure.body_markdown
-                    );
-                    if let Err(err) = self
-                        .work_db
-                        .fail_execution_start(&execution.id, "recovery", None, &error)
-                    {
-                        tracing::error!(execution_id = %execution.id, %err, "could not record recovery failure");
-                    }
-                    tracing::error!(execution_id = %execution.id, %error, "recovery predecessor release failed");
-                    return Some(error);
-                }
-                Some(detail)
-            }
-            Err(err) => Some(format!("recovery predecessor could not be resolved: {err:#}")),
-        }
-    }
-
     pub(super) async fn publish_dispatch_runtime_changed(&self, executions: &[WorkExecution], reason: &str) {
         for execution in executions {
             if let Ok(item) = self.resolve_execution_work_item(execution) {
@@ -1476,23 +1425,30 @@ impl ExecutionCoordinator {
             // this is not a scheduling policy but a guard against silently
             // abandoning work. Checked before any slot, lease or pane is
             // touched; `schedule_execution` repeats it for `force_dispatch`.
-            if let Some(detail) = self.predecessor_lease_hold_detail(&execution) {
-                if let Some(held) = self.record_dispatch_wait_reason(
-                    &execution,
-                    DISPATCH_WAIT_REASON_AWAITING_PREDECESSOR_PRESERVATION,
-                    None,
-                ) {
-                    // Logged when the hold begins, not on every pass it persists.
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        work_item_id = %execution.work_item_id,
-                        reason = DISPATCH_WAIT_REASON_AWAITING_PREDECESSOR_PRESERVATION,
-                        detail = %detail,
-                        "spawn_attempt status=ready -> held reason=awaiting_predecessor_preservation"
-                    );
-                    changed_waits.push(held);
+            match self.predecessor_lease_hold(&execution) {
+                None => {}
+                Some(PredecessorHold::Failed(error)) => {
+                    self.fail_predecessor_hold(&execution, &error);
+                    continue;
                 }
-                continue;
+                Some(PredecessorHold::Waiting(detail)) => {
+                    if let Some(held) = self.record_dispatch_wait_reason(
+                        &execution,
+                        DISPATCH_WAIT_REASON_AWAITING_PREDECESSOR_PRESERVATION,
+                        None,
+                    ) {
+                        // Logged when the hold begins, not on every pass it persists.
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            work_item_id = %execution.work_item_id,
+                            reason = DISPATCH_WAIT_REASON_AWAITING_PREDECESSOR_PRESERVATION,
+                            detail = %detail,
+                            "spawn_attempt status=ready -> held reason=awaiting_predecessor_preservation"
+                        );
+                        changed_waits.push(held);
+                    }
+                    continue;
+                }
             }
 
             // Production enables progression spawning at server setup. Hold rows

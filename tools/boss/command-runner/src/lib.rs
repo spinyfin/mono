@@ -55,6 +55,16 @@ pub trait CommandRunner: Send + Sync {
     fn is_real(&self) -> bool {
         false
     }
+
+    /// Whether worker-process registration and host-wide cleanup (signalling
+    /// processes by inherited execution identity) apply to this runner. A
+    /// separate capability from [`Self::is_real`]: that one guards tests from
+    /// reaching a live server and must stay false for every fake, while a
+    /// fixture that needs to exercise real ownership cleanup opts in here.
+    /// Defaults to the runner's realness.
+    fn manages_host_processes(&self) -> bool {
+        self.is_real()
+    }
 }
 
 /// Locale environment variables, in the precedence order POSIX gives them.
@@ -236,6 +246,8 @@ mod tests {
     fn is_real_defaults_to_false_and_is_true_only_for_the_real_runner() {
         assert!(!DefaultOnlyRunner.is_real());
         assert!(RealCommandRunner.is_real());
+        assert!(!DefaultOnlyRunner.manages_host_processes());
+        assert!(RealCommandRunner.manages_host_processes());
     }
 
     #[tokio::test]

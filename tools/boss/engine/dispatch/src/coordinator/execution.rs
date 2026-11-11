@@ -499,32 +499,40 @@ impl ExecutionCoordinator {
         // `force_dispatch` and for a lease that came back between that check
         // and this call. Starting from trunk here would strand the work, so it
         // refuses rather than guess. A pending preservation leaves the row
-        // ready; a recorded cleanup failure terminalizes it with a retry reason.
-        if let Some(detail) = self.predecessor_lease_hold_detail(execution) {
-            tracing::warn!(
+        // ready; a hold that outlasts its bound terminalizes it with a retry reason.
+        let hold = match self.predecessor_lease_hold(execution) {
+            None => return Ok(()),
+            Some(hold) => hold,
+        };
+        if let Err(err) = self.work_db.release_dispatch_claim(&execution.id) {
+            tracing::error!(
                 execution_id = %execution.id,
-                work_item_id = %execution.work_item_id,
-                worker_id = %worker_id,
-                reason = DISPATCH_WAIT_REASON_AWAITING_PREDECESSOR_PRESERVATION,
-                detail = %detail,
-                "spawn_attempt refused: the run this execution recovers from still holds its cube lease",
+                ?err,
+                "failed to release dispatch claim after predecessor-lease hold"
             );
-            if let Err(err) = self.work_db.release_dispatch_claim(&execution.id) {
-                tracing::error!(
-                    execution_id = %execution.id,
-                    ?err,
-                    "failed to release dispatch claim after predecessor-lease hold"
-                );
-            }
-            self.work_db
-                .set_dispatch_wait_reason(&execution.id, DISPATCH_WAIT_REASON_AWAITING_PREDECESSOR_PRESERVATION)?;
-            return Err(anyhow!(
-                "execution {} is held ({DISPATCH_WAIT_REASON_AWAITING_PREDECESSOR_PRESERVATION}): {detail}; \
-                 inspect the execution's status and the predecessor's cleanup attention before retrying",
-                execution.id
-            ));
         }
-        Ok(())
+        let detail = match hold {
+            super::predecessor_hold::PredecessorHold::Failed(error) => {
+                self.fail_predecessor_hold(execution, &error);
+                return Err(anyhow!("execution {} failed to start: {error}", execution.id));
+            }
+            super::predecessor_hold::PredecessorHold::Waiting(detail) => detail,
+        };
+        tracing::warn!(
+            execution_id = %execution.id,
+            work_item_id = %execution.work_item_id,
+            worker_id = %worker_id,
+            reason = DISPATCH_WAIT_REASON_AWAITING_PREDECESSOR_PRESERVATION,
+            detail = %detail,
+            "spawn_attempt refused: the run this execution recovers from still holds its cube lease",
+        );
+        self.work_db
+            .set_dispatch_wait_reason(&execution.id, DISPATCH_WAIT_REASON_AWAITING_PREDECESSOR_PRESERVATION)?;
+        Err(anyhow!(
+            "execution {} is held ({DISPATCH_WAIT_REASON_AWAITING_PREDECESSOR_PRESERVATION}): {detail}; \
+             inspect the execution's status and the predecessor's cleanup attention before retrying",
+            execution.id
+        ))
     }
 
     /// Take one `ready` execution all the way to a running worker: guards,

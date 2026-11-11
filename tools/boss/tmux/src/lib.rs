@@ -455,7 +455,7 @@ impl Tmux {
         for (name, value) in &session.environment {
             args.extend(["-e".into(), format!("{name}={value}").into()]);
         }
-        let command = if self.runner.is_real() {
+        let command = if self.runner.manages_host_processes() {
             let script = quote_for_shell(&boss_worker_processes::install().await?);
             format!("python3 {script} --exec-file {}", quote_for_shell(&session.command))
         } else {
@@ -737,7 +737,7 @@ impl Tmux {
                 Ok(KillSessionOutcome::Absent)
             }
             Some(actual) if actual == expected_token => {
-                if self.runner.is_real() {
+                if self.runner.manages_host_processes() {
                     boss_worker_processes::capture(BOSS_SPAWN_TOKEN_ENV, expected_token).await?;
                 }
                 // The session can still die on its own between the token
@@ -765,8 +765,18 @@ impl Tmux {
     /// Detached shells retain the spawn token even after setsid and reparenting.
     /// Await their exit before callers preserve files or return the lease.
     pub async fn cleanup_worker_processes(&self, token: &str) -> Result<()> {
-        if self.runner.is_real() {
+        if self.runner.manages_host_processes() {
             boss_worker_processes::cleanup(BOSS_SPAWN_TOKEN_ENV, token, "").await?;
+        }
+        Ok(())
+    }
+
+    /// Some drivers strip token-like variables from their tool shells (Codex
+    /// removes `*TOKEN*`), so a reparented background shell carries only the
+    /// run id. Stop everything that still carries this run's id.
+    pub async fn cleanup_run_processes(&self, run_id: &str, workspace: &Path) -> Result<()> {
+        if self.runner.manages_host_processes() {
+            boss_worker_processes::cleanup("BOSS_RUN_ID", run_id, &workspace.to_string_lossy()).await?;
         }
         Ok(())
     }
@@ -774,7 +784,7 @@ impl Tmux {
     /// A stopped remote worker must also prove that no unrelated process still
     /// occupies its lease before the hub can preserve and release it.
     pub async fn verify_workspace_quiescent(&self, workspace: &Path) -> Result<()> {
-        if self.runner.is_real() {
+        if self.runner.manages_host_processes() {
             let result = boss_worker_processes::cleanup("BOSS_RUN_ID", "", &workspace.to_string_lossy()).await?;
             anyhow::ensure!(
                 result.empty(),

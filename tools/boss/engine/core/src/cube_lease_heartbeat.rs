@@ -808,8 +808,8 @@ async fn run_one_pass_impl(
 
     // Terminal remote executions whose worker may still be running: a cancel
     // makes the execution terminal (so it drops out of the in-flight scan)
-    // but cannot stop the remote process, and `force_release` keeps the lease
-    // held until a pid probe proves death. Keep that retained lease alive
+    // without proving the remote process exited, and `force_release` keeps the
+    // lease held until a pid probe proves death. Keep that retained lease alive
     // until `remote_lease_reconcile` observes death and clears the lease
     // columns, at which point the row leaves this set. Runs with no recorded
     // pid are skipped: they can never be proven dead, so their lease is left

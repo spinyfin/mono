@@ -689,9 +689,10 @@ pub fn resolve_unreleased_attention(db: &WorkDb, execution_id: &str) {
 
 /// Release a remote worker's lease through the claimed release policy, for
 /// every path that releases on the strength of a recorded pid or a finished
-/// turn rather than a confirmed stop. The remote worker cannot be stopped by
-/// this engine, so the owning host's workspace occupancy (probed through
-/// `host`) must confirm; an inconclusive probe keeps the lease. Teardown
+/// turn rather than a confirmed stop. The owning host first stops the
+/// execution's owned processes (`cleanup_execution_processes`), then its
+/// workspace occupancy (probed through `host`) must confirm; an inconclusive
+/// probe keeps the lease. Teardown
 /// preservation runs on that host first and never holds the lease. `release`
 /// performs the cube call for the lease id it is handed. Returns what
 /// actually happened.

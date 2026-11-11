@@ -5,6 +5,7 @@ use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus};
 use std::sync::Mutex;
 
 mod preservation_retry;
+mod unowned;
 
 struct SweepCube;
 crate::stub_cube_client! { SweepCube {

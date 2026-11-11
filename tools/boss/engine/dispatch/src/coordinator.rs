@@ -829,6 +829,7 @@ mod config;
 mod dispatch_admission;
 mod execution;
 mod lease_limiter;
+mod predecessor_hold;
 mod preserved_work;
 mod progression_spawn;
 mod run;
