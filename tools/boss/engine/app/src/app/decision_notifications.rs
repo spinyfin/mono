@@ -6,6 +6,7 @@ use boss_protocol::OperatorDecisionNotification;
 pub(super) const TOPIC: &str = "work.decisions";
 
 fn snapshot(db: &WorkDb) -> anyhow::Result<Vec<OperatorDecisionNotification>> {
+    let remind_after_secs = db.progression_limit("remind_after_secs", 3 * 86400)?;
     let conn = db.connect()?;
     let mut stmt = conn.prepare(
         "SELECT q.id, json_extract(q.question_json, '$.text'), t.id, t.product_id,
@@ -18,6 +19,7 @@ fn snapshot(db: &WorkDb) -> anyhow::Result<Vec<OperatorDecisionNotification>> {
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(OperatorDecisionNotification {
+            remind_after_secs: Some(remind_after_secs),
             question_id: row.get(0)?,
             text: row.get(1)?,
             work_item_id: row.get(2)?,

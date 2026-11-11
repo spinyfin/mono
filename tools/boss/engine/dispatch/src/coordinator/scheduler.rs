@@ -1948,9 +1948,23 @@ impl ExecutionCoordinator {
             // either dispatched via preemption or deferred with
             // `interactive_concurrency_cap`), so a genuinely idle slot is
             // fair game.
-            let claimed = pool
-                .claim_worker(&execution.id, preferred_workspace_id.as_deref())
-                .await;
+            let calibrated_size = if self.execution_targets_progression_pool(&execution) {
+                self.work_db
+                    .get_metadata("progression.pool_size")
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(?error, "failed to read progression pool size");
+                        None
+                    })
+                    .and_then(|size| size.parse::<usize>().ok())
+            } else {
+                None
+            };
+            let claimed = if let Some(size) = calibrated_size {
+                pool.claim_progression_worker(&execution.id, size).await
+            } else {
+                pool.claim_worker(&execution.id, preferred_workspace_id.as_deref())
+                    .await
+            };
 
             // A mainline row that missed its slot gets ONE chance to
             // reclaim interactive capacity from a spilled automation run

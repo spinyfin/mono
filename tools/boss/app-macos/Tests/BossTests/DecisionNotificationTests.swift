@@ -10,6 +10,12 @@ final class DecisionNotificationTests: XCTestCase {
               productID: "another-product", label: "#42: Delivery recovery")
     }
 
+    func testCalibratedReminderAndLocalOverridePrecedence() {
+        XCTAssertEqual(DecisionReminderSchedule.interval(0, calibrated: 500000), 500000)
+        XCTAssertEqual(DecisionReminderSchedule.interval(100, calibrated: 500000), 100)
+        XCTAssertEqual(DecisionReminderSchedule.interval(0), 3 * 86400)
+    }
+
     func testCreationThenExactlyOneReminderEachIntervalWithoutCatchUpBurst() {
         var schedule = DecisionReminderSchedule()
         schedule.reconcile([question()])

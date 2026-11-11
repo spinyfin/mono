@@ -262,6 +262,7 @@ pub(super) fn build(
         |r| r.get(0),
     )?;
     let report = StuckReport::builder()
+        .maybe_progression_calibration(super::progression_calibration::read_report(conn)?)
         .generated_at_epoch_s(now)
         .minimum_age_secs(minimum_age_secs)
         .rows(rows)

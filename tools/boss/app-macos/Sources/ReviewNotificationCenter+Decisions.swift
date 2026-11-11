@@ -74,7 +74,8 @@ extension ReviewNotificationCenter {
         guard decisionFeedAvailable, isBundleContextSafe else { return }
         let now = Date()
         let interval = DecisionReminderSchedule.interval(
-            BossDefaults.store.double(forKey: DecisionReminderSchedule.intervalKey)
+            BossDefaults.store.double(forKey: DecisionReminderSchedule.intervalKey),
+            calibrated: decisionSchedule.questions.values.compactMap(\.remindAfterSecs).first
         )
         for question in decisionSchedule.due(at: now, interval: interval)
             where !pendingDecisionIDs.contains(question.questionID) {

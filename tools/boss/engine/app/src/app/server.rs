@@ -2652,7 +2652,17 @@ async fn serve_scoped(
     // Hourly check that stores at most one stuck report per UTC day and
     // refreshes the stuck-work gauges.
     let _stuck_metrics_handle =
-        boss_engine_runtime::stuck_metrics::spawn(server_state.metrics.clone(), server_state.work_db.clone());
+        boss_engine_runtime::stuck_metrics::spawn(server_state.metrics.clone(), server_state.work_db.clone(), {
+            let broker = server_state.topic_broker.clone();
+            let db = server_state.work_db.clone();
+            move || {
+                let broker = broker.clone();
+                let db = db.clone();
+                async move {
+                    broker.refresh_decisions(&db, false).await;
+                }
+            }
+        });
 
     // Once-a-minute work DB lock-contention summary (log line + metrics).
     let _db_lock_summary_handle = boss_work_db::lock_stats::spawn_summary_task(server_state.metrics.clone());

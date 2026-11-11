@@ -410,7 +410,23 @@ fn load_progression_settings(lookup: &impl Fn(&str) -> Option<OsString>) -> Resu
     if pool_size == 0 {
         bail!("BOSS_PROGRESSION_POOL_SIZE must be greater than zero");
     }
+    let mut overrides = 0;
+    for (index, key) in boss_engine_storage_values::progression::CALIBRATED_KEYS
+        .iter()
+        .enumerate()
+    {
+        if lookup(&format!("BOSS_PROGRESSION_{}", key.to_uppercase())).is_some() {
+            overrides |= 1 << index;
+        }
+    }
     Ok(ProgressionSettings::builder()
+        .explicit_overrides(overrides)
+        .remind_after_secs(positive("BOSS_PROGRESSION_REMIND_AFTER_SECS")?.unwrap_or(defaults.remind_after_secs))
+        .maybe_expected_questions_per_week(
+            lookup_u64(lookup, "BOSS_PROGRESSION_EXPECTED_QUESTIONS_PER_WEEK")?
+                .map(u32::try_from)
+                .transpose()?,
+        )
         .pool_size(pool_size)
         .sweep_interval_secs(positive("BOSS_PROGRESSION_SWEEP_INTERVAL_SECS")?.unwrap_or(defaults.sweep_interval_secs))
         .stuck_after_secs(secs("BOSS_PROGRESSION_STUCK_AFTER_SECS", defaults.stuck_after_secs)?)
@@ -1181,6 +1197,19 @@ mod tests {
         assert_eq!(settings.max_creates_per_item_window, 4);
         assert_eq!(settings.max_creates_window_secs, 55);
         assert_eq!(settings.run_timeout_secs, 66);
+    }
+
+    #[test]
+    fn progression_records_explicit_defaults_and_question_alarm_zero() {
+        let settings = progression_with(&[
+            ("BOSS_PROGRESSION_POOL_SIZE", "1"),
+            ("BOSS_PROGRESSION_REMIND_AFTER_SECS", "259200"),
+            ("BOSS_PROGRESSION_EXPECTED_QUESTIONS_PER_WEEK", "0"),
+        ])
+        .unwrap();
+        assert_eq!(settings.explicit_overrides, 1 | (1 << 6) | (1 << 7));
+        assert_eq!(settings.expected_questions_per_week, Some(0));
+        assert_eq!(settings.remind_after_secs, 259200);
     }
 
     #[test]

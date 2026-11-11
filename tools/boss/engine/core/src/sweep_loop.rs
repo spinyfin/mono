@@ -144,9 +144,23 @@ where
     Fut: Future<Output = O> + Send,
     F: FnMut() -> Fut + Send + 'static,
 {
+    spawn_adaptive_sweep_loop(move || {
+        let pass = pass_fn();
+        async move { (pass.await, interval) }
+    })
+}
+
+/// Same sweep contract, with the next interval supplied by each pass.
+#[track_caller]
+pub(crate) fn spawn_adaptive_sweep_loop<O, Fut, F>(mut pass_fn: F) -> tokio::task::JoinHandle<()>
+where
+    O: SweepOutcome + Send,
+    Fut: Future<Output = (O, Duration)> + Send,
+    F: FnMut() -> Fut + Send + 'static,
+{
     crate::work::db_diagnostics::spawn(async move {
         loop {
-            let outcome = pass_fn().await;
+            let (outcome, interval) = pass_fn().await;
             if outcome.has_activity() {
                 outcome.log();
             }

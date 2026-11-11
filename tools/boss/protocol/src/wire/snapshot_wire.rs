@@ -8,8 +8,11 @@
 use serde::{Deserialize, Serialize};
 
 /// An open operator decision, independent of the selected product or board filters.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct OperatorDecisionNotification {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remind_after_secs: Option<u64>,
     pub question_id: String,
     pub text: String,
     pub work_item_id: String,

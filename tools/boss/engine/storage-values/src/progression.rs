@@ -8,8 +8,8 @@
 //!
 //! Every value in [`ProgressionSettings`] defaults to the **placeholder** from
 //! the design's section 2.6 table. The placeholders exist so the feature can be
-//! exercised in a test instance; they are not yet tuned from measured traffic.
-//! None of them may be read as a measured number.
+//! exercised before enough history exists. Runtime calibration uses them as
+//! floors and fallbacks; explicit configuration takes precedence.
 //!
 //! The values the candidate view itself needs ([`ProgressionSettings::stuck_after_secs`],
 //! [`ProgressionSettings::cooldown_secs`], and the create-budget pair) are
@@ -56,7 +56,7 @@ pub const INFRASTRUCTURE_FAILURE_CAP: i64 = 2;
 /// The limits that bound progression (design section 2.6).
 ///
 /// Defaults are the table's placeholders. See the module documentation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, bon::Builder)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bon::Builder, serde::Serialize, serde::Deserialize)]
 pub struct ProgressionSettings {
     /// `progression.pool_size`: slots in the dedicated progression pool.
     /// Placeholder 1. When the pool is full, candidates wait in the sweep's
@@ -97,7 +97,26 @@ pub struct ProgressionSettings {
     /// question rate, never a cap. Unset until measured; nothing is dropped or
     /// delayed either way.
     pub expected_questions_per_week: Option<u32>,
+    /// Reminder interval, with the existing three-day notification floor.
+    #[builder(default = 3 * 86400)]
+    pub remind_after_secs: u64,
+    /// Presence bits in `CALIBRATED_KEYS` order; an explicitly configured
+    /// placeholder is still an override, not permission to calibrate it.
+    #[builder(default)]
+    pub explicit_overrides: u16,
 }
+
+/// Stable order used for configuration presence and calibration reports.
+pub const CALIBRATED_KEYS: [&str; 8] = [
+    "pool_size",
+    "sweep_interval_secs",
+    "stuck_after_secs",
+    "cooldown_secs",
+    "max_creates_per_item_window",
+    "run_timeout_secs",
+    "remind_after_secs",
+    "expected_questions_per_week",
+];
 
 /// Placeholder `progression.pool_size`.
 pub const DEFAULT_POOL_SIZE: usize = 1;
@@ -121,6 +140,19 @@ impl Default for ProgressionSettings {
 }
 
 impl ProgressionSettings {
+    pub fn calibration_values(&self) -> [Option<u64>; 8] {
+        [
+            Some(self.effective_pool_size() as u64),
+            Some(self.sweep_interval_secs),
+            Some(self.stuck_after_secs as u64),
+            Some(self.cooldown_secs as u64),
+            Some(u64::from(self.max_creates_per_item_window)),
+            Some(self.run_timeout_secs),
+            Some(self.remind_after_secs),
+            self.expected_questions_per_week.map(u64::from),
+        ]
+    }
+
     /// The pool size the engine actually builds: the configured value clamped to
     /// the slot-namespace ceiling.
     pub fn effective_pool_size(&self) -> usize {

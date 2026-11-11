@@ -75,7 +75,11 @@ pub fn register_metrics(registry: &Registry) {
     }
 }
 
-pub fn spawn(registry: Arc<Registry>, db: Arc<WorkDb>) -> tokio::task::JoinHandle<()> {
+pub fn spawn<F, Fut>(registry: Arc<Registry>, db: Arc<WorkDb>, refreshed: F) -> tokio::task::JoinHandle<()>
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
     boss_task_scope::spawn(async move {
         let mut tick = tokio::time::interval(TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -85,7 +89,10 @@ pub fn spawn(registry: Arc<Registry>, db: Arc<WorkDb>) -> tokio::task::JoinHandl
             let sampled =
                 tokio::task::spawn_blocking(move || sample(&db, boss_engine_utils::epoch_time::now_epoch_secs())).await;
             match sampled {
-                Ok(Ok(report)) => record(&registry, &report),
+                Ok(Ok(report)) => {
+                    record(&registry, &report);
+                    refreshed().await;
+                }
                 Ok(Err(error)) => tracing::warn!(?error, "daily stuck snapshot failed"),
                 Err(error) => tracing::warn!(?error, "daily stuck snapshot task failed"),
             }
@@ -94,7 +101,9 @@ pub fn spawn(registry: Arc<Registry>, db: Arc<WorkDb>) -> tokio::task::JoinHandl
 }
 
 fn sample(db: &WorkDb, now: i64) -> anyhow::Result<StuckReport> {
-    db.stuck_daily_snapshot(now, &|pid| crate::durable_liveness::probe_recorded_pid(pid).is_alive())
+    let report = db.stuck_daily_snapshot(now, &|pid| crate::durable_liveness::probe_recorded_pid(pid).is_alive())?;
+    db.calibrate_progression(now)?;
+    Ok(report)
 }
 
 pub(crate) fn record(registry: &Registry, report: &StuckReport) {

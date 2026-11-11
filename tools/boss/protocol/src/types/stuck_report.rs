@@ -73,6 +73,8 @@ pub struct StuckRow {
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct StuckReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progression_calibration: Option<ProgressionCalibration>,
     pub generated_at_epoch_s: i64,
     pub minimum_age_secs: i64,
     pub rows: Vec<StuckRow>,
@@ -82,4 +84,27 @@ pub struct StuckReport {
     #[builder(default)]
     pub questions_filed_by_stuck_kind: BTreeMap<String, u64>,
     pub unconverted_declared_blockers: u64,
+}
+
+/// One published value; absent values (the initial question alarm) remain unset.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgressionLimit {
+    pub value: Option<u64>,
+    pub source: String,
+    pub basis: String,
+}
+
+/// Persisted daily calibration, also available while progression is disabled.
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct ProgressionCalibration {
+    pub computed_at: i64,
+    pub window_start: i64,
+    pub snapshot_days: usize,
+    pub minimum_snapshot_days: usize,
+    pub inputs: BTreeMap<String, u64>,
+    pub limits: BTreeMap<String, ProgressionLimit>,
+    /// Ordered fingerprint changes between sampled runs, per item (including zero).
+    pub fingerprint_changes_per_item: BTreeMap<String, u64>,
+    pub fingerprint_risk: String,
 }

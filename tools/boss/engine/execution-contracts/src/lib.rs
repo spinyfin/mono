@@ -570,6 +570,8 @@ pub trait CubeClient: Send + Sync {
     }
 }
 
+mod progression_pool;
+
 #[derive(Debug, Clone)]
 pub struct WorkerPool {
     inner: Arc<Mutex<WorkerPoolInner>>,

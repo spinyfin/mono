@@ -2909,9 +2909,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let fake = Arc::new(FakeTmux::default());
         let supervisor = supervisor(root.path(), fake.clone()).await;
-        *fake.delivered_home.lock().unwrap() =
-            Some(boss_engine_driver::codex::codex_home_for_run("claude-run-test").unwrap());
         let mut command = spawn_command();
+        // Other spawn tests reclaim their homes concurrently. Keep this
+        // delivery-marker fixture in its own run home.
+        let run_id = root.path().file_name().unwrap().to_str().unwrap().replace('.', "_");
+        command.run.as_mut().unwrap().run_id = run_id.clone();
+        *fake.delivered_home.lock().unwrap() =
+            Some(boss_engine_driver::codex::codex_home_for_run(&format!("claude-{run_id}")).unwrap());
         if let Some(command::Body::Spawn(spawn)) = &mut command.body {
             spawn.settings_json = br#"{"hooks":{}}"#.to_vec();
             spawn.effort = Some("medium".into());
@@ -2951,7 +2955,7 @@ mod tests {
         assert!(envs.contains(&"KEEP_ME=yes".to_owned()), "{envs:?}");
         assert!(envs.iter().filter(|e| e.contains("forged")).count() == 0, "{envs:?}");
         assert!(!workspace.join(".boss-spoke-settings.json").exists());
-        let record = stored(&supervisor.store);
+        let record = decode(&supervisor.store.load(&run_id, "token").unwrap().unwrap()).unwrap();
         let settings = record.settings_file.expect("settings recorded");
         assert!(settings.starts_with(shared_homes()));
         use std::os::unix::fs::PermissionsExt;
@@ -2960,7 +2964,9 @@ mod tests {
             0o600
         );
         // Stop removes it with the home.
-        let stopped = supervisor.execute(&stop_command(), false, 1).await;
+        let mut stop = stop_command();
+        stop.run.as_mut().unwrap().run_id = run_id;
+        let stopped = supervisor.execute(&stop, false, 1).await;
         assert_eq!(stopped.code, ResultCode::Ok as i32, "{}", stopped.reason);
         assert!(!settings.exists());
     }

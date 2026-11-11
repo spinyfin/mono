@@ -84,12 +84,83 @@ pub fn render(report: &StuckReport) -> String {
             .join(", ")
     )
     .unwrap();
+    if let Some(calibration) = &report.progression_calibration {
+        writeln!(
+            out,
+            "Progression calibration: {} snapshots (minimum {}), window {}..{}, computed {}",
+            calibration.snapshot_days,
+            calibration.minimum_snapshot_days,
+            calibration.window_start,
+            calibration.computed_at / 86400 * 86400,
+            calibration.computed_at
+        )
+        .unwrap();
+        for (key, limit) in &calibration.limits {
+            writeln!(
+                out,
+                "  {key}={} [{}]: {}",
+                limit.value.map(|v| v.to_string()).unwrap_or("unset".into()),
+                limit.source,
+                limit.basis
+            )
+            .unwrap();
+        }
+        writeln!(out, "  Inputs: {:?}", calibration.inputs).unwrap();
+        writeln!(
+            out,
+            "  Fingerprint changes per item: {:?}",
+            calibration.fingerprint_changes_per_item
+        )
+        .unwrap();
+        writeln!(out, "  Fingerprint granularity: {}", calibration.fingerprint_risk).unwrap();
+        let questions = calibration
+            .inputs
+            .get("recent_week_progression_and_ladder_questions")
+            .copied()
+            .unwrap_or(0);
+        if calibration
+            .limits
+            .get("expected_questions_per_week")
+            .and_then(|v| v.value)
+            .is_some_and(|threshold| questions > threshold)
+        {
+            writeln!(
+                out,
+                "  QUESTION RATE ALARM: inspect progression and ladder questions; no questions are dropped."
+            )
+            .unwrap();
+        }
+    }
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renders_calibration_sources_fingerprint_risk_and_question_alarm() {
+        let report: StuckReport = serde_json::from_value(serde_json::json!({
+            "generated_at_epoch_s": 1000, "minimum_age_secs": 0, "rows": [],
+            "questions_filed": 0, "unconverted_declared_blockers": 0,
+            "progression_calibration": {
+                "computed_at": 1000, "window_start": 0, "snapshot_days": 7, "minimum_snapshot_days": 7,
+                "inputs": {"progression_questions": 8, "engine_ladder_questions": 1, "recent_week_progression_and_ladder_questions": 9},
+                "limits": {
+                    "pool_size": {"value": 3, "source": "computed", "basis": "formula"},
+                    "run_timeout_secs": {"value": 1800, "source": "fallback", "basis": "no samples"},
+                    "expected_questions_per_week": {"value": 1, "source": "overridden", "basis": "configuration"}
+                },
+                "fingerprint_changes_per_item": {"item": 2}, "fingerprint_risk": "inspect trivial changes"
+            }
+        })).unwrap();
+        let text = render(&report);
+        assert!(text.contains("pool_size=3 [computed]"));
+        assert!(text.contains("run_timeout_secs=1800 [fallback]"));
+        assert!(text.contains("expected_questions_per_week=1 [overridden]"));
+        assert!(text.contains("inspect trivial changes"));
+        assert!(text.contains("QUESTION RATE ALARM"));
+    }
 
     #[test]
     fn renders_the_reason_a_progression_run_left_the_item_alone() {

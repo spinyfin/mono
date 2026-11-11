@@ -40,7 +40,7 @@
 //!
 //! The `progression_agents` feature flag (default off) is re-checked on every
 //! pass, so turning it off stops minting within one interval without a restart.
-//! The limits the view reads are published once at spawn, whatever the flag says,
+//! The limits the view reads are calibrated at startup and daily, whatever the flag says,
 //! so the report and `diagnose` apply this engine's numbers either way.
 use std::sync::Arc;
 use std::time::Duration;
@@ -89,27 +89,44 @@ pub fn spawn_loop(
     kick_fn: Arc<dyn Fn() + Send + Sync>,
     feature_flags: Arc<crate::feature_flags::FeatureFlagsStore>,
 ) -> tokio::task::JoinHandle<()> {
-    if let Err(error) = work_db.publish_progression_limits(&settings) {
-        // The views fall back to the design's placeholders, which are the
-        // defaults; a failed publish only matters when they were overridden.
-        tracing::warn!(
-            ?error,
-            "progression: failed to publish limits; the candidate views use their defaults"
-        );
-    }
-    crate::sweep_loop::spawn_sweep_loop(Duration::from_secs(settings.sweep_interval_secs.max(1)), move || {
-        let work_db = Arc::clone(&work_db);
-        let kick_fn = Arc::clone(&kick_fn);
-        let feature_flags = Arc::clone(&feature_flags);
+    let initialized = work_db
+        .configure_progression_calibration(&settings, boss_engine_utils::epoch_time::now_epoch_secs())
+        .map_err(|error| tracing::error!(?error, "progression calibration initialization failed"))
+        .is_ok();
+    let initialized = Arc::new(std::sync::atomic::AtomicBool::new(initialized));
+    crate::sweep_loop::spawn_adaptive_sweep_loop(move || {
+        let work_db = work_db.clone();
+        let feature_flags = feature_flags.clone();
+        let kick_fn = kick_fn.clone();
+        let initialized = initialized.clone();
         async move {
-            if !feature_flags.is_enabled(PROGRESSION_AGENTS_FLAG) {
-                return ProgressionSweepOutcome::default();
+            use std::sync::atomic::Ordering;
+            if !initialized.load(Ordering::Relaxed) {
+                let db = work_db.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    db.configure_progression_calibration(&settings, boss_engine_utils::epoch_time::now_epoch_secs())
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => initialized.store(true, Ordering::Relaxed),
+                    error => tracing::error!(?error, "progression configuration retry failed; skipping nominations"),
+                }
             }
-            let outcome = run_one_pass(work_db).await;
+            let outcome = if initialized.load(Ordering::Relaxed) && feature_flags.is_enabled(PROGRESSION_AGENTS_FLAG) {
+                run_one_pass(work_db.clone()).await
+            } else {
+                ProgressionSweepOutcome::default()
+            };
             if outcome.minted > 0 {
                 kick_fn();
             }
-            outcome
+            let interval = work_db
+                .progression_limit("sweep_interval_secs", settings.sweep_interval_secs)
+                .unwrap_or_else(|error| {
+                    tracing::warn!(?error, "failed to read progression cadence");
+                    settings.sweep_interval_secs
+                });
+            (outcome, Duration::from_secs(interval.max(1)))
         }
     })
 }
