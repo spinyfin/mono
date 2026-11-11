@@ -457,7 +457,7 @@ impl ServerState {
     /// [`ProbeDeliveryState::Abandoned`] here instead, and this returns
     /// `false` so the caller can report the outcome accurately.
     pub(super) fn requeue_probe_front(&self, run_id: String, probe: PendingProbe) -> bool {
-        if self.worker_registry.slot_for_run(&run_id).is_none() {
+        if self.worker_registry.slot_for_run(&run_id).is_none() && !self.spoke_probe_owner_remains(&run_id) {
             tracing::warn!(
                 run_id,
                 probe_id = %probe.probe_id,

@@ -70,6 +70,7 @@ pub async fn run_one_pass(work_db: &WorkDb) -> ExecutionRetentionSweepOutcome {
     let _ = crate::codex_home_retention_sweep::run_one_pass(work_db, false).await;
 
     let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
+    prune_spoke_commands(work_db, now_epoch);
 
     // Storage does not probe processes; the sweep supplies the observation
     // that lets it reap staging files whose writer is proven gone.
@@ -94,6 +95,26 @@ pub async fn run_one_pass(work_db: &WorkDb) -> ExecutionRetentionSweepOutcome {
         Err(err) => {
             tracing::warn!(?err, "execution-retention sweep: prune failed; skipping this pass");
             ExecutionRetentionSweepOutcome::default()
+        }
+    }
+}
+
+fn prune_spoke_commands(work_db: &WorkDb, now_epoch: i64) {
+    let cutoff = now_epoch
+        .saturating_mul(1000)
+        .saturating_sub(boss_work_db::SETTLED_HOST_COMMAND_RETENTION_MS);
+    let hosts = match work_db.list_hosts() {
+        Ok(hosts) => hosts,
+        Err(error) => {
+            tracing::warn!(%error, "execution-retention sweep: cannot list spoke command owners");
+            return;
+        }
+    };
+    for host in hosts {
+        match work_db.prune_settled_host_commands(&host.id, cutoff, boss_work_db::MIN_RETAINED_SETTLED_HOST_COMMANDS) {
+            Ok(deleted) if deleted > 0 => tracing::info!(host = %host.id, deleted, "pruned settled spoke commands"),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(host = %host.id, %error, "spoke command retention failed"),
         }
     }
 }

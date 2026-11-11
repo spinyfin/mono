@@ -531,7 +531,9 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
         // see whether the probe it just minted is among the ones settled
         // `Abandoned` — deciding before answering, per the doc above, rather
         // than answering `ProbeQueued` for a probe already known dead.
-        let just_abandoned = if server_state.worker_registry.slot_for_run(&run_id).is_none() {
+        let just_abandoned = if server_state.worker_registry.slot_for_run(&run_id).is_none()
+            && !server_state.spoke_probe_owner_remains(&run_id)
+        {
             let ids = server_state.abandon_pending_probes_for_terminated_run(
                 &run_id,
                 "run's pane was released between the delivery-expectation check and the probe \
@@ -718,6 +720,14 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
 /// A `Spawning` worker is not refused either: it has a pane and will reach a
 /// boundary, so the probe legitimately waits.
 fn probe_delivery_expectation(server_state: &ServerState, run_id: &str) -> Result<ProbeDeliveryExpectation, String> {
+    if server_state
+        .work_db
+        .spoke_assignment_for_execution(run_id)
+        .map_err(|error| format!("cannot resolve worker ownership: {error}"))?
+        .is_some_and(|assignment| !assignment.resolved)
+    {
+        return Ok(ProbeDeliveryExpectation::Immediate);
+    }
     let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
         return Err(format!(
             "run {run_id} has no live worker pane (no slot mapping); there is nothing to inject into"

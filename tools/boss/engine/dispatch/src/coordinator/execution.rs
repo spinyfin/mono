@@ -1172,7 +1172,13 @@ impl ExecutionCoordinator {
                 return Err(err);
             }
         };
-        let adapter = match self.host_adapter_provider.adapter_for(&selected_host).await {
+        // Resolved per execution so a transport that records which host owns an
+        // execution does so before any command for it can be sent.
+        let adapter = match self
+            .host_adapter_provider
+            .adapter_for_execution(&selected_host, &execution.id)
+            .await
+        {
             Ok(adapter) => adapter,
             Err(err) => {
                 // Same silent-gap fix as the host-selection branch above:
@@ -1341,9 +1347,18 @@ impl ExecutionCoordinator {
             pr_number_for_workspace_goto(&self.work_db, execution, &work_item)
         };
 
-        let lease_result = self
-            .lease_workspace_with_fallback(execution, worker_id, &repo, &task, &adapter)
-            .await;
+        let lease_result = loop {
+            let result = self
+                .lease_workspace_with_fallback(execution, worker_id, &repo, &task, &adapter)
+                .await;
+            if result.is_err() && self.work_db.spoke_execution_in_doubt(&execution.id)? {
+                tracing::warn!(execution_id = %execution.id,
+                    "spoke lease unresolved; retaining ownership and reconciling the stored command");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+            break result;
+        };
         // The per-repo permit bounds concurrent lease calls, which contend on
         // cube's per-repo lock. Once the call has returned that contention is
         // over, so free the permit now rather than holding it through the
@@ -2350,7 +2365,7 @@ impl ExecutionCoordinator {
                             .with_details(details),
                     )
                     .await;
-                if reason == "timeout" {
+                if reason == "timeout" || self.work_db.spoke_execution_in_doubt(&execution.id)? {
                     // A timed-out lease must not immediately re-attempt
                     // inside this dispatch (the fallback is for a refused
                     // `--prefer`, not for a hang). Backoff lives on

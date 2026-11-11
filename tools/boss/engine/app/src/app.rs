@@ -131,6 +131,10 @@ mod selected_product;
 mod server;
 mod sessions;
 mod shutdown;
+mod spoke_installation;
+#[cfg(test)]
+mod spoke_probe_tests;
+mod spoke_probes;
 mod subscriptions;
 #[cfg(test)]
 mod tests;
@@ -603,6 +607,7 @@ struct ServerStateOverrides {
     /// Fake execution runner. `None` uses `PaneSpawnRunner`. Tests inject
     /// [`boss_engine_runtime::test_support::AlwaysSucceedsRunner`] to skip a real pane.
     execution_runner: Option<Arc<dyn ExecutionRunner>>,
+    host_adapter_provider: Option<Arc<dyn boss_execution_contracts::HostAdapterProvider>>,
     /// Shared worker pid map so a test can register its process as a
     /// worker shell before a subprocess `boss` call is attributed.
     worker_registry: Option<WorkerRegistry>,
@@ -1347,6 +1352,7 @@ impl ServerState {
             direct_merge_executor: direct_merge_executor_override,
             cube_client: cube_client_override,
             execution_runner: execution_runner_override,
+            host_adapter_provider: host_adapter_provider_override,
             worker_registry: worker_registry_override,
             branch_verifier: branch_verifier_override,
             workspace_diff_verifier: workspace_diff_verifier_override,
@@ -1793,6 +1799,8 @@ impl ServerState {
         let provider_events_socket = boss_engine_runtime::runner::bound_events_socket_path(&cfg);
         let provider_control_dir = boss_ssh_transport::default_control_socket_dir();
         let remote_pane_releaser = pane_releaser.clone();
+        let spoke_installation = spoke_installation::prepare(work_db.as_ref().clone(), &cfg.work.hub)?;
+        let hub_stream = spoke_installation.as_ref().map(|prepared| prepared.stream());
         let server_state = Arc::new_cyclic(move |weak_self: &Weak<ServerState>| {
             let mut execution_coordinator_inner = ExecutionCoordinator::with_host_adapter_and_publisher(
                 work_db.clone(),
@@ -1867,6 +1875,15 @@ impl ServerState {
                         ),
                     )),
                 ));
+            }
+            if let Some(installation) = spoke_installation {
+                execution_coordinator_inner.set_host_adapter_provider(installation.install(
+                    execution_coordinator_inner.host_adapter_provider(),
+                    live_worker_states.clone(),
+                ));
+            }
+            if let Some(provider) = host_adapter_provider_override {
+                execution_coordinator_inner.set_host_adapter_provider(provider);
             }
             execution_coordinator_inner.set_remote_pane_releaser(remote_pane_releaser);
             let execution_coordinator = Arc::new(execution_coordinator_inner);
@@ -2089,6 +2106,9 @@ impl ServerState {
         timeline.mark("coordinator_and_subsystems");
         timeline.finish();
 
+        if let Some(stream) = hub_stream {
+            server_state.set_hub_stream(Some(stream));
+        }
         Ok(server_state)
     }
 
@@ -2140,6 +2160,11 @@ impl ServerState {
         remote_proven_dead: bool,
         hold_unconfirmed_claim: bool,
     ) -> PaneReleaseOutcome {
+        // A spoke worker is stopped by its own host's supervisor; whether it is
+        // gone is then decided by the same proof every remote worker needs.
+        if !remote_proven_dead {
+            self.stop_spoke_worker(run_id).await;
+        }
         // Terminal status alone does not prove a remote worker has stopped.
         if self.execution_is_terminal(run_id)
             && self

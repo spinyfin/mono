@@ -97,15 +97,28 @@ impl ExecutionCoordinator {
         // so both outcomes below record against the same key.
         let streak_key = self.pre_start_streak_key(&execution, &worker_id);
 
-        let run_outcome = adapter
-            .spawn_worker(
-                &worker_id,
-                &execution,
-                &work_item,
-                lease.workspace_path.as_path(),
-                change.as_ref().map(|c| c.change_id.as_str()),
-            )
-            .await;
+        let run_outcome = loop {
+            let outcome = adapter
+                .spawn_worker(
+                    &worker_id,
+                    &execution,
+                    &work_item,
+                    lease.workspace_path.as_path(),
+                    change.as_ref().map(|c| c.change_id.as_str()),
+                )
+                .await;
+            if let Err(error) = &outcome
+                && error
+                    .chain()
+                    .any(|cause| cause.is::<boss_execution_contracts::SpawnOutcomeUncertain>())
+            {
+                tracing::warn!(execution_id = %execution.id, error = %format!("{error:#}"),
+                    "spoke spawn unresolved; retaining ownership and reconciling the stored command");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+            break outcome;
+        };
         drop(heartbeat);
 
         // Pane-spawn runs hand the slot to a live tmux worker; the

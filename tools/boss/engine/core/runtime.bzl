@@ -117,7 +117,7 @@ def runtime_libraries():
             # driver's test binaries are fetched from.
             "CODEX_CLI_VERSION": CODEX_CLI_VERSION,
         },
-        visibility = ["//tools/boss/engine/app:__pkg__"],
+        visibility = ["//tools/boss/engine/app:__pkg__", "//tools/boss/engine/spoke-adapter:__pkg__"],
         deps = [
             "//tools/boss/engine/execution-runner",
             "//tools/boss/engine/host-execution",

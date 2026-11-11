@@ -61,6 +61,11 @@ pub enum SendInputError {
     DriverLivenessUnavailable(String),
     #[error("tmux pane delivery failed: {0:#}")]
     Tmux(#[source] anyhow::Error),
+    /// The worker lives on a spoke host and the request did not reach it as
+    /// delivered. The text says whether anything was sent; an uncertain
+    /// request is never resent automatically.
+    #[error("spoke host control: {0}")]
+    Host(String),
 }
 
 /// Surfaced by [`ServerState::interrupt_worker_pane`]. Distinguishes
@@ -72,6 +77,8 @@ pub enum InterruptPaneError {
     UnknownRun,
     #[error("tmux pane delivery failed: {0:#}")]
     Tmux(#[source] anyhow::Error),
+    #[error("spoke host control: {0}")]
+    Host(String),
 }
 
 /// Outcome of [`ServerState::interrupt_plan_lookup`].
@@ -282,6 +289,19 @@ impl ServerState {
         run_id: &str,
         text: String,
     ) -> Result<(u8, Option<String>), SendInputError> {
+        // A worker supervised by a spoke is reached through its host's adapter;
+        // it has no local pane to write to and no slot to look up.
+        match self.spoke_worker_adapter(run_id).await {
+            Ok(Some(adapter)) => {
+                let outcome = adapter
+                    .deliver_worker_input(run_id, boss_execution_contracts::WorkerInputKind::Nudge, &text)
+                    .await
+                    .map_err(|err| SendInputError::Host(format!("{err:#}")))?;
+                return spoke_delivery(outcome).map(|()| (boss_protocol::REMOTE_SLOT_BASE, None));
+            }
+            Ok(None) => {}
+            Err(err) => return Err(SendInputError::Host(format!("{err:#}"))),
+        }
         let Some(slot_id) = self.worker_registry.slot_for_run(run_id) else {
             return Err(SendInputError::UnknownRun);
         };
@@ -392,6 +412,22 @@ impl ServerState {
     /// out to be gone, rather than adding a reap path to a call whose
     /// job is only to cancel a turn.
     pub async fn interrupt_worker_pane(&self, run_id: &str) -> Result<u8, InterruptPaneError> {
+        match self.spoke_worker_adapter(run_id).await {
+            Ok(Some(adapter)) => {
+                let outcome = adapter
+                    .interrupt_worker(run_id)
+                    .await
+                    .map_err(|err| InterruptPaneError::Host(format!("{err:#}")))?;
+                return spoke_delivery(outcome)
+                    .map(|()| boss_protocol::REMOTE_SLOT_BASE)
+                    .map_err(|err| match err {
+                        SendInputError::Host(reason) => InterruptPaneError::Host(reason),
+                        other => InterruptPaneError::Host(other.to_string()),
+                    });
+            }
+            Ok(None) => {}
+            Err(err) => return Err(InterruptPaneError::Host(format!("{err:#}"))),
+        }
         let plan = self.interrupt_plan_for_run(run_id);
         self.deliver_interrupt_gesture(run_id, plan.as_ref()).await
     }
@@ -1224,4 +1260,110 @@ pub(super) fn slot_from_tmux_session_name(session_name: &str) -> Option<u8> {
     let rest = session_name.strip_prefix("boss-")?;
     let (slot, _) = rest.split_once('-')?;
     slot.parse().ok()
+}
+
+/// How long a stopping spoke worker may take to exit before its session is killed.
+const SPOKE_STOP_GRACE: Duration = Duration::from_secs(10);
+
+impl ServerState {
+    /// The host adapter that supervises `run_id`'s worker, when that worker
+    /// belongs to a spoke assignment: `Ok(None)` for every other run, which
+    /// keeps its local path. An assignment whose adapter cannot be resolved is
+    /// an error rather than a silent fall back to a local pane that is not there.
+    pub(super) async fn spoke_worker_adapter(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Option<Arc<dyn boss_execution_contracts::HostAdapter>>> {
+        let Some(assignment) = self.work_db.spoke_assignment_for_execution(run_id)? else {
+            return Ok(None);
+        };
+        if assignment.resolved {
+            return Ok(None);
+        }
+        let provider = self.execution_coordinator.host_adapter_provider();
+        let adapter = boss_engine_completion::remote_host::resolve_host_adapter(
+            &self.work_db,
+            provider.as_ref(),
+            &assignment.host_id,
+        )
+        .await?;
+        Ok(Some(adapter))
+    }
+
+    /// Ask a spoke worker's host to stop its session. A no-op for any other run.
+    /// The answer is advisory: whether the worker is really gone is established
+    /// by the host's own observation (`probe_remote_worker_alive`), never by this.
+    pub(super) async fn stop_spoke_worker(&self, run_id: &str) {
+        let adapter = match self.spoke_worker_adapter(run_id).await {
+            Ok(Some(adapter)) => adapter,
+            Ok(None) => return,
+            Err(err) => {
+                tracing::warn!(run_id, error = %format!("{err:#}"), "cannot reach the host of a spoke worker to stop it");
+                return;
+            }
+        };
+        // The adapter persists a stable Stop command. Releasing a pane must not
+        // wait through the host grace period on every completion sweep; a lost
+        // reply remains uncertain and the next call reuses that command.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            adapter.stop_worker(run_id, SPOKE_STOP_GRACE),
+        )
+        .await
+        {
+            Ok(Ok(outcome)) => tracing::info!(run_id, ?outcome, "asked a spoke host to stop its worker"),
+            Ok(Err(err)) => tracing::warn!(run_id, error = %format!("{err:#}"), "stopping a spoke worker failed"),
+            Err(_) => tracing::info!(
+                run_id,
+                "spoke stop remains pending; release continues with remote proof checks"
+            ),
+        }
+    }
+}
+
+/// Collapse a spoke control outcome into the existing delivered/failed shape.
+/// Delivery means the host wrote the bytes; like an unconfirmed pane write it
+/// says nothing about consumption, and a refused or uncertain request is never
+/// retried here.
+fn spoke_delivery(outcome: boss_execution_contracts::ControlOutcome) -> Result<(), SendInputError> {
+    use boss_execution_contracts::ControlOutcome::*;
+    match outcome {
+        Delivered(_) => Ok(()),
+        Rejected { reason, .. } => Err(SendInputError::Host(format!("the host refused it: {reason}"))),
+        Uncertain(reason) => Err(SendInputError::Host(format!(
+            "the outcome is uncertain and it will not be resent automatically: {reason}"
+        ))),
+        NotSubmitted(reason) => Err(SendInputError::Host(format!("it was not sent: {reason}"))),
+    }
+}
+
+#[cfg(test)]
+mod spoke_control_tests {
+    use super::*;
+    use boss_execution_contracts::{ControlOutcome, WorkerLife, WorkerPane};
+
+    fn pane() -> WorkerPane {
+        WorkerPane {
+            life: WorkerLife::Alive,
+            session: "boss-token".into(),
+            pane_id: "%1".into(),
+            pid: Some(1),
+            exit_code: None,
+        }
+    }
+
+    #[test]
+    fn only_a_delivered_request_succeeds_and_the_rest_say_what_happened() {
+        assert!(spoke_delivery(ControlOutcome::Delivered(pane())).is_ok());
+        let text = |outcome| spoke_delivery(outcome).unwrap_err().to_string();
+        assert!(
+            text(ControlOutcome::Rejected {
+                reason: "worker is not running".into(),
+                pane: None
+            })
+            .contains("refused")
+        );
+        assert!(text(ControlOutcome::Uncertain("no result".into())).contains("will not be resent"));
+        assert!(text(ControlOutcome::NotSubmitted("host unavailable".into())).contains("not sent"));
+    }
 }

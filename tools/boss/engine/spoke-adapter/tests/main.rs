@@ -1,5 +1,6 @@
 //! The hub adapter against a real hub: mTLS gRPC stream manager, work database
 //! outbox, and a scripted spoke on the other end of the stream.
+mod coordinator;
 mod regressions;
 mod routing;
 mod support;
@@ -481,6 +482,7 @@ async fn recovery_operations_are_typed_workspace_commands() {
                         json!({"tip": {"change_id": "c", "commit_id": "d", "count": 2}, "inspect": null}),
                     ),
                     Kind::RestorePreserved => workspace(c, json!(null)),
+                    Kind::CheckPreservedUnpublished => workspace(c, json!(true)),
                     Kind::ForgetPreserved => workspace(c, json!(["preserved/exec_1"])),
                     _ => return standard(c),
                 };
@@ -516,6 +518,12 @@ async fn recovery_operations_are_typed_workspace_commands() {
 
     // Recovery that needs no working copy outlives the lease.
     adapter.release_workspace("lease-1").await.unwrap();
+    let tip = boss_engine_recovery::execution_bookmark::PreservedTip {
+        change_id: "k".repeat(32),
+        commit_id: commit.clone(),
+        count: 1,
+    };
+    assert!(adapter.preserved_work_unpublished(&record, &tip).await.unwrap());
     assert_eq!(
         adapter
             .forget_preserved_references(&record, PreservedScope::Tip)

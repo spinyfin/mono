@@ -3,8 +3,7 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 exports_files(["Cargo.toml"])
 
-# Hub-side adapter for workers that live on a spoke host. engine/core adds
-# itself to `visibility` when it installs the provider.
+# Hub-side adapter installed by the application's optional spoke listener.
 rust_library(
     name = "spoke-adapter",
     srcs = glob(["src/**/*.rs"]),
@@ -12,6 +11,7 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//tools/boss/engine/app:__pkg__"],
     deps = [
         "//tools/boss/engine/execution-contracts",
         "//tools/boss/engine/recovery",
@@ -35,6 +35,7 @@ rust_test(
     ),
     deps = [
         ":spoke-adapter",
+        "//tools/boss/engine/core:runtime",
         "//tools/boss/engine/execution-contracts",
         "//tools/boss/engine/host-enrollment",
         "//tools/boss/engine/recovery",
@@ -47,4 +48,28 @@ rust_test(
         normal = True,
         normal_dev = True,
     ),
+)
+
+rust_library(
+    name = "spoke_adapter_test_support",
+    testonly = True,
+    srcs = glob(["src/**/*.rs"]),
+    aliases = {
+        "//tools/boss/engine/work-db:work_db_test_support": "boss_work_db",
+        "//tools/boss/engine/execution-contracts:execution_contracts_test_support": "boss_execution_contracts",
+    },
+    crate_name = "boss_spoke_adapter",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//tools/boss/engine/app:__pkg__"],
+    deps = [
+        "//tools/boss/engine/execution-contracts:execution_contracts_test_support",
+        "//tools/boss/engine/recovery",
+        "//tools/boss/engine/spoke-stream",
+        "//tools/boss/engine/structured-output",
+        "//tools/boss/engine/work-db:work_db_test_support",
+        "//tools/boss/protocol",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(normal = True),
 )
