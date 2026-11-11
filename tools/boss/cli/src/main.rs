@@ -7,22 +7,85 @@ pub(crate) use anyhow::Result;
 pub(crate) use boss_client::{
     BossClient, Discovery, EngineStopOutcome, discover_running_engine, ensure_engine_running, stop_engine,
 };
-pub(crate) use boss_protocol::{
-    AddDependencyInput, AnswerAgentRun, Attention, AttentionGroup, Automation, AutomationDedupSuppression,
-    AutomationPatch, AutomationRun, AutomationTrigger, BackgroundWorkItem, BackgroundWorkKind, CREATED_VIA_CLI,
-    CiBudgetSnapshot, CiRemediation, CommentAnchor, ConflictHotspotReport, ConflictResolution, CostBucket,
-    CostMeasurement, CreateAttentionInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput,
-    CreateDecisionInput, CreateIdeaInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput,
-    CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateTaskInput, Decision, DependencyDirection,
-    DependencyEdge, DependencyFilter, EditorialAction, EditorialRules, EffortAuditReport, EffortLevel,
-    EngineAttemptListEntry, ExecutionKind, FollowupMemberOverride, FrontendEvent, FrontendRequest, GitHubAuthStateDto,
-    Idea, IdeaPatch, LinkExternalRefInput, ListDependenciesInput, OrgAuthState, PlannerOutput, PlannerRun,
-    PrWorkItemMatch, Product, Project, ProjectDesignDocState, ReasoningMode, RemoveDependencyInput,
-    ResolveProjectDesignDocOutput, ResolvedDesignDocKind, SetProductEditorialRulesInput,
-    SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskDocPointerInput, Task, TaskCostReport,
-    TaskRuntime, TopCostReport, UnpopulatePreservedTask, WindowCostReport, WorkAttentionItem, WorkComment,
-    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
-};
+pub(crate) use boss_protocol::AddDependencyInput;
+pub(crate) use boss_protocol::AnswerAgentRun;
+pub(crate) use boss_protocol::Attention;
+pub(crate) use boss_protocol::AttentionGroup;
+pub(crate) use boss_protocol::Automation;
+pub(crate) use boss_protocol::AutomationDedupSuppression;
+pub(crate) use boss_protocol::AutomationPatch;
+pub(crate) use boss_protocol::AutomationRun;
+pub(crate) use boss_protocol::AutomationTrigger;
+pub(crate) use boss_protocol::BackgroundWorkItem;
+pub(crate) use boss_protocol::BackgroundWorkKind;
+pub(crate) use boss_protocol::CREATED_VIA_CLI;
+pub(crate) use boss_protocol::CiBudgetSnapshot;
+pub(crate) use boss_protocol::CiRemediation;
+pub(crate) use boss_protocol::CommentAnchor;
+pub(crate) use boss_protocol::ConflictHotspotReport;
+pub(crate) use boss_protocol::ConflictResolution;
+pub(crate) use boss_protocol::CostBucket;
+pub(crate) use boss_protocol::CostMeasurement;
+pub(crate) use boss_protocol::CreateAttentionInput;
+pub(crate) use boss_protocol::CreateAutomationInput;
+pub(crate) use boss_protocol::CreateChoreInput;
+pub(crate) use boss_protocol::CreateCommentInput;
+pub(crate) use boss_protocol::CreateDecisionInput;
+pub(crate) use boss_protocol::CreateIdeaInput;
+pub(crate) use boss_protocol::CreateInvestigationInput;
+pub(crate) use boss_protocol::CreateManyChoresInput;
+pub(crate) use boss_protocol::CreateManyTasksInput;
+pub(crate) use boss_protocol::CreateProductInput;
+pub(crate) use boss_protocol::CreateProjectInput;
+pub(crate) use boss_protocol::CreateRevisionInput;
+pub(crate) use boss_protocol::CreateTaskInput;
+pub(crate) use boss_protocol::Decision;
+pub(crate) use boss_protocol::DependencyDirection;
+pub(crate) use boss_protocol::DependencyEdge;
+pub(crate) use boss_protocol::DependencyFilter;
+pub(crate) use boss_protocol::EditorialAction;
+pub(crate) use boss_protocol::EditorialRules;
+pub(crate) use boss_protocol::EffortAuditReport;
+pub(crate) use boss_protocol::EffortLevel;
+pub(crate) use boss_protocol::EngineAttemptListEntry;
+pub(crate) use boss_protocol::ExecutionKind;
+pub(crate) use boss_protocol::FollowupMemberOverride;
+pub(crate) use boss_protocol::FrontendEvent;
+pub(crate) use boss_protocol::FrontendRequest;
+pub(crate) use boss_protocol::GitHubAuthStateDto;
+pub(crate) use boss_protocol::Idea;
+pub(crate) use boss_protocol::IdeaPatch;
+pub(crate) use boss_protocol::LinkExternalRefInput;
+pub(crate) use boss_protocol::ListDependenciesInput;
+pub(crate) use boss_protocol::OrgAuthState;
+pub(crate) use boss_protocol::PlannerOutput;
+pub(crate) use boss_protocol::PlannerRun;
+pub(crate) use boss_protocol::PrWorkItemMatch;
+pub(crate) use boss_protocol::Product;
+pub(crate) use boss_protocol::Project;
+pub(crate) use boss_protocol::ProjectDesignDocState;
+pub(crate) use boss_protocol::ReasoningMode;
+pub(crate) use boss_protocol::RemoveDependencyInput;
+pub(crate) use boss_protocol::ResolveProjectDesignDocOutput;
+pub(crate) use boss_protocol::ResolvedDesignDocKind;
+pub(crate) use boss_protocol::SetProductEditorialRulesInput;
+pub(crate) use boss_protocol::SetProductExternalTrackerInput;
+pub(crate) use boss_protocol::SetProjectDesignDocInput;
+pub(crate) use boss_protocol::SetTaskDocPointerInput;
+pub(crate) use boss_protocol::Task;
+pub(crate) use boss_protocol::TaskCostReport;
+pub(crate) use boss_protocol::TaskRuntime;
+pub(crate) use boss_protocol::TopCostReport;
+pub(crate) use boss_protocol::UnpopulatePreservedTask;
+pub(crate) use boss_protocol::WindowCostReport;
+pub(crate) use boss_protocol::WorkAttentionItem;
+pub(crate) use boss_protocol::WorkComment;
+pub(crate) use boss_protocol::WorkExecution;
+pub(crate) use boss_protocol::WorkItem;
+pub(crate) use boss_protocol::WorkItemDependency;
+pub(crate) use boss_protocol::WorkItemDependencyDetail;
+pub(crate) use boss_protocol::WorkItemDependencyView;
+pub(crate) use boss_protocol::WorkItemPatch;
 pub(crate) use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 pub(crate) use comfy_table::{Cell, ContentArrangement, Table};
 pub(crate) use serde::Serialize;

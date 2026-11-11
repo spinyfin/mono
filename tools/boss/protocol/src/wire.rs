@@ -10,26 +10,9 @@ use crate::hosted_pane_status::HostedPaneStatus;
 use crate::live_worker_state::LiveWorkerState;
 use crate::metrics_wire::MetricLiveEntry;
 use crate::tmux_worker_status::TmuxWorkerStatus;
-use crate::types::{
-    AddDependencyInput, AnswerAgentRun, Attention, AttentionGroup, AttentionMerge, Automation,
-    AutomationDedupSuppression, AutomationPatch, AutomationRun, BackgroundWorkItem, BoardDropTarget, CiBudgetSnapshot,
-    CiRemediation, CommentAnchor, CommentThreadEntry, CommentWithThread, CommentsBannerState, ConflictHotspotReport,
-    ConflictResolution, CoordinatorGuidanceView, CoordinatorHandoffAuthorizationDelivery, CoordinatorHandoffView,
-    CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput,
-    CreateDecisionInput, CreateExecutionInput, CreateIdeaInput, CreateInvestigationInput, CreateManyChoresInput,
-    CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput,
-    Decision, DeferredScopeAttention, DependencyFilter, DesignDocContent, DesignDocTreeState, DispatchAdmission,
-    DispatchPauseScope, DriverQuotaSnapshot, DriverTrafficSplit, EditorialAction, EngineAttemptListEntry,
-    FollowupMemberOverride, GitHubAuthStateDto, GuideCommentDisposition, Idea, IdeaGraduationKind, IdeaPatch,
-    LinkExternalRefInput, ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch, ProbeDeliveryExpectation,
-    ProbeDeliveryState, ProbeInterruptOutcome, ProbeResumeEvidence, Product, Project, ProposalKind, ProposalState,
-    ProposalSubmissionError, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
-    ResolvedComment, ReviewGuideAttempt, ReviewGuideSummary, ReviewGuideVersion, ReviseDocInput, ReviseDocOutcome,
-    SelectedProductState, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput,
-    SetTaskDocPointerInput, Task, TaskRuntime, TranscriptSegment, WorkAttachment, WorkAttentionItem, WorkComment,
-    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
-    WorkRun, WorkerContextBundle, WorkerProposal, WorkerTierDenial,
-};
+
+mod type_imports;
+use type_imports::*;
 
 mod topics;
 pub use topics::*;

@@ -12,37 +12,9 @@ pub(super) fn all() -> Vec<Migration> {
             apply: |_| Ok(()),
         })
         .collect();
+    // Ordered by id. Insert new entries in that position; the runner also
+    // sorts by id, so source order is only for merge-conflict locality.
     migrations.extend([
-        Migration {
-            id: "20261110_2300_prompt_confirmation".into(),
-            legacy_version: None,
-            apply: |conn| {
-                if !table_has_column(conn, "work_runs", "prompt_confirmed")? {
-                    conn.execute_batch("ALTER TABLE work_runs ADD COLUMN prompt_confirmed INTEGER")?;
-                }
-                Ok(())
-            },
-        },
-        Migration {
-            id: "20261109_0451_explicit_launch_focus".into(),
-            legacy_version: None,
-            apply: dispatch_focus::migrate_explicit_launch,
-        },
-        Migration {
-            id: "20261104_1700_workspace_lease_boundary".into(),
-            legacy_version: None,
-            apply: preserved_work::migrate_lease_boundary,
-        },
-        Migration {
-            id: "20261105_1200_workspace_lease_generation".into(),
-            legacy_version: None,
-            apply: preserved_work::migrate_lease_generation,
-        },
-        Migration {
-            id: "20261029_1430_critical_requests".into(),
-            legacy_version: None,
-            apply: critical_requests::migrate,
-        },
         Migration {
             id: "00000000_0000_v033_postmortem_signals".into(),
             legacy_version: Some(33),
@@ -286,14 +258,14 @@ pub(super) fn all() -> Vec<Migration> {
             },
         },
         Migration {
-            id: "20261029_0420_sol_selection".into(),
-            legacy_version: None,
-            apply: driver_allocation::sol_selection::migrate,
-        },
-        Migration {
             id: task_status_audit::MIGRATION_ID.into(),
             legacy_version: None,
             apply: task_status_audit::migrate,
+        },
+        Migration {
+            id: "20261029_0420_sol_selection".into(),
+            legacy_version: None,
+            apply: driver_allocation::sol_selection::migrate,
         },
         Migration {
             id: "20261029_0735_work_executions_item_kind_status_finished_idx".into(),
@@ -304,14 +276,19 @@ pub(super) fn all() -> Vec<Migration> {
             },
         },
         Migration {
-            id: "20261029_1900_execution_waiting_human_history".into(),
+            id: "20261029_1430_critical_requests".into(),
             legacy_version: None,
-            apply: stuck_report::migrate_wait_history,
+            apply: critical_requests::migrate,
         },
         Migration {
             id: pr_flow::OPERATOR_QUESTION_STUCK_CLASSIFICATION_MIGRATION_ID.into(),
             legacy_version: None,
             apply: pr_flow::migrate_operator_question_stuck_classification,
+        },
+        Migration {
+            id: "20261029_1900_execution_waiting_human_history".into(),
+            legacy_version: None,
+            apply: stuck_report::migrate_wait_history,
         },
         Migration {
             id: "20261030_0900_sol_default_full_share".into(),
@@ -334,14 +311,14 @@ pub(super) fn all() -> Vec<Migration> {
             apply: preserved_work::migrate,
         },
         Migration {
-            id: execution_wait_history::MIGRATION_ID.into(),
-            legacy_version: None,
-            apply: execution_wait_history::migrate,
-        },
-        Migration {
             id: stuck_snapshot::MIGRATION_ID.into(),
             legacy_version: None,
             apply: stuck_snapshot::migrate,
+        },
+        Migration {
+            id: execution_wait_history::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: execution_wait_history::migrate,
         },
         Migration {
             id: conflict_mismatch::OPERATOR_FORCED_ADMISSION_MIGRATION_ID.into(),
@@ -352,6 +329,16 @@ pub(super) fn all() -> Vec<Migration> {
             id: parking::MIGRATION_ID.into(),
             legacy_version: None,
             apply: parking::migrate,
+        },
+        Migration {
+            id: "20261104_1700_workspace_lease_boundary".into(),
+            legacy_version: None,
+            apply: preserved_work::migrate_lease_boundary,
+        },
+        Migration {
+            id: "20261105_1200_workspace_lease_generation".into(),
+            legacy_version: None,
+            apply: preserved_work::migrate_lease_generation,
         },
         Migration {
             id: progression_candidates::GRACE_COLUMN_MIGRATION_ID.into(),
@@ -394,9 +381,19 @@ pub(super) fn all() -> Vec<Migration> {
             apply: parking_reconcile::migrate,
         },
         Migration {
+            id: spoke_hub::LEGACY_DESTINATION_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: spoke_hub::migrate_legacy_destinations,
+        },
+        Migration {
             id: "20261108_2100_parking_cancel_provenance".into(),
             legacy_version: None,
             apply: parking_reconcile::migrate_cancel_provenance,
+        },
+        Migration {
+            id: "20261109_0451_explicit_launch_focus".into(),
+            legacy_version: None,
+            apply: dispatch_focus::migrate_explicit_launch,
         },
         Migration {
             id: execution_bookmarks::RETIRE_PRUNE_STATE_MIGRATION_ID.into(),
@@ -412,11 +409,6 @@ pub(super) fn all() -> Vec<Migration> {
             id: "20261109_1930_preserved_archive_cleanup".into(),
             legacy_version: None,
             apply: preserved_cleanup::migrate_archive_cleanup,
-        },
-        Migration {
-            id: spoke_hub::LEGACY_DESTINATION_MIGRATION_ID.into(),
-            legacy_version: None,
-            apply: spoke_hub::migrate_legacy_destinations,
         },
         Migration {
             id: "20261110_0730_wait_input_invalidation".into(),
@@ -437,6 +429,16 @@ pub(super) fn all() -> Vec<Migration> {
             id: progression_ladder::MIGRATION_ID.into(),
             legacy_version: None,
             apply: progression_ladder::migrate,
+        },
+        Migration {
+            id: "20261110_2300_prompt_confirmation".into(),
+            legacy_version: None,
+            apply: |conn| {
+                if !table_has_column(conn, "work_runs", "prompt_confirmed")? {
+                    conn.execute_batch("ALTER TABLE work_runs ADD COLUMN prompt_confirmed INTEGER")?;
+                }
+                Ok(())
+            },
         },
     ]);
     migrations

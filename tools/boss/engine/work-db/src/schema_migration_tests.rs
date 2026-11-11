@@ -223,3 +223,14 @@ fn historical_ids_preserve_integer_order() {
     let versions: Vec<_> = known.iter().filter_map(|m| m.legacy_version).collect();
     assert_eq!(versions, (1..=60).collect::<Vec<_>>());
 }
+
+#[test]
+fn registry_entries_are_sorted_by_id() {
+    let ids: Vec<_> = registry::all().into_iter().map(|m| m.id).collect();
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(
+        ids, sorted,
+        "schema_migration_registry entries must be in id order so concurrent additions insert at different lines. Insert the new entry by id, not at the top of the list."
+    );
+}
