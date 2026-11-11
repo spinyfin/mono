@@ -390,6 +390,12 @@ pub(super) fn classification(conn: &Connection, task: &Task, wait: Option<&str>)
             other => format!("S1_dispatch_failure:{other}"),
         });
     }
+    // Same predicate as `positioning_hold_active`: a review-phase hold keeps
+    // `merge_conflict` / `ci_failure` / `in_review` on the row, so the open
+    // attention item is what names it here. Do not wait for `blocked_reason`.
+    if super::dispatch_helpers::positioning_hold_active(conn, &task.id)? {
+        return Ok(format!("S9_execution_recovery:{WORKSPACE_POSITIONING_REFUSED}"));
+    }
     if let Some(reason) = task.blocked_reason.as_deref() {
         let kind = match reason {
             "worker_failed" | "spawning_attempt_retired_unsuccessfully"

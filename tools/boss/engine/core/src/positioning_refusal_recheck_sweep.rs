@@ -125,29 +125,31 @@ pub async fn run_one_pass(
                 continue;
             }
         }
-        let result = if hold.restarts {
-            // The hold blocked the task row: the explicit-start path lowers it and
-            // mints the replacement execution in one transaction.
-            work_db
-                .request_execution_with_live_check(
-                    RequestExecutionInput::builder()
-                        .work_item_id(hold.work_item_id.clone())
-                        .explicit_start(true)
-                        .build(),
-                    |id| claimed.contains(id),
-                )
-                .map(|_| ())
-        } else {
-            // Review-phase rows kept their own status; lowering the hold lets
-            // their normal flow create its own execution again.
-            work_db.clear_positioning_hold(&hold.work_item_id).map(|_| ())
-        };
-        match result {
-            Ok(()) => {
+        match work_db.clear_positioning_hold(&hold.work_item_id) {
+            Ok(true) => {
                 outcome.cleared += 1;
-                outcome.restarted += usize::from(hold.restarts);
+                if hold.restarts {
+                    // Ordinary request, not an explicit start: automatic recovery
+                    // must not clear `deferred` or reopen a retired spawning attempt.
+                    match work_db.request_execution_with_live_check(
+                        RequestExecutionInput::builder()
+                            .work_item_id(hold.work_item_id.clone())
+                            .build(),
+                        |id| claimed.contains(id),
+                    ) {
+                        Ok(_) => outcome.restarted += 1,
+                        Err(err) => {
+                            tracing::warn!(
+                                work_item_id = %hold.work_item_id,
+                                ?err,
+                                "positioning-refusal recheck sweep: hold lowered but did not mint a replacement"
+                            );
+                        }
+                    }
+                }
                 tracing::info!(work_item_id = %hold.work_item_id, "positioning-refusal recheck sweep: refusal cleared; hold lowered");
             }
+            Ok(false) => {}
             Err(err) => {
                 tracing::warn!(work_item_id = %hold.work_item_id, ?err, "positioning-refusal recheck sweep: failed to lower hold; keeping it");
             }

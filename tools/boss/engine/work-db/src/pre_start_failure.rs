@@ -104,20 +104,31 @@ impl WorkDb {
     /// need the hold lowered.
     pub fn list_positioning_holds(&self) -> Result<Vec<PositioningHold>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare(
-            "SELECT t.id,
-                    (t.status = 'blocked' AND t.blocked_reason = ?1),
-                    (SELECT x.pr_url FROM work_executions x
-                      WHERE x.work_item_id = t.id AND x.pr_url IS NOT NULL AND x.pr_url <> ''
-                      ORDER BY x.created_at DESC, x.id DESC LIMIT 1)
-             FROM tasks t
-             WHERE t.deleted_at IS NULL AND t.status NOT IN ('done', 'archived')
-               AND (t.blocked_reason = ?1
-                    OR EXISTS (SELECT 1 FROM work_attention_items a
-                               WHERE a.work_item_id = t.id AND a.kind = ?1 AND a.status = 'open'))
+        let refused = WORKSPACE_POSITIONING_REFUSED;
+        let sql = format!(
+            "{walk}
+             SELECT t.id,
+                    (t.status = 'blocked' AND t.blocked_reason = '{refused}'),
+                    COALESCE(
+                        NULLIF(t.pr_url, ''),
+                        (SELECT x.pr_url FROM work_executions x
+                          WHERE x.work_item_id = t.id AND x.pr_url IS NOT NULL AND x.pr_url <> ''
+                          ORDER BY x.created_at DESC, x.id DESC LIMIT 1),
+                        NULLIF(root.pr_url, '')
+                    )
+             FROM roots r
+             JOIN tasks t ON t.id = r.task_id
+             JOIN tasks root ON root.id = r.cycle_root_id
              ORDER BY t.id",
-        )?;
-        let rows = stmt.query_map(params![WORKSPACE_POSITIONING_REFUSED], |row| {
+            walk = cycle_root_walk_cte(&format!(
+                "t.deleted_at IS NULL AND t.status NOT IN ('done', 'archived')
+                 AND (t.blocked_reason = '{refused}'
+                      OR EXISTS (SELECT 1 FROM work_attention_items a
+                                 WHERE a.work_item_id = t.id AND a.kind = '{refused}' AND a.status = 'open'))"
+            )),
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
             Ok(PositioningHold {
                 work_item_id: row.get(0)?,
                 restarts: row.get(1)?,
@@ -225,14 +236,33 @@ impl WorkDb {
                 ),
                 params![execution.work_item_id, format!("Workspace blocked: {message}"), now],
             )?;
+            let probe_pr = resolved_positioning_pr_url(&tx, &execution)?;
+            if execution
+                .pr_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .is_none()
+                && let Some(url) = probe_pr.as_deref()
+            {
+                tx.execute(
+                    "UPDATE work_executions SET pr_url = ?2 WHERE id = ?1 AND (pr_url IS NULL OR pr_url = '')",
+                    params![execution_id, url],
+                )?;
+            }
             if execution.work_item_id.starts_with("task_") {
+                let restart = if probe_pr.is_some() {
+                    "The item restarts on its own once the reported state is resolved, or launch it manually."
+                } else {
+                    "No pull request is bound, so this hold cannot clear automatically; launch the item manually once the reported state is resolved."
+                };
                 crate::workitems::upsert_refreshing_work_item_attention_in_tx(
                     &tx,
                     &execution.work_item_id,
                     WORKSPACE_POSITIONING_REFUSED,
                     "Workspace blocked: positioning refused",
                     &format!(
-                        "Execution `{execution_id}` could not position its workspace.\n\n{message}\n\nThe item restarts on its own once the reported state is resolved, or launch it manually. No repository content was discarded."
+                        "Workspace blocked: {message}\n\nExecution `{execution_id}` could not position its workspace.\n\n{restart} No repository content was discarded."
                     ),
                 )?;
             }
@@ -274,4 +304,22 @@ impl WorkDb {
         }
         Ok((execution, run, outcome))
     }
+}
+
+/// PR the refused goto targeted, matching dispatch's workspace-goto lookup:
+/// the execution's own URL, then the task row, then the revision chain root.
+fn resolved_positioning_pr_url(conn: &Connection, execution: &WorkExecution) -> Result<Option<String>> {
+    let nonempty = |url: Option<String>| url.filter(|value| !value.trim().is_empty());
+    if let Some(url) = nonempty(execution.pr_url.clone()) {
+        return Ok(Some(url));
+    }
+    let Some(task) = query_task(conn, &execution.work_item_id)? else {
+        return Ok(None);
+    };
+    if let Some(url) = nonempty(task.pr_url) {
+        return Ok(Some(url));
+    }
+    Ok(nonempty(
+        get_chain_root_task(conn, &execution.work_item_id)?.and_then(|root| root.pr_url),
+    ))
 }

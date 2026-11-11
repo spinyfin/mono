@@ -314,6 +314,52 @@ fn question() -> boss_protocol::OperatorQuestion {
 }
 
 #[test]
+fn attention_only_positioning_hold_is_not_a_progression_candidate() {
+    let f = fixture();
+    for (label, assignments) in [
+        (
+            "in_review with failing CI",
+            "status = 'in_review', ci_required_state = 'fail'",
+        ),
+        (
+            "blocked merge conflict",
+            "status = 'blocked', blocked_reason = 'merge_conflict'",
+        ),
+    ] {
+        let id = f.chore(label);
+        f.stick(&id, assignments, 3);
+        f.assert_candidate(&id, true);
+        f.db.upsert_work_item_attention(
+            &id,
+            "workspace_positioning_refused",
+            "Workspace blocked: positioning refused",
+            "Workspace blocked: PR is MERGED\n\nheld",
+        )
+        .unwrap();
+        f.assert_candidate(&id, false);
+        assert!(
+            f.clauses(&id).stuck_kind.is_none(),
+            "{label}: held review-phase items are not a progression stuck kind"
+        );
+        assert!(
+            f.db.mint_progression_execution(&id).unwrap().is_none(),
+            "{label}: mint of a held item"
+        );
+        let mint = f.db.mint_progression_executions().unwrap();
+        assert!(
+            mint.minted.iter().all(|(candidate, _)| candidate.work_item_id != id),
+            "{label}: bulk mint of a held item"
+        );
+        assert!(f.db.clear_positioning_hold(&id).unwrap());
+        f.assert_candidate(&id, true);
+        assert!(
+            f.db.mint_progression_execution(&id).unwrap().is_some(),
+            "{label}: mint after the hold clears"
+        );
+    }
+}
+
+#[test]
 fn clause_1_worker_failed_is_admitted_on_both_primary_and_revision_items() {
     let f = fixture();
     let primary = f.chore("Primary");

@@ -320,6 +320,7 @@ async fn review_phase_refusal_keeps_in_review_and_rejects_automatic_starts() {
 
     assert_eq!(task(&db, &item).status, TaskStatus::InReview);
     assert!(task(&db, &item).blocked_reason.is_none());
+    assert_review_phase_hold_surfaces(&db, &item, "PR 5 is MERGED");
     assert!(
         db.list_chores_pending_merge_check()
             .unwrap()
@@ -337,5 +338,194 @@ async fn review_phase_refusal_keeps_in_review_and_rejects_automatic_starts() {
     let outcome = crate::positioning_refusal_recheck_sweep::run_one_pass(&db, &coordinator, &fixed_probe(true)).await;
     assert_eq!((outcome.cleared, outcome.restarted), (1, 0));
     assert_eq!(task(&db, &item).status, TaskStatus::InReview);
+    assert!(task(&db, &item).blocked_reason.is_none());
     assert!(db.list_positioning_holds().unwrap().is_empty());
+    assert_review_phase_hold_cleared(&db, &item);
+}
+
+#[tokio::test]
+async fn review_hold_probe_uses_the_task_pr_when_the_execution_has_none() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let (product_id, _) = make_pr_review_fixture(&db, None);
+    let item = create_test_chore_manual(&db, product_id, "Reviewed without execution PR").id;
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'in_review', pr_url = 'https://github.com/spinyfin/mono/pull/5' WHERE id = ?1",
+            rusqlite::params![item],
+        )
+        .unwrap();
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(item.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Claimed)
+                .build(),
+        )
+        .unwrap();
+    assert!(execution.pr_url.is_none());
+    db.record_workspace_positioning_refusal(
+        &execution.id,
+        "worker",
+        None,
+        "Cube command failed: refused",
+        "PR 5 is MERGED",
+    )
+    .unwrap();
+
+    let holds = db.list_positioning_holds().unwrap();
+    assert_eq!(holds.len(), 1);
+    assert_eq!(
+        holds[0].pr_url.as_deref(),
+        Some("https://github.com/spinyfin/mono/pull/5")
+    );
+    assert_review_phase_hold_surfaces(&db, &item, "PR 5 is MERGED");
+
+    let coordinator = recheck_coordinator(&db);
+    let outcome = crate::positioning_refusal_recheck_sweep::run_one_pass(&db, &coordinator, &fixed_probe(true)).await;
+    assert_eq!((outcome.cleared, outcome.restarted), (1, 0));
+    assert_eq!(task(&db, &item).status, TaskStatus::InReview);
+    assert!(db.list_positioning_holds().unwrap().is_empty());
+    assert_review_phase_hold_cleared(&db, &item);
+}
+
+#[tokio::test]
+async fn recheck_sweep_does_not_reopen_a_retired_spawning_attempt() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let (product_id, root) = make_pr_review_fixture(&db, Some("https://github.com/spinyfin/mono/pull/99"));
+    let item = create_test_chore_manual(&db, product_id.clone(), "Fix CI").id;
+    let now = boss_engine_utils::epoch_time::now_epoch_secs().to_string();
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO conflict_resolutions
+                 (id, product_id, work_item_id, pr_url, pr_number, head_branch, base_branch, status, created_at)
+             VALUES ('crz_retired', ?1, ?2, 'https://github.com/spinyfin/mono/pull/99', 99, 'feat', 'main', 'failed', ?3)",
+            rusqlite::params![product_id, root, now],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET kind = 'revision', parent_task_id = ?2, created_via = 'merge-conflict:crz_retired' WHERE id = ?1",
+            rusqlite::params![item, root],
+        )
+        .unwrap();
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(item.clone())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Claimed)
+                .pr_url("https://github.com/spinyfin/mono/pull/99")
+                .build(),
+        )
+        .unwrap();
+    db.record_workspace_positioning_refusal(
+        &execution.id,
+        "worker",
+        None,
+        "Cube command failed: refused",
+        "PR 99 is MERGED",
+    )
+    .unwrap();
+
+    let coordinator = recheck_coordinator(&db);
+    let outcome = crate::positioning_refusal_recheck_sweep::run_one_pass(&db, &coordinator, &fixed_probe(true)).await;
+    assert_eq!(outcome.cleared, 1);
+    let attempt_status: String = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status FROM conflict_resolutions WHERE id = 'crz_retired'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempt_status, "failed");
+}
+
+#[test]
+fn refusal_without_a_pr_tells_the_operator_to_launch_manually() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (product_id, _) = make_pr_review_fixture(&db, None);
+    let item = create_test_chore_manual(&db, product_id, "No PR").id;
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(item.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Claimed)
+                .build(),
+        )
+        .unwrap();
+    db.record_workspace_positioning_refusal(
+        &execution.id,
+        "worker",
+        None,
+        "Cube command failed: refused",
+        "unpublished content",
+    )
+    .unwrap();
+    let holds = db.list_positioning_holds().unwrap();
+    assert_eq!(holds.len(), 1);
+    assert!(holds[0].pr_url.is_none());
+    let attention = db.list_attention_items_for_work_item(&item).unwrap();
+    assert!(
+        attention[0]
+            .body_markdown
+            .contains("No pull request is bound, so this hold cannot clear automatically"),
+        "{}",
+        attention[0].body_markdown
+    );
+    assert!(
+        attention[0]
+            .body_markdown
+            .contains("launch the item manually once the reported state is resolved"),
+        "{}",
+        attention[0].body_markdown
+    );
+}
+
+fn assert_review_phase_hold_surfaces(db: &WorkDb, item: &str, message: &str) {
+    let runtime = db.get_task_runtime(item).unwrap();
+    assert_eq!(
+        runtime.dispatch_wait_reason.as_deref(),
+        Some("workspace_positioning_refused")
+    );
+    let label = runtime.dispatch_wait_label.as_deref().unwrap();
+    assert!(label.starts_with("Workspace blocked:"), "{label}");
+    assert!(label.contains(message), "{label}");
+    let report = db.stuck_report(0, i64::MAX / 2, &|_| false).unwrap();
+    let row = report.rows.iter().find(|row| row.work_item_id == item).unwrap();
+    assert!(
+        row.classification.contains("workspace_positioning_refused"),
+        "{}",
+        row.classification
+    );
+    assert_eq!(row.wait_reason.as_deref(), Some("workspace_positioning_refused"));
+    assert!(row.wait_label.as_deref().unwrap().contains(message));
+}
+
+fn assert_review_phase_hold_cleared(db: &WorkDb, item: &str) {
+    let runtime = db.get_task_runtime(item).unwrap();
+    assert_ne!(
+        runtime.dispatch_wait_reason.as_deref(),
+        Some("workspace_positioning_refused")
+    );
+    let report = db.stuck_report(0, i64::MAX / 2, &|_| false).unwrap();
+    if let Some(row) = report.rows.iter().find(|row| row.work_item_id == item) {
+        assert!(
+            !row.classification.contains("workspace_positioning_refused"),
+            "{}",
+            row.classification
+        );
+        assert_ne!(row.wait_reason.as_deref(), Some("workspace_positioning_refused"));
+    }
 }
