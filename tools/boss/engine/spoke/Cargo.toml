@@ -4,7 +4,17 @@ version.workspace = true
 edition.workspace = true
 workspace = "../../../.."
 
+[lib]
+name = "boss_spoke_ingress"
+path = "src/lib.rs"
+
 [dependencies]
+base64 = { workspace = true }
+boss-engine-driver = { path = "../driver" }
+boss-transcript-tail = { path = "../transcript-tail" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 boss-host-execution = { path = "../host-execution" }
 anyhow = { workspace = true }
 boss-protocol-spoke = { path = "../../protocol-spoke" }

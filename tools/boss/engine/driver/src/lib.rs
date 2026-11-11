@@ -20,6 +20,7 @@ use boss_protocol::{
     WorkerEvent,
 };
 
+pub mod discovery;
 pub mod git_store_guard;
 pub mod initial_prompt;
 pub mod transcript_store;

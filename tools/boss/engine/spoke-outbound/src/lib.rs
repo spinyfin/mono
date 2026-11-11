@@ -429,6 +429,8 @@ const EXECUTOR_FEATURES: &[&str] = &[
     feature::WORKSPACE_RESET_RELEASE,
     feature::SPAWN_LAUNCH_INPUTS,
     feature::SPAWN_WORKER_POSTURE,
+    feature::WORKER_EVENT,
+    feature::TRANSCRIPT_DELTA,
 ];
 
 /// Journal contracts plus the executor-backed workspace/execution set.
@@ -509,7 +511,9 @@ pub async fn run_with_executor(
 }
 
 pub(crate) fn locked(journal: &SharedJournal) -> Result<std::sync::MutexGuard<'_, Journal>> {
-    journal.lock().map_err(|_| anyhow::anyhow!("journal owner panicked"))
+    journal
+        .lock()
+        .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))
 }
 
 pub(crate) fn network(error: impl std::fmt::Display) -> anyhow::Error {
@@ -551,6 +555,15 @@ mod tests {
         );
         assert!(offered.required.iter().any(|name| name == feature::WORKSPACE));
         assert!(offered.required.iter().any(|name| name == feature::EXECUTION));
+        for name in [feature::WORKER_EVENT, feature::TRANSCRIPT_DELTA] {
+            assert!(
+                offered
+                    .features
+                    .iter()
+                    .any(|item| item.name == name && item.revision == 1)
+            );
+            assert!(offered.required.iter().any(|required| required == name));
+        }
         assert!(
             !offered
                 .required

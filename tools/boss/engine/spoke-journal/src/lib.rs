@@ -2,6 +2,7 @@
 mod commands;
 mod executions;
 mod records;
+mod sources;
 mod schema {
     use anyhow::{Result, ensure};
     use rusqlite::Connection;
@@ -9,7 +10,7 @@ mod schema {
     pub fn migrate(db: &mut Connection) -> Result<()> {
         let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
         ensure!(
-            version <= 4,
+            version <= 6,
             "journal schema is newer than this reader; rollback refused"
         );
         if version == 0 {
@@ -75,6 +76,33 @@ mod schema {
             )?;
             tx.commit()?;
         }
+        if version < 5 {
+            db.execute_batch(
+                "BEGIN;
+                 CREATE TABLE sources (
+                    run_id TEXT NOT NULL, spawn_token TEXT NOT NULL, source TEXT NOT NULL,
+                    checkpoint BLOB NOT NULL, PRIMARY KEY(run_id,spawn_token,source)
+                 );
+                 CREATE TRIGGER source_added AFTER INSERT ON sources BEGIN
+                    UPDATE identity SET queued_bytes=queued_bytes+length(new.checkpoint)+length(new.source)+128;
+                 END;
+                 CREATE TRIGGER source_updated AFTER UPDATE ON sources BEGIN
+                    UPDATE identity SET queued_bytes=queued_bytes+length(new.checkpoint)-length(old.checkpoint);
+                 END;
+                 PRAGMA user_version=5;
+                 COMMIT;",
+            )?;
+        }
+        if version < 6 {
+            db.execute_batch(
+                "BEGIN;
+                 CREATE TRIGGER source_removed AFTER DELETE ON sources BEGIN
+                    UPDATE identity SET queued_bytes=queued_bytes-length(old.checkpoint)-length(old.source)-128;
+                 END;
+                 PRAGMA user_version=6;
+                 COMMIT;",
+            )?;
+        }
         Ok(())
     }
 }
@@ -90,6 +118,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 pub use records::{Admission, StoredRecord};
+pub use sources::LATEST_HOOK_SOURCE;
 
 /// Logical payload bounds, including retained records and command tombstones.
 /// SQLite's page ceiling separately bounds physical database growth.
@@ -122,6 +151,10 @@ pub enum Fault {
     Full,
     #[error("negotiated transport limits cannot carry retained command identities or records")]
     TransportLimit,
+    #[error("producer checkpoint changed")]
+    CheckpointConflict,
+    #[error("journal owner panicked")]
+    LockPoisoned,
 }
 
 impl Fault {
@@ -129,6 +162,34 @@ impl Fault {
     /// integrity failure.
     pub fn is_full(error: &anyhow::Error) -> bool {
         matches!(error.downcast_ref::<Fault>(), Some(Fault::Full))
+    }
+
+    /// Spool pressure, SQLite lock/IO, and OS I/O must retain the producer file.
+    pub fn is_retryable(error: &anyhow::Error) -> bool {
+        if Self::is_full(error) {
+            return true;
+        }
+        if matches!(
+            error.downcast_ref::<Fault>(),
+            Some(Fault::CheckpointConflict | Fault::LockPoisoned)
+        ) {
+            return true;
+        }
+        error.chain().any(|cause| {
+            if let Some(sql) = cause.downcast_ref::<rusqlite::Error>() {
+                return matches!(
+                    sql.sqlite_error_code(),
+                    Some(
+                        rusqlite::ErrorCode::DatabaseBusy
+                            | rusqlite::ErrorCode::DatabaseLocked
+                            | rusqlite::ErrorCode::SystemIoFailure
+                            | rusqlite::ErrorCode::OperationInterrupted
+                            | rusqlite::ErrorCode::DiskFull
+                    )
+                );
+            }
+            cause.downcast_ref::<std::io::Error>().is_some()
+        })
     }
 }
 

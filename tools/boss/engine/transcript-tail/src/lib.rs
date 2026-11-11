@@ -29,6 +29,104 @@ use thiserror::Error;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
+pub mod raw {
+    //! Bounded byte framing with a serializable, transaction-owned resume point.
+    use super::*;
+
+    #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, bon::Builder)]
+    #[builder(on(String, into))]
+    pub struct Cursor {
+        pub offset: u64,
+        pub generation: u64,
+        #[builder(skip)]
+        identity: Option<FileIdentity>,
+        #[builder(skip)]
+        checkpoint: Option<FileCheckpoint>,
+        #[builder(skip)]
+        observed_size: u64,
+        #[builder(skip)]
+        root_identity: Option<FileIdentity>,
+    }
+
+    #[derive(bon::Builder)]
+    #[builder(on(String, into))]
+    pub struct Chunk {
+        pub cursor: Cursor,
+        pub offset: u64,
+        pub data: Vec<u8>,
+        pub eof: bool,
+        /// Replacement can destroy an unread suffix. The caller must record the
+        /// gap, including the case where its final size was never observed.
+        pub replaced: bool,
+        pub previous_size: u64,
+        pub observed_size: u64,
+    }
+
+    pub async fn read_contained(
+        path: &Path,
+        root: Option<&Path>,
+        cursor: &Cursor,
+        max_bytes: usize,
+    ) -> Result<Chunk, TailError> {
+        let containment = root
+            .map(|root| {
+                let (canonical_root, root_identity, file_identity) = verify_initial_containment(path, root)?;
+                if cursor.root_identity.is_some_and(|old| old != root_identity) {
+                    return Err(TailError::Containment("transcript root changed identity".into()));
+                }
+                Ok(TranscriptContainment {
+                    root: root.into(),
+                    canonical_root,
+                    root_identity,
+                    file_identity,
+                })
+            })
+            .transpose()?;
+        let mut file = open_no_follow(path).await?;
+        let metadata = file.metadata().await?;
+        if let Some(containment) = &containment {
+            verify_opened_containment(path, containment, &metadata).await?;
+        }
+        let named = fs::symlink_metadata(path).await?;
+        if !metadata.is_file() || !same_file_identity(&metadata, &named) {
+            return Err(TailError::Containment(
+                "transcript must be a single-link regular file".into(),
+            ));
+        }
+        let identity = file_identity(&metadata);
+        let mut next = cursor.clone();
+        let replaced = cursor.identity.is_some_and(|old| old != identity)
+            || metadata.len() < cursor.offset
+            || match &cursor.checkpoint {
+                Some(checkpoint) => !checkpoint_matches(&mut file, checkpoint).await?,
+                None => cursor.offset != 0,
+            };
+        if replaced {
+            next.offset = 0;
+            next.generation += 1;
+        }
+        let offset = next.offset;
+        file.seek(SeekFrom::Start(offset)).await?;
+        let count = metadata.len().saturating_sub(offset).min(max_bytes as u64);
+        let mut data = Vec::with_capacity(count as usize);
+        (&mut file).take(count).read_to_end(&mut data).await?;
+        next.offset += data.len() as u64;
+        next.identity = Some(identity);
+        next.root_identity = containment.map(|c| c.root_identity);
+        next.observed_size = metadata.len();
+        next.checkpoint = read_checkpoint(&mut file, next.offset).await?;
+        Ok(Chunk {
+            eof: next.offset == metadata.len(),
+            cursor: next,
+            offset,
+            data,
+            replaced,
+            previous_size: cursor.observed_size,
+            observed_size: metadata.len(),
+        })
+    }
+}
+
 const CHECKPOINT_BYTES: u64 = 4096;
 
 #[derive(Debug, Error)]
@@ -51,13 +149,13 @@ struct TranscriptContainment {
     file_identity: FileIdentity,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct FileIdentity {
     device: u64,
     inode: u64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct FileCheckpoint {
     prefix: Vec<u8>,
     suffix_start: u64,

@@ -76,6 +76,8 @@
 //! retry case is treated exactly like an unreachable engine: the event is
 //! queued to the on-disk buffer for later redelivery.
 
+mod pending;
+
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -90,6 +92,8 @@ use fs4::fs_std::FileExt;
 
 /// Engine events socket path. Required.
 const SOCKET_ENV: &str = "BOSS_EVENTS_SOCKET";
+/// Pending-hook spool directory. Must match `boss_host_execution::worker::EVENT_SPOOL_ENV`.
+const EVENT_SPOOL_ENV: &str = "BOSS_EVENT_SPOOL";
 /// Run id to splice into payloads. Optional — splice falls back to
 /// forwarding the original payload when unset.
 const RUN_ID_ENV: &str = "BOSS_RUN_ID";
@@ -245,6 +249,10 @@ fn run() -> Result<()> {
         Err(_) => payload,
     };
 
+    if let Some(directory) = env::var_os(EVENT_SPOOL_ENV) {
+        return pending::deliver(Path::new(&directory), &socket_path, &payload_line, deadline);
+    }
+
     let buffer_path = resolve_buffer_path();
     let quarantine_path = resolve_quarantine_path();
 
@@ -267,7 +275,7 @@ fn run() -> Result<()> {
     // total across drain + this send can never exceed SHIM_TOTAL_BUDGET.
     match connect_with_retry(&socket_path, deadline) {
         Ok(stream) => match send_to_stream(stream, &payload_line, deadline) {
-            Ok(EngineResponse::None) => Ok(()),
+            Ok(EngineResponse::None | EngineResponse::Recorded) => Ok(()),
             Ok(EngineResponse::Rejected(reason)) => reject_delivery(&socket_path, &reason),
             Ok(EngineResponse::Retry(reason)) => {
                 eprintln!(
@@ -290,7 +298,7 @@ fn run() -> Result<()> {
                     match connect_once(&socket_path, write_timeout_for(deadline))
                         .and_then(|s| send_to_stream(s, &payload_line, deadline))
                     {
-                        Ok(EngineResponse::None) => Ok(()),
+                        Ok(EngineResponse::None | EngineResponse::Recorded) => Ok(()),
                         Ok(EngineResponse::Rejected(reason)) => reject_delivery(&socket_path, &reason),
                         Ok(EngineResponse::Retry(reason)) => {
                             eprintln!(
@@ -488,7 +496,7 @@ fn connect_with_retry_using(path: &str, deadline: Instant, sleep: impl Fn(Durati
 ///
 /// After the half-close, waits briefly for a [`REJECTION_PREFIX`] or
 /// [`RETRY_PREFIX`] notice (see [`read_response`]) and returns the
-/// decoded [`EngineResponse`]. `Ok(EngineResponse::None)` covers both a
+/// decoded [`EngineResponse`]. `Ok(EngineResponse::None | EngineResponse::Recorded)` covers both a
 /// genuinely successful delivery and the case where the wait window
 /// elapsed with nothing on the wire — the write itself already succeeded
 /// either way, so silence here is never treated as an error.
@@ -510,6 +518,7 @@ enum EngineResponse {
     Rejected(String),
     Retry(String),
     None,
+    Recorded,
 }
 
 /// Wait, bounded by [`REJECTION_READ_TIMEOUT`] and whatever remains of
@@ -536,6 +545,9 @@ fn read_response(stream: &mut UnixStream, deadline: Instant) -> Result<EngineRes
         .err()
         .filter(|err| !matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut));
     let text = String::from_utf8_lossy(&buf);
+    if text.trim() == "BOSS-EVENT-RECORDED" {
+        return Ok(EngineResponse::Recorded);
+    }
     if let Some(reason) = text.strip_prefix(REJECTION_PREFIX) {
         // A peer can deliver its rejection and then reset the
         // connection. The bytes are authoritative, so do not let the
@@ -568,7 +580,7 @@ fn send_one(socket_path: &str, payload: &[u8], deadline: Instant) -> std::result
     }
     let stream = connect_once(socket_path, write_timeout_for(deadline)).map_err(BufferedSendError::Transient)?;
     match send_to_stream(stream, payload, deadline).map_err(BufferedSendError::Transient)? {
-        EngineResponse::None => Ok(()),
+        EngineResponse::None | EngineResponse::Recorded => Ok(()),
         EngineResponse::Rejected(reason) => Err(BufferedSendError::Rejected(reason)),
         EngineResponse::Retry(reason) => Err(BufferedSendError::Transient(anyhow!(
             "engine reported a transient error: {reason}"

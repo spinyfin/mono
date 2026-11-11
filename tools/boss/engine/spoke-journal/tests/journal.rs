@@ -271,7 +271,7 @@ fn upgrades_received_commands_from_original_schema_without_losing_identity() {
     journal.receive_command(&command(1, "before-upgrade")).unwrap();
     drop(journal);
     let db = rusqlite::Connection::open(root.join("journal.db")).unwrap();
-    db.execute_batch("ALTER TABLE commands DROP COLUMN attempting; ALTER TABLE commands DROP COLUMN recovery; ALTER TABLE identity DROP COLUMN result_limit; PRAGMA user_version=1;")
+    db.execute_batch("DROP TABLE sources; ALTER TABLE commands DROP COLUMN attempting; ALTER TABLE commands DROP COLUMN recovery; ALTER TABLE identity DROP COLUMN result_limit; PRAGMA user_version=1;")
         .unwrap();
     drop(db);
     let mut journal = open(&root);
@@ -304,7 +304,7 @@ fn execution_records_survive_reopen_and_schema_upgrade() {
     );
     drop(journal);
     let db = rusqlite::Connection::open(root.join("journal.db")).unwrap();
-    db.execute_batch("ALTER TABLE commands DROP COLUMN attempting; ALTER TABLE commands DROP COLUMN recovery; ALTER TABLE identity DROP COLUMN result_limit; PRAGMA user_version=1;")
+    db.execute_batch("DROP TABLE sources; ALTER TABLE commands DROP COLUMN attempting; ALTER TABLE commands DROP COLUMN recovery; ALTER TABLE identity DROP COLUMN result_limit; PRAGMA user_version=1;")
         .unwrap();
     drop(db);
     let journal = open(&root);
@@ -367,4 +367,46 @@ fn bounded_diagnostic_preserves_a_known_rejection() {
         panic!("missing result")
     };
     assert_eq!(result.code, v1::ResultCode::Rejected as i32);
+}
+
+#[test]
+fn pruning_sources_returns_queued_bytes_to_baseline() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = open(&dir.path().join("state"));
+    let run = v1::Run {
+        run_id: "run".into(),
+        spawn_token: "token".into(),
+        ..Default::default()
+    };
+    let baseline = journal.bytes().unwrap();
+    journal
+        .commit_source(
+            &run,
+            "hook:0123456789abcdef0123456789abcdef:1",
+            None,
+            &vec![7u8; 4096],
+            Vec::new(),
+        )
+        .unwrap();
+    journal
+        .commit_source(&run, "transcript", None, &vec![9u8; 8192], Vec::new())
+        .unwrap();
+    journal
+        .commit_source(&run, "drained", None, b"true", Vec::new())
+        .unwrap();
+    assert!(journal.bytes().unwrap() > baseline);
+    assert!(journal.latest_source(&run).unwrap().is_some());
+    journal.prune_sources(&run).unwrap();
+    assert!(
+        journal
+            .source(&run, "hook:0123456789abcdef0123456789abcdef:1")
+            .unwrap()
+            .is_none()
+    );
+    assert!(journal.source(&run, "transcript").unwrap().is_none());
+    assert!(journal.source(&run, "drained").unwrap().is_some());
+    assert_eq!(
+        journal.bytes().unwrap(),
+        baseline + b"true".len() as u64 + "drained".len() as u64 + 128
+    );
 }
