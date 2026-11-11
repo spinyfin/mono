@@ -84,6 +84,26 @@ struct CapturingSpawner {
     hook_before_registration: std::sync::atomic::AtomicBool,
     /// Cancel exactly when confirmation first observes the pane.
     cancel_on_capture: StdMutex<Option<(Arc<WorkDb>, String)>>,
+    /// Cancels the execution when the engine first sends a key to the pane,
+    /// which only happens in the prompt wait after a driver start.
+    cancel_on_send_keys: StdMutex<Option<(Arc<WorkDb>, String)>>,
+    /// When true (the default), the stand-in worker takes its prompt: a
+    /// `UserPromptSubmit` is recorded wherever the pane is launched or read.
+    /// False models the driver that starts and then sits at its composer.
+    accept_prompt: std::sync::atomic::AtomicBool,
+    /// When true, a Return re-sent by the engine is taken as the submit.
+    accept_prompt_on_resubmit: std::sync::atomic::AtomicBool,
+    /// A launcher marker to leave in the run's delivery home when the pane
+    /// starts, as `(driver config dir, marker file name)`.
+    delivery_marker: StdMutex<Option<(PathBuf, &'static str)>>,
+    /// Every key the engine sent to the pane with `send-keys`.
+    sent_keys: StdMutex<Vec<String>>,
+    /// When true, the first live-state lookup after confirmation has first
+    /// read the pane delivers a `SessionStart`: a driver that starts just
+    /// after the start wait gave up.
+    late_session_start: std::sync::atomic::AtomicBool,
+    /// Set by the first `capture-pane`.
+    capture_seen: std::sync::atomic::AtomicBool,
     /// Keeps the per-run homes root pointed inside the test's workspace for
     /// as long as the spawner lives. See [`HomesPin`].
     homes_pin: StdMutex<Option<HomesPin>>,
@@ -146,8 +166,30 @@ impl CapturingSpawner {
             capture_log: StdMutex::new(Vec::new()),
             hook_before_registration: std::sync::atomic::AtomicBool::new(false),
             cancel_on_capture: StdMutex::new(None),
+            cancel_on_send_keys: StdMutex::new(None),
+            accept_prompt: std::sync::atomic::AtomicBool::new(true),
+            accept_prompt_on_resubmit: std::sync::atomic::AtomicBool::new(false),
+            delivery_marker: StdMutex::new(None),
+            sent_keys: StdMutex::new(Vec::new()),
+            late_session_start: std::sync::atomic::AtomicBool::new(false),
+            capture_seen: std::sync::atomic::AtomicBool::new(false),
             homes_pin: StdMutex::new(None),
         }
+    }
+
+    /// Record the turn evidence a worker that took its prompt would send.
+    fn record_prompt_accepted(&self, run_id: &str) {
+        self.live_states.record_turn_evidence(
+            run_id,
+            &boss_protocol::WorkerEvent::UserPromptSubmit {
+                session_id: "session".into(),
+                prompt: "brief".into(),
+            },
+        );
+    }
+
+    fn sent_keys(&self) -> Vec<String> {
+        self.sent_keys.lock().unwrap().clone()
     }
 
     fn spawn_input(&self) -> CapturedSpawn {
@@ -198,6 +240,13 @@ impl crate::spawn_flow::WorkerSpawner for CapturingSpawner {
     }
 
     fn live_worker_state_registry(&self) -> Option<&LiveWorkerStateRegistry> {
+        use std::sync::atomic::Ordering;
+        if self.capture_seen.load(Ordering::SeqCst) && self.late_session_start.swap(false, Ordering::SeqCst) {
+            let run_id = self.pending_run_id.lock().unwrap().clone();
+            self.live_states.record_hook_event_kind(&run_id, "SessionStart");
+            self.live_states
+                .record_driver_signal(&run_id, crate::live_worker_state::DriverSignalKind::HookEvent);
+        }
         Some(&self.live_states)
     }
 }
@@ -227,16 +276,36 @@ impl CommandRunner for CapturingSpawner {
                     env,
                     initial_input: args.last().unwrap().clone(),
                 });
+                let run_id = self.pending_run_id.lock().unwrap().clone();
                 if self.hook_before_registration.load(std::sync::atomic::Ordering::SeqCst) {
-                    let run_id = self.pending_run_id.lock().unwrap().clone();
                     self.live_states.record_hook_event_kind(&run_id, "SessionStart");
                     self.live_states
                         .record_driver_signal(&run_id, crate::live_worker_state::DriverSignalKind::HookEvent);
+                }
+                if self.accept_prompt.load(std::sync::atomic::Ordering::SeqCst) {
+                    self.record_prompt_accepted(&run_id);
+                }
+                if let Some((config_dir, marker)) = self.delivery_marker.lock().unwrap().as_ref() {
+                    let home = crate::driver::initial_prompt::delivery_home(config_dir);
+                    std::fs::write(home.join(marker), "").unwrap();
+                }
+                ""
+            }
+            Some("send-keys") => {
+                self.sent_keys.lock().unwrap().push(args.last().unwrap().clone());
+                if let Some((db, execution_id)) = self.cancel_on_send_keys.lock().unwrap().take() {
+                    db.cancel_running_execution(&execution_id).unwrap();
+                }
+                if self.accept_prompt_on_resubmit.load(std::sync::atomic::Ordering::SeqCst) {
+                    for state in self.live_states.snapshot() {
+                        self.record_prompt_accepted(&state.run_id);
+                    }
                 }
                 ""
             }
             Some("display-message") => "4242",
             Some("capture-pane") => {
+                self.capture_seen.store(true, std::sync::atomic::Ordering::SeqCst);
                 if let Some((db, execution_id)) = self.cancel_on_capture.lock().unwrap().take() {
                     db.cancel_running_execution(&execution_id).unwrap();
                 }
@@ -244,6 +313,11 @@ impl CommandRunner for CapturingSpawner {
                     for state in self.live_states.snapshot() {
                         self.live_states
                             .record_driver_signal(&state.run_id, crate::live_worker_state::DriverSignalKind::HookEvent);
+                    }
+                }
+                if self.accept_prompt.load(std::sync::atomic::Ordering::SeqCst) {
+                    for state in self.live_states.snapshot() {
+                        self.record_prompt_accepted(&state.run_id);
                     }
                 }
                 let history_only = self.history_only_text.lock().unwrap().clone();
@@ -2226,6 +2300,231 @@ async fn run_execution_reaps_and_signals_when_cancelled_during_confirmation() {
     assert_eq!(spawner.reaped_run_ids().as_slice(), [execution.id.as_str()]);
 }
 
+/// Run one spawn through confirmation against a stand-in driver that starts
+/// (chrome plus a `SessionStart`-class signal) but does not take its prompt,
+/// with the launcher having left `marker` behind (or nothing).
+async fn confirm_with_an_unsubmitted_prompt(
+    marker: Option<&'static str>,
+    accept_on_resubmit: bool,
+) -> (Result<RunOutcome>, Arc<CapturingSpawner>) {
+    use std::sync::atomic::Ordering;
+    let workspace = TempDir::new().unwrap();
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    spawner.pane_chrome.store(true, Ordering::SeqCst);
+    spawner.auto_confirm_turn.store(true, Ordering::SeqCst);
+    spawner.accept_prompt.store(false, Ordering::SeqCst);
+    spawner
+        .accept_prompt_on_resubmit
+        .store(accept_on_resubmit, Ordering::SeqCst);
+    *spawner.delivery_marker.lock().unwrap() = marker.map(|marker| (workspace.path().join(".claude"), marker));
+    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    let runner = PaneSpawnRunner::new(cfg, work_db, flags);
+    bind_runner(&runner, weak, &spawner);
+    runner.set_skip_spawn_confirm(false);
+    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(60));
+    let outcome = runner
+        .run_execution(
+            "worker-1",
+            &sample_execution(workspace.path()),
+            &sample_chore(),
+            workspace.path(),
+            Some("change-1"),
+        )
+        .await;
+    (outcome, spawner)
+}
+
+/// The 2026-11-10 shape: the brief sits pasted in the composer, `SessionStart`
+/// has fired, and no turn ever begins. The spawn must fail and the pane be
+/// reaped, after Return (and only Return) was re-sent a bounded number of
+/// times. The stand-in tmux panics on any command it does not model, so a
+/// second paste (`load-buffer` / `paste-buffer`) would fail this test.
+#[tokio::test(start_paused = true)]
+async fn spawn_confirmation_fails_a_started_driver_that_never_takes_its_prompt() {
+    let (outcome, spawner) =
+        confirm_with_an_unsubmitted_prompt(Some(crate::driver::initial_prompt::DELIVERED_MARKER), false).await;
+    let err = outcome.expect_err("a driver that never starts a turn must fail the spawn");
+    let msg = err.to_string();
+    assert!(msg.contains("never started a turn"), "{msg}");
+    assert!(msg.contains("Return re-sent 2 time(s)"), "{msg}");
+    assert!(msg.contains("failed spawn"), "{msg}");
+    assert_eq!(spawner.sent_keys(), ["C-m", "C-m"]);
+    let run_id = spawner.pending_run_id.lock().unwrap().clone();
+    assert!(
+        spawner.live_states.has_driver_signal_for_run(&run_id),
+        "fixture: the driver did start; its signal must not veto the reap"
+    );
+    assert_eq!(spawner.reaped_run_ids(), vec![run_id]);
+}
+
+/// A `SessionStart` that lands after the start wait gave up and before the
+/// reap check rescues the spawn from the start failure only. The brief was
+/// never taken, so the prompt wait must still run and fail the spawn.
+#[tokio::test(start_paused = true)]
+async fn a_late_session_start_does_not_skip_the_prompt_confirmation() {
+    use std::sync::atomic::Ordering;
+    let workspace = TempDir::new().unwrap();
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    spawner.accept_prompt.store(false, Ordering::SeqCst);
+    spawner.late_session_start.store(true, Ordering::SeqCst);
+    *spawner.delivery_marker.lock().unwrap() = Some((
+        workspace.path().join(".claude"),
+        crate::driver::initial_prompt::DELIVERED_MARKER,
+    ));
+    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    let runner = PaneSpawnRunner::new(cfg, work_db, flags);
+    bind_runner(&runner, weak, &spawner);
+    runner.set_skip_spawn_confirm(false);
+    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(60));
+    let err = runner
+        .run_execution(
+            "worker-1",
+            &sample_execution(workspace.path()),
+            &sample_chore(),
+            workspace.path(),
+            Some("change-1"),
+        )
+        .await
+        .expect_err("a late SessionStart with no turn must not count as a live worker");
+    let msg = err.to_string();
+    assert!(msg.contains("never started a turn"), "{msg}");
+    assert_eq!(spawner.sent_keys(), ["C-m", "C-m"]);
+    let run_id = spawner.pending_run_id.lock().unwrap().clone();
+    assert!(
+        spawner.live_states.has_driver_signal_for_run(&run_id),
+        "fixture: the late start arrived"
+    );
+    assert_eq!(spawner.reaped_run_ids(), vec![run_id]);
+}
+
+/// A cancel that lands while the late-start prompt wait is retrying Return
+/// must still be reconciled as a mid-spawn cancel, not reported as a spawn
+/// failure.
+#[tokio::test(start_paused = true)]
+async fn a_cancel_during_the_late_start_prompt_wait_is_reconciled() {
+    use std::sync::atomic::Ordering;
+    let workspace = TempDir::new().unwrap();
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    spawner.accept_prompt.store(false, Ordering::SeqCst);
+    spawner.late_session_start.store(true, Ordering::SeqCst);
+    *spawner.delivery_marker.lock().unwrap() = Some((
+        workspace.path().join(".claude"),
+        crate::driver::initial_prompt::DELIVERED_MARKER,
+    ));
+    let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
+    let chore = create_test_chore(&work_db, product.id.clone(), "Cancel during late prompt wait");
+    let ready = create_ready_chore_execution(&work_db, chore.id.clone());
+    let (execution, _run) = work_db
+        .start_execution_run(
+            &ready.id,
+            "worker-1",
+            "foo",
+            "lease-1",
+            "foo-agent-001",
+            workspace.path().to_str().unwrap(),
+        )
+        .unwrap();
+    *spawner.cancel_on_send_keys.lock().unwrap() = Some((work_db.clone(), execution.id.clone()));
+    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    let runner = PaneSpawnRunner::new(cfg, work_db.clone(), flags);
+    bind_runner(&runner, weak, &spawner);
+    runner.set_skip_spawn_confirm(false);
+    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(60));
+    let chore_item = work_db.get_work_item(&chore.id).unwrap();
+    let outcome = runner
+        .run_execution("worker-1", &execution, &chore_item, workspace.path(), Some("change-1"))
+        .await
+        .expect("a cancel is not a spawn failure");
+    assert_eq!(outcome.wait_state, RunWaitState::CancelledDuringSpawn);
+    assert!(spawner.cancel_on_send_keys.lock().unwrap().is_none());
+    assert_eq!(spawner.reaped_run_ids().as_slice(), [execution.id.as_str()]);
+}
+
+/// A cancel that lands during the first confirmation wait must be noticed
+/// before the late-start prompt wait, which would otherwise press Return and
+/// submit the brief of an execution that was already cancelled.
+#[tokio::test(start_paused = true)]
+async fn a_cancel_during_the_first_confirmation_never_presses_return() {
+    use std::sync::atomic::Ordering;
+    let workspace = TempDir::new().unwrap();
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    spawner.accept_prompt.store(false, Ordering::SeqCst);
+    spawner.late_session_start.store(true, Ordering::SeqCst);
+    *spawner.delivery_marker.lock().unwrap() = Some((
+        workspace.path().join(".claude"),
+        crate::driver::initial_prompt::DELIVERED_MARKER,
+    ));
+    let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
+    let chore = create_test_chore(&work_db, product.id.clone(), "Cancel during first confirmation");
+    let ready = create_ready_chore_execution(&work_db, chore.id.clone());
+    let (execution, _run) = work_db
+        .start_execution_run(
+            &ready.id,
+            "worker-1",
+            "foo",
+            "lease-1",
+            "foo-agent-001",
+            workspace.path().to_str().unwrap(),
+        )
+        .unwrap();
+    *spawner.cancel_on_capture.lock().unwrap() = Some((work_db.clone(), execution.id.clone()));
+    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    let runner = PaneSpawnRunner::new(cfg, work_db.clone(), flags);
+    bind_runner(&runner, weak, &spawner);
+    runner.set_skip_spawn_confirm(false);
+    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(60));
+    let chore_item = work_db.get_work_item(&chore.id).unwrap();
+    let outcome = runner
+        .run_execution("worker-1", &execution, &chore_item, workspace.path(), Some("change-1"))
+        .await
+        .expect("a cancel is not a spawn failure");
+    assert_eq!(outcome.wait_state, RunWaitState::CancelledDuringSpawn);
+    assert!(spawner.sent_keys().is_empty(), "{:?}", spawner.sent_keys());
+    assert_eq!(spawner.reaped_run_ids().as_slice(), [execution.id.as_str()]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn spawn_confirmation_resubmits_once_and_passes_when_the_turn_then_starts() {
+    let (outcome, spawner) =
+        confirm_with_an_unsubmitted_prompt(Some(crate::driver::initial_prompt::DELIVERED_MARKER), true).await;
+    outcome.expect("a re-sent Return that starts the turn must complete the spawn");
+    assert_eq!(spawner.sent_keys(), ["C-m"]);
+    assert!(spawner.reaped_run_ids().is_empty());
+}
+
+/// Return must never be pressed before the launcher has delivered the brief:
+/// it would land in whatever the driver is showing instead of the composer.
+#[tokio::test(start_paused = true)]
+async fn spawn_confirmation_fails_without_pressing_return_when_the_brief_was_not_delivered() {
+    for (marker, reason) in [
+        (
+            Some(crate::driver::initial_prompt::UNDELIVERED_MARKER),
+            "the launcher reported it could not deliver the brief",
+        ),
+        (None, "the launcher reported neither delivery nor failure"),
+    ] {
+        let (outcome, spawner) = confirm_with_an_unsubmitted_prompt(marker, true).await;
+        let msg = outcome
+            .expect_err("an undelivered brief must fail the spawn")
+            .to_string();
+        assert!(msg.contains("was not delivered"), "{msg}");
+        assert!(msg.contains(reason), "{msg}");
+        assert!(spawner.sent_keys().is_empty(), "{:?}", spawner.sent_keys());
+        assert_eq!(
+            spawner.reaped_run_ids(),
+            vec![spawner.pending_run_id.lock().unwrap().clone()]
+        );
+    }
+}
+
 /// Run a confirming spawn against a pane whose visible screen is empty and
 /// whose scrollback holds `history`; returns the spawn result and spawner.
 async fn confirm_with_history_only(history: &str) -> (Result<RunOutcome>, Arc<CapturingSpawner>) {
@@ -2491,6 +2790,9 @@ fn actual_driver_spawn_prefix_pins_boss_and_cube_before_path_decoys() {
     use crate::driver::{DriverRegistry, SpawnRequest, grok, test_support};
     use crate::protocol::EnvVar;
     use std::os::unix::fs::PermissionsExt;
+    // Held until the environment is restored: this test sets `BOSS_BIN_DIR`
+    // for the whole process.
+    let _ambient = crate::spawn_flow::BOSS_BIN_DIR_TEST_LOCK.blocking_lock();
     let root = TempDir::new().unwrap();
     let _codex = test_support::codex_auth_source_override(&root.path().join("codex"), &root.path().join("auth.json"));
     let _grok = test_support::grok_homes_override(&root.path().join("grok"));

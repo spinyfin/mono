@@ -755,6 +755,18 @@ impl AgentDriver for ClaudeDriver {
             .to_vec()
     }
 
+    fn paste_landed_markers(&self) -> Vec<String> {
+        // Recorded from Claude Code 2.1.322, which shows `[Pasted text #1 +N
+        // lines]` in the composer once it has taken a large paste. It holds a
+        // paste in which any line ends in an image extension (a diff header
+        // naming a `.png` is enough) while it runs `osascript` to ask the
+        // macOS clipboard for a file, showing only `Pasting…` meanwhile:
+        // 0.08-3.3 s on a host at its normal load and up to 46 s under heavy
+        // load. Return sent in that window reaches an empty composer and is
+        // lost.
+        vec!["[Pasted text #".into()]
+    }
+
     fn pane_monitor_spec(&self) -> Option<PaneMonitorSpec> {
         // Exact reproduction of the pre-spec literals in
         // `GhosttyTerminalView.makeClaudeSnapshot` / the tracker's

@@ -17,6 +17,7 @@ use boss_execution_contracts::slot_id_from_worker_id;
 use boss_protocol::{ExecutionKind, ExecutionStatus, ReviewBatchMemberRole, WorkItemBinding};
 
 use super::prompt::structured_output_env_vars;
+use super::spawn_confirmation::PromptSubmitPolicy;
 use super::work_item::{work_item_id, work_item_name, work_item_task_kind};
 use super::worker_spawn::{ComposedWorkerSpawn, WorkerSpawnOpts};
 use sol_spawn::prepare_worker_spawn;
@@ -394,8 +395,9 @@ mod pty_initial_input_tests;
 /// app may attach a viewer after the worker starts.
 ///
 /// Returns `WorkerPaneAlive` once the pane is up **and** spawn
-/// confirmation has seen driver-specific PTY evidence plus the first
-/// driver hook/session event. The tmux session stays alive with its
+/// confirmation has seen driver-specific PTY evidence, the first
+/// driver hook/session event, and evidence that the driver began a turn
+/// on its prompt. The tmux session stays alive with its
 /// agent working, and the workspace lease is retained until a
 /// follow-up flow concludes the run. Real lifecycle (the pane signaling
 /// "Stop" → run completes) lands once the events-socket consumer drives
@@ -472,9 +474,9 @@ impl PaneSpawnRunner {
             .store(skip, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Override both confirmation waits (composer + turn-start) with a
-    /// short timeout so timeout-path tests do not sit on the production
-    /// 20s/45s windows.
+    /// Override every confirmation wait (composer, turn-start, launcher
+    /// delivery and each post-Return wait) with a short timeout so
+    /// timeout-path tests do not sit on the production windows.
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_spawn_confirm_timeout(&self, timeout: StdDuration) {
         let _ = self.overrides.spawn_confirm_timeout.set(timeout);
@@ -502,6 +504,19 @@ impl PaneSpawnRunner {
             super::spawn_confirmation::COMPOSER_READY_TIMEOUT,
             super::spawn_confirmation::turn_start_timeout_for_driver(driver, self.cfg.rollout_discovery_timeout),
         )
+    }
+
+    fn prompt_submit_policy(&self, driver: &dyn crate::driver::AgentDriver) -> PromptSubmitPolicy {
+        let policy = PromptSubmitPolicy::for_driver(driver, self.cfg.rollout_discovery_timeout);
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(timeout) = self.overrides.spawn_confirm_timeout.get() {
+            return PromptSubmitPolicy {
+                delivery_timeout: *timeout,
+                confirm_timeout: *timeout,
+                ..policy
+            };
+        }
+        policy
     }
 
     fn events_socket_path(&self) -> PathBuf {
@@ -1431,10 +1446,56 @@ impl ExecutionRunner for PaneSpawnRunner {
                 spawner.driver_signals(),
                 &self.work_db,
                 &execution.id,
-                composer_timeout,
-                turn_timeout,
+                workspace_path,
+                SpawnConfirmBounds {
+                    composer_timeout,
+                    turn_timeout,
+                    prompt: self.prompt_submit_policy(driver.as_ref()),
+                },
             )
             .await;
+            // A driver start that lands just after the start wait gave up
+            // rescues the spawn from that failure only. Its brief still has to
+            // be taken, so the prompt wait runs now, with its retries and its
+            // own failure, instead of the veto reporting a live worker.
+            let confirm = match confirm {
+                Err(err) if late_start_rescues(spawner.driver_signals(), started.slot_id, &execution.id, &err) => {
+                    tracing::info!(
+                        worker_id,
+                        execution_id = %execution.id,
+                        %err,
+                        "driver started after the start wait expired; confirming prompt submission",
+                    );
+                    // The first confirmation can itself have run for minutes, so
+                    // a cancel that landed during it must be noticed before the
+                    // prompt wait can press Return and submit the brief.
+                    if let Some(cancelled) = self
+                        .take_cancelled_during_spawn(
+                            spawner.as_ref(),
+                            &execution.id,
+                            worker_id,
+                            &started,
+                            &spawn_config,
+                        )
+                        .await
+                    {
+                        return Ok(cancelled);
+                    }
+                    confirm_prompt_after_late_start(
+                        &tmux_host,
+                        driver.as_ref(),
+                        spawner.driver_signals(),
+                        &execution.id,
+                        workspace_path,
+                        self.prompt_submit_policy(driver.as_ref()),
+                    )
+                    .await
+                }
+                other => other,
+            };
+            // Re-check cancellation once more after the late-start prompt
+            // wait, which can itself run for minutes (it is also checked
+            // before that wait starts).
             if let Some(cancelled) = self
                 .take_cancelled_during_spawn(spawner.as_ref(), &execution.id, worker_id, &started, &spawn_config)
                 .await
@@ -1442,10 +1503,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 return Ok(cancelled);
             }
             if let Err(err) = confirm
-                && !spawner.driver_signals().is_some_and(|registry| {
-                    registry.commit_never_started_reap(started.slot_id, &execution.id)
-                        == crate::host::NeverStartedReap::DriverSignalled
-                })
+                && !reap_vetoed_by_late_evidence(spawner.driver_signals(), started.slot_id, &execution.id, &err)
             {
                 tracing::warn!(
                     worker_id,
@@ -1529,17 +1587,163 @@ impl PaneSpawnRunner {
     }
 }
 
-/// Bounded wait after prompt delivery: driver-specific PTY evidence that
+/// Whether evidence that arrived while confirmation was failing means the
+/// worker must be kept. The check commits the reap atomically, so evidence
+/// arriving after it cannot be recorded for a pane already being torn down.
+///
+/// A driver that never signalled is saved by any driver signal. One that
+/// started but did not take its prompt has signalled already, so only a turn
+/// saves it: without that distinction its `SessionStart` would veto the reap
+/// and leave it idle and counted as live.
+fn reap_vetoed_by_late_evidence(
+    signals: Option<&dyn crate::host::DriverSignals>,
+    slot_id: u8,
+    run_id: &str,
+    err: &anyhow::Error,
+) -> bool {
+    use super::spawn_confirmation::{SpawnConfirmationError, spawn_confirmation_error};
+    let Some(signals) = signals else {
+        return false;
+    };
+    if spawn_confirmation_error(err).is_some_and(SpawnConfirmationError::is_unsubmitted_prompt) {
+        signals.commit_unsubmitted_reap(slot_id, run_id) == crate::host::UnsubmittedReap::PromptAccepted
+    } else {
+        signals.commit_never_started_reap(slot_id, run_id) == crate::host::NeverStartedReap::DriverSignalled
+    }
+}
+
+/// Whether a driver start that arrived after the start wait failed rescues
+/// the spawn from that failure. Commits the reap when no driver signal is
+/// there, so a start arriving later cannot revive a pane being torn down.
+fn late_start_rescues(
+    signals: Option<&dyn crate::host::DriverSignals>,
+    slot_id: u8,
+    run_id: &str,
+    err: &anyhow::Error,
+) -> bool {
+    use super::spawn_confirmation::{SpawnConfirmationError, spawn_confirmation_error};
+    let Some(signals) = signals else {
+        return false;
+    };
+    matches!(
+        spawn_confirmation_error(err),
+        Some(SpawnConfirmationError::ComposerNotReady { .. } | SpawnConfirmationError::TurnDidNotStart { .. })
+    ) && signals.commit_never_started_reap(slot_id, run_id) == crate::host::NeverStartedReap::DriverSignalled
+}
+
+/// The prompt-acceptance wait for a driver whose start was only seen after
+/// the start wait expired.
+async fn confirm_prompt_after_late_start(
+    tmux_host: &TmuxWorkerHost,
+    driver: &dyn crate::driver::AgentDriver,
+    signals: Option<&dyn crate::host::DriverSignals>,
+    run_id: &str,
+    workspace_path: &Path,
+    prompt: PromptSubmitPolicy,
+) -> Result<()> {
+    let Some(signals) = signals else {
+        return Ok(());
+    };
+    let home = crate::driver::initial_prompt::delivery_home(&workspace_path.join(driver.descriptor().config_dir));
+    let last_capture = std::sync::Mutex::new(String::new());
+    let result = confirm_prompt_phase(
+        tmux_host,
+        driver.descriptor().name,
+        signals,
+        run_id,
+        &home,
+        prompt,
+        &last_capture,
+    )
+    .await;
+    log_delivery_steps(run_id, driver.descriptor().name, &home);
+    if result.is_err() {
+        tracing::warn!(run_id, last_pane_text = %last_capture.lock().expect("capture mutex poisoned"),
+            "spawn confirmation evidence at failure");
+    }
+    result
+}
+
+/// Wait for the driver to take its prompt, re-sending Return (never the
+/// paste) a bounded number of times. The pane's text is kept in `last_capture`
+/// on failure as the best account of why.
+async fn confirm_prompt_phase(
+    tmux_host: &TmuxWorkerHost,
+    driver_name: &str,
+    signals: &dyn crate::host::DriverSignals,
+    run_id: &str,
+    home: &Path,
+    prompt: PromptSubmitPolicy,
+    last_capture: &std::sync::Mutex<String>,
+) -> Result<()> {
+    let result = super::spawn_confirmation::confirm_prompt_submitted(
+        driver_name,
+        run_id,
+        prompt,
+        || async { signals.has_prompt_accepted_for_run(run_id) },
+        || async { crate::driver::initial_prompt::delivery_state(home) },
+        // Return alone: the launcher pasted the brief, and it is never pasted again.
+        || async { tmux_host.tmux().send_key(tmux_host.session_name(), "C-m").await },
+    )
+    .await;
+    // A stalled capture must not hold up the reap.
+    if result.is_err()
+        && let Ok(Ok(visible)) = tokio::time::timeout(
+            prompt.confirm_timeout,
+            tmux_host.tmux().capture_pane(tmux_host.session_name()),
+        )
+        .await
+    {
+        store_capture_snapshot(last_capture, &visible);
+    }
+    result
+}
+
+/// The bounds on each of spawn confirmation's waits.
+struct SpawnConfirmBounds {
+    composer_timeout: StdDuration,
+    turn_timeout: StdDuration,
+    prompt: PromptSubmitPolicy,
+}
+
+/// Report the launcher's delivery steps: readiness and how long it took, the
+/// paste, what showed the composer had taken it, and Return. The pane is the
+/// driver's terminal, so the launcher records them in a file instead.
+fn log_delivery_steps(run_id: &str, driver_name: &str, home: &Path) {
+    for step in crate::driver::initial_prompt::read_delivery_log(home) {
+        let detail = serde_json::Value::Object(step.fields);
+        let (message, degraded) = match step.step.as_str() {
+            "ready" => ("prompt delivery: composer ready", false),
+            "paste_sent" => ("prompt delivery: paste sent", false),
+            "paste_landed" => ("prompt delivery: composer showed the pasted brief", false),
+            "paste_unverified" => (
+                "prompt delivery: composer never showed the pasted brief; Return sent without that evidence",
+                true,
+            ),
+            "submit_sent" => ("prompt delivery: submit sent", false),
+            "failed" => ("prompt delivery: launcher failed", true),
+            _ => ("prompt delivery: unrecognised launcher step", false),
+        };
+        if degraded {
+            tracing::warn!(run_id, driver = driver_name, step = %step.step, at_ms = step.at_ms, %detail, "{message}");
+        } else {
+            tracing::info!(run_id, driver = driver_name, step = %step.step, at_ms = step.at_ms, %detail, "{message}");
+        }
+    }
+}
+
+/// Bounded waits after the pane is up: driver-specific PTY evidence that
 /// the CLI is up, then a driver hook/session event *or* a persisted
-/// `transcript_path` on the current `work_runs` row that the turn started.
+/// `transcript_path` on the current `work_runs` row that the driver
+/// started, then evidence that it began a turn on its prompt.
 async fn confirm_local_spawn(
     tmux_host: &TmuxWorkerHost,
     driver: &dyn crate::driver::AgentDriver,
     live_states: Option<&dyn crate::host::DriverSignals>,
     work_db: &WorkDb,
     run_id: &str,
-    composer_timeout: StdDuration,
-    turn_timeout: StdDuration,
+    workspace_path: &Path,
+    bounds: SpawnConfirmBounds,
 ) -> Result<()> {
     use super::spawn_confirmation::{SPAWN_CONFIRM_POLL, confirm_spawn_started, current_run_has_turn_start_evidence};
 
@@ -1548,12 +1752,13 @@ async fn confirm_local_spawn(
     let started_at = boss_engine_utils::epoch_time::now_epoch_secs();
     let started = std::time::Instant::now();
     let last_capture = std::sync::Mutex::new(String::new());
+    let home = crate::driver::initial_prompt::delivery_home(&workspace_path.join(driver.descriptor().config_dir));
     tracing::info!(run_id, %started_at, "composer readiness wait started");
-    let result = confirm_spawn_started(
+    let mut result = confirm_spawn_started(
         driver_name,
         run_id,
-        composer_timeout,
-        turn_timeout,
+        bounds.composer_timeout,
+        bounds.turn_timeout,
         SPAWN_CONFIRM_POLL,
         || async {
             capture_shows_driver_ready(tmux_host.tmux(), tmux_host.session_name(), spec.as_ref(), &last_capture).await
@@ -1561,6 +1766,28 @@ async fn confirm_local_spawn(
         || async { current_run_has_turn_start_evidence(work_db, live_states, run_id) },
     )
     .await;
+    // Without a signal registry nothing can report a turn, so there is
+    // nothing to wait for.
+    if let (Ok(()), Some(signals)) = (&result, live_states) {
+        tracing::info!(
+            run_id,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            first_hook_event = ?signals.first_hook_event_for_run(run_id),
+            "driver start confirmed; awaiting prompt submission",
+        );
+        result = confirm_prompt_phase(
+            tmux_host,
+            driver_name,
+            signals,
+            run_id,
+            &home,
+            bounds.prompt,
+            &last_capture,
+        )
+        .await;
+    }
+    // Whichever wait ended confirmation, say how far the launcher got.
+    log_delivery_steps(run_id, driver_name, &home);
     if result.is_err() {
         tracing::warn!(run_id, %started_at, elapsed_ms = started.elapsed().as_millis() as u64,
             first_hook_event = ?live_states.and_then(|registry| registry.first_hook_event_for_run(run_id)),

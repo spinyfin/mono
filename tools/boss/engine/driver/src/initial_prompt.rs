@@ -6,7 +6,8 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
@@ -17,12 +18,89 @@ pub const BRIEF_NOT_DELIVERED_EXIT: i32 = 64;
 pub const DELIVERED_MARKER: &str = "initial-prompt.delivered";
 pub const UNDELIVERED_MARKER: &str = "initial-prompt.undelivered";
 
+/// One JSON object per delivery step, written by the launcher beside the
+/// brief. The pane is the driver's terminal, so this file is the launcher's
+/// only log; the engine reports it (see [`read_delivery_log`]).
+pub const DELIVERY_LOG: &str = "initial-prompt.delivery.jsonl";
+
+/// The bound the launcher puts on each of: the driver becoming ready, the
+/// driver reading the paste, and the driver reading Return. Mirrors
+/// `readiness_timeout` in `initial_prompt.py`.
+pub const STAGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the launcher waits for the composer to show the pasted brief
+/// before it sends Return without that evidence. Mirrors `LANDING_TIMEOUT` in
+/// `initial_prompt.py`, which records the measurements behind the value.
+pub const LANDING_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// The longest a launcher that is still working can take to send Return:
+/// three bounded stages plus the landing wait. A launcher that has reported
+/// neither marker after this long is not going to.
+pub const DELIVERY_BUDGET: Duration = Duration::from_secs(3 * STAGE_TIMEOUT.as_secs() + LANDING_TIMEOUT.as_secs());
+
 pub fn undelivered_marker_present(home: &Path) -> bool {
     home.join(UNDELIVERED_MARKER).is_file()
 }
 
 pub fn delivered_marker_present(home: &Path) -> bool {
     home.join(DELIVERED_MARKER).is_file()
+}
+
+/// What the launcher has durably reported about delivering the brief.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryState {
+    /// Neither marker yet: the launcher is still waiting on the driver.
+    Pending,
+    /// The paste and Return were both written to the driver.
+    Submitted,
+    /// The launcher gave up before Return was written.
+    Failed,
+}
+
+pub fn delivery_state(home: &Path) -> DeliveryState {
+    if delivered_marker_present(home) {
+        DeliveryState::Submitted
+    } else if undelivered_marker_present(home) {
+        DeliveryState::Failed
+    } else {
+        DeliveryState::Pending
+    }
+}
+
+/// The directory holding the launcher's markers and delivery log: beside the
+/// brief that `<config_dir>/initial-prompt.txt` resolves to, which is how the
+/// launcher itself finds it.
+pub fn delivery_home(config_dir: &Path) -> PathBuf {
+    fs::canonicalize(config_dir.join("initial-prompt.txt"))
+        .ok()
+        .and_then(|brief| brief.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| config_dir.to_path_buf())
+}
+
+/// One step the launcher recorded while delivering the brief: `ready`,
+/// `paste_sent`, `paste_landed` or `paste_unverified`, `submit_sent`, and
+/// `failed`. `fields` carries the step's own measurements (`wait_ms`,
+/// `write_ms`, `bytes`, `evidence`, `reason`).
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct DeliveryStep {
+    pub step: String,
+    /// Wall-clock time of the step, Unix epoch milliseconds.
+    pub at_ms: i64,
+    #[serde(flatten)]
+    pub fields: serde_json::Map<String, serde_json::Value>,
+}
+
+/// The delivery steps the launcher has recorded in `home` so far. A missing or
+/// partly written log yields the steps that parse; it is diagnostics, and
+/// never decides an outcome.
+pub fn read_delivery_log(home: &Path) -> Vec<DeliveryStep> {
+    fs::read_to_string(home.join(DELIVERY_LOG))
+        .map(|text| {
+            text.lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Line the relay prints to stderr when it fails; the specific reasons
@@ -89,6 +167,7 @@ pub fn launcher_config(driver: &dyn crate::AgentDriver) -> Result<String> {
     Ok(serde_json::to_string(&serde_json::json!({
         "agent_markers": spec.agent_markers,
         "starting_markers": starting_markers,
+        "paste_landed_markers": driver.paste_landed_markers(),
     }))?)
 }
 
@@ -142,6 +221,15 @@ pub async fn warm_preflight() -> Result<()> {
 pub fn provision(config_dir: &Path, run_home: &Path, prompt: &str, driver: &dyn crate::AgentDriver) -> Result<()> {
     preflight()?;
     fs::create_dir_all(run_home)?;
+    // A relaunch reuses the run's home. What an earlier attempt recorded must
+    // not be read as this attempt's delivery.
+    for stale in [DELIVERED_MARKER, UNDELIVERED_MARKER, DELIVERY_LOG] {
+        match fs::remove_file(run_home.join(stale)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     let prompt_path = run_home.join("initial-prompt.txt");
     write_private(&prompt_path, prompt.as_bytes())?;
     let reference = config_dir.join("initial-prompt.txt");
@@ -163,6 +251,166 @@ pub fn provision(config_dir: &Path, run_home: &Path, prompt: &str, driver: &dyn 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in driver that takes the brief the way a composer does: it
+    /// shows its placeholder once it has the whole paste, then reads Return.
+    const STUB_TAKES_BRIEF: &str = "import os, sys, time, tty\n\
+         tty.setraw(0)\n\
+         os.write(1, b'\\x1b[?2004hClaude Code')\n\
+         data = b''\n\
+         while not data.endswith(b'\\x1b[201~'):\n\
+         \x20   data += os.read(0, 4096)\n\
+         os.write(1, b'\\r\\n[Pasted text #1 +1 lines]')\n\
+         while not data.endswith(b'\\r'):\n\
+         \x20   data += os.read(0, 4096)\n";
+
+    /// Run the launcher's `run()` over a stand-in driver whose behaviour after
+    /// it has read the whole paste is `after_paste` (Python), and return the
+    /// delivery steps it logged.
+    fn delivery_steps(brief: &str, landed_markers: &[&str], after_paste: &str) -> Vec<DeliveryStep> {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("initial-prompt.py"), LAUNCHER).unwrap();
+        fs::write(
+            temp.path().join("stub.py"),
+            format!(
+                "import os, select, sys, time, tty\n\
+                 tty.setraw(0)\n\
+                 os.write(1, b'\\x1b[?2004hClaude Code')\n\
+                 data = b''\n\
+                 while not data.endswith(b'\\x1b[201~'):\n\
+                 \x20   data += os.read(0, 4096)\n\
+                 {after_paste}\n\
+                 while not data.endswith(b'\\r'):\n\
+                 \x20   data += os.read(0, 4096)\n"
+            ),
+        )
+        .unwrap();
+        let code = r#"
+import importlib.util, json, pathlib, sys, time
+root = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("launcher", root / "initial-prompt.py")
+launcher = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(launcher)
+steps = []
+launcher.run([sys.executable, str(root / "stub.py")], sys.argv[2].encode(), [b"Claude Code"], [],
+             landed_markers=[marker.encode() for marker in json.loads(sys.argv[3])], landing_timeout=0.5,
+             log=lambda step, **fields: steps.append({"step": step, "at_ms": int(time.time() * 1000), **fields}))
+(root / "steps.jsonl").write_text("".join(json.dumps(step) + "\n" for step in steps))
+"#;
+        let output = boss_command_runner::output_blocking_timeout(
+            std::process::Command::new("python3")
+                .args(["-c", code])
+                .arg(temp.path())
+                .arg(brief)
+                .arg(serde_json::to_string(landed_markers).unwrap())
+                .stdin(std::process::Stdio::null()),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        fs::rename(temp.path().join("steps.jsonl"), temp.path().join(DELIVERY_LOG)).unwrap();
+        read_delivery_log(temp.path())
+    }
+
+    fn step_names(steps: &[DeliveryStep]) -> Vec<&str> {
+        steps.iter().map(|step| step.step.as_str()).collect()
+    }
+
+    #[test]
+    fn return_is_sent_when_a_short_brief_appears_in_the_composer() {
+        // A short paste is shown as its own text, not as a placeholder.
+        let steps = delivery_steps(
+            "private sentinel line",
+            &["[Pasted text #"],
+            "os.write(1, b'\\r\\n> private sentinel line')",
+        );
+        assert_eq!(
+            step_names(&steps),
+            ["ready", "paste_sent", "paste_landed", "submit_sent"]
+        );
+        assert_eq!(steps[2].fields["evidence"], "literal");
+    }
+
+    #[test]
+    fn a_driver_without_a_landed_marker_gets_return_on_its_first_repaint() {
+        let steps = delivery_steps("tiny", &[], "os.write(1, b'\\r\\n> ')");
+        assert_eq!(
+            step_names(&steps),
+            ["ready", "paste_sent", "paste_landed", "submit_sent"]
+        );
+        assert_eq!(steps[2].fields["evidence"], "repaint");
+    }
+
+    #[test]
+    fn return_is_sent_once_unverified_when_the_composer_never_shows_the_brief() {
+        // The stub repaints, but never with the brief or its placeholder.
+        let steps = delivery_steps("tiny", &["[Pasted text #"], "os.write(1, b'\\r\\nPasting')");
+        assert_eq!(
+            step_names(&steps),
+            ["ready", "paste_sent", "paste_unverified", "submit_sent"]
+        );
+        assert!(steps[2].fields["wait_ms"].as_u64().unwrap() >= 500, "{steps:?}");
+    }
+
+    #[test]
+    fn launcher_budgets_match_the_engine_constants() {
+        let python_seconds = |assignment: &str| -> u64 {
+            let at = LAUNCHER
+                .find(assignment)
+                .unwrap_or_else(|| panic!("launcher no longer contains {assignment:?}"));
+            LAUNCHER[at + assignment.len()..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap()
+        };
+        assert_eq!(python_seconds("LANDING_TIMEOUT = "), LANDING_TIMEOUT.as_secs());
+        assert_eq!(python_seconds("readiness_timeout="), STAGE_TIMEOUT.as_secs());
+        assert_eq!(DELIVERY_BUDGET, 3 * STAGE_TIMEOUT + LANDING_TIMEOUT);
+    }
+
+    #[test]
+    fn claude_declares_its_paste_placeholder_and_other_drivers_none() {
+        let landed = |name: &str| -> serde_json::Value {
+            let driver = crate::DriverRegistry::default().require(name).unwrap();
+            let config: serde_json::Value = serde_json::from_str(&launcher_config(driver.as_ref()).unwrap()).unwrap();
+            config["paste_landed_markers"].clone()
+        };
+        assert_eq!(landed("claude"), serde_json::json!(["[Pasted text #"]));
+        assert_eq!(landed("codex"), serde_json::json!([]));
+        assert_eq!(landed("grok"), serde_json::json!([]));
+    }
+
+    #[test]
+    fn reprovision_clears_an_earlier_attempts_delivery_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        let home = temp.path().join("run-home");
+        fs::create_dir(&config).unwrap();
+        provision(&config, &home, "first", &crate::ClaudeDriver).unwrap();
+        assert_eq!(delivery_home(&config), fs::canonicalize(&home).unwrap());
+        assert_eq!(delivery_state(&home), DeliveryState::Pending);
+        fs::write(home.join(UNDELIVERED_MARKER), "").unwrap();
+        assert_eq!(delivery_state(&home), DeliveryState::Failed);
+        fs::write(home.join(DELIVERED_MARKER), "").unwrap();
+        assert_eq!(delivery_state(&home), DeliveryState::Submitted);
+        fs::write(
+            home.join(DELIVERY_LOG),
+            "{\"step\":\"ready\",\"at_ms\":5,\"wait_ms\":7}\nnot json\n",
+        )
+        .unwrap();
+        let steps = read_delivery_log(&home);
+        assert_eq!(step_names(&steps), ["ready"]);
+        assert_eq!(
+            (steps[0].at_ms, &steps[0].fields["wait_ms"]),
+            (5, &serde_json::json!(7))
+        );
+
+        provision(&config, &home, "second", &crate::ClaudeDriver).unwrap();
+        assert_eq!(delivery_state(&home), DeliveryState::Pending);
+        assert!(read_delivery_log(&home).is_empty());
+    }
 
     #[test]
     fn terminal_relay_preserves_followups_resize_and_exit_status() {
@@ -326,9 +574,16 @@ os.write(1, b'\\x1b[?2004hClaude Code Quick safety check:')
 assert not select.select([0], [], [], 0.3)[0], 'brief pasted into startup dialog'
 os.write(1, b'\\x1b[2JClaude Code')
 data = b''
-while not data.endswith(b'\\x1b[201~\\r'):
+while not data.endswith(b'\\x1b[201~'):
     data += os.read(0, 4096)
-assert data == b'\\x1b[200~private sentinel\\x1b[201~\\r', data
+assert data == b'\\x1b[200~private sentinel\\x1b[201~', data
+# The composer has read the paste but not committed it, as Claude Code does
+# while it probes image-like lines. Return sent now would be dropped, and a
+# repaint that is not the brief must not release it.
+os.write(1, b'\\r\\nPasting')
+assert not select.select([0], [], [], 0.4)[0], 'Return sent before the composer showed the brief'
+os.write(1, b'\\r\\x1b[2K[Pasted text #1 +1 lines]')
+assert os.read(0, 4096) == b'\\r'
 def resized(*_):
     size = fcntl.ioctl(0, termios.TIOCGWINSZ, bytes(8))
     if struct.unpack('HHHH', size)[:2] == (37, 113):
@@ -377,6 +632,10 @@ try:
     os.write(master, b"follow-up probe\r")
     wait_for(b"FOLLOWUP_DELIVERED")
     assert proc.wait(timeout=10) == 23
+    steps = [json.loads(line) for line in (root / "initial-prompt.delivery.jsonl").read_text().splitlines()]
+    assert [step["step"] for step in steps] == ["ready", "paste_sent", "paste_landed", "submit_sent"], steps
+    assert steps[1]["bytes"] == len(b"private sentinel"), steps
+    assert steps[2]["evidence"] == "marker" and steps[2]["wait_ms"] >= 300, steps
 finally:
     if proc.poll() is None:
         proc.kill()
@@ -547,16 +806,13 @@ assert_processes_exited(lifetime_reader)
         let driver = temp.path().join("driver.py");
         fs::write(
             &driver,
-            "import os, sys, tty\n\
-             tty.setraw(0)\n\
-             os.write(1, b'\\x1b[?2004hClaude Code')\n\
-             data = b''\n\
-             while not data.endswith(b'\\r'):\n\
-             \x20   data += os.read(0, 4096)\n\
-             if os.fork() == 0:\n\
-             \x20   import time; time.sleep(60)\n\
-             \x20   os._exit(0)\n\
-             sys.exit(9)\n",
+            format!(
+                "{STUB_TAKES_BRIEF}\
+                 if os.fork() == 0:\n\
+                 \x20   time.sleep(60)\n\
+                 \x20   os._exit(0)\n\
+                 sys.exit(9)\n"
+            ),
         )
         .unwrap();
         let started = std::time::Instant::now();
@@ -582,17 +838,7 @@ assert_processes_exited(lifetime_reader)
         let temp = tempfile::tempdir().unwrap();
         provision(temp.path(), temp.path(), "private sentinel", &crate::ClaudeDriver).unwrap();
         let driver = temp.path().join("driver.py");
-        fs::write(
-            &driver,
-            "import os, time, tty\n\
-             tty.setraw(0)\n\
-             os.write(1, b'\\x1b[?2004hClaude Code')\n\
-             data = b''\n\
-             while not data.endswith(b'\\r'):\n\
-             \x20   data += os.read(0, 4096)\n\
-             time.sleep(30)\n",
-        )
-        .unwrap();
+        fs::write(&driver, format!("{STUB_TAKES_BRIEF}time.sleep(30)\n")).unwrap();
         let mut child = std::process::Command::new("python3")
             .arg(temp.path().join("initial-prompt.py"))
             .args(["python3"])

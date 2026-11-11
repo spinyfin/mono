@@ -51,6 +51,13 @@ use crate::worker_setup::{WorkerSetupInput, write_workspace_files};
 /// installs but Apple-silicon machines ignore it.
 pub(crate) const WORKER_SANITIZED_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
 
+/// Serialises a test that sets `BOSS_BIN_DIR` in the process environment
+/// against a test that asserts on the exact `PATH` a spawn derives from it.
+/// Tests in one binary share that environment, so whenever two such tests
+/// land in the same shard they interleave without this.
+#[cfg(test)]
+pub(crate) static BOSS_BIN_DIR_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The shell and PATH seed shared by a worker pane and local capability
 /// discovery.
 ///
@@ -2180,6 +2187,9 @@ mod tests {
 
     #[tokio::test]
     async fn env_includes_sanitized_path_and_engine_keys() {
+        // The exact-PATH assertion below holds only while no other test has
+        // `BOSS_BIN_DIR` set.
+        let _ambient = BOSS_BIN_DIR_TEST_LOCK.lock().await;
         let workspace = TempDir::new().unwrap();
         let spawner = ok_spawner_capturing();
 

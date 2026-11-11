@@ -18,7 +18,16 @@
 //!    (`WorkDb::transcript_path_for_execution`). Historical runs of the
 //!    same execution do not count.
 //!
-//! Either wait timing out fails the spawn immediately with a named error
+//! 3. **Prompt accepted** — evidence that the driver began a turn
+//!    ([`DriverSignals::has_prompt_accepted_for_run`]: `UserPromptSubmit` or
+//!    any later turn event). A `SessionStart` satisfies the second wait and
+//!    says nothing here: a CLI can be up with its brief pasted into the
+//!    composer and never submitted. If no turn begins once the launcher has
+//!    reported its Return, the engine presses Return again (never the paste)
+//!    a bounded number of times, then fails the spawn. See
+//!    [`confirm_prompt_submitted`].
+//!
+//! Any wait timing out fails the spawn immediately with a named error
 //! so the coordinator records `pane_spawn_failed` instead of leaving the
 //! execution `Spawning` for `spawn_ack_sweep`'s later generic reap.
 //! "Composer never became ready" is reported only when neither composer
@@ -30,9 +39,11 @@ use std::time::Duration;
 use boss_protocol::PaneMonitorSpec;
 
 pub use boss_execution_contracts::{
-    SpawnConfirmationError, composer_not_ready_error, spawn_confirmation_error, turn_did_not_start_error,
+    SpawnConfirmationError, composer_not_ready_error, prompt_not_delivered_error, prompt_not_submitted_error,
+    remote_prompt_not_submitted_error, spawn_confirmation_error, turn_did_not_start_error,
 };
 
+use crate::driver::initial_prompt::{DELIVERY_BUDGET, DeliveryState};
 use crate::driver::{AgentDriver, ProgressIngress, ProgressObservationConfig};
 use crate::host::DriverSignals;
 use crate::work::WorkDb;
@@ -56,7 +67,35 @@ pub(crate) const COMPOSER_READY_TIMEOUT: Duration = Duration::from_secs(20);
 /// spawn call site.
 pub(crate) const TURN_START_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// Poll period for both waits.
+/// How long a driver may take to report a turn once Return has reached it,
+/// for **hook-callback** drivers. Use [`prompt_confirm_timeout_for_driver`]
+/// at the spawn call site.
+///
+/// Measured against Claude Code 2.1.322 with 47 KB briefs, from the launcher
+/// writing Return to the `UserPromptSubmit` hook running: 37-198 ms on a host
+/// at its normal load (92 runs), and 0.13-4.0 s with 250 busy-loop processes
+/// on 12 cores (34 runs). 30 s is 7.5 times that peak. When it expires the
+/// engine presses Return again; it fails the spawn only after
+/// [`SUBMIT_RETRIES`] further waits of the same length.
+pub(crate) const SUBMIT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many times Return is re-sent to a delivered prompt that produced no
+/// turn before the spawn fails.
+pub(crate) const SUBMIT_RETRIES: u32 = 2;
+
+/// How long the launcher may go without reporting that it sent Return (or
+/// that it gave up) before the engine stops waiting. The launcher bounds its
+/// own stages and reports a failure itself, so this only catches a launcher
+/// that died without a trace; it sits above the launcher's whole budget so
+/// the engine never fails a spawn the launcher is still working on.
+///
+/// Measured from pane spawn to the launcher's Return: 0.6-4.9 s at normal
+/// load (71 runs) and 13.9-63.8 s with 250 busy-loop processes on 12 cores
+/// (30 runs), where Claude Code took up to 46 s to commit a deferred paste.
+/// This is 4.7 times that peak.
+pub(crate) const DELIVERY_REPORT_TIMEOUT: Duration = Duration::from_secs(DELIVERY_BUDGET.as_secs() + 30);
+
+/// Poll period for the confirmation waits.
 pub const SPAWN_CONFIRM_POLL: Duration = Duration::from_millis(100);
 
 /// True when `pane_text` shows this driver's TUI is up. Only
@@ -74,6 +113,19 @@ pub(crate) fn pane_shows_driver_ready(pane_text: &str, spec: &PaneMonitorSpec) -
 /// [`ProgressIngress::AgentJsonlFile`] drivers use rollout
 /// the injected discovery deadline.
 pub fn turn_start_timeout_for_driver(driver: &dyn AgentDriver, discovery_timeout: Duration) -> Duration {
+    hook_or_discovery_timeout(driver, TURN_START_TIMEOUT, discovery_timeout)
+}
+
+/// Wait for turn evidence after Return, sized like
+/// [`turn_start_timeout_for_driver`]: hook-callback drivers report
+/// `UserPromptSubmit` directly and use [`SUBMIT_CONFIRM_TIMEOUT`];
+/// [`ProgressIngress::AgentJsonlFile`] drivers report it through the rollout
+/// the engine must first discover, so they inherit that budget.
+pub fn prompt_confirm_timeout_for_driver(driver: &dyn AgentDriver, discovery_timeout: Duration) -> Duration {
+    hook_or_discovery_timeout(driver, SUBMIT_CONFIRM_TIMEOUT, discovery_timeout)
+}
+
+fn hook_or_discovery_timeout(driver: &dyn AgentDriver, hook: Duration, discovery: Duration) -> Duration {
     let dummy = ProgressObservationConfig {
         events_socket_path: PathBuf::from("/dev/null"),
         lease_id: String::new(),
@@ -82,8 +134,37 @@ pub fn turn_start_timeout_for_driver(driver: &dyn AgentDriver, discovery_timeout
         forwarder_binary: PathBuf::from("/dev/null"),
     };
     match driver.progress_observation_wiring(&dummy) {
-        ProgressIngress::AgentJsonlFile(_) => discovery_timeout,
-        ProgressIngress::HookCallback(_) | ProgressIngress::StdoutJsonl => TURN_START_TIMEOUT,
+        ProgressIngress::AgentJsonlFile(_) => discovery,
+        ProgressIngress::HookCallback(_) | ProgressIngress::StdoutJsonl => hook,
+    }
+}
+
+/// The bounds on confirming that a delivered prompt became a turn.
+#[derive(Debug, Clone, Copy)]
+pub struct PromptSubmitPolicy {
+    /// See [`DELIVERY_REPORT_TIMEOUT`].
+    pub delivery_timeout: Duration,
+    /// See [`SUBMIT_CONFIRM_TIMEOUT`]; applies afresh after each Return.
+    pub confirm_timeout: Duration,
+    /// See [`SUBMIT_RETRIES`].
+    pub retries: u32,
+    pub poll: Duration,
+}
+
+impl PromptSubmitPolicy {
+    pub fn for_driver(driver: &dyn AgentDriver, discovery_timeout: Duration) -> Self {
+        Self {
+            delivery_timeout: DELIVERY_REPORT_TIMEOUT,
+            confirm_timeout: prompt_confirm_timeout_for_driver(driver, discovery_timeout),
+            retries: SUBMIT_RETRIES,
+            poll: SPAWN_CONFIRM_POLL,
+        }
+    }
+
+    /// The longest a worker whose prompt is never accepted can be held
+    /// before it is failed, when nothing can re-send Return to it.
+    pub fn unattended_timeout(&self) -> Duration {
+        self.delivery_timeout + self.confirm_timeout
     }
 }
 
@@ -167,6 +248,129 @@ where
     Ok(())
 }
 
+/// Third spawn-time wait: the delivered prompt must become a turn.
+///
+/// `accepted` is turn evidence for the current run. `delivery` is what the
+/// launcher has durably reported. `resubmit` presses Return in the worker's
+/// pane and nothing else.
+///
+/// Return is re-sent only after the launcher reports that it wrote the paste
+/// and its own Return ([`DeliveryState::Submitted`]), so it can never land in
+/// a startup dialog, and only when a full `confirm_timeout` has passed with
+/// no turn. Re-sending is idempotent: the brief is pasted exactly once, by
+/// the launcher, and Return on an empty composer does nothing.
+pub(crate) async fn confirm_prompt_submitted<Accepted, AcceptedFut, Delivery, DeliveryFut, Resubmit, ResubmitFut>(
+    driver_name: &str,
+    run_id: &str,
+    policy: PromptSubmitPolicy,
+    mut accepted: Accepted,
+    mut delivery: Delivery,
+    mut resubmit: Resubmit,
+) -> anyhow::Result<()>
+where
+    Accepted: FnMut() -> AcceptedFut,
+    AcceptedFut: std::future::Future<Output = bool>,
+    Delivery: FnMut() -> DeliveryFut,
+    DeliveryFut: std::future::Future<Output = DeliveryState>,
+    Resubmit: FnMut() -> ResubmitFut,
+    ResubmitFut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let started = tokio::time::Instant::now();
+    let elapsed_ms = || started.elapsed().as_millis() as u64;
+    let mut retries = 0;
+    // When Return last reached the driver: first the launcher's, then ours.
+    let mut submitted_at = None;
+    loop {
+        if accepted().await {
+            tracing::info!(
+                run_id,
+                driver = driver_name,
+                retries,
+                elapsed_ms = elapsed_ms(),
+                "prompt submit confirmed: the driver started a turn",
+            );
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        match submitted_at {
+            None => match delivery().await {
+                DeliveryState::Submitted => {
+                    tracing::info!(
+                        run_id,
+                        driver = driver_name,
+                        elapsed_ms = elapsed_ms(),
+                        "prompt submit sent by the launcher; awaiting turn evidence",
+                    );
+                    submitted_at = Some(now);
+                }
+                DeliveryState::Failed => {
+                    tracing::warn!(
+                        run_id,
+                        driver = driver_name,
+                        elapsed_ms = elapsed_ms(),
+                        "prompt submit failed: the launcher reported the brief undelivered",
+                    );
+                    return Err(prompt_not_delivered_error(
+                        driver_name,
+                        run_id,
+                        "the launcher reported it could not deliver the brief",
+                    ));
+                }
+                DeliveryState::Pending if now.duration_since(started) >= policy.delivery_timeout => {
+                    tracing::warn!(
+                        run_id,
+                        driver = driver_name,
+                        elapsed_ms = elapsed_ms(),
+                        "prompt submit failed: the launcher never reported delivering the brief",
+                    );
+                    return Err(prompt_not_delivered_error(
+                        driver_name,
+                        run_id,
+                        format!(
+                            "the launcher reported neither delivery nor failure within {}s",
+                            policy.delivery_timeout.as_secs()
+                        ),
+                    ));
+                }
+                DeliveryState::Pending => {}
+            },
+            Some(at) if now.duration_since(at) >= policy.confirm_timeout => {
+                if retries == policy.retries {
+                    tracing::warn!(
+                        run_id,
+                        driver = driver_name,
+                        retries,
+                        elapsed_ms = elapsed_ms(),
+                        "prompt submit failed: no turn evidence after the final Return",
+                    );
+                    return Err(prompt_not_submitted_error(
+                        driver_name,
+                        run_id,
+                        retries,
+                        started.elapsed(),
+                    ));
+                }
+                retries += 1;
+                let sent = tokio::time::timeout(policy.confirm_timeout, resubmit())
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("pressing Return timed out")));
+                tracing::warn!(
+                    run_id,
+                    driver = driver_name,
+                    attempt = retries,
+                    of = policy.retries,
+                    elapsed_ms = elapsed_ms(),
+                    error = ?sent.err().map(|err| format!("{err:#}")),
+                    "prompt submit retried: no turn evidence since the last Return, pressed Return again",
+                );
+                submitted_at = Some(tokio::time::Instant::now());
+            }
+            Some(_) => {}
+        }
+        tokio::time::sleep(policy.poll).await;
+    }
+}
+
 /// Remote turn-start wait: same [`wait_until`] loop as the local path, then
 /// `reap` (pid kill) when no evidence arrives.
 pub async fn confirm_turn_start_or_reap<Started, StartedFut, Reap, ReapFut>(
@@ -188,6 +392,46 @@ where
     }
     reap().await;
     Err(turn_did_not_start_error(driver_name, run_id, timeout))
+}
+
+/// Remote prompt-accepted wait, then `reap` when no turn begins.
+///
+/// The engine cannot press Return in a remote worker's terminal, so there is
+/// no retry here: the launcher's own Return, sent once the composer shows the
+/// brief, is the only submit. A worker that still has not begun a turn after
+/// `timeout` is reaped and its spawn failed rather than left idle.
+pub async fn confirm_prompt_accepted_or_reap<Accepted, AcceptedFut, Reap, ReapFut>(
+    driver_name: &str,
+    run_id: &str,
+    timeout: Duration,
+    poll: Duration,
+    accepted: Accepted,
+    reap: Reap,
+) -> anyhow::Result<()>
+where
+    Accepted: FnMut() -> AcceptedFut,
+    AcceptedFut: std::future::Future<Output = bool>,
+    Reap: FnOnce() -> ReapFut,
+    ReapFut: std::future::Future<Output = ()>,
+{
+    let started = tokio::time::Instant::now();
+    if wait_until(timeout, poll, accepted).await {
+        tracing::info!(
+            run_id,
+            driver = driver_name,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "prompt submit confirmed: the driver started a turn",
+        );
+        return Ok(());
+    }
+    tracing::warn!(
+        run_id,
+        driver = driver_name,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "prompt submit failed: the remote driver started but reported no turn",
+    );
+    reap().await;
+    Err(remote_prompt_not_submitted_error(driver_name, run_id, timeout))
 }
 
 #[cfg(test)]
@@ -478,6 +722,194 @@ mod tests {
         .await
         .expect("turn-start evidence must complete the remote wait");
         assert!(!reaped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn prompt_confirm_timeout_follows_the_driver_ingress() {
+        let discovery_timeout = Duration::from_secs(123);
+        for hook_driver in [&ClaudeDriver as &dyn AgentDriver, &GrokDriver::default()] {
+            let policy = PromptSubmitPolicy::for_driver(hook_driver, discovery_timeout);
+            assert_eq!(policy.confirm_timeout, SUBMIT_CONFIRM_TIMEOUT);
+            assert_eq!(policy.delivery_timeout, DELIVERY_REPORT_TIMEOUT);
+            assert_eq!(policy.retries, SUBMIT_RETRIES);
+            assert_eq!(
+                policy.unattended_timeout(),
+                DELIVERY_REPORT_TIMEOUT + SUBMIT_CONFIRM_TIMEOUT
+            );
+        }
+        assert_eq!(
+            PromptSubmitPolicy::for_driver(&CodexDriver::default(), discovery_timeout).confirm_timeout,
+            discovery_timeout,
+            "a rollout-fed driver reports its turn through the file the engine must first discover"
+        );
+        assert!(
+            DELIVERY_REPORT_TIMEOUT > DELIVERY_BUDGET,
+            "the engine must outwait a launcher that is still working"
+        );
+    }
+
+    const SHORT_POLICY: PromptSubmitPolicy = PromptSubmitPolicy {
+        delivery_timeout: Duration::from_millis(500),
+        confirm_timeout: Duration::from_millis(100),
+        retries: 2,
+        poll: Duration::from_millis(5),
+    };
+
+    /// Drive [`confirm_prompt_submitted`] against a worker whose launcher
+    /// reports `delivery` after `delivered_after`, and which starts its turn
+    /// once Return has been re-sent `accepts_after_resubmits` times (`None`:
+    /// never, `Some(0)`: on the launcher's own Return). Returns the result,
+    /// how many times Return was re-sent, and whether any of those came
+    /// before the launcher reported delivery.
+    async fn confirm_prompt(
+        delivery: DeliveryState,
+        delivered_after: Duration,
+        accepts_after_resubmits: Option<u32>,
+    ) -> (anyhow::Result<()>, u32, bool) {
+        use std::sync::atomic::AtomicU32;
+        let started = tokio::time::Instant::now();
+        let resubmits = AtomicU32::new(0);
+        let early_resubmit = AtomicBool::new(false);
+        let reported = || started.elapsed() >= delivered_after;
+        let result = confirm_prompt_submitted(
+            "claude",
+            "exec-prompt",
+            SHORT_POLICY,
+            || async {
+                reported()
+                    && delivery == DeliveryState::Submitted
+                    && accepts_after_resubmits.is_some_and(|needed| resubmits.load(Ordering::SeqCst) >= needed)
+            },
+            || async { if reported() { delivery } else { DeliveryState::Pending } },
+            || async {
+                if !reported() {
+                    early_resubmit.store(true, Ordering::SeqCst);
+                }
+                resubmits.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        (
+            result,
+            resubmits.load(Ordering::SeqCst),
+            early_resubmit.load(Ordering::SeqCst),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_accepted_prompt_is_confirmed_without_pressing_return() {
+        let (result, resubmits, _) = confirm_prompt(DeliveryState::Submitted, Duration::from_millis(50), Some(0)).await;
+        result.expect("turn evidence must confirm the prompt");
+        assert_eq!(resubmits, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn return_is_resent_only_after_the_launcher_delivered_and_a_full_wait_passed() {
+        // The launcher takes four confirm windows to deliver. No Return may
+        // be pressed while it is still working, however long that takes.
+        let (result, resubmits, early) =
+            confirm_prompt(DeliveryState::Submitted, Duration::from_millis(400), Some(1)).await;
+        result.expect("the re-sent Return starts the turn");
+        assert_eq!(resubmits, 1);
+        assert!(!early, "Return was pressed before the launcher delivered the brief");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_prompt_that_never_becomes_a_turn_fails_after_bounded_retries() {
+        let started = tokio::time::Instant::now();
+        let (result, resubmits, _) = confirm_prompt(DeliveryState::Submitted, Duration::ZERO, None).await;
+        let err = result.expect_err("must fail the spawn");
+        assert_eq!(resubmits, SHORT_POLICY.retries);
+        assert!(matches!(
+            spawn_confirmation_error(&err),
+            Some(SpawnConfirmationError::PromptNotSubmitted { retries: 2, .. })
+        ));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exec-prompt") && msg.contains("never started a turn"),
+            "{msg}"
+        );
+        // One wait after the launcher's Return and one after each retry.
+        let waited = started.elapsed();
+        assert!(
+            waited >= SHORT_POLICY.confirm_timeout * 3 && waited < SHORT_POLICY.confirm_timeout * 4,
+            "{waited:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_undelivered_brief_fails_without_pressing_return() {
+        let (failed, resubmits, _) = confirm_prompt(DeliveryState::Failed, Duration::from_millis(50), None).await;
+        let err = failed.expect_err("a launcher failure must fail the spawn");
+        assert_eq!(resubmits, 0);
+        assert!(matches!(
+            spawn_confirmation_error(&err),
+            Some(SpawnConfirmationError::PromptNotDelivered { .. })
+        ));
+        assert!(err.to_string().contains("could not deliver the brief"), "{err}");
+
+        let started = tokio::time::Instant::now();
+        let (silent, resubmits, _) = confirm_prompt(DeliveryState::Pending, Duration::ZERO, None).await;
+        let err = silent.expect_err("a launcher that never reports must fail the spawn");
+        assert_eq!(resubmits, 0);
+        assert!(err.to_string().contains("neither delivery nor failure"), "{err}");
+        assert!(started.elapsed() >= SHORT_POLICY.delivery_timeout);
+        assert!(spawn_confirmation_error(&err).is_some_and(SpawnConfirmationError::is_unsubmitted_prompt));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_return_that_cannot_be_sent_still_ends_in_a_failed_spawn() {
+        let err = confirm_prompt_submitted(
+            "claude",
+            "exec-no-pane",
+            SHORT_POLICY,
+            || async { false },
+            || async { DeliveryState::Submitted },
+            || async { Err(anyhow::anyhow!("no such session")) },
+        )
+        .await
+        .expect_err("must fail the spawn");
+        assert!(err.to_string().contains("never started a turn"), "{err}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remote_prompt_never_accepted_reaps_then_fails() {
+        let reaped = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&reaped);
+        let err = confirm_prompt_accepted_or_reap(
+            "claude",
+            "exec-remote-idle",
+            Duration::from_millis(30),
+            Duration::from_millis(5),
+            || async { false },
+            || async move { flag.store(true, Ordering::SeqCst) },
+        )
+        .await
+        .expect_err("a remote worker that never starts a turn must fail the spawn");
+        assert!(reaped.load(Ordering::SeqCst), "timeout must reap the remote pid");
+        assert!(matches!(
+            spawn_confirmation_error(&err),
+            Some(SpawnConfirmationError::RemotePromptNotSubmitted { .. })
+        ));
+        assert!(spawn_confirmation_error(&err).is_some_and(SpawnConfirmationError::is_unsubmitted_prompt));
+        let msg = err.to_string();
+        assert!(msg.contains("unknown"), "{msg}");
+        assert!(!msg.contains("re-sent 0"), "{msg}");
+
+        let reaped = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&reaped);
+        confirm_prompt_accepted_or_reap(
+            "claude",
+            "exec-remote-working",
+            Duration::from_millis(30),
+            Duration::from_millis(5),
+            || async { true },
+            || async move { flag.store(true, Ordering::SeqCst) },
+        )
+        .await
+        .expect("turn evidence must complete the remote wait");
+        assert!(!reaped.load(Ordering::SeqCst), "an accepted prompt must not be reaped");
     }
 
     #[test]

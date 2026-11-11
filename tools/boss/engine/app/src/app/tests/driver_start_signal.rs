@@ -128,3 +128,58 @@ async fn a_driver_signal_for_an_admitted_canary_clears_in_flight_and_resumes_bre
         "a healthy canary must auto-resume a Breaker-origin pause"
     );
 }
+
+/// The 2026-11-10 shape at the ingress: `SessionStart` proves the driver
+/// started and must not be read as the prompt having been accepted. Spawn
+/// confirmation waits on the second fact, which only a turn event records.
+#[tokio::test]
+async fn a_session_start_records_driver_start_but_only_a_turn_records_prompt_acceptance() {
+    use boss_protocol::RequestExecutionInput;
+    use boss_protocol::WorkerEvent;
+
+    let (server_state, _dir) = test_server_state();
+    let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
+    let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
+    let execution = server_state
+        .work_db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    server_state
+        .live_worker_states
+        .register_spawn(1, execution.id.clone(), "claude-sonnet-5-5", 4242, None);
+    server_state.worker_registry.register_run_slot(&execution.id, 1);
+
+    let hook = |event| {
+        boss_engine_runtime::events_socket::IncomingHookEvent::for_test(event, Some(execution.id.clone()), None)
+    };
+    dispatch_live_worker_state(
+        &server_state,
+        &hook(WorkerEvent::SessionStart {
+            session_id: "claude-sess-1".into(),
+            source: boss_protocol::SessionStartSource::Startup,
+            model: None,
+        }),
+    )
+    .await;
+    assert!(server_state.live_worker_states.driver_signal_at(1).is_some());
+    assert!(
+        !server_state
+            .live_worker_states
+            .has_prompt_accepted_for_run(&execution.id),
+        "SessionStart must not count as the prompt being accepted",
+    );
+
+    dispatch_live_worker_state(
+        &server_state,
+        &hook(WorkerEvent::UserPromptSubmit {
+            session_id: "claude-sess-1".into(),
+            prompt: "brief".into(),
+        }),
+    )
+    .await;
+    assert!(
+        server_state
+            .live_worker_states
+            .has_prompt_accepted_for_run(&execution.id)
+    );
+}

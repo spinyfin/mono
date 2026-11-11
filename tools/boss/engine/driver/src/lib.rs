@@ -1892,6 +1892,18 @@ pub trait AgentDriver: Send + Sync {
         Vec::new()
     }
 
+    /// Screen text this driver's composer shows once it holds a pasted brief
+    /// (its placeholder for a large paste). The initial-brief launcher sends
+    /// Return only after one appears, because a composer that commits a paste
+    /// late drops a Return sent before the commit.
+    ///
+    /// Declare one only for a driver whose composer can commit a paste after
+    /// reading it. The default, none, tells the launcher this driver handles
+    /// input in order, so its first output after the paste is evidence enough.
+    fn paste_landed_markers(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     // ── WorkspaceProvisioning capability ────────────────────────────────────
 
     /// Write per-session workspace files (prompt file, agent-rules, gitignore)

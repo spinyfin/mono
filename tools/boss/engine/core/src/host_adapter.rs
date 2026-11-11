@@ -1334,6 +1334,36 @@ impl HostAdapter for SshHostAdapter {
             },
         )
         .await?;
+        // A started driver has not necessarily taken its prompt. Without a
+        // registry nothing can report a turn, so there is nothing to wait for.
+        if let Some(live_worker_states) = self.live_worker_states.clone() {
+            let policy = crate::runner::spawn_confirmation::PromptSubmitPolicy::for_driver(
+                driver.as_ref(),
+                crate::agent_jsonl_discovery::DISCOVERY_TIMEOUT,
+            );
+            crate::runner::spawn_confirmation::confirm_prompt_accepted_or_reap(
+                driver.descriptor().name,
+                &run_id,
+                policy.unattended_timeout(),
+                policy.poll,
+                || {
+                    let accepted = live_worker_states.has_prompt_accepted_for_run(&run_id);
+                    async move { accepted }
+                },
+                || async {
+                    reap_failed_remote_turn(
+                        &transport,
+                        &reap_run_id,
+                        remote_pid,
+                        &reap_workspace,
+                        &reap_remote_socket,
+                        &reap_engine_socket,
+                    )
+                    .await;
+                },
+            )
+            .await?;
+        }
 
         // WorkerPaneAlive: the remote agent is up and working, so the
         // execution stays `running` (never `waiting_human` — nothing is

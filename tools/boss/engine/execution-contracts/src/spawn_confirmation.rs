@@ -29,6 +29,55 @@ pub enum SpawnConfirmationError {
         run_id: String,
         timeout_secs: u64,
     },
+    /// The driver started and the brief reached its composer, but no turn
+    /// began, even after Return was re-sent.
+    #[error(
+        "refusing to complete {driver_name} spawn for {run_id}: the initial prompt was delivered but the driver \
+         never started a turn (no UserPromptSubmit or other turn event in {waited_secs}s, with Return re-sent \
+         {retries} time(s)); recording a failed spawn"
+    )]
+    PromptNotSubmitted {
+        driver_name: String,
+        run_id: String,
+        retries: u32,
+        waited_secs: u64,
+    },
+    /// A remote driver started but reported no turn. The engine neither sees
+    /// the remote launcher's delivery state nor can press Return there, so
+    /// it knows neither whether the brief was pasted nor whether a retry
+    /// would have helped.
+    #[error(
+        "refusing to complete {driver_name} spawn for {run_id}: the remote driver started but reported no turn \
+         within {waited_secs}s; whether the initial prompt was delivered is unknown (the engine cannot see the \
+         remote launcher) and Return could not be re-sent; recording a failed spawn"
+    )]
+    RemotePromptNotSubmitted {
+        driver_name: String,
+        run_id: String,
+        waited_secs: u64,
+    },
+    /// The driver started but the launcher never got the brief to it.
+    #[error(
+        "refusing to complete {driver_name} spawn for {run_id}: the initial prompt was not delivered to the \
+         driver ({reason}); recording a failed spawn"
+    )]
+    PromptNotDelivered {
+        driver_name: String,
+        run_id: String,
+        reason: String,
+    },
+}
+
+impl SpawnConfirmationError {
+    /// True when the driver had started and what failed was getting it to
+    /// take its prompt. Only a turn, not a driver signal, can then veto the
+    /// reap.
+    pub fn is_unsubmitted_prompt(&self) -> bool {
+        matches!(
+            self,
+            Self::PromptNotSubmitted { .. } | Self::RemotePromptNotSubmitted { .. } | Self::PromptNotDelivered { .. }
+        )
+    }
 }
 
 /// Walk an anyhow chain for a [`SpawnConfirmationError`].
@@ -50,5 +99,30 @@ pub fn turn_did_not_start_error(driver_name: &str, run_id: &str, timeout: Durati
         driver_name: driver_name.to_owned(),
         run_id: run_id.to_owned(),
         timeout_secs: timeout.as_secs(),
+    })
+}
+
+pub fn prompt_not_submitted_error(driver_name: &str, run_id: &str, retries: u32, waited: Duration) -> anyhow::Error {
+    anyhow::Error::from(SpawnConfirmationError::PromptNotSubmitted {
+        driver_name: driver_name.to_owned(),
+        run_id: run_id.to_owned(),
+        retries,
+        waited_secs: waited.as_secs(),
+    })
+}
+
+pub fn remote_prompt_not_submitted_error(driver_name: &str, run_id: &str, waited: Duration) -> anyhow::Error {
+    anyhow::Error::from(SpawnConfirmationError::RemotePromptNotSubmitted {
+        driver_name: driver_name.to_owned(),
+        run_id: run_id.to_owned(),
+        waited_secs: waited.as_secs(),
+    })
+}
+
+pub fn prompt_not_delivered_error(driver_name: &str, run_id: &str, reason: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::from(SpawnConfirmationError::PromptNotDelivered {
+        driver_name: driver_name.to_owned(),
+        run_id: run_id.to_owned(),
+        reason: reason.into(),
     })
 }

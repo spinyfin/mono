@@ -128,6 +128,9 @@ class TerminalTail:
             lines.pop()
         return "\n".join(lines[-12:]).encode()
 
+    def text(self):
+        return "\n".join("".join(row).rstrip() for row in self.rows).encode()
+
     def resize(self, height, width):
         self.height, self.width = max(1, height), max(1, width)
         self.rows = [row[:self.width] for row in self.rows[:self.height]]
@@ -140,6 +143,46 @@ def ready_for_prompt(view, raw, paste_enabled, markers, starting_markers):
     visible = view.tail()
     return (raw and paste_enabled and any(marker in visible for marker in markers)
             and not any(marker in visible for marker in starting_markers))
+
+
+# How long the composer may take to show a pasted brief before Return is sent
+# without that evidence. Measured against Claude Code 2.1.322 with 47 KB briefs,
+# from the last paste byte written to the placeholder appearing: 6-22 ms for an
+# ordinary brief and 0.08-3.3 s for one it defers as possible image paths, on a
+# host at its normal load; 0.4-2.9 s and 1.5-46 s with 250 busy-loop processes on
+# 12 cores. 180 s is 3.9 times that peak. Expiry is not a failure: Return is sent
+# once anyway and the engine confirms the turn started.
+LANDING_TIMEOUT = 180
+
+
+def brief_head(prompt):
+    """The brief's opening text as a composer shows a short paste, if distinctive."""
+    for line in prompt.decode("utf-8", "replace").splitlines():
+        head = line.strip()[:24].strip()
+        if head:
+            return head.encode() if len(head) >= 8 else None
+    return None
+
+
+def brief_landed(screen, echo, baseline, head, landed_markers):
+    """How the composer shows it now holds the pasted brief, or None while it does not.
+
+    A composer may commit a paste some time after reading it: Claude Code holds a
+    paste with a line that looks like an image path while it asks the system
+    clipboard for a file, which takes from a tenth of a second to most of a
+    minute. Return sent before that commit reaches an empty composer and is
+    dropped, leaving the brief pasted but never submitted, so Return waits for
+    this evidence instead of for a fixed delay.
+    """
+    if head and head in screen and head not in baseline:
+        return "literal"
+    if any(marker not in baseline and (marker in screen or marker in echo) for marker in landed_markers):
+        return "marker"
+    # A driver that declares no marker handles input in order: its first output
+    # after the whole paste was written is the composer taking it.
+    if not landed_markers and (echo or screen != baseline):
+        return "repaint"
+    return None
 
 
 def write_all(fd, data):
@@ -187,7 +230,8 @@ def spawn_supervised(argv, master, slave):
     return pid, writer
 
 
-def run(argv, prompt, markers, starting_markers, readiness_timeout=30):
+def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_markers=(),
+        landing_timeout=LANDING_TIMEOUT, log=lambda step, **fields: None):
     if b"\x1b[201~" in prompt or b"\0" in prompt:
         raise ValueError("initial brief contains a terminal paste terminator or NUL")
     outer_tty = os.isatty(0)
@@ -226,8 +270,16 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30):
     submitting = False
     paste_enabled = False
     ready_since = None
-    submit_at = None
-    deadline = time.monotonic() + readiness_timeout
+    started = time.monotonic()
+    # Each stage is bounded on its own: a slow start must not eat the time the
+    # composer needs to take the paste.
+    stage, deadline = "ready", started + readiness_timeout
+    head = brief_head(prompt)
+    baseline = echo = b""
+    paste_queued_at = paste_written_at = None
+
+    def elapsed_ms(since):
+        return int((time.monotonic() - since) * 1000)
     stdin_open = outer_tty
     exit_status = None
     drain_until = None
@@ -245,12 +297,22 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30):
                     exit_status, drain_until = status, now + 0.5
             elif now >= drain_until:
                 break
-            if not delivered and now >= deadline:
-                raise TimeoutError(f"driver did not become ready for initial brief within {readiness_timeout}s")
-            if submit_at is not None and now >= submit_at:
-                pending += b"\r"
-                submit_at = None
-                submitting = True
+            if stage == "landing":
+                evidence = brief_landed(view.text(), echo, baseline, head, landed_markers)
+                if evidence or now >= deadline:
+                    # Without evidence by the deadline Return is still sent, once:
+                    # the engine confirms the turn started and fails the spawn if not.
+                    log("paste_landed" if evidence else "paste_unverified",
+                        evidence=evidence, wait_ms=elapsed_ms(paste_written_at))
+                    pending += b"\r"
+                    submitting = True
+                    stage, deadline = "submit", now + readiness_timeout
+            elif stage != "delivered" and now >= deadline:
+                raise TimeoutError({
+                    "ready": f"driver did not become ready for initial brief within {readiness_timeout}s",
+                    "paste": f"driver did not read the initial brief within {readiness_timeout}s",
+                    "submit": f"driver did not read the submit key within {readiness_timeout}s",
+                }[stage])
             # Terminal query replies must reach the CLI during startup too;
             # waiting for brief delivery here deadlocks cursor-position probes.
             reads = [master] + ([0] if stdin_open else [])
@@ -272,9 +334,12 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30):
                         pending += REPLIES[query[1]]
                         consumed = query.end()
                     query_buffer = query_buffer[consumed:][-32:]
+                if not submitting:
+                    view.feed(output)
+                if stage == "landing":
+                    echo = (echo + output)[-65536:]
                 if not paste_started:
                     screen = (screen + output)[-65536:]
-                    view.feed(output)
                     # The mode transition can span reads. A raw terminal and
                     # driver chrome are both required: never paste into a shell
                     # or a canonical terminal that could truncate the brief.
@@ -290,6 +355,9 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30):
                     elif now - ready_since >= 0.2:
                         pending += b"\x1b[200~" + prompt + b"\x1b[201~"
                         paste_started = True
+                        paste_queued_at = now
+                        stage, deadline = "paste", now + readiness_timeout
+                        log("ready", wait_ms=elapsed_ms(started))
                 else:
                     ready_since = None
             if 0 in readable:
@@ -303,13 +371,19 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30):
                 pending = pending[count:]
                 if not pending and submitting and not delivered:
                     delivered = True
+                    stage = "delivered"
                     # Durable proof the moment the submit bytes are fully
                     # written, not when the (long-lived) driver exits.
                     write_marker(DELIVERED_MARKER)
-                elif not pending and paste_started and not delivered and submit_at is None:
-                    # Let the TUI consume the paste event before Return; this
-                    # is the same separation used by terminal paste delivery.
-                    submit_at = time.monotonic() + 0.1
+                    log("submit_sent")
+                elif not pending and stage == "paste":
+                    # Return follows only once the composer shows the brief.
+                    # The composer cannot have reacted to the whole paste before
+                    # its last byte was written, so this is what it must change.
+                    baseline = view.text()
+                    paste_written_at = time.monotonic()
+                    stage, deadline = "landing", paste_written_at + landing_timeout
+                    log("paste_sent", bytes=len(prompt), write_ms=elapsed_ms(paste_queued_at))
         if exit_status is None:
             _, exit_status = os.waitpid(pid, 0)
         status = exit_status
@@ -343,6 +417,9 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30):
 BRIEF_NOT_DELIVERED_EXIT = 64
 DELIVERED_MARKER = "initial-prompt.delivered"
 UNDELIVERED_MARKER = "initial-prompt.undelivered"
+# One JSON object per delivery step, for the engine to report: the pane is the
+# driver's terminal, so the relay has nowhere else to log.
+DELIVERY_LOG = "initial-prompt.delivery.jsonl"
 
 
 def prompt_home():
@@ -353,17 +430,23 @@ def prompt_home():
         return Path(__file__).parent
 
 
-def write_marker(name):
+def write_marker(name, data=b"", flags=os.O_TRUNC):
     path = prompt_home() / name
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    flags |= os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
     try:
         fd = os.open(path, flags, 0o600)
         try:
             os.fchmod(fd, 0o600)
+            write_all(fd, data)
         finally:
             os.close(fd)
     except OSError:
         pass
+
+
+def log_delivery(step, **fields):
+    record = {"step": step, "at_ms": int(time.time() * 1000), **fields}
+    write_marker(DELIVERY_LOG, json.dumps(record).encode() + b"\n", os.O_APPEND)
 
 
 def main():
@@ -375,6 +458,7 @@ def main():
     config = json.loads(Path(__file__).with_name("initial-prompt.json").read_text())
     markers = [s.encode() for s in config["agent_markers"]]
     starting_markers = [s.encode() for s in config["starting_markers"]]
+    landed_markers = [s.encode() for s in config.get("paste_landed_markers", [])]
     if not markers:
         raise ValueError("missing driver readiness markers")
     prompt_path = Path(__file__).with_name("initial-prompt.txt")
@@ -382,7 +466,9 @@ def main():
         if os.fstat(prompt_file.fileno()).st_mode & 0o777 != 0o600:
             raise PermissionError("initial brief must have mode 0600")
         prompt = prompt_file.read()
-    return run(argv, prompt, markers, starting_markers)
+    # A retried launch starts its own record.
+    write_marker(DELIVERY_LOG)
+    return run(argv, prompt, markers, starting_markers, landed_markers=landed_markers, log=log_delivery)
 
 
 if __name__ == "__main__":
@@ -390,6 +476,7 @@ if __name__ == "__main__":
         sys.exit(main())
     except Exception as error:
         print(f"boss initial brief delivery failed: {error}", file=sys.stderr)
+        log_delivery("failed", reason=str(error))
         if (prompt_home() / DELIVERED_MARKER).is_file():
             sys.exit(1)
         write_marker(UNDELIVERED_MARKER)

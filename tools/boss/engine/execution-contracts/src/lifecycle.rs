@@ -376,6 +376,19 @@ pub enum NeverStartedReap {
     AlreadyCommitted,
 }
 
+/// Result of atomically checking and fencing a run that never took its prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsubmittedReap {
+    /// The run is now fenced against later turn evidence.
+    Committed,
+    /// A turn started while the check was in flight; the run must not be reaped.
+    PromptAccepted,
+    /// The slot no longer belongs to this run.
+    SlotGone,
+    /// A reap was already committed for this registration.
+    AlreadyCommitted,
+}
+
 /// Driver observations and atomic reap fencing, supplied by the engine's live-state owner.
 pub trait DriverSignals: Send + Sync {
     fn has_driver_signal_for_run(&self, run_id: &str) -> bool;
@@ -383,4 +396,10 @@ pub trait DriverSignals: Send + Sync {
     /// Atomically commit the reap fence unless a driver signal already won.
     /// A successful commit prevents later driver signals from reviving the run.
     fn commit_never_started_reap(&self, slot_id: u8, run_id: &str) -> NeverStartedReap;
+    /// Whether the driver has started a turn for `run_id`: its prompt was
+    /// accepted. A driver that has merely started (`SessionStart`) has not.
+    fn has_prompt_accepted_for_run(&self, run_id: &str) -> bool;
+    /// Atomically commit the reap of a run whose prompt was never accepted,
+    /// unless a turn already started.
+    fn commit_unsubmitted_reap(&self, slot_id: u8, run_id: &str) -> UnsubmittedReap;
 }

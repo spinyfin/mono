@@ -325,6 +325,10 @@ while not response.endswith(b'R'):
 assert response == b'\x1b[1;1R', response
 os.write(1, b'\x1b[?2004h' + os.environ['BOSS_STUB_CHROME'].encode())
 data = b''
+while not data.endswith(b'\x1b[201~'):
+    data += os.read(0, 65536)
+# A composer shows the paste before it will take Return.
+os.write(1, b'\r\n[Pasted text #1 +1 lines]')
 while not data.endswith(b'\x1b[201~\r'):
     data += os.read(0, 65536)
 assert data.startswith(b'\x1b[200~'), data[:40]
