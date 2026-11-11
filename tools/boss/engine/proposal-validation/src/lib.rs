@@ -450,6 +450,28 @@ pub fn derive_idempotency_key(execution_id: &str, kind: ProposalKind, canonical_
     format!("auto:{kind}:{hex}")
 }
 
+/// Choose the idempotency key for a submission: the one policy shared by the
+/// engine and any spoke-local gateway.
+///
+/// A caller-supplied key (blank counts as absent, since an unset shell variable
+/// expands to an empty string) is validated and replays. A keyless `Wait` gets
+/// a fresh identity from `unique` so re-running it renews the deadline instead
+/// of replaying the original row. Every other keyless submission derives its
+/// key from the content, so a retried command is replay-safe.
+pub fn select_idempotency_key(
+    execution_id: &str,
+    kind: ProposalKind,
+    canonical_json: &str,
+    supplied: Option<&str>,
+    unique: u128,
+) -> Result<String, ProposalFieldError> {
+    match supplied.map(str::trim).filter(|key| !key.is_empty()) {
+        Some(key) => validate_caller_idempotency_key(key).map(|()| key.to_owned()),
+        None if kind == ProposalKind::Wait => Ok(format!("auto:wait:{execution_id}:{unique}")),
+        None => Ok(derive_idempotency_key(execution_id, kind, canonical_json)),
+    }
+}
+
 /// The prefix [`derive_idempotency_key`] reserves for keys it derives itself.
 pub const DERIVED_IDEMPOTENCY_KEY_PREFIX: &str = "auto:";
 

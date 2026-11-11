@@ -130,6 +130,7 @@ rust_test(
         "//tools/boss/engine/spoke-worker-api",
         "//tools/boss/engine/stdout-progress",
         "//tools/boss/engine/transcript-tail",
+        "//tools/boss/protocol",
         "//tools/boss/protocol-spoke",
     ] + all_crate_deps(
         normal = True,

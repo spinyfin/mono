@@ -35,6 +35,10 @@ use boss_protocol::ProposalSubmissionError;
 use boss_protocol::{ATTACHMENT_MAX_BYTES, ATTACHMENT_MAX_PIXELS_PER_SIDE, AttachmentMediaType, ProposalFieldError};
 use sha2::{Digest, Sha256};
 
+use crate::image::{self, HEADER_SCAN_BYTES};
+
+/// Longest accepted caption, in characters. A caption names what the image
+/// shows in one line; the detail belongs in the PR body.
 const MAX_CAPTION_CHARS: usize = 240;
 
 /// Validate the worker-supplied caption. Absent is fine; blank is normalised
@@ -58,8 +62,6 @@ pub fn validate_caption(caption: Option<&str>) -> std::result::Result<String, Pr
     }
     Ok(trimmed.to_owned())
 }
-
-use crate::image::{self, HEADER_SCAN_BYTES};
 
 /// Directory name of the blob store under the engine state root.
 pub const STORE_DIR_NAME: &str = "attachments";

@@ -16,7 +16,7 @@ libc.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
-tokio = { workspace = true, features = ["io-util", "net", "time", "rt", "macros"] }
+tokio = { workspace = true, features = ["io-util", "net", "time", "rt", "macros", "sync"] }
 tracing.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 

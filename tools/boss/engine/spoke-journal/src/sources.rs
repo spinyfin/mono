@@ -34,6 +34,22 @@ impl Journal {
         checkpoint: &[u8],
         observations: Vec<(Record, Admission)>,
     ) -> Result<()> {
+        self.commit_source_releasing(run, source, expected, checkpoint, observations, &[])
+    }
+
+    /// [`Self::commit_source`] that also deletes `released` sources in the same
+    /// transaction, before admission is measured. Moving staged bytes into a
+    /// numbered record therefore never counts them twice, and a crash can
+    /// neither lose the bytes nor keep both copies.
+    pub fn commit_source_releasing(
+        &mut self,
+        run: &Run,
+        source: &str,
+        expected: Option<&[u8]>,
+        checkpoint: &[u8],
+        observations: Vec<(Record, Admission)>,
+        released: &[String],
+    ) -> Result<()> {
         ensure!(!source.is_empty() && source.len() <= 1024, "invalid producer identity");
         ensure!(checkpoint.len() <= 512 * 1024, "source checkpoint too large");
         let tx = self.db.transaction()?;
@@ -49,6 +65,12 @@ impl Journal {
         }
         if old.as_deref() != expected {
             return Err(crate::Fault::CheckpointConflict.into());
+        }
+        for released in released {
+            tx.execute(
+                "DELETE FROM sources WHERE run_id=?1 AND spawn_token=?2 AND source=?3",
+                params![run.run_id, run.spawn_token, released],
+            )?;
         }
         let mirror_latest = source.starts_with("hook:");
         let latest_old: Option<Vec<u8>> = if mirror_latest {
@@ -111,8 +133,36 @@ impl Journal {
         Ok((credit - 4096) as usize)
     }
 
+    /// Delete the named sources of a run; absent names are ignored.
+    pub fn delete_sources(&mut self, run: &Run, sources: &[String]) -> Result<()> {
+        let tx = self.db.transaction()?;
+        for source in sources {
+            tx.execute(
+                "DELETE FROM sources WHERE run_id=?1 AND spawn_token=?2 AND source=?3",
+                params![run.run_id, run.spawn_token, source],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drop every `worker-*` source of a run: gateway state, caches, request and
+    /// reply rows, decisions and any artifact bytes not yet moved into records.
+    /// Called once the run is reclaimed and its artifacts are fully streamed.
+    pub fn release_worker_sources(&mut self, run: &Run) -> Result<()> {
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "DELETE FROM sources WHERE run_id=?1 AND spawn_token=?2 AND source LIKE 'worker-%'",
+            params![run.run_id, run.spawn_token],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Drop producer receipts and transcript checkpoints after drain. Keep the
-    /// tiny `drained` marker so reclaim can retry if home removal fails.
+    /// tiny `drained` marker so reclaim can retry if home removal fails. Worker
+    /// gateway sources outlive drain (artifacts may still be streaming) and are
+    /// released by [`Self::release_worker_sources`].
     pub fn prune_sources(&mut self, run: &Run) -> Result<()> {
         let tx = self.db.transaction()?;
         tx.execute(

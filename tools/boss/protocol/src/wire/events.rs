@@ -1080,6 +1080,11 @@ pub enum FrontendEvent {
         run_id: String,
         released: usize,
     },
+    /// Spoke-local receipt or revisioned cached read. Never implies hub acceptance.
+    WorkerGatewayResult {
+        status: String,
+        value: serde_json::Value,
+    },
     /// Success reply to [`FrontendRequest::SubmitProposal`]: the row is
     /// durable. `proposal` is the persisted `worker_proposals` row —
     /// engine-assigned `id` (`prp_…`), the canonicalised `payload_json`, and
@@ -1094,11 +1099,6 @@ pub enum FrontendEvent {
     ///
     /// Every row lands in `state: proposed` today: the apply pipeline is a
     /// later task, so nothing observes these rows yet.
-    /// Spoke-local receipt or revisioned cached read. Never implies hub acceptance.
-    WorkerGatewayResult {
-        status: String,
-        value: serde_json::Value,
-    },
     ProposalSubmitted {
         proposal: WorkerProposal,
         already_submitted: bool,

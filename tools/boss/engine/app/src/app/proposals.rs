@@ -42,7 +42,7 @@
 
 use super::*;
 
-use boss_engine_proposal_validation::{derive_idempotency_key, validate_caller_idempotency_key, validate_payload};
+use boss_engine_proposal_validation::{select_idempotency_key, validate_payload};
 use boss_protocol::{
     ProposalErrorCode, ProposalFieldError, ProposalKind, ProposalSubmissionError, WaitProposalPayload,
 };
@@ -437,37 +437,30 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
         }
     };
 
-    // A caller that supplied no key gets the same key the CLI would have
-    // derived, so an ad-hoc submission is replay-safe too. Blank is treated
-    // as absent: an unset shell variable expands to an empty string, and
-    // storing that would make every keyless submission from the run collide.
-    let idempotency_key = idempotency_key
-        .map(|key| key.trim().to_owned())
-        .filter(|key| !key.is_empty());
-
-    let idempotency_key = match idempotency_key {
-        Some(key) => match validate_caller_idempotency_key(&key) {
-            Ok(()) => key,
-            Err(field_error) => {
-                let error = ProposalSubmissionError::validation(vec![field_error]);
-                tracing::debug!(
-                    execution_id = %caller.execution_id,
-                    kind = %kind,
-                    "submit_proposal rejected: idempotency_key invalid",
-                );
-                return send_rejection(&sink, &request_id, error);
-            }
-        },
-        None if kind == ProposalKind::Wait => {
-            // Each wait declaration is a new row so re-running renews.
-            // A caller-supplied `--idempotency-key` still replays.
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            format!("auto:wait:{}:{nanos}", caller.execution_id)
+    // Key policy (blank-as-absent, fresh identity for a keyless wait so
+    // re-running renews, content-derived otherwise) is shared with the
+    // spoke-local gateway.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let idempotency_key = match select_idempotency_key(
+        &caller.execution_id,
+        kind,
+        &validated.canonical_json,
+        idempotency_key.as_deref(),
+        nanos,
+    ) {
+        Ok(key) => key,
+        Err(field_error) => {
+            let error = ProposalSubmissionError::validation(vec![field_error]);
+            tracing::debug!(
+                execution_id = %caller.execution_id,
+                kind = %kind,
+                "submit_proposal rejected: idempotency_key invalid",
+            );
+            return send_rejection(&sink, &request_id, error);
         }
-        None => derive_idempotency_key(&caller.execution_id, kind, &validated.canonical_json),
     };
 
     // Ended peers may recover an acknowledgement, but cannot create new work.

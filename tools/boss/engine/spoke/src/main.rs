@@ -97,17 +97,7 @@ mod commands {
             let observed = stamp()?;
             let result = match &command.body {
                 Some(command::Body::WorkerReply(_) | command::Body::ProposalDecision(_)) => {
-                    let applied = gateway.apply(&command);
-                    CommandResult {
-                        command_id: command.command_id.clone(),
-                        code: if applied.is_ok() {
-                            ResultCode::Ok
-                        } else {
-                            ResultCode::Rejected
-                        } as i32,
-                        reason: applied.err().map(|e| e.to_string()).unwrap_or_default(),
-                        value: None,
-                    }
+                    boss_spoke_ingress::apply_gateway_command(gateway, &command)
                 }
                 Some(command::Body::Workspace(_)) => {
                     executor.execute(&command, interrupted, observed.wall_unix_ms).await
@@ -118,14 +108,9 @@ mod commands {
                     | command::Body::Deliver(_)
                     | command::Body::Stop(_),
                 ) => match &supervisor {
-                    Some(supervisor) => match gateway.provision(&command, &observed) {
-                        Ok(()) => supervisor.execute(&command, interrupted, observed.wall_unix_ms).await,
-                        Err(error) => CommandResult {
-                            command_id: command.command_id.clone(),
-                            code: ResultCode::Rejected as i32,
-                            reason: error.to_string(),
-                            value: None,
-                        },
+                    Some(supervisor) => match boss_spoke_ingress::provision_rejection(gateway, &command, &observed) {
+                        None => supervisor.execute(&command, interrupted, observed.wall_unix_ms).await,
+                        Some(rejection) => rejection,
                     },
                     None => CommandResult {
                         command_id: command.command_id.clone(),
@@ -350,6 +335,13 @@ async fn serve(args: Args, homes_root: PathBuf) -> Result<()> {
     let gateway = boss_spoke_worker_api::Gateway {
         journal: Arc::clone(&journal),
         state_dir: args.state_dir.clone(),
+        probe: {
+            let journal = Arc::clone(&journal);
+            Arc::new(move |execution| {
+                let journal = Arc::clone(&journal);
+                Box::pin(async move { boss_spoke_ingress::transcripts::current_watermark(&journal, &execution).await })
+            })
+        },
     };
     let executions = commands::JournalExecutions(
         Arc::clone(&journal),

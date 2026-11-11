@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use boss_engine_driver::{DriverRegistry, ProgressSessionConfig, ProgressStreamSource, discovery};
-use boss_host_execution::worker::{ExecutionRecord, Phase};
+use boss_host_execution::worker::{ExecutionRecord, ObservationConfig, Phase};
 use boss_protocol_spoke::{
     v1::{Gap, Record, Stamp, TranscriptDelta, record, worker_event::Event},
     worker_event,
@@ -50,6 +50,83 @@ struct Checkpoint {
     incarnation: u64,
 }
 
+/// Where the transcript is: the file ingress scan when the driver feeds one,
+/// otherwise the path the latest hook reported. Keeps following an attached
+/// file when another candidate appears; before attachment, ambiguity must
+/// never pick a run by recency.
+async fn resolve_path(
+    observation: &ObservationConfig,
+    checkpoint: &Checkpoint,
+    hint: Option<Vec<u8>>,
+) -> Result<Option<PathBuf>> {
+    if let Some((ingress, baseline)) = &observation.file {
+        let ingress = ingress.clone();
+        let baseline = baseline.iter().cloned().collect();
+        let scan = tokio::task::spawn_blocking(move || {
+            let prepared = discovery::PreparedSource::with_baseline(ingress, baseline)?;
+            discovery::scan_once_classified(&prepared)
+        })
+        .await?
+        .map_err(|failure| match failure {
+            // Retryable I/O (EMFILE, EINTR, ...) in listing, candidate
+            // validation or preparation leaves the run undrained so a later
+            // poll retries; permanent failures become a source gap.
+            discovery::ScanFailure::Transient(message) => anyhow::Error::from(TransientSource(message)),
+            discovery::ScanFailure::Permanent(message) => anyhow::Error::from(SourceFailure(message)),
+        })?;
+        if scan.matched.iter().any(|c| c.path == checkpoint.path) {
+            Ok(Some(checkpoint.path.clone()))
+        } else {
+            if scan.matched.len() > 1 {
+                return Err(SourceFailure("multiple correlated transcript candidates".into()).into());
+            }
+            Ok(scan.matched.into_iter().next().map(|c| c.path))
+        }
+    } else {
+        Ok(hint
+            .map(|bytes| serde_json::from_slice::<crate::hooks::Receipt>(&bytes))
+            .transpose()?
+            .and_then(|r| r.path))
+    }
+}
+
+fn containment_root(execution: &ExecutionRecord, observation: &ObservationConfig) -> Result<Option<PathBuf>> {
+    Ok(if let Some((ingress, _)) = &observation.file {
+        Some(ingress.directory.clone())
+    } else {
+        DriverRegistry::default()
+            .require(&execution.driver_id)?
+            .transcript_containment_root(&execution.run_id)?
+    })
+}
+
+/// The transcript source as observed now, independent of how much has been
+/// ingested or of bulk credit: the generation and size a completion boundary
+/// (proposal, Stop) must be validated against. Reading only checkpoints
+/// assigns no transcript sequence. An error means the source cannot be
+/// resolved and the boundary must carry explicit unavailable evidence.
+pub async fn current_watermark(journal: &SharedJournal, execution: &ExecutionRecord) -> Result<(String, u64)> {
+    let observation = execution
+        .observation
+        .as_ref()
+        .context("missing observation configuration")?;
+    let run = crate::run_identity(execution);
+    let (saved, hint) = {
+        let journal = journal
+            .lock()
+            .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
+        (journal.source(&run, "transcript")?, journal.latest_source(&run)?)
+    };
+    let checkpoint: Checkpoint = saved
+        .map(|b| serde_json::from_slice(&b))
+        .transpose()?
+        .unwrap_or_default();
+    let path = resolve_path(observation, &checkpoint, hint)
+        .await?
+        .context("no transcript source resolved")?;
+    watermark(journal, execution, &path).await
+}
+
 /// Stop describes the source observed at the boundary, even when bulk credit
 /// is exhausted. Reading only checkpoints assigns no transcript sequence.
 pub async fn watermark(
@@ -69,9 +146,12 @@ pub async fn watermark(
         checkpoint.incarnation += 1;
         checkpoint.cursor = raw::Cursor::default();
     }
-    let root = DriverRegistry::default()
-        .require(&execution.driver_id)?
-        .transcript_containment_root(&execution.run_id)?;
+    let root = match &execution.observation {
+        Some(observation) => containment_root(execution, observation)?,
+        None => DriverRegistry::default()
+            .require(&execution.driver_id)?
+            .transcript_containment_root(&execution.run_id)?,
+    };
     let chunk = raw::read_contained(path, root.as_deref(), &checkpoint.cursor, 0).await?;
     Ok((
         format!("{}-{}", checkpoint.incarnation, chunk.cursor.generation),
@@ -220,36 +300,7 @@ async fn poll_source(journal: &SharedJournal, execution: &ExecutionRecord, stamp
         .map(|b| serde_json::from_slice(b))
         .transpose()?
         .unwrap_or_default();
-    let path = if let Some((ingress, baseline)) = &observation.file {
-        let ingress = ingress.clone();
-        let baseline = baseline.iter().cloned().collect();
-        let scan = tokio::task::spawn_blocking(move || {
-            let prepared = discovery::PreparedSource::with_baseline(ingress, baseline)?;
-            discovery::scan_once_classified(&prepared)
-        })
-        .await?
-        .map_err(|failure| match failure {
-            // Retryable I/O (EMFILE, EINTR, ...) in listing, candidate
-            // validation or preparation leaves the run undrained so a later
-            // poll retries; permanent failures become a source gap.
-            discovery::ScanFailure::Transient(message) => anyhow::Error::from(TransientSource(message)),
-            discovery::ScanFailure::Permanent(message) => anyhow::Error::from(SourceFailure(message)),
-        })?;
-        // Keep following an attached file when another candidate appears.
-        // Before attachment, ambiguity must never pick a run by recency.
-        if scan.matched.iter().any(|c| c.path == checkpoint.path) {
-            Some(checkpoint.path.clone())
-        } else {
-            if scan.matched.len() > 1 {
-                return Err(SourceFailure("multiple correlated transcript candidates".into()).into());
-            }
-            scan.matched.into_iter().next().map(|c| c.path)
-        }
-    } else {
-        hint.map(|bytes| serde_json::from_slice::<crate::hooks::Receipt>(&bytes))
-            .transpose()?
-            .and_then(|r| r.path)
-    };
+    let path = resolve_path(observation, &checkpoint, hint).await?;
     let Some(path) = path else {
         if execution.phase == Phase::Terminal && !crate::hooks::has_pending(&observation.pending)? {
             finish_missing(journal, &run, stamp, &checkpoint)?;
@@ -275,13 +326,7 @@ async fn poll_source(journal: &SharedJournal, execution: &ExecutionRecord, stamp
         checkpoint.progress = Progress::default();
         checkpoint.eof = false;
     }
-    let root = if let Some((ingress, _)) = &observation.file {
-        Some(ingress.directory.clone())
-    } else {
-        DriverRegistry::default()
-            .require(&execution.driver_id)?
-            .transcript_containment_root(&execution.run_id)?
-    };
+    let root = containment_root(execution, observation)?;
     // A missing terminal source is lifecycle evidence even without bulk
     // credit. A zero-byte probe can establish that without advancing a cursor.
     let chunk = match raw::read_contained(

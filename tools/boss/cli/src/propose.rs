@@ -1167,9 +1167,17 @@ pub(crate) fn print_gateway_result(ctx: &RunContext, status: &str, value: &serde
     print_entity(ctx, &serde_json::json!({"status": status, "value": value}), || {
         println!("Spoke worker API: {status}");
         if status == "queued" {
-            println!(
-                "Durably queued for hub validation. You may finish this turn and park; the run and workspace remain assigned."
-            );
+            // Only a proposal receipt lets the worker park. An attachment or a
+            // guide outcome is queued evidence for the hub, not a finish line.
+            if value.get("artifact").is_some() {
+                println!("Registered for streaming to the hub; keep working.");
+            } else if value["receipt"]["kind"] == "guide_outcome" {
+                println!("Guide outcome durably queued for the hub; keep working.");
+            } else {
+                println!(
+                    "Durably queued for hub validation. You may finish this turn and park; the run and workspace remain assigned."
+                );
+            }
         }
         println!("{}", serde_json::to_string_pretty(value).unwrap_or_default());
     })

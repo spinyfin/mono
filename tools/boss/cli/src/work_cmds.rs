@@ -1528,6 +1528,10 @@ pub(crate) async fn run_comment_guide_outcome(ctx: &RunContext, args: CommentGui
         .await
         .map_err(CliError::internal)?
     {
+        // A spoke-hosted worker's outcome is queued for the hub, not applied yet.
+        FrontendEvent::WorkerGatewayResult { status, value } => {
+            crate::propose::print_gateway_result(ctx, &status, &value)
+        }
         FrontendEvent::CommentResult { comment } => {
             print_entity(ctx, &serde_json::json!({ "comment": comment }), || {
                 if !ctx.quiet {
@@ -1538,6 +1542,7 @@ pub(crate) async fn run_comment_guide_outcome(ctx: &RunContext, args: CommentGui
         FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
             Err(CliError::application(message))
         }
+        FrontendEvent::ProposalRejected { error } => Err(CliError::application(error.message)),
         other => Err(unexpected_event("comment guide-outcome", &other)),
     }
 }

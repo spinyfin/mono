@@ -14,6 +14,9 @@ type StoredExecutions = HashMap<(String, String), Vec<u8>>;
 struct MemoryStore(Arc<Mutex<StoredExecutions>>, Arc<std::sync::atomic::AtomicBool>);
 
 impl ExecutionStore for MemoryStore {
+    fn worker_api_paths(&self) -> Option<(PathBuf, PathBuf)> {
+        Some(("/host/worker.sock".into(), "/host/bin/boss".into()))
+    }
     fn observations_drained(&self, _record: &ExecutionRecord) -> Result<bool> {
         Ok(self.1.load(std::sync::atomic::Ordering::SeqCst))
     }
@@ -1702,6 +1705,8 @@ async fn spawn_stamps_identity_last_and_keeps_settings_out_of_the_workspace() {
             ("BOSS_SPAWN_TOKEN", "forged"),
             ("BOSS_RUN_ID", "forged"),
             ("BOSS_SESSION_SCHEMA", "forged"),
+            ("BOSS_SOCKET_PATH", "/tmp/forged.sock"),
+            ("BOSS_BIN", "/tmp/forged-boss"),
             ("KEEP_ME", "yes"),
         ] {
             spawn.env.push(boss_protocol_spoke::v1::Env {
@@ -1720,6 +1725,9 @@ async fn spawn_stamps_identity_last_and_keeps_settings_out_of_the_workspace() {
         envs.contains(&format!("BOSS_SESSION_SCHEMA={SESSION_SCHEMA}")),
         "{envs:?}"
     );
+    for gateway in ["BOSS_SOCKET_PATH=/host/worker.sock", "BOSS_BIN=/host/bin/boss"] {
+        assert!(envs.contains(&gateway.to_owned()), "{envs:?}");
+    }
     assert!(fake.launches.lock().unwrap()[0].contains("--effort medium"));
     let output = envs
         .iter()

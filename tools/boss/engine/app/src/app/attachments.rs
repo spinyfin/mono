@@ -31,6 +31,7 @@
 
 use super::*;
 
+use boss_engine_attachments::store::validate_caption;
 use boss_engine_attachments::{AllowedRoots, IngestRejection};
 use boss_protocol::{ProposalErrorCode, ProposalSubmissionError};
 
@@ -66,8 +67,6 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&ATTACHMENT_VALIDATION_FAILED);
     registry.register_counter(&ATTACHMENT_RATE_LIMITED);
 }
-
-use boss_engine_attachments::store::validate_caption;
 
 pub(super) async fn handle_submit_attachment(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {

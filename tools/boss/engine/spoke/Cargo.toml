@@ -35,6 +35,7 @@ tracing-subscriber = { workspace = true }
 async-trait = { workspace = true }
 boss-host-enrollment = { path = "../host-enrollment" }
 boss-host-execution = { path = "../host-execution" }
+boss-protocol = { path = "../../protocol" }
 boss-tmux = { path = "../../tmux" }
 prost = { workspace = true }
 rcgen = { workspace = true }

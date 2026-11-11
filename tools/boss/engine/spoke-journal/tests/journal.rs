@@ -410,3 +410,59 @@ fn pruning_sources_returns_queued_bytes_to_baseline() {
         baseline + b"true".len() as u64 + "drained".len() as u64 + 128
     );
 }
+
+#[test]
+fn released_sources_leave_the_same_transaction_that_charges_their_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = Journal::open(
+        &dir.path().join("state"),
+        "host",
+        Limits {
+            spool_bytes: 100_000,
+            lifecycle_reserve: 10_000,
+        },
+    )
+    .unwrap();
+    let run = v1::Run {
+        execution_id: "execution".into(),
+        run_id: "run".into(),
+        spawn_token: "token".into(),
+        assignment_generation: 1,
+    };
+    let baseline = journal.bytes().unwrap();
+    journal
+        .commit_source(&run, "worker-blob:a:0", None, &vec![1u8; 70_000], Vec::new())
+        .unwrap();
+    // A second 70 KB copy would not fit beside the first; moving it does.
+    let state = vec![2u8; 70_000];
+    assert!(
+        journal
+            .commit_source(&run, "worker-api", None, &state, Vec::new())
+            .is_err()
+    );
+    journal
+        .commit_source_releasing(
+            &run,
+            "worker-api",
+            None,
+            &state,
+            Vec::new(),
+            &["worker-blob:a:0".to_owned()],
+        )
+        .unwrap();
+    assert!(journal.source(&run, "worker-blob:a:0").unwrap().is_none());
+    journal
+        .commit_source(&run, "worker-cache:1", None, b"x", Vec::new())
+        .unwrap();
+    journal
+        .commit_source(&run, "transcript", None, b"y", Vec::new())
+        .unwrap();
+    // Drain pruning leaves gateway rows alone; releasing them is explicit.
+    journal.prune_sources(&run).unwrap();
+    assert!(journal.source(&run, "worker-api").unwrap().is_some());
+    assert!(journal.source(&run, "transcript").unwrap().is_none());
+    journal.release_worker_sources(&run).unwrap();
+    assert!(journal.source(&run, "worker-api").unwrap().is_none());
+    assert!(journal.source(&run, "worker-cache:1").unwrap().is_none());
+    assert_eq!(journal.bytes().unwrap(), baseline);
+}

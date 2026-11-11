@@ -1653,6 +1653,7 @@ dependencies = [
  "boss-engine-stdout-progress",
  "boss-host-enrollment",
  "boss-host-execution",
+ "boss-protocol",
  "boss-protocol-spoke",
  "boss-spoke-journal",
  "boss-spoke-outbound",
