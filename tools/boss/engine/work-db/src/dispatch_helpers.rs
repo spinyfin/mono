@@ -1428,6 +1428,16 @@ pub fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
     input: RequestExecutionInput,
     is_live: F,
 ) -> Result<WorkExecution> {
+    request_execution_in_tx_as_actor(pending, conn, input, is_live, "engine")
+}
+
+pub(crate) fn request_execution_in_tx_as_actor<F: FnOnce(&str) -> bool>(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    input: RequestExecutionInput,
+    is_live: F,
+    actor: &str,
+) -> Result<WorkExecution> {
     super::local_worker_quarantine_store::ensure_work_item_not_quarantined_in(conn, &input.work_item_id)?;
     let RequestExecutionInput {
         work_item_id,
@@ -1549,17 +1559,17 @@ pub fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         let rows_cleared = crate::task_status_audit::execute(
             conn,
             "explicit_start_dependency_clear",
-            "engine",
+            actor,
             "UPDATE tasks
              SET status            = 'todo',
                  blocked_reason    = NULL,
-                 last_status_actor = 'engine',
+                 last_status_actor = ?3,
                  updated_at        = ?2
              WHERE id              = ?1
                AND deleted_at      IS NULL
                AND status          = 'blocked'
                AND (blocked_reason = 'dependency' OR blocked_reason IS NULL)",
-            params![work_item_id, now],
+            params![work_item_id, now, actor],
         )?;
         if rows_cleared > 0 {
             tracing::info!(
@@ -1584,7 +1594,7 @@ pub fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         crate::task_status_audit::execute(
             conn,
             "explicit_start_dispatch_failure_clear",
-            "engine",
+            actor,
             "UPDATE tasks
              SET dispatch_failed_reason = NULL,
                  dispatch_failed_error  = NULL,
@@ -1618,11 +1628,11 @@ pub fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         crate::task_status_audit::execute(
             conn,
             "explicit_start_failure_clear",
-            "engine",
+            actor,
             "UPDATE tasks SET status = 'todo', blocked_reason = NULL, blocked_detail = NULL,
-                 last_status_actor = 'engine', updated_at = ?2
+                 last_status_actor = ?3, updated_at = ?2
              WHERE id = ?1 AND status = 'blocked' AND blocked_reason IN ('worker_failed', 'awaiting_operator_answer')",
-            params![work_item_id, now],
+            params![work_item_id, now, actor],
         )?;
 
         // Explicit dispatch is the human-approval signal for a deferred
@@ -1675,11 +1685,11 @@ pub fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
             let unblocked = crate::task_status_audit::execute(
                 conn,
                 "explicit_start_retired_attempt_clear",
-                "engine",
+                actor,
                 "UPDATE tasks SET status = 'todo', blocked_reason = NULL, blocked_detail = NULL,
-                     last_status_actor = 'engine', updated_at = ?2
+                     last_status_actor = ?4, updated_at = ?2
                  WHERE id = ?1 AND status = 'blocked' AND blocked_reason = ?3 AND deleted_at IS NULL",
-                params![work_item_id, now, BLOCKED_REASON_SPAWNING_ATTEMPT_RETIRED],
+                params![work_item_id, now, BLOCKED_REASON_SPAWNING_ATTEMPT_RETIRED, actor],
             )?;
             if let Some(attempt) = reopened {
                 tracing::info!(
@@ -1860,18 +1870,18 @@ pub fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
                 let rows_cleared = crate::task_status_audit::execute(
                     conn,
                     "explicit_start_ci_failure_clear",
-                    "engine",
+                    actor,
                     "UPDATE tasks
                      SET status             = 'todo',
                          blocked_reason     = NULL,
                          blocked_attempt_id = NULL,
-                         last_status_actor  = 'engine',
+                         last_status_actor  = ?3,
                          updated_at         = ?2
                      WHERE id               = ?1
                        AND deleted_at       IS NULL
                        AND status           = 'blocked'
                        AND blocked_reason   IN ('ci_failure', 'ci_failure_exhausted')",
-                    params![work_item_id, now],
+                    params![work_item_id, now, actor],
                 )?;
                 if rows_cleared > 0 {
                     // Clear matching task_blocked_signals rows and insert a

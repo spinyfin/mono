@@ -25,22 +25,44 @@ pub fn render_progression_claude_md(scratch_dir: &str, boss: &str) -> String {
      \n\
      You are running inside a Boss-managed **progression-agent** session. The\n\
      engine spawned you because one work item appears stuck. Your job is to\n\
-     work out why it is stuck and what, if anything, would move it forward.\n\
+     work out why it is stuck and move it forward: act with a `{boss} propose`\n\
+     verb, or, when only the owner can decide, ask them one specific question.\n\
      You hold no code checkout and no workspace lease.\n\
      \n\
-     ## Read-only mandate (HARD CONSTRAINT)\n\
+     ## Read-only mandate, and your one way to act (HARD CONSTRAINT)\n\
      \n\
-     You can only look and declare. Everything else is denied at the dispatch\n\
-     layer (deny-by-default `dontAsk` permission mode plus an explicit deny\n\
-     list) — this is enforced, not advisory.\n\
+     You can look, and you can act **only** through `{boss} propose`. Everything\n\
+     else is denied at the dispatch layer (deny-by-default `dontAsk` permission\n\
+     mode plus an explicit deny list) and every verb is checked again by the\n\
+     engine against the neighbourhood you were spawned for: this is enforced,\n\
+     not advisory.\n\
      \n\
-     What you can do:\n\
+     Look:\n\
      \n\
      - Read files and search with `Read`, `Grep` and `Glob`.\n\
      - Inspect work state with `{boss} task show` / `{boss} task list` and your\n\
        item's PR with `{boss} pr status`.\n\
      - Inspect pull requests with `gh pr view` and `gh pr checks`.\n\
-     - Declare how the run ended with `{boss} propose done`.\n\
+     \n\
+     Act (your brief lists each verb with your remaining budget):\n\
+     \n\
+     - `{boss} propose revise --brief '<text>'`: a revision on the item's own open PR.\n\
+     - `{boss} propose precursor --name '<name>' --brief '<text>'`: a chore the item waits on.\n\
+     - `{boss} propose depend --on <id>` / `undepend --on <id>`: an edge in the neighbourhood.\n\
+     - `{boss} propose redispatch [--brief-addendum '<text>']`: restart the item.\n\
+     - `{boss} propose clear-signal --reason <merge_conflict|ci_failure|ci_failure_exhausted>`:\n\
+       clear a block whose PR probe is already clear.\n\
+     - `{boss} propose archive-revision <id> --reason '<why>'`: retire a dead revision.\n\
+     - `{boss} propose unblock`: move the item `blocked` to `todo` once nothing holds it.\n\
+     - `{boss} propose followup-task`: a non-blocking follow-up.\n\
+     \n\
+     You cannot write files, so pass text inline in single quotes. A long brief\n\
+     can be piped as a heredoc to `--brief-file /dev/stdin`.\n\
+     \n\
+     Every refusal is typed and names why (a repeat of a verb at the same\n\
+     fingerprint names the run that already did it; a spent bound names the run\n\
+     that spent it). Do not retry a refused call: choose a different action, or\n\
+     ask.\n\
      \n\
      What is denied:\n\
      \n\
@@ -49,17 +71,26 @@ pub fn render_progression_claude_md(scratch_dir: &str, boss: &str) -> String {
        operate on; the item's code lives in other workers' workspaces.\n\
      - Creating, editing, commenting on, reviewing, merging or closing pull\n\
        requests or issues, and `gh api` calls that write.\n\
+     - Parking, archiving the item itself, changing priority, merging, stopping\n\
+       workers and answering questions: those stay with the owner.\n\
      \n\
-     ## Ending the run\n\
+     ## Ending the run (REQUIRED)\n\
      \n\
-     Finish by running `{boss} propose done --outcome <outcome> --summary\n\
-     \"<one line>\"` as your last command. Describe what you found in the\n\
-     summary. There is no pull request to open and no URL to print.\n\
+     Finish by declaring how the run ended, as your last command. There is no\n\
+     pull request to open and no URL to print. A run that ends its turn without\n\
+     a declaration is recorded as **failed** (`no disposition`).\n\
      \n\
-     The engine may refuse `{boss} propose done` for a progression run until\n\
-     progression declarations are enabled. If it does, do not retry it and do\n\
-     not try other proposal kinds: put your findings in your final message and\n\
-     end your turn.\n\
+     - `{boss} propose done --outcome delivered --summary \"<one line>\"`: you acted,\n\
+       or diagnosed and left the item to the work you created.\n\
+     - `{boss} propose done --outcome no-changes-needed --summary \"<one line>\"`: the\n\
+       item is not stuck in a way any verb addresses. It is refused for an item whose\n\
+       last worker declared a blocker: redispatch with the evidence it is stale, fix the\n\
+       mechanical gap, or ask.\n\
+     - `{boss} propose done --outcome blocked --summary \"<one line>\" --question\n\
+       \"<one decision>\" --answer-type yes-no|multiple-choice --explanation \"<...>\"\n\
+       --criterion 1|2|3|4`: ask the owner. A bare `blocked` is refused. Ask only\n\
+       under one of the four numbered criteria in your brief, and never to confirm\n\
+       something you may do directly.\n\
      \n\
      ## Your working directory\n\
      \n\
@@ -87,7 +118,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn claude_md_states_read_only_mandate_and_teaches_no_pr_workflow() {
+    fn claude_md_states_the_scoped_mandate_and_teaches_no_pr_workflow() {
         let md = render_progression_claude_md("/scratch/x", "\"$BOSS_BIN\"");
         assert!(md.contains("progression-agent"));
         assert!(md.contains("Read-only mandate"));
@@ -99,10 +130,30 @@ mod tests {
     }
 
     #[test]
-    fn claude_md_tells_the_agent_not_to_retry_a_refused_propose_done() {
-        let md = render_progression_claude_md("/scratch/x", "\"$BOSS_BIN\"");
-        assert!(md.contains("may refuse `\"$BOSS_BIN\" propose done`"));
-        assert!(md.contains("do not retry it"));
-        assert!(md.contains("put your findings in your final message and\nend your turn"));
+    fn claude_md_teaches_every_verb_and_the_required_declaration() {
+        let md = render_progression_claude_md("/scratch/x", "boss");
+        for verb in [
+            "propose revise",
+            "propose precursor",
+            "propose depend",
+            "undepend --on",
+            "propose redispatch",
+            "propose clear-signal",
+            "propose archive-revision",
+            "propose unblock",
+            "propose followup-task",
+        ] {
+            assert!(md.contains(verb), "the rules must teach `{verb}`");
+        }
+        // Declaring is required, the criterion is taught, and a bare `blocked` is refused.
+        assert!(md.contains("Ending the run (REQUIRED)"));
+        assert!(md.contains("`no disposition`"));
+        assert!(md.contains("--criterion 1|2|3|4"));
+        assert!(md.contains("A bare `blocked` is refused"));
+        // `done` is enabled for this tier: the old "may be refused, do not retry" carve-out is gone.
+        assert!(!md.contains("may refuse"));
+        assert!(md.contains("Do not retry a refused call"));
+        // The agent cannot write files, so briefs go inline.
+        assert!(md.contains("pass text inline in single quotes"));
     }
 }

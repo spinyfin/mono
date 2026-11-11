@@ -43,14 +43,14 @@ use serde::Serialize;
 use crate::blocking_signal::{self, SignalKind};
 use crate::work::{
     ARCHIVE_MECHANISM_CI_WATCH_SUPERSESSION, ArchiveProvenance, CiRemediation, CiRemediationInsertInput,
-    CreateExecutionInput, PendingMergeCheck, PrStateChecker, StrandedCiRemediationAttempt, TaskStatus, WorkDb,
-    WorkItem,
+    ClearResolvedSignal, CreateExecutionInput, PendingMergeCheck, PrStateChecker, SignalRetirement,
+    StrandedCiRemediationAttempt, WorkDb,
 };
 use crate::{
     OpenPrCiStatus, OpenPrMergeability, PrLifecycleProbe, PrLifecycleState, RequiredCheckFailure, pr_labels_opt_out,
     stored_pr_number,
 };
-use boss_execution_contracts::ExecutionPublisher;
+use boss_execution_contracts::{CubeClient, ExecutionPublisher};
 
 /// Pre-spawn classification (design §Q4 "pre-triage"): if every failure
 /// has `conclusion ∈ {STARTUP_FAILURE, CANCELLED}` (engine-discernible
@@ -2238,49 +2238,77 @@ pub(crate) fn retire_moot_ci_fix_revisions(
     }
     closed
 }
-
-/// Whether the CI-fix revision `revision_task_id` spawned for a Trunk
-/// queue eviction has concluded, and so the PR may be auto-resubmitted to
-/// the queue.
-///
-/// "Concluded" is `in_review` or `done` — the two statuses a revision can
-/// come to rest in — and the distinction matters because only one of them
-/// is reachable while the parent PR is still open:
-///
-/// - `in_review` is the **normal** revision terminal. Every worker-completion
-///   path for a revision on an open PR lands here
-///   (`WorkerPrCompletionTarget::InReview` from `completion::stop`,
-///   `execution_started`, `metadata_gate`, `finalize_passes`). A revision
-///   does not own a PR of its own; it pushes onto the parent's branch and
-///   then rests.
-/// - `done` is reachable only *after* the parent PR merges or closes
-///   (`flip_in_review_revisions_to_done`, called from
-///   `mark_chore_pr_merged` / `mark_chore_pr_closed_unmerged`, and
-///   `WorkerPrCompletionTarget::Done`, reached only from
-///   `PrStatus::Merged`). Accepted here for completeness — by then the
-///   resubmit is moot and `mark_trunk_intent_awaiting_resubmit` will find no
-///   active intent — never as the sole trigger.
-///
-/// `archived` is deliberately excluded: an archived revision was withdrawn
-/// (moot/superseded), which is not evidence a fix landed. The eviction then
-/// stays unresolved and the queue poller's stalled-resubmit backstop raises
-/// it to a human rather than resubmitting an unfixed PR.
-fn trunk_eviction_fix_concluded(work_db: &WorkDb, revision_task_id: &str) -> bool {
-    match work_db.get_work_item(revision_task_id) {
-        // Both task-bearing variants, so the answer can never hinge on which
-        // one the mapper chose for a revision row.
-        Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => {
-            matches!(task.status, TaskStatus::InReview | TaskStatus::Done)
+/// Post-commit effects after a retire transaction commits: release a
+/// succeeded conflict attempt's cube lease and publish the typed CI /
+/// conflict completion events. Shared by the poller retire paths and
+/// progression `clear-signal`. Callers must not invoke this on a
+/// replayed submission — the durable writes already happened.
+pub async fn apply_retired_signal(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    cube_client: Option<&dyn CubeClient>,
+    candidate: &PendingMergeCheck,
+    result: SignalRetirement,
+) {
+    if let Some(succeeded) = result.conflict_attempt {
+        if let (Some(client), Some(lease)) = (cube_client, succeeded.cube_lease_id.as_deref())
+            && let Err(err) = client.release_workspace(lease).await
+        {
+            tracing::debug!(?err, "conflict_watch: lease release on retire failed");
         }
-        Ok(_) => false,
-        Err(err) => {
-            tracing::warn!(
-                revision_task_id,
-                ?err,
-                "ci_watch: failed to read the eviction fix revision; declining the auto-resubmit this pass",
-            );
-            false
+        publisher
+            .publish_frontend_event_on_product(
+                &candidate.product_id,
+                FrontendEvent::ConflictResolutionSucceeded {
+                    attempt: work_db.remediation_entry(succeeded.list_entry()),
+                    product_id: candidate.product_id.clone(),
+                    work_item_id: candidate.work_item_id.clone(),
+                    attempt_id: succeeded.id.clone(),
+                    pr_url: candidate.pr_url.clone(),
+                },
+            )
+            .await;
+    }
+    if result.ci {
+        let had_ci_attempt = result.ci_attempt.is_some();
+        if let Some(succeeded) = result.ci_attempt {
+            publisher
+                .publish_frontend_event_on_product(
+                    &candidate.product_id,
+                    FrontendEvent::CiRemediationSucceeded {
+                        attempt: work_db.remediation_entry(succeeded.list_entry()),
+                        product_id: candidate.product_id.clone(),
+                        work_item_id: candidate.work_item_id.clone(),
+                        attempt_id: succeeded.id.clone(),
+                        pr_url: candidate.pr_url.clone(),
+                    },
+                )
+                .await;
+        } else {
+            publisher
+                .publish_frontend_event_on_product(
+                    &candidate.product_id,
+                    FrontendEvent::CiFailureCleared {
+                        product_id: candidate.product_id.clone(),
+                        work_item_id: candidate.work_item_id.clone(),
+                        pr_url: candidate.pr_url.clone(),
+                    },
+                )
+                .await;
         }
+        if result.task_transitioned || !had_ci_attempt {
+            publisher
+                .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, "ci_failure_resolved")
+                .await;
+        }
+    } else if result.task_transitioned {
+        publisher
+            .publish_work_item_changed(
+                &candidate.product_id,
+                &candidate.work_item_id,
+                "merge_conflict_resolved",
+            )
+            .await;
     }
 }
 
@@ -2302,320 +2330,27 @@ pub async fn on_ci_resolved(
         return false;
     }
 
-    let attempt = match work_db.active_ci_remediation_for_work_item(&candidate.work_item_id) {
-        Ok(found) => found,
-        Err(err) => {
-            tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                ?err,
-                "ci_watch: failed to look up active ci_remediations row; falling back to relaxed retire",
-            );
-            None
-        }
-    };
-
-    // A queue-side failure (merge-queue rebounce or a Trunk queue eviction)
-    // must not be cleared by a bare clean head-branch CI probe. The PR's own
-    // CI is always green in this case — the failure is on a synthetic/
-    // ephemeral commit the queue assembled, not on the PR's head ref — so a
-    // naive `ci_clean` gate would immediately undo detection and create a
-    // flip-flop loop where every sweep detects the failure and the next
-    // probe clears it.
-    //
-    // `trunk_queue_eviction` is the one exception, and only once its fix
-    // revision has genuinely concluded: Trunk has no automatic retry, so Boss
-    // must auto-resubmit — see `trunk_merge::mark_trunk_intent_awaiting_resubmit`,
-    // which the fall-through below calls.
-    //
-    // The gate is [`trunk_eviction_fix_concluded`]: the spawned CI-fix
-    // revision has reached a terminal state *it can actually reach while the
-    // parent PR is still open* — `in_review` (the normal revision terminal)
-    // or `done` (only when the parent PR has already merged/closed, at which
-    // point the resubmit is moot anyway). It deliberately does NOT require
-    // `done` alone: a revision on an open PR can never reach `done`, because
-    // every writer of that status (`flip_in_review_revisions_to_done`,
-    // `WorkerPrCompletionTarget::Done`) fires only once the parent PR is
-    // merged or closed. Requiring it made this resubmit depend on the very
-    // merge it exists to cause — a circular dependency that stranded a real
-    // PR out of the queue for 50 hours (mono#2673 follow-up). The conflict
-    // lane never had that bug: `conflict_watch::on_resolved` gates on
-    // GitHub reporting the PR mergeable again, a condition observable on an
-    // open PR, and this gate is now modelled on it.
-    //
-    // Gating on the revision's conclusion (not merely on this sweep's
-    // `ci_clean`) is still what prevents a flip-flop: right after eviction
-    // detection the revision is freshly spawned and `todo`/`active`, so this
-    // check fails until the revision's own push-and-review cycle actually
-    // concludes. `merge_queue_rebounce` (GitHub-native) has no such hook —
-    // GitHub's own queue automatically re-tries an evicted-but-still-armed
-    // PR once its checks pass again, so the block there stays released only
-    // when the ci_remediation worker marks the attempt succeeded (at which
-    // point `active_ci_remediation_for_work_item` returns None and this
-    // guard doesn't fire).
-    let failure_kind = attempt.as_ref().and_then(|a| a.failure_kind.as_deref());
-    let is_trunk_eviction = failure_kind == Some("trunk_queue_eviction");
-    if is_queue_side_failure_kind(failure_kind) {
-        let revision_landed = is_trunk_eviction
-            && attempt
-                .as_ref()
-                .and_then(|a| a.revision_task_id.as_deref())
-                .is_some_and(|id| trunk_eviction_fix_concluded(work_db, id));
-        if !revision_landed {
-            if let Some(active) = attempt.as_ref() {
-                record_declined_evaluation(candidate, active, None, "queue_failure_not_cleared_by_head_ci_clean");
-            }
+    let result = match work_db.clear_resolved_pr_signal(&candidate.work_item_id, &candidate.pr_url, true) {
+        Ok(ClearResolvedSignal::Applied(result)) => *result,
+        Ok(ClearResolvedSignal::QueueSideUnresolved { attempt }) => {
+            record_declined_evaluation(candidate, &attempt, None, "queue_failure_not_cleared_by_head_ci_clean");
             return false;
         }
-    }
-
-    let task_result = work_db.clear_chore_blocked_ci_failure(&candidate.work_item_id, &candidate.pr_url);
-    let task_transitioned = match task_result {
-        Ok(Some(_)) => true,
-        Ok(None) => false,
+        Ok(ClearResolvedSignal::Nothing) => return false,
         Err(err) => {
-            tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                ?err,
-                "ci_watch: failed to clear blocked: ci_failure",
-            );
+            tracing::warn!(?err, work_item_id = %candidate.work_item_id, "ci_watch: signal retirement failed");
             return false;
         }
     };
-
-    let mut attempt_transitioned = false;
-    let mut parent_in_review_with_revision = false;
-    if let Some(attempt) = attempt.as_ref() {
-        // Parent stayed `in_review` the whole time (the shared in_review model
-        // — a fix revision was in flight): the task clear above missed because
-        // the status never moved to blocked, but the attempt should retire and
-        // the in-flight signal must clear so `maybe_clear_blocked` does not
-        // re-fire. Detect via a pending attempt that has a revision. Mirrors
-        // conflict_watch::on_resolved.
-        parent_in_review_with_revision =
-            !task_transitioned && attempt.status == "pending" && attempt.revision_task_id.is_some();
-        match work_db.mark_ci_remediation_succeeded(&attempt.id, None) {
-            Ok(Some(succeeded)) => {
-                attempt_transitioned = true;
-                if parent_in_review_with_revision
-                    && let Err(err) = work_db.clear_ci_failure_signal_only(&candidate.work_item_id)
-                {
-                    tracing::warn!(
-                        work_item_id = %candidate.work_item_id,
-                        ?err,
-                        "ci_watch: failed to clear in-flight signal after retire",
-                    );
-                }
-                // Close the revision task this attempt spawned so a retired
-                // attempt never leaves a stale todo/active/blocked row
-                // behind — mirrors conflict_watch::on_resolved. No-op for
-                // the trunk-eviction case above: that revision already came
-                // to rest at `in_review`/`done` before this branch was
-                // reachable, and `close_moot_revision_task` refuses both.
-                close_superseded_moot_revision(
-                    work_db,
-                    &candidate.work_item_id,
-                    succeeded.revision_task_id.as_deref(),
-                    "CI resolved before parent PR merged; revision moot",
-                );
-                publisher
-                    .publish_frontend_event_on_product(
-                        &candidate.product_id,
-                        FrontendEvent::CiRemediationSucceeded {
-                            attempt: work_db.remediation_entry(succeeded.list_entry()),
-                            product_id: candidate.product_id.clone(),
-                            work_item_id: candidate.work_item_id.clone(),
-                            attempt_id: succeeded.id.clone(),
-                            pr_url: candidate.pr_url.clone(),
-                        },
-                    )
-                    .await;
-            }
-            Ok(None) => {
-                tracing::debug!(
-                    attempt_id = %attempt.id,
-                    "ci_watch: attempt row already terminal; skipping succeeded UPDATE",
-                );
-            }
-            Err(err) => {
-                tracing::warn!(
-                    attempt_id = %attempt.id,
-                    ?err,
-                    "ci_watch: failed to mark ci_remediation succeeded",
-                );
-            }
-        }
-    }
-
-    // CI is green for this work item's PR, so EVERY *non-queue-side* attempt
-    // still open against it is moot — not just the one
-    // `active_ci_remediation_for_work_item` happened to return. That read is
-    // `LIMIT 1` over `created_at DESC`, so an older `pending` row is
-    // invisible to it and, before this sweep existed, was retired by nothing
-    // at all: it outlived its episode, kept `sendListCiRemediations`
-    // re-arming the "ci failing" badge on every app restart, and its revision
-    // (if any) stayed dispatchable. Runs after the retire above so the
-    // selected attempt is already `succeeded` and this only catches the rows
-    // it masked.
-    //
-    // A queue-side row must NOT be swept on this evidence alone: head CI is
-    // green *by construction* when the failure lived on the queue's
-    // synthetic commit, so a green head-branch probe says nothing about
-    // whether the queue-side issue is resolved — the same invariant
-    // `is_queue_side_failure_kind` enforces above and in
-    // `on_ci_in_flight_supersedes_failure`. The one exception is when the
-    // attempt just retired above was itself queue-side (this function
-    // already required its fix revision to have concluded to get here) —
-    // the back-to-back-eviction case, where sweeping an older queue-side
-    // episode is correct because the newer episode's resolution supersedes
-    // it.
-    if attempt_transitioned {
-        let include_queue_side = is_queue_side_failure_kind(failure_kind);
-        match work_db.abandon_active_ci_remediations_for_work_item(
-            &candidate.work_item_id,
-            "superseded_by_resolved_ci",
-            include_queue_side,
-        ) {
-            Ok(masked) => {
-                for row in &masked {
-                    tracing::info!(
-                        work_item_id = %candidate.work_item_id,
-                        attempt_id = %row.id,
-                        "ci_watch: abandoned an older active attempt masked by the newest one; CI is green",
-                    );
-                    close_superseded_moot_revision(
-                        work_db,
-                        &candidate.work_item_id,
-                        row.revision_task_id.as_deref(),
-                        "an older CI remediation attempt was superseded; CI is green on the PR head",
-                    );
-                }
-            }
-            Err(err) => tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                ?err,
-                "ci_watch: failed to sweep older active ci_remediations after retire",
-            ),
-        }
-    }
-
-    // CI has reached Clean — any leftover never-starts observation
-    // (e.g. a long InFlight stretch finally produced green) is no
-    // longer the relevant signal. Best-effort cleanup.
-    if let Err(err) = work_db.clear_ci_inflight_observations(&candidate.work_item_id) {
-        tracing::debug!(
-            work_item_id = %candidate.work_item_id,
-            ?err,
-            "ci_watch: failed to clear inflight observations on Clean transition",
-        );
-    }
-
-    if !task_transitioned && !attempt_transitioned {
-        // Stale in-flight signal: in_review model, no active attempt (attempt
-        // was terminal before CI went green). Clear the signal so
-        // `maybe_clear_blocked` does not re-fire on every Clean sweep.
-        let signal_cleared = work_db
-            .clear_ci_failure_signal_only(&candidate.work_item_id)
-            .unwrap_or_else(|err| {
-                tracing::warn!(
-                    work_item_id = %candidate.work_item_id,
-                    ?err,
-                    "ci_watch: failed to clear stale in-flight signal on CI resolved",
-                );
-                false
-            });
-        if !signal_cleared {
-            return false;
-        }
-        if let Err(err) = work_db.reset_ci_attempts_used(&candidate.work_item_id) {
-            tracing::debug!(
-                ?err,
-                "ci_watch: failed to reset ci_attempts_used after stale signal clear"
-            );
-        }
-        publisher
-            .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, "ci_failure_resolved")
-            .await;
-        publisher
-            .publish_frontend_event_on_product(
-                &candidate.product_id,
-                FrontendEvent::CiFailureCleared {
-                    product_id: candidate.product_id.clone(),
-                    work_item_id: candidate.work_item_id.clone(),
-                    pr_url: candidate.pr_url.clone(),
-                },
-            )
-            .await;
-        tracing::info!(
-            work_item_id = %candidate.work_item_id,
-            pr_url = %candidate.pr_url,
-            "ci_watch: CI back at clean; cleared stale in-flight signal (no active attempt)",
-        );
-        return true;
-    }
-    if task_transitioned {
-        // Design §Q3: a successful cycle clears the counter so the
-        // next failure (a new push, a new round of CI) gets a fresh
-        // budget. The reset is unguarded because we only land here
-        // after the parent flipped back to `in_review`; best-effort
-        // because a failure here just means the next attempt starts
-        // with a non-zero counter.
-        if let Err(err) = work_db.reset_ci_attempts_used(&candidate.work_item_id) {
-            tracing::debug!(?err, "ci_watch: failed to reset ci_attempts_used");
-        }
-        publisher
-            .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, "ci_failure_resolved")
-            .await;
-        // When the task transitions back to `in_review` but no active
-        // remediation attempt was found (the prior attempt was already
-        // terminal — failed, abandoned, or succeeded via the rebase path),
-        // emit `CiFailureCleared` so the UI can clear the `ci failing`
-        // badge. The `CiRemediationSucceeded` path covers the case where
-        // an active attempt is retired; this covers every other path where
-        // the blocked status clears without an active attempt.
-        if !attempt_transitioned {
-            publisher
-                .publish_frontend_event_on_product(
-                    &candidate.product_id,
-                    FrontendEvent::CiFailureCleared {
-                        product_id: candidate.product_id.clone(),
-                        work_item_id: candidate.work_item_id.clone(),
-                        pr_url: candidate.pr_url.clone(),
-                    },
-                )
-                .await;
-        }
-    } else if parent_in_review_with_revision && attempt_transitioned {
-        // In_review model: a CI-fix revision finished and CI went green.
-        // The parent was never blocked so `task_transitioned` is false,
-        // but the cycle is complete — reset the budget counter so the
-        // next failure gets a fresh allotment.
-        if let Err(err) = work_db.reset_ci_attempts_used(&candidate.work_item_id) {
-            tracing::debug!(?err, "ci_watch: failed to reset ci_attempts_used after revision retire");
-        }
-    }
-    if is_trunk_eviction && attempt_transitioned {
-        // The fix revision concluded, head CI is green, and this attempt just
-        // retired — tell the TrunkQueueProbe it's clear to resubmit (design §"Eviction: a
-        // first-class failure signal", step 4). Scoped to the eviction
-        // sub-state only: a conflict episode
-        // (`TRUNK_INTENT_SUPERSEDED_BY_CONFLICT`) can be live on the same
-        // work item at once, and only `conflict_watch::on_resolved` owns
-        // clearing that one.
-        crate::trunk_merge::mark_trunk_intent_awaiting_resubmit(
-            work_db,
-            &candidate.work_item_id,
-            &["failed", "pending_failure"],
-        );
-    }
+    let attempt_id = result.ci_attempt.as_ref().map(|attempt| attempt.id.clone());
+    let task_transitioned = result.task_transitioned;
+    apply_retired_signal(work_db, publisher, None, candidate, result).await;
     tracing::info!(
         work_item_id = %candidate.work_item_id,
         pr_url = %candidate.pr_url,
-        attempt_id = ?attempt.as_ref().map(|a| a.id.as_str()),
+        attempt_id = attempt_id.as_deref(),
         task_transitioned,
-        attempt_transitioned,
-        "ci_watch: CI back at clean; retire path ran",
+        "ci_watch: PR CI clean again; retire path ran"
     );
     true
 }
@@ -2812,3 +2547,180 @@ pub async fn on_pr_merged(work_db: &WorkDb, publisher: &dyn ExecutionPublisher, 
 #[cfg(test)]
 #[path = "ci_watch_tests/mod.rs"]
 mod tests;
+
+#[cfg(test)]
+mod retirement_post_commit_tests {
+    use super::*;
+    use crate::test_support::{RecordingPublisher, create_test_chore_manual, create_test_product};
+    use crate::tests::RecordingCubeClient;
+    use crate::work::{
+        CiRemediationInsertInput, ConflictResolutionInsertInput, FakePrStateChecker, PrOpenState,
+        SubmitWorkerProposalInput,
+    };
+    use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus, ProposalKind};
+
+    fn open_db() -> WorkDb {
+        WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap()
+    }
+
+    fn bind_pr(db: &WorkDb, item: &str, pr: &str) {
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET pr_url = ?2, status = 'in_review' WHERE id = ?1",
+                rusqlite::params![item, pr],
+            )
+            .unwrap();
+    }
+
+    fn progression_run(db: &WorkDb, item: &str, stuck: &str) -> String {
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(item)
+                    .kind(ExecutionKind::Progression)
+                    .status(ExecutionStatus::Running)
+                    .build(),
+            )
+            .unwrap();
+        db.capture_progression_neighbourhood(&execution.id).unwrap();
+        db.record_progression_episode(&execution.id, "fp-retire", stuck)
+            .unwrap();
+        execution.id
+    }
+
+    fn submit_clear(db: &WorkDb, run: &str, item: &str, reason: &str) -> crate::work::SubmitWorkerProposalOutcome {
+        db.submit_progression_verb(
+            SubmitWorkerProposalInput {
+                execution_id: run,
+                work_item_id: item,
+                kind: ProposalKind::ClearSignal,
+                payload_json: &format!(r#"{{"reason":"{reason}"}}"#),
+                idempotency_key: "clear-1",
+            },
+            &FakePrStateChecker::always(PrOpenState::Open),
+        )
+        .unwrap()
+        .unwrap_or_else(|error| panic!("clear-signal refused: {error}"))
+    }
+
+    #[tokio::test]
+    async fn progression_clear_signal_releases_conflict_lease_and_publishes_once() {
+        let db = open_db();
+        let product = create_test_product(&db).id;
+        let item = create_test_chore_manual(&db, product.clone(), "Conflicted").id;
+        let pr = "https://github.com/spinyfin/mono/pull/3522";
+        bind_pr(&db, &item, pr);
+        assert!(db.mark_chore_blocked_merge_conflict(&item, pr).unwrap().is_some());
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET pr_mergeable_state = 'MERGEABLE' WHERE id = ?1",
+                [&item],
+            )
+            .unwrap();
+        let attempt = db
+            .insert_conflict_resolution(ConflictResolutionInsertInput {
+                product_id: product.clone(),
+                work_item_id: item.clone(),
+                pr_url: pr.into(),
+                pr_number: 3522,
+                head_branch: "feature".into(),
+                base_branch: "main".into(),
+                base_sha_at_trigger: Some("base-1".into()),
+                head_sha_before: Some("head-1".into()),
+            })
+            .unwrap()
+            .expect("conflict attempt");
+        db.mark_conflict_resolution_running(&attempt.id, "lease-conflict-1", "ws-1", "worker-1")
+            .unwrap();
+
+        let run = progression_run(&db, &item, "S5_merge_conflict");
+        let outcome = submit_clear(&db, &run, &item, "merge_conflict");
+        let retirement = outcome.signal_retirement.expect("fresh clear-signal retires");
+        let replay = submit_clear(&db, &run, &item, "merge_conflict");
+        assert!(replay.already_submitted);
+        assert!(
+            replay.signal_retirement.is_none(),
+            "replay must not re-run post-commit lease release or events"
+        );
+        let cube = RecordingCubeClient::default();
+        let publisher = RecordingPublisher::default();
+        let candidate = PendingMergeCheck {
+            work_item_id: item.clone(),
+            product_id: product.clone(),
+            pr_url: pr.into(),
+        };
+        apply_retired_signal(&db, &publisher, Some(&cube), &candidate, retirement).await;
+
+        let releases = cube.releases.lock().await.clone();
+        assert_eq!(releases, vec!["lease-conflict-1".to_owned()]);
+        let succeeded = publisher
+            .typed_events
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, event)| matches!(event, FrontendEvent::ConflictResolutionSucceeded { .. }))
+            .count();
+        assert_eq!(succeeded, 1);
+    }
+
+    #[tokio::test]
+    async fn progression_clear_signal_publishes_ci_success_once() {
+        let db = open_db();
+        let product = create_test_product(&db).id;
+        let item = create_test_chore_manual(&db, product.clone(), "CI red").id;
+        let pr = "https://github.com/spinyfin/mono/pull/3523";
+        bind_pr(&db, &item, pr);
+        let attempt = db
+            .insert_ci_remediation(CiRemediationInsertInput {
+                product_id: product.clone(),
+                work_item_id: item.clone(),
+                pr_url: pr.into(),
+                pr_number: 3523,
+                head_branch: "feature".into(),
+                head_sha_at_trigger: "head-1".into(),
+                attempt_kind: "fix".into(),
+                consumes_budget: 1,
+                failed_checks: "[]".into(),
+                failure_kind: "pr_branch_ci".into(),
+                before_commit_sha: None,
+            })
+            .unwrap()
+            .expect("ci attempt");
+        assert!(
+            db.mark_chore_blocked_ci_failure(&item, pr, Some(&attempt.id))
+                .unwrap()
+                .is_some()
+        );
+        db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET ci_required_state = 'success' WHERE id = ?1", [&item])
+            .unwrap();
+
+        let run = progression_run(&db, &item, "S6_ci_failure");
+        let outcome = submit_clear(&db, &run, &item, "ci_failure");
+        let retirement = outcome.signal_retirement.expect("fresh clear-signal retires");
+        let replay = submit_clear(&db, &run, &item, "ci_failure");
+        assert!(replay.already_submitted);
+        assert!(replay.signal_retirement.is_none());
+        let cube = RecordingCubeClient::default();
+        let publisher = RecordingPublisher::default();
+        let candidate = PendingMergeCheck {
+            work_item_id: item.clone(),
+            product_id: product.clone(),
+            pr_url: pr.into(),
+        };
+        apply_retired_signal(&db, &publisher, Some(&cube), &candidate, retirement).await;
+
+        assert!(cube.releases.lock().await.is_empty());
+        let succeeded = publisher
+            .typed_events
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, event)| matches!(event, FrontendEvent::CiRemediationSucceeded { .. }))
+            .count();
+        assert_eq!(succeeded, 1);
+    }
+}

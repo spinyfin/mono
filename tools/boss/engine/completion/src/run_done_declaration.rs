@@ -175,6 +175,15 @@ impl WorkerCompletionHandler {
             return StopOutcome::AlreadyTerminal;
         }
 
+        // A progression run holds no checkout and opens no PR, so there is nothing
+        // to resolve or to wait for a driver boundary to verify: every outcome
+        // finishes the run at submission, and `delivered` / `no-changes-needed`
+        // never go looking for a PR. The disposition was recorded with the
+        // declaration; this completes the run (and, when it asked, parks the item).
+        if execution.kind == ExecutionKind::Progression {
+            return self.finalize_progression_run(&execution, None, true).await;
+        }
+
         match outcome {
             boss_protocol::RunDoneOutcome::NoChangesNeeded => {
                 // Only the driver's terminal boundary has authoritative command

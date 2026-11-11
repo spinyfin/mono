@@ -85,6 +85,10 @@ pub enum ProposalApplyPolicy {
     /// and may create a remediation work item — that must not block the
     /// submission socket.
     Async,
+    /// A progression verb: it is scope-checked against the calling run's
+    /// neighbourhood and applied by `WorkDb::submit_progression_verb` in its own
+    /// transaction, never by the generic pipeline.
+    Scoped,
 }
 
 /// The policy table. Exhaustive match: adding a `ProposalKind` variant is a
@@ -113,6 +117,14 @@ pub fn apply_policy(kind: ProposalKind) -> ProposalApplyPolicy {
         // `stage_followup_task_in_transaction` for what *does* still happen
         // synchronously at submission for this kind despite being gated.
         ProposalKind::FollowupTask => ProposalApplyPolicy::Gated,
+        ProposalKind::Revise
+        | ProposalKind::Precursor
+        | ProposalKind::Depend
+        | ProposalKind::Undepend
+        | ProposalKind::Redispatch
+        | ProposalKind::ClearSignal
+        | ProposalKind::ArchiveRevision
+        | ProposalKind::Unblock => ProposalApplyPolicy::Scoped,
     }
 }
 
@@ -195,6 +207,16 @@ pub(super) fn apply_in_transaction(
         ProposalKind::FollowupTask => anyhow::bail!(
             "no applier for `followup_task`; it stages via \
              stage_followup_task_in_transaction and remains Gated for human acceptance"
+        ),
+        ProposalKind::Revise
+        | ProposalKind::Precursor
+        | ProposalKind::Depend
+        | ProposalKind::Undepend
+        | ProposalKind::Redispatch
+        | ProposalKind::ClearSignal
+        | ProposalKind::ArchiveRevision
+        | ProposalKind::Unblock => anyhow::bail!(
+            "`{kind}` is a progression verb; it is applied by `submit_progression_verb`, not the generic pipeline"
         ),
     }
 }
@@ -993,6 +1015,16 @@ fn apply_run_done(
     if let Err(err) = super::queue_ci_evidence::validate_declaration(tx, execution_id, &payload) {
         return Ok(ApplyDecision::Rejected(err.to_string()));
     }
+    // A progression run has its own rules for how it may end (design 2.5): no bare
+    // `blocked`, a criterion on every question, no `no-changes-needed` for a
+    // declared-blocker item. It is judged before anything is stamped.
+    let execution = query_execution(tx, execution_id).require("execution", execution_id)?;
+    let progression_run = execution.kind == boss_protocol::ExecutionKind::Progression;
+    if progression_run
+        && let Some(reason) = super::progression_done::refuse_progression_done(tx, &execution, &payload, payload_json)?
+    {
+        return Ok(ApplyDecision::Rejected(reason));
+    }
 
     let affected = tx.execute(
         "UPDATE work_executions SET run_done_declared_at = ?2, run_done_outcome = ?3 WHERE id = ?1",
@@ -1003,6 +1035,9 @@ fn apply_run_done(
             "execution {execution_id} no longer exists; a run cannot declare itself done after its \
              row has been pruned"
         )));
+    }
+    if progression_run {
+        super::progression_done::record_disposition(tx, execution_id, payload.outcome)?;
     }
 
     let preserve_mismatch_question = payload.outcome == boss_protocol::RunDoneOutcome::Blocked
@@ -1341,6 +1376,9 @@ mod tests {
         assert_eq!(apply_policy(ProposalKind::RunDone), ProposalApplyPolicy::AutoApply);
         assert_eq!(apply_policy(ProposalKind::Wait), ProposalApplyPolicy::AutoApply);
         assert_eq!(apply_policy(ProposalKind::ReviewVerdict), ProposalApplyPolicy::Async);
+        for &kind in ProposalKind::PROGRESSION_VERBS {
+            assert_eq!(apply_policy(kind), ProposalApplyPolicy::Scoped, "{kind}");
+        }
     }
 
     /// The whole point of the kind: a declaration stamps the execution row,

@@ -65,28 +65,55 @@ pub enum RpcTier {
 }
 
 /// Every kind must be reviewed for both agent tiers when the vocabulary grows.
-/// Progression ships closed; a kind is enabled only alongside its scoped handler.
+///
+/// Three groups, so a kind is never reachable by an agent tier nobody decided
+/// it for:
+///
+/// - **Worker-only kinds** (`pr-created`, the `review-*` kinds, `blocked`, …):
+///   a progression session holds no checkout and opens no PR, so they are
+///   closed to it.
+/// - **Shared kinds** (`followup-task`, `done`): both agent tiers. `done` is how
+///   a progression run declares its disposition; `followup-task` is the
+///   existing non-blocking follow-up.
+/// - **Progression verbs** ([`ProposalKind::PROGRESSION_VERBS`]): they mutate the
+///   taxonomy, so a worker never gets them. Each is enabled for `Progression`
+///   alongside its scoped handler (`WorkDb::submit_progression_verb`), which
+///   re-checks the caller's neighbourhood for every target it touches.
 pub fn proposal_kind_decision(tier: RpcTier, kind: ProposalKind) -> WorkerVerbDecision {
+    let verb = || format!("SubmitProposal:{}", kind.as_str());
     match kind {
         ProposalKind::Attention
         | ProposalKind::EffortEscalation
         | ProposalKind::Blocked
         | ProposalKind::DeferredScope
-        | ProposalKind::FollowupTask
         | ProposalKind::AutomationOutcome
         | ProposalKind::PrCreated
         | ProposalKind::ReviewGuide
         | ProposalKind::ReviewReport
         | ProposalKind::ReviewVerdict
-        | ProposalKind::RunDone
         | ProposalKind::Wait => match tier {
             RpcTier::Progression => WorkerVerbDecision::Deny(Box::new(WorkerTierDenial::progression(
-                format!("SubmitProposal:{}", kind.as_str()),
+                verb(),
                 WorkerTierDenialReason::ProgressionScope,
                 format!("proposal kind `{kind}` is not enabled for them."),
                 None,
             ))),
             RpcTier::Worker | RpcTier::User | RpcTier::AppOrBoss | RpcTier::BossOnly => WorkerVerbDecision::Allow,
+        },
+        ProposalKind::FollowupTask | ProposalKind::RunDone => WorkerVerbDecision::Allow,
+        ProposalKind::Revise
+        | ProposalKind::Precursor
+        | ProposalKind::Depend
+        | ProposalKind::Undepend
+        | ProposalKind::Redispatch
+        | ProposalKind::ClearSignal
+        | ProposalKind::ArchiveRevision
+        | ProposalKind::Unblock => match tier {
+            RpcTier::Worker => WorkerVerbDecision::Deny(Box::new(WorkerTierDenial::closed(
+                verb(),
+                WorkerTierDenialReason::MutatingTaxonomy,
+            ))),
+            RpcTier::Progression | RpcTier::User | RpcTier::AppOrBoss | RpcTier::BossOnly => WorkerVerbDecision::Allow,
         },
     }
 }

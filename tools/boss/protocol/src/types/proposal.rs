@@ -41,6 +41,27 @@ pub enum ProposalKind {
     /// ladder should hold until the wait expires. Re-running renews the
     /// wait, subject to the per-declaration and per-execution caps.
     Wait,
+    /// Progression verbs (design 2.4). Each is accepted only from a
+    /// `progression` execution, scope-checked against the neighbourhood that
+    /// execution was spawned with, and applied through the existing engine path
+    /// it names. See [`ProposalKind::is_progression_verb`].
+    ///
+    /// Create a revision on the stuck item's own open PR.
+    Revise,
+    /// Create a precursor chore and make the stuck item depend on it.
+    Precursor,
+    /// Add a dependency edge inside the neighbourhood.
+    Depend,
+    /// Remove a dependency edge inside the neighbourhood.
+    Undepend,
+    /// Explicitly restart the stuck item.
+    Redispatch,
+    /// Clear a `blocked_reason` whose probe is already clear.
+    ClearSignal,
+    /// Archive a dead revision of the item's chain.
+    ArchiveRevision,
+    /// Move the item `blocked -> todo` once its block reason is cleared.
+    Unblock,
 }
 
 impl ProposalKind {
@@ -57,7 +78,56 @@ impl ProposalKind {
         ProposalKind::ReviewVerdict,
         ProposalKind::RunDone,
         ProposalKind::Wait,
+        ProposalKind::Revise,
+        ProposalKind::Precursor,
+        ProposalKind::Depend,
+        ProposalKind::Undepend,
+        ProposalKind::Redispatch,
+        ProposalKind::ClearSignal,
+        ProposalKind::ArchiveRevision,
+        ProposalKind::Unblock,
     ];
+
+    /// The verbs only a progression execution may submit (design 2.4). Every
+    /// one of them mutates the work taxonomy, so none goes through the generic
+    /// auto-apply pipeline: they are scope-checked and applied by
+    /// `WorkDb::submit_progression_verb`.
+    pub const PROGRESSION_VERBS: &'static [ProposalKind] = &[
+        ProposalKind::Revise,
+        ProposalKind::Precursor,
+        ProposalKind::Depend,
+        ProposalKind::Undepend,
+        ProposalKind::Redispatch,
+        ProposalKind::ClearSignal,
+        ProposalKind::ArchiveRevision,
+        ProposalKind::Unblock,
+    ];
+
+    /// `true` for the kinds in [`Self::PROGRESSION_VERBS`].
+    pub fn is_progression_verb(self) -> bool {
+        match self {
+            ProposalKind::Revise
+            | ProposalKind::Precursor
+            | ProposalKind::Depend
+            | ProposalKind::Undepend
+            | ProposalKind::Redispatch
+            | ProposalKind::ClearSignal
+            | ProposalKind::ArchiveRevision
+            | ProposalKind::Unblock => true,
+            ProposalKind::Attention
+            | ProposalKind::EffortEscalation
+            | ProposalKind::Blocked
+            | ProposalKind::DeferredScope
+            | ProposalKind::FollowupTask
+            | ProposalKind::AutomationOutcome
+            | ProposalKind::PrCreated
+            | ProposalKind::ReviewGuide
+            | ProposalKind::ReviewReport
+            | ProposalKind::ReviewVerdict
+            | ProposalKind::RunDone
+            | ProposalKind::Wait => false,
+        }
+    }
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -73,6 +143,14 @@ impl ProposalKind {
             ProposalKind::ReviewVerdict => "review_verdict",
             ProposalKind::RunDone => "run_done",
             ProposalKind::Wait => "wait",
+            ProposalKind::Revise => "revise",
+            ProposalKind::Precursor => "precursor",
+            ProposalKind::Depend => "depend",
+            ProposalKind::Undepend => "undepend",
+            ProposalKind::Redispatch => "redispatch",
+            ProposalKind::ClearSignal => "clear_signal",
+            ProposalKind::ArchiveRevision => "archive_revision",
+            ProposalKind::Unblock => "unblock",
         }
     }
 }
@@ -99,10 +177,19 @@ impl std::str::FromStr for ProposalKind {
             "review_verdict" => Ok(ProposalKind::ReviewVerdict),
             "run_done" => Ok(ProposalKind::RunDone),
             "wait" => Ok(ProposalKind::Wait),
+            "revise" => Ok(ProposalKind::Revise),
+            "precursor" => Ok(ProposalKind::Precursor),
+            "depend" => Ok(ProposalKind::Depend),
+            "undepend" => Ok(ProposalKind::Undepend),
+            "redispatch" => Ok(ProposalKind::Redispatch),
+            "clear_signal" => Ok(ProposalKind::ClearSignal),
+            "archive_revision" => Ok(ProposalKind::ArchiveRevision),
+            "unblock" => Ok(ProposalKind::Unblock),
             other => Err(format!(
                 "unknown proposal kind `{other}`; expected one of: attention, effort_escalation, \
                  blocked, deferred_scope, followup_task, automation_outcome, pr_created, review_guide, review_report, \
-                 review_verdict, run_done, wait"
+                 review_verdict, run_done, wait, revise, precursor, depend, undepend, redispatch, clear_signal, \
+                 archive_revision, unblock"
             )),
         }
     }
@@ -504,6 +591,232 @@ pub const WAIT_MAX_DURATION_SECS: u64 = 2 * 60 * 60;
 /// (4 hours). Each declaration's requested duration counts in full against
 /// this cap, including renewals, so overlapping waits cannot run forever.
 pub const WAIT_MAX_TOTAL_SECS_PER_EXECUTION: u64 = 4 * 60 * 60;
+
+// ---------------------------------------------------------------------------
+// Progression verbs (design 2.4 / 2.5)
+// ---------------------------------------------------------------------------
+
+/// Payload for [`ProposalKind::Revise`]: the brief of a revision on the item's
+/// own open PR. Counts against the create budget.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviseProposalPayload {
+    pub brief: String,
+}
+
+/// Payload for [`ProposalKind::Precursor`]: a chore the stuck item will depend
+/// on (a red check that belongs on `main`, a missing prerequisite). Counts
+/// against the create budget.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrecursorProposalPayload {
+    pub name: String,
+    pub brief: String,
+}
+
+/// Payload for [`ProposalKind::Depend`]: `on` is a work-item id (`task_…` or a
+/// short `T<n>`) inside the run's neighbourhood. The stuck item becomes its
+/// dependent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DependProposalPayload {
+    pub on: String,
+}
+
+/// Payload for [`ProposalKind::Undepend`]: drop the edge from the stuck item to
+/// `on`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UndependProposalPayload {
+    pub on: String,
+}
+
+/// Payload for [`ProposalKind::Redispatch`]. The addendum quotes a declared
+/// blocker and the evidence that it is stale (design 2.9); it is appended to the
+/// item's description so the next worker does not re-declare it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RedispatchProposalPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief_addendum: Option<String>,
+}
+
+/// The block reasons [`ProposalKind::ClearSignal`] may name: the ones the merge
+/// poller's polymorphic clear path owns.
+pub const CLEARABLE_BLOCK_REASONS: &[&str] = &["merge_conflict", "ci_failure", "ci_failure_exhausted"];
+
+/// Payload for [`ProposalKind::ClearSignal`]. `reason` is the `blocked_reason`
+/// to clear (one of [`CLEARABLE_BLOCK_REASONS`]), not an explanation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClearSignalProposalPayload {
+    pub reason: String,
+}
+
+/// Payload for [`ProposalKind::ArchiveRevision`]: a revision of the item's own
+/// chain that is dead and whose parent PR is green.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchiveRevisionProposalPayload {
+    pub revision: String,
+    pub reason: String,
+}
+
+/// Payload for [`ProposalKind::Unblock`]. It carries nothing: the verb names
+/// the stuck item and moves it `blocked -> todo`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnblockProposalPayload {}
+
+/// How a progression run ended, recorded on its execution
+/// (`work_executions.progression_disposition`) when it declares `done`
+/// (design 2.5). There is deliberately no "needs a human" value: a run that
+/// needs the owner must say what it needs, as a question (`Asked`).
+/// `Withdrawn` is written at finalization when that question never reached
+/// the owner because work resumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressionDisposition {
+    /// `done --outcome delivered`: the run acted, or diagnosed and left the
+    /// item for the work it created.
+    Progressed,
+    /// `done --outcome no-changes-needed`: the run judged the item not stuck in
+    /// a way any verb addresses. Files nothing.
+    NoAction,
+    /// `done --outcome blocked` with a question: the owner was asked.
+    Asked,
+    /// A question was filed at submission, then withdrawn at finalization
+    /// because work had resumed. Distinct from [`Self::Asked`] (the question
+    /// never reached the owner) and from [`Self::NoAction`] (three consecutive
+    /// `no_action` runs fire the escalation ladder).
+    Withdrawn,
+}
+
+impl ProgressionDisposition {
+    pub const ALL: &'static [ProgressionDisposition] = &[
+        ProgressionDisposition::Progressed,
+        ProgressionDisposition::NoAction,
+        ProgressionDisposition::Asked,
+        ProgressionDisposition::Withdrawn,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProgressionDisposition::Progressed => "progressed",
+            ProgressionDisposition::NoAction => "no_action",
+            ProgressionDisposition::Asked => "asked",
+            ProgressionDisposition::Withdrawn => "withdrawn",
+        }
+    }
+
+    /// The disposition a `done` outcome records.
+    pub fn for_outcome(outcome: RunDoneOutcome) -> Self {
+        match outcome {
+            RunDoneOutcome::Delivered => ProgressionDisposition::Progressed,
+            RunDoneOutcome::NoChangesNeeded => ProgressionDisposition::NoAction,
+            RunDoneOutcome::Blocked => ProgressionDisposition::Asked,
+        }
+    }
+}
+
+impl std::fmt::Display for ProgressionDisposition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ProgressionDisposition {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "progressed" => Ok(ProgressionDisposition::Progressed),
+            "no_action" => Ok(ProgressionDisposition::NoAction),
+            "asked" => Ok(ProgressionDisposition::Asked),
+            "withdrawn" => Ok(ProgressionDisposition::Withdrawn),
+            other => Err(format!(
+                "unknown progression disposition `{other}`; expected one of: progressed, no_action, asked, withdrawn"
+            )),
+        }
+    }
+}
+
+/// Which of the four numbered reasons in design 2.5 ("When a question is
+/// permitted") a progression question cites. Required on a progression `ask`,
+/// carried on the `done` payload under `criterion` and stored with it, so the
+/// stuck report can list the criterion each progression question cited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressionQuestionCriterion {
+    /// Criterion 1: the action the item needs is human-only (park, archive the
+    /// item itself, change priority, merge, reap a worker, answer an open question).
+    HumanOnlyAction,
+    /// Criterion 2: every direct verb that applies to the stuck kind has been tried or is
+    /// refused (fingerprint, redispatch bound, budget).
+    VerbsExhausted,
+    /// Criterion 3: a declared blocker, or the item's own brief and design doc, names a
+    /// decision only the owner can make.
+    HumanDecision,
+    /// Criterion 4: the evidence contradicts itself in a way that changes product
+    /// behaviour, so any direct action would be a guess.
+    ContradictoryEvidence,
+}
+
+impl ProgressionQuestionCriterion {
+    pub const ALL: &'static [ProgressionQuestionCriterion] = &[
+        ProgressionQuestionCriterion::HumanOnlyAction,
+        ProgressionQuestionCriterion::VerbsExhausted,
+        ProgressionQuestionCriterion::HumanDecision,
+        ProgressionQuestionCriterion::ContradictoryEvidence,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProgressionQuestionCriterion::HumanOnlyAction => "human_only_action",
+            ProgressionQuestionCriterion::VerbsExhausted => "verbs_exhausted",
+            ProgressionQuestionCriterion::HumanDecision => "human_decision",
+            ProgressionQuestionCriterion::ContradictoryEvidence => "contradictory_evidence",
+        }
+    }
+
+    /// The number the brief gives this criterion (1 to 4).
+    pub fn number(self) -> u8 {
+        match self {
+            ProgressionQuestionCriterion::HumanOnlyAction => 1,
+            ProgressionQuestionCriterion::VerbsExhausted => 2,
+            ProgressionQuestionCriterion::HumanDecision => 3,
+            ProgressionQuestionCriterion::ContradictoryEvidence => 4,
+        }
+    }
+}
+
+impl std::fmt::Display for ProgressionQuestionCriterion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ProgressionQuestionCriterion {
+    type Err = String;
+    /// Accepts the numbered form the brief teaches (`3`) and the stored name
+    /// (`human_decision`).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|criterion| s == criterion.as_str() || s == criterion.number().to_string())
+            .ok_or_else(|| {
+                format!(
+                    "unknown question criterion `{s}`; expected 1-4 or one of: human_only_action, \
+                     verbs_exhausted, human_decision, contradictory_evidence"
+                )
+            })
+    }
+}
+
+/// The question criterion a stored `run_done` payload cites, if any. The
+/// criterion rides beside the typed [`RunDoneProposalPayload`] (as a `criterion`
+/// key of the stored JSON) rather than inside it, so the many existing payload
+/// literals are unaffected; readers that predate it ignore the key.
+pub fn run_done_question_criterion(payload_json: &str) -> Option<ProgressionQuestionCriterion> {
+    serde_json::from_str::<serde_json::Value>(payload_json)
+        .ok()?
+        .get("criterion")?
+        .as_str()?
+        .parse()
+        .ok()
+}
 
 // ---------------------------------------------------------------------------
 // Submission errors and rate caps (the `SubmitProposal` / `ListProposals` RPCs)

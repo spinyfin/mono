@@ -30,12 +30,9 @@ pub const TRUNK_REPO_HOST: &str = "github.com";
 //   `failed` / `pending_failure`  (eviction, ci_watch owns the fix)  ─┐
 //   `TRUNK_INTENT_SUPERSEDED_BY_CONFLICT` (conflict mid-queue,       ─┼─▶ TRUNK_INTENT_AWAITING_RESUBMIT ─▶ submitPullRequest ─▶ (cleared; live tracking resumes)
 //    conflict_watch owns the fix, poller cancels the entry)          ─┘
-pub const TRUNK_INTENT_AWAITING_RESUBMIT: &str = "boss:awaiting_resubmit";
-pub const TRUNK_INTENT_SUPERSEDED_BY_CONFLICT: &str = "boss:superseded_by_conflict";
-/// Stamped when `submitPullRequest` failed and the subsequent intent-row
-/// delete also failed, so a later Merge click cannot treat `last_trunk_state
-/// = None` as "just submitted, already in the queue".
-pub const TRUNK_INTENT_SUBMIT_FAILED: &str = "boss:submit_failed";
+pub use crate::work::{
+    TRUNK_INTENT_AWAITING_RESUBMIT, TRUNK_INTENT_SUBMIT_FAILED, TRUNK_INTENT_SUPERSEDED_BY_CONFLICT,
+};
 
 /// Whether an active intent's `last_trunk_state` marks it as needing a
 /// Boss-driven fix before it can be resubmitted: evicted (an active
@@ -102,8 +99,8 @@ pub fn intent_is_live_in_queue(last_trunk_state: Option<&str>) -> bool {
 /// fix for. Without this, an unrelated conflict resolution could resubmit a
 /// PR whose eviction fix hasn't landed yet, or vice versa. Callers pass
 /// exactly the state(s) they own:
-/// `mark_trunk_intent_awaiting_resubmit(db, id, &["failed", "pending_failure"])` for
-/// `ci_watch`, `&[TRUNK_INTENT_SUPERSEDED_BY_CONFLICT]` for `conflict_watch`.
+/// `clear_resolved_signal_in_tx` (CI retire, `["failed", "pending_failure"]`;
+/// conflict retire, `&[TRUNK_INTENT_SUPERSEDED_BY_CONFLICT]`).
 ///
 /// A no-op — not an error — when the work item has no active Trunk merge
 /// intent (not a `trunk_queue` product, or the intent already retired) or
@@ -113,25 +110,8 @@ pub fn intent_is_live_in_queue(last_trunk_state: Option<&str>) -> bool {
 /// mirroring every other side-table write in the `ci_watch`/`conflict_watch`
 /// retire paths.
 pub fn mark_trunk_intent_awaiting_resubmit(work_db: &WorkDb, work_item_id: &str, allowed_from: &[&str]) {
-    let intent = match work_db.get_active_trunk_merge_intent(work_item_id) {
-        Ok(Some(intent)) => intent,
-        Ok(None) => return,
-        Err(err) => {
-            tracing::warn!(
-                work_item_id,
-                ?err,
-                "trunk_merge: failed to look up active trunk merge intent",
-            );
-            return;
-        }
-    };
-    let current = intent.last_trunk_state.as_deref();
-    if !current.is_some_and(|state| allowed_from.contains(&state)) {
-        return;
-    }
-    if let Err(err) = work_db.record_trunk_merge_intent_state(&intent.id, TRUNK_INTENT_AWAITING_RESUBMIT) {
+    if let Err(err) = work_db.mark_active_trunk_intent_awaiting_resubmit(work_item_id, allowed_from) {
         tracing::warn!(
-            intent_id = %intent.id,
             work_item_id,
             ?err,
             "trunk_merge: failed to mark intent awaiting_resubmit",

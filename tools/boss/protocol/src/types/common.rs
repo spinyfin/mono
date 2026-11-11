@@ -443,6 +443,12 @@ pub const CREATED_VIA_GUIDE_COMMENT_PREFIX: &str = "guide-comment:";
 /// row Boothby touched in that pass is recoverable from `boothby_actions`,
 /// which carries the pre/post images needed to undo it.
 pub const CREATED_VIA_BOOTHBY_PREFIX: &str = "boothby:";
+/// Prefix for work a progression run created for a stuck item (a revision, a
+/// precursor chore, or the execution a `redispatch` minted):
+/// `progression:<progression execution id>`. The execution id is the
+/// back-pointer; the create budget, the redispatch bound and the churn guard
+/// all count work by this stamp.
+pub const CREATED_VIA_PROGRESSION_PREFIX: &str = "progression:";
 /// Prefix for the chore produced by graduating an idea to a chore
 /// (`FrontendRequest::GraduateIdea`): `idea-graduation:<ideas.id>`. The
 /// idea id is the back-pointer; graduating to a project has no equivalent
@@ -478,6 +484,7 @@ pub fn is_known_created_via(value: &str) -> bool {
         || value.starts_with(CREATED_VIA_GUIDE_COMMENT_PREFIX)
         || value.starts_with(CREATED_VIA_BOOTHBY_PREFIX)
         || value.starts_with(CREATED_VIA_IDEA_GRADUATION_PREFIX)
+        || value.starts_with(CREATED_VIA_PROGRESSION_PREFIX)
         || value.starts_with("pr-comment:")
 }
 

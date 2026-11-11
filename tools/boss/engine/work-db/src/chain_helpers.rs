@@ -12,6 +12,8 @@ pub const ARCHIVE_MECHANISM_BOSS_STATUS_CHANGE: &str = "boss_status_change";
 /// Engine-attributed `update_task` archive that is not one of the dedicated
 /// sweep helpers. Reason required.
 pub const ARCHIVE_MECHANISM_ENGINE_STATUS_CHANGE: &str = "engine_status_change";
+/// A progression run's `archive-revision` verb. Reason required.
+pub const ARCHIVE_MECHANISM_PROGRESSION: &str = "progression_archive_revision";
 
 /// Required provenance for an automated archival write. Its private fields
 /// and required constructor make it impossible for an archive helper caller
@@ -379,16 +381,28 @@ pub fn archive_revision_task(
     now: &str,
     provenance: ArchiveProvenance<'_>,
 ) -> Result<usize> {
+    archive_revision_task_as_actor(conn, rev_id, now, provenance, "engine")
+}
+
+/// [`archive_revision_task`] recording `actor` as the writer. A progression run
+/// that retires a dead revision passes `"progression"`.
+pub fn archive_revision_task_as_actor(
+    conn: &Connection,
+    rev_id: &str,
+    now: &str,
+    provenance: ArchiveProvenance<'_>,
+    actor: &str,
+) -> Result<usize> {
     let rows_changed = crate::task_status_audit::execute(
         conn,
         "archive_revision_task",
-        "engine",
+        actor,
         "UPDATE tasks
          SET status            = 'archived',
              archived_by       = ?3,
              archived_at       = ?2,
              archived_reason   = ?4,
-             last_status_actor = 'engine',
+             last_status_actor = ?5,
              updated_at        = ?2,
              completed_at      = COALESCE(completed_at, ?2),
              deleted_at        = ?2,
@@ -397,7 +411,7 @@ pub fn archive_revision_task(
          WHERE id = ?1
            AND kind = 'revision'
            AND deleted_at IS NULL",
-        params![rev_id, now, provenance.mechanism, provenance.reason],
+        params![rev_id, now, provenance.mechanism, provenance.reason, actor],
     )?;
     Ok(rows_changed)
 }

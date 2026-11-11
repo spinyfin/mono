@@ -163,6 +163,9 @@ async fn progression_gate_is_unconditional_and_precedes_proposal_dispatch() {
             .progression_scope_denial(&PeerClass::Other, "test", &item.id)
             .is_some()
     );
+    // The kinds enabled for progression (`done`, `followup-task`, the verbs) reach
+    // the proposal handler, which judges the empty payload; every other kind is
+    // refused at the gate, before any handler runs.
     for &kind in boss_protocol::ProposalKind::ALL {
         let request = serde_json::json!({"request_id": "proposal", "payload": {
             "type": "submit_proposal", "run_id": execution.id, "kind": kind,
@@ -170,8 +173,20 @@ async fn progression_gate_is_unconditional_and_precedes_proposal_dispatch() {
         }})
         .to_string();
         let response = round_trip(state.clone(), Some(self_pid()), &request).await;
-        assert_eq!(response["payload"]["type"], "worker_tier_denied", "{kind}");
-        assert_eq!(response["payload"]["denial"]["verb"], format!("SubmitProposal:{kind}"));
+        if boss_engine_worker_policy::proposal_kind_decision(RpcTier::Progression, kind).is_allowed() {
+            // Judged by the handler: an empty payload is invalid for most, and the
+            // all-optional verbs are refused because this fixture run is not a
+            // progression execution.
+            assert_eq!(response["payload"]["type"], "proposal_rejected", "{kind}: {response}");
+            let code = response["payload"]["error"]["code"].as_str().unwrap().to_owned();
+            assert!(
+                ["validation_failed", "not_accepted"].contains(&code.as_str()),
+                "{kind}: {code}"
+            );
+        } else {
+            assert_eq!(response["payload"]["type"], "worker_tier_denied", "{kind}");
+            assert_eq!(response["payload"]["denial"]["verb"], format!("SubmitProposal:{kind}"));
+        }
     }
     let request =
         r#"{"request_id":"write","payload":{"type":"update_work_item","id":"outside","patch":{"name":"No"}}}"#;
@@ -202,6 +217,105 @@ async fn progression_gate_is_unconditional_and_precedes_proposal_dispatch() {
     assert_eq!(response["payload"]["type"], "worker_tier_denied");
     state.worker_registry.unregister(parent);
     assert_eq!(state.classify_peer(Some(self_pid())), PeerClass::Other);
+}
+
+/// A registered progression pane submits verbs through the real connection path:
+/// the engine applies an in-scope verb, refuses one aimed outside the
+/// neighbourhood the run was spawned with, and a worker session is shut out of
+/// the verbs by the tier (and by the handler when the tier is not enforced).
+#[tokio::test]
+async fn progression_verbs_apply_in_scope_and_are_refused_outside_it_and_to_workers() {
+    let (state, _dir) = test_server_state();
+    let product = boss_engine_runtime::test_support::create_test_product(&state.work_db);
+    let item =
+        boss_engine_runtime::test_support::create_test_chore_manual(&state.work_db, product.id.clone(), "Stale block");
+    let outside = boss_engine_runtime::test_support::create_test_chore_manual(&state.work_db, product.id, "Elsewhere");
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'blocked', blocked_reason = 'dependency' WHERE id = ?1",
+            [&item.id],
+        )
+        .unwrap();
+    let execution = state
+        .work_db
+        .create_execution(
+            boss_protocol::CreateExecutionInput::builder()
+                .work_item_id(&item.id)
+                .kind(boss_protocol::ExecutionKind::Progression)
+                .status(boss_protocol::ExecutionStatus::Running)
+                .build(),
+        )
+        .unwrap();
+    state
+        .work_db
+        .record_progression_episode(&execution.id, "fingerprint-1", "S4_dependency")
+        .unwrap();
+    let parent = boss_engine_runtime::worker_registry::parent_pid(self_pid())
+        .unwrap()
+        .unwrap();
+    state
+        .worker_registry
+        .register_progression(parent, &execution.id, &state.work_db)
+        .unwrap();
+    let submit = |kind: &str, payload: serde_json::Value| {
+        serde_json::json!({"request_id": "verb", "payload": {
+            "type": "submit_proposal", "run_id": execution.id, "kind": kind, "payload": payload
+        }})
+        .to_string()
+    };
+
+    // Outside the neighbourhood: refused by the handler, nothing written.
+    let response = round_trip(
+        state.clone(),
+        Some(self_pid()),
+        &submit("depend", serde_json::json!({"on": outside.id})),
+    )
+    .await;
+    assert_eq!(response["payload"]["type"], "proposal_rejected", "{response}");
+    assert_eq!(response["payload"]["error"]["code"], "not_accepted");
+    assert!(
+        response["payload"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("outside the neighbourhood")
+    );
+
+    // In scope: applied, stamped as the progression actor.
+    let response = round_trip(
+        state.clone(),
+        Some(self_pid()),
+        &submit("unblock", serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(response["payload"]["type"], "proposal_submitted", "{response}");
+    assert_eq!(response["payload"]["proposal"]["state"], "applied");
+    let WorkItem::Chore(updated) = state.work_db.get_work_item(&item.id).unwrap() else {
+        panic!("chore")
+    };
+    assert_eq!(updated.status, boss_protocol::TaskStatus::Todo);
+    let actor: String = state
+        .work_db
+        .connect()
+        .unwrap()
+        .query_row("SELECT last_status_actor FROM tasks WHERE id = ?1", [&item.id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(actor, boss_protocol::LAST_STATUS_ACTOR_PROGRESSION);
+    state.worker_registry.unregister(parent);
+
+    // A worker session is refused the verbs at the tier when it is enforced.
+    let (state, _dir) = enforcing_state("exec_worker");
+    let request = serde_json::json!({"request_id": "verb", "payload": {
+        "type": "submit_proposal", "run_id": "exec_worker", "kind": "revise", "payload": {"brief": "x"}
+    }})
+    .to_string();
+    let response = round_trip(state, Some(self_pid()), &request).await;
+    assert_eq!(response["payload"]["type"], "worker_tier_denied", "{response}");
+    assert_eq!(response["payload"]["denial"]["verb"], "SubmitProposal:revise");
 }
 
 // ── Classification ───────────────────────────────────────────────────────────

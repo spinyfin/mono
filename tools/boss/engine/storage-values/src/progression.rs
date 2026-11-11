@@ -79,7 +79,7 @@ pub struct ProgressionSettings {
     /// `progression.max_creates_per_item_window`: revisions plus precursors a
     /// progression run may create for one item per window. Placeholder 3. The
     /// candidate views read it (an exhausted budget stops the sweep nominating
-    /// the item); no verb layer enforces it on a running agent yet.
+    /// the item), and `revise` / `precursor` refuse once it is spent.
     #[builder(default = DEFAULT_MAX_CREATES_PER_ITEM_WINDOW)]
     pub max_creates_per_item_window: u32,
     /// The rolling window `max_creates_per_item_window` counts over, in

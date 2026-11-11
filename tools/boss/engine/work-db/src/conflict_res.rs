@@ -11,7 +11,7 @@ use super::*;
 /// Every conflict not resolved by a mechanical rung — or evaluated while the
 /// ladder itself is disabled — still falls through to a full worker doing
 /// the whole job by hand.
-const RUNG_FULL_WORKER: i64 = 3;
+pub(crate) const RUNG_FULL_WORKER: i64 = 3;
 
 /// How long a conflict revision that has no execution yet still counts as
 /// queued for its first dispatch.
@@ -476,19 +476,9 @@ impl WorkDb {
     ) -> Result<Option<ConflictResolution>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let now = now_string();
-        let rows = tx.execute(
-            "UPDATE conflict_resolutions
-                SET status                    = 'succeeded',
-                    head_sha_after            = COALESCE(?2, head_sha_after),
-                    finished_at               = COALESCE(finished_at, ?3),
-                    resolved_by_rung          = COALESCE(resolved_by_rung, ?4),
-                    mechanical_rung_in_flight = NULL
-              WHERE id = ?1
-                AND status IN ('pending', 'running')",
-            params![attempt_id, head_sha_after, now, rung],
-        )?;
-        finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
+        let updated = mark_conflict_resolution_succeeded_at_rung_in_tx(&tx, attempt_id, head_sha_after, rung)?;
+        tx.commit()?;
+        Ok(updated)
     }
 
     /// Close the revision task a conflict-resolution or CI-fix attempt
@@ -541,30 +531,10 @@ impl WorkDb {
         revision_task_id: &str,
         provenance: ArchiveProvenance<'_>,
     ) -> Result<Option<Task>> {
-        if self.get_live_execution_for_work_item(revision_task_id, "")?.is_some() {
-            return Ok(None);
-        }
         let mut conn = self.connect()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let Some(rev) = query_task(&tx, revision_task_id)? else {
-            return Ok(None);
-        };
-        if rev.deleted_at.is_some()
-            || matches!(
-                rev.status,
-                TaskStatus::Done | TaskStatus::Archived | TaskStatus::InReview
-            )
-        {
-            return Ok(None);
-        }
-        let now = now_string();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut pending = PendingEvents::new();
-        let rows_changed = archive_revision_task(&tx, &rev.id, &now, provenance)?;
-        if rows_changed == 0 {
-            return Ok(None);
-        }
-        cascade_dependents_after_prereq_status_change(&mut pending, &tx, &rev.id, "archived", &now)?;
-        let updated = query_task(&tx, revision_task_id)?;
+        let updated = close_moot_revision_task_in_tx(&tx, &mut pending, revision_task_id, provenance, "engine")?;
         commit_and_publish(tx, pending, self.event_bus())?;
         Ok(updated)
     }
@@ -1349,4 +1319,59 @@ fn open_revisions_of_ended_attempts(
     ))?;
     let rows = stmt.query_map(params![work_item_id, created_via_prefix], |row| row.get::<_, String>(0))?;
     collect_rows(rows)
+}
+
+pub(crate) fn mark_conflict_resolution_succeeded_at_rung_in_tx(
+    conn: &Connection,
+    attempt_id: &str,
+    head_sha_after: Option<&str>,
+    rung: i64,
+) -> Result<Option<ConflictResolution>> {
+    let now = now_string();
+    let rows = conn.execute(
+        "UPDATE conflict_resolutions
+            SET status                    = 'succeeded',
+                head_sha_after            = COALESCE(?2, head_sha_after),
+                finished_at               = COALESCE(finished_at, ?3),
+                resolved_by_rung          = COALESCE(resolved_by_rung, ?4),
+                mechanical_rung_in_flight = NULL
+          WHERE id = ?1
+            AND status IN ('pending', 'running')",
+        params![attempt_id, head_sha_after, now, rung],
+    )?;
+    if rows == 0 {
+        return Ok(None);
+    }
+    query_conflict_resolution(conn, attempt_id)
+}
+
+/// Retire a moot revision inside the caller's transaction, preserving attribution.
+pub(crate) fn close_moot_revision_task_in_tx(
+    conn: &Connection,
+    pending: &mut PendingEvents,
+    revision_task_id: &str,
+    provenance: ArchiveProvenance<'_>,
+    actor: &str,
+) -> Result<Option<Task>> {
+    if query_live_execution_for_work_item(conn, revision_task_id)?.is_some() {
+        return Ok(None);
+    }
+    let Some(rev) = query_task(conn, revision_task_id)? else {
+        return Ok(None);
+    };
+    if rev.deleted_at.is_some()
+        || matches!(
+            rev.status,
+            TaskStatus::Done | TaskStatus::Archived | TaskStatus::InReview
+        )
+    {
+        return Ok(None);
+    }
+    let now = now_string();
+    if crate::chain_helpers::archive_revision_task_as_actor(conn, &rev.id, &now, provenance, actor)? == 0 {
+        return Ok(None);
+    }
+    cascade_dependents_after_prereq_status_change(pending, conn, &rev.id, "archived", &now)?;
+    stage_task_board_change(pending, conn, &rev.id)?;
+    query_task(conn, revision_task_id)
 }

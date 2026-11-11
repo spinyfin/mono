@@ -463,6 +463,16 @@ pub fn maybe_engine_block_dependent(
     dependent_id: &str,
     now_epoch: &str,
 ) -> Result<Option<WorkExecution>> {
+    maybe_engine_block_dependent_as_actor(pending, conn, dependent_id, now_epoch, "engine")
+}
+
+pub(crate) fn maybe_engine_block_dependent_as_actor(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    dependent_id: &str,
+    now_epoch: &str,
+    actor: &str,
+) -> Result<Option<WorkExecution>> {
     let gating = deps::gating_prereqs_for(conn, dependent_id)?;
     if gating.is_empty() {
         return Ok(None);
@@ -477,12 +487,13 @@ pub fn maybe_engine_block_dependent(
     if dependent_id.starts_with("proj_") {
         write_engine_project_status(conn, dependent_id, ProjectStatus::Blocked, now_epoch)?;
     } else if dependent_id.starts_with("task_") {
-        write_engine_task_status(
+        write_task_status_as_actor(
             conn,
             dependent_id,
             TaskStatus::Blocked,
             now_epoch,
             "maybe_engine_block_dependent",
+            actor,
         )?;
     }
     // Stamp blocked_reason so the user-override path in
@@ -493,7 +504,7 @@ pub fn maybe_engine_block_dependent(
         crate::task_status_audit::execute(
             conn,
             "maybe_engine_block_dependent",
-            "engine",
+            actor,
             "UPDATE tasks SET blocked_reason = 'dependency'
              WHERE id = ?1 AND status = 'blocked' AND deleted_at IS NULL",
             [dependent_id],
@@ -583,6 +594,26 @@ pub fn add_dependency_edge_in_tx(
     relation: &str,
     now_epoch: &str,
 ) -> Result<(WorkItemDependency, Option<WorkExecution>)> {
+    add_dependency_edge_in_tx_as_actor(
+        pending,
+        conn,
+        dependent_id,
+        prerequisite_id,
+        relation,
+        now_epoch,
+        "engine",
+    )
+}
+
+pub(crate) fn add_dependency_edge_in_tx_as_actor(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    dependent_id: &str,
+    prerequisite_id: &str,
+    relation: &str,
+    now_epoch: &str,
+    actor: &str,
+) -> Result<(WorkItemDependency, Option<WorkExecution>)> {
     if dependent_id == prerequisite_id {
         bail!("a work item cannot depend on itself: {dependent_id}");
     }
@@ -623,7 +654,7 @@ pub fn add_dependency_edge_in_tx(
         deps::insert_edge(conn, dependent_id, prerequisite_id, relation, now_epoch)?;
     // Auto-block (Q4): if the new edge introduces a gating prereq, flip
     // the dependent to `blocked` and (defect #2) reap any live worker.
-    let reaped = maybe_engine_block_dependent(pending, conn, dependent_id, now_epoch)?;
+    let reaped = maybe_engine_block_dependent_as_actor(pending, conn, dependent_id, now_epoch, actor)?;
     Ok((edge, reaped))
 }
 
@@ -651,6 +682,16 @@ pub fn maybe_engine_unblock_dependent(
     dependent_id: &str,
     now_epoch: &str,
 ) -> Result<bool> {
+    maybe_engine_unblock_dependent_as_actor(pending, conn, dependent_id, now_epoch, "engine")
+}
+
+pub(crate) fn maybe_engine_unblock_dependent_as_actor(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    dependent_id: &str,
+    now_epoch: &str,
+    actor: &str,
+) -> Result<bool> {
     let current = match deps::lookup_work_item_status(conn, dependent_id)? {
         Some(s) => s,
         None => return Ok(false),
@@ -666,23 +707,11 @@ pub fn maybe_engine_unblock_dependent(
     // auto-blocked before the blocked_reason column existed.
     // For projects (no blocked_reason column), fall back to the actor check.
     //
-    // The actor test goes through `StatusActor::is_engine_cascade` rather
-    // than a bare `== "engine"` so the rule lives in one place and adding a
-    // new actor fails to compile there until someone decides which side it
-    // belongs on. `'boothby'` and `'progression'` deliberately answer
-    // `false`, alongside `'human'` / `'boss'`: a Boothby block is a per-row
-    // judgement and a progression decision is a scoped, autonomous one —
-    // neither is cascade bookkeeping, so this sweep must leave them alone
-    // exactly as it leaves a human's alone. (In practice the branch is
-    // unreachable for either — `write_engine_project_status` /
-    // `write_engine_task_status` are the only auto-blockers and both
-    // hardcode `'engine'`.)
-    //
-    // An actor outside the known vocabulary fails to parse and is treated
-    // as not-engine-owned, preserving the exact behaviour of the `==
-    // "engine"` compare this replaced.
-    let actor = lookup_last_status_actor(conn, dependent_id)?;
-    let engine_owned = actor
+    // A canonical dependency block is owned by this cascade even when a
+    // progression verb installed it. For legacy blocks with no reason, only
+    // an engine actor permits automatic release; other reasons stay untouched.
+    let previous_actor = lookup_last_status_actor(conn, dependent_id)?;
+    let engine_owned = previous_actor
         .as_deref()
         .and_then(|a| a.parse::<StatusActor>().ok())
         .is_some_and(StatusActor::is_engine_cascade);
@@ -705,12 +734,17 @@ pub fn maybe_engine_unblock_dependent(
     if dependent_id.starts_with("proj_") {
         write_engine_project_status(conn, dependent_id, ProjectStatus::Planned, now_epoch)?;
     } else if dependent_id.starts_with("task_") {
-        write_engine_task_status(
+        write_task_status_as_actor(
             conn,
             dependent_id,
-            TaskStatus::Todo,
+            if crate::dispatch_admission::primary_pr_awaits_review(conn, dependent_id)? {
+                TaskStatus::InReview
+            } else {
+                TaskStatus::Todo
+            },
             now_epoch,
             "maybe_engine_unblock_dependent",
+            actor,
         )?;
     }
     // Clear blocked_reason so it doesn't linger on a todo row.
@@ -718,7 +752,7 @@ pub fn maybe_engine_unblock_dependent(
         crate::task_status_audit::execute(
             conn,
             "maybe_engine_unblock_dependent",
-            "engine",
+            actor,
             "UPDATE tasks SET blocked_reason = NULL
              WHERE id = ?1 AND deleted_at IS NULL",
             [dependent_id],
@@ -742,7 +776,7 @@ pub fn maybe_engine_unblock_dependent(
     // during the gated window via a timing race — skip the reconcile.
     // Creating or promoting a `ready` execution on top of a live one
     // would let the dispatcher spawn a second worker for the same row.
-    if dependent_id.starts_with("task_") {
+    if dependent_id.starts_with("task_") && !crate::dispatch_admission::primary_pr_awaits_review(conn, dependent_id)? {
         let live = query_live_execution_for_work_item(conn, dependent_id)?;
         if live.is_none() {
             let kind = execution_kind_for_work_item(conn, dependent_id)?;
@@ -911,21 +945,22 @@ pub(crate) fn write_engine_project_status(
 /// Task-table counterpart of [`write_engine_project_status`]. See that
 /// function's doc comment for why this is split by table and typed by
 /// [`TaskStatus`] rather than a bare `&str`.
-pub(crate) fn write_engine_task_status(
+pub(crate) fn write_task_status_as_actor(
     conn: &Connection,
     task_id: &str,
     new_status: TaskStatus,
     now_epoch: &str,
     basis: &str,
+    actor: &str,
 ) -> Result<()> {
     crate::task_status_audit::execute(
         conn,
         basis,
-        "engine",
+        actor,
         "UPDATE tasks
-         SET status = ?2, last_status_actor = 'engine', updated_at = ?3
+         SET status = ?2, last_status_actor = ?4, updated_at = ?3
          WHERE id = ?1 AND deleted_at IS NULL",
-        params![task_id, new_status.as_str(), now_epoch],
+        params![task_id, new_status.as_str(), now_epoch, actor],
     )?;
     Ok(())
 }

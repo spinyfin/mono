@@ -43,18 +43,25 @@ impl WorkDb {
     /// are errors, never permission to recompute or expand the neighbourhood.
     pub fn check_progression_scope(&self, execution_id: &str, target: &str) -> Result<()> {
         let conn = self.connect()?;
-        let raw: Option<String> = conn.query_row(
-            "SELECT progression_neighbourhood FROM work_executions WHERE id = ?1",
-            [execution_id],
-            |row| row.get(0),
-        )?;
-        let ids: Vec<String> = serde_json::from_str(&raw.context("progression scope was not captured")?)?;
-        anyhow::ensure!(
-            ids.iter().any(|id| id == target),
-            "target is outside the progression neighbourhood"
-        );
-        Ok(())
+        check_progression_scope_on(&conn, execution_id, target)
     }
+}
+
+/// [`WorkDb::check_progression_scope`] on a connection the caller already
+/// holds: the progression verbs run it inside their own transaction, where
+/// re-locking the database connection would deadlock.
+pub(crate) fn check_progression_scope_on(conn: &Connection, execution_id: &str, target: &str) -> Result<()> {
+    let raw: Option<String> = conn.query_row(
+        "SELECT progression_neighbourhood FROM work_executions WHERE id = ?1",
+        [execution_id],
+        |row| row.get(0),
+    )?;
+    let ids: Vec<String> = serde_json::from_str(&raw.context("progression scope was not captured")?)?;
+    anyhow::ensure!(
+        ids.iter().any(|id| id == target),
+        "target is outside the progression neighbourhood"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

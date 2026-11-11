@@ -39,8 +39,8 @@ use crate::merge_poller::{PrLifecycleProbe, pr_labels_opt_out, stored_pr_number}
 #[cfg(test)]
 use crate::work::TaskStatus;
 use crate::work::{
-    ARCHIVE_MECHANISM_CONFLICT_WATCH_SUPERSESSION, ArchiveProvenance, ConflictResolutionInsertInput, PendingMergeCheck,
-    PrStateChecker, WorkDb,
+    ARCHIVE_MECHANISM_CONFLICT_WATCH_SUPERSESSION, ArchiveProvenance, ClearResolvedSignal,
+    ConflictResolutionInsertInput, PendingMergeCheck, PrStateChecker, WorkDb,
 };
 use boss_execution_contracts::{CubeClient, ExecutionPublisher};
 
@@ -1646,210 +1646,30 @@ pub async fn on_resolved(
         return false;
     }
     crate::conflict_ladder::clear_lockfile_regeneration_failed_attention(work_db, &candidate.work_item_id);
-    // Look up the engine-owned attempt row first. If one exists, drive
-    // the strict (attempt-id-guarded) retire path; otherwise fall back
-    // to the relaxed pr_url-only WHERE clause so this module still
-    // closes the loop when Phase 3 wiring hasn't shipped yet.
-    let attempt = match work_db.active_conflict_resolution_for_work_item(&candidate.work_item_id) {
-        Ok(found) => found,
+    let result = match work_db.clear_resolved_pr_signal(&candidate.work_item_id, &candidate.pr_url, false) {
+        Ok(ClearResolvedSignal::Applied(result)) => *result,
+        Ok(ClearResolvedSignal::QueueSideUnresolved { .. } | ClearResolvedSignal::Nothing) => return false,
         Err(err) => {
             tracing::warn!(
+                ?err,
                 work_item_id = %candidate.work_item_id,
                 pr_url = %candidate.pr_url,
-                ?err,
-                "conflict_watch: failed to look up active conflict_resolutions row; falling back to relaxed retire",
-            );
-            None
-        }
-    };
-
-    let task_result = if let Some(attempt) = attempt.as_ref() {
-        work_db.clear_chore_blocked_merge_conflict_for_attempt(&candidate.work_item_id, &candidate.pr_url, &attempt.id)
-    } else {
-        work_db.clear_chore_blocked_merge_conflict(&candidate.work_item_id, &candidate.pr_url)
-    };
-
-    let task_transitioned = match task_result {
-        Ok(Some(_)) => true,
-        Ok(None) => false,
-        Err(err) => {
-            tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                ?err,
-                "conflict_watch: failed to clear blocked: merge_conflict",
+                "conflict_watch: signal retirement failed"
             );
             return false;
         }
     };
-
-    // The attempt row's update is independent of the parent flip. The
-    // design (Q5) requires both to happen even if one of them has
-    // already been moved by a concurrent path (manual override, on-Stop
-    // completion, etc.).
-    //
-    // For a `pending` attempt we mark succeeded when:
-    //   (a) The parent was blocked and we just cleared it (`task_transitioned`).
-    //   (b) The parent was `in_review` (revision fix vehicle — the WHERE guard
-    //       on the task clear missed, but the attempt itself should retire).
-    //       We detect this via `revision_task_id` being set: a pending attempt
-    //       with a revision always corresponds to the new-model in-flight path.
-    //   (c) The attempt was already `running` (worker was active).
-    let mut attempt_transitioned = false;
-    if let Some(attempt) = attempt.as_ref() {
-        let parent_in_review_with_revision =
-            !task_transitioned && attempt.status == "pending" && attempt.revision_task_id.is_some();
-        let should_succeed = attempt.status == "running" || task_transitioned || parent_in_review_with_revision;
-        if should_succeed {
-            match work_db.mark_conflict_resolution_succeeded(&attempt.id, None) {
-                Ok(Some(succeeded)) => {
-                    attempt_transitioned = true;
-                    // When the parent was `in_review` (never blocked:
-                    // merge_conflict — either the happy pending+revision case,
-                    // or the attempt reached `running` under a *foreign*
-                    // scalar block, e.g. `skip_parent_flip` armed a
-                    // `merge_conflict` side-table row on a `blocked:
-                    // dependency` parent), the scalar clear above never ran
-                    // and never touched `task_blocked_signals` — so clear the
-                    // `merge_conflict` signal here whenever the parent flip
-                    // itself did not (`!task_transitioned`), not only in the
-                    // narrower pending+revision case, or the row is left
-                    // armed with no path left to retire it.
-                    if !task_transitioned
-                        && let Err(err) = work_db.clear_merge_conflict_signal_only(&candidate.work_item_id)
-                    {
-                        tracing::warn!(
-                            work_item_id = %candidate.work_item_id,
-                            ?err,
-                            "conflict_watch: failed to clear in-flight signal after retire",
-                        );
-                    }
-                    // Release the cube workspace lease the attempt owned.
-                    // Idempotent on the cube side — the lease may already
-                    // have been released by the worker's on-Stop completion
-                    // path, in which case cube returns a benign error that
-                    // we log at debug.
-                    if let (Some(client), Some(lease_id)) = (cube_client, succeeded.cube_lease_id.as_deref())
-                        && let Err(err) = client.release_workspace(lease_id).await
-                    {
-                        tracing::debug!(
-                            attempt_id = %succeeded.id,
-                            lease_id,
-                            ?err,
-                            "conflict_watch: lease release on retire failed (likely already released)",
-                        );
-                    }
-                    // Close the revision task this attempt spawned so a
-                    // retired attempt never leaves a stale
-                    // todo/active/blocked row behind — see
-                    // `WorkDb::close_moot_revision_task`'s doc for why this
-                    // can't just wait for the eventual parent-PR-merge sweep
-                    // to clean it up.
-                    if let Some(revision_task_id) = succeeded.revision_task_id.as_deref() {
-                        match work_db.close_moot_revision_task(
-                            revision_task_id,
-                            ArchiveProvenance::new(
-                                ARCHIVE_MECHANISM_CONFLICT_WATCH_SUPERSESSION,
-                                &format!(
-                                    "merge conflict resolved before parent PR merged; revision moot \
-                                     (work_item_id={}, revision_task_id={revision_task_id})",
-                                    candidate.work_item_id,
-                                ),
-                            ),
-                        ) {
-                            Ok(Some(_)) => {
-                                tracing::info!(
-                                    work_item_id = %candidate.work_item_id,
-                                    attempt_id = %succeeded.id,
-                                    revision_task_id,
-                                    "conflict_watch: closed the revision task the resolved attempt spawned",
-                                );
-                            }
-                            Ok(None) => {
-                                // Already terminal/in_review, or a worker is
-                                // still live driving it — nothing to do.
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    work_item_id = %candidate.work_item_id,
-                                    attempt_id = %succeeded.id,
-                                    revision_task_id,
-                                    ?err,
-                                    "conflict_watch: failed to close revision task on retire",
-                                );
-                            }
-                        }
-                    }
-                    publisher
-                        .publish_frontend_event_on_product(
-                            &candidate.product_id,
-                            FrontendEvent::ConflictResolutionSucceeded {
-                                attempt: work_db.remediation_entry(succeeded.list_entry()),
-                                product_id: candidate.product_id.clone(),
-                                work_item_id: candidate.work_item_id.clone(),
-                                attempt_id: succeeded.id.clone(),
-                                pr_url: candidate.pr_url.clone(),
-                            },
-                        )
-                        .await;
-                }
-                Ok(None) => {
-                    tracing::debug!(
-                        attempt_id = %attempt.id,
-                        work_item_id = %candidate.work_item_id,
-                        "conflict_watch: attempt row already terminal; skipping succeeded UPDATE",
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        attempt_id = %attempt.id,
-                        ?err,
-                        "conflict_watch: failed to mark conflict_resolution succeeded",
-                    );
-                }
-            }
-        }
-    }
-
-    if !task_transitioned && !attempt_transitioned {
-        return false;
-    }
-    // Publish a work-item status-change event only when the parent actually
-    // transitioned (blocked → in_review). When the parent was already
-    // `in_review` the status didn't change, so no broadcast is needed;
-    // `ConflictResolutionSucceeded` (above) handles the activity-feed entry.
-    if task_transitioned {
-        publisher
-            .publish_work_item_changed(
-                &candidate.product_id,
-                &candidate.work_item_id,
-                "merge_conflict_resolved",
-            )
-            .await;
-    }
-    // GitHub reporting the PR mergeable again is a trustworthy signal here
-    // (unlike a bare CI-clean probe for a queue-side CI failure) — mergeable
-    // genuinely reflects the rebase the conflict-resolution revision just
-    // pushed. If a Trunk merge intent was superseded by THIS conflict, it's
-    // now clear to resubmit. Scoped to only that sub-state: an eviction
-    // episode (`last_trunk_state` `failed`/`pending_failure`) can be live on
-    // the same work item at once (see `on_conflict_detected`'s takeover of a
-    // `blocked: ci_failure` row) and must not be advanced by an unrelated
-    // conflict resolving — only `ci_watch::on_ci_resolved` owns that fix.
-    crate::trunk_merge::mark_trunk_intent_awaiting_resubmit(
-        work_db,
-        &candidate.work_item_id,
-        &[crate::trunk_merge::TRUNK_INTENT_SUPERSEDED_BY_CONFLICT],
-    );
+    let attempt_id = result.conflict_attempt.as_ref().map(|attempt| attempt.id.clone());
+    let task_transitioned = result.task_transitioned;
+    crate::ci_watch::apply_retired_signal(work_db, publisher, cube_client, candidate, result).await;
     tracing::info!(
         work_item_id = %candidate.work_item_id,
         pr_url = %candidate.pr_url,
-        attempt_id = ?attempt.as_ref().map(|a| a.id.as_str()),
+        attempt_id = attempt_id.as_deref(),
         task_transitioned,
-        attempt_transitioned,
         raw_mergeable,
         raw_merge_state_status,
-        "conflict_watch: PR mergeable again; retire path ran",
+        "conflict_watch: PR mergeable again; retire path ran"
     );
     true
 }

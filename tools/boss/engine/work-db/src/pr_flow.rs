@@ -2346,8 +2346,14 @@ pub(super) fn insert_question_with_liveness(
     // still waiting on the human. Any other blocked reason, an archived or
     // deleted item, or a work item that is not a task, is withdrawn as
     // `task_not_parkable`.
+    // A progression run is sent to an item that is already stuck, so it is
+    // rarely `active` or `todo` (a `blocked` or `in_review` item is the usual
+    // case). Its question is the one human hold for that item, so any open item
+    // can park on it; `progression_done` moves the item when the run ends.
+    let progression_ask = execution.kind == ExecutionKind::Progression && !task.status.is_terminal();
     let parkable = task.deleted_at.is_none()
-        && (matches!(task.status, TaskStatus::Active | TaskStatus::Todo)
+        && (progression_ask
+            || matches!(task.status, TaskStatus::Active | TaskStatus::Todo)
             || (task.status == TaskStatus::Blocked
                 && task.blocked_reason.as_deref() == Some("awaiting_operator_answer")));
     let stuck_classification = if task.blocked_reason.is_some() || task.dispatch_failed_reason.is_some() {
@@ -2684,6 +2690,23 @@ pub(super) fn restart_after_answer(
 ) -> Result<bool> {
     let description = format!("{}{block}", task.description);
     super::description_guard::validate_description_update(&task.description, &description, false)?;
+    // An item with a bound PR that a progression run asked about goes back to
+    // review with the answer on its brief. A new implementation of it would be
+    // refused ("use a revision"), which would roll the whole answer back and leave
+    // the question open for good.
+    let asked_by_progression =
+        query_execution(tx, &question.execution_id)?.is_some_and(|asking| asking.kind == ExecutionKind::Progression);
+    if asked_by_progression && crate::dispatch_admission::primary_pr_awaits_review(tx, &task.id)? {
+        crate::task_status_audit::execute(
+            tx,
+            "restart_after_answer",
+            "human",
+            "UPDATE tasks SET description = ?2, status = 'in_review', blocked_reason = NULL,
+             blocked_detail = NULL, autostart = 1, last_status_actor = 'human', updated_at = ?3 WHERE id = ?1",
+            params![task.id, description, now],
+        )?;
+        return Ok(false);
+    }
     crate::task_status_audit::execute(
         tx,
         "restart_after_answer",

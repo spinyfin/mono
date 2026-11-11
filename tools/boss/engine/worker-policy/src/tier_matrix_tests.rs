@@ -406,12 +406,37 @@ fn progression_denials_carry_no_worker_guidance() {
 }
 
 #[test]
-fn proposal_kinds_are_denied_to_progression_and_allowed_to_workers() {
+fn proposal_kinds_split_into_worker_only_shared_and_progression_verbs() {
+    // The classification is explicit per kind, so a new kind cannot silently
+    // inherit either agent tier's access.
+    let shared = [ProposalKind::FollowupTask, ProposalKind::RunDone];
     for &kind in ProposalKind::ALL {
+        let progression = proposal_kind_decision(RpcTier::Progression, kind).is_allowed();
+        let worker = proposal_kind_decision(RpcTier::Worker, kind).is_allowed();
+        if shared.contains(&kind) {
+            assert!(progression && worker, "{kind} is a shared kind");
+        } else if kind.is_progression_verb() {
+            assert!(progression && !worker, "{kind} is a progression-only verb");
+        } else {
+            assert!(!progression && worker, "{kind} is a worker-only kind");
+        }
+    }
+    assert_eq!(ProposalKind::PROGRESSION_VERBS.len(), 8);
+    for &kind in ProposalKind::PROGRESSION_VERBS {
+        let denial = proposal_kind_decision(RpcTier::Worker, kind).denial().cloned().unwrap();
+        assert_eq!(denial.verb, format!("SubmitProposal:{kind}"));
+        assert_eq!(denial.reason, WorkerTierDenialReason::MutatingTaxonomy);
+    }
+    // The worker-only kinds named by the design stay closed to progression.
+    for kind in [
+        ProposalKind::PrCreated,
+        ProposalKind::ReviewGuide,
+        ProposalKind::ReviewReport,
+        ProposalKind::ReviewVerdict,
+    ] {
         assert!(
             !proposal_kind_decision(RpcTier::Progression, kind).is_allowed(),
             "{kind}"
         );
-        assert!(proposal_kind_decision(RpcTier::Worker, kind).is_allowed(), "{kind}");
     }
 }
