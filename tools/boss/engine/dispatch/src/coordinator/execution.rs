@@ -2588,21 +2588,31 @@ impl ExecutionCoordinator {
                 .is_some_and(|error| error.positioning_refused());
         let (attention_kind, attention_title) = if positioning_refused {
             (
-                "workspace_positioning_refused",
+                crate::work::WORKSPACE_POSITIONING_REFUSED,
                 "Workspace blocked: positioning refused",
             )
         } else {
             attention
         };
         let error_text = format!("{error:#}");
+        // Cube's own message, without its JSON envelope, for the label and the attention body.
+        let refusal_message = error
+            .downcast_ref::<boss_host_execution::cube::CubeCliError>()
+            .and_then(|error| error.refusal_message())
+            .unwrap_or_else(|| error_text.clone());
         let retry_delays: &[std::time::Duration] = if positioning_refused {
             &[]
         } else {
             &self.pre_start_retry_delays
         };
         let transition = if positioning_refused {
-            self.work_db
-                .record_workspace_positioning_refusal(&execution.id, worker_id, cube_repo_id, &error_text)
+            self.work_db.record_workspace_positioning_refusal(
+                &execution.id,
+                worker_id,
+                cube_repo_id,
+                &error_text,
+                &refusal_message,
+            )
         } else {
             self.work_db
                 .record_pre_start_failure(&execution.id, worker_id, cube_repo_id, &error_text, retry_delays)
@@ -2722,9 +2732,14 @@ impl ExecutionCoordinator {
                 let attention_body = format!(
                     "Execution `{execution_id}` could not start on worker `{worker_id}` \
                      after {attempts} attempt(s).\n\n\
-                     **Error:** {error_text}\n\n\
+                     **Error:** {shown_error}\n\n\
                      Inspect `dispatch-events/executions/{execution_id}/dispatch.jsonl` \
                      for the full stage timeline.",
+                    shown_error = if positioning_refused {
+                        &refusal_message
+                    } else {
+                        &error_text
+                    },
                     execution_id = execution.id,
                     attempts = execution.pre_start_failure_count,
                 );

@@ -149,9 +149,9 @@ const fn entry(kind: &'static str, cleared_by: ClearedBy, rationale: &'static st
 /// `every_registered_kind_is_declared_once` below pins the table itself.
 pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     entry(
-        "workspace_positioning_refused",
+        WORKSPACE_POSITIONING_REFUSED,
         ClearedBy::ProducerReconciles,
-        "Explicit launch clears the workspace hold and its attention before trying the repaired repository state.",
+        "The positioning-refusal recheck sweep probes the live PR state each pass and clears the hold with its attention once cube would accept it; an explicit launch also clears both.",
     ),
     entry(
         REVISION_CHAIN_RECOVERY_BLOCKED_ATTENTION_KIND,

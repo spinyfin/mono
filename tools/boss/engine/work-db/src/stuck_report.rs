@@ -402,7 +402,7 @@ pub(super) fn classification(conn: &Connection, task: &Task, wait: Option<&str>)
             "worker_failed" => "S7_worker_failed",
             "awaiting_operator_answer" => "S8_operator_question",
             "dependency" => "S4_dependency",
-            "execution_recovery_failed" | "workspace_positioning_refused" => "S9_execution_recovery",
+            "execution_recovery_failed" | WORKSPACE_POSITIONING_REFUSED => "S9_execution_recovery",
             "spawning_attempt_retired_unsuccessfully" => "S10_retired_attempt",
             "merge_conflict" => "S5_merge_conflict",
             "ci_failure" | "ci_failure_exhausted" => "S6_ci_failure",

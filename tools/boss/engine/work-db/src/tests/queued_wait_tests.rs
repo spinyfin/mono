@@ -464,6 +464,7 @@ fn every_waiting_state_yields_a_named_reason() {
         &attempt.id,
         "worker",
         None,
+        "Cube command failed: {\n  \"error\": \"Preserve commit abc123 before positioning def456; inspect the repository\",\n  \"error_kind\": \"workspace_positioning_refused\"\n}",
         "Preserve commit abc123 before positioning def456; inspect the repository",
     )
     .unwrap();

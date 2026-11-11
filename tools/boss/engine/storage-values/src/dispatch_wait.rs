@@ -138,8 +138,9 @@ pub const DISPATCH_WAIT_REASON_DELIBERATE_PARK: &str = "deliberate_park";
 /// failure (the churn guard, a deliberate park) is holding it.
 pub const DISPATCH_WAIT_REASON_DISPATCH_FAILED: &str = "dispatch_failed";
 
-/// Cube refused repository state that requires repair before an explicit launch.
-pub const DISPATCH_WAIT_REASON_WORKSPACE_POSITIONING_REFUSED: &str = "workspace_positioning_refused";
+/// Cube refused repository state that requires repair before the item can restart.
+pub const DISPATCH_WAIT_REASON_WORKSPACE_POSITIONING_REFUSED: &str =
+    crate::attention_kinds::WORKSPACE_POSITIONING_REFUSED;
 
 /// The item is `active` with no run pending or live because worker recovery
 /// gave up and raised an attention item for a person.
@@ -256,7 +257,7 @@ pub const DISPATCH_WAIT_REASON_CODES: &[(&str, &str)] = &[
     ),
     (
         DISPATCH_WAIT_REASON_WORKSPACE_POSITIONING_REFUSED,
-        "Workspace blocked: resolve the positioning refusal, then launch manually",
+        "Workspace blocked: resolve the positioning refusal; the item restarts once it clears",
     ),
     (
         DISPATCH_WAIT_REASON_RECOVERY_ATTENTION,

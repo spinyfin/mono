@@ -339,3 +339,13 @@ fn goto_fetch_failure_remains_retryable() {
     let error = run_goto(&runner, None, Some(42)).unwrap_err();
     assert_eq!(error.json_error()["retryable"], true);
 }
+
+#[test]
+fn unclassified_errors_do_not_claim_to_be_retryable() {
+    let error = CubeError::InvalidArgument("bad flag".to_string());
+    assert!(error.json_error().get("retryable").is_none());
+    assert_eq!(
+        CubeError::PositioningRefused("x".into()).json_error()["retryable"],
+        false
+    );
+}

@@ -92,6 +92,7 @@ pub mod dispatch_failure_recovery_sweep;
 pub mod durable_liveness;
 pub mod grok_home_retention_sweep;
 pub mod grok_quota_refresh;
+pub mod positioning_refusal_recheck_sweep;
 pub use boss_dispatch_reader as dispatch_reader;
 pub use boss_engine_attachments as attachments;
 pub use boss_engine_codex_rollout_retention as codex_rollout_retention;

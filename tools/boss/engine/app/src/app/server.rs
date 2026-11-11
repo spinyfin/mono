@@ -2353,6 +2353,16 @@ async fn serve_scoped(
         Duration::from_secs(60),
     );
 
+    // Periodic recheck of items held by a cube positioning refusal: probes the
+    // live PR state read-only and lowers the hold (attention included) once cube
+    // would accept positioning again, so the item restarts without a manual launch.
+    let _positioning_refusal_recheck_handle = boss_engine_runtime::positioning_refusal_recheck_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.execution_coordinator.clone(),
+        boss_engine_runtime::positioning_refusal_recheck_sweep::github_positioning_probe(),
+        Duration::from_secs(300),
+    );
+
     // Periodic pr_review dead-review recovery sweep: a `pr_review`
     // execution that dies (host failure, cube-lease reap, crash) without
     // ever finalizing leaves its PR silently unreviewed — the producing

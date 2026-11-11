@@ -200,11 +200,12 @@ fn open_attention_sql(a: &str, kind_predicate: &str) -> String {
 /// The "waiting on a human" holds, in SQL. This is the one definition: the stuck
 /// report reads clause 1 from the clause view rather than keeping a Rust copy.
 fn human_held_sql(a: &str) -> String {
+    let refused = crate::WORKSPACE_POSITIONING_REFUSED;
     // COALESCE: a NULL `blocked_reason` makes several terms NULL, and a NULL hold
     // must read as "not held", not poison the clause that negates it.
     format!(
         "COALESCE({a}.deferred = 1 OR {a}.human_driven = 1
-          OR {a}.blocked_reason IN ('awaiting_operator_answer', 'deletion_signoff', 'workspace_positioning_refused')
+          OR {a}.blocked_reason IN ('awaiting_operator_answer', 'deletion_signoff', '{refused}')
           OR EXISTS (SELECT 1 FROM operator_questions oq WHERE oq.work_item_id = {a}.id AND oq.status = 'open')
           OR EXISTS (SELECT 1 FROM work_executions hx WHERE hx.work_item_id = {a}.id AND hx.status = 'waiting_human')
           OR ({a}.blocked_reason = 'worker_failed' AND COALESCE(

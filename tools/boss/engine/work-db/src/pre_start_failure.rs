@@ -1,6 +1,21 @@
 //! Durable pre-start failures and repository-state holds.
 use super::*;
 
+/// One item held by a positioning refusal; see [`WorkDb::list_positioning_holds`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositioningHold {
+    pub work_item_id: String,
+    pub pr_url: Option<String>,
+    pub restarts: bool,
+}
+
+/// How a pre-start failure is handled: retried with backoff, or a definitive
+/// cube refusal that stops after one attempt and holds the item.
+enum RetryPolicy<'a> {
+    Retry(&'a [Duration]),
+    Refused { message: &'a str },
+}
+
 impl WorkDb {
     /// Record a pre-start failure for `execution_id`, either resetting the
     /// execution to `ready` with a backoff delay (retry) or marking it
@@ -44,18 +59,85 @@ impl WorkDb {
         error_text: &str,
         retry_delays: &[Duration],
     ) -> Result<(WorkExecution, Option<WorkRun>, PreStartFailureOutcome)> {
-        self.record_start_failure_with_policy(execution_id, agent_id, cube_repo_id, error_text, Some(retry_delays))
+        self.record_start_failure_with_policy(
+            execution_id,
+            agent_id,
+            cube_repo_id,
+            error_text,
+            RetryPolicy::Retry(retry_delays),
+        )
     }
 
     /// Atomically stop the execution and hold its item before publishing terminal events.
+    ///
+    /// `error_text` is the full failure (kept on the execution and in dispatch
+    /// events); `refusal_message` is cube's own readable message, used for the
+    /// blocked label and the attention body.
+    ///
+    /// Only `todo`/`active` rows are rewritten to `blocked`. A review-phase item
+    /// (`in_review`, or blocked for a merge conflict or CI failure) keeps its status
+    /// and blocked reason so the merge poller and review flow still see it; the
+    /// open attention item alone holds it.
     pub fn record_workspace_positioning_refusal(
         &self,
         execution_id: &str,
         agent_id: &str,
         cube_repo_id: Option<&str>,
         error_text: &str,
+        refusal_message: &str,
     ) -> Result<(WorkExecution, Option<WorkRun>, PreStartFailureOutcome)> {
-        self.record_start_failure_with_policy(execution_id, agent_id, cube_repo_id, error_text, None)
+        self.record_start_failure_with_policy(
+            execution_id,
+            agent_id,
+            cube_repo_id,
+            error_text,
+            RetryPolicy::Refused {
+                message: refusal_message,
+            },
+        )
+    }
+
+    /// Items currently held by a positioning refusal, with the PR their refused
+    /// execution targeted (the recheck probe's subject). `restarts` is true when the
+    /// task row itself was moved to `blocked` by the hold, so lowering it must
+    /// also start the item again; review-phase rows keep their status and only
+    /// need the hold lowered.
+    pub fn list_positioning_holds(&self) -> Result<Vec<PositioningHold>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT t.id,
+                    (t.status = 'blocked' AND t.blocked_reason = ?1),
+                    (SELECT x.pr_url FROM work_executions x
+                      WHERE x.work_item_id = t.id AND x.pr_url IS NOT NULL AND x.pr_url <> ''
+                      ORDER BY x.created_at DESC, x.id DESC LIMIT 1)
+             FROM tasks t
+             WHERE t.deleted_at IS NULL AND t.status NOT IN ('done', 'archived')
+               AND (t.blocked_reason = ?1
+                    OR EXISTS (SELECT 1 FROM work_attention_items a
+                               WHERE a.work_item_id = t.id AND a.kind = ?1 AND a.status = 'open'))
+             ORDER BY t.id",
+        )?;
+        let rows = stmt.query_map(params![WORKSPACE_POSITIONING_REFUSED], |row| {
+            Ok(PositioningHold {
+                work_item_id: row.get(0)?,
+                restarts: row.get(1)?,
+                pr_url: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Lower the positioning hold on `work_item_id` (attention and, for a row the
+    /// hold blocked, the blocked status). Returns whether a hold was present.
+    pub fn clear_positioning_hold(&self, work_item_id: &str) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let held = crate::dispatch_helpers::positioning_hold_active(&tx, work_item_id)?;
+        if held {
+            crate::dispatch_helpers::clear_positioning_hold_in_tx(&tx, work_item_id, "engine")?;
+        }
+        tx.commit()?;
+        Ok(held)
     }
 
     fn record_start_failure_with_policy(
@@ -64,10 +146,12 @@ impl WorkDb {
         agent_id: &str,
         cube_repo_id: Option<&str>,
         error_text: &str,
-        retry_delays: Option<&[Duration]>,
+        policy: RetryPolicy<'_>,
     ) -> Result<(WorkExecution, Option<WorkRun>, PreStartFailureOutcome)> {
-        let positioning_refused = retry_delays.is_none();
-        let retry_delays = retry_delays.unwrap_or_default();
+        let (refusal_message, retry_delays): (Option<&str>, &[Duration]) = match policy {
+            RetryPolicy::Retry(delays) => (None, delays),
+            RetryPolicy::Refused { message } => (Some(message), &[]),
+        };
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
@@ -129,24 +213,26 @@ impl WorkDb {
             (PreStartFailureOutcome::PermanentFail, Some(run_id))
         };
 
-        if positioning_refused {
+        if let Some(message) = refusal_message {
             crate::task_status_audit::execute(
                 &tx,
-                "workspace_positioning_refused",
+                WORKSPACE_POSITIONING_REFUSED,
                 "engine",
-                "UPDATE tasks SET status = 'blocked', blocked_reason = 'workspace_positioning_refused',
-                 blocked_detail = ?2, last_status_actor = 'engine', updated_at = ?3
-                 WHERE id = ?1 AND deleted_at IS NULL AND status NOT IN ('done', 'archived')",
-                params![execution.work_item_id, format!("Workspace blocked: {error_text}"), now],
+                &format!(
+                    "UPDATE tasks SET status = 'blocked', blocked_reason = '{WORKSPACE_POSITIONING_REFUSED}',
+                     blocked_detail = ?2, last_status_actor = 'engine', updated_at = ?3
+                     WHERE id = ?1 AND deleted_at IS NULL AND status IN ('todo', 'active')"
+                ),
+                params![execution.work_item_id, format!("Workspace blocked: {message}"), now],
             )?;
             if execution.work_item_id.starts_with("task_") {
                 crate::workitems::upsert_refreshing_work_item_attention_in_tx(
                     &tx,
                     &execution.work_item_id,
-                    "workspace_positioning_refused",
+                    WORKSPACE_POSITIONING_REFUSED,
                     "Workspace blocked: positioning refused",
                     &format!(
-                        "Execution `{execution_id}` could not position its workspace.\n\n{error_text}\n\nResolve the reported repository state, then launch the item manually. No repository content was discarded."
+                        "Execution `{execution_id}` could not position its workspace.\n\n{message}\n\nThe item restarts on its own once the reported state is resolved, or launch it manually. No repository content was discarded."
                     ),
                 )?;
             }

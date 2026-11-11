@@ -144,9 +144,34 @@ pub mod cube {
         /// Only cube's explicit structured refusal suppresses positioning retries.
         /// Older binaries, transport errors and malformed payloads remain retryable.
         pub fn positioning_refused(&self) -> bool {
-            [&self.stderr, &self.stdout].into_iter().any(|output| {
-                serde_json::from_str::<serde_json::Value>(output).is_ok_and(|value| {
-                    value["error_kind"] == "workspace_positioning_refused" && value["retryable"] == false
+            self.structured_refusal().is_some()
+        }
+
+        /// Cube's own refusal message (the envelope's `error` string), free of the
+        /// JSON wrapper, for the blocked label and the attention body.
+        pub fn refusal_message(&self) -> Option<String> {
+            self.structured_refusal()?["error"].as_str().map(str::to_owned)
+        }
+
+        /// The refusal envelope, wherever it sits in the captured output. Cube
+        /// prints other diagnostics (fetch retries, op-divergence recovery) to
+        /// stderr before the envelope, so the whole stream is not one document:
+        /// try each top-level `{` line, last first, and accept the first object
+        /// that parses and carries the refusal kind.
+        fn structured_refusal(&self) -> Option<serde_json::Value> {
+            [&self.stderr, &self.stdout].into_iter().find_map(|output| {
+                let starts = output
+                    .match_indices('{')
+                    .map(|(index, _)| index)
+                    .filter(|&index| index == 0 || output.as_bytes()[index - 1] == b'\n');
+                let starts: Vec<usize> = starts.collect();
+                starts.into_iter().rev().find_map(|start| {
+                    let value = serde_json::Deserializer::from_str(&output[start..])
+                        .into_iter::<serde_json::Value>()
+                        .next()?
+                        .ok()?;
+                    (value["error_kind"] == "workspace_positioning_refused" && value["retryable"] == false)
+                        .then_some(value)
                 })
             })
         }
@@ -197,6 +222,10 @@ pub mod cube {
                     (r#"{"error":"workspace_positioning_refused unpushed content"}"#, false),
                     ("workspace_positioning_refused", false),
                     (r#"{"retryable":false}"#, false),
+                    (
+                        "warning: jj fetch retry 1/3\n{\n  \"error\": \"x\",\n  \"error_kind\": \"workspace_positioning_refused\",\n  \"retryable\": false\n}",
+                        true,
+                    ),
                 ] {
                     for stderr in [true, false] {
                         let error = CubeCliError {
@@ -209,6 +238,27 @@ pub mod cube {
                     }
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod refusal_message_tests {
+        use super::CubeCliError;
+
+        #[test]
+        fn refusal_message_is_cubes_error_string_without_the_envelope() {
+            let error = CubeCliError {
+                host: "local".into(),
+                exit_code: Some(2),
+                stdout: String::new(),
+                stderr: "warning: retrying fetch\n{\n  \"error\": \"PR 7 is MERGED\",\n  \"error_kind\": \"workspace_positioning_refused\",\n  \"retryable\": false\n}\n".into(),
+            };
+            assert_eq!(error.refusal_message().as_deref(), Some("PR 7 is MERGED"));
+            let transient = CubeCliError {
+                stderr: r#"{"error":"network","error_kind":"command_failed","retryable":true}"#.into(),
+                ..error
+            };
+            assert_eq!(transient.refusal_message(), None);
         }
     }
 

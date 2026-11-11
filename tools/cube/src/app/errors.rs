@@ -204,13 +204,26 @@ pub(super) const JJ_REVISION_DOESNT_EXIST_SIGNATURE: &str = "doesn't exist";
 impl CubeError {
     /// Machine-readable classification; callers must never parse the diagnostic.
     pub fn json_error(&self) -> Value {
-        serde_json::json!({
+        let mut payload = serde_json::json!({
             "error": self.to_string(),
             "error_kind": if matches!(self, Self::PositioningRefused(_)) {
                 "workspace_positioning_refused"
             } else { "command_failed" },
-            "retryable": !matches!(self, Self::PositioningRefused(_)),
-        })
+        });
+        // Only variants whose retryability is known carry the field; an
+        // unclassified error says nothing rather than claiming it is retryable.
+        let retryable = match self {
+            Self::PositioningRefused(_) => Some(false),
+            Self::MaintenanceBusy
+            | Self::CommandFailed { .. }
+            | Self::CommandTimedOut { .. }
+            | Self::DeadlineExceeded { .. } => Some(true),
+            _ => None,
+        };
+        if let Some(retryable) = retryable {
+            payload["retryable"] = Value::Bool(retryable);
+        }
+        payload
     }
 
     pub fn exit_code(&self) -> ExitCode {
