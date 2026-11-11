@@ -120,7 +120,7 @@ fn seed(db: &WorkDb) {
         conn.execute(
             "INSERT INTO ci_remediations(id,product_id,work_item_id,pr_url,pr_number,head_branch,head_sha_at_trigger,
             attempt_kind,consumes_budget,failed_checks,status,created_at,finished_at)
-            VALUES (?1,?2,?3,'https://example.com/pr',1,'branch',?1,'fix',1,'[]','completed',?4,?5)",
+            VALUES (?1,?2,?3,'https://example.com/pr',1,'branch',?1,'fix',1,'[]','failed',?4,?5)",
             params![
                 format!("remediation{index}"),
                 product,
@@ -183,7 +183,7 @@ fn seeded_ledger_computes_formulas_publishes_report_and_caches_the_day() {
     assert_eq!(value(&report, "remind_after_secs"), Some(3 * DAY as u64));
     assert_eq!(report.limits["remind_after_secs"].source, "fallback");
     assert!(report.limits["sweep_interval_secs"].basis.contains("WARNING"));
-    assert_eq!(report.inputs["automatic_pause_max_secs"], 10000);
+    assert_eq!(report.inputs["automatic_pause_p99_secs"], 10000);
     assert_eq!(report.inputs["engine_ladder_questions"], 2);
     assert_eq!(report.inputs["progression_questions"], 3);
     assert_eq!(
@@ -217,13 +217,13 @@ fn explicit_override_even_equal_to_placeholder_wins_and_restart_can_remove_it() 
         .explicit_overrides(0xff)
         .expected_questions_per_week(1)
         .build();
-    db.configure_progression_calibration(&settings, NOW).unwrap();
+    db.configure_progression_calibration(&settings).unwrap();
     let report = db.calibrate_progression(NOW).unwrap();
     for (index, key) in CALIBRATED_KEYS.iter().enumerate() {
         assert_eq!(report.limits[*key].source, "overridden");
         assert_eq!(value(&report, key), settings.calibration_values()[index]);
     }
-    db.configure_progression_calibration(&ProgressionSettings::default(), NOW)
+    db.configure_progression_calibration(&ProgressionSettings::default())
         .unwrap();
     assert_eq!(
         db.calibrate_progression(NOW).unwrap().limits["pool_size"].source,
@@ -231,27 +231,120 @@ fn explicit_override_even_equal_to_placeholder_wins_and_restart_can_remove_it() 
     );
 }
 
+/// Insert production-shaped remediations for one item: `(created, finished,
+/// status, head_after)` with a distinct trigger head per row.
+fn remediations(db: &WorkDb, product: &str, item: &str, rows: &[(i64, i64, &str, Option<&str>)]) {
+    let conn = db.connect().unwrap();
+    for (index, (created, finished, status, after)) in rows.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO ci_remediations(id,product_id,work_item_id,pr_url,pr_number,head_branch,
+            head_sha_at_trigger,head_sha_after,attempt_kind,consumes_budget,failed_checks,status,created_at,finished_at)
+            VALUES (?1,?2,?3,'https://example.com/pr',1,'branch',?4,?5,'fix',1,'[]',?6,?7,?8)",
+            params![
+                format!("{item}-r{index}"),
+                product,
+                item,
+                format!("head{index}"),
+                after,
+                status,
+                created,
+                finished
+            ],
+        )
+        .unwrap();
+    }
+}
+
+fn pause_inputs(db: &WorkDb) -> ProgressionCalibration {
+    super::progression_calibration_data::measure(&db.connect().unwrap(), NOW, 7 * DAY).unwrap()
+}
+
 #[test]
-fn coding_merge_and_execution_human_waits_do_not_inflate_automatic_pauses() {
+fn production_shaped_history_yields_a_computed_stuck_after() {
     let db = db();
     seed(&db);
-    let baseline = super::super::progression_calibration_data::measure(&db.connect().unwrap(), NOW, 7 * DAY).unwrap();
+    let report = db.calibrate_progression(NOW).unwrap();
+    assert_eq!(report.inputs["automatic_pause_samples"], 3);
+    assert_eq!(report.inputs["automatic_pause_p99_secs"], 10000);
+    assert_eq!(report.limits["stuck_after_secs"].source, "computed");
+    assert_eq!(value(&report, "stuck_after_secs"), Some(30000));
+}
+
+#[test]
+fn gaps_after_green_attempts_and_with_coding_runs_are_not_pauses() {
+    let db = db();
     let product = create_test_product(&db).id;
-    let item = create_test_chore_manual(&db, &product, "human waits").id;
+    let start = NOW - 20 * DAY;
+    // A succeeded attempt followed by a later, unrelated push: review/merge wait.
+    let green = create_test_chore_manual(&db, &product, "green then later push").id;
+    remediations(
+        &db,
+        &product,
+        &green,
+        &[
+            (start, start + 100, "succeeded", Some("pushed")),
+            (start + 10 * DAY, start + 10 * DAY + 100, "failed", None),
+        ],
+    );
+    assert_eq!(pause_inputs(&db).inputs["automatic_pause_samples"], 0);
+    // A failed attempt whose gap contains a coding run on the item: not scheduling lag.
+    let coded = create_test_chore_manual(&db, &product, "coding in gap").id;
+    remediations(
+        &db,
+        &product,
+        &coded,
+        &[
+            (start, start + 100, "failed", None),
+            (start + 10 * DAY, start + 10 * DAY + 100, "failed", None),
+        ],
+    );
     let run = db
         .create_execution(
             CreateExecutionInput::builder()
-                .work_item_id(&item)
+                .work_item_id(&coded)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Completed)
                 .build(),
         )
         .unwrap();
-    let start = NOW - 20 * DAY;
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET created_at=?2, started_at=?2, finished_at=?3 WHERE id=?1",
+            params![run.id, start + DAY, start + 2 * DAY],
+        )
+        .unwrap();
+    assert_eq!(pause_inputs(&db).inputs["automatic_pause_samples"], 0);
+    // A failed attempt whose revision task ran a human-waiting execution.
+    let waited = create_test_chore_manual(&db, &product, "human wait on revision").id;
+    let revision = create_test_chore_manual(&db, &product, "revision").id;
+    remediations(
+        &db,
+        &product,
+        &waited,
+        &[
+            (start, start + 100, "failed", None),
+            (start + 10 * DAY, start + 10 * DAY + 100, "failed", None),
+        ],
+    );
+    let run = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&revision)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
     let conn = db.connect().unwrap();
     conn.execute(
+        "UPDATE ci_remediations SET revision_task_id=?1 WHERE id=?2",
+        params![revision, format!("{waited}-r0")],
+    )
+    .unwrap();
+    conn.execute(
         "UPDATE work_executions SET created_at=?2, started_at=?2, finished_at=?3 WHERE id=?1",
-        params![run.id, start, NOW - 1],
+        params![run.id, start - DAY, start + 11 * DAY],
     )
     .unwrap();
     conn.execute(
@@ -259,44 +352,30 @@ fn coding_merge_and_execution_human_waits_do_not_inflate_automatic_pauses() {
         params![run.id, start + DAY],
     )
     .unwrap();
-    for (stamp, old, new) in [
-        (start, "backlog", "active"),
-        (start + DAY, "active", "in_review"),
-        (NOW - 1, "in_review", "done"),
-    ] {
-        conn.execute(
-            "INSERT INTO task_status_audit(work_item_id,property,old_value,new_value,actor,changed_at,basis)
-            VALUES (?1,'status',?2,?3,'engine',?4,'observed')",
-            params![item, old, new, stamp],
-        )
-        .unwrap();
-    }
-    for index in 0..2 {
-        conn.execute(
-            "INSERT INTO ci_remediations(id,product_id,work_item_id,pr_url,pr_number,head_branch,
-            head_sha_at_trigger,attempt_kind,consumes_budget,failed_checks,status,created_at,finished_at)
-            VALUES (?1,?2,?3,'https://example.com/pr',1,'branch',?1,'fix',1,'[]','completed',?4,?5)",
-            params![
-                format!("human-remediation{index}"),
-                product,
-                item,
-                start + index * 10 * DAY,
-                start + index * 10 * DAY + 1000
-            ],
-        )
-        .unwrap();
-    }
     drop(conn);
-    let report = db.calibrate_progression(NOW).unwrap();
-    assert_eq!(
-        report.inputs["automatic_pause_samples"],
-        baseline.inputs["automatic_pause_samples"]
-    );
-    assert_eq!(
-        report.inputs["automatic_pause_max_secs"],
-        baseline.inputs["automatic_pause_max_secs"]
-    );
-    assert_eq!(value(&report, "stuck_after_secs"), Some(30000));
+    assert_eq!(pause_inputs(&db).inputs["automatic_pause_samples"], 0);
+}
+
+#[test]
+fn a_failed_gap_or_a_head_that_still_failed_is_a_pause_and_one_outlier_is_ignored() {
+    let db = db();
+    let product = create_test_product(&db).id;
+    let item = create_test_chore_manual(&db, &product, "red gaps").id;
+    let start = NOW - 20 * DAY;
+    // Ten 100s gaps after failed attempts, a still-red succeeded attempt, and one 10-day outlier.
+    let mut rows = vec![];
+    let mut at = start;
+    for _ in 0..10 {
+        rows.push((at, at + 10, "failed", None));
+        at += 110;
+    }
+    rows.push((at, at + 10, "succeeded", Some("head11")));
+    rows.push((at + 110, at + 120, "failed", None));
+    rows.push((at + 120 + 10 * DAY, at + 130 + 10 * DAY, "failed", None));
+    remediations(&db, &product, &item, &rows);
+    let report = pause_inputs(&db);
+    assert_eq!(report.inputs["automatic_pause_samples"], 12);
+    assert_eq!(report.inputs["automatic_pause_p99_secs"], 100);
 }
 
 #[test]
@@ -309,7 +388,7 @@ fn configuration_and_snapshots_survive_measurement_and_metadata_errors() {
             .progression_calibration
             .is_none()
     );
-    db.configure_progression_calibration(&ProgressionSettings::default(), NOW)
+    db.configure_progression_calibration(&ProgressionSettings::default())
         .unwrap();
     db.set_metadata(CONFIG_KEY, "invalid config").unwrap();
     assert!(db.calibrate_progression(NOW).is_err());

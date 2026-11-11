@@ -102,11 +102,8 @@ pub fn spawn_loop(
                 use std::sync::atomic::Ordering;
                 if !initialized.load(Ordering::Relaxed) {
                     let db = work_db.clone();
-                    let result = tokio::task::spawn_blocking(move || {
-                        let now = boss_engine_utils::epoch_time::now_epoch_secs();
-                        db.configure_progression_calibration(&settings, now)
-                    })
-                    .await;
+                    let result =
+                        tokio::task::spawn_blocking(move || db.configure_progression_calibration(&settings)).await;
                     match result {
                         Ok(Ok(())) => {
                             initialized.store(true, Ordering::Relaxed);

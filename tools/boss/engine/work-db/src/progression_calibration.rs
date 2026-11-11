@@ -28,7 +28,7 @@ pub(super) fn read_report(conn: &Connection) -> Result<Option<ProgressionCalibra
 impl WorkDb {
     /// Publish configuration and fallbacks without measuring history.
     /// Unchanged configuration preserves the calibrated values.
-    pub fn configure_progression_calibration(&self, settings: &ProgressionSettings, _now: i64) -> Result<()> {
+    pub fn configure_progression_calibration(&self, settings: &ProgressionSettings) -> Result<()> {
         let json = serde_json::to_string(settings)?;
         if self.get_metadata(CONFIG_KEY)?.as_deref() != Some(&json) {
             let mut conn = self.connect()?;
@@ -95,7 +95,7 @@ impl WorkDb {
                         .max(1)
                 }),
             measurement("ledger_interval_p99_secs").map(|v| v.saturating_mul(10)),
-            triple("automatic_pause_max_secs"),
+            triple("automatic_pause_p99_secs"),
             triple("revision_to_review_max_secs"),
             triple("remediation_attempts_p99"),
             triple("run_duration_p99_secs"),

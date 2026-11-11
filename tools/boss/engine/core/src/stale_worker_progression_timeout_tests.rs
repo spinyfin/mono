@@ -145,7 +145,6 @@ fn the_engine_publishes_the_timeout_the_sweep_reads() {
         &boss_engine_storage_values::progression::ProgressionSettings::builder()
             .run_timeout_secs(77)
             .build(),
-        0,
     )
     .unwrap();
     assert_eq!(progression_run_timeout_secs(&db), 77);

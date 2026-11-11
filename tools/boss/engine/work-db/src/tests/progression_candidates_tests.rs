@@ -872,10 +872,10 @@ fn clause_5_an_item_must_be_stuck_for_the_grace_unless_it_is_waived() {
     f.assert_candidate(&id, true);
 
     // The grace is the published limit, not a constant in the view.
-    f.db.configure_progression_calibration(&ProgressionSettings::builder().stuck_after_secs(10 * HOUR).build(), 0)
+    f.db.configure_progression_calibration(&ProgressionSettings::builder().stuck_after_secs(10 * HOUR).build())
         .unwrap();
     f.assert_candidate(&id, false);
-    f.db.configure_progression_calibration(&ProgressionSettings::builder().stuck_after_secs(HOUR).build(), 0)
+    f.db.configure_progression_calibration(&ProgressionSettings::builder().stuck_after_secs(HOUR).build())
         .unwrap();
     f.assert_candidate(&id, true);
     f.sql(&format!(
@@ -1030,7 +1030,7 @@ fn clause_6_a_recent_run_puts_the_item_in_cooldown() {
     let id = f.stuck_chore("Tuned");
     finished_progression_run(&f, &id, ExecutionStatus::Completed, 2 * HOUR);
     f.assert_candidate(&id, false);
-    f.db.configure_progression_calibration(&ProgressionSettings::builder().cooldown_secs(HOUR).build(), 0)
+    f.db.configure_progression_calibration(&ProgressionSettings::builder().cooldown_secs(HOUR).build())
         .unwrap();
     f.assert_candidate(&id, true);
 }
@@ -1073,11 +1073,8 @@ fn clause_6_an_exhausted_create_budget_stops_the_nominations() {
 
     // Raising the published budget admits it again; the placeholder of 3 is
     // what the view reads when the key is absent.
-    f.db.configure_progression_calibration(
-        &ProgressionSettings::builder().max_creates_per_item_window(10).build(),
-        0,
-    )
-    .unwrap();
+    f.db.configure_progression_calibration(&ProgressionSettings::builder().max_creates_per_item_window(10).build())
+        .unwrap();
     f.assert_candidate(&id, true);
     f.sql(&format!(
         "DELETE FROM metadata WHERE key = '{}'",

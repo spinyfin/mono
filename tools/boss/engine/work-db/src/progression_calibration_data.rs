@@ -20,6 +20,29 @@ fn percentile(values: &mut [u64]) -> Option<u64> {
     (!values.is_empty()).then(|| values[(values.len() * 99).div_ceil(100) - 1])
 }
 
+/// Executions of the item itself or of its revision tasks (review or
+/// remediation revisions), correlated with the `steps` CTE row.
+const ITEM_OR_REVISION: &str = "(e.work_item_id=steps.work_item_id
+    OR e.work_item_id IN (SELECT id FROM tasks WHERE parent_task_id=steps.work_item_id)
+    OR e.work_item_id IN (SELECT revision_task_id FROM ci_remediations r
+        WHERE r.work_item_id=steps.work_item_id AND r.revision_task_id IS NOT NULL))";
+
+/// Fewest pause samples worth computing a statistic from.
+const MIN_PAUSE_SAMPLES: usize = 3;
+
+/// p99 that never degenerates to the maximum on small samples: below 100
+/// samples the p99 rank is the largest value, so the top sample is dropped.
+fn small_sample_p99(values: &mut [u64]) -> Option<u64> {
+    if values.len() < MIN_PAUSE_SAMPLES {
+        return None;
+    }
+    values.sort_unstable();
+    if values.len() < 100 {
+        return Some(values[values.len() - 2]);
+    }
+    percentile(values)
+}
+
 pub(super) fn measure(conn: &Connection, now: i64, create_window_secs: i64) -> Result<ProgressionCalibration> {
     let mut report = empty_report(now);
     let start = report.window_start;
@@ -78,34 +101,45 @@ pub(super) fn measure(conn: &Connection, now: i64, create_window_secs: i64) -> R
     if let Some(p99) = percentile(&mut intervals) {
         report.inputs.insert("ledger_interval_p99_secs".into(), p99);
     }
-    // Completed remediation to next remediation measures scheduling lag.
-    // Coding and merge waits are not pauses. Wait history records starts only,
-    // so conservatively exclude overlapping lifetimes that contain a human wait.
+    // Scheduling lag after a remediation that left CI red: the gap from a
+    // failed or abandoned attempt (or one whose pushed head still failed CI)
+    // to the next attempt. Gaps containing any other coding or review run on
+    // the item or its revision tasks, human waits, parking or autostart
+    // changes are excluded; so are gaps after an attempt that turned CI green,
+    // because the next attempt then follows an unrelated later push.
     let mut pauses = samples(
         conn,
-        "WITH steps AS (
-        SELECT work_item_id, CAST(created_at AS INTEGER) AS stamp,
-        LAG(CAST(finished_at AS INTEGER)) OVER (PARTITION BY work_item_id ORDER BY CAST(created_at AS INTEGER), id) AS prior
-        FROM ci_remediations WHERE status='completed'
-        AND CAST(created_at AS INTEGER)>=?1 AND CAST(created_at AS INTEGER)<?2)
+        &format!(
+            "WITH steps AS (
+        SELECT work_item_id, head_sha_at_trigger AS head, CAST(created_at AS INTEGER) AS stamp,
+        LAG(CAST(finished_at AS INTEGER)) OVER win AS prior,
+        LAG(status) OVER win AS prior_status,
+        LAG(head_sha_after) OVER win AS prior_after
+        FROM ci_remediations
+        WHERE CAST(created_at AS INTEGER)>=?1 AND CAST(created_at AS INTEGER)<?2
+        WINDOW win AS (PARTITION BY work_item_id ORDER BY CAST(created_at AS INTEGER), id))
         SELECT stamp-prior FROM steps WHERE prior IS NOT NULL AND stamp>=prior
+        AND (prior_status IN ('failed','abandoned') OR (prior_after IS NOT NULL AND prior_after=head))
         AND NOT EXISTS (SELECT 1 FROM task_status_audit hold
             WHERE hold.work_item_id=steps.work_item_id
             AND CAST(hold.changed_at AS INTEGER)>=prior AND CAST(hold.changed_at AS INTEGER)<=stamp
             AND hold.property IN ('parked_at','autostart'))
         AND NOT EXISTS (SELECT 1 FROM work_executions e
+            WHERE e.kind<>'progression' AND {ITEM_OR_REVISION}
+            AND CAST(e.created_at AS INTEGER)>=prior AND CAST(e.created_at AS INTEGER)<stamp)
+        AND NOT EXISTS (SELECT 1 FROM work_executions e
             JOIN execution_wait_history h ON h.execution_id=e.id
-            WHERE e.work_item_id=steps.work_item_id AND h.changed_at<=stamp
-            AND (e.finished_at IS NULL OR CAST(e.finished_at AS INTEGER)>=prior))",
+            WHERE {ITEM_OR_REVISION} AND h.changed_at<=stamp
+            AND (e.finished_at IS NULL OR CAST(e.finished_at AS INTEGER)>=prior))"
+        ),
         start,
         end,
     )?;
     report
         .inputs
         .insert("automatic_pause_samples".into(), pauses.len() as u64);
-    if let Some(p99) = percentile(&mut pauses) {
-        // Historical report key retained for readers; the statistic is p99.
-        report.inputs.insert("automatic_pause_max_secs".into(), p99);
+    if let Some(p99) = small_sample_p99(&mut pauses) {
+        report.inputs.insert("automatic_pause_p99_secs".into(), p99);
     }
     let revisions = samples(
         conn,
@@ -243,6 +277,14 @@ fn fingerprints(conn: &Connection, start: i64, end: i64, report: &mut Progressio
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn small_sample_p99_drops_the_top_sample_and_needs_a_minimum() {
+        assert_eq!(super::small_sample_p99(&mut [5, 5]), None);
+        let mut pauses = vec![100; 10];
+        pauses.push(20 * 86400);
+        assert_eq!(super::small_sample_p99(&mut pauses), Some(100));
+    }
+
     #[test]
     fn p99_does_not_follow_a_single_extreme_pause() {
         let mut pauses = vec![100; 100];
