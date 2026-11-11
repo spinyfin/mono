@@ -1697,7 +1697,7 @@ async fn confirm_prompt_phase(
         || async { signals.has_prompt_accepted_for_run(run_id) },
         || async { crate::driver::initial_prompt::delivery_state(home) },
         // Return alone: the launcher pasted the brief, and it is never pasted again.
-        || async { tmux_host.tmux().send_key(tmux_host.session_name(), "C-m").await },
+        || async { tmux_host.tmux().send_submit(tmux_host.session_name()).await },
         || {
             work_db
                 .get_execution(run_id)

@@ -453,7 +453,7 @@ impl boss_engine_runtime::spawn_ack_sweep::SpawnAckReaper for ServerState {
             !self.work_db.get_execution(execution_id)?.status.is_terminal(),
             "execution is terminal"
         );
-        tmux.send_key(&identity.session_name, "C-m").await
+        tmux.send_submit(&identity.session_name).await
     }
 
     /// Route the driver-start-timeout reap through the same

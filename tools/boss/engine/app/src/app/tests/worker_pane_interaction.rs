@@ -255,7 +255,7 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
             "send-keys",
             "-t",
             "boss-tmux-send",
-            "C-m"
+            "Enter"
         ]
     );
     for extra in &calls[6..] {
@@ -1103,4 +1103,37 @@ async fn engine_nudge_queued_while_parked_interrupts_if_the_worker_went_busy() {
     let pasted = String::from_utf8(runner.stdin().first().unwrap().clone()).unwrap();
     assert!(pasted.contains("act now"));
     assert_eq!(server_state.pending_probe_count(&run_id), 0);
+}
+
+/// The spawn-ack sweep re-presses Return in a pane whose brief is pasted but
+/// unsubmitted. It must send `Enter`: `C-m` reaches an application that has
+/// enabled modifyOtherKeys as `ESC [27;5;109~`, not Return.
+#[tokio::test]
+async fn resubmit_prompt_presses_enter_not_c_m() {
+    use boss_engine_runtime::spawn_ack_sweep::SpawnAckReaper;
+
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_idle_worker_with_driver(&server_state, 7, None);
+    register_tmux_identity_for_test(&server_state, &run_id, "boss-resubmit", TEST_SPAWN_TOKEN);
+    let runner = Arc::new(RecordingPaneRunner::alive("claude", "boss-resubmit"));
+    *server_state.pane_delivery_tmux_override.write().unwrap() = Some(tmux_with_runner(runner.clone()));
+
+    server_state.resubmit_prompt(&run_id).await.expect("resubmit");
+
+    let sent: Vec<Vec<String>> = runner
+        .calls()
+        .into_iter()
+        .filter(|call| call.iter().any(|arg| arg == "send-keys"))
+        .collect();
+    assert_eq!(
+        sent,
+        vec![vec![
+            "-S".to_owned(),
+            boss_tmux::TEST_SOCKET_PATH.to_owned(),
+            "send-keys".to_owned(),
+            "-t".to_owned(),
+            "boss-resubmit".to_owned(),
+            "Enter".to_owned(),
+        ]]
+    );
 }

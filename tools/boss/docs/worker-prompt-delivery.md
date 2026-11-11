@@ -49,7 +49,7 @@ If no evidence appears within `LANDING_TIMEOUT`, the launcher sends Return once 
 Spawn confirmation's third wait ([`confirm_prompt_submitted`](../engine/execution-runner/src/runner/spawn_confirmation.rs)) requires that evidence:
 
 1. It waits for the launcher to report that it sent Return (the `initial-prompt.delivered` marker). Until then the engine presses nothing: Return would land in whatever the driver is showing, which may be a startup dialog.
-2. If no turn starts within `SUBMIT_CONFIRM_TIMEOUT` of a Return, the engine presses Return in the pane (`tmux send-keys C-m`) and waits again, at most `SUBMIT_RETRIES` times.
+2. If no turn starts within `SUBMIT_CONFIRM_TIMEOUT` of a Return, the engine presses Return in the pane (`tmux send-keys Enter`) and waits again, at most `SUBMIT_RETRIES` times.
 3. If there is still no turn, the spawn fails with `PromptNotSubmitted`, the pane is reaped, and the coordinator raises `pane_spawn_failed`.
 
 The retry is Return and nothing else. The brief is pasted exactly once, by the launcher, so a retry cannot deliver a second copy, and Return on an empty composer does nothing.

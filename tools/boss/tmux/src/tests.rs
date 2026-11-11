@@ -800,7 +800,7 @@ async fn send_keys_chunks_utf8_then_submits_in_a_separate_command() {
                 "x".repeat(DEFAULT_SEND_CHUNK_BYTES).as_str()
             ],
             vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "-l", "--", "é"],
-            vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "C-m"],
+            vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "Enter"],
         ]
     );
 }
@@ -822,7 +822,7 @@ async fn send_keys_marks_dash_prefixed_literal_input_as_an_argument() {
                 "--",
                 "-R dashdash"
             ],
-            vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "C-m"],
+            vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "Enter"],
         ]
     );
 }
@@ -857,7 +857,7 @@ async fn send_keys_pastes_multiline_text_then_submits_once() {
     );
     assert_eq!(
         calls[2],
-        vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "C-m"]
+        vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "Enter"]
     );
     assert_eq!(runner.stdin(), vec![b"first\nsecond".to_vec()]);
 }
@@ -882,7 +882,7 @@ async fn send_keys_strips_trailing_newlines_on_single_line_path() {
         runner.calls(),
         vec![
             vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "-l", "--", "hello"],
-            vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "C-m"],
+            vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "Enter"],
         ]
     );
 }
@@ -1098,4 +1098,15 @@ async fn readiness_capture_includes_bounded_scrollback() {
             "boss-1"
         ]]
     );
+}
+
+#[tokio::test]
+async fn send_submit_presses_enter_never_c_m() {
+    let (tmux, runner) = tmux([success("")]);
+    tmux.send_submit("boss-1").await.unwrap();
+    assert_eq!(
+        runner.calls(),
+        vec![vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "Enter"]]
+    );
+    assert_eq!(SUBMIT_KEY, "Enter");
 }
