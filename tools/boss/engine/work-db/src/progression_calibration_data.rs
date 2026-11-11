@@ -172,12 +172,26 @@ pub(super) fn measure(conn: &Connection, now: i64, create_window_secs: i64) -> R
     if let Some(max) = revisions.into_iter().max() {
         report.inputs.insert("revision_to_review_max_secs".into(), max);
     }
+    // A real attempt reached execution and was not abandoned as superseded
+    // or rejected by admission; insertion alone is not remediation work.
     let mut attempts = samples(
         conn,
         &format!(
             "WITH attempts AS (
         SELECT work_item_id, CAST(created_at AS INTEGER) AS stamp FROM ci_remediations
-        UNION ALL SELECT work_item_id, CAST(created_at AS INTEGER) FROM conflict_resolutions),
+        WHERE consumes_budget=1
+          AND COALESCE(failure_reason,'') NOT IN
+            ('new_head_sha_inflight','merge_queue_trigger_superseded',
+             'superseded_by_resolved_ci','superseded_by_conflict')
+          AND (started_at IS NOT NULL OR EXISTS (
+            SELECT 1 FROM work_executions e
+            WHERE e.work_item_id=ci_remediations.revision_task_id AND e.started_at IS NOT NULL))
+        UNION ALL SELECT work_item_id, CAST(created_at AS INTEGER) FROM conflict_resolutions
+        WHERE COALESCE(failure_reason,'') NOT IN
+            ('superseded_stale_head','retry_abandoned_still_conflicting')
+          AND (started_at IS NOT NULL OR EXISTS (
+            SELECT 1 FROM work_executions e
+            WHERE e.work_item_id=conflict_resolutions.revision_task_id AND e.started_at IS NOT NULL))),
         counts AS (SELECT work_item_id, COUNT(*) OVER (PARTITION BY work_item_id ORDER BY stamp
             RANGE BETWEEN {} PRECEDING AND CURRENT ROW) AS n FROM attempts WHERE stamp>=?1 AND stamp<?2)
         SELECT MAX(n) FROM counts GROUP BY work_item_id",
@@ -189,7 +203,9 @@ pub(super) fn measure(conn: &Connection, now: i64, create_window_secs: i64) -> R
     report
         .inputs
         .insert("remediation_item_samples".into(), attempts.len() as u64);
-    if let Some(p99) = percentile(&mut attempts) {
+    // Outlier-trimmed: this limit is a safety brake, so one churning item
+    // must not set it for every item.
+    if let Some(p99) = small_sample_p99(&mut attempts) {
         report.inputs.insert("remediation_attempts_p99".into(), p99);
     }
     let mut answers = samples(
@@ -203,6 +219,13 @@ pub(super) fn measure(conn: &Connection, now: i64, create_window_secs: i64) -> R
     report
         .inputs
         .insert("answered_question_samples".into(), answers.len() as u64);
+    if answers.len() >= MIN_PAUSE_SAMPLES {
+        answers.sort_unstable();
+        report.inputs.insert(
+            "answer_latency_p75_secs".into(),
+            answers[(answers.len() * 75).div_ceil(100) - 1],
+        );
+    }
     if let Some(p99) = percentile(&mut answers) {
         report.inputs.insert("answer_latency_p99_secs".into(), p99);
     }

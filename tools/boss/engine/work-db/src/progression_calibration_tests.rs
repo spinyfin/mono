@@ -1,6 +1,10 @@
 use super::*;
 use crate::test_support::{create_test_chore_manual, create_test_product};
+use boss_engine_storage_values::progression::{METADATA_KEY_RUN_TIMEOUT_SECS, METADATA_KEY_STUCK_AFTER_SECS};
 use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus, StuckBucket, StuckReport, StuckRow};
+
+#[path = "progression_calibration_identity_tests.rs"]
+mod identity;
 
 const NOW: i64 = 20_000 * DAY;
 fn db() -> WorkDb {
@@ -117,6 +121,27 @@ fn seed(db: &WorkDb) {
             params![format!("q{index}"),task,run_ids[0],proposal,start,start+4*DAY]).unwrap();
     }
     drop(conn);
+    // Low-churn items with genuine attempts. The four abandoned
+    // new-head rows seeded below are superseded and never started, so they
+    // are excluded from the population; the real outlier case is covered by
+    // `high_churn_outlier_does_not_set_the_create_budget`.
+    for other in 0..3 {
+        let item = create_test_chore_manual(db, &product, format!("quiet{other}")).id;
+        for index in 0..2 {
+            let id = attempt(
+                db,
+                &product,
+                &item,
+                &format!("q{other}h{index}"),
+                "fix",
+                "merge_queue_rebounce",
+            );
+            let revision = revision_execution(db, &product, true);
+            db.set_ci_remediation_revision_task_id(&id, &revision).unwrap();
+            db.mark_ci_remediation_failed(&id, "fix_failed").unwrap();
+            dates(db, &id, start + index * 11000, start + index * 11000 + 1000);
+        }
+    }
     for index in 0..4 {
         let id = attempt(db, &product, &task, &format!("head{index}"), "fix", "pr_branch_ci");
         db.mark_ci_remediation_abandoned_with_head(&id, "new_head_sha_inflight", Some(&format!("head{}", index + 1)))
@@ -164,16 +189,21 @@ fn seeded_ledger_computes_formulas_publishes_report_and_caches_the_day() {
         ("sweep_interval_secs", 100000),
         ("stuck_after_secs", 30000),
         ("cooldown_secs", 60000),
-        ("max_creates_per_item_window", 12),
+        ("max_creates_per_item_window", 6),
         ("run_timeout_secs", 32400),
         ("expected_questions_per_week", 2),
     ] {
         assert_eq!(value(&report, key), Some(expected), "{key}");
         assert_eq!(report.limits[key].source, "computed", "{key}");
-        assert_eq!(db.progression_limit(key, 0).unwrap(), expected);
+        assert_eq!(
+            db.progression_limit(&format!("progression.{key}"), 0).unwrap(),
+            expected
+        );
     }
+    // Seeded questions were answered after four days; the placeholder is a
+    // ceiling, so the reminder stays at three days here.
     assert_eq!(value(&report, "remind_after_secs"), Some(3 * DAY as u64));
-    assert_eq!(report.limits["remind_after_secs"].source, "fallback");
+    assert_eq!(report.limits["remind_after_secs"].source, "computed");
     assert!(report.limits["sweep_interval_secs"].basis.contains("WARNING"));
     assert_eq!(report.inputs["automatic_pause_p99_secs"], 10000);
     assert_eq!(report.inputs["engine_ladder_questions"], 2);
@@ -198,7 +228,7 @@ fn seeded_ledger_computes_formulas_publishes_report_and_caches_the_day() {
     let expired = db.calibrate_progression(NOW + 29 * DAY).unwrap();
     assert_eq!(expired.snapshot_days, 0);
     assert_eq!(expired.limits["run_timeout_secs"].source, "fallback");
-    assert_eq!(db.progression_limit("run_timeout_secs", 0).unwrap(), 1800);
+    assert_eq!(db.progression_limit(METADATA_KEY_RUN_TIMEOUT_SECS, 0).unwrap(), 1800);
 }
 
 #[test]
@@ -504,7 +534,7 @@ fn configuration_and_snapshots_survive_measurement_and_metadata_errors() {
         .unwrap();
     db.set_metadata(CONFIG_KEY, "invalid config").unwrap();
     assert!(db.calibrate_progression(NOW).is_err());
-    assert_eq!(db.progression_limit("stuck_after_secs", 0).unwrap(), 7200);
+    assert_eq!(db.progression_limit(METADATA_KEY_STUCK_AFTER_SECS, 0).unwrap(), 7200);
     let snapshot = db.stuck_daily_snapshot(NOW, &|_| false).unwrap();
     assert!(snapshot.progression_calibration.is_none());
 }
@@ -536,4 +566,89 @@ fn daily_snapshot_omits_calibration_while_live_report_includes_it() {
         )
         .unwrap();
     assert!(!json.contains("fingerprint_changes_per_item"));
+}
+
+#[test]
+fn remind_after_follows_fast_answers_and_never_exceeds_the_placeholder() {
+    let db = db();
+    seed(&db);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE operator_questions SET answered_at=CAST(created_at AS INTEGER)+7200",
+            [],
+        )
+        .unwrap();
+    let report = db.calibrate_progression(NOW).unwrap();
+    assert_eq!(report.inputs["answer_latency_p75_secs"], 7200);
+    assert_eq!(value(&report, "remind_after_secs"), Some(7200));
+    assert_eq!(report.limits["remind_after_secs"].source, "computed");
+    assert_eq!(report.inputs["remediation_attempts_p99"], 2);
+}
+
+#[test]
+fn high_churn_outlier_does_not_set_the_create_budget() {
+    let db = db();
+    snapshots(&db, 7);
+    let product = create_test_product(&db).id;
+    let start = NOW - 10 * DAY;
+    // Three quiet items with two genuine attempts each, one item with fifteen,
+    // all started via a linked revision execution (started_at stays NULL).
+    for (name, count) in [("quiet0", 2), ("quiet1", 2), ("quiet2", 2), ("noisy", 15)] {
+        let item = create_test_chore_manual(&db, &product, name).id;
+        for index in 0..count {
+            let id = attempt(
+                &db,
+                &product,
+                &item,
+                &format!("{name}h{index}"),
+                "fix",
+                "merge_queue_rebounce",
+            );
+            let revision = revision_execution(&db, &product, true);
+            db.set_ci_remediation_revision_task_id(&id, &revision).unwrap();
+            db.mark_ci_remediation_failed(&id, "fix_failed").unwrap();
+            dates(&db, &id, start + index * 100, start + index * 100 + 50);
+        }
+    }
+    let report = pause_inputs(&db);
+    assert_eq!(report.inputs["remediation_item_samples"], 4);
+    // A raw percentile would give 15 attempts and a budget of 45.
+    assert_eq!(report.inputs["remediation_attempts_p99"], 2);
+    let calibrated = db.calibrate_progression(NOW).unwrap();
+    assert_eq!(value(&calibrated, "max_creates_per_item_window"), Some(6));
+}
+
+// Revision-backed attempts keep their ledger start unset in production.
+fn revision_execution(db: &WorkDb, product: &str, started: bool) -> String {
+    let task_count: i64 = db
+        .connect()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+        .unwrap();
+    let revision = create_test_chore_manual(db, product, format!("fix revision {task_count}")).id;
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET kind='revision' WHERE id=?1", [&revision])
+        .unwrap();
+    // Multiple executions must still count as one ledger attempt.
+    for _ in 0..2 {
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(&revision)
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Failed)
+                    .build(),
+            )
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET started_at=?2 WHERE id=?1",
+                params![execution.id, started.then_some(NOW - 5 * DAY)],
+            )
+            .unwrap();
+    }
+    revision
 }

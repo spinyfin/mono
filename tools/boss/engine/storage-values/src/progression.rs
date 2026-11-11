@@ -9,7 +9,8 @@
 //! Every value in [`ProgressionSettings`] defaults to the **placeholder** from
 //! the design's section 2.6 table. The placeholders exist so the feature can be
 //! exercised before enough history exists. Runtime calibration uses them as
-//! floors and fallbacks; explicit configuration takes precedence.
+//! floors and fallbacks, except the reminder placeholder caps its calibrated
+//! interval; explicit configuration takes precedence.
 //!
 //! The values the candidate view itself needs ([`ProgressionSettings::stuck_after_secs`],
 //! [`ProgressionSettings::cooldown_secs`], and the create-budget pair) are
@@ -28,6 +29,18 @@ pub const CREATED_VIA_PROGRESSION_SWEEP: &str = "progression_sweep";
 
 /// `metadata` key holding the published `progression.stuck_after` grace.
 pub const METADATA_KEY_STUCK_AFTER_SECS: &str = "progression.stuck_after_secs";
+
+/// `metadata` key holding the published `progression.pool_size`.
+pub const METADATA_KEY_POOL_SIZE: &str = "progression.pool_size";
+
+/// `metadata` key holding the published `progression.sweep_interval`.
+pub const METADATA_KEY_SWEEP_INTERVAL_SECS: &str = "progression.sweep_interval_secs";
+
+/// `metadata` key holding the published `progression.remind_after`.
+pub const METADATA_KEY_REMIND_AFTER_SECS: &str = "progression.remind_after_secs";
+
+/// `metadata` key holding the published `progression.expected_questions_per_week`.
+pub const METADATA_KEY_EXPECTED_QUESTIONS_PER_WEEK: &str = "progression.expected_questions_per_week";
 
 /// `metadata` key holding the published `progression.cooldown`.
 pub const METADATA_KEY_COOLDOWN_SECS: &str = "progression.cooldown_secs";
@@ -97,26 +110,46 @@ pub struct ProgressionSettings {
     /// question rate, never a cap. Unset until measured; nothing is dropped or
     /// delayed either way.
     pub expected_questions_per_week: Option<u32>,
-    /// Reminder interval, with the existing three-day notification floor.
-    #[builder(default = 3 * 86400)]
+    /// Calibrated reminder interval capped at `DEFAULT_REMIND_AFTER_SECS`;
+    /// an explicit setting takes precedence.
+    #[builder(default = DEFAULT_REMIND_AFTER_SECS as u64)]
     pub remind_after_secs: u64,
-    /// Presence bits in `CALIBRATED_KEYS` order; an explicitly configured
+    /// Presence bits from `CalibrationSetting::override_bit`; an explicitly configured
     /// placeholder is still an override, not permission to calibrate it.
     #[builder(default)]
     pub explicit_overrides: u16,
 }
 
-/// Stable order used for configuration presence and calibration reports.
-pub const CALIBRATED_KEYS: [&str; 8] = [
-    "pool_size",
-    "sweep_interval_secs",
-    "stuck_after_secs",
-    "cooldown_secs",
-    "max_creates_per_item_window",
-    "run_timeout_secs",
-    "remind_after_secs",
-    "expected_questions_per_week",
-];
+/// A named setting binds publication and configuration to one field.
+#[derive(Clone, Copy)]
+pub struct CalibrationSetting {
+    pub key: &'static str,
+    pub metadata_key: &'static str,
+    pub override_bit: u16,
+    pub value: fn(&ProgressionSettings) -> Option<u64>,
+}
+
+macro_rules! calibration_settings {
+    ($(($name:ident, $field:ident, $metadata:ident, $bit:expr, $value:expr)),* $(,)?) => {
+        $(pub const $name: CalibrationSetting = CalibrationSetting {
+            key: stringify!($field), metadata_key: $metadata, override_bit: 1 << $bit, value: $value,
+        };)*
+        /// Stable order used for configuration presence and calibration reports.
+        pub const CALIBRATED_KEYS: [&str; 8] = [$(stringify!($field)),*];
+        pub const CALIBRATED_SETTINGS: [CalibrationSetting; 8] = [$($name),*];
+    };
+}
+
+calibration_settings! {
+    (POOL_SIZE_SETTING, pool_size, METADATA_KEY_POOL_SIZE, 0, |s| Some(s.effective_pool_size() as u64)),
+    (SWEEP_INTERVAL_SECS_SETTING, sweep_interval_secs, METADATA_KEY_SWEEP_INTERVAL_SECS, 1, |s| Some(s.sweep_interval_secs)),
+    (STUCK_AFTER_SECS_SETTING, stuck_after_secs, METADATA_KEY_STUCK_AFTER_SECS, 2, |s| Some(s.stuck_after_secs as u64)),
+    (COOLDOWN_SECS_SETTING, cooldown_secs, METADATA_KEY_COOLDOWN_SECS, 3, |s| Some(s.cooldown_secs as u64)),
+    (MAX_CREATES_PER_ITEM_WINDOW_SETTING, max_creates_per_item_window, METADATA_KEY_MAX_CREATES_PER_ITEM_WINDOW, 4, |s| Some(s.max_creates_per_item_window as u64)),
+    (RUN_TIMEOUT_SECS_SETTING, run_timeout_secs, METADATA_KEY_RUN_TIMEOUT_SECS, 5, |s| Some(s.run_timeout_secs)),
+    (REMIND_AFTER_SECS_SETTING, remind_after_secs, METADATA_KEY_REMIND_AFTER_SECS, 6, |s| Some(s.remind_after_secs)),
+    (EXPECTED_QUESTIONS_PER_WEEK_SETTING, expected_questions_per_week, METADATA_KEY_EXPECTED_QUESTIONS_PER_WEEK, 7, |s| s.expected_questions_per_week.map(u64::from)),
+}
 
 /// Placeholder `progression.pool_size`.
 pub const DEFAULT_POOL_SIZE: usize = 1;
@@ -130,6 +163,9 @@ pub const DEFAULT_COOLDOWN_SECS: i64 = 6 * 60 * 60;
 pub const DEFAULT_MAX_CREATES_PER_ITEM_WINDOW: u32 = 3;
 /// Placeholder window for `progression.max_creates_per_item_window` (7 days).
 pub const DEFAULT_MAX_CREATES_WINDOW_SECS: i64 = 7 * 24 * 60 * 60;
+/// Placeholder `progression.remind_after` (3 days); a ceiling for the
+/// calibrated value.
+pub const DEFAULT_REMIND_AFTER_SECS: u32 = 3 * 86400;
 /// Placeholder `progression.run_timeout` (30 minutes).
 pub const DEFAULT_RUN_TIMEOUT_SECS: u64 = 30 * 60;
 
@@ -141,16 +177,7 @@ impl Default for ProgressionSettings {
 
 impl ProgressionSettings {
     pub fn calibration_values(&self) -> [Option<u64>; 8] {
-        [
-            Some(self.effective_pool_size() as u64),
-            Some(self.sweep_interval_secs),
-            Some(self.stuck_after_secs as u64),
-            Some(self.cooldown_secs as u64),
-            Some(u64::from(self.max_creates_per_item_window)),
-            Some(self.run_timeout_secs),
-            Some(self.remind_after_secs),
-            self.expected_questions_per_week.map(u64::from),
-        ]
+        CALIBRATED_SETTINGS.map(|setting| (setting.value)(self))
     }
 
     /// The pool size the engine actually builds: the configured value clamped to

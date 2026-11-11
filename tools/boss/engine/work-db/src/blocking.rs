@@ -1925,7 +1925,7 @@ impl WorkDb {
             "UPDATE ci_remediations
                 SET status         = 'abandoned',
                     failure_reason = ?2,
-                    head_sha_after = ?4,
+                    head_sha_after = COALESCE(?4, head_sha_after),
                     finished_at    = COALESCE(finished_at, ?3)
               WHERE id = ?1
                 AND status IN ('pending', 'running')",

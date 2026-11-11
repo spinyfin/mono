@@ -45,7 +45,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use boss_engine_storage_values::progression::{PROGRESSION_AGENTS_FLAG, ProgressionSettings};
+use boss_engine_storage_values::progression::{
+    METADATA_KEY_SWEEP_INTERVAL_SECS, PROGRESSION_AGENTS_FLAG, ProgressionSettings,
+};
 
 use crate::work::WorkDb;
 
@@ -134,7 +136,7 @@ pub fn spawn_loop(
                     kick_fn();
                 }
                 let interval = work_db
-                    .progression_limit("sweep_interval_secs", settings.sweep_interval_secs)
+                    .progression_limit(METADATA_KEY_SWEEP_INTERVAL_SECS, settings.sweep_interval_secs)
                     .unwrap_or_else(|error| {
                         tracing::warn!(?error, "failed to read progression cadence");
                         settings.sweep_interval_secs
@@ -146,7 +148,7 @@ pub fn spawn_loop(
             let db = cadence_db.clone();
             async move {
                 match tokio::task::spawn_blocking(move || {
-                    db.progression_limit("sweep_interval_secs", settings.sweep_interval_secs)
+                    db.progression_limit(METADATA_KEY_SWEEP_INTERVAL_SECS, settings.sweep_interval_secs)
                 })
                 .await
                 {
