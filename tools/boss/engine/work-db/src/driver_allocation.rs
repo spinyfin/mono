@@ -1,10 +1,10 @@
-//! Three-way driver traffic allocation (experiment, operator-controlled).
+//! Four-way driver traffic allocation (experiment, operator-controlled).
 //!
-//! One persisted [`DriverTrafficSplit`] — three shares summing to exactly
+//! One persisted [`DriverTrafficSplit`] — four shares summing to exactly
 //! 100 — decides how work that dispatches on its own row's driver is divided
-//! between the `grok`, `claude`, and `codex` drivers. This generalises the
+//! between the `grok`, `claude`, `codex`, and `agy` drivers. This generalises the
 //! earlier single Codex percentage; see [`boss_protocol::DriverTrafficSplit`]
-//! for why the split is modelled as three explicit integers with a hard sum
+//! for why the split is modelled as four explicit integers with a hard sum
 //! constraint rather than an implied remainder or normalised weights.
 //!
 //! **Which work that is, is mostly not decided here.** Allocation asks
@@ -12,7 +12,7 @@
 //! dispatch capability gate, `CapabilityResolver::check_dispatch`, resolving
 //! the row's `TaskKind` **and** the execution's own `ExecutionKind` (see
 //! [`eligible_drivers_for`]) against each driver's declared `CapabilitySet` —
-//! which of the three drivers may run a work item of that kind, and
+//! which of the four drivers may run a work item of that kind, and
 //! renormalises the configured split over exactly that subset
 //! ([`DriverTrafficSplit::driver_for_bucket_among`]). One source of truth: a
 //! driver declared eligible for a kind can receive it, one that is not
@@ -87,6 +87,8 @@ use sha2::{Digest, Sha256};
 
 use super::*;
 
+pub(super) mod traffic_split_migration;
+
 /// Metadata KV key for the persisted split, stored as the JSON encoding of
 /// [`DriverTrafficSplit`]. Same shape as `dispatch_concurrency_limit` (see
 /// `app/handler_helpers.rs`): read fresh at each decision point rather than
@@ -94,7 +96,7 @@ use super::*;
 /// without disturbing any execution already dispatched (a decision already
 /// recorded on an existing row is never recomputed).
 ///
-/// Deliberately ONE row holding the whole triple rather than three rows: an
+/// Deliberately ONE row holding the whole split rather than four rows: an
 /// operator edit is a single atomic write, so a concurrent dispatch can
 /// never read a half-applied edit that transits through an invalid split.
 const METADATA_KEY_DRIVER_TRAFFIC_SPLIT: &str = "driver_traffic_split";
@@ -230,12 +232,12 @@ fn hash_bucket(work_item_id: &str) -> u8 {
 /// non-reentrant mutex and would deadlock.
 ///
 /// An absent value yields [`DriverTrafficSplit::default`] — `claude = 100`,
-/// `grok = 0`, `codex = 0`. That is the behaviour-preserving state: `claude`
+/// `grok = 0`, `codex = 0`, `agy = 0`. That is the behaviour-preserving state: `claude`
 /// is `boss_engine_effort::ENGINE_DEFAULT_DRIVER`, and rows that pinned a
 /// driver at row or product level never reach allocation at all, so an
 /// engine that has never had a split configured routes exactly where it
-/// always did. `grok` starting at 0 also means shipping this sends nothing
-/// to the `grok` driver until an operator deliberately raises it.
+/// always did. `agy` starting at 0 also means shipping this sends nothing
+/// to the Antigravity driver until an operator deliberately raises it.
 ///
 /// A value that is present but does not parse, or parses to a split that
 /// fails [`DriverTrafficSplit::validate`], can only come from a hand-edited
@@ -292,7 +294,7 @@ impl WorkDb {
     /// Persist `split`, or fail without writing anything when it does not
     /// sum to exactly 100. Nothing is clamped, redistributed, or normalised
     /// — an invalid split is the caller's error to surface, and
-    /// all-three-zero is rejected by the same rule as every other bad total.
+    /// all-four-zero is rejected by the same rule as every other bad total.
     ///
     /// Takes effect on the next execution created — never touches an
     /// execution already dispatched, exactly like the interactive

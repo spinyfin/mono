@@ -59,7 +59,7 @@ extension EngineClient {
         sendLine(["type": "set_codex_sol_percentage", "percentage": percentage])
     }
 
-    /// Set the driver traffic split. The three shares must sum to exactly
+    /// Set the driver traffic split. The four shares must sum to exactly
     /// 100; the engine rejects anything else with a `work_error` rather
     /// than repairing it, so callers must send a split built by
     /// `DriverTrafficSplit.adjusting(_:to:)`, which preserves that
@@ -74,6 +74,7 @@ extension EngineClient {
                 "grok": split.grok,
                 "claude": split.claude,
                 "codex": split.codex,
+                "agy": split.agy,
             ],
         ])
     }

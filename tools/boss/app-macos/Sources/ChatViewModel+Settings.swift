@@ -61,7 +61,7 @@ extension ChatViewModel {
         engine.sendGetDriverQuotaUsage(refresh: force)
     }
 
-    /// Move `driver`'s share to `value`, letting the other two absorb the
+    /// Move `driver`'s share to `value`, letting the other three absorb the
     /// difference (see `DriverTrafficSplit.adjusting(_:to:)`), and send the
     /// resulting split.
     ///

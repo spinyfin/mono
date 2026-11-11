@@ -491,7 +491,8 @@ mod tests {
         use boss_protocol::{DRIVER_SLUG_GROK, DriverTrafficSplit};
 
         let (_dir, db) = open_db();
-        db.set_driver_traffic_split(DriverTrafficSplit::new(100, 0, 0)).unwrap();
+        db.set_driver_traffic_split(DriverTrafficSplit::new(100, 0, 0, 0))
+            .unwrap();
         let product = create_test_product(&db);
         let chore = create_test_chore(&db, &product.id, "later became a tier row");
         let execution = create_ready_chore_execution(&db, &chore.id);

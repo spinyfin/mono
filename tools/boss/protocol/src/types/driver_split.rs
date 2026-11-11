@@ -1,13 +1,13 @@
-//! Global driver traffic allocation: how ordinary dispatch is split three
-//! ways between the `grok`, `claude`, and `codex` drivers.
+//! Global driver traffic allocation: how ordinary dispatch is split four
+//! ways between the `grok`, `claude`, `codex`, and `agy` drivers.
 //!
 //! This generalises the earlier single "Codex percentage" (one integer, with
 //! an implicit remainder falling through to whatever the row would otherwise
-//! have used) into an explicit three-way split. The modelling choice is
+//! have used) into an explicit four-way split. The modelling choice is
 //! deliberate on three counts:
 //!
-//! 1. **Three explicit integers, not two-with-an-implied-third and not
-//!    normalised weights.** An implied third makes the invariant invisible at
+//! 1. **Four explicit integers, with no implied remainder or
+//!    normalised weights.** An implied remainder makes the invariant invisible at
 //!    the call site and makes the UI's "which of the others gives way?"
 //!    question unanswerable without extra state. Normalised weights would
 //!    quietly turn a typo (`50/50/50`) into a valid-looking allocation, which
@@ -15,35 +15,35 @@
 //!    [`DriverTrafficSplit::validate`] instead requires the shares to sum to
 //!    exactly 100 and rejects anything else loudly.
 //!
-//! 2. **All-three-zero is rejected by the same rule that catches every other
+//! 2. **All-four-zero is rejected by the same rule that catches every other
 //!    bad split** — it does not sum to 100 — so there is no separate
-//!    "nowhere to dispatch" special case to forget. Any *one* or any *two*
+//!    "nowhere to dispatch" special case to forget. Up to *three*
 //!    shares may be zero; a zero share is a literally empty bucket (see
 //!    [`DriverTrafficSplit::driver_for_bucket`]), not a very small one.
 //!
-//! 3. **The whole triple is one value.** Persisting and transporting it as a
+//! 3. **The whole split is one value.** Persisting and transporting it as a
 //!    single unit (one metadata row, one wire field) means an operator edit is
 //!    one atomic write; a concurrent dispatch reading the allocation can never
 //!    observe a half-applied edit that transits through an invalid state.
 
 use serde::{Deserialize, Serialize};
 
-/// The three drivers traffic allocation distributes between, in the order
+/// The four drivers traffic allocation distributes between, in the order
 /// they occupy the `[0, 100)` bucket line (see
 /// [`DriverTrafficSplit::driver_for_bucket`]).
 pub const DRIVER_SLUG_CODEX: &str = "codex";
 pub const DRIVER_SLUG_CLAUDE: &str = "claude";
 pub const DRIVER_SLUG_GROK: &str = "grok";
+pub const DRIVER_SLUG_AGY: &str = "agy";
 
-/// A three-way allocation of eligible dispatch traffic. Shares are whole
+/// A four-way allocation of eligible dispatch traffic. Shares are whole
 /// percentage points and MUST sum to exactly 100 — see the module doc.
 ///
-/// [`Default`] is `claude = 100`, with both `grok` and `codex` at zero. That
+/// [`Default`] is `claude = 100`, with `grok`, `codex`, and `agy` at zero. That
 /// is the behaviour-preserving state: `claude` is
 /// `boss_engine_effort::ENGINE_DEFAULT_DRIVER`, so an engine that has never
 /// had a split configured allocates exactly where it always did, and the
-/// `grok` driver — whose spawn path is currently under investigation —
-/// receives nothing at all until an operator deliberately raises it.
+/// `agy` driver receives nothing until an operator deliberately raises it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DriverTrafficSplit {
     /// Share routed to the `claude` driver.
@@ -52,6 +52,8 @@ pub struct DriverTrafficSplit {
     pub codex: u8,
     /// Share routed to the `grok` driver.
     pub grok: u8,
+    /// Share routed to the `agy` (Antigravity) driver.
+    pub agy: u8,
 }
 
 impl Default for DriverTrafficSplit {
@@ -60,6 +62,7 @@ impl Default for DriverTrafficSplit {
             claude: 100,
             codex: 0,
             grok: 0,
+            agy: 0,
         }
     }
 }
@@ -69,13 +72,14 @@ impl Default for DriverTrafficSplit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum DriverTrafficSplitError {
     #[error(
-        "driver traffic split must sum to exactly 100 (got {total}: grok={grok}, claude={claude}, codex={codex}); \
-         any one or two shares may be 0, but the three together allocate all eligible traffic"
+        "driver traffic split must sum to exactly 100 (got {total}: grok={grok}, claude={claude}, codex={codex}, agy={agy}); \
+         up to three shares may be 0, but the four together allocate all eligible traffic"
     )]
     NotOneHundred {
         grok: u8,
         claude: u8,
         codex: u8,
+        agy: u8,
         total: u16,
     },
 }
@@ -84,16 +88,22 @@ impl DriverTrafficSplit {
     /// The drivers in bucket-line order, low to high. The UI renders shares
     /// in this order too, so the on-screen bar reads left-to-right as the
     /// same line the hash is compared against.
-    pub const DRIVERS_IN_BUCKET_ORDER: [&'static str; 3] = [DRIVER_SLUG_CODEX, DRIVER_SLUG_CLAUDE, DRIVER_SLUG_GROK];
+    pub const DRIVERS_IN_BUCKET_ORDER: [&'static str; 4] =
+        [DRIVER_SLUG_CODEX, DRIVER_SLUG_CLAUDE, DRIVER_SLUG_GROK, DRIVER_SLUG_AGY];
 
-    pub fn new(grok: u8, claude: u8, codex: u8) -> Self {
-        Self { claude, codex, grok }
+    pub fn new(grok: u8, claude: u8, codex: u8, agy: u8) -> Self {
+        Self {
+            claude,
+            codex,
+            grok,
+            agy,
+        }
     }
 
-    /// Sum of the three shares, in `u16` so a bad split (e.g. `100/100/100`)
+    /// Sum of the four shares, in `u16` so a bad split (e.g. `100/100/100/100`)
     /// is reported at its real total instead of wrapping a `u8`.
     pub fn total(&self) -> u16 {
-        u16::from(self.grok) + u16::from(self.claude) + u16::from(self.codex)
+        u16::from(self.grok) + u16::from(self.claude) + u16::from(self.codex) + u16::from(self.agy)
     }
 
     /// `Ok(())` only when the shares sum to exactly 100. Never repairs,
@@ -108,6 +118,7 @@ impl DriverTrafficSplit {
                 grok: self.grok,
                 claude: self.claude,
                 codex: self.codex,
+                agy: self.agy,
                 total,
             })
         }
@@ -116,11 +127,12 @@ impl DriverTrafficSplit {
     /// Which driver owns `bucket`, where `bucket` is a stable hash of a work
     /// item's id in `[0, 100)`.
     ///
-    /// The line is laid out `codex | claude | grok`, low to high:
+    /// The line is laid out `codex | claude | grok | agy`, low to high:
     ///
     /// - `[0, codex)` → `codex`
     /// - `[codex, codex + claude)` → `claude`
-    /// - `[100 - grok, 100)` → `grok`
+    /// - `[codex + claude, 100 - agy)` → `grok`
+    /// - `[100 - agy, 100)` → `agy`
     ///
     /// Two properties fall out of half-open intervals on a sum-to-100 split
     /// and both are load-bearing:
@@ -142,8 +154,10 @@ impl DriverTrafficSplit {
             DRIVER_SLUG_CODEX
         } else if u16::from(bucket) < u16::from(self.codex) + u16::from(self.claude) {
             DRIVER_SLUG_CLAUDE
-        } else {
+        } else if u16::from(bucket) < u16::from(self.codex) + u16::from(self.claude) + u16::from(self.grok) {
             DRIVER_SLUG_GROK
+        } else {
+            DRIVER_SLUG_AGY
         }
     }
 
@@ -154,6 +168,7 @@ impl DriverTrafficSplit {
             DRIVER_SLUG_CODEX => Some(self.codex),
             DRIVER_SLUG_CLAUDE => Some(self.claude),
             DRIVER_SLUG_GROK => Some(self.grok),
+            DRIVER_SLUG_AGY => Some(self.agy),
             _ => None,
         }
     }
@@ -218,7 +233,7 @@ impl DriverTrafficSplit {
     /// bucket-line order, ending at exactly 100.
     ///
     /// Unrecognised slugs in `eligible` are ignored (this split covers
-    /// exactly three drivers); duplicates are collapsed, and the order of
+    /// exactly four drivers); duplicates are collapsed, and the order of
     /// `eligible` does not matter — the result is always in
     /// [`Self::DRIVERS_IN_BUCKET_ORDER`].
     ///
@@ -277,12 +292,13 @@ pub enum EligibleAllocationError {
     NoEligibleDriver,
     #[error(
         "every driver eligible for this work item holds a 0 share ({}): the split is \
-         grok={}, claude={}, codex={} — raise one of the eligible drivers' shares, or make an \
+         grok={}, claude={}, codex={}, agy={} — raise one of the eligible drivers' shares, or make an \
          already-funded driver eligible for this kind",
         .eligible.join(", "),
         .split.grok,
         .split.claude,
         .split.codex,
+        .split.agy,
     )]
     EveryEligibleDriverAtZero {
         eligible: Vec<&'static str>,
@@ -317,33 +333,38 @@ mod tests {
     #[test]
     fn default_is_all_claude() {
         let split = DriverTrafficSplit::default();
-        assert_eq!(split, DriverTrafficSplit::new(0, 100, 0));
+        assert_eq!(split, DriverTrafficSplit::new(0, 100, 0, 0));
+        assert_eq!(split.agy, 0, "Antigravity must receive no traffic by default");
         split.validate().unwrap();
     }
 
     #[test]
     fn validate_rejects_sums_other_than_one_hundred() {
         for split in [
-            DriverTrafficSplit::new(0, 0, 0),
-            DriverTrafficSplit::new(50, 50, 50),
-            DriverTrafficSplit::new(1, 1, 1),
-            DriverTrafficSplit::new(0, 99, 0),
-            DriverTrafficSplit::new(0, 101, 0),
+            DriverTrafficSplit::new(0, 0, 0, 0),
+            DriverTrafficSplit::new(50, 50, 50, 0),
+            DriverTrafficSplit::new(1, 1, 1, 0),
+            DriverTrafficSplit::new(0, 99, 0, 0),
+            DriverTrafficSplit::new(0, 101, 0, 0),
+            DriverTrafficSplit::new(0, 100, 0, 1),
+            DriverTrafficSplit::new(0, 0, 0, 99),
         ] {
             assert!(split.validate().is_err(), "{split:?} must be rejected");
         }
     }
 
     #[test]
-    fn validate_accepts_any_one_or_two_shares_at_zero() {
+    fn validate_accepts_up_to_three_shares_at_zero() {
         for split in [
-            DriverTrafficSplit::new(100, 0, 0),
-            DriverTrafficSplit::new(0, 100, 0),
-            DriverTrafficSplit::new(0, 0, 100),
-            DriverTrafficSplit::new(50, 50, 0),
-            DriverTrafficSplit::new(50, 0, 50),
-            DriverTrafficSplit::new(0, 50, 50),
-            DriverTrafficSplit::new(33, 33, 34),
+            DriverTrafficSplit::new(100, 0, 0, 0),
+            DriverTrafficSplit::new(0, 100, 0, 0),
+            DriverTrafficSplit::new(0, 0, 100, 0),
+            DriverTrafficSplit::new(50, 50, 0, 0),
+            DriverTrafficSplit::new(50, 0, 50, 0),
+            DriverTrafficSplit::new(0, 50, 50, 0),
+            DriverTrafficSplit::new(33, 33, 34, 0),
+            DriverTrafficSplit::new(0, 0, 0, 100),
+            DriverTrafficSplit::new(25, 25, 25, 25),
         ] {
             split.validate().expect("valid split rejected");
         }
@@ -351,13 +372,14 @@ mod tests {
 
     #[test]
     fn all_zero_error_names_the_real_total() {
-        let err = DriverTrafficSplit::new(0, 0, 0).validate().unwrap_err();
+        let err = DriverTrafficSplit::new(0, 0, 0, 0).validate().unwrap_err();
         assert_eq!(
             err,
             DriverTrafficSplitError::NotOneHundred {
                 grok: 0,
                 claude: 0,
                 codex: 0,
+                agy: 0,
                 total: 0,
             }
         );
@@ -366,9 +388,10 @@ mod tests {
     /// The error reports the true total rather than a wrapped `u8`.
     #[test]
     fn oversized_split_reports_unwrapped_total() {
-        let err = DriverTrafficSplit::new(100, 100, 100).validate().unwrap_err();
+        let err = DriverTrafficSplit::new(255, 255, 255, 255).validate().unwrap_err();
+        assert!(err.to_string().contains("agy=255"));
         let DriverTrafficSplitError::NotOneHundred { total, .. } = err;
-        assert_eq!(total, 300);
+        assert_eq!(total, 1020);
     }
 
     /// Every bucket in `[0, 100)` lands on exactly the share each driver was
@@ -376,23 +399,28 @@ mod tests {
     #[test]
     fn buckets_partition_exactly_by_share() {
         for split in [
-            DriverTrafficSplit::new(0, 100, 0),
-            DriverTrafficSplit::new(10, 60, 30),
-            DriverTrafficSplit::new(0, 0, 100),
-            DriverTrafficSplit::new(100, 0, 0),
-            DriverTrafficSplit::new(1, 98, 1),
-            DriverTrafficSplit::new(33, 33, 34),
+            DriverTrafficSplit::new(0, 100, 0, 0),
+            DriverTrafficSplit::new(10, 60, 30, 0),
+            DriverTrafficSplit::new(0, 0, 100, 0),
+            DriverTrafficSplit::new(100, 0, 0, 0),
+            DriverTrafficSplit::new(1, 98, 1, 0),
+            DriverTrafficSplit::new(33, 33, 34, 0),
+            DriverTrafficSplit::new(0, 0, 0, 100),
+            DriverTrafficSplit::new(10, 20, 30, 40),
+            DriverTrafficSplit::new(0, 0, 99, 1),
+            DriverTrafficSplit::new(0, 0, 1, 99),
         ] {
-            let mut counts = (0u8, 0u8, 0u8);
+            let mut counts = (0u8, 0u8, 0u8, 0u8);
             for bucket in 0..100u8 {
                 match split.driver_for_bucket(bucket) {
                     DRIVER_SLUG_GROK => counts.0 += 1,
                     DRIVER_SLUG_CLAUDE => counts.1 += 1,
                     DRIVER_SLUG_CODEX => counts.2 += 1,
+                    DRIVER_SLUG_AGY => counts.3 += 1,
                     other => panic!("unexpected driver {other}"),
                 }
             }
-            assert_eq!(counts, (split.grok, split.claude, split.codex), "{split:?}");
+            assert_eq!(counts, (split.grok, split.claude, split.codex, split.agy), "{split:?}");
         }
     }
 
@@ -400,17 +428,21 @@ mod tests {
     /// merely unlikely.
     #[test]
     fn zero_share_is_unreachable() {
-        let split = DriverTrafficSplit::new(0, 40, 60);
+        let split = DriverTrafficSplit::new(0, 40, 60, 0);
         for bucket in 0..100u8 {
             assert_ne!(split.driver_for_bucket(bucket), DRIVER_SLUG_GROK);
         }
-        let split = DriverTrafficSplit::new(60, 40, 0);
+        let split = DriverTrafficSplit::new(60, 40, 0, 0);
         for bucket in 0..100u8 {
             assert_ne!(split.driver_for_bucket(bucket), DRIVER_SLUG_CODEX);
         }
-        let split = DriverTrafficSplit::new(60, 0, 40);
+        let split = DriverTrafficSplit::new(60, 0, 40, 0);
         for bucket in 0..100u8 {
             assert_ne!(split.driver_for_bucket(bucket), DRIVER_SLUG_CLAUDE);
+        }
+        let split = DriverTrafficSplit::new(20, 40, 40, 0);
+        for bucket in 0..100u8 {
+            assert_ne!(split.driver_for_bucket(bucket), DRIVER_SLUG_AGY);
         }
     }
 
@@ -418,8 +450,8 @@ mod tests {
     /// allocated to `codex` — the anchoring property the bucket order buys.
     #[test]
     fn moving_the_claude_grok_boundary_leaves_codex_rows_alone() {
-        let before = DriverTrafficSplit::new(0, 70, 30);
-        let after = DriverTrafficSplit::new(20, 50, 30);
+        let before = DriverTrafficSplit::new(0, 70, 30, 0);
+        let after = DriverTrafficSplit::new(20, 50, 30, 0);
         for bucket in 0..100u8 {
             if before.driver_for_bucket(bucket) == DRIVER_SLUG_CODEX {
                 assert_eq!(after.driver_for_bucket(bucket), DRIVER_SLUG_CODEX, "bucket {bucket}");
@@ -433,7 +465,7 @@ mod tests {
     #[test]
     fn codex_low_end_matches_the_superseded_percentage_scheme() {
         for percentage in [0u8, 1, 25, 50, 99, 100] {
-            let split = DriverTrafficSplit::new(0, 100 - percentage, percentage);
+            let split = DriverTrafficSplit::new(0, 100 - percentage, percentage, 0);
             for bucket in 0..100u8 {
                 let expected_codex = bucket < percentage;
                 assert_eq!(
@@ -453,11 +485,13 @@ mod tests {
     fn full_eligibility_reproduces_the_unrestricted_line_exactly() {
         let all = DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER;
         for split in [
-            DriverTrafficSplit::new(0, 100, 0),
-            DriverTrafficSplit::new(10, 60, 30),
-            DriverTrafficSplit::new(33, 33, 34),
-            DriverTrafficSplit::new(1, 98, 1),
-            DriverTrafficSplit::new(0, 0, 100),
+            DriverTrafficSplit::new(0, 100, 0, 0),
+            DriverTrafficSplit::new(10, 60, 30, 0),
+            DriverTrafficSplit::new(33, 33, 34, 0),
+            DriverTrafficSplit::new(1, 98, 1, 0),
+            DriverTrafficSplit::new(0, 0, 100, 0),
+            DriverTrafficSplit::new(10, 20, 30, 40),
+            DriverTrafficSplit::new(0, 0, 0, 100),
         ] {
             for bucket in 0..100u8 {
                 assert_eq!(
@@ -472,6 +506,7 @@ mod tests {
                     (DRIVER_SLUG_CODEX, split.codex),
                     (DRIVER_SLUG_CLAUDE, split.claude),
                     (DRIVER_SLUG_GROK, split.grok),
+                    (DRIVER_SLUG_AGY, split.agy),
                 ],
             );
         }
@@ -482,7 +517,7 @@ mod tests {
     /// they already had*, not evenly.
     #[test]
     fn renormalising_preserves_the_configured_proportions() {
-        let split = DriverTrafficSplit::new(30, 50, 20);
+        let split = DriverTrafficSplit::new(30, 50, 20, 0);
         // {codex, claude} keep 20:50 → 28.57 : 71.43 → 28/72 by cumulative
         // flooring (codex's boundary floors to 28, claude takes the rest).
         assert_eq!(
@@ -515,10 +550,10 @@ mod tests {
             &[DRIVER_SLUG_CODEX, DRIVER_SLUG_CLAUDE, DRIVER_SLUG_GROK],
         ];
         for split in [
-            DriverTrafficSplit::new(33, 33, 34),
-            DriverTrafficSplit::new(10, 60, 30),
-            DriverTrafficSplit::new(1, 98, 1),
-            DriverTrafficSplit::new(0, 50, 50),
+            DriverTrafficSplit::new(33, 33, 34, 0),
+            DriverTrafficSplit::new(10, 60, 30, 0),
+            DriverTrafficSplit::new(1, 98, 1, 0),
+            DriverTrafficSplit::new(0, 50, 50, 0),
         ] {
             for eligible in subsets {
                 let Ok(shares) = shares_over(&split, eligible) else {
@@ -553,10 +588,10 @@ mod tests {
             &[DRIVER_SLUG_CODEX, DRIVER_SLUG_GROK],
         ];
         for split in [
-            DriverTrafficSplit::new(0, 100, 0),
-            DriverTrafficSplit::new(80, 10, 10),
-            DriverTrafficSplit::new(33, 33, 34),
-            DriverTrafficSplit::new(100, 0, 0),
+            DriverTrafficSplit::new(0, 100, 0, 0),
+            DriverTrafficSplit::new(80, 10, 10, 0),
+            DriverTrafficSplit::new(33, 33, 34, 0),
+            DriverTrafficSplit::new(100, 0, 0, 0),
         ] {
             for eligible in subsets {
                 for bucket in 0..100u8 {
@@ -581,7 +616,7 @@ mod tests {
     /// rather than being handed a slice of the ineligible driver's share.
     #[test]
     fn a_zero_share_stays_zero_after_renormalising() {
-        let split = DriverTrafficSplit::new(0, 40, 60);
+        let split = DriverTrafficSplit::new(0, 40, 60, 0);
         let eligible = [DRIVER_SLUG_CODEX, DRIVER_SLUG_GROK];
         assert_eq!(
             shares_over(&split, &eligible).unwrap(),
@@ -599,7 +634,7 @@ mod tests {
     /// not cover — is an error, never a fallback.
     #[test]
     fn an_empty_eligible_set_is_an_error() {
-        let split = DriverTrafficSplit::new(10, 60, 30);
+        let split = DriverTrafficSplit::new(10, 60, 30, 0);
         assert_eq!(
             shares_over(&split, &[]).unwrap_err(),
             EligibleAllocationError::NoEligibleDriver,
@@ -616,7 +651,7 @@ mod tests {
     /// so the operator can see which of the two to change.
     #[test]
     fn every_eligible_driver_at_zero_is_an_error_naming_both_sides() {
-        let split = DriverTrafficSplit::new(0, 100, 0);
+        let split = DriverTrafficSplit::new(0, 100, 0, 0);
         let err = split
             .driver_for_bucket_among(7, &[DRIVER_SLUG_GROK, DRIVER_SLUG_CODEX])
             .unwrap_err();
@@ -636,7 +671,7 @@ mod tests {
     /// answer, so two call sites that compute it differently cannot disagree.
     #[test]
     fn eligible_set_order_and_duplicates_do_not_matter() {
-        let split = DriverTrafficSplit::new(20, 50, 30);
+        let split = DriverTrafficSplit::new(20, 50, 30, 0);
         let canonical: Vec<_> = (0..100u8)
             .map(|b| {
                 split
@@ -656,21 +691,88 @@ mod tests {
     }
 
     #[test]
-    fn share_for_covers_exactly_the_three_drivers() {
-        let split = DriverTrafficSplit::new(10, 60, 30);
+    fn share_for_covers_exactly_the_four_drivers() {
+        let split = DriverTrafficSplit::new(10, 40, 30, 20);
         assert_eq!(split.share_for(DRIVER_SLUG_GROK), Some(10));
-        assert_eq!(split.share_for(DRIVER_SLUG_CLAUDE), Some(60));
+        assert_eq!(split.share_for(DRIVER_SLUG_CLAUDE), Some(40));
         assert_eq!(split.share_for(DRIVER_SLUG_CODEX), Some(30));
+        assert_eq!(split.share_for(DRIVER_SLUG_AGY), Some(20));
         assert_eq!(split.share_for("copilot"), None);
     }
 
     #[test]
     fn json_round_trips_and_requires_every_share() {
-        let split = DriverTrafficSplit::new(10, 60, 30);
+        let split = DriverTrafficSplit::new(10, 20, 30, 40);
         let json = serde_json::to_string(&split).unwrap();
         assert_eq!(serde_json::from_str::<DriverTrafficSplit>(&json).unwrap(), split);
-        // A hand-edited value missing a share is a parse error, not a
-        // silently-defaulted zero.
-        assert!(serde_json::from_str::<DriverTrafficSplit>(r#"{"grok":0,"claude":100}"#).is_err());
+        // Every share is required on the wire; only the DB migration fills
+        // in the fourth share for previously persisted three-way splits.
+        for driver in DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER {
+            let mut value = serde_json::to_value(split).unwrap();
+            value.as_object_mut().unwrap().remove(driver);
+            assert!(serde_json::from_value::<DriverTrafficSplit>(value).is_err(), "{driver}");
+        }
+    }
+
+    #[test]
+    fn four_way_renormalisation_covers_every_eligible_subset() {
+        let drivers = DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER;
+        for split in [
+            DriverTrafficSplit::new(10, 20, 30, 40),
+            DriverTrafficSplit::new(0, 33, 34, 33),
+            DriverTrafficSplit::default(),
+            DriverTrafficSplit::new(0, 0, 0, 100),
+        ] {
+            for mask in 1..16 {
+                let eligible: Vec<_> = drivers
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask & (1 << i) != 0)
+                    .map(|(_, driver)| *driver)
+                    .collect();
+                let total: u16 = eligible
+                    .iter()
+                    .map(|driver| u16::from(split.share_for(driver).unwrap()))
+                    .sum();
+                let mut counts = [0u16; 4];
+                for bucket in 0..100 {
+                    let result = split.driver_for_bucket_among(bucket, &eligible);
+                    if total == 0 {
+                        assert!(matches!(
+                            result,
+                            Err(EligibleAllocationError::EveryEligibleDriverAtZero { .. })
+                        ));
+                    } else {
+                        let driver = result.unwrap();
+                        assert!(eligible.contains(&driver));
+                        counts[drivers.iter().position(|d| *d == driver).unwrap()] += 1;
+                    }
+                }
+                if total == 0 {
+                    continue;
+                }
+                assert_eq!(counts.iter().sum::<u16>(), 100);
+                for (i, driver) in drivers.iter().enumerate() {
+                    let share = if eligible.contains(driver) {
+                        u16::from(split.share_for(driver).unwrap())
+                    } else {
+                        0
+                    };
+                    let exact = share * 100;
+                    assert!(
+                        counts[i] == exact / total || counts[i] == exact.div_ceil(total),
+                        "{split:?} {eligible:?} {driver}"
+                    );
+                    if share == 0 {
+                        assert_eq!(counts[i], 0);
+                    }
+                }
+            }
+        }
+        let split = DriverTrafficSplit::new(10, 20, 30, 40);
+        assert_eq!(
+            shares_over(&split, &[DRIVER_SLUG_CODEX, DRIVER_SLUG_AGY]).unwrap(),
+            vec![(DRIVER_SLUG_CODEX, 42), (DRIVER_SLUG_AGY, 58)]
+        );
     }
 }

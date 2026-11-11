@@ -1337,14 +1337,17 @@ final class EngineClient: @unchecked Sendable {
             emit(.engineHealthResult(apiKeyPresent: apiKeyPresent, issues: issues))
         case "driver_traffic_split_result":
             let raw = payload["split"] as? [String: Any] ?? [:]
-            // A share the engine did not send would make the decoded
-            // split fail its sum-to-100 invariant, so fall back to the
-            // engine default wholesale rather than to a partly-decoded
-            // split the UI would then treat as real.
+            // Require the complete atomic value, including zero shares.
+            // A missing share must not look like a valid zero allocation.
+            guard let grok = raw["grok"] as? Int,
+                  let claude = raw["claude"] as? Int,
+                  let codex = raw["codex"] as? Int,
+                  let agy = raw["agy"] as? Int else {
+                emit(.driverTrafficSplitResult(split: .engineDefault))
+                return true
+            }
             let decoded = DriverTrafficSplit(
-                grok: (raw["grok"] as? NSNumber)?.intValue ?? 0,
-                claude: (raw["claude"] as? NSNumber)?.intValue ?? 0,
-                codex: (raw["codex"] as? NSNumber)?.intValue ?? 0
+                grok: grok, claude: claude, codex: codex, agy: agy
             )
             emit(.driverTrafficSplitResult(split: decoded.isValid ? decoded : .engineDefault))
         case "codex_sol_percentage":
