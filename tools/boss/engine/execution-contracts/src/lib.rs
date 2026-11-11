@@ -11,7 +11,7 @@ pub use host_selection::{
 mod spawn_confirmation;
 pub use spawn_confirmation::{
     SpawnConfirmationError, composer_not_ready_error, prompt_not_delivered_error, prompt_not_submitted_error,
-    spawn_confirmation_error, turn_did_not_start_error,
+    remote_prompt_not_submitted_error, spawn_confirmation_error, turn_did_not_start_error,
 };
 mod worker_kind;
 pub use worker_kind::{WorkerKind, worker_kind_for_execution};

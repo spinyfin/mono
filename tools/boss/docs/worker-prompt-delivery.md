@@ -111,6 +111,8 @@ A `paste_landed` whose `wait_ms` is far above the usual tens of milliseconds is 
 
 A `paste_unverified` on every spawn of one driver means its composer no longer shows the declared marker. Record the new text from the installed CLI and update that driver's `paste_landed_markers`.
 
+A driver start that arrives only after the start wait expired rescues the spawn from that failure and nothing more: the prompt wait still runs, with its Return retries, and fails the spawn if no turn begins.
+
 ## What this does not cover
 
 - A worker adopted after an engine restart is not re-confirmed. Confirmation is the spawning engine's wait. A worker whose spawn the engine did not finish confirming is covered only by the driver-start sweep, which a `SessionStart` satisfies.

@@ -38,6 +38,7 @@ fn pane_spawn_failed_attention_body(
         }
         Some(
             boss_execution_contracts::SpawnConfirmationError::PromptNotSubmitted { .. }
+            | boss_execution_contracts::SpawnConfirmationError::RemotePromptNotSubmitted { .. }
             | boss_execution_contracts::SpawnConfirmationError::PromptNotDelivered { .. },
         ) => {
             format!(

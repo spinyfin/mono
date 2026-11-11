@@ -40,7 +40,7 @@ use boss_protocol::PaneMonitorSpec;
 
 pub use boss_execution_contracts::{
     SpawnConfirmationError, composer_not_ready_error, prompt_not_delivered_error, prompt_not_submitted_error,
-    spawn_confirmation_error, turn_did_not_start_error,
+    remote_prompt_not_submitted_error, spawn_confirmation_error, turn_did_not_start_error,
 };
 
 use crate::driver::initial_prompt::{DELIVERY_BUDGET, DeliveryState};
@@ -431,7 +431,7 @@ where
         "prompt submit failed: the remote driver started but reported no turn",
     );
     reap().await;
-    Err(prompt_not_submitted_error(driver_name, run_id, 0, timeout))
+    Err(remote_prompt_not_submitted_error(driver_name, run_id, timeout))
 }
 
 #[cfg(test)]
@@ -890,8 +890,12 @@ mod tests {
         assert!(reaped.load(Ordering::SeqCst), "timeout must reap the remote pid");
         assert!(matches!(
             spawn_confirmation_error(&err),
-            Some(SpawnConfirmationError::PromptNotSubmitted { retries: 0, .. })
+            Some(SpawnConfirmationError::RemotePromptNotSubmitted { .. })
         ));
+        assert!(spawn_confirmation_error(&err).is_some_and(SpawnConfirmationError::is_unsubmitted_prompt));
+        let msg = err.to_string();
+        assert!(msg.contains("unknown"), "{msg}");
+        assert!(!msg.contains("re-sent 0"), "{msg}");
 
         let reaped = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&reaped);

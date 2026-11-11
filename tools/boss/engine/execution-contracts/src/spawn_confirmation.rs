@@ -42,6 +42,20 @@ pub enum SpawnConfirmationError {
         retries: u32,
         waited_secs: u64,
     },
+    /// A remote driver started but reported no turn. The engine neither sees
+    /// the remote launcher's delivery state nor can press Return there, so
+    /// it knows neither whether the brief was pasted nor whether a retry
+    /// would have helped.
+    #[error(
+        "refusing to complete {driver_name} spawn for {run_id}: the remote driver started but reported no turn \
+         within {waited_secs}s; whether the initial prompt was delivered is unknown (the engine cannot see the \
+         remote launcher) and Return could not be re-sent; recording a failed spawn"
+    )]
+    RemotePromptNotSubmitted {
+        driver_name: String,
+        run_id: String,
+        waited_secs: u64,
+    },
     /// The driver started but the launcher never got the brief to it.
     #[error(
         "refusing to complete {driver_name} spawn for {run_id}: the initial prompt was not delivered to the \
@@ -59,7 +73,10 @@ impl SpawnConfirmationError {
     /// take its prompt. Only a turn, not a driver signal, can then veto the
     /// reap.
     pub fn is_unsubmitted_prompt(&self) -> bool {
-        matches!(self, Self::PromptNotSubmitted { .. } | Self::PromptNotDelivered { .. })
+        matches!(
+            self,
+            Self::PromptNotSubmitted { .. } | Self::RemotePromptNotSubmitted { .. } | Self::PromptNotDelivered { .. }
+        )
     }
 }
 
@@ -90,6 +107,14 @@ pub fn prompt_not_submitted_error(driver_name: &str, run_id: &str, retries: u32,
         driver_name: driver_name.to_owned(),
         run_id: run_id.to_owned(),
         retries,
+        waited_secs: waited.as_secs(),
+    })
+}
+
+pub fn remote_prompt_not_submitted_error(driver_name: &str, run_id: &str, waited: Duration) -> anyhow::Error {
+    anyhow::Error::from(SpawnConfirmationError::RemotePromptNotSubmitted {
+        driver_name: driver_name.to_owned(),
+        run_id: run_id.to_owned(),
         waited_secs: waited.as_secs(),
     })
 }
