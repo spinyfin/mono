@@ -179,9 +179,18 @@ pub(super) fn measure(conn: &Connection, now: i64, create_window_secs: i64) -> R
         &format!(
             "WITH attempts AS (
         SELECT work_item_id, CAST(created_at AS INTEGER) AS stamp FROM ci_remediations
-        WHERE consumes_budget=1 AND status<>'abandoned' AND started_at IS NOT NULL
+        WHERE consumes_budget=1
+          AND COALESCE(failure_reason,'') NOT IN
+            ('new_head_sha_inflight','merge_queue_trigger_superseded',
+             'superseded_by_resolved_ci','superseded_by_conflict')
+          AND (started_at IS NOT NULL OR EXISTS (
+            SELECT 1 FROM work_executions e
+            WHERE e.work_item_id=ci_remediations.revision_task_id AND e.started_at IS NOT NULL))
         UNION ALL SELECT work_item_id, CAST(created_at AS INTEGER) FROM conflict_resolutions
-        WHERE status<>'abandoned' AND started_at IS NOT NULL),
+        WHERE COALESCE(failure_reason,'') <> 'superseded_stale_head'
+          AND (started_at IS NOT NULL OR EXISTS (
+            SELECT 1 FROM work_executions e
+            WHERE e.work_item_id=conflict_resolutions.revision_task_id AND e.started_at IS NOT NULL))),
         counts AS (SELECT work_item_id, COUNT(*) OVER (PARTITION BY work_item_id ORDER BY stamp
             RANGE BETWEEN {} PRECEDING AND CURRENT ROW) AS n FROM attempts WHERE stamp>=?1 AND stamp<?2)
         SELECT MAX(n) FROM counts GROUP BY work_item_id",

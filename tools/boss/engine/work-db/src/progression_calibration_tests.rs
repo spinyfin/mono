@@ -133,8 +133,8 @@ fn seed(db: &WorkDb) {
                 "fix",
                 "merge_queue_rebounce",
             );
-            db.mark_ci_remediation_running(&id, "lease", "workspace", "worker")
-                .unwrap();
+            let revision = revision_execution(db, &product, true);
+            db.set_ci_remediation_revision_task_id(&id, &revision).unwrap();
             db.mark_ci_remediation_failed(&id, "fix_failed").unwrap();
             dates(db, &id, start + index * 11000, start + index * 11000 + 1000);
         }
@@ -581,4 +581,38 @@ fn remind_after_follows_fast_answers_and_never_exceeds_the_placeholder() {
     assert_eq!(value(&report, "remind_after_secs"), Some(7200));
     assert_eq!(report.limits["remind_after_secs"].source, "computed");
     assert_eq!(report.inputs["remediation_attempts_p99"], 2);
+}
+
+// Revision-backed attempts keep their ledger start unset in production.
+fn revision_execution(db: &WorkDb, product: &str, started: bool) -> String {
+    let task_count: i64 = db
+        .connect()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+        .unwrap();
+    let revision = create_test_chore_manual(db, product, format!("fix revision {task_count}")).id;
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET kind='revision' WHERE id=?1", [&revision])
+        .unwrap();
+    // Multiple executions must still count as one ledger attempt.
+    for _ in 0..2 {
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(&revision)
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Failed)
+                    .build(),
+            )
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET started_at=?2 WHERE id=?1",
+                params![execution.id, started.then_some(NOW - 5 * DAY)],
+            )
+            .unwrap();
+    }
+    revision
 }
