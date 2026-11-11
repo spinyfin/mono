@@ -1069,17 +1069,20 @@ impl HostAdapter for SshHostAdapter {
             structured_output_kind,
             pr_url_output,
         } = crate::hub_spawn::prepare_remote_launch(
-            &self.work_db,
-            execution,
-            work_item,
-            (&spawn_config.driver, &lease_id, &host),
-            (
-                Path::new(&workspace),
-                Path::new(&remote_socket),
-                Path::new(REMOTE_BOSS_EVENT_BIN),
-            ),
-            spawn_opts,
-            (prompt_text, embedded_output_path.as_deref()),
+            crate::hub_spawn::RemoteLaunchInput::builder()
+                .db(&self.work_db)
+                .execution(execution)
+                .item(work_item)
+                .driver_slug(&spawn_config.driver)
+                .lease_id(&lease_id)
+                .host(&host)
+                .workspace_path(Path::new(&workspace))
+                .events_socket_path(Path::new(&remote_socket))
+                .boss_event_path(Path::new(REMOTE_BOSS_EVENT_BIN))
+                .opts(spawn_opts)
+                .prompt_text(prompt_text)
+                .maybe_embedded_output_path(embedded_output_path.as_deref())
+                .build(),
         )?;
 
         // 5. Ship the prompt to the path the driver's SpawnPlan reads and

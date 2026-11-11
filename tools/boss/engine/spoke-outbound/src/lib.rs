@@ -428,6 +428,7 @@ const EXECUTOR_FEATURES: &[&str] = &[
     feature::EXECUTION,
     feature::WORKSPACE_RESET_RELEASE,
     feature::SPAWN_LAUNCH_INPUTS,
+    feature::SPAWN_WORKER_POSTURE,
 ];
 
 /// Journal contracts plus the executor-backed workspace/execution set.
@@ -443,13 +444,6 @@ pub fn executor_contracts() -> Contracts {
         }
     }
     contracts
-}
-
-/// What a spoke that runs workers itself offers. Same set as
-/// [`executor_contracts`]: journal plus executor-backed workspace/execution,
-/// including optional `workspace-reset-release` and `spawn-launch-inputs`.
-pub fn execution_contracts() -> Contracts {
-    executor_contracts()
 }
 
 pub fn hello(journal: &Journal, boot_id: &str, nonce: &[u8]) -> Result<Hello> {

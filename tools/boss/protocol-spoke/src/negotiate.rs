@@ -38,6 +38,8 @@ pub mod feature {
     /// that predates them ignores the fields, so a `Spawn` that depends on
     /// them lists this feature in `required_features`.
     pub const SPAWN_LAUNCH_INPUTS: &str = "spawn-launch-inputs";
+    /// Forced permission mode and generated agent rules.
+    pub const SPAWN_WORKER_POSTURE: &str = "spawn-worker-posture";
 }
 
 /// Features without which no execution traffic is possible. A peer missing one
@@ -55,11 +57,12 @@ pub const REQUIRED_FEATURES: [&str; 8] = [
 
 /// Negotiated per connection when both sides offer them; a mixed-version
 /// connection keeps execution without them.
-pub const OPTIONAL_FEATURES: [&str; 4] = [
+pub const OPTIONAL_FEATURES: [&str; 5] = [
     feature::PANE_CAPTURE,
     feature::UPGRADE,
     feature::WORKSPACE_RESET_RELEASE,
     feature::SPAWN_LAUNCH_INPUTS,
+    feature::SPAWN_WORKER_POSTURE,
 ];
 
 /// `Reject.code` values.

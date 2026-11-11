@@ -219,6 +219,9 @@ pub async fn bind_hub_listener(config: &HubConfig, db: WorkDb) -> Result<Option<
             .with_context(|| format!("opening hub credentials at {}", plan.credentials_dir.display()))?,
     );
     let identity = load_server_identity(&plan.tls_cert, &plan.tls_key)?;
+    tonic::transport::Server::builder()
+        .tls_config(boss_spoke_hub::server_tls(identity.clone(), &credentials)?)
+        .context("validating hub TLS identity")?;
     let incoming = TcpListener::bind(plan.listen)
         .await
         .with_context(|| format!("binding hub listener on {}", plan.listen))?;
@@ -325,6 +328,64 @@ mod tests {
             .build();
         let isolated = config.isolate_for_fixture(true, Some(PathBuf::from("/tmp/fixture-identity")));
         assert!(isolated.listener_plan().unwrap().is_none());
+    }
+
+    #[test]
+    fn fixture_guards_are_independent_and_reject_escaping_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let derived = root.path().join("credentials");
+        std::fs::create_dir(&derived).unwrap();
+        let inside = derived.join("identity");
+        let outside = root.path().join("outside");
+        std::fs::write(&inside, "identity").unwrap();
+        std::fs::write(&outside, "identity").unwrap();
+        let link = derived.join("symlink");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        for (listen, identity, enabled) in [
+            ("127.0.0.1:0", &inside, true),
+            ("127.0.0.1:0", &outside, false),
+            ("127.0.0.1:8443", &inside, false),
+            ("0.0.0.0:0", &inside, false),
+            ("127.0.0.1:0", &link, false),
+        ] {
+            let config = HubConfig::builder()
+                .listen(listen)
+                .credentials_dir(derived.clone())
+                .tls_cert(identity.clone())
+                .tls_key(identity.clone())
+                .build()
+                .isolate_for_fixture(true, Some(derived.clone()));
+            assert_eq!(
+                config.listener_plan().unwrap().is_some(),
+                enabled,
+                "{listen} {identity:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_tls_key_fails_before_listener_is_ready() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = tempfile::tempdir().unwrap();
+        let cert = root.path().join("cert.pem");
+        let key = root.path().join("key.pem");
+        ServerPki::new().write_identity(&cert, &key);
+        std::fs::write(&key, "not a PEM private key").unwrap();
+        let config = HubConfig::builder()
+            .listen("127.0.0.1:0")
+            .credentials_dir(root.path().join("credentials"))
+            .tls_cert(cert)
+            .tls_key(key)
+            .build();
+        let db = WorkDb::open(root.path().join("state.db")).unwrap();
+        let error = bind_hub_listener(&config, db)
+            .await
+            .err()
+            .expect("invalid key rejected at bind");
+        assert!(
+            format!("{error:#}").contains("validating hub TLS identity"),
+            "{error:#}"
+        );
     }
 
     #[test]
