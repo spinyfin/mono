@@ -382,8 +382,9 @@ fn pause_exemptions_are_read_for_the_whole_set() {
         whole_cost.idle_active.statements, half_cost.idle_active.statements,
         "idle active: statements must not grow with the cards under a pause"
     );
-    // The unpaused count plus three metadata reads and the two set reads.
-    assert_eq!(whole_cost.idle_active.statements, 9 + 4);
+    // The unpaused 9 (which already read `dispatch_paused`), plus the pause's
+    // origin and scope reads and the two set reads.
+    assert_eq!(whole_cost.idle_active.statements, 9 + 2 + 2);
     let reasons = |tasks: &[&Task]| -> BTreeMap<String, String> {
         let ids: Vec<&str> = tasks.iter().map(|task| task.id.as_str()).collect();
         let latest = latest_execution_statuses(&conn, &ids).unwrap();
@@ -420,6 +421,71 @@ fn pause_exemptions_are_read_for_the_whole_set() {
         );
     }
     assert!(held.contains("task_ws06477") && !held.contains("task_ws06469"));
+}
+
+/// Annotation statements and wait reasons of one warm board assembly.
+fn warm_board(db: &WorkDb, product: &str, caches: &BoardCaches) -> (i64, BTreeMap<String, String>) {
+    let assemble = || {
+        let mut trace = PopulationTrace::new(product, "wait-scale", None, Instant::now());
+        let tree = db.get_work_tree_cached(product, &mut trace, caches).unwrap();
+        (tree, trace)
+    };
+    assemble();
+    let (tree, trace) = assemble();
+    let (_, _, statements) = trace.segment_counts(segment::DB_TASK_RUNTIMES_ANNOTATION).unwrap();
+    let reasons = tree
+        .task_runtimes
+        .iter()
+        .filter_map(|runtime| Some((runtime.work_item_id.clone(), runtime.dispatch_wait_reason.clone()?)))
+        .collect();
+    (statements.unwrap(), reasons)
+}
+
+/// Through the board and heartbeat entry points themselves, an operator pause
+/// adds a fixed four statements on the 6,535-card board (none on the 270-card
+/// one, which has nothing to hold), and the exempt and held cards get their reasons.
+#[test]
+fn pause_cost_is_fixed_through_board_and_heartbeat() {
+    let (_dir, db) = open_seeded("wait-scale-pause-entry");
+    // The engine's connection is shared, so it is not held across the calls
+    // below that take it themselves.
+    {
+        let conn = db.connect().unwrap();
+        conn.execute("UPDATE tasks SET priority = 'critical' WHERE id = 'task_ws06469'", [])
+            .unwrap();
+    }
+    let caches = BoardCaches::default();
+    let unpaused: Vec<_> = [PRODUCT, CONTROL_PRODUCT]
+        .iter()
+        .map(|product| warm_board(&db, product, &caches).0)
+        .collect();
+    let (_, heartbeat_before) = db.list_unexplained_dispatch_waits_measured().unwrap();
+    operator_new_work_pause(&db.connect().unwrap());
+    let mut deltas = Vec::new();
+    for (product, before) in [PRODUCT, CONTROL_PRODUCT].iter().zip(&unpaused) {
+        let (statements, reasons) = warm_board(&db, product, &caches);
+        deltas.push(statements - before);
+        if *product == PRODUCT {
+            assert_eq!(
+                reasons["task_ws06469"], "awaiting_redispatch",
+                "critical work is exempt"
+            );
+            assert_eq!(reasons["task_ws06477"], "dispatch_paused", "other work is held");
+        }
+    }
+    println!("wait-scale paused board deltas {deltas:?}");
+    // The origin and scope reads and the two set reads for the 6,535-card
+    // board; the 270-card board has no redispatchable idle card, so reads none.
+    assert_eq!(deltas, [4, 0], "pause statements must not grow with the board");
+    let (_, heartbeat_after) = db.list_unexplained_dispatch_waits_measured().unwrap();
+    // The 88 pending executions are projected one by one either way.
+    assert_eq!(heartbeat_after.pending_executions, heartbeat_before.pending_executions);
+    assert!(
+        heartbeat_after.classified.statements() <= heartbeat_before.classified.statements() + 4,
+        "{:?} vs {:?}",
+        heartbeat_before.classified,
+        heartbeat_after.classified
+    );
 }
 
 fn plan_of(conn: &Connection, sql: &str) -> Vec<String> {
