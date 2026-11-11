@@ -1,7 +1,7 @@
 //! Daily, durable calibration. Readers consume the published values rather
 //! than scanning the ledger on each sweep. Overrides survive recalibration.
 use super::*;
-use boss_engine_storage_values::progression::{CALIBRATED_KEYS, ProgressionSettings};
+use boss_engine_storage_values::progression::*;
 use boss_protocol::{ProgressionCalibration, ProgressionLimit};
 use std::collections::BTreeMap;
 
@@ -39,15 +39,16 @@ impl WorkDb {
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 params![CONFIG_KEY, json],
             )?;
-            for (key, value) in CALIBRATED_KEYS.iter().zip(settings.calibration_values()) {
+            for setting in CALIBRATED_SETTINGS {
+                let value = (setting.value)(settings);
                 if let Some(value) = value {
                     conn.execute(
                         "INSERT INTO metadata(key,value) VALUES (?1,?2)
                         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                        params![format!("progression.{key}"), value.to_string()],
+                        params![setting.metadata_key, value.to_string()],
                     )?;
                 } else {
-                    conn.execute("DELETE FROM metadata WHERE key=?1", [format!("progression.{key}")])?;
+                    conn.execute("DELETE FROM metadata WHERE key=?1", [setting.metadata_key])?;
                 }
             }
             conn.execute(
@@ -79,17 +80,16 @@ impl WorkDb {
             .unwrap_or_default();
         let mut report = super::progression_calibration_data::measure(&tx, now, settings.max_creates_window_secs)?;
         let enough = report.snapshot_days >= MINIMUM_DAYS;
-        let defaults = ProgressionSettings::default().calibration_values();
-        let configured = settings.calibration_values();
+        let defaults = ProgressionSettings::default();
         let m = &report.inputs;
         let measurement = |key: &str| m.get(key).copied();
         let triple = |key: &str| measurement(key).map(|v| v.saturating_mul(3));
         // One descriptor per published key: formula, basis and sanity bound
-        // travel together and are matched to the settings by key name.
+        // travel with the named setting, metadata key and override bit.
         let remind_default = u64::from(boss_engine_storage_values::progression::DEFAULT_REMIND_AFTER_SECS);
         let descriptors = [
             Descriptor::new(
-                "pool_size",
+                POOL_SIZE_SETTING,
                 measurement("peak_candidates_per_day")
                     .zip(measurement("mean_run_seconds"))
                     .map(|(count, seconds)| {
@@ -103,31 +103,31 @@ impl WorkDb {
                 64,
             ),
             Descriptor::new(
-                "sweep_interval_secs",
+                SWEEP_INTERVAL_SECS_SETTING,
                 measurement("ledger_interval_p99_secs").map(|v| v.saturating_mul(10)),
                 "10 * p99 ledger interval",
                 3600,
             ),
             Descriptor::new(
-                "stuck_after_secs",
+                STUCK_AFTER_SECS_SETTING,
                 triple("automatic_pause_p99_secs"),
                 "3 * p99 automatic remediation scheduling pause",
                 DAY as u64,
             ),
             Descriptor::new(
-                "cooldown_secs",
+                COOLDOWN_SECS_SETTING,
                 triple("revision_to_review_max_secs"),
                 "3 * longest progression revision time to first review",
                 7 * DAY as u64,
             ),
             Descriptor::new(
-                "max_creates_per_item_window",
+                MAX_CREATES_PER_ITEM_WINDOW_SETTING,
                 triple("remediation_attempts_p99"),
                 "3 * outlier-trimmed p99 per-item remediation attempts in a create-budget window",
                 100,
             ),
             Descriptor::new(
-                "run_timeout_secs",
+                RUN_TIMEOUT_SECS_SETTING,
                 triple("run_duration_p99_secs"),
                 "3 * p99 completed progression run duration",
                 DAY as u64,
@@ -136,14 +136,14 @@ impl WorkDb {
             // frequent than the default when people answer faster, never
             // less frequent when answers slow down.
             Descriptor::new(
-                "remind_after_secs",
+                REMIND_AFTER_SECS_SETTING,
                 measurement("answer_latency_p75_secs").map(|v| v.clamp(MIN_REMIND_SECS, remind_default)),
                 "p75 observed answer latency, at least 1 hour and at most the 3-day placeholder",
                 remind_default,
             )
             .ceiling_at_default(),
             Descriptor::new(
-                "expected_questions_per_week",
+                EXPECTED_QUESTIONS_PER_WEEK_SETTING,
                 measurement("progression_questions")
                     .zip(measurement("engine_ladder_questions"))
                     .filter(|(p, l)| p + l > 0)
@@ -152,25 +152,21 @@ impl WorkDb {
                 100,
             ),
         ];
-        for key in CALIBRATED_KEYS.iter() {
-            let index = CALIBRATED_KEYS
-                .iter()
-                .position(|candidate| candidate == key)
-                .expect("key comes from CALIBRATED_KEYS");
-            let descriptor = descriptors
-                .iter()
-                .find(|descriptor| descriptor.key == *key)
-                .expect("every calibrated key has a descriptor");
-            let overridden = settings.explicit_overrides & (1 << index) != 0 || configured[index] != defaults[index];
+        for descriptor in &descriptors {
+            let setting = descriptor.setting;
+            let key = setting.key;
+            let default = (setting.value)(&defaults);
+            let configured = (setting.value)(&settings);
+            let overridden = settings.explicit_overrides & setting.override_bit != 0 || configured != default;
             let (value, source, basis) = if overridden {
-                (configured[index], "overridden", "explicit configuration".to_owned())
+                (configured, "overridden", "explicit configuration".to_owned())
             } else if enough && descriptor.computed.is_some() {
                 (
                     descriptor.computed.map(|v| {
                         if descriptor.default_is_ceiling {
-                            v.min(defaults[index].unwrap_or(u64::MAX))
+                            v.min(default.unwrap_or(u64::MAX))
                         } else {
-                            v.max(defaults[index].unwrap_or(0))
+                            v.max(default.unwrap_or(0))
                         }
                     }),
                     "computed",
@@ -178,7 +174,7 @@ impl WorkDb {
                 )
             } else {
                 (
-                    defaults[index],
+                    default,
                     "fallback",
                     if enough {
                         "no eligible measurement samples".to_owned()
@@ -197,14 +193,14 @@ impl WorkDb {
             } else {
                 basis
             };
-            let ceiling = match *key {
+            let ceiling = match key {
                 "pool_size" => boss_engine_storage_values::pool_policy::MAX_PROGRESSION_POOL_SIZE as u64,
                 "max_creates_per_item_window" | "expected_questions_per_week" => u32::MAX as u64,
                 _ => i64::MAX as u64,
             };
             let limited = value.map(|v| v.min(ceiling));
             report.limits.insert(
-                (*key).into(),
+                key.into(),
                 ProgressionLimit {
                     value: limited,
                     source: source.into(),
@@ -227,15 +223,17 @@ impl WorkDb {
             current_config == config,
             "progression configuration changed during measurement"
         );
-        for (key, limit) in &report.limits {
+        for descriptor in &descriptors {
+            let setting = descriptor.setting;
+            let limit = &report.limits[setting.key];
             if let Some(value) = limit.value {
                 tx.execute(
                     "INSERT INTO metadata(key,value) VALUES (?1,?2)
                     ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    params![format!("progression.{key}"), value.to_string()],
+                    params![setting.metadata_key, value.to_string()],
                 )?;
             } else {
-                tx.execute("DELETE FROM metadata WHERE key=?1", [format!("progression.{key}")])?;
+                tx.execute("DELETE FROM metadata WHERE key=?1", [setting.metadata_key])?;
             }
         }
         tx.execute(
@@ -267,7 +265,7 @@ const MIN_REMIND_SECS: u64 = 3600;
 
 /// How one published key is calibrated.
 struct Descriptor {
-    key: &'static str,
+    setting: CalibrationSetting,
     computed: Option<u64>,
     basis: &'static str,
     sanity_bound: u64,
@@ -276,9 +274,9 @@ struct Descriptor {
 }
 
 impl Descriptor {
-    fn new(key: &'static str, computed: Option<u64>, basis: &'static str, sanity_bound: u64) -> Self {
+    fn new(setting: CalibrationSetting, computed: Option<u64>, basis: &'static str, sanity_bound: u64) -> Self {
         Self {
-            key,
+            setting,
             computed,
             basis,
             sanity_bound,

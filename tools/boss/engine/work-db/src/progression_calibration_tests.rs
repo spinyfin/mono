@@ -3,6 +3,9 @@ use crate::test_support::{create_test_chore_manual, create_test_product};
 use boss_engine_storage_values::progression::{METADATA_KEY_RUN_TIMEOUT_SECS, METADATA_KEY_STUCK_AFTER_SECS};
 use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus, StuckBucket, StuckReport, StuckRow};
 
+#[path = "progression_calibration_identity_tests.rs"]
+mod identity;
+
 const NOW: i64 = 20_000 * DAY;
 fn db() -> WorkDb {
     WorkDb::open(PathBuf::from(":memory:")).unwrap()
@@ -130,7 +133,9 @@ fn seed(db: &WorkDb) {
                 "fix",
                 "merge_queue_rebounce",
             );
-            db.mark_ci_remediation_abandoned(&id, "owner_abandon").unwrap();
+            db.mark_ci_remediation_running(&id, "lease", "workspace", "worker")
+                .unwrap();
+            db.mark_ci_remediation_failed(&id, "fix_failed").unwrap();
             dates(db, &id, start + index * 11000, start + index * 11000 + 1000);
         }
     }

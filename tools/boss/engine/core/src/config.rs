@@ -411,12 +411,9 @@ fn load_progression_settings(lookup: &impl Fn(&str) -> Option<OsString>) -> Resu
         bail!("BOSS_PROGRESSION_POOL_SIZE must be greater than zero");
     }
     let mut overrides = 0;
-    for (index, key) in boss_engine_storage_values::progression::CALIBRATED_KEYS
-        .iter()
-        .enumerate()
-    {
-        if lookup(&format!("BOSS_PROGRESSION_{}", key.to_uppercase())).is_some() {
-            overrides |= 1 << index;
+    for setting in boss_engine_storage_values::progression::CALIBRATED_SETTINGS {
+        if lookup(&format!("BOSS_PROGRESSION_{}", setting.key.to_uppercase())).is_some() {
+            overrides |= setting.override_bit;
         }
     }
     Ok(ProgressionSettings::builder()

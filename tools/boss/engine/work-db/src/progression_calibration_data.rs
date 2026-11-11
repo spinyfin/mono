@@ -172,13 +172,16 @@ pub(super) fn measure(conn: &Connection, now: i64, create_window_secs: i64) -> R
     if let Some(max) = revisions.into_iter().max() {
         report.inputs.insert("revision_to_review_max_secs".into(), max);
     }
+    // A real attempt reached execution and was not abandoned as superseded
+    // or rejected by admission; insertion alone is not remediation work.
     let mut attempts = samples(
         conn,
         &format!(
             "WITH attempts AS (
         SELECT work_item_id, CAST(created_at AS INTEGER) AS stamp FROM ci_remediations
-        WHERE consumes_budget=1
-        UNION ALL SELECT work_item_id, CAST(created_at AS INTEGER) FROM conflict_resolutions),
+        WHERE consumes_budget=1 AND status<>'abandoned' AND started_at IS NOT NULL
+        UNION ALL SELECT work_item_id, CAST(created_at AS INTEGER) FROM conflict_resolutions
+        WHERE status<>'abandoned' AND started_at IS NOT NULL),
         counts AS (SELECT work_item_id, COUNT(*) OVER (PARTITION BY work_item_id ORDER BY stamp
             RANGE BETWEEN {} PRECEDING AND CURRENT ROW) AS n FROM attempts WHERE stamp>=?1 AND stamp<?2)
         SELECT MAX(n) FROM counts GROUP BY work_item_id",
