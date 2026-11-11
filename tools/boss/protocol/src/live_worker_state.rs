@@ -222,10 +222,20 @@ pub struct LiveWorkerState {
     /// `None` when the pane has no work item or the row predates short ids.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_item_short_id: Option<i64>,
+    /// Display owner; the raw binding still routes lifecycle events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owning_work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owning_work_item_title: Option<String>,
     /// Product that owns the bound work item. Lets the Agents pane
     /// reveal the card without a second lookup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub product_id: Option<String>,
+    /// Display name of [`Self::product_id`], as the left nav shows it. The
+    /// Agents pane header leads with it because short ids are only unique
+    /// within a product. `None` when the pane has no work item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_name: Option<String>,
     /// GitHub PR URL bound to the work item, when one exists. Updated
     /// mid-run once a `cube pr create` / `gh pr create` URL is verified
     /// against this execution's branch.
@@ -412,7 +422,10 @@ pub struct LiveWorkerMetadata {
     pub host_id: Option<String>,
     pub started_at: Option<String>,
     pub product_id: Option<String>,
+    pub product_name: Option<String>,
     pub work_item_short_id: Option<i64>,
+    pub owning_work_item_id: Option<String>,
+    pub owning_work_item_title: Option<String>,
     pub pr_url: Option<String>,
 }
 
@@ -426,7 +439,10 @@ impl LiveWorkerState {
         self.host_id = metadata.host_id;
         self.started_at = metadata.started_at;
         self.product_id = metadata.product_id;
+        self.product_name = metadata.product_name;
         self.work_item_short_id = metadata.work_item_short_id;
+        self.owning_work_item_id = metadata.owning_work_item_id;
+        self.owning_work_item_title = metadata.owning_work_item_title;
         self.pr_url = metadata.pr_url;
     }
 }
@@ -505,8 +521,11 @@ impl LiveWorkerState {
             hung_since: None,
             work_item_id,
             work_item_name,
+            owning_work_item_id: None,
+            owning_work_item_title: None,
             work_item_short_id: None,
             product_id: None,
+            product_name: None,
             pr_url: None,
             execution_id,
             pool,
@@ -678,8 +697,11 @@ mod tests {
             hung_since: None,
             work_item_id: Some("task_42".into()),
             work_item_name: Some("Fix fencer scraping".into()),
+            owning_work_item_id: None,
+            owning_work_item_title: None,
             work_item_short_id: Some(42),
             product_id: Some("prod_1".into()),
+            product_name: Some("Boss".into()),
             pr_url: Some("https://github.com/spinyfin/mono/pull/3356".into()),
             execution_id: Some("run-7".into()),
             pool: Some("main".into()),
@@ -748,8 +770,11 @@ mod tests {
             hung_since: None,
             work_item_id: None,
             work_item_name: None,
+            owning_work_item_id: None,
+            owning_work_item_title: None,
             work_item_short_id: None,
             product_id: None,
+            product_name: None,
             pr_url: None,
             execution_id: None,
             pool: None,
@@ -875,6 +900,7 @@ mod tests {
             "host_id",
             "started_at",
             "product_id",
+            "product_name",
             "work_item_short_id",
             "pr_url",
         ] {
@@ -900,6 +926,9 @@ mod tests {
             host_id: Some(LOCAL_HOST_ID.into()),
             started_at: Some("2026-10-09T00:00:00Z".into()),
             product_id: Some("prod_1".into()),
+            product_name: Some("Boss".into()),
+            owning_work_item_id: None,
+            owning_work_item_title: None,
             work_item_short_id: Some(42),
             pr_url: Some("https://github.com/spinyfin/mono/pull/3356".into()),
         });
@@ -910,6 +939,7 @@ mod tests {
         assert_eq!(state.host_id.as_deref(), Some("local"));
         assert_eq!(state.started_at.as_deref(), Some("2026-10-09T00:00:00Z"));
         assert_eq!(state.product_id.as_deref(), Some("prod_1"));
+        assert_eq!(state.product_name.as_deref(), Some("Boss"));
         assert_eq!(state.work_item_short_id, Some(42));
         assert_eq!(
             state.pr_url.as_deref(),

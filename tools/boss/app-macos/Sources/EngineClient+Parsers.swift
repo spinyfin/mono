@@ -626,8 +626,11 @@ extension EngineClient {
             hungSince: payload["hung_since"] as? String,
             workItemId: payload["work_item_id"] as? String,
             workItemName: payload["work_item_name"] as? String,
+            owningWorkItemId: payload["owning_work_item_id"] as? String,
+            owningWorkItemTitle: payload["owning_work_item_title"] as? String,
             workItemShortId: (payload["work_item_short_id"] as? NSNumber)?.intValue,
             productId: payload["product_id"] as? String,
+            productName: payload["product_name"] as? String,
             prURL: payload["pr_url"] as? String
         )
     }

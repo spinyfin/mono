@@ -306,12 +306,21 @@ pub fn progression_summary(task_name: &str) -> Option<String> {
     Some(derived_task_phrase("unsticking", "unsticking work", task_name, 3))
 }
 
-/// Fixed phrase for [`ExecutionKind::PrReviewGuide`], mirroring
-/// [`answer_agent_summary`]: this kind's synthetic row is keyed by a source
-/// comparison id, not a real task, so there is no `work_item_id` cache slot
-/// worth sharing and no model call worth spending on a titlebar phrase.
-pub fn review_guide_summary() -> Option<String> {
-    Some("generating a review guide".to_owned())
+/// Derived phrase for [`ExecutionKind::PrReviewGuide`]. This kind's synthetic
+/// row is keyed by a source comparison id, not a real task, so there is no
+/// `work_item_id` cache slot worth sharing and no model call worth spending on
+/// a titlebar phrase. `task_name` is the owning root task's name (not the
+/// synthetic row's `Review guide: <PR title>`), so the pane reads
+/// `"<Name> is generating a review guide for <task-name>"`; it is capped to 2
+/// words because the verb phrase is already 5. Falls back to the bare phrase
+/// when the series has no owning task.
+pub fn review_guide_summary(task_name: &str) -> Option<String> {
+    Some(derived_task_phrase(
+        "generating a review guide for",
+        "generating a review guide",
+        task_name,
+        2,
+    ))
 }
 
 /// Route an execution kind to a *derived* pane-titlebar phrase, bypassing
@@ -345,7 +354,7 @@ pub fn derived_title_summary(
         }
         ExecutionKind::PrReview => Some(pr_review_summary(task_name)),
         ExecutionKind::AnswerAgent => Some(answer_agent_summary()),
-        ExecutionKind::PrReviewGuide => Some(review_guide_summary()),
+        ExecutionKind::PrReviewGuide => Some(review_guide_summary(task_name)),
         ExecutionKind::AutomationTriage
         | ExecutionKind::ChoreImplementation
         | ExecutionKind::InvestigationImplementation
@@ -699,6 +708,15 @@ mod tests {
             .as_deref(),
             Some("reviewing the PR for SessionEnd…"),
         );
+    }
+
+    #[test]
+    fn review_guide_summary_names_the_owning_task_and_falls_back_without_one() {
+        assert_eq!(
+            review_guide_summary("Header metadata for panes").as_deref(),
+            Some("generating a review guide for Header metadata…"),
+        );
+        assert_eq!(review_guide_summary("").as_deref(), Some("generating a review guide"));
     }
 
     #[test]

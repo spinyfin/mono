@@ -106,6 +106,7 @@ boss-design-doc-fetcher = { path = "../../design-doc-fetcher" }
 boss-pr-review-sources = { path = "../../pr-review-sources" }
 
 [dev-dependencies]
+boss-pane-summary = { path = "../../pane-summary" }
 boss-engine-completion = { path = "../../completion", features = ["test-support"] }
 boss-engine-live-worker-state = { path = "../../live-worker-state", features = ["test-support"] }
 boss-engine-merge-poller = { path = "../../merge-poller", features = ["test-support"] }

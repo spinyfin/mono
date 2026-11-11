@@ -999,6 +999,12 @@ pub struct ExecutionWorkLabel {
     /// Product that owns the work item, so the frontend can reveal its card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub product_id: Option<String>,
+    /// Display name of the product, as the left nav shows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_name: Option<String>,
+    /// Name of the project the work item belongs to; `None` when unfiled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
     /// PR bound to the work item (or, for a revision, to its chain root).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,

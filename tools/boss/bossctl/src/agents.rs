@@ -1904,11 +1904,20 @@ fn live_state_text(
     if let Some(recovery) = &state.recovery_status {
         outln!(out, "  recovery:      {recovery}");
     }
-    if let Some(id) = &state.work_item_id {
+    if let Some(id) = state.owning_work_item_id.as_ref().or(state.work_item_id.as_ref()) {
         outln!(out, "  work_item:     {id}");
     }
-    if let Some(name) = &state.work_item_name {
+    if let Some(name) = state.owning_work_item_title.as_ref().or(state.work_item_name.as_ref()) {
         outln!(out, "  work_item_name:{name}");
+    }
+    if let Some(product) = &state.product_name {
+        outln!(out, "  product:       {product}");
+    }
+    if let Some(task) = task_short_label(state) {
+        outln!(out, "  task:          {task}");
+    }
+    if let Some(pr) = state.pr_url.as_deref().and_then(pr_compact_label) {
+        outln!(out, "  pr:            {pr}");
     }
     if let Some(id) = &state.execution_id {
         outln!(out, "  execution:     {id}");
@@ -1961,6 +1970,27 @@ fn project_status_label(state: &LiveWorkerState) -> Option<String> {
         (_, None) if state.host_id.is_some() => Some("Unfiled".to_owned()),
         (_, None) => None,
     }
+}
+
+/// `T<n>` for tasks and chores, `P<n>` for projects; `None` without a short id.
+fn task_short_label(state: &LiveWorkerState) -> Option<String> {
+    let short_id = state.work_item_short_id?;
+    let prefix = if state
+        .owning_work_item_id
+        .as_deref()
+        .or(state.work_item_id.as_deref())
+        .is_some_and(|id| id.starts_with("proj_"))
+    {
+        'P'
+    } else {
+        'T'
+    };
+    Some(format!("{prefix}{short_id}"))
+}
+
+/// `repo#n` from a GitHub `/pull/<n>` URL, dropping the owner.
+fn pr_compact_label(url: &str) -> Option<String> {
+    boss_github::pr_url::parse_pr_url_parts(url).map(|(_, repo, n)| format!("{repo}#{n}"))
 }
 
 fn print_live_state_short(state: &LiveWorkerState, tmux: TmuxListEvidence<'_>) {
@@ -2095,8 +2125,16 @@ fn hosted_pane_status_json(
 /// the pool + exec-kind columns without capturing stdout.
 fn format_live_state_short(state: &LiveWorkerState, tmux: TmuxListEvidence<'_>) -> String {
     let tool = state.current_tool.as_deref().unwrap_or("-");
-    let work_item = state.work_item_id.as_deref().unwrap_or("-");
-    let work_item_name = state.work_item_name.as_deref().unwrap_or("-");
+    let work_item = state
+        .owning_work_item_id
+        .as_deref()
+        .or(state.work_item_id.as_deref())
+        .unwrap_or("-");
+    let work_item_name = state
+        .owning_work_item_title
+        .as_deref()
+        .or(state.work_item_name.as_deref())
+        .unwrap_or("-");
     // `pool` / `kind` always print (as `-` when unset) so a glance at
     // `agents list` shows attributed routing even for test / direct-
     // launch spawns that never stamped them. Values match
@@ -2127,6 +2165,18 @@ fn format_live_state_short(state: &LiveWorkerState, tmux: TmuxListEvidence<'_>) 
         work_item,
         work_item_name,
     );
+    // The same product / task / PR the app's pane header shows, as resolved by
+    // the engine (a review-guide run resolves to its root task and PR).
+    line.push_str(&format!(
+        "  product=\"{}\"  task={}  pr={}",
+        state.product_name.as_deref().unwrap_or("-"),
+        task_short_label(state).unwrap_or_else(|| "-".to_owned()),
+        state
+            .pr_url
+            .as_deref()
+            .and_then(pr_compact_label)
+            .unwrap_or_else(|| "-".to_owned()),
+    ));
     // Surfaced whenever the transient-recovery sweep is actively nudging
     // this slot — without this an auto-recovering worker prints as plain
     // `activity=idle`, indistinguishable from a normally-finished turn.

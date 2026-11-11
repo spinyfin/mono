@@ -4,6 +4,7 @@ use boss_protocol::{CreateProjectInput, CreateRevisionInput, CreateTaskInput, Ex
 
 use crate::test_support::{
     create_test_chore_manual, create_test_product, insert_host_capability, open_db, seed_daily_automation,
+    seed_review_guide_series_for_pr,
 };
 use crate::work::{FakePrStateChecker, PrOpenState};
 
@@ -182,6 +183,160 @@ fn revision_falls_back_to_execution_pr_url_when_task_row_has_none() {
     assert_eq!(resolve(&db, &without_pr, "local").pr_url, None);
 }
 
+fn set_task_pr(db: &WorkDb, task_id: &str, pr_url: &str) {
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'in_review', pr_url = ?1 WHERE id = ?2",
+            rusqlite::params![pr_url, task_id],
+        )
+        .unwrap();
+}
+
+/// Every pane kind carries the product's display name next to the short id,
+/// and the project (when there is one) and PR once one exists.
+#[test]
+fn every_pane_kind_carries_product_project_short_id_and_pr() {
+    const PR: &str = "https://github.com/spinyfin/mono/pull/3401";
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let project = create_project(&db, &product.id, "Platform");
+    let task = create_project_task(&db, &product.id, &project.id, "Header metadata");
+    let started = started_execution(&db, &task.id, "local");
+
+    // No PR yet: the product, project and short id are present, the PR is not.
+    let metadata = resolve(&db, &as_kind(&started, ExecutionKind::TaskImplementation), "local");
+    assert_eq!(metadata.product_name.as_deref(), Some(product.name.as_str()));
+    assert_eq!(metadata.project_name.as_deref(), Some("Platform"));
+    assert_eq!(metadata.work_item_short_id, task.short_id);
+    assert_eq!(metadata.pr_url, None);
+
+    set_task_pr(&db, &task.id, PR);
+    for kind in [
+        ExecutionKind::TaskImplementation,
+        ExecutionKind::PrReview,
+        ExecutionKind::CiRemediation,
+        ExecutionKind::ConflictResolution,
+    ] {
+        let metadata = resolve(&db, &as_kind(&started, kind.clone()), "local");
+        assert_eq!(metadata.product_name.as_deref(), Some(product.name.as_str()), "{kind}");
+        assert_eq!(metadata.project_name.as_deref(), Some("Platform"), "{kind}");
+        assert_eq!(metadata.work_item_short_id, task.short_id, "{kind}");
+        assert_eq!(metadata.pr_url.as_deref(), Some(PR), "{kind}");
+    }
+
+    // A chore with no project leaves the project out.
+    let chore = create_test_chore_manual(&db, product.id.clone(), "loose");
+    let metadata = resolve(&db, &started_execution(&db, &chore.id, "local"), "local");
+    assert_eq!(metadata.product_name.as_deref(), Some(product.name.as_str()));
+    assert_eq!(metadata.project_name, None);
+}
+
+#[test]
+fn revision_pane_carries_product_and_project_of_its_chain() {
+    const PR: &str = "https://github.com/spinyfin/mono/pull/3401";
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let project = create_project(&db, &product.id, "Platform");
+    let parent = create_project_task(&db, &product.id, &project.id, "Parent");
+    set_task_pr(&db, &parent.id, PR);
+    let revision = db
+        .create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(parent.id.clone())
+                .description("Address review findings")
+                .build(),
+            &FakePrStateChecker::always(PrOpenState::Open),
+        )
+        .unwrap();
+    let execution = WorkExecution {
+        kind: ExecutionKind::RevisionImplementation,
+        pr_url: Some(PR.to_owned()),
+        ..started_execution(&db, &revision.id, "local")
+    };
+
+    let metadata = resolve(&db, &execution, "local");
+
+    assert_eq!(metadata.product_name.as_deref(), Some(product.name.as_str()));
+    assert_eq!(metadata.project_name.as_deref(), Some("Platform"));
+    assert_eq!(metadata.work_item_short_id, revision.short_id);
+    assert_eq!(metadata.pr_url.as_deref(), Some(PR));
+}
+
+/// A review-guide run is bound to a comparison, not a task. Its header is the
+/// series' root task (the chain root when the PR belongs to a revision chain)
+/// and the comparison's canonical PR.
+#[test]
+fn review_guide_pane_resolves_to_the_root_task_and_canonical_pr() {
+    const PR: &str = "https://github.com/spinyfin/mono/pull/3401";
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let project = create_project(&db, &product.id, "Platform");
+    let root = create_project_task(&db, &product.id, &project.id, "Guided change");
+    let started = started_execution(&db, &root.id, "local");
+    set_task_pr(&db, &root.id, PR);
+    // The PR belongs to a revision chain; the series is keyed on the root.
+    db.create_revision(
+        CreateRevisionInput::builder()
+            .parent_task_id(root.id.clone())
+            .description("Address review findings")
+            .build(),
+        &FakePrStateChecker::always(PrOpenState::Open),
+    )
+    .unwrap();
+    let (_series, comparison) = seed_review_guide_series_for_pr(&db, &root.id, PR, "base", "head");
+    let execution = WorkExecution {
+        work_item_id: comparison,
+        ..as_kind(&started, ExecutionKind::PrReviewGuide)
+    };
+
+    let metadata = resolve(&db, &execution, "local");
+
+    assert_eq!(metadata.product_name.as_deref(), Some(product.name.as_str()));
+    assert_eq!(metadata.product_id.as_deref(), Some(product.id.as_str()));
+    assert_eq!(metadata.project_name.as_deref(), Some("Platform"));
+    assert_eq!(metadata.owning_work_item_id.as_deref(), Some(root.id.as_str()));
+    assert_eq!(metadata.owning_work_item_title.as_deref(), Some(root.name.as_str()));
+    let registry = crate::live_worker_state::LiveWorkerStateRegistry::new();
+    registry.register_spawn_with_capabilities(
+        1,
+        "run-guide",
+        "model",
+        0,
+        Some(execution_binding(&db, &execution)),
+        false,
+        crate::live_worker_state::LiveSpawnRouting::none().with_metadata(metadata.clone()),
+    );
+    let state = registry.get(1).unwrap();
+    assert_eq!(state.work_item_id.as_deref(), Some(execution.work_item_id.as_str()));
+    assert_eq!(state.owning_work_item_id.as_deref(), Some(root.id.as_str()));
+    assert_eq!(state.owning_work_item_title.as_deref(), Some(root.name.as_str()));
+    assert_eq!(metadata.work_item_short_id, root.short_id);
+    assert_eq!(metadata.pr_url.as_deref(), Some(PR));
+}
+
+/// A missing comparison has neither an owning task nor a canonical PR.
+#[test]
+fn review_guide_pane_with_a_missing_comparison_falls_back_cleanly() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let chore = create_test_chore_manual(&db, product.id.clone(), "x");
+    let execution = WorkExecution {
+        work_item_id: "prgc_missing".to_owned(),
+        ..as_kind(
+            &started_execution(&db, &chore.id, "local"),
+            ExecutionKind::PrReviewGuide,
+        )
+    };
+
+    let metadata = resolve(&db, &execution, "local");
+
+    assert_eq!(metadata.product_name, None);
+    assert_eq!(metadata.project_name, None);
+    assert_eq!(metadata.work_item_short_id, None);
+    assert_eq!(metadata.pr_url, None);
+}
+
 #[test]
 fn work_item_ids_that_are_not_tasks_are_unfiled_not_guessed() {
     let (_dir, db) = open_db();
@@ -333,4 +488,43 @@ fn guide_recovery_does_not_replace_an_unknown_attempt_driver_with_live_policy() 
         adopted_identity(&db, &execution, driver.as_deref()),
         ("retired-model".to_owned(), false)
     );
+}
+
+/// A real external-PR comparison retains its PR without inventing task metadata.
+#[test]
+fn review_guide_pane_without_an_owning_task_falls_back_cleanly() {
+    const PR: &str = "https://github.com/spinyfin/mono/pull/3401";
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let chore = create_test_chore_manual(&db, product.id.clone(), "x");
+    let (_, comparison) = seed_review_guide_series_for_pr(&db, "task_absent", PR, "base", "head");
+    let execution = WorkExecution {
+        work_item_id: comparison,
+        ..as_kind(
+            &started_execution(&db, &chore.id, "local"),
+            ExecutionKind::PrReviewGuide,
+        )
+    };
+    let metadata = resolve(&db, &execution, "local");
+    assert_eq!(metadata.product_id, None);
+    assert_eq!(metadata.product_name, None);
+    assert_eq!(metadata.project_id, None);
+    assert_eq!(metadata.project_name, None);
+    assert_eq!(metadata.work_item_short_id, None);
+    assert_eq!(metadata.owning_work_item_id, None);
+    assert_eq!(metadata.owning_work_item_title, None);
+    assert_eq!(metadata.pr_url.as_deref(), Some(PR));
+    let title = boss_pane_summary::derived_title_summary(
+        &execution.kind,
+        None,
+        metadata.owning_work_item_title.as_deref().unwrap_or_default(),
+    );
+    assert_eq!(title.flatten().as_deref(), Some("generating a review guide"));
+    let label = crate::execution_label::label_for_execution(&db, &execution);
+    assert_eq!(label.status, boss_protocol::ExecutionLabelStatus::NoWorkItem);
+    assert_eq!(label.pr_url.as_deref(), Some(PR));
+    assert_eq!(label.work_item_id, None);
+    assert_eq!(label.work_item_short_id, None);
+    assert_eq!(label.product_name, None);
+    assert_eq!(label.project_name, None);
 }

@@ -154,6 +154,7 @@ rust_test(
     ),
     shard_count = 7,
     deps = TEST_DEPS + [
+        "//tools/boss/engine/pane-summary",
         "//tools/boss/engine/prose-vocabulary",
         "//tools/boss/engine/recovery-fixtures",
         "//tools/boss/engine/task-scope",
@@ -206,6 +207,7 @@ network_enabled_rust_test(
     ),
     tags = ["manual"],
     deps = TEST_DEPS + [
+        "//tools/boss/engine/pane-summary",
         "//tools/boss/engine/prose-vocabulary",
         "//tools/boss/engine/recovery-fixtures",
         "//tools/boss/engine/task-scope",

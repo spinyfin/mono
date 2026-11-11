@@ -191,8 +191,11 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         "viewerAttachError",
         "workItemId",
         "workItemName",
+        "owningWorkItemId",
+        "owningWorkItemTitle",
         "workItemShortId",
         "productId",
+        "productName",
         "prURL",
     ]
 
@@ -380,8 +383,11 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             ("viewerAttachError", Self.makeLiveState(viewerAttachError: "the app refused the viewer")),
             ("workItemId", Self.makeLiveState(workItemId: "task_header")),
             ("workItemName", Self.makeLiveState(workItemName: "Worker pane header")),
+            ("owningWorkItemId", Self.makeLiveState(owningWorkItemId: "task_owner")),
+            ("owningWorkItemTitle", Self.makeLiveState(owningWorkItemTitle: "Owning task")),
             ("workItemShortId", Self.makeLiveState(workItemShortId: 42)),
             ("productId", Self.makeLiveState(productId: "prod_boss")),
+            ("productName", Self.makeLiveState(productName: "Boss")),
             ("prURL", Self.makeLiveState(prURL: "https://github.com/spinyfin/mono/pull/12")),
         ]
         for (field, other) in flips {
@@ -885,6 +891,34 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         XCTAssertEqual(links?.prLabel, "mono#3356")
     }
 
+    func testHeaderWorkLinksLeadWithProductAndProject() {
+        let live = Self.makeLiveState(
+            projectName: "ISEE practice: platform",
+            workItemId: "task_header",
+            workItemName: "Worker pane header",
+            workItemShortId: 11,
+            productId: "prod_isse",
+            productName: "isse",
+            prURL: "https://github.com/spinyfin/isse/pull/6"
+        )
+        let links = WorkerSlotSnapshot.build(slot: WorkerSlot(slotId: 1, runId: "exec-1"), liveState: live)
+            .headerWorkLinks
+        XCTAssertEqual(links?.productName, "isse")
+        XCTAssertEqual(links?.projectName, "ISEE practice: platform")
+        XCTAssertEqual(links?.shortIdLabel, "T11")
+        XCTAssertEqual(links?.prLabel, "isse#6")
+
+        // No project (a chore) and no PR yet: both parts are left out.
+        let chore = Self.makeLiveState(
+            workItemId: "task_chore", workItemShortId: 12, productId: "prod_isse", productName: "isse"
+        )
+        let choreLinks = WorkerSlotSnapshot.build(slot: WorkerSlot(slotId: 1, runId: "exec-1"), liveState: chore)
+            .headerWorkLinks
+        XCTAssertEqual(choreLinks?.productName, "isse")
+        XCTAssertNil(choreLinks?.projectName)
+        XCTAssertNil(choreLinks?.prLabel)
+    }
+
     func testHeaderWorkLinksOmitsPRWhenNone() {
         let live = Self.makeLiveState(
             workItemId: "task_header",
@@ -943,6 +977,23 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         XCTAssertEqual(WorkerSlotSnapshot.shortIdLabel(workItemId: "task_header", shortId: 42), "T42")
         XCTAssertEqual(WorkerSlotSnapshot.shortIdLabel(workItemId: "chore_header", shortId: 7), "T7")
         XCTAssertEqual(WorkerSlotSnapshot.shortIdLabel(workItemId: "proj_header", shortId: 9), "P9")
+    }
+
+    func testReviewGuideHeaderRevealsOwningTask() throws {
+        let client = EngineClient(socketPath: "/tmp/guide-header.sock")
+        let live = try XCTUnwrap(client.parseWorkerLiveState([
+            "slot_id": 1, "run_id": "run-guide", "model": "opus", "activity": "working",
+            "work_item_id": "prgc_comparison", "work_item_name": "Review guide: PR title",
+            "owning_work_item_id": "task_owner", "owning_work_item_title": "Owning task",
+            "work_item_short_id": 42, "product_id": "prod_boss",
+        ]))
+        let links = WorkerSlotSnapshot.build(
+            slot: WorkerSlot(slotId: 1, runId: "run-guide"), liveState: live
+        ).headerWorkLinks
+        XCTAssertEqual(live.workItemId, "prgc_comparison")
+        XCTAssertEqual(links?.workItemId, "task_owner")
+        XCTAssertEqual(links?.title, "Owning task")
+        XCTAssertEqual(links?.shortIdLabel, "T42")
     }
 
     func testParseHeaderWorkItemFields() throws {
@@ -1065,8 +1116,11 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         viewerAttachError: String? = nil,
         workItemId: String? = nil,
         workItemName: String? = nil,
+        owningWorkItemId: String? = nil,
+        owningWorkItemTitle: String? = nil,
         workItemShortId: Int? = nil,
         productId: String? = nil,
+        productName: String? = nil,
         prURL: String? = nil
     ) -> WorkerLiveState {
         WorkerLiveState(
@@ -1096,8 +1150,11 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             viewerAttachError: viewerAttachError,
             workItemId: workItemId,
             workItemName: workItemName,
+            owningWorkItemId: owningWorkItemId,
+            owningWorkItemTitle: owningWorkItemTitle,
             workItemShortId: workItemShortId,
             productId: productId,
+            productName: productName,
             prURL: prURL
         )
     }
