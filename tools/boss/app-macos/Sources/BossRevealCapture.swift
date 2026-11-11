@@ -50,7 +50,7 @@ enum BossRevealCapture {
             BossWorkSwitcherCapture.start(path: path, hidden: state == "switcher-hidden", updateModel: updateModel)
             return
         }
-        if state == "work-search-idle" || state == "work-search-filter" || state == "work-search-reveal" {
+        if state.hasPrefix("work-search-") {
             BossWorkSearchCapture.start(path: path, state: state, updateModel: updateModel)
             return
         }

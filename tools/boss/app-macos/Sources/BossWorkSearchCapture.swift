@@ -4,11 +4,13 @@ import SwiftUI
 import UpdateCore
 
 /// Quiet fixtures of the work-board search chrome: `--capture-reveal-state=
-/// work-search-idle | work-search-filter | work-search-reveal --capture-to`.
+/// work-search-idle | work-search-filter | work-search-reveal |
+/// work-search-agents | work-search-find --capture-to`.
 ///
 /// `work-search-idle` is the board with SwiftUI's toolbar search empty.
 /// `work-search-filter` types a short id so the filter banner and matching
-/// parent+revision cards are visible. `work-search-reveal` starts from that
+/// parent+revision cards are visible (the revision has no matching text).
+/// `work-search-reveal` starts from that
 /// hiding filter and reveals a non-matching card, which must clear search.
 @MainActor
 enum BossWorkSearchCapture {
@@ -41,7 +43,7 @@ enum BossWorkSearchCapture {
         }
         let parent = task("task-parent", "Short-id parent", shortID: 2801, status: "active")
         let revision = task(
-            "task-revision", "Revision of 2801", shortID: 2900, status: "active",
+            "task-revision", "Improve search ranking", shortID: 2900, status: "active",
             kind: "revision", parent: parent.id
         )
         let unrelated = task("task-unrelated", "Unrelated banana", shortID: 3000, status: "todo")
@@ -61,13 +63,22 @@ enum BossWorkSearchCapture {
         ))
         model.setNavigationMode(.work, refreshWorkOnEntry: false)
         switch state {
-        case "work-search-idle":
+        case "work-search-idle", "work-search-find":
             model.workSearchText = ""
         case "work-search-filter":
             model.workSearchText = "2801"
+            precondition(model.visibleWorkItems.contains { $0.id == revision.id })
+            precondition(!model.visibleWorkItems.contains { $0.id == unrelated.id })
         case "work-search-reveal":
-            model.workSearchText = "Banana"
+            model.workSearchText = "2801"
+            precondition(!model.visibleWorkItems.contains { $0.id == unrelated.id })
+            fputs("Reveal target absent before reveal under query 2801\n", stderr)
             model.revealWorkCard(unrelated.id, productID: product.id)
+            precondition(model.workSearchText.isEmpty)
+            precondition(model.visibleWorkItems.contains { $0.id == unrelated.id })
+        case "work-search-agents":
+            model.workSearchText = "2801"
+            model.setNavigationMode(.agents, refreshWorkOnEntry: false)
         default:
             fputs("unknown work-search capture state: \(state)\n", stderr)
             exit(1)
@@ -84,13 +95,37 @@ enum BossWorkSearchCapture {
         captureWindow.contentView?.layoutSubtreeIfNeeded()
         DispatchQueue.main.asyncAfter(deadline: .now() + max(BossCaptureArgs.shared.captureAfter, 1.0)) {
             captureWindow.contentView?.layoutSubtreeIfNeeded()
-            do {
-                try BossWindowCapture.captureWindow(captureWindow, to: path)
-                NSApp.terminate(nil)
-            } catch {
-                fputs("work-search capture failed: \(error)\n", stderr)
+            if state == "work-search-find" {
+                let event = NSEvent.keyEvent(
+                    with: .keyDown, location: .zero, modifierFlags: .command,
+                    timestamp: 0, windowNumber: captureWindow.windowNumber,
+                    context: nil, characters: "f", charactersIgnoringModifiers: "f",
+                    isARepeat: false, keyCode: 3
+                )!
+                precondition(captureWindow.performKeyEquivalent(with: event), "Find shortcut was not handled")
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                finishCapture(captureWindow, path: path, state: state)
+            }
+        }
+    }
+
+    private static func finishCapture(_ captureWindow: NSWindow, path: String, state: String) {
+        if state == "work-search-find" {
+            guard let editor = captureWindow.firstResponder as? NSTextView,
+                  let field = editor.delegate as? NSSearchField,
+                  field.placeholderString == "Search tasks…" else {
+                fputs("Find did not focus the toolbar search field\n", stderr)
                 exit(1)
             }
+            fputs("Command-F focused the toolbar search field\n", stderr)
+        }
+        do {
+            try BossWindowCapture.captureWindow(captureWindow, to: path)
+            NSApp.terminate(nil)
+        } catch {
+            fputs("work-search capture failed: \(error)\n", stderr)
+            exit(1)
         }
     }
 }

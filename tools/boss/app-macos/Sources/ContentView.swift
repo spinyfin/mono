@@ -29,6 +29,14 @@ struct ContentView: View {
         Binding(get: { model.isWorkSidebarHidden ? .detailOnly : .all },
                 set: { model.isWorkSidebarHidden = $0 == .detailOnly })
     }
+    @FocusState private var workSearchFocused: Bool
+    // The hidden Work tree still contributes to the shared window toolbar.
+    private var workSearchBinding: Binding<String> {
+        Binding(
+            get: { model.navigationMode == .work ? model.workSearchText : "" },
+            set: { if model.navigationMode == .work { model.workSearchText = $0 } }
+        )
+    }
     @State private var showCoordinatorResetConfirmFromBanner = false
     @Environment(\.openWindow) private var openWindow
     @AppStorage(KanbanBoardStyle.storageKey, store: BossDefaults.store) private var kanbanBoardStyle: KanbanBoardStyle = .productDefault
@@ -76,10 +84,21 @@ struct ContentView: View {
             .opacity(model.navigationMode == .work ? 1 : 0)
             .allowsHitTesting(model.navigationMode == .work)
             .searchable(
-                text: $model.workSearchText,
+                text: workSearchBinding,
                 placement: .toolbar,
                 prompt: "Search tasks…"
             )
+            .searchFocused($workSearchFocused)
+            .disabled(model.navigationMode != .work)
+            .background {
+                Button("Find tasks") { workSearchFocused = true }
+                    .keyboardShortcut("f", modifiers: .command)
+                    .hidden()
+                    .disabled(model.navigationMode != .work)
+            }
+            .onChange(of: model.navigationMode) { _, mode in
+                if mode != .work { workSearchFocused = false }
+            }
 
             agentsView
                 .opacity(model.navigationMode == .agents ? 1 : 0)
