@@ -95,6 +95,8 @@ struct WorkerLiveState {
     let workItemShortId: Int?
     /// Product that owns `workItemId`. Needed to reveal the Work card.
     let productId: String?
+    /// Display name of `productId`, as the left nav shows it.
+    let productName: String?
     /// GitHub PR URL bound to the work item; updates when a PR is opened
     /// mid-run.
     let prURL: String?
@@ -149,6 +151,7 @@ struct WorkerLiveState {
         workItemName: String? = nil,
         workItemShortId: Int? = nil,
         productId: String? = nil,
+        productName: String? = nil,
         prURL: String? = nil
     ) {
         self.hungSince = hungSince
@@ -180,6 +183,7 @@ struct WorkerLiveState {
         self.workItemName = workItemName
         self.workItemShortId = workItemShortId
         self.productId = productId
+        self.productName = productName
         self.prURL = prURL
     }
 
@@ -251,6 +255,7 @@ extension WorkerLiveState: Hashable {
             && lhs.workItemName == rhs.workItemName
             && lhs.workItemShortId == rhs.workItemShortId
             && lhs.productId == rhs.productId
+            && lhs.productName == rhs.productName
             && lhs.prURL == rhs.prURL
     }
 
@@ -282,6 +287,7 @@ extension WorkerLiveState: Hashable {
         hasher.combine(workItemName)
         hasher.combine(workItemShortId)
         hasher.combine(productId)
+        hasher.combine(productName)
         hasher.combine(prURL)
     }
 }
