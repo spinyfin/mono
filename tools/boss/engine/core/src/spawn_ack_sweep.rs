@@ -917,6 +917,22 @@ pub(crate) async fn reap_never_started_spawn(
     .await
 }
 
+/// Occupancy probe for spawn-reap lease release. Production scans the host.
+/// Tests skip that scan: confirmation fixtures keep a live tempdir, and Linux
+/// CI's process table is incomplete (`Occupancy::Unknown`), which would keep
+/// the lease. Occupancy policy is covered by `workspace_lease_release` tests.
+fn spawn_reap_occupancy_probe() -> Option<&'static dyn crate::workspace_lease_release::WorkspaceOccupancy> {
+    #[cfg(test)]
+    {
+        static EMPTY: crate::workspace_lease_release::EmptyOccupancy = crate::workspace_lease_release::EmptyOccupancy;
+        Some(&EMPTY)
+    }
+    #[cfg(not(test))]
+    {
+        None
+    }
+}
+
 /// Shared terminalization and resource release after a confirmation-specific
 /// evidence fence has committed.
 pub(crate) async fn finish_reap(
@@ -1010,11 +1026,12 @@ pub(crate) async fn finish_reap(
     // `lost_workspace_sweep::run_one_pass`. Best-effort: a lease already
     // gone is the common benign case, so failure is `debug`, not `warn`.
     if execution.cube_lease_id.is_some() {
-        crate::workspace_lease_release::release_lease_after_inferred_death(
+        crate::workspace_lease_release::release_lease_after_inferred_death_with(
             ctx.work_db,
             execution,
             crate::workspace_lease_release::PaneStatus::Gone,
             None,
+            spawn_reap_occupancy_probe(),
             Some(ctx.cube_client),
             ctx.cube_client.force_release_lease(
                 execution.cube_lease_id.as_deref().expect("lease checked"),
