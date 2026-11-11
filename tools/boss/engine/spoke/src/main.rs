@@ -306,6 +306,7 @@ async fn serve(args: Args, homes_root: PathBuf) -> Result<()> {
     };
     let tmux_ready = tmux.is_some();
     let (failures, preflights) = watch::channel(vec![PREFLIGHT_PENDING.to_owned()]);
+    let (first_report, first_report_sent) = tokio::sync::oneshot::channel();
     // No hub-reachability check here: a connected daemon is the proof, and a stale
     // failure would keep a reconnected host unschedulable for a whole interval.
     let readiness = boss_spoke_preflight::Config::builder()
@@ -326,8 +327,8 @@ async fn serve(args: Args, homes_root: PathBuf) -> Result<()> {
     tokio::select! {
         result = boss_spoke_outbound::run_with_executor(Arc::clone(&journal), endpoint, stamp, true) => result,
         result = commands::run(Arc::clone(&journal), executor, supervisor, stamp) => result,
-        result = produce(&journal, &args.state_dir, &boot, tmux_ready, preflights) => result,
-        result = preflight_loop(readiness, failures) => result,
+        result = produce(&journal, &args.state_dir, &boot, tmux_ready, preflights, first_report) => result,
+        result = preflight_loop(readiness, failures, first_report_sent) => result,
         result = commands::heartbeat(cube, executions) => result,
         result = boss_spoke_ingress::hooks::serve(hooks, Arc::clone(&journal), stamp) => result,
         result = boss_spoke_ingress::observe(Arc::clone(&journal), stamp) => result,
@@ -336,8 +337,16 @@ async fn serve(args: Args, homes_root: PathBuf) -> Result<()> {
 }
 
 /// Keeps the failing-check list current. It never decides anything itself: the
-/// hub reads the list from capacity reports and holds back new work.
-async fn preflight_loop(config: boss_spoke_preflight::Config, failures: watch::Sender<Vec<String>>) -> Result<()> {
+/// hub reads the list from capacity reports and holds back new work. The first
+/// check waits for the first capacity report, so that report deterministically
+/// carries the pending marker instead of racing the check's outcome.
+async fn preflight_loop(
+    config: boss_spoke_preflight::Config,
+    failures: watch::Sender<Vec<String>>,
+    first_report_sent: tokio::sync::oneshot::Receiver<()>,
+) -> Result<()> {
+    // An Err only means the producer is gone; the select! is ending anyway.
+    let _ = first_report_sent.await;
     let mut interval = tokio::time::interval(PREFLIGHT_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -358,7 +367,9 @@ async fn produce(
     boot: &str,
     tmux_ready: bool,
     preflights: watch::Receiver<Vec<String>>,
+    first_report: tokio::sync::oneshot::Sender<()>,
 ) -> Result<()> {
+    let mut first_report = Some(first_report);
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -399,6 +410,9 @@ async fn produce(
             } else {
                 return Err(error);
             }
+        }
+        if let Some(first_report) = first_report.take() {
+            let _ = first_report.send(());
         }
     }
 }
