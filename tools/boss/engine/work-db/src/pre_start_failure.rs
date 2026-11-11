@@ -110,10 +110,10 @@ impl WorkDb {
              SELECT t.id,
                     (t.status = 'blocked' AND t.blocked_reason = '{refused}'),
                     COALESCE(
-                        NULLIF(t.pr_url, ''),
                         (SELECT x.pr_url FROM work_executions x
                           WHERE x.work_item_id = t.id AND x.pr_url IS NOT NULL AND x.pr_url <> ''
                           ORDER BY x.created_at DESC, x.id DESC LIMIT 1),
+                        NULLIF(t.pr_url, ''),
                         NULLIF(root.pr_url, '')
                     )
              FROM roots r

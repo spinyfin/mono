@@ -112,7 +112,11 @@ impl Board {
             Some(&counter),
         )
         .unwrap();
-        counter.total() as i64
+        // The open positioning-refusal lookup is one statement for the whole
+        // set and is not attributed to a classification branch, so the
+        // cached path's per-branch count excludes it.
+        let hold_lookup = i64::from(!cards.is_empty());
+        counter.total() as i64 - hold_lookup
     }
 
     /// Assemble through the cache and without it, assert the trees are equal,

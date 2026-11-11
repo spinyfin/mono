@@ -130,8 +130,13 @@ pub(super) fn classify(
             || hold_messages.contains_key(&candidate.task.id)
         {
             let mut wait = DispatchWait::named(DISPATCH_WAIT_REASON_WORKSPACE_POSITIONING_REFUSED);
+            // `blocked_detail` belongs to the hold only when the hold rewrote
+            // the row; a review-phase hold leaves the earlier conflict / CI
+            // diagnostic there, which must not stand in for cube's message.
+            let hold_rewrote_row =
+                candidate.task.blocked_reason.as_deref() == Some(DISPATCH_WAIT_REASON_WORKSPACE_POSITIONING_REFUSED);
             wait.label = positioning_hold_label(
-                candidate.task.blocked_detail.as_deref(),
+                candidate.task.blocked_detail.as_deref().filter(|_| hold_rewrote_row),
                 hold_messages.get(&candidate.task.id).map(String::as_str),
             )
             .or(wait.label);

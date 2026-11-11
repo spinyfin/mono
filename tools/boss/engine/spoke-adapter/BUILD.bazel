@@ -67,6 +67,7 @@ rust_library(
     visibility = ["//tools/boss/engine/app:__pkg__"],
     deps = [
         "//tools/boss/engine/execution-contracts:execution_contracts_test_support",
+        "//tools/boss/engine/host-execution",
         "//tools/boss/engine/recovery",
         "//tools/boss/engine/spoke-stream",
         "//tools/boss/engine/structured-output",

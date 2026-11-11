@@ -287,6 +287,38 @@ async fn recheck_sweep_restarts_a_held_item_on_its_own_once_the_refusal_clears()
 }
 
 #[tokio::test]
+async fn recheck_sweep_never_approves_a_deferred_held_item() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let (item, _) = refused_revision_fixture(&db);
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET deferred = 1 WHERE id = ?1", rusqlite::params![item])
+        .unwrap();
+    let coordinator = recheck_coordinator(&db);
+
+    let outcome = crate::positioning_refusal_recheck_sweep::run_one_pass(&db, &coordinator, &fixed_probe(true)).await;
+    assert_eq!(outcome.cleared, 1);
+
+    let deferred: i64 = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT deferred FROM tasks WHERE id = ?1",
+            rusqlite::params![item],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(deferred, 1, "automatic recovery must leave the item deferred");
+    assert_eq!(
+        db.list_executions(Some(&item)).unwrap().len(),
+        1,
+        "no replacement execution may be minted for a deferred item"
+    );
+}
+
+#[tokio::test]
 async fn review_phase_refusal_keeps_in_review_and_rejects_automatic_starts() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
@@ -341,6 +373,60 @@ async fn review_phase_refusal_keeps_in_review_and_rejects_automatic_starts() {
     assert!(task(&db, &item).blocked_reason.is_none());
     assert!(db.list_positioning_holds().unwrap().is_empty());
     assert_review_phase_hold_cleared(&db, &item);
+}
+
+#[tokio::test]
+async fn review_phase_hold_label_ignores_an_earlier_ci_diagnostic() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let (product_id, _) = make_pr_review_fixture(&db, None);
+    let item = create_test_chore_manual(&db, product_id, "Reviewed with CI diagnostic").id;
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'in_review', blocked_reason = 'ci_failure',
+                 blocked_detail = 'CI failed: unit tests', pr_url = 'https://github.com/spinyfin/mono/pull/5'
+             WHERE id = ?1",
+            rusqlite::params![item],
+        )
+        .unwrap();
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(item.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Claimed)
+                .pr_url("https://github.com/spinyfin/mono/pull/5")
+                .build(),
+        )
+        .unwrap();
+    db.record_workspace_positioning_refusal(
+        &execution.id,
+        "worker",
+        None,
+        "Cube command failed: refused",
+        "PR 5 is MERGED",
+    )
+    .unwrap();
+    let held = task(&db, &item);
+    assert_eq!(held.blocked_reason.as_deref(), Some("ci_failure"));
+    assert_eq!(held.blocked_detail.as_deref(), Some("CI failed: unit tests"));
+    assert_review_phase_hold_surfaces(&db, &item, "PR 5 is MERGED");
+    let label = db.get_task_runtime(&item).unwrap().dispatch_wait_label.unwrap();
+    assert!(!label.contains("CI failed"), "{label}");
+
+    let coordinator = recheck_coordinator(&db);
+    crate::positioning_refusal_recheck_sweep::run_one_pass(&db, &coordinator, &fixed_probe(true)).await;
+    assert_review_phase_hold_cleared(&db, &item);
+    assert_eq!(
+        task(&db, &item).blocked_detail.as_deref(),
+        Some("CI failed: unit tests")
+    );
+    let label = db.get_task_runtime(&item).unwrap().dispatch_wait_label;
+    assert!(
+        label.as_deref().is_none_or(|l| !l.starts_with("Workspace blocked")),
+        "{label:?}"
+    );
 }
 
 #[tokio::test]
@@ -451,7 +537,7 @@ async fn recheck_sweep_does_not_reopen_a_retired_spawning_attempt() {
 }
 
 #[test]
-fn refusal_without_a_pr_tells_the_operator_to_launch_manually() {
+fn refusal_without_a_pr_says_the_item_must_be_launched_manually() {
     let dir = tempdir().unwrap();
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
     let (product_id, _) = make_pr_review_fixture(&db, None);

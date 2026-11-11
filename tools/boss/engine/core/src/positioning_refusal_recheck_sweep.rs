@@ -128,9 +128,15 @@ pub async fn run_one_pass(
         match work_db.clear_positioning_hold(&hold.work_item_id) {
             Ok(true) => {
                 outcome.cleared += 1;
-                if hold.restarts {
+                // A deferred item stays parked: only a human approves it, and the
+                // request below would mint an execution for it regardless.
+                let deferred = matches!(
+                    work_db.get_work_item(&hold.work_item_id),
+                    Ok(boss_protocol::WorkItem::Task(ref t) | boss_protocol::WorkItem::Chore(ref t)) if t.deferred
+                );
+                if hold.restarts && !deferred {
                     // Ordinary request, not an explicit start: automatic recovery
-                    // must not clear `deferred` or reopen a retired spawning attempt.
+                    // must not reopen a retired spawning attempt.
                     match work_db.request_execution_with_live_check(
                         RequestExecutionInput::builder()
                             .work_item_id(hold.work_item_id.clone())
