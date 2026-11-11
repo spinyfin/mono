@@ -106,6 +106,7 @@ mod guidance;
 mod handoff;
 mod idea_args;
 mod idea_commands;
+mod operator_question_text;
 mod output;
 mod project_create_args;
 mod report;

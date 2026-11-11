@@ -433,8 +433,8 @@ struct AttentionMemberRow: View {
     private var yesNoControl: some View {
         Picker("", selection: yesNoBinding) {
             Text("—").tag("")
-            Text("Yes").tag("yes")
-            Text("No").tag("no")
+            Text(member.optionLabels?.yes ?? "Yes").tag("yes")
+            Text(member.optionLabels?.no ?? "No").tag("no")
         }
         .labelsHidden()
         .pickerStyle(.segmented)

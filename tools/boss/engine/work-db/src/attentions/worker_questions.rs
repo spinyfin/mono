@@ -28,14 +28,25 @@ pub fn create_in_tx(
         OperatorAnswerType::YesNo => ("yes_no", None),
         OperatorAnswerType::MultipleChoice { choices } => ("multiple_choice", Some(serde_json::to_string(choices)?)),
         OperatorAnswerType::CreatePrerequisiteTask { name, brief, .. } => {
-            prompt.push_str(&format!("\n\nPrerequisite: {name}\n\n{brief}\n\nYes creates or links this prerequisite for the work that handles this answer."));
+            let (yes, no) = question
+                .answer_type
+                .option_labels()
+                .map_or(("Yes", "No"), |labels| (labels.yes.as_str(), labels.no.as_str()));
+            prompt.push_str(&format!("\n\nPrerequisite: {name}\n\n{brief}\n\n{yes} creates or links this prerequisite for the work that handles this answer."));
             if let Some(spec) = question.answer_type.file_count_bypass() {
                 prompt.push_str(&format!(
-                    " No authorizes a change/file-count exception for this PR only, up to {} files (limit {}), and the work continues in one PR.",
+                    " {no} authorizes a change/file-count exception for this PR only, up to {} files (limit {}), and the work continues in one PR.",
                     spec.files, spec.limit
                 ));
             }
-            ("yes_no", None)
+            (
+                "yes_no",
+                question
+                    .answer_type
+                    .option_labels()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+            )
         }
     };
     create_attention_in_tx(
@@ -191,7 +202,11 @@ pub(super) fn apply_typed_answer_in_tx(
             super::super::pr_flow::file_count_bypass_authorization_block(&question, spec, &timestamp)
         }
         QuestionSuccessor::FinishedPr | QuestionSuccessor::NoPr => format!(
-            "\n\n## Recorded answer ({timestamp})\n\nThe operator answered No to: {}\n\nThis successor does not continue an open PR from the original work. This answer is context only and grants no authorization for a new PR; exceeding the file-count limit requires fresh approval.\n",
+            "\n\n## Recorded answer ({timestamp})\n\nThe operator answered {} to: {}\n\nThis successor does not continue an open PR from the original work. This answer is context only and grants no authorization for a new PR; exceeding the file-count limit requires fresh approval.\n",
+            question
+                .answer_type
+                .option_labels()
+                .map_or("No", |labels| labels.no.as_str()),
             question.text
         ),
     };

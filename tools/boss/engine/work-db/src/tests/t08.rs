@@ -526,6 +526,129 @@ fn action_question_without_source_task_creates_design_task() {
 }
 
 #[test]
+fn labelled_yes_no_attention_stores_canonical_answer_and_rejects_typos() {
+    let (db, _product, project_id, _task) = fixture();
+    let labels = serde_json::to_string(&boss_protocol::AnswerOptionLabels::split_or_bypass()).unwrap();
+    let make = |doc: &str| {
+        let input = CreateAttentionInput::builder()
+            .kind("question")
+            .association_project_id(&project_id)
+            .source_kind("design_doc")
+            .source_doc_path(doc)
+            .question_type("yes_no")
+            .choice_options(labels.clone())
+            .prompt_text("Split or bypass?")
+            .build();
+        db.create_attention(input).unwrap().0
+    };
+    let a = make("docs/split.md");
+    let err = db
+        .answer_attention(&a.id, Some("Bypas limit".to_owned()), false, false)
+        .unwrap_err();
+    assert!(err.to_string().contains("not one of this question's options"), "{err}");
+    let group = db
+        .answer_attention(&a.id, Some("Bypass limit".to_owned()), false, false)
+        .unwrap();
+    let stored = db.list_attentions_for_group(&group.id).unwrap();
+    assert_eq!(stored[0].answer.as_deref(), Some("no"));
+
+    let b = make("docs/split2.md");
+    let group = db
+        .answer_attention(&b.id, Some("Split".to_owned()), false, false)
+        .unwrap();
+    assert_eq!(
+        db.list_attentions_for_group(&group.id).unwrap()[0].answer.as_deref(),
+        Some("yes")
+    );
+}
+
+/// A split-vs-bypass worker question answered with the named "Bypass limit"
+/// option is stored as the canonical No, and the answer consumer then reads the
+/// stored file-count spec and records the scoped authorization on the successor.
+/// Answering "Split" must not.
+#[test]
+fn named_bypass_answer_reaches_the_file_count_bypass_consumer() {
+    let (db, product_id, project_id, _task_id) = fixture();
+    let run = |answer: &str| {
+        // A parent with an open PR, so the answer continues that PR as a revision.
+        let task = db
+            .create_task(
+                CreateTaskInput::builder()
+                    .product_id(product_id.clone())
+                    .project_id(project_id.clone())
+                    .name(format!("Parent for {answer}"))
+                    .build(),
+            )
+            .unwrap();
+        let task_id = task.id.clone();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET pr_url = 'https://github.com/example/repo/pull/1' WHERE id = ?1",
+                [&task_id],
+            )
+            .unwrap();
+        let task = read_task(&db, &task_id);
+        let execution = create_ready_chore_execution(&db, task_id.clone());
+        let question = boss_protocol::OperatorQuestion {
+            text: "Split this 48-file change (limit 30), or bypass the limit?".to_owned(),
+            answer_type: boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
+                name: "Extract the first capability".to_owned(),
+                brief: "Land the first capability as its own PR.".to_owned(),
+                file_count_bypass: Some(boss_protocol::FileCountBypassSpec { files: 48, limit: 30 }),
+                option_labels: Some(boss_protocol::AnswerOptionLabels::split_or_bypass()),
+            },
+            explanation: "Context:\nToo big.\nSplit:\nLand the first PR.\nBypass limit:\nKeep one PR.\nRecommendation:\nBypass limit".to_owned(),
+        };
+        let conn = db.connect().unwrap();
+        let (attention, _group) =
+            crate::attentions::worker_questions::create_in_tx(&conn, &task, &execution.id, &question).unwrap();
+        // The asking run records its question; the parent is not parked on it.
+        conn.execute(
+            "INSERT INTO operator_questions
+             (id, work_item_id, execution_id, proposal_id, question_json, status, withdrawn_reason, created_at)
+             VALUES (?1, ?2, ?3, 'prop_example', ?4, 'withdrawn', 'task_not_parkable', '1')",
+            rusqlite::params![
+                format!("oq_{}", execution.id),
+                task_id,
+                execution.id,
+                serde_json::to_string(&question).unwrap()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        let group = db
+            .answer_attention(&attention.id, Some(answer.to_owned()), false, false)
+            .unwrap();
+        let stored = db.list_attentions_for_group(&group.id).unwrap();
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let actioned = db
+            .action_attention_group(&group.id, false, &Default::default(), &checker)
+            .unwrap();
+        (
+            stored[0].answer.clone(),
+            read_task(&db, &actioned.produced_work_item_ids[0]).description,
+        )
+    };
+
+    let (stored, description) = run("Bypass limit");
+    assert_eq!(stored.as_deref(), Some("no"));
+    assert!(
+        !description.contains("A No answer does not authorize the proposed action."),
+        "{description}"
+    );
+    assert!(description.contains("## Repo owner approval"), "{description}");
+    assert!(
+        description.contains("up to 48 files (repository limit 30)"),
+        "{description}"
+    );
+
+    let (stored, description) = run("Split");
+    assert_eq!(stored.as_deref(), Some("yes"));
+    assert!(!description.contains("## Repo owner approval"), "{description}");
+}
+
+#[test]
 fn action_followup_group_creates_tasks() {
     let (db, _product, project_id, task_id) = fixture();
     let (a1, _g) = db.create_attention(followup(&task_id, "extract helper")).unwrap();

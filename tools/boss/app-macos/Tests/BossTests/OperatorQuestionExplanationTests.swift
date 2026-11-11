@@ -61,4 +61,37 @@ final class OperatorQuestionExplanationTests: XCTestCase {
         XCTAssertNil(OperatorQuestionExplanation("Context:\nPick.\nRecommendation:\n"))
         XCTAssertNil(OperatorQuestionExplanation("Context:\nPick.\nYes:\nA\nRecommendation:\nB"))
     }
+
+    private let named = """
+    Context:
+    The change is 48 files against a limit of 30.
+    Split:
+    Land the first PR, then finish the rest.
+    Bypass limit:
+    Keep one PR with a one-time exception.
+    Recommendation:
+    I recommend Bypass limit because the change is one unit.
+    """
+    private let labels = AnswerOptionLabels(yes: "Split", no: "Bypass limit")
+
+    func testSectionsAreNamedForTheEnginesOptionLabels() throws {
+        let value = try XCTUnwrap(OperatorQuestionExplanation(named, optionLabels: labels))
+        XCTAssertEqual(value.yes, "Land the first PR, then finish the rest.")
+        XCTAssertEqual(value.no, "Keep one PR with a one-time exception.")
+        XCTAssertEqual(value.yesLabel, "Split")
+        XCTAssertEqual(value.noLabel, "Bypass limit")
+        XCTAssertEqual(value.recommendation, "I recommend Bypass limit because the change is one unit.")
+        // Without the engine's names, the named sections are not Yes/No sections.
+        XCTAssertNil(try XCTUnwrap(OperatorQuestionExplanation(named)).yes)
+        let withDetails = try XCTUnwrap(OperatorQuestionExplanation(named + "\nDetails:\nBypass limit:\nverbatim", optionLabels: labels))
+        XCTAssertEqual(withDetails.details, "Bypass limit:\nverbatim")
+    }
+
+    func testAnExplanationWrittenBeforeOptionsWereNamedStillReadsOnALabelledQuestion() throws {
+        let value = try XCTUnwrap(OperatorQuestionExplanation(plain, optionLabels: labels))
+        XCTAssertEqual(value.yesLabel, "Yes")
+        XCTAssertEqual(value.noLabel, "No")
+        XCTAssertEqual(value.yes, "Resend only actions that never left. Smaller change.")
+        XCTAssertEqual(try XCTUnwrap(OperatorQuestionExplanation(plain)).yesLabel, "Yes")
+    }
 }

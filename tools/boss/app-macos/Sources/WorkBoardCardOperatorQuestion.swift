@@ -3,7 +3,8 @@ import SwiftUI
 // ===========================================================================
 // The inline question on a Doing ▸ Queued card: what a blocked
 // worker asked the user, a "Why?" disclosure with the full detail, and
-// Yes / No buttons (or one button per option for a multiple-choice question).
+// two buttons — Yes / No, or the names the engine gave the two actions — or
+// one button per option for a multiple-choice question.
 //
 // Equatable over its own [[OperatorQuestionPresentation]] so a live-status
 // flip elsewhere on the card does not re-lay-out the block. The answer
@@ -40,7 +41,7 @@ struct WorkBoardCardOperatorQuestion: View, @MainActor Equatable {
     var body: some View {
         let question = slice.presentation
         VStack(alignment: .leading, spacing: 6) {
-            if let explanation = OperatorQuestionExplanation(question.explanation) {
+            if let explanation = OperatorQuestionExplanation(question.explanation, optionLabels: question.optionLabels) {
                 OperatorQuestionDecisionContent(question: question.text, explanation: explanation)
             } else {
                 // Three lines inline; the whole text is in the tooltip and the
@@ -63,10 +64,12 @@ struct WorkBoardCardOperatorQuestion: View, @MainActor Equatable {
                     whyButton(question)
                     Spacer(minLength: 0)
                     // No default action on either button: a stray Return must not
-                    // authorize a bypass.
-                    Button("Yes") { onAnswer?(.yesNo(true)) }
+                    // authorize a bypass. A question whose answers are distinct
+                    // actions shows the engine's names for them; the answer sent
+                    // is still the yes/no the position stands for.
+                    Button(question.optionLabels?.yes ?? "Yes") { onAnswer?(.yesNo(true)) }
                         .accessibilityIdentifier("operator-question-yes")
-                    Button("No") { onAnswer?(.yesNo(false)) }
+                    Button(question.optionLabels?.no ?? "No") { onAnswer?(.yesNo(false)) }
                         .accessibilityIdentifier("operator-question-no")
                 }
                 .controlSize(.small)
@@ -130,7 +133,7 @@ struct OperatorQuestionDetailPopover: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
-                if let explanation = OperatorQuestionExplanation(question.explanation) {
+                if let explanation = OperatorQuestionExplanation(question.explanation, optionLabels: question.optionLabels) {
                     OperatorQuestionDecisionContent(question: question.text, explanation: explanation)
                 } else {
                     section("Question", question.text)
@@ -140,7 +143,7 @@ struct OperatorQuestionDetailPopover: View {
                 }
                 DisclosureGroup("Details", isExpanded: $showingTechnicalDetails) {
                     VStack(alignment: .leading, spacing: 10) {
-                        if let details = OperatorQuestionExplanation(question.explanation)?.details {
+                        if let details = OperatorQuestionExplanation(question.explanation, optionLabels: question.optionLabels)?.details {
                             section("Technical details", details)
                         }
                         if let proposed = question.prerequisiteTask {

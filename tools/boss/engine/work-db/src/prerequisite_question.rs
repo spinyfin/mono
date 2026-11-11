@@ -340,6 +340,7 @@ mod tests {
                 name: "Fix the shared fixture".to_owned(),
                 brief: "Fix the shared fixture on main.".to_owned(),
                 file_count_bypass: None,
+                option_labels: None,
             })
             .explanation("CI cannot go green until the fixture is fixed on main.")
             .asked_at("2026-10-23")

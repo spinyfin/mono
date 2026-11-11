@@ -672,6 +672,30 @@ impl WorkDb {
         if new_state == "answered" && group.kind == "question" && answer.is_none() {
             bail!("answering a question attention requires an answer value");
         }
+        // A yes/no question that names its two options is answered by the
+        // option's name or by the canonical tag; store only the canonical tag
+        // so downstream consumers (prerequisite creation, file-count bypass)
+        // see `yes` / `no`, and a typo fails instead of silently applying
+        // neither path.
+        let answer = match (new_state, answer) {
+            ("answered", Some(value)) if before.question_type.as_deref() == Some("yes_no") => {
+                let labels = before
+                    .choice_options
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<boss_protocol::AnswerOptionLabels>(raw).ok());
+                match labels {
+                    Some(labels) if value == labels.yes => Some("yes".to_owned()),
+                    Some(labels) if value == labels.no => Some("no".to_owned()),
+                    Some(labels) if value != "yes" && value != "no" => bail!(
+                        "answer {value:?} is not one of this question's options: {:?}, {:?} (or yes / no)",
+                        labels.yes,
+                        labels.no
+                    ),
+                    _ => Some(value),
+                }
+            }
+            (_, answer) => answer,
+        };
         let answered_at = if new_state == "answered" {
             Some(now_string())
         } else {

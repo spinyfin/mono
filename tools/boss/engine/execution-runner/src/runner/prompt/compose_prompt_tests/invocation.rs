@@ -265,6 +265,12 @@ fn run_done_seam_on_worker_signal_seam_off_teaches_summary_not_blocked_verb() {
         "file-count guidance must teach the split-vs-bypass flags:\n{prompt}",
     );
     assert!(
+        prompt.contains("two buttons named for the actions, Split and Bypass limit")
+            && prompt.contains("`Split:` and `Bypass limit:` sections instead of `Yes:` and `No:`")
+            && prompt.contains("question answered Bypass limit by the repo owner on <date>"),
+        "file-count guidance must name the options, not Yes/No:\n{prompt}",
+    );
+    assert!(
         prompt.contains("Never apply that bypass without the recorded authorization"),
         "file-count guidance must forbid applying the bypass without approval:\n{prompt}",
     );

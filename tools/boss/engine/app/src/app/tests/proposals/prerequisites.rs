@@ -133,6 +133,7 @@ async fn prerequisite_question_reads_like_the_yes_no_question_and_carries_the_pr
             name: PREREQUISITE_NAME.into(),
             brief: "The shared fixture races retention cleanup. Fix it on main.".into(),
             file_count_bypass: None,
+            option_labels: None,
         }
     );
 }
@@ -675,7 +676,7 @@ pub(super) fn file_count_split_payload() -> Value {
             "name": FILE_COUNT_SPLIT_NAME,
             "brief":"Land the first capability as its own PR. The remainder stays on this task.",
             "file_count_bypass":{"files":48,"limit":30}},
-        "explanation":"The change is 48 files against a limit of 30. Yes lands the first PR; No keeps this PR and applies a file-count exception."
+        "explanation":"Context:\nThe change is 48 files against a limit of 30.\nSplit:\nLand the first PR, then finish the rest.\nBypass limit:\nKeep this PR and apply a file-count exception.\nRecommendation:\nI recommend Bypass limit because the change is one unit."
     }})
 }
 
@@ -685,7 +686,7 @@ async fn file_count_split_question_states_count_limit_and_first_pr() {
     let question = question_task(&state, &task_id).operator_question.unwrap();
     assert_eq!(
         question.text,
-        "Split this 48-file change (limit 30) by landing 'Extract the first capability' first, or keep it in one PR?"
+        "Split this 48-file change (limit 30) by landing 'Extract the first capability' first, or bypass the limit and keep it in one PR?"
     );
     assert_eq!(
         question.answer_type,
@@ -693,6 +694,8 @@ async fn file_count_split_question_states_count_limit_and_first_pr() {
             name: FILE_COUNT_SPLIT_NAME.into(),
             brief: "Land the first capability as its own PR. The remainder stays on this task.".into(),
             file_count_bypass: Some(boss_protocol::FileCountBypassSpec { files: 48, limit: 30 }),
+            // The engine, not the worker, names the two actions the card offers.
+            option_labels: Some(boss_protocol::AnswerOptionLabels::split_or_bypass()),
         }
     );
 }
@@ -749,17 +752,17 @@ async fn file_count_split_no_records_scoped_authorization_and_redispatches() {
             .unwrap()
             .len(),
         tasks_before,
-        "No does not create a prerequisite"
+        "Bypass limit does not create a prerequisite"
     );
     assert!(task.description.contains("Repo owner approval"));
-    assert!(task.description.contains("No — keep this change in one PR"));
+    assert!(task.description.contains("Bypass limit — keep this change in one PR"));
     assert!(
         task.description
             .contains("change/file-count for this PR only, up to 48 files")
     );
     assert!(
         task.description
-            .contains("BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered No by the repo owner on ")
+            .contains("BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered Bypass limit by the repo owner on ")
     );
     assert!(
         task.description
@@ -773,6 +776,113 @@ async fn file_count_split_no_records_scoped_authorization_and_redispatches() {
             .unwrap()
             .iter()
             .any(|e| e.status == boss_protocol::ExecutionStatus::Ready && e.id != old_execution),
-        "No mints a ready execution so the worker finishes in one PR"
+        "Bypass limit mints a ready execution so the worker finishes in one PR"
+    );
+}
+
+async fn answer_by_name(state: &Arc<ServerState>, id: &str, option: &str) -> FrontendEvent {
+    call_with_peer(
+        state,
+        None,
+        FrontendRequest::AnswerOperatorQuestion {
+            id: id.into(),
+            answer: boss_protocol::OperatorAnswer::MultipleChoice { value: option.into() },
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn file_count_split_is_answerable_by_option_name() {
+    let (state, _dir, _, task_id) = parked_task_with_question(file_count_split_payload()).await;
+    let question = question_task(&state, &task_id).operator_question.unwrap();
+    // A name that is not one of the offered options is refused and leaves the card open.
+    let FrontendEvent::OperatorQuestionError {
+        error: boss_protocol::OperatorQuestionError::ValidationFailed { message },
+    } = answer_by_name(&state, &question.id, "Keep it").await
+    else {
+        panic!("an unknown option must be refused");
+    };
+    assert!(
+        message.contains("Split") && message.contains("Bypass limit"),
+        "{message}"
+    );
+    assert!(question_task(&state, &task_id).operator_question.is_some());
+
+    let FrontendEvent::WorkItemUpdated {
+        item: boss_work_db::WorkItem::Task(task),
+    } = answer_by_name(&state, &question.id, "Bypass limit").await
+    else {
+        panic!("expected updated task");
+    };
+    assert_eq!(task.status, boss_protocol::TaskStatus::Todo);
+    assert!(task.description.contains("Bypass limit — keep this change in one PR"));
+    // The recorded answer is the Yes/No it stands for, so a retry by the other
+    // spelling is the same answer, not a conflict.
+    let history = state.work_db.list_operator_questions(&task_id).unwrap();
+    assert_eq!(
+        history[0].answer,
+        Some(boss_protocol::OperatorAnswer::YesNo { value: false })
+    );
+    assert!(matches!(
+        answer_question(&state, &question.id, false).await,
+        FrontendEvent::WorkItemUpdated { .. }
+    ));
+    assert!(matches!(
+        answer_by_name(&state, &question.id, "Split").await,
+        FrontendEvent::OperatorQuestionError {
+            error: boss_protocol::OperatorQuestionError::Conflict { .. }
+        }
+    ));
+}
+
+#[tokio::test]
+async fn naming_the_split_option_creates_the_prerequisite() {
+    let (state, _dir, _, task_id) = parked_task_with_question(file_count_split_payload()).await;
+    let question = question_task(&state, &task_id).operator_question.unwrap();
+    let FrontendEvent::WorkItemUpdated {
+        item: boss_work_db::WorkItem::Task(task),
+    } = answer_by_name(&state, &question.id, "Split").await
+    else {
+        panic!("expected updated task");
+    };
+    assert_eq!(task.blocked_reason.as_deref(), Some("dependency"));
+    assert_eq!(chore_named(&state, &task.product_id, FILE_COUNT_SPLIT_NAME).len(), 1);
+}
+
+#[tokio::test]
+async fn a_question_stored_without_labels_still_answers_yes_no_only() {
+    // Open before option names existed: no `option_labels` on the stored question.
+    let mut payload = file_count_split_payload();
+    payload["question"]["explanation"] = json!("Yes lands the first PR; No keeps one PR.");
+    let (state, _dir, _, task_id) = parked_task_with_question(payload).await;
+    let question = question_task(&state, &task_id).operator_question.unwrap();
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE operator_questions SET question_json = json_remove(question_json, '$.answer_type.option_labels') WHERE id = ?1",
+            [&question.id],
+        )
+        .unwrap();
+    let reloaded = question_task(&state, &task_id).operator_question.unwrap();
+    assert_eq!(reloaded.answer_type.option_labels(), None);
+    assert!(matches!(
+        answer_by_name(&state, &question.id, "Bypass limit").await,
+        FrontendEvent::OperatorQuestionError {
+            error: boss_protocol::OperatorQuestionError::ValidationFailed { .. }
+        }
+    ));
+    let FrontendEvent::WorkItemUpdated {
+        item: boss_work_db::WorkItem::Task(task),
+    } = answer_question(&state, &question.id, false).await
+    else {
+        panic!("expected updated task");
+    };
+    assert!(task.description.contains("No — keep this change in one PR"));
+    assert!(
+        task.description
+            .contains("BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered No by the repo owner on ")
     );
 }

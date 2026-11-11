@@ -322,7 +322,8 @@ struct WorkCardSnapshot: Equatable {
                 errorMessage: context.operatorAnswerError,
                 runSummary: question.runSummary,
                 prerequisiteTask: question.prerequisiteTask,
-                choices: question.choices
+                choices: question.choices,
+                optionLabels: question.optionLabels
             )
         }()
 

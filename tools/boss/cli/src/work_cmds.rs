@@ -1628,50 +1628,8 @@ pub(crate) async fn run_show_leaf(
     print_entity(ctx, &task_json, || {
         print_task_details(label_titlecase(label), &item, Some(&product), with_primary_id);
         for record in &questions {
-            let q = &record.question;
-            println!("\nOperator question {} ({:?}): {}", q.id, record.status, q.text);
-            let answer_type = match &q.answer_type {
-                boss_protocol::OperatorAnswerType::YesNo => "yes_no",
-                boss_protocol::OperatorAnswerType::CreatePrerequisiteTask { .. } => "create_prerequisite_task",
-                boss_protocol::OperatorAnswerType::MultipleChoice { .. } => "multiple_choice",
-            };
-            println!(
-                "  Answer type: {answer_type}; asked: {}; execution: {}",
-                q.asked_at, q.execution_id
-            );
-            println!("  Explanation: {}", q.explanation);
-            if let boss_protocol::OperatorAnswerType::CreatePrerequisiteTask { name, brief, .. } = &q.answer_type {
-                println!("  Proposed prerequisite task: {name}");
-                println!("  Proposed brief:");
-                for line in brief.lines() {
-                    println!("    {line}");
-                }
-                if let Some(spec) = q.answer_type.file_count_bypass() {
-                    println!(
-                        "  File-count split: {} files, limit {}. No authorizes a file-count exception for this PR only.",
-                        spec.files, spec.limit
-                    );
-                }
-            }
-            if let boss_protocol::OperatorAnswerType::MultipleChoice { choices } = &q.answer_type {
-                println!("  Options:");
-                for choice in choices {
-                    println!("    {choice}");
-                }
-            }
-            if let Some(answer) = &record.answer {
-                let answer = match answer {
-                    boss_protocol::OperatorAnswer::YesNo { value } => (if *value { "Yes" } else { "No" }).to_owned(),
-                    boss_protocol::OperatorAnswer::MultipleChoice { value } => value.clone(),
-                };
-                println!(
-                    "  Answer: {answer}; by: {}; at: {}",
-                    record.answered_by.as_deref().unwrap_or(""),
-                    record.answered_at.as_deref().unwrap_or("")
-                );
-            }
-            if let Some(reason) = &record.withdrawn_reason {
-                println!("  Withdrawn: {reason}");
+            for line in crate::operator_question_text::operator_question_lines(record) {
+                println!("{line}");
             }
         }
         print_attention_items_section(&attention_items);

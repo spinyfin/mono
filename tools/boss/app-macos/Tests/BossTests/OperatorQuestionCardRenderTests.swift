@@ -45,6 +45,18 @@ final class OperatorQuestionCardRenderTests: XCTestCase {
         )
     }
 
+    func testButtonsAreNamedForTheEnginesOptionLabels() throws {
+        let yesNo = try render(presentation())
+        let named = try render(presentation(optionLabels: AnswerOptionLabels(yes: "Split", no: "Bypass limit")))
+        let renamed = try render(presentation(optionLabels: AnswerOptionLabels(yes: "Land first", no: "Keep one PR")))
+        guard !isUniformlyBlank(yesNo) else {
+            throw XCTSkip("render came back uniformly blank; host does not support offscreen SwiftUI rendering")
+        }
+        let png = { (rep: NSBitmapImageRep) in rep.representation(using: .png, properties: [:]) }
+        XCTAssertNotEqual(png(yesNo), png(named), "named options must replace the Yes / No labels")
+        XCTAssertNotEqual(png(named), png(renamed), "the card shows whatever names the engine sent")
+    }
+
     func testRefusalTextIsRenderedUnderTheButtons() throws {
         let plain = fittingHeight(of: presentation())
         let refused = fittingHeight(of: presentation(error: "This question no longer exists."))
@@ -122,11 +134,42 @@ final class OperatorQuestionCardRenderTests: XCTestCase {
 
     // MARK: - Helpers
 
+    func testInReviewAttentionRendersEngineLabelsAndLegacyFallback() throws {
+        let group = try JSONDecoder().decode(AttentionGroup.self, from: Data("""
+        {"id":"review_question","product_id":"product","kind":"question",
+         "source_kind":"task_transcript","grouping_key":"worker_question|execution",
+         "generation":0,"state":"open","created_at":"123"}
+        """.utf8))
+        var member = try JSONDecoder().decode(Attention.self, from: Data("""
+        {"id":"split_question","group_id":"review_question","ordinal":1,
+         "answer_state":"open","created_at":"123","question_type":"yes_no",
+         "prompt_text":"How should the change be delivered?","confidence_source":"structured","score":1}
+        """.utf8))
+        let model = ChatViewModel(socketPath: "/tmp/boss-attention-render-\(UUID().uuidString).sock")
+        func renderRow() throws -> Data? {
+            let row = AttentionMemberRow(group: group, member: member, promptDraft: .constant(""))
+                .environmentObject(model)
+            return try renderView(row, size: CGSize(width: 440, height: 140))
+                .representation(using: .png, properties: [:])
+        }
+        let legacy = try renderRow()
+        member.choiceOptions = "{\"yes\":\"Split\",\"no\":\"Bypass limit\"}"
+        let split = try renderRow()
+        member.choiceOptions = "{\"yes\":\"Land first\",\"no\":\"Keep one PR\"}"
+        let renamed = try renderRow()
+        XCTAssertNotNil(legacy)
+        XCTAssertNotEqual(legacy, split, "The attention picker must replace Yes/No with the engine's labels")
+        XCTAssertNotEqual(split, renamed, "The attention picker must render the supplied names")
+        member.choiceOptions = "not-json"
+        XCTAssertEqual(legacy, try renderRow(), "Invalid legacy labels fall back to Yes/No")
+    }
+
     private func presentation(
         text: String = "Approve bypass of the 30 max file limit (48 needed)?",
         explanation: String = "Sweeps 48 files.",
         answerInFlight: Bool = false,
-        error: String? = nil
+        error: String? = nil,
+        optionLabels: AnswerOptionLabels? = nil
     ) -> OperatorQuestionPresentation {
         OperatorQuestionPresentation(
             questionID: "oq_1",
@@ -134,7 +177,8 @@ final class OperatorQuestionCardRenderTests: XCTestCase {
             explanation: explanation,
             askedAt: "1790000000",
             answerInFlight: answerInFlight,
-            errorMessage: error
+            errorMessage: error,
+            optionLabels: optionLabels
         )
     }
 
