@@ -1466,6 +1466,21 @@ impl ExecutionRunner for PaneSpawnRunner {
                         %err,
                         "driver started after the start wait expired; confirming prompt submission",
                     );
+                    // The first confirmation can itself have run for minutes, so
+                    // a cancel that landed during it must be noticed before the
+                    // prompt wait can press Return and submit the brief.
+                    if let Some(cancelled) = self
+                        .take_cancelled_during_spawn(
+                            spawner.as_ref(),
+                            &execution.id,
+                            worker_id,
+                            &started,
+                            &spawn_config,
+                        )
+                        .await
+                    {
+                        return Ok(cancelled);
+                    }
                     confirm_prompt_after_late_start(
                         &tmux_host,
                         driver.as_ref(),
@@ -1478,8 +1493,9 @@ impl ExecutionRunner for PaneSpawnRunner {
                 }
                 other => other,
             };
-            // Re-check cancellation only after the late-start prompt wait,
-            // which can run for minutes after the first confirmation returned.
+            // Re-check cancellation once more after the late-start prompt
+            // wait, which can itself run for minutes (it is also checked
+            // before that wait starts).
             if let Some(cancelled) = self
                 .take_cancelled_during_spawn(spawner.as_ref(), &execution.id, worker_id, &started, &spawn_config)
                 .await
