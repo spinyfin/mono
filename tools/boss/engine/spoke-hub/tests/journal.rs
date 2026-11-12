@@ -7,6 +7,60 @@ use prost::Message;
 use crate::support::*;
 
 #[tokio::test]
+async fn only_data_free_worker_denials_can_address_a_superseded_assignment() {
+    let (_dir, db) = work_db();
+    spoke_ready(&db, "host-a");
+    spoke_ready(&db, "host-b");
+    let first = db.reserve_spoke_assignment("execution", "host-a").unwrap();
+    let run = proto_run(&run_key(&first));
+    db.resolve_spoke_assignment("execution", first.assignment_generation, "completed")
+        .unwrap();
+    db.reserve_spoke_assignment("execution", "host-a").unwrap();
+    let (_, outbox) = stores(db);
+    let reply = |id: &str, code: ResultCode, data: &[u8]| Command {
+        command_id: id.into(),
+        run: Some(run.clone()),
+        not_after_unix_ms: 4_102_444_800_000,
+        body: Some(command::Body::WorkerReply(v1::WorkerReply {
+            request_id: "request".into(),
+            code: code as i32,
+            result_json: data.to_vec(),
+            reason: "superseded".into(),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    for command in [
+        reply("success", ResultCode::Ok, b"{}"),
+        reply("data", ResultCode::Rejected, b"private data"),
+        stop_command("stop", run.clone()),
+    ] {
+        assert!(matches!(
+            outbox.append("host-a", CommandAdmission::Recovery, command).await,
+            Err(StoreError::Denied)
+        ));
+    }
+    assert!(matches!(
+        outbox
+            .append(
+                "host-b",
+                CommandAdmission::Recovery,
+                reply("cross-host", ResultCode::Rejected, b"")
+            )
+            .await,
+        Err(StoreError::Denied)
+    ));
+    outbox
+        .append(
+            "host-a",
+            CommandAdmission::Recovery,
+            reply("denied", ResultCode::Rejected, b""),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn restart_replays_the_durable_receipt_and_generation() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("work.db");

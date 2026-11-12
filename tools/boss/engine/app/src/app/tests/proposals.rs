@@ -1363,6 +1363,9 @@ mod run_done_finalize_retry;
 #[path = "spoke_projection.rs"]
 mod spoke_projection;
 
+#[path = "spoke_requests.rs"]
+mod spoke_requests;
+
 /// A mandated stop fails visibly, without bypassing a check or cycling workers.
 #[tokio::test]
 async fn mandated_check_approval_stop_fails_visibly_without_replacement_workers() {

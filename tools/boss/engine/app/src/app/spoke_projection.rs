@@ -74,6 +74,11 @@ pub(super) fn applier(state: &Arc<ServerState>) -> Arc<dyn ObservationApplier> {
 
 /// Start applying what the hub's spokes report, on the engine task scope.
 pub(super) fn start(state: &Arc<ServerState>, stream: &HubStream) {
+    // Publish credentials before a restarted projector can apply an
+    // already-received online request. Receipt does not wait for projection;
+    // a restart resumes from the application cursor.
+    state.set_hub_stream(Some(stream.clone()));
+    super::pane_viewers::bridge_hub_stream(state, stream);
     if let Err(reason) = state.restore_spoke_turns() {
         tracing::warn!(%reason, "cannot restore spoke turn state at projector start; every sweep retries it");
     }
@@ -97,6 +102,17 @@ impl ServerApplier {
 
 #[async_trait]
 impl ObservationApplier for ServerApplier {
+    async fn worker_request(
+        &self,
+        observation: &projection::WorkerObservation,
+        method: projection::WorkerRead,
+    ) -> projection::WorkerResponse {
+        match self.state() {
+            Ok(state) => super::spoke_requests::read(&state, observation, method).await,
+            Err(reason) => projection::WorkerResponse::Retry(reason),
+        }
+    }
+
     async fn event(&self, observation: &EventObservation) -> Applied {
         let state = match self.state() {
             Ok(state) => state,

@@ -219,7 +219,17 @@ impl CommandOutbox for WorkDbOutbox {
             request.sequence = 0;
             let request = request.encode_to_vec();
             let run = command.run.as_ref().map(run_key);
-            let admission = run_admission(admission);
+            // A denial must reach the worker even if its assignment was
+            // superseded after receipt. Only data-free rejected replies may
+            // cross that fence; ordinary commands retain current-run checks.
+            let admission = match &command.body {
+                Some(boss_protocol_spoke::v1::command::Body::WorkerReply(reply))
+                    if reply.code == ResultCode::Rejected as i32 && reply.result_json.is_empty() =>
+                {
+                    RunAdmission::Rejection
+                }
+                _ => run_admission(admission),
+            };
             let stored = db
                 .append_host_command(
                     &host,

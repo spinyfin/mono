@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+boss-host-enrollment = { path = "../host-enrollment" }
 boss-spoke-adapter = { path = "../spoke-adapter" }
 boss-command-runner = { path = "../../command-runner" }
 boss-engine-runtime = { path = "../core/runtime" }
@@ -69,6 +70,11 @@ rustls = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+tonic = { workspace = true }
+tokio-stream = { workspace = true }
+boss-host-execution = { path = "../host-execution" }
+boss-spoke-journal = { path = "../spoke-journal" }
+boss-spoke-worker-api = { path = "../spoke-worker-api" }
 rcgen = { workspace = true }
 prost = { workspace = true }
 boss-worker-processes = { path = "../../worker-processes" }

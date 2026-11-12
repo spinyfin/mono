@@ -92,7 +92,7 @@ fn dependencies_for(work_db: &WorkDb, work_item_id: &str) -> Result<WorkItemDepe
     })
 }
 
-fn build_bundle(work_db: &WorkDb, work_item_id: &str) -> Result<WorkerContextBundle> {
+pub(super) fn build_bundle(work_db: &WorkDb, work_item_id: &str) -> Result<WorkerContextBundle> {
     let task = own_task(work_db, work_item_id)?;
     let product = work_db
         .get_product(&task.product_id)?

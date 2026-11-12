@@ -51,6 +51,8 @@
 //! already reflects such evidence; the hub's existing policy decides the rest.
 
 pub mod reduce;
+mod worker;
+pub use worker::{WORKER_REPLY, WorkerRead, WorkerResponse};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{
@@ -79,7 +81,8 @@ use tokio::sync::Notify;
 use tokio::task::{Id, JoinSet};
 
 pub use reduce::{
-    EventObservation, Life, Observation, Origin, PaneObservation, ProposalObservation, ProposalRequest, Reduction, Skip,
+    EventObservation, Life, Observation, Origin, PaneObservation, ProposalObservation, ProposalRequest, Reduction,
+    Skip, WorkerObservation,
 };
 
 /// Effect kind: the decision for a queued proposal, owed to the spoke.
@@ -159,6 +162,13 @@ pub enum Proposed {
 /// attempt superseded.
 #[async_trait]
 pub trait ObservationApplier: Send + Sync {
+    /// Serve only the gateway's online reads. The projector checks assignment
+    /// ownership; the applier rechecks host authorization before reading data.
+    async fn worker_request(&self, observation: &WorkerObservation, method: WorkerRead) -> WorkerResponse {
+        let _ = (observation, method);
+        WorkerResponse::Denied("worker reads are not supported by this hub".into())
+    }
+
     /// Fan one hook event out to live state, completion, probes and the other
     /// worker-progress consumers, as a hook arriving on the local events socket
     /// would be.
@@ -674,6 +684,7 @@ impl Inner {
     async fn apply_observation(&self, observation: Observation, owed: &mut Vec<Owed>) -> Result<(), Interrupted> {
         let currentness = self.currentness(observation.origin()).await?;
         match (observation, currentness) {
+            (Observation::Worker(request), currentness) => self.apply_worker(request, currentness, owed).await,
             (Observation::Proposal(proposal), currentness) => self.apply_proposal(proposal, currentness, owed).await,
             (observation, Currentness::Superseded(why)) => {
                 tracing::debug!(
@@ -865,7 +876,7 @@ impl Inner {
 
     async fn deliver(&self, effect: &SpokeEffect) -> SpokeEffectOutcome {
         match effect.kind.as_str() {
-            PROPOSAL_DECISION => self.deliver_decision(effect).await,
+            PROPOSAL_DECISION | WORKER_REPLY => self.deliver_decision(effect).await,
             other => SpokeEffectOutcome::Failed(format!("no delivery for effect kind `{other}`")),
         }
     }

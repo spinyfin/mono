@@ -12,6 +12,7 @@ filegroup(
 )
 
 APP_DEPS = [
+    "//tools/boss/engine/host-enrollment",
     "//tools/boss/engine/spoke-adapter",
     "//tools/boss/command-runner",
     "//tools/boss/engine/execution-runner",
@@ -91,6 +92,7 @@ rust_test(
     },
     crate = ":app",
     data = [
+        "//tools/boss/cli:boss",
         "//tools/boss/bossctl",
         # Config loading requires an engine-owned cube, just like the engine.
         "//tools/cube",
@@ -98,6 +100,7 @@ rust_test(
     ],
     edition = "2024",
     env = {
+        "BOSS_TEST_CLI": "$(rootpath //tools/boss/cli:boss)",
         "BOSSCTL_TEST_BINARY": "$(rootpath //tools/boss/bossctl)",
         "BOSS_EVENT_BIN": "/opt/boss/bin/boss-event",
         "BOSS_JJ_BIN": "$(rootpath @jj_test_tools//:jj)",
@@ -112,8 +115,11 @@ rust_test(
     visibility = ["//tools/boss/engine/core:__pkg__"],
     deps = TEST_DEPS + [
         "//tools/boss/engine/core:runtime_test_support",
+        "//tools/boss/engine/host-execution",
         "//tools/boss/engine/prose-vocabulary",
         "//tools/boss/engine/spoke-adapter:spoke_adapter_test_support",
+        "//tools/boss/engine/spoke-journal",
+        "//tools/boss/engine/spoke-worker-api",
         "//tools/boss/engine/task-scope",
         "//tools/boss/protocol-spoke",
         "//tools/boss/worker-processes",

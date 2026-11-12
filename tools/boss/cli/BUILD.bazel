@@ -55,6 +55,7 @@ rust_binary(
         "BOSS_BUILD_INFO_RS": "$(execpath //tools/boss/installer:build_info_rs)",
     },
     visibility = [
+        "//tools/boss/engine/app:__pkg__",
         "//tools/boss/engine/spoke-worker-api:__pkg__",
         "//tools/boss/app-macos:__pkg__",
         # Runfiles-only: the engine ships the CLI so dev-mode workers get
