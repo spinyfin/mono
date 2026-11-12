@@ -335,6 +335,10 @@ fn bookkeeping_pointers_are_not_stack_boundaries_but_a_published_branch_is() {
         !commit_has_blocking_bookmark(&legacy_ctx, ancestor, BookmarkPolicy::PushBranch("boss/exec_x")).unwrap(),
         "obsolete pr/<n> aliases are local bookkeeping, never published branches"
     );
+    // The fixture also leaves the PR's own branch bookmark on the ancestor, which
+    // `Strict` (unlike `PushBranch`) rightly treats as a stack boundary; drop it
+    // so only the legacy alias remains.
+    legacy_repo.jj(&legacy_repo.root, &["bookmark", "delete", "boss/exec_x"]);
     assert!(
         !commit_has_blocking_bookmark(&legacy_ctx, ancestor, BookmarkPolicy::Strict).unwrap(),
         "rebase-time collapse uses the same bookkeeping classification as push"
