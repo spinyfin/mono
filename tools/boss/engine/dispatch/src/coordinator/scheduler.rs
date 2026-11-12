@@ -414,18 +414,25 @@ impl ExecutionCoordinator {
         // A forced launch overrides the interactive cap, not the per-repo
         // lease bound: extra concurrent leases on one repo only queue on
         // cube's per-repo lock, so a forced launch during a lease storm
-        // would add timeouts rather than start sooner.
-        let Some(_lease_attempt) = self
-            .repo_lease_limiter
-            .try_begin(&execution.repo_remote_url, &execution.id)
-            .map(|guard| guard.with_kick(Arc::clone(self)))
-        else {
-            return Err(anyhow!(
-                "{bound} cube workspace leases are already in flight for {repo}; \
-                 cannot force-dispatch {execution_id} until one finishes",
-                bound = self.repo_lease_limiter_bound(),
-                repo = execution.repo_remote_url,
-            ));
+        // would add timeouts rather than start sooner. A spoke lease the
+        // host has not answered is a retry of a stored command, not a new
+        // cube lease, and must not occupy that bound.
+        let _lease_attempt = if self.spoke_lease_retry_skips_repo_bound(&execution) {
+            None
+        } else {
+            let Some(guard) = self
+                .repo_lease_limiter
+                .try_begin(&execution.repo_remote_url, &execution.id)
+                .map(|guard| guard.with_kick(Arc::clone(self)))
+            else {
+                return Err(anyhow!(
+                    "{bound} cube workspace leases are already in flight for {repo}; \
+                     cannot force-dispatch {execution_id} until one finishes",
+                    bound = self.repo_lease_limiter_bound(),
+                    repo = execution.repo_remote_url,
+                ));
+            };
+            Some(guard)
         };
         let preferred_workspace_id = execution.preferred_workspace_id.clone();
         let pool = self.pool_for_execution(&execution);
@@ -1614,15 +1621,8 @@ impl ExecutionCoordinator {
                     is_critical,
                     pause_bypass_admitted.contains(&execution.id),
                 );
-                self.dispatch_claimed_execution(
-                    &execution,
-                    &worker_id,
-                    pool_label,
-                    false,
-                    admission,
-                    Some(lease_attempt),
-                )
-                .await;
+                self.dispatch_claimed_execution(&execution, &worker_id, pool_label, false, admission, lease_attempt)
+                    .await;
                 continue;
             }
 
@@ -2059,15 +2059,8 @@ impl ExecutionCoordinator {
                 pause_bypass_admitted.contains(&execution.id),
             );
             dispatch_claim.disarm();
-            self.dispatch_claimed_execution(
-                &execution,
-                &worker_id,
-                pool_label,
-                false,
-                admission,
-                Some(lease_attempt),
-            )
-            .await;
+            self.dispatch_claimed_execution(&execution, &worker_id, pool_label, false, admission, lease_attempt)
+                .await;
         }
 
         // ---- Pass 2: automation spillover into Lower Decks ----
@@ -2168,15 +2161,8 @@ impl ExecutionCoordinator {
                 false,
                 pause_bypass_admitted.contains(&execution.id),
             );
-            self.dispatch_claimed_execution(
-                &execution,
-                &worker_id,
-                "automation",
-                true,
-                admission,
-                Some(lease_attempt),
-            )
-            .await;
+            self.dispatch_claimed_execution(&execution, &worker_id, "automation", true, admission, lease_attempt)
+                .await;
         }
 
         // All deferred pickup claims have dropped before clients refetch their runtime.
@@ -2504,16 +2490,22 @@ impl ExecutionCoordinator {
     }
 
     /// Take a per-repo lease-attempt permit, or record a workspace wait
-    /// and return `None`. The permit covers the cube lease only; it is
+    /// and return `None`. The permit covers a new cube lease only; it is
     /// released as soon as `schedule_execution`'s lease call returns.
-    /// `miss_reason` overrides the recorded wait text when another
-    /// constraint (the interactive cap) is also holding the row.
+    /// A spoke lease the host has not answered is a retry of the stored
+    /// command, so it proceeds without a permit (`Some(None)`) and does
+    /// not pin the bound while the host is silent. `miss_reason` overrides
+    /// the recorded wait text when another constraint (the interactive
+    /// cap) is also holding the row.
     async fn begin_repo_lease_or_wait(
         self: &Arc<Self>,
         execution: &WorkExecution,
         changed_waits: &mut Vec<WorkExecution>,
         miss_reason: Option<&str>,
-    ) -> Option<super::lease_limiter::LeaseAttemptGuard> {
+    ) -> Option<Option<super::lease_limiter::LeaseAttemptGuard>> {
+        if self.spoke_lease_retry_skips_repo_bound(execution) {
+            return Some(None);
+        }
         match self
             .repo_lease_limiter
             .try_begin(&execution.repo_remote_url, &execution.id)
@@ -2522,7 +2514,7 @@ impl ExecutionCoordinator {
             // once a slot is claimed. A permit dropped here without a
             // claimed slot must not kick: that would re-enter the drain for
             // rows that cannot dispatch.
-            Some(guard) => Some(guard),
+            Some(guard) => Some(Some(guard)),
             None => {
                 tracing::info!(
                     execution_id = %execution.id,
@@ -2548,6 +2540,36 @@ impl ExecutionCoordinator {
                     None,
                 ));
                 None
+            }
+        }
+    }
+
+    /// Retries of a stored spoke lease the host has not answered are not
+    /// new cube leases, so they must not occupy the per-repo bound. A spawn
+    /// that is in doubt already holds a lease; that wait is not a lease retry.
+    fn spoke_lease_retry_skips_repo_bound(&self, execution: &WorkExecution) -> bool {
+        match self.work_db.spoke_assignment_for_execution(&execution.id) {
+            Ok(Some(assignment)) if assignment.lease_id.is_none() && !assignment.resolved => {
+                match self.work_db.spoke_execution_in_doubt(&execution.id) {
+                    Ok(in_doubt) => in_doubt,
+                    Err(error) => {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            error = %format!("{error:#}"),
+                            "could not read whether the spoke assignment is in doubt; taking a lease permit"
+                        );
+                        false
+                    }
+                }
+            }
+            Ok(_) => false,
+            Err(error) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    error = %format!("{error:#}"),
+                    "could not read the spoke assignment; taking a lease permit"
+                );
+                false
             }
         }
     }
