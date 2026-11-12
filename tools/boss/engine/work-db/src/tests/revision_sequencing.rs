@@ -376,6 +376,54 @@ fn demotion_and_wake_stage_status_events_published_only_on_commit() {
 }
 
 #[test]
+fn completed_review_revision_unblocks_to_in_review_and_releases_later_revision() {
+    let (db, root) = setup();
+    let completed = revision(&db, &root, false);
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE work_executions SET status = 'completed' WHERE work_item_id = ?1",
+        [&completed.id],
+    )
+    .unwrap();
+    conn.execute("UPDATE tasks SET status = 'active' WHERE id = ?1", [&completed.id])
+        .unwrap();
+    drop(conn);
+
+    let later = revision(&db, &root, false);
+    assert_eq!(execution(&db, &later).status, ExecutionStatus::WaitingDependency);
+    assert_eq!(db.gating_prereqs_for(&later.id).unwrap(), vec![completed.id.clone()]);
+
+    let conflict = revision(&db, &root, true);
+    let conn = db.connect().unwrap();
+    let completed_row = query_task(&conn, &completed.id).unwrap().unwrap();
+    assert_eq!(completed_row.status, TaskStatus::Blocked);
+    assert_eq!(completed_row.blocked_reason.as_deref(), Some("dependency"));
+    drop(conn);
+    assert_eq!(db.gating_prereqs_for(&completed.id).unwrap(), vec![conflict.id.clone()]);
+    assert_eq!(execution(&db, &conflict).status, ExecutionStatus::Ready);
+
+    finish(&db, &conflict);
+    assert!(db.try_unblock_dependency_if_resolved(&completed.id).unwrap());
+    let conn = db.connect().unwrap();
+    let completed_row = query_task(&conn, &completed.id).unwrap().unwrap();
+    assert_eq!(completed_row.status, TaskStatus::InReview);
+    assert_eq!(completed_row.blocked_reason, None);
+    drop(conn);
+    let completed_execs = db.list_executions(Some(&completed.id)).unwrap();
+    assert_eq!(completed_execs.len(), 1);
+    assert_eq!(completed_execs[0].status, ExecutionStatus::Completed);
+
+    assert!(db.try_unblock_dependency_if_resolved(&later.id).unwrap());
+    let conn = db.connect().unwrap();
+    let later_row = query_task(&conn, &later.id).unwrap().unwrap();
+    assert_eq!(later_row.status, TaskStatus::Todo);
+    assert_eq!(later_row.blocked_reason, None);
+    drop(conn);
+    assert!(db.gating_prereqs_for(&later.id).unwrap().is_empty());
+    assert_eq!(execution(&db, &later).status, ExecutionStatus::Ready);
+}
+
+#[test]
 fn failed_newer_conflict_revision_does_not_strand_older_conflict_revision() {
     let (db, root) = setup();
     let older = revision(&db, &root, true);

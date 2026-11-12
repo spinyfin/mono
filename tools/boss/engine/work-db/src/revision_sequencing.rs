@@ -141,6 +141,14 @@ pub(super) fn prioritize_conflict_revision(
         let Some(task) = query_task(conn, id)? else { continue };
         // A restarted `in_review` revision is still unsettled while it holds
         // a pending writer execution, even though its status has not moved.
+        // A completed implementation whose board status is still a writer
+        // status (`todo` / `active` / `blocked`) is parked too: an explicit
+        // start can still mint a newer implementation, and leaving it in
+        // `active` would keep later same-chain revisions gated on the
+        // status-only live-writer predicate. `in_review` has already
+        // published and is skipped unless a pending writer is attached.
+        // Unblock restores `in_review` for a completed implementation via
+        // `delivered_or_completed`; it must not land in `todo`.
         let can_change = task.status.can_still_change_pr();
         if task.kind != TaskKind::Revision || !(can_change || has_pending_writer(conn, id)?) {
             continue;
