@@ -447,7 +447,9 @@ async fn poll_source(journal: &SharedJournal, execution: &ExecutionRecord, stamp
     }
     checkpoint.cursor = chunk.cursor;
     checkpoint.eof = chunk.eof;
-    let shared = journal;
+    if turn_stopped {
+        boss_spoke_worker_api::note_turn_stop(journal, &run)?;
+    }
     let mut journal = journal
         .lock()
         .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
@@ -466,10 +468,6 @@ async fn poll_source(journal: &SharedJournal, execution: &ExecutionRecord, stamp
         journal.commit_source(&run, "drained", None, b"true", Vec::new())?;
     }
     drop(journal);
-    // A turn ended: the worker may have written its outputs and parked.
-    if turn_stopped {
-        boss_spoke_worker_api::note_turn_stop(shared, &run)?;
-    }
     Ok(())
 }
 

@@ -30,14 +30,16 @@
 //! Commands that need an answer the hub must compute synchronously, or that are
 //! administration verbs, are denied (as is every general app/board/control
 //! method), so the execution kinds that depend on them are not composed for
-//! remote dispatch (`compose_remote_spawn` rejects them): CI remediation needs
+//! remote dispatch (`compose_remote_spawn` rejects them): CI remediation, both
+//! direct and revision runs with ci-fix provenance, needs
 //! `engine ci mark-noop` (live-CI verdict), `mark-retriggered`, `classify` and
 //! `mark-succeeded-via-rebase`; automation triage needs
 //! `task create --automation`; progression supervision also uses arbitrary task
 //! reads (`task show`), design-doc commands (`project design-doc`,
 //! `project set-design-doc`), stuck reports (`propose unreachable`) and
 //! `resolved merge`. Enabling such kinds remotely requires their own run-scoped
-//! contracts.
+//! contracts. Product and project design likewise require `project set-design-doc`.
+//! Review guides require host-local git store resolution.
 //! Cube publication and gh remain host-local commands using host credentials.
 //! The host-allocated PR/structured-output files are captured into durable
 //! artifact sources and chunked over the same stream, including after restart.
@@ -55,7 +57,7 @@
 //! pending marker that every tick retries (then an explicit gap), and reclaim
 //! waits for the exit capture to conclude.
 //!
-//! Proposal receipts permit a worker to finish its turn and park. Decisions
+//! Done and wait receipts permit a worker to finish its turn and park. Decisions
 //! arrive separately through ProposalDecision; only hub commands may stop or
 //! release an assignment. No completion or scheduling policy lives here.
 mod artifacts {
@@ -72,7 +74,8 @@ mod artifacts {
     const RECORD_OVERHEAD: usize = 1024;
     /// Chunk records an artifact may need per staged chunk when bulk credit is
     /// smaller than a chunk and a chunk is emitted in more than one piece.
-    const RECORDS_PER_CHUNK: usize = 2;
+    const MIN_FRAGMENT: usize = CHUNK / 2;
+    const RECORDS_PER_CHUNK: usize = CHUNK / MIN_FRAGMENT;
     /// A source checkpoint may not exceed 512 KiB.
     const MAX_RESERVE: usize = 400_000;
     /// Retries (one per observe tick) before an output that cannot be staged
@@ -192,7 +195,8 @@ mod artifacts {
             // failed registration releases whatever it staged.
             metadata["registered_unix_ms"] = stamp.wall_unix_ms.into();
             let record_overhead = RECORD_OVERHEAD + serde_json::to_vec(&metadata)?.len();
-            let reserve = (bytes.len().div_ceil(CHUNK) * RECORDS_PER_CHUNK * record_overhead).min(MAX_RESERVE);
+            let reserve = bytes.len().div_ceil(CHUNK) * RECORDS_PER_CHUNK * record_overhead;
+            ensure!(reserve <= MAX_RESERVE, "artifact metadata exceeds reservation limit");
             let mut staged = Vec::new();
             let reserved = std::iter::once((reserve_key(&id), vec![0u8; reserve])).chain(
                 bytes
@@ -282,11 +286,9 @@ mod artifacts {
             }
         }
 
-        /// Record that an output name has reached its final outcome for the
-        /// current completion boundary: one slot per output name, never one per
-        /// rewrite. An invalid output also leaves a lifecycle gap the hub can
-        /// classify. A rejected completion reopens the slot (see
-        /// [`Gateway::apply`]), so a corrected file is captured again.
+        /// Deduplicate gap markers by output name within a completion boundary.
+        /// Every boundary re-reads the file; registration deduplicates valid
+        /// bytes by digest, so corrected files are never shadowed by this list.
         fn conclude_output(
             &self,
             execution: &ExecutionRecord,
@@ -297,6 +299,12 @@ mod artifacts {
             let run = identity(execution);
             let mut journal = lock(&self.journal)?;
             let (old, mut state) = state(&journal, &run)?;
+            if gap.is_none() {
+                // A successful read clears an earlier gap, so a later invalid
+                // rewrite can report its own failure at the next boundary.
+                state.capture.captured.retain(|n| n != name);
+                return journal.commit_source(&run, STATE, old.as_deref(), &serde_json::to_vec(&state)?, vec![]);
+            }
             if state.capture.captured.iter().any(|n| n == name) {
                 return Ok(());
             }
@@ -313,13 +321,9 @@ mod artifacts {
         /// explicit gap marker, or `Ok(true)` when something must be retried
         /// because the spool had no room. Only journal faults are returned.
         pub fn capture_outputs(&self, execution: &ExecutionRecord, stamp: &v1::Stamp) -> Result<bool> {
-            let run = identity(execution);
             let mut retry = false;
             for (name, path) in &execution.worker_outputs {
                 if !matches!(name.as_str(), "BOSS_PR_URL_OUTPUT" | "BOSS_STRUCTURED_OUTPUT") {
-                    continue;
-                }
-                if state(&*lock(&self.journal)?, &run)?.1.capture.captured.contains(name) {
                     continue;
                 }
                 match self.read_output(execution, name, path, stamp) {
@@ -405,6 +409,9 @@ mod artifacts {
             let key = blob_key(&artifact.id, artifact.offset / CHUNK);
             let source = journal.source(run, &key)?.context("artifact source missing")?;
             let take = source.len().min(credit);
+            if take == 0 || (take < MIN_FRAGMENT && take < source.len()) {
+                return Ok(false);
+            }
             let data = source[..take].to_vec();
             let metadata_json = serde_json::to_vec(&artifact.metadata)?;
             let overhead = RECORD_OVERHEAD + metadata_json.len();
@@ -602,6 +609,8 @@ pub struct Gateway {
 #[derive(Default, Serialize, Deserialize)]
 struct State {
     proposals: Vec<Receipt>,
+    #[serde(default)]
+    superseded: Vec<Receipt>,
     artifacts: Vec<artifacts::Artifact>,
     #[serde(default)]
     capture: CaptureState,
@@ -610,8 +619,8 @@ struct State {
 /// Where a run's output capture stands.
 #[derive(Default, Serialize, Deserialize)]
 struct CaptureState {
-    /// Output names whose capture reached a final outcome at the current
-    /// completion boundary. A rejected done reopens them.
+    /// Output names with an outstanding gap marker. A successful read or a
+    /// rejected done reopens them; this never suppresses reading output bytes.
     captured: Vec<String>,
     /// A capture is owed (a turn ended or done was submitted) and must be
     /// retried on every upkeep tick until it concludes, whatever the phase.
@@ -888,6 +897,7 @@ impl Gateway {
                 let receipt = state
                     .proposals
                     .iter()
+                    .chain(state.superseded.iter())
                     .find(|p| p.id == decision.proposal_id)
                     .context("unknown proposal")?;
                 // A rejected done ends that completion boundary. The worker will
@@ -1042,16 +1052,7 @@ impl Gateway {
                 payload,
                 idempotency_key,
                 ..
-            } => {
-                if kind == boss_protocol::ProposalKind::RunDone
-                    && let Err(error) = self.capture_boundary(execution, stamp, false)
-                {
-                    // Lifecycle records outrank bulk data: done is queued regardless,
-                    // and a pending marker keeps the capture owed.
-                    tracing::warn!(run = execution.run_id, %error, "worker output capture failed at done");
-                }
-                self.submit(execution, kind, payload, idempotency_key, stamp).await
-            }
+            } => self.submit(execution, kind, payload, idempotency_key, stamp).await,
             FrontendRequest::CommentsRecordGuideOutcome {
                 comment_id,
                 disposition,
@@ -1143,6 +1144,9 @@ impl Gateway {
                 return Ok(response("cached", serde_json::to_value(cached)?));
             }
         }
+        if lock(&self.journal)?.source(run, &late_key(method))?.is_some() {
+            anyhow::bail!("hub_unavailable: previous request is still outstanding");
+        }
         let id = uuid::Uuid::new_v4().to_string();
         let key = format!("worker-request:{id}");
         let reply_key = format!("worker-reply:{id}");
@@ -1184,6 +1188,9 @@ impl Gateway {
                 // The wait is over, but a reply that arrives later is still worth
                 // caching. One tombstone per method bounds what this leaves behind.
                 let mut journal = lock(&self.journal)?;
+                if journal.source(run, &reply_key)?.is_some() {
+                    continue;
+                }
                 let tombstone = late_key(method);
                 let previous = journal.source(run, &tombstone)?;
                 journal.commit_source(run, &tombstone, previous.as_deref(), id.as_bytes(), vec![])?;
@@ -1269,6 +1276,27 @@ impl Gateway {
             canonical,
             supersedes: None,
         };
+        if kind == ProposalKind::RunDone {
+            {
+                let journal = lock(&self.journal)?;
+                let (_, state) = state(&journal, &identity(execution))?;
+                if !state.proposals.iter().any(|p| p.id == queued.id)
+                    && let Err(error) = validation::check_rate_caps(
+                        kind,
+                        ProposalCounts {
+                            total: state.proposals.iter().filter(|p| !is_run_write(&p.kind)).count(),
+                            for_kind: state.proposals.iter().filter(|p| p.kind == kind.as_str()).count(),
+                        },
+                    )
+                {
+                    return Ok(FrontendEvent::ProposalRejected { error });
+                }
+            }
+            if let Err(error) = self.capture_boundary(execution, stamp, false) {
+                tracing::warn!(run = execution.run_id, %error, "worker output capture failed at done");
+                note_turn_stop(&self.journal, &identity(execution))?;
+            }
+        }
         self.enqueue(
             execution,
             queued,
@@ -1432,6 +1460,15 @@ impl Gateway {
         {
             fields.push(ProposalFieldError::new("reason", message));
         }
+        if kind == RunWriteKind::ConflictMarkFailed && reason == boss_protocol::CONFLICT_ARCHITECTURAL_MISMATCH_REASON {
+            let evidence =
+                serde_json::from_value::<boss_protocol::ArchitecturalMismatchEvidence>(extra["evidence"].clone())
+                    .map_err(|error| format!("architectural mismatch evidence required: {error}"))
+                    .and_then(|evidence| evidence.validate());
+            if let Err(message) = evidence {
+                fields.push(ProposalFieldError::new("evidence", message));
+            }
+        }
         self.submit_run_write(
             execution,
             RunWrite {
@@ -1512,7 +1549,12 @@ impl Gateway {
         let run = identity(execution);
         let mut journal = lock(&self.journal)?;
         let (old, mut state) = state(&journal, &run)?;
-        if let Some(receipt) = state.proposals.iter().find(|p| p.id == queued.id) {
+        if let Some(receipt) = state
+            .proposals
+            .iter()
+            .chain(state.superseded.iter())
+            .find(|p| p.id == queued.id)
+        {
             ensure!(
                 receipt.digest == digest && receipt.kind == queued.label,
                 "idempotency key reused with different proposal"
@@ -1525,7 +1567,20 @@ impl Gateway {
             return Ok(receipt_event(&receipt, true));
         }
         if let Some(stem) = &queued.supersedes {
-            state.proposals.retain(|p| !p.id.starts_with(stem.as_str()));
+            if state.superseded.len() >= RUN_WRITE_CAP {
+                return Ok(FrontendEvent::ProposalRejected {
+                    error: ProposalSubmissionError::new(
+                        ProposalErrorCode::RateLimited,
+                        "superseded receipt cap reached",
+                    ),
+                });
+            }
+            let (superseded, current): (Vec<_>, Vec<_>) = state
+                .proposals
+                .into_iter()
+                .partition(|p| p.id.starts_with(stem.as_str()));
+            state.superseded.extend(superseded);
+            state.proposals = current;
         }
         if let Err(error) = caps(&state) {
             return Ok(FrontendEvent::ProposalRejected { error });

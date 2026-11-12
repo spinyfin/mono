@@ -1500,4 +1500,87 @@ mod tests {
             96 * 1024
         );
     }
+    #[tokio::test]
+    async fn stop_capture_marker_survives_ingestion_capacity_faults() {
+        // Sweep admission boundaries to inject failures before and after each
+        // source commit, then retry the actual ingestion after freeing space.
+        for file_ingress in [false, true] {
+            let mut failures = 0;
+            for available in (100..2500).step_by(100) {
+                let root = tempfile::tempdir().unwrap();
+                let mut execution = execution(root.path());
+                if file_ingress {
+                    execution.driver_id = "codex".into();
+                    let directory = root.path().join("sessions");
+                    std::fs::create_dir(&directory).unwrap();
+                    execution.observation.as_mut().unwrap().file = Some((
+                        boss_engine_driver::AgentJsonlFileIngress {
+                            directory: directory.clone(),
+                            filename_prefix: "rollout-".into(),
+                            filename_suffix: ".jsonl".into(),
+                            workspace_path: root.path().into(),
+                        },
+                        Vec::new(),
+                    ));
+                    let meta = serde_json::json!({"type":"session_meta","payload":{"id":"session","cwd":root.path()}});
+                    let stop = serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"done"}});
+                    std::fs::write(
+                        directory.join("rollout-example-session.jsonl"),
+                        format!("{meta}\n{stop}\n"),
+                    )
+                    .unwrap();
+                }
+                let test_limits = Limits {
+                    spool_bytes: 12_000,
+                    lifecycle_reserve: 3_000,
+                };
+                let journal = journal(root.path(), test_limits);
+                let run = run_identity(&execution);
+                let filler = vec![0; 4_000];
+                {
+                    let mut journal = journal.lock().unwrap();
+                    journal.commit_source(&run, "filler-a", None, &filler, vec![]).unwrap();
+                    let used = journal.bytes().unwrap() as usize;
+                    let tail = vec![0; test_limits.spool_bytes as usize - used - available - "filler-b".len() - 128];
+                    journal.commit_source(&run, "filler-b", None, &tail, vec![]).unwrap();
+                }
+                let result = if file_ingress {
+                    transcripts::poll(&journal, &execution, &stamp().unwrap()).await
+                } else {
+                    hooks::ingest(&journal, &execution, &hook(None), &stamp().unwrap()).await
+                };
+                if let Err(error) = result {
+                    assert!(Fault::is_full(&error), "{error:#}");
+                    failures += 1;
+                }
+                let has_stop = records(&journal).iter().any(|record| {
+                    matches!(&record.body,
+                    Some(record::Body::Event(event)) if matches!(event.event,
+                        Some(boss_protocol_spoke::v1::worker_event::Event::Stop(_))))
+                });
+                if has_stop {
+                    assert!(
+                        !boss_spoke_worker_api::captures_concluded(&journal, &execution).unwrap(),
+                        "accepted Stop must already have a durable capture marker"
+                    );
+                }
+                journal
+                    .lock()
+                    .unwrap()
+                    .delete_sources(&run, &["filler-a".into(), "filler-b".into()])
+                    .unwrap();
+                if file_ingress {
+                    transcripts::poll(&journal, &execution, &stamp().unwrap())
+                        .await
+                        .unwrap();
+                } else {
+                    hooks::ingest(&journal, &execution, &hook(None), &stamp().unwrap())
+                        .await
+                        .unwrap();
+                }
+                assert!(!boss_spoke_worker_api::captures_concluded(&journal, &execution).unwrap());
+            }
+            assert!(failures > 0);
+        }
+    }
 }

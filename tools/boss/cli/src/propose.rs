@@ -1173,6 +1173,8 @@ pub(crate) fn print_gateway_result(ctx: &RunContext, status: &str, value: &serde
                 println!("Registered for streaming to the hub; keep working.");
             } else if value["receipt"]["kind"] == "guide_outcome" {
                 println!("Guide outcome durably queued for the hub; keep working.");
+            } else if !matches!(value["receipt"]["kind"].as_str(), Some("run_done" | "wait")) {
+                println!("Durably queued for hub validation; keep working.");
             } else {
                 println!(
                     "Durably queued for hub validation. You may finish this turn and park; the run and workspace remain assigned."

@@ -95,6 +95,10 @@ fn records(gateway: &Gateway) -> Vec<v1::Record> {
 }
 
 async fn cli(socket: &Path, run: &str, args: &[&str]) -> std::process::Output {
+    cli_format(socket, run, args, true).await
+}
+
+async fn cli_format(socket: &Path, run: &str, args: &[&str], json: bool) -> std::process::Output {
     let bin = std::env::current_dir()
         .unwrap()
         .join(std::env::var("BOSS_TEST_CLI").unwrap());
@@ -102,7 +106,7 @@ async fn cli(socket: &Path, run: &str, args: &[&str]) -> std::process::Output {
         .env("BOSS_SOCKET_PATH", socket)
         .env("BOSS_RUN_ID", run)
         .args(args)
-        .arg("--json")
+        .args(json.then_some("--json"))
         .output()
         .await
         .unwrap()
@@ -878,6 +882,17 @@ async fn a_late_hub_reply_fills_the_cache_and_leaves_no_rows_behind() {
     // No hub reply: the wait times out and its request row is deleted.
     let timed_out = cli(&socket, "execution", &["pr", "body"]).await;
     assert!(String::from_utf8_lossy(&timed_out.stderr).contains("hub_unavailable"));
+    for _ in 0..3 {
+        let repeated = cli(&socket, "execution", &["pr", "body"]).await;
+        assert!(String::from_utf8_lossy(&repeated.stderr).contains("hub_unavailable"));
+    }
+    assert_eq!(
+        records(&gateway)
+            .iter()
+            .filter(|r| matches!(r.body, Some(record::Body::Request(_))))
+            .count(),
+        1
+    );
     // The numbered request record remains; the request row is replaced by a tombstone.
     let request_id = records(&gateway)
         .into_iter()
@@ -998,6 +1013,10 @@ async fn run_scoped_writes_from_real_prompts_queue_as_records_and_the_rest_stay_
         success(cli(&socket, "execution", &producer).await)["value"]["already_submitted"],
         true
     );
+    let human = cli_format(&socket, "execution", &producer, false).await;
+    assert!(human.status.success());
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.contains("keep working") && !text.contains("finish this turn"));
     let mut foreign = producer;
     foreign[4] = "sibling";
     let wrong_run = cli(&socket, "execution", &foreign).await;
@@ -1110,6 +1129,24 @@ async fn guide_outcomes_are_bounded_per_comment_and_never_spend_the_proposal_bud
     success(cli(&socket, "execution", &args).await);
     let (_, state) = crate::state(&gateway.journal.lock().unwrap(), &identity(&execution(root.path()))).unwrap();
     assert_eq!(state.proposals.len(), 40);
+    assert_eq!(state.superseded.len(), 1);
+    let old_id = state.superseded[0].id.clone();
+    gateway
+        .apply(&command(
+            &identity(&execution(root.path())),
+            command::Body::ProposalDecision(v1::ProposalDecision {
+                proposal_id: old_id.clone(),
+                code: v1::ResultCode::Ok as i32,
+                reason: String::new(),
+                result_json: b"{}".to_vec(),
+            }),
+        ))
+        .unwrap();
+    let args = outcome(3, "grounded");
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let retry = success(cli(&socket, "execution", &args).await);
+    assert_eq!(retry["value"]["receipt"]["id"], old_id);
+    assert_eq!(retry["value"]["already_submitted"], true);
     // Forty outcomes leave every proposal kind its full budget, done included.
     let done = ["propose", "done", "--outcome", "delivered", "--summary", "Done"];
     assert_eq!(success(cli(&socket, "execution", &done).await)["status"], "queued");
@@ -1253,6 +1290,8 @@ async fn a_rejected_done_reopens_capture_so_the_corrected_output_streams() {
             }),
         ))
         .unwrap();
+    crate::note_turn_stop(&gateway.journal, &identity(&execution)).unwrap();
+    gateway.upkeep(&execution, &stamp().unwrap());
     std::fs::write(&structured, br#"{"verdict":"corrected"}"#).unwrap();
     // The worker finishes again; the replay is refused but the capture runs.
     let _ = cli(&socket, "execution", &done).await;
@@ -1269,11 +1308,35 @@ async fn a_rejected_done_reopens_capture_so_the_corrected_output_streams() {
     let _ = task.await;
 }
 
+fn pin_small_credit(gateway: &Gateway, execution: &ExecutionRecord) {
+    gateway
+        .journal
+        .lock()
+        .unwrap()
+        .append(
+            v1::Record {
+                run: Some(identity(execution)),
+                observed: Some(stamp().unwrap()),
+                body: Some(record::Body::Gap(v1::Gap {
+                    resource: "credit".into(),
+                    reason: "x".repeat(245_000),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            boss_spoke_journal::Admission::Lifecycle,
+        )
+        .unwrap();
+    let credit = gateway.journal.lock().unwrap().bulk_credit().unwrap();
+    assert!((8_000..16_000).contains(&credit), "{credit}");
+}
+
 fn accepts_artifact(limits: Limits, size: usize) -> bool {
     let root = tempfile::tempdir().unwrap();
     let execution = execution(root.path());
     let gateway = open_with(root.path(), limits);
     save(&gateway, &execution);
+    pin_small_credit(&gateway, &execution);
     let path = root.path().join("image.png");
     std::fs::write(&path, png(size)).unwrap();
     gateway
@@ -1301,12 +1364,21 @@ async fn an_artifact_accepted_at_the_bulk_boundary_streams_to_eof_without_new_ca
     let execution = execution(root.path());
     let gateway = open_with(root.path(), limits);
     save(&gateway, &execution);
+    pin_small_credit(&gateway, &execution);
     let path = root.path().join("image.png");
     let bytes = png(accepted);
     std::fs::write(&path, &bytes).unwrap();
     gateway
         .attach(&execution, path.to_str().unwrap(), None, &stamp().unwrap())
         .unwrap();
+    for _ in 0..8 {
+        gateway.pump(&identity(&execution), &stamp().unwrap()).unwrap();
+        assert!(
+            chunks(&gateway).is_empty(),
+            "small credit must not spend the overhead reserve"
+        );
+    }
+    ack_all(&gateway);
     for _ in 0..64 {
         match gateway.pump(&identity(&execution), &stamp().unwrap()) {
             Ok(()) => {}
@@ -1371,4 +1443,101 @@ async fn partial_credit_below_one_chunk_never_counts_an_emitted_prefix_twice() {
     // The bytes live in records now; staging holds nothing for them.
     let after = gateway.journal.lock().unwrap().bytes().unwrap();
     assert!(after < before + 150_000 + 24 * 1024, "{before} -> {after}");
+}
+
+#[tokio::test]
+async fn architectural_mismatch_requires_valid_evidence_from_the_cli() {
+    let root = tempfile::tempdir().unwrap();
+    let gateway = open(root.path());
+    save(&gateway, &execution(root.path()));
+    let socket = root.path().join("worker.sock");
+    let task = server(&gateway, &socket);
+    let base = [
+        "engine",
+        "conflicts",
+        "mark-failed",
+        "attempt",
+        "--reason",
+        "architectural_mismatch",
+    ];
+    assert!(!cli(&socket, "execution", &base).await.status.success());
+    let mut args = base.to_vec();
+    args.extend([
+        "--basis",
+        "subsystem_deleted",
+        "--conflicting-commits",
+        "abc123",
+        "--main-changes",
+        "The queue was deleted",
+        "--attempted-port",
+        "Tried using the dispatcher",
+        "--recommendation",
+        "Rewrite around the dispatcher",
+        "--contradiction",
+        "too short",
+    ]);
+    let invalid = cli(&socket, "execution", &args).await;
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("evidence"));
+    *args.last_mut().unwrap() = "Main deleted the review queue entirely, so queue priority has nowhere to live.";
+    assert_eq!(success(cli(&socket, "execution", &args).await)["status"], "queued");
+    let missing = gateway
+        .submit_attempt_failure(
+            &execution(root.path()),
+            crate::RunWriteKind::ConflictMarkFailed,
+            "attempt".into(),
+            "architectural_mismatch".into(),
+            serde_json::json!({"evidence": null}),
+            &stamp().unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(missing, FrontendEvent::ProposalRejected { .. }));
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn continuation_and_locally_rejected_done_do_not_freeze_output_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let mut execution = execution(root.path());
+    let path = root.path().join("output.json");
+    execution
+        .worker_outputs
+        .insert("BOSS_STRUCTURED_OUTPUT".into(), path.display().to_string());
+    let gateway = open(root.path());
+    save(&gateway, &execution);
+    std::fs::write(&path, br#"{"result":"first"}"#).unwrap();
+    crate::note_turn_stop(&gateway.journal, &identity(&execution)).unwrap();
+    gateway.upkeep(&execution, &stamp().unwrap());
+    assert_eq!(chunks(&gateway).len(), 1);
+    let socket = root.path().join("worker.sock");
+    let task = server(&gateway, &socket);
+    std::fs::write(&path, br#"{"result":"invalid-done"}"#).unwrap();
+    let invalid = cli(
+        &socket,
+        "execution",
+        &["propose", "done", "--outcome", "delivered", "--summary", ""],
+    )
+    .await;
+    assert!(!invalid.status.success());
+    gateway.upkeep(&execution, &stamp().unwrap());
+    assert_eq!(chunks(&gateway).len(), 1, "refused done must not capture");
+    std::fs::write(&path, br#"{"result":"corrected"}"#).unwrap();
+    success(
+        cli(
+            &socket,
+            "execution",
+            &["propose", "done", "--outcome", "delivered", "--summary", "Done"],
+        )
+        .await,
+    );
+    gateway.upkeep(&execution, &stamp().unwrap());
+    assert_eq!(chunks(&gateway).len(), 2);
+    assert!(String::from_utf8_lossy(&chunks(&gateway)[1].data).contains("corrected"));
+    execution.phase = Phase::Terminal;
+    std::fs::write(&path, br#"{"result":"exit"}"#).unwrap();
+    gateway.upkeep(&execution, &stamp().unwrap());
+    assert!(String::from_utf8_lossy(&chunks(&gateway).last().unwrap().data).contains("exit"));
+    task.abort();
+    let _ = task.await;
 }

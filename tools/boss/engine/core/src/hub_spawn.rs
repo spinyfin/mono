@@ -70,8 +70,14 @@ pub struct ComposeRemoteSpawn<'a> {
 /// (`boss_spoke_worker_api`) denies: it queues only run-scoped writes bound to
 /// the claimed run, and cannot answer a synchronous hub verdict or perform
 /// engine administration. Composing them remotely would let the run start and
-/// then fail at the command that records its outcome.
-fn remote_unsupported(kind: &ExecutionKind) -> Option<&'static str> {
+/// then fail at the command that records its outcome. CI remediation reaches
+/// workers both directly and through revisions with ci-fix provenance.
+fn remote_unsupported(kind: &ExecutionKind, item: &WorkItem) -> Option<&'static str> {
+    let ci_fix =
+        matches!(item, WorkItem::Task(task) | WorkItem::Chore(task) if task.created_via.starts_with("ci-fix:"));
+    if *kind == ExecutionKind::RevisionImplementation && ci_fix {
+        return remote_unsupported(&ExecutionKind::CiRemediation, item);
+    }
     match kind {
         ExecutionKind::PrReviewGuide => {
             Some("remote review-guide composition requires host-local git store resolution")
@@ -125,7 +131,7 @@ pub async fn compose_remote_spawn(request: ComposeRemoteSpawn<'_>) -> Result<Spa
         );
     }
 
-    if let Some(reason) = remote_unsupported(&execution.kind) {
+    if let Some(reason) = remote_unsupported(&execution.kind, item) {
         bail!("{reason}");
     }
     opts.remote_workspace = true;
@@ -444,6 +450,41 @@ mod tests {
                             .any(|f| f.name == "spawn-worker-posture" && f.revision == 1)
                     );
                 }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ci_fix_revisions_reject_remote_composition_but_other_revisions_remain_eligible() {
+        let workspace = Path::new("/remote/workspace");
+        let (db, mut execution, mut item) = chore_fixture(workspace);
+        execution.kind = ExecutionKind::RevisionImplementation;
+        for provenance in ["human", "merge-conflict:attempt", "ci-fix:attempt"] {
+            if let WorkItem::Chore(task) = &mut item {
+                task.created_via = provenance.into();
+            }
+            let result = compose_remote_spawn(
+                ComposeRemoteSpawn::builder()
+                    .db(&db)
+                    .worker_id("worker")
+                    .host_id("spoke")
+                    .execution(&execution)
+                    .item(&item)
+                    .workspace_path(workspace)
+                    .events_socket_path(Path::new("/spoke/events.sock"))
+                    .lease_id("lease")
+                    .workspace_id("workspace")
+                    .opts(opts(Some(true)))
+                    .build(),
+            )
+            .await;
+            if provenance.starts_with("ci-fix:") {
+                let error = result.unwrap_err().to_string();
+                for verb in ["mark-noop", "mark-retriggered", "classify", "mark-succeeded-via-rebase"] {
+                    assert!(error.contains(verb));
+                }
+            } else {
+                assert!(result.is_ok(), "{provenance}: {result:?}");
             }
         }
     }
