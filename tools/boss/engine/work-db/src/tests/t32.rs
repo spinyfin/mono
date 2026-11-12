@@ -9,11 +9,14 @@
 //! `reconcile_revision_execution`), never in `task_accepts_execution` —
 //! the cascade bypasses that gate and calls the reconcile helpers directly.
 //!
-//! These tests pin all four behaviours the design calls out:
+//! These tests pin the behaviours the design calls out:
 //!   1. normal item behind a dependency → clears → auto-dispatches (guard),
 //!   2. deferred item behind a dependency → clears → `todo`, no execution,
 //!   3. explicit approval dispatches the deferred item and clears the flag,
-//!   4. the same suppression on the `reconcile_revision_execution` branch.
+//!   4. the same suppression on the `reconcile_revision_execution` branch,
+//!   5. undeferring remints a pending execution that deferral abandoned,
+//!      including a gated project task whose prerequisites then clear,
+//!   6. an execution that actually ran is not reminted automatically.
 
 use super::*;
 
@@ -375,4 +378,247 @@ fn deferred_revision_is_not_auto_dispatched() {
         !has_ready(&db, &revision.id),
         "a deferred revision must not receive a ready execution from reconcile_revision_execution",
     );
+}
+
+fn latest_status(db: &WorkDb, work_item_id: &str) -> ExecutionStatus {
+    db.list_executions(Some(work_item_id)).unwrap()[0].status.clone()
+}
+
+/// Deferral abandons a pending execution. Clearing deferred must remint
+/// once the item is runnable again — otherwise the abandoned row strands it
+/// as "last run ended" with no run ever having started.
+#[test]
+fn undeferring_remints_an_abandoned_never_started_execution() {
+    let db = WorkDb::open(temp_db_path("deferred-undefer-remint")).unwrap();
+    let product = create_test_product_named(&db, "Boss-deferred-undefer-remint");
+    let chore = create_test_chore(&db, product.id.clone(), "queued work");
+
+    db.reconcile_product_executions(&product.id).unwrap();
+    let first = db
+        .list_executions(Some(&chore.id))
+        .unwrap()
+        .into_iter()
+        .find(|execution| execution.status == ExecutionStatus::Ready)
+        .expect("precondition: the item is queued (ready)");
+
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            deferred: Some(true),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(latest_status(&db, &chore.id), ExecutionStatus::Abandoned);
+
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            deferred: Some(false),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.reconcile_product_executions(&product.id).unwrap();
+
+    let executions = db.list_executions(Some(&chore.id)).unwrap();
+    let ready = executions
+        .iter()
+        .find(|execution| execution.status == ExecutionStatus::Ready)
+        .expect("undeferring must mint a replacement ready execution");
+    assert_ne!(ready.id, first.id, "the replacement must be a new execution");
+    assert_eq!(
+        executions
+            .iter()
+            .filter(|execution| execution.status == ExecutionStatus::Abandoned)
+            .count(),
+        1,
+        "the abandoned pending row stays in history"
+    );
+}
+
+/// A project task deferred while waiting on a prerequisite remints and
+/// dispatches once both the deferral and the prerequisite clear.
+#[test]
+fn undeferring_a_gated_project_task_remints_once_prerequisites_are_done() {
+    let db = WorkDb::open(temp_db_path("deferred-project-task-remint")).unwrap();
+    let product = create_test_product_named(&db, "Boss-deferred-project-task-remint");
+    let project = db
+        .create_project(CreateProjectInput {
+            product_id: product.id.clone(),
+            name: "Ordered project".to_owned(),
+            description: None,
+            goal: None,
+            autostart: true,
+            no_design_task: false,
+            design_reasoning_effort_xhigh: false,
+        })
+        .unwrap();
+    let gate = create_test_chore(&db, product.id.clone(), "gate");
+    let task = db
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("gated project task")
+                .autostart(true)
+                .build(),
+        )
+        .unwrap();
+    complete_design_for_project(&db, &project.id);
+    db.add_dependency(AddDependencyInput {
+        dependent: task.id.clone(),
+        prerequisite: gate.id.clone(),
+        relation: Some(RELATION_BLOCKS.to_owned()),
+    })
+    .unwrap();
+
+    db.reconcile_product_executions(&product.id).unwrap();
+    let first = db
+        .list_executions(Some(&task.id))
+        .unwrap()
+        .into_iter()
+        .find(|execution| execution.status == ExecutionStatus::WaitingDependency)
+        .expect("precondition: the gated task has a waiting_dependency execution");
+
+    db.update_work_item(
+        &task.id,
+        WorkItemPatch {
+            deferred: Some(true),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(latest_status(&db, &task.id), ExecutionStatus::Abandoned);
+
+    db.update_work_item(
+        &task.id,
+        WorkItemPatch {
+            deferred: Some(false),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.update_work_item(
+        &gate.id,
+        WorkItemPatch {
+            status: Some("done".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let executions = db.list_executions(Some(&task.id)).unwrap();
+    let ready = executions
+        .iter()
+        .find(|execution| execution.status == ExecutionStatus::Ready)
+        .expect("clearing the gate after undefer must mint a ready execution");
+    assert_ne!(ready.id, first.id);
+    assert_eq!(status_of(&db, &task.id), TaskStatus::Todo);
+}
+
+/// Completing a run must not auto-remint; the card stays "start it again".
+#[test]
+fn a_finished_run_is_not_reminted_by_reconcile() {
+    let db = WorkDb::open(temp_db_path("finished-run-no-remint")).unwrap();
+    let product = create_test_product_named(&db, "Boss-finished-run-no-remint");
+    let chore = create_test_chore(&db, product.id.clone(), "already ran");
+
+    db.reconcile_product_executions(&product.id).unwrap();
+    let first = db
+        .list_executions(Some(&chore.id))
+        .unwrap()
+        .into_iter()
+        .find(|execution| execution.status == ExecutionStatus::Ready)
+        .expect("precondition: the item is queued (ready)");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'completed', started_at = '1', finished_at = '2' WHERE id = ?1",
+            params![first.id],
+        )
+        .unwrap();
+
+    db.reconcile_product_executions(&product.id).unwrap();
+
+    let executions = db.list_executions(Some(&chore.id)).unwrap();
+    assert_eq!(executions.len(), 1, "a finished run must not be reminted");
+    assert_eq!(executions[0].id, first.id);
+    assert_eq!(executions[0].status, ExecutionStatus::Completed);
+}
+
+/// An abandoned execution that actually started is a finished attempt, not
+/// a withdrawn pending row, so reconcile must not remint it.
+#[test]
+fn an_abandoned_execution_that_started_is_not_reminted() {
+    let db = WorkDb::open(temp_db_path("abandoned-started-no-remint")).unwrap();
+    let product = create_test_product_named(&db, "Boss-abandoned-started-no-remint");
+    let chore = create_test_chore(&db, product.id.clone(), "ran then abandoned");
+
+    db.reconcile_product_executions(&product.id).unwrap();
+    let first = db
+        .list_executions(Some(&chore.id))
+        .unwrap()
+        .into_iter()
+        .find(|execution| execution.status == ExecutionStatus::Ready)
+        .expect("precondition: the item is queued (ready)");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'abandoned', started_at = '1', finished_at = '2' WHERE id = ?1",
+            params![first.id],
+        )
+        .unwrap();
+
+    db.reconcile_product_executions(&product.id).unwrap();
+
+    let executions = db.list_executions(Some(&chore.id)).unwrap();
+    assert_eq!(
+        executions.len(),
+        1,
+        "an abandoned execution that started must not be reminted"
+    );
+    assert_eq!(executions[0].id, first.id);
+    assert_eq!(executions[0].status, ExecutionStatus::Abandoned);
+}
+
+/// A `work_runs` row is evidence the execution ran even when `started_at`
+/// was never stamped, so it must not be reminted as a never-started abandon.
+#[test]
+fn an_abandoned_execution_with_a_run_is_not_reminted() {
+    let db = WorkDb::open(temp_db_path("abandoned-with-run-no-remint")).unwrap();
+    let product = create_test_product_named(&db, "Boss-abandoned-with-run-no-remint");
+    let chore = create_test_chore(&db, product.id.clone(), "has a run row");
+
+    db.reconcile_product_executions(&product.id).unwrap();
+    let first = db
+        .list_executions(Some(&chore.id))
+        .unwrap()
+        .into_iter()
+        .find(|execution| execution.status == ExecutionStatus::Ready)
+        .expect("precondition: the item is queued (ready)");
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_executions SET status = 'abandoned' WHERE id = ?1",
+            params![first.id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO work_runs (id, execution_id, agent_id, status, created_at, host_id)
+             VALUES ('run_abandoned_evidence', ?1, 'synthetic', 'completed', '1', 'local')",
+            params![first.id],
+        )
+        .unwrap();
+    }
+
+    db.reconcile_product_executions(&product.id).unwrap();
+
+    let executions = db.list_executions(Some(&chore.id)).unwrap();
+    assert_eq!(
+        executions.len(),
+        1,
+        "an abandoned execution with a work_runs row must not be reminted"
+    );
+    assert_eq!(executions[0].id, first.id);
 }

@@ -891,12 +891,34 @@ pub fn reconcile_work_item_execution(
                 // doing, not a decision about the work, so the row is minted
                 // afresh exactly as one that had never had an execution.
                 insert_fresh(result, Some(&execution))?;
+            } else if execution.kind == kind && abandoned_never_started(conn, &execution)? {
+                // Deferral (and other pending-withdrawals) abandon a
+                // never-started execution. Once the item is runnable again
+                // that row is as good as absent, same as a park's cancelled
+                // never-started execution. An execution that actually ran
+                // and then ended keeps the "start it again" behaviour.
+                insert_fresh(result, Some(&execution))?;
             }
         }
         None => insert_fresh(result, None)?,
     }
 
     Ok(())
+}
+
+/// True when this execution was withdrawn before a worker ever started:
+/// status `abandoned`, no `started_at`, and no `work_runs` row. Deferral
+/// abandons pending executions this way; they count as absent for remint
+/// once the work item is runnable again.
+pub(crate) fn abandoned_never_started(conn: &Connection, execution: &WorkExecution) -> Result<bool> {
+    if execution.status != ExecutionStatus::Abandoned || execution.started_at.is_some() {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM work_runs WHERE execution_id = ?1)",
+        params![execution.id],
+        |row| row.get(0),
+    )?)
 }
 
 /// Look up the chain root's task for a revision (the first non-revision

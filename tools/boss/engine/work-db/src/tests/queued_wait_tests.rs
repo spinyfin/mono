@@ -305,6 +305,26 @@ fn every_waiting_state_yields_a_named_reason() {
         DISPATCH_WAIT_REASON_RUN_ENDED,
     ));
 
+    let abandoned_started = create_test_chore(&db, pid, "abandoned after a worker started");
+    let abandoned_run = pending(
+        &db,
+        &abandoned_started.id,
+        ExecutionKind::ChoreImplementation,
+        ExecutionStatus::Abandoned,
+    );
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET started_at = '1' WHERE id = ?1",
+            [&abandoned_run.id],
+        )
+        .unwrap();
+    covered.insert(assert_named(
+        "abandoned after it started",
+        &wait_of(&db, pid, &abandoned_started.id),
+        DISPATCH_WAIT_REASON_RUN_ENDED,
+    ));
+
     let delivered = create_test_chore(&db, pid, "pull request already open");
     db.connect()
         .unwrap()
@@ -515,6 +535,56 @@ fn every_waiting_state_yields_a_named_reason() {
         .filter(|code| code != DISPATCH_WAIT_REASON_UNCLASSIFIED)
         .collect();
     assert_eq!(covered, vocabulary);
+}
+
+/// A pending execution abandoned by deferral never started, so the queued
+/// card is not "its last run ended". Until reconcile mints a replacement it
+/// is unclassified (about to be dispatched, or held for another named reason).
+#[test]
+fn a_never_started_abandoned_queued_card_is_not_run_ended() {
+    let db = db();
+    let product = create_test_product(&db);
+    let pid = product.id.as_str();
+    let chore = create_test_chore(&db, pid, "deferred then approved");
+
+    db.reconcile_product_executions(pid).unwrap();
+    assert_eq!(
+        wait_of(&db, pid, &chore.id).dispatch_wait_reason.as_deref(),
+        Some(DISPATCH_WAIT_REASON_AWAITING_DISPATCH)
+    );
+
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            deferred: Some(true),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        wait_of(&db, pid, &chore.id).dispatch_wait_reason.as_deref(),
+        Some(DISPATCH_WAIT_REASON_DEFERRED)
+    );
+
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            deferred: Some(false),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        wait_of(&db, pid, &chore.id).dispatch_wait_reason.as_deref(),
+        Some(DISPATCH_WAIT_REASON_UNCLASSIFIED),
+        "an abandoned never-started row must not be named run_ended"
+    );
+
+    db.reconcile_product_executions(pid).unwrap();
+    assert_eq!(
+        wait_of(&db, pid, &chore.id).dispatch_wait_reason.as_deref(),
+        Some(DISPATCH_WAIT_REASON_AWAITING_DISPATCH)
+    );
 }
 
 #[test]

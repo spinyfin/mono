@@ -438,6 +438,35 @@ fn open_positioning_hold_messages(conn: &Connection, ids: &[&str]) -> Result<Has
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// Members of `ids` whose latest non-progression execution was abandoned
+/// before a worker started: no `started_at` and no `work_runs` row. Those
+/// rows are reminted once the item is runnable, so they must not be named
+/// `run_ended`.
+fn abandoned_never_started_among(conn: &Connection, ids: &[&str]) -> Result<HashSet<String>> {
+    if ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT e.work_item_id
+         FROM work_executions e
+         WHERE e.work_item_id IN (SELECT value FROM json_each(?1))
+           AND e.kind <> 'progression'
+           AND e.status = 'abandoned'
+           AND e.started_at IS NULL
+           AND NOT EXISTS (SELECT 1 FROM work_runs r WHERE r.execution_id = e.id)
+           AND e.id = (
+             SELECT e2.id FROM work_executions e2
+             WHERE e2.work_item_id = e.work_item_id AND e2.kind <> 'progression'
+             ORDER BY e2.created_at DESC, e2.id DESC
+             LIMIT 1
+           )",
+    )?;
+    let found = stmt
+        .query_map([id_array(ids)], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(found)
+}
+
 /// The members of `ids` with an open attention item of one of `kinds`.
 /// `kinds` are attention-kind constants, never caller data.
 fn open_attention_among(conn: &Connection, ids: &[&str], kinds: &[&str]) -> Result<HashSet<String>> {
@@ -474,6 +503,12 @@ fn classify_queued(
 ) -> Result<()> {
     let ids: Vec<&str> = cards.iter().map(|card| card.task.id.as_str()).collect();
     let holds = RowHolds::load(conn, &ids)?;
+    let abandoned: Vec<&str> = cards
+        .iter()
+        .filter(|card| card.latest == Some(&ExecutionStatus::Abandoned))
+        .map(|card| card.task.id.as_str())
+        .collect();
+    let remintable = abandoned_never_started_among(conn, &abandoned)?;
     let (mut revisions, mut unowned) = (Vec::new(), Vec::new());
     for card in cards {
         let task = card.task;
@@ -481,8 +516,10 @@ fn classify_queued(
             code
         } else if task.deferred || holds.deferred.contains(&task.id) {
             DISPATCH_WAIT_REASON_DEFERRED
-        } else if card.latest.is_some() {
+        } else if card.latest.is_some() && !remintable.contains(&task.id) {
             // The reconciler never mints a replacement after a finished run.
+            // A never-started abandoned row is reminted once the item is
+            // runnable again, so it is classified as if it had no execution.
             DISPATCH_WAIT_REASON_RUN_ENDED
         } else if task.kind == TaskKind::Revision {
             revisions.push(task);
