@@ -126,7 +126,7 @@ mod tests {
     use std::{
         os::unix::fs::PermissionsExt,
         path::Path,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, MutexGuard, PoisonError},
     };
     use tokio::io::AsyncWriteExt;
 
@@ -147,19 +147,21 @@ mod tests {
     fn daemon_lock_held(error: &anyhow::Error) -> bool {
         error.to_string().contains("spoke daemon lock is held")
     }
-    /// Serializes shim `spawn` with `Journal::open`. A forked child shares
-    /// `daemon.lock` until exec, so an overlapping open sees the flock as held.
+    /// Serializes shim `spawn` with `Journal::open`. That gate is the load-bearing
+    /// fix: a forked child shares `daemon.lock` until exec (`O_CLOEXEC` only
+    /// closes it at exec), so an overlapping open sees the flock as held. The
+    /// one-second retry in `journal` is defence in depth for lock holders this
+    /// crate does not route through the gate (for example a process that spawned
+    /// outside it). Retry only the lock-held error.
     static SPAWN_OR_OPEN: Mutex<()> = Mutex::new(());
-    /// `Journal::open` takes an exclusive flock on `daemon.lock`. Sibling tests
-    /// in this binary spawn the `boss-event` shim through `tokio::process::Command`.
-    /// Between fork and exec the child shares that open file description
-    /// (`O_CLOEXEC` only closes it at exec), so the flock can briefly outlive
-    /// this test's drop. Retry only that lock-held error.
+    fn gate() -> MutexGuard<'static, ()> {
+        SPAWN_OR_OPEN.lock().unwrap_or_else(PoisonError::into_inner)
+    }
     fn journal(root: &Path, limits: Limits) -> SharedJournal {
         let path = root.join("state");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         loop {
-            let _gate = SPAWN_OR_OPEN.lock().expect("spawn/open gate");
+            let _gate = gate();
             match Journal::open(&path, "host", limits) {
                 Ok(opened) => return Arc::new(Mutex::new(opened)),
                 Err(error) if daemon_lock_held(&error) => {
@@ -249,7 +251,7 @@ mod tests {
             .unwrap()
             .join(std::env::var("SHIM_BIN").unwrap());
         let mut child = {
-            let _gate = SPAWN_OR_OPEN.lock().expect("spawn/open gate");
+            let _gate = gate();
             tokio::process::Command::new(binary)
                 .env("BOSS_EVENTS_SOCKET", socket)
                 .env(boss_host_execution::worker::EVENT_SPOOL_ENV, root.join("pending"))
