@@ -74,10 +74,10 @@ pub const EXECUTOR_FEATURES: &[&str] = &[
     feature::PANE_CAPTURE,
 ];
 
-/// Journal plus the executor-backed workspace/execution set. This is the
-/// production executor Hello.
-pub fn executor_contracts() -> Contracts {
-    let mut contracts = Contracts {
+/// Epoch 1 with journal at revision 1 required. The journal-only Hello and
+/// the executor Hello both start here so the journal revision cannot drift.
+pub fn journal_contracts() -> Contracts {
+    Contracts {
         min_epoch: EPOCH,
         max_epoch: EPOCH,
         features: vec![Feature {
@@ -85,7 +85,13 @@ pub fn executor_contracts() -> Contracts {
             revision: 1,
         }],
         required: vec![feature::JOURNAL.into()],
-    };
+    }
+}
+
+/// Journal plus the executor-backed workspace/execution set. This is the
+/// production executor Hello.
+pub fn executor_contracts() -> Contracts {
+    let mut contracts = journal_contracts();
     for &name in EXECUTOR_FEATURES {
         contracts.features.push(Feature {
             name: name.into(),
@@ -459,6 +465,28 @@ mod tests {
         let mut partial = required_at(1);
         partial.pop();
         assert!(local.confirm(&welcome(1, partial)).is_err(), "required feature dropped");
+    }
+
+    #[test]
+    fn journal_contracts_are_the_shared_journal_only_base() {
+        let offered = journal_contracts();
+        assert_eq!(offered.min_epoch, EPOCH);
+        assert_eq!(offered.max_epoch, EPOCH);
+        assert_eq!(
+            offered.features,
+            vec![Feature {
+                name: feature::JOURNAL.into(),
+                revision: 1,
+            }]
+        );
+        assert_eq!(offered.required, vec![feature::JOURNAL.to_owned()]);
+        let executor = executor_contracts();
+        for item in &offered.features {
+            assert!(executor.features.iter().any(|feature| feature == item));
+        }
+        for name in &offered.required {
+            assert!(executor.required.iter().any(|required| required == name));
+        }
     }
 
     #[test]

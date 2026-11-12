@@ -408,8 +408,8 @@ mod session {
 
 use anyhow::{Result, ensure};
 use boss_protocol_spoke::{
-    negotiate::{Contracts, EPOCH, feature},
-    v1::{Feature, Hello, Stamp},
+    negotiate::{Contracts, EPOCH},
+    v1::{Hello, Stamp},
 };
 use boss_spoke_journal::Journal;
 use std::sync::{Arc, Mutex};
@@ -432,15 +432,7 @@ pub type SharedJournal = Arc<Mutex<Journal>>;
 pub use session::connect_once;
 
 pub fn contracts() -> Contracts {
-    Contracts {
-        min_epoch: EPOCH,
-        max_epoch: EPOCH,
-        features: vec![Feature {
-            name: feature::JOURNAL.into(),
-            revision: 1,
-        }],
-        required: vec![feature::JOURNAL.into()],
-    }
+    boss_protocol_spoke::negotiate::journal_contracts()
 }
 
 /// Journal contracts plus the executor-backed workspace/execution set.
@@ -553,6 +545,11 @@ pub(crate) fn status(error: tonic::Status) -> anyhow::Error {
 mod tests {
     use super::*;
     use boss_protocol_spoke::negotiate::{EXECUTOR_FEATURES, feature};
+
+    #[test]
+    fn journal_only_hello_uses_the_shared_journal_contracts() {
+        assert_eq!(contracts(), boss_protocol_spoke::negotiate::journal_contracts());
+    }
 
     #[test]
     fn production_executor_negotiates_only_with_a_compatible_hub() {

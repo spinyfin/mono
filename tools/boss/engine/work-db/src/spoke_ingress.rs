@@ -269,8 +269,10 @@ impl WorkDb {
         if commit.sequence <= received {
             // Already receipted and never stored (an ephemeral capture) or a
             // hole left by not retaining a frame. Results are always retained,
-            // so a result at such a sequence is a lie.
-            if commit.result.is_some() {
+            // so a result at such a sequence is a lie. A retained-type frame
+            // at an unstored sequence is also a lie: the hub never kept that
+            // sequence, so this cannot be a legitimate replay of a kept record.
+            if commit.result.is_some() || commit.retain {
                 return Err(fault(HostOutboxFault::Denied));
             }
             tx.commit()?;
@@ -824,5 +826,38 @@ mod tests {
         assert_eq!(put(3, b"another-capture", false).unwrap(), 3);
         assert!(db.spoke_ingress_frame("host-a", 3).unwrap().is_none());
         assert_eq!(db.spoke_journal("host-a").unwrap().unwrap().received, 3);
+    }
+
+    #[test]
+    fn a_retained_replay_at_an_unstored_sequence_is_denied() {
+        let db = db();
+        db.set_host_transport("host-a", HostTransport::SpokeReady).unwrap();
+        let owned = db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
+        let run = key(&owned);
+        let admission = db.open_spoke_journal("host-a", "journal", 0, 1).unwrap();
+        let put = |sequence: u64, frame: &[u8], retain: bool| {
+            db.commit_spoke_record(
+                SpokeIngressCommit::builder()
+                    .host_id("host-a")
+                    .generation(admission.generation)
+                    .journal_id(&admission.journal_id)
+                    .sequence(sequence)
+                    .frame(frame)
+                    .epoch(1)
+                    .features("execution=1")
+                    .observed_at_ms(1)
+                    .runs(std::slice::from_ref(&run))
+                    .retain(retain)
+                    .build(),
+            )
+        };
+        assert_eq!(put(1, b"capture", false).unwrap(), 1);
+        assert!(db.spoke_ingress_frame("host-a", 1).unwrap().is_none());
+        assert_eq!(
+            fault_of(&put(1, b"lifecycle", true).unwrap_err()),
+            Some(HostOutboxFault::Denied)
+        );
+        assert_eq!(put(1, b"changed-capture", false).unwrap(), 1);
+        assert_eq!(db.spoke_journal("host-a").unwrap().unwrap().received, 1);
     }
 }
