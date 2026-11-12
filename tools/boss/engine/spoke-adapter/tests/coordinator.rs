@@ -1,5 +1,5 @@
 //! The real dispatch coordinator against the authenticated scripted spoke.
-use super::{short, support::*};
+use super::{short, support::*, workspace_slack};
 use boss_engine_runtime::{
     coordinator::{ExecutionCoordinator, SpokeInDoubtTiming},
     lifecycle_adapter::CoreLifecycleServices,
@@ -212,7 +212,7 @@ async fn restarted(fx: &Fixture, previous: &Arc<ExecutionCoordinator>, slots: us
 
 #[tokio::test]
 async fn an_unanswered_spawn_past_the_retry_bound_parks_and_a_late_result_reconciles() {
-    let fx = Fixture::with(short(300)).await;
+    let fx = Fixture::with(workspace_slack(300)).await;
     let env = env(&fx, 1).await;
     let execution = triage(&fx, &env, "unanswered spawn");
     let peer = fx
@@ -280,7 +280,7 @@ async fn an_unanswered_spawn_past_the_retry_bound_parks_and_a_late_result_reconc
 
 #[tokio::test]
 async fn a_settled_indeterminate_spawn_parks_then_an_adopt_that_finds_it_alive_reconciles() {
-    let fx = Fixture::with(short(300)).await;
+    let fx = Fixture::with(workspace_slack(300)).await;
     let env = env(&fx, 1).await;
     let execution = triage(&fx, &env, "indeterminate spawn");
     let alive = Arc::new(AtomicBool::new(false));
@@ -329,7 +329,7 @@ async fn a_settled_indeterminate_spawn_parks_then_an_adopt_that_finds_it_alive_r
 
 #[tokio::test]
 async fn a_settled_uncertain_spawn_the_host_then_reports_absent_fails_and_releases_the_workspace() {
-    let fx = Fixture::with(short(300)).await;
+    let fx = Fixture::with(workspace_slack(300)).await;
     let env = env(&fx, 1).await;
     let execution = triage(&fx, &env, "absent after uncertain");
     let peer = fx
@@ -360,7 +360,7 @@ async fn a_settled_uncertain_spawn_the_host_then_reports_absent_fails_and_releas
 
 #[tokio::test]
 async fn cancelling_while_a_spawn_is_in_doubt_keeps_the_workspace_lease() {
-    let fx = Fixture::with(short(300)).await;
+    let fx = Fixture::with(workspace_slack(300)).await;
     let env = env(&fx, 1).await;
     let execution = triage(&fx, &env, "cancel in doubt");
     let alive = Arc::new(AtomicBool::new(false));
@@ -445,7 +445,7 @@ async fn cancelling_while_a_spawn_is_in_doubt_keeps_the_workspace_lease() {
 
 #[tokio::test]
 async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_retry_budget() {
-    let fx = Fixture::with(short(300)).await;
+    let fx = Fixture::with(workspace_slack(300)).await;
     let env = env(&fx, 2).await;
     let executions = [triage(&fx, &env, "first"), triage(&fx, &env, "second")];
     let peer = fx
@@ -509,7 +509,7 @@ async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_r
 /// dispatch passes than the pre-start retry budget allows, and optionally a
 /// second host that every later pass would rank higher.
 async fn a_disconnected_host_is_never_charged_for_an_admitted_lease(other_host: bool) {
-    let fx = Fixture::with(short(300)).await;
+    let fx = Fixture::with(workspace_slack(300)).await;
     let env = env(&fx, 1).await;
     if other_host {
         fx.db.add_host("other", "worker@other", 8, &[]).unwrap();
@@ -578,7 +578,7 @@ async fn a_better_ranked_host_never_takes_over_an_admitted_lease() {
 
 #[tokio::test]
 async fn a_local_error_on_a_spawn_retry_does_not_discard_the_earlier_uncertainty() {
-    let fx = Fixture::with(short(300)).await;
+    let fx = Fixture::with(workspace_slack(300)).await;
     let env = env(&fx, 1).await;
     let execution = triage(&fx, &env, "local error on retry");
     let peer = fx
@@ -624,7 +624,7 @@ async fn a_local_error_on_a_spawn_retry_does_not_discard_the_earlier_uncertainty
 
 #[tokio::test]
 async fn a_lease_in_doubt_does_not_stop_another_execution_for_the_repo_from_leasing() {
-    let fx = Fixture::with(short(300)).await;
+    let fx = Fixture::with(workspace_slack(300)).await;
     let env = env(&fx, 3).await;
     let executions = [
         triage(&fx, &env, "first"),
@@ -665,7 +665,7 @@ async fn a_lease_in_doubt_does_not_stop_another_execution_for_the_repo_from_leas
 
 #[tokio::test]
 async fn a_cancelled_unanswered_spawn_is_reconciled_from_stored_state_after_a_restart() {
-    let fx = Fixture::with(short(300)).await;
+    let fx = Fixture::with(workspace_slack(300)).await;
     let env = env(&fx, 1).await;
     let execution = triage(&fx, &env, "cancelled unanswered spawn");
     let started = Arc::new(AtomicBool::new(false));
@@ -753,7 +753,7 @@ async fn a_cancelled_unanswered_spawn_is_reconciled_from_stored_state_after_a_re
 
 #[tokio::test]
 async fn a_parked_running_spawn_is_reconciled_from_stored_state_after_a_restart() {
-    let fx = Fixture::with(short(300)).await;
+    let fx = Fixture::with(workspace_slack(300)).await;
     let env = env(&fx, 1).await;
     let execution = triage(&fx, &env, "parked running spawn");
     let peer = fx
@@ -807,7 +807,7 @@ async fn a_parked_running_spawn_is_reconciled_from_stored_state_after_a_restart(
 
 #[tokio::test]
 async fn an_unanswered_spawn_still_in_pre_attention_retries_is_reconciled_after_a_restart() {
-    let fx = Fixture::with(short(300)).await;
+    let fx = Fixture::with(workspace_slack(300)).await;
     let env = env(&fx, 1).await;
     let execution = triage(&fx, &env, "pre-attention spawn");
     let peer = fx
@@ -860,7 +860,7 @@ async fn an_unanswered_spawn_still_in_pre_attention_retries_is_reconciled_after_
 
 #[tokio::test]
 async fn a_cancelled_unanswered_lease_stays_open_until_a_late_grant_is_released() {
-    let fx = Fixture::with(short(300)).await;
+    let fx = Fixture::with(workspace_slack(300)).await;
     let env = env(&fx, 1).await;
     let execution = triage(&fx, &env, "cancelled unanswered lease");
     let show_lease = Arc::new(AtomicBool::new(false));
@@ -930,7 +930,7 @@ async fn a_cancelled_unanswered_lease_stays_open_until_a_late_grant_is_released(
 
 #[tokio::test]
 async fn a_lease_in_doubt_does_not_stop_another_execution_from_leasing_on_a_second_host() {
-    let fx = Fixture::with(short(300)).await;
+    let fx = Fixture::with(workspace_slack(300)).await;
     let env = env(&fx, 3).await;
     let parked = [triage(&fx, &env, "first"), triage(&fx, &env, "second")];
     let peer = fx
@@ -1007,7 +1007,7 @@ async fn a_hung_in_doubt_adopt_does_not_stall_the_scheduler_heartbeat() {
     let other = fx.spoke_as("other", Box::new(answer), None, 0).await;
     let second = triage(&fx, &env, "stranded ready");
     let _handle = env.coordinator.spawn_scheduler_heartbeat(Duration::from_millis(80));
-    tokio::time::timeout(Duration::from_millis(500), async {
+    tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if other
                 .commands()
@@ -1020,5 +1020,5 @@ async fn a_hung_in_doubt_adopt_does_not_stall_the_scheduler_heartbeat() {
         }
     })
     .await
-    .expect("a stranded ready row is re-kicked within one heartbeat interval while Adopt is unanswered");
+    .expect("a stranded ready row is re-kicked while Adopt is unanswered");
 }

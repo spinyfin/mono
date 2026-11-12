@@ -53,6 +53,21 @@ fn short(deadline_ms: u64) -> SpokeAdapterConfig {
         .build()
 }
 
+/// Workspace/lease commands get a load-tolerant deadline; spawn still times
+/// out in `spawn_deadline_ms` so unanswered-spawn tests park quickly.
+///
+/// Coordinator tests that share this process with dozens of siblings miss a
+/// 200–300ms lease deadline under CI contention, and that miss is recorded as
+/// a pre-start failure (`dispatch_not_before` + count) before the spawn the
+/// test is actually exercising.
+fn workspace_slack(spawn_deadline_ms: u64) -> SpokeAdapterConfig {
+    SpokeAdapterConfig::builder()
+        .command_deadline(Duration::from_secs(5))
+        .spawn_deadline(Duration::from_millis(spawn_deadline_ms))
+        .prompt_timeout(Duration::from_secs(5))
+        .build()
+}
+
 async fn lease(adapter: &Arc<dyn HostAdapter>) {
     let lease = adapter.lease_workspace("repo", "task", None, false, &[]).await.unwrap();
     assert_eq!(lease.lease_id, "lease-1");
@@ -587,7 +602,14 @@ fn host_call_errors_say_whether_anything_happened() {
 
 #[tokio::test]
 async fn session_start_without_a_turn_stops_the_spoke_worker_and_fails_spawn() {
-    let fx = Fixture::with(short(100)).await;
+    let fx = Fixture::with(
+        SpokeAdapterConfig::builder()
+            .command_deadline(Duration::from_secs(5))
+            .spawn_deadline(Duration::from_secs(5))
+            .prompt_timeout(Duration::from_millis(100))
+            .build(),
+    )
+    .await;
     fx.signals.0.store(false, Ordering::SeqCst);
     fx.ready(HOST);
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
