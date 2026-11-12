@@ -42,7 +42,7 @@ fn insert_attempt(db: &WorkDb, product_id: &str, work_item_id: &str, base_sha: &
 //   after sorting by count descending;
 // * strict per-product isolation — a second product's rows never leak
 //   into the first's report;
-// * historical and missing diagnoses are excluded from all counts.
+// * historical, missing, and errored diagnoses are excluded from all counts.
 
 fn diagnosis_json(paths: &[&str]) -> String {
     let diagnosis = boss_conflict_diagnosis::ConflictDiagnosis {
@@ -95,6 +95,34 @@ fn historical_diagnoses_are_retained_but_excluded() {
     let report = db.conflict_hotspots(&product, 20).unwrap();
     assert_eq!(report.total_events, 1, "a current empty diagnosis is still counted");
     assert!(report.file_frequency.is_empty());
+    assert_eq!(report.class_counts[0].count, 1);
+}
+
+#[test]
+fn errored_fetched_base_diagnoses_are_excluded() {
+    let (db, product, chore) = seed_product_and_chore("hotspots-errored-v2");
+    let errored = insert_attempt(&db, &product, &chore, "errored-v2");
+    let diagnosis = boss_conflict_diagnosis::ConflictDiagnosis {
+        schema_version: 2,
+        base_sha: "aaa".into(),
+        head_sha: "bbb".into(),
+        files: vec![],
+        error: Some("base branch fetch failed".into()),
+    };
+    db.set_conflict_resolution_diagnosis(&errored.id, &serde_json::to_string(&diagnosis).unwrap())
+        .unwrap();
+
+    let empty_ok = insert_attempt(&db, &product, &chore, "empty-ok");
+    db.set_conflict_resolution_diagnosis(&empty_ok.id, &diagnosis_json(&[]))
+        .unwrap();
+
+    let report = db.conflict_hotspots(&product, 20).unwrap();
+    assert_eq!(
+        report.total_events, 1,
+        "a successful empty diagnosis still counts; an errored v2 probe does not"
+    );
+    assert!(report.file_frequency.is_empty());
+    assert_eq!(report.class_counts.len(), 1);
     assert_eq!(report.class_counts[0].count, 1);
 }
 

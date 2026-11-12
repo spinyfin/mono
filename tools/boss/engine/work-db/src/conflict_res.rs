@@ -823,9 +823,12 @@ impl WorkDb {
     /// meaningful within one repo). `top_n` caps each ranked list
     /// (file/pair frequency) to its highest-count entries; class
     /// counts are never truncated since there are only a handful of
-    /// classes. Only version 2 diagnoses (fetched base tip) are included.
-    /// Historical diagnoses remain stored but are excluded from every count
-    /// because the recorded PR base could produce a trivially clean merge.
+    /// classes. Only successful version 2 diagnoses (fetched base tip,
+    /// `error` unset) are included. Historical diagnoses and failed probes
+    /// remain stored but are excluded from every count: the recorded PR
+    /// base could produce a trivially clean merge, and an errored probe
+    /// has empty files that would otherwise count as `"unknown"`.
+    /// Empty-but-successful fetched-base diagnoses still count.
     pub fn conflict_hotspots(&self, product_id: &str, top_n: usize) -> Result<ConflictHotspotReport> {
         let conn = self.connect()?;
         let mut stmt =
@@ -847,7 +850,7 @@ impl WorkDb {
             let Ok(diagnosis) = serde_json::from_str::<boss_conflict_diagnosis::ConflictDiagnosis>(&json) else {
                 continue;
             };
-            if diagnosis.schema_version != 2 {
+            if diagnosis.schema_version != 2 || diagnosis.error.is_some() {
                 continue;
             }
             total_events += 1;

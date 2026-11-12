@@ -288,7 +288,7 @@ fn default_review_watch_event_source() -> String {
 }
 
 /// Aggregated hotspot report over `conflict_resolutions.conflict_diagnosis`
-/// for one product (Layer 0 telemetry, T5 — see `tools/boss/docs/designs/
+/// for one product (Layer 0 telemetry — see `tools/boss/docs/designs/
 /// merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`).
 /// Exposed as `boss engine conflicts hotspots`. Always scoped to a single
 /// `product_id` — hotspot data is only meaningful within one repo, so the
@@ -296,8 +296,9 @@ fn default_review_watch_event_source() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConflictHotspotReport {
     pub product_id: String,
-    /// Number of fetched-base diagnoses included for this product.
-    /// Historical diagnoses without a fetched base tip are excluded.
+    /// Number of successful fetched-base diagnoses included for this product.
+    /// Historical diagnoses without a fetched base tip, and probes that
+    /// recorded an error, are excluded.
     pub total_events: u64,
     /// Per-file conflict frequency, most-frequent first, capped to the
     /// requested top-N.

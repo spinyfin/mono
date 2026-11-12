@@ -1,16 +1,33 @@
 //! Fetch a branch tip into a private ref so concurrent probes cannot replace it.
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use crate::{ConflictDiagnosis, collect, resolve_git_dir, run_git};
+
+/// Bound on the pre-spawn `git fetch` of the PR base branch. A hung remote
+/// or auth prompt must not stall the resolver spawn; expiry yields an
+/// errored diagnosis and still deletes the private ref.
+pub const BASE_BRANCH_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Version 2 identifies diagnoses made against a freshly fetched base branch.
 /// `base_sha` in the persisted JSON is the exact tip used, independently of the
 /// PR's recorded base at detection. No checkout or published ref is changed.
+/// Failed probes stay at schema version 1 so hotspot aggregation does not
+/// count them as fetched-base events.
 pub async fn collect_current_base(
     workspace: &Path,
     base_branch: &str,
     head_sha: &str,
+) -> std::io::Result<ConflictDiagnosis> {
+    collect_current_base_with_timeout(workspace, base_branch, head_sha, BASE_BRANCH_FETCH_TIMEOUT).await
+}
+
+async fn collect_current_base_with_timeout(
+    workspace: &Path,
+    base_branch: &str,
+    head_sha: &str,
+    fetch_timeout: Duration,
 ) -> std::io::Result<ConflictDiagnosis> {
     static NEXT_REF: AtomicU64 = AtomicU64::new(0);
     let git_dir = resolve_git_dir(workspace)?;
@@ -20,13 +37,26 @@ pub async fn collect_current_base(
         NEXT_REF.fetch_add(1, Ordering::Relaxed)
     );
     let refspec = format!("+refs/heads/{base_branch}:{private_ref}");
-    let fetch = run_git(
-        &["fetch", "--no-tags", "--no-write-fetch-head", "origin", &refspec],
-        workspace,
-        &git_dir,
-    )
-    .await?;
     let result = async {
+        let fetch = match tokio::time::timeout(
+            fetch_timeout,
+            run_git(
+                &["fetch", "--no-tags", "--no-write-fetch-head", "origin", &refspec],
+                workspace,
+                &git_dir,
+            ),
+        )
+        .await
+        {
+            Ok(output) => output?,
+            Err(_) => {
+                return Ok(ConflictDiagnosis::errored(
+                    "",
+                    head_sha,
+                    format!("base branch fetch timed out after {fetch_timeout:?}"),
+                ));
+            }
+        };
         if !fetch.status.success() {
             return Ok(ConflictDiagnosis::errored(
                 "",
@@ -46,7 +76,9 @@ pub async fn collect_current_base(
         let mut diagnosis = collect(workspace, &base_sha, head_sha).await.unwrap_or_else(|error| {
             ConflictDiagnosis::errored(&base_sha, head_sha, format!("git probe failed: {error}"))
         });
-        diagnosis.schema_version = 2;
+        if diagnosis.error.is_none() {
+            diagnosis.schema_version = 2;
+        }
         Ok(diagnosis)
     }
     .await;
@@ -117,5 +149,48 @@ mod tests {
             .unwrap();
         assert!(failed.error.unwrap().contains("base branch fetch failed"));
         assert!(failed.base_sha.is_empty(), "never fall back to the stale base");
+        assert_eq!(failed.schema_version, 1, "errored probes are not fetched-base events");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_timeout_returns_errored_diagnosis_and_deletes_the_private_ref() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().unwrap();
+        boss_engine_test_git::init_repo_with_branch(workspace.path(), "main");
+        git(workspace.path(), &["config", "user.email", "test@example.invalid"]);
+        git(workspace.path(), &["config", "user.name", "Test"]);
+        std::fs::write(workspace.path().join("a.txt"), "original\n").unwrap();
+        git(workspace.path(), &["add", "a.txt"]);
+        git(workspace.path(), &["commit", "-m", "Initial"]);
+        let head = git(workspace.path(), &["rev-parse", "HEAD"]);
+        // Repo-local ssh command that ignores extra BatchMode flags and hangs,
+        // so a fetch of an ssh remote cannot complete before the probe deadline.
+        let sleeper = workspace.path().join("hang-ssh");
+        std::fs::write(&sleeper, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&sleeper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(
+            workspace.path(),
+            &["config", "core.sshCommand", sleeper.to_str().unwrap()],
+        );
+        git(
+            workspace.path(),
+            &["remote", "add", "origin", "ssh://example.invalid/repo.git"],
+        );
+
+        let diagnosis = collect_current_base_with_timeout(workspace.path(), "main", &head, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(
+            diagnosis
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("timed out")),
+            "{diagnosis:?}"
+        );
+        assert_eq!(diagnosis.schema_version, 1);
+        assert!(diagnosis.base_sha.is_empty());
+        assert!(git(workspace.path(), &["for-each-ref", "refs/boss/conflict-diagnosis"]).is_empty());
     }
 }
