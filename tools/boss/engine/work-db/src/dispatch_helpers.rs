@@ -188,8 +188,9 @@ pub(crate) fn not_positioning_held_sql(a: &str) -> String {
 /// blocked only by the hold to `todo`. Review-phase rows never had their status
 /// rewritten, so they are left exactly as they were.
 ///
-/// Deleted / `done` / `archived` rows keep their status; any leftover
-/// `blocked_reason` is still cleared so they leave the hold listing. Returns
+/// `done` / `archived` rows keep their status; any leftover `blocked_reason`
+/// is still cleared so they leave the hold listing. Deleted rows keep both
+/// status and reason so a restore returns a coherent hold. Returns
 /// whether attention was resolved or a row was rewritten.
 pub(crate) fn clear_positioning_hold_in_tx(conn: &Connection, work_item_id: &str, actor: &str) -> Result<bool> {
     let now = now_string();
@@ -206,9 +207,10 @@ pub(crate) fn clear_positioning_hold_in_tx(conn: &Connection, work_item_id: &str
         ),
         params![work_item_id, now, actor],
     )?;
-    // Terminal and deleted rows fail the status rewrite above (status is no
-    // longer `blocked`, or `deleted_at` is set). Drop the leftover reason
-    // without touching status so the hold listing converges.
+    // Terminal rows fail the status rewrite above (status is no longer
+    // `blocked`). Drop the leftover reason without touching status so the
+    // hold listing converges. Tombstones keep their reason: a restore must
+    // bring back the coherent hold, which the recheck sweep then lists again.
     let leftover = crate::task_status_audit::execute(
         conn,
         "workspace_positioning_hold_cleared",
@@ -216,7 +218,7 @@ pub(crate) fn clear_positioning_hold_in_tx(conn: &Connection, work_item_id: &str
         &format!(
             "UPDATE tasks SET blocked_reason = NULL, blocked_detail = NULL,
                  last_status_actor = ?3, updated_at = ?2
-             WHERE id = ?1 AND blocked_reason = '{WORKSPACE_POSITIONING_REFUSED}'"
+             WHERE id = ?1 AND deleted_at IS NULL AND blocked_reason = '{WORKSPACE_POSITIONING_REFUSED}'"
         ),
         params![work_item_id, now, actor],
     )?;
@@ -392,6 +394,7 @@ impl RuntimePassCost {
                 &annotation.idle_active,
             ),
             (segment::DB_TASK_RUNTIMES_ANNOTATION_REVIEW, &annotation.review),
+            (segment::DB_TASK_RUNTIMES_ANNOTATION_HOLDS, &annotation.holds),
         ] {
             trace.record_nplus1(name, branch.millis, branch.cards, branch.statements);
         }

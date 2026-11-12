@@ -156,7 +156,7 @@ impl WorkDb {
              JOIN tasks root ON root.id = r.cycle_root_id
              ORDER BY t.id",
             walk = cycle_root_walk_cte(&format!(
-                "(COALESCE(t.blocked_reason, '') = '{refused}'
+                "((t.deleted_at IS NULL AND COALESCE(t.blocked_reason, '') = '{refused}')
                       OR EXISTS (SELECT 1 FROM work_attention_items a
                                  WHERE a.work_item_id = t.id AND a.kind = '{refused}' AND a.status = 'open'))"
             )),
@@ -404,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_positioning_hold_clears_leftover_reason_on_a_deleted_blocked_row() {
+    fn a_deleted_blocked_row_keeps_its_reason_so_a_restore_is_still_held() {
         let (_dir, db) = open_db();
         let product = create_test_product(&db);
         let chore = create_test_chore_manual(&db, product.id, "deleted after refusal");
@@ -426,9 +426,15 @@ mod tests {
         )
         .unwrap();
         db.delete_work_item(&chore.id).unwrap();
-        assert_eq!(db.list_positioning_holds().unwrap().len(), 1);
-        assert!(db.clear_positioning_hold(&chore.id).unwrap());
+        // The delete resolved the attention; the tombstone is not listed, and
+        // clearing the hold must not strip its reason.
         assert!(db.list_positioning_holds().unwrap().is_empty());
         assert!(!db.clear_positioning_hold(&chore.id).unwrap());
+        db.restore_work_item(&chore.id).unwrap();
+        let holds = db.list_positioning_holds().unwrap();
+        assert_eq!(holds.len(), 1);
+        assert!(holds[0].restarts && !holds[0].terminal);
+        assert!(db.clear_positioning_hold(&chore.id).unwrap());
+        assert!(db.list_positioning_holds().unwrap().is_empty());
     }
 }

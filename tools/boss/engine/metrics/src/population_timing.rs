@@ -115,6 +115,9 @@ pub mod segment {
     pub const DB_TASK_RUNTIMES_ANNOTATION_IDLE_ACTIVE: &str = "db.task_runtimes.annotation.idle_active";
     /// Within the annotation: cards in review.
     pub const DB_TASK_RUNTIMES_ANNOTATION_REVIEW: &str = "db.task_runtimes.annotation.review";
+    /// Within the annotation: the open positioning-refusal lookup. `rows` is
+    /// the cards named from a hold.
+    pub const DB_TASK_RUNTIMES_ANNOTATION_HOLDS: &str = "db.task_runtimes.annotation.holds";
     /// `SELECT` for the product's cross-item dependencies.
     pub const DB_DEPENDENCIES: &str = "db.dependencies";
     /// Batched `IN (...)` query for the "AI reviewing" badge.
