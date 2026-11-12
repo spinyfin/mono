@@ -189,12 +189,21 @@ fn describe_cmd(revision: &str, message: &str) -> ExpectedCommand {
     ExpectedCommand::ok(rebase_cwd(), "jj", &["describe", "-r", revision, "-m", message], "")
 }
 
-/// The stacked-PR guard probe: does any bookmark point at this commit?
+/// Local bookmarks on a conflicted ancestor — bookkeeping names (`pr/<n>`,
+/// engine pointers) are ignored by the collapse guard; any other local
+/// bookmark is a stacked-PR boundary.
 fn bookmarks_at_cmd(commit_id: &str, out: &str) -> ExpectedCommand {
     ExpectedCommand::ok(
         rebase_cwd(),
         "jj",
-        &["log", "-r", commit_id, "--no-graph", "-T", "bookmarks"],
+        &[
+            "bookmark",
+            "list",
+            "-r",
+            commit_id,
+            "-T",
+            r#"if(!remote, name ++ "\n")"#,
+        ],
         out,
     )
 }
@@ -686,6 +695,51 @@ fn rebase_collapses_a_replay_only_conflicted_ancestor_and_pushes() {
         "the human message must disclose that history shape changed: {}",
         result.message
     );
+}
+
+/// A leftover `pr/<n>` alias on a conflicted ancestor is local bookkeeping,
+/// not another PR's branch. The rebase-time collapse must ignore it the same
+/// way the push-time collapse does, or a jj rebase that carried the alias
+/// along with the commits would still hand a replay-only conflict to an agent.
+#[test]
+fn rebase_collapses_when_the_conflicted_ancestor_only_carries_a_legacy_pr_bookmark() {
+    let branch = "boss/exec_replay_pr_alias";
+    let push_range = format!("main@github..{branch}");
+    let mut cmds = vec![
+        fetch_cmd(),
+        remote_exists_cmd(branch, "r1"),
+        positioned_cmd(branch, "r1"),
+    ];
+    cmds.extend(set_track_rebase_check_cmds(branch, &["ancestor7"]));
+    cmds.push(head_conflict_probe_cmd(branch, ""));
+    cmds.push(head_commit_id_cmd(branch, "headbefore\n"));
+    cmds.push(conflicts_in_revset_cmd(&push_range, &["ancestor7"]));
+    cmds.push(bookmarks_at_cmd("ancestor7", "pr/9\n"));
+    cmds.push(children_of_cmd("ancestor7", &["child7"]));
+    cmds.extend(collapse_round_cmds(
+        &push_range,
+        "ancestor7",
+        "child7",
+        "wip: half the fix",
+        "op-squash-1",
+    ));
+    cmds.push(conflicts_in_revset_cmd(&push_range, &[]));
+    cmds.push(conflicts_in_revset_cmd("main@github..@", &[]));
+    cmds.push(tree_delta_cmd("headbefore", branch, ""));
+    cmds.push(description_cmd(branch, "the real change\n"));
+    cmds.push(describe_cmd(
+        branch,
+        &merged_description("the real change", &["wip: half the fix"]),
+    ));
+    cmds.push(op_id_cmd("op-describe\n"));
+    cmds.extend(push_and_verify_cmds(branch));
+
+    let runner = FakeRunner::new(cmds);
+    let result = run_rebase(&runner, &rebase_opts(Some(branch), None, false)).expect("legacy pr bookmark rebase");
+    runner.assert_exhausted();
+    assert_eq!(result.payload["status"], "clean");
+    assert_eq!(result.payload["pushed"], true);
+    assert_eq!(result.payload["linearized_commits"], 1);
 }
 
 /// The `--no-push` path must disclose the collapse just as loudly as the

@@ -757,14 +757,14 @@ fn hermetic_resolvers(_base_revision: &str) -> ResolverRegistry {
 struct MissingBaseLock;
 
 #[async_trait::async_trait]
-impl boss_deterministic_resolvers::CommandRunner for MissingBaseLock {
+impl boss_command_runner::CommandRunner for MissingBaseLock {
     async fn run(
         &self,
         program: &std::path::Path,
         args: &[std::ffi::OsString],
         cwd: Option<&std::path::Path>,
-    ) -> std::io::Result<boss_deterministic_resolvers::CommandOutput> {
-        use boss_deterministic_resolvers::CommandOutput;
+    ) -> std::io::Result<boss_command_runner::CommandOutput> {
+        use boss_command_runner::CommandOutput;
         let args: Vec<_> = args.iter().map(|s| s.to_str().unwrap()).collect();
         if args.first() == Some(&"file") {
             assert_eq!(args[2..], ["-r", "main@origin", "--", "MODULE.bazel.lock"]);
@@ -815,7 +815,7 @@ async fn module_lock_absent_on_base_regenerates_and_retires_without_an_agent() {
     let factory = |base: &str| {
         let mut registry = ResolverRegistry::empty();
         registry.register(Box::new(
-            boss_deterministic_resolvers::BazelModuleLockResolver::with_runner(Arc::new(MissingBaseLock))
+            boss_deterministic_resolvers::inject::bazel_module_lock(Arc::new(MissingBaseLock))
                 .with_base_revision(base.into()),
         ));
         registry
@@ -832,17 +832,147 @@ async fn module_lock_absent_on_base_regenerates_and_retires_without_an_agent() {
         std::fs::read_to_string(ws.path().join("MODULE.bazel.lock")).unwrap(),
         "regenerated from merged manifest\n"
     );
-    let decisions: serde_json::Value = serde_json::from_str(row.ladder_outcomes.as_deref().unwrap()).unwrap();
-    assert_eq!(decisions[0]["tier"], "engine_rebase");
-    assert_eq!(decisions[0]["outcome"], "residual_conflicts");
-    assert_eq!(decisions[1]["tier"], "deterministic");
-    assert_eq!(decisions[1]["outcome"], "retired");
+    let decisions = row.ladder_outcomes.as_ref().unwrap();
+    assert_eq!(decisions[0].tier, "engine_rebase");
+    assert_eq!(decisions[0].outcome, "residual_conflicts");
+    assert_eq!(decisions[1].tier, "deterministic");
+    assert_eq!(decisions[1].outcome, "retired");
     assert!(row.ladder_reason.as_deref().is_some_and(|r| !r.is_empty()));
     assert_eq!(
         db.metrics_registry()
             .counter_value("conflict_ladder.deterministic.retired"),
         Some(1)
     );
+}
+
+/// Seeds regeneration from a base that already has the lockfile (the
+/// production shape: `MODULE.bazel.lock` / `Cargo.lock` are checked in on
+/// main), then regenerates and retires without an agent. Covers the
+/// fall-through that "absent on base" does not represent.
+#[derive(Clone, Copy)]
+struct PresentBaseLock {
+    lock_path: &'static str,
+    tool: &'static str,
+    tool_args: &'static [&'static str],
+}
+
+#[async_trait::async_trait]
+impl boss_command_runner::CommandRunner for PresentBaseLock {
+    async fn run(
+        &self,
+        program: &std::path::Path,
+        args: &[std::ffi::OsString],
+        cwd: Option<&std::path::Path>,
+    ) -> std::io::Result<boss_command_runner::CommandOutput> {
+        use boss_command_runner::CommandOutput;
+        let args: Vec<_> = args.iter().map(|s| s.to_str().unwrap()).collect();
+        if args.first() == Some(&"file") {
+            assert_eq!(args[2..], ["-r", "main@origin", "--", self.lock_path]);
+            assert_eq!(args[1], "show");
+            return Ok(CommandOutput {
+                success: true,
+                code: Some(0),
+                stdout: "base lockfile\n".into(),
+                stderr: String::new(),
+            });
+        }
+        assert_eq!(program, std::path::Path::new(self.tool));
+        assert_eq!(args, self.tool_args);
+        let cwd = cwd.unwrap();
+        assert_eq!(std::fs::read_to_string(cwd.join(self.lock_path))?, "base lockfile\n");
+        std::fs::write(cwd.join(self.lock_path), "regenerated from seeded base\n")?;
+        Ok(CommandOutput {
+            success: true,
+            code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn module_lock_present_on_base_regenerates_and_retires_without_an_agent() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, chore_id) = blocked_with_attempt(&db);
+    let publisher = RecordingPublisher::default();
+    let ws = tempdir().unwrap();
+    std::fs::write(ws.path().join("MODULE.bazel"), "merged manifest\n").unwrap();
+    std::fs::write(ws.path().join("MODULE.bazel.lock"), "<<<<<<< conflicted\n").unwrap();
+    let cube = ScriptCube::with_workspace_path(
+        Script::Conflicts(vec!["MODULE.bazel.lock".into()]),
+        ws.path().to_path_buf(),
+    );
+    let factory = |base: &str| {
+        let mut registry = ResolverRegistry::empty();
+        registry.register(Box::new(
+            boss_deterministic_resolvers::inject::bazel_module_lock(Arc::new(PresentBaseLock {
+                lock_path: "MODULE.bazel.lock",
+                tool: "bazel",
+                tool_args: &["mod", "deps", "--lockfile_mode=update"],
+            }))
+            .with_base_revision(base.into()),
+        ));
+        registry
+    };
+    let outcome = try_mechanical_rungs_with(&db, &publisher, &cube, &candidate, &attempt, &factory).await;
+    assert_eq!(outcome, LadderOutcome::Retired);
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.status, "succeeded");
+    assert_eq!(row.resolved_by_rung, Some(0));
+    assert!(row.revision_task_id.is_none());
+    assert_eq!(*cube.pushes.lock().await, vec![42]);
+    assert_eq!(chore_state(&db, &chore_id).0, "InReview");
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("MODULE.bazel.lock")).unwrap(),
+        "regenerated from seeded base\n"
+    );
+    let decisions = row.ladder_outcomes.as_ref().unwrap();
+    assert_eq!(decisions.last().unwrap().tier, "deterministic");
+    assert_eq!(decisions.last().unwrap().outcome, "retired");
+}
+
+#[tokio::test]
+async fn cargo_lock_present_on_base_regenerates_and_retires_without_an_agent() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, chore_id) = blocked_with_attempt(&db);
+    let publisher = RecordingPublisher::default();
+    let ws = tempdir().unwrap();
+    std::fs::write(
+        ws.path().join("Cargo.toml"),
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(ws.path().join("Cargo.lock"), "<<<<<<< conflicted\n").unwrap();
+    let cube = ScriptCube::with_workspace_path(Script::Conflicts(vec!["Cargo.lock".into()]), ws.path().to_path_buf());
+    let factory = |base: &str| {
+        let mut registry = ResolverRegistry::empty();
+        registry.register(Box::new(
+            boss_deterministic_resolvers::inject::cargo_lock(Arc::new(PresentBaseLock {
+                lock_path: "Cargo.lock",
+                tool: "cargo",
+                tool_args: &["update", "--workspace"],
+            }))
+            .with_base_revision(base.into()),
+        ));
+        registry
+    };
+    let outcome = try_mechanical_rungs_with(&db, &publisher, &cube, &candidate, &attempt, &factory).await;
+    assert_eq!(outcome, LadderOutcome::Retired);
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.status, "succeeded");
+    assert_eq!(row.resolved_by_rung, Some(0));
+    assert!(row.revision_task_id.is_none());
+    assert_eq!(*cube.pushes.lock().await, vec![42]);
+    assert_eq!(chore_state(&db, &chore_id).0, "InReview");
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("Cargo.lock")).unwrap(),
+        "regenerated from seeded base\n"
+    );
+    let decisions = row.ladder_outcomes.as_ref().unwrap();
+    assert_eq!(decisions.last().unwrap().tier, "deterministic");
+    assert_eq!(decisions.last().unwrap().outcome, "retired");
 }
 
 #[tokio::test]
@@ -869,8 +999,9 @@ async fn mechanical_exits_persist_reasons_and_list_json_survives_reopen() {
             .unwrap();
         let json = serde_json::to_value(&rows).unwrap();
         assert!(json[0]["ladder_reason"].as_str().is_some_and(|s| !s.is_empty()));
-        let decisions: Vec<serde_json::Value> =
-            serde_json::from_str(json[0]["ladder_outcomes"].as_str().unwrap()).unwrap();
+        let decisions = json[0]["ladder_outcomes"]
+            .as_array()
+            .expect("ladder_outcomes is an array of decision objects, not a nested JSON string");
         assert!(!decisions.is_empty());
         for decision in decisions {
             for field in ["tier", "outcome", "reason", "recorded_at"] {
@@ -898,10 +1029,44 @@ fn agent_scheduling_keeps_the_mechanical_fallthrough_reason() {
         row.ladder_reason.as_deref(),
         Some("push gate rejected the regenerated tree")
     );
-    let events: Vec<serde_json::Value> = serde_json::from_str(row.ladder_outcomes.as_deref().unwrap()).unwrap();
+    let events = row.ladder_outcomes.as_ref().unwrap();
     assert_eq!(events.len(), 2);
-    assert_eq!(events[0]["outcome"], "push_failed");
-    assert_eq!(events[1]["outcome"], "spawned");
+    assert_eq!(events[0].outcome, "push_failed");
+    assert_eq!(events[1].outcome, "spawned");
+}
+
+#[test]
+fn rung0_declined_with_empty_lists_still_persists_a_reason() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (_, attempt, _) = blocked_with_attempt(&db);
+    record_rung0_registry_decline(
+        &db,
+        &attempt,
+        &[],
+        &[],
+        "rung 0 declined: one or more residual files have no applicable deterministic resolver, or a matched resolver declined",
+    );
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert!(
+        row.ladder_reason.as_deref().is_some_and(|reason| !reason.is_empty()),
+        "every ladder exit must write a non-null reason, even with empty decline lists"
+    );
+    let events = row.ladder_outcomes.as_ref().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].tier, "deterministic");
+    assert_eq!(events[0].outcome, "declined");
+    assert!(!events[0].reason.is_empty());
+}
+
+#[test]
+fn record_tier_falls_back_when_the_detail_string_is_empty() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (_, attempt, _) = blocked_with_attempt(&db);
+    record_tier(&db, &attempt, "engine_rebase", "deferred", "   ");
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.ladder_reason.as_deref(), Some("engine_rebase deferred"));
 }
 
 fn failing_resolvers(_base_revision: &str) -> ResolverRegistry {
@@ -1210,8 +1375,8 @@ async fn rung0_push_failure_falls_through_without_marking_succeeded() {
     // Every file resolved, but the push failed — must not mark succeeded.
     let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
     assert!(row.ladder_reason.as_deref().unwrap().contains("push boom"));
-    let decisions: serde_json::Value = serde_json::from_str(row.ladder_outcomes.as_deref().unwrap()).unwrap();
-    assert_eq!(decisions[0]["outcome"], "push_failed");
+    let decisions = row.ladder_outcomes.as_ref().unwrap();
+    assert_eq!(decisions[0].outcome, "push_failed");
     assert_eq!(row.status, "pending");
     assert_eq!(row.resolved_by_rung, None);
     let (_status, reason) = chore_state(&db, &chore_id);

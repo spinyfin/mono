@@ -335,6 +335,10 @@ fn bookkeeping_pointers_are_not_stack_boundaries_but_a_published_branch_is() {
         !commit_has_blocking_bookmark(&legacy_ctx, ancestor, BookmarkPolicy::PushBranch("boss/exec_x")).unwrap(),
         "obsolete pr/<n> aliases are local bookkeeping, never published branches"
     );
+    assert!(
+        !commit_has_blocking_bookmark(&legacy_ctx, ancestor, BookmarkPolicy::Strict).unwrap(),
+        "rebase-time collapse uses the same bookkeeping classification as push"
+    );
 
     let preserved_repo = Repo::new();
     preserved_repo.lockfile_conflict_with_resolved_child(Some("preserved/x"));

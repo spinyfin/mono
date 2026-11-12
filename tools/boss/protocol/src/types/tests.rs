@@ -458,10 +458,20 @@ fn conflict_resolution_roundtrips_with_all_fields() {
         mismatch_exit_barred: false,
         deferral_arm: Some("control".into()),
         deferral_end_reason: None,
-        ladder_outcomes: None,
-        ladder_reason: None,
+        ladder_outcomes: Some(vec![LadderDecision {
+            tier: "deterministic".into(),
+            outcome: "retired".into(),
+            reason: "resolution pushed".into(),
+            recorded_at: "1747000100".into(),
+        }]),
+        ladder_reason: Some("resolution pushed".into()),
     };
     let raw = serde_json::to_value(&attempt).unwrap();
+    assert!(
+        raw["ladder_outcomes"].is_array(),
+        "conflicts list --json must emit decisions as an array, not a nested JSON string: {raw}"
+    );
+    assert_eq!(raw["ladder_outcomes"][0]["tier"], "deterministic");
     let back: ConflictResolution = serde_json::from_value(raw).unwrap();
     assert_eq!(attempt, back);
 }

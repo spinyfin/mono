@@ -25,9 +25,9 @@ mod registry;
 mod resolvers;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use async_trait::async_trait;
-pub use boss_command_runner::{CommandOutput, CommandRunner};
 pub use boss_conflict_diagnosis::ConflictedFile;
 
 pub use recipe_config::{ConflictRecipe, ConflictRecipesStore};
@@ -36,6 +36,21 @@ pub use resolvers::{
     BazelModuleLockResolver, CargoLockResolver, InvalidRecipe, RecipeResolver, RegistryAppendUnionResolver,
     is_generated_lockfile,
 };
+
+/// Host and ladder-fixture constructors that inject a
+/// [`boss_command_runner::CommandRunner`]. Production code uses
+/// [`BazelModuleLockResolver::new`] / [`CargoLockResolver::new`].
+pub mod inject {
+    use super::*;
+
+    pub fn bazel_module_lock(runner: Arc<dyn boss_command_runner::CommandRunner>) -> BazelModuleLockResolver {
+        BazelModuleLockResolver::with_runner(runner)
+    }
+
+    pub fn cargo_lock(runner: Arc<dyn boss_command_runner::CommandRunner>) -> CargoLockResolver {
+        CargoLockResolver::with_runner(runner)
+    }
+}
 
 /// Coarse classification of a conflicted file's resolution strategy, kept
 /// for telemetry attribution (`conflict_resolutions.conflict_class`,
