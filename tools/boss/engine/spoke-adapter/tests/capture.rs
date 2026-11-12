@@ -90,19 +90,12 @@ fn script(capture_code: ResultCode) -> Script {
 }
 
 #[tokio::test]
-async fn production_executor_hello_is_refused_by_the_production_hub() {
+async fn production_executor_hello_is_accepted_by_the_production_hub() {
     let fx = Fixture::with_hub_contracts(adapter_config(), production_hub_contracts()).await;
     match fx.hello_reply(production_executor_hello().features).await {
-        hub_frame::Body::Reject(reject) => {
-            assert_eq!(reject.code, "missing_required_feature");
-        }
-        other => panic!("expected reject, got {other:?}"),
+        hub_frame::Body::Welcome(_) => {}
+        other => panic!("expected welcome, got {other:?}"),
     }
-    assert_eq!(
-        fx.manager.host_supports(HOST, feature::PANE_CAPTURE).await,
-        None,
-        "a refused Hello never negotiates pane-capture"
-    );
 }
 
 #[tokio::test]

@@ -72,6 +72,9 @@ pub const EXECUTOR_FEATURES: &[&str] = &[
     feature::WORKER_EVENT,
     feature::TRANSCRIPT_DELTA,
     feature::PANE_CAPTURE,
+    feature::WORKER_API,
+    feature::PROPOSAL_JSON,
+    feature::ARTIFACT,
 ];
 
 /// Epoch 1 with journal at revision 1 required. The journal-only Hello and
@@ -511,13 +514,12 @@ mod tests {
             let required = offered.required.iter().any(|required| required == name);
             assert_eq!(required, !OPTIONAL_FEATURES.contains(&name), "{name}");
         }
-        assert_eq!(
-            Contracts::first_release()
-                .select(&hello(1, 1, offered.features))
-                .unwrap_err()
-                .code(),
-            reject_code::MISSING_REQUIRED_FEATURE
-        );
+        let selection = Contracts::first_release()
+            .select(&hello(1, 1, offered.features))
+            .unwrap();
+        for name in [feature::WORKER_API, feature::PROPOSAL_JSON, feature::ARTIFACT] {
+            assert!(selection.has(name), "{name}");
+        }
     }
 
     #[test]
