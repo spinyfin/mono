@@ -186,7 +186,7 @@ pub(super) fn apply_typed_answer_in_tx(
                 },
                 crate::task_status_audit::WriteAttribution {
                     actor: boss_protocol::LAST_STATUS_ACTOR_HUMAN,
-                    provenance: None,
+                    provenance: Some("attention_successor"),
                 },
             )?;
             if task.kind == TaskKind::Revision {

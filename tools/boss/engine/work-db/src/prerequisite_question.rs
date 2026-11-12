@@ -88,7 +88,7 @@ pub(super) fn approve_in_tx(
         Some(existing) => (existing, false),
         None => {
             let prerequisite = if let Some(project_id) = &task.project_id {
-                insert_task_in_tx(
+                insert_task_in_tx_as_actor_with_provenance(
                     conn,
                     CreateTaskInput::builder()
                         .product_id(&task.product_id)
@@ -99,9 +99,11 @@ pub(super) fn approve_in_tx(
                         .created_via(CREATED_VIA_ENGINE_AUTO)
                         .force_duplicate(true)
                         .build(),
+                    attribution.actor,
+                    attribution.provenance,
                 )?
             } else {
-                insert_chore_in_tx(
+                insert_chore_in_tx_as_actor_with_provenance(
                     conn,
                     CreateChoreInput::builder()
                         .product_id(task.product_id.clone())
@@ -116,6 +118,8 @@ pub(super) fn approve_in_tx(
                         // a task that has just been completed.
                         .force_duplicate(true)
                         .build(),
+                    attribution.actor,
+                    attribution.provenance,
                 )?
             };
             (prerequisite, true)

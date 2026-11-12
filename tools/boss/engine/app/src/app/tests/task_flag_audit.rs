@@ -421,14 +421,12 @@ async fn answering_a_question_that_restarts_autostart_records_the_socket_caller(
     );
 }
 
-fn park_with_question(
+fn park_work_item_with_question(
     state: &ServerState,
-    product_id: String,
-    name: &str,
+    work_item_id: String,
     question: OperatorQuestion,
 ) -> (String, String) {
-    let chore = create_test_chore(&state.work_db, product_id, name);
-    let execution = create_ready_chore_execution(&state.work_db, chore.id.clone());
+    let execution = create_ready_chore_execution(&state.work_db, work_item_id.clone());
     let (execution, run) = state
         .work_db
         .start_execution_run(
@@ -452,11 +450,47 @@ fn park_with_question(
         .unwrap()
         .query_row(
             "SELECT id FROM operator_questions WHERE work_item_id = ?1 ORDER BY created_at DESC LIMIT 1",
-            [&chore.id],
+            [&work_item_id],
             |row| row.get(0),
         )
         .unwrap();
-    (chore.id, question_id)
+    (work_item_id, question_id)
+}
+
+fn park_with_question(
+    state: &ServerState,
+    product_id: String,
+    name: &str,
+    question: OperatorQuestion,
+) -> (String, String) {
+    let chore = create_test_chore(&state.work_db, product_id, name);
+    park_work_item_with_question(state, chore.id, question)
+}
+
+fn linked_prerequisite_id(state: &ServerState, dependent_id: &str) -> String {
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT prerequisite_id FROM work_item_dependencies WHERE dependent_id = ?1",
+            [dependent_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn prerequisite_create_question(name: &str) -> OperatorQuestion {
+    OperatorQuestion {
+        text: "Create the missing work?".into(),
+        explanation: "This cannot proceed without it.".into(),
+        answer_type: OperatorAnswerType::CreatePrerequisiteTask {
+            name: name.into(),
+            brief: "Fix the shared fixture first.".into(),
+            file_count_bypass: None,
+            option_labels: None,
+        },
+    }
 }
 
 async fn answer_over_socket(state: &Arc<ServerState>, work_item_id: &str, request_id: &str, answer: OperatorAnswer) {
@@ -535,16 +569,7 @@ async fn answering_a_prerequisite_question_records_the_socket_caller() {
         &state,
         product.id,
         "Needs the fixture",
-        OperatorQuestion {
-            text: "Create the missing work?".into(),
-            explanation: "This cannot proceed without it.".into(),
-            answer_type: OperatorAnswerType::CreatePrerequisiteTask {
-                name: "Shared fixture".into(),
-                brief: "Fix the shared fixture first.".into(),
-                file_count_bypass: None,
-                option_labels: None,
-            },
-        },
+        prerequisite_create_question("Shared fixture"),
     );
     answer_over_socket(
         &state,
@@ -562,6 +587,93 @@ async fn answering_a_prerequisite_question_records_the_socket_caller() {
     );
     assert_eq!(history(&state, &dependent_id, "autostart").last(), Some(&expected));
     assert_eq!(history(&state, &existing.id, "autostart").last(), Some(&expected));
+}
+
+fn assert_created_prerequisite_flag_rows(
+    state: &ServerState,
+    prerequisite_id: &str,
+    insert_helper: &str,
+    request_id: &str,
+) {
+    let answer_basis = socket_basis("rpc:answer", request_id);
+    let expected_actor = "human".to_owned();
+    let expected_basis = format!("{insert_helper} {answer_basis}");
+    assert_eq!(
+        history(state, prerequisite_id, "autostart"),
+        [(None, Some("1".into()), expected_actor.clone(), expected_basis.clone())]
+    );
+    assert_eq!(
+        history(state, prerequisite_id, "deferred"),
+        [(None, Some("0".into()), expected_actor, expected_basis)]
+    );
+}
+
+#[tokio::test]
+async fn answering_a_prerequisite_question_records_the_socket_caller_when_creating_a_chore() {
+    let (state, _dir) = test_server_state();
+    let product = create_test_product_named(&state.work_db, "Flag prereq create chore");
+    let (dependent_id, _) = park_with_question(
+        &state,
+        product.id,
+        "Needs a new chore",
+        prerequisite_create_question("New shared chore"),
+    );
+    answer_over_socket(
+        &state,
+        &dependent_id,
+        "req-prereq-chore",
+        OperatorAnswer::YesNo { value: true },
+    )
+    .await;
+    let created_id = linked_prerequisite_id(&state, &dependent_id);
+    assert_ne!(created_id, dependent_id);
+    assert_created_prerequisite_flag_rows(
+        &state,
+        &created_id,
+        "insert_chore_with_project_in_tx_as_actor",
+        "req-prereq-chore",
+    );
+}
+
+#[tokio::test]
+async fn answering_a_prerequisite_question_records_the_socket_caller_when_creating_a_project_task() {
+    let (state, _dir) = test_server_state();
+    let product = create_test_product_named(&state.work_db, "Flag prereq create task");
+    let project = state
+        .work_db
+        .create_project(
+            CreateProjectInput::builder()
+                .product_id(product.id.clone())
+                .name("Flag prereq project")
+                .goal("Hold the dependent")
+                .build(),
+        )
+        .unwrap();
+    let dependent = state
+        .work_db
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id)
+                .project_id(project.id)
+                .name("Needs a new project task")
+                .build(),
+        )
+        .unwrap();
+    let (dependent_id, _) = park_work_item_with_question(
+        &state,
+        dependent.id,
+        prerequisite_create_question("New shared project task"),
+    );
+    answer_over_socket(
+        &state,
+        &dependent_id,
+        "req-prereq-task",
+        OperatorAnswer::YesNo { value: true },
+    )
+    .await;
+    let created_id = linked_prerequisite_id(&state, &dependent_id);
+    assert_ne!(created_id, dependent_id);
+    assert_created_prerequisite_flag_rows(&state, &created_id, "insert_task_in_tx_as_actor", "req-prereq-task");
 }
 
 #[tokio::test]
