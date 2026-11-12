@@ -189,15 +189,20 @@ async fn capture_task(state: Arc<ServerState>, run_id: String, wake: Arc<TaskWak
                     adapter = Some(resolved);
                 }
                 Ok(None) => {
-                    publish_state(
-                        &state,
-                        &run_id,
-                        &host_id,
-                        PaneCaptureState::Unsupported,
-                        "pane capture is only available for workers on spoke-connected hosts",
-                    )
-                    .await;
-                    // Nothing to renew; a later subscribe starts afresh.
+                    let (status, detail) = match state.work_db.spoke_assignment_for_execution(&run_id) {
+                        Ok(Some(assignment)) if assignment.resolved => {
+                            (PaneCaptureState::Ended, "the worker has ended".to_owned())
+                        }
+                        Ok(_) => (
+                            PaneCaptureState::Unsupported,
+                            "pane capture is only available for workers on spoke-connected hosts".to_owned(),
+                        ),
+                        Err(error) => (
+                            PaneCaptureState::Unreachable,
+                            format!("could not read the worker's assignment: {error:#}"),
+                        ),
+                    };
+                    publish_state(&state, &run_id, &host_id, status, &detail).await;
                     finish(&state, &run_id).await;
                     return;
                 }
@@ -807,6 +812,22 @@ mod flow_tests {
         })
         .await;
         assert_eq!(remote.cancels(), 0, "there is nothing left to cancel");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_already_resolved_spoke_assignment_ends_the_view() {
+        let remote = Remote::new(PaneCaptureOutcome::Accepted);
+        let (state, _dir) = state_with(&remote, true);
+        let assignment = state.work_db.spoke_assignment_for_execution(RUN).unwrap().unwrap();
+        assert!(
+            state
+                .work_db
+                .resolve_spoke_assignment(RUN, assignment.assignment_generation, "released")
+                .unwrap()
+        );
+        let sink = viewer(&state, "viewer-a").await;
+        assert_eq!(next_capture(&sink).await.0, PaneCaptureState::Ended);
+        assert!(remote.requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -150,6 +150,32 @@ async fn captures_journaled_before_a_reconnect_are_never_shown_as_current() {
 }
 
 #[tokio::test]
+async fn capture_backlog_is_receipted_without_the_optional_feature() {
+    let fx = Fixture::new().await;
+    let mut feed = fx.manager.subscribe_captures();
+    let mut old = fx.connect(hello()).await.unwrap();
+    old.welcome().await;
+    old.send(spoke_frame::Body::Record(pane_capture(1, b"before"))).await;
+    assert!(matches!(old.next().await, Some(hub_frame::Body::RecordReceipt(c)) if c.through == 1));
+    feed.recv().await.unwrap();
+    let mut reconnect = hello();
+    reconnect.last_record = 2;
+    reconnect.features.retain(|f| f.name != "pane-capture");
+    let mut new = fx.connect(reconnect).await.unwrap();
+    new.welcome().await;
+    for seq in [1, 2] {
+        let text: &[u8] = if seq == 1 { b"before" } else { b"pending" };
+        new.send(spoke_frame::Body::Record(pane_capture(seq, text))).await;
+        assert!(matches!(new.next().await, Some(hub_frame::Body::RecordReceipt(c)) if c.through == seq));
+    }
+    new.send(spoke_frame::Body::Record(record(3))).await;
+    assert!(matches!(new.next().await, Some(hub_frame::Body::RecordReceipt(c)) if c.through == 3));
+    assert!(feed.try_recv().is_err());
+    new.send(spoke_frame::Body::Record(pane_capture(4, b"fresh"))).await;
+    assert!(new.next().await.is_none(), "fresh unnegotiated captures remain invalid");
+}
+
+#[tokio::test]
 async fn a_host_that_did_not_negotiate_capture_says_so() {
     use boss_protocol_spoke::negotiate::feature;
     let fx = Fixture::new().await;
@@ -516,6 +542,62 @@ mod outbound_session {
         })
         .await
         .expect("hub committed the spoke's records");
+    }
+
+    #[tokio::test]
+    async fn outbound_session_reports_capability_and_disconnect() {
+        use boss_spoke_outbound::SessionObserver;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Observer(AtomicUsize);
+        impl SessionObserver for Observer {
+            fn connected(&self, capture: bool, _: u64) {
+                self.0.store(if capture { 2 } else { 1 }, Ordering::SeqCst);
+            }
+            fn disconnected(&self) {
+                self.0.store(0, Ordering::SeqCst);
+            }
+        }
+        for capture in [true, false] {
+            let mut contracts = boss_spoke_outbound::executor_contracts();
+            if !capture {
+                contracts.features.retain(|f| f.name != "pane-capture");
+            }
+            let fixture = Fixture::with_contracts(contracts).await;
+            let dir = tempfile::tempdir().unwrap();
+            let journal = Arc::new(Mutex::new(
+                Journal::open(&dir.path().join("state"), "host", Limits::default()).unwrap(),
+            ));
+            let observer = Arc::new(Observer(AtomicUsize::new(0)));
+            let task = tokio::spawn({
+                let observer = observer.clone();
+                let dialer = fixture.dialer.clone();
+                async move { boss_spoke_outbound::run_with_observer(journal, dialer, stamp, true, observer.as_ref()).await }
+            });
+            tokio::time::timeout(STEP, async {
+                while observer.0.load(Ordering::SeqCst) == 0 {
+                    assert!(!task.is_finished(), "session ended before Welcome");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(observer.0.load(Ordering::SeqCst), if capture { 2 } else { 1 });
+            *fixture.auth.revoked.lock().unwrap() = true;
+            fixture
+                .auth
+                .events
+                .send(boss_host_enrollment::CredentialEvent::Revoked { host_id: "host".into() })
+                .unwrap();
+            tokio::time::timeout(STEP, async {
+                while observer.0.load(Ordering::SeqCst) != 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            task.abort();
+            let _ = task.await;
+        }
     }
 
     #[tokio::test]

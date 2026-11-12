@@ -239,7 +239,10 @@ impl Driver {
         if record.sequence > self.record_through.saturating_add(1) {
             return Err(Status::failed_precondition("record sequence gap").into());
         }
-        if matches!(record.body, Some(record::Body::Capture(_))) && !self.session.selection.has(feature::PANE_CAPTURE) {
+        if matches!(record.body, Some(record::Body::Capture(_)))
+            && !self.session.selection.has(feature::PANE_CAPTURE)
+            && record.sequence > self.backlog_through
+        {
             return Err(Status::failed_precondition("pane capture not negotiated").into());
         }
         let mut gate = self.host.lock().await;

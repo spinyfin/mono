@@ -178,7 +178,7 @@ mod session {
         nonce: &[u8],
         stamp: &impl Fn() -> Result<v1::Stamp>,
     ) -> Result<()> {
-        connect_with_executor(journal, endpoint, nonce, stamp, false).await
+        connect_with_executor(journal, endpoint, nonce, stamp, false, &()).await
     }
 
     /// External execution runs independently from connection liveness.
@@ -188,6 +188,7 @@ mod session {
         nonce: &[u8],
         stamp: &impl Fn() -> Result<v1::Stamp>,
         external_executor: bool,
+        observer: &impl super::SessionObserver,
     ) -> Result<()> {
         ensure!(
             endpoint.uri().scheme_str() == Some("https"),
@@ -232,7 +233,7 @@ mod session {
             }
             _ => bail!("expected Welcome as first hub frame"),
         };
-        selected_contracts.confirm(&welcome)?;
+        let selection = selected_contracts.confirm(&welcome)?;
         ensure!(
             first.frame.connection_generation == welcome.connection_generation,
             "Welcome generation mismatch"
@@ -248,6 +249,19 @@ mod session {
                 error
             }
         })?;
+        // Dropping a session (including cancellation) invalidates its transient work.
+        struct SessionGuard<'a, T: super::SessionObserver>(&'a T);
+        impl<T: super::SessionObserver> Drop for SessionGuard<'_, T> {
+            fn drop(&mut self) {
+                self.0.disconnected();
+            }
+        }
+        let _guard = SessionGuard(observer);
+        let through = locked(journal)?.received_commands()?.map_or(0, |cursor| cursor.through);
+        observer.connected(
+            selection.has(boss_protocol_spoke::negotiate::feature::PANE_CAPTURE),
+            through,
+        );
         let limits = Limits::default().negotiated(welcome.max_frame_bytes, welcome.max_inflight_bytes);
         let frame_limit = limits.max_frame_bytes as usize;
         let credit = limits.max_inflight_bytes as usize;
@@ -403,6 +417,17 @@ use std::time::Duration;
 use tonic::transport::Endpoint;
 use uuid::Uuid;
 
+/// Connection-scoped work expires when the transport ends. The command
+/// cursor fences work already admitted on a previous connection.
+pub trait SessionObserver: Send + Sync {
+    fn connected(&self, pane_capture: bool, received_commands: u64);
+    fn disconnected(&self);
+}
+impl SessionObserver for () {
+    fn connected(&self, _: bool, _: u64) {}
+    fn disconnected(&self) {}
+}
+
 pub type SharedJournal = Arc<Mutex<Journal>>;
 pub use session::connect_once;
 
@@ -484,6 +509,16 @@ pub async fn run_with_executor(
     stamp: impl Fn() -> Result<Stamp>,
     external_executor: bool,
 ) -> Result<()> {
+    run_with_observer(journal, endpoint, stamp, external_executor, &()).await
+}
+
+pub async fn run_with_observer(
+    journal: SharedJournal,
+    endpoint: Endpoint,
+    stamp: impl Fn() -> Result<Stamp>,
+    external_executor: bool,
+    observer: &impl SessionObserver,
+) -> Result<()> {
     ensure!(
         endpoint.uri().scheme_str() == Some("https"),
         "spoke requires mTLS HTTPS"
@@ -493,7 +528,8 @@ pub async fn run_with_executor(
     loop {
         let started = std::time::Instant::now();
         if let Err(error) =
-            session::connect_with_executor(&journal, endpoint.clone(), &nonce, &stamp, external_executor).await
+            session::connect_with_executor(&journal, endpoint.clone(), &nonce, &stamp, external_executor, observer)
+                .await
         {
             if error.downcast_ref::<Retry>().is_none() {
                 return Err(error);
@@ -545,6 +581,26 @@ pub(crate) fn status(error: tonic::Status) -> anyhow::Error {
 mod tests {
     use super::*;
     use boss_protocol_spoke::negotiate::feature;
+
+    #[test]
+    fn production_executor_negotiates_only_with_a_compatible_hub() {
+        let offered = executor_contracts();
+        let hello = Hello {
+            host_id: "host".into(),
+            journal_id: "journal".into(),
+            boot_id: "boot".into(),
+            instance_nonce: vec![1; 16],
+            min_epoch: offered.min_epoch,
+            max_epoch: offered.max_epoch,
+            features: offered.features,
+            ..Default::default()
+        };
+        let mut hub = Contracts::first_release();
+        assert_eq!(hub.select(&hello).unwrap_err().code(), "missing_required_feature");
+        hub.required
+            .retain(|name| ![feature::WORKER_API, feature::PROPOSAL_JSON, feature::ARTIFACT].contains(&name.as_str()));
+        assert!(hub.select(&hello).unwrap().has(feature::PANE_CAPTURE));
+    }
 
     #[test]
     fn executor_hello_offers_reset_release_from_the_shared_list() {

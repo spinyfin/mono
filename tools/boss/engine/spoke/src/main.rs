@@ -343,9 +343,9 @@ async fn serve(args: Args, homes_root: PathBuf) -> Result<()> {
         brief_budget: boss_host_execution::worker::BRIEF_DELIVERY_BUDGET,
     });
     tokio::select! {
-        result = boss_spoke_outbound::run_with_executor(Arc::clone(&journal), endpoint, stamp, true) => result,
+        result = boss_spoke_outbound::run_with_observer(Arc::clone(&journal), endpoint, stamp, true, captures.as_ref()) => result,
         result = commands::run(Arc::clone(&journal), executor, supervisor, Arc::clone(&captures), stamp) => result,
-        result = capture_loop(Arc::clone(&journal), captures, panes, stamp) => result,
+        result = capture_loop(Arc::clone(&journal), Arc::clone(&captures), panes, stamp) => result,
         result = produce(&journal, &args.state_dir, &boot, tmux_ready, preflights, first_report) => result,
         result = preflight_loop(readiness, failures, first_report_sent) => result,
         result = commands::heartbeat(cube, executions) => result,

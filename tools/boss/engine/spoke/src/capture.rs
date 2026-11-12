@@ -5,7 +5,7 @@
 //!   `subscription_id`. It lives `ttl_seconds` past the last renewal (default
 //!   30, at most 120) and is cancelled at once by a TTL of one second or less.
 //!   The hub renews while a viewer is visible and stops renewing when it
-//!   leaves, so a disconnected or vanished hub costs at most one TTL of work.
+//!   leaves. Disconnect clears all subscriptions immediately.
 //! * Each due subscription appends a `PaneCapture` record carrying a bounded
 //!   text snapshot (at most the requested bytes, never more than 64 KiB, the
 //!   newest lines first). Captures are admitted below every other record
@@ -16,7 +16,10 @@
 //! Nothing here can write to a pane or reach anything but the text of a worker
 //! whose token-named session this spoke supervises.
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -34,9 +37,14 @@ use boss_spoke_outbound::SharedJournal;
 const TICK: Duration = Duration::from_millis(250);
 
 struct Subscription {
+    generation: u64,
     run: Run,
-    interval: Duration,
     max_bytes: usize,
+    schedule: Schedule,
+}
+
+struct Schedule {
+    interval: Duration,
     expires: Instant,
     next_due: Instant,
 }
@@ -54,6 +62,7 @@ pub enum Applied {
 /// A subscription that is due now.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Due {
+    generation: u64,
     pub subscription_id: String,
     pub run: Run,
     pub max_bytes: usize,
@@ -61,7 +70,23 @@ pub struct Due {
 
 #[derive(Default)]
 pub struct Captures {
+    session: Mutex<Option<u64>>,
+    generation: AtomicU64,
     subscriptions: Mutex<HashMap<String, Subscription>>,
+}
+
+impl boss_spoke_outbound::SessionObserver for Captures {
+    fn connected(&self, pane_capture: bool, received_commands: u64) {
+        let mut session = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.table().clear();
+        *session = pane_capture.then_some(received_commands);
+    }
+
+    fn disconnected(&self) {
+        let mut session = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *session = None;
+        self.table().clear();
+    }
 }
 
 impl Captures {
@@ -107,23 +132,26 @@ impl Captures {
         };
         let expires = now + Duration::from_secs(u64::from(ttl));
         if let Some(existing) = table.get_mut(&capture.subscription_id) {
-            existing.interval = Duration::from_millis(u64::from(interval));
+            existing.schedule.interval = Duration::from_millis(u64::from(interval));
             existing.max_bytes = max_bytes;
-            existing.expires = expires;
+            existing.schedule.expires = expires;
             return Applied::Renewed;
         }
-        table.retain(|_, subscription| subscription.expires > now);
+        table.retain(|_, subscription| subscription.schedule.expires > now);
         if table.len() >= MAX_CAPTURE_SUBSCRIPTIONS {
             return Applied::Refused("too many capture subscriptions");
         }
         table.insert(
             capture.subscription_id.clone(),
             Subscription {
+                generation: self.generation.fetch_add(1, Ordering::Relaxed),
                 run: run.clone(),
-                interval: Duration::from_millis(u64::from(interval)),
                 max_bytes,
-                expires,
-                next_due: now,
+                schedule: Schedule {
+                    interval: Duration::from_millis(u64::from(interval)),
+                    expires,
+                    next_due: now,
+                },
             },
         );
         Applied::Opened
@@ -133,13 +161,14 @@ impl Captures {
     /// scheduling each one's next look a full interval later.
     pub fn due(&self, now: Instant) -> Vec<Due> {
         let mut table = self.table();
-        table.retain(|_, subscription| subscription.expires > now);
+        table.retain(|_, subscription| subscription.schedule.expires > now);
         let mut due: Vec<Due> = table
             .iter_mut()
-            .filter(|(_, subscription)| subscription.next_due <= now)
+            .filter(|(_, subscription)| subscription.schedule.next_due <= now)
             .map(|(id, subscription)| {
-                subscription.next_due = now + subscription.interval;
+                subscription.schedule.next_due = now + subscription.schedule.interval;
                 Due {
+                    generation: subscription.generation,
                     subscription_id: id.clone(),
                     run: subscription.run.clone(),
                     max_bytes: subscription.max_bytes,
@@ -148,6 +177,22 @@ impl Captures {
             .collect();
         due.sort_by(|a, b| a.subscription_id.cmp(&b.subscription_id));
         due
+    }
+
+    fn current(table: &HashMap<String, Subscription>, due: &Due, now: Instant) -> bool {
+        table
+            .get(&due.subscription_id)
+            .is_some_and(|s| s.generation == due.generation && s.schedule.expires > now)
+    }
+
+    fn remove_current(&self, due: &Due) {
+        let mut table = self.table();
+        if table
+            .get(&due.subscription_id)
+            .is_some_and(|s| s.generation == due.generation)
+        {
+            table.remove(&due.subscription_id);
+        }
     }
 
     pub fn remove(&self, subscription_id: &str) {
@@ -176,6 +221,11 @@ impl Captures {
         };
         if command.not_after_unix_ms <= now_ms {
             return reply(ResultCode::Rejected, "command expired");
+        }
+        // Hold this guard through apply so disconnect cannot race an open.
+        let session = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !session.is_some_and(|through| command.sequence > through) {
+            return reply(ResultCode::Rejected, "capture connection ended or not negotiated");
         }
         let cancelling = capture.ttl_seconds != 0 && capture.ttl_seconds <= CANCEL_CAPTURE_TTL_SECONDS;
         if !cancelling {
@@ -216,10 +266,13 @@ pub async fn tick(
     now: Instant,
 ) -> Result<()> {
     for due in captures.due(now) {
+        if !Captures::current(&captures.table(), &due, now.max(Instant::now())) {
+            continue;
+        }
         let record = match live_record(journal, &due.run) {
             Ok(Some(record)) => record,
             Ok(None) => {
-                captures.remove(&due.subscription_id);
+                captures.remove_current(&due);
                 continue;
             }
             Err(error) => {
@@ -230,7 +283,7 @@ pub async fn tick(
         let text = match source.read(&record.session, &record.spawn_token).await {
             PaneRead::Text(text) => text,
             PaneRead::Gone => {
-                captures.remove(&due.subscription_id);
+                captures.remove_current(&due);
                 continue;
             }
             PaneRead::Unreadable(reason) => {
@@ -249,10 +302,15 @@ pub async fn tick(
             })),
             ..Default::default()
         };
+        let table = captures.table();
+        if !Captures::current(&table, &due, now.max(Instant::now())) {
+            continue;
+        }
         let appended = journal
             .lock()
             .map_err(|_| anyhow::Error::from(Fault::LockPoisoned))?
             .append(capture, Admission::Capture);
+        drop(table);
         match appended {
             Ok(_) => {}
             // Captures are the first thing the spool sheds; the next look retries.
@@ -435,7 +493,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let journal = journal(root.path());
         let captures = Captures::default();
+        boss_spoke_outbound::SessionObserver::connected(&captures, true, 0);
         let mut command = Command {
+            sequence: 1,
             command_id: "c1".into(),
             run: Some(run()),
             not_after_unix_ms: 100,
@@ -515,6 +575,117 @@ mod tests {
             .unwrap();
         assert!(captures.is_empty());
         assert!(captured(&journal).is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnect_and_capability_loss_stop_captures_and_fence_old_commands() {
+        use boss_spoke_outbound::SessionObserver;
+        let root = tempfile::tempdir().unwrap();
+        let journal = journal(root.path());
+        save(&journal, Phase::Alive);
+        let captures = Captures::default();
+        let command = Command {
+            sequence: 1,
+            command_id: "c".into(),
+            run: Some(run()),
+            not_after_unix_ms: 100,
+            ..Default::default()
+        };
+        let now = Instant::now();
+        captures.connected(true, 0);
+        assert_eq!(
+            captures
+                .command(&journal, &command, &subscribe("s", 120, 1000), 1, now)
+                .code,
+            ResultCode::Ok as i32
+        );
+        captures.disconnected();
+        tick(
+            &journal,
+            &captures,
+            &Script(Mutex::new(vec![PaneRead::Text("stale".into())])),
+            &stamp,
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(captured(&journal).is_empty());
+        captures.connected(true, 1);
+        assert_eq!(
+            captures
+                .command(&journal, &command, &subscribe("s", 120, 1000), 1, now)
+                .code,
+            ResultCode::Rejected as i32
+        );
+        captures.connected(false, 1);
+        let command = Command { sequence: 2, ..command };
+        assert_eq!(
+            captures
+                .command(&journal, &command, &subscribe("s", 120, 1000), 1, now)
+                .code,
+            ResultCode::Rejected as i32
+        );
+        tick(
+            &journal,
+            &captures,
+            &Script(Mutex::new(vec![])),
+            &stamp,
+            now + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(captured(&journal).is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_or_replacement_during_read_discards_the_snapshot() {
+        struct Blocking {
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+        impl PaneSource for Blocking {
+            async fn read(&self, _: &str, _: &str) -> PaneRead {
+                self.entered.notify_one();
+                self.release.notified().await;
+                PaneRead::Text("stale".into())
+            }
+        }
+        for action in ["cancel", "replace", "expire", "disconnect"] {
+            let root = tempfile::tempdir().unwrap();
+            let journal = journal(root.path());
+            save(&journal, Phase::Alive);
+            let captures = Captures::default();
+            let now = Instant::now();
+            captures.apply(&run(), &subscribe("a", 30, 1000), now);
+            captures.apply(&run(), &subscribe("b", 30, 1000), now);
+            let source = Blocking {
+                entered: Default::default(),
+                release: Default::default(),
+            };
+            let read = tick(&journal, &captures, &source, &stamp, now);
+            let cancel = async {
+                source.entered.notified().await;
+                match action {
+                    "expire" => {
+                        for subscription in captures.table().values_mut() {
+                            subscription.schedule.expires = Instant::now();
+                        }
+                    }
+                    "disconnect" => boss_spoke_outbound::SessionObserver::disconnected(&captures),
+                    _ => {
+                        captures.remove("a");
+                        captures.remove("b");
+                        if action == "replace" {
+                            captures.apply(&run(), &subscribe("a", 30, 1000), now);
+                        }
+                    }
+                }
+                source.release.notify_one();
+            };
+            let (result, ()) = tokio::join!(read, cancel);
+            result.unwrap();
+            assert!(captured(&journal).is_empty());
+        }
     }
 
     #[tokio::test]
