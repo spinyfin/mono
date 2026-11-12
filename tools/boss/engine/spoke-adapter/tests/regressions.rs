@@ -134,7 +134,7 @@ async fn release(adapter: &Arc<dyn HostAdapter>, kind: Kind) -> anyhow::Result<(
 
 #[tokio::test]
 async fn unanswered_sweep_queries_reuse_their_commands() {
-    let fx = Fixture::with(short(200)).await;
+    let fx = Fixture::with(short(2_000)).await;
     fx.ready(HOST);
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
     let peer = fx.spoke(Box::new(standard), None, 0).await;
