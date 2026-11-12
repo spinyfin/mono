@@ -246,7 +246,7 @@ pub fn task_accepts_execution(task: &Task) -> bool {
     // start another attempt. Ordinary blocked dependency work still reconciles.
     if matches!(
         task.blocked_reason.as_deref(),
-        Some("worker_failed" | "awaiting_operator_answer")
+        Some("worker_failed" | "awaiting_operator_answer" | WORKSPACE_POSITIONING_REFUSED)
     ) {
         return false;
     }

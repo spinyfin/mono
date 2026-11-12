@@ -137,6 +137,7 @@ pub(super) struct FakeCubeClient {
     /// The `inherited_base` each bookmark creation was handed, in call order.
     pub(super) bookmark_inherited_bases: Mutex<Vec<Option<String>>>,
     pub(super) fail_goto: bool,
+    pub(super) positioning_refused: AtomicBool,
     /// Fail the first N `goto_workspace` calls, then succeed.
     pub(super) fail_first_n_goto: usize,
     /// Fail the first N `release_workspace` calls, then succeed.
@@ -375,6 +376,18 @@ crate::stub_cube_client! { FakeCubeClient {
             calls.push((workspace_path.display().to_string(), pr));
             calls.len() - 1
         };
+        if self.positioning_refused.load(Ordering::SeqCst) {
+            return Err(boss_host_execution::cube::CubeCliError {
+                host: "local".into(),
+                exit_code: Some(2),
+                stderr: serde_json::json!({
+                    "error_kind": "workspace_positioning_refused",
+                    "retryable": false,
+                    "error": "Cannot position abc123 onto def456: unpublished content. Inspect the commits and resolve before launching."
+                }).to_string(),
+                stdout: String::new(),
+            }.into());
+        }
         if call_index < self.fail_first_n_goto {
             return Err(anyhow!("cube workspace goto failed"));
         }

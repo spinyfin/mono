@@ -200,11 +200,16 @@ fn open_attention_sql(a: &str, kind_predicate: &str) -> String {
 /// The "waiting on a human" holds, in SQL. This is the one definition: the stuck
 /// report reads clause 1 from the clause view rather than keeping a Rust copy.
 fn human_held_sql(a: &str) -> String {
+    let not_positioning_held = crate::dispatch_helpers::not_positioning_held_sql(a);
     // COALESCE: a NULL `blocked_reason` makes several terms NULL, and a NULL hold
     // must read as "not held", not poison the clause that negates it.
+    // Positioning refusals use the shared predicate so an open attention item
+    // holds a review-phase row the same way `blocked_reason` holds a rewritten
+    // todo/active row.
     format!(
         "COALESCE({a}.deferred = 1 OR {a}.human_driven = 1
           OR {a}.blocked_reason IN ('awaiting_operator_answer', 'deletion_signoff')
+          OR NOT {not_positioning_held}
           OR EXISTS (SELECT 1 FROM operator_questions oq WHERE oq.work_item_id = {a}.id AND oq.status = 'open')
           OR EXISTS (SELECT 1 FROM work_executions hx WHERE hx.work_item_id = {a}.id AND hx.status = 'waiting_human')
           OR ({a}.blocked_reason = 'worker_failed' AND COALESCE(
@@ -234,6 +239,7 @@ fn human_held_sql(a: &str) -> String {
 /// `stuck_report::classification` so the two never classify one item two ways.
 fn stuck_kind_sql(a: &str, root: &str) -> String {
     let chain_root_ci = format!("{root}.ci_required_state");
+    let not_positioning_held = crate::dispatch_helpers::not_positioning_held_sql(a);
     let trunk_queue = open_attention_sql(a, "wa.kind LIKE 'trunk_queue_%'");
     let abandoned = open_attention_sql(a, "wa.kind = 'abandoned_branch_no_pr'");
     let recovery = open_attention_sql(
@@ -248,6 +254,7 @@ fn stuck_kind_sql(a: &str, root: &str) -> String {
                    WHEN 'churn_guard' THEN 'S2_churn_guard'
                    WHEN 'deliberate_park' THEN 'S3_deliberate_park'
                    ELSE 'S1_dispatch_failure' END
+           WHEN NOT {not_positioning_held} THEN NULL
            WHEN {a}.blocked_reason IS NOT NULL THEN
                CASE
                    WHEN {a}.blocked_reason IN ('worker_failed', 'spawning_attempt_retired_unsuccessfully')

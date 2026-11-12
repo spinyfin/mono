@@ -163,6 +163,7 @@ pub enum ChurnTrip {
 }
 
 pub use boss_engine_storage_values::attention_kinds::CHURN_GUARD_PARKED_ATTENTION_KIND;
+pub use boss_engine_storage_values::attention_kinds::WORKSPACE_POSITIONING_REFUSED;
 
 pub use boss_engine_storage_values::attention_kinds::LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND;
 
@@ -871,6 +872,8 @@ mod operator_answer_outcome;
 pub mod parking;
 pub mod parking_reconcile;
 pub mod personas;
+mod pre_start_failure;
+pub use pre_start_failure::PositioningHold;
 mod progression_candidates;
 mod progression_done;
 mod progression_ladder;

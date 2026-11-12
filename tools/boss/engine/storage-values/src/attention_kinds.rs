@@ -392,6 +392,12 @@ pub const REVIEW_VERDICT_BATCH_NOT_APPLYING_ATTENTION_KIND: &str = "pr_review_ve
 /// (`attention_lifecycle::ClearedBy::WorkResumed`).
 pub const CHURN_GUARD_PARKED_ATTENTION_KIND: &str = "churn_guard_parked";
 
+/// Cube refused to position a workspace because the repository state needs
+/// repair (closed or merged PR, missing head, missing branch). This one string
+/// is the `tasks.blocked_reason`, the attention kind and the dispatch-wait
+/// reason for the hold; the automatic recheck or an explicit launch lowers it.
+pub const WORKSPACE_POSITIONING_REFUSED: &str = "workspace_positioning_refused";
+
 /// Attention kind filed when a lockfile-only conflict could not be
 /// regenerated mechanically. Lowered by the work layer whenever the
 /// `merge_conflict` blocked signal is cleared or the attempt is retried.

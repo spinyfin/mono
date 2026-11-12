@@ -91,6 +91,13 @@ impl SpokeHostAdapter {
                 self.hub.config.command_deadline,
             )
             .await?;
+        if result.code == ResultCode::Rejected as i32
+            && let Some(command_result::Value::Workspace(value)) = &result.value
+            && let Ok(error) = json::<boss_host_execution::cube::CubeCliError>(value, "cube refusal")
+            && error.positioning_refused()
+        {
+            return Err(error.into());
+        }
         Self::workspace_value(self.host_name(), name, expect_ok(self.host_name(), name, result)?)
     }
 

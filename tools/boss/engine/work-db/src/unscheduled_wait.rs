@@ -32,6 +32,7 @@ use boss_engine_storage_values::dispatch_wait::{
     DISPATCH_WAIT_REASON_PR_OPEN, DISPATCH_WAIT_REASON_RECOVERY_ATTENTION, DISPATCH_WAIT_REASON_REPO_UNRESOLVED,
     DISPATCH_WAIT_REASON_REVIEW_BATCH, DISPATCH_WAIT_REASON_REVIEW_COMPLETE, DISPATCH_WAIT_REASON_REVIEW_RESERVATION,
     DISPATCH_WAIT_REASON_REVISION_PENDING, DISPATCH_WAIT_REASON_RUN_ENDED, DISPATCH_WAIT_REASON_UNCLASSIFIED,
+    DISPATCH_WAIT_REASON_WORKSPACE_POSITIONING_REFUSED,
 };
 
 /// An item to classify: its row and the status of its most recent execution.
@@ -116,8 +117,33 @@ pub(super) fn classify(
     counter: Option<&StatementCounter<'_>>,
 ) -> Result<(HashMap<String, DispatchWait>, ClassifyCost)> {
     let mut waits = HashMap::new();
+    let ids: Vec<&str> = candidates.iter().map(|candidate| candidate.task.id.as_str()).collect();
+    let hold_messages = open_positioning_hold_messages(conn, &ids)?;
     let (mut queued, mut idle_active, mut review) = (Vec::new(), Vec::new(), Vec::new());
     for candidate in candidates {
+        // Same predicate as `positioning_hold_active`: the task-row rewrite or
+        // the open attention item. Review-phase holds keep `in_review` /
+        // `merge_conflict` / `ci_failure`, so the attention set is what names
+        // them here — ahead of the Review branch, which would otherwise call
+        // them a review-batch or human-review wait.
+        if candidate.task.blocked_reason.as_deref() == Some(DISPATCH_WAIT_REASON_WORKSPACE_POSITIONING_REFUSED)
+            || hold_messages.contains_key(&candidate.task.id)
+        {
+            let mut wait = DispatchWait::named(DISPATCH_WAIT_REASON_WORKSPACE_POSITIONING_REFUSED);
+            // `blocked_detail` belongs to the hold only when the hold rewrote
+            // the row; a review-phase hold leaves the earlier conflict / CI
+            // diagnostic there, which must not stand in for cube's message.
+            let hold_rewrote_row =
+                candidate.task.blocked_reason.as_deref() == Some(DISPATCH_WAIT_REASON_WORKSPACE_POSITIONING_REFUSED);
+            wait.label = positioning_hold_label(
+                candidate.task.blocked_detail.as_deref().filter(|_| hold_rewrote_row),
+                hold_messages.get(&candidate.task.id).map(String::as_str),
+            )
+            .or(wait.label);
+            wait.reads_other_items = true;
+            waits.insert(candidate.task.id.clone(), wait);
+            continue;
+        }
         match branch_of(candidate.task, candidate.latest) {
             Some(Branch::Queued) => queued.push(candidate),
             Some(Branch::IdleActive) => idle_active.push(candidate.task),
@@ -312,6 +338,41 @@ impl TaskBrief {
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
+}
+
+/// First-line wait label for a positioning hold: the blocked-row detail when
+/// the hold rewrote the task, otherwise the attention body's first line
+/// (cube's readable message, prefixed `Workspace blocked:`).
+fn positioning_hold_label(blocked_detail: Option<&str>, attention_body: Option<&str>) -> Option<String> {
+    if let Some(detail) = blocked_detail.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(detail.to_owned());
+    }
+    attention_body.and_then(|body| {
+        body.lines()
+            .next()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+/// Open positioning-refusal attention bodies, keyed by work item. One
+/// statement for the whole candidate set, matching [`open_attention_among`].
+fn open_positioning_hold_messages(conn: &Connection, ids: &[&str]) -> Result<HashMap<String, String>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut stmt = conn.prepare(&format!(
+        "SELECT a.work_item_id, a.body_markdown
+         FROM work_attention_items a
+         WHERE a.status = 'open' AND a.kind = '{kind}'
+           AND a.work_item_id IN (SELECT value FROM json_each(?1))",
+        kind = DISPATCH_WAIT_REASON_WORKSPACE_POSITIONING_REFUSED,
+    ))?;
+    let rows = stmt.query_map([id_array(ids)], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// The members of `ids` with an open attention item of one of `kinds`.

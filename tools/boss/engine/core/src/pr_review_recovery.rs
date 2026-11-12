@@ -1342,6 +1342,74 @@ mod tests {
         );
     }
 
+    /// A refused PrReview start holds the item without leaving `in_review`; the
+    /// recovery sweep creates no replacement and files no second attention item
+    /// until the hold clears.
+    #[tokio::test]
+    async fn refused_review_start_is_held_not_refired_until_the_hold_clears() {
+        let (_dir, db) = open_db();
+        let (work_item_id, dead_execution_id, _batch_id) =
+            create_chore_with_dead_supervisor(&db, "https://github.com/test/repo/pull/31", "head-sha");
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET status = 'claimed' WHERE id = ?1",
+                rusqlite::params![dead_execution_id],
+            )
+            .unwrap();
+        db.record_workspace_positioning_refusal(
+            &dead_execution_id,
+            "worker",
+            None,
+            "Cube command failed: refused",
+            "PR 31 is MERGED",
+        )
+        .unwrap();
+        // The review-phase item keeps its status and stays visible to the merge poller.
+        let task = match db.get_work_item(&work_item_id).unwrap() {
+            boss_protocol::WorkItem::Task(task) | boss_protocol::WorkItem::Chore(task) => task,
+            _ => panic!("expected task"),
+        };
+        assert_eq!(task.status, boss_protocol::TaskStatus::InReview);
+        assert!(task.blocked_reason.is_none());
+        assert!(
+            db.list_chores_pending_merge_check()
+                .unwrap()
+                .iter()
+                .any(|pending| pending.work_item_id == work_item_id)
+        );
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let checker = FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha");
+        let executions_before = db.list_executions(Some(&work_item_id)).unwrap().len();
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            Arc::new(checker.clone()),
+        )
+        .await;
+        assert_eq!(outcome.refired, 0);
+        assert_eq!(
+            db.list_executions(Some(&work_item_id)).unwrap().len(),
+            executions_before
+        );
+        let open: Vec<_> = db
+            .list_attention_items_for_work_item(&work_item_id)
+            .unwrap()
+            .into_iter()
+            .filter(|item| item.status == "open")
+            .collect();
+        assert_eq!(open.len(), 1, "exactly one attention item: {open:?}");
+        assert_eq!(open[0].kind, "workspace_positioning_refused");
+
+        assert!(db.clear_positioning_hold(&work_item_id).unwrap());
+        let outcome = run_one_pass(db.as_ref(), coordinator, sink.as_ref(), Arc::new(checker)).await;
+        assert_eq!(outcome.refired, 1, "the role resumes once the hold clears");
+    }
+
     #[tokio::test]
     async fn refires_dead_supervisor_when_head_sha_is_unknown() {
         let (_dir, db) = open_db();

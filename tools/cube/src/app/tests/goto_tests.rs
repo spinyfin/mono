@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use super::rebase_tests::failing_cmd;
 use super::support::{ExpectedCommand, FakeRunner};
 
-use crate::app::errors::Result;
+use crate::app::errors::{CubeError, Result};
 use crate::app::workspace_ops::workspace_goto;
 
 pub(super) const GOTO_CWD: &str = "/goto-ws";
@@ -32,7 +32,14 @@ fn goto_exists_cmd(branch: &str, sha: &str) -> ExpectedCommand {
     ExpectedCommand::ok(
         goto_cwd(),
         "jj",
-        &["log", "-r", &remote_ref, "--no-graph", "-T", "commit_id"],
+        &[
+            "log",
+            "-r",
+            &format!("present({remote_ref})"),
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ],
         sha,
     )
 }
@@ -218,16 +225,24 @@ fn goto_missing_bookmark_errors_clearly() {
     let cmds = vec![
         goto_remote_list_cmd(),
         goto_fetch_cmd(),
-        failing_cmd(
+        ExpectedCommand::ok(
             goto_cwd(),
             "jj",
-            &["log", "-r", &remote_ref, "--no-graph", "-T", "commit_id"],
-            &format!("Error: Revision \"{remote_ref}\" doesn't exist"),
+            &[
+                "log",
+                "-r",
+                &format!("present({remote_ref})"),
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "",
         ),
     ];
     let runner = FakeRunner::new(cmds);
     let err = run_goto(&runner, Some(branch), None).expect_err("missing bookmark");
     runner.assert_exhausted();
+    assert!(matches!(err, CubeError::PositioningRefused(_)));
     let msg = format!("{err}");
     assert!(msg.contains(branch), "names the branch: {msg}");
     assert!(msg.contains("was not found on remote"), "{msg}");
@@ -281,4 +296,56 @@ fn goto_revision_already_positioned_skips_new() {
     let result = run_goto_revision(&runner, sha).expect("idempotent revision goto");
     runner.assert_exhausted();
     assert_eq!(result.payload["already_positioned"], true);
+}
+
+#[test]
+fn goto_closed_pr_is_a_structured_refusal_without_mutating_bookmarks() {
+    for state in ["closed", "merged"] {
+        let info = if state == "merged" {
+            r#"{"state":"closed","merged":true,"head":{"ref":"feature"}}"#
+        } else {
+            r#"{"state":"closed","merged":false,"head":{"ref":"feature"}}"#
+        };
+        let runner = FakeRunner::new(vec![
+            goto_remote_list_cmd(),
+            goto_fetch_cmd(),
+            ExpectedCommand::ok(
+                goto_cwd(),
+                "gh",
+                &["api", &format!("repos/{GOTO_OWNER_REPO}/pulls/42")],
+                info,
+            ),
+        ]);
+        let error = run_goto(&runner, None, Some(42)).unwrap_err();
+        runner.assert_exhausted();
+        assert!(matches!(error, CubeError::PositioningRefused(_)));
+        assert_eq!(error.json_error()["error_kind"], "workspace_positioning_refused");
+        assert_eq!(error.json_error()["retryable"], false);
+        assert!(error.to_string().contains("cannot position"));
+    }
+}
+
+#[test]
+fn goto_fetch_failure_remains_retryable() {
+    let runner = FakeRunner::new(vec![
+        goto_remote_list_cmd(),
+        failing_cmd(
+            goto_cwd(),
+            "jj",
+            &["git", "fetch", "--remote", GOTO_REMOTE],
+            "network unavailable",
+        ),
+    ]);
+    let error = run_goto(&runner, None, Some(42)).unwrap_err();
+    assert_eq!(error.json_error()["retryable"], true);
+}
+
+#[test]
+fn unclassified_errors_do_not_claim_to_be_retryable() {
+    let error = CubeError::InvalidArgument("bad flag".to_string());
+    assert!(error.json_error().get("retryable").is_none());
+    assert_eq!(
+        CubeError::PositioningRefused("x".into()).json_error()["retryable"],
+        false
+    );
 }

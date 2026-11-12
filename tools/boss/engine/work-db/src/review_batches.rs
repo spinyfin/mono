@@ -2209,6 +2209,8 @@ impl WorkDb {
         let conn = self.connect()?;
         let unproductive_completed = super::review_verdicts::unproductive_completed_pr_review_sql();
         let upkeep = super::parking::upkeep_eligible_task_sql("task");
+        // A refused start is held, not dead: the role resumes only after the hold clears.
+        let not_held = super::dispatch_helpers::not_positioning_held_sql("task");
         let sql = format!(
             "SELECT we.work_item_id, we.id, we.status
              FROM pr_review_batch_members member
@@ -2217,6 +2219,7 @@ impl WorkDb {
              JOIN tasks task ON task.id = we.work_item_id
              WHERE batch.phase = 'pre_merge'
                AND {upkeep}
+               AND {not_held}
                AND (
                    (
                      member.role IN ('claude_reviewer', 'codex_reviewer', 'grok_reviewer')
@@ -2313,6 +2316,15 @@ impl WorkDb {
             tx.commit()?;
             return Ok(RetryDeadReviewBatchMember::NotRetried);
         };
+        // Recheck inside the transaction: a refusal recorded since the candidate
+        // scan holds the item, and the replacement waits for the hold to clear.
+        let work_item_id =
+            crate::query_ensure::RequireRow::require(query_execution(&tx, execution_id), "execution", execution_id)?
+                .work_item_id;
+        if super::dispatch_helpers::positioning_hold_active(&tx, &work_item_id)? {
+            tx.commit()?;
+            return Ok(RetryDeadReviewBatchMember::NotRetried);
+        }
         if !retryable_batch_member_role(member.role) {
             tx.commit()?;
             return Ok(RetryDeadReviewBatchMember::NotRetried);

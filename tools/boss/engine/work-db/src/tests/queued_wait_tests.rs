@@ -459,6 +459,26 @@ fn every_waiting_state_yields_a_named_reason() {
         DISPATCH_WAIT_REASON_DELIBERATE_PARK,
     ));
 
+    let (refused, attempt) = ready_chore(&db, pid, "workspace positioning refused");
+    db.record_workspace_positioning_refusal(
+        &attempt.id,
+        "worker",
+        None,
+        "Cube command failed: {\n  \"error\": \"Preserve commit abc123 before positioning def456; inspect the repository\",\n  \"error_kind\": \"workspace_positioning_refused\"\n}",
+        "Preserve commit abc123 before positioning def456; inspect the repository",
+    )
+    .unwrap();
+    let wait = wait_of(&db, pid, &refused.id);
+    assert_eq!(
+        wait.dispatch_wait_reason.as_deref(),
+        Some(DISPATCH_WAIT_REASON_WORKSPACE_POSITIONING_REFUSED),
+    );
+    assert_eq!(
+        wait.dispatch_wait_label.as_deref(),
+        Some("Workspace blocked: Preserve commit abc123 before positioning def456; inspect the repository")
+    );
+    covered.insert(DISPATCH_WAIT_REASON_WORKSPACE_POSITIONING_REFUSED.to_owned());
+
     // Every reason in the vocabulary is reachable from a state above, so a
     // reason cannot be added without a state that produces it.
     covered.extend(review_states_use_admission_and_current_head_evidence_on_every_surface());

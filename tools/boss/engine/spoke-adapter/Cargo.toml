@@ -10,6 +10,7 @@ async-trait = { workspace = true }
 bon = { workspace = true }
 boss-engine-recovery = { path = "../recovery" }
 boss-execution-contracts = { path = "../execution-contracts" }
+boss-host-execution = { path = "../host-execution" }
 boss-protocol = { path = "../../protocol" }
 boss-protocol-spoke = { path = "../../protocol-spoke" }
 boss-spoke-stream = { path = "../spoke-stream" }

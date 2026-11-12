@@ -1132,3 +1132,40 @@ async fn recovery_for_a_resolved_spoke_run_crosses_the_stream_after_the_host_ret
     );
     assert!(fx.legacy_calls().is_empty(), "{:?}", fx.legacy_calls());
 }
+
+#[tokio::test]
+async fn structured_positioning_refusal_survives_the_spoke_transport() {
+    let fx = Fixture::new().await;
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let peer = fx
+        .spoke(
+            Box::new(|c| {
+                if workspace_kind(c) == Some(Kind::GotoPr) {
+                    let error = boss_host_execution::cube::CubeCliError {
+                        host: HOST.into(),
+                        exit_code: Some(2),
+                        stdout: String::new(),
+                        stderr: json!({"error_kind":"workspace_positioning_refused",
+                    "retryable":false,"error":"preserve abc123 before positioning def456"})
+                        .to_string(),
+                    };
+                    let mut result = refused(c, ResultCode::Rejected, "positioning refused");
+                    result.value = Some(workspace(c, serde_json::to_value(error).unwrap()));
+                    Some(result)
+                } else {
+                    standard(c)
+                }
+            }),
+            None,
+            0,
+        )
+        .await;
+    lease(&adapter).await;
+    let error = adapter.goto_workspace(Path::new(PATH), 42).await.unwrap_err();
+    let typed = error.downcast_ref::<boss_host_execution::cube::CubeCliError>().unwrap();
+    assert!(typed.positioning_refused());
+    assert_eq!(typed.host, HOST);
+    assert!(typed.detail().contains("abc123"));
+    peer.disconnect();
+}

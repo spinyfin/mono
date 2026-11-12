@@ -21,6 +21,7 @@ mod pause_all_spawns;
 mod pause_bypass;
 mod pool;
 mod pool_contract;
+mod positioning_refusal;
 mod post_merge_review_dispatch;
 mod pre_start_streak;
 mod predecessor_lease_hold;

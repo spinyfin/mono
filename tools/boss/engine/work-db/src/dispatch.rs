@@ -946,6 +946,7 @@ impl WorkDb {
         let conn = self.connect()?;
         let unproductive_completed = super::review_verdicts::unproductive_completed_pr_review_sql();
         let upkeep = super::parking::upkeep_eligible_task_sql("t");
+        let not_held = super::dispatch_helpers::not_positioning_held_sql("t");
         // Releasing a never-started batch abandons its leaves and removes
         // their membership rows. The deferred marker routes those roots back
         // through batch admission rather than minting a legacy reviewer.
@@ -956,6 +957,7 @@ impl WorkDb {
              WHERE t.deleted_at IS NULL
                AND t.status NOT IN ('done', 'archived')
                AND {upkeep}
+               AND {not_held}
                AND t.pr_url IS NOT NULL AND t.pr_url != ''
                AND we.kind = 'pr_review'
                AND NOT EXISTS (

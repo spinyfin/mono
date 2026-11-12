@@ -611,14 +611,16 @@ pub(super) fn workspace_goto(
             .map_err(|e| CubeError::InvalidArgument(format!("failed to resolve PR {n} in {owner_repo}: {e}")))?;
         let state = gh_pr::state(&pr_info);
         if state == "MERGED" || state == "CLOSED" {
-            return Err(CubeError::InvalidArgument(format!(
+            return Err(CubeError::PositioningRefused(format!(
                 "PR {n} ({owner_repo}) is {state} — cannot position on a non-open PR. \
                  Use `cube workspace lease` for a fresh task (don't run `cube workspace goto`), or verify the PR number."
             )));
         }
         let branch = gh_pr::head_ref(&pr_info)
             .ok_or_else(|| {
-                CubeError::InvalidArgument(format!("PR {n} ({owner_repo}) returned no head.ref from GitHub"))
+                CubeError::PositioningRefused(format!(
+                    "PR {n} ({owner_repo}) returned no head.ref from GitHub; verify the PR head before launching again"
+                ))
             })?
             .to_string();
         // GitHub's `head.sha` is the PR head. The branch name only labels it:
@@ -644,15 +646,24 @@ pub(super) fn workspace_goto(
         Some(head) => head.sha.clone(),
         None => {
             let remote_ref = format!("{branch}@{github_remote}");
-            if runner
-                .run(&RealCommandRunner::invocation(
+            let found = run_jj(
+                runner,
+                database_path,
+                &RealCommandRunner::invocation(
                     &cwd,
                     "jj",
-                    &["log", "-r", &remote_ref, "--no-graph", "-T", "commit_id"],
-                ))
-                .is_err()
-            {
-                return Err(CubeError::InvalidArgument(format!(
+                    &[
+                        "log",
+                        "-r",
+                        &format!("present({remote_ref})"),
+                        "--no-graph",
+                        "-T",
+                        "commit_id",
+                    ],
+                ),
+            )?;
+            if found.trim().is_empty() {
+                return Err(CubeError::PositioningRefused(format!(
                     "branch `{branch}` was not found on remote `{github_remote}` \
                      (looked for `{remote_ref}`). Confirm the bookmark exists and is pushed, \
                      or pass `--pr <n>` to let cube resolve the head from GitHub."
