@@ -101,7 +101,8 @@ pub(super) fn build(
         let failure_basis = latest_basis(conn, &id, "blocked_reason")?;
         let basis: String = conn
             .query_row(
-                "SELECT basis FROM task_status_audit WHERE work_item_id = ?1 ORDER BY id DESC LIMIT 1",
+                "SELECT basis FROM task_status_audit WHERE work_item_id = ?1 AND property <> 'deferred'
+                 ORDER BY id DESC LIMIT 1",
                 [&id],
                 |r| r.get(0),
             )
@@ -120,7 +121,7 @@ pub(super) fn build(
             .query_row(
                 "SELECT CAST(changed_at AS INTEGER), age_is_lower_bound
              FROM task_status_audit WHERE work_item_id = ?1
-             AND (?2 IS NULL OR property = ?2)
+             AND (property = ?2 OR (?2 IS NULL AND property <> 'deferred'))
              ORDER BY id DESC LIMIT 1",
                 params![id, age_property],
                 |r| Ok((r.get(0)?, r.get(1)?)),

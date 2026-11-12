@@ -191,6 +191,7 @@ pub const PROGRESSION_ALLOWED_VERBS: &[&str] = &[
     "ListProposals",
     "ListRevisions",
     "ListRuns",
+    "ListTaskFieldAudit",
     "ListTasks",
     "ResolveProjectDesignDoc",
     "SubmitProposal",
@@ -215,7 +216,7 @@ fn worker_decision(request: &FrontendRequest) -> WorkerVerbDecision {
     match request {
         // An answer is operator authorization; a worker cannot grant its own.
         FrontendRequest::AnswerOperatorQuestion { .. } => coordinator(variant_name(request)),
-        FrontendRequest::ListOperatorQuestions { .. } => Allow,
+        FrontendRequest::ListOperatorQuestions { .. } | FrontendRequest::ListTaskFieldAudit { .. } => Allow,
         // ── Allowed: taxonomy reads ──────────────────────────────────────
         //
         // The model half of the isolation boundary. Nothing here mutates,

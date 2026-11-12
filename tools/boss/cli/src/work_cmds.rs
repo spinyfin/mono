@@ -1606,6 +1606,14 @@ pub(crate) async fn run_show_leaf(
         other => return Err(unexpected_event("operator question history", &other)),
     };
     let attention_groups = list_attention_groups(client, &product.id, None, Some(item.id.clone()), None, None).await?;
+    let field_audit = match client
+        .send_request(&FrontendRequest::ListTaskFieldAudit { id: item.id.clone() })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::TaskFieldAuditList { rows, .. } => rows,
+        other => return Err(unexpected_event("task flag history", &other)),
+    };
     let mut task_json = task_json_with_runtime(&item, &runtime)?;
     // These keys share a namespace with `Task`'s own serialized fields, so a
     // future `Task` field named `dependencies`/`executions`/`attention_items`/
@@ -1631,6 +1639,12 @@ pub(crate) async fn run_show_leaf(
             "attention_groups".to_owned(),
             serde_json::to_value(&attention_groups).map_err(CliError::internal)?,
         );
+        // Every recorded change to `deferred` / `autostart`, oldest first,
+        // each with the actor and the code path (and calling process) behind it.
+        map.insert(
+            "field_audit".to_owned(),
+            serde_json::to_value(&field_audit).map_err(CliError::internal)?,
+        );
     } else {
         return Err(CliError::internal(anyhow::anyhow!("task JSON was not an object")));
     }
@@ -1646,7 +1660,27 @@ pub(crate) async fn run_show_leaf(
         print_runtime_section(&runtime);
         print_dependency_section(&detail);
         print_executions_section(&execution_runs);
+        print_field_audit_section(&field_audit);
     })
+}
+
+/// The `deferred` / `autostart` history of a task, oldest first: what changed,
+/// who the engine attributes it to, and the code path that wrote it.
+fn print_field_audit_section(rows: &[boss_protocol::TaskFieldAuditRow]) {
+    if rows.is_empty() {
+        return;
+    }
+    println!();
+    println!("Flag history ({}):", rows.len());
+    for row in rows {
+        let old = row.old_value.as_deref().unwrap_or("-");
+        let new = row.new_value.as_deref().unwrap_or("-");
+        let lower_bound = if row.age_is_lower_bound { " (or earlier)" } else { "" };
+        println!(
+            "  {} {} -> {} by {} at {}{} via {}",
+            row.property, old, new, row.actor, row.changed_at, lower_bound, row.basis
+        );
+    }
 }
 
 /// Serialise `item` and splice the runtime's `current_execution_id`

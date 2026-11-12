@@ -875,6 +875,20 @@ impl WorkDb {
     /// where the caller tier has already been resolved to `"human"` or
     /// `"boss"`.
     pub fn update_work_item_as_actor(&self, id: &str, patch: WorkItemPatch, actor: &str) -> Result<WorkItem> {
+        self.update_work_item_with_basis(id, patch, actor, crate::updates::DEFAULT_UPDATE_BASIS)
+    }
+
+    /// [`Self::update_work_item_as_actor`] recording `basis` — the code path
+    /// and, for a socket request, the calling peer — in the field-change
+    /// ledger rows the patch produces. Every writer that sets `deferred` or
+    /// `autostart` through a patch should name itself here.
+    pub fn update_work_item_with_basis(
+        &self,
+        id: &str,
+        patch: WorkItemPatch,
+        actor: &str,
+        basis: &str,
+    ) -> Result<WorkItem> {
         // Park and un-park are the owner's decision with their own cascade, so
         // they never ride along with an unrelated edit: see `parking`.
         if patch.parked.is_some() || patch.parked_reason.is_some() {
@@ -883,7 +897,7 @@ impl WorkDb {
         match classify_id(id)? {
             ItemKind::Product => self.update_product(id, patch, actor),
             ItemKind::Project => self.update_project(id, patch, actor),
-            ItemKind::Task => self.update_task(id, patch, actor),
+            ItemKind::Task => self.update_task_with_basis(id, patch, actor, basis),
             ItemKind::Comment => bail!("comment ids are not product/project/task work items: {id}"),
             ItemKind::Comparison => bail!("comparison ids are not product/project/task work items: {id}"),
         }

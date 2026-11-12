@@ -1782,7 +1782,10 @@ pub(crate) fn request_execution_in_tx_as_actor<F: FnOnce(&str) -> bool>(
         // Mirrors `autostart`'s single-shot clear on start — deliberately
         // starting an item means it is no longer future scope. Guarded on
         // `deferred = 1` so it is a no-op for ordinary items.
-        let approved = conn.execute(
+        let approved = crate::task_status_audit::execute(
+            conn,
+            "explicit_start_clears_deferred",
+            actor,
             "UPDATE tasks SET deferred = 0 WHERE id = ?1 AND deferred = 1 AND deleted_at IS NULL",
             params![work_item_id],
         )?;

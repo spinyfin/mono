@@ -198,6 +198,7 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::ListLiveStatusDisabledSlots
         | FrontendRequest::ListCriticalPriorityRequests
         | FrontendRequest::ListOperatorQuestions { .. }
+        | FrontendRequest::ListTaskFieldAudit { .. }
         | FrontendRequest::ListPlannerRuns { .. }
         | FrontendRequest::ListProductDesignDocs { .. }
         | FrontendRequest::ListProducts

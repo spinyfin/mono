@@ -132,6 +132,7 @@ pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
         | R::GitHubAuthStatus
         | R::TrunkStatus
         | R::ListOperatorQuestions { .. }
+        | R::ListTaskFieldAudit { .. }
         | R::ListCoordinatorGuidance { .. } => ReadLane::Bulk,
         with_live_variants!(live_pattern) => ReadLane::Live,
         R::AbandonCiRemediation { .. }

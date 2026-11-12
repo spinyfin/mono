@@ -60,6 +60,28 @@ pub(super) fn refuse_agent_parking(server_state: &ServerState, peer_pid: Option<
     Ok(())
 }
 
+/// Reply with the recorded `deferred` / `autostart` changes of one task.
+pub(super) async fn handle_list_task_field_audit(ctx: Dispatch, req: FrontendRequest) {
+    let FrontendRequest::ListTaskFieldAudit { id } = req else {
+        unreachable!()
+    };
+    let id = match ctx.server_state.resolve_work_item_id(&id).await {
+        Ok(id) => id,
+        Err(err) => {
+            send_work_error(&ctx.sink, &ctx.request_id, &err);
+            return;
+        }
+    };
+    match ctx.work_db.list_task_field_audit(&id) {
+        Ok(rows) => send_response(
+            &ctx.sink,
+            &ctx.request_id,
+            FrontendEvent::TaskFieldAuditList { work_item_id: id, rows },
+        ),
+        Err(err) => send_work_error(&ctx.sink, &ctx.request_id, &err),
+    }
+}
+
 pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
@@ -705,11 +727,11 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
             let pause_bypass = bypass_dispatch_pause.then_some(BoardDragPauseBypass {
                 observed_pause_since_epoch_s,
             });
-            apply_work_item_patch(ctx, id, patch, pause_bypass).await;
+            apply_work_item_patch_from(ctx, id, patch, pause_bypass, "board_drop:set_status").await;
         }
         DropResolution::ClearAutostart => {
             let patch = WorkItemPatch::builder().autostart(false).build();
-            apply_work_item_patch(ctx, id, patch, None).await;
+            apply_work_item_patch_from(ctx, id, patch, None, "board_drop:clear_autostart").await;
         }
         DropResolution::Refused { message } => {
             let err = anyhow!(message);
@@ -753,6 +775,20 @@ pub(super) async fn apply_work_item_patch(
     id: String,
     patch: WorkItemPatch,
     pause_bypass: Option<BoardDragPauseBypass>,
+) {
+    apply_work_item_patch_from(ctx, id, patch, pause_bypass, "rpc:update_work_item").await;
+}
+
+/// [`apply_work_item_patch`] naming the handler that built the patch. `source`
+/// becomes the first word of the field-change ledger basis, so a `deferred` or
+/// `autostart` write made by a kanban gesture reads differently from one made
+/// by an explicit `UpdateWorkItem`.
+pub(super) async fn apply_work_item_patch_from(
+    ctx: Dispatch,
+    id: String,
+    patch: WorkItemPatch,
+    pause_bypass: Option<BoardDragPauseBypass>,
+    source: &str,
 ) {
     let Dispatch {
         server_state,
@@ -893,8 +929,9 @@ pub(super) async fn apply_work_item_patch(
                 .apply_parking_patch_reporting(&id, &patch, actor)
                 .map(|(item, report)| (item, Some(report)))
         } else {
+            let basis = resolve_write_basis(&server_state, peer_pid, &session_id, &request_id, source).await;
             work_db
-                .update_work_item_as_actor(&id, patch, actor)
+                .update_work_item_with_basis(&id, patch, actor, &basis)
                 .map(|item| (item, None))
         };
         match applied {

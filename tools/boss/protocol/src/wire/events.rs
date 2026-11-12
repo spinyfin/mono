@@ -146,6 +146,11 @@ pub enum FrontendEvent {
     OperatorQuestionsList {
         questions: Vec<crate::OperatorQuestionRecord>,
     },
+    /// Reply for [`FrontendRequest::ListTaskFieldAudit`].
+    TaskFieldAuditList {
+        work_item_id: String,
+        rows: Vec<crate::TaskFieldAuditRow>,
+    },
     OperatorQuestionError {
         error: crate::OperatorQuestionError,
     },

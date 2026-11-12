@@ -292,7 +292,8 @@ fn stuck_since_sql(a: &str) -> String {
     format!(
         "COALESCE(
            (SELECT CAST(la.changed_at AS INTEGER) FROM task_status_audit la
-            WHERE la.work_item_id = {a}.id AND (({age_property}) IS NULL OR la.property = ({age_property}))
+            WHERE la.work_item_id = {a}.id
+              AND (la.property = ({age_property}) OR (({age_property}) IS NULL AND la.property <> 'deferred'))
             ORDER BY la.id DESC LIMIT 1),
            NULLIF(CAST({a}.updated_at AS INTEGER), 0),
            {NOW})"

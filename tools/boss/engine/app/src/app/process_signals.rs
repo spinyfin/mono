@@ -105,6 +105,34 @@ pub(super) fn resolve_status_actor(server_state: &ServerState, peer_pid: Option<
     boss_protocol::LAST_STATUS_ACTOR_HUMAN
 }
 
+/// The ledger basis for a work-item write that arrived over the socket: the
+/// handler that applied it (`source`) and the caller, so a `deferred` or
+/// `autostart` change can be traced to a process and joined to the engine log
+/// by session and request id. `actor` stays the coarse tier
+/// ([`resolve_status_actor`]); this is the part that tells two `human` callers
+/// apart.
+pub(super) async fn resolve_write_basis(
+    server_state: &Arc<ServerState>,
+    peer_pid: Option<libc::pid_t>,
+    session_id: &str,
+    request_id: &str,
+    source: &str,
+) -> String {
+    let peer_class = server_state.classify_peer(peer_pid);
+    let peer = match peer_class.worker_run_id() {
+        Some(run_id) if peer_class.is_progression() => format!("progression:{run_id}"),
+        Some(run_id) => format!("worker:{run_id}"),
+        None if transport_default_created_via(server_state, session_id).await == boss_protocol::CREATED_VIA_MAC_APP => {
+            "mac_app".to_owned()
+        }
+        // The CLI, `bossctl` and any other socket client: the engine cannot
+        // tell them apart beyond the pid below.
+        None => "socket_client".to_owned(),
+    };
+    let pid = peer_pid.map_or_else(|| "unknown".to_owned(), |pid| pid.to_string());
+    format!("{source} peer={peer} pid={pid} session={session_id} request={request_id}")
+}
+
 pub(super) fn current_parent_pid() -> Option<libc::pid_t> {
     // BOSS_APP_PID is the only signal we trust to identify the app
     // tier. The macOS app sets it to its own pid before spawning the

@@ -1258,6 +1258,7 @@ fn operator_yes_and_prerequisite_approval_record_exact_bases() {
     db.answer_operator_question(&yes.id, OperatorAnswer::YesNo { value: true })
         .unwrap();
     assert_latest(&db, &yes.id, "status", "restart_after_answer", "human");
+    assert_has(&db, &yes.id, "autostart", "restart_after_answer", "human");
 
     let gated = create_test_chore(&db, product.clone(), "Needs prereq");
     let gated_exec = start_waiting_human(&db, &gated.id);

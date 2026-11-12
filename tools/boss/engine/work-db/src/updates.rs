@@ -18,6 +18,9 @@ use unicode_segmentation::UnicodeSegmentation;
 /// the example custom tag `🚧 Future` is 8).
 pub const BLOCKED_REASON_MAX_GRAPHEMES: usize = 40;
 
+/// The ledger basis of a patch whose caller did not name itself.
+pub(crate) const DEFAULT_UPDATE_BASIS: &str = "update_task";
+
 /// Reject a `blocked_reason` patch value that would render as a
 /// truncated, unrecoverable pill. Validates the incoming value only —
 /// never the value already stored on a row, so updating an unrelated
@@ -388,6 +391,14 @@ impl WorkDb {
     }
 
     pub fn update_task(&self, id: &str, patch: WorkItemPatch, actor: &str) -> Result<WorkItem> {
+        self.update_task_with_basis(id, patch, actor, DEFAULT_UPDATE_BASIS)
+    }
+
+    /// [`Self::update_task`] recording `basis` in the field-change ledger for
+    /// every column the patch changes (status, `deferred`, `autostart`, ...).
+    /// A caller that can name the code path or the socket peer it is acting
+    /// for passes that here; `update_task` is the unattributed default.
+    pub fn update_task_with_basis(&self, id: &str, patch: WorkItemPatch, actor: &str, basis: &str) -> Result<WorkItem> {
         // Fail fast, before opening a transaction: validate the incoming
         // value only (never a value already sitting in a row from before
         // this limit existed — see `validate_blocked_reason_length`).
@@ -695,7 +706,7 @@ impl WorkDb {
 
         crate::task_status_audit::execute(
             &tx,
-            "update_task",
+            basis,
             actor,
             "UPDATE tasks
              SET name = ?2, description = ?3, status = ?4, ordinal = ?5, pr_url = ?6, updated_at = ?7,

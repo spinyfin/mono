@@ -187,13 +187,14 @@ pub(super) async fn handle_release_project(ctx: Dispatch, req: FrontendRequest) 
     };
 
     let actor = resolve_status_actor(&server_state, peer_pid);
+    let basis = resolve_write_basis(&server_state, peer_pid, &session_id, &request_id, "rpc:release_project").await;
     let mut released = 0usize;
     for task_id in &task_ids {
         let patch = WorkItemPatch {
             autostart: Some(true),
             ..WorkItemPatch::default()
         };
-        match work_db.update_work_item_as_actor(task_id, patch, actor) {
+        match work_db.update_work_item_with_basis(task_id, patch, actor, &basis) {
             Ok(_) => released += 1,
             Err(err) => {
                 tracing::warn!(task_id, ?err, "release_project: failed to flip autostart");
