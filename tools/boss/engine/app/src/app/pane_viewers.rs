@@ -156,6 +156,7 @@ async fn capture_task(state: Arc<ServerState>, run_id: String, wake: Arc<TaskWak
             tokio::select! {
                 _ = renew.tick() => { due = true; }
                 _ = wake.notify.notified() => {}
+                _ = state.topic_broker.pane_departures.notified() => {}
                 snapshot = snapshots.recv() => {
                     match snapshot {
                         Ok(snapshot) if snapshot.run_id == run_id && snapshot.subscription_id == sub_id => {

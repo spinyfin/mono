@@ -8,19 +8,27 @@ use anyhow::Result;
 use async_trait::async_trait;
 use boss_execution_contracts::*;
 use boss_protocol::{
-    FrontendEvent, FrontendRequest, PaneCaptureState, TopicEventPayload, WorkExecution, WorkItem, pane_capture_topic,
+    FrontendEvent, FrontendEventEnvelope, FrontendRequest, InvalidationClass, PaneCaptureState, TopicEventPayload,
+    WorkExecution, WorkItem, pane_capture_topic,
 };
 use std::{
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
 };
+use tokio::sync::oneshot;
 
 const RUN: &str = "execution";
+
+struct CancelHold {
+    arrived: Option<oneshot::Sender<()>>,
+    release: oneshot::Receiver<()>,
+}
 
 struct Remote {
     answer: Mutex<PaneCaptureOutcome>,
     requests: Mutex<Vec<PaneCaptureRequest>>,
+    hold_cancel: Mutex<Option<CancelHold>>,
 }
 struct Provider(Arc<Remote>);
 
@@ -36,7 +44,20 @@ impl Remote {
         Arc::new(Self {
             answer: Mutex::new(answer),
             requests: Mutex::new(vec![]),
+            hold_cancel: Mutex::new(None),
         })
+    }
+    /// Hold the next cancel until the test releases it. The first receiver
+    /// fires when that cancel arrives; sending on the returned sender lets
+    /// it complete.
+    fn hold_next_cancel(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (arrived_tx, arrived_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *self.hold_cancel.lock().unwrap() = Some(CancelHold {
+            arrived: Some(arrived_tx),
+            release: release_rx,
+        });
+        (arrived_rx, release_tx)
     }
     fn opens(&self) -> usize {
         self.requests.lock().unwrap().iter().filter(|r| !r.cancel).count()
@@ -109,11 +130,17 @@ impl HostAdapter for Remote {
     }
     async fn capture_worker_pane(&self, _: &str, request: &PaneCaptureRequest) -> Result<PaneCaptureOutcome> {
         self.requests.lock().unwrap().push(request.clone());
-        Ok(if request.cancel {
-            PaneCaptureOutcome::Accepted
-        } else {
-            self.answer.lock().unwrap().clone()
-        })
+        if request.cancel {
+            let hold = self.hold_cancel.lock().unwrap().take();
+            if let Some(mut hold) = hold {
+                if let Some(arrived) = hold.arrived.take() {
+                    let _ = arrived.send(());
+                }
+                let _ = hold.release.await;
+            }
+            return Ok(PaneCaptureOutcome::Accepted);
+        }
+        Ok(self.answer.lock().unwrap().clone())
     }
 }
 
@@ -390,35 +417,104 @@ async fn a_departure_that_leaves_viewers_asks_the_host_for_nothing() {
 async fn a_replacement_capture_is_never_cancelled_by_the_task_it_replaced() {
     let remote = Remote::new(PaneCaptureOutcome::Accepted);
     let (state, _dir) = state_with(&remote, true);
-    for round in 0..8 {
-        let id = format!("viewer-{round}");
-        let _sink = viewer(&state, &id).await;
-        until("an open", || remote.opens() > round).await;
-        let watched = remote.latest_subscription();
-        // Leave and come straight back, as a closed and reopened panel does.
-        unsubscribe(&state, &id).await;
-        let again = format!("viewer-{round}-again");
-        let _sink = viewer(&state, &again).await;
-        // Long enough for a departing task's cancel and the replacement's
-        // first open to both have reached the host.
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        let live = remote.latest_subscription();
-        let cancelled: Vec<String> = remote
-            .requests
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|r| r.cancel)
-            .map(|r| r.subscription_id.clone())
-            .collect();
-        assert!(
-            !cancelled.contains(&live),
-            "round {round}: the cancel of {watched} ended the live subscription {live}"
-        );
-        unsubscribe(&state, &again).await;
-        until("the task to end", || {
-            futures_executor_block(state.pane_viewers.active_runs()) == 0
-        })
-        .await;
+    state.pane_viewers.set_renew_every(Duration::from_secs(600));
+    let first = viewer(&state, "viewer-a").await;
+    until("an open", || remote.opens() >= 1).await;
+    let watched = remote.latest_subscription();
+    let (cancel_arrived, release_cancel) = remote.hold_next_cancel();
+
+    unsubscribe(&state, "viewer-a").await;
+    tokio::time::timeout(Duration::from_secs(10), cancel_arrived)
+        .await
+        .expect("the old task's cancel never arrived")
+        .expect("cancel hold dropped");
+    until("the old task to leave the registry", || {
+        futures_executor_block(state.pane_viewers.active_runs()) == 0
+    })
+    .await;
+
+    let replacement = viewer(&state, "viewer-a-again").await;
+    until("the replacement open", || remote.opens() >= 2).await;
+    let live = remote.latest_subscription();
+    assert_ne!(live, watched, "the replacement uses its own subscription");
+    state
+        .pane_viewers
+        .feed()
+        .send(snapshot(&remote, "replacement"))
+        .unwrap();
+    assert_eq!(next_capture(&replacement).await.1, "replacement");
+
+    release_cancel.send(()).expect("old cancel still waiting");
+    until("the old cancel to finish", || remote.cancels() >= 1).await;
+    assert_eq!(
+        futures_executor_block(state.pane_viewers.active_runs()),
+        1,
+        "the replacement is still running after the old cancel completes"
+    );
+    state.pane_viewers.feed().send(snapshot(&remote, "still live")).unwrap();
+    assert_eq!(next_capture(&replacement).await.1, "still live");
+    let cancelled: Vec<String> = remote
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.cancel)
+        .map(|r| r.subscription_id.clone())
+        .collect();
+    assert_eq!(cancelled, vec![watched.clone()]);
+    assert!(!cancelled.contains(&live), "the old cancel named the live subscription");
+    drop(first);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_queue_eviction_cancels_the_capture_without_waiting_for_renewal() {
+    let remote = Remote::new(PaneCaptureOutcome::Accepted);
+    let (state, _dir) = state_with(&remote, true);
+    state.pane_viewers.set_renew_every(Duration::from_secs(600));
+    let sink = viewer(&state, "viewer-a").await;
+    until("the capture to open", || remote.opens() >= 1).await;
+
+    {
+        let mut q = sink.queue.lock().unwrap();
+        let mut i = 0usize;
+        while q.items.len() < super::session_queue::MAX_SESSION_QUEUE {
+            assert_eq!(
+                q.enqueue(FrontendEventEnvelope::response(
+                    format!("r-{i}"),
+                    FrontendEvent::ProductsList { products: vec![] },
+                )),
+                super::session_queue::EnqueueOutcome::Enqueued
+            );
+            i += 1;
+        }
+        q.backdate_oldest_bulk_entry(super::session_queue::STUCK_CLIENT_AGE_MS + 100);
     }
+
+    state
+        .topic_broker
+        .publish(
+            &pane_capture_topic(RUN),
+            FrontendEventEnvelope::push(FrontendEvent::TopicEvent {
+                topic: pane_capture_topic(RUN),
+                revision: 0,
+                origin_session_id: String::new(),
+                origin_request_id: None,
+                event: TopicEventPayload::WorkInvalidated {
+                    reason: "overflow".into(),
+                    product_id: None,
+                    item_ids: vec![],
+                    class: InvalidationClass::Structural,
+                },
+            }),
+        )
+        .await;
+
+    until("the cancel after eviction", || remote.cancels() >= 1).await;
+    until("the task to end after eviction", || {
+        futures_executor_block(state.pane_viewers.active_runs()) == 0
+    })
+    .await;
+    let opens = remote.opens();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(remote.opens(), opens, "eviction must not wait for a renewal tick");
 }
