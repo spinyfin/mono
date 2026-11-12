@@ -30,8 +30,9 @@ percentage of new work is sent to each driver. They always sum to 100%.
   split is never in a state the engine would reject mid-edit.
 - **Up to three drivers may sit at 0%.** A driver at zero receives no work
   at all, and every such state is reachable by repeated single-share edits.
-  Antigravity ships at 0% and stays inert until it is a registered, capable
-  driver.
+  Antigravity ships at 0%. Before an Antigravity driver is registered, its
+  share is excluded and the remaining shares renormalise; at 100% work goes
+  to the engine default driver (Claude) even if Claude is at 0%.
 
 ## Codex Sol model
 

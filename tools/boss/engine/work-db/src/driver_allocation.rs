@@ -212,21 +212,31 @@ fn eligible_drivers_for(
         .collect()
 }
 
-/// True when some share is assigned to a slug the current binary has not
-/// registered, and every currently eligible driver holds 0.
+/// True when `eligible` is non-empty and every *registered* driver in
+/// [`DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER`] holds 0 — i.e. the whole
+/// share sits on unregistered slugs.
 ///
 /// Settings can persist that split (the stepper does not know which slugs
-/// the engine has registered). The unregistered share is dropped from the
-/// eligible set, so `agy = 100` before an Antigravity driver exists leaves
-/// every registered driver at 0. Failing the insert would strand every
-/// unpinned row; [`decide_execution_driver`] falls through to the engine
-/// default instead.
-fn unregistered_share_left_every_eligible_driver_at_zero(split: &DriverTrafficSplit, eligible: &[&str]) -> bool {
+/// the engine has registered). `agy = 100` before an Antigravity driver
+/// exists is the current case: the unregistered share is dropped from the
+/// eligible set and every registered driver is at 0. Failing the insert
+/// would strand every unpinned row; [`decide_execution_driver`] falls
+/// through to the engine default instead.
+///
+/// A leftover unregistered share next to a funded registered driver does
+/// not qualify. ConflictResolution / CiRemediation with `claude = 0` and
+/// `agy > 0` is still `EveryEligibleDriverAtZero`, and an empty `eligible`
+/// set is still `NoEligibleDriver` — falling back would hand those to a
+/// gate-refusing default or revive a registered driver set to 0.
+fn whole_share_sits_on_unregistered_drivers(split: &DriverTrafficSplit, eligible: &[&str]) -> bool {
+    if eligible.is_empty() {
+        return false;
+    }
     let registry = boss_engine_driver::DriverRegistry::default();
-    let unregistered_holds_share = DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER
+    DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER
         .iter()
-        .any(|driver| split.share_for(driver).unwrap_or(0) > 0 && registry.get(driver).is_none());
-    unregistered_holds_share && eligible.iter().all(|driver| split.share_for(driver).unwrap_or(0) == 0)
+        .filter(|driver| registry.get(driver).is_some())
+        .all(|driver| split.share_for(driver) == Some(0))
 }
 
 /// Deterministic hash of `work_item_id` into `[0, 100)`. SHA-256 rather
@@ -458,13 +468,16 @@ pub(crate) fn driver_has_design_investigation_model(driver_slug: &str) -> bool {
 ///
 /// Errors (failing the execution insert) when the row's kind is
 /// unrecognised, or when the eligible drivers hold no share between them
-/// and that is not because the funded share sits on an unregistered driver.
+/// and that is not because the whole share sits on unregistered drivers.
 /// Remaining failures are loud on purpose: falling back to the engine
 /// default would hand an eligibility failure to a driver whose gate refuses
 /// it, or revive a registered driver that was set to 0. Zero means zero.
-/// A Settings-reachable split that puts the whole share on an unregistered
-/// driver (today: `agy = 100` with no Antigravity implementation) falls
+/// A Settings-reachable split that puts the whole share on unregistered
+/// drivers (today: `agy = 100` with no Antigravity implementation) falls
 /// through to the engine default instead of failing every unpinned insert.
+/// A leftover unregistered share next to a funded registered driver does
+/// not: ConflictResolution / CiRemediation with `claude = 0` still fails
+/// the insert, as does an empty eligible set.
 pub fn decide_execution_driver(conn: &Connection, work_item_id: &str, kind: ExecutionKind) -> Result<DriverDecision> {
     let row = conn
         .query_row(
@@ -569,7 +582,7 @@ pub fn decide_execution_driver(conn: &Connection, work_item_id: &str, kind: Exec
         Ok(driver) => driver,
         Err(_) if model_override.is_some() => return Ok(DriverDecision::default_no_override()),
         Err(_) if design_or_investigation_tier => return Ok(DriverDecision::default_no_override()),
-        Err(_) if unregistered_share_left_every_eligible_driver_at_zero(&split, &eligible) => {
+        Err(_) if whole_share_sits_on_unregistered_drivers(&split, &eligible) => {
             return Ok(DriverDecision::default_no_override());
         }
         Err(err) => return Err(err),
