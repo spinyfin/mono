@@ -97,6 +97,18 @@ impl SpokeTurns {
             turns.remove(run);
         }
     }
+
+    /// Rebuild one run after a hub restart from durable turn state.
+    pub(super) fn restore(&self, run: &str, parked: bool) {
+        self.record(run, if parked { SpokeTurn::Parked } else { SpokeTurn::Working });
+    }
+
+    #[cfg(test)]
+    pub(super) fn clear(&self) {
+        if let Ok(mut turns) = self.0.lock() {
+            turns.clear();
+        }
+    }
 }
 
 /// Mid-turn delivery to a spoke worker is allowed only once a turn's `Stop` has
@@ -110,8 +122,12 @@ pub(super) fn spoke_parked_for_delivery(state: &ServerState, run: &str) -> bool 
 impl ServerState {
     /// Note a turn boundary for a run no local slot tracks. Runs with a slot
     /// are covered by the slot's own activity, so they are not recorded here.
-    pub(super) fn record_spoke_turn_event(&self, run: &str, event: &boss_protocol::WorkerEvent) {
+    /// Subagent events never move the parent session's parked/working state.
+    pub(super) fn record_spoke_turn_event(&self, run: &str, event: &boss_protocol::WorkerEvent, from_subagent: bool) {
         use boss_protocol::WorkerEvent;
+        if from_subagent {
+            return;
+        }
         let turn = match event {
             WorkerEvent::Stop { .. } => SpokeTurn::Parked,
             WorkerEvent::UserPromptSubmit { .. }
@@ -123,8 +139,56 @@ impl ServerState {
                 return;
             }
         };
-        if self.worker_registry.slot_for_run(run).is_none() && self.spoke_probe_owner_remains(run) {
-            self.spoke_turns.record(run, turn);
+        // A remote worker gets a virtual live-status slot on its first hook.
+        // That slot is display-only; mid-turn delivery still reads this map,
+        // so turn state is keyed on spoke ownership rather than slot absence.
+        if !self.spoke_probe_owner_remains(run) {
+            return;
+        }
+        self.spoke_turns.record(run, turn);
+        let assignment_generation = match self.work_db.spoke_assignment_for_execution(run) {
+            Ok(Some(assignment)) => assignment.assignment_generation,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(run, error = %error, "cannot persist spoke turn state");
+                return;
+            }
+        };
+        if let Err(error) = self.work_db.upsert_spoke_turn_state(&boss_work_db::SpokeTurnState {
+            execution_id: run.to_owned(),
+            assignment_generation,
+            parked: turn == SpokeTurn::Parked,
+        }) {
+            tracing::warn!(run, error = %error, "cannot persist spoke turn state");
+        }
+    }
+
+    /// Rebuild the in-memory turn map from durable rows after a hub restart.
+    pub(super) fn restore_spoke_turns(&self) {
+        let stored = match self.work_db.spoke_turn_states() {
+            Ok(stored) => stored,
+            Err(error) => {
+                tracing::warn!(error = %error, "cannot restore spoke turn state");
+                return;
+            }
+        };
+        for turn in stored {
+            match self.work_db.spoke_assignment_for_execution(&turn.execution_id) {
+                Ok(Some(assignment))
+                    if assignment.assignment_generation == turn.assignment_generation && !assignment.resolved =>
+                {
+                    self.spoke_turns.restore(&turn.execution_id, turn.parked);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        run = %turn.execution_id,
+                        error = %error,
+                        "cannot check spoke assignment while restoring turn state; keeping the stored turn"
+                    );
+                    self.spoke_turns.restore(&turn.execution_id, turn.parked);
+                }
+            }
         }
     }
 

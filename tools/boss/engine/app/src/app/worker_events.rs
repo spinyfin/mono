@@ -586,7 +586,7 @@ pub(super) async fn dispatch_live_worker_state(
         return;
     };
     server_state.dispatcher_stats.record_last_hook(run_id, event_kind);
-    server_state.record_spoke_turn_event(run_id, &incoming.event);
+    server_state.record_spoke_turn_event(run_id, &incoming.event, incoming.connection.from_subagent);
     // **Driver-start verification.** A hook is the earliest
     // driver-ORIGINATED evidence Boss ever gets that the driver binary
     // actually executed — a login shell cannot emit one. Record it here,

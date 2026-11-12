@@ -6,26 +6,26 @@
 //! observation does to work state.
 //!
 //! Decoding fails closed. A frame that does not decode, fails validation, or
-//! carries an event or proposal this build cannot read is *quarantined*, which
-//! records it for an operator and moves on. It is never mapped to a success,
-//! and never silently dropped: an unknown stop reason must not become
-//! completion evidence, and a proposal this hub cannot read gets an explicit
-//! refusal rather than silence.
+//! carries an event or proposal this build cannot read is *quarantined*: a
+//! failed `quarantine` effect is stored and never retried, and the cursor
+//! moves on. It is never mapped to a success, and never silently dropped: an
+//! unknown stop reason must not become completion evidence, and a proposal
+//! this hub cannot read gets an explicit refusal rather than silence.
 
 use boss_protocol::{ProposalKind, WorkerEvent};
 use boss_protocol_spoke::{
     Validate,
+    proposal::{self, ProposalJsonEnvelope},
     v1::{self, PaneState, Run, Stamp, record, spoke_frame},
     worker_event,
 };
 use prost::Message;
-use serde::Deserialize;
 use serde_json::Value;
 
 use boss_work_db::SpokeIngressRow;
 
-/// The payload contract the hub reads proposals under.
-pub const PROPOSAL_JSON: &str = "proposal-json/1";
+/// The payload contract the hub reads `propose` calls under.
+pub const PROPOSAL_JSON: &str = proposal::PROPOSAL_JSON;
 
 /// Where an observation came from.
 #[derive(Debug, Clone, PartialEq)]
@@ -54,6 +54,14 @@ pub enum ProposalRequest {
     /// A proposal the existing validators and apply pipeline already handle.
     Standard {
         kind: ProposalKind,
+        payload: Value,
+        idempotency_key: String,
+    },
+    /// A run-scoped write the gateway queued under its own contract. The
+    /// hub applies the same ownership-checked handlers a local worker's
+    /// matching RPC uses.
+    RunWrite {
+        contract: String,
         payload: Value,
         idempotency_key: String,
     },
@@ -144,7 +152,8 @@ pub enum Skip {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Reduction {
     Skip(Skip),
-    /// Cannot be read. Recorded for an operator; the cursor moves on.
+    /// Cannot be read. Stored as a failed effect and never retried; the cursor
+    /// moves on.
     Quarantine(String),
     Observations(Vec<Observation>),
 }
@@ -240,30 +249,36 @@ pub fn reduce(host_id: &str, journal_id: &str, row: &SpokeIngressRow) -> Reducti
     }
 }
 
-/// The envelope the spoke gateway queues under `proposal-json/1`: the exact
-/// frontend payload, its kind and its idempotency key.
-#[derive(Deserialize)]
-struct Envelope {
-    kind: ProposalKind,
-    payload: Value,
-    idempotency_key: String,
-}
-
 fn proposal_request(proposal: &v1::Proposal) -> ProposalRequest {
+    if proposal::is_run_write_contract(&proposal.payload_contract) {
+        if proposal.kind != v1::ProposalKind::OtherValidated as i32 {
+            return ProposalRequest::Refused("run-scoped writes must be stamped OtherValidated on the wire".into());
+        }
+        let payload: Value = match serde_json::from_slice(&proposal.canonical_json) {
+            Ok(Value::Object(map)) => Value::Object(map),
+            Ok(_) => return ProposalRequest::Refused("run-scoped write payload must be a JSON object".into()),
+            Err(error) => return ProposalRequest::Refused(format!("run-scoped write is unreadable: {error}")),
+        };
+        return ProposalRequest::RunWrite {
+            contract: proposal.payload_contract.clone(),
+            payload,
+            idempotency_key: proposal.proposal_id.clone(),
+        };
+    }
     if proposal.payload_contract != PROPOSAL_JSON {
         return ProposalRequest::Refused(format!(
             "payload contract `{}` is not supported by this hub",
             proposal.payload_contract
         ));
     }
-    let envelope: Envelope = match serde_json::from_slice(&proposal.canonical_json) {
+    let envelope: ProposalJsonEnvelope = match serde_json::from_slice(&proposal.canonical_json) {
         Ok(envelope) => envelope,
         Err(error) => return ProposalRequest::Refused(format!("proposal envelope is unreadable: {error}")),
     };
     if envelope.idempotency_key != proposal.proposal_id {
         return ProposalRequest::Refused("proposal id does not match its idempotency key".into());
     }
-    if wire_kind(envelope.kind) as i32 != proposal.kind {
+    if proposal::wire_kind(envelope.kind) as i32 != proposal.kind {
         return ProposalRequest::Refused(format!(
             "wire kind does not match the `{}` payload it carries",
             envelope.kind
@@ -278,18 +293,5 @@ fn proposal_request(proposal: &v1::Proposal) -> ProposalRequest {
         kind: envelope.kind,
         payload: envelope.payload,
         idempotency_key: envelope.idempotency_key,
-    }
-}
-
-/// The wire kind the spoke gateway stamps for a payload kind. Both ends must
-/// agree, so a record whose two disagree is refused.
-fn wire_kind(kind: ProposalKind) -> v1::ProposalKind {
-    match kind {
-        ProposalKind::PrCreated => v1::ProposalKind::PrCreated,
-        ProposalKind::RunDone => v1::ProposalKind::RunDone,
-        ProposalKind::Wait => v1::ProposalKind::Wait,
-        ProposalKind::ReviewReport => v1::ProposalKind::ReviewReport,
-        ProposalKind::ReviewVerdict => v1::ProposalKind::ReviewVerdict,
-        _ => v1::ProposalKind::OtherValidated,
     }
 }

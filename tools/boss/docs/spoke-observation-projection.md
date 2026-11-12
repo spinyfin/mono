@@ -16,17 +16,18 @@ The sink stores the original frame bytes and advances the receipt in one transac
 
 ## What a record does
 
-`projection::reduce::reduce` is a pure function from a stored frame to observations. It fails closed: a frame that does not decode, fails validation, has the wrong sequence, or carries an event this build cannot read is **quarantined** (a `failed` `quarantine` effect for an operator, and the cursor moves on). It is never mapped to a success.
+`projection::reduce::reduce` is a pure function from a stored frame to observations. It fails closed: a frame that does not decode, fails validation, has the wrong sequence, or carries an event this build cannot read is **quarantined** (a `failed` `quarantine` effect is stored and never retried, and the cursor moves on). It is never mapped to a success.
 
-| Record                                              | Becomes                    | Applied by                                                                                                                                                                              |
-| --------------------------------------------------- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `WorkerEvent`                                       | a hook event of the run    | `dispatch_worker_event_fanout`, the same fan-out a hook on the local events socket takes (live state, completion on `Stop`, probes, spoke turn map)                                     |
-| `Proposal` (`proposal-json/1`)                      | a queued `propose` call    | `proposals::submit_for_caller`, the same validators, apply pipeline and run-done finalization as `SubmitProposal`; yields a **decision**                                                |
-| `Proposal` (any other contract)                     | a refusal                  | a `Rejected` decision naming the contract; nothing is applied                                                                                                                           |
-| `PaneState`, inventory page                         | a pane observation per run | durable `spoke_pane_observations` row, then live state: `Exited` marks the slot terminated, `Missing` shows it exited without fencing, `Alive` revives it, `Indeterminate` does nothing |
-| `CommandResult`                                     | nothing                    | settled at ingress with its receipt                                                                                                                                                     |
-| `PaneCapture`                                       | nothing                    | live display data, already fed to viewers by the stream manager                                                                                                                         |
-| capacity, transcript, artifact, gap, worker request | nothing yet                | owned by other consumers                                                                                                                                                                |
+| Record                                                                                                                | Becomes                    | Applied by                                                                                                                                                                              |
+| --------------------------------------------------------------------------------------------------------------------- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `WorkerEvent`                                                                                                         | a hook event of the run    | `dispatch_worker_event_fanout`, the same fan-out a hook on the local events socket takes (live state, completion on `Stop`, probes, spoke turn map)                                     |
+| `Proposal` (`proposal-json/1`)                                                                                        | a queued `propose` call    | `proposals::submit_for_caller`, the same validators, apply pipeline and run-done finalization as `SubmitProposal`; yields a **decision**                                                |
+| `Proposal` (`guide-outcome/1`, `answer-reply/1`, `conflict-producer/1`, `conflict-mark-failed/1`, `ci-mark-failed/1`) | a run-scoped write         | the same ownership-checked handlers a local worker's matching RPC uses; replay of an already-applied write is accepted                                                                  |
+| `Proposal` (any other contract)                                                                                       | a refusal                  | a `Rejected` decision naming the contract; nothing is applied                                                                                                                           |
+| `PaneState`, inventory page                                                                                           | a pane observation per run | durable `spoke_pane_observations` row, then live state: `Exited` marks the slot terminated, `Missing` shows it exited without fencing, `Alive` revives it, `Indeterminate` does nothing |
+| `CommandResult`                                                                                                       | nothing                    | settled at ingress with its receipt                                                                                                                                                     |
+| `PaneCapture`                                                                                                         | nothing                    | live display data, already fed to viewers by the stream manager                                                                                                                         |
+| capacity, transcript, artifact, gap, worker request                                                                   | nothing yet                | owned by other consumers                                                                                                                                                                |
 
 A pane observation is evidence only. Whether absence or an exit changes a task's status is still decided by the engine's existing liveness policy.
 
@@ -53,20 +54,20 @@ The decision for a queued proposal is stored in `spoke_effects` as the exact `Pr
 
 - host unreachable, or outcome uncertain: stays pending, retried every few seconds with the same command id;
 - spoke answers `Ok`: settled;
-- spoke refuses: retried under a fresh id (`<id>-r<n>`) up to three times, then `failed` for an operator.
+- spoke refuses: retried under a fresh id (`<id>-r<n>`) up to three times, then stored as a failed effect and never retried.
 
 A decision is `Ok` with a bounded summary (hub proposal id, state, applied reference, whether it was a replay), or `Rejected` with the typed submission error.
 
 ## Not covered
 
-- The run-scoped writes the gateway queues under their own contracts (`guide-outcome/1`, `answer-reply/1`, `conflict-producer/1`, `conflict-mark-failed/1`, `ci-mark-failed/1`) are refused with a decision that names the contract. Each needs its own hub-side ownership checks.
-- `WorkerRequest` replies (the gateway's online reads) are a separate follow-on.
+- Authorizing the worker gateway's online requests (`WorkerRequest` replies) is separate follow-on work; this projection does not touch them.
 - Transcripts, artifacts and gaps are not projected here, so `spoke_ingress` is not pruned yet; whichever consumer is last to need a frame decides when it can go.
-- Wall-clock age is not yet distinguished from liveness: replaying an old event refreshes the worker's last-activity time. Staleness judgments should not be trusted for a host until its backlog has drained.
+- Wall-clock age is not yet distinguished from liveness: replaying an old event refreshes the worker's last-activity time. Staleness judgments should not be trusted for a host until its backlog has drained. A projected `Stop` carries no hub-local transcript path; Stop-time consumers that read a transcript see unavailable evidence.
 
 ## Diagnosing
 
-- Lag: `WorkDb::spoke_projection_status()`; `received` vs `applied`, `pending_effects`, `failed_effects`.
-- Halted host: the log says `spoke observation projection halted` with the position. Received evidence that cannot be applied is never skipped; this is a recovery incident for the host, retried after a hold.
-- Quarantined frames and abandoned decisions are `spoke_effects` rows in state `failed` with `last_error`.
+- Lag: `WorkDb::spoke_projection_status()`; `received` vs `applied`, `pending_effects`, `failed_effects`, `halt_reason`. The same facts appear on `GetEngineHealth` as `spoke_projection_halted` and `spoke_projection_failed_effects` issues.
+- Halted host: the log says `spoke observation projection halted` with the position, `halt_reason` is persisted, and the host is retried after a hold. Received evidence that cannot be applied is never skipped.
+- Quarantined frames and abandoned decisions are `spoke_effects` rows in state `failed` with `last_error`; they are never retried.
 - Pane evidence: `WorkDb::spoke_pane_observation(execution_id)`.
+- Parked remote workers: `spoke_turn_state` holds the latest main-session turn per assignment so a hub restart rebuilds the in-memory map.

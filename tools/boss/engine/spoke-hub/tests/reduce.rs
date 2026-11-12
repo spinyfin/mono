@@ -134,9 +134,9 @@ fn proposals_the_hub_cannot_read_are_refused_not_dropped() {
             ProposalKind::RunDone,
             "k",
             v1::ProposalKind::RunDone,
-            "guide-outcome/1"
+            "not-a-real-contract/1"
         ))
-        .contains("guide-outcome/1")
+        .contains("not-a-real-contract/1")
     );
     // Wire kind and payload kind must agree.
     assert!(
@@ -165,6 +165,42 @@ fn proposals_the_hub_cannot_read_are_refused_not_dropped() {
     let mut garbage = proposal(ProposalKind::RunDone, "k", v1::ProposalKind::RunDone, PROPOSAL_JSON);
     garbage.canonical_json = b"{not json".to_vec();
     assert!(refused(garbage).contains("unreadable"));
+}
+
+#[test]
+fn a_run_write_contract_is_routed_not_refused() {
+    let mut proposal = proposal(
+        ProposalKind::Blocked,
+        "guide:abc",
+        v1::ProposalKind::OtherValidated,
+        "guide-outcome/1",
+    );
+    proposal.canonical_json = serde_json::to_vec(&json!({
+        "run_id": "exec_1",
+        "comment_id": "c1",
+        "disposition": "answered",
+        "body": "fixed",
+        "request_regeneration": false,
+    }))
+    .unwrap();
+    let found = observations(reduce("h", "j", &row(2, Some(run()), record::Body::Proposal(proposal))));
+    let [Observation::Proposal(found)] = found.as_slice() else {
+        panic!("one proposal expected")
+    };
+    assert_eq!(
+        found.request,
+        ProposalRequest::RunWrite {
+            contract: "guide-outcome/1".into(),
+            payload: json!({
+                "run_id": "exec_1",
+                "comment_id": "c1",
+                "disposition": "answered",
+                "body": "fixed",
+                "request_regeneration": false,
+            }),
+            idempotency_key: "guide:abc".into(),
+        }
+    );
 }
 
 #[test]

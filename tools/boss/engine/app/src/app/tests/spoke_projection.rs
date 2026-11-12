@@ -185,6 +185,22 @@ impl Fixture {
         self.receive(record::Body::Event(worker_event::to_wire(event)));
     }
 
+    fn receive_event_from_subagent(&mut self, event: &boss_protocol::WorkerEvent) {
+        let mut wire = worker_event::to_wire(event);
+        wire.from_subagent = true;
+        self.receive(record::Body::Event(wire));
+    }
+
+    fn receive_run_write(&mut self, contract: &str, key: &str, payload: Value) {
+        self.receive(record::Body::Proposal(v1::Proposal {
+            proposal_id: key.into(),
+            kind: v1::ProposalKind::OtherValidated as i32,
+            payload_contract: contract.into(),
+            canonical_json: serde_json::to_vec(&payload).unwrap(),
+            ..Default::default()
+        }));
+    }
+
     fn receive_pane(&mut self, life: v1::PaneLife, exit_code: Option<i32>) {
         self.receive(record::Body::Pane(v1::PaneState {
             life: life as i32,
@@ -470,4 +486,128 @@ async fn a_review_guide_is_refused_from_a_spoke_without_touching_the_hub() {
     assert_eq!(decisions.len(), 1);
     assert_eq!(decisions[0].code, ResultCode::Rejected as i32);
     assert!(decisions[0].reason.contains("review guide"));
+}
+
+#[tokio::test]
+async fn an_awaiting_input_stop_is_restored_as_parked_after_memory_is_cleared() {
+    use boss_protocol::WorkerEvent;
+    let mut fx = delivered_with_a_resolvable_pr();
+    fx.receive_event(&WorkerEvent::Stop {
+        session_id: "remote-session".into(),
+        stop_hook_active: false,
+        stop_reason: boss_protocol::StopReason::AwaitingInput,
+    });
+    fx.projector().drain().await;
+    assert!(crate::app::spoke_probes::spoke_parked_for_delivery(
+        &fx.state,
+        &fx.execution_id
+    ));
+    fx.state.spoke_turns.clear();
+    assert!(!crate::app::spoke_probes::spoke_parked_for_delivery(
+        &fx.state,
+        &fx.execution_id
+    ));
+    fx.state.restore_spoke_turns();
+    assert!(crate::app::spoke_probes::spoke_parked_for_delivery(
+        &fx.state,
+        &fx.execution_id
+    ));
+}
+
+#[tokio::test]
+async fn subagent_events_do_not_move_the_parent_turn() {
+    use boss_protocol::WorkerEvent;
+    let mut fx = delivered_with_a_resolvable_pr();
+    fx.receive_event(&WorkerEvent::UserPromptSubmit {
+        session_id: "main".into(),
+        prompt: "go".into(),
+    });
+    fx.projector().drain().await;
+    fx.receive_event_from_subagent(&WorkerEvent::Stop {
+        session_id: "sub".into(),
+        stop_hook_active: false,
+        stop_reason: boss_protocol::StopReason::Completed,
+    });
+    fx.projector().drain().await;
+    assert!(!crate::app::spoke_probes::spoke_parked_for_delivery(
+        &fx.state,
+        &fx.execution_id
+    ));
+    fx.receive_event(&WorkerEvent::Stop {
+        session_id: "main".into(),
+        stop_hook_active: false,
+        stop_reason: boss_protocol::StopReason::AwaitingInput,
+    });
+    fx.projector().drain().await;
+    assert!(crate::app::spoke_probes::spoke_parked_for_delivery(
+        &fx.state,
+        &fx.execution_id
+    ));
+    fx.receive_event_from_subagent(&WorkerEvent::PreToolUse {
+        session_id: "sub".into(),
+        tool_name: "Bash".into(),
+        tool_input: json!({"command": "ls"}),
+    });
+    fx.projector().drain().await;
+    assert!(crate::app::spoke_probes::spoke_parked_for_delivery(
+        &fx.state,
+        &fx.execution_id
+    ));
+}
+
+#[tokio::test]
+async fn a_run_scoped_write_is_applied_through_the_local_handler() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    fx.receive_run_write(
+        boss_protocol_spoke::proposal::CONFLICT_PRODUCER,
+        "producer-1",
+        json!({
+            "execution_id": fx.execution_id,
+            "head_branch": "feature",
+            "base_branch": "main",
+            "conflicted_files": ["src/lib.rs"],
+        }),
+    );
+    fx.projector().drain().await;
+    let decisions = fx.wire.decisions();
+    assert_eq!(decisions.len(), 1, "{decisions:?}");
+    assert_eq!(decisions[0].code, ResultCode::Ok as i32);
+    let recorded = fx
+        .state
+        .work_db
+        .latest_conflict_resolution_for_work_item(&fx.work_item_id)
+        .unwrap()
+        .expect("producer conflict row");
+    assert_eq!(recorded.event_source, "producer_rebase");
+    fx.receive_run_write(
+        boss_protocol_spoke::proposal::CONFLICT_PRODUCER,
+        "producer-1",
+        json!({
+            "execution_id": fx.execution_id,
+            "head_branch": "feature",
+            "base_branch": "main",
+            "conflicted_files": ["src/lib.rs"],
+        }),
+    );
+    fx.projector().drain().await;
+    assert_eq!(fx.wire.decisions().len(), 1, "the same write is not applied twice");
+}
+
+#[tokio::test]
+async fn a_run_scoped_write_for_another_runs_attempt_is_refused() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    fx.receive_run_write(
+        boss_protocol_spoke::proposal::CONFLICT_MARK_FAILED,
+        "mark-1",
+        json!({
+            "run_id": fx.execution_id,
+            "attempt_id": "crz_not_this_run",
+            "reason": "semantic_obsolescence",
+            "extra": {},
+        }),
+    );
+    fx.projector().drain().await;
+    let decisions = fx.wire.decisions();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].code, ResultCode::Rejected as i32);
 }

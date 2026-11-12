@@ -355,6 +355,48 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
         });
     }
 
+    match server_state.work_db.spoke_projection_status() {
+        Ok(hosts) => {
+            for host in hosts {
+                if let Some(reason) = host.halt_reason.as_deref() {
+                    issues.push(EngineHealthIssue {
+                        kind: "spoke_projection_halted".to_owned(),
+                        severity: "error".to_owned(),
+                        title: format!("Spoke host {} projection is halted", host.position.host_id),
+                        body: format!(
+                            "Received evidence for host {} cannot be applied (applied={}, received={}). \
+                             The host is retried after a hold and its records are not skipped. {reason}",
+                            host.position.host_id, host.position.applied, host.position.received
+                        ),
+                    });
+                }
+                if host.failed_effects > 0 {
+                    issues.push(EngineHealthIssue {
+                        kind: "spoke_projection_failed_effects".to_owned(),
+                        severity: "warning".to_owned(),
+                        title: format!(
+                            "Spoke host {} has {} failed projection effect(s)",
+                            host.position.host_id, host.failed_effects
+                        ),
+                        body: format!(
+                            "Quarantined frames or abandoned decisions for host {} are stored as failed \
+                             effects and never retried. Inspect spoke_effects for last_error.",
+                            host.position.host_id
+                        ),
+                    });
+                }
+            }
+        }
+        Err(error) => {
+            issues.push(EngineHealthIssue {
+                kind: "spoke_projection_status_unreadable".to_owned(),
+                severity: "warning".to_owned(),
+                title: "Spoke projection status could not be read".to_owned(),
+                body: format!("{error:#}"),
+            });
+        }
+    }
+
     EngineHealthReport {
         engine_version: boss_engine_runtime::build_info::version().to_owned(),
         engine_git_sha: boss_engine_runtime::build_info::git_sha().to_owned(),

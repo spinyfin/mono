@@ -133,6 +133,7 @@ impl ObservationApplier for Applier {
 struct Sender {
     sent: Mutex<Vec<(String, Command)>>,
     script: Mutex<Vec<Result<CommandResult, CommandOutcome>>>,
+    unavailable: Mutex<HashSet<String>>,
 }
 
 impl Sender {
@@ -148,6 +149,9 @@ impl Sender {
 #[async_trait]
 impl CommandSender for Sender {
     async fn send(&self, host_id: &str, command: Command, _: Duration) -> Result<CommandResult, CommandOutcome> {
+        if self.unavailable.lock().unwrap().contains(host_id) {
+            return Err(CommandOutcome::Unavailable);
+        }
         let id = command.command_id.clone();
         self.sent.lock().unwrap().push((host_id.to_owned(), command));
         let mut script = self.script.lock().unwrap();
@@ -257,16 +261,20 @@ struct Spoke {
 
 impl Spoke {
     async fn connect(db: &WorkDb, wake: Option<Arc<Notify>>) -> Self {
+        Self::connect_host(db, HOST, wake).await
+    }
+
+    async fn connect_host(db: &WorkDb, host: &str, wake: Option<Arc<Notify>>) -> Self {
         let sink = match wake {
             Some(wake) => WorkDbSink::with_wake(db.clone(), wake),
             None => WorkDbSink::new(db.clone()),
         };
-        let mut hello = hello(HOST);
-        hello.last_record = db.spoke_journal(HOST).unwrap().map_or(0, |j| j.received);
+        let mut hello = hello(host);
+        hello.last_record = db.spoke_journal(host).unwrap().map_or(0, |j| j.received);
         let admission = sink.open(&hello, &selection()).await.expect("open journal");
         Self {
             sink,
-            session: session(HOST, admission.generation),
+            session: session(host, admission.generation),
         }
     }
 
@@ -559,7 +567,7 @@ async fn a_record_that_cannot_be_applied_yet_holds_the_cursor_and_the_order() {
 }
 
 #[tokio::test]
-async fn an_unreadable_frame_is_quarantined_for_an_operator_and_the_cursor_moves_on() {
+async fn an_unreadable_frame_is_quarantined_and_the_cursor_moves_on() {
     let world = World::new();
     let db = world.open();
     let run = assign(&db, "exec_1").1;
@@ -618,7 +626,7 @@ async fn a_proposal_the_hub_cannot_read_is_refused_by_decision_not_dropped() {
     let spoke = Spoke::connect(&db, None).await;
     let mut record = proposal_record(1, &run, "key-1");
     if let Some(record::Body::Proposal(proposal)) = &mut record.body {
-        proposal.payload_contract = "guide-outcome/1".into();
+        proposal.payload_contract = "not-a-real-contract/1".into();
         proposal.kind = v1::ProposalKind::OtherValidated as i32;
     }
     spoke.send(&record).await;
@@ -631,7 +639,7 @@ async fn a_proposal_the_hub_cannot_read_is_refused_by_decision_not_dropped() {
         panic!("a refusal is a decision")
     };
     assert_eq!(decision.code, ResultCode::Rejected as i32);
-    assert!(decision.reason.contains("guide-outcome/1"));
+    assert!(decision.reason.contains("not-a-real-contract/1"));
 }
 
 #[tokio::test]
@@ -670,7 +678,7 @@ async fn a_decision_waits_for_the_host_and_a_refusing_spoke_gets_it_under_a_fres
 }
 
 #[tokio::test]
-async fn a_spoke_that_keeps_refusing_a_decision_ends_it_for_an_operator() {
+async fn a_spoke_that_keeps_refusing_a_decision_stores_it_failed_and_never_retries() {
     let world = World::new();
     let db = world.open();
     let run = assign(&db, "exec_1").1;
@@ -747,4 +755,46 @@ async fn a_committed_record_wakes_the_projector_without_waiting_for_a_sweep() {
     eventually("the wake to apply the record", || applied(&db) == 1).await;
     assert_eq!(applier.log(|l| l.events.clone()), ["1#stop"]);
     running.abort();
+}
+
+#[tokio::test]
+async fn an_unreachable_host_does_not_starve_later_hosts_of_decisions() {
+    let world = World::new();
+    let db = world.open();
+    db.add_host("host-b", "worker@b", 1, &[]).unwrap();
+    crate::support::spoke_ready(&db, "host-b");
+    let run_a = assign(&db, "exec_a").1;
+    let owned_b = db.reserve_spoke_assignment("exec_b", "host-b").unwrap();
+    let run_b = crate::support::proto_run(&crate::support::run_key(&owned_b));
+    let spoke_a = Spoke::connect(&db, None).await;
+    let spoke_b = Spoke::connect_host(&db, "host-b", None).await;
+    for sequence in 1..=3 {
+        spoke_a
+            .send(&proposal_record(sequence, &run_a, &format!("a-{sequence}")))
+            .await;
+    }
+    spoke_b.send(&proposal_record(1, &run_b, "b-1")).await;
+    let sender = Arc::new(Sender::default());
+    sender.unavailable.lock().unwrap().insert(HOST.to_owned());
+    let projector = Projector::new(
+        db.clone(),
+        Arc::new(Applier::default()),
+        sender.clone(),
+        Arc::new(Notify::new()),
+        ProjectorConfig::builder()
+            .batch(2)
+            .retry_initial(Duration::from_millis(5))
+            .retry_max(Duration::from_millis(20))
+            .delivery_deadline(Duration::from_millis(500))
+            .build(),
+    );
+    projector.drain().await;
+    assert!(
+        sender.sent().iter().any(|(host, _)| host == "host-b"),
+        "host-b must receive its decision while host-a is unreachable; sent={:?}",
+        sender.sent()
+    );
+    let key = format!("{}:b-1", run_b.run_id);
+    let settled = db.spoke_effect("host-b", PROPOSAL_DECISION, &key).unwrap().unwrap();
+    assert_eq!(settled.state, SpokeEffectState::Done);
 }

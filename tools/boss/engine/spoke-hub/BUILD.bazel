@@ -18,6 +18,7 @@ rust_library(
         "//tools/boss/engine/core:__pkg__",
     ],
     deps = [
+        "//tools/boss/backoff",
         "//tools/boss/engine/host-enrollment",
         "//tools/boss/engine/spoke-stream",
         "//tools/boss/engine/work-db",
@@ -44,6 +45,7 @@ rust_library(
         "//tools/boss/engine/core:__pkg__",
     ],
     deps = [
+        "//tools/boss/backoff",
         "//tools/boss/engine/host-enrollment",
         "//tools/boss/engine/spoke-stream",
         "//tools/boss/engine/work-db:work_db_test_support",

@@ -58,6 +58,7 @@ use std::sync::{
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use boss_backoff::exponential_delay;
 use boss_protocol::ProposalKind;
 use boss_protocol_spoke::{
     limits::MAX_PAYLOAD_BYTES,
@@ -66,8 +67,8 @@ use boss_protocol_spoke::{
 pub use boss_spoke_stream::CommandOutcome;
 use boss_spoke_stream::{StreamManager, store::CommandAdmission};
 use boss_work_db::{
-    NewSpokeEffect, SpokeEffect, SpokeEffectOutcome, SpokeIngressRow, SpokePaneObservation, SpokeProjectionFault,
-    SpokeProjectionPosition, WorkDb,
+    NewSpokeEffect, SpokeAdvance, SpokeEffect, SpokeEffectOutcome, SpokeIngressRow, SpokePaneObservation,
+    SpokeProjectionFault, SpokeProjectionPosition, WorkDb,
 };
 use prost::Message;
 use serde_json::{Value, json};
@@ -81,7 +82,8 @@ pub use reduce::{
 
 /// Effect kind: the decision for a queued proposal, owed to the spoke.
 pub const PROPOSAL_DECISION: &str = "proposal_decision";
-/// Effect kind: a frame that could not be read, recorded for an operator.
+/// Effect kind: a frame that could not be read. Stored as a failed effect and
+/// never retried; the cursor moves on.
 pub const QUARANTINE: &str = "quarantine";
 
 /// The longest `reason` a decision carries.
@@ -141,6 +143,16 @@ pub trait ObservationApplier: Send + Sync {
     /// a local worker's `propose` uses, including its completion finalization,
     /// and report the decision. Replaying the same proposal must be safe.
     async fn proposal(&self, origin: &Origin, kind: ProposalKind, payload: &Value, idempotency_key: &str) -> Proposed;
+
+    /// Apply a run-scoped write the gateway queued under its own contract,
+    /// through the same ownership-checked handlers a local worker's matching
+    /// RPC uses. Replaying the same write must be safe.
+    async fn run_write(&self, origin: &Origin, contract: &str, payload: &Value, idempotency_key: &str) -> Proposed {
+        let _ = (origin, payload, idempotency_key);
+        Proposed::Decided(Decision::refused(format!(
+            "payload contract `{contract}` is not supported by this hub"
+        )))
+    }
 
     /// Reflect a pane the host looked at. The projector has already recorded the
     /// observation durably; this is its effect on live state.
@@ -206,8 +218,8 @@ impl Default for ProjectorConfig {
 enum Interrupted {
     /// Try the same record again after a backoff.
     Retry(String),
-    /// The journal cannot be projected as it stands. The host waits for an
-    /// operator rather than skipping evidence.
+    /// The journal cannot be projected as it stands. The host stays halted
+    /// (retried after a hold) rather than skipping evidence.
     Halt(String),
 }
 
@@ -392,7 +404,21 @@ impl Inner {
                 }
             };
             if position.lag() == 0 {
+                let host_id = host.to_owned();
+                let _ = self.blocking(move |db| db.clear_spoke_projection_halt(&host_id)).await;
                 return HostEnd::CaughtUp;
+            }
+            if position
+                .cursor_journal_id
+                .as_deref()
+                .is_some_and(|cursor| cursor != position.journal_id.as_str())
+            {
+                self.halt(
+                    host,
+                    position.applied,
+                    "the host's projection cursor belongs to another journal",
+                );
+                return HostEnd::Halted;
             }
             let (host_id, journal_id, applied, batch) = (
                 host.to_owned(),
@@ -441,9 +467,18 @@ impl Inner {
                 applied,
                 reason,
                 "spoke observation projection halted: received evidence cannot be applied and is not skipped; \
-                 this is a recovery incident for the host"
+                 the host is retried after a hold"
             );
         }
+        let (host_id, halt_reason) = (host.to_owned(), reason.to_owned());
+        let db = self.db.clone();
+        // Best-effort: a halt that does not persist still holds the host in
+        // this process and is retried after the hold.
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = db.set_spoke_projection_halt(&host_id, &halt_reason) {
+                tracing::warn!(host = %host_id, %error, "cannot persist a spoke projection halt");
+            }
+        });
     }
 
     /// Apply one record, retrying transient failures in place. Returns an error
@@ -456,8 +491,7 @@ impl Inner {
                 Err(Interrupted::Halt(reason)) => return Err(reason),
                 Err(Interrupted::Retry(reason)) => {
                     attempt += 1;
-                    let wait =
-                        (self.config.retry_initial * 2u32.saturating_pow(attempt.min(16))).min(self.config.retry_max);
+                    let wait = exponential_delay(self.config.retry_initial, self.config.retry_max, attempt.min(16));
                     tracing::warn!(
                         host,
                         sequence = row.sequence,
@@ -472,6 +506,15 @@ impl Inner {
     }
 
     async fn apply_record(&self, host: &str, journal: &str, row: &SpokeIngressRow) -> Result<(), Interrupted> {
+        let (host_id, journal_id, sequence) = (host.to_owned(), journal.to_owned(), row.sequence);
+        match self
+            .blocking(move |db| db.check_spoke_projection_advance(&host_id, &journal_id, sequence))
+            .await
+        {
+            Ok(SpokeAdvance::AlreadyApplied) => return Ok(()),
+            Ok(SpokeAdvance::Advanced { .. }) => {}
+            Err(interrupted) => return Err(interrupted),
+        }
         let mut owed: Vec<Owed> = Vec::new();
         match reduce::reduce(host, journal, row) {
             Reduction::Skip(skip) => {
@@ -572,6 +615,17 @@ impl Inner {
                 Proposed::Decided(decision) => decision,
                 Proposed::Retry(reason) => return Err(Interrupted::Retry(reason)),
             },
+            (
+                ProposalRequest::RunWrite {
+                    contract,
+                    payload,
+                    idempotency_key,
+                },
+                Currentness::Current,
+            ) => match self.applier.run_write(origin, contract, payload, idempotency_key).await {
+                Proposed::Decided(decision) => decision,
+                Proposed::Retry(reason) => return Err(Interrupted::Retry(reason)),
+            },
         };
         owed.push(Owed::decision(&proposal, &key, &decision));
         Ok(())
@@ -642,7 +696,13 @@ impl Inner {
             {
                 tracing::warn!(host = %effect.host_id, %reason, "cannot record a spoke effect's outcome; it will be retried");
             } else if let SpokeEffectOutcome::Failed(reason) = outcome {
-                tracing::error!(host = %effect.host_id, kind = %effect.kind, key = %effect.key, %reason, "a spoke effect failed and needs an operator");
+                tracing::error!(
+                    host = %effect.host_id,
+                    kind = %effect.kind,
+                    key = %effect.key,
+                    %reason,
+                    "a spoke effect failed and is never retried"
+                );
             }
         }
     }

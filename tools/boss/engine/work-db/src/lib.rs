@@ -1140,7 +1140,7 @@ pub use spoke_ingress::{
 };
 pub use spoke_projection::{
     NewSpokeEffect, SpokeAdvance, SpokeEffect, SpokeEffectOutcome, SpokeEffectState, SpokeIngressRow,
-    SpokePaneObservation, SpokeProjectionFault, SpokeProjectionPosition, SpokeProjectionStatus,
+    SpokePaneObservation, SpokeProjectionFault, SpokeProjectionPosition, SpokeProjectionStatus, SpokeTurnState,
 };
 pub use trunk_merge_intents::{ActiveTrunkMergeIntent, TrunkMergeIntent, TrunkMergeIntentInsertInput};
 

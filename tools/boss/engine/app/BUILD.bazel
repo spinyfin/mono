@@ -55,6 +55,7 @@ APP_DEPS = [
     "//tools/boss/http_retry",
     "//tools/boss/log-files",
     "//tools/boss/protocol",
+    "//tools/boss/protocol-spoke",
     "//tools/boss/tmux",
     "//tools/boss/trunk_auth",
     "//tools/boss/trunk_client",

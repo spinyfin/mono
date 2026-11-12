@@ -32,6 +32,8 @@
 use crate::*;
 
 pub(crate) const MIGRATION_ID: &str = "20261112_1400_spoke_projection";
+/// Turn state for parked remote workers, and a persisted halt reason per host.
+pub(crate) const TURN_STATE_MIGRATION_ID: &str = "20261112_1900_spoke_turn_state";
 
 /// Effect rows live in `spoke_effects.state`.
 const PENDING: &str = "pending";
@@ -101,6 +103,25 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn migrate_turn_state(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS spoke_turn_state (
+            execution_id          TEXT PRIMARY KEY,
+            assignment_generation INTEGER NOT NULL,
+            parked                INTEGER NOT NULL
+         );",
+    )?;
+    let has_halt: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('spoke_projection') WHERE name = 'halt_reason'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_halt == 0 {
+        conn.execute_batch("ALTER TABLE spoke_projection ADD COLUMN halt_reason TEXT")?;
+    }
+    Ok(())
+}
+
 /// Where one host's projection stands against its durable receipt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpokeProjectionPosition {
@@ -110,6 +131,10 @@ pub struct SpokeProjectionPosition {
     pub received: u64,
     /// Highest ingress sequence whose effects are applied or recorded.
     pub applied: u64,
+    /// The cursor's journal, if a cursor exists. Differs from [`Self::journal_id`]
+    /// when the host opened a new journal; projection then stops rather than
+    /// re-applying the new journal from sequence 1.
+    pub cursor_journal_id: Option<String>,
 }
 
 impl SpokeProjectionPosition {
@@ -138,8 +163,7 @@ pub struct NewSpokeEffect<'a> {
     pub key: &'a str,
     pub payload: &'a [u8],
     /// Where the effect starts. `Pending` is work still owed; `Failed` records
-    /// something that needs an operator and is never retried, such as a frame
-    /// that cannot be decoded.
+    /// something that is never retried, such as a frame that cannot be decoded.
     pub state: SpokeEffectState,
     /// Why, for a `Failed` effect.
     pub error: Option<&'a str>,
@@ -157,7 +181,7 @@ impl<'a> NewSpokeEffect<'a> {
         }
     }
 
-    /// A record that could not be applied and needs an operator.
+    /// A record that could not be applied. Stored failed and never retried.
     pub fn failed(kind: &'a str, key: &'a str, payload: &'a [u8], error: &'a str) -> Self {
         Self {
             kind,
@@ -185,7 +209,7 @@ pub enum SpokeEffectState {
     /// Recorded and not yet settled; it is retried until it is.
     Pending,
     Done,
-    /// Settled without success. Surfaced for an operator, never retried.
+    /// Settled without success. Never retried.
     Failed,
 }
 
@@ -246,6 +270,18 @@ pub struct SpokeProjectionStatus {
     pub position: SpokeProjectionPosition,
     pub pending_effects: u64,
     pub failed_effects: u64,
+    /// Why this host's projector is halted, if it is. Cleared once the host
+    /// catches up.
+    pub halt_reason: Option<String>,
+}
+
+/// Latest main-session turn for a spoke-supervised run, rebuilt into memory
+/// after a hub restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpokeTurnState {
+    pub execution_id: String,
+    pub assignment_generation: u64,
+    pub parked: bool,
 }
 
 /// The newest `PaneState` a host reported for an assignment.
@@ -298,7 +334,8 @@ impl WorkDb {
         let conn = self.connect()?;
         let mut statement = conn.prepare(
             "SELECT j.host_id, j.journal_id, j.received,
-                    CASE WHEN p.journal_id = j.journal_id THEN p.applied ELSE 0 END
+                    CASE WHEN p.journal_id = j.journal_id THEN p.applied ELSE 0 END,
+                    p.journal_id
                FROM spoke_journals j LEFT JOIN spoke_projection p ON p.host_id = j.host_id
               WHERE j.received >
                     COALESCE(CASE WHEN p.journal_id = j.journal_id THEN p.applied END, 0)
@@ -314,7 +351,8 @@ impl WorkDb {
             .connect()?
             .query_row(
                 "SELECT j.host_id, j.journal_id, j.received,
-                        CASE WHEN p.journal_id = j.journal_id THEN p.applied ELSE 0 END
+                        CASE WHEN p.journal_id = j.journal_id THEN p.applied ELSE 0 END,
+                        p.journal_id
                    FROM spoke_journals j LEFT JOIN spoke_projection p ON p.host_id = j.host_id
                   WHERE j.host_id = ?1",
                 [host_id],
@@ -349,6 +387,25 @@ impl WorkDb {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Whether advancing the cursor past `sequence` would succeed, without
+    /// recording effects. Call this before applying a record so a journal
+    /// mismatch or a gap is detected before side effects run.
+    pub fn check_spoke_projection_advance(
+        &self,
+        host_id: &str,
+        journal_id: &str,
+        sequence: u64,
+    ) -> Result<SpokeAdvance> {
+        let conn = self.connect()?;
+        match projection_cursor(&conn, host_id, journal_id, sequence)? {
+            CursorCheck::AlreadyApplied => Ok(SpokeAdvance::AlreadyApplied),
+            CursorCheck::Ready => Ok(SpokeAdvance::Advanced {
+                recorded: 0,
+                duplicates: 0,
+            }),
+        }
+    }
+
     /// Record the effects `sequence` owes and move the cursor past it, in one
     /// transaction. The cursor moves one record at a time: `sequence` must be
     /// the record after it, and must already be durably received.
@@ -367,39 +424,11 @@ impl WorkDb {
     ) -> Result<SpokeAdvance> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let journal: Option<(String, i64)> = tx
-            .query_row(
-                "SELECT journal_id, received FROM spoke_journals WHERE host_id = ?1",
-                [host_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let Some((stored_journal, received)) = journal else {
-            return Err(fault(SpokeProjectionFault::NotReceived));
-        };
-        if stored_journal != journal_id {
-            return Err(fault(SpokeProjectionFault::JournalChanged));
-        }
-        if sequence == 0 || sequence > received as u64 {
-            return Err(fault(SpokeProjectionFault::NotReceived));
-        }
-        let cursor: Option<(String, i64)> = tx
-            .query_row(
-                "SELECT journal_id, applied FROM spoke_projection WHERE host_id = ?1",
-                [host_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let applied = match cursor {
-            None => 0,
-            Some((cursor_journal, applied)) if cursor_journal == journal_id => applied as u64,
-            Some(_) => return Err(fault(SpokeProjectionFault::JournalChanged)),
-        };
-        if sequence <= applied {
+        if matches!(
+            projection_cursor(&tx, host_id, journal_id, sequence)?,
+            CursorCheck::AlreadyApplied
+        ) {
             return Ok(SpokeAdvance::AlreadyApplied);
-        }
-        if sequence != applied + 1 {
-            return Err(fault(SpokeProjectionFault::OutOfOrder));
         }
         let now = now_ms();
         let (mut recorded, mut duplicates) = (0, 0);
@@ -463,12 +492,19 @@ impl WorkDb {
             .optional()?)
     }
 
-    /// Up to `limit` effects still owed, oldest record first within each host.
+    /// Up to `limit` pending effects per host, oldest record first within each
+    /// host. A bound per host so one unreachable host cannot fill the batch
+    /// and starve every later host.
     pub fn pending_spoke_effects(&self, limit: u32) -> Result<Vec<SpokeEffect>> {
         let conn = self.connect()?;
         let mut statement = conn.prepare(&format!(
-            "SELECT {EFFECT_COLUMNS} FROM spoke_effects
-              WHERE state = 'pending' ORDER BY host_id, sequence, effect_kind LIMIT ?1"
+            "SELECT {EFFECT_COLUMNS} FROM (
+                SELECT {EFFECT_COLUMNS},
+                       ROW_NUMBER() OVER (PARTITION BY host_id ORDER BY sequence, effect_kind) AS rn
+                  FROM spoke_effects
+                 WHERE state = 'pending'
+             ) WHERE rn <= ?1
+             ORDER BY host_id, sequence, effect_kind"
         ))?;
         let rows = statement.query_map([limit], map_effect)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -507,16 +543,19 @@ impl WorkDb {
         let mut statement = conn.prepare(
             "SELECT j.host_id, j.journal_id, j.received,
                     CASE WHEN p.journal_id = j.journal_id THEN p.applied ELSE 0 END,
+                    p.journal_id,
                     (SELECT COUNT(*) FROM spoke_effects e WHERE e.host_id = j.host_id AND e.state = 'pending'),
-                    (SELECT COUNT(*) FROM spoke_effects e WHERE e.host_id = j.host_id AND e.state = 'failed')
+                    (SELECT COUNT(*) FROM spoke_effects e WHERE e.host_id = j.host_id AND e.state = 'failed'),
+                    p.halt_reason
                FROM spoke_journals j LEFT JOIN spoke_projection p ON p.host_id = j.host_id
               ORDER BY j.host_id",
         )?;
         let rows = statement.query_map([], |row| {
             Ok(SpokeProjectionStatus {
                 position: position_row(row)?,
-                pending_effects: row.get::<_, i64>(4)? as u64,
-                failed_effects: row.get::<_, i64>(5)? as u64,
+                pending_effects: row.get::<_, i64>(5)? as u64,
+                failed_effects: row.get::<_, i64>(6)? as u64,
+                halt_reason: row.get(7)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -551,6 +590,71 @@ impl WorkDb {
             ],
         )?;
         Ok(changed > 0)
+    }
+
+    /// Persist why this host's projector is halted. Cleared when the host
+    /// catches up.
+    pub fn set_spoke_projection_halt(&self, host_id: &str, reason: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let updated = conn.execute(
+            "UPDATE spoke_projection SET halt_reason = ?2 WHERE host_id = ?1",
+            params![host_id, reason],
+        )?;
+        if updated == 0 {
+            conn.execute(
+                "INSERT INTO spoke_projection(host_id, journal_id, applied, halt_reason)
+                 SELECT host_id, journal_id, 0, ?2 FROM spoke_journals WHERE host_id = ?1",
+                params![host_id, reason],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Clear a persisted halt once the host has no remaining lag.
+    pub fn clear_spoke_projection_halt(&self, host_id: &str) -> Result<()> {
+        self.connect()?.execute(
+            "UPDATE spoke_projection SET halt_reason = NULL WHERE host_id = ?1",
+            [host_id],
+        )?;
+        Ok(())
+    }
+
+    /// Persist the latest main-session turn for a spoke-supervised run.
+    pub fn upsert_spoke_turn_state(&self, state: &SpokeTurnState) -> Result<()> {
+        self.connect()?.execute(
+            "INSERT INTO spoke_turn_state(execution_id, assignment_generation, parked)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(execution_id) DO UPDATE SET
+                assignment_generation = excluded.assignment_generation,
+                parked = excluded.parked",
+            params![
+                state.execution_id,
+                state.assignment_generation as i64,
+                if state.parked { 1 } else { 0 }
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every stored main-session turn, for rebuilding memory after a restart.
+    pub fn spoke_turn_states(&self) -> Result<Vec<SpokeTurnState>> {
+        let conn = self.connect()?;
+        let mut statement = conn.prepare("SELECT execution_id, assignment_generation, parked FROM spoke_turn_state")?;
+        let rows = statement.query_map([], |row| {
+            Ok(SpokeTurnState {
+                execution_id: row.get(0)?,
+                assignment_generation: row.get::<_, i64>(1)? as u64,
+                parked: row.get::<_, i64>(2)? != 0,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Drop stored turn state when the assignment is released.
+    pub fn forget_spoke_turn_state(&self, execution_id: &str) -> Result<()> {
+        self.connect()?
+            .execute("DELETE FROM spoke_turn_state WHERE execution_id = ?1", [execution_id])?;
+        Ok(())
     }
 
     /// The newest pane observation of the execution's latest assignment.
@@ -589,7 +693,51 @@ fn position_row(row: &Row<'_>) -> rusqlite::Result<SpokeProjectionPosition> {
         journal_id: row.get(1)?,
         received: row.get::<_, i64>(2)? as u64,
         applied: row.get::<_, i64>(3)? as u64,
+        cursor_journal_id: row.get(4)?,
     })
+}
+
+enum CursorCheck {
+    Ready,
+    AlreadyApplied,
+}
+
+fn projection_cursor(conn: &Connection, host_id: &str, journal_id: &str, sequence: u64) -> Result<CursorCheck> {
+    let journal: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT journal_id, received FROM spoke_journals WHERE host_id = ?1",
+            [host_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((stored_journal, received)) = journal else {
+        return Err(fault(SpokeProjectionFault::NotReceived));
+    };
+    if stored_journal != journal_id {
+        return Err(fault(SpokeProjectionFault::JournalChanged));
+    }
+    if sequence == 0 || sequence > received as u64 {
+        return Err(fault(SpokeProjectionFault::NotReceived));
+    }
+    let cursor: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT journal_id, applied FROM spoke_projection WHERE host_id = ?1",
+            [host_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let applied = match cursor {
+        None => 0,
+        Some((cursor_journal, applied)) if cursor_journal == journal_id => applied as u64,
+        Some(_) => return Err(fault(SpokeProjectionFault::JournalChanged)),
+    };
+    if sequence <= applied {
+        return Ok(CursorCheck::AlreadyApplied);
+    }
+    if sequence != applied + 1 {
+        return Err(fault(SpokeProjectionFault::OutOfOrder));
+    }
+    Ok(CursorCheck::Ready)
 }
 
 #[cfg(test)]
@@ -718,7 +866,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_effect_is_recorded_for_an_operator_and_never_retried() {
+    fn a_failed_effect_is_stored_and_never_retried() {
         let db = db();
         receive(&db, "host-a", 1);
         db.advance_spoke_projection(
@@ -837,5 +985,82 @@ mod tests {
         let stored = db.spoke_pane_observation("exec_1").unwrap().unwrap();
         assert_eq!((stored.life, stored.exit_code, stored.source_sequence), (2, Some(3), 7));
         assert!(db.spoke_pane_observation("exec_2").unwrap().is_none());
+    }
+
+    #[test]
+    fn pending_effects_are_fair_across_hosts() {
+        let db = db();
+        receive(&db, "host-a", 70);
+        receive(&db, "host-b", 1);
+        for sequence in 1..=70 {
+            db.advance_spoke_projection(
+                "host-a",
+                "journal",
+                sequence,
+                &[effect("decision", &format!("a-{sequence}"), b"a")],
+            )
+            .unwrap();
+        }
+        db.advance_spoke_projection("host-b", "journal", 1, &[effect("decision", "b-1", b"b")])
+            .unwrap();
+        let pending = db.pending_spoke_effects(64).unwrap();
+        assert!(
+            pending.iter().any(|effect| effect.host_id == "host-b"),
+            "a reachable later host must appear even when an earlier host has more than one batch pending: {pending:?}"
+        );
+        assert!(
+            pending.iter().filter(|effect| effect.host_id == "host-a").count() <= 64,
+            "one host must not fill the batch: {pending:?}"
+        );
+    }
+
+    #[test]
+    fn check_advance_rejects_a_journal_mismatch_before_any_write() {
+        let db = db();
+        receive(&db, "host-a", 1);
+        db.advance_spoke_projection("host-a", "journal", 1, &[]).unwrap();
+        let error = db.check_spoke_projection_advance("host-a", "other", 1).unwrap_err();
+        assert_eq!(fault_of(&error), Some(SpokeProjectionFault::JournalChanged));
+        assert_eq!(
+            db.check_spoke_projection_advance("host-a", "journal", 1).unwrap(),
+            SpokeAdvance::AlreadyApplied
+        );
+    }
+
+    #[test]
+    fn a_halt_reason_and_turn_state_survive_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("work.db");
+        {
+            let db = WorkDb::open(path.clone()).unwrap();
+            receive(&db, "host-a", 1);
+            db.set_spoke_projection_halt("host-a", "record 1 is received but not stored")
+                .unwrap();
+            db.upsert_spoke_turn_state(&SpokeTurnState {
+                execution_id: "exec_1".into(),
+                assignment_generation: 2,
+                parked: true,
+            })
+            .unwrap();
+        }
+        let db = WorkDb::open(path).unwrap();
+        let status = db.spoke_projection_status().unwrap();
+        assert_eq!(
+            status[0].halt_reason.as_deref(),
+            Some("record 1 is received but not stored")
+        );
+        db.clear_spoke_projection_halt("host-a").unwrap();
+        assert!(db.spoke_projection_status().unwrap()[0].halt_reason.is_none());
+        let turns = db.spoke_turn_states().unwrap();
+        assert_eq!(
+            turns,
+            [SpokeTurnState {
+                execution_id: "exec_1".into(),
+                assignment_generation: 2,
+                parked: true,
+            }]
+        );
+        db.forget_spoke_turn_state("exec_1").unwrap();
+        assert!(db.spoke_turn_states().unwrap().is_empty());
     }
 }

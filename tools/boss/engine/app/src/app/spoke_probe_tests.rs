@@ -187,7 +187,7 @@ async fn a_spoke_run_with_no_local_slot_is_busy_until_its_host_reports_a_stop() 
     let probe = state.queue_probe(run_id.clone(), "continue".into(), false);
 
     // Mid-turn: the host has reported the turn starting and nothing since.
-    state.record_spoke_turn_event(&run_id, &prompt_submit());
+    state.record_spoke_turn_event(&run_id, &prompt_submit(), false);
     assert_eq!(
         dispatch_probe_now(&state, &run_id).await,
         ProbeDispatchOutcome::PostureRefused
@@ -202,7 +202,7 @@ async fn a_spoke_run_with_no_local_slot_is_busy_until_its_host_reports_a_stop() 
 
     // Parked: the host reported the turn's Stop, so the same run now accepts
     // both a probe-now and a nudge, with no local slot involved.
-    state.record_spoke_turn_event(&run_id, &stop());
+    state.record_spoke_turn_event(&run_id, &stop(), false);
     assert_eq!(
         dispatch_probe_now(&state, &run_id).await,
         ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Buffered)
@@ -240,8 +240,72 @@ async fn turn_events_for_a_run_without_a_spoke_assignment_are_not_recorded() {
         calls: Mutex::new(vec![]),
     });
     let (state, _dir) = spoke_state(remote);
-    state.record_spoke_turn_event("local-run", &stop());
+    state.record_spoke_turn_event("local-run", &stop(), false);
     assert!(!super::spoke_probes::spoke_parked_for_delivery(&state, "local-run"));
+}
+
+fn pre_tool() -> boss_protocol::WorkerEvent {
+    boss_protocol::WorkerEvent::PreToolUse {
+        session_id: "remote-session".into(),
+        tool_name: "Bash".into(),
+        tool_input: serde_json::json!({"command": "ls"}),
+    }
+}
+
+#[tokio::test]
+async fn a_subagent_stop_does_not_park_a_working_parent() {
+    let remote = Arc::new(Remote {
+        outcome: delivered(),
+        calls: Mutex::new(vec![]),
+    });
+    let (state, _dir) = spoke_state(remote);
+    let run_id = "spoke-run".to_owned();
+    state.work_db.reserve_spoke_assignment(&run_id, "spoke").unwrap();
+    state.queue_probe(run_id.clone(), "continue".into(), false);
+    state.record_spoke_turn_event(&run_id, &prompt_submit(), false);
+    state.record_spoke_turn_event(&run_id, &stop(), true);
+    assert!(!super::spoke_probes::spoke_parked_for_delivery(&state, &run_id));
+    assert_eq!(
+        dispatch_probe_now(&state, &run_id).await,
+        ProbeDispatchOutcome::PostureRefused
+    );
+}
+
+#[tokio::test]
+async fn a_subagent_tool_event_does_not_unpark_a_parked_parent() {
+    let remote = Arc::new(Remote {
+        outcome: delivered(),
+        calls: Mutex::new(vec![]),
+    });
+    let (state, _dir) = spoke_state(remote.clone());
+    let run_id = "spoke-run".to_owned();
+    state.work_db.reserve_spoke_assignment(&run_id, "spoke").unwrap();
+    state.queue_probe(run_id.clone(), "continue".into(), false);
+    state.record_spoke_turn_event(&run_id, &stop(), false);
+    state.record_spoke_turn_event(&run_id, &pre_tool(), true);
+    assert!(super::spoke_probes::spoke_parked_for_delivery(&state, &run_id));
+    assert_eq!(
+        dispatch_probe_now(&state, &run_id).await,
+        ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Buffered)
+    );
+    assert_eq!(remote.calls.lock().unwrap().as_slice(), &[WorkerInputKind::Probe]);
+}
+
+#[tokio::test]
+async fn parked_turn_state_is_restored_from_durable_rows() {
+    let remote = Arc::new(Remote {
+        outcome: delivered(),
+        calls: Mutex::new(vec![]),
+    });
+    let (state, _dir) = spoke_state(remote);
+    let run_id = "spoke-run".to_owned();
+    state.work_db.reserve_spoke_assignment(&run_id, "spoke").unwrap();
+    state.record_spoke_turn_event(&run_id, &stop(), false);
+    assert!(super::spoke_probes::spoke_parked_for_delivery(&state, &run_id));
+    state.spoke_turns.clear();
+    assert!(!super::spoke_probes::spoke_parked_for_delivery(&state, &run_id));
+    state.restore_spoke_turns();
+    assert!(super::spoke_probes::spoke_parked_for_delivery(&state, &run_id));
 }
 
 #[tokio::test]

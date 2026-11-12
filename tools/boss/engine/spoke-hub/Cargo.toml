@@ -8,6 +8,7 @@ workspace = "../../../.."
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
+boss-backoff = { path = "../../backoff" }
 boss-host-enrollment = { path = "../host-enrollment" }
 boss-protocol = { path = "../../protocol" }
 boss-protocol-spoke = { path = "../../protocol-spoke" }

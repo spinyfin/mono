@@ -424,6 +424,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: spoke_projection::migrate,
         },
         Migration {
+            id: spoke_projection::TURN_STATE_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: spoke_projection::migrate_turn_state,
+        },
+        Migration {
             id: parking::MIGRATION_ID.into(),
             legacy_version: None,
             apply: parking::migrate,
