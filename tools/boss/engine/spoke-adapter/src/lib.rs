@@ -40,7 +40,8 @@ use boss_engine_recovery::execution_bookmark::{
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_execution_contracts::{
     CollectOutcome, ControlOutcome, CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
-    CubeWorkspaceStatus, HostAdapter, HostAdapterProvider, Occupancy, RunOutcome, WorkerInputKind, WorkerPane,
+    CubeWorkspaceStatus, HostAdapter, HostAdapterProvider, Occupancy, PaneCaptureOutcome, PaneCaptureRequest,
+    RunOutcome, WorkerInputKind, WorkerPane,
 };
 use boss_protocol::{WorkExecution, WorkItem};
 use boss_protocol_spoke::v1::{Command, CommandResult, ResultCode, Run, WorkspaceKind, command};
@@ -985,7 +986,6 @@ impl HostAdapter for SpokeHostAdapter {
     async fn observe_worker(&self, execution_id: &str) -> Result<Option<WorkerPane>> {
         self.ctl_observe(execution_id).await
     }
-
     async fn complete_in_doubt_lease(&self) -> Result<Option<CubeWorkspaceLease>> {
         self.ws_complete_in_doubt_lease().await
     }
@@ -1003,6 +1003,14 @@ impl HostAdapter for SpokeHostAdapter {
 
     async fn gc_cube_repo(&self, repo_id: &str) -> Result<()> {
         self.legacy_adapter("cube repo gc").await?.gc_cube_repo(repo_id).await
+    }
+
+    async fn capture_worker_pane(
+        &self,
+        execution_id: &str,
+        request: &PaneCaptureRequest,
+    ) -> Result<PaneCaptureOutcome> {
+        self.ctl_capture(execution_id, request).await
     }
 }
 

@@ -421,8 +421,10 @@ pub fn contracts() -> Contracts {
 /// Features offered when a workspace executor is attached. Keep this list in
 /// lockstep with executor support: every workspace op that needs a negotiated
 /// feature is advertised from here, so Hello and the executor cannot drift.
-/// Protocol-optional names (`workspace-reset-release`, `spawn-launch-inputs`)
-/// stay optional; the rest are required.
+/// Protocol-optional names (`workspace-reset-release`, `spawn-launch-inputs`,
+/// `pane-capture`) stay optional; the rest are required. `pane-capture` is
+/// offered because the production spoke runs the capture loop beside this
+/// session; a hub that predates it simply negotiates it away.
 const EXECUTOR_FEATURES: &[&str] = &[
     feature::WORKSPACE,
     feature::EXECUTION,
@@ -431,6 +433,7 @@ const EXECUTOR_FEATURES: &[&str] = &[
     feature::SPAWN_WORKER_POSTURE,
     feature::WORKER_EVENT,
     feature::TRANSCRIPT_DELTA,
+    feature::PANE_CAPTURE,
 ];
 
 /// Journal contracts plus the executor-backed workspace/execution set.
@@ -581,6 +584,17 @@ mod tests {
         assert!(
             !offered.required.iter().any(|name| name == feature::SPAWN_LAUNCH_INPUTS),
             "spawn-launch-inputs stays optional so older hubs can still connect"
+        );
+        assert!(
+            offered
+                .features
+                .iter()
+                .any(|item| item.name == feature::PANE_CAPTURE && item.revision == 1),
+            "the production spoke runs the capture loop, so its Hello must advertise pane-capture/1"
+        );
+        assert!(
+            !offered.required.iter().any(|name| name == feature::PANE_CAPTURE),
+            "pane-capture stays optional so older hubs can still connect"
         );
         assert_eq!(
             offered.features.len(),

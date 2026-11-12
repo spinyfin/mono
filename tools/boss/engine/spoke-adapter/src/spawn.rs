@@ -17,22 +17,24 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use boss_execution_contracts::{
-    ControlOutcome, LocalSpawnFailure, RunOutcome, RunWaitState, SpawnOutcomeUncertain, WorkerInputKind, WorkerLife,
-    WorkerPane,
+    ControlOutcome, LocalSpawnFailure, PaneCaptureOutcome, PaneCaptureRequest, RunOutcome, RunWaitState,
+    SpawnOutcomeUncertain, WorkerInputKind, WorkerLife, WorkerPane,
 };
 use boss_protocol::{WorkExecution, WorkItem};
 use boss_protocol_spoke::{
     Validate,
-    limits::MAX_STOP_GRACE_MS,
+    limits::{CANCEL_CAPTURE_TTL_SECONDS, MAX_STOP_GRACE_MS},
+    negotiate::feature,
     v1::{
-        Command, CommandResult, Deliver, DeliveryKind, Empty, PaneLife, PaneState, ResultCode, Spawn, Stop, command,
-        command_result,
+        Capture, Command, CommandResult, Deliver, DeliveryKind, Empty, PaneLife, PaneState, ResultCode, Spawn, Stop,
+        command, command_result,
     },
 };
+use boss_spoke_stream::CommandOutcome;
 use boss_work_db::{SpokeAssignment, host_command_spawn_id, host_command_stop_id};
 use prost::Message;
 
-use crate::{HostCallError, SpokeHostAdapter, expect_ok, run_of};
+use crate::{HostCallError, SpokeHostAdapter, expect_ok, outbox, run_of};
 
 /// What the host needs to start a worker, composed by the engine.
 ///
@@ -581,6 +583,78 @@ impl SpokeHostAdapter {
                 }
             },
         }
+    }
+
+    /// Open, renew or cancel a viewer's capture of the worker's pane. The
+    /// snapshots themselves arrive on the hub's capture feed, not here.
+    ///
+    /// A renewal is a fresh command with a short expiry (`not_after`), never a
+    /// retry of an old one: a viewer that left or a host that was away must not
+    /// find the subscription reopened by a stale command. Nothing is sent when
+    /// the host is not connected or did not negotiate capture.
+    ///
+    /// Every command that is sent, including each renewal and cancel, is a row
+    /// in the durable host command outbox. It counts against the host's budget
+    /// of unsettled commands until the spoke answers, and once settled it is
+    /// kept for the outbox's ordinary retention period like any other command.
+    pub(crate) async fn ctl_capture(
+        &self,
+        execution_id: &str,
+        request: &PaneCaptureRequest,
+    ) -> Result<PaneCaptureOutcome> {
+        /// A capture command is for a viewer who is looking now.
+        const COMMAND_TTL: Duration = Duration::from_secs(20);
+        const DEADLINE: Duration = Duration::from_secs(10);
+        let Some(assignment) = self.control_target(execution_id).await? else {
+            return Ok(PaneCaptureOutcome::Ended);
+        };
+        let host = self.host_name();
+        match self.hub.streams.host_supports(host, feature::PANE_CAPTURE).await {
+            None => return Ok(PaneCaptureOutcome::Unreachable(format!("host {host} is not connected"))),
+            Some(false) => {
+                return Ok(PaneCaptureOutcome::Unsupported(format!(
+                    "host {host} did not negotiate pane capture"
+                )));
+            }
+            Some(true) => {}
+        }
+        // One second or less would cancel, so a renewal never asks for it.
+        let ttl_seconds = if request.cancel {
+            CANCEL_CAPTURE_TTL_SECONDS
+        } else if request.ttl_seconds == 0 {
+            0
+        } else {
+            request.ttl_seconds.max(CANCEL_CAPTURE_TTL_SECONDS + 1)
+        };
+        let id = self.hub.unique_id("capture", &assignment.run_id);
+        let mut command = self.hub.new_command(
+            &id,
+            Some(run_of(&assignment)),
+            command::Body::Capture(Capture {
+                subscription_id: request.subscription_id.clone(),
+                interval_ms: request.interval_ms,
+                max_bytes: request.max_bytes,
+                ttl_seconds,
+            }),
+        );
+        command.not_after_unix_ms = (std::time::SystemTime::now() + COMMAND_TTL)
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as i64);
+        let sent = self
+            .hub
+            .streams
+            .command(host, outbox::command_admission(&command), command, DEADLINE)
+            .await;
+        Ok(match sent {
+            Ok(result) => match ResultCode::try_from(result.code) {
+                Ok(ResultCode::Ok) => PaneCaptureOutcome::Accepted,
+                Ok(ResultCode::Absent) => PaneCaptureOutcome::Ended,
+                Ok(ResultCode::Rejected) => PaneCaptureOutcome::Refused(result.reason),
+                _ => PaneCaptureOutcome::Unreachable(format!("host {host} could not answer: {}", result.reason)),
+            },
+            Err(CommandOutcome::Invalid) => PaneCaptureOutcome::Refused("the capture request was invalid".to_owned()),
+            Err(other) => PaneCaptureOutcome::Unreachable(other.to_string()),
+        })
     }
 
     /// Liveness for the existing remote-worker sweeps, which know a worker only

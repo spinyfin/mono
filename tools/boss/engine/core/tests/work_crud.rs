@@ -487,6 +487,9 @@ async fn second_client_receives_invalidation_from_first() -> Result<()> {
         TopicEventPayload::ResyncRequired => {
             panic!("unexpected resync marker on work topic")
         }
+        TopicEventPayload::WorkerPaneCapture { .. } => {
+            panic!("unexpected pane capture on work topic")
+        }
     }
 
     Ok(())
@@ -573,6 +576,9 @@ async fn cli_status_update_propagates_to_subscriber_within_one_second() -> Resul
         }
         TopicEventPayload::ResyncRequired => {
             panic!("unexpected resync marker on work topic")
+        }
+        TopicEventPayload::WorkerPaneCapture { .. } => {
+            panic!("unexpected pane capture on work topic")
         }
     }
 

@@ -1,5 +1,6 @@
 //! Host filesystem execution shared by the hub's local adapter and the spoke.
 //! Work policy, GitHub decisions and scheduling remain in the hub.
+pub mod capture;
 pub mod homes;
 pub mod process;
 pub mod recovery_ops;

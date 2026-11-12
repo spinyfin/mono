@@ -110,6 +110,7 @@ mod live_status;
 mod metrics;
 mod pane_delivery;
 mod pane_ops;
+mod pane_viewers;
 mod panes;
 mod panic_hook;
 mod pid_file;
@@ -689,6 +690,9 @@ struct ServerState {
     /// journaled hook events into worker-event dispatch (see `SpokeTurns`).
     #[builder(default)]
     spoke_turns: spoke_probes::SpokeTurns,
+    /// Read-only remote pane viewers: one capture task per run being watched.
+    #[builder(default)]
+    pane_viewers: pane_viewers::PaneViewers,
     /// Socket this engine's tmux handle must target. Resolved once from
     /// [`boss_engine_runtime::config::WorkConfig`] (and isolation) so no downstream call
     /// re-derives it from the environment.
@@ -2147,6 +2151,7 @@ impl ServerState {
         timeline.finish();
 
         if let Some(stream) = hub_stream {
+            pane_viewers::bridge_hub_stream(&server_state, &stream);
             server_state.set_hub_stream(Some(stream));
         }
         Ok(server_state)
@@ -2950,7 +2955,15 @@ async fn handle_frontend_connection(
     }
 
     tracing::info!(session_id = %session_id, "frontend connection reader loop exited; tearing down session");
-    server_state.topic_broker.remove_session(&session_id).await;
+    let dropped_topics = server_state.topic_broker.remove_session(&session_id).await;
+    // A disconnected viewer must not keep a remote pane capture alive. A
+    // session that never watched a pane is not worth waking anyone for.
+    if dropped_topics
+        .iter()
+        .any(|topic| boss_protocol::pane_capture_topic_run(topic).is_some())
+    {
+        server_state.pane_viewers.viewers_may_have_left().await;
+    }
     // Clears the app-session registration iff this was the app (logged there).
     server_state.drop_app_session_if_matches(&session_id).await;
     sink.close();

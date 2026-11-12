@@ -30,6 +30,24 @@ pub const MAX_CAPTURE_BYTES: usize = 64 * 1024;
 pub const DEFAULT_CAPTURE_INTERVAL_MS: u32 = 5_000;
 pub const DEFAULT_CAPTURE_TTL_SECONDS: u32 = 30;
 
+/// A spoke raises a faster cadence to this and lowers a slower one to the max.
+pub const MIN_CAPTURE_INTERVAL_MS: u32 = 1_000;
+pub const MAX_CAPTURE_INTERVAL_MS: u32 = 60_000;
+
+/// The longest a capture subscription lives without a renewal; a longer request
+/// is lowered to it. A renewal is another `Capture` naming the same
+/// `subscription_id`.
+pub const MAX_CAPTURE_TTL_SECONDS: u32 = 120;
+
+/// A `Capture` whose TTL is this or less ends its subscription at once, so a
+/// viewer that leaves can say so without a new message type. Zero is not a
+/// cancel: it asks for [`DEFAULT_CAPTURE_TTL_SECONDS`].
+pub const CANCEL_CAPTURE_TTL_SECONDS: u32 = 1;
+
+/// Most capture subscriptions one spoke serves at once; further ones are
+/// refused rather than queued.
+pub const MAX_CAPTURE_SUBSCRIPTIONS: usize = 32;
+
 /// A `Stop` grace period is capped; longer requests are invalid, not clamped.
 pub const MAX_STOP_GRACE_MS: u32 = 30_000;
 

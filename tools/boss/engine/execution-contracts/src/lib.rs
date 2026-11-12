@@ -1866,7 +1866,6 @@ pub trait HostAdapter: Send + Sync {
     async fn observe_worker(&self, _execution_id: &str) -> Result<Option<WorkerPane>> {
         Ok(None)
     }
-
     /// Replay the stored in-doubt lease command and bind a late grant.
     ///
     /// `Ok(Some(lease))` when the host granted (or recovered) a lease.
@@ -1876,6 +1875,52 @@ pub trait HostAdapter: Send + Sync {
     async fn complete_in_doubt_lease(&self) -> Result<Option<CubeWorkspaceLease>> {
         Ok(None)
     }
+
+    /// Open, renew or cancel a short-lived, read-only text capture of the
+    /// worker's pane for a viewer. The host streams bounded snapshots to the
+    /// hub (not through this call) until the subscription's TTL passes without
+    /// a renewal. Adapters that cannot capture a pane say so; this never writes
+    /// to the pane.
+    async fn capture_worker_pane(
+        &self,
+        _execution_id: &str,
+        _request: &PaneCaptureRequest,
+    ) -> Result<PaneCaptureOutcome> {
+        Ok(PaneCaptureOutcome::Unsupported(
+            "this host adapter cannot capture a worker pane".to_owned(),
+        ))
+    }
+}
+
+/// One capture subscription request. Zero `interval_ms`, `max_bytes` or
+/// `ttl_seconds` asks for the host's default; the host clamps the rest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneCaptureRequest {
+    /// Names the subscription, so a renewal extends it rather than opening a
+    /// second one and a cancel ends exactly this viewer's.
+    pub subscription_id: String,
+    pub interval_ms: u32,
+    pub max_bytes: u32,
+    pub ttl_seconds: u32,
+    /// End the subscription now instead of opening or renewing it.
+    pub cancel: bool,
+}
+
+/// How far a capture request got.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneCaptureOutcome {
+    /// The host accepted it (a cancel of a subscription that is already gone is
+    /// also accepted).
+    Accepted,
+    /// The host has no such worker any more.
+    Ended,
+    /// The host is connected but cannot capture panes (it did not negotiate the
+    /// capability), or the adapter has no such channel. Retrying will not help.
+    Unsupported(String),
+    /// The host is not connected or the request was not sent. Worth retrying.
+    Unreachable(String),
+    /// The host refused it.
+    Refused(String),
 }
 
 /// Which text a control request types into a worker.

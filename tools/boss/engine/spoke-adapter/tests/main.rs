@@ -1,5 +1,6 @@
 //! The hub adapter against a real hub: mTLS gRPC stream manager, work database
 //! outbox, and a scripted spoke on the other end of the stream.
+mod capture;
 mod coordinator;
 mod regressions;
 mod routing;
@@ -34,7 +35,7 @@ fn workspace_kind(command: &Command) -> Option<Kind> {
 }
 
 /// The answers a healthy spoke gives to lease, release and spawn.
-fn standard(command: &Command) -> Option<CommandResult> {
+pub(crate) fn standard(command: &Command) -> Option<CommandResult> {
     match (&command.body, workspace_kind(command)) {
         (_, Some(Kind::Lease)) => Some(ok(command, Some(workspace(command, lease_json())))),
         (_, Some(Kind::Release | Kind::ReleaseWithReset | Kind::ForceRelease)) => {
@@ -68,12 +69,12 @@ fn workspace_slack(spawn_deadline_ms: u64) -> SpokeAdapterConfig {
         .build()
 }
 
-async fn lease(adapter: &Arc<dyn HostAdapter>) {
+pub(crate) async fn lease(adapter: &Arc<dyn HostAdapter>) {
     let lease = adapter.lease_workspace("repo", "task", None, false, &[]).await.unwrap();
     assert_eq!(lease.lease_id, "lease-1");
 }
 
-async fn spawn(adapter: &Arc<dyn HostAdapter>) -> anyhow::Result<boss_execution_contracts::RunOutcome> {
+pub(crate) async fn spawn(adapter: &Arc<dyn HostAdapter>) -> anyhow::Result<boss_execution_contracts::RunOutcome> {
     adapter
         .spawn_worker("worker-1", &execution("exec_1"), &work_item(), Path::new(PATH), None)
         .await

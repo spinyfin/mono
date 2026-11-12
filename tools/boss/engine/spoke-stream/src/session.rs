@@ -34,6 +34,10 @@ pub(crate) struct Driver {
     wake: Arc<Notify>,
     probes: mpsc::Receiver<oneshot::Sender<ChallengeOutcome>>,
     record_through: u64,
+    /// The last record the spoke had journaled when it connected. Records up to
+    /// here describe a moment before this connection, so a pane capture among
+    /// them is history, not what the pane shows now.
+    backlog_through: u64,
     command_journal: String,
     command_through: u64,
 }
@@ -262,7 +266,15 @@ impl Driver {
         {
             return Err(Status::internal("sink returned invalid receipt").into());
         }
+        let fresh = record.sequence > self.record_through;
         self.record_through = receipt.through;
+        // A replay after reconnect re-delivers records this hub already showed,
+        // and a spoke that kept capturing while disconnected delivers snapshots
+        // from the outage: neither is shown, since a viewer would take them for
+        // the pane as it is now. The next renewal brings a current one.
+        if fresh && record.sequence > self.backlog_through {
+            self.manager.publish_capture(&self.session.host_id, &record);
+        }
         if let Some(record::Body::Result(result)) = &record.body
             && let Some(sender) = gate.as_mut().and_then(|c| c.waiters.remove(&result.command_id))
         {

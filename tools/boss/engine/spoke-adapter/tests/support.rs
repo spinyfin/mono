@@ -363,6 +363,11 @@ impl Fixture {
     }
 
     pub async fn with(config: SpokeAdapterConfig) -> Self {
+        Self::with_hub_contracts(config, Contracts::first_release()).await
+    }
+
+    /// A hub that offers `contracts` instead of the first-release set.
+    pub async fn with_hub_contracts(config: SpokeAdapterConfig, contracts: Contracts) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("work.db")).unwrap());
         let mut params = CertificateParams::default();
@@ -400,6 +405,7 @@ impl Fixture {
                 .hello_timeout(Duration::from_secs(2))
                 .pulse_interval(Duration::from_secs(2))
                 .pulse_timeout(Duration::from_secs(1))
+                .contracts(contracts)
                 .build(),
             auth,
             sink,
@@ -551,6 +557,42 @@ impl Fixture {
     ) -> Peer {
         self.spoke_as_contracts(host_id, script, command_cursor, last_record, Contracts::first_release())
             .await
+    }
+
+    /// First hub frame for a Hello advertising `features`. Used to pin that
+    /// the production executor Hello is refused by a first-release hub.
+    pub async fn hello_reply(&self, features: Vec<Feature>) -> hub_frame::Body {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(SpokeFrame {
+            body: Some(spoke_frame::Body::Hello(Hello {
+                host_id: HOST.into(),
+                journal_id: "journal".into(),
+                boot_id: "boot".into(),
+                min_epoch: 1,
+                max_epoch: 1,
+                features,
+                instance_nonce: vec![1; 16],
+                first_retained: 1,
+                last_record: 0,
+                received_commands: None,
+                ..Default::default()
+            })),
+        })
+        .await
+        .unwrap();
+        let channel = tokio::time::timeout(STEP, self.dialer.connect())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut incoming = tokio::time::timeout(
+            STEP,
+            spoke_hub_client::SpokeHubClient::new(channel).connect(ReceiverStream::new(rx)),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .into_inner();
+        incoming.message().await.unwrap().unwrap().body.expect("hub frame")
     }
 
     pub async fn spoke_contracts(
@@ -745,6 +787,14 @@ impl Peer {
             ))))
             .await
             .unwrap();
+    }
+
+    /// Append a record the scripted spoke produced after answering a command.
+    /// Sequence is assigned from the journal cursor so the caller need not
+    /// count result records.
+    pub async fn send_record(&self, mut record: Record) {
+        record.sequence = self.next_record.fetch_add(1, Ordering::SeqCst);
+        self.tx.send(frame_of(spoke_frame::Body::Record(record))).await.unwrap();
     }
 }
 

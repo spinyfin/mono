@@ -2,7 +2,7 @@
 
 use boss_protocol_spoke::{
     negotiate::Selection,
-    v1::{Command, CommandResult, Cursor, Hello, Record, ResultCode, Run, record},
+    v1::{Command, CommandResult, Cursor, Hello, Record, ResultCode, Run, SpokeFrame, record, spoke_frame},
 };
 use boss_spoke_stream::store::{
     Admission, CommandAdmission, CommandJournal, CommandOutbox, PendingCommand, Session, SpokeObservationSink,
@@ -77,6 +77,29 @@ fn claimed_runs(record: &Record) -> Vec<SpokeRunKey> {
     runs
 }
 
+/// What the hub keeps of an incoming frame. A pane snapshot is shown to a
+/// watcher and then forgotten: storing up to 64 KiB every few seconds would
+/// fill the host's ingress quota with display data nothing reads back. The
+/// record's identity (sequence, run, subscription, observation time) is kept
+/// so the shared sequence and receipt stay contiguous and a replay is still an
+/// identical duplicate; only the text is dropped. Every other record is kept
+/// byte for byte.
+fn stored_frame(raw_frame: &[u8], record: &Record) -> Vec<u8> {
+    match &record.body {
+        Some(record::Body::Capture(_)) => {
+            let mut stub = record.clone();
+            if let Some(record::Body::Capture(capture)) = &mut stub.body {
+                capture.text_utf8.clear();
+            }
+            SpokeFrame {
+                body: Some(spoke_frame::Body::Record(stub)),
+            }
+            .encode_to_vec()
+        }
+        _ => raw_frame.to_vec(),
+    }
+}
+
 fn encode_features(selection: &Selection) -> String {
     selection
         .to_features()
@@ -133,7 +156,7 @@ impl SpokeObservationSink for WorkDbSink {
         let generation = session.generation;
         let epoch = session.selection.epoch;
         let features = encode_features(&session.selection);
-        let frame = raw_frame.to_vec();
+        let frame = stored_frame(raw_frame, record);
         let sequence = record.sequence;
         let observed_at_ms = observed_at_ms(record);
         let runs = claimed_runs(record);

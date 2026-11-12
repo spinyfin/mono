@@ -56,6 +56,49 @@ async fn duplicate_frames_return_the_receipt_without_changing_bytes() {
 }
 
 #[tokio::test]
+async fn pane_capture_text_is_shown_but_not_stored() {
+    let (_dir, db) = work_db();
+    spoke_ready(&db, "host-a");
+    let owned = db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
+    let run = proto_run(&run_key(&owned));
+    let reader = db.clone();
+    let (sink, _) = stores(db);
+    let admission = sink.open(&hello("host-a"), &selection()).await.unwrap();
+    let session = session("host-a", admission.generation);
+    let mut capture = pane(1, Some(run.clone()));
+    capture.body = Some(record::Body::Capture(v1::PaneCapture {
+        subscription_id: "view".into(),
+        text_utf8: vec![b'x'; 60 * 1024],
+        truncated: true,
+    }));
+    let frame = v1::SpokeFrame {
+        body: Some(v1::spoke_frame::Body::Record(capture.clone())),
+    }
+    .encode_to_vec();
+    assert!(frame.len() > 60 * 1024);
+    assert_eq!(sink.commit(&session, &frame, &capture).await.unwrap().through, 1);
+    let stored = reader.spoke_ingress_frame("host-a", 1).unwrap().unwrap();
+    assert!(stored.len() < 512, "{} bytes kept", stored.len());
+    let Some(v1::spoke_frame::Body::Record(kept)) = v1::SpokeFrame::decode(stored.as_slice()).unwrap().body else {
+        panic!("a record frame is kept");
+    };
+    assert_eq!((kept.sequence, kept.run.as_ref()), (1, Some(&run)));
+    let Some(record::Body::Capture(kept)) = kept.body else {
+        panic!("the capture is kept");
+    };
+    assert_eq!(
+        (kept.subscription_id.as_str(), kept.truncated, kept.text_utf8.len()),
+        ("view", true, 0)
+    );
+    // A replay after reconnect is still an identical duplicate.
+    assert_eq!(sink.commit(&session, &frame, &capture).await.unwrap().through, 1);
+    // Everything else is stored exactly as received.
+    let verbatim = pane(2, Some(run));
+    assert_eq!(sink.commit(&session, b"verbatim", &verbatim).await.unwrap().through, 2);
+    assert_eq!(reader.spoke_ingress_frame("host-a", 2).unwrap().unwrap(), b"verbatim");
+}
+
+#[tokio::test]
 async fn wrong_host_or_run_is_denied_and_inventory_members_are_checked() {
     let (_dir, db) = work_db();
     spoke_ready(&db, "host-a");
