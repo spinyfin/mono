@@ -408,3 +408,54 @@ fn remote_only_parent_pr_branch_is_a_stack_boundary() {
         "push-time collapse uses the same remote-inclusive listing"
     );
 }
+
+fn conflicted_ancestor(repo: &Repo) -> String {
+    repo.conflicted("main..@")
+        .lines()
+        .next()
+        .expect("conflicted ancestor")
+        .trim()
+        .to_owned()
+}
+
+#[test]
+fn several_bookmarks_on_one_commit_are_classified_name_by_name() {
+    // The push branch alongside bookkeeping aliases: the fixture already puts
+    // `boss/exec_x` on the ancestor, so adding aliases yields one commit with
+    // several local names, which jj would otherwise render on a single line.
+    let aliased = Repo::new();
+    aliased.lockfile_conflict_with_resolved_child(Some("pr/9"));
+    let ancestor = conflicted_ancestor(&aliased);
+    aliased.jj(
+        &aliased.root,
+        &["bookmark", "create", "boss-recovery/x", "-r", &ancestor],
+    );
+    assert!(
+        !commit_has_blocking_bookmark(&ctx(&aliased), &ancestor, BookmarkPolicy::PushBranch("boss/exec_x")).unwrap(),
+        "push branch plus bookkeeping aliases on one commit is not a stack boundary"
+    );
+    assert!(
+        commit_has_blocking_bookmark(&ctx(&aliased), &ancestor, BookmarkPolicy::Strict).unwrap(),
+        "Strict still treats the PR's own branch as a boundary"
+    );
+    aliased.jj(&aliased.root, &["bookmark", "delete", "boss/exec_x"]);
+    assert!(
+        !commit_has_blocking_bookmark(&ctx(&aliased), &ancestor, BookmarkPolicy::Strict).unwrap(),
+        "several bookkeeping aliases alone are never a boundary"
+    );
+
+    // A recovery pointer must not hide a real parent branch on the same commit.
+    let hidden = Repo::new();
+    hidden.lockfile_conflict_with_resolved_child(Some("boss-recovery/x"));
+    let ancestor = conflicted_ancestor(&hidden);
+    hidden.jj(
+        &hidden.root,
+        &["bookmark", "create", "stacked-feature", "-r", &ancestor],
+    );
+    for policy in [BookmarkPolicy::Strict, BookmarkPolicy::PushBranch("boss/exec_x")] {
+        assert!(
+            commit_has_blocking_bookmark(&ctx(&hidden), &ancestor, policy).unwrap(),
+            "a parent branch sharing a commit with a recovery pointer is still a boundary"
+        );
+    }
+}

@@ -28,7 +28,7 @@ const CONFLICT_COMMITS_TMPL: &str = r#"if(conflict, commit_id ++ "\n")"#;
 /// `remote_bookmarks` on `jj log` include those remotes; `.name()` strips
 /// the `@remote` suffix so [`is_bookkeeping_bookmark`] classifies them.
 pub(crate) const BOOKMARK_NAMES_TMPL: &str =
-    r#"separate("\n", local_bookmarks.map(|b| b.name()), remote_bookmarks.map(|b| b.name())) ++ "\n""#;
+    r#"local_bookmarks.map(|b| b.name()).join("\n") ++ "\n" ++ remote_bookmarks.map(|b| b.name()).join("\n") ++ "\n""#;
 
 /// Upper bound on collapse iterations in [`try_linearize_replay_conflicts`],
 /// as a multiple of the conflicted-commit count. Each iteration removes at
