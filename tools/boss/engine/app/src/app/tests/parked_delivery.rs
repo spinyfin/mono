@@ -12,6 +12,7 @@ use super::*;
 
 use crate::app::parked_delivery::{RETURN_RETRIES, TURN_START_CONFIRM_TIMEOUT};
 use crate::app::probes::ServerStateProbeQueuer;
+use crate::app::worker_events::dispatch_completion_on_stop;
 use boss_engine_completion::nudge_breaker::{ABSOLUTE_MAX_NUDGES, NudgeBreaker};
 use boss_engine_completion::tests::{StubPrDetector, TestHarness};
 use boss_engine_completion::{NudgeDelivery, ProbeQueuer, StopOutcome};
@@ -47,12 +48,12 @@ fn stop(run_id: &str) -> boss_engine_runtime::events_socket::IncomingHookEvent {
 }
 
 /// What a driver reports when it takes the composer's contents as a prompt.
-/// Codex's carries no text, so nothing here can be matched on content.
+/// The prompt identifies the probe whose submission is being confirmed.
 fn turn_started(run_id: &str) -> boss_engine_runtime::events_socket::IncomingHookEvent {
     hook(
         WorkerEvent::UserPromptSubmit {
             session_id: "sess".into(),
-            prompt: String::new(),
+            prompt: "push your branch".to_owned(),
         },
         run_id,
     )
@@ -400,4 +401,182 @@ async fn a_parked_worker_is_not_failed_for_nudges_it_was_never_shown() {
     );
     assert_eq!(cube.release_calls.lock().await.len(), 1);
     assert!(!server_state.work_db.get_execution(&run_id).unwrap().status.is_live());
+}
+
+// A provisionally consumed interrupting nudge retains its claim until its
+// own text is confirmed, even if another interrupting probe arrives.
+#[tokio::test(start_paused = true)]
+async fn an_unconfirmed_interrupting_nudge_cannot_be_displaced() {
+    let (server, _dir) = test_server_state();
+    let (run, _) = parked_codex_worker(&server);
+    let queuer = ServerStateProbeQueuer::default();
+    queuer.set_server_state(Arc::downgrade(&server));
+    queuer.queue_probe(&run, "push your branch");
+    let first = server.try_reserve_probe_for_delivery(&run, None, 0).unwrap();
+    server.set_probe_lifecycle(&first.probe_id, ProbeDeliveryState::Consumed);
+    server.set_probe_submission(&first.probe_id, true, Some(ProbeResumeEvidence::Unconfirmed));
+    server.mark_in_flight_probe_awaiting_turn_start(&run, &first.probe_id, &first.text);
+    let second = server.queue_probe(run.clone(), "another instruction".into(), false);
+    assert!(
+        server
+            .try_reserve_specific_probe_for_delivery(&run, &second, None, 0)
+            .is_none()
+    );
+    assert_eq!(
+        server.in_flight_probe_id(&run).as_deref(),
+        Some(first.probe_id.as_str())
+    );
+    assert!(matches!(queuer.nudge_delivery(&run), NudgeDelivery::Pending { .. }));
+    dispatch_live_worker_state(&server, &turn_started(&run)).await;
+    assert_eq!(
+        server.probe_record(&first.probe_id).unwrap().resumed,
+        Some(ProbeResumeEvidence::Confirmed)
+    );
+    server.set_probe_submission(&first.probe_id, true, Some(ProbeResumeEvidence::Unconfirmed));
+    assert_eq!(
+        server.probe_record(&first.probe_id).unwrap().resumed,
+        Some(ProbeResumeEvidence::Confirmed),
+        "late write bookkeeping cannot undo submission evidence"
+    );
+    assert!(matches!(queuer.nudge_delivery(&run), NudgeDelivery::Settled));
+    assert!(
+        server
+            .try_reserve_specific_probe_for_delivery(&run, &second, None, 0)
+            .is_some()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unrelated_turn_does_not_confirm_a_parked_probe() {
+    let (server, _dir) = test_server_state();
+    let (run, _) = parked_codex_worker(&server);
+    let probe = server.queue_probe(run.clone(), "push your branch".into(), false);
+    dispatch_probe_now(&server, &run).await;
+    let unrelated = hook(
+        WorkerEvent::UserPromptSubmit {
+            session_id: "sess".into(),
+            prompt: "what time is it?".into(),
+        },
+        &run,
+    );
+    dispatch_live_worker_state(&server, &unrelated).await;
+    assert_eq!(server.probe_lifecycle_state(&probe), Some(ProbeDeliveryState::Injected));
+    assert!(server.probe_awaiting_turn_start(&run, &probe));
+    dispatch_probe_reply_on_stop(&server, &stop(&run)).await;
+    assert!(
+        server.probe_awaiting_turn_start(&run, &probe),
+        "an unrelated Stop cannot take the claim"
+    );
+    // A later prompt carrying the probe itself proves submission.
+    dispatch_live_worker_state(&server, &turn_started(&run)).await;
+    assert_eq!(
+        server.probe_record(&probe).unwrap().resumed,
+        Some(ProbeResumeEvidence::Confirmed)
+    );
+}
+
+async fn confirmation_during_diagnostics(deadline: u32) {
+    let (server, _dir) = test_server_state();
+    let (run, _) = parked_codex_worker(&server);
+    let pause = Arc::new(super::tmux_stub::ProbePause::default());
+    let runner = Arc::new(super::tmux_stub::RecordingPaneRunner::new("boss-6").pause_capture(pause.clone()));
+    *server.pane_delivery_tmux_override.write().unwrap() = Some(super::tmux_stub::tmux_with_runner(runner.clone()));
+    let probe = server.queue_probe(run.clone(), "push your branch".into(), false);
+    server.try_reserve_probe_for_delivery(&run, None, 0).unwrap();
+    server.set_probe_lifecycle(&probe, ProbeDeliveryState::Consumed);
+    server.set_probe_submission(&probe, true, Some(ProbeResumeEvidence::Unconfirmed));
+    server.mark_in_flight_probe_awaiting_turn_start(&run, &probe, "push your branch");
+    super::super::parked_delivery::watch_parked_write(&server, &run, SLOT, &probe, "push your branch".into());
+    for window in 0..=deadline {
+        pause.entered.notified().await;
+        if window == deadline {
+            dispatch_live_worker_state(&server, &turn_started(&run)).await;
+        }
+        pause.resume.notify_one();
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(one_failed_delivery()).await;
+    let record = server.probe_record(&probe).unwrap();
+    assert_eq!(record.state, ProbeDeliveryState::Consumed);
+    assert_eq!(record.resumed, Some(ProbeResumeEvidence::Confirmed));
+    assert_eq!(
+        runner.return_presses(),
+        deadline as usize,
+        "no Return after confirmation"
+    );
+    assert!(undelivered_probe_attentions(&server, &run).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn confirmation_during_retry_diagnostics_prevents_return() {
+    confirmation_during_diagnostics(0).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn confirmation_during_final_diagnostics_prevents_failure() {
+    confirmation_during_diagnostics(RETURN_RETRIES).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn mid_turn_dispatch_that_finds_a_parked_pane_watches_the_echo() {
+    let (server, _dir) = test_server_state();
+    let run = register_idle_worker_with_driver(&server, SLOT, Some("claude"));
+    server.worker_registry.register_tmux_run_slot(&run, SLOT, "boss-6");
+    register_tmux_identity_for_test(&server, &run, "boss-6", super::tmux_stub::TEST_SPAWN_TOKEN);
+    let runner =
+        Arc::new(super::tmux_stub::RecordingPaneRunner::new("boss-6").capture_text("[nudge] push your branch"));
+    *server.pane_delivery_tmux_override.write().unwrap() = Some(super::tmux_stub::tmux_with_runner(runner.clone()));
+    let probe = server.queue_probe(run.clone(), "push your branch".into(), false);
+    let event = hook(
+        WorkerEvent::PostToolUse {
+            session_id: "sess".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({}),
+            tool_response: serde_json::json!({}),
+        },
+        &run,
+    );
+    let outcome = dispatch_probe_on_post_tool_use(&server, &event).await;
+    assert_eq!(outcome, ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Injected));
+    assert!(server.probe_awaiting_turn_start(&run, &probe));
+    tokio::time::sleep(one_failed_delivery()).await;
+    assert_eq!(
+        server.probe_lifecycle_state(&probe),
+        Some(ProbeDeliveryState::Unconfirmed)
+    );
+    assert!(!server.has_in_flight_probe(&run));
+    assert_eq!(runner.return_presses(), 1 + RETURN_RETRIES as usize);
+    assert_eq!(undelivered_probe_attentions(&server, &run).len(), 1);
+}
+
+struct CompletionDetector(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl boss_engine_completion::PrDetector for CompletionDetector {
+    async fn detect_pr(&self, _remote: &str, _branch: &str) -> anyhow::Result<boss_engine_completion::PrStatus> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(boss_engine_completion::PrStatus::None)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_pre_pass_write_rechecks_the_deferred_stop_decision() {
+    let detector = Arc::new(CompletionDetector(std::sync::atomic::AtomicUsize::new(0)));
+    let (server, _dir) = test_server_state_with_fakes_and_pr_detector(detector.clone(), None);
+    let (run, _) = parked_codex_worker(&server);
+    let probe = server.queue_probe(run.clone(), "push your branch".into(), false);
+    let outcome = dispatch_probe_on_stop(&server, &stop(&run)).await;
+    assert_eq!(outcome, ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Injected));
+    dispatch_completion_on_stop(&server, &stop(&run), true).await;
+    assert!(server.parked_probe_snapshot(&run).unwrap().deferred_completion);
+    assert_eq!(detector.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    tokio::time::sleep(one_failed_delivery()).await;
+    assert_eq!(
+        server.probe_lifecycle_state(&probe),
+        Some(ProbeDeliveryState::Unconfirmed)
+    );
+    assert!(
+        detector.0.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the failed write must re-drive the PR detection withheld at Stop"
+    );
 }

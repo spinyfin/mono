@@ -1,68 +1,20 @@
-//! Confirming that a probe written into a parked pane started a turn.
-//!
-//! A probe for a worker sitting at its prompt is typed into the pane and
-//! submitted with Return. tmux reporting success for those keys says they
-//! were accepted, not that the driver took them as a prompt, and the two come
-//! apart in ways that leave no trace at the write:
-//!
-//! * **The Return is taken as part of a paste.** Codex's TUI treats keys that
-//!   arrive in a burst as a paste and a Return right behind them as a newline
-//!   in it, so the text sits in the composer and nothing is submitted
-//!   (measured: `docs/investigations/codex-0.160.1-qualification-2026-10-06.md`,
-//!   "Harness notes"). Whether it happens depends on how long the Return's
-//!   own `tmux` invocation takes to start, so it comes and goes with host
-//!   load.
-//! * **The pane is in a tmux mode.** A pane someone has scrolled is in
-//!   copy-mode, where tmux consumes the keys itself: the text runs as
-//!   copy-mode commands and the Return is swallowed.
-//!
-//! Both are prevented where the write is made ([`AgentDriver::pane_submit_settle`],
-//! [`ServerState::leave_pane_modes_before_keys`]). This module is what makes
-//! delivery not depend on having thought of every such cause: it holds the
-//! probe at `Injected` until the driver is seen to start a turn, presses
-//! Return again when it has not, and after a bounded number of tries settles
-//! the delivery as failed, with what the pane looked like.
-//!
-//! **Why it matters beyond the one probe.** A probe written into a pane holds
-//! the run's single delivery slot until the next turn boundary. A write that
-//! starts no turn never reaches one, so the slot was held forever and every
-//! later probe for the run queued behind it. The engine's own nudges were
-//! among them, counted as they were queued: a worker was failed for ignoring
-//! three nudges of which it had been shown none.
-//!
-//! The retry is Return and nothing else, the same rule the spawn path follows
-//! for a brief that was pasted and not submitted
-//! (`docs/worker-prompt-delivery.md`). The text is typed exactly once, so a
-//! retry cannot deliver a second copy, and Return on an empty composer does
-//! nothing.
-//!
-//! [`AgentDriver::pane_submit_settle`]: boss_engine_driver::AgentDriver::pane_submit_settle
+//! Verify that a parked pane submits the probe text before delivery counts.
+//! A write retains the delivery slot until matching prompt or transcript
+//! evidence confirms submission, or bounded Return retries fail visibly.
+//! Retries send only Return; the text is written exactly once.
 
 use super::*;
 
-use boss_engine_runtime::spawn_ack_sweep::SpawnAckReaper;
 use boss_protocol::WorkerActivity;
 
 use crate::app::pane_delivery::{PaneDeliveryDiagnostics, transcript_shows_text};
 
-/// How long a write into a parked pane may go without the driver starting a
-/// turn before the engine presses Return again.
-///
-/// The same bound, on the same measurement, as the spawn path's wait for a
-/// submitted brief: Return to `UserPromptSubmit` took 37 to 198 ms at normal
-/// load and up to 4.0 s under heavy load, so 30 s is 7.5 times the peak
-/// (`docs/worker-prompt-delivery.md`). A turn that starts is seen in well
-/// under a second; this only bounds how long one that does not is waited for.
-pub(super) const TURN_START_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// How many times Return is pressed again for a write that started no turn
-/// before the delivery is settled as failed.
-pub(super) const RETURN_RETRIES: u32 = 2;
-
-/// How often the watch re-reads the run's state. The turn-start signal itself
-/// is pushed ([`ServerState::confirm_parked_write_turn_started`]); the poll is
-/// for the readings nothing pushes, and bounds how stale a release can be.
-const TURN_START_POLL: Duration = Duration::from_millis(100);
+// Share the spawn path's measured submission bounds. The parked watch
+// extends its deadline while busy, when sending Return is unsafe.
+pub(super) use boss_execution_runner::spawn_confirmation::{
+    SPAWN_CONFIRM_POLL as TURN_START_POLL, SUBMIT_CONFIRM_TIMEOUT as TURN_START_CONFIRM_TIMEOUT,
+    SUBMIT_RETRIES as RETURN_RETRIES,
+};
 
 /// The poll period while the pane is busy and the watch is only waiting for
 /// it to come back to its prompt.
@@ -112,12 +64,25 @@ fn confirm_turn_start(
             let diagnostics = server
                 .capture_pane_delivery_diagnostics(&write.run_id, write.slot_id)
                 .await;
+            if !server.probe_awaiting_turn_start(&write.run_id, &write.probe_id) {
+                return;
+            }
+            if server.pane_typed_input_activity(write.slot_id) == Some(WorkerActivity::Working) {
+                continue;
+            }
             if returns_pressed == RETURN_RETRIES {
                 fail_parked_write(&server, &write, returns_pressed, &diagnostics).await;
                 return;
             }
+            let pressed = server
+                .resubmit_prompt_if(&write.run_id, || {
+                    server.parked_probe_needs_return(&write.run_id, &write.probe_id, write.slot_id)
+                })
+                .await;
+            if let Ok(false) = &pressed {
+                continue;
+            }
             returns_pressed += 1;
-            let pressed = SpawnAckReaper::resubmit_prompt(server.as_ref(), &write.run_id).await;
             tracing::warn!(
                 run_id = %write.run_id,
                 slot_id = write.slot_id,
@@ -163,13 +128,7 @@ async fn wait_for_turn_start(server: &ServerState, write: &ParkedWrite) -> bool 
             return true;
         }
         if server.in_flight_probe_id(&write.run_id).as_deref() != Some(write.probe_id.as_str()) {
-            // The claim is gone and the run is not. For a probe still
-            // `Injected` only a turn boundary can have taken it. One already
-            // recorded on the strength of its write may instead have been
-            // displaced by a later probe, which is evidence of nothing.
-            if state == Some(ProbeDeliveryState::Injected) {
-                server.settle_parked_write_delivered(write, "a turn boundary followed the write");
-            }
+            // Losing the claim is not evidence that this text was submitted.
             return true;
         }
         if !server.probe_awaiting_turn_start(&write.run_id, &write.probe_id) {
@@ -192,7 +151,6 @@ async fn wait_for_turn_start(server: &ServerState, write: &ParkedWrite) -> bool 
     if let Some(path) = transcript_path
         && transcript_shows_text(&path, offset_bytes, &write.text).await
     {
-        server.take_probe_awaiting_turn_start(&write.run_id);
         server.settle_parked_write_delivered(write, "the transcript recorded the text");
         return true;
     }
@@ -233,22 +191,12 @@ async fn fail_parked_write(
          {waited_secs}s, but the driver never started a turn ({})",
         diagnostics.summary(),
     );
-    let settled = [ProbeDeliveryState::Injected, ProbeDeliveryState::Consumed]
-        .into_iter()
-        .any(|from| {
-            server.advance_probe_lifecycle(
-                &write.probe_id,
-                from,
-                ProbeDeliveryState::Unconfirmed,
-                Some(detail.clone()),
-            ) == Some(ProbeDeliveryState::Unconfirmed)
-        });
-    if !settled {
-        // Settled by another path between the last look and here.
+    let deferred_completion = server
+        .parked_probe_snapshot(&write.run_id)
+        .is_some_and(|claim| claim.probe_id == write.probe_id && claim.deferred_completion);
+    if !server.settle_awaiting_probe(&write.run_id, &write.probe_id, false, detail.clone()) {
         return;
     }
-    server.set_probe_submission(&write.probe_id, true, Some(ProbeResumeEvidence::Unconfirmed));
-    server.take_in_flight_probe_if(&write.run_id, &write.probe_id, |_| true);
     tracing::error!(
         run_id = %write.run_id,
         slot_id = write.slot_id,
@@ -279,6 +227,10 @@ async fn fail_parked_write(
             unconfirmed_attention_body(write, &detail, diagnostics),
         )
         .await;
+    if deferred_completion {
+        let outcome = server.completion_handler.on_stop(&write.run_id).await;
+        tracing::info!(run_id = %write.run_id, ?outcome, "rechecked completion after parked delivery failed");
+    }
     // Whatever queued behind this probe was waiting on a boundary that is
     // not coming either.
     if server.has_pending_probe(&write.run_id) {
@@ -314,47 +266,74 @@ fn unconfirmed_attention_body(write: &ParkedWrite, detail: &str, diagnostics: &P
 }
 
 impl ServerState {
-    /// The main session of `run_id` started a turn. If a probe was written
-    /// into its parked pane and is waiting on exactly that, the probe was
-    /// taken.
-    ///
-    /// Called from the ingress for every turn start. A no-op for all but the
-    /// one a parked write produced.
-    pub(super) fn confirm_parked_write_turn_started(&self, run_id: &str) {
-        let Some(probe_id) = self.take_probe_awaiting_turn_start(run_id) else {
+    /// A main-session turn confirms only the text carried by this probe.
+    /// Empty prompts and tool-only events need transcript evidence.
+    pub(super) async fn confirm_parked_write_turn_started(&self, run_id: &str, prompt: Option<&str>) {
+        let Some(claim) = self.parked_probe_snapshot(run_id) else {
             return;
         };
-        let state = self.advance_probe_lifecycle(
-            &probe_id,
-            ProbeDeliveryState::Injected,
-            ProbeDeliveryState::Consumed,
-            Some("written into the parked pane; the driver started a turn on it".to_owned()),
-        );
-        self.set_probe_submission(&probe_id, true, Some(ProbeResumeEvidence::Confirmed));
-        tracing::info!(
-            run_id,
-            probe_id,
-            state = state.map(ProbeDeliveryState::as_str),
-            "probe delivery confirmed: the driver started a turn after the write into its parked pane",
-        );
+        let Some(text) = claim.awaiting_turn_text.as_deref() else {
+            return;
+        };
+        let needle = super::pane_delivery::normalize_ws(text);
+        let matches_prompt = !needle.is_empty()
+            && prompt.is_some_and(|prompt| super::pane_delivery::normalize_ws(prompt).contains(&needle));
+        let needs_transcript = prompt.is_none_or(|prompt| prompt.trim().is_empty());
+        let matches_transcript = needs_transcript
+            && !matches_prompt
+            && if let Some(path) = claim.transcript_path.as_deref() {
+                transcript_shows_text(path, claim.offset_bytes, text).await
+            } else {
+                false
+            };
+        if matches_prompt || matches_transcript {
+            self.settle_awaiting_probe(
+                run_id,
+                &claim.probe_id,
+                true,
+                "written into the parked pane; matching submission evidence confirmed delivery".to_owned(),
+            );
+        }
     }
 
-    /// Record evidence, other than the turn-start signal itself, that the
-    /// driver took a parked write.
     fn settle_parked_write_delivered(&self, write: &ParkedWrite, evidence: &str) {
-        let state = self.advance_probe_lifecycle(
+        self.settle_awaiting_probe(
+            &write.run_id,
             &write.probe_id,
-            ProbeDeliveryState::Injected,
-            ProbeDeliveryState::Consumed,
-            Some(format!("written into the parked pane; {evidence}")),
+            true,
+            format!("written into the parked pane; {evidence}"),
         );
-        self.set_probe_submission(&write.probe_id, true, Some(ProbeResumeEvidence::Confirmed));
-        tracing::info!(
-            run_id = %write.run_id,
-            probe_id = %write.probe_id,
-            evidence,
-            state = state.map(ProbeDeliveryState::as_str),
-            "probe delivery confirmed for a write into a parked pane",
+    }
+}
+
+impl ServerState {
+    /// Share identity validation with spawn retries; parked retries also
+    /// recheck their claim after the last diagnostic or tmux await.
+    pub(super) async fn resubmit_prompt_if(
+        &self,
+        execution_id: &str,
+        permitted: impl Fn() -> bool,
+    ) -> anyhow::Result<bool> {
+        let identity = self
+            .work_db
+            .tmux_identity_for_execution(execution_id)?
+            .ok_or_else(|| anyhow::anyhow!("no recorded tmux identity"))?;
+        let tmux = self.tmux_for_pane_delivery(execution_id)?;
+        let token = boss_engine_runtime::tmux_adoption::session_spawn_token(&tmux, &identity.session_name).await?;
+        anyhow::ensure!(
+            token.as_deref() == Some(identity.spawn_token.as_str()),
+            "worker session token changed"
         );
+        anyhow::ensure!(
+            !self.work_db.get_execution(execution_id)?.status.is_terminal(),
+            "execution is terminal"
+        );
+        self.leave_pane_modes_before_keys(execution_id, &tmux, &identity.session_name)
+            .await?;
+        if !permitted() {
+            return Ok(false);
+        }
+        tmux.send_submit(&identity.session_name).await?;
+        Ok(true)
     }
 }

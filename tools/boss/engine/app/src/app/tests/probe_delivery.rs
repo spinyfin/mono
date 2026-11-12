@@ -54,11 +54,11 @@ fn post_tool_use(run_id: &str) -> boss_engine_runtime::events_socket::IncomingHo
 
 /// The driver taking the composer's contents as its next prompt: the
 /// evidence that a write into a parked pane was delivered.
-fn prompt_submitted(run_id: &str) -> boss_engine_runtime::events_socket::IncomingHookEvent {
+fn prompt_submitted(run_id: &str, prompt: &str) -> boss_engine_runtime::events_socket::IncomingHookEvent {
     boss_engine_runtime::events_socket::IncomingHookEvent::for_test(
         WorkerEvent::UserPromptSubmit {
             session_id: "claude-sess-1".into(),
-            prompt: String::new(),
+            prompt: prompt.to_owned(),
         },
         Some(run_id.to_owned()),
         None,
@@ -372,7 +372,7 @@ async fn effort_escalation_ack_reaches_a_parked_worker_immediately() {
         Some(ProbeDeliveryState::Injected),
         "written at once, with no boundary to wait for",
     );
-    dispatch_live_worker_state(&server_state, &prompt_submitted(&run_id)).await;
+    dispatch_live_worker_state(&server_state, &prompt_submitted(&run_id, ack)).await;
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
         Some(ProbeDeliveryState::Consumed),
@@ -952,7 +952,7 @@ async fn a_live_worker_still_records_consumed() {
 
     let _ = runner.last_paste();
     assert_eq!(outcome, ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Injected));
-    dispatch_live_worker_state(&server_state, &prompt_submitted(&run_id)).await;
+    dispatch_live_worker_state(&server_state, &prompt_submitted(&run_id, "still with me?")).await;
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
         Some(ProbeDeliveryState::Consumed),
@@ -1559,7 +1559,7 @@ async fn the_turn_boundary_fanout_delivers_a_probe_queued_before_it() {
         Some(ProbeDeliveryState::Injected),
         "the fan-out must write on the boundary, not leave the probe queued",
     );
-    dispatch_live_worker_state(&server_state, &prompt_submitted(&run_id)).await;
+    dispatch_live_worker_state(&server_state, &prompt_submitted(&run_id, "hold the PR")).await;
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
         Some(ProbeDeliveryState::Consumed),

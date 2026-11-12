@@ -808,7 +808,11 @@ pub(super) async fn dispatch_live_worker_state(
     // prompt submission is one even for a slot with no boundary on record.
     let prompt_submitted = matches!(incoming.event, boss_protocol::WorkerEvent::UserPromptSubmit { .. });
     if applied.resumed_after.is_some() || (prompt_submitted && !stale_event && !incoming.connection.from_subagent) {
-        server_state.confirm_parked_write_turn_started(run_id);
+        let prompt = match &incoming.event {
+            boss_protocol::WorkerEvent::UserPromptSubmit { prompt, .. } => Some(prompt.as_str()),
+            _ => None,
+        };
+        server_state.confirm_parked_write_turn_started(run_id, prompt).await;
     }
     let changed = applied.repaired || matches!(applied.outcome, ApplyEventOutcome::Applied { changed: true });
     let new_state = server_state.live_worker_states.get(slot_id);
@@ -1786,7 +1790,7 @@ async fn deliver_probe_via_pane_write(
     if parked {
         // Before the write, so a turn that starts while the keys are still
         // going out is recognised as this probe's.
-        server_state.mark_in_flight_probe_awaiting_turn_start(run_id, &probe_id);
+        server_state.mark_in_flight_probe_awaiting_turn_start(run_id, &probe_id, &probe.text);
     }
     match server_state.send_pane_text_checked(run_id, slot_id, &probe.text).await {
         Ok(()) => {
@@ -2201,26 +2205,26 @@ async fn inject_probe_mid_turn(
             // transcript. That is direct evidence of consumption by a live
             // process — strictly stronger than a `kill(pid, 0)` probe.
             server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Consumed);
+            server_state.set_probe_submission(&probe_id, true, Some(ProbeResumeEvidence::Confirmed));
             ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Consumed)
         }
         PaneInjectOutcome::PaneEcho => {
-            // Defensive: `inject_probe_mid_turn` is reached from PostToolUse
-            // and from the mid-turn branch of `dispatch_probe_now`, and a
-            // MidTurnBuffered posture never yields PaneEcho. This arm fires
-            // when that PostToolUse resolved Parked because the worker had
-            // already gone idle. A capture-pane match can only prove that
-            // our paste remains on screen. Preserve it as an unconfirmed
-            // write and run the liveness checks that prevent a dead pane
-            // from looking delivered.
+            // The worker parked before the write. Verify submission with
+            // the same bounded watch as any other parked pane write.
+            server_state.mark_in_flight_probe_awaiting_turn_start(run_id, &probe_id, &probe.text);
             let state = record_pane_write_outcome(
                 server_state,
                 run_id,
                 slot_id,
                 &probe_id,
-                ProbeDeliveryState::Unconfirmed,
-                "probe pane echo observed but worker consumption remains unconfirmed",
+                ProbeDeliveryState::Injected,
+                "probe pane echo observed; awaiting submission evidence",
             )
             .await;
+            if !state.is_undeliverable() {
+                server_state.mark_probe_written(&probe_id);
+                super::parked_delivery::watch_parked_write(server_state, run_id, slot_id, &probe_id, probe.text);
+            }
             ProbeDispatchOutcome::Dispatched(state)
         }
         PaneInjectOutcome::Buffered => {
@@ -2539,18 +2543,9 @@ pub(super) async fn dispatch_probe_reply_on_stop(
         previous_replies.push(previous);
     }
     // Compare both identity and lifecycle while holding the ownership lock.
-    let current = server_state.in_flight_probe_id(run_id).and_then(|probe_id| {
-        server_state.take_in_flight_probe_if(run_id, &probe_id, |state| {
-            matches!(
-                state,
-                ProbeDeliveryState::Injected
-                    | ProbeDeliveryState::Consumed
-                    | ProbeDeliveryState::Buffered
-                    | ProbeDeliveryState::Unconfirmed
-                    | ProbeDeliveryState::Orphaned
-            )
-        })
-    });
+    let current = server_state
+        .in_flight_probe_id(run_id)
+        .and_then(|probe_id| server_state.take_submitted_probe_reply(run_id, &probe_id));
     // Decide which claim this boundary can consume before awaiting transcript
     // reads: the replacement may be submitted while an older reply is read.
     for previous in previous_replies {
@@ -2796,6 +2791,9 @@ pub(super) async fn dispatch_completion_on_stop(
     let Some(run_id) = incoming.run_id.as_deref() else {
         return;
     };
+    if defer_finalization {
+        server_state.defer_completion_for_parked_probe(run_id);
+    }
     let outcome = server_state
         .completion_handler
         .on_stop_with_turn_end_deferrable(run_id, incoming.turn_boundary(), defer_finalization)

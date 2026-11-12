@@ -1210,6 +1210,9 @@ impl WorkerCompletionHandler {
         // the shared auto-nudge breaker so a reviewer that never produces a
         // valid result cannot loop forever.
         if review_result.is_none() {
+            if let Some(outcome) = self.nudge_delivery_gate(execution, None).await {
+                return outcome;
+            }
             match self.nudge_breaker.record(
                 &execution.id,
                 "pr_review:awaiting_result",
@@ -1284,6 +1287,17 @@ impl WorkerCompletionHandler {
                          both empty/invalid); re-prompting reviewer to write the artifact",
                     );
                     self.probe_queuer.queue_probe(&execution.id, &probe);
+                    self.background_children_tracker.record_intent(
+                        &execution.id,
+                        BackgroundNudgeIntent {
+                            probe_text: probe,
+                            fingerprint: "pr_review:awaiting_result".to_owned(),
+                            bound_pr_url: None,
+                            proceed_outcome: StopOutcome::ReviewPassAwaitingResult,
+                            activity_watermark: self.background_activity_probe.activity_watermark(&execution.id),
+                            hold: NudgeHold::AwaitingDelivery,
+                        },
+                    );
                     return StopOutcome::ReviewPassAwaitingResult;
                 }
                 NudgeDecision::Trip { count } => {

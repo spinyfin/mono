@@ -227,7 +227,7 @@ impl ProbeQueuer for ServerStateProbeQueuer {
             ProbeDeliveryState::Queued | ProbeDeliveryState::Injected => NudgeDelivery::Pending { nudge_id },
             // Written after an interrupt and recorded on the strength of the
             // write alone; the turn it should start has not been seen yet.
-            ProbeDeliveryState::Consumed if server.probe_awaiting_turn_start(run_id, &nudge_id) => {
+            ProbeDeliveryState::Consumed if record.resumed != Some(ProbeResumeEvidence::Confirmed) => {
                 NudgeDelivery::Pending { nudge_id }
             }
             ProbeDeliveryState::Consumed | ProbeDeliveryState::Buffered | ProbeDeliveryState::Replied => {
@@ -372,6 +372,11 @@ pub(super) struct InFlightProbe {
     /// [`super::parked_delivery`].
     #[builder(default)]
     awaiting_turn_start: bool,
+    /// Text whose submission must be proved before releasing verification.
+    pub(super) awaiting_turn_text: Option<String>,
+    /// A Stop decision is waiting for this write to settle.
+    #[builder(default)]
+    pub(super) deferred_completion: bool,
 }
 
 /// Everything the engine knows about one probe id after it was accepted:
@@ -415,6 +420,12 @@ impl ServerState {
             .expect("probe_lifecycle mutex poisoned")
             .get_mut(probe_id)
         {
+            // A delayed transport result cannot undo positive turn evidence.
+            if record.resumed == Some(ProbeResumeEvidence::Confirmed)
+                && resumed == Some(ProbeResumeEvidence::Unconfirmed)
+            {
+                return;
+            }
             record.submitted = Some(submitted);
             record.resumed = resumed;
         }
@@ -437,7 +448,7 @@ impl ServerState {
     /// Mark `run_id`'s claim on `probe_id` as a parked write that still owes
     /// evidence of a turn. Set before the write goes out, so a turn that
     /// starts while the keys are still being sent is not missed.
-    pub(super) fn mark_in_flight_probe_awaiting_turn_start(&self, run_id: &str, probe_id: &str) {
+    pub(super) fn mark_in_flight_probe_awaiting_turn_start(&self, run_id: &str, probe_id: &str, text: &str) {
         if let Some(entry) = self
             .in_flight_probes
             .lock()
@@ -446,17 +457,87 @@ impl ServerState {
             .filter(|entry| entry.probe_id == probe_id)
         {
             entry.awaiting_turn_start = true;
+            entry.awaiting_turn_text = Some(text.to_owned());
         }
     }
 
-    /// The probe `run_id` holds a parked write for that has not yet been seen
-    /// to start a turn, clearing the mark. `None` when there is none, which is
-    /// every turn start but the one a parked write produced.
-    pub(super) fn take_probe_awaiting_turn_start(&self, run_id: &str) -> Option<String> {
+    pub(super) fn defer_completion_for_parked_probe(&self, run_id: &str) {
+        if let Some(claim) = self
+            .in_flight_probes
+            .lock()
+            .expect("in_flight_probes mutex poisoned")
+            .get_mut(run_id)
+            .filter(|claim| claim.awaiting_turn_start)
+        {
+            claim.deferred_completion = true;
+        }
+    }
+
+    /// Snapshot only the claim still awaiting evidence for its own text.
+    pub(super) fn parked_probe_snapshot(&self, run_id: &str) -> Option<InFlightProbe> {
+        self.in_flight_probes
+            .lock()
+            .expect("in_flight_probes mutex poisoned")
+            .get(run_id)
+            .filter(|claim| claim.awaiting_turn_start)
+            .cloned()
+    }
+
+    /// Settle verification while holding the claim and lifecycle locks in
+    /// claim-first order, so a late timeout cannot overwrite confirmation.
+    pub(super) fn settle_awaiting_probe(&self, run_id: &str, probe_id: &str, confirmed: bool, detail: String) -> bool {
         let mut claims = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
-        let entry = claims.get_mut(run_id).filter(|entry| entry.awaiting_turn_start)?;
-        entry.awaiting_turn_start = false;
-        Some(entry.probe_id.clone())
+        let Some(claim) = claims
+            .get_mut(run_id)
+            .filter(|claim| claim.probe_id == probe_id && claim.awaiting_turn_start)
+        else {
+            return false;
+        };
+        let mut records = self.probe_lifecycle.lock().expect("probe_lifecycle mutex poisoned");
+        let Some(record) = records.get_mut(probe_id).filter(|record| {
+            matches!(
+                record.state,
+                ProbeDeliveryState::Injected | ProbeDeliveryState::Consumed
+            )
+        }) else {
+            return false;
+        };
+        claim.awaiting_turn_start = false;
+        record.state = if confirmed {
+            ProbeDeliveryState::Consumed
+        } else {
+            ProbeDeliveryState::Unconfirmed
+        };
+        record.submitted = Some(true);
+        record.resumed = Some(if confirmed {
+            ProbeResumeEvidence::Confirmed
+        } else {
+            ProbeResumeEvidence::Unconfirmed
+        });
+        record.detail = Some(detail);
+        if !confirmed {
+            let previous = claims.remove(run_id).and_then(|claim| claim.previous_reply);
+            if let Some(previous) = previous {
+                claims.insert(run_id.to_owned(), *previous);
+            }
+        }
+        true
+    }
+
+    /// Recheck ownership, evidence and activity immediately before Return.
+    pub(super) fn parked_probe_needs_return(&self, run_id: &str, probe_id: &str, slot_id: u8) -> bool {
+        let claims = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
+        let records = self.probe_lifecycle.lock().expect("probe_lifecycle mutex poisoned");
+        claims
+            .get(run_id)
+            .is_some_and(|claim| claim.probe_id == probe_id && claim.awaiting_turn_start)
+            && records.get(probe_id).is_some_and(|record| {
+                matches!(
+                    record.state,
+                    ProbeDeliveryState::Injected | ProbeDeliveryState::Consumed
+                ) && record.resumed != Some(ProbeResumeEvidence::Confirmed)
+            })
+            && self.pane_typed_input_activity(slot_id) != Some(boss_protocol::WorkerActivity::Working)
     }
 
     /// Whether `run_id`'s claim on `probe_id` is a parked write still owing
@@ -770,7 +851,10 @@ impl ServerState {
         if let Some(held) = in_flight.get(run_id) {
             let records = self.probe_lifecycle.lock().expect("probe_lifecycle mutex poisoned");
             let record = records.get(&held.probe_id)?;
-            if !awaits_reply_after_submission(record.state) || record.submitted == Some(false) {
+            if held.awaiting_turn_start
+                || !awaits_reply_after_submission(record.state)
+                || record.submitted == Some(false)
+            {
                 return None;
             }
         }
@@ -1285,12 +1369,36 @@ impl ServerState {
         probe_id: &str,
         eligible: impl FnOnce(ProbeDeliveryState) -> bool,
     ) -> Option<InFlightProbe> {
+        self.take_in_flight_probe_where(run_id, probe_id, |_, state| eligible(state))
+    }
+
+    /// A boundary may extract a reply only after the parked text was submitted.
+    pub(super) fn take_submitted_probe_reply(&self, run_id: &str, probe_id: &str) -> Option<InFlightProbe> {
+        self.take_in_flight_probe_where(run_id, probe_id, |claim, state| {
+            !claim.awaiting_turn_start
+                && matches!(
+                    state,
+                    ProbeDeliveryState::Injected
+                        | ProbeDeliveryState::Consumed
+                        | ProbeDeliveryState::Buffered
+                        | ProbeDeliveryState::Unconfirmed
+                        | ProbeDeliveryState::Orphaned
+                )
+        })
+    }
+
+    fn take_in_flight_probe_where(
+        &self,
+        run_id: &str,
+        probe_id: &str,
+        eligible: impl FnOnce(&InFlightProbe, ProbeDeliveryState) -> bool,
+    ) -> Option<InFlightProbe> {
         let mut claims = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
         if claims.get(run_id)?.probe_id != probe_id || claims.get(run_id)?.reply_reading {
             return None;
         }
         let records = self.probe_lifecycle.lock().expect("probe_lifecycle mutex poisoned");
-        if !eligible(records.get(probe_id)?.state) {
+        if !eligible(claims.get(run_id)?, records.get(probe_id)?.state) {
             return None;
         }
         let mut claim = claims.remove(run_id)?;

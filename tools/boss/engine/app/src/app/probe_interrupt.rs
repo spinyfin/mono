@@ -624,23 +624,16 @@ async fn inject_after_interrupt(
             }
         }
         PaneInjectOutcome::Unconfirmed => {
-            // The worker is parked by construction — we confirmed the turn
-            // ended before typing. A successful write into a parked pane is
-            // the same evidence `deliver_probe_via_pane_write` records as
-            // Consumed without waiting for a hook. UserPromptSubmit for
-            // pane-injected text has never been validated end-to-end and
-            // routinely misses this window (Grok's hooks block the TUI for
-            // up to 15s after an interrupted tool call; JSONL stores
-            // multi-line injections escaped). Treating that miss as "NOT
-            // delivered" is the false negative this path existed to close.
-            // Liveness still gates the claim: a dead process is Orphaned.
+            // A parked write proves only that the keys reached the pane.
+            // Keep its claim under verification until submission is proved
+            // or the bounded watch settles delivery as unconfirmed.
             tracing::info!(
                 run_id,
                 slot_id,
                 probe_id = %probe_id,
                 timeout = ?POST_INTERRUPT_VERIFY_TIMEOUT,
                 "probe written into a parked pane after interrupt; UserPromptSubmit/transcript did \
-                 not confirm within the window — recording parked-write consumption",
+                 not confirm within the window — awaiting parked-write submission evidence",
             );
             settle_unconfirmed_write(
                 server_state,
@@ -708,6 +701,7 @@ async fn settle_unconfirmed_write(
     attempts: u8,
 ) -> InterruptingDelivery {
     let probe_id = probe.probe_id.as_str();
+    server_state.mark_in_flight_probe_awaiting_turn_start(run_id, probe_id, &probe.text);
     let state = super::worker_events::record_pane_write_outcome(
         server_state,
         run_id,
@@ -721,7 +715,6 @@ async fn settle_unconfirmed_write(
     if state == ProbeDeliveryState::Consumed
         && let Some(server) = server_state._self_weak.upgrade()
     {
-        server_state.mark_in_flight_probe_awaiting_turn_start(run_id, probe_id);
         super::parked_delivery::watch_parked_write(&server, run_id, slot_id, probe_id, probe.text.clone());
     }
     InterruptingDelivery {
