@@ -383,7 +383,7 @@ struct DriverQuotaSection: View {
     /// the engine has stopped refreshing and this reading is genuinely old.
     static let staleThreshold: TimeInterval = 2 * 60 * 60
 
-    /// Every driver Boss implements, in a stable order, with the engine's
+    /// Every driver with a quota probe, in a stable order, with the engine's
     /// entry where there is one.
     ///
     /// A driver the engine omitted entirely still gets a row, marked as
@@ -393,7 +393,9 @@ struct DriverQuotaSection: View {
     /// three drivers or is told why they do not.
     static func roster(from snapshot: DriverQuotaSnapshot) -> [DriverQuotaEntry] {
         let known = Dictionary(uniqueKeysWithValues: snapshot.entries.map { ($0.driver, $0) })
-        return DriverSlug.allCases
+        // Traffic allocation also includes Antigravity, which has no quota
+        // probe. Its allocation share must not imply a failed quota reading.
+        return [DriverSlug.claude, .codex, .grok]
             .map(\.rawValue)
             .sorted()
             .map { slug in

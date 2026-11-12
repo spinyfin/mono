@@ -845,8 +845,8 @@ pub enum FrontendRequest {
         refresh: bool,
     },
 
-    /// Query the current driver traffic split (the three-way `grok` /
-    /// `claude` / `codex` allocation of eligible `standard`-reasoning
+    /// Query the current driver traffic split (the four-way `grok` /
+    /// `claude` / `codex` / `agy` allocation of eligible `standard`-reasoning
     /// implementation work) without changing it. Replies with
     /// [`FrontendEvent::DriverTrafficSplitResult`].
     GetDriverTrafficSplit,
@@ -2360,7 +2360,7 @@ pub enum FrontendRequest {
         budget: Option<i64>,
     },
 
-    /// Human engine setting, independent of the three-way driver allocation.
+    /// Human engine setting, independent of the four-way driver allocation.
     SetCodexSolPercentage {
         percentage: u8,
     },
@@ -2450,13 +2450,13 @@ pub enum FrontendRequest {
 
     /// Set the driver traffic split: how eligible `standard`-reasoning
     /// implementation work (`task_implementation`, `chore_implementation`,
-    /// `revision_implementation`) is allocated three ways between the
-    /// `grok`, `claude`, and `codex` drivers.
+    /// `revision_implementation`) is allocated four ways between the
+    /// `grok`, `claude`, `codex`, and `agy` drivers.
     ///
-    /// The three shares must sum to exactly 100. A split that does not is
+    /// The four shares must sum to exactly 100. A split that does not is
     /// **rejected** with [`FrontendEvent::WorkError`] — never clamped,
-    /// redistributed, or normalised into something valid-looking. Any one
-    /// or any two shares may be `0`, and a share of `0` sends that driver
+    /// redistributed, or normalised into something valid-looking. Any one,
+    /// two, or three shares may be `0`, and a share of `0` sends that driver
     /// literally nothing.
     ///
     /// Persisted to `state.db` as a single value, so an edit is one atomic

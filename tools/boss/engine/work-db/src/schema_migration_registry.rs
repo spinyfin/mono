@@ -299,6 +299,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: dispatch_focus::migrate_explicit_launch,
         },
         Migration {
+            id: driver_allocation::traffic_split_migration::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: driver_allocation::traffic_split_migration::migrate,
+        },
+        Migration {
             id: spoke_hub::RUN_INDEX_MIGRATION_ID.into(),
             legacy_version: None,
             apply: spoke_hub::migrate_host_commands_run_idx,
@@ -377,7 +382,8 @@ pub(super) fn all() -> Vec<Migration> {
                 }
                 Ok(())
             },
-        },        Migration {
+        },
+        Migration {
             id: "20261102_2105_recovery_fresh_start".into(),
             legacy_version: None,
             apply: execution_recovery_rearm::migrate_fresh_start,

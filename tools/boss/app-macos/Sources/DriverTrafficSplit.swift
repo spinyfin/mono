@@ -1,8 +1,8 @@
 import Foundation
 
-/// The three drivers global traffic allocation distributes eligible dispatch
+/// The four drivers global traffic allocation distributes eligible dispatch
 /// between, in the order they occupy the engine's `[0, 100)` bucket line
-/// (`codex | claude | grok`, low to high — see the engine's
+/// (`codex | claude | grok | agy`, low to high — see the engine's
 /// `work::driver_allocation`). The Settings bar and stepper list render in
 /// this order so the on-screen bar reads left to right as the same line the
 /// engine compares its hash against.
@@ -10,17 +10,19 @@ enum DriverSlug: String, CaseIterable, Sendable {
     case codex
     case claude
     case grok
+    case agy
 
     var displayName: String {
         switch self {
         case .codex: return "Codex"
         case .claude: return "Claude"
         case .grok: return "Grok"
+        case .agy: return "Antigravity"
         }
     }
 }
 
-/// Mirror of the engine's `DriverTrafficSplit`: three whole-percentage shares
+/// Mirror of the engine's `DriverTrafficSplit`: four whole-percentage shares
 /// that must sum to exactly 100.
 ///
 /// The engine *rejects* a split that does not sum to 100 rather than repairing
@@ -29,26 +31,30 @@ enum DriverSlug: String, CaseIterable, Sendable {
 /// driver's share and the others absorb the difference, so the sum invariant
 /// holds by construction at every intermediate step. There is no "apply"
 /// button, no rejected intermediate, and every valid state — including any
-/// one or any two drivers at zero — is reachable by repeated single-share
+/// one, two, or three drivers at zero — is reachable by repeated single-share
 /// edits.
 struct DriverTrafficSplit: Equatable, Sendable {
     var grok: Int
     var claude: Int
     var codex: Int
+    var agy: Int
 
     /// The engine's default and the behaviour-preserving state: everything on
-    /// `claude` (the engine's default driver), nothing on `grok` or `codex`.
-    static let engineDefault = DriverTrafficSplit(grok: 0, claude: 100, codex: 0)
+    /// `claude` (the engine's default driver), nothing on the other drivers.
+    static let engineDefault = DriverTrafficSplit(grok: 0, claude: 100, codex: 0, agy: 0)
 
-    var total: Int { grok + claude + codex }
+    var total: Int { grok + claude + codex + agy }
 
-    var isValid: Bool { total == 100 }
+    var isValid: Bool {
+        DriverSlug.allCases.allSatisfy { (0...100).contains(share(for: $0)) } && total == 100
+    }
 
     func share(for driver: DriverSlug) -> Int {
         switch driver {
         case .codex: return codex
         case .claude: return claude
         case .grok: return grok
+        case .agy: return agy
         }
     }
 
@@ -58,24 +64,25 @@ struct DriverTrafficSplit: Equatable, Sendable {
         case .codex: next.codex = value
         case .claude: next.claude = value
         case .grok: next.grok = value
+        case .agy: next.agy = value
         }
         return next
     }
 
     /// Which drivers give way when `driver`'s share moves, in priority order.
     ///
-    /// `claude` is first for the other two because it is the engine's default
+    /// `claude` is first for the other three because it is the engine's default
     /// driver — the safest place for traffic nobody has deliberately claimed,
     /// and therefore both the natural donor when a share is raised and the
     /// natural recipient when one is lowered. Lowering `claude` itself has to
-    /// go somewhere, and it goes to `codex` before `grok`: `grok` only ever
-    /// receives traffic the operator explicitly gave it.
+    /// go somewhere, and it goes to `codex` before `grok` or `agy`: Grok and
+    /// Antigravity receive traffic only when their shares are explicitly increased.
     private static func donors(for driver: DriverSlug) -> [DriverSlug] {
-        [.claude, .codex, .grok].filter { $0 != driver }
+        [.claude, .codex, .grok, .agy].filter { $0 != driver }
     }
 
     /// This split with `driver` set to `value`, the difference taken from (or
-    /// given back to) the other two in `donors(for:)` order. The result always
+    /// given back to) the other three in `donors(for:)` order. The result always
     /// sums to 100, so it can always be sent to the engine as-is.
     ///
     /// Raising a share drains the donors in order, each only as far as zero.

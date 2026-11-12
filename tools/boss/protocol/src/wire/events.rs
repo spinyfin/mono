@@ -1370,7 +1370,7 @@ pub enum FrontendEvent {
     },
     /// Response to [`FrontendRequest::SetDriverTrafficSplit`] and
     /// [`FrontendRequest::GetDriverTrafficSplit`]. `split` is the current
-    /// effective allocation; its three shares always sum to exactly 100.
+    /// effective allocation; its four shares always sum to exactly 100.
     DriverTrafficSplitResult {
         split: DriverTrafficSplit,
     },

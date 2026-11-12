@@ -233,7 +233,7 @@ final class EngineReconnectIntegrationTests: XCTestCase {
                 "body": "fixture", "author": "fixture", "doc_version": "fixture", "new_doc_version": "fixture",
                 "plain_text": "fixture", "plain_text_projection_version": 1,
                 "anchor": ["exact": "fixture", "prefix": "", "suffix": ""],
-                "status": "active", "intent": "revision", "split": ["grok": 0, "claude": 0, "codex": 100],
+                "status": "active", "intent": "revision", "split": ["grok": 0, "claude": 0, "codex": 100, "agy": 0],
                 "keep_hourly": 1, "keep_daily": 1, "rules": NSNull(), "unset": true,
                 "mechanism": "direct", "host_id": "missing", "ssh_target": "", "tag": "fixture",
                 "pool_size": 1, "tags": [], "standing_instruction": "fixture", "open_task_limit": 1,

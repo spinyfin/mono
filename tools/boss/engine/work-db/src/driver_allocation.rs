@@ -1,10 +1,10 @@
-//! Three-way driver traffic allocation (experiment, operator-controlled).
+//! Four-way driver traffic allocation (experiment, configured through Settings).
 //!
-//! One persisted [`DriverTrafficSplit`] — three shares summing to exactly
+//! One persisted [`DriverTrafficSplit`] — four shares summing to exactly
 //! 100 — decides how work that dispatches on its own row's driver is divided
-//! between the `grok`, `claude`, and `codex` drivers. This generalises the
+//! between the `grok`, `claude`, `codex`, and `agy` drivers. This generalises the
 //! earlier single Codex percentage; see [`boss_protocol::DriverTrafficSplit`]
-//! for why the split is modelled as three explicit integers with a hard sum
+//! for why the split is modelled as four explicit integers with a hard sum
 //! constraint rather than an implied remainder or normalised weights.
 //!
 //! **Which work that is, is mostly not decided here.** Allocation asks
@@ -12,7 +12,7 @@
 //! dispatch capability gate, `CapabilityResolver::check_dispatch`, resolving
 //! the row's `TaskKind` **and** the execution's own `ExecutionKind` (see
 //! [`eligible_drivers_for`]) against each driver's declared `CapabilitySet` —
-//! which of the three drivers may run a work item of that kind, and
+//! which of the four drivers may run a work item of that kind, and
 //! renormalises the configured split over exactly that subset
 //! ([`DriverTrafficSplit::driver_for_bucket_among`]). One source of truth: a
 //! driver declared eligible for a kind can receive it, one that is not
@@ -87,6 +87,8 @@ use sha2::{Digest, Sha256};
 
 use super::*;
 
+pub(super) mod traffic_split_migration;
+
 /// Metadata KV key for the persisted split, stored as the JSON encoding of
 /// [`DriverTrafficSplit`]. Same shape as `dispatch_concurrency_limit` (see
 /// `app/handler_helpers.rs`): read fresh at each decision point rather than
@@ -94,7 +96,7 @@ use super::*;
 /// without disturbing any execution already dispatched (a decision already
 /// recorded on an existing row is never recomputed).
 ///
-/// Deliberately ONE row holding the whole triple rather than three rows: an
+/// Deliberately ONE row holding the whole split rather than four rows: an
 /// operator edit is a single atomic write, so a concurrent dispatch can
 /// never read a half-applied edit that transits through an invalid split.
 const METADATA_KEY_DRIVER_TRAFFIC_SPLIT: &str = "driver_traffic_split";
@@ -210,6 +212,23 @@ fn eligible_drivers_for(
         .collect()
 }
 
+/// True when some share is assigned to a slug the current binary has not
+/// registered, and every currently eligible driver holds 0.
+///
+/// Settings can persist that split (the stepper does not know which slugs
+/// the engine has registered). The unregistered share is dropped from the
+/// eligible set, so `agy = 100` before an Antigravity driver exists leaves
+/// every registered driver at 0. Failing the insert would strand every
+/// unpinned row; [`decide_execution_driver`] falls through to the engine
+/// default instead.
+fn unregistered_share_left_every_eligible_driver_at_zero(split: &DriverTrafficSplit, eligible: &[&str]) -> bool {
+    let registry = boss_engine_driver::DriverRegistry::default();
+    let unregistered_holds_share = DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER
+        .iter()
+        .any(|driver| split.share_for(driver).unwrap_or(0) > 0 && registry.get(driver).is_none());
+    unregistered_holds_share && eligible.iter().all(|driver| split.share_for(driver).unwrap_or(0) == 0)
+}
+
 /// Deterministic hash of `work_item_id` into `[0, 100)`. SHA-256 rather
 /// than `std::hash::Hasher` so the mapping is stable across engine
 /// versions/restarts, not just within one process — the whole point is
@@ -230,12 +249,12 @@ fn hash_bucket(work_item_id: &str) -> u8 {
 /// non-reentrant mutex and would deadlock.
 ///
 /// An absent value yields [`DriverTrafficSplit::default`] — `claude = 100`,
-/// `grok = 0`, `codex = 0`. That is the behaviour-preserving state: `claude`
+/// `grok = 0`, `codex = 0`, `agy = 0`. That is the behaviour-preserving state: `claude`
 /// is `boss_engine_effort::ENGINE_DEFAULT_DRIVER`, and rows that pinned a
 /// driver at row or product level never reach allocation at all, so an
 /// engine that has never had a split configured routes exactly where it
-/// always did. `grok` starting at 0 also means shipping this sends nothing
-/// to the `grok` driver until an operator deliberately raises it.
+/// always did. `agy` starting at 0 also means shipping this sends nothing
+/// to the Antigravity driver until its configured share is explicitly increased.
 ///
 /// A value that is present but does not parse, or parses to a split that
 /// fails [`DriverTrafficSplit::validate`], can only come from a hand-edited
@@ -292,7 +311,7 @@ impl WorkDb {
     /// Persist `split`, or fail without writing anything when it does not
     /// sum to exactly 100. Nothing is clamped, redistributed, or normalised
     /// — an invalid split is the caller's error to surface, and
-    /// all-three-zero is rejected by the same rule as every other bad total.
+    /// all-four-zero is rejected by the same rule as every other bad total.
     ///
     /// Takes effect on the next execution created — never touches an
     /// execution already dispatched, exactly like the interactive
@@ -438,11 +457,14 @@ pub(crate) fn driver_has_design_investigation_model(driver_slug: &str) -> bool {
 /// 5. Not a `tasks` row at all — no override.
 ///
 /// Errors (failing the execution insert) when the row's kind is
-/// unrecognised, or when the eligible drivers hold no share between them.
-/// Both are loud on purpose: the alternative is dispatching to the engine
-/// default driver, which for an eligibility failure means handing the row to
-/// a driver whose gate refuses it, and for a zero-share failure means
-/// overruling an operator who set that driver to 0. Zero means zero.
+/// unrecognised, or when the eligible drivers hold no share between them
+/// and that is not because the funded share sits on an unregistered driver.
+/// Remaining failures are loud on purpose: falling back to the engine
+/// default would hand an eligibility failure to a driver whose gate refuses
+/// it, or revive a registered driver that was set to 0. Zero means zero.
+/// A Settings-reachable split that puts the whole share on an unregistered
+/// driver (today: `agy = 100` with no Antigravity implementation) falls
+/// through to the engine default instead of failing every unpinned insert.
 pub fn decide_execution_driver(conn: &Connection, work_item_id: &str, kind: ExecutionKind) -> Result<DriverDecision> {
     let row = conn
         .query_row(
@@ -547,6 +569,9 @@ pub fn decide_execution_driver(conn: &Connection, work_item_id: &str, kind: Exec
         Ok(driver) => driver,
         Err(_) if model_override.is_some() => return Ok(DriverDecision::default_no_override()),
         Err(_) if design_or_investigation_tier => return Ok(DriverDecision::default_no_override()),
+        Err(_) if unregistered_share_left_every_eligible_driver_at_zero(&split, &eligible) => {
+            return Ok(DriverDecision::default_no_override());
+        }
         Err(err) => return Err(err),
     };
     Ok(DriverDecision::allocated(driver, split))

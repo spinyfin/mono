@@ -1,4 +1,4 @@
-//! Tests for three-way driver traffic allocation.
+//! Tests for four-way driver traffic allocation.
 //!
 //! The end-to-end cases deliberately go through `create_ready_chore_execution`
 //! (which funnels into `insert_execution`) rather than calling
@@ -8,7 +8,8 @@
 use super::*;
 use crate::test_support::{create_ready_chore_execution, create_test_chore, create_test_product, open_db};
 use boss_protocol::{
-    CreateExecutionInput, DRIVER_SLUG_CLAUDE, DRIVER_SLUG_CODEX, DRIVER_SLUG_GROK, ExecutionStatus, WorkItemPatch,
+    CreateExecutionInput, DRIVER_SLUG_AGY, DRIVER_SLUG_CLAUDE, DRIVER_SLUG_CODEX, DRIVER_SLUG_GROK, ExecutionStatus,
+    WorkItemPatch,
 };
 
 /// Rewrite a work item's `kind` in place.
@@ -61,15 +62,16 @@ fn hash_bucket_is_in_range() {
 fn split_defaults_to_all_claude_and_persists_across_get() {
     let (_dir, db) = open_db();
     let default = db.get_driver_traffic_split().unwrap();
-    assert_eq!(default, DriverTrafficSplit::new(0, 100, 0));
+    assert_eq!(default, DriverTrafficSplit::new(0, 100, 0, 0));
     assert_eq!(default.grok, 0, "grok must ship at 0");
+    assert_eq!(default.agy, 0, "agy must ship at 0");
     assert_eq!(
         boss_engine_effort::ENGINE_DEFAULT_DRIVER,
         DRIVER_SLUG_CLAUDE,
         "the default split's 100% driver must be the engine default, or the default is not behaviour-preserving",
     );
 
-    let split = DriverTrafficSplit::new(20, 50, 30);
+    let split = DriverTrafficSplit::new(20, 30, 30, 20);
     assert_eq!(db.set_driver_traffic_split(split).unwrap(), split);
     assert_eq!(db.get_driver_traffic_split().unwrap(), split);
 }
@@ -79,14 +81,15 @@ fn split_defaults_to_all_claude_and_persists_across_get() {
 #[test]
 fn set_rejects_splits_that_do_not_sum_to_one_hundred() {
     let (_dir, db) = open_db();
-    let good = DriverTrafficSplit::new(10, 60, 30);
+    let good = DriverTrafficSplit::new(10, 60, 30, 0);
     db.set_driver_traffic_split(good).unwrap();
 
     for bad in [
-        DriverTrafficSplit::new(0, 0, 0),
-        DriverTrafficSplit::new(50, 50, 50),
-        DriverTrafficSplit::new(10, 60, 10),
-        DriverTrafficSplit::new(0, 99, 0),
+        DriverTrafficSplit::new(0, 0, 0, 0),
+        DriverTrafficSplit::new(50, 50, 50, 0),
+        DriverTrafficSplit::new(10, 60, 10, 0),
+        DriverTrafficSplit::new(0, 99, 0, 0),
+        DriverTrafficSplit::new(0, 100, 0, 1),
     ] {
         let err = db.set_driver_traffic_split(bad).unwrap_err();
         assert!(err.to_string().contains("sum to exactly 100"), "{err}");
@@ -103,7 +106,11 @@ fn set_rejects_splits_that_do_not_sum_to_one_hundred() {
 /// version of the garbage.
 #[test]
 fn unparseable_or_invalid_persisted_split_falls_back_to_the_default() {
-    for raw in [r#"{"grok":50,"claude":50,"codex":50}"#, "not json", r#"{"grok":0}"#] {
+    for raw in [
+        r#"{"grok":50,"claude":50,"codex":50,"agy":0}"#,
+        "not json",
+        r#"{"grok":0}"#,
+    ] {
         let (_dir, db) = open_db();
         db.set_metadata(METADATA_KEY_DRIVER_TRAFFIC_SPLIT, raw).unwrap();
         assert_eq!(
@@ -132,11 +139,11 @@ fn eligibility_is_exactly_what_the_dispatch_gate_says() {
     for kind in TaskKind::ALL {
         let eligible = eligible_drivers_for(kind, &execution_kind, None, false);
         for driver in DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER {
+            // A split may precede a driver's registration. That driver must
+            // fail closed until the registry can apply its capability gate.
             let gate_ok = registry
                 .resolver(driver)
-                .unwrap()
-                .check_dispatch(kind, Some(&execution_kind))
-                .is_ok();
+                .is_some_and(|resolver| resolver.check_dispatch(kind, Some(&execution_kind)).is_ok());
             assert_eq!(
                 eligible.contains(&driver),
                 gate_ok,
@@ -158,10 +165,11 @@ fn eligibility_is_exactly_what_the_dispatch_gate_says() {
 fn every_kind_is_allocated_to_a_driver_the_gate_accepts() {
     let registry = boss_engine_driver::DriverRegistry::default();
     for split in [
-        DriverTrafficSplit::new(0, 100, 0),
-        DriverTrafficSplit::new(33, 33, 34),
-        DriverTrafficSplit::new(10, 60, 30),
-        DriverTrafficSplit::new(0, 0, 100),
+        DriverTrafficSplit::new(0, 100, 0, 0),
+        DriverTrafficSplit::new(33, 33, 34, 0),
+        DriverTrafficSplit::new(10, 60, 30, 0),
+        DriverTrafficSplit::new(0, 0, 100, 0),
+        DriverTrafficSplit::new(10, 20, 30, 40),
     ] {
         let (_dir, db) = open_db();
         db.set_driver_traffic_split(split).unwrap();
@@ -192,7 +200,7 @@ fn every_kind_is_allocated_to_a_driver_the_gate_accepts() {
 #[test]
 fn design_and_investigation_never_allocate_to_grok_but_postmortems_remain_ordinary() {
     let (_dir, db) = open_db();
-    db.set_driver_traffic_split(DriverTrafficSplit::new(80, 10, 10))
+    db.set_driver_traffic_split(DriverTrafficSplit::new(80, 10, 10, 0))
         .unwrap();
     let product = create_test_product(&db);
 
@@ -251,7 +259,8 @@ fn design_and_investigation_never_allocate_to_grok_but_postmortems_remain_ordina
 #[test]
 fn pr_review_executions_record_the_pool_driver_over_a_row_pin() {
     let (_dir, db) = open_db();
-    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100)).unwrap();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100, 0))
+        .unwrap();
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, &product.id, "reviewed chore");
     db.update_work_item(
@@ -303,7 +312,7 @@ fn conflict_resolution_and_ci_remediation_stay_on_claude_regardless_of_the_split
     // grok=50, claude=30, codex=20 — claude is a minority share, so this
     // proves the restriction is the capability gate, not a split that
     // happens to favour claude.
-    db.set_driver_traffic_split(DriverTrafficSplit::new(50, 30, 20))
+    db.set_driver_traffic_split(DriverTrafficSplit::new(50, 30, 20, 0))
         .unwrap();
     let product = create_test_product(&db);
     for kind in [ExecutionKind::ConflictResolution, ExecutionKind::CiRemediation] {
@@ -340,7 +349,7 @@ fn conflict_resolution_and_ci_remediation_yield_a_codex_task_pin_to_claude() {
     // Claude is a minority share so the result cannot be explained by the
     // split alone: only the capability gate (eligible set = {claude}) can
     // force the yield. codex=70 would own ordinary unpinned work.
-    db.set_driver_traffic_split(DriverTrafficSplit::new(10, 20, 70))
+    db.set_driver_traffic_split(DriverTrafficSplit::new(10, 20, 70, 0))
         .unwrap();
     let product = create_test_product(&db);
     for kind in [ExecutionKind::ConflictResolution, ExecutionKind::CiRemediation] {
@@ -387,7 +396,7 @@ fn conflict_resolution_and_ci_remediation_yield_a_codex_task_pin_to_claude() {
 #[test]
 fn conflict_resolution_and_ci_remediation_yield_a_codex_product_pin_to_claude() {
     let (_dir, db) = open_db();
-    db.set_driver_traffic_split(DriverTrafficSplit::new(10, 20, 70))
+    db.set_driver_traffic_split(DriverTrafficSplit::new(10, 20, 70, 0))
         .unwrap();
     let product = create_test_product(&db);
     db.update_work_item(
@@ -432,7 +441,8 @@ fn conflict_resolution_and_ci_remediation_yield_a_codex_product_pin_to_claude() 
 #[test]
 fn ordinary_chore_implementation_still_honours_a_codex_task_pin() {
     let (_dir, db) = open_db();
-    db.set_driver_traffic_split(DriverTrafficSplit::new(100, 0, 0)).unwrap();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(100, 0, 0, 0))
+        .unwrap();
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, &product.id, "pinned ordinary chore");
     db.update_work_item(
@@ -460,7 +470,8 @@ fn ordinary_chore_implementation_still_honours_a_codex_task_pin() {
 #[test]
 fn automation_sourced_rows_record_their_own_driver_decision() {
     let (_dir, db) = open_db();
-    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100)).unwrap();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100, 0))
+        .unwrap();
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, &product.id, "automation-sourced chore");
     let automation = db
@@ -623,7 +634,7 @@ fn automation_sourced_rows_use_live_pin_when_spilled_to_ordinary_worker() {
 /// today — all three built-in drivers clear every kind's gate.
 #[test]
 fn allocation_fails_loudly_when_no_eligible_driver_holds_a_share() {
-    let split = DriverTrafficSplit::new(0, 100, 0);
+    let split = DriverTrafficSplit::new(0, 100, 0, 0);
     let err = allocate_among(split, "task_zero", &TaskKind::Design, &[DRIVER_SLUG_GROK]).unwrap_err();
     let text = err.to_string();
     assert!(text.contains("task_zero"), "{text}");
@@ -638,7 +649,8 @@ fn allocation_fails_loudly_when_no_eligible_driver_holds_a_share() {
 #[test]
 fn design_tier_falls_back_to_the_default_when_only_grok_is_funded() {
     let (_dir, db) = open_db();
-    db.set_driver_traffic_split(DriverTrafficSplit::new(100, 0, 0)).unwrap();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(100, 0, 0, 0))
+        .unwrap();
     let product = create_test_product(&db);
     let task = create_test_chore(&db, &product.id, "design tier fallback");
     set_task_kind(&db, &task.id, &TaskKind::Design);
@@ -656,12 +668,85 @@ fn allocation_fails_loudly_when_nothing_is_eligible() {
     assert!(err.to_string().contains("no driver is eligible"), "{err}");
 }
 
+#[test]
+fn allocation_renormalises_four_shares_and_never_revives_zero_agy() {
+    let eligible = [DRIVER_SLUG_CODEX, DRIVER_SLUG_AGY];
+    let split = DriverTrafficSplit::new(10, 20, 30, 40);
+    let zero_agy = DriverTrafficSplit::new(10, 60, 30, 0);
+    let mut saw_agy = false;
+    for i in 0..200 {
+        let id = format!("task_{i}");
+        let driver = allocate_among(split, &id, &TaskKind::Chore, &eligible).unwrap();
+        let expected = if hash_bucket(&id) < 42 {
+            DRIVER_SLUG_CODEX
+        } else {
+            DRIVER_SLUG_AGY
+        };
+        assert_eq!(driver, expected);
+        saw_agy |= driver == DRIVER_SLUG_AGY;
+        assert_eq!(
+            allocate_among(zero_agy, &id, &TaskKind::Chore, &eligible).unwrap(),
+            DRIVER_SLUG_CODEX
+        );
+    }
+    assert!(saw_agy);
+    let err = allocate_among(zero_agy, "task_zero_agy", &TaskKind::Chore, &[DRIVER_SLUG_AGY]).unwrap_err();
+    assert!(err.to_string().contains("agy=0"));
+}
+
+/// Settings can persist `agy > 0` before any Antigravity driver is
+/// registered. The real registry drops the unregistered slug, so that share
+/// redistributes among registered drivers: no row is allocated to `agy`,
+/// and every row lands on a registered driver.
+#[test]
+fn unregistered_agy_share_is_redistributed_among_registered_drivers() {
+    let registry = boss_engine_driver::DriverRegistry::default();
+    assert!(
+        registry.get(DRIVER_SLUG_AGY).is_none(),
+        "this test pins the Settings-reachable state where agy has a share before any agy driver is registered",
+    );
+    let registered: Vec<_> = registry.slugs().collect();
+    assert!(!registered.is_empty());
+
+    let (_dir, db) = open_db();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(10, 20, 30, 40))
+        .unwrap();
+    let product = create_test_product(&db);
+    for driver in allocated_drivers(&db, &product.id, 200) {
+        let slug = driver.expect("an allocated row always names a driver");
+        assert_ne!(slug, DRIVER_SLUG_AGY, "unregistered agy must receive no rows");
+        assert!(registered.contains(&slug.as_str()), "{slug} is not a registered driver",);
+    }
+}
+
+/// `agy = 100` with no registered Antigravity driver leaves every eligible
+/// registered driver at 0. Inserting that unpinned row must fall through to
+/// the engine default rather than failing — Settings can persist this split.
+#[test]
+fn unregistered_agy_at_one_hundred_falls_back_instead_of_failing_insert() {
+    assert!(
+        boss_engine_driver::DriverRegistry::default()
+            .get(DRIVER_SLUG_AGY)
+            .is_none(),
+        "this test pins the Settings-reachable state where agy is 100 before any agy driver is registered",
+    );
+    let (_dir, db) = open_db();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 0, 100))
+        .unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, &product.id, "agy 100 unregistered");
+    let execution = create_ready_chore_execution(&db, &chore.id);
+    let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+    assert_eq!(decision.reason, REASON_DEFAULT);
+    assert_eq!(decision.driver, None);
+}
+
 /// Restricting to a subset keeps allocation inside that subset for every
 /// bucket, and keeps it deterministic — the same row, split and eligible
 /// set always give the same answer.
 #[test]
 fn allocation_stays_inside_a_restricted_eligible_set() {
-    let split = DriverTrafficSplit::new(20, 50, 30);
+    let split = DriverTrafficSplit::new(20, 50, 30, 0);
     let eligible = [DRIVER_SLUG_CODEX, DRIVER_SLUG_CLAUDE];
     for i in 0..200 {
         let id = format!("task_{i}");
@@ -678,13 +763,14 @@ fn allocation_stays_inside_a_restricted_eligible_set() {
 /// End-to-end: a driver at 0 receives literally zero eligible rows, across a
 /// wide spread of work item ids (not a hand-picked one that happens to hash
 /// into a convenient bucket). Run for each driver in turn, so "zero is zero"
-/// is proven for all three, not just the one that used to be special.
+/// is proven for all four, not just the one that used to be special.
 #[test]
 fn a_driver_at_zero_receives_no_rows_end_to_end() {
     for (split, zeroed) in [
-        (DriverTrafficSplit::new(0, 50, 50), DRIVER_SLUG_GROK),
-        (DriverTrafficSplit::new(50, 0, 50), DRIVER_SLUG_CLAUDE),
-        (DriverTrafficSplit::new(50, 50, 0), DRIVER_SLUG_CODEX),
+        (DriverTrafficSplit::new(20, 50, 30, 0), DRIVER_SLUG_AGY),
+        (DriverTrafficSplit::new(0, 50, 50, 0), DRIVER_SLUG_GROK),
+        (DriverTrafficSplit::new(50, 0, 50, 0), DRIVER_SLUG_CLAUDE),
+        (DriverTrafficSplit::new(50, 50, 0, 0), DRIVER_SLUG_CODEX),
     ] {
         let (_dir, db) = open_db();
         db.set_driver_traffic_split(split).unwrap();
@@ -699,13 +785,13 @@ fn a_driver_at_zero_receives_no_rows_end_to_end() {
     }
 }
 
-/// Two of three at zero: every eligible row goes to the survivor.
+/// Three of four at zero: every eligible row goes to the funded registered driver.
 #[test]
-fn two_drivers_at_zero_sends_everything_to_the_third() {
+fn three_drivers_at_zero_send_everything_to_the_funded_registered_driver() {
     for (split, expected) in [
-        (DriverTrafficSplit::new(100, 0, 0), DRIVER_SLUG_GROK),
-        (DriverTrafficSplit::new(0, 100, 0), DRIVER_SLUG_CLAUDE),
-        (DriverTrafficSplit::new(0, 0, 100), DRIVER_SLUG_CODEX),
+        (DriverTrafficSplit::new(100, 0, 0, 0), DRIVER_SLUG_GROK),
+        (DriverTrafficSplit::new(0, 100, 0, 0), DRIVER_SLUG_CLAUDE),
+        (DriverTrafficSplit::new(0, 0, 100, 0), DRIVER_SLUG_CODEX),
     ] {
         let (_dir, db) = open_db();
         db.set_driver_traffic_split(split).unwrap();
@@ -721,7 +807,7 @@ fn two_drivers_at_zero_sends_everything_to_the_third() {
 #[test]
 fn allocation_records_the_split_it_was_decided_under() {
     let (_dir, db) = open_db();
-    let split = DriverTrafficSplit::new(25, 50, 25);
+    let split = DriverTrafficSplit::new(25, 50, 25, 0);
     db.set_driver_traffic_split(split).unwrap();
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, &product.id, "recorded chore");
@@ -736,7 +822,8 @@ fn allocation_records_the_split_it_was_decided_under() {
 #[test]
 fn explicit_row_driver_overrides_allocation() {
     let (_dir, db) = open_db();
-    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100)).unwrap();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100, 0))
+        .unwrap();
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, &product.id, "explicit-driver chore");
     db.update_work_item(
@@ -761,7 +848,8 @@ fn explicit_row_driver_overrides_allocation() {
 #[test]
 fn product_default_driver_overrides_allocation() {
     let (_dir, db) = open_db();
-    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100)).unwrap();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100, 0))
+        .unwrap();
     let product = create_test_product(&db);
     db.update_work_item(
         &product.id,
@@ -789,7 +877,8 @@ fn product_default_driver_overrides_allocation() {
 #[test]
 fn design_row_with_grok_product_default_yields_to_allocation_instead_of_wedging() {
     let (_dir, db) = open_db();
-    db.set_driver_traffic_split(DriverTrafficSplit::new(50, 0, 50)).unwrap();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(50, 0, 50, 0))
+        .unwrap();
     let product = create_test_product(&db);
     db.update_work_item(
         &product.id,
@@ -826,7 +915,8 @@ fn design_row_with_grok_product_default_yields_to_allocation_instead_of_wedging(
 #[test]
 fn incompatible_model_override_falls_back_to_the_engine_default_driver() {
     let (_dir, db) = open_db();
-    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100)).unwrap();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100, 0))
+        .unwrap();
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, &product.id, "model-pinned chore");
     db.update_work_item(
@@ -850,7 +940,7 @@ fn incompatible_model_override_falls_back_to_the_engine_default_driver() {
 #[test]
 fn same_work_item_id_is_stable_across_repeated_dispatch() {
     let (_dir, db) = open_db();
-    db.set_driver_traffic_split(DriverTrafficSplit::new(33, 33, 34))
+    db.set_driver_traffic_split(DriverTrafficSplit::new(33, 33, 34, 0))
         .unwrap();
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, &product.id, "retried chore");
@@ -870,14 +960,16 @@ fn same_work_item_id_is_stable_across_repeated_dispatch() {
 #[test]
 fn changing_the_split_does_not_rewrite_an_existing_decision() {
     let (_dir, db) = open_db();
-    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100)).unwrap();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100, 0))
+        .unwrap();
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, &product.id, "already-decided chore");
     let execution = create_ready_chore_execution(&db, &chore.id);
     let before = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
     assert_eq!(before.driver.as_deref(), Some(DRIVER_SLUG_CODEX));
 
-    db.set_driver_traffic_split(DriverTrafficSplit::new(100, 0, 0)).unwrap();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(100, 0, 0, 0))
+        .unwrap();
     let after = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
     assert_eq!(after, before, "an existing decision must never be recomputed");
 }
@@ -889,7 +981,8 @@ fn changing_the_split_does_not_rewrite_an_existing_decision() {
 #[test]
 fn a_pin_applied_after_the_execution_exists_still_wins() {
     let (_dir, db) = open_db();
-    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100)).unwrap();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100, 0))
+        .unwrap();
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, &product.id, "late-pin chore");
     let execution = create_ready_chore_execution(&db, &chore.id);
@@ -934,7 +1027,8 @@ fn a_pin_applied_after_the_execution_exists_still_wins() {
 #[test]
 fn a_product_pin_applied_after_the_execution_exists_still_wins() {
     let (_dir, db) = open_db();
-    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100)).unwrap();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100, 0))
+        .unwrap();
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, &product.id, "late-product-pin chore");
     let execution = create_ready_chore_execution(&db, &chore.id);
@@ -972,9 +1066,9 @@ fn a_product_pin_applied_after_the_execution_exists_still_wins() {
 #[test]
 fn an_allocated_row_routes_to_its_allocated_driver() {
     for (split, expected) in [
-        (DriverTrafficSplit::new(100, 0, 0), DRIVER_SLUG_GROK),
-        (DriverTrafficSplit::new(0, 0, 100), DRIVER_SLUG_CODEX),
-        (DriverTrafficSplit::new(0, 100, 0), DRIVER_SLUG_CLAUDE),
+        (DriverTrafficSplit::new(100, 0, 0, 0), DRIVER_SLUG_GROK),
+        (DriverTrafficSplit::new(0, 0, 100, 0), DRIVER_SLUG_CODEX),
+        (DriverTrafficSplit::new(0, 100, 0, 0), DRIVER_SLUG_CLAUDE),
     ] {
         let (_dir, db) = open_db();
         db.set_driver_traffic_split(split).unwrap();

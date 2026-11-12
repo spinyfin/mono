@@ -2232,7 +2232,7 @@ fn tag_cases() -> Vec<TagCase> {
         TagCase {
             label: "DriverTrafficSplitResult",
             event: FrontendEvent::DriverTrafficSplitResult {
-                split: DriverTrafficSplit::new(10, 60, 30),
+                split: DriverTrafficSplit::new(10, 60, 30, 0),
             },
             expected_tag: "driver_traffic_split_result",
         },
@@ -2546,18 +2546,19 @@ fn hello_pins_session_id_field() {
     assert_eq!(v["session_id"], "sess_1");
 }
 
-/// The macOS app hand-decodes the nested split object, so its three share
+/// The macOS app hand-decodes the nested split object, so its four share
 /// keys are wire contract, not internals.
 #[test]
 fn driver_traffic_split_result_pins_nested_share_field_names() {
     let v = serde_json::to_value(FrontendEvent::DriverTrafficSplitResult {
-        split: DriverTrafficSplit::new(10, 60, 30),
+        split: DriverTrafficSplit::new(10, 20, 30, 40),
     })
     .unwrap();
     assert_eq!(v["type"], "driver_traffic_split_result");
     assert_eq!(v["split"]["grok"], 10);
-    assert_eq!(v["split"]["claude"], 60);
+    assert_eq!(v["split"]["claude"], 20);
     assert_eq!(v["split"]["codex"], 30);
+    assert_eq!(v["split"]["agy"], 40);
 }
 
 #[test]

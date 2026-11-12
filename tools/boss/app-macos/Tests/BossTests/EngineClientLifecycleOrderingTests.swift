@@ -7,6 +7,51 @@ import os
 /// asserting that lifecycle events (`.disconnected`, `.connected`) are
 /// delivered behind the replies already handed to the decoder.
 final class EngineClientLifecycleOrderingTests: XCTestCase {
+    func testEngineClientSendsAndReceivesTheCompleteFourWaySplit() throws {
+        let path = socketPath()
+        defer { unlink(path) }
+        let server = try TestSocketServer(path: path)
+        let client = EngineClient(socketPath: path)
+        let connected = expectation(description: "connected")
+        let received = expectation(description: "split replies")
+        received.expectedFulfillmentCount = 4
+        let values = OSAllocatedUnfairLock(initialState: [DriverTrafficSplit]())
+        client.onEvent = { event in
+            switch event {
+            case .connected: connected.fulfill()
+            case .driverTrafficSplitResult(let split):
+                values.withLock { $0.append(split) }
+                received.fulfill()
+            default: break
+            }
+        }
+        client.start()
+        defer { client.stop() }
+        let peer = try XCTUnwrap(server.accept(timeout: 5))
+        defer { peer.close() }
+        wait(for: [connected], timeout: 5)
+        let split = DriverTrafficSplit(grok: 10, claude: 20, codex: 30, agy: 40)
+        client.sendSetDriverTrafficSplit(split)
+        let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(peer.readLine(timeout: 5))) as? [String: Any])
+        let payload = try XCTUnwrap(envelope["payload"] as? [String: Any])
+        XCTAssertEqual(payload["type"] as? String, "set_driver_traffic_split")
+        XCTAssertEqual(payload["split"] as? [String: Int], ["grok": 10, "claude": 20, "codex": 30, "agy": 40])
+        for raw in [
+            ["grok": 10, "claude": 20, "codex": 30, "agy": 40],
+            ["grok": 10, "claude": 60, "codex": 30],
+            ["grok": 0, "claude": 100, "codex": 0, "agy": 1],
+            ["grok": 0, "claude": 101, "codex": 0, "agy": -1],
+        ] {
+            var data = try JSONSerialization.data(withJSONObject: [
+                "payload": ["type": "driver_traffic_split_result", "split": raw],
+            ])
+            data.append(0x0A)
+            peer.sendBytes(data)
+        }
+        wait(for: [received], timeout: 5)
+        XCTAssertEqual(values.withLock { $0 }, [split, .engineDefault, .engineDefault, .engineDefault])
+    }
+
     func testAcceptedQueuedWritesReserveCapacityAcrossDisconnect() throws {
         let path = socketPath()
         defer { unlink(path) }

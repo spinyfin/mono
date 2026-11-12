@@ -279,20 +279,19 @@ private struct EngineConfigPane: View {
 /// The driver traffic split control in the "Engine" Settings tab: a
 /// proportional bar plus one stepper per driver.
 ///
-/// Three interdependent values that must total 100 do not decompose into
-/// three independent steppers — the operator would spend their time fighting
-/// a sum constraint. They are not modelled as independent here either: each
-/// stepper moves ONE share and `DriverTrafficSplit.adjusting(_:to:)` makes
-/// the other two absorb the difference (Claude gives way first — it is the
-/// engine's default driver, so it holds the traffic nobody has deliberately
-/// claimed). The sum invariant therefore holds at every intermediate step,
-/// which means:
+/// Four interdependent values that must total 100 do not decompose into
+/// four independent steppers: independent steppers would require manual
+/// enforcement of the sum constraint. They are not modelled as independent
+/// here either: each stepper moves ONE share and
+/// `DriverTrafficSplit.adjusting(_:to:)` makes the other three absorb the
+/// difference (Claude gives way first — it is the engine's default driver,
+/// so it holds the traffic nobody has deliberately claimed). The sum
+/// invariant therefore holds at every intermediate step, which means:
 ///
 /// - there is no "apply" button and no rejected intermediate state;
 /// - every valid split is reachable by repeated single-share edits,
-///   including any one or two drivers at 0 — raising a driver to 100 drains
-///   the other two to zero in donor order, and raising one to 20 then
-///   another to 80 zeroes the third;
+///   including up to three drivers at 0 — raising a driver to 100 drains
+///   the other three to zero in donor order;
 /// - the engine's hard "shares must sum to exactly 100" rejection is a
 ///   backstop against a hand-written RPC, not something this UI can trip.
 ///
@@ -319,7 +318,7 @@ private struct DriverTrafficSplitRow: View {
                             .fill(driver.tint)
                             .frame(width: 8, height: 8)
                         Text(driver.displayName)
-                            .frame(minWidth: 64, alignment: .leading)
+                            .frame(minWidth: 88, alignment: .leading)
                         Text("\(chatModel.driverTrafficSplit.share(for: driver))%")
                             .font(.body.monospacedDigit())
                             .frame(minWidth: 48, alignment: .leading)
@@ -333,7 +332,7 @@ private struct DriverTrafficSplitRow: View {
 }
 
 /// The split rendered as one 100%-wide bar, segments in the same
-/// `codex | claude | grok` order the engine lays its bucket line out in, so
+/// `codex | claude | grok | agy` order the engine lays its bucket line out in, so
 /// the picture matches the mechanism. A driver at 0 has a zero-width segment
 /// — visibly absent, which is the point.
 private struct DriverTrafficSplitBar: View {
@@ -370,6 +369,7 @@ extension DriverSlug {
         case .codex: return .purple
         case .claude: return .accentColor
         case .grok: return .orange
+        case .agy: return .green
         }
     }
 }
