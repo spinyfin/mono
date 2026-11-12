@@ -27,6 +27,15 @@ pub(super) async fn handle_subscribe(ctx: Dispatch, req: FrontendRequest) {
                 .refresh_decisions(&server_state.work_db, true)
                 .await;
         }
+        // A pane-capture topic is a request to watch: start (or join) the
+        // run's capture. Only newly added topics count, so a repeat
+        // subscribe does not start a second one.
+        for run_id in topics
+            .iter()
+            .filter_map(|topic| boss_protocol::pane_capture_topic_run(topic))
+        {
+            server_state.pane_viewers.viewer_joined(&server_state, run_id).await;
+        }
         send_response(
             &sink,
             &request_id,
@@ -51,6 +60,12 @@ pub(super) async fn handle_unsubscribe(ctx: Dispatch, req: FrontendRequest) {
     };
     {
         let topics = server_state.topic_broker.unsubscribe(&session_id, &topics).await;
+        if topics
+            .iter()
+            .any(|topic| boss_protocol::pane_capture_topic_run(topic).is_some())
+        {
+            server_state.pane_viewers.viewers_may_have_left().await;
+        }
         send_response(&sink, &request_id, FrontendEvent::Unsubscribed { topics });
     }
 }

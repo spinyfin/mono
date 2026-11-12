@@ -691,3 +691,45 @@ async fn daemon_restart_adopts_the_same_live_session_without_a_second_launch() {
         pane_pid
     );
 }
+
+#[tokio::test]
+async fn pane_capture_checks_real_tmux_tokens_and_exact_session_names() {
+    use boss_host_execution::capture::{PaneRead, PaneSource, TmuxPanes};
+    let root = tempfile::tempdir().unwrap();
+    let (tmux, _guard) = live_tmux(root.path()).await;
+    for name in ["capture-sibling", "capture"] {
+        if name == "capture" {
+            assert_eq!(
+                TmuxPanes(tmux.clone()).read("capture", "secret").await,
+                PaneRead::Gone,
+                "a prefix sibling must not match"
+            );
+        }
+        tmux.new_session(&NewSession {
+            name: name.into(),
+            environment: [(TMUX_SPAWN_TOKEN_ENV.into(), "secret".into())].into(),
+            working_directory: root.path().to_path_buf(),
+            command: "printf 'capture-marker'; exec sleep 60".into(),
+        })
+        .await
+        .unwrap();
+    }
+    let source = TmuxPanes(tmux.clone());
+    // Wait for output, rather than assuming new-session waited for the shell.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match source.read("capture", "secret").await {
+                PaneRead::Text(text) if text.contains("capture-marker") => break,
+                PaneRead::Text(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                other => panic!("matching pane was not readable: {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(source.read("capture", "foreign").await, PaneRead::Gone);
+    assert!(matches!(
+        source.read("capture-sibling", "secret").await,
+        PaneRead::Text(_)
+    ));
+}

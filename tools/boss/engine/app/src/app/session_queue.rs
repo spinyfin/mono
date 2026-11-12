@@ -699,11 +699,14 @@ impl TopicBroker {
         inner.sinks.insert(session_id.to_owned(), sink);
     }
 
-    pub(super) async fn remove_session(&self, session_id: &str) {
+    /// Drop a session and its subscriptions, returning the topics it held.
+    pub(super) async fn remove_session(&self, session_id: &str) -> Vec<String> {
         let mut inner = self.inner.lock().await;
         inner.sinks.remove(session_id);
+        let mut removed = Vec::new();
         if let Some(topics) = inner.topics_by_session.remove(session_id) {
             for topic in topics {
+                removed.push(topic.clone());
                 if let Some(sessions) = inner.sessions_by_topic.get_mut(&topic) {
                     sessions.remove(session_id);
                     if sessions.is_empty() {
@@ -712,6 +715,17 @@ impl TopicBroker {
                 }
             }
         }
+        removed
+    }
+
+    /// Whether any session is subscribed to `topic`.
+    pub(super) async fn has_subscribers(&self, topic: &str) -> bool {
+        self.inner
+            .lock()
+            .await
+            .sessions_by_topic
+            .get(topic)
+            .is_some_and(|sessions| !sessions.is_empty())
     }
 
     pub(super) async fn subscribe(&self, session_id: &str, topics: &[String]) -> Vec<String> {

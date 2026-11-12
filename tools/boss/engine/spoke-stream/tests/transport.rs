@@ -48,6 +48,147 @@ async fn negotiation_rejects_required_features_but_allows_different_builds() {
     assert!(fx.store.ingress.lock().unwrap().records.is_empty());
 }
 
+fn pane_capture(sequence: u64, text: &[u8]) -> Record {
+    let mut capture = record(sequence);
+    capture.observed.as_mut().unwrap().wall_unix_ms = 1234;
+    capture.body = Some(record::Body::Capture(PaneCapture {
+        subscription_id: "view".into(),
+        text_utf8: text.to_vec(),
+        truncated: true,
+    }));
+    capture
+}
+
+#[tokio::test]
+async fn pane_captures_reach_the_viewer_feed_once_and_only_while_connected() {
+    use boss_protocol_spoke::negotiate::feature;
+    let fx = Fixture::new().await;
+    assert_eq!(fx.manager.host_supports("host", feature::PANE_CAPTURE).await, None);
+    let mut feed = fx.manager.subscribe_captures();
+    let mut peer = fx.connect(hello()).await.unwrap();
+    peer.welcome().await;
+    assert_eq!(
+        fx.manager.host_supports("host", feature::PANE_CAPTURE).await,
+        Some(true)
+    );
+    assert_eq!(fx.manager.host_supports("host", "telepathy").await, Some(false));
+
+    // The hub hands text on exactly as the spoke sent it: escaping is the
+    // viewer-facing layer's job, and a control sequence must survive to it.
+    peer.send(spoke_frame::Body::Record(pane_capture(1, b"ok \x1b[31mred\x07")))
+        .await;
+    assert!(matches!(peer.next().await, Some(hub_frame::Body::RecordReceipt(c)) if c.through == 1));
+    let seen = tokio::time::timeout(STEP, feed.recv()).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            seen.host_id.as_str(),
+            seen.run.execution_id.as_str(),
+            seen.subscription_id.as_str()
+        ),
+        ("host", "execution", "view")
+    );
+    assert_eq!(seen.text, "ok \x1b[31mred\x07");
+    assert!(seen.truncated);
+    assert_eq!(seen.observed_unix_ms, 1234);
+    assert!(seen.received_unix_ms > 0);
+
+    // A replay of a record the hub already has is receipted, not shown again.
+    peer.send(spoke_frame::Body::Record(pane_capture(1, b"ok \x1b[31mred\x07")))
+        .await;
+    assert!(matches!(peer.next().await, Some(hub_frame::Body::RecordReceipt(c)) if c.through == 1));
+    peer.send(spoke_frame::Body::Record(pane_capture(2, b"next"))).await;
+    assert!(matches!(peer.next().await, Some(hub_frame::Body::RecordReceipt(c)) if c.through == 2));
+    let next = tokio::time::timeout(STEP, feed.recv()).await.unwrap().unwrap();
+    assert_eq!(next.text, "next", "the replay produced nothing in between");
+
+    // Not-capture records never reach it.
+    peer.send(spoke_frame::Body::Record(record(3))).await;
+    assert!(matches!(peer.next().await, Some(hub_frame::Body::RecordReceipt(c)) if c.through == 3));
+    assert!(matches!(
+        feed.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+
+    // Disconnecting makes the host unknown again.
+    drop(peer);
+    tokio::time::timeout(STEP, async {
+        while fx.manager.host_supports("host", feature::PANE_CAPTURE).await.is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a closed stream stops counting as connected");
+}
+
+#[tokio::test]
+async fn captures_journaled_before_a_reconnect_are_never_shown_as_current() {
+    let fx = Fixture::new().await;
+    let mut feed = fx.manager.subscribe_captures();
+    let mut old = fx.connect(hello()).await.unwrap();
+    old.welcome().await;
+    old.send(spoke_frame::Body::Record(pane_capture(1, b"before"))).await;
+    assert!(matches!(old.next().await, Some(hub_frame::Body::RecordReceipt(c)) if c.through == 1));
+    assert_eq!(
+        tokio::time::timeout(STEP, feed.recv()).await.unwrap().unwrap().text,
+        "before"
+    );
+
+    // The spoke kept capturing during the outage: record 2 was journaled but
+    // never delivered. It arrives only after the reconnect.
+    let mut reconnect = hello();
+    reconnect.last_record = 2;
+    let mut new = fx.connect(reconnect).await.unwrap();
+    new.welcome().await;
+    new.send(spoke_frame::Body::Record(pane_capture(2, b"outage"))).await;
+    assert!(matches!(new.next().await, Some(hub_frame::Body::RecordReceipt(c)) if c.through == 2));
+    // The backlog is stored and receipted but not published; a capture taken on
+    // this connection is.
+    new.send(spoke_frame::Body::Record(pane_capture(3, b"now"))).await;
+    assert!(matches!(new.next().await, Some(hub_frame::Body::RecordReceipt(c)) if c.through == 3));
+    let seen = tokio::time::timeout(STEP, feed.recv()).await.unwrap().unwrap();
+    assert_eq!(seen.text, "now", "the outage snapshot was not shown");
+}
+
+#[tokio::test]
+async fn capture_backlog_is_receipted_without_the_optional_feature() {
+    let fx = Fixture::new().await;
+    let mut feed = fx.manager.subscribe_captures();
+    let mut old = fx.connect(hello()).await.unwrap();
+    old.welcome().await;
+    old.send(spoke_frame::Body::Record(pane_capture(1, b"before"))).await;
+    assert!(matches!(old.next().await, Some(hub_frame::Body::RecordReceipt(c)) if c.through == 1));
+    feed.recv().await.unwrap();
+    let mut reconnect = hello();
+    reconnect.last_record = 2;
+    reconnect.features.retain(|f| f.name != "pane-capture");
+    let mut new = fx.connect(reconnect).await.unwrap();
+    new.welcome().await;
+    for seq in [1, 2] {
+        let text: &[u8] = if seq == 1 { b"before" } else { b"pending" };
+        new.send(spoke_frame::Body::Record(pane_capture(seq, text))).await;
+        assert!(matches!(new.next().await, Some(hub_frame::Body::RecordReceipt(c)) if c.through == seq));
+    }
+    new.send(spoke_frame::Body::Record(record(3))).await;
+    assert!(matches!(new.next().await, Some(hub_frame::Body::RecordReceipt(c)) if c.through == 3));
+    assert!(feed.try_recv().is_err());
+    new.send(spoke_frame::Body::Record(pane_capture(4, b"fresh"))).await;
+    assert!(new.next().await.is_none(), "fresh unnegotiated captures remain invalid");
+}
+
+#[tokio::test]
+async fn a_host_that_did_not_negotiate_capture_says_so() {
+    use boss_protocol_spoke::negotiate::feature;
+    let fx = Fixture::new().await;
+    let mut older = hello();
+    older.features.retain(|f| f.name != feature::PANE_CAPTURE);
+    let mut peer = fx.connect(older).await.unwrap();
+    peer.welcome().await;
+    assert_eq!(
+        fx.manager.host_supports("host", feature::PANE_CAPTURE).await,
+        Some(false)
+    );
+}
+
 #[tokio::test]
 async fn reconnect_fences_old_reader_and_writer_and_returns_durable_receipt() {
     let fx = Fixture::new().await;
@@ -401,6 +542,62 @@ mod outbound_session {
         })
         .await
         .expect("hub committed the spoke's records");
+    }
+
+    #[tokio::test]
+    async fn outbound_session_reports_capability_and_disconnect() {
+        use boss_spoke_outbound::SessionObserver;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Observer(AtomicUsize);
+        impl SessionObserver for Observer {
+            fn connected(&self, capture: bool, _: u64) {
+                self.0.store(if capture { 2 } else { 1 }, Ordering::SeqCst);
+            }
+            fn disconnected(&self) {
+                self.0.store(0, Ordering::SeqCst);
+            }
+        }
+        for capture in [true, false] {
+            let mut contracts = boss_spoke_outbound::executor_contracts();
+            if !capture {
+                contracts.features.retain(|f| f.name != "pane-capture");
+            }
+            let fixture = Fixture::with_contracts(contracts).await;
+            let dir = tempfile::tempdir().unwrap();
+            let journal = Arc::new(Mutex::new(
+                Journal::open(&dir.path().join("state"), "host", Limits::default()).unwrap(),
+            ));
+            let observer = Arc::new(Observer(AtomicUsize::new(0)));
+            let task = tokio::spawn({
+                let observer = observer.clone();
+                let dialer = fixture.dialer.clone();
+                async move { boss_spoke_outbound::run_with_observer(journal, dialer, stamp, true, observer.as_ref()).await }
+            });
+            tokio::time::timeout(STEP, async {
+                while observer.0.load(Ordering::SeqCst) == 0 {
+                    assert!(!task.is_finished(), "session ended before Welcome");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(observer.0.load(Ordering::SeqCst), if capture { 2 } else { 1 });
+            *fixture.auth.revoked.lock().unwrap() = true;
+            fixture
+                .auth
+                .events
+                .send(boss_host_enrollment::CredentialEvent::Revoked { host_id: "host".into() })
+                .unwrap();
+            tokio::time::timeout(STEP, async {
+                while observer.0.load(Ordering::SeqCst) != 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            task.abort();
+            let _ = task.await;
+        }
     }
 
     #[tokio::test]

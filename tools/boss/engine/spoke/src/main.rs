@@ -57,6 +57,7 @@ mod commands {
         journal: SharedJournal,
         executor: Executor<LocalCube>,
         supervisor: Option<Supervisor<LocalCube, JournalExecutions>>,
+        captures: std::sync::Arc<boss_spoke_ingress::capture::Captures>,
         stamp: impl Fn() -> Result<Stamp>,
     ) -> Result<()> {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
@@ -101,6 +102,21 @@ mod commands {
                         reason: "tmux unavailable".into(),
                         value: None,
                     },
+                },
+                // Subscriptions live in memory and only `capture::serve` reads
+                // them, so the command itself is quick and never blocks on tmux.
+                Some(command::Body::Capture(capture)) if supervisor.is_some() => captures.command(
+                    &journal,
+                    &command,
+                    capture,
+                    observed.wall_unix_ms,
+                    std::time::Instant::now(),
+                ),
+                Some(command::Body::Capture(_)) => CommandResult {
+                    command_id: command.command_id.clone(),
+                    code: ResultCode::Rejected.into(),
+                    reason: "tmux unavailable".into(),
+                    value: None,
                 },
                 _ => CommandResult {
                     command_id: command.command_id.clone(),
@@ -315,6 +331,8 @@ async fn serve(args: Args, homes_root: PathBuf) -> Result<()> {
         .cube_bin(cube.command.clone())
         .maybe_tmux_bin(args.tmux_bin.clone())
         .build();
+    let panes = tmux.clone().map(boss_host_execution::capture::TmuxPanes);
+    let captures = Arc::new(boss_spoke_ingress::capture::Captures::default());
     let supervisor = tmux.map(|tmux| boss_host_execution::worker::Supervisor {
         cube: cube.clone(),
         tmux,
@@ -325,14 +343,29 @@ async fn serve(args: Args, homes_root: PathBuf) -> Result<()> {
         brief_budget: boss_host_execution::worker::BRIEF_DELIVERY_BUDGET,
     });
     tokio::select! {
-        result = boss_spoke_outbound::run_with_executor(Arc::clone(&journal), endpoint, stamp, true) => result,
-        result = commands::run(Arc::clone(&journal), executor, supervisor, stamp) => result,
+        result = boss_spoke_outbound::run_with_observer(Arc::clone(&journal), endpoint, stamp, true, captures.as_ref()) => result,
+        result = commands::run(Arc::clone(&journal), executor, supervisor, Arc::clone(&captures), stamp) => result,
+        result = capture_loop(Arc::clone(&journal), Arc::clone(&captures), panes, stamp) => result,
         result = produce(&journal, &args.state_dir, &boot, tmux_ready, preflights, first_report) => result,
         result = preflight_loop(readiness, failures, first_report_sent) => result,
         result = commands::heartbeat(cube, executions) => result,
         result = boss_spoke_ingress::hooks::serve(hooks, Arc::clone(&journal), stamp) => result,
         result = boss_spoke_ingress::observe(Arc::clone(&journal), stamp) => result,
         result = tokio::signal::ctrl_c() => { result?; Ok(()) }
+    }
+}
+
+/// Without tmux there is nothing to read, and `Capture` commands are refused,
+/// so the loop simply never runs.
+async fn capture_loop(
+    journal: SharedJournal,
+    captures: Arc<boss_spoke_ingress::capture::Captures>,
+    panes: Option<boss_host_execution::capture::TmuxPanes>,
+    stamp: impl Fn() -> Result<boss_protocol_spoke::v1::Stamp>,
+) -> Result<()> {
+    match panes {
+        Some(panes) => boss_spoke_ingress::capture::serve(journal, captures, panes, stamp).await,
+        None => std::future::pending().await,
     }
 }
 

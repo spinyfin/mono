@@ -1,4 +1,5 @@
 //! Host-local observations terminate at durable normalized journal records.
+pub mod capture;
 pub mod hooks;
 pub mod transcripts;
 
@@ -110,7 +111,30 @@ mod tests {
         }
     }
     fn journal(root: &Path, limits: Limits) -> SharedJournal {
-        Arc::new(Mutex::new(Journal::open(&root.join("state"), "host", limits).unwrap()))
+        let path = root.join("state");
+        Arc::new(Mutex::new(
+            Journal::open(&path, "host", limits).unwrap_or_else(|error| panic!("open {}: {error}", path.display())),
+        ))
+    }
+    /// `Journal::open` takes an exclusive daemon lock. A spawned observer may
+    /// still hold a clone after abort until the runtime next polls it.
+    async fn reopen(root: &Path, limits: Limits, mut journal: SharedJournal) -> SharedJournal {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let inner = loop {
+            match Arc::try_unwrap(journal) {
+                Ok(mutex) => break mutex.into_inner().expect("journal mutex"),
+                Err(shared) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "journal still shared after observer shutdown"
+                    );
+                    journal = shared;
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            }
+        };
+        drop(inner);
+        self::journal(root, limits)
     }
     fn execution(root: &Path) -> ExecutionRecord {
         let pending = root.join("pending");
@@ -711,8 +735,7 @@ mod tests {
         // Simulate a crash between the durable write and final rename.
         let temporary = pending.with_extension("tmp");
         std::fs::rename(&pending, &temporary).unwrap();
-        drop(original);
-        let reopened = journal(root.path(), limits());
+        let reopened = reopen(root.path(), limits(), original).await;
         let observer = tokio::spawn(crate::observe(reopened.clone(), stamp));
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while records(&reopened).is_empty() {
@@ -797,8 +820,7 @@ mod tests {
         transcripts::poll(&original, &execution, &stamp().unwrap())
             .await
             .unwrap();
-        drop(original);
-        let reopened = journal(root.path(), limits());
+        let reopened = reopen(root.path(), limits(), original).await;
         use std::io::Write;
         std::fs::OpenOptions::new()
             .append(true)
@@ -1005,8 +1027,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        drop(journal);
-        let reopened = self::journal(root.path(), limits());
+        let reopened = reopen(root.path(), limits(), journal).await;
         execution.phase = Phase::Terminal;
         transcripts::poll(&reopened, &execution, &stamp().unwrap())
             .await
@@ -1099,8 +1120,7 @@ mod tests {
                 .iter()
                 .any(|record| matches!(&record.body, Some(record::Body::Transcript(t)) if t.data == b"later\n"))
         );
-        drop(original);
-        let reopened = journal(root.path(), limits());
+        let reopened = reopen(root.path(), limits(), original).await;
         let observer = tokio::spawn(crate::observe(reopened.clone(), stamp));
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         observer.abort();

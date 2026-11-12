@@ -56,6 +56,52 @@ async fn duplicate_frames_return_the_receipt_without_changing_bytes() {
 }
 
 #[tokio::test]
+async fn pane_capture_original_bytes_are_kept_and_changed_replays_are_denied() {
+    let (_dir, db) = work_db();
+    spoke_ready(&db, "host-a");
+    let owned = db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
+    let run = proto_run(&run_key(&owned));
+    let reader = db.clone();
+    let (sink, _) = stores(db);
+    let admission = sink.open(&hello("host-a"), &selection()).await.unwrap();
+    let session = session("host-a", admission.generation);
+    let mut capture = pane(1, Some(run.clone()));
+    capture.body = Some(record::Body::Capture(v1::PaneCapture {
+        subscription_id: "view".into(),
+        text_utf8: vec![b'x'; 60 * 1024],
+        truncated: true,
+    }));
+    let mut frame = v1::SpokeFrame {
+        body: Some(v1::spoke_frame::Body::Record(capture.clone())),
+    }
+    .encode_to_vec();
+    // Unknown envelope fields must survive durable ingress as well.
+    frame.extend_from_slice(&[0xa0, 0x06, 0x01]);
+    assert!(frame.len() > 60 * 1024);
+    assert_eq!(sink.commit(&session, &frame, &capture).await.unwrap().through, 1);
+    let stored = reader.spoke_ingress_frame("host-a", 1).unwrap().unwrap();
+    assert_eq!(stored, frame);
+    assert_eq!(sink.commit(&session, &frame, &capture).await.unwrap().through, 1);
+    let Some(record::Body::Capture(text)) = &mut capture.body else {
+        unreachable!()
+    };
+    text.text_utf8 = b"changed".to_vec();
+    let mut changed = v1::SpokeFrame {
+        body: Some(v1::spoke_frame::Body::Record(capture.clone())),
+    }
+    .encode_to_vec();
+    changed.extend_from_slice(&[0xa0, 0x06, 0x01]);
+    assert!(matches!(
+        sink.commit(&session, &changed, &capture).await,
+        Err(StoreError::Denied)
+    ));
+    // Everything else is stored exactly as received.
+    let verbatim = pane(2, Some(run));
+    assert_eq!(sink.commit(&session, b"verbatim", &verbatim).await.unwrap().through, 2);
+    assert_eq!(reader.spoke_ingress_frame("host-a", 2).unwrap().unwrap(), b"verbatim");
+}
+
+#[tokio::test]
 async fn wrong_host_or_run_is_denied_and_inventory_members_are_checked() {
     let (_dir, db) = work_db();
     spoke_ready(&db, "host-a");

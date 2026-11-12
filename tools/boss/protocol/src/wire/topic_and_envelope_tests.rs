@@ -41,6 +41,44 @@ fn editorial_actions_topic_pins_grammar() {
 }
 
 #[test]
+fn pane_capture_topic_pins_grammar_and_round_trips() {
+    assert_eq!(pane_capture_topic("exec_1"), "pane_capture.exec_1");
+    assert_eq!(pane_capture_topic_run("pane_capture.exec_1"), Some("exec_1"));
+    assert_eq!(pane_capture_topic_run("pane_capture."), None);
+    assert_eq!(pane_capture_topic_run("probes.exec_1"), None);
+}
+
+#[test]
+fn pane_capture_payload_wire_shape_is_pinned() {
+    let payload = TopicEventPayload::WorkerPaneCapture {
+        run_id: "exec_1".into(),
+        host_id: "spoke".into(),
+        state: PaneCaptureState::Unreachable,
+        text: String::new(),
+        truncated: false,
+        observed_unix_ms: None,
+        received_unix_ms: 7,
+        detail: Some("gone".into()),
+    };
+    let value = serde_json::to_value(&payload).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "type": "worker_pane_capture", "run_id": "exec_1", "host_id": "spoke",
+            "state": "unreachable", "text": "", "truncated": false,
+            "received_unix_ms": 7, "detail": "gone"
+        })
+    );
+    assert!(matches!(
+        serde_json::from_value::<TopicEventPayload>(value).unwrap(),
+        TopicEventPayload::WorkerPaneCapture {
+            state: PaneCaptureState::Unreachable,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn topic_builders_interpolate_ids_verbatim() {
     // Ids are substituted without escaping or transformation; an id
     // containing separators flows straight into the emitted string.

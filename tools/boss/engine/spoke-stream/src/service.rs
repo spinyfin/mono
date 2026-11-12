@@ -263,6 +263,7 @@ impl StreamManager {
             .wake(wake)
             .probes(probes)
             .record_through(admission.received.through)
+            .backlog_through(hello.last_record)
             .command_journal(journal.journal_id)
             .command_through(journal.received)
             .build();

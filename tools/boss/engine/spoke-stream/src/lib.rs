@@ -18,8 +18,8 @@ use std::sync::{
 use std::time::Duration;
 
 use boss_host_enrollment::HostAuthorizer;
-use boss_protocol_spoke::{negotiate::Contracts, v1::CommandResult};
-use tokio::sync::{Mutex, Notify, Semaphore, mpsc, oneshot};
+use boss_protocol_spoke::{negotiate::Contracts, v1::CommandResult, v1::Run};
+use tokio::sync::{Mutex, Notify, Semaphore, broadcast, mpsc, oneshot};
 
 pub use commands::CommandOutcome;
 pub use service::StreamService;
@@ -92,12 +92,41 @@ pub(crate) struct Storage {
     outbox: Arc<dyn CommandOutbox>,
 }
 
+#[derive(bon::Builder)]
 pub(crate) struct Inner {
     config: Config,
     auth: Arc<dyn HostAuthorizer>,
     storage: Storage,
     hosts: Mutex<HashMap<String, Host>>,
     connections: Arc<Semaphore>,
+    captures: broadcast::Sender<Arc<CapturedPane>>,
+}
+
+/// Snapshots a slow viewer feed may lag behind by before it skips the oldest.
+const CAPTURE_FEED_CAPACITY: usize = 32;
+
+/// One pane snapshot a spoke reported for a viewer's capture subscription.
+///
+/// Snapshots are live display data, not journal facts: the hub commits the
+/// record like any other (receipt and sequence stay contiguous) and then hands
+/// this to whoever is watching. Nothing replays it, and a feed that lags simply
+/// skips to the newest.
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
+pub struct CapturedPane {
+    pub host_id: String,
+    pub run: Run,
+    pub subscription_id: String,
+    /// The spoke's text, exactly as received. UTF-8 is validated on ingress;
+    /// terminal control characters are NOT removed, so a consumer that shows it
+    /// must escape it.
+    pub text: String,
+    /// Older lines were dropped to fit the subscriber's byte budget.
+    pub truncated: bool,
+    /// The spoke's wall clock when it looked; display only.
+    pub observed_unix_ms: i64,
+    /// This hub's wall clock when the record was committed.
+    pub received_unix_ms: i64,
 }
 
 #[derive(Clone)]
@@ -114,13 +143,58 @@ impl StreamManager {
         assert!(!config.pulse_interval.is_zero() && !config.pulse_timeout.is_zero());
         assert!(!config.hub_id.is_empty() && !config.authority_generation.is_empty());
         let connections = Arc::new(Semaphore::new(config.max_hosts.saturating_mul(2)));
-        Self(Arc::new(Inner {
-            config,
-            auth,
-            storage: Storage { sink, outbox },
-            hosts: Mutex::new(HashMap::new()),
-            connections,
-        }))
+        let (captures, _) = broadcast::channel(CAPTURE_FEED_CAPACITY);
+        Self(Arc::new(
+            Inner::builder()
+                .config(config)
+                .auth(auth)
+                .storage(Storage { sink, outbox })
+                .hosts(Mutex::new(HashMap::new()))
+                .connections(connections)
+                .captures(captures)
+                .build(),
+        ))
+    }
+
+    /// Pane snapshots from every connected spoke, newest last. A receiver that
+    /// falls behind sees `Lagged` and should carry on: only the latest snapshot
+    /// per subscription matters.
+    pub fn subscribe_captures(&self) -> broadcast::Receiver<Arc<CapturedPane>> {
+        self.0.captures.subscribe()
+    }
+
+    /// Whether `host_id` has a live connection that negotiated `feature`.
+    /// `None` when it is not connected, which is different from "connected
+    /// without it": the first is worth retrying, the second is not.
+    pub async fn host_supports(&self, host_id: &str, feature: &str) -> Option<bool> {
+        let host = self.0.hosts.lock().await.get(host_id).cloned()?;
+        let guard = host.lock().await;
+        let connection = guard.as_ref().filter(|c| c.active.load(Ordering::Acquire))?;
+        Some(connection.session.selection.has(feature))
+    }
+
+    pub(crate) fn publish_capture(&self, host_id: &str, record: &boss_protocol_spoke::v1::Record) {
+        use boss_protocol_spoke::v1::record::Body;
+        let (Some(Body::Capture(capture)), Some(run)) = (&record.body, &record.run) else {
+            return;
+        };
+        if self.0.captures.receiver_count() == 0 {
+            return;
+        }
+        let received = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as i64);
+        let _ = self.0.captures.send(Arc::new(
+            CapturedPane::builder()
+                .host_id(host_id)
+                .run(run.clone())
+                .subscription_id(&capture.subscription_id)
+                .text(String::from_utf8_lossy(&capture.text_utf8))
+                .truncated(capture.truncated)
+                .observed_unix_ms(record.observed.as_ref().map_or(0, |stamp| stamp.wall_unix_ms))
+                .received_unix_ms(received)
+                .build(),
+        ));
     }
 
     pub fn service(&self) -> StreamService {
