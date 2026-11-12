@@ -42,13 +42,11 @@ fn insert_attempt(db: &WorkDb, product_id: &str, work_item_id: &str, base_sha: &
 //   after sorting by count descending;
 // * strict per-product isolation — a second product's rows never leak
 //   into the first's report;
-// * rows with no `conflict_diagnosis` still count toward
-//   `total_events` / `class_counts` but contribute nothing to file or
-//   pair frequency.
+// * historical, missing, and errored diagnoses are excluded from all counts.
 
 fn diagnosis_json(paths: &[&str]) -> String {
     let diagnosis = boss_conflict_diagnosis::ConflictDiagnosis {
-        schema_version: 1,
+        schema_version: 2,
         base_sha: "aaa".into(),
         head_sha: "bbb".into(),
         files: paths
@@ -73,6 +71,59 @@ fn empty_product_returns_empty_report() {
     assert!(report.file_frequency.is_empty());
     assert!(report.file_pair_frequency.is_empty());
     assert!(report.class_counts.is_empty());
+}
+
+#[test]
+fn historical_diagnoses_are_retained_but_excluded() {
+    let (db, product, chore) = seed_product_and_chore("hotspots-history");
+    for (base, paths) in [("old-empty", vec![]), ("old-files", vec!["old.rs"])] {
+        let attempt = insert_attempt(&db, &product, &chore, base);
+        let json = diagnosis_json(&paths).replace("\"schema_version\":2", "\"schema_version\":1");
+        db.set_conflict_resolution_diagnosis(&attempt.id, &json).unwrap();
+        assert_eq!(
+            db.get_conflict_resolution(&attempt.id)
+                .unwrap()
+                .unwrap()
+                .conflict_diagnosis
+                .as_deref(),
+            Some(json.as_str())
+        );
+    }
+    let current = insert_attempt(&db, &product, &chore, "current-empty");
+    db.set_conflict_resolution_diagnosis(&current.id, &diagnosis_json(&[]))
+        .unwrap();
+    let report = db.conflict_hotspots(&product, 20).unwrap();
+    assert_eq!(report.total_events, 1, "a current empty diagnosis is still counted");
+    assert!(report.file_frequency.is_empty());
+    assert_eq!(report.class_counts[0].count, 1);
+}
+
+#[test]
+fn errored_fetched_base_diagnoses_are_excluded() {
+    let (db, product, chore) = seed_product_and_chore("hotspots-errored-v2");
+    let errored = insert_attempt(&db, &product, &chore, "errored-v2");
+    let diagnosis = boss_conflict_diagnosis::ConflictDiagnosis {
+        schema_version: 2,
+        base_sha: "aaa".into(),
+        head_sha: "bbb".into(),
+        files: vec![],
+        error: Some("base branch fetch failed".into()),
+    };
+    db.set_conflict_resolution_diagnosis(&errored.id, &serde_json::to_string(&diagnosis).unwrap())
+        .unwrap();
+
+    let empty_ok = insert_attempt(&db, &product, &chore, "empty-ok");
+    db.set_conflict_resolution_diagnosis(&empty_ok.id, &diagnosis_json(&[]))
+        .unwrap();
+
+    let report = db.conflict_hotspots(&product, 20).unwrap();
+    assert_eq!(
+        report.total_events, 1,
+        "a successful empty diagnosis still counts; an errored v2 probe does not"
+    );
+    assert!(report.file_frequency.is_empty());
+    assert_eq!(report.class_counts.len(), 1);
+    assert_eq!(report.class_counts[0].count, 1);
 }
 
 #[test]
@@ -111,7 +162,7 @@ fn a_file_repeated_within_one_event_counts_once() {
     // Same path twice in one diagnosis (shouldn't happen from a real
     // probe, but the aggregation must not double-count within an event).
     let diagnosis = boss_conflict_diagnosis::ConflictDiagnosis {
-        schema_version: 1,
+        schema_version: 2,
         base_sha: "aaa".into(),
         head_sha: "bbb".into(),
         files: vec![
@@ -152,16 +203,16 @@ fn class_counts_source_from_conflict_class_column() {
     db.set_conflict_resolution_diagnosis(&semantic.id, &diagnosis_json(&["src/completion.rs"]))
         .unwrap();
 
-    // No diagnosis at all: still counted, classified "unknown".
+    // No diagnosis at all: excluded because its base provenance is unknown.
     insert_attempt(&db, &product, &chore, "sha-class-3");
 
     let report = db.conflict_hotspots(&product, 20).unwrap();
-    assert_eq!(report.total_events, 3);
+    assert_eq!(report.total_events, 2);
     let class_map: std::collections::HashMap<String, u64> =
         report.class_counts.iter().map(|c| (c.class.clone(), c.count)).collect();
     assert_eq!(class_map.get("lockfile"), Some(&1));
     assert_eq!(class_map.get("semantic"), Some(&1));
-    assert_eq!(class_map.get("unknown"), Some(&1));
+    assert_eq!(class_map.get("unknown"), None);
 
     // The no-diagnosis row must not contribute to file frequency.
     assert_eq!(report.file_frequency.len(), 2);

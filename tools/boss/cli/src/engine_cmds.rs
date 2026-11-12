@@ -817,7 +817,7 @@ pub(crate) async fn run_engine_conflicts_command(
 
 pub(crate) fn print_conflict_hotspot_report(report: &ConflictHotspotReport) {
     println!(
-        "Conflict hotspots for product {} ({} event(s) scanned)",
+        "Conflict hotspots for product {} ({} fetched-base event(s); historical and failed diagnoses excluded)",
         report.product_id, report.total_events,
     );
 

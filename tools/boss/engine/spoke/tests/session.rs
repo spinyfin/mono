@@ -11,6 +11,21 @@ fn capacity(body: spoke_frame::Body) -> v1::Record {
     record
 }
 
+fn journal_lock_still_held(error: &anyhow::Error) -> bool {
+    let text = error.to_string();
+    text.contains("lock is held")
+        || text.contains("Resource temporarily unavailable")
+        || text.contains("temporarily unavailable")
+        || text.contains("WouldBlock")
+        || text.contains("already locked")
+        || error.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted
+            )
+        })
+}
+
 /// Opens the journal once the stopped daemon's exclusive lock is released.
 /// The lock drops when the kernel finishes tearing the killed process down,
 /// which on a loaded host can trail the parent's `wait` by a moment.
@@ -19,7 +34,7 @@ fn open_after_daemon_exit(root: &std::path::Path) -> Journal {
     loop {
         match Journal::open(root, "host", Limits::default()) {
             Ok(journal) => return journal,
-            Err(error) if error.to_string().contains("lock is held") && std::time::Instant::now() < deadline => {
+            Err(error) if journal_lock_still_held(&error) && std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             Err(error) => panic!("journal open failed: {error}"),
@@ -73,7 +88,7 @@ async fn actual_daemon_drains_pending_hook_without_another_peer_connection() {
     }
     assert!(!source.exists(), "daemon independently drained the pending event");
     drop(daemon);
-    let journal = Journal::open(&hub.root(), "host", Limits::default()).unwrap();
+    let journal = open_after_daemon_exit(&hub.root());
     assert!(
         journal
             .source(
@@ -182,7 +197,7 @@ async fn actual_daemon_journals_capacity_before_welcome_and_replays_offline_back
     tokio::time::sleep(std::time::Duration::from_secs(12)).await;
     drop(daemon);
     drop(first);
-    let journal = Journal::open(&hub.root(), "host", Limits::default()).unwrap();
+    let journal = open_after_daemon_exit(&hub.root());
     assert!(
         journal.record_bounds().unwrap().1 >= 2,
         "producer continues before stream is admitted"
@@ -206,7 +221,7 @@ async fn actual_daemon_stops_on_gap_without_advancing_receipt() {
     let connection = hub.connection().await;
     connection.welcome(u64::MAX).await;
     assert!(daemon.failed().await.contains("replay_gap"));
-    let journal = Journal::open(&hub.root(), "host", Limits::default()).unwrap();
+    let journal = open_after_daemon_exit(&hub.root());
     assert!(journal.next_record(0).unwrap().is_some());
 }
 
@@ -246,7 +261,7 @@ async fn restored_hub_cannot_skip_compacted_history() {
     assert_eq!(connection.hello.first_retained, 2);
     connection.welcome(0).await;
     assert!(daemon.failed().await.contains("replay_gap"));
-    let journal = Journal::open(&hub.root(), "host", Limits::default()).unwrap();
+    let journal = open_after_daemon_exit(&hub.root());
     assert_eq!(journal.identity().unwrap().1, journal_id);
     assert_eq!(journal.record_bounds().unwrap().0, 2);
 }
@@ -272,7 +287,7 @@ async fn actual_daemon_rejects_stale_generation_and_unreceived_commands() {
         .await
         .unwrap();
     assert!(daemon.failed().await.contains("stale stream generation"));
-    let journal = Journal::open(&hub.root(), "host", Limits::default()).unwrap();
+    let journal = open_after_daemon_exit(&hub.root());
     assert_eq!(journal.received_commands().unwrap().unwrap().through, 0);
 }
 

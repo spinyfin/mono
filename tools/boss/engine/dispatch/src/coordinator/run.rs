@@ -5,6 +5,29 @@ use super::*;
 
 pub use boss_engine_storage_values::attention_kinds::PANE_SPAWN_FAILED_ATTENTION_KIND;
 
+/// Keep a previously successful diagnosis when a respawn re-probe fails.
+/// A transient fetch error must not wipe the file list the resolver prompt uses.
+fn keep_stored_conflict_diagnosis(
+    stored_json: Option<&str>,
+    new_diagnosis: &conflict_diagnosis::ConflictDiagnosis,
+) -> bool {
+    if new_diagnosis.error.is_none() {
+        return false;
+    }
+    stored_json
+        .and_then(|json| serde_json::from_str::<conflict_diagnosis::ConflictDiagnosis>(json).ok())
+        .is_some_and(|stored| stored.error.is_none())
+}
+
+/// Emit the per-product class counter only the first time a class is stored,
+/// or when a later successful probe changes it. Respawn must not inflate the metric.
+fn should_record_conflict_class(stored_class: Option<&str>, new_class: Option<&str>) -> bool {
+    match new_class {
+        Some(new) => stored_class != Some(new),
+        None => false,
+    }
+}
+
 fn pane_spawn_failed_attention_body(
     exec_id: &str,
     workspace_id: &str,
@@ -867,8 +890,8 @@ impl ExecutionCoordinator {
     /// resolve the `conflict_resolutions` row a merge-conflict revision was
     /// spawned from (via `created_via = "merge-conflict:<crz_id>"`) and
     /// collect its diagnosis. No-op when the revision's provenance is not a
-    /// merge conflict (e.g. operator/CI-fix revisions), or when a diagnosis
-    /// is already stored (a respawn).
+    /// merge conflict (e.g. operator/CI-fix revisions). Respawns probe again:
+    /// the base branch may have advanced since the previous diagnosis.
     async fn collect_revision_conflict_diagnosis_pre_spawn(
         &self,
         execution: &WorkExecution,
@@ -902,17 +925,10 @@ impl ExecutionCoordinator {
                 return;
             }
         };
-        if attempt.conflict_diagnosis.is_some() {
-            tracing::debug!(
-                attempt_id = %attempt.id,
-                "collect_conflict_diagnosis: diagnosis already present on linked attempt; skipping",
-            );
-            return;
-        }
         self.collect_conflict_diagnosis_for_attempt(&attempt, lease).await;
     }
 
-    /// Run `conflict_diagnosis::collect` in the leased workspace and persist
+    /// Fetch the base branch and collect a diagnosis in the leased workspace; persist
     /// the result on `attempt`. Shared by the bespoke `conflict_resolution`
     /// path and the Phase 3 merge-conflict revision path. Best-effort —
     /// failures are logged but never propagate.
@@ -921,28 +937,38 @@ impl ExecutionCoordinator {
         attempt: &crate::work::ConflictResolution,
         lease: &CubeWorkspaceLease,
     ) {
-        let base_sha = attempt.base_sha_at_trigger.as_deref().unwrap_or("");
         let head_sha = attempt.head_sha_before.as_deref().unwrap_or("");
-        if base_sha.is_empty() || head_sha.is_empty() {
+        if attempt.base_branch.is_empty() || head_sha.is_empty() {
             tracing::debug!(
                 attempt_id = %attempt.id,
-                "collect_conflict_diagnosis: missing base/head sha; skipping",
+                "collect_conflict_diagnosis: missing base branch/head sha; skipping",
             );
             return;
         }
 
-        let diagnosis = match conflict_diagnosis::collect(&lease.workspace_path, base_sha, head_sha).await {
-            Ok(d) => d,
-            Err(err) => {
-                tracing::warn!(
-                    attempt_id = %attempt.id,
-                    workspace_path = %lease.workspace_path.display(),
-                    ?err,
-                    "collect_conflict_diagnosis: git spawn failed; using errored diagnosis",
-                );
-                conflict_diagnosis::ConflictDiagnosis::errored(base_sha, head_sha, format!("git spawn failed: {err}"))
-            }
-        };
+        let diagnosis =
+            match conflict_diagnosis::collect_current_base(&lease.workspace_path, &attempt.base_branch, head_sha).await
+            {
+                Ok(d) => d,
+                Err(err) => {
+                    tracing::warn!(
+                        attempt_id = %attempt.id,
+                        workspace_path = %lease.workspace_path.display(),
+                        ?err,
+                        "collect_conflict_diagnosis: git spawn failed; using errored diagnosis",
+                    );
+                    conflict_diagnosis::ConflictDiagnosis::errored("", head_sha, format!("git spawn failed: {err}"))
+                }
+            };
+
+        if keep_stored_conflict_diagnosis(attempt.conflict_diagnosis.as_deref(), &diagnosis) {
+            tracing::warn!(
+                attempt_id = %attempt.id,
+                error = diagnosis.error.as_deref().unwrap_or("unknown"),
+                "collect_conflict_diagnosis: re-probe failed; keeping stored diagnosis",
+            );
+            return;
+        }
 
         let json = match serde_json::to_string(&diagnosis) {
             Ok(j) => j,
@@ -967,7 +993,9 @@ impl ExecutionCoordinator {
                     "collect_conflict_diagnosis: diagnosis persisted",
                 );
                 let counted = updated.and_then(|row| row.conflict_class.clone().map(|class| (row.product_id, class)));
-                if let Some((product_id, class)) = counted {
+                if let Some((product_id, class)) = counted
+                    && should_record_conflict_class(attempt.conflict_class.as_deref(), Some(&class))
+                {
                     self.lifecycle
                         .record_conflict_class_counter(&self.metrics, &product_id, &class);
                 }
@@ -1305,5 +1333,396 @@ mod pane_spawn_failed_attention_body_tests {
         let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, true, false);
         assert!(body.contains("worker pane never came up"), "{body}");
         assert!(!body.contains("the driver started"), "{body}");
+    }
+}
+
+#[cfg(test)]
+mod conflict_diagnosis_for_attempt_tests {
+    use super::*;
+    use crate::work::ConflictResolutionInsertInput;
+    use crate::work::test_support::{create_active_chore, create_product, open_db};
+    use boss_execution_contracts::{
+        CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceStatus, ExecutionPublisher, HostAdapter,
+        HostAdapterProvider, LeaseReleaseOutcome, LifecycleServices, LiveWorkerLiveness, PaneStatus, PidStatus,
+        ReattachSummary, RemoteLeaseReconcileOutcome, RunOutcome, TeardownReason, TerminalCause, WorkerPaneReleaser,
+    };
+    use boss_protocol::{WorkExecution, WorkItem};
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[derive(Default)]
+    struct RecordingLifecycle {
+        classes: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LifecycleServices for RecordingLifecycle {
+        async fn apply_proven_workspace_release(
+            &self,
+            _: &WorkExecution,
+            _: &str,
+            _: TerminalCause,
+            _: &dyn HostAdapter,
+        ) -> LeaseReleaseOutcome {
+            unimplemented!()
+        }
+        async fn release_lease_after_proven_never_started(
+            &self,
+            _: &WorkExecution,
+            _: &str,
+            _: &dyn HostAdapter,
+        ) -> LeaseReleaseOutcome {
+            unimplemented!()
+        }
+        async fn release_refused_workspace(
+            &self,
+            _: &WorkExecution,
+            _: &str,
+            _: &dyn HostAdapter,
+        ) -> LeaseReleaseOutcome {
+            unimplemented!()
+        }
+        async fn release_lease_after_inferred_death(
+            &self,
+            _: &WorkExecution,
+            _: PaneStatus,
+            _: &dyn HostAdapter,
+            _: &str,
+        ) -> LeaseReleaseOutcome {
+            unimplemented!()
+        }
+        async fn teardown_driver_workspace(&self, _: &str, _: Option<&Path>, _: TeardownReason) {}
+        fn report_bookmark_failure(&self, _: &WorkExecution, _: &str) {}
+        fn block_unrecoverable_bookmark(&self, _: &WorkExecution, _: &anyhow::Error) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn reconcile_if_execution_dead(&self, _: &WorkExecution, _: &dyn DispatchEventSink) -> bool {
+            false
+        }
+        async fn reconcile_if_pane_dead(
+            &self,
+            _: &WorkExecution,
+            _: &dyn DispatchEventSink,
+            _: i64,
+            _: Option<&dyn LiveWorkerLiveness>,
+        ) -> bool {
+            false
+        }
+        fn probe_pid(&self, _: i32) -> PidStatus {
+            PidStatus::Unknown
+        }
+        async fn reattach_remote_runs(&self, _: &dyn HostAdapterProvider, _: &str) -> ReattachSummary {
+            ReattachSummary::default()
+        }
+        async fn reconcile_remote_leases(
+            &self,
+            _: &dyn HostAdapterProvider,
+            _: &dyn DispatchEventSink,
+            _: Option<&dyn WorkerPaneReleaser>,
+        ) -> RemoteLeaseReconcileOutcome {
+            RemoteLeaseReconcileOutcome::default()
+        }
+        fn register_answer_agent_metrics(&self, _: &crate::metrics::Registry) {}
+        fn record_answer_agent_started(&self, _: &crate::metrics::Registry, _: u64) {}
+        fn record_conflict_class_counter(&self, _: &crate::metrics::Registry, product_id: &str, conflict_class: &str) {
+            self.classes
+                .lock()
+                .unwrap()
+                .push((product_id.to_owned(), conflict_class.to_owned()));
+        }
+        async fn notify_review_guide_changed(&self, _: &Arc<dyn ExecutionPublisher>, _: &str, _: &str) {}
+        fn is_unconfirmed_spawn_abort(&self, _: &anyhow::Error) -> bool {
+            false
+        }
+        async fn verify_deletion_tripwire(&self, _: &str, _: &str, _: &str, _: u64) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    struct UnusedHost;
+
+    #[async_trait::async_trait]
+    impl HostAdapter for UnusedHost {
+        fn host_id(&self) -> &str {
+            "local"
+        }
+        async fn ensure_repo(&self, _: &str) -> anyhow::Result<CubeRepoHandle> {
+            unimplemented!()
+        }
+        async fn lease_workspace(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: bool,
+            _: &[&str],
+        ) -> anyhow::Result<CubeWorkspaceLease> {
+            unimplemented!()
+        }
+        async fn release_workspace(&self, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn heartbeat_lease(&self, _: &str, _: Option<u64>) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn force_release_lease(&self, _: &str, _: Option<&str>) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn create_change(&self, _: &Path, _: &str) -> anyhow::Result<CubeChangeHandle> {
+            unimplemented!()
+        }
+        async fn goto_workspace(&self, _: &Path, _: u64) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn workspace_status(&self, _: &Path) -> anyhow::Result<CubeWorkspaceStatus> {
+            unimplemented!()
+        }
+        async fn list_workspaces(&self) -> anyhow::Result<Vec<CubeWorkspaceStatus>> {
+            Ok(vec![])
+        }
+        async fn list_repos(&self) -> anyhow::Result<Vec<CubeRepoSummary>> {
+            Ok(vec![])
+        }
+        fn command_repr(&self, _: &[&str]) -> Option<(String, String)> {
+            None
+        }
+        async fn spawn_worker(
+            &self,
+            _: &str,
+            _: &WorkExecution,
+            _: &WorkItem,
+            _: &Path,
+            _: Option<&str>,
+        ) -> anyhow::Result<RunOutcome> {
+            unimplemented!()
+        }
+    }
+
+    fn diagnosis_harness(db: crate::work::WorkDb) -> (ExecutionCoordinator, Arc<RecordingLifecycle>) {
+        let lifecycle = Arc::new(RecordingLifecycle::default());
+        let coordinator = ExecutionCoordinator::with_host_adapter_and_publisher(
+            Arc::new(db),
+            WorkerPool::new(1),
+            Arc::new(UnusedHost),
+            Arc::new(NoopExecutionPublisher),
+            Arc::clone(&lifecycle) as Arc<dyn LifecycleServices>,
+        );
+        (coordinator, lifecycle)
+    }
+
+    fn conflicting_fetched_base_fixture() -> (tempfile::TempDir, tempfile::TempDir, String, String, String) {
+        let remote = tempfile::tempdir().unwrap();
+        let repo = remote.path();
+        boss_engine_test_git::init_repo_with_branch(repo, "main");
+        git(repo, &["config", "user.email", "test@example.invalid"]);
+        git(repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("a.txt"), "original\n").unwrap();
+        git(repo, &["add", "a.txt"]);
+        git(repo, &["commit", "-m", "Initial"]);
+        let recorded_base = git(repo, &["rev-parse", "HEAD"]);
+        git(repo, &["checkout", "-b", "feature"]);
+        std::fs::write(repo.join("a.txt"), "feature\n").unwrap();
+        git(repo, &["commit", "-am", "Feature"]);
+        let head = git(repo, &["rev-parse", "HEAD"]);
+        let workspace = tempfile::tempdir().unwrap();
+        git(workspace.path(), &["clone", repo.to_str().unwrap(), "."]);
+        git(repo, &["checkout", "main"]);
+        std::fs::write(repo.join("a.txt"), "main\n").unwrap();
+        git(repo, &["commit", "-am", "Conflicting main change"]);
+        let tip = git(repo, &["rev-parse", "HEAD"]);
+        (remote, workspace, recorded_base, head, tip)
+    }
+
+    #[test]
+    fn keep_stored_conflict_diagnosis_only_when_reprobe_errored() {
+        let good = conflict_diagnosis::ConflictDiagnosis {
+            schema_version: 2,
+            base_sha: "aaa".into(),
+            head_sha: "bbb".into(),
+            files: vec![conflict_diagnosis::ConflictedFile {
+                path: "a.txt".into(),
+                marker_count: None,
+                shape: "content".into(),
+            }],
+            error: None,
+        };
+        let stored = serde_json::to_string(&good).unwrap();
+        let failed = conflict_diagnosis::ConflictDiagnosis::errored("", "bbb", "base branch fetch failed");
+        assert!(keep_stored_conflict_diagnosis(Some(&stored), &failed));
+        assert!(!keep_stored_conflict_diagnosis(Some(&stored), &good));
+        assert!(!keep_stored_conflict_diagnosis(None, &failed));
+    }
+
+    #[test]
+    fn should_record_conflict_class_only_when_unset_or_changed() {
+        assert!(should_record_conflict_class(None, Some("lockfile")));
+        assert!(!should_record_conflict_class(Some("lockfile"), Some("lockfile")));
+        assert!(should_record_conflict_class(Some("lockfile"), Some("semantic")));
+        assert!(!should_record_conflict_class(Some("lockfile"), None));
+    }
+
+    #[tokio::test]
+    async fn fetched_base_probe_persists_the_remote_tip_not_the_recorded_base() {
+        let (_remote, workspace, recorded_base, head, tip) = conflicting_fetched_base_fixture();
+        let (_dir, db) = open_db();
+        let product = create_product(&db);
+        let chore = create_active_chore(&db, &product, "conflict");
+        let attempt = db
+            .insert_conflict_resolution(
+                ConflictResolutionInsertInput::builder()
+                    .product_id(product.clone())
+                    .work_item_id(chore)
+                    .pr_url("https://github.com/foo/bar/pull/1")
+                    .pr_number(1)
+                    .head_branch("feature")
+                    .base_branch("main")
+                    .base_sha_at_trigger(recorded_base.clone())
+                    .head_sha_before(head.clone())
+                    .build(),
+            )
+            .unwrap()
+            .expect("pending attempt");
+        assert_ne!(recorded_base, tip, "the recorded base must be an ancestor of the tip");
+
+        let (coordinator, lifecycle) = diagnosis_harness(db);
+        let lease = CubeWorkspaceLease {
+            lease_id: "lease".into(),
+            workspace_id: "ws".into(),
+            workspace_path: workspace.path().to_path_buf(),
+            dirty_verified: None,
+        };
+        coordinator
+            .collect_conflict_diagnosis_for_attempt(&attempt, &lease)
+            .await;
+
+        let stored = coordinator
+            .work_db
+            .get_conflict_resolution(&attempt.id)
+            .unwrap()
+            .unwrap();
+        let diagnosis: conflict_diagnosis::ConflictDiagnosis =
+            serde_json::from_str(stored.conflict_diagnosis.as_deref().unwrap()).unwrap();
+        assert!(diagnosis.error.is_none(), "{diagnosis:?}");
+        assert_eq!(diagnosis.schema_version, 2);
+        assert_eq!(diagnosis.base_sha, tip);
+        assert_eq!(diagnosis.head_sha, head);
+        assert_eq!(diagnosis.files.len(), 1);
+        assert_eq!(diagnosis.files[0].path, "a.txt");
+        assert_eq!(
+            lifecycle.classes.lock().unwrap().as_slice(),
+            &[(product, "semantic".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn respawn_keeps_a_good_diagnosis_when_the_reprobe_fails() {
+        let (_remote, workspace, recorded_base, head, tip) = conflicting_fetched_base_fixture();
+        let (_dir, db) = open_db();
+        let product = create_product(&db);
+        let chore = create_active_chore(&db, &product, "conflict");
+        let attempt = db
+            .insert_conflict_resolution(
+                ConflictResolutionInsertInput::builder()
+                    .product_id(product)
+                    .work_item_id(chore)
+                    .pr_url("https://github.com/foo/bar/pull/1")
+                    .pr_number(1)
+                    .head_branch("feature")
+                    .base_branch("main")
+                    .base_sha_at_trigger(recorded_base)
+                    .head_sha_before(head)
+                    .build(),
+            )
+            .unwrap()
+            .expect("pending attempt");
+
+        let (coordinator, lifecycle) = diagnosis_harness(db);
+        let lease = CubeWorkspaceLease {
+            lease_id: "lease".into(),
+            workspace_id: "ws".into(),
+            workspace_path: workspace.path().to_path_buf(),
+            dirty_verified: None,
+        };
+        coordinator
+            .collect_conflict_diagnosis_for_attempt(&attempt, &lease)
+            .await;
+        git(workspace.path(), &["remote", "remove", "origin"]);
+        let stored = coordinator
+            .work_db
+            .get_conflict_resolution(&attempt.id)
+            .unwrap()
+            .unwrap();
+        coordinator
+            .collect_conflict_diagnosis_for_attempt(&stored, &lease)
+            .await;
+
+        let after = coordinator
+            .work_db
+            .get_conflict_resolution(&attempt.id)
+            .unwrap()
+            .unwrap();
+        let diagnosis: conflict_diagnosis::ConflictDiagnosis =
+            serde_json::from_str(after.conflict_diagnosis.as_deref().unwrap()).unwrap();
+        assert!(diagnosis.error.is_none(), "{diagnosis:?}");
+        assert_eq!(diagnosis.base_sha, tip);
+        assert_eq!(diagnosis.files[0].path, "a.txt");
+        assert_eq!(lifecycle.classes.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn successful_respawn_does_not_reemit_the_class_counter() {
+        let (_remote, workspace, recorded_base, head, _tip) = conflicting_fetched_base_fixture();
+        let (_dir, db) = open_db();
+        let product = create_product(&db);
+        let chore = create_active_chore(&db, &product, "conflict");
+        let attempt = db
+            .insert_conflict_resolution(
+                ConflictResolutionInsertInput::builder()
+                    .product_id(product)
+                    .work_item_id(chore)
+                    .pr_url("https://github.com/foo/bar/pull/1")
+                    .pr_number(1)
+                    .head_branch("feature")
+                    .base_branch("main")
+                    .base_sha_at_trigger(recorded_base)
+                    .head_sha_before(head)
+                    .build(),
+            )
+            .unwrap()
+            .expect("pending attempt");
+
+        let (coordinator, lifecycle) = diagnosis_harness(db);
+        let lease = CubeWorkspaceLease {
+            lease_id: "lease".into(),
+            workspace_id: "ws".into(),
+            workspace_path: workspace.path().to_path_buf(),
+            dirty_verified: None,
+        };
+        coordinator
+            .collect_conflict_diagnosis_for_attempt(&attempt, &lease)
+            .await;
+        let stored = coordinator
+            .work_db
+            .get_conflict_resolution(&attempt.id)
+            .unwrap()
+            .unwrap();
+        coordinator
+            .collect_conflict_diagnosis_for_attempt(&stored, &lease)
+            .await;
+        assert_eq!(lifecycle.classes.lock().unwrap().len(), 1);
     }
 }
