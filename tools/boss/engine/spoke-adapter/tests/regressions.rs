@@ -457,3 +457,78 @@ async fn a_launched_worker_whose_stop_is_not_confirmed_is_settled_uncertain() {
         "the spawn itself answered; replaying it cannot learn the stop"
     );
 }
+
+#[tokio::test]
+async fn an_adopt_that_finds_no_session_does_not_end_the_doubt_of_an_unanswered_spawn() {
+    let fx = Fixture::with(short(300)).await;
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let _peer = fx
+        .spoke(
+            Box::new(|c| match &c.body {
+                Some(command::Body::Spawn(_)) => None,
+                Some(command::Body::Adopt(_)) => Some(refused(c, ResultCode::Absent, "no session")),
+                _ => standard(c),
+            }),
+            None,
+            0,
+        )
+        .await;
+    lease(&adapter).await;
+    let error = spawn(&adapter).await.unwrap_err();
+    assert!(error.downcast_ref::<SpawnOutcomeUncertain>().is_some(), "{error:#}");
+    // The stored spawn is still deliverable, so a session that does not exist
+    // yet is no evidence that nothing will start.
+    let refused = adapter.release_workspace("lease-1").await.unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("may have started a worker"),
+        "{refused:#}"
+    );
+    assert!(
+        !fx.db
+            .spoke_assignment_for_execution("exec_1")
+            .unwrap()
+            .unwrap()
+            .resolved
+    );
+}
+
+#[tokio::test]
+async fn a_stop_that_stays_unconfirmed_is_retried_without_waiting_for_the_prompt_again() {
+    let fx = Fixture::with(short(300)).await;
+    fx.ready(HOST);
+    fx.signals.0.store(false, Ordering::SeqCst);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let peer = fx
+        .spoke(
+            Box::new(|c| match &c.body {
+                Some(command::Body::Stop(_)) => None,
+                _ => standard(c),
+            }),
+            None,
+            0,
+        )
+        .await;
+    lease(&adapter).await;
+    let first = spawn(&adapter).await.unwrap_err();
+    let uncertain = first.downcast_ref::<SpawnOutcomeUncertain>().expect("stop unconfirmed");
+    assert!(uncertain.settled, "{first:#}");
+    // A later attempt asks only about the stop: it waits for the stop's
+    // answer only, not for the prompt a second time as well.
+    let started = std::time::Instant::now();
+    let second = spawn(&adapter).await.unwrap_err();
+    assert!(second.downcast_ref::<SpawnOutcomeUncertain>().is_some(), "{second:#}");
+    assert!(
+        started.elapsed() < Duration::from_millis(450),
+        "{:?}",
+        started.elapsed()
+    );
+    let stop = peer
+        .commands()
+        .into_iter()
+        .find(|c| matches!(c.body, Some(command::Body::Stop(_))))
+        .expect("a stop was sent");
+    peer.answer_late(&stop, ok(&stop, Some(pane(PaneLife::Exited)))).await;
+    let third = spawn(&adapter).await.unwrap_err();
+    assert!(third.downcast_ref::<SpawnOutcomeUncertain>().is_none(), "{third:#}");
+}

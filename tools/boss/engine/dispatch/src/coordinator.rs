@@ -34,8 +34,8 @@ use crate::work::{
     WorkDb, WorkExecution, WorkItem, WorkRun,
 };
 use boss_execution_contracts::{
-    HostAdapter, HostAdapterProvider, LeaseOutcomeUncertain, LocalHostAdapterProvider, RunOutcome, RunWaitState,
-    SpawnOutcomeUncertain,
+    HostAdapter, HostAdapterProvider, LeaseOutcomeUncertain, LocalHostAdapterProvider, LocalSpawnFailure, RunOutcome,
+    RunWaitState, SpawnOutcomeUncertain,
 };
 
 /// Extra attempts at an unanswered spoke spawn after the first command
@@ -58,7 +58,7 @@ pub struct SpokeInDoubtTiming {
     /// stored command, while it still holds its pool slot.
     pub spawn_retry_sleep: Duration,
     /// How long an assignment may stay in doubt before an attention item is
-    /// raised for the operator.
+    /// raised.
     pub attention_after: Duration,
     /// How often a parked spawn re-asks the host (replaying the stored spawn
     /// and observing the worker's session).

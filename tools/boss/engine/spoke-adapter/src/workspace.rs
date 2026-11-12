@@ -51,6 +51,18 @@ pub(crate) enum ReleaseMode {
     Force(String),
 }
 
+/// How far a run's stored spawn command has got.
+enum StoredSpawn {
+    /// No spawn was ever stored, so nothing can have started.
+    None,
+    /// Stored and unanswered: still deliverable.
+    Unanswered,
+    /// Answered with an uncertain outcome.
+    SettledUncertain,
+    /// Answered with a definitive result.
+    Settled,
+}
+
 impl SpokeHostAdapter {
     /// A workspace op for `assignment`'s repository, addressing its lease when
     /// the kind operates on a working copy (store operations name neither).
@@ -291,15 +303,18 @@ impl SpokeHostAdapter {
         Ok(self.db(move |db| db.host_command_wire(&host, &id)).await?.is_none())
     }
 
-    /// Whether this run has a spawn that may have started a worker. The spawn
-    /// command's own result is never rewritten, so a spawn that settled as
-    /// uncertain stays so forever; what ends the doubt is the host's present
-    /// answer. Adopt says whether the worker's session exists: gone (absent,
-    /// exited or missing) is definitive and the doubt is over, while alive,
-    /// indeterminate or no answer at all keeps it.
+    /// Whether this run has a spawn that may have started a worker. A spawn the
+    /// host has not answered stays deliverable, so no present answer about the
+    /// worker's session can end the doubt: the session may simply not exist yet.
+    /// A spawn that settled as uncertain keeps that result forever; what ends
+    /// the doubt then is the host's present answer. Adopt says whether the
+    /// worker's session exists: gone (absent, exited or missing) is definitive,
+    /// while alive, indeterminate or no answer at all keeps the doubt.
     pub(crate) async fn spawn_in_doubt(&self, assignment: &SpokeAssignment) -> Result<bool> {
-        if !self.spawn_command_in_doubt(assignment).await? {
-            return Ok(false);
+        match self.stored_spawn(assignment).await? {
+            StoredSpawn::None | StoredSpawn::Settled => return Ok(false),
+            StoredSpawn::Unanswered => return Ok(true),
+            StoredSpawn::SettledUncertain => {}
         }
         Ok(match self.ctl_observe(&assignment.execution_id).await {
             Ok(None) => false,
@@ -308,21 +323,25 @@ impl SpokeHostAdapter {
         })
     }
 
-    /// Whether the stored spawn is unanswered or answered with an uncertain outcome.
-    async fn spawn_command_in_doubt(&self, assignment: &SpokeAssignment) -> Result<bool> {
+    /// What the work database holds for this run's spawn command.
+    async fn stored_spawn(&self, assignment: &SpokeAssignment) -> Result<StoredSpawn> {
         let (host, id) = (self.host_name().to_owned(), host_command_spawn_id(&assignment.run_id));
         let stored = self
             .db(move |db| Ok((db.host_command_wire(&host, &id)?, db.host_command_result(&host, &id)?)))
             .await?;
         Ok(match stored {
-            (None, _) => false,
-            (Some(_), None) => true,
+            (None, _) => StoredSpawn::None,
+            (Some(_), None) => StoredSpawn::Unanswered,
             (Some(_), Some(bytes)) => {
                 let result = boss_protocol_spoke::v1::CommandResult::decode(bytes.as_slice())?;
-                !matches!(
+                if matches!(
                     ResultCode::try_from(result.code),
                     Ok(ResultCode::Ok | ResultCode::Rejected | ResultCode::Absent)
-                )
+                ) {
+                    StoredSpawn::Settled
+                } else {
+                    StoredSpawn::SettledUncertain
+                }
             }
         })
     }

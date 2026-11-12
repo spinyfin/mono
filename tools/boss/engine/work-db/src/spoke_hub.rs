@@ -385,6 +385,30 @@ impl WorkDb {
         )?)
     }
 
+    /// The spoke host that holds this execution's open assignment when that
+    /// assignment may already have leased a workspace or started a worker (a
+    /// lease or a command names the run, or the assignment is flagged in doubt).
+    /// While this is `Some`, the execution can only be reconciled on that host:
+    /// no other host may be chosen, and a failure to reach it is not a failed
+    /// start.
+    pub fn spoke_host_holding_execution(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let open = conn
+            .query_row(
+                &format!("SELECT {ASSIGNMENT_COLUMNS} FROM spoke_assignments WHERE execution_id = ?1 AND resolved_at_ms IS NULL"),
+                [execution_id],
+                map_assignment,
+            )
+            .optional()?;
+        let Some(open) = open else {
+            return Ok(None);
+        };
+        Ok(
+            assignment_may_have_started(&conn, execution_id, open.assignment_generation as i64)?
+                .then_some(open.host_id),
+        )
+    }
+
     /// How long the execution's open assignment has been held, in milliseconds.
     /// `None` when it holds none. Durable, so a wait that spans engine restarts
     /// and dispatch passes still measures from the first reservation.

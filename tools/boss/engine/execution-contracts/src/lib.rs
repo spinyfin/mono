@@ -1968,6 +1968,16 @@ pub struct SpawnOutcomeUncertain {
     pub settled: bool,
 }
 
+/// A spawn attempt that failed on this side before the host was asked anything
+/// (a failed database read, an undecodable stored command, a rejected local
+/// precondition). It says nothing about whether an earlier attempt of the same
+/// spawn started a worker, so a coordinator that already holds a
+/// [`SpawnOutcomeUncertain`] for the run keeps that uncertainty instead of
+/// treating this error as evidence the worker did not start.
+#[derive(Debug, thiserror::Error)]
+#[error("{0:#}")]
+pub struct LocalSpawnFailure(pub anyhow::Error);
+
 /// A workspace lease whose outcome is unknown: the host may have granted it.
 /// A retry reuses the current `lease-<run>-…` attempt while that command is
 /// unanswered, or starts a new recorded attempt when a settled-uncertain

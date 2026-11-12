@@ -456,6 +456,11 @@ pub struct SpokeHostAdapter {
     bound: Option<SpokeAssignment>,
     /// The provider of the transport older runs on this host still use.
     legacy: Option<Arc<dyn HostAdapterProvider>>,
+    /// Set once a launched worker's prompt was never confirmed and the stop sent
+    /// to reap it was not confirmed either. The spawn itself is settled by then,
+    /// so later attempts retry only the stop instead of waiting for the prompt
+    /// again.
+    stop_unconfirmed: std::sync::atomic::AtomicBool,
 }
 
 impl SpokeHostAdapter {
@@ -1051,6 +1056,7 @@ impl SpokeHostAdapterProvider {
             hub: Arc::clone(&self.hub),
             bound,
             legacy: legacy.then(|| Arc::clone(&self.inner)),
+            stop_unconfirmed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

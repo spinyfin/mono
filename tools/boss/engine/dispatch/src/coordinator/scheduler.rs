@@ -159,6 +159,7 @@ impl ExecutionCoordinator {
             let interval_ms = interval.as_millis() as u64;
             let mut unexplained_waits = UnexplainedWaitWatch::default();
             loop {
+                coordinator.reconcile_ended_in_doubt_spokes().await;
                 let ready = match coordinator.work_db.list_ready_executions() {
                     Ok(rows) => rows,
                     Err(err) => {

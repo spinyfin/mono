@@ -69,9 +69,16 @@ enum SpokeTurn {
     Parked,
 }
 
-/// The latest turn boundary seen for each spoke-supervised run. The host
-/// forwards the worker's hook events, which is the only activity evidence a
-/// run without a local slot has.
+/// The latest turn boundary seen for each spoke-supervised run.
+///
+/// Turn evidence reaches this map only through `record_spoke_turn_event`, whose
+/// sole production caller handles hook events arriving on the engine's local
+/// events socket. A spoke host journals its worker's hook events and sends them
+/// to the hub as stream records, but the hub does not yet project those records
+/// into worker-event dispatch, so no production path records a turn boundary for
+/// a spoke run today. Until that projection lands the map stays empty and
+/// `spoke_parked_for_delivery` stays closed: mid-turn delivery to a spoke worker
+/// is refused rather than guessed at.
 #[derive(Default)]
 pub(super) struct SpokeTurns(std::sync::Mutex<std::collections::HashMap<String, SpokeTurn>>);
 
@@ -93,9 +100,10 @@ impl SpokeTurns {
     }
 }
 
-/// Mid-turn delivery to a spoke worker is allowed only once its host has
-/// reported the turn's `Stop` and nothing since. A worker that has reported
-/// no turn boundary yet is not known to be idle, so it is refused.
+/// Mid-turn delivery to a spoke worker is allowed only once a turn's `Stop` has
+/// been recorded and nothing since. A worker with no recorded turn boundary is
+/// not known to be idle, so it is refused; as the type's docs explain, that is
+/// every spoke worker until stream-record projection exists.
 pub(super) fn spoke_parked_for_delivery(state: &ServerState, run: &str) -> bool {
     state.spoke_turns.get(run) == Some(SpokeTurn::Parked)
 }

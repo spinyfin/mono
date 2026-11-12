@@ -683,9 +683,10 @@ struct ServerState {
     /// through it.
     #[builder(default)]
     hub_stream: StdMutex<Option<boss_engine_runtime::hub::HubStream>>,
-    /// Where each spoke-supervised worker is in its turn, from the hook
-    /// events its host forwards. A spoke run has no local slot, so the slot's
-    /// live activity cannot say whether it is parked.
+    /// Where each spoke-supervised worker is in its turn. A spoke run has no
+    /// local slot, so the slot's live activity cannot say whether it is parked.
+    /// Nothing in production fills this yet: the hub does not project a spoke's
+    /// journaled hook events into worker-event dispatch (see `SpokeTurns`).
     #[builder(default)]
     spoke_turns: spoke_probes::SpokeTurns,
     /// Socket this engine's tmux handle must target. Resolved once from

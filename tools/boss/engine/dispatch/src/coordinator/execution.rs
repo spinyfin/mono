@@ -1118,8 +1118,33 @@ impl ExecutionCoordinator {
         // backs off and raises an attention item rather than hot-looping,
         // and a later kick retries once a host comes online / tags change.
         let had_requested_host = self.requested_host_ids.lock().unwrap().contains_key(&execution.id);
-        let selected_host = match self.select_host_for_execution(execution, &work_item, worker_id) {
+        // An assignment that may already have leased a workspace or started a
+        // worker can only be reconciled on its own host: placement is not
+        // reconsidered, and nothing below that fails to reach the host is a
+        // failed start. Those outcomes park the attempt instead.
+        let held_spoke_host = match self.work_db.spoke_host_holding_execution(&execution.id) {
             Ok(host) => host,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    error = %format!("{err:#}"),
+                    "could not read the execution's spoke assignment; selecting a host normally",
+                );
+                None
+            }
+        };
+        let selection = match held_spoke_host.as_deref() {
+            Some(host_id) => self
+                .work_db
+                .get_host(host_id)
+                .and_then(|host| host.ok_or_else(|| anyhow!("host '{host_id}' is missing from the registry"))),
+            None => self.select_host_for_execution(execution, &work_item, worker_id),
+        };
+        let selected_host = match selection {
+            Ok(host) => host,
+            Err(err) if held_spoke_host.is_some() => {
+                return Err(self.park_held_spoke_attempt(execution, err).await);
+            }
             Err(err) => {
                 if had_requested_host {
                     match self.work_db.cancel_execution_with(
@@ -1188,6 +1213,9 @@ impl ExecutionCoordinator {
             .await
         {
             Ok(adapter) => adapter,
+            Err(err) if held_spoke_host.is_some() => {
+                return Err(self.park_held_spoke_attempt(execution, err).await);
+            }
             Err(err) => {
                 // Same silent-gap fix as the host-selection branch above:
                 // a host was chosen but its adapter could not be built
@@ -1276,6 +1304,9 @@ impl ExecutionCoordinator {
                     serde_json::json!({ "host_id": selected_host.id.clone() }),
                 )
                 .await;
+                if held_spoke_host.is_some() {
+                    return Err(self.park_held_spoke_attempt(execution, err).await);
+                }
                 if had_requested_host {
                     self.cancel_requested_host_pre_start_failure(execution, "cube repo ensure", &err)
                         .await;
@@ -1309,6 +1340,9 @@ impl ExecutionCoordinator {
                     }),
                 )
                 .await;
+                if held_spoke_host.is_some() {
+                    return Err(self.park_held_spoke_attempt(execution, err).await);
+                }
                 if had_requested_host {
                     self.cancel_requested_host_pre_start_failure(execution, "cube repo ensure", &err)
                         .await;

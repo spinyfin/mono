@@ -154,17 +154,30 @@ impl ExecutionCoordinator {
                     change.as_ref().map(|c| c.change_id.as_str()),
                 )
                 .await;
-            let Some(uncertain) = outcome
-                .as_ref()
-                .err()
-                .and_then(|error| {
-                    error
+            let uncertain = match outcome.as_ref().err() {
+                None => break outcome,
+                Some(error) => {
+                    match error
                         .chain()
                         .find_map(|cause| cause.downcast_ref::<SpawnOutcomeUncertain>())
-                })
-                .cloned()
-            else {
-                break outcome;
+                    {
+                        Some(uncertain) => uncertain.clone(),
+                        // A failure on this side, before the host was asked
+                        // anything, says nothing about the spawn an earlier
+                        // attempt may have started: keep that uncertainty.
+                        None if last_uncertain.is_some()
+                            && error.chain().any(|cause| cause.is::<LocalSpawnFailure>()) =>
+                        {
+                            tracing::warn!(
+                                execution_id = %execution.id,
+                                error = %format!("{error:#}"),
+                                "spoke spawn retry failed locally; the earlier in-doubt spawn stays in doubt"
+                            );
+                            last_uncertain.clone().expect("checked above")
+                        }
+                        None => break outcome,
+                    }
+                }
             };
             let detail = format!("{:#}", outcome.as_ref().unwrap_err());
             if !parked && !uncertain.settled && unsettled_retries < SPOKE_UNSETTLED_RETRY_LIMIT {
@@ -436,6 +449,9 @@ impl ExecutionCoordinator {
                     error = %format!("{err:#}"),
                     "spoke spawn still in doubt when the execution ended; keeping the workspace lease",
                 );
+                // Whether or not the spawn was ever parked, the held lease and
+                // persona need an item that stays until a confirmed stop.
+                self.raise_spoke_in_doubt_attention(&execution, "worker spawn", &err, Duration::ZERO);
                 self.dispatch_events
                     .emit(
                         DispatchEvent::new(Stage::PaneSpawned, DispatchOutcome::Skipped, &execution.id)
@@ -966,7 +982,11 @@ impl ExecutionCoordinator {
                 // Failed spawns can release immediately. Successful remote
                 // launches retain their lease until terminal remote cleanup;
                 // deferred local panes retain it until verified tmux teardown.
-                if !remote_worker_alive {
+                // A spawn still in doubt when the execution ended may yet start
+                // a worker under this persona, so persona and live-state
+                // tracking stay until a confirmed stop (see
+                // `reconcile_ended_in_doubt_spokes`).
+                if !remote_worker_alive && !cancelled_in_doubt {
                     if let Some(states) = &self.live_worker_states {
                         states.release_slot_for_run(&execution.id);
                         states.release_persona_for_run(&execution.id);
