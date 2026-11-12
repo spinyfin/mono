@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail, ensure};
 
 use crate::install::{Account, Host, RunOutput};
 use crate::manifest::Platform;
-use crate::service::{LAUNCHD_LABEL, SYSTEMD_UNIT};
+use crate::service::{LAUNCHD_LABEL, LAUNCHD_UPDATE_LABEL, SYSTEMD_UNIT, SYSTEMD_UPDATE_PATH, SYSTEMD_UPDATE_SERVICE};
 
 pub struct System {
     pub platform: Platform,
@@ -93,10 +93,18 @@ impl Host for System {
         if self.platform.is_macos() {
             // Not loaded yet is the normal first-install case.
             let _ = run("launchctl", &["bootout", &format!("system/{LAUNCHD_LABEL}")]);
-            succeed("launchctl", &["bootstrap", "system", &definition.display().to_string()])
+            succeed("launchctl", &["bootstrap", "system", &definition.display().to_string()])?;
+            let helper = definition.with_file_name(format!("{LAUNCHD_UPDATE_LABEL}.plist"));
+            if helper.is_file() {
+                let _ = run("launchctl", &["bootout", &format!("system/{LAUNCHD_UPDATE_LABEL}")]);
+                succeed("launchctl", &["bootstrap", "system", &helper.display().to_string()])?;
+            }
+            Ok(())
         } else {
             succeed("systemctl", &["daemon-reload"])?;
-            succeed("systemctl", &["enable", SYSTEMD_UNIT])
+            succeed("systemctl", &["enable", SYSTEMD_UNIT])?;
+            succeed("systemctl", &["enable", SYSTEMD_UPDATE_SERVICE])?;
+            succeed("systemctl", &["enable", "--now", SYSTEMD_UPDATE_PATH])
         }
     }
 
@@ -117,6 +125,14 @@ impl Host for System {
             succeed("launchctl", &["kickstart", "-k", &format!("system/{LAUNCHD_LABEL}")])
         } else {
             succeed("systemctl", &["restart", SYSTEMD_UNIT])
+        }
+    }
+
+    fn stop_service(&self) -> Result<()> {
+        if self.platform.is_macos() {
+            succeed("launchctl", &["kill", "SIGTERM", &format!("system/{LAUNCHD_LABEL}")])
+        } else {
+            succeed("systemctl", &["stop", SYSTEMD_UNIT])
         }
     }
 
@@ -186,6 +202,10 @@ impl Host for Staged {
     }
 
     fn restart_service(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn stop_service(&self) -> Result<()> {
         Ok(())
     }
 

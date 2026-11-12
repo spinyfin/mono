@@ -78,6 +78,50 @@ impl Layout {
         self.prefix().join("current")
     }
 
+    pub fn previous(&self) -> PathBuf {
+        self.prefix().join("previous")
+    }
+
+    pub fn request_dir(&self) -> PathBuf {
+        self.state_dir().join("update-request")
+    }
+
+    pub fn request_path(&self) -> PathBuf {
+        self.request_dir().join("request.json")
+    }
+
+    pub fn status_path(&self) -> PathBuf {
+        self.etc().join("upgrade-status.json")
+    }
+
+    pub fn in_progress_path(&self) -> PathBuf {
+        self.etc().join("upgrade-in-progress.json")
+    }
+
+    pub fn health_path(&self) -> PathBuf {
+        self.state_dir().join("update-health.json")
+    }
+
+    pub fn attempt_path(&self) -> PathBuf {
+        self.etc().join("update-attempt.json")
+    }
+
+    pub fn helper_definition(&self) -> PathBuf {
+        if self.platform.is_macos() {
+            Path::new("/Library/LaunchDaemons").join(format!("{}.plist", service::LAUNCHD_UPDATE_LABEL))
+        } else {
+            Path::new("/etc/systemd/system").join(service::SYSTEMD_UPDATE_SERVICE)
+        }
+    }
+
+    pub fn helper_path_definition(&self) -> Option<PathBuf> {
+        if self.platform.is_macos() {
+            None
+        } else {
+            Some(Path::new("/etc/systemd/system").join(service::SYSTEMD_UPDATE_PATH))
+        }
+    }
+
     pub fn definition(&self) -> PathBuf {
         if self.platform.is_macos() {
             Path::new("/Library/LaunchDaemons").join(format!("{}.plist", service::LAUNCHD_LABEL))
@@ -90,7 +134,7 @@ impl Layout {
         self.etc().join("install.json")
     }
 
-    fn pinned_key_path(&self) -> PathBuf {
+    pub fn pinned_key_path(&self) -> PathBuf {
         self.etc().join("release-verify-key.pub")
     }
 
@@ -143,6 +187,11 @@ pub struct InstallRecord {
     pub user: String,
     pub host_id: String,
     pub hub_url: String,
+    /// HTTPS origin prefix later upgrades must fetch from. Empty on records
+    /// written before the updater; the next verified install fills it.
+    #[builder(default)]
+    #[serde(default)]
+    pub package_origin: String,
 }
 
 impl InstallRecord {
@@ -214,6 +263,8 @@ pub trait Host {
     /// the definition bytes on disk changed.
     fn service_registered(&self) -> Result<bool>;
     fn restart_service(&self) -> Result<()>;
+    /// Stops the daemon without starting it again, so the journal has no writer.
+    fn stop_service(&self) -> Result<()>;
     fn service_running(&self) -> Result<bool>;
     /// PID and service-manager launch count, absent when no instance is running.
     fn service_instance(&self) -> Result<Option<(u32, u64)>>;
@@ -289,12 +340,16 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
     );
 
     // A host's journal is keyed by its id; changing it would strand the journal.
-    if let Some(existing) = InstallRecord::load(&layout.on_disk(&layout.config_path()))? {
+    let existing = InstallRecord::load(&layout.on_disk(&layout.config_path()))?;
+    if let Some(existing) = &existing {
         ensure!(
             existing.host_id == request.host_id,
             "this host is installed as {}; a host id never changes because the journal belongs to it",
             existing.host_id
         );
+        if !existing.package_origin.is_empty() {
+            manifest::require_origin(&verified.manifest.package.url, &existing.package_origin)?;
+        }
     }
 
     // Nothing is installed before this point.
@@ -348,6 +403,10 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
     if trust_changed {
         report.changed.push("hub trust installed");
     }
+    let package_origin = match &existing {
+        Some(existing) if !existing.package_origin.is_empty() => existing.package_origin.clone(),
+        _ => manifest::pinned_origin(&verified.manifest.package.url)?,
+    };
     let record = InstallRecord::builder()
         .schema(1)
         .release_id(release_id.clone())
@@ -355,6 +414,7 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
         .user(layout.user.clone())
         .host_id(request.host_id)
         .hub_url(request.hub_url)
+        .package_origin(package_origin)
         .build();
     let mut record_bytes = serde_json::to_vec_pretty(&record)?;
     record_bytes.push(b'\n');
@@ -390,6 +450,10 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
     if definition_changed {
         report.changed.push("service definition");
     }
+    let helper_changed = install_update_helper(layout)?;
+    if helper_changed {
+        report.changed.push("update helper");
+    }
     let registration_pending = match secure_fs::read_file_at(&etc, "definition-registered") {
         Ok((bytes, metadata)) => {
             secure_fs::verify_installer_file(&metadata, "definition registration record")?;
@@ -398,7 +462,7 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
         Err(error) if secure_fs::is_not_found(&error) => true,
         Err(error) => return Err(error),
     };
-    if registration_pending || definition_changed || !host.service_registered()? {
+    if registration_pending || definition_changed || helper_changed || !host.service_registered()? {
         host.register_service(&layout.definition())?;
         write_logical(
             layout,
@@ -500,7 +564,7 @@ fn ensure_state(layout: &Layout, account: &Account) -> Result<bool> {
         .context("state directory is not a plain name")?;
     let (state_dir, state_created) = secure_fs::ensure_user_dir_at(&home_dir, state_name, account, true)?;
     changed |= state_created;
-    for name in ["credentials", "homes"] {
+    for name in ["credentials", "homes", "update-request"] {
         let (_, created) = secure_fs::ensure_user_dir_at(&state_dir, name, account, true)?;
         changed |= created;
     }
@@ -510,7 +574,73 @@ fn ensure_state(layout: &Layout, account: &Account) -> Result<bool> {
 /// Writes `bytes` into an installer-owned directory walked from the layout
 /// base. The parent is re-checked (owner, no group/other write, not a symlink)
 /// before the file is created.
-fn write_logical(layout: &Layout, logical: &Path, bytes: &[u8], mode: u32) -> Result<bool> {
+const SERVICE_FILE_MAX: u64 = 64 * 1024;
+
+pub(crate) fn read_service_file(layout: &Layout, logical: &Path, account: &Account) -> Result<Option<Vec<u8>>> {
+    let parent = logical.parent().context("path has no parent")?;
+    let name = logical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("path has no name")?;
+    let dir = match secure_fs::open_dir(layout.base(), parent) {
+        Ok(dir) => dir,
+        Err(error) if secure_fs::is_not_found(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    match secure_fs::read_file_at_capped(&dir, name, SERVICE_FILE_MAX) {
+        Ok((bytes, metadata)) => {
+            ensure!(
+                metadata.st_uid == account.uid,
+                "{} is not owned by the service user",
+                logical.display()
+            );
+            Ok(Some(bytes))
+        }
+        Err(error) if secure_fs::is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn unlink_service_file(layout: &Layout, logical: &Path) -> Result<()> {
+    let parent = logical.parent().context("path has no parent")?;
+    let name = logical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("path has no name")?;
+    let dir = match secure_fs::open_dir(layout.base(), parent) {
+        Ok(dir) => dir,
+        Err(error) if secure_fs::is_not_found(&error) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    secure_fs::unlink_file_at(&dir, name)
+}
+
+pub(crate) fn journal_sqlite_path(layout: &Layout, account: &Account) -> Result<Option<PathBuf>> {
+    let logical = layout.state_dir().join("journal.db");
+    let parent = logical.parent().context("journal has no parent")?;
+    let dir = match secure_fs::open_dir(layout.base(), parent) {
+        Ok(dir) => dir,
+        Err(error) if secure_fs::is_not_found(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    match secure_fs::open_regular_at(&dir, "journal.db") {
+        Ok((_, metadata)) => {
+            ensure!(
+                metadata.st_uid == account.uid,
+                "journal.db is not owned by the service user"
+            );
+            ensure!(
+                metadata.st_size >= 100,
+                "journal.db is too short to be a SQLite database"
+            );
+            Ok(Some(layout.on_disk(&logical)))
+        }
+        Err(error) if secure_fs::is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn write_logical(layout: &Layout, logical: &Path, bytes: &[u8], mode: u32) -> Result<bool> {
     let parent = logical.parent().context("destination has no parent")?;
     let name = logical
         .file_name()
@@ -524,7 +654,7 @@ fn write_logical(layout: &Layout, logical: &Path, bytes: &[u8], mode: u32) -> Re
 /// Unpacks into a staging directory next to the final one and renames it into
 /// place, so a release directory is either absent or complete. A release id
 /// names one set of bytes forever.
-fn install_release(layout: &Layout, release_id: &str, package: &[u8], digest: &str) -> Result<bool> {
+pub(crate) fn install_release(layout: &Layout, release_id: &str, package: &[u8], digest: &str) -> Result<bool> {
     let target = layout.on_disk(&layout.release_dir(release_id));
     let releases_logical = layout
         .release_dir(release_id)
@@ -550,20 +680,80 @@ fn install_release(layout: &Layout, release_id: &str, package: &[u8], digest: &s
 }
 
 /// Points `current` at the release with an atomic rename of a relative link.
-fn point_current(layout: &Layout, release_id: &str) -> Result<bool> {
-    let link = layout.on_disk(&layout.current());
+pub(crate) fn point_current(layout: &Layout, release_id: &str) -> Result<bool> {
+    point_link(layout, &layout.current(), ".current.new", release_id)
+}
+
+pub(crate) fn point_previous(layout: &Layout, release_id: &str) -> Result<bool> {
+    point_link(layout, &layout.previous(), ".previous.new", release_id)
+}
+
+pub(crate) fn current_release(layout: &Layout) -> Option<String> {
+    release_of(&layout.on_disk(&layout.current()))
+}
+
+fn release_of(link: &Path) -> Option<String> {
+    fs::read_link(link)
+        .ok()
+        .and_then(|target| target.file_name().map(|name| name.to_string_lossy().into_owned()))
+}
+
+fn point_link(layout: &Layout, logical: &Path, temp_name: &str, release_id: &str) -> Result<bool> {
+    let link = layout.on_disk(logical);
     let target = Path::new("releases").join(release_id);
     if fs::read_link(&link).is_ok_and(|existing| existing == target) {
         return Ok(false);
     }
-    let temp = link.with_file_name(".current.new");
+    let temp = link.with_file_name(temp_name);
     let _ = fs::remove_file(&temp);
     symlink(&target, &temp)?;
     fs::rename(&temp, &link)?;
     Ok(true)
 }
 
-fn wait_healthy(host: &dyn Host, health: &Health, layout: &Layout) -> Result<()> {
+pub(crate) fn write_status(layout: &Layout, bytes: &[u8]) -> Result<bool> {
+    write_logical(layout, &layout.status_path(), bytes, 0o644)
+}
+
+pub(crate) fn write_in_progress(layout: &Layout, bytes: &[u8]) -> Result<bool> {
+    write_logical(layout, &layout.in_progress_path(), bytes, 0o644)
+}
+
+pub(crate) fn clear_in_progress(layout: &Layout) -> Result<()> {
+    let path = layout.on_disk(&layout.in_progress_path());
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn install_update_helper(layout: &Layout) -> Result<bool> {
+    let installer = layout.current().join(INSTALLER_BINARY);
+    let mut changed = false;
+    if layout.platform.is_macos() {
+        let body = service::render_update_launchd(&installer, &layout.config_path(), &layout.request_dir());
+        changed |= write_logical(layout, &layout.helper_definition(), body.as_bytes(), 0o644)?;
+    } else {
+        let service_body = service::render_update_systemd(&installer, &layout.config_path());
+        changed |= write_logical(layout, &layout.helper_definition(), service_body.as_bytes(), 0o644)?;
+        let path_body = service::render_update_path(&layout.request_dir());
+        changed |= write_logical(
+            layout,
+            &layout.helper_path_definition().expect("linux helper path unit"),
+            path_body.as_bytes(),
+            0o644,
+        )?;
+    }
+    Ok(changed)
+}
+
+pub(crate) fn resolve_pinned_key(layout: &Layout) -> Result<crate::manifest::TrustedKey> {
+    let (key, _) = resolve_trust(layout, None)?;
+    Ok(key)
+}
+
+pub(crate) fn wait_healthy(host: &dyn Host, health: &Health, layout: &Layout) -> Result<()> {
     let started = Instant::now();
     loop {
         if let Some(instance) = host.service_instance()? {
@@ -791,12 +981,44 @@ mod secure_fs {
     }
 
     pub fn read_file_at(dir: &DirFd, name: &str) -> Result<(Vec<u8>, libc::stat)> {
-        let fd = open_at(&dir.0, name, libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0)?;
+        read_file_at_capped(dir, name, 1024 * 1024)
+    }
+
+    pub fn read_file_at_capped(dir: &DirFd, name: &str, max_bytes: u64) -> Result<(Vec<u8>, libc::stat)> {
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+        let fd = open_at(&dir.0, name, flags, 0)?;
         let metadata = fstat(fd.as_raw_fd())?;
+        ensure!(
+            metadata.st_mode & libc::S_IFMT == libc::S_IFREG,
+            "{name} must be a regular file, not a symlink, fifo or device"
+        );
+        ensure!(
+            metadata.st_size as u64 <= max_bytes,
+            "{name} is larger than {max_bytes} bytes"
+        );
         let mut file = File::from(fd);
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 <= max_bytes,
+            "{name} is larger than {max_bytes} bytes"
+        );
         Ok((bytes, metadata))
+    }
+
+    pub fn unlink_file_at(dir: &DirFd, name: &str) -> Result<()> {
+        unlink_at(dir, name)
+    }
+
+    pub fn open_regular_at(dir: &DirFd, name: &str) -> Result<(OwnedFd, libc::stat)> {
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+        let fd = open_at(&dir.0, name, flags, 0)?;
+        let metadata = fstat(fd.as_raw_fd())?;
+        ensure!(
+            metadata.st_mode & libc::S_IFMT == libc::S_IFREG,
+            "{name} must be a regular file, not a symlink, fifo or device"
+        );
+        Ok((fd, metadata))
     }
 
     pub fn verify_installer_file(metadata: &libc::stat, what: &str) -> Result<()> {

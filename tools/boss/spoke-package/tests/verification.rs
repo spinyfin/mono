@@ -61,6 +61,68 @@ fn a_correctly_signed_release_verifies() {
     assert_eq!(verified.manifest.installer.file, "boss-spoke-package-linux-amd64");
     assert_eq!(verified.manifest.installer.size, b"installer".len() as u64);
     assert_eq!(verified.manifest.installer.sha256.len(), 64);
+    assert_eq!(
+        verified.manifest.oldest_journal_version,
+        manifest::OLDEST_JOURNAL_VERSION
+    );
+}
+
+#[test]
+fn package_urls_pin_an_https_origin_through_releases() {
+    assert_eq!(
+        manifest::pinned_origin("https://github.com/spinyfin/mono/releases/download/tag/file.tar.gz").unwrap(),
+        "https://github.com/spinyfin/mono/releases"
+    );
+    assert_eq!(
+        manifest::pinned_origin("https://example.com/boss-spoke.tar.gz").unwrap(),
+        "https://example.com"
+    );
+    assert!(manifest::origin_allowed(
+        "https://github.com/spinyfin/mono/releases/download/tag/file",
+        "https://github.com/spinyfin/mono/releases"
+    ));
+    assert!(!manifest::origin_allowed(
+        "https://evil.example/releases/download/tag/file",
+        "https://github.com/spinyfin/mono/releases"
+    ));
+    assert_eq!(
+        manifest::require_origin("https://evil.example/file", "https://github.com/spinyfin/mono/releases")
+            .unwrap_err()
+            .code(),
+        "unapproved_origin"
+    );
+    let pin = "https://github.com/spinyfin/mono/releases";
+    assert!(!manifest::origin_allowed(
+        "https://github.com/spinyfin/mono/releases/../other/file",
+        pin
+    ));
+    assert!(!manifest::origin_allowed(
+        "https://github.com/spinyfin/mono/releases/%2e%2e/other/file",
+        pin
+    ));
+    assert!(!manifest::origin_allowed(
+        "https://user@github.com/spinyfin/mono/releases/file",
+        pin
+    ));
+    assert_eq!(
+        manifest::redirect_hop(
+            "https://github.com/spinyfin/mono/releases/download/x/manifest.json",
+            "https://evil.example/file",
+            pin
+        )
+        .unwrap_err()
+        .code(),
+        "unapproved_origin"
+    );
+    assert_eq!(
+        manifest::redirect_hop(
+            "https://github.com/spinyfin/mono/releases/download/x/manifest.json",
+            "/releases/download/x/package.tar.gz",
+            pin
+        )
+        .unwrap(),
+        "https://github.com/spinyfin/mono/releases/download/x/package.tar.gz"
+    );
 }
 
 #[test]

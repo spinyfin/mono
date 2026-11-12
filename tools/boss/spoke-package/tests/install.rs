@@ -119,6 +119,12 @@ impl Host for Recording {
         Ok(())
     }
 
+    fn stop_service(&self) -> Result<()> {
+        self.calls.borrow_mut().push("stop");
+        self.service.instance.running.set(false);
+        Ok(())
+    }
+
     fn service_running(&self) -> Result<bool> {
         Ok(self.service.instance.running.get())
     }
@@ -257,6 +263,7 @@ fn a_fresh_install_lays_out_owner_only_state_and_enrolls_nothing() {
         layout.state_dir(),
         layout.state_dir().join("credentials"),
         layout.state_dir().join("homes"),
+        layout.request_dir(),
     ] {
         assert_eq!(fixture.mode(dir.clone()), 0o700, "{}", dir.display());
     }
@@ -283,6 +290,9 @@ fn a_fresh_install_lays_out_owner_only_state_and_enrolls_nothing() {
         (record.release_id.as_str(), record.host_id.as_str()),
         ("1.0.1", "host-one")
     );
+    assert_eq!(record.package_origin, "https://github.com/spinyfin/mono/releases");
+    assert!(fixture.at(layout.helper_definition()).is_file());
+    assert!(report.changed.contains(&"update helper"));
 }
 
 #[test]

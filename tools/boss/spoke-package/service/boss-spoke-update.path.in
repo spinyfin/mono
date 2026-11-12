@@ -1,0 +1,9 @@
+[Unit]
+Description=Boss spoke update request
+
+[Path]
+PathChanged={{request}}
+MakeDirectory=false
+
+[Install]
+WantedBy=multi-user.target

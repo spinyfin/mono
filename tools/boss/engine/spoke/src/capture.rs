@@ -83,7 +83,7 @@ pub struct Captures {
 }
 
 impl boss_spoke_outbound::SessionObserver for Captures {
-    fn connected(&self, pane_capture: bool, received_commands: u64) {
+    fn connected(&self, pane_capture: bool, received_commands: u64, _: bool) {
         let mut session = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         self.table().clear();
         *session = pane_capture.then_some(received_commands);

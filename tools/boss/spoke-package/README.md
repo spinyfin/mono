@@ -3,9 +3,10 @@
 `boss-spoke-package` builds, signs, verifies and installs the `boss-spoke`
 worker-host daemon. It implements the install half of the hub-and-spoke design
 ([Manual enrollment and upgrades](../docs/designs/hub-and-spoke-distributed-engine.md)):
-a person installs a signed package by hand on a host, and the host does nothing
-until it is enrolled. **Installing files enrolls nothing, and an un-enrolled
-host's service never starts.**
+a person installs a signed package by hand on a host once, and the host does
+nothing until it is enrolled. After that, the installed update helper applies
+signed upgrades the hub offers. **Installing files enrolls nothing, and an
+un-enrolled host's service never starts.**
 
 ## What a release is
 
@@ -25,9 +26,12 @@ parsed before it verifies), then the manifest's own validity (schema, plain
 release id, `https` URL, 64-hex digest), then the **platform** against the host,
 then the package's **size and SHA-256**. Failures carry a stable code:
 `manifest_sig`, `manifest_malformed`, `platform_mismatch`, `digest_mismatch`,
-`origin_not_https`, `unsupported_host`, `key_invalid`. The archive is then
-unpacked as hostile input (regular files only, plain relative paths, no links,
-bounded size, never setuid or group/world-writable).
+`origin_not_https`, `unapproved_origin`, `journal_incompatible`,
+`unsupported_host`, `key_invalid`. The archive is then unpacked as hostile
+input (regular files only, plain relative paths, no links, bounded size, never
+setuid or group/world-writable). The manifest also names the oldest journal
+schema the release can read; the helper refuses a switch that would leave the
+host's journal unreadable.
 
 ## Trust
 
@@ -83,16 +87,21 @@ boss-spoke-package install \
 It lays out, and is safe to run again with the same inputs (nothing changes,
 nothing restarts):
 
-| Path (Linux; macOS differs only in prefix, home and definition) | Owner / mode            | Purpose                                             |
-| --------------------------------------------------------------- | ----------------------- | --------------------------------------------------- |
-| `/opt/boss-spoke/releases/<release-id>/`                        | root, 0755              | Immutable release; a release id is never reused.    |
-| `/opt/boss-spoke/current`                                       | root, symlink           | Atomically switched to the active release.          |
-| `/var/lib/boss-worker/spoke`                                    | `boss-worker`, **0700** | State: journal, tmux socket, credentials, homes.    |
-| `…/spoke/credentials`                                           | `boss-worker`, **0700** | `ca.pem` (hub trust); enrollment adds cert and key. |
-| `…/spoke/homes`                                                 | `boss-worker`, **0700** | `BOSS_CODEX_HOMES_DIR`: per-run driver homes.       |
-| `/etc/boss-spoke/{install.json,release-verify-key.pub}`         | root, 0644              | What was installed, and the pinned release key.     |
-| `/etc/systemd/system/boss-spoke.service` (Linux)                | root, 0644              | The service definition.                             |
-| `/Library/LaunchDaemons/dev.boss.spoke.plist` (macOS)           | root, 0644              | The service definition.                             |
+| Path (Linux; macOS differs only in prefix, home and definition) | Owner / mode            | Purpose                                                                      |
+| --------------------------------------------------------------- | ----------------------- | ---------------------------------------------------------------------------- |
+| `/opt/boss-spoke/releases/<release-id>/`                        | root, 0755              | Immutable release; a release id is never reused.                             |
+| `/opt/boss-spoke/current`                                       | root, symlink           | Atomically switched to the active release.                                   |
+| `/opt/boss-spoke/previous`                                      | root, symlink           | Last healthy release; kept until the new one is.                             |
+| `/var/lib/boss-worker/spoke`                                    | `boss-worker`, **0700** | State: journal, tmux socket, credentials, homes.                             |
+| `…/spoke/credentials`                                           | `boss-worker`, **0700** | `ca.pem` (hub trust); enrollment adds cert and key.                          |
+| `…/spoke/homes`                                                 | `boss-worker`, **0700** | `BOSS_CODEX_HOMES_DIR`: per-run driver homes.                                |
+| `…/spoke/update-request/`                                       | `boss-worker`, **0700** | Request directory the helper watches; the service user drops `request.json`. |
+| `/etc/boss-spoke/{install.json,release-verify-key.pub}`         | root, 0644              | What was installed, and the pinned release key.                              |
+| `/etc/boss-spoke/upgrade-status.json`                           | root, 0644              | Last helper attempt, result and error.                                       |
+| `/etc/systemd/system/boss-spoke.service` (Linux)                | root, 0644              | The service definition.                                                      |
+| `/etc/systemd/system/boss-spoke-update.{service,path}` (Linux)  | root, 0644              | Path-activated update helper.                                                |
+| `/Library/LaunchDaemons/dev.boss.spoke.plist` (macOS)           | root, 0644              | The service definition.                                                      |
+| `/Library/LaunchDaemons/dev.boss.spoke.update.plist` (macOS)    | root, 0644              | WatchPaths update helper.                                                    |
 
 Directories the service user controls are verified, never repaired: an existing
 one that is a symlink, not owned by the service user, or not owner-only stops
@@ -122,11 +131,21 @@ daemon over a live tmux session).
 
 ### Upgrades
 
-Install a newer signed package the same way. `current` is switched, and an
-enrolled host's service is restarted and must stay up (default: 10 s stable
-within 120 s). Nothing rolls back automatically: the previous release stays in
-`releases/` and the person reinstalls its package by hand. A host id never
-changes after the first install (the journal belongs to it).
+Provisioning is one-time. The first install also writes a root-run helper
+(systemd path unit / launchd WatchPaths) that applies a request the service
+user drops into `update-request/`. The request names a release; the helper
+fetches the manifest, signature and package from the origin pinned at install,
+verifies them against the root-pinned key, refuses an unreadable journal, then
+stages, switches `current` and restarts only the daemon. Tmux workers and the
+journal stay up. Health is lock, journal, inventory and a management handshake
+within two minutes; failure rolls `current` back to `previous` automatically.
+A person reinstalls a signed package by hand only when neither the current nor
+the previous binary can start. A host id never changes after the first install
+(the journal belongs to it).
+
+A hand `install` of a newer package still does not roll back automatically:
+that path is disaster recovery. The helper path is what keeps a live host
+current.
 
 ## Checking a host: `preflight`
 
@@ -175,11 +194,15 @@ There is no Linux arm64 agent, so those assets are optional.
 `bazel test //tools/boss/spoke-package/... //tools/boss/engine/spoke-preflight/...`
 
 - `verification_test`: signature, digest, platform, manifest validation, key
-  handling, hostile archives.
+  handling, hostile archives, approved origin.
 - `install_test`: the installer against a staging root with the real binaries
   executed as the service user: layout and modes, idempotence, upgrade and
   restart, key pinning, wrong platform and bad digest installing nothing, unsafe
   state directories refused, the unset-pin refusal, and both service definitions.
+- `update_test`: the helper against a staging root: verified switch with
+  workers retained, bad signature/digest, wrong platform, unapproved origin,
+  journal incompatibility, health-fail rollback, interrupted-switch recovery,
+  and root-owned paths the service user cannot write.
 
 The real `System` host (account creation, systemctl, launchctl) is exercised only
 on a real host: nothing in the test suite creates accounts or drives a service

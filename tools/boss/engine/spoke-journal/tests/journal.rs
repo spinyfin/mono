@@ -1,5 +1,11 @@
 use boss_protocol_spoke::v1::{self, command, record};
-use boss_spoke_journal::{Admission, Fault, Journal, Limits};
+use boss_spoke_journal::{Admission, Fault, Journal, Limits, OLDEST_READABLE, SCHEMA_VERSION};
+
+#[test]
+fn reader_bounds_match_the_shipped_schema() {
+    assert_eq!(SCHEMA_VERSION, 6);
+    assert_eq!(OLDEST_READABLE, 1);
+}
 use prost::Message;
 
 fn open(root: &std::path::Path) -> Journal {

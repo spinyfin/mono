@@ -18,7 +18,10 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    deps = ["//tools/boss/engine/spoke-preflight"] + all_crate_deps(normal = True),
+    deps = [
+        "//tools/boss/engine/spoke-preflight",
+        "//tools/boss/http_retry",
+    ] + all_crate_deps(normal = True),
 )
 
 # Run on the worker host by the person installing; also bundled into each
@@ -33,6 +36,35 @@ rust_binary(
         ":spoke-package",
         "//tools/boss/engine/spoke-preflight",
     ] + all_crate_deps(normal = True),
+)
+
+# Privileged update helper: fetch/verify/switch/rollback against a staging root.
+# size = "small" / timeout = "moderate": each case unpacks a package through
+# the real installer as a subprocess, same as install_test.
+rust_test(
+    name = "update_test",
+    size = "small",
+    timeout = "moderate",
+    srcs = ["tests/update.rs"],
+    data = [
+        ":boss-spoke-package",
+        "//tools/boss/engine/spoke:boss-spoke",
+        "@host_tmux//:tmux",
+    ],
+    edition = "2024",
+    env = {
+        "INSTALLER_BIN": "$(rootpath :boss-spoke-package)",
+        "SPOKE_BIN": "$(rootpath //tools/boss/engine/spoke:boss-spoke)",
+        "TMUX_BIN": "$(rootpath @host_tmux//:tmux)",
+    },
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [":spoke-package"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
 )
 
 # Signature, digest, platform and archive-safety checks.

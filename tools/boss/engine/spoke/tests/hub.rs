@@ -69,6 +69,22 @@ impl Connection {
     pub async fn welcome(&self, through: u64) {
         self.send(hub_frame::Body::Welcome(self.welcome_body(through))).await;
     }
+
+    pub async fn welcome_features(&self, through: u64, features: Vec<v1::Feature>) {
+        let mut welcome = self.welcome_body(through);
+        welcome.features = features;
+        self.send(hub_frame::Body::Welcome(welcome)).await;
+    }
+
+    pub async fn reject(&self, code: &str, diagnostic: &str) {
+        self.send(hub_frame::Body::Reject(v1::Reject {
+            code: code.into(),
+            diagnostic: diagnostic.into(),
+            supported_min_epoch: 1,
+            supported_max_epoch: 1,
+        }))
+        .await;
+    }
     pub async fn next(&mut self) -> spoke_frame::Body {
         tokio::time::timeout(STEP, self.incoming.message())
             .await
@@ -286,6 +302,7 @@ impl Daemon {
             .args(["--host-id", "host", "--hub", endpoint])
             .arg("--tls-dir")
             .arg(dir)
+            .env("BOSS_SPOKE_INSTALL_CONFIG", dir.join("install.json"))
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&log).unwrap());
         if let Some(tmux) = tmux {

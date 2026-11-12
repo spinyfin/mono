@@ -1,0 +1,12 @@
+[Unit]
+Description=Boss spoke update helper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=600
+ExecStart={{installer}} apply-update --config {{config}}
+
+[Install]
+WantedBy=multi-user.target

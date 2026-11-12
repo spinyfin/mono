@@ -1,6 +1,7 @@
 //! `boss-spoke-package`: build, sign, verify and install signed spoke packages,
 //! and check a host's readiness as its service user.
 
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -11,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use boss_spoke_package::install::{self, Host, InstallRecord, Layout, Request};
 use boss_spoke_package::manifest::{self, Platform, SigningKey, TrustedKey};
 use boss_spoke_package::system::{Staged, System, run_as};
+use boss_spoke_package::update::{self, AlwaysReady, Apply, FileProbe, HttpFetcher, MapFetcher};
 use boss_spoke_package::{build, read_owner_only};
 use clap::Parser;
 
@@ -66,6 +68,18 @@ enum Cli {
     },
     /// Verify a release and install it, as root. Enrolls nothing.
     Install(InstallArgs),
+    /// Apply a request dropped by the service user. Root-only; installed as the
+    /// path-activated helper at provisioning.
+    ApplyUpdate {
+        #[arg(long, default_value = "/etc/boss-spoke/install.json")]
+        config: PathBuf,
+        /// Stage against this directory instead of `/`. Test and inspect only.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// JSON object of URL → file path, used by isolated crash tests.
+        #[arg(long, hide = true)]
+        fixture_files: Option<PathBuf>,
+    },
     /// Check this host as the service user, in the installed service environment.
     Preflight {
         #[arg(long, default_value = "/etc/boss-spoke/install.json")]
@@ -189,6 +203,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
             );
         }
         Cli::Install(args) => return install_command(args),
+        Cli::ApplyUpdate {
+            config,
+            root,
+            fixture_files,
+        } => return apply_update_command(&config, root, fixture_files),
         Cli::Preflight {
             config,
             storage_only,
@@ -220,6 +239,75 @@ fn read_key(path: &Path) -> Result<TrustedKey> {
 
 fn manifest_name(platform: Platform) -> String {
     format!("boss-spoke-{}.manifest.json", platform.as_str())
+}
+
+fn load_fixture_fetcher(path: &Path) -> Result<MapFetcher> {
+    let spec: HashMap<String, String> = serde_json::from_slice(&fs::read(path)?)?;
+    let mut files = HashMap::new();
+    for (url, file) in spec {
+        files.insert(url, fs::read(file)?);
+    }
+    Ok(MapFetcher { files })
+}
+
+fn apply_update_command(config: &Path, root: Option<PathBuf>, fixture_files: Option<PathBuf>) -> Result<ExitCode> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if root.is_none() && unsafe { libc::geteuid() } != 0 {
+        bail!("apply-update rewrites the root-owned release layout; run it as root");
+    }
+    let record = InstallRecord::read(config)?;
+    let mut layout = record.layout()?;
+    layout.root = root;
+    let platform = layout.platform;
+    let staged = layout.root.is_some();
+    let host: &dyn Host = if staged { &Staged } else { &System { platform } };
+    let account = host
+        .lookup_user(&record.user)?
+        .with_context(|| format!("service user {} is missing", record.user))?;
+    let file_probe = FileProbe {
+        layout: &layout,
+        account,
+    };
+    let always = AlwaysReady;
+    let probe: &dyn update::HealthProbe = if staged { &always } else { &file_probe };
+    let http = HttpFetcher {
+        origin: record.package_origin.clone(),
+    };
+    let mapped = fixture_files
+        .as_ref()
+        .map(|path| load_fixture_fetcher(path))
+        .transpose()?;
+    let fetcher: &dyn update::Fetcher = match &mapped {
+        Some(map) => map,
+        None => &http,
+    };
+    let status = update::apply(&Apply {
+        host,
+        layout: &layout,
+        fetcher,
+        probe,
+        health: if staged {
+            install::Health {
+                deadline: std::time::Duration::from_millis(50),
+                poll: std::time::Duration::from_millis(1),
+                stable: std::time::Duration::ZERO,
+            }
+        } else {
+            install::Health::default()
+        },
+        crash: None,
+    })?;
+    println!(
+        "upgrade {} {} {}",
+        status.result,
+        status.release_id,
+        if status.error.is_empty() {
+            status.running_release_id.as_str()
+        } else {
+            status.error.as_str()
+        }
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 fn install_command(args: InstallArgs) -> Result<ExitCode> {
