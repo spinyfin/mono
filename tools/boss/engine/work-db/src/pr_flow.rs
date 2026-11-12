@@ -2598,7 +2598,14 @@ impl WorkDb {
             (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. })
                 if ladder_question =>
             {
-                let effect = crate::progression_ladder::answer_in_tx(&mut pending, &tx, &task, &value, &now, actor)?;
+                let effect = crate::progression_ladder::answer_in_tx(
+                    &mut pending,
+                    &tx,
+                    &task,
+                    &value,
+                    &now,
+                    crate::task_status_audit::WriteAttribution { actor, provenance },
+                )?;
                 archive_work_item_id = effect.archive.then(|| task.id.clone());
             }
             (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. })
@@ -2627,10 +2634,13 @@ impl WorkDb {
                     &mut pending,
                     &tx,
                     &task,
-                    &question.question,
-                    (name, brief),
-                    answered_at,
-                    &now,
+                    super::prerequisite_question::Approval {
+                        question: &question.question,
+                        proposed: (name, brief),
+                        answered_at,
+                        now: &now,
+                    },
+                    crate::task_status_audit::WriteAttribution { actor, provenance },
                 )?;
                 prerequisite_work_item_id = Some(linked.id);
             }
@@ -2806,6 +2816,8 @@ pub(super) fn restart_after_answer_from(
             .maybe_preferred_workspace_id(asking.preferred_workspace_id)
             .entry_point(DispatchAdmissionEntryPoint::OperatorAnswer)
             .explicit_start(true)
+            .audit_actor(actor)
+            .maybe_audit_basis(attribution.provenance.map(str::to_owned))
             .build(),
         // Match request_execution's conservative behavior when
         // no live-worker oracle is supplied.

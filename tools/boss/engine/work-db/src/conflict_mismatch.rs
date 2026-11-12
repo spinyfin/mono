@@ -404,7 +404,7 @@ pub(super) fn answer_in_tx(
                     "replaced by a port revision after the repo owner chose to rewrite onto the new base",
                 ),
             )?;
-            let port = assert_parent_revisable_and_insert_as_actor(
+            let port = assert_parent_revisable_and_insert_as_actor_with_provenance(
                 pending,
                 tx,
                 CreateRevisionInput::builder()
@@ -420,7 +420,8 @@ pub(super) fn answer_in_tx(
                     .reasoning(ReasoningMode::Standard)
                     .build(),
                 pr_checker,
-                "human",
+                attribution.actor,
+                attribution.provenance,
             )?;
             tx.execute(
                 "UPDATE conflict_resolutions SET revision_task_id = ?2 WHERE id = ?1",

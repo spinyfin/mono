@@ -574,7 +574,7 @@ fn restore_prior(
     item_id: &str,
     prior: Option<&PriorState>,
     waive_grace: bool,
-    actor: &str,
+    attribution: crate::task_status_audit::WriteAttribution<'_>,
 ) -> Result<()> {
     let now = now_string();
     let grace = waive_grace.then_some(now.as_str());
@@ -586,8 +586,8 @@ fn restore_prior(
             // provenance so progression classification is unchanged.
             crate::task_status_audit::execute(
                 conn,
-                "progression_ladder_restore_autostart",
-                actor,
+                &attribution.basis("progression_ladder_restore_autostart"),
+                attribution.actor,
                 "UPDATE tasks SET autostart = ?2, updated_at = ?3
                  WHERE id = ?1 AND deleted_at IS NULL
                    AND status = 'blocked' AND blocked_reason = 'awaiting_operator_answer'",
@@ -805,7 +805,7 @@ pub(crate) fn answer_in_tx(
     task: &Task,
     choice: &str,
     now: &str,
-    actor: &str,
+    attribution: crate::task_status_audit::WriteAttribution<'_>,
 ) -> Result<LadderAnswerEffect> {
     let prior: Option<PriorState> = tx
         .query_row(
@@ -827,7 +827,7 @@ pub(crate) fn answer_in_tx(
                  WHERE work_item_id = ?1",
                 params![task.id, now],
             )?;
-            restore_prior(tx, &task.id, prior.as_ref(), true, actor)?;
+            restore_prior(tx, &task.id, prior.as_ref(), true, attribution)?;
         }
         PARK_IT => {
             // A revision follows its parent PR and cannot be parked alone.
@@ -838,13 +838,13 @@ pub(crate) fn answer_in_tx(
                 &root,
                 true,
                 Some("progression could not unstick it; the owner chose to park it"),
-                actor,
+                attribution.actor,
                 now,
             )?;
-            restore_prior(tx, &task.id, prior.as_ref(), false, actor)?;
+            restore_prior(tx, &task.id, prior.as_ref(), false, attribution)?;
         }
         ARCHIVE_IT => {
-            restore_prior(tx, &task.id, prior.as_ref(), false, actor)?;
+            restore_prior(tx, &task.id, prior.as_ref(), false, attribution)?;
             effect.archive = true;
         }
         other => bail!("`{other}` is not an answer to the progression ladder's question"),

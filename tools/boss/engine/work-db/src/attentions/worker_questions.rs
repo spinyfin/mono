@@ -178,10 +178,16 @@ pub(super) fn apply_typed_answer_in_tx(
                 pending,
                 conn,
                 &task,
-                &record.question,
-                (name, brief),
-                answered_at,
-                &now,
+                super::super::prerequisite_question::Approval {
+                    question: &record.question,
+                    proposed: (name, brief),
+                    answered_at,
+                    now: &now,
+                },
+                crate::task_status_audit::WriteAttribution {
+                    actor: boss_protocol::LAST_STATUS_ACTOR_HUMAN,
+                    provenance: None,
+                },
             )?;
             if task.kind == TaskKind::Revision {
                 let task = query_task(conn, id).require("task", id)?;

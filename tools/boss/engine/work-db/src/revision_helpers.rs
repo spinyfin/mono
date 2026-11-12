@@ -65,7 +65,14 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut pending = PendingEvents::new();
-        let task = assert_parent_revisable_and_insert_as_actor(&mut pending, &tx, input, pr_checker, actor)?;
+        let task = assert_parent_revisable_and_insert_as_actor_with_provenance(
+            &mut pending,
+            &tx,
+            input,
+            pr_checker,
+            actor,
+            None,
+        )?;
         commit_and_publish(tx, pending, self.event_bus())?;
         Ok(task)
     }
@@ -157,6 +164,17 @@ pub(crate) fn assert_parent_revisable_and_insert_as_actor(
     pr_checker: &dyn PrStateChecker,
     actor: &str,
 ) -> Result<Task> {
+    assert_parent_revisable_and_insert_as_actor_with_provenance(pending, conn, input, pr_checker, actor, None)
+}
+
+pub(crate) fn assert_parent_revisable_and_insert_as_actor_with_provenance(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    input: CreateRevisionInput,
+    pr_checker: &dyn PrStateChecker,
+    actor: &str,
+    provenance: Option<&str>,
+) -> Result<Task> {
     // A review execution (legacy) or review-verdict proposal (batch) is the
     // idempotency key for materialising its findings. The finalizer / applier
     // normally reaches this function once, but a repeated Stop/reconciliation
@@ -231,7 +249,7 @@ pub(crate) fn assert_parent_revisable_and_insert_as_actor(
     // work item so the UI's direct-child rollup sees the whole chain.
     let now = now_string();
     let depends_on = input.depends_on.clone();
-    let new_revision = insert_revision_in_tx(conn, input, &root_id, &root, actor)?;
+    let new_revision = insert_revision_in_tx(conn, input, &root_id, &root, actor, provenance)?;
 
     // ── 7. Caller-supplied `--depends-on` gate ──────────────────────────────
     // Declared atomically with the row insert, same as `task create` /
@@ -1632,6 +1650,7 @@ pub fn insert_revision_in_tx(
     parent_id: &str,
     root: &Task,
     actor: &str,
+    provenance: Option<&str>,
 ) -> Result<Task> {
     let id = next_id("task");
     let now = now_string();
@@ -1704,7 +1723,7 @@ pub fn insert_revision_in_tx(
     let autostart_value: i64 = if input.autostart { 1 } else { 0 };
     crate::task_status_audit::execute(
         conn,
-        "insert_revision_in_tx",
+        &crate::task_status_audit::compose_basis("insert_revision_in_tx", provenance),
         actor,
         "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, \
          pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, \

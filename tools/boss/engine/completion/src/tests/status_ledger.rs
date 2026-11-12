@@ -1339,7 +1339,7 @@ fn operator_yes_and_prerequisite_approval_record_exact_bases() {
         .unwrap();
     db.answer_operator_question(&waiting.id, OperatorAnswer::YesNo { value: true })
         .unwrap();
-    assert_has(&db, &parked.id, "autostart", "approve_in_tx", "engine");
+    assert_has(&db, &parked.id, "autostart", "approve_in_tx", "human");
 }
 
 #[test]

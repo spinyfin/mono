@@ -10,7 +10,7 @@ use boss_engine_runtime::test_support::{
 };
 use boss_protocol::{
     BoardColumn, BoardDropTarget, CreateChoreInput, CreateProjectInput, CreateTaskInput, FrontendRequest,
-    OperatorAnswer, OperatorQuestion, RequestExecutionInput, TaskFieldAuditRow, WorkItemPatch,
+    OperatorAnswer, OperatorAnswerType, OperatorQuestion, RequestExecutionInput, TaskFieldAuditRow, WorkItemPatch,
 };
 
 fn dispatch(state: &Arc<ServerState>, sink: &Arc<SessionSink>, request_id: &str) -> Dispatch {
@@ -417,6 +417,186 @@ async fn answering_a_question_that_restarts_autostart_records_the_socket_caller(
             Some("1".into()),
             "human".into(),
             format!("restart_after_answer {answer_basis}")
+        ))
+    );
+}
+
+fn park_with_question(
+    state: &ServerState,
+    product_id: String,
+    name: &str,
+    question: OperatorQuestion,
+) -> (String, String) {
+    let chore = create_test_chore(&state.work_db, product_id, name);
+    let execution = create_ready_chore_execution(&state.work_db, chore.id.clone());
+    let (execution, run) = state
+        .work_db
+        .start_execution_run(
+            &execution.id,
+            "worker-1",
+            "mono",
+            "lease-1",
+            "mono-agent-001",
+            "/tmp/ws",
+        )
+        .unwrap();
+    finish_run_worker_pane_alive(&state.work_db, &execution.id, &run.id, Some("spawned"));
+    boss_work_db::insert_question(&state.work_db.connect().unwrap(), &execution.id, "proposal", &question).unwrap();
+    state
+        .work_db
+        .record_worker_awaiting_operator_answer(&execution.id, "needs a decision", &question)
+        .unwrap();
+    let question_id: String = state
+        .work_db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT id FROM operator_questions WHERE work_item_id = ?1 ORDER BY created_at DESC LIMIT 1",
+            [&chore.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    (chore.id, question_id)
+}
+
+async fn answer_over_socket(state: &Arc<ServerState>, work_item_id: &str, request_id: &str, answer: OperatorAnswer) {
+    let sink = make_session_sink();
+    work_items::handle_operator_question(
+        dispatch(state, &sink, request_id),
+        FrontendRequest::AnswerOperatorQuestion {
+            id: work_item_id.to_owned(),
+            answer,
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn answering_a_ladder_question_records_the_socket_caller_on_autostart_restore() {
+    let (state, _dir) = test_server_state();
+    let product = create_test_product_named(&state.work_db, "Flag ladder answer");
+    let (chore_id, question_id) = park_with_question(
+        &state,
+        product.id,
+        "Ladder restore",
+        OperatorQuestion {
+            text: boss_work_db::QUESTION_TEXT.into(),
+            explanation: "Progression spent its attempts.".into(),
+            answer_type: OperatorAnswerType::MultipleChoice {
+                choices: vec![
+                    boss_work_db::PARK_IT.into(),
+                    boss_work_db::ARCHIVE_IT.into(),
+                    boss_work_db::KEEP_TRYING.into(),
+                ],
+            },
+        },
+    );
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO progression_ladder (work_item_id, question_id, question_reason, question_filed_at, prior_state_json)
+             VALUES (?1, ?2, 'ladder_exhausted', 1, ?3)",
+            [
+                &chore_id,
+                &question_id,
+                r#"{"status":"todo","blocked_reason":null,"blocked_detail":null,"blocked_attempt_id":null,"autostart":true,"dispatch_failed_reason":null,"dispatch_failed_error":null,"dispatch_failed_at":null,"last_status_actor":"engine","basis":null}"#,
+            ],
+        )
+        .unwrap();
+    answer_over_socket(
+        &state,
+        &chore_id,
+        "req-ladder",
+        OperatorAnswer::MultipleChoice {
+            value: boss_work_db::KEEP_TRYING.into(),
+        },
+    )
+    .await;
+    let answer_basis = socket_basis("rpc:answer", "req-ladder");
+    assert_eq!(
+        history(&state, &chore_id, "autostart").last(),
+        Some(&(
+            Some("0".into()),
+            Some("1".into()),
+            "human".into(),
+            format!("progression_ladder_restore_autostart {answer_basis}")
+        ))
+    );
+}
+
+#[tokio::test]
+async fn answering_a_prerequisite_question_records_the_socket_caller() {
+    let (state, _dir) = test_server_state();
+    let product = create_test_product_named(&state.work_db, "Flag prereq answer");
+    let existing = create_test_chore_manual(&state.work_db, product.id.clone(), "Shared fixture");
+    let (dependent_id, _) = park_with_question(
+        &state,
+        product.id,
+        "Needs the fixture",
+        OperatorQuestion {
+            text: "Create the missing work?".into(),
+            explanation: "This cannot proceed without it.".into(),
+            answer_type: OperatorAnswerType::CreatePrerequisiteTask {
+                name: "Shared fixture".into(),
+                brief: "Fix the shared fixture first.".into(),
+                file_count_bypass: None,
+                option_labels: None,
+            },
+        },
+    );
+    answer_over_socket(
+        &state,
+        &dependent_id,
+        "req-prereq",
+        OperatorAnswer::YesNo { value: true },
+    )
+    .await;
+    let answer_basis = socket_basis("rpc:answer", "req-prereq");
+    let expected = (
+        Some("0".into()),
+        Some("1".into()),
+        "human".into(),
+        format!("approve_in_tx {answer_basis}"),
+    );
+    assert_eq!(history(&state, &dependent_id, "autostart").last(), Some(&expected));
+    assert_eq!(history(&state, &existing.id, "autostart").last(), Some(&expected));
+}
+
+#[tokio::test]
+async fn answering_yes_on_a_deferred_task_records_the_socket_caller_clearing_deferred() {
+    let (state, _dir) = test_server_state();
+    let product = create_test_product_named(&state.work_db, "Flag deferred answer");
+    let (chore_id, _) = park_with_question(
+        &state,
+        product.id,
+        "Deferred until answered",
+        OperatorQuestion {
+            text: "Ship the change?".into(),
+            explanation: "Need a decision.".into(),
+            answer_type: OperatorAnswerType::YesNo,
+        },
+    );
+    state
+        .work_db
+        .update_work_item(
+            &chore_id,
+            WorkItemPatch {
+                deferred: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    answer_over_socket(&state, &chore_id, "req-deferred", OperatorAnswer::YesNo { value: true }).await;
+    let answer_basis = socket_basis("rpc:answer", "req-deferred");
+    assert_eq!(
+        history(&state, &chore_id, "deferred").last(),
+        Some(&(
+            Some("1".into()),
+            Some("0".into()),
+            "human".into(),
+            format!("explicit_start_clears_deferred {answer_basis}")
         ))
     );
 }
