@@ -135,6 +135,12 @@ fn create_revision_records_caller_actor() {
     let (basis, actor) = insert_ledger(&db, &engine.id, "status");
     assert_eq!(basis, "insert_revision_in_tx");
     assert_eq!(actor, "engine");
+    let (basis, actor) = insert_ledger(&db, &engine.id, "autostart");
+    assert_eq!(basis, "insert_revision_in_tx");
+    assert_eq!(actor, "engine");
+    let (basis, actor) = insert_ledger(&db, &engine.id, "deferred");
+    assert_eq!(basis, "insert_revision_in_tx");
+    assert_eq!(actor, "engine");
 
     let human = db
         .create_revision_as_actor(
@@ -147,6 +153,9 @@ fn create_revision_records_caller_actor() {
         )
         .unwrap();
     let (basis, actor) = insert_ledger(&db, &human.id, "status");
+    assert_eq!(basis, "insert_revision_in_tx");
+    assert_eq!(actor, "human");
+    let (basis, actor) = insert_ledger(&db, &human.id, "autostart");
     assert_eq!(basis, "insert_revision_in_tx");
     assert_eq!(actor, "human");
 }
@@ -1091,6 +1100,39 @@ fn chain_conflict_and_queue_producers_record_exact_bases() {
         "convert_revision_to_review_findings_followup",
         "engine",
     );
+
+    // A findings revision still in `todo` is not WIP, so convert turns
+    // autostart off. That write must name convert, not the insert that
+    // first set autostart.
+    let todo_parent = create_test_chore(&db, product.clone(), "Todo findings parent");
+    let todo_pr = "https://github.com/spinyfin/mono/pull/1053";
+    bind_pr(&db, &todo_parent.id, todo_pr);
+    let todo_findings = db
+        .create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(&todo_parent.id)
+                .description("Review findings still in todo")
+                .created_via(format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_todo_findings"))
+                .build(),
+            &checker,
+        )
+        .unwrap();
+    db.mark_chore_pr_merged(&todo_parent.id, todo_pr).unwrap();
+    let autostart = db
+        .list_task_field_audit(&todo_findings.id)
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.property == "autostart")
+        .collect::<Vec<_>>();
+    assert_eq!(autostart.len(), 2, "{autostart:?}");
+    assert_eq!(autostart[0].old_value, None);
+    assert_eq!(autostart[0].new_value.as_deref(), Some("1"));
+    assert_eq!(autostart[0].actor, "engine");
+    assert_eq!(autostart[0].basis, "insert_revision_in_tx");
+    assert_eq!(autostart[1].old_value.as_deref(), Some("1"));
+    assert_eq!(autostart[1].new_value.as_deref(), Some("0"));
+    assert_eq!(autostart[1].actor, "engine");
+    assert_eq!(autostart[1].basis, "convert_revision_to_review_findings_followup");
 
     let delivered_parent = create_test_chore(&db, product.clone(), "Delivered parent");
     let delivered_pr = "https://github.com/spinyfin/mono/pull/1052";

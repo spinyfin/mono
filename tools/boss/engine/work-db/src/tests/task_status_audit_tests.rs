@@ -585,22 +585,49 @@ fn patch_writes_record_the_callers_actor_and_named_or_default_basis() {
 fn explicit_start_records_the_deferred_clear() {
     let db = WorkDb::open(temp_db_path("flag-audit-start")).unwrap();
     let product = create_test_product_named(&db, "Flag start");
-    let chore = create_test_chore(&db, &product.id, "Future scope");
-    db.update_work_item(
-        &chore.id,
-        WorkItemPatch {
-            deferred: Some(true),
-            ..Default::default()
-        },
+    let defer = |db: &WorkDb, id: &str| {
+        db.update_work_item(
+            id,
+            WorkItemPatch {
+                deferred: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    };
+
+    let automatic = create_test_chore(&db, &product.id, "Automatic start");
+    defer(&db, &automatic.id);
+    db.request_execution(
+        RequestExecutionInput::builder()
+            .work_item_id(automatic.id.clone())
+            .build(),
     )
     .unwrap();
-
-    db.request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
-        .unwrap();
-
     assert_eq!(
-        flag_history(&db, &chore.id, "deferred").last(),
+        flag_history(&db, &automatic.id, "deferred").last(),
         Some(&history_row(Some("1"), "0", "engine", "explicit_start_clears_deferred"))
+    );
+
+    let human = create_test_chore(&db, &product.id, "Human start");
+    defer(&db, &human.id);
+    let provenance = "rpc:request_execution peer=socket_client pid=4242 session=s1 request=r1";
+    db.request_execution(
+        RequestExecutionInput::builder()
+            .work_item_id(human.id.clone())
+            .audit_actor("human")
+            .audit_basis(provenance)
+            .build(),
+    )
+    .unwrap();
+    assert_eq!(
+        flag_history(&db, &human.id, "deferred").last(),
+        Some(&history_row(
+            Some("1"),
+            "0",
+            "human",
+            &format!("explicit_start_clears_deferred {provenance}")
+        ))
     );
 }
 

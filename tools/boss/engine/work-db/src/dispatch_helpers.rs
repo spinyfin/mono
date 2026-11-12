@@ -1564,7 +1564,11 @@ pub fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
     input: RequestExecutionInput,
     is_live: F,
 ) -> Result<WorkExecution> {
-    request_execution_in_tx_as_actor(pending, conn, input, is_live, "engine")
+    let actor = input
+        .audit_actor
+        .clone()
+        .unwrap_or_else(|| boss_protocol::LAST_STATUS_ACTOR_ENGINE.to_owned());
+    request_execution_in_tx_as_actor(pending, conn, input, is_live, &actor)
 }
 
 pub(crate) fn request_execution_in_tx_as_actor<F: FnOnce(&str) -> bool>(
@@ -1595,6 +1599,8 @@ pub(crate) fn request_execution_in_tx_as_actor<F: FnOnce(&str) -> bool>(
         observed_pause_since_epoch_s: _,
         allow_dirty,
         explicit_start,
+        audit_actor: _,
+        audit_basis,
         // Placement is a coordinator concern. The coordinator validates and
         // installs this onto the one execution after this transaction has
         // created or refreshed it; it must never become a work-item field.
@@ -1782,9 +1788,11 @@ pub(crate) fn request_execution_in_tx_as_actor<F: FnOnce(&str) -> bool>(
         // Mirrors `autostart`'s single-shot clear on start — deliberately
         // starting an item means it is no longer future scope. Guarded on
         // `deferred = 1` so it is a no-op for ordinary items.
+        let deferred_basis =
+            crate::task_status_audit::compose_basis("explicit_start_clears_deferred", audit_basis.as_deref());
         let approved = crate::task_status_audit::execute(
             conn,
-            "explicit_start_clears_deferred",
+            &deferred_basis,
             actor,
             "UPDATE tasks SET deferred = 0 WHERE id = ?1 AND deferred = 1 AND deleted_at IS NULL",
             params![work_item_id],

@@ -166,6 +166,15 @@ pub fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Result<Ta
 }
 
 pub fn insert_task_in_tx_as_actor(conn: &Connection, input: CreateTaskInput, actor: &str) -> Result<Task> {
+    insert_task_in_tx_as_actor_with_provenance(conn, input, actor, None)
+}
+
+pub fn insert_task_in_tx_as_actor_with_provenance(
+    conn: &Connection,
+    input: CreateTaskInput,
+    actor: &str,
+    provenance: Option<&str>,
+) -> Result<Task> {
     ensure_product_exists(conn, &input.product_id)?;
     ensure_project_belongs_to_product(conn, &input.project_id, &input.product_id)?;
 
@@ -203,7 +212,7 @@ pub fn insert_task_in_tx_as_actor(conn: &Connection, input: CreateTaskInput, act
 
     crate::task_status_audit::execute(
         conn,
-        "insert_task_in_tx_as_actor",
+        &crate::task_status_audit::compose_basis("insert_task_in_tx_as_actor", provenance),
         actor,
         "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, deferred, human_driven, effort_matched_rule, effort_reasons)
          VALUES (?1, ?2, ?3, 'project_task', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
@@ -274,7 +283,16 @@ pub(crate) fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> 
 }
 
 pub(crate) fn insert_chore_in_tx_as_actor(conn: &Connection, input: CreateChoreInput, actor: &str) -> Result<Task> {
-    insert_chore_with_project_in_tx_as_actor(conn, input, None, actor)
+    insert_chore_in_tx_as_actor_with_provenance(conn, input, actor, None)
+}
+
+pub(crate) fn insert_chore_in_tx_as_actor_with_provenance(
+    conn: &Connection,
+    input: CreateChoreInput,
+    actor: &str,
+    provenance: Option<&str>,
+) -> Result<Task> {
+    insert_chore_with_project_in_tx_as_actor(conn, input, None, actor, provenance)
 }
 
 /// Review follow-ups may inherit project membership at creation time.
@@ -283,7 +301,7 @@ pub(crate) fn insert_chore_with_project_in_tx(
     input: CreateChoreInput,
     project_id: Option<&str>,
 ) -> Result<Task> {
-    insert_chore_with_project_in_tx_as_actor(conn, input, project_id, boss_protocol::LAST_STATUS_ACTOR_ENGINE)
+    insert_chore_with_project_in_tx_as_actor(conn, input, project_id, boss_protocol::LAST_STATUS_ACTOR_ENGINE, None)
 }
 
 fn insert_chore_with_project_in_tx_as_actor(
@@ -291,6 +309,7 @@ fn insert_chore_with_project_in_tx_as_actor(
     input: CreateChoreInput,
     project_id: Option<&str>,
     actor: &str,
+    provenance: Option<&str>,
 ) -> Result<Task> {
     let ordinal = project_id
         .map(|project_id| {
@@ -336,7 +355,7 @@ fn insert_chore_with_project_in_tx_as_actor(
 
     crate::task_status_audit::execute(
         conn,
-        "insert_chore_with_project_in_tx_as_actor",
+        &crate::task_status_audit::compose_basis("insert_chore_with_project_in_tx_as_actor", provenance),
         actor,
         "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, origin_task_short_id, origin_pr_number, deferred, human_driven, effort_matched_rule, effort_reasons)
          VALUES (?1, ?2, ?22, ?3, ?4, ?5, 'todo', ?23, NULL, NULL, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
@@ -365,6 +384,15 @@ pub fn insert_investigation_in_tx_as_actor(
     conn: &Connection,
     input: boss_protocol::CreateInvestigationInput,
     actor: &str,
+) -> Result<Task> {
+    insert_investigation_in_tx_as_actor_with_provenance(conn, input, actor, None)
+}
+
+pub fn insert_investigation_in_tx_as_actor_with_provenance(
+    conn: &Connection,
+    input: boss_protocol::CreateInvestigationInput,
+    actor: &str,
+    provenance: Option<&str>,
 ) -> Result<Task> {
     ensure_product_exists(conn, &input.product_id)?;
     if let Some(ref pid) = input.project_id {
@@ -397,7 +425,7 @@ pub fn insert_investigation_in_tx_as_actor(
     let short_id = allocate_short_id(conn, &input.product_id)?;
     crate::task_status_audit::execute(
         conn,
-        "insert_investigation_in_tx_as_actor",
+        &crate::task_status_audit::compose_basis("insert_investigation_in_tx_as_actor", provenance),
         actor,
         "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, deferred, human_driven, effort_matched_rule, effort_reasons)
          VALUES (?1, ?2, ?3, 'investigation', ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",

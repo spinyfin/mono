@@ -11,6 +11,28 @@ pub(super) const DEFERRED_MIGRATION_ID: &str = "20261112_1900_task_deferred_audi
 /// [`execute`]; a bare write records `unattributed_write`.
 pub(super) const FLAG_PROPERTIES: [&str; 2] = ["deferred", "autostart"];
 
+/// Join the concrete write helper (`path`) with the socket caller identity
+/// (`provenance`, from `resolve_write_basis`). Engine-internal writers pass
+/// `None` and keep the helper name alone.
+pub(crate) fn compose_basis(path: &str, provenance: Option<&str>) -> String {
+    match provenance.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(provenance) => format!("{path} {provenance}"),
+        None => path.to_owned(),
+    }
+}
+
+/// Actor plus optional socket caller identity for a ledger write.
+pub(crate) struct WriteAttribution<'a> {
+    pub actor: &'a str,
+    pub provenance: Option<&'a str>,
+}
+
+impl WriteAttribution<'_> {
+    pub(crate) fn basis(&self, path: &str) -> String {
+        compose_basis(path, self.provenance)
+    }
+}
+
 /// A savepoint also makes callers that otherwise use autocommit atomic.
 /// The context is transaction-local in effect: SQLite serializes writers and
 /// readers cannot see the context until the savepoint has removed it.

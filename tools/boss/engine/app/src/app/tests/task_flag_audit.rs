@@ -3,11 +3,14 @@
 //! and the calling peer, through the real request handlers.
 
 use super::*;
-use crate::app::{planner_ops, work_items};
-use boss_engine_runtime::test_support::{create_test_chore, create_test_chore_manual, create_test_product_named};
+use crate::app::{executions, planner_ops, work_items};
+use boss_engine_runtime::test_support::{
+    create_ready_chore_execution, create_test_chore, create_test_chore_manual, create_test_product_named,
+    create_test_product_with_repo, finish_run_worker_pane_alive,
+};
 use boss_protocol::{
-    BoardColumn, BoardDropTarget, CreateProjectInput, CreateTaskInput, FrontendRequest, TaskFieldAuditRow,
-    WorkItemPatch,
+    BoardColumn, BoardDropTarget, CreateChoreInput, CreateProjectInput, CreateTaskInput, FrontendRequest,
+    OperatorAnswer, OperatorQuestion, RequestExecutionInput, TaskFieldAuditRow, WorkItemPatch,
 };
 
 fn dispatch(state: &Arc<ServerState>, sink: &Arc<SessionSink>, request_id: &str) -> Dispatch {
@@ -211,4 +214,209 @@ async fn list_task_field_audit_replies_with_the_flag_rows() {
         }
         other => panic!("expected TaskFieldAuditList, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn creating_a_deferred_task_and_chore_records_the_socket_caller() {
+    let (state, _dir) = test_server_state();
+    let product = create_test_product_named(&state.work_db, "Flag create");
+    let project = state
+        .work_db
+        .create_project(
+            CreateProjectInput::builder()
+                .product_id(product.id.clone())
+                .name("Flag create project")
+                .goal("Hold a task")
+                .build(),
+        )
+        .unwrap();
+    let sink = make_session_sink();
+
+    work_items::handle_create_chore(
+        dispatch(&state, &sink, "req-create-chore"),
+        FrontendRequest::CreateChore {
+            input: CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Deferred chore")
+                .autostart(false)
+                .deferred(true)
+                .build(),
+        },
+    )
+    .await;
+    work_items::handle_create_task(
+        dispatch(&state, &sink, "req-create-task"),
+        FrontendRequest::CreateTask {
+            input: CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("Deferred task")
+                .deferred(true)
+                .build(),
+        },
+    )
+    .await;
+
+    sink.close();
+    let mut created = Vec::new();
+    while let Some(envelope) = sink.next().await {
+        if let FrontendEvent::WorkItemCreated { item } = envelope.payload {
+            created.push(item);
+        }
+    }
+    assert_eq!(created.len(), 2, "{created:?}");
+    let chore_id = created
+        .iter()
+        .find_map(|item| match item {
+            WorkItem::Chore(task) => Some(task.id.clone()),
+            _ => None,
+        })
+        .expect("chore");
+    let task_id = created
+        .iter()
+        .find_map(|item| match item {
+            WorkItem::Task(task) => Some(task.id.clone()),
+            _ => None,
+        })
+        .expect("task");
+
+    let chore_basis = socket_basis("rpc:create_chore", "req-create-chore");
+    assert_eq!(
+        history(&state, &chore_id, "deferred"),
+        [(
+            None,
+            Some("1".into()),
+            "human".into(),
+            format!("insert_chore_with_project_in_tx_as_actor {chore_basis}")
+        )]
+    );
+    let task_basis = socket_basis("rpc:create_task", "req-create-task");
+    assert_eq!(
+        history(&state, &task_id, "deferred"),
+        [(
+            None,
+            Some("1".into()),
+            "human".into(),
+            format!("insert_task_in_tx_as_actor {task_basis}")
+        )]
+    );
+}
+
+#[tokio::test]
+async fn request_execution_and_drag_to_doing_record_the_human_who_cleared_deferred() {
+    let (state, _dir) = test_server_state();
+    let product = create_test_product_with_repo(&state.work_db, "Flag start", Some("git@example.com:flag/start.git"));
+    let sink = make_session_sink();
+
+    let started = create_test_chore_manual(&state.work_db, product.id.clone(), "Start me");
+    state
+        .work_db
+        .update_work_item(
+            &started.id,
+            WorkItemPatch {
+                deferred: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    executions::handle_request_execution(
+        dispatch(&state, &sink, "req-start"),
+        FrontendRequest::RequestExecution {
+            input: RequestExecutionInput::builder()
+                .work_item_id(started.id.clone())
+                .build(),
+        },
+    )
+    .await;
+    let start_basis = socket_basis("rpc:request_execution", "req-start");
+    assert_eq!(
+        history(&state, &started.id, "deferred").last(),
+        Some(&(
+            Some("1".into()),
+            Some("0".into()),
+            "human".into(),
+            format!("explicit_start_clears_deferred {start_basis}")
+        ))
+    );
+
+    let dragged = create_test_chore_manual(&state.work_db, product.id.clone(), "Drag me");
+    state
+        .work_db
+        .update_work_item(
+            &dragged.id,
+            WorkItemPatch {
+                deferred: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    work_items::handle_move_work_item_on_board(
+        dispatch(&state, &sink, "req-drag"),
+        FrontendRequest::MoveWorkItemOnBoard {
+            id: dragged.id.clone(),
+            target: BoardDropTarget::new(BoardColumn::Doing, None),
+            bypass_dispatch_pause: false,
+            observed_pause_since_epoch_s: None,
+        },
+    )
+    .await;
+    let drag_basis = socket_basis("board_drop:request_execution", "req-drag");
+    assert_eq!(
+        history(&state, &dragged.id, "deferred").last(),
+        Some(&(
+            Some("1".into()),
+            Some("0".into()),
+            "human".into(),
+            format!("explicit_start_clears_deferred {drag_basis}")
+        ))
+    );
+}
+
+#[tokio::test]
+async fn answering_a_question_that_restarts_autostart_records_the_socket_caller() {
+    let (state, _dir) = test_server_state();
+    let product = create_test_product_named(&state.work_db, "Flag answer");
+    let chore = create_test_chore(&state.work_db, product.id, "Needs an answer");
+    let execution = create_ready_chore_execution(&state.work_db, chore.id.clone());
+    let (execution, run) = state
+        .work_db
+        .start_execution_run(
+            &execution.id,
+            "worker-1",
+            "mono",
+            "lease-1",
+            "mono-agent-001",
+            "/tmp/ws",
+        )
+        .unwrap();
+    finish_run_worker_pane_alive(&state.work_db, &execution.id, &run.id, Some("spawned"));
+    let question = OperatorQuestion {
+        text: "Ship the change?".into(),
+        explanation: "Need a decision.".into(),
+        answer_type: boss_protocol::OperatorAnswerType::YesNo,
+    };
+    boss_work_db::insert_question(&state.work_db.connect().unwrap(), &execution.id, "proposal", &question).unwrap();
+    state
+        .work_db
+        .record_worker_awaiting_operator_answer(&execution.id, "needs a decision", &question)
+        .unwrap();
+    let sink = make_session_sink();
+    work_items::handle_operator_question(
+        dispatch(&state, &sink, "req-answer"),
+        FrontendRequest::AnswerOperatorQuestion {
+            id: chore.id.clone(),
+            answer: OperatorAnswer::YesNo { value: true },
+        },
+    )
+    .await;
+    let answer_basis = socket_basis("rpc:answer", "req-answer");
+    assert_eq!(
+        history(&state, &chore.id, "autostart").last(),
+        Some(&(
+            Some("0".into()),
+            Some("1".into()),
+            "human".into(),
+            format!("restart_after_answer {answer_basis}")
+        ))
+    );
 }

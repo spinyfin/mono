@@ -2516,6 +2516,19 @@ impl WorkDb {
         answer: OperatorAnswer,
         pr_checker: &dyn PrStateChecker,
     ) -> Result<OperatorAnswerOutcome> {
+        self.answer_operator_question_from(id, answer, pr_checker, boss_protocol::LAST_STATUS_ACTOR_HUMAN, None)
+    }
+
+    /// [`Self::answer_operator_question_with`] with the resolved caller so an
+    /// answer that re-enables autostart records who answered.
+    pub fn answer_operator_question_from(
+        &self,
+        id: &str,
+        answer: OperatorAnswer,
+        pr_checker: &dyn PrStateChecker,
+        actor: &str,
+        provenance: Option<&str>,
+    ) -> Result<OperatorAnswerOutcome> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let question = tx
@@ -2585,7 +2598,7 @@ impl WorkDb {
             (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. })
                 if ladder_question =>
             {
-                let effect = crate::progression_ladder::answer_in_tx(&mut pending, &tx, &task, &value, &now)?;
+                let effect = crate::progression_ladder::answer_in_tx(&mut pending, &tx, &task, &value, &now, actor)?;
                 archive_work_item_id = effect.archive.then(|| task.id.clone());
             }
             (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. })
@@ -2603,6 +2616,7 @@ impl WorkDb {
                         answered_at,
                         now: &now,
                     },
+                    crate::task_status_audit::WriteAttribution { actor, provenance },
                 )?;
                 minted_execution = effect.minted_execution;
                 touched_work_item_ids = effect.touched;
@@ -2623,12 +2637,28 @@ impl WorkDb {
             (OperatorAnswer::YesNo { value: true }, OperatorAnswerType::YesNo) => {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
                 let block = authorization_block(&question.question, &timestamp);
-                minted_execution = restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
+                minted_execution = restart_after_answer_from(
+                    &mut pending,
+                    &tx,
+                    &task,
+                    &question.question,
+                    &block,
+                    &now,
+                    crate::task_status_audit::WriteAttribution { actor, provenance },
+                )?;
             }
             (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. }) => {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
                 let block = choice_block(&question.question, &value, &timestamp);
-                minted_execution = restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
+                minted_execution = restart_after_answer_from(
+                    &mut pending,
+                    &tx,
+                    &task,
+                    &question.question,
+                    &block,
+                    &now,
+                    crate::task_status_audit::WriteAttribution { actor, provenance },
+                )?;
             }
             (
                 OperatorAnswer::YesNo { value: false },
@@ -2639,12 +2669,28 @@ impl WorkDb {
             ) => {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
                 let block = file_count_bypass_authorization_block(&question.question, *spec, &timestamp);
-                minted_execution = restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
+                minted_execution = restart_after_answer_from(
+                    &mut pending,
+                    &tx,
+                    &task,
+                    &question.question,
+                    &block,
+                    &now,
+                    crate::task_status_audit::WriteAttribution { actor, provenance },
+                )?;
             }
             (OperatorAnswer::YesNo { value: false }, _) => {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
                 let block = declined_block(&question.question, &timestamp);
-                minted_execution = restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
+                minted_execution = restart_after_answer_from(
+                    &mut pending,
+                    &tx,
+                    &task,
+                    &question.question,
+                    &block,
+                    &now,
+                    crate::task_status_audit::WriteAttribution { actor, provenance },
+                )?;
             }
             // `check_answer` above refuses every other pairing.
             (answer, answer_type) => anyhow::bail!("unhandled operator answer {answer:?} for {answer_type:?}"),
@@ -2677,6 +2723,7 @@ pub use crate::operator_answer_outcome::OperatorAnswerOutcome;
 /// `dependency` with a waiting execution, matching revision insert and
 /// prerequisite approval, so the dependency cascade promotes it on the
 /// event path when the gate clears.
+#[cfg(test)]
 pub(super) fn restart_after_answer(
     pending: &mut PendingEvents,
     tx: &rusqlite::Transaction<'_>,
@@ -2685,8 +2732,33 @@ pub(super) fn restart_after_answer(
     block: &str,
     now: &str,
 ) -> Result<bool> {
+    restart_after_answer_from(
+        pending,
+        tx,
+        task,
+        question,
+        block,
+        now,
+        crate::task_status_audit::WriteAttribution {
+            actor: boss_protocol::LAST_STATUS_ACTOR_HUMAN,
+            provenance: None,
+        },
+    )
+}
+
+pub(super) fn restart_after_answer_from(
+    pending: &mut PendingEvents,
+    tx: &rusqlite::Transaction<'_>,
+    task: &Task,
+    question: &OperatorQuestionView,
+    block: &str,
+    now: &str,
+    attribution: crate::task_status_audit::WriteAttribution<'_>,
+) -> Result<bool> {
     let description = format!("{}{block}", task.description);
     super::description_guard::validate_description_update(&task.description, &description, false)?;
+    let actor = attribution.actor;
+    let basis = attribution.basis("restart_after_answer");
     // An item with a bound PR that a progression run asked about goes back to
     // review with the answer on its brief. A new implementation of it would be
     // refused ("use a revision"), which would roll the whole answer back and leave
@@ -2696,21 +2768,21 @@ pub(super) fn restart_after_answer(
     if asked_by_progression && crate::dispatch_admission::primary_pr_awaits_review(tx, &task.id)? {
         crate::task_status_audit::execute(
             tx,
-            "restart_after_answer",
-            "human",
+            &basis,
+            actor,
             "UPDATE tasks SET description = ?2, status = 'in_review', blocked_reason = NULL,
-             blocked_detail = NULL, autostart = 1, last_status_actor = 'human', updated_at = ?3 WHERE id = ?1",
-            params![task.id, description, now],
+             blocked_detail = NULL, autostart = 1, last_status_actor = ?4, updated_at = ?3 WHERE id = ?1",
+            params![task.id, description, now, actor],
         )?;
         return Ok(false);
     }
     crate::task_status_audit::execute(
         tx,
-        "restart_after_answer",
-        "human",
+        &basis,
+        actor,
         "UPDATE tasks SET description = ?2, status = 'todo', blocked_reason = NULL,
-         blocked_detail = NULL, autostart = 1, last_status_actor = 'human', updated_at = ?3 WHERE id = ?1",
-        params![task.id, description, now],
+         blocked_detail = NULL, autostart = 1, last_status_actor = ?4, updated_at = ?3 WHERE id = ?1",
+        params![task.id, description, now, actor],
     )?;
     if !parking::upkeep_eligible(tx, &task.id)? {
         return Ok(false);

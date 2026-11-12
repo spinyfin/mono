@@ -360,6 +360,7 @@ pub(super) fn answer_in_tx(
     asker: &Task,
     question: &OperatorQuestionView,
     answer: &Answer<'_>,
+    attribution: crate::task_status_audit::WriteAttribution<'_>,
 ) -> Result<AnswerEffect> {
     let Answer {
         attempt_id,
@@ -377,7 +378,8 @@ pub(super) fn answer_in_tx(
     match choice {
         CONFLICT_MISMATCH_CHOICE_FORCE_MERGE => {
             let block = force_merge_block(question, &timestamp);
-            let minted_execution = super::pr_flow::restart_after_answer(pending, tx, asker, question, &block, now)?;
+            let minted_execution =
+                super::pr_flow::restart_after_answer_from(pending, tx, asker, question, &block, now, attribution)?;
             mark_operator_forced_admission_in_tx(tx, &asker.id)?;
             Ok(AnswerEffect {
                 touched: vec![asker.id.clone()],

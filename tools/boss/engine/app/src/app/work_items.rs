@@ -89,6 +89,7 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
         sink,
         session_id,
         request_id,
+        peer_pid,
         ..
     } = ctx;
     let (id, answer) = match req {
@@ -121,7 +122,15 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
         }
         return;
     };
-    match work_db.answer_operator_question_with(&id, answer, server_state.pr_state_checker.as_ref()) {
+    let actor = resolve_status_actor(&server_state, peer_pid);
+    let provenance = resolve_write_basis(&server_state, peer_pid, &session_id, &request_id, "rpc:answer").await;
+    match work_db.answer_operator_question_from(
+        &id,
+        answer,
+        server_state.pr_state_checker.as_ref(),
+        actor,
+        Some(&provenance),
+    ) {
         Ok(outcome) => {
             let mut item = outcome.item;
             // "Archive it", the owner's answer to the engine's question about an
@@ -457,8 +466,9 @@ pub(super) async fn handle_create_task(ctx: Dispatch, req: FrontendRequest) {
     // canonical origin now so the durable row is dispatchable
     // and `cube repo ensure` never sees a bare slug (#861).
     repo_slug::resolve_repo_slugs(&server_state.cube_client, &mut [&mut input.repo_remote_url]).await;
+    let provenance = resolve_write_basis(&server_state, peer_pid, &session_id, &request_id, "rpc:create_task").await;
     let created = resolve_write_actor(&server_state, peer_pid, input.priority.as_deref(), None)
-        .and_then(|actor| work_db.create_task_as_actor(input, actor))
+        .and_then(|actor| work_db.create_task_as_actor_with_provenance(input, actor, Some(&provenance)))
         .map(WorkItem::Task);
     finish_create_work_item(
         &server_state,
@@ -491,8 +501,9 @@ pub(super) async fn handle_create_chore(ctx: Dispatch, req: FrontendRequest) {
     // Resolve a `--repo <slug>` override to its canonical cube
     // origin before persisting (#861); see the CreateTask arm.
     repo_slug::resolve_repo_slugs(&server_state.cube_client, &mut [&mut input.repo_remote_url]).await;
+    let provenance = resolve_write_basis(&server_state, peer_pid, &session_id, &request_id, "rpc:create_chore").await;
     let created = resolve_write_actor(&server_state, peer_pid, input.priority.as_deref(), None)
-        .and_then(|actor| work_db.create_chore_as_actor(input, actor))
+        .and_then(|actor| work_db.create_chore_as_actor_with_provenance(input, actor, Some(&provenance)))
         .map(WorkItem::Chore);
     finish_create_work_item(
         &server_state,
@@ -1049,6 +1060,14 @@ pub(super) async fn apply_work_item_patch_from(
                 if task_transitioned_to_active(&previous_task_status, &item) {
                     let work_item_id_for_event = work_item_id(&item);
                     let from_status = previous_task_status.clone();
+                    let start_basis = resolve_write_basis(
+                        &server_state,
+                        peer_pid,
+                        &session_id,
+                        &request_id,
+                        "board_drop:request_execution",
+                    )
+                    .await;
                     // Human-driven: status flip to Doing is the whole point —
                     // mark "someone is on this" without spawning a worker.
                     let item_is_human_driven = matches!(
@@ -1086,6 +1105,8 @@ pub(super) async fn apply_work_item_patch_from(
                             .explicit_start(true)
                             .entry_point(DispatchAdmissionEntryPoint::AppDrag)
                             .maybe_observed_pause_since_epoch_s(bypass.observed_pause_since_epoch_s)
+                            .audit_actor(actor)
+                            .audit_basis(start_basis.clone())
                             .build();
                         match coordinator
                             .dispatch_with_pause_bypass(dispatch_input, live_states)
@@ -1119,6 +1140,8 @@ pub(super) async fn apply_work_item_patch_from(
                         let dispatch_input = RequestExecutionInput::builder()
                             .work_item_id(work_item_id_for_event.clone())
                             .explicit_start(true)
+                            .audit_actor(actor)
+                            .audit_basis(start_basis.clone())
                             .build();
                         match work_db
                             .request_execution_with_live_check(dispatch_input, |run_id| live_states.is_run_live(run_id))
@@ -1724,8 +1747,16 @@ pub(super) async fn handle_create_investigation(ctx: Dispatch, req: FrontendRequ
     let FrontendRequest::CreateInvestigation { input } = req else {
         unreachable!()
     };
+    let provenance = resolve_write_basis(
+        &server_state,
+        peer_pid,
+        &session_id,
+        &request_id,
+        "rpc:create_investigation",
+    )
+    .await;
     let created = resolve_write_actor(&server_state, peer_pid, input.priority.as_deref(), None)
-        .and_then(|actor| work_db.create_investigation_as_actor(input, actor))
+        .and_then(|actor| work_db.create_investigation_as_actor_with_provenance(input, actor, Some(&provenance)))
         .map(WorkItem::Task);
     finish_create_work_item(
         &server_state,

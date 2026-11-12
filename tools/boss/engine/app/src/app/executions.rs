@@ -42,7 +42,9 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
         server_state,
         work_db,
         sink,
+        session_id,
         request_id,
+        peer_pid,
         ..
     } = ctx;
     let FrontendRequest::RequestExecution { mut input } = req else {
@@ -51,6 +53,17 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
     // This RPC is the human-facing start verb (kanban drag, `bossctl work
     // start`); automatic recovery calls the DB layer directly.
     input.explicit_start = true;
+    input.audit_actor = Some(resolve_status_actor(&server_state, peer_pid).to_owned());
+    input.audit_basis = Some(
+        resolve_write_basis(
+            &server_state,
+            peer_pid,
+            &session_id,
+            &request_id,
+            "rpc:request_execution",
+        )
+        .await,
+    );
     if let Err(err) = work_db.validate_manual_launch_target(&input.work_item_id) {
         send_work_error(&sink, &request_id, &err);
         return;

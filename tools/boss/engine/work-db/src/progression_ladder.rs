@@ -569,20 +569,39 @@ fn capture_prior(conn: &Connection, item_id: &str) -> Result<PriorState> {
 /// Put the item back as it was before the question. `waive_grace` stamps the
 /// stuck-after grace waiver, so a "keep trying" is not made to wait out the
 /// grace a second time. Only an item still waiting on the question is touched.
-fn restore_prior(conn: &Connection, item_id: &str, prior: Option<&PriorState>, waive_grace: bool) -> Result<()> {
+fn restore_prior(
+    conn: &Connection,
+    item_id: &str,
+    prior: Option<&PriorState>,
+    waive_grace: bool,
+    actor: &str,
+) -> Result<()> {
     let now = now_string();
     let grace = waive_grace.then_some(now.as_str());
     match prior {
         Some(prior) => {
+            // Restore autostart first, while the row is still waiting on the
+            // question, so this write keeps its own basis and actor. Status
+            // and reason restoration below keeps the earlier failure's
+            // provenance so progression classification is unchanged.
+            crate::task_status_audit::execute(
+                conn,
+                "progression_ladder_restore_autostart",
+                actor,
+                "UPDATE tasks SET autostart = ?2, updated_at = ?3
+                 WHERE id = ?1 AND deleted_at IS NULL
+                   AND status = 'blocked' AND blocked_reason = 'awaiting_operator_answer'",
+                params![item_id, prior.autostart, now],
+            )?;
             crate::task_status_audit::execute(
                 conn,
                 prior.basis.as_deref().unwrap_or("progression_ladder_restore"),
                 &prior.last_status_actor,
                 "UPDATE tasks
-                 SET status = ?2, blocked_reason = ?3, blocked_detail = ?4, blocked_attempt_id = ?5, autostart = ?6,
-                     dispatch_failed_reason = ?7, dispatch_failed_error = ?8, dispatch_failed_at = ?9,
-                     last_status_actor = ?10, updated_at = ?11,
-                     progression_grace_waived_at = COALESCE(?12, progression_grace_waived_at)
+                 SET status = ?2, blocked_reason = ?3, blocked_detail = ?4, blocked_attempt_id = ?5,
+                     dispatch_failed_reason = ?6, dispatch_failed_error = ?7, dispatch_failed_at = ?8,
+                     last_status_actor = ?9, updated_at = ?10,
+                     progression_grace_waived_at = COALESCE(?11, progression_grace_waived_at)
                  WHERE id = ?1 AND deleted_at IS NULL
                    AND status = 'blocked' AND blocked_reason = 'awaiting_operator_answer'",
                 params![
@@ -591,7 +610,6 @@ fn restore_prior(conn: &Connection, item_id: &str, prior: Option<&PriorState>, w
                     prior.blocked_reason,
                     prior.blocked_detail,
                     prior.blocked_attempt_id,
-                    prior.autostart,
                     prior.dispatch_failed_reason,
                     prior.dispatch_failed_error,
                     prior.dispatch_failed_at,
@@ -787,6 +805,7 @@ pub(crate) fn answer_in_tx(
     task: &Task,
     choice: &str,
     now: &str,
+    actor: &str,
 ) -> Result<LadderAnswerEffect> {
     let prior: Option<PriorState> = tx
         .query_row(
@@ -808,7 +827,7 @@ pub(crate) fn answer_in_tx(
                  WHERE work_item_id = ?1",
                 params![task.id, now],
             )?;
-            restore_prior(tx, &task.id, prior.as_ref(), true)?;
+            restore_prior(tx, &task.id, prior.as_ref(), true, actor)?;
         }
         PARK_IT => {
             // A revision follows its parent PR and cannot be parked alone.
@@ -819,13 +838,13 @@ pub(crate) fn answer_in_tx(
                 &root,
                 true,
                 Some("progression could not unstick it; the owner chose to park it"),
-                boss_protocol::LAST_STATUS_ACTOR_HUMAN,
+                actor,
                 now,
             )?;
-            restore_prior(tx, &task.id, prior.as_ref(), false)?;
+            restore_prior(tx, &task.id, prior.as_ref(), false, actor)?;
         }
         ARCHIVE_IT => {
-            restore_prior(tx, &task.id, prior.as_ref(), false)?;
+            restore_prior(tx, &task.id, prior.as_ref(), false, actor)?;
             effect.archive = true;
         }
         other => bail!("`{other}` is not an answer to the progression ladder's question"),
