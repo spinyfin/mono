@@ -201,6 +201,64 @@ async fn transient_positioning_failure_keeps_pre_start_backoff() {
     assert_eq!(failure.details["retry_delay_secs"], 5);
 }
 
+fn leftover_blocked_reason(db: &WorkDb, id: &str) -> Option<String> {
+    db.connect()
+        .unwrap()
+        .query_row(
+            "SELECT blocked_reason FROM tasks WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn refused_chore_implementation(db: &WorkDb, item: &str, pr_url: &str) {
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(item.to_owned())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Claimed)
+                .pr_url(pr_url)
+                .build(),
+        )
+        .unwrap();
+    db.record_workspace_positioning_refusal(
+        &execution.id,
+        "worker",
+        None,
+        "Cube command failed: refused",
+        "PR 99 is MERGED",
+    )
+    .unwrap();
+    assert_eq!(task(db, item).status, TaskStatus::Blocked);
+    assert_eq!(
+        leftover_blocked_reason(db, item).as_deref(),
+        Some("workspace_positioning_refused")
+    );
+}
+
+fn refused_blocked_chore(db: &WorkDb) -> String {
+    let (product_id, _) = make_pr_review_fixture(db, Some("https://github.com/spinyfin/mono/pull/99"));
+    let item = create_test_chore_manual(db, product_id, "Held chore").id;
+    refused_chore_implementation(db, &item, "https://github.com/spinyfin/mono/pull/99");
+    item
+}
+
+fn refused_blocked_revision(db: &WorkDb) -> String {
+    let (product_id, root) = make_pr_review_fixture(db, Some("https://github.com/spinyfin/mono/pull/99"));
+    let item = create_test_chore_manual(db, product_id, "Held revision").id;
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET kind = 'revision', parent_task_id = ?2 WHERE id = ?1",
+            rusqlite::params![item, root],
+        )
+        .unwrap();
+    refused_chore_implementation(db, &item, "https://github.com/spinyfin/mono/pull/99");
+    item
+}
+
 fn refused_revision_fixture(db: &Arc<WorkDb>) -> (String, WorkExecution) {
     let (product_id, root) = make_pr_review_fixture(db, Some("https://github.com/spinyfin/mono/pull/99"));
     let item = create_test_chore_manual(db, product_id, "Revise PR").id;
@@ -242,7 +300,11 @@ fn recheck_coordinator(db: &Arc<WorkDb>) -> Arc<ExecutionCoordinator> {
 }
 
 fn positionable_checker() -> Arc<dyn crate::work::PrStateChecker> {
-    Arc::new(crate::work::FakePrStateChecker::always(crate::work::PrOpenState::Open).with_head_sha("a".repeat(40)))
+    Arc::new(
+        crate::work::FakePrStateChecker::always(crate::work::PrOpenState::Open)
+            .with_head_sha("a".repeat(40))
+            .with_head_ref_name("feature"),
+    )
 }
 
 fn unpositionable_checker() -> Arc<dyn crate::work::PrStateChecker> {
@@ -611,6 +673,69 @@ async fn recheck_sweep_lowers_a_hold_on_a_done_item_without_probing() {
             .iter()
             .all(|a| a.status != "open")
     );
+}
+
+#[tokio::test]
+async fn recheck_sweep_converges_after_deleting_a_blocked_refused_chore() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let item = refused_blocked_chore(&db);
+    db.delete_work_item(&item).unwrap();
+    assert_eq!(
+        leftover_blocked_reason(&db, &item).as_deref(),
+        Some("workspace_positioning_refused")
+    );
+    let holds = db.list_positioning_holds().unwrap();
+    assert_eq!(holds.len(), 1);
+    assert!(holds[0].terminal);
+
+    let coordinator = recheck_coordinator(&db);
+    let first =
+        crate::positioning_refusal_recheck_sweep::run_one_pass(&db, &coordinator, &unpositionable_checker()).await;
+    assert_eq!((first.held, first.cleared, first.restarted), (1, 1, 0));
+    assert!(db.list_positioning_holds().unwrap().is_empty());
+    assert!(leftover_blocked_reason(&db, &item).is_none());
+    let second =
+        crate::positioning_refusal_recheck_sweep::run_one_pass(&db, &coordinator, &unpositionable_checker()).await;
+    assert_eq!((second.held, second.cleared), (0, 0));
+}
+
+#[tokio::test]
+async fn recheck_sweep_converges_after_archiving_a_blocked_refused_revision() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let item = refused_blocked_revision(&db);
+    let now = boss_engine_utils::epoch_time::now_epoch_secs().to_string();
+    assert_eq!(
+        crate::work::archive_revision_task(
+            &db.connect().unwrap(),
+            &item,
+            &now,
+            crate::work::ArchiveProvenance::new(
+                crate::work::ARCHIVE_MECHANISM_MANUAL_STATUS_CHANGE,
+                "archived after positioning refusal",
+            ),
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        leftover_blocked_reason(&db, &item).as_deref(),
+        Some("workspace_positioning_refused")
+    );
+    let holds = db.list_positioning_holds().unwrap();
+    assert_eq!(holds.len(), 1);
+    assert!(holds[0].terminal);
+
+    let coordinator = recheck_coordinator(&db);
+    let first =
+        crate::positioning_refusal_recheck_sweep::run_one_pass(&db, &coordinator, &unpositionable_checker()).await;
+    assert_eq!((first.held, first.cleared, first.restarted), (1, 1, 0));
+    assert!(db.list_positioning_holds().unwrap().is_empty());
+    assert!(leftover_blocked_reason(&db, &item).is_none());
+    let second =
+        crate::positioning_refusal_recheck_sweep::run_one_pass(&db, &coordinator, &unpositionable_checker()).await;
+    assert_eq!((second.held, second.cleared), (0, 0));
 }
 
 #[test]

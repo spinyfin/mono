@@ -174,16 +174,20 @@ impl WorkDb {
     }
 
     /// Lower the positioning hold on `work_item_id` (attention and, for a row the
-    /// hold blocked, the blocked status). Returns whether a hold was present.
+    /// hold blocked, the blocked status). Returns whether attention was resolved
+    /// or a row was rewritten; a leftover reason on a tombstone counts as a
+    /// rewrite, a no-op does not.
     pub fn clear_positioning_hold(&self, work_item_id: &str) -> Result<bool> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let held = crate::dispatch_helpers::positioning_hold_active(&tx, work_item_id)?;
-        if held {
-            crate::dispatch_helpers::clear_positioning_hold_in_tx(&tx, work_item_id, "engine")?;
-        }
+        let changed = if held {
+            crate::dispatch_helpers::clear_positioning_hold_in_tx(&tx, work_item_id, "engine")?
+        } else {
+            false
+        };
         tx.commit()?;
-        Ok(held)
+        Ok(changed)
     }
 
     fn record_start_failure_with_policy(
@@ -397,5 +401,34 @@ mod tests {
         assert_eq!(holds[0].work_item_id, chore.id);
         assert!(!holds[0].restarts, "NULL blocked_reason is not a row rewrite");
         assert!(!holds[0].terminal);
+    }
+
+    #[test]
+    fn clear_positioning_hold_clears_leftover_reason_on_a_deleted_blocked_row() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_test_chore_manual(&db, product.id, "deleted after refusal");
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Claimed)
+                    .build(),
+            )
+            .unwrap();
+        db.record_workspace_positioning_refusal(
+            &execution.id,
+            "worker",
+            None,
+            "Cube command failed: refused",
+            "unpublished content",
+        )
+        .unwrap();
+        db.delete_work_item(&chore.id).unwrap();
+        assert_eq!(db.list_positioning_holds().unwrap().len(), 1);
+        assert!(db.clear_positioning_hold(&chore.id).unwrap());
+        assert!(db.list_positioning_holds().unwrap().is_empty());
+        assert!(!db.clear_positioning_hold(&chore.id).unwrap());
     }
 }

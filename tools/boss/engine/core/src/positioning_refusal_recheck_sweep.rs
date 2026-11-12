@@ -10,11 +10,11 @@
 //!
 //! Live holds reuse [`PrStateChecker::inspect`] — the same `gh pr view` path as
 //! the neighbouring review-recovery sweep — and treat a PR as positionable when
-//! that inspect reports [`PrOpenState::Open`] with a full 40-character head SHA.
-//! Cube's `goto --pr` also requires a REST `head.ref`; a missing name with a live
-//! SHA is the pull-ref fallback cube already uses for deleted heads, so this
-//! sweep does not keep a parallel REST client just to re-read the branch name.
-//! Items with no PR to probe stay held until an explicit launch.
+//! that inspect reports [`PrOpenState::Open`] with a full 40-character head SHA
+//! and a non-empty head branch name. Cube's `goto --pr` refuses immediately
+//! when GitHub omits `head.ref`, before any pull-ref fallback, so this sweep
+//! keeps the same check. Items with no PR to probe stay held until an explicit
+//! launch.
 //!
 //! Terminal rows (`done`, `archived`, deleted) are a resolve-only pass: the PR
 //! that refused positioning is often the one that just merged, so probing it
@@ -53,15 +53,18 @@ impl crate::sweep_loop::SweepOutcome for PositioningRecheckOutcome {
     }
 }
 
-/// Cube would accept positioning: the PR is still open and GitHub reports a
-/// full 40-character head commit. Open vs merged vs closed-unmerged is the
-/// shared [`crate::work::classify_pr_merge_state`] decision inside inspect.
+/// Cube would accept positioning: the PR is still open, GitHub reports a
+/// full 40-character head commit, and a non-empty head branch name. Cube's
+/// `goto --pr` refuses a missing `head.ref` before any SHA fallback.
+/// Open vs merged vs closed-unmerged is the shared
+/// [`crate::work::classify_pr_merge_state`] decision inside inspect.
 fn pr_is_positionable(inspect: &PrInspect) -> bool {
     matches!(inspect.open_state, PrOpenState::Open)
         && inspect
             .head_sha
             .as_deref()
             .is_some_and(|sha| sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+        && inspect.head_ref_name.as_deref().is_some_and(|name| !name.is_empty())
 }
 
 /// Spawn the sweep, firing on spawn and then every `interval`.
@@ -182,20 +185,39 @@ mod tests {
     use super::pr_is_positionable;
     use crate::work::{PrInspect, PrOpenState};
 
-    fn inspect(open_state: PrOpenState, head_sha: Option<&str>) -> PrInspect {
+    fn inspect(open_state: PrOpenState, head_sha: Option<&str>, head_ref_name: Option<&str>) -> PrInspect {
         PrInspect {
             open_state,
             head_sha: head_sha.map(str::to_owned),
+            head_ref_name: head_ref_name.map(str::to_owned),
         }
     }
 
     #[test]
-    fn only_an_open_pr_with_a_full_head_is_positionable() {
+    fn only_an_open_pr_with_a_full_head_and_branch_name_is_positionable() {
         let sha = "a".repeat(40);
-        assert!(pr_is_positionable(&inspect(PrOpenState::Open, Some(&sha))));
-        assert!(!pr_is_positionable(&inspect(PrOpenState::Merged, Some(&sha))));
-        assert!(!pr_is_positionable(&inspect(PrOpenState::ClosedUnmerged, Some(&sha))));
-        assert!(!pr_is_positionable(&inspect(PrOpenState::Open, None)));
-        assert!(!pr_is_positionable(&inspect(PrOpenState::Open, Some("abc"))));
+        assert!(pr_is_positionable(&inspect(
+            PrOpenState::Open,
+            Some(&sha),
+            Some("feature")
+        )));
+        assert!(!pr_is_positionable(&inspect(
+            PrOpenState::Merged,
+            Some(&sha),
+            Some("feature")
+        )));
+        assert!(!pr_is_positionable(&inspect(
+            PrOpenState::ClosedUnmerged,
+            Some(&sha),
+            Some("feature")
+        )));
+        assert!(!pr_is_positionable(&inspect(PrOpenState::Open, None, Some("feature"))));
+        assert!(!pr_is_positionable(&inspect(
+            PrOpenState::Open,
+            Some("abc"),
+            Some("feature")
+        )));
+        assert!(!pr_is_positionable(&inspect(PrOpenState::Open, Some(&sha), None)));
+        assert!(!pr_is_positionable(&inspect(PrOpenState::Open, Some(&sha), Some(""))));
     }
 }

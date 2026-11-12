@@ -25,17 +25,21 @@ pub trait PrStateChecker: Send + Sync {
     /// Return the live lifecycle state of the given PR URL.
     fn check(&self, pr_url: &str) -> Result<PrOpenState>;
 
-    /// Lifecycle state plus the current head SHA, from one `gh pr view`.
+    /// Lifecycle state plus the current head SHA and branch name, from one
+    /// `gh pr view`.
     ///
-    /// Default implementation has no SHA (existing [`Self::check`]-only
-    /// impls keep working). [`GhPrStateChecker`] fetches `headRefOid` in
-    /// the same call as `state,mergedAt` so supervisor recovery can refuse
-    /// to collate stale leaf reports against a moved head without a second
-    /// GitHub round-trip.
+    /// Default implementation has no SHA or branch name (existing
+    /// [`Self::check`]-only impls keep working). [`GhPrStateChecker`] fetches
+    /// `headRefOid` and `headRefName` in the same call as `state,mergedAt`
+    /// so supervisor recovery can refuse to collate stale leaf reports
+    /// against a moved head without a second GitHub round-trip, and
+    /// positioning recheck can require the same `head.ref` cube's
+    /// `goto --pr` requires.
     fn inspect(&self, pr_url: &str) -> Result<PrInspect> {
         Ok(PrInspect {
             open_state: self.check(pr_url)?,
             head_sha: None,
+            head_ref_name: None,
         })
     }
 
@@ -57,6 +61,10 @@ pub trait PrStateChecker: Send + Sync {
 pub struct PrInspect {
     pub open_state: PrOpenState,
     pub head_sha: Option<String>,
+    /// GitHub `headRefName`. Cube's `goto --pr` refuses when this is missing,
+    /// so callers that decide whether positioning would succeed must require
+    /// a non-empty name rather than treating a SHA alone as sufficient.
+    pub head_ref_name: Option<String>,
 }
 
 /// Lifecycle state returned by [`PrStateChecker::check`].
@@ -142,7 +150,7 @@ impl PrStateChecker for GhPrStateChecker {
                     "view",
                     pr_url,
                     "--json",
-                    "state,mergedAt,headRefOid",
+                    "state,mergedAt,headRefOid,headRefName",
                 ])
             })
             .with_context(|| format!("failed to run `gh pr view` for {pr_url}"))?;
@@ -177,19 +185,26 @@ fn map_gh_state(v: &serde_json::Value) -> PrOpenState {
     }
 }
 
-/// Pure mapping from `gh pr view --json state,mergedAt,headRefOid` JSON.
-/// Empty / missing / non-string `headRefOid` is `None` so a caller that
-/// cannot confirm the live SHA does not treat "unknown" as a move.
+/// Pure mapping from `gh pr view --json state,mergedAt,headRefOid,headRefName` JSON.
+/// Empty / missing / non-string `headRefOid` or `headRefName` is `None` so a
+/// caller that cannot confirm the live SHA or branch name does not treat
+/// "unknown" as positionable.
 fn map_gh_inspect(v: &serde_json::Value) -> PrInspect {
-    let head_sha = v["headRefOid"]
-        .as_str()
-        .map(str::trim)
-        .filter(|sha| !sha.is_empty())
-        .map(str::to_owned);
+    let head_sha = optional_trimmed_json_str(v, "headRefOid");
+    let head_ref_name = optional_trimmed_json_str(v, "headRefName");
     PrInspect {
         open_state: map_gh_state(v),
         head_sha,
+        head_ref_name,
     }
+}
+
+fn optional_trimmed_json_str(v: &serde_json::Value, key: &str) -> Option<String> {
+    v[key]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 /// A `PrStateChecker` that returns a fixed, already-observed state without
@@ -214,6 +229,7 @@ pub struct FakePrStateChecker {
     pub states: std::collections::HashMap<String, PrOpenState>,
     pub default: PrOpenState,
     pub head_sha: Option<String>,
+    pub head_ref_name: Option<String>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -223,6 +239,7 @@ impl FakePrStateChecker {
             states: Default::default(),
             default: state,
             head_sha: None,
+            head_ref_name: None,
         }
     }
     pub fn with(mut self, url: &str, state: PrOpenState) -> Self {
@@ -231,6 +248,10 @@ impl FakePrStateChecker {
     }
     pub fn with_head_sha(mut self, sha: impl Into<String>) -> Self {
         self.head_sha = Some(sha.into());
+        self
+    }
+    pub fn with_head_ref_name(mut self, name: impl Into<String>) -> Self {
+        self.head_ref_name = Some(name.into());
         self
     }
 }
@@ -245,6 +266,7 @@ impl PrStateChecker for FakePrStateChecker {
         Ok(PrInspect {
             open_state: self.check(pr_url)?,
             head_sha: self.head_sha.clone(),
+            head_ref_name: self.head_ref_name.clone(),
         })
     }
 }
@@ -327,6 +349,7 @@ mod tests {
             PrInspect {
                 open_state: PrOpenState::Open,
                 head_sha: Some("abc123".to_owned()),
+                head_ref_name: None,
             }
         );
     }
@@ -340,6 +363,44 @@ mod tests {
         );
         assert_eq!(
             map_gh_inspect(&json!({"state": "OPEN", "headRefOid": "   "})).head_sha,
+            None
+        );
+    }
+
+    #[test]
+    fn inspect_extracts_head_ref_name() {
+        assert_eq!(
+            map_gh_inspect(&json!({
+                "state": "OPEN",
+                "mergedAt": null,
+                "headRefOid": "abc123",
+                "headRefName": "feature"
+            })),
+            PrInspect {
+                open_state: PrOpenState::Open,
+                head_sha: Some("abc123".to_owned()),
+                head_ref_name: Some("feature".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn inspect_open_pr_with_sha_and_no_head_name_is_not_named() {
+        let sha = "a".repeat(40);
+        let inspect = map_gh_inspect(&json!({
+            "state": "OPEN",
+            "mergedAt": null,
+            "headRefOid": sha
+        }));
+        assert_eq!(inspect.open_state, PrOpenState::Open);
+        assert_eq!(inspect.head_sha.as_deref(), Some(sha.as_str()));
+        assert_eq!(inspect.head_ref_name, None);
+        assert_eq!(
+            map_gh_inspect(&json!({"state": "OPEN", "headRefName": ""})).head_ref_name,
+            None
+        );
+        assert_eq!(
+            map_gh_inspect(&json!({"state": "OPEN", "headRefName": "   "})).head_ref_name,
             None
         );
     }

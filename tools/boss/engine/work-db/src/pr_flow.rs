@@ -1484,8 +1484,8 @@ impl WorkDb {
             return Ok(None);
         };
         if task.deleted_at.is_some() {
-            // A leftover positioning hold on a tombstone would otherwise stay
-            // open forever: the recheck sweep used to skip deleted rows.
+            // Lower any positioning hold left on a tombstone so its attention
+            // does not stay open.
             resolve_attention_kind_in_tx(&tx, work_item_id, WORKSPACE_POSITIONING_REFUSED)?;
             tx.commit()?;
             return Ok(None);

@@ -187,9 +187,14 @@ pub(crate) fn not_positioning_held_sql(a: &str) -> String {
 /// Lower the positioning hold: resolve its attention and return a row that was
 /// blocked only by the hold to `todo`. Review-phase rows never had their status
 /// rewritten, so they are left exactly as they were.
-pub(crate) fn clear_positioning_hold_in_tx(conn: &Connection, work_item_id: &str, actor: &str) -> Result<()> {
-    resolve_attention_kind_in_tx(conn, work_item_id, WORKSPACE_POSITIONING_REFUSED)?;
-    crate::task_status_audit::execute(
+///
+/// Deleted / `done` / `archived` rows keep their status; any leftover
+/// `blocked_reason` is still cleared so they leave the hold listing. Returns
+/// whether attention was resolved or a row was rewritten.
+pub(crate) fn clear_positioning_hold_in_tx(conn: &Connection, work_item_id: &str, actor: &str) -> Result<bool> {
+    let now = now_string();
+    let attention = resolve_attention_kind_in_tx(conn, work_item_id, WORKSPACE_POSITIONING_REFUSED)?;
+    let rewritten = crate::task_status_audit::execute(
         conn,
         "workspace_positioning_hold_cleared",
         actor,
@@ -199,9 +204,23 @@ pub(crate) fn clear_positioning_hold_in_tx(conn: &Connection, work_item_id: &str
              WHERE id = ?1 AND deleted_at IS NULL
                AND status = 'blocked' AND blocked_reason = '{WORKSPACE_POSITIONING_REFUSED}'"
         ),
-        params![work_item_id, now_string(), actor],
+        params![work_item_id, now, actor],
     )?;
-    Ok(())
+    // Terminal and deleted rows fail the status rewrite above (status is no
+    // longer `blocked`, or `deleted_at` is set). Drop the leftover reason
+    // without touching status so the hold listing converges.
+    let leftover = crate::task_status_audit::execute(
+        conn,
+        "workspace_positioning_hold_cleared",
+        actor,
+        &format!(
+            "UPDATE tasks SET blocked_reason = NULL, blocked_detail = NULL,
+                 last_status_actor = ?3, updated_at = ?2
+             WHERE id = ?1 AND blocked_reason = '{WORKSPACE_POSITIONING_REFUSED}'"
+        ),
+        params![work_item_id, now, actor],
+    )?;
+    Ok(attention > 0 || rewritten > 0 || leftover > 0)
 }
 
 /// Mark every open attention item of `kind` for `work_item_id` as
@@ -1684,7 +1703,7 @@ pub(crate) fn request_execution_in_tx_as_actor<F: FnOnce(&str) -> bool>(
         // retains the explanation, while the new attempt starts without a stale
         // failure blocker. Automatic reconciliation cannot reach this clear.
         super::pr_flow::withdraw_questions(conn, &work_item_id, "restarted_without_answer")?;
-        clear_positioning_hold_in_tx(conn, &work_item_id, actor)?;
+        let _ = clear_positioning_hold_in_tx(conn, &work_item_id, actor)?;
         crate::task_status_audit::execute(
             conn,
             "explicit_start_failure_clear",
