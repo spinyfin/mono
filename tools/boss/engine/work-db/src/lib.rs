@@ -356,41 +356,163 @@ pub const CI_CHURN_WINDOW_SECS: i64 = 60 * 60;
 /// manual retries against a flaky / fundamentally-broken PR.
 pub const CI_CHURN_LIMIT: i64 = 5;
 
-pub use boss_protocol::{
-    ADMISSION_BLOCKER_AUTOSTART_DISABLED, ADMISSION_BLOCKER_CHURN_GUARD_PARKED, ADMISSION_BLOCKER_DELIBERATE_PARKED,
-    ADMISSION_BLOCKER_INELIGIBLE_STATUS, ADMISSION_BLOCKER_INTERACTIVE_CONCURRENCY_CAP,
-    ADMISSION_BLOCKER_UNMET_DEPENDENCY, ANSWER_AGENT_RUN_STATUS_FAILED, ANSWER_AGENT_RUN_STATUS_REPLIED,
-    ANSWER_AGENT_RUN_STATUS_RUNNING, ANSWER_AGENT_RUN_STATUS_SUPERSEDED, AddDependencyInput, AnswerAgentRun, Attention,
-    AttentionGroup, AttentionMerge, Automation, AutomationPatch, AutomationRun, AutomationTrigger,
-    BOOTHBY_REVERSIBILITY_IRREVERSIBLE, BOOTHBY_TARGET_ATTENTION, BOOTHBY_TARGET_ATTENTION_ITEM,
-    BOOTHBY_TARGET_PROJECT, BOOTHBY_TARGET_TASK, BlockedSignal, BoothbyAction, BoothbyCursor, BoothbyFinding,
-    BoothbyPass, BranchNaming, COMMENT_STATUS_ACTIVE, COMMENT_STATUS_ANSWER_FAILED, COMMENT_STATUS_ANSWERED,
-    COMMENT_STATUS_ANSWERING, COMMENT_STATUS_AWAITING_FOLLOWUP, COMMENT_STATUS_DISMISSED, COMMENT_STATUS_IN_REVISION,
-    COMMENT_STATUS_ORPHANED, COMMENT_STATUS_RESOLVED, CREATED_VIA_ATTENTION, CREATED_VIA_BOOTHBY_PREFIX,
-    CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_DOC_COMMENT_PREFIX, CREATED_VIA_ENGINE_AUTO,
-    CREATED_VIA_GUIDE_COMMENT_PREFIX, CREATED_VIA_IDEA_GRADUATION_PREFIX, CREATED_VIA_MERGE_CONFLICT_PREFIX,
-    CREATED_VIA_PR_REVIEW_POST_MERGE_PREFIX, CREATED_VIA_PR_REVIEW_PREFIX, CREATED_VIA_UNKNOWN, CiBudgetSnapshot,
-    CiRemediation, CommentAnchor, CommentResolution, CommentThreadEntry, CommentWithThread, CommentsBannerState,
-    ConflictClassCount, ConflictFileFrequency, ConflictFilePairFrequency, ConflictHotspotReport, ConflictResolution,
-    CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput,
-    CreateDecisionInput, CreateExecutionInput, CreateIdeaInput, CreateManyChoresInput, CreateManyTasksInput,
-    CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput, Decision,
-    DecisionKind, DecisionStatus, DeferredScopeAttention, DependencyDirection, DependencyEdge, DependencyFilter,
-    DispatchAdmission, DispatchAdmissionBlocker, DispatchPauseSnapshot, DocOwner, DocOwnerPrLifecycle,
-    DriverTrafficSplit, EditorialAction, EditorialRules, EffortLevel, EngineAttemptListEntry, ExecutionKind,
-    ExecutionReconcileResult, ExecutionStatus, FinishExecutionRunInput, FollowupMemberOverride,
-    GuideCommentDisposition, GuideCommentOutcome, INTENT_QUESTION, INTENT_REVISION, Idea, IdeaGraduationKind,
-    IdeaPatch, IdeaStatus, LAST_STATUS_ACTOR_BOOTHBY, LAST_STATUS_ACTOR_HUMAN, ListDependenciesInput, PrWorkItemMatch,
-    Product, Project, ProjectDesignDocState, ProjectStatus, RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY,
-    RESOLVED_WITH_ORPHAN, ReasoningMode, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
-    ResolvedComment, ResolvedDesignDoc, ResolvedDesignDocKind, ReviewBatch, ReviewBatchMember, ReviewBatchMemberRole,
-    ReviewBatchMemberStatus, ReviewBatchPhase, ReviewBatchStatus, ReviewClassification, ReviseDocInput,
-    ReviseDocOutcome, SetProjectDesignDocInput, SetTaskDocPointerInput, StatusActor, THREAD_ENTRY_AUTHOR_ENGINE,
-    THREAD_ENTRY_KIND_ANSWER, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP, Task, TaskKind, TaskRuntime, TaskStatus,
-    WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
-    WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun, WorkTree, comment_status_is_closed,
-    is_known_created_via,
-};
+pub use boss_protocol::ADMISSION_BLOCKER_AUTOSTART_DISABLED;
+pub use boss_protocol::ADMISSION_BLOCKER_CHURN_GUARD_PARKED;
+pub use boss_protocol::ADMISSION_BLOCKER_DELIBERATE_PARKED;
+pub use boss_protocol::ADMISSION_BLOCKER_INELIGIBLE_STATUS;
+pub use boss_protocol::ADMISSION_BLOCKER_INTERACTIVE_CONCURRENCY_CAP;
+pub use boss_protocol::ADMISSION_BLOCKER_UNMET_DEPENDENCY;
+pub use boss_protocol::ANSWER_AGENT_RUN_STATUS_FAILED;
+pub use boss_protocol::ANSWER_AGENT_RUN_STATUS_REPLIED;
+pub use boss_protocol::ANSWER_AGENT_RUN_STATUS_RUNNING;
+pub use boss_protocol::ANSWER_AGENT_RUN_STATUS_SUPERSEDED;
+pub use boss_protocol::AddDependencyInput;
+pub use boss_protocol::AnswerAgentRun;
+pub use boss_protocol::Attention;
+pub use boss_protocol::AttentionGroup;
+pub use boss_protocol::AttentionMerge;
+pub use boss_protocol::Automation;
+pub use boss_protocol::AutomationPatch;
+pub use boss_protocol::AutomationRun;
+pub use boss_protocol::AutomationTrigger;
+pub use boss_protocol::BOOTHBY_REVERSIBILITY_IRREVERSIBLE;
+pub use boss_protocol::BOOTHBY_TARGET_ATTENTION;
+pub use boss_protocol::BOOTHBY_TARGET_ATTENTION_ITEM;
+pub use boss_protocol::BOOTHBY_TARGET_PROJECT;
+pub use boss_protocol::BOOTHBY_TARGET_TASK;
+pub use boss_protocol::BlockedSignal;
+pub use boss_protocol::BoothbyAction;
+pub use boss_protocol::BoothbyCursor;
+pub use boss_protocol::BoothbyFinding;
+pub use boss_protocol::BoothbyPass;
+pub use boss_protocol::BranchNaming;
+pub use boss_protocol::COMMENT_STATUS_ACTIVE;
+pub use boss_protocol::COMMENT_STATUS_ANSWER_FAILED;
+pub use boss_protocol::COMMENT_STATUS_ANSWERED;
+pub use boss_protocol::COMMENT_STATUS_ANSWERING;
+pub use boss_protocol::COMMENT_STATUS_AWAITING_FOLLOWUP;
+pub use boss_protocol::COMMENT_STATUS_DISMISSED;
+pub use boss_protocol::COMMENT_STATUS_IN_REVISION;
+pub use boss_protocol::COMMENT_STATUS_ORPHANED;
+pub use boss_protocol::COMMENT_STATUS_RESOLVED;
+pub use boss_protocol::CREATED_VIA_ATTENTION;
+pub use boss_protocol::CREATED_VIA_BOOTHBY_PREFIX;
+pub use boss_protocol::CREATED_VIA_CI_FIX_PREFIX;
+pub use boss_protocol::CREATED_VIA_DOC_COMMENT_PREFIX;
+pub use boss_protocol::CREATED_VIA_ENGINE_AUTO;
+pub use boss_protocol::CREATED_VIA_GUIDE_COMMENT_PREFIX;
+pub use boss_protocol::CREATED_VIA_IDEA_GRADUATION_PREFIX;
+pub use boss_protocol::CREATED_VIA_MERGE_CONFLICT_PREFIX;
+pub use boss_protocol::CREATED_VIA_PR_REVIEW_POST_MERGE_PREFIX;
+pub use boss_protocol::CREATED_VIA_PR_REVIEW_PREFIX;
+pub use boss_protocol::CREATED_VIA_UNKNOWN;
+pub use boss_protocol::CiBudgetSnapshot;
+pub use boss_protocol::CiRemediation;
+pub use boss_protocol::CommentAnchor;
+pub use boss_protocol::CommentResolution;
+pub use boss_protocol::CommentThreadEntry;
+pub use boss_protocol::CommentWithThread;
+pub use boss_protocol::CommentsBannerState;
+pub use boss_protocol::ConflictClassCount;
+pub use boss_protocol::ConflictFileFrequency;
+pub use boss_protocol::ConflictFilePairFrequency;
+pub use boss_protocol::ConflictHotspotReport;
+pub use boss_protocol::ConflictResolution;
+pub use boss_protocol::CreateAttentionInput;
+pub use boss_protocol::CreateAttentionItemInput;
+pub use boss_protocol::CreateAutomationInput;
+pub use boss_protocol::CreateChoreInput;
+pub use boss_protocol::CreateCommentInput;
+pub use boss_protocol::CreateDecisionInput;
+pub use boss_protocol::CreateExecutionInput;
+pub use boss_protocol::CreateIdeaInput;
+pub use boss_protocol::CreateManyChoresInput;
+pub use boss_protocol::CreateManyTasksInput;
+pub use boss_protocol::CreateProductInput;
+pub use boss_protocol::CreateProjectInput;
+pub use boss_protocol::CreateRevisionInput;
+pub use boss_protocol::CreateRunInput;
+pub use boss_protocol::CreateTaskInput;
+pub use boss_protocol::Decision;
+pub use boss_protocol::DecisionKind;
+pub use boss_protocol::DecisionStatus;
+pub use boss_protocol::DeferredScopeAttention;
+pub use boss_protocol::DependencyDirection;
+pub use boss_protocol::DependencyEdge;
+pub use boss_protocol::DependencyFilter;
+pub use boss_protocol::DispatchAdmission;
+pub use boss_protocol::DispatchAdmissionBlocker;
+pub use boss_protocol::DispatchPauseSnapshot;
+pub use boss_protocol::DocOwner;
+pub use boss_protocol::DocOwnerPrLifecycle;
+pub use boss_protocol::DriverTrafficSplit;
+pub use boss_protocol::EditorialAction;
+pub use boss_protocol::EditorialRules;
+pub use boss_protocol::EffortLevel;
+pub use boss_protocol::EngineAttemptListEntry;
+pub use boss_protocol::ExecutionKind;
+pub use boss_protocol::ExecutionReconcileResult;
+pub use boss_protocol::ExecutionStatus;
+pub use boss_protocol::FinishExecutionRunInput;
+pub use boss_protocol::FollowupMemberOverride;
+pub use boss_protocol::GuideCommentDisposition;
+pub use boss_protocol::GuideCommentOutcome;
+pub use boss_protocol::INTENT_QUESTION;
+pub use boss_protocol::INTENT_REVISION;
+pub use boss_protocol::Idea;
+pub use boss_protocol::IdeaGraduationKind;
+pub use boss_protocol::IdeaPatch;
+pub use boss_protocol::IdeaStatus;
+pub use boss_protocol::LAST_STATUS_ACTOR_BOOTHBY;
+pub use boss_protocol::LAST_STATUS_ACTOR_HUMAN;
+pub use boss_protocol::ListDependenciesInput;
+pub use boss_protocol::PrWorkItemMatch;
+pub use boss_protocol::Product;
+pub use boss_protocol::Project;
+pub use boss_protocol::ProjectDesignDocState;
+pub use boss_protocol::ProjectStatus;
+pub use boss_protocol::RESOLVED_WITH_EXACT;
+pub use boss_protocol::RESOLVED_WITH_FUZZY;
+pub use boss_protocol::RESOLVED_WITH_ORPHAN;
+pub use boss_protocol::ReasoningMode;
+pub use boss_protocol::RemoveDependencyInput;
+pub use boss_protocol::RequestExecutionInput;
+pub use boss_protocol::ResolveProjectDesignDocOutput;
+pub use boss_protocol::ResolvedComment;
+pub use boss_protocol::ResolvedDesignDoc;
+pub use boss_protocol::ResolvedDesignDocKind;
+pub use boss_protocol::ReviewBatch;
+pub use boss_protocol::ReviewBatchMember;
+pub use boss_protocol::ReviewBatchMemberRole;
+pub use boss_protocol::ReviewBatchMemberStatus;
+pub use boss_protocol::ReviewBatchPhase;
+pub use boss_protocol::ReviewBatchStatus;
+pub use boss_protocol::ReviewClassification;
+pub use boss_protocol::ReviseDocInput;
+pub use boss_protocol::ReviseDocOutcome;
+pub use boss_protocol::SetProjectDesignDocInput;
+pub use boss_protocol::SetTaskDocPointerInput;
+pub use boss_protocol::StatusActor;
+pub use boss_protocol::THREAD_ENTRY_AUTHOR_ENGINE;
+pub use boss_protocol::THREAD_ENTRY_KIND_ANSWER;
+pub use boss_protocol::THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP;
+pub use boss_protocol::Task;
+pub use boss_protocol::TaskKind;
+pub use boss_protocol::TaskRuntime;
+pub use boss_protocol::TaskStatus;
+pub use boss_protocol::WorkAttentionItem;
+pub use boss_protocol::WorkComment;
+pub use boss_protocol::WorkExecution;
+pub use boss_protocol::WorkItem;
+pub use boss_protocol::WorkItemDependency;
+pub use boss_protocol::WorkItemDependencyDetail;
+pub use boss_protocol::WorkItemDependencyView;
+pub use boss_protocol::WorkItemExternalRef;
+pub use boss_protocol::WorkItemPatch;
+pub use boss_protocol::WorkRun;
+pub use boss_protocol::WorkTree;
+pub use boss_protocol::comment_status_is_closed;
+pub use boss_protocol::is_known_created_via;
 
 /// Outcome of [`WorkDb::claim_execution_for_dispatch`]: the Ready → Claimed
 /// compare-and-swap that keeps `reconcile_product_executions` from rewriting

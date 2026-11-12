@@ -12,37 +12,10 @@ pub(super) fn all() -> Vec<Migration> {
             apply: |_| Ok(()),
         })
         .collect();
+    // Frozen 00000000_0000_vNNN_* ids stay first in version order; named
+    // entries follow by the suffix after YYYYMMDD_HHMM_. Source order is
+    // only for merge-conflict locality. The runner sorts by id.
     migrations.extend([
-        Migration {
-            id: "20261110_2300_prompt_confirmation".into(),
-            legacy_version: None,
-            apply: |conn| {
-                if !table_has_column(conn, "work_runs", "prompt_confirmed")? {
-                    conn.execute_batch("ALTER TABLE work_runs ADD COLUMN prompt_confirmed INTEGER")?;
-                }
-                Ok(())
-            },
-        },
-        Migration {
-            id: "20261109_0451_explicit_launch_focus".into(),
-            legacy_version: None,
-            apply: dispatch_focus::migrate_explicit_launch,
-        },
-        Migration {
-            id: "20261104_1700_workspace_lease_boundary".into(),
-            legacy_version: None,
-            apply: preserved_work::migrate_lease_boundary,
-        },
-        Migration {
-            id: "20261105_1200_workspace_lease_generation".into(),
-            legacy_version: None,
-            apply: preserved_work::migrate_lease_generation,
-        },
-        Migration {
-            id: "20261029_1430_critical_requests".into(),
-            legacy_version: None,
-            apply: critical_requests::migrate,
-        },
         Migration {
             id: "00000000_0000_v033_postmortem_signals".into(),
             legacy_version: Some(33),
@@ -286,14 +259,168 @@ pub(super) fn all() -> Vec<Migration> {
             },
         },
         Migration {
+            id: conflict_mismatch::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: conflict_mismatch::migrate,
+        },
+        Migration {
+            id: "20261029_1430_critical_requests".into(),
+            legacy_version: None,
+            apply: critical_requests::migrate,
+        },
+        Migration {
+            id: execution_bookmarks::HAS_RECOVERY_HEAD_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: execution_bookmarks::migrate_has_recovery_head,
+        },
+        Migration {
+            id: execution_bookmarks::RETIRE_PRUNE_STATE_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: execution_bookmarks::migrate_retire_prune_state,
+        },
+        Migration {
+            id: progression_candidates::EXECUTION_PROVENANCE_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: progression_candidates::migrate_execution_provenance,
+        },
+        Migration {
+            id: execution_wait_history::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: execution_wait_history::migrate,
+        },
+        Migration {
+            id: "20261029_1900_execution_waiting_human_history".into(),
+            legacy_version: None,
+            apply: stuck_report::migrate_wait_history,
+        },
+        Migration {
+            id: "20261109_0451_explicit_launch_focus".into(),
+            legacy_version: None,
+            apply: dispatch_focus::migrate_explicit_launch,
+        },
+        Migration {
+            id: spoke_hub::RUN_INDEX_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: spoke_hub::migrate_host_commands_run_idx,
+        },
+        Migration {
+            id: spoke_hub::LEGACY_DESTINATION_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: spoke_hub::migrate_legacy_destinations,
+        },
+        Migration {
+            id: legacy_store_cleanup::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: legacy_store_cleanup::migrate,
+        },
+        Migration {
+            id: conflict_mismatch::OPERATOR_FORCED_ADMISSION_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: conflict_mismatch::migrate_operator_forced_admission,
+        },
+        Migration {
+            id: pr_flow::OPERATOR_QUESTION_STUCK_CLASSIFICATION_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: pr_flow::migrate_operator_question_stuck_classification,
+        },
+        Migration {
+            id: "20261108_2100_parking_cancel_provenance".into(),
+            legacy_version: None,
+            apply: parking_reconcile::migrate_cancel_provenance,
+        },
+        Migration {
+            id: "20261107_0543_parking_membership".into(),
+            legacy_version: None,
+            apply: parking::migrate_membership,
+        },
+        Migration {
+            id: "20261109_1930_preserved_archive_cleanup".into(),
+            legacy_version: None,
+            apply: preserved_cleanup::migrate_archive_cleanup,
+        },
+        Migration {
+            id: "20261103_0501_preserved_execution_tip".into(),
+            legacy_version: None,
+            apply: preserved_work::migrate,
+        },
+        Migration {
+            id: progression_verbs::ACTIONS_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: progression_verbs::migrate_actions,
+        },
+        Migration {
+            id: progression_candidates::VIEWS_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: progression_candidates::migrate_views_noop,
+        },
+        Migration {
+            id: progression_candidates::GRACE_COLUMN_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: parking_reconcile::migrate,
+        },
+        Migration {
+            id: parking_reconcile::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: parking_reconcile::migrate,
+        },
+        Migration {
+            id: progression_ladder::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: progression_ladder::migrate,
+        },
+        Migration {
+            id: "20261110_2300_prompt_confirmation".into(),
+            legacy_version: None,
+            apply: |conn| {
+                if !table_has_column(conn, "work_runs", "prompt_confirmed")? {
+                    conn.execute_batch("ALTER TABLE work_runs ADD COLUMN prompt_confirmed INTEGER")?;
+                }
+                Ok(())
+            },
+        },        Migration {
+            id: "20261102_2105_recovery_fresh_start".into(),
+            legacy_version: None,
+            apply: execution_recovery_rearm::migrate_fresh_start,
+        },
+        Migration {
+            id: "20261030_0900_sol_default_full_share".into(),
+            legacy_version: None,
+            apply: driver_allocation::sol_selection::migrate_default_full_share,
+        },
+        Migration {
             id: "20261029_0420_sol_selection".into(),
             legacy_version: None,
             apply: driver_allocation::sol_selection::migrate,
         },
         Migration {
+            id: spoke_hub::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: spoke_hub::migrate,
+        },
+        Migration {
+            id: spoke_ingress::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: spoke_ingress::migrate,
+        },
+        Migration {
+            id: parking::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: parking::migrate,
+        },
+        Migration {
             id: task_status_audit::MIGRATION_ID.into(),
             legacy_version: None,
             apply: task_status_audit::migrate,
+        },
+        Migration {
+            id: stuck_snapshot::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: stuck_snapshot::migrate,
+        },
+        Migration {
+            id: "20261110_0730_wait_input_invalidation".into(),
+            legacy_version: None,
+            apply: board_projection_schema::refine_triggers,
         },
         Migration {
             id: "20261029_0735_work_executions_item_kind_status_finished_idx".into(),
@@ -304,139 +431,14 @@ pub(super) fn all() -> Vec<Migration> {
             },
         },
         Migration {
-            id: "20261029_1900_execution_waiting_human_history".into(),
+            id: "20261104_1700_workspace_lease_boundary".into(),
             legacy_version: None,
-            apply: stuck_report::migrate_wait_history,
+            apply: preserved_work::migrate_lease_boundary,
         },
         Migration {
-            id: pr_flow::OPERATOR_QUESTION_STUCK_CLASSIFICATION_MIGRATION_ID.into(),
+            id: "20261105_1200_workspace_lease_generation".into(),
             legacy_version: None,
-            apply: pr_flow::migrate_operator_question_stuck_classification,
-        },
-        Migration {
-            id: "20261030_0900_sol_default_full_share".into(),
-            legacy_version: None,
-            apply: driver_allocation::sol_selection::migrate_default_full_share,
-        },
-        Migration {
-            id: conflict_mismatch::MIGRATION_ID.into(),
-            legacy_version: None,
-            apply: conflict_mismatch::migrate,
-        },
-        Migration {
-            id: "20261102_2105_recovery_fresh_start".into(),
-            legacy_version: None,
-            apply: execution_recovery_rearm::migrate_fresh_start,
-        },
-        Migration {
-            id: "20261103_0501_preserved_execution_tip".into(),
-            legacy_version: None,
-            apply: preserved_work::migrate,
-        },
-        Migration {
-            id: execution_wait_history::MIGRATION_ID.into(),
-            legacy_version: None,
-            apply: execution_wait_history::migrate,
-        },
-        Migration {
-            id: stuck_snapshot::MIGRATION_ID.into(),
-            legacy_version: None,
-            apply: stuck_snapshot::migrate,
-        },
-        Migration {
-            id: conflict_mismatch::OPERATOR_FORCED_ADMISSION_MIGRATION_ID.into(),
-            legacy_version: None,
-            apply: conflict_mismatch::migrate_operator_forced_admission,
-        },
-        Migration {
-            id: parking::MIGRATION_ID.into(),
-            legacy_version: None,
-            apply: parking::migrate,
-        },
-        Migration {
-            id: progression_candidates::GRACE_COLUMN_MIGRATION_ID.into(),
-            legacy_version: None,
-            apply: parking_reconcile::migrate,
-        },
-        Migration {
-            id: progression_candidates::EXECUTION_PROVENANCE_MIGRATION_ID.into(),
-            legacy_version: None,
-            apply: progression_candidates::migrate_execution_provenance,
-        },
-        Migration {
-            id: progression_candidates::VIEWS_MIGRATION_ID.into(),
-            legacy_version: None,
-            apply: progression_candidates::migrate_views_noop,
-        },
-        Migration {
-            id: spoke_hub::MIGRATION_ID.into(),
-            legacy_version: None,
-            apply: spoke_hub::migrate,
-        },
-        Migration {
-            id: "20261107_0543_parking_membership".into(),
-            legacy_version: None,
-            apply: parking::migrate_membership,
-        },
-        Migration {
-            id: execution_bookmarks::HAS_RECOVERY_HEAD_MIGRATION_ID.into(),
-            legacy_version: None,
-            apply: execution_bookmarks::migrate_has_recovery_head,
-        },
-        Migration {
-            id: spoke_hub::RUN_INDEX_MIGRATION_ID.into(),
-            legacy_version: None,
-            apply: spoke_hub::migrate_host_commands_run_idx,
-        },
-        Migration {
-            id: parking_reconcile::MIGRATION_ID.into(),
-            legacy_version: None,
-            apply: parking_reconcile::migrate,
-        },
-        Migration {
-            id: "20261108_2100_parking_cancel_provenance".into(),
-            legacy_version: None,
-            apply: parking_reconcile::migrate_cancel_provenance,
-        },
-        Migration {
-            id: execution_bookmarks::RETIRE_PRUNE_STATE_MIGRATION_ID.into(),
-            legacy_version: None,
-            apply: execution_bookmarks::migrate_retire_prune_state,
-        },
-        Migration {
-            id: spoke_ingress::MIGRATION_ID.into(),
-            legacy_version: None,
-            apply: spoke_ingress::migrate,
-        },
-        Migration {
-            id: "20261109_1930_preserved_archive_cleanup".into(),
-            legacy_version: None,
-            apply: preserved_cleanup::migrate_archive_cleanup,
-        },
-        Migration {
-            id: spoke_hub::LEGACY_DESTINATION_MIGRATION_ID.into(),
-            legacy_version: None,
-            apply: spoke_hub::migrate_legacy_destinations,
-        },
-        Migration {
-            id: "20261110_0730_wait_input_invalidation".into(),
-            legacy_version: None,
-            apply: board_projection_schema::refine_triggers,
-        },
-        Migration {
-            id: legacy_store_cleanup::MIGRATION_ID.into(),
-            legacy_version: None,
-            apply: legacy_store_cleanup::migrate,
-        },
-        Migration {
-            id: progression_verbs::ACTIONS_MIGRATION_ID.into(),
-            legacy_version: None,
-            apply: progression_verbs::migrate_actions,
-        },
-        Migration {
-            id: progression_ladder::MIGRATION_ID.into(),
-            legacy_version: None,
-            apply: progression_ladder::migrate,
+            apply: preserved_work::migrate_lease_generation,
         },
     ]);
     migrations

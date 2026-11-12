@@ -730,78 +730,264 @@ mod floor_tests {
     #[test]
     fn supported_databases_apply_post_floor_migrations_without_losing_data() {
         // The independent expected schema is identical for every supported version.
+        // Pair each step with its migration id. Write the vec in the same
+        // name order as the registry so concurrent additions insert at
+        // different lines; sort by id at run time for application order.
         let expected = Connection::open_in_memory().unwrap();
         seed_released_schema(&expected);
-        project_postmortem::migrate_project_postmortem_signals(&expected).unwrap();
-        pr_flow::migrate_operator_questions(&expected).unwrap();
-        expected.execute_batch("CREATE TABLE execution_restore_reports (execution_id TEXT PRIMARY KEY REFERENCES work_executions(id) ON DELETE CASCADE, report TEXT NOT NULL)").unwrap();
-        personas::migrate(&expected).unwrap();
         expected.execute_batch("CREATE TABLE sentinel (value TEXT)").unwrap();
-        expected
-            .execute_batch("ALTER TABLE work_executions ADD COLUMN dispatch_wait_blocker_id TEXT")
-            .unwrap();
-        expected
-            .execute_batch("ALTER TABLE ci_remediations ADD COLUMN queue_base_sha TEXT")
-            .unwrap();
-        expected
-            .execute_batch("ALTER TABLE ci_remediations ADD COLUMN requeue_enqueued_at INTEGER")
-            .unwrap();
-        review_guide_jobs::guide_updates::migrate(&expected).unwrap();
-        expected.execute_batch(EXECUTION_BOOKMARK_COLUMNS_43).unwrap();
-        expected.execute_batch(TASKS_PR_URL_INDEX_SQL).unwrap();
-        expected.execute_batch(TASKS_PR_UPDATED_AT_45).unwrap();
-        expected.execute_batch(TASKS_CRITICAL_PROVENANCE_46).unwrap();
-        expected.execute_batch(IN_FLIGHT_WORKSPACES_INDEX_SQL).unwrap();
-        expected.execute_batch(ATTENTION_OPEN_KIND_INDEX_SQL).unwrap();
-        expected.execute_batch(BOARD_RUNTIME_EPOCH_49).unwrap();
-        expected.execute_batch(WORK_RUNS_SEMANTIC_TURN_CONDITION_50).unwrap();
-        ci_failure_identity::migrate(&expected).unwrap();
-        expected
-            .execute_batch("ALTER TABLE work_executions ADD COLUMN progression_neighbourhood TEXT")
-            .unwrap();
-        expected.execute_batch(BOARD_REVIEW_EPOCH_53).unwrap();
-        expected.execute_batch(TASKS_PARENT_KIND_INDEX_54).unwrap();
-        expected.execute_batch(VERDICT_REVISION_INDEX_55).unwrap();
-        super::super::board_projection_schema::migrate(&expected).unwrap();
-        expected.execute_batch(EXECUTION_BOOKMARK_PRUNE_COLUMNS_60).unwrap();
         expected.execute_batch(migrations::CREATE_LEDGER).unwrap();
-        driver_allocation::sol_selection::migrate(&expected).unwrap();
-        task_status_audit::migrate(&expected).unwrap();
-        super::super::critical_requests::migrate(&expected).unwrap();
-        expected
-            .execute_batch(WORK_EXECUTIONS_ITEM_KIND_STATUS_FINISHED_INDEX)
-            .unwrap();
-        pr_flow::migrate_operator_question_stuck_classification(&expected).unwrap();
-        stuck_report::migrate_wait_history(&expected).unwrap();
-        super::super::conflict_mismatch::migrate(&expected).unwrap();
-        preserved_work::migrate(&expected).unwrap();
-        execution_wait_history::migrate(&expected).unwrap();
-        stuck_snapshot::migrate(&expected).unwrap();
-        super::super::conflict_mismatch::migrate_operator_forced_admission(&expected).unwrap();
-        preserved_work::migrate_lease_boundary(&expected).unwrap();
-        preserved_work::migrate_lease_generation(&expected).unwrap();
-        super::super::parking::migrate(&expected).unwrap();
-        super::super::parking_reconcile::migrate(&expected).unwrap();
-        super::super::progression_candidates::migrate_execution_provenance(&expected).unwrap();
-        // The candidate views read this table, so it exists before they do.
-        super::super::progression_ladder::migrate(&expected).unwrap();
+        type ExpectedStep = (&'static str, Box<dyn FnOnce(&Connection)>);
+        let mut steps: Vec<ExpectedStep> = vec![
+            (
+                "00000000_0000_v033_postmortem_signals",
+                Box::new(|c| project_postmortem::migrate_project_postmortem_signals(c).unwrap()),
+            ),
+            (
+                "00000000_0000_v034_operator_questions",
+                Box::new(|c| pr_flow::migrate_operator_questions(c).unwrap()),
+            ),
+            (
+                "00000000_0000_v035_restore_reports",
+                Box::new(|c| {
+                    c.execute_batch("CREATE TABLE execution_restore_reports (execution_id TEXT PRIMARY KEY REFERENCES work_executions(id) ON DELETE CASCADE, report TEXT NOT NULL)").unwrap();
+                }),
+            ),
+            (
+                "00000000_0000_v037_personas",
+                Box::new(|c| personas::migrate(c).unwrap()),
+            ),
+            (
+                "00000000_0000_v038_dispatch_wait_blocker",
+                Box::new(|c| {
+                    c.execute_batch("ALTER TABLE work_executions ADD COLUMN dispatch_wait_blocker_id TEXT")
+                        .unwrap();
+                }),
+            ),
+            (
+                "00000000_0000_v040_queue_base",
+                Box::new(|c| {
+                    c.execute_batch("ALTER TABLE ci_remediations ADD COLUMN queue_base_sha TEXT")
+                        .unwrap();
+                }),
+            ),
+            (
+                "00000000_0000_v041_requeue_timestamp",
+                Box::new(|c| {
+                    c.execute_batch("ALTER TABLE ci_remediations ADD COLUMN requeue_enqueued_at INTEGER")
+                        .unwrap();
+                }),
+            ),
+            (
+                "00000000_0000_v042_guide_updates",
+                Box::new(|c| review_guide_jobs::guide_updates::migrate(c).unwrap()),
+            ),
+            (
+                "00000000_0000_v043_recovery_bookmarks",
+                Box::new(|c| c.execute_batch(EXECUTION_BOOKMARK_COLUMNS_43).unwrap()),
+            ),
+            (
+                "00000000_0000_v044_pr_url_index",
+                Box::new(|c| c.execute_batch(TASKS_PR_URL_INDEX_SQL).unwrap()),
+            ),
+            (
+                "00000000_0000_v045_pr_updated_at",
+                Box::new(|c| c.execute_batch(TASKS_PR_UPDATED_AT_45).unwrap()),
+            ),
+            (
+                "00000000_0000_v046_critical_provenance",
+                Box::new(|c| c.execute_batch(TASKS_CRITICAL_PROVENANCE_46).unwrap()),
+            ),
+            (
+                "00000000_0000_v047_in_flight_index",
+                Box::new(|c| c.execute_batch(IN_FLIGHT_WORKSPACES_INDEX_SQL).unwrap()),
+            ),
+            (
+                "00000000_0000_v048_attention_index",
+                Box::new(|c| c.execute_batch(ATTENTION_OPEN_KIND_INDEX_SQL).unwrap()),
+            ),
+            (
+                "00000000_0000_v049_runtime_epoch",
+                Box::new(|c| c.execute_batch(BOARD_RUNTIME_EPOCH_49).unwrap()),
+            ),
+            (
+                "00000000_0000_v050_semantic_turn",
+                Box::new(|c| c.execute_batch(WORK_RUNS_SEMANTIC_TURN_CONDITION_50).unwrap()),
+            ),
+            (
+                "00000000_0000_v051_ci_failure_identity",
+                Box::new(|c| ci_failure_identity::migrate(c).unwrap()),
+            ),
+            (
+                "00000000_0000_v052_progression_neighbourhood",
+                Box::new(|c| {
+                    c.execute_batch("ALTER TABLE work_executions ADD COLUMN progression_neighbourhood TEXT")
+                        .unwrap();
+                }),
+            ),
+            (
+                "00000000_0000_v053_review_epoch",
+                Box::new(|c| c.execute_batch(BOARD_REVIEW_EPOCH_53).unwrap()),
+            ),
+            (
+                "00000000_0000_v054_parent_kind_index",
+                Box::new(|c| c.execute_batch(TASKS_PARENT_KIND_INDEX_54).unwrap()),
+            ),
+            (
+                "00000000_0000_v055_verdict_revision_index",
+                Box::new(|c| c.execute_batch(VERDICT_REVISION_INDEX_55).unwrap()),
+            ),
+            (
+                "00000000_0000_v056_board_projection",
+                Box::new(|c| super::super::board_projection_schema::migrate(c).unwrap()),
+            ),
+            (
+                "00000000_0000_v060_bookmark_prune",
+                Box::new(|c| c.execute_batch(EXECUTION_BOOKMARK_PRUNE_COLUMNS_60).unwrap()),
+            ),
+            (
+                super::super::conflict_mismatch::MIGRATION_ID,
+                Box::new(|c| super::super::conflict_mismatch::migrate(c).unwrap()),
+            ),
+            (
+                "20261029_1430_critical_requests",
+                Box::new(|c| super::super::critical_requests::migrate(c).unwrap()),
+            ),
+            (
+                execution_bookmarks::HAS_RECOVERY_HEAD_MIGRATION_ID,
+                Box::new(|c| execution_bookmarks::migrate_has_recovery_head(c).unwrap()),
+            ),
+            (
+                execution_bookmarks::RETIRE_PRUNE_STATE_MIGRATION_ID,
+                Box::new(|c| execution_bookmarks::migrate_retire_prune_state(c).unwrap()),
+            ),
+            (
+                super::super::progression_candidates::EXECUTION_PROVENANCE_MIGRATION_ID,
+                Box::new(|c| super::super::progression_candidates::migrate_execution_provenance(c).unwrap()),
+            ),
+            (
+                execution_wait_history::MIGRATION_ID,
+                Box::new(|c| execution_wait_history::migrate(c).unwrap()),
+            ),
+            (
+                "20261029_1900_execution_waiting_human_history",
+                Box::new(|c| stuck_report::migrate_wait_history(c).unwrap()),
+            ),
+            (
+                "20261109_0451_explicit_launch_focus",
+                Box::new(|c| super::super::dispatch_focus::migrate_explicit_launch(c).unwrap()),
+            ),
+            (
+                super::super::spoke_hub::RUN_INDEX_MIGRATION_ID,
+                Box::new(|c| super::super::spoke_hub::migrate_host_commands_run_idx(c).unwrap()),
+            ),
+            (
+                super::super::spoke_hub::LEGACY_DESTINATION_MIGRATION_ID,
+                Box::new(|c| super::super::spoke_hub::migrate_legacy_destinations(c).unwrap()),
+            ),
+            (
+                legacy_store_cleanup::MIGRATION_ID,
+                Box::new(|c| legacy_store_cleanup::migrate(c).unwrap()),
+            ),
+            (
+                super::super::conflict_mismatch::OPERATOR_FORCED_ADMISSION_MIGRATION_ID,
+                Box::new(|c| super::super::conflict_mismatch::migrate_operator_forced_admission(c).unwrap()),
+            ),
+            (
+                pr_flow::OPERATOR_QUESTION_STUCK_CLASSIFICATION_MIGRATION_ID,
+                Box::new(|c| pr_flow::migrate_operator_question_stuck_classification(c).unwrap()),
+            ),
+            (
+                "20261108_2100_parking_cancel_provenance",
+                Box::new(|c| super::super::parking_reconcile::migrate_cancel_provenance(c).unwrap()),
+            ),
+            (
+                "20261107_0543_parking_membership",
+                Box::new(|c| super::super::parking::migrate_membership(c).unwrap()),
+            ),
+            (
+                "20261109_1930_preserved_archive_cleanup",
+                Box::new(|c| preserved_cleanup::migrate_archive_cleanup(c).unwrap()),
+            ),
+            (
+                "20261103_0501_preserved_execution_tip",
+                Box::new(|c| preserved_work::migrate(c).unwrap()),
+            ),
+            (
+                super::super::progression_verbs::ACTIONS_MIGRATION_ID,
+                Box::new(|c| super::super::progression_verbs::migrate_actions(c).unwrap()),
+            ),
+            (
+                super::super::progression_candidates::VIEWS_MIGRATION_ID,
+                Box::new(|c| super::super::progression_candidates::migrate_views_noop(c).unwrap()),
+            ),
+            (
+                super::super::progression_candidates::GRACE_COLUMN_MIGRATION_ID,
+                Box::new(|c| super::super::parking_reconcile::migrate(c).unwrap()),
+            ),
+            (
+                super::super::parking_reconcile::MIGRATION_ID,
+                Box::new(|c| super::super::parking_reconcile::migrate(c).unwrap()),
+            ),
+            (
+                super::super::progression_ladder::MIGRATION_ID,
+                Box::new(|c| super::super::progression_ladder::migrate(c).unwrap()),
+            ),
+            (
+                "20261110_2300_prompt_confirmation",
+                Box::new(|c| {
+                    c.execute_batch("ALTER TABLE work_runs ADD COLUMN prompt_confirmed INTEGER")
+                        .unwrap();
+                }),
+            ),
+            (
+                "20261029_0420_sol_selection",
+                Box::new(|c| driver_allocation::sol_selection::migrate(c).unwrap()),
+            ),
+            (
+                super::super::spoke_hub::MIGRATION_ID,
+                Box::new(|c| super::super::spoke_hub::migrate(c).unwrap()),
+            ),
+            (
+                super::super::spoke_ingress::MIGRATION_ID,
+                Box::new(|c| super::super::spoke_ingress::migrate(c).unwrap()),
+            ),
+            (
+                super::super::parking::MIGRATION_ID,
+                Box::new(|c| super::super::parking::migrate(c).unwrap()),
+            ),
+            (
+                task_status_audit::MIGRATION_ID,
+                Box::new(|c| task_status_audit::migrate(c).unwrap()),
+            ),
+            (
+                stuck_snapshot::MIGRATION_ID,
+                Box::new(|c| stuck_snapshot::migrate(c).unwrap()),
+            ),
+            (
+                "20261029_0735_work_executions_item_kind_status_finished_idx",
+                Box::new(|c| {
+                    c.execute_batch(WORK_EXECUTIONS_ITEM_KIND_STATUS_FINISHED_INDEX)
+                        .unwrap()
+                }),
+            ),
+            (
+                "20261104_1700_workspace_lease_boundary",
+                Box::new(|c| preserved_work::migrate_lease_boundary(c).unwrap()),
+            ),
+            (
+                "20261105_1200_workspace_lease_generation",
+                Box::new(|c| preserved_work::migrate_lease_generation(c).unwrap()),
+            ),
+        ];
+        steps.sort_by_key(|(id, _)| *id);
+        for (_, apply) in steps {
+            apply(&expected);
+        }
+        // Matching WorkDb::init: the views registry entry is a no-op so later
+        // table rebuilds cannot fail while the views exist. Recreate them after
+        // every schema step.
         super::super::progression_candidates::migrate_views(&expected).unwrap();
-        super::super::spoke_hub::migrate(&expected).unwrap();
-        super::super::parking::migrate_membership(&expected).unwrap();
-        execution_bookmarks::migrate_has_recovery_head(&expected).unwrap();
-        super::super::spoke_hub::migrate_host_commands_run_idx(&expected).unwrap();
-        super::super::parking_reconcile::migrate(&expected).unwrap();
-        super::super::parking_reconcile::migrate_cancel_provenance(&expected).unwrap();
-        super::super::dispatch_focus::migrate_explicit_launch(&expected).unwrap();
-        execution_bookmarks::migrate_retire_prune_state(&expected).unwrap();
-        super::super::spoke_ingress::migrate(&expected).unwrap();
-        preserved_cleanup::migrate_archive_cleanup(&expected).unwrap();
-        super::super::spoke_hub::migrate_legacy_destinations(&expected).unwrap();
-        legacy_store_cleanup::migrate(&expected).unwrap();
-        super::super::progression_verbs::migrate_actions(&expected).unwrap();
-        expected
-            .execute_batch("ALTER TABLE work_runs ADD COLUMN prompt_confirmed INTEGER")
-            .unwrap();
         let before = capture(&expected);
         drop(expected);
         let upgrade = |version: i32| {

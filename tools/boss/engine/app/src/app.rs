@@ -197,21 +197,52 @@ use boss_protocol::{
 };
 
 // Re-import handler helpers so all handler submodules can access them via `use super::*`.
-use handler_helpers::{
-    METADATA_KEY_AUTOMATION_PAUSE_REASON, METADATA_KEY_AUTOMATION_PAUSED, METADATA_KEY_AUTOMATION_PAUSED_SINCE,
-    METADATA_KEY_DISPATCH_CONCURRENCY_LIMIT, METADATA_KEY_DISPATCH_PAUSE_ORIGIN, METADATA_KEY_DISPATCH_PAUSE_REASON,
-    METADATA_KEY_DISPATCH_PAUSE_SCOPE, METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE,
-    TRANSCRIPT_NOT_YET_AVAILABLE_PREFIX, TranscriptResolution, active_chore_run_id, active_to_todo_execution,
-    build_chore_update_message, build_effort_audit_report, build_engine_health_report, build_live_status_debug_report,
-    duplicate_or_work_error, handle_create_many, in_review_chore_execution, live_execution_for_task_id,
-    load_automation_paused_state, load_dispatch_concurrency_limit, load_live_status_disabled_slots,
-    open_review_terminal_async, persist_live_status_disabled_slots, publish_comment_invalidation,
-    publish_runtime_work_invalidation, publish_work_invalidation, read_transcript_tail, resolve_transcript_for_tail,
-    restore_persisted_dispatch_pause, segment_to_wire, send_push, send_response, send_response_with_revision,
-    send_work_error, tail_lines_from_content, task_name_description_for_id, task_status_for_id,
-    task_transitioned_to_active, terminal_chore_execution, transport_default_created_via,
-    validate_external_tracker_config, work_item_id, work_item_needs_dispatch,
-};
+use handler_helpers::METADATA_KEY_AUTOMATION_PAUSE_REASON;
+use handler_helpers::METADATA_KEY_AUTOMATION_PAUSED;
+use handler_helpers::METADATA_KEY_AUTOMATION_PAUSED_SINCE;
+use handler_helpers::METADATA_KEY_DISPATCH_CONCURRENCY_LIMIT;
+use handler_helpers::METADATA_KEY_DISPATCH_PAUSE_ORIGIN;
+use handler_helpers::METADATA_KEY_DISPATCH_PAUSE_REASON;
+use handler_helpers::METADATA_KEY_DISPATCH_PAUSE_SCOPE;
+use handler_helpers::METADATA_KEY_DISPATCH_PAUSED;
+use handler_helpers::METADATA_KEY_DISPATCH_PAUSED_SINCE;
+use handler_helpers::TRANSCRIPT_NOT_YET_AVAILABLE_PREFIX;
+use handler_helpers::TranscriptResolution;
+use handler_helpers::active_chore_run_id;
+use handler_helpers::active_to_todo_execution;
+use handler_helpers::build_chore_update_message;
+use handler_helpers::build_effort_audit_report;
+use handler_helpers::build_engine_health_report;
+use handler_helpers::build_live_status_debug_report;
+use handler_helpers::duplicate_or_work_error;
+use handler_helpers::handle_create_many;
+use handler_helpers::in_review_chore_execution;
+use handler_helpers::live_execution_for_task_id;
+use handler_helpers::load_automation_paused_state;
+use handler_helpers::load_dispatch_concurrency_limit;
+use handler_helpers::load_live_status_disabled_slots;
+use handler_helpers::open_review_terminal_async;
+use handler_helpers::persist_live_status_disabled_slots;
+use handler_helpers::publish_comment_invalidation;
+use handler_helpers::publish_runtime_work_invalidation;
+use handler_helpers::publish_work_invalidation;
+use handler_helpers::read_transcript_tail;
+use handler_helpers::resolve_transcript_for_tail;
+use handler_helpers::restore_persisted_dispatch_pause;
+use handler_helpers::segment_to_wire;
+use handler_helpers::send_push;
+use handler_helpers::send_response;
+use handler_helpers::send_response_with_revision;
+use handler_helpers::send_work_error;
+use handler_helpers::tail_lines_from_content;
+use handler_helpers::task_name_description_for_id;
+use handler_helpers::task_status_for_id;
+use handler_helpers::task_transitioned_to_active;
+use handler_helpers::terminal_chore_execution;
+use handler_helpers::transport_default_created_via;
+use handler_helpers::validate_external_tracker_config;
+use handler_helpers::work_item_id;
+use handler_helpers::work_item_needs_dispatch;
 
 /// Per-request handler context: the connection-scoped state every
 /// [`FrontendRequest`] handler needs. Built once per request in
