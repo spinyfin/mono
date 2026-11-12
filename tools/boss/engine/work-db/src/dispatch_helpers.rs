@@ -196,7 +196,8 @@ pub(crate) fn clear_positioning_hold_in_tx(conn: &Connection, work_item_id: &str
         &format!(
             "UPDATE tasks SET status = 'todo', blocked_reason = NULL, blocked_detail = NULL,
                  last_status_actor = ?3, updated_at = ?2
-             WHERE id = ?1 AND status = 'blocked' AND blocked_reason = '{WORKSPACE_POSITIONING_REFUSED}'"
+             WHERE id = ?1 AND deleted_at IS NULL
+               AND status = 'blocked' AND blocked_reason = '{WORKSPACE_POSITIONING_REFUSED}'"
         ),
         params![work_item_id, now_string(), actor],
     )?;

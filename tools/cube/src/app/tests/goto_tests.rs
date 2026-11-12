@@ -326,7 +326,7 @@ fn goto_closed_pr_is_a_structured_refusal_without_mutating_bookmarks() {
 }
 
 #[test]
-fn goto_fetch_failure_remains_retryable() {
+fn goto_fetch_failure_does_not_claim_retryability() {
     let runner = FakeRunner::new(vec![
         goto_remote_list_cmd(),
         failing_cmd(
@@ -337,15 +337,29 @@ fn goto_fetch_failure_remains_retryable() {
         ),
     ]);
     let error = run_goto(&runner, None, Some(42)).unwrap_err();
-    assert_eq!(error.json_error()["retryable"], true);
+    assert!(matches!(error, CubeError::CommandFailed { .. }));
+    assert!(error.json_error().get("retryable").is_none());
+    assert!(error.json_error().get("error_kind").is_none());
 }
 
 #[test]
 fn unclassified_errors_do_not_claim_to_be_retryable() {
     let error = CubeError::InvalidArgument("bad flag".to_string());
     assert!(error.json_error().get("retryable").is_none());
+    assert!(error.json_error().get("error_kind").is_none());
+    assert!(
+        CubeError::RepoNotFound("mono".into())
+            .json_error()
+            .get("error_kind")
+            .is_none()
+    );
     assert_eq!(
         CubeError::PositioningRefused("x".into()).json_error()["retryable"],
         false
     );
+    assert_eq!(
+        CubeError::PositioningRefused("x".into()).json_error()["error_kind"],
+        "workspace_positioning_refused"
+    );
+    assert_eq!(CubeError::MaintenanceBusy.json_error()["retryable"], true);
 }

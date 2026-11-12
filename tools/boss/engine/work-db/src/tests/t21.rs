@@ -153,6 +153,64 @@ fn mark_chore_pr_merged_advances_in_review_to_done_and_binds_pr() {
     assert_eq!(requeried.pr_url.as_deref(), Some(pr_url));
 }
 
+/// A review-phase positioning refusal keeps the item `in_review` so the merge
+/// poller can observe the PR. Once that PR merges, the hold and its wait must
+/// lower with the row — otherwise the Done card keeps a "Workspace blocked"
+/// wait forever.
+#[test]
+fn mark_chore_pr_merged_lowers_a_review_phase_positioning_hold() {
+    let db = WorkDb::open(temp_db_path("merged-clears-positioning-hold")).unwrap();
+    let product_id = make_revision_product(&db, "merged-hold");
+    let pr_url = "https://github.com/spinyfin/mono/pull/4008";
+    let chore_id = make_in_review_chore(&db, &product_id, pr_url);
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Claimed)
+                .pr_url(pr_url)
+                .build(),
+        )
+        .unwrap();
+    db.record_workspace_positioning_refusal(
+        &execution.id,
+        "worker",
+        None,
+        "Cube command failed: refused",
+        "PR 4008 is MERGED",
+    )
+    .unwrap();
+    assert_eq!(task_status(&db, &chore_id), "in_review");
+    assert!(
+        db.list_attention_items_for_work_item(&chore_id)
+            .unwrap()
+            .iter()
+            .any(|item| item.status == "open" && item.kind == WORKSPACE_POSITIONING_REFUSED)
+    );
+    assert_eq!(
+        db.get_task_runtime(&chore_id).unwrap().dispatch_wait_reason.as_deref(),
+        Some(WORKSPACE_POSITIONING_REFUSED)
+    );
+
+    db.mark_chore_pr_merged(&chore_id, pr_url)
+        .unwrap()
+        .expect("in_review chore must transition");
+
+    assert_eq!(task_status(&db, &chore_id), "done");
+    assert!(
+        db.list_attention_items_for_work_item(&chore_id)
+            .unwrap()
+            .iter()
+            .all(|item| item.status != "open"),
+        "positioning-refusal attention must not stay open on a done item"
+    );
+    assert!(
+        db.get_task_runtime(&chore_id).unwrap().dispatch_wait_reason.is_none(),
+        "a done item must not keep a workspace-positioning wait"
+    );
+}
+
 /// No eligible PR to act on: a chore already in a terminal status (its PR was
 /// merged on a prior pass) is a no-op — `mark_chore_pr_merged` returns `None`
 /// and leaves the row untouched. This is what makes the merge poller safe to

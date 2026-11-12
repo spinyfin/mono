@@ -945,7 +945,9 @@ impl WorkDb {
                          WHERE id = ?1 AND deleted_at IS NULL",
                         params![rev_id, now],
                     )?;
+                    resolve_attention_kind_in_tx(&tx, rev_id, WORKSPACE_POSITIONING_REFUSED)?;
                 }
+                resolve_attention_kind_in_tx(&tx, id, WORKSPACE_POSITIONING_REFUSED)?;
                 // Q10 (deleted prereq): drop every dependency edge that
                 // names this task as either endpoint. A row with a
                 // tombstoned prerequisite is the worst of both worlds —

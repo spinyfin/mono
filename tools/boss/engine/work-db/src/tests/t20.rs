@@ -1935,10 +1935,10 @@ fn start_execution_run_does_not_clear_autostart_for_revision_with_live_child() {
 /// End-to-end proof that `get_work_tree_instrumented` captures the
 /// per-item runtime N+1: for `N` items that each have a live execution and
 /// a run, the `db.task_runtimes` segment must report `rows == N` and
-/// `db_queries == 2 * N` (one latest-execution lookup + one latest-run
-/// lookup per item). This is the segment expected to dominate the ~7s live
-/// trace, and the reason the app-side `request` duration scales
-/// super-linearly with item count.
+/// `db_queries == 2 * N + 1` (one latest-execution lookup + one latest-run
+/// lookup per item, plus one bulk positioning-hold lookup). This is the
+/// segment expected to dominate the ~7s live trace, and the reason the
+/// app-side `request` duration scales super-linearly with item count.
 #[test]
 fn get_work_tree_instrumented_reports_task_runtime_nplus1() {
     use boss_metrics::population_timing::{PopulationTrace, segment};
@@ -1994,8 +1994,8 @@ fn get_work_tree_instrumented_reports_task_runtime_nplus1() {
     assert_eq!(rows, Some(N as i64), "one runtime row per item");
     assert_eq!(
         db_queries,
-        Some(2 * N as i64),
-        "N+1 fan-out: 2 point queries per item (latest execution + latest run)"
+        Some(2 * N as i64 + 1),
+        "N+1 fan-out: 2 point queries per item (latest execution + latest run) plus one bulk positioning-hold lookup"
     );
 
     // The bulk chores query, by contrast, is a single statement — no
