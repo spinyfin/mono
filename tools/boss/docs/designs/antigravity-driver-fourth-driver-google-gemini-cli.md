@@ -6,7 +6,7 @@
 - **Subject CLI:** `agy` 1.5.5 (`~/.local/bin/agy`), Google Antigravity, OAuth against a personal Google account. Qualified against 1.5.5, not 1.1.12, which loses briefs submitted early (study, "Two versions, and why" and Q1). The binary self-updates, so this pin warns rather than gates (study, "Corrections to the design", and Negatives 10). The hook study independently picks 1.5.5 as the next conformance pin (hook study, "Verdict").
 - **Evidence:** [`ghostty-agy-pane-viability.md`](../investigations/ghostty-agy-pane-viability.md), [`agy-hook-surface.md`](../investigations/agy-hook-surface.md)
 - **Sibling designs:** [`grok-as-a-first-class-interactive-agent-driver.md`](./grok-as-a-first-class-interactive-agent-driver.md), [`codex-as-a-first-class-agent-driver.md`](./codex-as-a-first-class-agent-driver.md), [`agent-driver-abstraction-decouple-boss-from-claude-code-capabilities-oriented-mix-and-match.md`](./agent-driver-abstraction-decouple-boss-from-claude-code-capabilities-oriented-mix-and-match.md)
-- **Perishable status/ledger:** kept out of this doc deliberately — see the acceptance-ledger entry in the task breakdown
+- **Perishable status/ledger:** [`antigravity-driver-acceptance-ledger.md`](./antigravity-driver-acceptance-ledger.md) — kept out of this doc so status can be refreshed without touching durable reasoning.
 
 ## The contested property, stated first
 
@@ -18,7 +18,7 @@
 
 Technically the integration looks tractable: `agy` has a Claude-shaped hook system with a real `Stop` hook, an interactive TUI suitable for a pane, and — verified in this pass and by the pane viability study (Q8) — a state tree that relocates cleanly under a scoped `HOME`.
 
-The initial operating state is a **pinned-only, zero-share driver** — reachable by explicit `--driver agy`, receiving no allocated traffic — as a behaviour-preserving rollout default, not an economic verdict. The operator has a paid Gemini subscription, but this pass did not establish its entitlement or an apples-to-apples quota comparison with `claude`, `codex`, or `grok`. Spend and quota accounting belongs in a separate, driver-neutral project; it is not an implementation gate for this driver.
+The initial operating state is a **pinned-only, zero-share driver** — reachable by explicit `--driver agy`, receiving no allocated traffic — as a behaviour-preserving rollout default, not an economic verdict. Live gate status lives in the [acceptance ledger](./antigravity-driver-acceptance-ledger.md). The operator has a paid Gemini subscription, but this pass did not establish its entitlement or an apples-to-apples quota comparison with `claude`, `codex`, or `grok`. Spend and quota accounting belongs in a separate, driver-neutral project; it is not an implementation gate for this driver.
 
 ## Goals
 
@@ -228,8 +228,8 @@ So the gate is inverted. Rather than a checkpoint at the end, it is the **defaul
 
 - **What enforces it.** `DriverTrafficSplit`'s shipped default gives `agy` **zero**, and `allocate_among` treats zero as literally empty — "zero means zero", with `driver_for_bucket` handing it no bucket at all. No allocated work reaches `agy` until an operator makes a deliberate, atomic, single-write change to the persisted split. The four-way migration lands with a unit assertion that the shipped default is `agy = 0`, so a later edit that quietly raises it fails a test rather than silently changing fleet behaviour.
 - **The state while unmet: `pinned-only`.** `agy` is registered, resolvable, and reachable _only_ by an explicit `tasks.driver` / product `default_driver` pin that clears the capability gate. This is a steady state, not a waiting state: nothing is blocked, nothing silently proceeds, and the driver is exercised on real work the whole time.
-- **What would move it.** A recorded run of N pinned `agy` executions reaching merged PRs without engine-side incident, followed by an explicit operator decision to raise the share. The run evidence is written into a separate acceptance-ledger document so the durable reasoning here is not disturbed every time the status changes. Cross-driver spend and quota accounting is not part of this gate.
-- **Who can move it.** Raising the share is an operator action against engine state. No task in the breakdown below has "raise the share" as its deliverable, because no cube worker can or should perform it.
+- **What would move it.** A recorded run of N pinned `agy` executions reaching merged PRs without engine-side incident, followed by an explicit operator decision to raise the share. The run evidence lives in the [acceptance ledger](./antigravity-driver-acceptance-ledger.md) so the durable reasoning here is not disturbed every time the status changes. Cross-driver spend and quota accounting is not part of this gate.
+- **Who can move it.** Raising the share is an operator action against engine state. No task in the breakdown below has "raise the share" as its deliverable, because no cube worker can or should perform it. The ledger records whether the criterion is met; it does not raise the share.
 
 One more structural rule, taken from the same retrospective: **the acceptance evidence must come from real Boss dispatch, not from a harness.** A hand-built reproduction is assembled from the same beliefs that produced the code, so it is structurally incapable of finding the integration bugs — the events-socket routing, the credential strip, the adapter identity mismatch — that are precisely what killed Grok's sweep. Every phase-0 investigation likewise runs in a real GhosttyKit pane, not a simulated one.
 
@@ -291,7 +291,7 @@ Widen `DriverTrafficSplit` from three shares to four across every layer that mus
 
 ### Acceptance ledger and pinned-only gate state
 
-Create the acceptance ledger as a separate document from this design so status can be refreshed without touching durable reasoning: the criterion (N pinned `agy` executions reaching merged PRs without engine-side incident), an empty evidence table, the explicit statement that the project sits in `pinned-only` state until the criterion is met, and the explicit statement that raising the share is an operator action no task performs. Document how `pinned-only` is enforced — zero share plus "zero means zero" in `allocate_among`, with an explicit pin still routing — and cross-link it from this design. Spend and quota do not appear in this driver-specific ledger.
+**Done:** delivered as [`antigravity-driver-acceptance-ledger.md`](./antigravity-driver-acceptance-ledger.md). Current gate state is `pinned-only`; the evidence table is empty. Original scope: create the acceptance ledger as a separate document from this design so status can be refreshed without touching durable reasoning: the criterion (N pinned `agy` executions reaching merged PRs without engine-side incident), an empty evidence table, the explicit statement that the project sits in `pinned-only` state until the criterion is met, and the explicit statement that raising the share is an operator action no task performs. Document how `pinned-only` is enforced — zero share plus "zero means zero" in `allocate_among`, with an explicit pin still routing — and cross-link it from this design. Spend and quota do not appear in this driver-specific ledger.
 
 - **Effort:** small
 - **Dependencies:** Four-way driver traffic split migration
