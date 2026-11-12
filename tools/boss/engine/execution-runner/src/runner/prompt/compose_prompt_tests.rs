@@ -1089,37 +1089,20 @@ pub(super) fn sample_conflict_attempt() -> crate::work::ConflictResolution {
         }],
         error: None,
     };
-    crate::work::ConflictResolution {
-        id: "crz_frag_01".into(),
-        product_id: "prod-1".into(),
-        work_item_id: "task-rev-1".into(),
-        pr_url: "https://github.com/org/repo/pull/77".into(),
-        pr_number: 77,
-        head_branch: "feature/frag".into(),
-        base_branch: "main".into(),
-        base_sha_at_trigger: Some("aaa111".into()),
-        head_sha_before: None,
-        head_sha_after: None,
-        status: "running".into(),
-        failure_reason: None,
-        cube_lease_id: None,
-        cube_workspace_id: None,
-        worker_id: None,
-        conflict_diagnosis: Some(serde_json::to_string(&diag).unwrap()),
-        created_at: "2026-05-15T00:00:00Z".into(),
-        started_at: None,
-        finished_at: None,
-        revision_task_id: Some("task-rev-1".into()),
-        event_source: "review_watch".into(),
-        conflict_class: None,
-        resolved_by_rung: None,
-        mechanical_rung_in_flight: None,
-        mismatch_exit_barred: false,
-        deferral_arm: None,
-        deferral_end_reason: None,
-        ladder_outcomes: None,
-        ladder_reason: None,
-    }
+    crate::work::ConflictResolution::builder()
+        .id("crz_frag_01")
+        .product_id("prod-1")
+        .work_item_id("task-rev-1")
+        .pr_url("https://github.com/org/repo/pull/77")
+        .pr_number(77_i64)
+        .head_branch("feature/frag")
+        .base_branch("main")
+        .status("running")
+        .created_at("2026-05-15T00:00:00Z")
+        .base_sha_at_trigger("aaa111")
+        .conflict_diagnosis(serde_json::to_string(&diag).unwrap())
+        .revision_task_id("task-rev-1")
+        .build()
 }
 
 fn sample_ci_attempt() -> crate::work::CiRemediation {

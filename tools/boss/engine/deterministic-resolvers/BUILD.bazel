@@ -16,6 +16,7 @@ rust_library(
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
+        "//tools/boss/engine/app:__pkg__",
         "//tools/boss/engine/core:__pkg__",
     ],
     deps = DETERMINISTIC_RESOLVERS_DEPS + all_crate_deps(normal = True),
@@ -33,6 +34,7 @@ rust_library(
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
+        "//tools/boss/engine/app:__pkg__",
         "//tools/boss/engine/core:__pkg__",
     ],
     deps = DETERMINISTIC_RESOLVERS_DEPS + all_crate_deps(normal = True),
