@@ -28,7 +28,7 @@ Ranked recommendations, quick wins first:
 1. Fix the diagnosis base so the engine sees the real conflict (small change, unblocks everything that depends on classification).
 2. Make lockfile-only conflicts actually retire in the deterministic tier, and record on each ledger row why the ladder fell through.
 3. Remove the two shared append points left in the schema migration chain, and break up the five giant wrapped import lists.
-4. Keep the current `crate.from_cargo` configuration after the [initial lockfile trial](#executed-lockfile-trial): reproducibility moves the two observed conflicts into cargo-bazel's JSON, and repinning is not consistently cheaper. Stripping alone leaves manifest conflicts.
+4. Treat a reproducible `crate.from_cargo` configuration as a small, conditional gain, not a fix. In the [expanded lockfile trial](#executed-lockfile-trial) it cleared 6 of 33 replayed lockfile conflicts, all involving a third-party dependency change, and moved the other conflicts into cargo-bazel's JSON, which the engine cannot regenerate today. Repinning is not cheaper. The adoption decision is pending two measurements still in progress.
 5. Resolve conflicts just in time: stop re-resolving PRs that are not about to merge, and give long-stale PRs a close-or-rewrite decision.
 6. Add a keep-both resolver for same-spot insertions, and trial a syntax-aware merge tool as a tier between the engine rebase and an agent.
 
@@ -301,7 +301,7 @@ Each idea lists the measured source it addresses, expected impact, cost, risk an
 
 #### S1. Evaluating external-only Cargo lockfiles
 
-**Verdict:** retain the current configuration. The [executed four-pair trial](#executed-lockfile-trial) below found two unresolved lockfile conflicts under each configuration and no consistent repin speedup. The combination removes the crate extension's record from `MODULE.bazel.lock`, but the JSON still contains a shared checksum and workspace dependency maps. Stripping by itself leaves manifest conflicts. The following source analysis explains the configurations tested; it is not an adoption recommendation.
+**Verdict:** pending; the current configuration is unchanged. The initial four-pair trial found the same number of unresolved lockfile conflicts under each configuration. The [expanded trial](#expanded-trial-on-recorded-conflict-states) on 33 recorded conflict states shows a modest reduction instead: the combination leaves 27 pairs conflicted where the current configuration leaves 33, all six cleared pairs involve a third-party dependency change, and none of the 12 crate-addition pairs is cleared. The remaining conflicts move from `MODULE.bazel.lock` into the JSON, which still contains a shared checksum and workspace dependency maps and which the engine's resolver does not handle. Repinning is no cheaper. Stripping by itself clears four of the six. The following source analysis explains the configurations tested; it is not an adoption recommendation.
 
 The [BazelCon slides](https://static.sched.com/hosted_files/bazelcon2025/54/Hofbauer%20Zipline%20CargoSplicing.pdf), pages 5–7, propose feeding `Cargo.bazel.lock`, containing only external dependencies, to `from_cargo`. [rules_rust #3699](https://github.com/bazelbuild/rules_rust/pull/3699), merged November 10, 2025, replaces the separate stripping hook with `strip_internal_dependencies_from_cargo_lockfile`. Mono already pins 0.70.0, which contains the flag; no rules_rust upgrade is needed. This section evaluates that pinned implementation, not a newer release.
 
@@ -375,7 +375,7 @@ use_repo(crate, "mono_crates")
 
 Regeneration is mechanical **after dependency intent is merged**, not permission to discard one side's version changes. Merge manifests/specs and external pins first, regenerate JSON with the pinned Bazel/rules_rust toolchain, and require a second evaluation to leave all lockfiles unchanged. The engine currently recognizes `Cargo.lock` and `MODULE.bazel.lock` by basename (`deterministic-resolvers/src/resolvers/generated_lock.rs:33–38`), not these two proposed names; extend its existing resolver before claiming automatic resolution. Do not deploy the configuration merely to move conflicts into a file the ladder cannot handle.
 
-**Decision criterion:** compare the combination against stripping-only and the current configuration on the same replayed crate-extraction and third-party-update pairs. Count conflicts across **all** lockfiles, time repinning with normal caches, check dependency/helper parity, and verify repeat evaluations are stable. Prefer the combination only if it reduces total unresolved conflicts or makes regeneration reliably cheaper. The [executed trial](#executed-lockfile-trial) did not meet either criterion, so this change records the results and retains the existing build configuration and resolver.
+**Decision criterion:** compare the combination against stripping-only and the current configuration on the same replayed crate-extraction and third-party-update pairs. Count conflicts across **all** lockfiles, time repinning with normal caches, check dependency/helper parity, and verify repeat evaluations are stable. Prefer the combination only if it reduces total unresolved conflicts or makes regeneration reliably cheaper. The initial four-pair trial met neither criterion. The [expanded trial](#expanded-trial-on-recorded-conflict-states) meets the first one narrowly and not the second; see its [decision](#decision). This change records the results and leaves the build configuration and resolver as they are.
 
 **S2. Remove the shared append points in the schema migration chain.**
 
@@ -473,7 +473,7 @@ Regeneration is mechanical **after dependency intent is merged**, not permission
 **E7. Overlap-aware scheduling: keep it narrow.**
 
 - **Evidence:** [measured] of 31,663 pairs where one PR merged while another was open, 5,044 shared a file, and at most 1,164 of those (23%) were involved in a conflict. Holding back work on any shared file would delay about three harmless pairs for each conflict avoided.
-- **Verdict:** serialising dispatch on file overlap is not supported by the data, which agrees with the earlier design's rejection. The files where overlap nearly guarantees a conflict (yield above 0.6) contain the shared inputs targeted by S1 and S2; S1's subsequent trial did not demonstrate a net reduction.
+- **Verdict:** serialising dispatch on file overlap is not supported by the data, which agrees with the earlier design's rejection. The files where overlap nearly guarantees a conflict (yield above 0.6) contain the shared inputs targeted by S1 and S2; S1's subsequent trials found a reduction only where one side changes third-party dependencies.
 
 **E8. Rebasing earlier or more often: no.** [measured] 73% of conflicts come from a single merge and the branch is a median of 6 commits behind. An earlier rebase finds the same conflict sooner and adds a CI run. The default-off speculative pass predicts conflicts but cannot prevent them.
 
@@ -515,20 +515,20 @@ Regeneration is mechanical **after dependency intent is merged**, not permission
 
 ## Ranked recommendation
 
-| #   | Change                                                           | Addresses (share of conflict states)                         | Cost   | Confidence                                   |
-| --- | ---------------------------------------------------------------- | ------------------------------------------------------------ | ------ | -------------------------------------------- |
-| 1   | E1: diagnose against current `main`                              | Enables the rest; 88% of diagnoses empty                     | Small  | High: reproduced on every row                |
-| 2   | E2: record ladder outcomes, make lockfile-only retire            | 16% (30% in November)                                        | Small  | High on the gap, unknown on the cause        |
-| 3   | S2: schema chain append points                                   | 8% sole cause                                                | Small  | High: the metrics precedent cut yield by 2/3 |
-| 4   | S3: five import lists                                            | 5% sole cause, 12% touched                                   | Small  | High                                         |
-| 5   | S1: evaluate reproducible `from_cargo` + stripped Cargo lockfile | Cargo input hunks in 255 states; JSON conflicts replace some | Medium | Four-pair trial: no demonstrated net benefit |
-| 6   | E5: stale-PR decision                                            | Up to 19% of resolution work                                 | Small  | Medium: needs a decision per PR              |
-| 7   | E4: just-in-time resolution                                      | Up to 58% of resolutions (upper bound)                       | Medium | Medium: depends on the readiness signal      |
-| 8   | E3: keep-both resolver                                           | 13% to 29%                                                   | Medium | Medium: needs the replay experiment          |
-| 9   | N1: syntax-aware merge tier                                      | 13% plus an unmeasured part of the hard 55%                  | Small  | Unknown until tested                         |
-| 10  | E10 and S6: shorter-lived, smaller PRs                           | The underlying rate                                          | Varies | High on the effect, unknown on the means     |
+| #   | Change                                                           | Addresses (share of conflict states)                         | Cost   | Confidence                                          |
+| --- | ---------------------------------------------------------------- | ------------------------------------------------------------ | ------ | --------------------------------------------------- |
+| 1   | E1: diagnose against current `main`                              | Enables the rest; 88% of diagnoses empty                     | Small  | High: reproduced on every row                       |
+| 2   | E2: record ladder outcomes, make lockfile-only retire            | 16% (30% in November)                                        | Small  | High on the gap, unknown on the cause               |
+| 3   | S2: schema chain append points                                   | 8% sole cause                                                | Small  | High: the metrics precedent cut yield by 2/3        |
+| 4   | S3: five import lists                                            | 5% sole cause, 12% touched                                   | Small  | High                                                |
+| 5   | S1: evaluate reproducible `from_cargo` + stripped Cargo lockfile | Cargo input hunks in 255 states; JSON conflicts replace most | Medium | 33-pair trial: 6 pairs cleared, none adding a crate |
+| 6   | E5: stale-PR decision                                            | Up to 19% of resolution work                                 | Small  | Medium: needs a decision per PR                     |
+| 7   | E4: just-in-time resolution                                      | Up to 58% of resolutions (upper bound)                       | Medium | Medium: depends on the readiness signal             |
+| 8   | E3: keep-both resolver                                           | 13% to 29%                                                   | Medium | Medium: needs the replay experiment                 |
+| 9   | N1: syntax-aware merge tier                                      | 13% plus an unmeasured part of the hard 55%                  | Small  | Unknown until tested                                |
+| 10  | E10 and S6: shorter-lived, smaller PRs                           | The underlying rate                                          | Varies | High on the effect, unknown on the means            |
 
-Items 1 to 4 are independent and small. Together they address about 30% of today's conflict states (the lockfile, schema chain and import-list sole causes) and add the instrumentation needed to steer the rest. The cost of item 2 is small for the recording and unknown for the fixes until the reasons are visible. Item 5 has now been tried on four pairs without meeting its adoption criterion; keep the current configuration. Any later adoption must integrate the deterministic tier for both proposed files and demonstrate a net benefit across all lockfiles. Stripping alone is a small adjunct; `from_specs` is a larger dependency-model migration and is not justified by these measurements alone.
+Items 1 to 4 are independent and small. Together they address about 30% of today's conflict states (the lockfile, schema chain and import-list sole causes) and add the instrumentation needed to steer the rest. The cost of item 2 is small for the recording and unknown for the fixes until the reasons are visible. Item 5 has now been tried on 33 recorded conflict states. It clears about one pair in five in a sample weighted towards third-party changes, roughly 4% when weighted by the population's classes, and it is not cheaper to regenerate. Any adoption must first integrate the deterministic tier for both proposed files, because most of the remaining conflicts move into the JSON. Stripping alone is a small adjunct; `from_specs` is a larger dependency-model migration and is not justified by these measurements alone.
 
 Not recommended: `.gitattributes` merge drivers (S7), more frequent rebasing (E8), general file-overlap serialisation (E7), and a change of merge queue for conflict reasons (E9).
 
@@ -539,7 +539,7 @@ Not recommended: `.gitattributes` merge drivers (S7), more frequent rebasing (E8
 3. **Offline merge-tool replay.** Rebuild the corpus (see the appendix), extract base, ours and theirs for the 1,860 content-conflicted file rows, and run the candidate resolver on each: first a keep-both union for E3, then Mergiraf for N1. Report the share of files and of whole conflict states resolved, then build and test a sample of 50 resolved states. This needs no production change.
 4. **Schema chain and import lists.** After S2 and S3, track conflict states per `main` commit touching those files. Baselines: 0.84 for the schema chain; 180 import-list hunks in six months. Expect a drop of at least half over the next 30 touches, as the metrics change showed.
 5. **Just-in-time resolution.** Split PRs by number parity for two weeks. Compare resolutions per merged PR, time from merge request to merge, and how often a deferred conflict needed a human.
-6. **Lockfile spike — four-pair trial completed.** The [results below](#executed-lockfile-trial) compare the current configuration, stripping alone, and S1's reproducible-plus-stripping configuration on identical crate-extraction and third-party-update pairs. They report changed files, unresolved conflicts across all lockfiles, repin duration with normal caches, dependency/helper parity, and repeat-evaluation stability. The baseline is 255 states with Cargo input conflicts, not 255 states known to disappear. The trial did not justify adoption; the existing resolver and configuration remain unchanged.
+6. **Lockfile spike — four-pair trial completed, 33-pair trial nearly so.** The [results below](#executed-lockfile-trial) compare the current configuration, stripping alone, and S1's reproducible-plus-stripping configuration on identical crate-extraction and third-party-update pairs. They report changed files, unresolved conflicts across all lockfiles, repin duration with normal caches, dependency/helper parity, and repeat-evaluation stability. The baseline is 255 states with Cargo input conflicts, not 255 states known to disappear. The four-pair trial did not justify adoption. The 33-pair trial shows a modest reduction in conflicts and no cheaper regeneration; the existing resolver and configuration remain unchanged.
 7. **Where PR lifetime goes.** From engine state, split lifetime into waiting for CI, automated review, human review and merge. This decides whether E10 is tractable.
 
 ## Follow-up code changes
@@ -564,11 +564,15 @@ These are for separate PRs; none was made here.
 
 The scripts were run from a scratch directory and are not part of this change.
 
-**S1 recount method.** Select the earliest conflicted row for each `(pr, head)` from `replay_L.jsonl`, yielding 1,233 states; select its 260 `MODULE.bazel.lock` rows. Read each stored result tree's lockfile blob and parse every diff3 marker block without truncating long generated-output lines. Within each block, parse `FILE:@@//<path> <digest>` entries on ours/base/theirs and count a path when its value or presence differs. Group paths into root `Cargo.lock`, any `Cargo.toml`, and other inputs; count both hunks and distinct states, retaining overlaps. Separately compare non-input lines and count embedded `defs.bzl` entries. The earlier `replay2.json` contains 259 matching `(main, head)` pairs, including the 254-state Cargo-input subset; the final corpus adds the state on #3544. Reading retained merge-result objects suffices for these counts; no merge or resolution was rerun. That recount did not measure a hypothetical external graph or its mergeability; the subsequent S1 trial below does so for four pairs.
+**S1 recount method.** Select the earliest conflicted row for each `(pr, head)` from `replay_L.jsonl`, yielding 1,233 states; select its 260 `MODULE.bazel.lock` rows. Read each stored result tree's lockfile blob and parse every diff3 marker block without truncating long generated-output lines. Within each block, parse `FILE:@@//<path> <digest>` entries on ours/base/theirs and count a path when its value or presence differs. Group paths into root `Cargo.lock`, any `Cargo.toml`, and other inputs; count both hunks and distinct states, retaining overlaps. Separately compare non-input lines and count embedded `defs.bzl` entries. The earlier `replay2.json` contains 259 matching `(main, head)` pairs, including the 254-state Cargo-input subset; the final corpus adds the state on #3544. Reading retained merge-result objects suffices for these counts; no merge or resolution was rerun. That recount did not measure a hypothetical external graph or its mergeability; the subsequent S1 trials below do so for four pairs and then for 33.
 
 ## Executed lockfile trial
 
-### Method and inputs
+Two runs are recorded here: the initial four-pair trial, and an expanded trial on recorded conflict states that supersedes its conclusion. The [decision](#decision) applies the adoption criterion to both.
+
+### Initial four-pair trial
+
+#### Method and inputs
 
 [measured] The November 11–12, 2026 trial uses four recorded review-conflict pairs: crate extraction in [#3430](https://github.com/spinyfin/mono/pull/3430) and [#3438](https://github.com/spinyfin/mono/pull/3438), and concurrent branches crossing the external dependency changes in [#3091](https://github.com/spinyfin/mono/pull/3091) and [#3262](https://github.com/spinyfin/mono/pull/3262). The latter pairs use the recorded heads of [#3050](https://github.com/spinyfin/mono/pull/3050) and [#3257](https://github.com/spinyfin/mono/pull/3257). This is a four-pair sample, not a rerun of the entire 260-state corpus. Each configuration uses the same merge base, PR head and main revision:
 
@@ -593,7 +597,7 @@ The historical rules_rust 0.70.0 pin, annotations and all eight supported platfo
 
 For each pair and configuration, the four lockfile paths (`Cargo.lock`, `MODULE.bazel.lock`, `Cargo.bazel.lock`, `cargo-bazel-lock.json`) are copied into a separate jj repository. Base is committed first; head and main are separate children of base; `jj new <head> <main>` and `jj resolve --list` measure unresolved files. No conflicted file is replaced with one side, and no dependency choice is made during the merge. Only `Cargo.lock` and `MODULE.bazel.lock` changed among existing lockfiles in these reviewed pairs. This measures jj 0.26.0's merge result, whereas the original corpus used Git merge-tree. Replaying the original lockfiles with jj leaves a lockfile conflict in two pairs; the other two serve as controls.
 
-### Conflict results
+#### Conflict results
 
 | Pair                               | A: unresolved lockfiles  | B: unresolved lockfiles  | C: unresolved lockfiles  |
 | ---------------------------------- | ------------------------ | ------------------------ | ------------------------ |
@@ -605,7 +609,7 @@ For each pair and configuration, the four lockfile paths (`Cargo.lock`, `MODULE.
 
 C removes the crate extension's entire committed MODULE record, but both unresolved conflicts move into its JSON context. In #3430 both sides change the JSON checksum and crate map; the extraction also changes workspace members. In #3050 both sides change the checksum and crate map, and main changes direct dependencies. B retains manifest hash conflicts. Neither `Cargo.lock` nor `Cargo.bazel.lock` conflicts in this sample; the total conflict count does not fall.
 
-### Dependency parity and stability
+#### Dependency parity and stability
 
 All 36 endpoints preserve the complete external package records from their reviewed `Cargo.lock`, including source, checksum and dependency arrays. Package counts for base/head/main are 541/541/541 for each extraction pair, 491/491/492 for #3050, and 492/492/533 for #3257. This retains the dependency updates on main as well as the historical head's pins. B and C contain no source-less packages in `Cargo.bazel.lock`; the ordinary `Cargo.lock` stays byte-identical.
 
@@ -619,7 +623,7 @@ At every endpoint, B and C's generated `defs.bzl` and hub `BUILD.bazel` are byte
 
 B's initial generation rewrites its watched Cargo input by stripping workspace packages. The next evaluation updates the recorded input digest, so two evaluations are insufficient for byte stability from the initial full-lockfile seed. A third evaluation of #3430's base completed in 0.154 s and changed no files. C's stability measurement begins after removing the repin environment variable; it is not evidence that an explicit repin itself is byte-stable. A's short times are cached evaluations, not repin timings.
 
-### Repin measurements
+#### Repin measurements
 
 The initial runs exposed the generator's default 600-second subprocess timeout: an unchanged A configuration completed one explicit repin in 572.423 s, then failed its second at 604.789 s with `cargo-bazel splice: Timed out`; B's first #3430-base generation similarly failed at 605.248 s. Stripping happens after splicing, and the unchanged configuration reproduces the failure. A diagnostic retry with `CARGO_BAZEL_DEBUG=true CARGO_BAZEL_TIMEOUT=7200` allowed B to complete; the original failed observations are retained here. C's first #3430-base initialization took 993.236 s with that subprocess limit. No shell timeout or cache override was used, and no repository timeout/check setting was changed.
 
@@ -641,8 +645,187 @@ All 24 explicit repins and their 24 subsequent ordinary evaluations exited 0. Wa
 
 C avoids another splice when the repin variable is removed, but its repin itself is not consistently faster. The extra A evaluation in this benchmark is induced by changing the repin environment: normal A regeneration can use ordinary `bazel mod deps` without that toggle. Its cached ordinary evaluations were already below one second. Thus the faster post-repin C evaluation is not a demonstrated reduction in the cost of the existing resolver's ordinary regeneration path. These are wall times on one host with network and cache warming effects, not a controlled CPU benchmark or a prediction of CI latency.
 
+### Expanded trial on recorded conflict states
+
+[measured] The four-pair trial was too small to carry a decision, and two of its four pairs were controls that never conflicted. This run, on November 11–12, 2026, repeats the three-configuration comparison on 33 pairs, every one of them a recorded lockfile conflict state from the corpus. **Status: the conflict, parity and stability results for these 33 pairs are complete. Two measurements are still in progress and are marked as such below: the repin timing (9 of 24 heads measured so far) and a supplementary stratum of 8 pairs whose changes are manifest edits only.**
+
+#### How the pairs were selected
+
+The population is the 260 conflict states whose replay conflicts in `MODULE.bazel.lock`, plus one state that conflicts only in `Cargo.lock`. All but one have rules_rust 0.70.0 and the unmodified `from_cargo` call at the merge base, PR head and main; that one (0.68.1, which lacks the stripping flag) is excluded. Each remaining state was classified by diffing `Cargo.lock` and the manifests between its merge base and each side: a side makes a **third-party** change when the set of packages with a `source` differs, and adds a **new crate** when it adds a `Cargo.toml`.
+
+| Class of the 260 states                            | States | PRs |
+| -------------------------------------------------- | -----: | --: |
+| New crate on either side, no third-party change    |    174 |  74 |
+| Third-party change on either side                  |     36 |  32 |
+| Manifest edits only (no new crate, no third-party) |     50 |  27 |
+
+Pairs were taken by these rules, in order, one state per PR:
+
+1. Every state whose PR head makes a third-party change (5 pairs).
+2. The earliest state for each distinct third-party change on main, so the same dependency update is not replayed against several PRs (15 pairs).
+3. Every remaining PR with a recorded `Cargo.lock` conflict (8 pairs: 7 add a crate, 1 edits manifests only).
+4. The initial trial's #3430, the only one of its four pairs present in the population with no third-party change (1 pair). Its #3050 pair re-enters through rule 2; #3438 and #3257 are not recorded lockfile conflict states and are not repeated.
+5. Four more crate-adding PRs with no third-party change on either side, evenly spaced through the remaining candidates in time order (4 pairs).
+6. Supplementary: eight manifest-edit-only PRs, evenly spaced in time order, to cover the class the first five rules reach only once (8 pairs, evaluation pending).
+
+The sample is deliberately weighted towards third-party changes (20 of 33 pairs against 14% of the population), so its totals must not be read as population rates. Results are therefore also reported per class.
+
+Revisions are abbreviated to 12 hex digits. Head and main come from the conflict ledger replay (main is the first-parent tip at detection); the merge base is their common ancestor.
+
+| PR    | Rule | Change class                                           | Merge base     | PR head        | Main at detection | Swift ext. |
+| ----- | ---- | ------------------------------------------------------ | -------------- | -------------- | ----------------- | ---------- |
+| #748  | 1    | third-party (PR), third-party (main)                   | `3e94cda00d41` | `0282c2b60031` | `a896beb7309a`    | ok         |
+| #945  | 5    | new crate (PR)                                         | `4e4b14ab2964` | `d8a9a7e9e13b` | `7ddedb3da85d`    | ok         |
+| #919  | 3    | new crate (PR), new crate (main)                       | `7ddedb3da85d` | `a936563da858` | `4971a8614afa`    | ok         |
+| #1285 | 2    | third-party (main), new crate (PR)                     | `643bb381cc8d` | `68936cf8903b` | `b439b0e3cc4c`    | ok         |
+| #1383 | 2    | third-party (main)                                     | `3503370d84b2` | `7ecb51578a0a` | `7d870cc8596d`    | ok         |
+| #1421 | 1    | third-party (PR), new crate (PR)                       | `348f1ee5c6c8` | `aa0e8a729bdc` | `5ade93609048`    | ok         |
+| #1424 | 1    | third-party (PR), third-party (main), new crate (main) | `5ade93609048` | `511fe8dd6bc5` | `b120e5210a0e`    | failed     |
+| #1422 | 2    | third-party (main), new crate (main)                   | `5ade93609048` | `22f06e1cd944` | `b120e5210a0e`    | failed     |
+| #1430 | 2    | third-party (main)                                     | `b120e5210a0e` | `c2f2fbc82990` | `d63c05320a69`    | failed     |
+| #1398 | 2    | third-party (main), new crate (main)                   | `fdce7e0783ad` | `d44894a5e147` | `20e23d1a4323`    | ok         |
+| #1428 | 2    | third-party (main)                                     | `41ebae29dc40` | `a85853650ba3` | `c86b4d969fe9`    | ok         |
+| #1467 | 2    | third-party (main), new crate (main)                   | `a6de8e93b476` | `9ab3d8c743d0` | `3534119aa4a2`    | failed     |
+| #1539 | 3    | new crate (PR), new crate (main)                       | `3dae779dd38d` | `c5aff65dc37f` | `743dadfce4d1`    | failed     |
+| #1542 | 2    | third-party (main), new crate (PR)                     | `8a7976c8f87c` | `53c0de02956e` | `d53158c51899`    | ok         |
+| #1395 | 2    | third-party (main), new crate (main)                   | `b241a3a430a8` | `49943879729c` | `28598579fa35`    | failed     |
+| #1553 | 2    | third-party (main), new crate (PR)                     | `28598579fa35` | `c3a7bcbe5d84` | `5623a282fe73`    | failed     |
+| #1566 | 2    | third-party (main), new crate (main)                   | `260c3a350bc1` | `1dd45506a186` | `b7283028a74a`    | failed     |
+| #1581 | 1    | third-party (PR)                                       | `44c74c94d099` | `0bb3fedf3159` | `7f58d98588da`    | failed     |
+| #2066 | 3    | new crate (PR), new crate (main)                       | `8ebe39b8ad48` | `2bc072a42f49` | `0e2c856a1b1d`    | failed     |
+| #2067 | 3    | new crate (PR), new crate (main)                       | `c8837bf6bb59` | `d5b7550ac6e1` | `6363699359b3`    | failed     |
+| #2081 | 3    | new crate (PR), new crate (main)                       | `c8837bf6bb59` | `9406f3a38b89` | `6363699359b3`    | failed     |
+| #2202 | 5    | new crate (PR)                                         | `ef2ef9005db0` | `015f1929f17d` | `429494245391`    | ok         |
+| #2570 | 5    | new crate (PR), new crate (main)                       | `80d542d5ea91` | `c3d668a3a6a6` | `2368d92a6a24`    | ok         |
+| #2589 | 1    | third-party (PR)                                       | `eeb6bce6705d` | `0793b8ca64ff` | `38f96f98b4f8`    | ok         |
+| #2563 | 2    | third-party (main)                                     | `412f9d6122f2` | `8118e31f9c60` | `abba3c24b6d4`    | ok         |
+| #2973 | 3    | manifest edits only                                    | `44c94bce7383` | `77c5910e6398` | `52342c52b290`    | ok         |
+| #3050 | 2    | third-party (main)                                     | `ab6355744cfa` | `f434dcf24e36` | `a06c56a0435f`    | ok         |
+| #3242 | 2    | third-party (main), new crate (PR), new crate (main)   | `2f8dda99612a` | `7cc6ec27e9c4` | `8b04af4d1bb6`    | ok         |
+| #3271 | 3    | new crate (PR), new crate (main)                       | `8c9ee8eefa7d` | `a7906d770f5e` | `94985e87e18c`    | ok         |
+| #3311 | 2    | third-party (main), new crate (main)                   | `29635c5c9a13` | `f9fdf200a0a1` | `8576a08bbcb1`    | ok         |
+| #3430 | 4    | new crate (PR)                                         | `8d559994b81e` | `c60e927b9688` | `fd5f0e8459d4`    | ok         |
+| #3473 | 3    | new crate (PR), new crate (main)                       | `41b7ea38039f` | `35efbf04e335` | `6cba950fa7da`    | ok         |
+| #3536 | 5    | new crate (PR)                                         | `23cf5381c4be` | `e9370f8983ed` | `5d0db10c6f30`    | ok         |
+
+#### Method, and differences from the initial trial
+
+Each of the 91 distinct revisions was checked out in a scratch worktree of a throwaway clone and evaluated under A, B and C exactly as configured in the initial trial: same `MODULE.bazel` edit, same root `exports_files` with `visibility = ["//:__pkg__"]`, `Cargo.bazel.lock` seeded from that revision's reviewed `Cargo.lock`, C's JSON initialized with `CARGO_BAZEL_REPIN=true bazel mod deps --lockfile_mode=update`. A and B then get ordinary `bazel mod deps --lockfile_mode=update` evaluations (two for A, three for B); C gets two with the repin variable unset. `bazel query @mono_crates//:all` materializes the helpers. Bazel 9.1.0, the revision's own `.bazelrc` and the normal disk and repository caches were used throughout. Four worktrees ran in parallel for this phase, so its wall times are not a speed comparison.
+
+Three things differ from the initial trial:
+
+- **No diagnostic environment.** `CARGO_BAZEL_DEBUG` and `CARGO_BAZEL_TIMEOUT` were not set. The crate extension records both, and `CARGO_BAZEL_REPIN`, as inputs in `MODULE.bazel.lock` (`ENV:CARGO_BAZEL_TIMEOUT 7200` replaces `ENV:CARGO_BAZEL_TIMEOUT \0`), so setting them rewrites the file under A and B and forces a regeneration. With the default 600-second limit, none of the 728 `bazel mod deps` commands in this phase timed out.
+- **A is reported twice.** "A: reviewed" merges the lockfiles exactly as committed at the three revisions. "A: regenerated" merges what an ordinary evaluation writes on the trial host, which is the like-for-like comparison with B and C, whose files are necessarily generated there. The host rewrote the committed `MODULE.bazel.lock` at 61 of 91 revisions, almost always only the `bzlTransitiveDigest` of the two crate_universe extensions.
+- **Merges are replayed with both tools.** The lockfile set for base, head and main is committed to a fresh repository and merged with jj 0.26.0 (`jj new <head> <main>`, `jj resolve --list`) and with `git merge-tree --write-tree`, the tool the corpus and GitHub's mergeability check use. jj needs `snapshot.max-new-file-size` raised, because `MODULE.bazel.lock` exceeds its 1 MiB default and is otherwise left untracked without failing. The two tools agree on every file and every conflict region in all 132 replays. No conflicted file is replaced by one side and no dependency choice is made.
+
+**An unrelated extension fails at 22 revisions.** For commits dated June 6 to July 16, `rules_swift_package_manager`'s extension runs `swift package describe`, which needs a `GhosttyKit.xcframework` binary that is not in git. `bazel mod deps` exits 2 at those revisions under all three configurations alike. The crate extension still completes, the lockfiles are written and the helpers materialize, so their lockfile and parity data are used, but 12 pairs touch such a revision. Totals are given for all 33 pairs and for the 21 pairs whose every command exited 0.
+
+#### Conflict results
+
+Unresolved files per pair, with the number of conflict regions in each: **M** `MODULE.bazel.lock`, **L** `Cargo.lock`, **X** `Cargo.bazel.lock`, **J** `cargo-bazel-lock.json`.
+
+| PR    | A: reviewed | A: regenerated | B        | C        |
+| ----- | ----------- | -------------- | -------- | -------- |
+| #748  | L1          | M4 L1          | M4 L1 X1 | L1 X1 J2 |
+| #945  | M3          | M3             | M2       | J1       |
+| #919  | M3 L2       | M3 L2          | M3 L2    | L2 J3    |
+| #1285 | M2          | M2             | M2       | J1       |
+| #1383 | M1          | M1             | none     | none     |
+| #1421 | M3          | M3             | M2       | J1       |
+| #1424 | M4          | M4             | M4       | J2       |
+| #1422 | M1          | M1             | M1       | none     |
+| #1430 | M11         | M11            | M11      | J4       |
+| #1398 | M4          | M4             | M3       | J1       |
+| #1428 | M2          | M2             | M1       | J1       |
+| #1467 | M2          | M2             | M1       | J1       |
+| #1539 | M3 L2       | M3 L2          | M3 L2    | L2 J3    |
+| #1542 | M2          | M2             | M2       | J1       |
+| #1395 | M2          | M2             | M1       | J1       |
+| #1553 | M4 L2       | M4 L2          | M4 L2    | L2 J3    |
+| #1566 | M3          | none           | none     | none     |
+| #1581 | M1          | M1             | M1       | none     |
+| #2066 | M4 L2       | M4 L2          | M4 L2    | L2 J3    |
+| #2067 | M4 L1       | M4 L1          | M4 L1    | L1 J1    |
+| #2081 | M4 L2       | M4 L2          | M4 L2    | L2 J3    |
+| #2202 | M3          | M3             | M2       | J1       |
+| #2570 | M3          | M3             | M3       | J1       |
+| #2589 | M1          | M1             | none     | none     |
+| #2563 | M1          | M1             | none     | none     |
+| #2973 | M3 L1       | M3 L1          | M2 L1    | L1 J2    |
+| #3050 | M2          | M2             | M1       | J1       |
+| #3242 | M2          | M2             | M2       | J1       |
+| #3271 | M2 L1       | M2 L1          | M2 L1    | L1 J3    |
+| #3311 | M2          | M2             | M1       | J1       |
+| #3430 | M1          | M1             | M1       | J1       |
+| #3473 | M2 L1       | M2 L1          | M1 L1    | L1       |
+| #3536 | M2          | M2             | M1       | J1       |
+
+| Set                                     | Measure               | A: reviewed | A: regenerated |   B |   C |
+| --------------------------------------- | --------------------- | ----------: | -------------: | --: | --: |
+| All 33 pairs                            | Pairs with a conflict |          33 |             32 |  29 |  27 |
+|                                         | Unresolved files      |          42 |             42 |  40 |  37 |
+|                                         | Conflict regions      |         102 |            103 |  89 |  60 |
+| 21 pairs with every command exiting 0   | Pairs with a conflict |          21 |             21 |  18 |  18 |
+|                                         | Unresolved files      |          25 |             26 |  24 |  23 |
+|                                         | Conflict regions      |          50 |             54 |  42 |  30 |
+| Third-party change on either side (20)  | Pairs with a conflict |          20 |             19 |  16 |  14 |
+|                                         | Unresolved files      |          21 |             21 |  19 |  17 |
+| New crate, no third-party change (12)   | Pairs with a conflict |          12 |             12 |  12 |  12 |
+|                                         | Unresolved files      |          19 |             19 |  19 |  18 |
+| Manifest edits only (1; 8 more pending) | Pairs with a conflict |           1 |              1 |   1 |   1 |
+|                                         | Unresolved files      |           2 |              2 |   2 |   2 |
+
+What the larger sample shows that four pairs could not:
+
+- **C does remove some conflicts outright.** Six pairs that conflict under A merge cleanly under C (#1383, #1422, #1566, #1581, #2563, #2589), and in a seventh (#3473) the JSON merges while `Cargo.lock` still conflicts, because both sides arrive at a byte-identical JSON. In each of the six, only one side changes the JSON. The other side edited a manifest or `Cargo.lock` in a way that changes the file hashes recorded in `MODULE.bazel.lock` but not the rendered crate context. That is the hash churn the reproducible configuration was expected to absorb.
+- **Every other conflict moves rather than disappears.** In the 26 remaining pairs both sides change the JSON checksum, so it conflicts wherever `MODULE.bazel.lock` did. Regions fall from 102 to 60 because the JSON conflicts in fewer places per file, not because fewer files need regenerating.
+- **The gain is confined to third-party pairs.** All six pairs that become conflict-free have a third-party change on one side. Among the 12 crate-addition pairs, the class that makes up two thirds of the population, C leaves all 12 conflicted.
+- **Stripping alone gets part of the way.** B clears four of the same six pairs and never clears one that C does not.
+- **The ordinary `Cargo.lock` conflicts are untouched.** All 10 remain under every configuration, because that file is still committed and still changes with first-party edits. One pair (#748, where both sides change third-party packages) adds a `Cargo.bazel.lock` conflict under B and C.
+- **A's regenerated files behave like the reviewed ones.** They differ in two pairs: #1566 stops conflicting once a stale committed record is regenerated, and #748 gains a `MODULE.bazel.lock` conflict.
+
+The two pairs shared with the initial trial reproduce it: #3430 and #3050 each conflict in `MODULE.bazel.lock` under A and B and in the JSON under C.
+
+Not measured: whether a JSON that merges cleanly is still current for the merged manifests. In the six clean pairs the result is simply the changed side's file. A stale checksum would not conflict; it would fail the next build until someone repins.
+
+#### Dependency parity and stability
+
+All 273 evaluations (91 revisions, three configurations) keep the complete external package records of the reviewed `Cargo.lock`, between 383 and 541 packages per revision. B and C's `Cargo.bazel.lock` contains no source-less package at any revision. B and C's generated `defs.bzl` and hub `BUILD.bazel` are byte-identical to A's at all 91 revisions.
+
+| Configuration | Second ordinary evaluation leaves every lockfile unchanged | Third |
+| ------------- | ---------------------------------------------------------- | ----- |
+| A             | 90/91                                                      | n/a   |
+| B             | 0/91                                                       | 91/91 |
+| C             | 91/91, after the repin and one unset-variable evaluation   | n/a   |
+
+B needs three evaluations from a full-lockfile seed at every revision, as in the initial trial: the first strips the watched input and the second records its new digest, with a second full regeneration (31 to 222 s here, with four worktrees running).
+
+A's one unstable revision is the head of #945, whose reviewed `Cargo.lock` was out of date for its own manifests: A's first evaluation rewrote a first-party entry in `Cargo.lock`, and the second updated the recorded digest. B and C left `Cargo.lock` as committed there. Under B and C nothing in the Bazel path maintains the ordinary `Cargo.lock`, which the release script, checkleft metadata and the toolchain coherence test still read.
+
+#### Repin measurements (in progress)
+
+One explicit repin per configuration is being timed at each of the 24 PR heads whose own evaluation exited 0, serially in one worktree with nothing else from the trial running, in the order A/B/C, B/C/A, C/A/B rotating by head. Each measurement restores the head with its initialized lockfiles, runs one ordinary evaluation to settle, then `CARGO_BAZEL_REPIN=true bazel mod deps --lockfile_mode=update`, then the same command with the variable unset. No diagnostic variables are set and the caches are the normal ones.
+
+Interim figures from the first 9 heads (27 of 72 measurements; all commands exited 0, none timed out, external pins equal the reviewed pins after each):
+
+| Wall time, seconds                    |  A: current | B: stripping only | C: reproducible + stripping |
+| ------------------------------------- | ----------: | ----------------: | --------------------------: |
+| Explicit repin, median                |       16.96 |             14.63 |                       14.26 |
+| Explicit repin, range                 | 13.32–23.38 |      12.40–344.08 |                 13.32–67.40 |
+| Following ordinary evaluation, median |       16.03 |             15.41 |                        0.49 |
+
+The repin itself costs the same in all three. The difference is afterwards: under A and B the repin writes `ENV:CARGO_BAZEL_REPIN true` into `MODULE.bazel.lock`, and the next ordinary evaluation regenerates to remove it; under C the extension has no record there and the next evaluation takes half a second. This explains the same pattern in the initial trial. It is a cost of using the repin variable, not of A's normal path: A regenerates through an ordinary `bazel mod deps` with no variable, which is one generation. C cannot do that. Its JSON is only rewritten by an explicit repin.
+
+Final figures for all 24 heads will replace this table.
+
 ### Decision
 
-**Do not adopt C on this evidence.** It leaves the same total unresolved lockfile conflicts as A and B, moves both observed conflicts to the JSON file, and does not make repinning reliably cheaper. It does preserve dependency/helper parity and produces a stable ordinary evaluation after repinning. Those properties establish feasibility, but do not satisfy the adoption criterion.
+**Pending the two measurements still in progress.** The initial trial's finding, that C leaves the same number of unresolved lockfile conflicts as A, does not hold on the larger sample.
 
-`MODULE.bazel`, root BUILD exports, production lockfiles and the generated-lock resolver remain unchanged. `Cargo.lock` continues serving the release script, checkleft metadata and toolchain coherence test. No new lockfile is introduced that the current resolver cannot regenerate, and neither side of an external version change is discarded. This conclusion applies to the four measured pairs; it does not estimate an elimination rate for the full historical corpus.
+The criterion is to prefer the combination only if it reduces total unresolved conflicts or makes regeneration reliably cheaper. On the 33 pairs:
+
+- **Total unresolved conflicts: reduced, modestly.** C leaves 37 unresolved lockfiles in 27 pairs against 42 in 33 for the reviewed current configuration (23 in 18 against 25 in 21 where every command exited 0). The reduction comes entirely from pairs with a third-party change. In the crate-addition class it is one file in 19 and no pair. Weighted by the population's classes instead of the sample's, and with the manifest-edit class still to be measured, the six cleared pairs correspond to roughly 4% of lockfile conflict states.
+- **Regeneration: not shown to be cheaper.** On the interim timings a repin costs the same under all three configurations. C needs an explicit repin where A regenerates on an ordinary evaluation.
+- **What C adds.** 26 of its 27 remaining conflicted pairs conflict in `cargo-bazel-lock.json`, a file the engine's generated-lock resolver does not recognise, where 32 of A's 33 conflict in `MODULE.bazel.lock`, which it regenerates today. Adopting C without first extending the resolver would move most lockfile conflicts into a file it cannot regenerate.
+
+Production configuration, lockfiles and the resolver are unchanged by this change. No new lockfile is introduced, and neither side of an external version change is discarded. The decision will be stated here once the supplementary stratum and the remaining timings are in.
