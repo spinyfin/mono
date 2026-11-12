@@ -1169,3 +1169,16 @@ async fn structured_positioning_refusal_survives_the_spoke_transport() {
     assert!(typed.detail().contains("abc123"));
     peer.disconnect();
 }
+
+#[tokio::test]
+async fn spoke_ready_host_cleans_the_legacy_store_and_gcs_through_the_provider() {
+    let fx = Fixture::new().await;
+    fx.ready(HOST);
+    fx.serve_legacy();
+    let adapter = fx.provider_adapter(HOST).await;
+    adapter.cleanup_legacy_store(Path::new("/ssh/repo"), &[]).await.unwrap();
+    adapter.gc_cube_repo("repo").await.unwrap();
+    let calls = fx.legacy_calls();
+    assert!(calls.iter().any(|call| call == "cleanup_legacy_store"), "{calls:?}");
+    assert!(calls.iter().any(|call| call == "gc_cube_repo:repo"), "{calls:?}");
+}

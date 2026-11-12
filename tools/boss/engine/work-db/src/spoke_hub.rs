@@ -29,6 +29,30 @@ pub const SETTLED_HOST_COMMAND_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// Newest settled commands per host that retention never removes.
 pub const MIN_RETAINED_SETTLED_HOST_COMMANDS: u32 = 256;
 
+/// Stable command-id prefixes the adapter formats and retention protects.
+/// Keep these in this crate so a rename cannot silently drop lease/spawn/stop
+/// rows that `current_attempt` and in-doubt retry still need.
+pub const HOST_COMMAND_LEASE_PREFIX: &str = "lease-";
+pub const HOST_COMMAND_SPAWN_PREFIX: &str = "spawn-";
+pub const HOST_COMMAND_STOP_PREFIX: &str = "stop-";
+
+/// `lease-{run_id}-{digest}` for the current attempt at a workspace lease.
+pub fn host_command_lease_id(run_id: &str, digest: u64) -> String {
+    format!("{HOST_COMMAND_LEASE_PREFIX}{run_id}-{digest:016x}")
+}
+
+/// `spawn-{run_id}` for the one launch command of a run.
+pub fn host_command_spawn_id(run_id: &str) -> String {
+    format!("{HOST_COMMAND_SPAWN_PREFIX}{run_id}")
+}
+
+/// `stop-{grace_ms}-{run_id}` for a stop request with that grace. This is the
+/// whole base id the adapter hands to `current_attempt`; the adapter adds no
+/// part of its own, so retention and the adapter cannot disagree about it.
+pub fn host_command_stop_id(grace_ms: u32, run_id: &str) -> String {
+    format!("{HOST_COMMAND_STOP_PREFIX}{grace_ms}-{run_id}")
+}
+
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS spoke_assignments (
@@ -254,6 +278,14 @@ pub struct StoredHostCommand {
     pub wire: Vec<u8>,
 }
 
+/// The newest stored lease command for a run, including an optional result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredLeaseCommand {
+    pub command_id: String,
+    pub wire: Vec<u8>,
+    pub result: Option<Vec<u8>>,
+}
+
 const ASSIGNMENT_COLUMNS: &str = "execution_id, assignment_generation, run_id, spawn_token, host_id, repo_id,
     workspace_id, lease_id, display_path, pane_pid, resolved_at_ms";
 
@@ -359,6 +391,97 @@ impl WorkDb {
             [execution_id],
             |row| row.get(0),
         )?)
+    }
+
+    /// The spoke host that holds this execution's open assignment when that
+    /// assignment may already have leased a workspace or started a worker (a
+    /// lease or a command names the run, or the assignment is flagged in doubt).
+    /// While this is `Some`, the execution can only be reconciled on that host:
+    /// no other host may be chosen, and a failure to reach it is not a failed
+    /// start.
+    pub fn spoke_host_holding_execution(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let open = conn
+            .query_row(
+                &format!("SELECT {ASSIGNMENT_COLUMNS} FROM spoke_assignments WHERE execution_id = ?1 AND resolved_at_ms IS NULL"),
+                [execution_id],
+                map_assignment,
+            )
+            .optional()?;
+        let Some(open) = open else {
+            return Ok(None);
+        };
+        Ok(
+            assignment_may_have_started(&conn, execution_id, open.assignment_generation as i64)?
+                .then_some(open.host_id),
+        )
+    }
+
+    /// Executions whose open spoke assignment is still in doubt: the flag is
+    /// set, or a stored lease/spawn command has no result yet. Used after a
+    /// restart, when the in-memory run task and the attention item may both
+    /// be gone.
+    pub fn list_in_doubt_spoke_execution_ids(&self) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT execution_id FROM spoke_assignments
+              WHERE resolved_at_ms IS NULL AND (
+                in_doubt <> 0
+                OR EXISTS (
+                    SELECT 1 FROM host_commands c
+                     WHERE c.run_execution_id = spoke_assignments.execution_id
+                       AND c.run_generation = spoke_assignments.assignment_generation
+                       AND c.result IS NULL
+                       AND (c.command_id LIKE 'lease-%' OR c.command_id LIKE 'spawn-%')
+                )
+              )",
+        )?;
+        let ids = stmt.query_map([], |row| row.get(0))?;
+        ids.collect::<rusqlite::Result<Vec<String>>>().map_err(Into::into)
+    }
+
+    /// Whether this run has a stored spawn command, answered or not.
+    pub fn assignment_has_stored_spawn(&self, host_id: &str, run_id: &str) -> Result<bool> {
+        let id = host_command_spawn_id(run_id);
+        Ok(self.host_command_wire(host_id, &id)?.is_some())
+    }
+
+    /// The newest stored lease command for `run_id` on `host_id`, with its
+    /// wire and optional result. `None` when no lease was ever stored.
+    pub fn current_lease_command(&self, host_id: &str, run_id: &str) -> Result<Option<StoredLeaseCommand>> {
+        let prefix = format!("{HOST_COMMAND_LEASE_PREFIX}{run_id}-%");
+        Ok(self
+            .connect()?
+            .query_row(
+                "SELECT command_id, wire, result FROM host_commands
+                  WHERE host_id = ?1 AND command_id LIKE ?2
+                  ORDER BY created_at_ms DESC LIMIT 1",
+                params![host_id, prefix],
+                |row| {
+                    Ok(StoredLeaseCommand {
+                        command_id: row.get(0)?,
+                        wire: row.get(1)?,
+                        result: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// How long the execution's open assignment has been held, in milliseconds.
+    /// `None` when it holds none. Durable, so a wait that spans engine restarts
+    /// and dispatch passes still measures from the first reservation.
+    pub fn spoke_assignment_age_ms(&self, execution_id: &str) -> Result<Option<i64>> {
+        Ok(self
+            .connect()?
+            .query_row(
+                "SELECT created_at_ms FROM spoke_assignments
+                 WHERE execution_id = ?1 AND resolved_at_ms IS NULL",
+                [execution_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|created| (now_ms() - created).max(0)))
     }
 
     /// Reserve `execution_id` for `host_id`, or return the reservation it already
@@ -1076,6 +1199,9 @@ impl WorkDb {
             .optional()?
             .unwrap_or(0);
         let highest = highest_sequence(&tx, host_id)? as i64;
+        let lease_glob = format!("{HOST_COMMAND_LEASE_PREFIX}*");
+        let spawn_glob = format!("{HOST_COMMAND_SPAWN_PREFIX}*");
+        let stop_glob = format!("{HOST_COMMAND_STOP_PREFIX}*");
         let removed = tx.execute(
             "DELETE FROM host_commands
              WHERE host_id = ?1 AND result IS NOT NULL AND settled_at_ms < ?2
@@ -1085,13 +1211,22 @@ impl WorkDb {
                      WHERE a.execution_id = host_commands.run_execution_id
                        AND a.assignment_generation = host_commands.run_generation
                        AND a.resolved_at_ms IS NULL
-                       AND (command_id GLOB 'lease-*' OR command_id GLOB 'spawn-*'
-                            OR command_id GLOB 'stop-*')))
+                       AND (command_id GLOB ?6 OR command_id GLOB ?7
+                            OR command_id GLOB ?8)))
                AND command_id NOT IN (
                     SELECT command_id FROM host_commands
                      WHERE host_id = ?1 AND result IS NOT NULL
                      ORDER BY settled_at_ms DESC, created_at_ms DESC, command_id DESC LIMIT ?5)",
-            params![host_id, settled_before_ms, received, highest, keep_recent as i64],
+            params![
+                host_id,
+                settled_before_ms,
+                received,
+                highest,
+                keep_recent as i64,
+                lease_glob,
+                spawn_glob,
+                stop_glob
+            ],
         )?;
         tx.commit()?;
         Ok(removed)
@@ -1286,6 +1421,54 @@ mod tests {
                 (execution_id, host, lease),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn host_command_ids_use_the_retention_prefixes() {
+        assert!(host_command_lease_id("run", 1).starts_with(HOST_COMMAND_LEASE_PREFIX));
+        assert!(host_command_spawn_id("run").starts_with(HOST_COMMAND_SPAWN_PREFIX));
+        assert!(host_command_stop_id(250, "run").starts_with(HOST_COMMAND_STOP_PREFIX));
+        assert_eq!(host_command_spawn_id("exec_1-g1"), "spawn-exec_1-g1");
+        assert_eq!(host_command_stop_id(0, "exec_1-g1"), "stop-0-exec_1-g1");
+    }
+
+    #[test]
+    fn list_in_doubt_spoke_execution_ids_includes_unanswered_commands_without_the_flag() {
+        let db = spoke_db();
+        let reserved = db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
+        assert!(db.list_in_doubt_spoke_execution_ids().unwrap().is_empty());
+        append(
+            &db,
+            "host-a",
+            &host_command_lease_id(&reserved.run_id, 1),
+            Some(&key(&reserved)),
+            b"lease",
+        )
+        .unwrap();
+        assert_eq!(db.list_in_doubt_spoke_execution_ids().unwrap(), ["exec_1"]);
+        db.settle_host_command(
+            "host-a",
+            &host_command_lease_id(&reserved.run_id, 1),
+            Some(&key(&reserved)),
+            b"ok",
+        )
+        .unwrap();
+        assert!(db.list_in_doubt_spoke_execution_ids().unwrap().is_empty());
+        db.set_spoke_in_doubt("exec_1", reserved.assignment_generation, true)
+            .unwrap();
+        assert_eq!(db.list_in_doubt_spoke_execution_ids().unwrap(), ["exec_1"]);
+        let other = db.reserve_spoke_assignment("exec_2", "host-b").unwrap();
+        append(
+            &db,
+            "host-b",
+            &host_command_spawn_id(&other.run_id),
+            Some(&key(&other)),
+            b"spawn",
+        )
+        .unwrap();
+        let mut ids = db.list_in_doubt_spoke_execution_ids().unwrap();
+        ids.sort();
+        assert_eq!(ids, ["exec_1", "exec_2"]);
     }
 
     fn held_by(error: &anyhow::Error) -> Option<String> {
@@ -1945,6 +2128,28 @@ mod tests {
         db.record_host_command_receipt("h", &journal, 5).unwrap();
         assert_eq!(db.prune_settled_host_commands("h", i64::MAX, 0).unwrap(), 1);
         assert_eq!(ids(&db, "h", &names), ["lease-run", "spawn-run", "stop-run", "receipt"]);
+    }
+
+    #[test]
+    fn retention_keeps_every_id_the_helpers_format_for_an_unresolved_assignment() {
+        let db = spoke_db();
+        let assignment = db.reserve_spoke_assignment("exec_1", "h").unwrap();
+        let run = key(&assignment);
+        let lease = host_command_lease_id(&assignment.run_id, 7);
+        let spawn = host_command_spawn_id(&assignment.run_id);
+        let stop = host_command_stop_id(250, &assignment.run_id);
+        let names = [lease.as_str(), spawn.as_str(), stop.as_str(), "observe-x", "receipt"];
+        for name in names {
+            append(&db, "h", name, Some(&run), name.as_bytes()).unwrap();
+            db.settle_host_command("h", name, Some(&run), b"result").unwrap();
+        }
+        let (journal, _) = db.resume_host_command_journal("h", None).unwrap();
+        db.record_host_command_receipt("h", &journal, 5).unwrap();
+        assert_eq!(db.prune_settled_host_commands("h", i64::MAX, 0).unwrap(), 1);
+        assert_eq!(
+            ids(&db, "h", &names),
+            [lease.as_str(), spawn.as_str(), stop.as_str(), "receipt"]
+        );
     }
 
     #[test]

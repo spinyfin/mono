@@ -17,7 +17,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use boss_execution_contracts::{
-    ControlOutcome, RunOutcome, SpawnOutcomeUncertain, WorkerInputKind, WorkerLife, WorkerPane,
+    ControlOutcome, LocalSpawnFailure, RunOutcome, RunWaitState, SpawnOutcomeUncertain, WorkerInputKind, WorkerLife,
+    WorkerPane,
 };
 use boss_protocol::{WorkExecution, WorkItem};
 use boss_protocol_spoke::{
@@ -28,7 +29,7 @@ use boss_protocol_spoke::{
         command_result,
     },
 };
-use boss_work_db::SpokeAssignment;
+use boss_work_db::{SpokeAssignment, host_command_spawn_id, host_command_stop_id};
 use prost::Message;
 
 use crate::{HostCallError, SpokeHostAdapter, expect_ok, run_of};
@@ -89,7 +90,10 @@ fn pane_in(result: &CommandResult) -> Option<WorkerPane> {
 
 enum ControlId {
     Fresh,
-    StableUntilOk(String),
+    /// A stop: its id is the work database's `stop-{grace_ms}-{run_id}`.
+    StableStop {
+        grace_ms: u32,
+    },
     Refreshing(String),
 }
 
@@ -102,6 +106,82 @@ impl SpokeHostAdapter {
         workspace_path: &Path,
         cube_change_id: Option<&str>,
     ) -> Result<RunOutcome> {
+        // Everything before the command is sent is local: a failure there is no
+        // evidence about an earlier attempt of the same spawn.
+        let (assignment, id, had_stored, command, template) = self
+            .prepare_spawn(worker_id, execution, work_item, workspace_path, cube_change_id)
+            .await
+            .map_err(|error| anyhow::Error::new(LocalSpawnFailure(error)))?;
+        let sent = self
+            .hub
+            .send_command(self.host_name(), "spawn", command, self.hub.config.spawn_deadline)
+            .await;
+        let result = match sent {
+            Ok(result) => result,
+            Err(HostCallError::NotSent { reason, .. }) if !had_stored => {
+                bail!(
+                    "host {} could not take the spawn; nothing was sent: {reason}",
+                    self.host_name()
+                )
+            }
+            // An earlier attempt may have been delivered: do not call this a failure.
+            Err(HostCallError::NotSent { reason, .. } | HostCallError::Uncertain { reason, .. }) => {
+                return Err(self.uncertain_spawn(&id, reason, false));
+            }
+            Err(other) => return Err(other.into()),
+        };
+        match ResultCode::try_from(result.code) {
+            Ok(ResultCode::Ok) => {}
+            Ok(ResultCode::Rejected) => bail!("host {} rejected the spawn: {}", self.host_name(), result.reason),
+            Ok(ResultCode::Absent) => bail!(
+                "the worker's session on host {} was already gone when the spawn finished: {}",
+                self.host_name(),
+                result.reason
+            ),
+            _ => {
+                return self
+                    .finish_settled_uncertain_spawn(&assignment, execution, &id, result.reason, template)
+                    .await;
+            }
+        }
+        let pane = pane_in(&result).context("the host reported a spawn without the worker's pane")?;
+        match pane.life {
+            WorkerLife::Alive => {}
+            WorkerLife::BriefNotDelivered => bail!(
+                "the worker launched on host {} but its initial brief was never delivered",
+                self.host_name()
+            ),
+            WorkerLife::Exited => bail!(
+                "the worker on host {} exited during launch (exit code {:?})",
+                self.host_name(),
+                pane.exit_code
+            ),
+            WorkerLife::Missing | WorkerLife::Indeterminate => {
+                return self
+                    .finish_settled_uncertain_spawn(
+                        &assignment,
+                        execution,
+                        &id,
+                        "the host could not confirm the worker's session".to_owned(),
+                        template,
+                    )
+                    .await;
+            }
+        }
+        self.finish_launch(&assignment, execution, &id, &pane, template).await
+    }
+
+    /// The assignment, command id, whether a spawn was already stored, and the
+    /// (possibly stored) spawn command with the outcome template, all read and
+    /// composed locally.
+    async fn prepare_spawn(
+        &self,
+        worker_id: &str,
+        execution: &WorkExecution,
+        work_item: &WorkItem,
+        workspace_path: &Path,
+        cube_change_id: Option<&str>,
+    ) -> Result<(SpokeAssignment, String, bool, Command, Option<RunOutcome>)> {
         let assignment = self.bound_open().await?;
         ensure!(
             assignment.execution_id == execution.id,
@@ -123,7 +203,7 @@ impl SpokeHostAdapter {
                 "execution records lease {recorded} but its assignment holds {lease_id}"
             );
         }
-        let id = format!("spawn-{}", assignment.run_id);
+        let id = host_command_spawn_id(&assignment.run_id);
 
         // The first stored spawn is the spawn: a retry sends exactly that command.
         let (host, stored_id) = (self.host_name().to_owned(), id.clone());
@@ -172,57 +252,31 @@ impl SpokeHostAdapter {
         };
         command.sequence = 0;
 
-        let sent = self
-            .hub
-            .send_command(self.host_name(), "spawn", command, self.hub.config.spawn_deadline)
-            .await;
-        let uncertain = |reason: String| {
-            anyhow::Error::new(SpawnOutcomeUncertain {
-                host_id: self.host_name().to_owned(),
-                command_id: id.clone(),
-                reason,
-            })
-        };
-        let result = match sent {
-            Ok(result) => result,
-            Err(HostCallError::NotSent { reason, .. }) if !had_stored => {
-                bail!(
-                    "host {} could not take the spawn; nothing was sent: {reason}",
-                    self.host_name()
-                )
-            }
-            // An earlier attempt may have been delivered: do not call this a failure.
-            Err(HostCallError::NotSent { reason, .. } | HostCallError::Uncertain { reason, .. }) => {
-                return Err(uncertain(reason));
-            }
-            Err(other) => return Err(other.into()),
-        };
-        match ResultCode::try_from(result.code) {
-            Ok(ResultCode::Ok) => {}
-            Ok(ResultCode::Rejected) => bail!("host {} rejected the spawn: {}", self.host_name(), result.reason),
-            Ok(ResultCode::Absent) => bail!(
-                "the worker's session on host {} was already gone when the spawn finished: {}",
-                self.host_name(),
-                result.reason
-            ),
-            _ => return Err(uncertain(result.reason)),
-        }
-        let pane = pane_in(&result).context("the host reported a spawn without the worker's pane")?;
-        match pane.life {
-            WorkerLife::Alive => {}
-            WorkerLife::BriefNotDelivered => bail!(
-                "the worker launched on host {} but its initial brief was never delivered",
-                self.host_name()
-            ),
-            WorkerLife::Exited => bail!(
-                "the worker on host {} exited during launch (exit code {:?})",
-                self.host_name(),
-                pane.exit_code
-            ),
-            WorkerLife::Missing | WorkerLife::Indeterminate => {
-                return Err(uncertain("the host could not confirm the worker's session".to_owned()));
-            }
-        }
+        Ok((assignment, id, had_stored, command, template))
+    }
+
+    fn uncertain_spawn(&self, command_id: &str, reason: String, settled: bool) -> anyhow::Error {
+        anyhow::Error::new(SpawnOutcomeUncertain {
+            host_id: self.host_name().to_owned(),
+            command_id: command_id.to_owned(),
+            reason,
+            settled,
+        })
+    }
+
+    /// What follows a pane the host reports alive, whichever way the report
+    /// arrived (the spawn's own result, or an Adopt after it settled as
+    /// uncertain): record the pid the liveness sweeps key on, then insist the
+    /// worker accepted its brief before calling it launched. An interrupted
+    /// launch is exactly when the brief may never have arrived.
+    async fn finish_launch(
+        &self,
+        assignment: &SpokeAssignment,
+        execution: &WorkExecution,
+        command_id: &str,
+        pane: &WorkerPane,
+        template: Option<RunOutcome>,
+    ) -> Result<RunOutcome> {
         if let Some(pid) = pane.pid {
             let (run_execution, generation, run_id) = (
                 assignment.execution_id.clone(),
@@ -242,6 +296,16 @@ impl SpokeHostAdapter {
                 tracing::warn!(error = %format!("{error:#}"), "could not record the worker's pane pid");
             }
         }
+        if self.stop_unconfirmed.load(std::sync::atomic::Ordering::SeqCst) {
+            // The flag lives only on this adapter instance. A new adapter (the
+            // in-doubt sweep's, or one created after a restart) never sees it
+            // and waits for prompt evidence the usual way.
+            if self.hub.signals.has_prompt_accepted_for_run(&execution.id) {
+                self.stop_unconfirmed.store(false, std::sync::atomic::Ordering::SeqCst);
+            } else {
+                return self.retry_unconfirmed_stop(execution, command_id).await;
+            }
+        }
         let mut stopped = None;
         let confirmed = boss_execution_contracts::confirm_prompt_accepted_or_reap(
             "spoke",
@@ -257,15 +321,20 @@ impl SpokeHostAdapter {
         if let Err(error) = confirmed {
             match stopped {
                 Some(Ok(ControlOutcome::Delivered(_))) => return Err(error),
+                // The spawn itself is settled: what is unknown is whether the
+                // worker was stopped, which a replay of the spawn cannot learn.
                 other => {
-                    return Err(uncertain(format!(
-                        "{error:#}; worker stop was not confirmed: {other:?}"
-                    )));
+                    self.stop_unconfirmed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Err(self.uncertain_spawn(
+                        command_id,
+                        format!("{error:#}; worker stop was not confirmed: {other:?}"),
+                        true,
+                    ));
                 }
             }
         }
         let mut outcome = template.unwrap_or(RunOutcome {
-            wait_state: boss_execution_contracts::RunWaitState::WorkerPaneAlive,
+            wait_state: RunWaitState::WorkerPaneAlive,
             result_summary: None,
             attention: None,
             slot_id: None,
@@ -278,6 +347,56 @@ impl SpokeHostAdapter {
             pane.session
         ));
         Ok(outcome)
+    }
+
+    /// A launched worker whose prompt was never confirmed and whose stop is
+    /// still unconfirmed: ask for the stable stop again, and only that. Prompt
+    /// acceptance is checked by [`Self::finish_launch`] before this runs; a
+    /// delivered stop is the definitive failure the first attempt could not
+    /// establish. The `stop_unconfirmed` flag is in-memory on this adapter
+    /// instance only, so a new adapter falls back to the full prompt wait.
+    async fn retry_unconfirmed_stop(&self, execution: &WorkExecution, command_id: &str) -> Result<RunOutcome> {
+        match self.ctl_stop(&execution.id, Duration::ZERO).await {
+            Ok(ControlOutcome::Delivered(_)) => {
+                self.stop_unconfirmed.store(false, std::sync::atomic::Ordering::SeqCst);
+                bail!(
+                    "the worker on host {} never confirmed its prompt and was stopped",
+                    self.host_name()
+                )
+            }
+            other => Err(self.uncertain_spawn(command_id, format!("worker stop was not confirmed: {other:?}"), true)),
+        }
+    }
+
+    /// A spawn command that already settled as uncertain is not unanswered:
+    /// re-sending it only replays the stored result. Adopt the pane instead.
+    /// Alive means the worker launched; Missing/Absent is a definite failure;
+    /// anything else stays uncertain so the coordinator can park.
+    async fn finish_settled_uncertain_spawn(
+        &self,
+        assignment: &SpokeAssignment,
+        execution: &WorkExecution,
+        command_id: &str,
+        reason: String,
+        template: Option<RunOutcome>,
+    ) -> Result<RunOutcome> {
+        match self.ctl_observe(&assignment.execution_id).await {
+            Ok(Some(pane)) if pane.life == WorkerLife::Alive => {
+                self.finish_launch(assignment, execution, command_id, &pane, template)
+                    .await
+            }
+            Ok(None)
+            | Ok(Some(WorkerPane {
+                life: WorkerLife::Missing | WorkerLife::Exited,
+                ..
+            })) => {
+                bail!(
+                    "the worker's session on host {} was gone when spawn settled as uncertain: {reason}",
+                    self.host_name()
+                )
+            }
+            _ => Err(self.uncertain_spawn(command_id, reason, true)),
+        }
     }
 
     // ── Control ─────────────────────────────────────────────────────────────
@@ -322,8 +441,10 @@ impl SpokeHostAdapter {
                     )
                     .await?));
             }
-            ControlId::StableUntilOk(prefix) => {
-                let id = self.stable_control_id(&assignment, &prefix).await?;
+            ControlId::StableStop { grace_ms } => {
+                let id = self
+                    .stable_control_id(host_command_stop_id(grace_ms, &assignment.run_id))
+                    .await?;
                 self.hub
                     .send_stable(self.host_name(), name, id, Some(run_of(&assignment)), body, deadline)
                     .await
@@ -349,9 +470,9 @@ impl SpokeHostAdapter {
     /// settled as anything but success (refused, nothing to stop, or an
     /// uncertain outcome) is asked again as a new, recorded attempt, which is
     /// itself reused until it settles.
-    async fn stable_control_id(&self, assignment: &SpokeAssignment, prefix: &str) -> Result<String> {
+    async fn stable_control_id(&self, base_id: String) -> Result<String> {
         self.hub
-            .current_attempt(self.host_name(), &format!("{prefix}-{}", assignment.run_id), |result| {
+            .current_attempt(self.host_name(), &base_id, |result| {
                 ResultCode::try_from(result.code) != Ok(ResultCode::Ok)
             })
             .await
@@ -423,7 +544,7 @@ impl SpokeHostAdapter {
                     "stop",
                     deadline,
                     command::Body::Stop(Stop { grace_ms }),
-                    ControlId::StableUntilOk(format!("stop-{grace_ms}")),
+                    ControlId::StableStop { grace_ms },
                 )
                 .await?
             {

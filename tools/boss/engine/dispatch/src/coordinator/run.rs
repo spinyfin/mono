@@ -1,6 +1,7 @@
 //! Running an execution to completion: spawn, conflict-diagnosis capture,
 //! worker release, and run-completion bookkeeping. Part of the `coordinator`
 //! module split; see [`super`] for the struct and shared types.
+use super::spoke_in_doubt::execution_no_longer_runnable;
 use super::*;
 
 pub use boss_engine_storage_values::attention_kinds::PANE_SPAWN_FAILED_ATTENTION_KIND;
@@ -83,6 +84,29 @@ impl ExecutionCoordinator {
     // `change` is `None` for `pr_review` executions that checked out the PR
     // head directly; `Some` for all other executions that created a jj change.
     #[allow(clippy::too_many_arguments)]
+    pub(super) fn spawn_run_execution(
+        self: &Arc<Self>,
+        execution: WorkExecution,
+        run: WorkRun,
+        work_item: WorkItem,
+        worker_id: String,
+        lease: CubeWorkspaceLease,
+        change: Option<CubeChangeHandle>,
+        adapter: Arc<dyn HostAdapter>,
+    ) {
+        let execution_id = execution.id.clone();
+        self.begin_driving_run(&execution_id);
+        let coordinator = Arc::clone(self);
+        let handle = boss_task_scope::spawn(async move {
+            coordinator
+                .run_execution(execution, run, work_item, worker_id, lease, change, adapter)
+                .await;
+        });
+        self.store_driving_handle(&execution_id, handle.abort_handle());
+    }
+
+    // Same argument list as `spawn_run_execution`; clippy counts the Arc receiver.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_execution(
         self: Arc<Self>,
         execution: WorkExecution,
@@ -93,7 +117,11 @@ impl ExecutionCoordinator {
         change: Option<CubeChangeHandle>,
         adapter: Arc<dyn HostAdapter>,
     ) {
-        // Keep the cube lease alive for blocking runners (in-process test
+        let _driving = DrivingRunGuard {
+            coordinator: Arc::clone(&self),
+            execution_id: execution.id.clone(),
+        };
+        // Keep the cube lease alive for blocking runners (in-process test)
         // fakes, ACP-style runners). For pane-spawn (the production path),
         // spawn_worker returns immediately and this guard is dropped below
         // without ever firing — pane workers are covered instead by the
@@ -120,7 +148,31 @@ impl ExecutionCoordinator {
         // so both outcomes below record against the same key.
         let streak_key = self.pre_start_streak_key(&execution, &worker_id);
 
+        let timing = self.spoke_in_doubt_timing;
+        let mut unsettled_retries = 0_u32;
+        // Set once the spawn has been parked as in doubt: the pool slot was
+        // handed back then, so the tail below must not release it again.
+        let mut parked = false;
+        let mut last_uncertain: Option<SpawnOutcomeUncertain> = None;
         let run_outcome = loop {
+            // Only after a spawn has been sent can a cancellation leave a worker
+            // that may still start. A failed read is not a cancellation.
+            if let Some(uncertain) = last_uncertain.as_ref() {
+                match execution_no_longer_runnable(&self.work_db, &execution.id) {
+                    Ok(true) => {
+                        break Err(anyhow::Error::new(uncertain.clone()).context(format!(
+                            "execution {} was cancelled or became terminal while its spoke spawn was in doubt",
+                            execution.id
+                        )));
+                    }
+                    Ok(false) => {}
+                    Err(error) => tracing::warn!(
+                        execution_id = %execution.id,
+                        error = %format!("{error:#}"),
+                        "could not read the execution while its spoke spawn is in doubt; treating it as still runnable"
+                    ),
+                }
+            }
             let outcome = adapter
                 .spawn_worker(
                     &worker_id,
@@ -130,18 +182,73 @@ impl ExecutionCoordinator {
                     change.as_ref().map(|c| c.change_id.as_str()),
                 )
                 .await;
-            if let Err(error) = &outcome
-                && error
-                    .chain()
-                    .any(|cause| cause.is::<boss_execution_contracts::SpawnOutcomeUncertain>())
-            {
-                tracing::warn!(execution_id = %execution.id, error = %format!("{error:#}"),
-                    "spoke spawn unresolved; retaining ownership and reconciling the stored command");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+            let uncertain = match outcome.as_ref().err() {
+                None => break outcome,
+                Some(error) => {
+                    match error
+                        .chain()
+                        .find_map(|cause| cause.downcast_ref::<SpawnOutcomeUncertain>())
+                    {
+                        Some(uncertain) => uncertain.clone(),
+                        // A failure on this side, before the host was asked
+                        // anything, says nothing about the spawn an earlier
+                        // attempt may have started: keep that uncertainty.
+                        None if last_uncertain.is_some()
+                            && error.chain().any(|cause| cause.is::<LocalSpawnFailure>()) =>
+                        {
+                            tracing::warn!(
+                                execution_id = %execution.id,
+                                error = %format!("{error:#}"),
+                                "spoke spawn retry failed locally; the earlier in-doubt spawn stays in doubt"
+                            );
+                            last_uncertain.clone().expect("checked above")
+                        }
+                        None => break outcome,
+                    }
+                }
+            };
+            let detail = format!("{:#}", outcome.as_ref().unwrap_err());
+            if !parked && !uncertain.settled && unsettled_retries < SPOKE_UNSETTLED_RETRY_LIMIT {
+                unsettled_retries += 1;
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    command_id = %uncertain.command_id,
+                    attempt = unsettled_retries,
+                    error = %detail,
+                    "spoke spawn unanswered; reconciling the stored command"
+                );
+                last_uncertain = Some(uncertain);
+                tokio::time::sleep(timing.spawn_retry_sleep).await;
                 continue;
             }
-            break outcome;
+            // The host has still not said whether the worker started. The
+            // execution is not failed and nothing is re-dispatched: it keeps
+            // its assignment, lease and persona, hands back only the local
+            // pool capacity, and keeps asking the host about the stored
+            // spawn until the host (or an Adopt of the session) answers.
+            if !parked {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    command_id = %uncertain.command_id,
+                    settled = uncertain.settled,
+                    error = %detail,
+                    "spoke spawn outcome unknown; parking the execution as in doubt"
+                );
+                self.park_in_doubt_spawn(&execution, &worker_id, outcome.as_ref().unwrap_err())
+                    .await;
+                parked = true;
+            }
+            last_uncertain = Some(uncertain);
+            tokio::time::sleep(timing.spawn_poll).await;
         };
+        let cancelled_in_doubt = run_outcome
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.chain().any(|cause| cause.is::<SpawnOutcomeUncertain>()));
+        if parked && !cancelled_in_doubt {
+            // The host answered, one way or the other.
+            self.resolve_spoke_in_doubt_attention(&execution.id);
+        }
         drop(heartbeat);
 
         // Pane-spawn runs hand the slot to a live tmux worker; the
@@ -353,6 +460,39 @@ impl ExecutionCoordinator {
                             .with_cube_lease(&lease.lease_id)
                             .with_cube_workspace(&lease.workspace_id)
                             .with_details(details),
+                    )
+                    .await;
+            }
+            // Cancelled (or otherwise ended) while the host had still not said
+            // whether the worker started. The stored spawn may yet run, so the
+            // workspace lease and driver state stay with the assignment: only
+            // a confirmed stop of the worker may release them. The row is
+            // already terminal, so there is no failure to record.
+            Err(err) if cancelled_in_doubt => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    run_id = %run.id,
+                    worker_id = %worker_id,
+                    cube_lease_id = %lease.lease_id,
+                    error = %format!("{err:#}"),
+                    "spoke spawn still in doubt when the execution ended; keeping the workspace lease",
+                );
+                // Whether or not the spawn was ever parked, the held lease and
+                // persona need an item that stays until a confirmed stop.
+                self.raise_spoke_in_doubt_attention(&execution, "worker spawn", &err, Duration::ZERO);
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::PaneSpawned, DispatchOutcome::Skipped, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(&worker_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_error(&err)
+                            .with_details(serde_json::json!({
+                                "run_id": run.id,
+                                "spawn_in_doubt": true,
+                                "released_workspace": false,
+                            })),
                     )
                     .await;
             }
@@ -870,7 +1010,11 @@ impl ExecutionCoordinator {
                 // Failed spawns can release immediately. Successful remote
                 // launches retain their lease until terminal remote cleanup;
                 // deferred local panes retain it until verified tmux teardown.
-                if !remote_worker_alive {
+                // A spawn still in doubt when the execution ended may yet start
+                // a worker under this persona, so persona and live-state
+                // tracking stay until a confirmed stop (see
+                // `reconcile_ended_in_doubt_spokes`).
+                if !remote_worker_alive && !cancelled_in_doubt {
                     if let Some(states) = &self.live_worker_states {
                         states.release_slot_for_run(&execution.id);
                         states.release_persona_for_run(&execution.id);
@@ -878,10 +1022,42 @@ impl ExecutionCoordinator {
                         tracing::error!(execution_id = %execution.id, %error, "could not release persona after runner cleanup");
                     }
                 }
-                self.release_worker_and_kick(&worker_id, Some(lease.workspace_id.as_str()))
-                    .await;
+                if parked {
+                    // The pool slot went back when the spawn was parked; it may
+                    // be another execution's by now.
+                    self.rescan_active_dispatch_after_release();
+                    self.kick();
+                } else {
+                    self.release_worker_and_kick(&worker_id, Some(lease.workspace_id.as_str()))
+                        .await;
+                }
             }
         }
+    }
+
+    /// Hand back the local capacity a spawn in doubt holds and say so. The
+    /// execution stays running, with its assignment, lease, persona and live
+    /// state, so nothing can be dispatched onto its workspace and the stored
+    /// spawn can still be reconciled; only the pool slot (and with it the
+    /// dispatch pass) is freed.
+    async fn park_in_doubt_spawn(self: &Arc<Self>, execution: &WorkExecution, worker_id: &str, err: &anyhow::Error) {
+        if let Ok(Some(assignment)) = self.work_db.spoke_assignment_for_execution(&execution.id)
+            && let Err(error) = self
+                .work_db
+                .set_spoke_in_doubt(&execution.id, assignment.assignment_generation, true)
+        {
+            tracing::warn!(
+                execution_id = %execution.id,
+                error = %format!("{error:#}"),
+                "could not flag the spoke assignment as in doubt"
+            );
+        }
+        self.raise_spoke_in_doubt_attention(execution, "worker spawn", err, Duration::ZERO);
+        self.pool_for_worker_id(worker_id)
+            .release_worker_if_execution(worker_id, &execution.id, None)
+            .await;
+        self.rescan_active_dispatch_after_release();
+        self.kick();
     }
 
     /// Phase 3 cutover: for revision_implementation executions with merge-conflict
@@ -1236,17 +1412,24 @@ impl ExecutionCoordinator {
             }
         };
 
-        let host = self
+        let host_id = self
             .work_db
             .latest_run_host_for_execution(&execution.id)?
+            .or_else(|| self.work_db.spoke_host_holding_execution(&execution.id).ok().flatten())
             .unwrap_or_else(|| "local".to_owned());
-        if host != "local" {
-            return Err(anyhow!(
-                "cannot resume pane spawn for {}: host `{host}` is not local (remote reattach owns that path)",
-                execution.id
-            ));
-        }
-        let adapter = self.host_adapter();
+        let adapter = if host_id == "local" {
+            self.host_adapter()
+        } else {
+            let host = self.work_db.get_host(&host_id)?.ok_or_else(|| {
+                anyhow!(
+                    "cannot resume pane spawn for {}: host `{host_id}` is gone",
+                    execution.id
+                )
+            })?;
+            self.host_adapter_provider
+                .adapter_for_execution(&host, &execution.id)
+                .await?
+        };
 
         if leaseless {
             // A checkout-free run re-enters its own spawn path: the scratch
@@ -1269,14 +1452,19 @@ impl ExecutionCoordinator {
             workspace_path: PathBuf::from(workspace_path),
             dirty_verified: None,
         };
-        let execution = execution.clone();
-        let coordinator = Arc::clone(self);
-        boss_task_scope::spawn(async move {
-            coordinator
-                .run_execution(execution, run, work_item, worker_id, lease, None, adapter)
-                .await;
-        });
+        self.spawn_run_execution(execution.clone(), run, work_item, worker_id, lease, None, adapter);
         Ok(())
+    }
+}
+
+struct DrivingRunGuard {
+    coordinator: Arc<ExecutionCoordinator>,
+    execution_id: String,
+}
+
+impl Drop for DrivingRunGuard {
+    fn drop(&mut self) {
+        self.coordinator.forget_driving_run(&self.execution_id);
     }
 }
 

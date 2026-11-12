@@ -143,7 +143,6 @@ impl RepoLeaseLimiter {
     }
 
     /// Attempts currently in flight for `repo`.
-    #[cfg(any(test, feature = "test-support"))]
     pub fn in_flight(&self, repo: &str) -> usize {
         self.inner
             .state

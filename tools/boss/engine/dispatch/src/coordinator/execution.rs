@@ -5,6 +5,7 @@ use crate::work::CancelExecutionOpts;
 use anyhow::bail;
 use boss_protocol::ReviewBatchPhase;
 
+use super::spoke_in_doubt::waitable_spoke_lease;
 use super::*;
 
 /// The original dispatch failure is already visible in the event stream.
@@ -1118,8 +1119,33 @@ impl ExecutionCoordinator {
         // backs off and raises an attention item rather than hot-looping,
         // and a later kick retries once a host comes online / tags change.
         let had_requested_host = self.requested_host_ids.lock().unwrap().contains_key(&execution.id);
-        let selected_host = match self.select_host_for_execution(execution, &work_item, worker_id) {
+        // An assignment that may already have leased a workspace or started a
+        // worker can only be reconciled on its own host: placement is not
+        // reconsidered, and nothing below that fails to reach the host is a
+        // failed start. Those outcomes park the attempt instead.
+        let held_spoke_host = match self.work_db.spoke_host_holding_execution(&execution.id) {
             Ok(host) => host,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    error = %format!("{err:#}"),
+                    "could not read the execution's spoke assignment; selecting a host normally",
+                );
+                None
+            }
+        };
+        let selection = match held_spoke_host.as_deref() {
+            Some(host_id) => self
+                .work_db
+                .get_host(host_id)
+                .and_then(|host| host.ok_or_else(|| anyhow!("host '{host_id}' is missing from the registry"))),
+            None => self.select_host_for_execution(execution, &work_item, worker_id),
+        };
+        let selected_host = match selection {
+            Ok(host) => host,
+            Err(err) if held_spoke_host.is_some() => {
+                return Err(self.park_held_spoke_attempt(execution, err).await);
+            }
             Err(err) => {
                 if had_requested_host {
                     match self.work_db.cancel_execution_with(
@@ -1188,6 +1214,9 @@ impl ExecutionCoordinator {
             .await
         {
             Ok(adapter) => adapter,
+            Err(err) if held_spoke_host.is_some() => {
+                return Err(self.park_held_spoke_attempt(execution, err).await);
+            }
             Err(err) => {
                 // Same silent-gap fix as the host-selection branch above:
                 // a host was chosen but its adapter could not be built
@@ -1276,6 +1305,9 @@ impl ExecutionCoordinator {
                     serde_json::json!({ "host_id": selected_host.id.clone() }),
                 )
                 .await;
+                if held_spoke_host.is_some() {
+                    return Err(self.park_held_spoke_attempt(execution, err).await);
+                }
                 if had_requested_host {
                     self.cancel_requested_host_pre_start_failure(execution, "cube repo ensure", &err)
                         .await;
@@ -1309,6 +1341,9 @@ impl ExecutionCoordinator {
                     }),
                 )
                 .await;
+                if held_spoke_host.is_some() {
+                    return Err(self.park_held_spoke_attempt(execution, err).await);
+                }
                 if had_requested_host {
                     self.cancel_requested_host_pre_start_failure(execution, "cube repo ensure", &err)
                         .await;
@@ -1355,17 +1390,21 @@ impl ExecutionCoordinator {
             pr_number_for_workspace_goto(&self.work_db, execution, &work_item)
         };
 
-        let lease_result = loop {
-            let result = self
-                .lease_workspace_with_fallback(execution, worker_id, &repo, &task, &adapter)
-                .await;
-            if result.is_err() && self.work_db.spoke_execution_in_doubt(&execution.id)? {
-                tracing::warn!(execution_id = %execution.id,
-                    "spoke lease unresolved; retaining ownership and reconciling the stored command");
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
+        let lease_result = self
+            .lease_workspace_with_fallback(execution, worker_id, &repo, &task, &adapter)
+            .await;
+        // A spoke host that has not said whether it granted the lease is not a
+        // failed start. Hand back every claim this attempt holds (the per-repo
+        // permit, the dispatch slot and the pool slot are all released when
+        // this returns) and come back to the same stored lease command later.
+        let lease_result = match lease_result {
+            Err(err) if waitable_spoke_lease(&err).is_some() => {
+                if self.repo_lease_limiter.release(&execution.id) {
+                    self.kick();
+                }
+                return Err(self.park_in_doubt_spoke_lease(execution, err).await);
             }
-            break result;
+            other => other,
         };
         // The per-repo permit bounds concurrent lease calls, which contend on
         // cube's per-repo lock. Once the call has returned that contention is
@@ -1406,6 +1445,7 @@ impl ExecutionCoordinator {
         // Record the lease before any fallible work so a later cube-release
         // failure still leaves columns the leftover-lease sweep can retry.
         self.persist_acquired_lease(execution, &lease);
+        self.resolve_spoke_in_doubt_attention(&execution.id);
 
         // The answer-agent run is already bound to this execution before it
         // can reach the dispatcher. Stamp the lease immediately so comment
@@ -2108,12 +2148,7 @@ impl ExecutionCoordinator {
                 // as "inapplicable" — never noisier than the
                 // pre-change behaviour.
                 self.execution_started_hook.on_execution_started(&execution.id).await;
-                let coordinator = self.clone();
-                boss_task_scope::spawn(async move {
-                    coordinator
-                        .run_execution(execution, run, work_item, worker_id_owned, lease, change, adapter)
-                        .await;
-                });
+                self.spawn_run_execution(execution, run, work_item, worker_id_owned, lease, change, adapter);
                 Ok(())
             }
             Err(err) => {
@@ -2373,7 +2408,7 @@ impl ExecutionCoordinator {
                             .with_details(details),
                     )
                     .await;
-                if reason == "timeout" || self.work_db.spoke_execution_in_doubt(&execution.id)? {
+                if reason == "timeout" || waitable_spoke_lease(&err).is_some() {
                     // A timed-out lease must not immediately re-attempt
                     // inside this dispatch (the fallback is for a refused
                     // `--prefer`, not for a hang). Backoff lives on
@@ -2535,7 +2570,7 @@ impl ExecutionCoordinator {
             .await;
     }
 
-    fn persist_acquired_lease(&self, execution: &WorkExecution, lease: &CubeWorkspaceLease) {
+    pub(super) fn persist_acquired_lease(&self, execution: &WorkExecution, lease: &CubeWorkspaceLease) {
         if let Err(err) = self.work_db.restore_execution_workspace(
             &execution.id,
             &lease.lease_id,
@@ -2858,30 +2893,6 @@ impl ExecutionCoordinator {
             }
         }
         Ok(())
-    }
-
-    /// Refresh the owning review-guide card after a pre-start failure. The
-    /// attempt row is already terminal; this is the board-invalidation the
-    /// comparison-id `work_item_id` cannot provide on its own.
-    pub(super) fn notify_review_guide_pre_start_failure(&self, execution: &WorkExecution) {
-        if execution.kind != ExecutionKind::PrReviewGuide {
-            return;
-        }
-        let work_db = self.work_db.clone();
-        let publisher = self.publisher.clone();
-        let lifecycle = self.lifecycle.clone();
-        let execution_id = execution.id.clone();
-        boss_task_scope::spawn(async move {
-            let Ok(Some(attempt)) = work_db.pr_review_guide_attempt_for_execution(&execution_id) else {
-                return;
-            };
-            let Ok(Some(root_task_id)) = work_db.root_task_id_for_review_guide_series(&attempt.series_id) else {
-                return;
-            };
-            lifecycle
-                .notify_review_guide_changed(&publisher, &root_task_id, "review_guide_failed")
-                .await;
-        });
     }
 
     /// A recoverable pre-start failure (host adapter build, `cube repo

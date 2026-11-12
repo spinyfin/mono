@@ -456,6 +456,12 @@ pub struct SpokeHostAdapter {
     bound: Option<SpokeAssignment>,
     /// The provider of the transport older runs on this host still use.
     legacy: Option<Arc<dyn HostAdapterProvider>>,
+    /// Set once a launched worker's prompt was never confirmed and the stop sent
+    /// to reap it was not confirmed either. The spawn itself is settled by then,
+    /// so later attempts retry only the stop instead of waiting for the prompt
+    /// again. Lives only on this adapter instance: a new adapter (after a
+    /// restart, or the in-doubt sweep's) does the full prompt wait.
+    stop_unconfirmed: std::sync::atomic::AtomicBool,
 }
 
 impl SpokeHostAdapter {
@@ -979,6 +985,25 @@ impl HostAdapter for SpokeHostAdapter {
     async fn observe_worker(&self, execution_id: &str) -> Result<Option<WorkerPane>> {
         self.ctl_observe(execution_id).await
     }
+
+    async fn complete_in_doubt_lease(&self) -> Result<Option<CubeWorkspaceLease>> {
+        self.ws_complete_in_doubt_lease().await
+    }
+
+    async fn cleanup_legacy_store(
+        &self,
+        repo: &Path,
+        published_heads: &[String],
+    ) -> Result<boss_engine_recovery::execution_bookmark::LegacyCleanupReport> {
+        self.legacy_adapter("legacy store cleanup")
+            .await?
+            .cleanup_legacy_store(repo, published_heads)
+            .await
+    }
+
+    async fn gc_cube_repo(&self, repo_id: &str) -> Result<()> {
+        self.legacy_adapter("cube repo gc").await?.gc_cube_repo(repo_id).await
+    }
 }
 
 /// Routes hosts whose transport is the spoke to [`SpokeHostAdapter`] and every
@@ -1036,6 +1061,7 @@ impl SpokeHostAdapterProvider {
             hub: Arc::clone(&self.hub),
             bound,
             legacy: legacy.then(|| Arc::clone(&self.inner)),
+            stop_unconfirmed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

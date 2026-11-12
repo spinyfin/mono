@@ -683,6 +683,12 @@ struct ServerState {
     /// through it.
     #[builder(default)]
     hub_stream: StdMutex<Option<boss_engine_runtime::hub::HubStream>>,
+    /// Where each spoke-supervised worker is in its turn. A spoke run has no
+    /// local slot, so the slot's live activity cannot say whether it is parked.
+    /// Nothing in production fills this yet: the hub does not project a spoke's
+    /// journaled hook events into worker-event dispatch (see `SpokeTurns`).
+    #[builder(default)]
+    spoke_turns: spoke_probes::SpokeTurns,
     /// Socket this engine's tmux handle must target. Resolved once from
     /// [`boss_engine_runtime::config::WorkConfig`] (and isolation) so no downstream call
     /// re-derives it from the environment.
@@ -2185,6 +2191,11 @@ impl ServerState {
             .await
     }
 
+    #[cfg(test)]
+    pub(super) async fn release_proven_dead_remote_pane_for_test(&self, run_id: &str) -> PaneReleaseOutcome {
+        self.release_worker_pane_with_teardown_policy(run_id, true, false).await
+    }
+
     async fn release_worker_pane_with_teardown_policy(
         &self,
         run_id: &str,
@@ -2214,6 +2225,7 @@ impl ServerState {
             {
                 return PaneReleaseOutcome::NoLiveWorker;
             }
+            self.settle_probes_for_released_run(run_id).await;
             self.worker_registry.take_slot_for_run(run_id);
             if let Some(slot_id) = self.live_worker_states.release_slot_for_run(run_id) {
                 self.live_status_manager.stop_slot_for_run(slot_id, run_id);
@@ -2246,25 +2258,7 @@ impl ServerState {
         // no-slot early return below: a run that never finished spawning can
         // have probes queued against it too (`dispatch_probe_if_idle` leaves
         // them there when no slot is mapped yet).
-        let abandoned = self.abandon_pending_probes_for_terminated_run(run_id, "worker pane released");
-        self.surface_undelivered_probes(
-            run_id,
-            &abandoned,
-            ProbeDeliveryState::Abandoned,
-            "the worker's pane was released before the probe's delivery boundary arrived",
-        )
-        .await;
-        // The probe past the queue, if any. Its reply would have arrived at
-        // the worker's next turn boundary, and there is not going to be one.
-        for orphaned in self.orphan_in_flight_probe_for_terminated_run(run_id, "worker pane released") {
-            self.surface_undelivered_probe(
-                run_id,
-                &orphaned,
-                ProbeDeliveryState::Orphaned,
-                "the worker's pane was released before it answered the probe",
-            )
-            .await;
-        }
+        self.settle_probes_for_released_run(run_id).await;
         let Some(pane) = self.worker_registry.take_worker_pane_for_run(run_id) else {
             // The tmux worker was reaped even if this engine never adopted its slot.
             return self.detach_untracked_worker_viewer(run_id).await;

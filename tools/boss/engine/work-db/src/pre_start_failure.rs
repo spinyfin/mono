@@ -68,6 +68,30 @@ impl WorkDb {
         )
     }
 
+    /// Park a claimed (or ready) execution until `delay` has passed without
+    /// counting it as a failed start. Used while a spoke host has not yet said
+    /// whether it granted the lease: the attempt is neither a failure nor a
+    /// reason to spend the retry budget, and the stored host command is reused
+    /// on the next pass. Returns whether a row was parked; `false` when the
+    /// execution is no longer `ready`/`claimed` (cancelled or already running).
+    pub fn park_pre_start_attempt(&self, execution_id: &str, delay: Duration, note: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let dispatch_not_before =
+            (boss_engine_utils::epoch_time::now_epoch_secs() as u64 + delay.as_secs()).to_string();
+        let rows = conn.execute(
+            "UPDATE work_executions
+             SET status = 'ready',
+                 started_at = NULL,
+                 finished_at = NULL,
+                 dispatch_not_before = ?2,
+                 last_error = ?3
+             WHERE id = ?1
+               AND status IN ('ready', 'claimed')",
+            params![execution_id, dispatch_not_before, note],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// Atomically stop the execution and hold its item before publishing terminal events.
     ///
     /// `error_text` is the full failure (kept on the execution and in dispatch

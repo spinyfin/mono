@@ -293,6 +293,13 @@ impl ServerState {
         // it has no local pane to write to and no slot to look up.
         match self.spoke_worker_adapter(run_id).await {
             Ok(Some(adapter)) => {
+                if !super::spoke_probes::spoke_parked_for_delivery(self, run_id) {
+                    let activity = self
+                        .worker_registry
+                        .slot_for_run(run_id)
+                        .and_then(|slot_id| self.pane_typed_input_activity(slot_id));
+                    return Err(SendInputError::NotAcceptingInput { activity });
+                }
                 let outcome = adapter
                     .deliver_worker_input(run_id, boss_execution_contracts::WorkerInputKind::Nudge, &text)
                     .await

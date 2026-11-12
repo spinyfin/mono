@@ -263,6 +263,14 @@ pub const DRIVER_START_ATTENTION_KIND: &str = "worker_driver_never_started";
 /// Stable — operator tooling pins it.
 pub const LIVENESS_UNDETERMINABLE_ATTENTION_KIND: &str = "worker_liveness_undeterminable";
 
+/// Filed against an execution whose spoke lease or spawn has gone unanswered
+/// past the bounded wait, or whose spawn settled as uncertain. The host may
+/// have granted the lease or started the worker, so the execution keeps its
+/// assignment, lease and persona and is neither failed nor re-dispatched. The
+/// dispatcher resolves it itself once the host's answer or an Adopt of the
+/// worker's session settles the question.
+pub const SPOKE_ASSIGNMENT_IN_DOUBT_ATTENTION_KIND: &str = "spoke_assignment_in_doubt";
+
 /// Kind string for the single loud attention item raised when the breaker
 /// trips. Stable — external tooling and the app's attention pane pin it.
 pub const SPAWN_CAPABILITY_ATTENTION_KIND: &str = "app_spawn_capability_unhealthy";

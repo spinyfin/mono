@@ -413,17 +413,6 @@ impl Drop for CapabilityDiscoveryPendingGuard {
     }
 }
 
-/// Clear the published handle on completion, cancellation, or unwinding.
-#[cfg(test)]
-struct HubStreamGuard(Arc<ServerState>);
-
-#[cfg(test)]
-impl Drop for HubStreamGuard {
-    fn drop(&mut self) {
-        self.0.set_hub_stream(None);
-    }
-}
-
 /// Same as [`serve`], but accepts an optional `MergeProbe` override, plumbed
 /// straight through to [`ServerState`]. Production callers (and most tests)
 /// go through `serve` and get the real `CommandMergeProbe`; tests that need
@@ -2543,6 +2532,10 @@ async fn serve_scoped(
     let _scheduler_heartbeat_handle = server_state
         .execution_coordinator
         .spawn_scheduler_heartbeat(Duration::from_secs(15));
+    // Ask about parked spoke leases and spawns from persisted state at boot,
+    // without waiting on the heartbeat's startup stagger. Later passes ride
+    // the heartbeat via `spawn_in_doubt_reconcile` (single-flight).
+    server_state.execution_coordinator.spawn_in_doubt_reconcile();
 
     // DispatchReady bus subscriber — no-op (returns `None`, spawns nothing)
     // unless `BOSS_ENABLE_DISPATCH_READY_BUS` is on. When it is, this is

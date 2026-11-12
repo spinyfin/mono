@@ -807,6 +807,27 @@ impl ServerState {
     /// (`handle_probe_run`'s post-insert re-check) can tell whether its own
     /// probe was among the ones abandoned, without hand-copying this
     /// function's drain-and-log body.
+    pub(super) async fn settle_probes_for_released_run(&self, run_id: &str) {
+        self.spoke_turns.forget(run_id);
+        let abandoned = self.abandon_pending_probes_for_terminated_run(run_id, "worker pane released");
+        self.surface_undelivered_probes(
+            run_id,
+            &abandoned,
+            ProbeDeliveryState::Abandoned,
+            "the worker's pane was released before the probe's delivery boundary arrived",
+        )
+        .await;
+        for orphaned in self.orphan_in_flight_probe_for_terminated_run(run_id, "worker pane released") {
+            self.surface_undelivered_probe(
+                run_id,
+                &orphaned,
+                ProbeDeliveryState::Orphaned,
+                "the worker's pane was released before it answered the probe",
+            )
+            .await;
+        }
+    }
+
     pub(super) fn abandon_pending_probes_for_terminated_run(&self, run_id: &str, cause: &str) -> Vec<String> {
         let ids = self.drain_pending_probes(
             run_id,

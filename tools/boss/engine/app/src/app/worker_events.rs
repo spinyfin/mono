@@ -586,6 +586,7 @@ pub(super) async fn dispatch_live_worker_state(
         return;
     };
     server_state.dispatcher_stats.record_last_hook(run_id, event_kind);
+    server_state.record_spoke_turn_event(run_id, &incoming.event);
     // **Driver-start verification.** A hook is the earliest
     // driver-ORIGINATED evidence Boss ever gets that the driver binary
     // actually executed — a login shell cannot emit one. Record it here,
@@ -2076,9 +2077,8 @@ pub(super) async fn dispatch_probe_on_post_tool_use(
         return ProbeDispatchOutcome::AlreadyInFlight;
     }
 
-    if let Some(outcome) = super::spoke_probes::dispatch(server_state, run_id).await {
-        return outcome;
-    }
+    // Spoke hosts do not report mid-turn activity yet; PostToolUse must
+    // not type into a busy pane. Stop remains the delivery boundary.
     let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
         // Leave the probe queued — a later PostToolUse / Stop after slot
         // registration can still deliver it.
@@ -2379,8 +2379,18 @@ async fn dispatch_probe_now_inner(server_state: &Arc<ServerState>, run_id: &str)
         tracing::debug!(run_id, "probe-now: nothing queued for this run");
         return ProbeDispatchOutcome::NothingQueued;
     }
-    if let Some(outcome) = super::spoke_probes::dispatch(server_state, run_id).await {
-        return outcome;
+    if server_state.spoke_probe_owner_remains(run_id) {
+        if !super::spoke_probes::spoke_parked_for_delivery(server_state, run_id) {
+            tracing::debug!(
+                run_id,
+                queued,
+                "probe-now: spoke worker is not parked; probe waits for Stop"
+            );
+            return ProbeDispatchOutcome::PostureRefused;
+        }
+        if let Some(outcome) = super::spoke_probes::dispatch(server_state, run_id).await {
+            return outcome;
+        }
     }
     let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
         // Worker not yet mapped to a slot (spawning) — probe stays queued.
