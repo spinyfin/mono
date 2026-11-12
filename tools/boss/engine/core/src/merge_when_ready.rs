@@ -130,6 +130,75 @@ impl DirectMergeExecutor for CommandDirectMergeExecutor {
     }
 }
 
+/// Run the shared checked merge and surface repository push restrictions.
+pub async fn execute_direct_merge(
+    db: &crate::work::WorkDb,
+    executor: &dyn DirectMergeExecutor,
+    task_id: &str,
+    product: &boss_protocol::Product,
+    pr_url: &str,
+) -> Result<DirectMergeSuccess> {
+    let result = executor.execute(pr_url).await;
+    if let Err(err) = &result {
+        let message = format!("{err:#}");
+        if crate::merge_mechanism::is_push_restriction_error(&message) {
+            db.create_attention_item(crate::work::CreateAttentionItemInput {
+                work_item_id: Some(task_id.to_owned()),
+                kind: crate::merge_mechanism::PUSH_RESTRICTION_ATTENTION_KIND.to_owned(),
+                title: crate::merge_mechanism::PUSH_RESTRICTION_ATTENTION_TITLE.to_owned(),
+                body_markdown: crate::merge_mechanism::render_push_restriction_attention_body(
+                    &product.name,
+                    &product.slug,
+                    &message,
+                ),
+                execution_id: None,
+                status: None,
+                resolved_at: None,
+            })?;
+        }
+    }
+    result
+}
+
+/// Persist acceptance before acknowledging it or publishing card changes.
+pub fn record_direct_merge(
+    db: &crate::work::WorkDb,
+    task_id: &str,
+    pr_url: &str,
+    success: &DirectMergeSuccess,
+) -> Result<crate::work::GithubMergeIntentRecordOutcome> {
+    let detail = serde_json::json!({"position": null, "state": null, "enqueued_at": null,
+        "section_order": boss_engine_merge_poller::QUEUED_NO_POSITION_SECTION_ORDER})
+    .to_string();
+    db.record_github_merge_intent(
+        crate::work::GithubMergeIntentInsertInput::builder()
+            .work_item_id(task_id)
+            .pr_url(pr_url)
+            .head_sha(&success.head_sha)
+            .build(),
+        &detail,
+    )
+}
+
+/// Wake reconciliation immediately and publish the durable queue transition.
+pub async fn publish_direct_merge(
+    db: &crate::work::WorkDb,
+    publisher: &dyn boss_execution_contracts::ExecutionPublisher,
+    product_id: &str,
+    task_id: &str,
+    pr_url: &str,
+    state_changed: bool,
+) {
+    db.event_bus().publish(boss_event_bus::Event::PrReconcileRequested {
+        pr_url: pr_url.to_owned(),
+    });
+    if state_changed {
+        publisher
+            .publish_work_item_changed(product_id, task_id, "gh_merge_queue_submitted")
+            .await;
+    }
+}
+
 /// Return the exact PR head the subsequent merge command must match.
 async fn probe_head_sha(pr_url: &str) -> Result<String> {
     let output = gh_scope(

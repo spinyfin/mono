@@ -37,18 +37,15 @@ pub struct CoreSweepHost {
     /// ladder inline on the sweep's task when the sweep has a cube client.
     remediation: Option<ConflictRemediationQueue>,
     design: CoreDocDetection,
-    decisions: Option<(Arc<WorkDb>, Arc<dyn ExecutionPublisher>)>,
 }
 
 impl CoreSweepHost {
     /// The production host: conflict remediation is handed to a bounded
     /// background queue that drives the escalation ladder.
     pub fn new(work_db: Arc<WorkDb>, publisher: Arc<dyn ExecutionPublisher>, cube_client: Arc<dyn CubeClient>) -> Self {
-        let mut host = Self::with_remediation(Some(ConflictRemediationQueue::new(Arc::new(
-            LadderRemediationJob::new(work_db.clone(), publisher.clone(), cube_client),
-        ))));
-        host.decisions = Some((work_db, publisher));
-        host
+        Self::with_remediation(Some(ConflictRemediationQueue::new(Arc::new(
+            LadderRemediationJob::new(work_db, publisher, cube_client),
+        ))))
     }
 
     /// A host with the given remediator — `None` runs the ladder inline when the
@@ -58,7 +55,6 @@ impl CoreSweepHost {
         Self {
             remediation,
             design: CoreDocDetection,
-            decisions: None,
         }
     }
 }
@@ -181,10 +177,7 @@ impl PopulationRequests for CoreSweepHost {
 
 impl LoopPasses for CoreSweepHost {
     fn start_passes(&self) -> Box<dyn SweepPasses> {
-        Box::new(CorePasses {
-            decisions: self.decisions.clone(),
-            ..CorePasses::default()
-        })
+        Box::new(CorePasses::default())
     }
 }
 
@@ -194,13 +187,12 @@ impl LoopPasses for CoreSweepHost {
 struct CorePasses {
     speculative: SpeculativeCheckSchedule,
     stacking: StackingSchedule,
-    decisions: Option<(Arc<WorkDb>, Arc<dyn ExecutionPublisher>)>,
     decision_job: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[async_trait]
 impl SweepPasses for CorePasses {
-    async fn run_conflict_decisions(&mut self, _work_db: &WorkDb, _publisher: &dyn ExecutionPublisher) {
+    async fn run_conflict_decisions(&mut self, db: Arc<WorkDb>, publisher: Arc<dyn ExecutionPublisher>) {
         // A large batch of approved closes must not block PR detection. One
         // job at a time also prevents overlapping retries of the same action.
         if self.decision_job.as_ref().is_some_and(|job| !job.is_finished()) {
@@ -211,16 +203,15 @@ impl SweepPasses for CorePasses {
         {
             tracing::error!(?err, "conflict decision delivery task failed");
         }
-        if let Some((db, publisher)) = self.decisions.clone() {
-            self.decision_job = Some(boss_task_scope::spawn(async move {
-                crate::conflict_inventory_actions::run(
-                    &db,
-                    publisher.as_ref(),
-                    &crate::conflict_inventory_actions::GithubActions,
-                )
-                .await;
-            }));
-        }
+        self.decision_job = Some(boss_task_scope::spawn(async move {
+            crate::conflict_inventory_actions::run(
+                &db,
+                publisher.as_ref(),
+                &crate::conflict_inventory_actions::GithubActions,
+                Arc::new(crate::merge_when_ready::CommandDirectMergeExecutor),
+            )
+            .await;
+        }));
     }
 
     async fn run_speculative_pass(

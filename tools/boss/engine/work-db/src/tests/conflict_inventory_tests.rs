@@ -203,6 +203,13 @@ fn grouped_choices_record_close_and_create_one_merge_or_port_revision() {
                 assert!(
                     revision
                         .description
+                        .contains("Automatic conflict resolution reached its lifetime limit")
+                );
+                assert!(!revision.description.contains("How should PR"));
+                assert!(revision.description.contains(" UTC)"));
+                assert!(
+                    revision
+                        .description
                         .contains("Preserve the PR's behaviour and every earlier review fix")
                 );
             }
@@ -243,7 +250,19 @@ fn skipped_decisions_stay_stopped_and_invalid_choices_roll_back_the_batch() {
         "human",
     )
     .unwrap();
-    assert_eq!(stop(&db, &input).0.id, question.id);
+    let (next, next_group) = stop(&db, &input);
+    assert_ne!(next.id, question.id);
+    db.answer_attention(&next.id, Some(CONFLICT_INVENTORY_CLOSE.into()), false, false)
+        .unwrap();
+    db.action_attention_group_as_actor(
+        &next_group.id,
+        false,
+        &Default::default(),
+        &FakePrStateChecker::always(PrOpenState::Open),
+        "human",
+    )
+    .unwrap();
+    assert_eq!(db.pending_conflict_inventory_actions().unwrap().len(), 1);
 }
 
 #[test]
@@ -314,7 +333,7 @@ fn stale_binding_or_nonhuman_action_cannot_authorize_closing_a_pr() {
 }
 
 #[test]
-fn a_new_stop_supersedes_an_older_pending_merge_authorization() {
+fn a_new_stop_holds_merge_authorization_until_a_replacement_answer_is_applied() {
     let db = WorkDb::open(temp_db_path("inventory-recurrence")).unwrap();
     let product = make_revision_product(&db, "inventory");
     let input = fixture(&db, &product, 30);
@@ -349,10 +368,89 @@ fn a_new_stop_supersedes_an_older_pending_merge_authorization() {
     db.mark_conflict_resolution_succeeded(&approved.id, Some("fixed"))
         .unwrap();
     assert_eq!(db.pending_conflict_inventory_actions().unwrap().len(), 1);
-    let (next, _) = stop(&db, &input);
+    let (next, group) = stop(&db, &input);
     assert_ne!(next.id, question.id);
     assert!(
         db.pending_conflict_inventory_actions().unwrap().is_empty(),
-        "a later rewrite or close must not inherit an earlier merge request"
+        "an unresolved decision holds the earlier merge request"
     );
+    let prior: Option<String> = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT action_completed_at FROM conflict_inventory_decisions WHERE attention_id = ?1",
+            [&question.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(prior.is_none(), "raising a question preserves explicit authorization");
+    db.dismiss_attention_as_actor(&group.id, None, "human").unwrap();
+    let (fresh, fresh_group) = stop(&db, &input);
+    assert_ne!(fresh.id, next.id);
+    db.answer_attention(
+        &fresh.id,
+        Some(boss_protocol::CONFLICT_MISMATCH_CHOICE_REWRITE.into()),
+        false,
+        false,
+    )
+    .unwrap();
+    db.action_attention_group_as_actor(
+        &fresh_group.id,
+        false,
+        &Default::default(),
+        &FakePrStateChecker::always(PrOpenState::Open),
+        "human",
+    )
+    .unwrap();
+    assert!(db.pending_conflict_inventory_actions().unwrap().is_empty());
+    let prior: Option<String> = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT action_completed_at FROM conflict_inventory_decisions WHERE attention_id = ?1",
+            [&question.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        prior.is_some(),
+        "applying a replacement answer retires the earlier merge request"
+    );
+}
+
+#[test]
+fn a_skipped_member_of_an_applied_batch_can_be_answered_in_a_successor_batch() {
+    let db = WorkDb::open(temp_db_path("inventory-mixed-batch")).unwrap();
+    let product = make_revision_product(&db, "inventory");
+    let first = fixture(&db, &product, 40);
+    let second = fixture(&db, &product, 41);
+    resolved(&db, &first);
+    resolved(&db, &second);
+    let (answered, group) = stop(&db, &first);
+    let (skipped, _) = stop(&db, &second);
+    db.answer_attention(&answered.id, Some(CONFLICT_INVENTORY_CLOSE.into()), false, false)
+        .unwrap();
+    db.answer_attention(&skipped.id, None, true, false).unwrap();
+    db.action_attention_group_as_actor(
+        &group.id,
+        false,
+        &Default::default(),
+        &FakePrStateChecker::always(PrOpenState::Open),
+        "human",
+    )
+    .unwrap();
+    let (renewed, successor) = stop(&db, &second);
+    assert_ne!(renewed.id, skipped.id);
+    assert_ne!(successor.id, group.id);
+    db.answer_attention(&renewed.id, Some(CONFLICT_INVENTORY_CLOSE.into()), false, false)
+        .unwrap();
+    db.action_attention_group_as_actor(
+        &successor.id,
+        false,
+        &Default::default(),
+        &FakePrStateChecker::always(PrOpenState::Open),
+        "human",
+    )
+    .unwrap();
+    assert_eq!(db.pending_conflict_inventory_actions().unwrap().len(), 2);
 }

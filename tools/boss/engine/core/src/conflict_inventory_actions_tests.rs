@@ -26,8 +26,13 @@ impl DecisionActions for Actions {
         anyhow::ensure!(!self.fail.load(Ordering::SeqCst), "GitHub unavailable");
         Ok(())
     }
-    async fn merge(&self, _: &str) -> Result<crate::merge_when_ready::DirectMergeSuccess> {
+}
+
+#[async_trait]
+impl crate::merge_when_ready::DirectMergeExecutor for Actions {
+    async fn execute(&self, _: &str) -> Result<crate::merge_when_ready::DirectMergeSuccess> {
         self.merges.fetch_add(1, Ordering::SeqCst);
+        anyhow::ensure!(!self.fail.load(Ordering::SeqCst), "GH013: repository rule violations");
         Ok(crate::merge_when_ready::DirectMergeSuccess {
             head_sha: "fixed".into(),
         })
@@ -87,9 +92,9 @@ fn fixture(choice: &str) -> (WorkDb, String, String) {
 #[tokio::test]
 async fn close_is_explicit_retries_failure_and_never_marks_the_stop_clean() {
     let (db, _, stopped) = fixture("Close");
-    let actions = Actions::default();
+    let actions = std::sync::Arc::new(Actions::default());
     actions.fail.store(true, Ordering::SeqCst);
-    run(&db, &RecordingPublisher::default(), &actions).await;
+    run(&db, &RecordingPublisher::default(), actions.as_ref(), actions.clone()).await;
     assert_eq!(db.pending_conflict_inventory_actions().unwrap().len(), 1);
     assert!(
         db.get_conflict_resolution(&stopped)
@@ -100,8 +105,8 @@ async fn close_is_explicit_retries_failure_and_never_marks_the_stop_clean() {
             .contains("GitHub unavailable")
     );
     actions.fail.store(false, Ordering::SeqCst);
-    run(&db, &RecordingPublisher::default(), &actions).await;
-    run(&db, &RecordingPublisher::default(), &actions).await;
+    run(&db, &RecordingPublisher::default(), actions.as_ref(), actions.clone()).await;
+    run(&db, &RecordingPublisher::default(), actions.as_ref(), actions.clone()).await;
     assert_eq!(actions.closes.load(Ordering::SeqCst), 2);
     assert_eq!(actions.merges.load(Ordering::SeqCst), 0);
     assert!(db.pending_conflict_inventory_actions().unwrap().is_empty());
@@ -114,14 +119,14 @@ async fn close_is_explicit_retries_failure_and_never_marks_the_stop_clean() {
 #[tokio::test]
 async fn merge_waits_for_resolution_and_revisions_then_uses_the_checked_merge() {
     let (db, root, _) = fixture("Merge now");
-    let actions = Actions::default();
-    run(&db, &RecordingPublisher::default(), &actions).await;
+    let actions = std::sync::Arc::new(Actions::default());
+    run(&db, &RecordingPublisher::default(), actions.as_ref(), actions.clone()).await;
     assert_eq!(actions.merges.load(Ordering::SeqCst), 0);
     let approved = db.active_conflict_resolution_for_work_item(&root).unwrap().unwrap();
     db.mark_conflict_resolution_succeeded(&approved.id, Some("fixed"))
         .unwrap();
     db.clear_chore_blocked_merge_conflict(&root, &approved.pr_url).unwrap();
-    run(&db, &RecordingPublisher::default(), &actions).await;
+    run(&db, &RecordingPublisher::default(), actions.as_ref(), actions.clone()).await;
     assert_eq!(
         actions.merges.load(Ordering::SeqCst),
         0,
@@ -136,9 +141,25 @@ async fn merge_waits_for_resolution_and_revisions_then_uses_the_checked_merge() 
         },
     )
     .unwrap();
-    run(&db, &RecordingPublisher::default(), &actions).await;
-    run(&db, &RecordingPublisher::default(), &actions).await;
-    assert_eq!(actions.merges.load(Ordering::SeqCst), 1);
+    let mut events = db.event_bus().subscribe(boss_event_bus::TopicFilter::kind(
+        boss_event_bus::EventKind::PrReconcileRequested,
+    ));
+    actions.fail.store(true, Ordering::SeqCst);
+    run(&db, &RecordingPublisher::default(), actions.as_ref(), actions.clone()).await;
+    assert!(
+        db.list_attention_items_for_work_item(&root)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == crate::merge_mechanism::PUSH_RESTRICTION_ATTENTION_KIND)
+    );
+    actions.fail.store(false, Ordering::SeqCst);
+    run(&db, &RecordingPublisher::default(), actions.as_ref(), actions.clone()).await;
+    run(&db, &RecordingPublisher::default(), actions.as_ref(), actions.clone()).await;
+    assert!(matches!(
+        events.recv().await,
+        Some(boss_event_bus::Event::PrReconcileRequested { .. })
+    ));
+    assert_eq!(actions.merges.load(Ordering::SeqCst), 2);
     assert_eq!(actions.closes.load(Ordering::SeqCst), 0);
     assert!(db.pending_conflict_inventory_actions().unwrap().is_empty());
 }
@@ -164,8 +185,8 @@ async fn trunk_merge_uses_the_existing_durable_queue_submission_path() {
         },
     )
     .unwrap();
-    let actions = Actions::default();
-    run(&db, &RecordingPublisher::default(), &actions).await;
+    let actions = std::sync::Arc::new(Actions::default());
+    run(&db, &RecordingPublisher::default(), actions.as_ref(), actions.clone()).await;
     let intent = db.get_active_trunk_merge_intent(&root).unwrap().unwrap();
     assert_eq!(
         intent.last_trunk_state.as_deref(),
@@ -195,8 +216,7 @@ fn limits_are_configurable_and_invalid_values_are_refused() {
     }
 }
 
-#[tokio::test]
-async fn conflict_detection_stops_before_spawning_and_publishes_the_decision() {
+async fn detect_stopped_conflict(block: Option<&str>) {
     let db = WorkDb::open(":memory:".into()).unwrap();
     let product = create_test_product_with_repo(&db, "threshold", Some("git@github.com:foo/bar.git"));
     let task = create_test_chore_manual(&db, product.id.clone(), "threshold");
@@ -227,6 +247,15 @@ async fn conflict_detection_stops_before_spawning_and_publishes_the_decision() {
         db.mark_conflict_resolution_succeeded(&attempt.id, Some("fixed"))
             .unwrap();
     }
+    if let Some(reason) = block {
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'blocked', blocked_reason = ?2 WHERE id = ?1",
+                rusqlite::params![task.id, reason],
+            )
+            .unwrap();
+    }
     let candidate = crate::work::PendingMergeCheck {
         product_id: product.id.clone(),
         work_item_id: task.id.clone(),
@@ -247,6 +276,32 @@ async fn conflict_detection_stops_before_spawning_and_publishes_the_decision() {
         .head_ref_oid("latest")
         .build();
     let publisher = RecordingPublisher::default();
+    if block.is_none() {
+        assert!(
+            crate::conflict_watch::on_conflict_detected_with_limits(
+                &db,
+                &publisher,
+                crate::conflict_watch::ConflictRemediationMode::Inline(&NoAutomaticRebase),
+                &FakePrStateChecker::always(PrOpenState::Open),
+                &candidate,
+                &probe,
+                Err(anyhow::anyhow!("invalid configured conflict limit"))
+            )
+            .await
+        );
+        let WorkItem::Chore(blocked) = db.get_work_item(&task.id).unwrap() else {
+            panic!("expected chore")
+        };
+        assert_eq!(blocked.blocked_reason.as_deref(), Some("merge_conflict"));
+        assert!(
+            db.active_blocked_signals(&task.id)
+                .unwrap()
+                .iter()
+                .any(|s| s.reason == "merge_conflict")
+        );
+        db.clear_chore_blocked_merge_conflict(&task.id, url).unwrap();
+    }
+
     assert!(
         crate::conflict_watch::on_conflict_detected(
             &db,
@@ -270,4 +325,42 @@ async fn conflict_detection_stops_before_spawning_and_publishes_the_decision() {
         attempt.failure_reason.as_deref(),
         Some(crate::work::CONFLICT_INVENTORY_STOP_REASON)
     );
+    if let Some(reason) = block {
+        let task = db.get_work_item(&task.id).unwrap();
+        let WorkItem::Chore(task) = task else {
+            panic!("expected chore")
+        };
+        assert_eq!(task.blocked_reason.as_deref(), Some(reason));
+    } else {
+        assert!(crate::conflict_watch::on_resolved(&db, &publisher, None, &candidate, &[], "MERGEABLE", "CLEAN").await);
+        assert!(
+            crate::conflict_watch::on_conflict_detected(
+                &db,
+                &publisher,
+                Some(&NoAutomaticRebase),
+                &FakePrStateChecker::always(PrOpenState::Open),
+                &candidate,
+                &probe
+            )
+            .await
+        );
+        let WorkItem::Chore(task) = db.get_work_item(&task.id).unwrap() else {
+            panic!("expected chore")
+        };
+        assert_eq!(task.status, boss_protocol::TaskStatus::Blocked);
+        assert_eq!(task.blocked_reason.as_deref(), Some("merge_conflict"));
+        assert_eq!(
+            db.list_attention_groups(&product.id, None, None, Some("question"), None)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn conflict_detection_stops_before_spawning_in_review_and_under_other_blocks() {
+    for reason in [None, Some("ci_failure"), Some("review_feedback"), Some("dependency")] {
+        detect_stopped_conflict(reason).await;
+    }
 }

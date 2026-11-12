@@ -118,7 +118,12 @@ pub trait PopulationRequests: Send + Sync {
 #[async_trait]
 pub trait SweepPasses: Send {
     /// Retry owner-approved conflict disposition actions, including after a restart.
-    async fn run_conflict_decisions(&mut self, _work_db: &WorkDb, _publisher: &dyn ExecutionPublisher) {}
+    async fn run_conflict_decisions(
+        &mut self,
+        _work_db: std::sync::Arc<WorkDb>,
+        _publisher: std::sync::Arc<dyn ExecutionPublisher>,
+    ) {
+    }
 
     /// Predict conflicts for `candidates` (the caller has checked the feature flag).
     async fn run_speculative_pass(

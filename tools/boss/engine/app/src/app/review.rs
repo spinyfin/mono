@@ -134,11 +134,8 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 let request_id2 = request_id.clone();
                 let work_item_id2 = work_item_id.clone();
                 let pr_url2 = pr_url.clone();
-                let event_bus = server_state.event_bus.clone();
                 let direct_merge_executor = server_state.direct_merge_executor.clone();
                 let work_db2 = work_db.clone();
-                let product_name = product.name.clone();
-                let product_slug = product.slug.clone();
                 let publisher = server_state.publisher.clone();
                 let product_id2 = product_id.clone();
                 tracing::info!(%request_id, elapsed_ms = recv_instant.elapsed().as_secs_f64() * 1000.0, "merge request preflight completed");
@@ -149,34 +146,20 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                         "merge_when_ready: requesting GitHub-native merge",
                     );
                     let external_started = std::time::Instant::now();
-                    match direct_merge_executor.execute(&pr_url2).await {
+                    match merge_when_ready::execute_direct_merge(
+                        &work_db2,
+                        direct_merge_executor.as_ref(),
+                        &work_item_id2,
+                        &product,
+                        &pr_url2,
+                    )
+                    .await
+                    {
                         Ok(success) => {
                             tracing::info!(request_id = %request_id2, elapsed_ms = external_started.elapsed().as_secs_f64() * 1000.0, "merge request external operation completed");
                             let record_started = std::time::Instant::now();
-                            // `gh pr merge --auto --squash` has accepted a
-                            // merge request for this exact head. GitHub's
-                            // queue/auto-merge projection lags that command,
-                            // so persist the request and move the card before
-                            // asking the poller for its first observation.
-                            // A future empty probe is absence, not a dequeue;
-                            // the per-row intent keeps it from clobbering this
-                            // state until the timeline or terminal probe says
-                            // otherwise.
-                            let detail = serde_json::json!({
-                                "position": null,
-                                "state": null,
-                                "enqueued_at": null,
-                                "section_order": boss_engine_merge_poller::QUEUED_NO_POSITION_SECTION_ORDER,
-                            })
-                            .to_string();
-                            let record = work_db2.record_github_merge_intent(
-                                boss_work_db::GithubMergeIntentInsertInput::builder()
-                                    .work_item_id(work_item_id2.clone())
-                                    .pr_url(pr_url2.clone())
-                                    .head_sha(success.head_sha.clone())
-                                    .build(),
-                                &detail,
-                            );
+                            let record =
+                                merge_when_ready::record_direct_merge(&work_db2, &work_item_id2, &pr_url2, &success);
                             let record = match record {
                                 Ok(record) => record,
                                 Err(err) => {
@@ -221,37 +204,20 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                                 },
                             );
                             tracing::info!(request_id = %request_id2, elapsed_ms = recv_instant.elapsed().as_secs_f64() * 1000.0, "merge request acknowledgement enqueued");
-                            event_bus.publish(Event::PrReconcileRequested {
-                                pr_url: pr_url2.clone(),
-                            });
                             let publication_started = std::time::Instant::now();
-                            if record.merge_queue_state_changed {
-                                publisher
-                                    .publish_work_item_changed(&product_id2, &work_item_id2, "gh_merge_queue_submitted")
-                                    .await;
-                            }
+                            merge_when_ready::publish_direct_merge(
+                                &work_db2,
+                                publisher.as_ref(),
+                                &product_id2,
+                                &work_item_id2,
+                                &pr_url2,
+                                record.merge_queue_state_changed,
+                            )
+                            .await;
                             tracing::info!(request_id = %request_id2, elapsed_ms = publication_started.elapsed().as_secs_f64() * 1000.0, "merge request board publication completed");
                         }
                         Err(err) => {
                             let message = format!("{err:#}");
-                            if boss_engine_runtime::merge_mechanism::is_push_restriction_error(&message) {
-                                let _ = work_db2.create_attention_item(boss_work_db::CreateAttentionItemInput {
-                                    work_item_id: Some(work_item_id2.clone()),
-                                    kind: boss_engine_runtime::merge_mechanism::PUSH_RESTRICTION_ATTENTION_KIND
-                                        .to_owned(),
-                                    title: boss_engine_runtime::merge_mechanism::PUSH_RESTRICTION_ATTENTION_TITLE
-                                        .to_owned(),
-                                    body_markdown:
-                                        boss_engine_runtime::merge_mechanism::render_push_restriction_attention_body(
-                                            &product_name,
-                                            &product_slug,
-                                            &message,
-                                        ),
-                                    execution_id: None,
-                                    status: None,
-                                    resolved_at: None,
-                                });
-                            }
                             send_response(
                                 &sink2,
                                 &request_id2,

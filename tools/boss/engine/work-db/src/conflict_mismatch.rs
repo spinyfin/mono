@@ -405,7 +405,13 @@ pub(super) fn answer_in_tx(
             let port = assert_parent_revisable_and_insert_as_actor(
                 pending,
                 tx,
-                port_revision_input(&parent_id, &attempt, &question.explanation, &timestamp),
+                port_revision_input(
+                    &parent_id,
+                    &attempt,
+                    &question.explanation,
+                    &timestamp,
+                    "The conflict cannot be resolved textually",
+                ),
                 pr_checker,
                 "human",
             )?;
@@ -440,22 +446,26 @@ pub(super) fn port_revision_input(
     attempt: &ConflictResolution,
     explanation: &str,
     timestamp: &str,
+    reason: &str,
 ) -> CreateRevisionInput {
     CreateRevisionInput::builder()
         .parent_task_id(parent_id)
         .name(format!("Port PR #{} onto the new base", attempt.pr_number))
-        .description(port_brief(attempt, explanation, timestamp))
+        .description(port_brief(attempt, explanation, timestamp, reason))
+        // Same provenance as the fix it replaces: the PR is still
+        // conflicting, this revision is what resolves it, and it
+        // queues ahead of the PR's other revisions the same way.
         .created_via(format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}{}", attempt.id))
         .effort_level(EffortLevel::Large)
         .reasoning(ReasoningMode::Standard)
         .build()
 }
 
-pub(super) fn port_brief(attempt: &ConflictResolution, explanation: &str, timestamp: &str) -> String {
+pub(super) fn port_brief(attempt: &ConflictResolution, explanation: &str, timestamp: &str, reason: &str) -> String {
     format!(
         "Port PR #{pr} onto the current `{base}` branch.\n\n\
 ## Why this revision exists\n\n\
-`{base}` moved under this PR. The repo owner chose to rewrite onto the new base ({timestamp}).\n\n\
+`{base}` moved under this PR. {reason}. The repo owner chose to rewrite onto the new base ({timestamp}).\n\n\
 ## What to do\n\n\
 - Study how `{base}` is laid out now: where the code this PR changes lives, which modules, crates and files moved, were split, renamed or became private, and what replaced anything that was deleted.\n\
 - Port this PR's change onto that layout, or rebuild it there, putting code where it now lives. Rebasing and mapping the moved code commit by commit is a good way to keep the history reviewable. Push the result to the existing PR branch.\n\

@@ -175,13 +175,34 @@ pub async fn on_conflict_detected_with(
     candidate: &PendingMergeCheck,
     probe: &PrLifecycleProbe,
 ) -> bool {
+    on_conflict_detected_with_limits(
+        work_db,
+        publisher,
+        remediation,
+        pr_checker,
+        candidate,
+        probe,
+        crate::config::conflict_inventory_limits(|key| std::env::var_os(key)),
+    )
+    .await
+}
+
+pub(crate) async fn on_conflict_detected_with_limits(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    remediation: ConflictRemediationMode<'_>,
+    pr_checker: &dyn PrStateChecker,
+    candidate: &PendingMergeCheck,
+    probe: &PrLifecycleProbe,
+    limits: anyhow::Result<crate::work::ConflictInventoryLimits>,
+) -> bool {
     // Phase 6 #18 / Q7: the unified opt-out gates the entire flow.
     // Check it first so opted-out products never even probe the
     // rebase-attempt table or touch the parent row.
     if auto_pr_maintenance_disabled(work_db, candidate, &probe.labels) {
         return false;
     }
-    let stopped = crate::config::conflict_inventory_limits(|key| std::env::var_os(key)).and_then(|limits| {
+    let stopped = limits.and_then(|limits| {
         work_db.stop_long_conflicting_pr(
             &ConflictResolutionInsertInput {
                 product_id: candidate.product_id.clone(),
@@ -219,7 +240,29 @@ pub async fn on_conflict_detected_with(
         Ok(None) => {}
         Err(err) => {
             tracing::error!(?err, pr_url = %candidate.pr_url, "conflict inventory guard failed; refusing automatic resolution");
-            return false;
+            // A guard failure must still surface the conflict, never silently
+            // leave an in-review task eligible for normal delivery.
+            let changed = work_db
+                .mark_chore_blocked_merge_conflict(&candidate.work_item_id, &candidate.pr_url)
+                .map(|task| task.is_some())
+                .unwrap_or(false);
+            if let Err(signal_err) = work_db.rearm_blocked_merge_conflict_signal(&candidate.work_item_id) {
+                tracing::error!(?signal_err, "cannot restore conflict signal after guard failure");
+            }
+            let _ = work_db.upsert_external_tracker_attention(
+                &candidate.work_item_id,
+                "conflict_inventory_guard_failed",
+                "Conflict handling needs attention",
+                &format!("{err:#}"),
+            );
+            publisher
+                .publish_work_item_changed(
+                    &candidate.product_id,
+                    &candidate.work_item_id,
+                    "conflict_inventory_guard_failed",
+                )
+                .await;
+            return changed;
         }
     }
     // Q7: when `auto-rebase-stacked-prs` is already chasing this PR,

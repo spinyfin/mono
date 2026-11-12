@@ -9,7 +9,6 @@ use boss_protocol::WorkItem;
 #[async_trait]
 pub(crate) trait DecisionActions: Send + Sync {
     async fn close(&self, pr_url: &str) -> Result<()>;
-    async fn merge(&self, pr_url: &str) -> Result<crate::merge_when_ready::DirectMergeSuccess>;
 }
 
 pub(crate) struct GithubActions;
@@ -21,12 +20,14 @@ impl DecisionActions for GithubActions {
         boss_github::gh_runner::run_gh(&["pr", "close", pr_url], "close owner-approved PR").await?;
         Ok(())
     }
-    async fn merge(&self, pr_url: &str) -> Result<crate::merge_when_ready::DirectMergeSuccess> {
-        crate::merge_when_ready::gh_merge_when_ready(pr_url).await
-    }
 }
 
-pub(crate) async fn run(db: &WorkDb, publisher: &dyn ExecutionPublisher, actions: &dyn DecisionActions) {
+pub(crate) async fn run(
+    db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    actions: &dyn DecisionActions,
+    merge: std::sync::Arc<dyn crate::merge_when_ready::DirectMergeExecutor>,
+) {
     let pending = match db.pending_conflict_inventory_actions() {
         Ok(pending) => pending,
         Err(err) => {
@@ -35,7 +36,7 @@ pub(crate) async fn run(db: &WorkDb, publisher: &dyn ExecutionPublisher, actions
         }
     };
     for (id, choice, attempt) in pending {
-        let result = apply(db, actions, &id, &choice, &attempt).await;
+        let result = apply(db, publisher, actions, merge.as_ref(), &id, &choice, &attempt).await;
         if let Err(err) = result {
             let message = format!("{err:#}");
             if let Err(record_err) = db.record_conflict_inventory_action(&id, Some(&message)) {
@@ -61,7 +62,9 @@ pub(crate) async fn run(db: &WorkDb, publisher: &dyn ExecutionPublisher, actions
 
 async fn apply(
     db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
     actions: &dyn DecisionActions,
+    merge: &dyn crate::merge_when_ready::DirectMergeExecutor,
     id: &str,
     choice: &str,
     attempt: &ConflictResolution,
@@ -92,18 +95,18 @@ async fn apply(
     let product = db.get_product(&attempt.product_id)?.context("missing product")?;
     match crate::merge_mechanism::MergeMechanism::parse(product.merge_mechanism.as_deref())? {
         crate::merge_mechanism::MergeMechanism::Direct => {
-            let result = actions.merge(&attempt.pr_url).await?;
-            let detail = serde_json::json!({"position": null, "state": null, "enqueued_at": null,
-                "section_order": boss_engine_merge_poller::QUEUED_NO_POSITION_SECTION_ORDER})
-            .to_string();
-            db.record_github_merge_intent(
-                crate::work::GithubMergeIntentInsertInput::builder()
-                    .work_item_id(&task.id)
-                    .pr_url(&attempt.pr_url)
-                    .head_sha(result.head_sha)
-                    .build(),
-                &detail,
-            )?;
+            let result =
+                crate::merge_when_ready::execute_direct_merge(db, merge, &task.id, &product, &attempt.pr_url).await?;
+            let record = crate::merge_when_ready::record_direct_merge(db, &task.id, &attempt.pr_url, &result)?;
+            crate::merge_when_ready::publish_direct_merge(
+                db,
+                publisher,
+                &attempt.product_id,
+                &task.id,
+                &attempt.pr_url,
+                record.merge_queue_state_changed,
+            )
+            .await;
             db.record_conflict_inventory_action(id, None)?;
         }
         crate::merge_mechanism::MergeMechanism::TrunkQueue { target_branch } => {

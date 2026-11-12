@@ -10,7 +10,7 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, bail};
-use boss_event_bus::{Event, EventBus, EventKind, TopicFilter};
+use boss_event_bus::{EventBus, EventKind, TopicFilter};
 use boss_timer_wheel::TimerWheel;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};

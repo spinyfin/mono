@@ -476,6 +476,7 @@ fn rewrite_replaces_the_fix_with_a_port_sized_revision_ahead_of_review_revisions
     assert_ne!(port.effort_level, Some(EffortLevel::Trivial));
     for needle in [
         "Port PR #3405 onto the current `main` branch",
+        "The conflict cannot be resolved textually",
         "every earlier review fix",
         "Do not stop on the ground of architectural mismatch",
         "effort-escalation marker",

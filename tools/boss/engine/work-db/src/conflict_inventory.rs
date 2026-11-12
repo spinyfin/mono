@@ -89,6 +89,8 @@ impl WorkDb {
             "SELECT d.attempt_id, d.answer FROM conflict_inventory_decisions d
             JOIN conflict_resolutions cr ON cr.id = d.action_attempt_id
             WHERE d.answer = 'Merge now' AND d.action_completed_at IS NULL AND cr.status = 'succeeded'
+              AND NOT EXISTS (SELECT 1 FROM conflict_inventory_decisions newer
+                  WHERE newer.pr_url = d.pr_url AND newer.rowid > d.rowid AND newer.answer IS NULL)
             UNION ALL SELECT attempt_id, answer FROM conflict_inventory_decisions
             WHERE answer = 'Close' AND action_completed_at IS NULL",
         )?;
@@ -121,7 +123,7 @@ impl WorkDb {
 
     /// Stop before any automatic rebase/worker. The decision, stopped ledger
     /// row and question commit together. Repeated observations return the same
-    /// stop, even after dismissal, a restart or a different head SHA.
+    /// stop across restarts or head changes; terminal unanswered questions are renewed.
     pub fn stop_long_conflicting_pr(
         &self,
         input: &ConflictResolutionInsertInput,
@@ -133,18 +135,55 @@ impl WorkDb {
         );
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task = query_task(&tx, &input.work_item_id).require("task", &input.work_item_id)?;
+        if task.pr_url.as_deref() != Some(&input.pr_url)
+            || task.deleted_at.is_some()
+            || !matches!(task.status, TaskStatus::InReview | TaskStatus::Blocked)
+        {
+            return Ok(None);
+        }
         let held: Option<String> = tx
             .query_row(
                 "SELECT attention_id FROM conflict_inventory_decisions
              WHERE pr_url = ?1 AND (answer IS NULL OR answer = 'Close')
-             ORDER BY CAST(stopped_at AS INTEGER) DESC LIMIT 1",
+             ORDER BY rowid DESC LIMIT 1",
                 [&input.pr_url],
                 |r| r.get(0),
             )
             .optional()?;
         if let Some(id) = held {
-            let (attention, group) = super::attentions::attention_with_group(&tx, &id)?;
-            return Ok(Some((attention, group, false)));
+            let (mut attention, mut group) = super::attentions::attention_with_group(&tx, &id)?;
+            let attempt_id = attention.source_anchor.clone().context("missing stop attempt")?;
+            let mut changed = restore_stop(&tx, &task, &attempt_id)?;
+            let unanswered: bool = tx.query_row(
+                "SELECT answer IS NULL FROM conflict_inventory_decisions WHERE attention_id = ?1",
+                [&id],
+                |r| r.get(0),
+            )?;
+            if unanswered
+                && (matches!(group.state.as_str(), "actioned" | "dismissed") || attention.answer_state == "dismissed")
+            {
+                (attention, group) = super::attentions::create_attention_in_tx(
+                    &tx,
+                    CreateAttentionInput::builder()
+                        .kind("question")
+                        .group_key(format!("{CONFLICT_INVENTORY_GROUP_PREFIX}{}", input.product_id))
+                        .association_task_id(&input.work_item_id)
+                        .source_kind("manual")
+                        .source_anchor(&attempt_id)
+                        .question_type("multiple_choice")
+                        .prompt_text(attention.prompt_text.context("missing stop prompt")?)
+                        .choice_options(attention.choice_options.context("missing choices")?)
+                        .build(),
+                )?;
+                tx.execute(
+                    "UPDATE conflict_inventory_decisions SET attention_id = ?2 WHERE attempt_id = ?1",
+                    params![attempt_id, attention.id],
+                )?;
+                changed = true;
+            }
+            tx.commit()?;
+            return Ok(Some((attention, group, changed)));
         }
         // An explicit answer authorizes one resolution/port. Do not interrupt
         // that work or an already-running automatic writer.
@@ -175,24 +214,7 @@ impl WorkDb {
         if (count as u64) < limits.resolutions && age_days < limits.days {
             return Ok(None);
         }
-        let task = query_task(&tx, &input.work_item_id).require("task", &input.work_item_id)?;
-        if task.pr_url.as_deref() != Some(&input.pr_url)
-            || task.deleted_at.is_some()
-            || !(task.status == TaskStatus::InReview
-                || (task.status == TaskStatus::Blocked && task.blocked_reason.as_deref() == Some("merge_conflict")))
-        {
-            return Ok(None);
-        }
         let id = next_id("crz");
-        // A new conflict needs a fresh disposition. A previous Merge now
-        // authorization must not fire later after the owner chooses rewrite
-        // or close for this recurrence.
-        tx.execute(
-            "UPDATE conflict_inventory_decisions SET action_completed_at = ?2,
-             action_error = 'Superseded by a new conflict decision'
-             WHERE pr_url = ?1 AND answer = 'Merge now' AND action_completed_at IS NULL",
-            params![input.pr_url, now],
-        )?;
         // This records a stop, not a rebase attempt against a known fetched
         // base. NULL base keeps it separate from the completed observation.
         tx.execute(
@@ -244,20 +266,7 @@ impl WorkDb {
                     VALUES (?1, ?2, ?3, ?4)",
             params![id, attention.id, input.pr_url, now],
         )?;
-        crate::task_status_audit::execute(
-            &tx,
-            "conflict_inventory_stop",
-            "engine",
-            "UPDATE tasks SET status = 'blocked', blocked_reason = 'merge_conflict',
-             blocked_attempt_id = ?2, blocked_detail = ?3, updated_at = ?4 WHERE id = ?1",
-            params![
-                input.work_item_id,
-                id,
-                "Automatic conflict resolution stopped; awaiting merge, close or rewrite decision",
-                now
-            ],
-        )?;
-        upsert_task_blocked_signal(&tx, &input.work_item_id, "merge_conflict", Some(&id), &now)?;
+        restore_stop(&tx, &task, &id)?;
         tx.commit()?;
         Ok(Some((attention, group, true)))
     }
@@ -301,6 +310,15 @@ pub(super) fn action_group(
             "UPDATE conflict_inventory_decisions SET answer = ?2, answered_at = ?3 WHERE attempt_id = ?1",
             params![attempt_id, choice, now],
         )?;
+        // A replacement answer, rather than an unanswered question, retires
+        // the earlier merge authorization. Raising a question only holds it.
+        tx.execute(
+            "UPDATE conflict_inventory_decisions SET action_completed_at = ?3,
+            action_error = 'Superseded by a replacement conflict decision'
+            WHERE pr_url = ?1 AND attempt_id != ?2 AND answer = 'Merge now'
+              AND action_completed_at IS NULL",
+            params![attempt.pr_url, attempt_id, now],
+        )?;
         touched.push(parent.id.clone());
         if choice == CONFLICT_INVENTORY_CLOSE {
             continue;
@@ -319,8 +337,12 @@ pub(super) fn action_group(
             super::conflict_mismatch::port_revision_input(
                 &parent.id,
                 &approved,
-                member.prompt_text.as_deref().unwrap_or_default(),
-                &now,
+                "Automatic conflict resolution reached its lifetime limit; the repo owner chose to port the change onto the current base.",
+                &chrono::DateTime::from_timestamp(now.parse()?, 0)
+                    .context("invalid decision timestamp")?
+                    .format("%Y-%m-%d %H:%M UTC")
+                    .to_string(),
+                "The lifetime conflict resolution limit was reached",
             )
         } else {
             CreateRevisionInput::builder().parent_task_id(&parent.id)
@@ -350,4 +372,33 @@ pub(super) fn action_group(
         touched.push(revision.id);
     }
     Ok(touched)
+}
+
+/// Keep independent scalar blocks while recording the conflict as a signal.
+fn restore_stop(tx: &Transaction<'_>, task: &Task, attempt_id: &str) -> Result<bool> {
+    let now = now_string();
+    let reblock = task.status == TaskStatus::InReview;
+    let signaled: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_blocked_signals WHERE work_item_id = ?1
+            AND reason = 'merge_conflict' AND attempt_id = ?2 AND cleared_at IS NULL)",
+        params![task.id, attempt_id],
+        |row| row.get(0),
+    )?;
+    if reblock || task.blocked_reason.as_deref() == Some("merge_conflict") {
+        crate::task_status_audit::execute(
+            tx,
+            "conflict_inventory_stop",
+            "engine",
+            "UPDATE tasks SET status = 'blocked', blocked_reason = 'merge_conflict',
+             blocked_attempt_id = ?2, blocked_detail = ?3, updated_at = ?4 WHERE id = ?1",
+            params![
+                task.id,
+                attempt_id,
+                "Automatic conflict resolution stopped; awaiting merge, close or rewrite decision",
+                now
+            ],
+        )?;
+    }
+    upsert_task_blocked_signal(tx, &task.id, "merge_conflict", Some(attempt_id), &now)?;
+    Ok(reblock || !signaled)
 }
