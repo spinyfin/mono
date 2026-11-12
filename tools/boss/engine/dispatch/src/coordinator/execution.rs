@@ -146,7 +146,7 @@ impl ExecutionCoordinator {
     /// completion handler branches on `kind` to run the outcome detector, so
     /// the synthetic fields never drive real task work.
     ///
-    /// An `answer_agent` execution (P3b) binds to a `work_comments.id` for
+    /// An `answer_agent` execution binds to a `work_comments.id` for
     /// the same reason — see [`crate::work::WorkDb::create_answer_agent_execution`]
     /// — so it gets the same synthetic-item treatment via
     /// [`Self::synthetic_answer_agent_work_item`].

@@ -382,6 +382,13 @@ fn now_ms() -> i64 {
     boss_engine_utils::epoch_time::now_epoch_ms() as i64
 }
 
+/// Persisted workspace release policy, reused after an interrupted handback.
+pub enum SpokeRelease {
+    Normal,
+    Reset,
+    Force(String),
+}
+
 #[work_db_boundary::instrument]
 impl WorkDb {
     /// Whether dispatch must retain ownership while a host command is unresolved.
@@ -418,35 +425,41 @@ impl WorkDb {
         )
     }
 
-    /// Recover from persisted commands, never from the advisory in-doubt flag.
-    /// Stale flags are cleared locally so older engines' assignments self-heal.
+    /// List recovery candidates without mutating assignment or attention state.
     pub fn list_in_doubt_spoke_execution_ids(&self) -> Result<Vec<String>> {
-        let ids = {
-            let conn = self.connect()?;
-            let mut stmt = conn.prepare("SELECT execution_id FROM spoke_assignments WHERE resolved_at_ms IS NULL")?;
-            stmt.query_map([], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT a.execution_id FROM spoke_assignments a
+             JOIN work_executions e ON e.id = a.execution_id
+             WHERE a.resolved_at_ms IS NULL AND (
+                 a.in_doubt = 1 OR e.status NOT IN ('running', 'waiting_human')
+                 OR EXISTS (SELECT 1 FROM work_runs r
+                     WHERE r.execution_id = a.execution_id AND r.finished_at IS NULL
+                     AND r.id = (SELECT latest.id FROM work_runs latest
+                         WHERE latest.execution_id = a.execution_id
+                         ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1)))",
+        )?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        drop(conn);
         let mut pending = Vec::new();
         for id in ids {
-            if self.spoke_assignment_needs_recovery(&id)? {
-                pending.push(id);
-            } else {
-                self.connect()?.execute(
-                    "UPDATE spoke_assignments SET in_doubt = 0 WHERE execution_id = ?1",
-                    [&id],
-                )?;
-                self.resolve_attention_kind_for_execution(
-                    &id,
-                    boss_engine_storage_values::attention_kinds::SPOKE_ASSIGNMENT_IN_DOUBT_ATTENTION_KIND,
-                )?;
+            match self.spoke_assignment_needs_recovery(&id) {
+                Ok(true) => pending.push(id),
+                Ok(false) => {
+                    if self.spoke_execution_in_doubt(&id).unwrap_or(false) {
+                        pending.push(id);
+                    }
+                }
+                Err(error) => tracing::warn!(execution_id = %id, %error, "could not classify spoke recovery candidate"),
             }
         }
         Ok(pending)
     }
 
-    /// A live launch is recoverable only while its latest run is unfinished
-    /// and its spawn is unanswered or settled-uncertain. Terminal assignments
+    /// A stored reply is not consumed until the latest launch run finishes. Terminal assignments
     /// also retain unresolved leases so cleanup can finish after a restart.
     pub fn spoke_assignment_needs_recovery(&self, execution_id: &str) -> Result<bool> {
         use boss_protocol_spoke::v1::{CommandResult, ResultCode, command_result};
@@ -470,13 +483,18 @@ impl WorkDb {
             if !runs.last().is_some_and(|run| run.finished_at.is_none()) {
                 return Ok(false);
             }
-            return Ok(self.host_command_wire(&assignment.host_id, &spawn)?.is_some()
-                && uncertain(self.host_command_result(&assignment.host_id, &spawn)?)?);
+            return Ok(self.host_command_wire(&assignment.host_id, &spawn)?.is_some());
         }
         if self.host_command_wire(&assignment.host_id, &spawn)?.is_some() {
-            return Ok(
-                execution.status.is_terminal() || uncertain(self.host_command_result(&assignment.host_id, &spawn)?)?
-            );
+            return Ok(execution.cube_lease_id.is_some()
+                || assignment.lease_id.is_some()
+                || assignment.pane_pid.is_some()
+                || match self.host_command_result(&assignment.host_id, &spawn)? {
+                    None => true,
+                    Some(bytes) => {
+                        boss_protocol_spoke::spawn_result_is_uncertain(&CommandResult::decode(bytes.as_slice())?)
+                    }
+                });
         }
         match self.current_lease_command(&assignment.host_id, &assignment.run_id)? {
             Some(lease) => {
@@ -498,6 +516,37 @@ impl WorkDb {
             }
             None => Ok(false),
         }
+    }
+
+    /// The latest recorded release owns teardown; retry it without another stop.
+    pub fn spoke_assignment_release(&self, execution_id: &str) -> Result<Option<SpokeRelease>> {
+        use rusqlite::OptionalExtension;
+        let conn = self.connect()?;
+        let wire: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT c.wire FROM host_commands c
+             JOIN spoke_assignments a ON c.host_id = a.host_id AND c.run_id = a.run_id
+             WHERE a.execution_id = ?1 AND a.resolved_at_ms IS NULL
+             AND (c.command_id LIKE 'release-%' OR c.command_id LIKE 'release_reset-%'
+                 OR c.command_id LIKE 'force_release-%')
+             ORDER BY c.created_at_ms DESC, c.command_id DESC LIMIT 1",
+                [execution_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        use boss_protocol_spoke::v1::{Command, WorkspaceKind, command};
+        use prost::Message;
+        let Some(wire) = wire else { return Ok(None) };
+        let command = Command::decode(wire.as_slice())?;
+        Ok(match command.body {
+            Some(command::Body::Workspace(op)) => match WorkspaceKind::try_from(op.kind) {
+                Ok(WorkspaceKind::Release) => Some(SpokeRelease::Normal),
+                Ok(WorkspaceKind::ReleaseWithReset) => Some(SpokeRelease::Reset),
+                Ok(WorkspaceKind::ForceRelease) => Some(SpokeRelease::Force(op.reason)),
+                _ => None,
+            },
+            _ => None,
+        })
     }
 
     /// Whether this run has a stored spawn command, answered or not.
@@ -1497,7 +1546,7 @@ mod tests {
         use boss_protocol_spoke::v1::{CommandResult, ResultCode};
         use prost::Message;
         let db = spoke_db();
-        for id in ["exec_1", "exec_2"] {
+        for id in ["exec_1", "exec_2", "exec_bad"] {
             db.connect()
                 .unwrap()
                 .execute(
@@ -1532,8 +1581,10 @@ mod tests {
         assert!(db.list_in_doubt_spoke_execution_ids().unwrap().is_empty());
         db.set_spoke_in_doubt("exec_1", reserved.assignment_generation, true)
             .unwrap();
-        assert!(db.list_in_doubt_spoke_execution_ids().unwrap().is_empty());
-        assert!(!db.spoke_execution_in_doubt("exec_1").unwrap());
+        assert_eq!(db.list_in_doubt_spoke_execution_ids().unwrap(), ["exec_1"]);
+        assert!(db.spoke_execution_in_doubt("exec_1").unwrap());
+        db.set_spoke_in_doubt("exec_1", reserved.assignment_generation, false)
+            .unwrap();
         let other = db.reserve_spoke_assignment("exec_2", "host-b").unwrap();
         append(
             &db,
@@ -1543,16 +1594,30 @@ mod tests {
             b"spawn",
         )
         .unwrap();
+        let bad = db.reserve_spoke_assignment("exec_bad", "host-b").unwrap();
+        let bad_id = host_command_lease_id(&bad.run_id, 1);
+        append(&db, "host-b", &bad_id, Some(&key(&bad)), b"lease").unwrap();
+        db.settle_host_command("host-b", &bad_id, Some(&key(&bad)), &[255])
+            .unwrap();
+        assert!(db.spoke_assignment_needs_recovery("exec_bad").is_err());
+        // A malformed candidate cannot prevent recovery of the healthy row.
         let mut ids = db.list_in_doubt_spoke_execution_ids().unwrap();
         ids.sort();
         assert_eq!(ids, ["exec_2"]);
     }
 
     #[test]
-    fn live_recovery_requires_an_uncertain_spawn_and_the_latest_launch_still_active() {
+    fn live_recovery_requires_a_stored_spawn_and_the_latest_launch_still_active() {
         use boss_protocol_spoke::v1::{CommandResult, ResultCode};
         use prost::Message;
-        for code in [None, Some(ResultCode::OutcomeUncertain), Some(ResultCode::Ok)] {
+        for code in [
+            None,
+            Some(ResultCode::OutcomeUncertain),
+            Some(ResultCode::Unknown),
+            Some(ResultCode::Ok),
+            Some(ResultCode::Rejected),
+            Some(ResultCode::Absent),
+        ] {
             let db = spoke_db();
             legacy_execution(&db, "host-a", "exec_1", "lease");
             db.connect()
@@ -1583,10 +1648,8 @@ mod tests {
                     [],
                 )
                 .unwrap();
-            assert_eq!(
-                db.spoke_assignment_needs_recovery("exec_1").unwrap(),
-                code != Some(ResultCode::Ok)
-            );
+            assert!(db.spoke_assignment_needs_recovery("exec_1").unwrap());
+            assert_eq!(db.list_in_doubt_spoke_execution_ids().unwrap(), ["exec_1"]);
             db.connect()
                 .unwrap()
                 .execute("UPDATE work_runs SET finished_at = '2' WHERE id = 'launch'", [])

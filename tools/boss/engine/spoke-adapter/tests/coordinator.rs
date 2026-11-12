@@ -1116,3 +1116,5 @@ async fn a_hung_in_doubt_adopt_does_not_stall_the_scheduler_heartbeat() {
     .await
     .expect("a stranded ready row is re-kicked within one heartbeat interval while Adopt is unanswered");
 }
+
+mod recovery;

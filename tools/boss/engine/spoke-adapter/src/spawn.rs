@@ -130,6 +130,11 @@ impl SpokeHostAdapter {
             }
             Err(other) => return Err(other.into()),
         };
+        if boss_protocol_spoke::spawn_result_is_uncertain(&result) {
+            return self
+                .finish_settled_uncertain_spawn(&assignment, execution, &id, result.reason, template)
+                .await;
+        }
         match ResultCode::try_from(result.code) {
             Ok(ResultCode::Ok) => {}
             Ok(ResultCode::Rejected) => bail!("host {} rejected the spawn: {}", self.host_name(), result.reason),

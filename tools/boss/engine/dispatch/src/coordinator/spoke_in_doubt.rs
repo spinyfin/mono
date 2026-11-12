@@ -193,24 +193,23 @@ impl ExecutionCoordinator {
                 return;
             }
         };
-        if execution.status.is_live() {
-            if self.is_driving_run(execution_id) {
+        // The normal driver owns launch and terminal release until it exits.
+        if self.is_driving_run(execution_id) {
+            return;
+        }
+        match self.work_db.spoke_assignment_needs_recovery(execution_id) {
+            Ok(false) => {
+                self.clear_spoke_in_doubt(execution_id);
+                self.resolve_spoke_in_doubt_attention(execution_id);
                 return;
             }
-            // Only a spawn still awaiting its answer is resumed: a worker whose
-            // launch already completed must not have its launch path re-driven.
-            match self.work_db.spoke_assignment_needs_recovery(execution_id) {
-                Ok(false) => {
-                    self.clear_spoke_in_doubt(execution_id);
-                    self.resolve_spoke_in_doubt_attention(execution_id);
-                    return;
-                }
-                Ok(true) => {}
-                Err(error) => {
-                    tracing::warn!(execution_id, error = %format!("{error:#}"), "could not read the stored spoke recovery state");
-                    return;
-                }
+            Ok(true) => {}
+            Err(error) => {
+                tracing::warn!(execution_id, %error, "could not read stored spoke recovery state");
+                return;
             }
+        }
+        if execution.status.is_live() {
             match self.resume_pane_spawn_for_running_execution(&execution).await {
                 Ok(()) => {}
                 Err(error) => tracing::warn!(
@@ -273,6 +272,37 @@ impl ExecutionCoordinator {
                 return;
             }
         };
+        let release_started = match self.work_db.spoke_assignment_release(execution_id) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(execution_id, %error, "could not read stored workspace release");
+                return;
+            }
+        };
+        if let Some(release) = release_started {
+            // A durable release follows the normal cleanup proof. Reuse its
+            // stable command; another Stop could race the host releasing it.
+            let Some(lease_id) = assignment.lease_id.as_deref() else {
+                return;
+            };
+            let result = match release {
+                boss_work_db::SpokeRelease::Normal => adapter.release_workspace(lease_id).await,
+                boss_work_db::SpokeRelease::Reset => adapter.release_workspace_with_reset(lease_id).await,
+                boss_work_db::SpokeRelease::Force(reason) => adapter.force_release_lease(lease_id, Some(&reason)).await,
+            };
+            match result {
+                Ok(()) => {
+                    if let Err(error) = self.work_db.clear_execution_workspace(execution_id) {
+                        tracing::warn!(execution_id, %error, "could not clear released workspace");
+                        return;
+                    }
+                    self.release_in_doubt_persona(execution_id);
+                    self.resolve_spoke_in_doubt_attention(execution_id);
+                }
+                Err(error) => tracing::warn!(execution_id, %error, "stored workspace release is still unresolved"),
+            }
+            return;
+        }
         let released = if has_spawn {
             match adapter.observe_worker(execution_id).await {
                 Ok(Some(pane)) if !matches!(pane.life, WorkerLife::Exited | WorkerLife::Missing) => {

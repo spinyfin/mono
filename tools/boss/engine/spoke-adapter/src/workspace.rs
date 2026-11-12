@@ -428,10 +428,7 @@ impl SpokeHostAdapter {
             (Some(_), None) => StoredSpawn::Unanswered,
             (Some(_), Some(bytes)) => {
                 let result = boss_protocol_spoke::v1::CommandResult::decode(bytes.as_slice())?;
-                if matches!(
-                    ResultCode::try_from(result.code),
-                    Ok(ResultCode::Ok | ResultCode::Rejected | ResultCode::Absent)
-                ) {
+                if !boss_protocol_spoke::spawn_result_is_uncertain(&result) {
                     StoredSpawn::Settled
                 } else {
                     StoredSpawn::SettledUncertain
