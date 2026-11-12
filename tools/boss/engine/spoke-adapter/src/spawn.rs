@@ -653,11 +653,15 @@ impl SpokeHostAdapter {
         Ok(match sent {
             Ok(result) => match ResultCode::try_from(result.code) {
                 Ok(ResultCode::Ok) => PaneCaptureOutcome::Accepted,
-                // control_target already returned None (Ended) when the hub's
-                // assignment is resolved. Absent and Unknown mean the worker
-                // is missing or has not spawned yet; keep renewing while the
-                // assignment is open.
                 Ok(ResultCode::Rejected) => PaneCaptureOutcome::Refused(result.reason),
+                // Absent and Unknown are reported as Unreachable so the viewer
+                // keeps renewing while the assignment is open. control_target
+                // already returned Ended for a resolved assignment; a
+                // terminal-record Absent still lands here when the assignment
+                // has not been marked resolved yet.
+                Ok(ResultCode::Absent) | Ok(ResultCode::Unknown) => {
+                    PaneCaptureOutcome::Unreachable(format!("host {host} could not answer: {}", result.reason))
+                }
                 _ => PaneCaptureOutcome::Unreachable(format!("host {host} could not answer: {}", result.reason)),
             },
             Err(CommandOutcome::Invalid) => PaneCaptureOutcome::Refused("the capture request was invalid".to_owned()),

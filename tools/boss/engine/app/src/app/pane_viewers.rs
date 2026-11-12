@@ -128,7 +128,7 @@ impl PaneViewers {
 /// Keeps `run_id`'s capture alive while someone watches it.
 async fn capture_task(state: Arc<ServerState>, run_id: String, wake: Arc<TaskWake>) {
     let topic = pane_capture_topic(&run_id);
-    let sub_id = subscription_id(&run_id);
+    let mut sub_id = subscription_id(&run_id);
     let mut snapshots = state.pane_viewers.feed.subscribe();
     let renew_every = Duration::from_millis(state.pane_viewers.renew_every_ms.load(Ordering::SeqCst).max(1));
     let mut renew = tokio::time::interval(renew_every);
@@ -140,11 +140,17 @@ async fn capture_task(state: Arc<ServerState>, run_id: String, wake: Arc<TaskWak
     // What viewers were last told about the capture's health, so an unchanged
     // failure is not re-pushed on every renewal.
     let mut told: Option<(PaneCaptureState, String)> = None;
-    // Last Live snapshot this task published. A late joiner or a recovery from
-    // a health banner is replayed from here so they do not wait for the spoke's
-    // keep-alive. Cleared only by a newer snapshot; a health/terminal publish
-    // supersedes it without dropping it.
+    // Last Live snapshot this task published. A late joiner, while no health
+    // banner is current, is replayed from here so they do not wait for the
+    // spoke's keep-alive. Each newer snapshot replaces it; a health or terminal
+    // publish leaves it in place, and `told` gates the join path so a
+    // superseded Live is not replayed. Recovery from a banner waits for a
+    // fresh snapshot: the next host request uses a new subscription id so the
+    // spoke captures immediately instead of waiting out keep-alive.
     let mut last_live: Option<Arc<PaneSnapshot>> = None;
+    // One new subscription id per banner, so ordinary renewals stay
+    // deduplicated and a recovery does not open a subscription on every tick.
+    let mut rotated_for_banner = false;
     let mut first = true;
 
     loop {
@@ -157,6 +163,7 @@ async fn capture_task(state: Arc<ServerState>, run_id: String, wake: Arc<TaskWak
                     match snapshot {
                         Ok(snapshot) if snapshot.run_id == run_id && snapshot.subscription_id == sub_id => {
                             told = None;
+                            rotated_for_banner = false;
                             last_live = Some(Arc::clone(&snapshot));
                             publish_snapshot(&state, &snapshot).await;
                         }
@@ -237,6 +244,13 @@ async fn capture_task(state: Arc<ServerState>, run_id: String, wake: Arc<TaskWak
         }
         let Some(host) = adapter.as_ref() else { continue };
 
+        // Accepted only means the spoke opened or renewed the subscription.
+        // After a banner, a new id makes that open due immediately with no
+        // last snapshot, so recovery does not wait out keep-alive.
+        if told.is_some() && !rotated_for_banner {
+            sub_id = subscription_id(&run_id);
+            rotated_for_banner = true;
+        }
         let request = PaneCaptureRequest {
             subscription_id: sub_id.clone(),
             interval_ms: 0,
@@ -250,16 +264,9 @@ async fn capture_task(state: Arc<ServerState>, run_id: String, wake: Arc<TaskWak
             Err(_) => PaneCaptureOutcome::Unreachable("the host did not answer in time".to_owned()),
         };
         match outcome {
-            // Snapshots arrive on the feed. A join or renewal that recovered
-            // from a health/terminal banner republishes the last Live text so
-            // viewers are not blank until the spoke's keep-alive.
-            PaneCaptureOutcome::Accepted => {
-                if told.take().is_some()
-                    && let Some(cached) = &last_live
-                {
-                    publish_snapshot(&state, cached).await;
-                }
-            }
+            // Snapshots arrive on the feed. Do not restore Live from the cache:
+            // Accepted is not evidence a pane read succeeded.
+            PaneCaptureOutcome::Accepted => {}
             PaneCaptureOutcome::Ended => {
                 tell_if_new(
                     &state,
@@ -804,7 +811,43 @@ mod flow_tests {
         })
         .await
         .expect("second viewer did not receive the cached pane");
+        // The original observation time is preserved; a join must not look like
+        // a freshly captured pane.
         assert_eq!(envelope, ("idle pane".into(), Some(1_700_000_000_000), true));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accepted_after_a_banner_does_not_republish_cached_live_text() {
+        let remote = Remote::new(PaneCaptureOutcome::Accepted);
+        let (state, _dir) = state_with(&remote, true);
+        let sink = viewer(&state, "viewer-a").await;
+        until("the capture to open", || remote.opens() >= 1).await;
+        let original_sub = remote.latest_subscription();
+
+        state.pane_viewers.feed().send(snapshot(&remote, "x")).unwrap();
+        assert_eq!(next_capture(&sink).await.1, "x");
+
+        *remote.answer.lock().unwrap() = PaneCaptureOutcome::Unreachable("host spoke is not connected".into());
+        assert_eq!(next_capture(&sink).await.0, PaneCaptureState::Unreachable);
+
+        *remote.answer.lock().unwrap() = PaneCaptureOutcome::Accepted;
+        let opened = remote.opens();
+        until("the Accepted recovery request", || remote.opens() > opened).await;
+        assert_ne!(
+            remote.latest_subscription(),
+            original_sub,
+            "recovery opens a new subscription so the spoke captures immediately"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), next_capture(&sink))
+                .await
+                .is_err(),
+            "Accepted after a banner must not republish cached Live text"
+        );
+
+        state.pane_viewers.feed().send(snapshot(&remote, "fresh")).unwrap();
+        let (capture_state, text, ..) = next_capture(&sink).await;
+        assert_eq!((capture_state, text.as_str()), (PaneCaptureState::Live, "fresh"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
