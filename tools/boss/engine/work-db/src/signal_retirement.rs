@@ -67,6 +67,12 @@ pub(crate) fn clear_resolved_signal_in_tx(
     actor: &str,
 ) -> Result<ClearResolvedSignal> {
     if crate::parking::is_parked(conn, item)? {
+        tracing::info!(
+            work_item_id = item,
+            pr_url = pr,
+            ci,
+            "signal retirement declined: work item is parked",
+        );
         return Ok(ClearResolvedSignal::Nothing);
     }
     let table = if ci { "ci_remediations" } else { "conflict_resolutions" };
@@ -119,6 +125,13 @@ pub(crate) fn clear_resolved_signal_in_tx(
                 None => false,
             };
         if !concluded {
+            tracing::info!(
+                work_item_id = item,
+                pr_url = pr,
+                attempt_id = attempt.as_ref().map(|a| a.id.as_str()),
+                failure_kind = attempt.as_ref().and_then(|a| a.failure_kind.as_deref()),
+                "signal retirement declined: queue-side failure is not cleared by a clean head probe",
+            );
             return Ok(ClearResolvedSignal::QueueSideUnresolved {
                 attempt: Box::new(attempt.expect("queue-side gate requires an attempt")),
             });
@@ -127,12 +140,12 @@ pub(crate) fn clear_resolved_signal_in_tx(
     let task_transitioned = if ci {
         crate::blocking::clear_blocked_ci_failure_in_tx(conn, item, pr, false, actor)?.is_some()
     } else {
-        // A newer scalar block belongs to its own attempt.
-        let matches_attempt = match conflict.as_ref() {
-            Some(a) => query_task(conn, item)?.is_some_and(|t| t.blocked_attempt_id.as_deref() == Some(&a.id)),
-            None => true,
-        };
-        matches_attempt && crate::blocking::clear_blocked_merge_conflict_in_tx(conn, item, pr, actor)?.is_some()
+        // A definitive mergeable observation of the task's current PR is the
+        // authority for lifting the block, whichever attempt (if any) is
+        // recorded as its owner: a stale or foreign `blocked_attempt_id` must
+        // never keep a mergeable PR blocked. Attempt retirement is handled
+        // separately below.
+        crate::blocking::clear_blocked_merge_conflict_in_tx(conn, item, pr, actor)?.is_some()
     };
     let retire_conflict = conflict
         .as_ref()
@@ -173,6 +186,14 @@ pub(crate) fn clear_resolved_signal_in_tx(
         conn.execute("DELETE FROM ci_inflight_observations WHERE work_item_id = ?1", [item])?;
     }
     if !task_transitioned && !retire && !signal_cleared {
+        tracing::info!(
+            work_item_id = item,
+            pr_url = pr,
+            ci,
+            active_attempt_id = ids.first().map(String::as_str),
+            "signal retirement declined: nothing to clear (task not blocked on this signal for this PR, \
+             and no running or revision-backed attempt to retire)",
+        );
         return Ok(ClearResolvedSignal::Nothing);
     }
     if ci {
@@ -394,5 +415,92 @@ mod tests {
         let still_running = query_task(&db.connect().unwrap(), &with_exec).unwrap().unwrap();
         assert_eq!(still_running.status, TaskStatus::Todo);
         assert!(still_running.deleted_at.is_none());
+    }
+
+    fn blocked_on_conflict(db: &WorkDb, product: &str, name: &str) -> (String, String) {
+        let (item, pr) = pr_item(db, product, name);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET blocked_reason = 'merge_conflict', blocked_attempt_id = NULL WHERE id = ?1",
+                rusqlite::params![item],
+            )
+            .unwrap();
+        db.record_merge_conflict_in_flight(&item, "seed").unwrap();
+        (item, pr)
+    }
+
+    fn conflict_attempt(db: &WorkDb, product: &str, item: &str, pr: &str, head: &str) -> ConflictResolution {
+        db.insert_conflict_resolution(ConflictResolutionInsertInput {
+            product_id: product.to_owned(),
+            work_item_id: item.to_owned(),
+            pr_url: pr.to_owned(),
+            pr_number: 1,
+            head_branch: "feature".into(),
+            base_branch: "main".into(),
+            base_sha_at_trigger: Some("base".into()),
+            head_sha_before: Some(head.into()),
+        })
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn conflict_clear_ignores_a_missing_blocked_attempt_id() {
+        let db = db();
+        let product = create_test_product(&db).id;
+        let (item, pr) = blocked_on_conflict(&db, &product, "Legacy row");
+        let attempt = conflict_attempt(&db, &product, &item, &pr, "h1");
+        db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET blocked_attempt_id = NULL WHERE id = ?1", [&item])
+            .unwrap();
+
+        let ClearResolvedSignal::Applied(applied) = db.clear_resolved_pr_signal(&item, &pr, false).unwrap() else {
+            panic!("a mergeable PR must clear the block even without a recorded attempt");
+        };
+        assert!(applied.task_transitioned);
+        assert_eq!(applied.conflict_attempt.map(|a| a.id), Some(attempt.id));
+        let task = query_task(&db.connect().unwrap(), &item).unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::InReview);
+    }
+
+    #[test]
+    fn conflict_clear_recovers_when_a_different_live_attempt_owns_the_block() {
+        let db = db();
+        let product = create_test_product(&db).id;
+        let (item, pr) = blocked_on_conflict(&db, &product, "Owned elsewhere");
+        let owner = conflict_attempt(&db, &product, &item, &pr, "h1");
+        db.mark_conflict_resolution_running(&owner.id, "lease", "ws", "worker")
+            .unwrap()
+            .unwrap();
+        conflict_attempt(&db, &product, &item, &pr, "h2");
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET blocked_attempt_id = ?2 WHERE id = ?1",
+                rusqlite::params![item, owner.id],
+            )
+            .unwrap();
+
+        assert_ne!(
+            db.clear_resolved_pr_signal(&item, &pr, false).unwrap(),
+            ClearResolvedSignal::Nothing,
+            "a mergeable PR must unblock the task whoever owns the block"
+        );
+        let task = query_task(&db.connect().unwrap(), &item).unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::InReview);
+        // Repeated calls converge: attempt retirement may take a call or two,
+        // but the task stays unblocked and the calls settle on `Nothing`.
+        let mut settled = false;
+        for _ in 0..4 {
+            if db.clear_resolved_pr_signal(&item, &pr, false).unwrap() == ClearResolvedSignal::Nothing {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "repeated calls must converge on Nothing");
+        let task = query_task(&db.connect().unwrap(), &item).unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::InReview);
     }
 }

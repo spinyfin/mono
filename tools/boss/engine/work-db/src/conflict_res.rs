@@ -248,6 +248,41 @@ impl WorkDb {
             tx.commit()?;
             return Ok(None);
         }
+        // A newer *live* attempt for the work item supersedes older `pending`
+        // ones that never spawned a fix vehicle. A `pending` row that outlives
+        // its successor is never retired by anything else, and a later UNIQUE
+        // collision on re-detection would adopt it as the live attempt, so
+        // retire it here, in the same transaction as the insert. The key's
+        // base sha is NULLed (see `abandon_conflict_resolution_for_supersede`)
+        // so the stale row cannot collide with a future insert either.
+        // Skipped when the churn guard pre-abandoned the new row (it supersedes
+        // nothing), and for rows with a `revision_task_id`: an in-flight
+        // revision must be closed alongside its attempt by the caller's
+        // supersede path, not orphaned here. `running` rows are left alone:
+        // they hold a lease on a real worker.
+        if !churn_tripped {
+            let retired = tx.execute(
+                "UPDATE conflict_resolutions
+                    SET status              = 'abandoned',
+                        failure_reason      = 'superseded_by_newer_attempt',
+                        base_sha_at_trigger = NULL,
+                        finished_at         = COALESCE(finished_at, ?3)
+                  WHERE work_item_id = ?1
+                    AND id != ?2
+                    AND status = 'pending'
+                    AND revision_task_id IS NULL
+                    AND event_source != 'speculative_predicted'",
+                params![input.work_item_id, id, now],
+            )?;
+            if retired > 0 {
+                tracing::info!(
+                    work_item_id = %input.work_item_id,
+                    new_attempt_id = %id,
+                    retired,
+                    "conflict_resolutions: retired older pending attempts superseded by a newer attempt",
+                );
+            }
+        }
         // Only stamp the parent's `blocked_attempt_id` for live
         // attempts; an immediately-abandoned churn-guard row would
         // mis-point the kanban at a dead attempt.
@@ -267,6 +302,33 @@ impl WorkDb {
             .with_context(|| format!("unknown conflict_resolution after insert: {id}"))?;
         tx.commit()?;
         Ok(Some(inserted))
+    }
+
+    /// Record `attempt_id` as the `blocked_attempt_id` of a work item that is
+    /// `blocked: merge_conflict`, the same stamp [`Self::insert_conflict_resolution`]
+    /// applies to a freshly inserted attempt. Used when the caller reuses an
+    /// existing live attempt instead of inserting one, so the retire path can
+    /// later match the block to its attempt. Only a `pending`/`running`
+    /// attempt of this same work item is recorded. Returns `true` when the
+    /// task row was updated.
+    pub fn record_blocked_conflict_attempt(&self, work_item_id: &str, attempt_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let rows = conn.execute(
+            "UPDATE tasks
+                SET blocked_attempt_id = ?2,
+                    updated_at         = ?3
+              WHERE id = ?1
+                AND status = 'blocked'
+                AND blocked_reason = 'merge_conflict'
+                AND deleted_at IS NULL
+                AND blocked_attempt_id IS NOT ?2
+                AND EXISTS (SELECT 1 FROM conflict_resolutions
+                             WHERE id = ?2
+                               AND work_item_id = ?1
+                               AND status IN ('pending', 'running'))",
+            params![work_item_id, attempt_id, now_string()],
+        )?;
+        Ok(rows > 0)
     }
 
     /// Fetch a single attempt row by id. `Ok(None)` if the row is

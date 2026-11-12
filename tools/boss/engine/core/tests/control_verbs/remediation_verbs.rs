@@ -1074,7 +1074,8 @@ async fn engine_conflicts_list_and_show_round_trip() -> Result<()> {
         .await?;
     match response {
         FrontendEvent::ConflictResolutionsList { attempts } => {
-            assert_eq!(attempts.len(), 2);
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].id, b.id);
             assert!(attempts.iter().all(|a| a.status == "pending"));
         }
         other => return Err(anyhow!("unexpected response: {other:?}")),
@@ -1304,6 +1305,12 @@ async fn seed_two_conflict_resolutions(
             head_sha_before: Some("ddd".to_owned()),
         })?
         .expect("first insert seeds the row");
+    // A newer attempt retires older `pending` ones, so the first attempt is
+    // moved to `running` (which holds a worker lease and is never retired)
+    // before the second is inserted.
+    work_db
+        .mark_conflict_resolution_running(&a.id, "lease-seed", "ws-seed", "worker-seed")?
+        .expect("seeded attempt flips to running");
     // `created_at` has second resolution (`now_string()` stamps whole
     // epoch seconds), so the second row only sorts after the first once
     // the wall clock ticks into a new second. Poll for that instead of a
