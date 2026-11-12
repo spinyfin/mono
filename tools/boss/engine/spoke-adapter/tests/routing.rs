@@ -14,7 +14,7 @@ use boss_work_db::HostTransport;
 use serde_json::json;
 
 use crate::support::*;
-use crate::{PATH, lease, short, spawn, standard, workspace_kind};
+use crate::{PATH, lease, short, spawn, standard, workspace_kind, workspace_slack};
 
 fn lease_commands(commands: &[Command]) -> Vec<Command> {
     commands
@@ -74,7 +74,9 @@ async fn a_lease_retry_resends_the_stored_command_before_and_after_it_settles() 
 
 #[tokio::test]
 async fn repeating_a_stop_reuses_durable_state() {
-    let fx = Fixture::with(short(400)).await;
+    // Lease/spawn must succeed under sibling-test load; the unanswered stop
+    // still parks once `command_deadline` elapses (5s via workspace_slack).
+    let fx = Fixture::with(workspace_slack(400)).await;
     fx.ready(HOST);
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
     let peer = fx

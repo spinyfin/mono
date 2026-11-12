@@ -61,7 +61,7 @@ fn short(deadline_ms: u64) -> SpokeAdapterConfig {
 /// 200–300ms lease deadline under CI contention, and that miss is recorded as
 /// a pre-start failure (`dispatch_not_before` + count) before the spawn the
 /// test is actually exercising.
-fn workspace_slack(spawn_deadline_ms: u64) -> SpokeAdapterConfig {
+pub(crate) fn workspace_slack(spawn_deadline_ms: u64) -> SpokeAdapterConfig {
     SpokeAdapterConfig::builder()
         .command_deadline(Duration::from_secs(5))
         .spawn_deadline(Duration::from_millis(spawn_deadline_ms))
