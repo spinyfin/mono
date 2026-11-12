@@ -22,6 +22,14 @@ use crate::app::reset::resolve_github_remote_for_workspace;
 /// in this range carries jj's conflict flag".
 const CONFLICT_COMMITS_TMPL: &str = r#"if(conflict, commit_id ++ "\n")"#;
 
+/// Bare bookmark names on a commit, local and remote. `jj bookmark list -r`
+/// only considers local targets, so a fetched parent-PR branch with no local
+/// bookmark is invisible even with `--all-remotes`. `local_bookmarks` /
+/// `remote_bookmarks` on `jj log` include those remotes; `.name()` strips
+/// the `@remote` suffix so [`is_bookkeeping_bookmark`] classifies them.
+pub(crate) const BOOKMARK_NAMES_TMPL: &str =
+    r#"separate("\n", local_bookmarks.map(|b| b.name()), remote_bookmarks.map(|b| b.name())) ++ "\n""#;
+
 /// Upper bound on collapse iterations in [`try_linearize_replay_conflicts`],
 /// as a multiple of the conflicted-commit count. Each iteration removes at
 /// least one conflicted commit, so the count alone suffices; the multiplier
@@ -501,9 +509,10 @@ fn commit_is_conflicted(ctx: &JjCtx<'_>, revision: &str) -> Result<bool> {
 /// Which bookmarks on a conflicted ancestor count as a stacked-PR boundary.
 #[derive(Clone, Copy)]
 pub(super) enum BookmarkPolicy<'a> {
-    /// Rebase path: local bookkeeping pointers (`pr/<n>`, engine recovery /
-    /// preserved namespaces) are not stack boundaries. Any other local
-    /// bookmark still blocks.
+    /// Rebase path: bookkeeping pointers (`pr/<n>`, engine recovery /
+    /// preserved namespaces) are not stack boundaries, locally or on a
+    /// remote. Any other bookmark still blocks, including a parent-PR
+    /// branch that exists only as a fetched remote ref.
     Strict,
     /// Push path: same classification as [`Self::Strict`], and the branch
     /// about to be advanced to `@` is also not a stack boundary.
@@ -519,7 +528,7 @@ pub(super) fn commit_has_blocking_bookmark(
         BookmarkPolicy::Strict => None,
         BookmarkPolicy::PushBranch(branch) => Some(branch),
     };
-    let out = ctx.run(&["bookmark", "list", "-r", revision, "-T", r#"if(!remote, name ++ "\n")"#])?;
+    let out = ctx.run(&["log", "-r", revision, "--no-graph", "-T", BOOKMARK_NAMES_TMPL])?;
     Ok(out.lines().map(str::trim).any(|name| {
         !name.is_empty()
             && skip_branch.is_none_or(|branch| name != branch)

@@ -354,3 +354,57 @@ fn bookkeeping_pointers_are_not_stack_boundaries_but_a_published_branch_is() {
         "preserved/ bookmarks are engine pointers, not stack boundaries"
     );
 }
+
+#[test]
+fn remote_only_parent_pr_branch_is_a_stack_boundary() {
+    let repo = Repo::new();
+    repo.lockfile_conflict_with_resolved_child(None);
+    let conflicted = repo.conflicted("main..@");
+    let ancestor = conflicted
+        .lines()
+        .next()
+        .expect("conflicted ancestor")
+        .trim()
+        .to_owned();
+    let origin = repo._dir.path().join("origin.git");
+    let git = std::process::Command::new("git")
+        .args(["init", "--bare", origin.to_str().unwrap()])
+        .output()
+        .expect("git init --bare");
+    assert!(git.status.success(), "{}", String::from_utf8_lossy(&git.stderr));
+    repo.jj(
+        &repo.root,
+        &["git", "remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    // jj refuses to push a conflicted commit. Git will still transfer the
+    // object so the parent-PR ref can exist only on the remote — the shape
+    // cube sees after fetching a stacked parent it never bookmarked locally.
+    let planted = std::process::Command::new("git")
+        .args([
+            "-C",
+            repo.root.to_str().unwrap(),
+            "push",
+            origin.to_str().unwrap(),
+            &format!("{ancestor}:refs/heads/stacked-feature"),
+        ])
+        .output()
+        .expect("git push parent-PR ref");
+    assert!(
+        planted.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&planted.stdout),
+        String::from_utf8_lossy(&planted.stderr)
+    );
+    repo.jj(&repo.root, &["bookmark", "forget", "boss/exec_x"]);
+    repo.jj(&repo.root, &["git", "fetch", "--remote", "origin"]);
+
+    let collapse_ctx = ctx(&repo);
+    assert!(
+        commit_has_blocking_bookmark(&collapse_ctx, &ancestor, BookmarkPolicy::Strict).unwrap(),
+        "a fetched parent-PR branch with no local bookmark must still block rebase-time collapse"
+    );
+    assert!(
+        commit_has_blocking_bookmark(&collapse_ctx, &ancestor, BookmarkPolicy::PushBranch("boss/exec_x")).unwrap(),
+        "push-time collapse uses the same remote-inclusive listing"
+    );
+}

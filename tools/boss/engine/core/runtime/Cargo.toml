@@ -8,6 +8,7 @@ path = "../src/lib.rs"
 
 [features]
 test-support = [
+  "boss-deterministic-resolvers/test-support",
   "boss-engine-completion/test-support",
   "boss-engine-dispatch/test-support",
   "boss-engine-live-worker-state/test-support",

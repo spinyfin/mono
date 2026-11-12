@@ -25,7 +25,6 @@ mod registry;
 mod resolvers;
 
 use std::path::Path;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 pub use boss_conflict_diagnosis::ConflictedFile;
@@ -37,10 +36,13 @@ pub use resolvers::{
     is_generated_lockfile,
 };
 
-/// Host and ladder-fixture constructors that inject a
+/// Ladder-fixture constructors that inject a
 /// [`boss_command_runner::CommandRunner`]. Production code uses
 /// [`BazelModuleLockResolver::new`] / [`CargoLockResolver::new`].
+#[cfg(any(test, feature = "test-support"))]
 pub mod inject {
+    use std::sync::Arc;
+
     use super::*;
 
     pub fn bazel_module_lock(runner: Arc<dyn boss_command_runner::CommandRunner>) -> BazelModuleLockResolver {

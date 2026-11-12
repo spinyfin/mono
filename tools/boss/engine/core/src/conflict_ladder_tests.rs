@@ -847,8 +847,13 @@ async fn module_lock_absent_on_base_regenerates_and_retires_without_an_agent() {
 
 /// Seeds regeneration from a base that already has the lockfile (the
 /// production shape: `MODULE.bazel.lock` / `Cargo.lock` are checked in on
-/// main), then regenerates and retires without an agent. Covers the
-/// fall-through that "absent on base" does not represent.
+/// main), then regenerates and retires without an agent.
+///
+/// These tests prove the resolver's present-base seed path: a successful
+/// `jj file show` of the lockfile, the owner command seeing that seed, and
+/// the ladder retiring at rung 0. They use a fake `CommandRunner` and
+/// `ScriptCube`, so they do not exercise a real-jj push or the cube
+/// bookmark gate.
 #[derive(Clone, Copy)]
 struct PresentBaseLock {
     lock_path: &'static str,

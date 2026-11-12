@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use super::support::{ExpectedCommand, FakeRunner};
 
 use crate::app::errors::{CubeError, Result};
-use crate::app::workspace_ops::{RebaseOpts, rebase_workspace_branch};
+use crate::app::workspace_ops::{BOOKMARK_NAMES_TMPL, RebaseOpts, rebase_workspace_branch};
 
 const REBASE_CWD: &str = "/ws";
 const REBASE_REMOTE: &str = "github";
@@ -189,21 +189,14 @@ fn describe_cmd(revision: &str, message: &str) -> ExpectedCommand {
     ExpectedCommand::ok(rebase_cwd(), "jj", &["describe", "-r", revision, "-m", message], "")
 }
 
-/// Local bookmarks on a conflicted ancestor — bookkeeping names (`pr/<n>`,
-/// engine pointers) are ignored by the collapse guard; any other local
-/// bookmark is a stacked-PR boundary.
+/// Bare bookmark names on a conflicted ancestor — local and remote. Bookkeeping
+/// names (`pr/<n>`, engine pointers) are ignored; any other name, including a
+/// fetched parent-PR branch with no local bookmark, is a stacked-PR boundary.
 fn bookmarks_at_cmd(commit_id: &str, out: &str) -> ExpectedCommand {
     ExpectedCommand::ok(
         rebase_cwd(),
         "jj",
-        &[
-            "bookmark",
-            "list",
-            "-r",
-            commit_id,
-            "-T",
-            r#"if(!remote, name ++ "\n")"#,
-        ],
+        &["log", "-r", commit_id, "--no-graph", "-T", BOOKMARK_NAMES_TMPL],
         out,
     )
 }
@@ -840,6 +833,34 @@ fn rebase_declines_collapse_when_a_conflicted_ancestor_carries_a_bookmark() {
     let runner = FakeRunner::new(cmds);
     let result = run_rebase(&runner, &rebase_opts(Some(branch), None, false)).expect("stacked rebase");
     // No `jj op undo` in the script: assert_exhausted proves none was needed.
+    runner.assert_exhausted();
+    assert_eq!(result.payload["status"], "conflicts");
+    assert_eq!(result.payload["linearized_commits"], 0);
+    assert_eq!(result.payload["linearize_decline"], "bookmarked_ancestor");
+    assert!(result.message.starts_with("REBASED_WITH_CONFLICTS"));
+}
+
+/// A parent-PR branch that exists only as a fetched remote ref still names
+/// a stacked-PR boundary. The listing uses bare names (`boss/exec_lower`),
+/// matching a remote-only `boss/exec_lower@github` after fetch.
+#[test]
+fn rebase_declines_collapse_when_a_conflicted_ancestor_carries_only_a_remote_bookmark() {
+    let branch = "boss/exec_stacked_remote";
+    let push_range = format!("main@github..{branch}");
+    let mut cmds = vec![
+        fetch_cmd(),
+        remote_exists_cmd(branch, "sr1"),
+        positioned_cmd(branch, "sr1"),
+    ];
+    cmds.extend(set_track_rebase_check_cmds(branch, &["parentpr"]));
+    cmds.push(head_conflict_probe_cmd(branch, ""));
+    cmds.push(head_commit_id_cmd(branch, "stackhead\n"));
+    cmds.push(conflicts_in_revset_cmd(&push_range, &["parentpr"]));
+    cmds.push(bookmarks_at_cmd("parentpr", "boss/exec_lower\n"));
+    cmds.push(resolve_list_for_commit_cmd("parentpr", "src/stack.rs\n"));
+
+    let runner = FakeRunner::new(cmds);
+    let result = run_rebase(&runner, &rebase_opts(Some(branch), None, false)).expect("remote-only stacked rebase");
     runner.assert_exhausted();
     assert_eq!(result.payload["status"], "conflicts");
     assert_eq!(result.payload["linearized_commits"], 0);
