@@ -144,47 +144,42 @@ mod tests {
             lifecycle_reserve: 64 * 1024,
         }
     }
+    fn daemon_lock_held(error: &anyhow::Error) -> bool {
+        error.to_string().contains("spoke daemon lock is held")
+    }
+    /// Serializes shim `spawn` with `Journal::open`. A forked child shares
+    /// `daemon.lock` until exec, so an overlapping open sees the flock as held.
+    static SPAWN_OR_OPEN: Mutex<()> = Mutex::new(());
+    /// `Journal::open` takes an exclusive flock on `daemon.lock`. Sibling tests
+    /// in this binary spawn the `boss-event` shim through `tokio::process::Command`.
+    /// Between fork and exec the child shares that open file description
+    /// (`O_CLOEXEC` only closes it at exec), so the flock can briefly outlive
+    /// this test's drop. Retry only that lock-held error.
     fn journal(root: &Path, limits: Limits) -> SharedJournal {
         let path = root.join("state");
-        Arc::new(Mutex::new(
-            Journal::open(&path, "host", limits).unwrap_or_else(|error| panic!("open {}: {error}", path.display())),
-        ))
-    }
-    /// `Journal::open` takes an exclusive daemon lock. A spawned observer may
-    /// still hold a clone after abort until the runtime next polls it.
-    async fn reopen(root: &Path, limits: Limits, mut journal: SharedJournal) -> SharedJournal {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
-        let inner = loop {
-            match Arc::try_unwrap(journal) {
-                Ok(mutex) => break mutex.into_inner().expect("journal mutex"),
-                Err(shared) => {
-                    assert!(
-                        tokio::time::Instant::now() < deadline,
-                        "journal still shared after observer shutdown"
-                    );
-                    journal = shared;
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-            }
-        };
-        drop(inner);
-        // Sibling tests fork shim children in this process. A child forked while
-        // our lock fd was open keeps the flock's open file description alive
-        // until its exec closes it, so the lock can stay held briefly after the
-        // journal is dropped. Retry until that window closes.
-        let path = root.join("state");
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         loop {
+            let _gate = SPAWN_OR_OPEN.lock().expect("spawn/open gate");
             match Journal::open(&path, "host", limits) {
-                Ok(journal) => return Arc::new(Mutex::new(journal)),
-                Err(error)
-                    if error.to_string().contains("daemon lock is held") && tokio::time::Instant::now() < deadline =>
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                Ok(opened) => return Arc::new(Mutex::new(opened)),
+                Err(error) if daemon_lock_held(&error) => {
+                    drop(_gate);
+                    assert!(std::time::Instant::now() < deadline, "open {}: {error}", path.display());
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
-                Err(error) => panic!("reopen {}: {error}", path.display()),
+                Err(error) => panic!("open {}: {error}", path.display()),
             }
         }
+    }
+    /// An aborted observer cannot still hold a journal clone: `abort` then
+    /// `await` drops the task future, and its `Arc`, before the join resolves.
+    fn reopen(root: &Path, limits: Limits, journal: SharedJournal) -> SharedJournal {
+        let mutex = match Arc::try_unwrap(journal) {
+            Ok(mutex) => mutex,
+            Err(_) => panic!("journal still shared after observer shutdown"),
+        };
+        drop(mutex.into_inner().expect("journal mutex"));
+        self::journal(root, limits)
     }
     fn execution(root: &Path) -> ExecutionRecord {
         let pending = root.join("pending");
@@ -253,16 +248,19 @@ mod tests {
         let binary = std::env::current_dir()
             .unwrap()
             .join(std::env::var("SHIM_BIN").unwrap());
-        let mut child = tokio::process::Command::new(binary)
-            .env("BOSS_EVENTS_SOCKET", socket)
-            .env(boss_host_execution::worker::EVENT_SPOOL_ENV, root.join("pending"))
-            .env("BOSS_RUN_ID", "run")
-            .env("BOSS_EVENT_RETRY_DELAYS_MS", "0")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child = {
+            let _gate = SPAWN_OR_OPEN.lock().expect("spawn/open gate");
+            tokio::process::Command::new(binary)
+                .env("BOSS_EVENTS_SOCKET", socket)
+                .env(boss_host_execution::worker::EVENT_SPOOL_ENV, root.join("pending"))
+                .env("BOSS_RUN_ID", "run")
+                .env("BOSS_EVENT_RETRY_DELAYS_MS", "0")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
         child.stdin.take().unwrap().write_all(payload).await.unwrap();
         let result = child.wait_with_output().await.unwrap();
         assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
@@ -785,7 +783,7 @@ mod tests {
         // Simulate a crash between the durable write and final rename.
         let temporary = pending.with_extension("tmp");
         std::fs::rename(&pending, &temporary).unwrap();
-        let reopened = reopen(root.path(), limits(), original).await;
+        let reopened = reopen(root.path(), limits(), original);
         let observer = tokio::spawn(crate::observe(reopened.clone(), stamp));
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while records(&reopened).is_empty() {
@@ -870,7 +868,7 @@ mod tests {
         transcripts::poll(&original, &execution, &stamp().unwrap())
             .await
             .unwrap();
-        let reopened = reopen(root.path(), limits(), original).await;
+        let reopened = reopen(root.path(), limits(), original);
         use std::io::Write;
         std::fs::OpenOptions::new()
             .append(true)
@@ -1077,7 +1075,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let reopened = reopen(root.path(), limits(), journal).await;
+        let reopened = reopen(root.path(), limits(), journal);
         execution.phase = Phase::Terminal;
         transcripts::poll(&reopened, &execution, &stamp().unwrap())
             .await
@@ -1170,7 +1168,7 @@ mod tests {
                 .iter()
                 .any(|record| matches!(&record.body, Some(record::Body::Transcript(t)) if t.data == b"later\n"))
         );
-        let reopened = reopen(root.path(), limits(), original).await;
+        let reopened = reopen(root.path(), limits(), original);
         let observer = tokio::spawn(crate::observe(reopened.clone(), stamp));
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         observer.abort();
