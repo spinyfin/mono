@@ -1,0 +1,47 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "spoke-worker-api",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "boss_spoke_worker_api",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//tools/boss/engine/spoke:__pkg__"],
+    deps = [
+        "//tools/boss/engine/attachments",
+        "//tools/boss/engine/host-execution",
+        "//tools/boss/engine/proposal-validation",
+        "//tools/boss/engine/spoke-journal",
+        "//tools/boss/protocol",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "worker_cli_test",
+    size = "small",
+    crate = ":spoke-worker-api",
+    data = ["//tools/boss/cli:boss"],
+    edition = "2024",
+    env = {"BOSS_TEST_CLI": "$(rootpath //tools/boss/cli:boss)"},
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":spoke-worker-api",
+        "//tools/boss/engine/attachments",
+        "//tools/boss/engine/host-execution",
+        "//tools/boss/engine/proposal-validation",
+        "//tools/boss/engine/spoke-journal",
+        "//tools/boss/protocol",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

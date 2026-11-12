@@ -1507,6 +1507,14 @@ fn tag_cases() -> Vec<TagCase> {
         },
         // --- Worker proposals ---
         TagCase {
+            label: "WorkerGatewayResult",
+            event: FrontendEvent::WorkerGatewayResult {
+                status: "queued".into(),
+                value: serde_json::json!({"id": "receipt"}),
+            },
+            expected_tag: "worker_gateway_result",
+        },
+        TagCase {
             label: "ProposalSubmitted",
             event: FrontendEvent::ProposalSubmitted {
                 proposal: worker_proposal(),
@@ -2404,6 +2412,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::PlanProjectResult { .. }
         | FrontendEvent::ReleaseProjectResult { .. }
         | FrontendEvent::ProjectPostmortemResult { .. }
+        | FrontendEvent::WorkerGatewayResult { .. }
         | FrontendEvent::ProposalSubmitted { .. }
         | FrontendEvent::ProposalRejected { .. }
         | FrontendEvent::ProposalsList { .. }

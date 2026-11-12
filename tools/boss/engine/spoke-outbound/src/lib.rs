@@ -459,6 +459,9 @@ const EXECUTOR_FEATURES: &[&str] = &[
     feature::WORKER_EVENT,
     feature::TRANSCRIPT_DELTA,
     feature::PANE_CAPTURE,
+    feature::WORKER_API,
+    feature::PROPOSAL_JSON,
+    feature::ARTIFACT,
 ];
 
 /// Journal contracts plus the executor-backed workspace/execution set.
@@ -595,11 +598,14 @@ mod tests {
             features: offered.features,
             ..Default::default()
         };
-        let mut hub = Contracts::first_release();
-        assert_eq!(hub.select(&hello).unwrap_err().code(), "missing_required_feature");
-        hub.required
-            .retain(|name| ![feature::WORKER_API, feature::PROPOSAL_JSON, feature::ARTIFACT].contains(&name.as_str()));
-        assert!(hub.select(&hello).unwrap().has(feature::PANE_CAPTURE));
+        let hub = Contracts::first_release();
+        let selection = hub.select(&hello).expect(
+            "the production spoke offers worker-api, proposal-json and artifact, which first-release hubs require",
+        );
+        assert!(selection.has(feature::PANE_CAPTURE));
+        assert!(selection.has(feature::WORKER_API));
+        assert!(selection.has(feature::PROPOSAL_JSON));
+        assert!(selection.has(feature::ARTIFACT));
     }
 
     #[test]

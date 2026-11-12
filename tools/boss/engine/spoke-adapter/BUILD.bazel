@@ -27,6 +27,7 @@ rust_library(
 rust_test(
     name = "integration_test",
     size = "small",
+    timeout = "moderate",
     srcs = glob(["tests/**/*.rs"]),
     crate_root = "tests/main.rs",
     edition = "2024",

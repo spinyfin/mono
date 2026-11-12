@@ -275,6 +275,7 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::PlanProjectResult { .. }
         | FrontendEvent::ReleaseProjectResult { .. }
         | FrontendEvent::ProjectPostmortemResult { .. }
+        | FrontendEvent::WorkerGatewayResult { .. }
         | FrontendEvent::ProposalSubmitted { .. }
         | FrontendEvent::ProposalRejected { .. }
         | FrontendEvent::WorkerTierDenied { .. }

@@ -118,7 +118,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 pub use records::{Admission, StoredRecord};
-pub use sources::LATEST_HOOK_SOURCE;
+pub use sources::{LATEST_HOOK_SOURCE, Staging};
 
 /// Logical payload bounds, including retained records and command tombstones.
 /// SQLite's page ceiling separately bounds physical database growth.

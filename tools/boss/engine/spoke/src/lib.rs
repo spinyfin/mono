@@ -5,8 +5,42 @@ pub mod transcripts;
 
 use anyhow::Result;
 use boss_host_execution::worker::ExecutionRecord;
-use boss_protocol_spoke::v1::{Run, Stamp};
+use boss_protocol_spoke::v1::{Command, CommandResult, ResultCode, Run, Stamp};
 use boss_spoke_outbound::SharedJournal;
+use boss_spoke_worker_api::Gateway;
+
+fn rejected(command: &Command, reason: String) -> CommandResult {
+    CommandResult {
+        command_id: command.command_id.clone(),
+        code: ResultCode::Rejected as i32,
+        reason,
+        value: None,
+    }
+}
+
+/// Apply a hub `WorkerReply` or `ProposalDecision` to the run-scoped gateway.
+/// A reply that does not belong to the run, or does not match its request, is
+/// refused with the reason rather than failing the daemon.
+pub fn apply_gateway_command(gateway: &Gateway, command: &Command) -> CommandResult {
+    match gateway.apply(command) {
+        Ok(()) => CommandResult {
+            command_id: command.command_id.clone(),
+            code: ResultCode::Ok as i32,
+            reason: String::new(),
+            value: None,
+        },
+        Err(error) => rejected(command, error.to_string()),
+    }
+}
+
+/// Commit the assigned context snapshot before a Spawn runs. `Some` carries the
+/// rejection to report; the worker is not started.
+pub fn provision_rejection(gateway: &Gateway, command: &Command, stamp: &Stamp) -> Option<CommandResult> {
+    gateway
+        .provision(command, stamp)
+        .err()
+        .map(|error| rejected(command, error.to_string()))
+}
 
 pub fn run_identity(record: &ExecutionRecord) -> Run {
     Run {
@@ -1307,5 +1341,246 @@ mod tests {
                 + 64 * 1024
                 >= std::fs::metadata(&path).unwrap().len()
         );
+    }
+
+    fn gateway(journal: &SharedJournal) -> boss_spoke_worker_api::Gateway {
+        boss_spoke_worker_api::Gateway {
+            journal: journal.clone(),
+            state_dir: std::env::temp_dir(),
+            probe: Arc::new(|_| Box::pin(async { Err(anyhow::anyhow!("no transcript")) })),
+        }
+    }
+
+    fn save(journal: &SharedJournal, execution: &ExecutionRecord) {
+        journal
+            .lock()
+            .unwrap()
+            .save_execution(
+                &execution.run_id,
+                &execution.spawn_token,
+                &serde_json::to_vec(execution).unwrap(),
+            )
+            .unwrap();
+    }
+
+    fn reply(execution: &ExecutionRecord, event: &boss_protocol::FrontendEvent) -> boss_protocol_spoke::v1::Command {
+        boss_protocol_spoke::v1::Command {
+            sequence: 1,
+            command_id: "reply".into(),
+            run: Some(run_identity(execution)),
+            not_after_unix_ms: 99999,
+            body: Some(boss_protocol_spoke::v1::command::Body::WorkerReply(
+                boss_protocol_spoke::v1::WorkerReply {
+                    request_id: "r1".into(),
+                    code: boss_protocol_spoke::v1::ResultCode::Ok as i32,
+                    result_json: serde_json::to_vec(event).unwrap(),
+                    revision: "hub-1".into(),
+                    observed_unix_ms: 4567,
+                    reason: String::new(),
+                },
+            )),
+        }
+    }
+
+    #[test]
+    fn command_loop_routes_worker_replies_to_the_gateway_and_rejects_mismatches() {
+        use boss_protocol::{FrontendEvent, PrBodyView};
+        use boss_protocol_spoke::v1::{ResultCode, WorkerMethod};
+        let root = tempfile::tempdir().unwrap();
+        let execution = execution(root.path());
+        let journal = journal(root.path(), limits());
+        save(&journal, &execution);
+        let gateway = gateway(&journal);
+        let run = run_identity(&execution);
+        journal
+            .lock()
+            .unwrap()
+            .commit_source(
+                &run,
+                "worker-request:r1",
+                None,
+                &serde_json::to_vec(&(WorkerMethod::PrBody as i32)).unwrap(),
+                vec![],
+            )
+            .unwrap();
+        let body = FrontendEvent::PrBodyResult {
+            body: PrBodyView {
+                pr_url: None,
+                title: Some("Gateway".into()),
+                body: Some("Evidence".into()),
+            },
+        };
+        // A reply of the wrong shape for its request never reaches the cache.
+        let wrong = FrontendEvent::PrStatusResult {
+            status: boss_protocol::PrStatusView::builder().refreshed(false).build(),
+        };
+        let result = crate::apply_gateway_command(&gateway, &reply(&execution, &wrong));
+        assert_eq!(result.code, ResultCode::Rejected as i32, "{}", result.reason);
+        // A reply addressed to another assignment is refused.
+        let mut foreign = reply(&execution, &body);
+        foreign.run.as_mut().unwrap().spawn_token = "foreign".into();
+        let result = crate::apply_gateway_command(&gateway, &foreign);
+        assert_eq!(result.code, ResultCode::Rejected as i32);
+        assert!(
+            journal
+                .lock()
+                .unwrap()
+                .source(&run, &format!("worker-cache:{}", WorkerMethod::PrBody as i32))
+                .unwrap()
+                .is_none()
+        );
+        let result = crate::apply_gateway_command(&gateway, &reply(&execution, &body));
+        assert_eq!(result.code, ResultCode::Ok as i32, "{}", result.reason);
+        assert_eq!(result.command_id, "reply");
+        assert!(
+            journal
+                .lock()
+                .unwrap()
+                .source(&run, &format!("worker-cache:{}", WorkerMethod::PrBody as i32))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn spawn_is_rejected_when_the_context_snapshot_cannot_be_provisioned() {
+        use boss_protocol_spoke::v1::{ResultCode, Spawn, command};
+        let root = tempfile::tempdir().unwrap();
+        let execution = execution(root.path());
+        let journal = journal(root.path(), limits());
+        save(&journal, &execution);
+        let gateway = gateway(&journal);
+        let spawn = |revision: &str| boss_protocol_spoke::v1::Command {
+            sequence: 1,
+            command_id: "spawn".into(),
+            run: Some(run_identity(&execution)),
+            not_after_unix_ms: 99999,
+            body: Some(command::Body::Spawn(Spawn {
+                run_context_json: b"{\"not\":\"a bundle\"}".to_vec(),
+                context_revision: revision.into(),
+                ..Default::default()
+            })),
+        };
+        let rejection = crate::provision_rejection(&gateway, &spawn(""), &stamp().unwrap()).unwrap();
+        assert_eq!(rejection.code, ResultCode::Rejected as i32);
+        assert_eq!(rejection.command_id, "spawn");
+        let rejection = crate::provision_rejection(&gateway, &spawn("rev-1"), &stamp().unwrap()).unwrap();
+        assert_eq!(rejection.code, ResultCode::Rejected as i32);
+    }
+
+    #[tokio::test]
+    async fn completion_watermark_follows_the_source_not_the_ingestion_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        let execution = execution(root.path());
+        let path = root.path().join("transcript.jsonl");
+        std::fs::write(&path, vec![b'x'; 64 * 1024]).unwrap();
+        let journal = journal(root.path(), limits());
+        assert!(
+            transcripts::current_watermark(&journal, &execution).await.is_err(),
+            "no resolved source is unavailable evidence, not offset zero"
+        );
+        hooks::ingest(&journal, &execution, &hook(Some(&path)), &stamp().unwrap())
+            .await
+            .unwrap();
+        // Nothing has been ingested yet: the cursor lags the file entirely.
+        assert!(
+            journal
+                .lock()
+                .unwrap()
+                .source(&run_identity(&execution), "transcript")
+                .unwrap()
+                .is_none()
+        );
+        let (generation, through) = transcripts::current_watermark(&journal, &execution).await.unwrap();
+        assert_eq!(through, 64 * 1024);
+        assert!(!generation.is_empty());
+        std::fs::write(&path, vec![b'x'; 96 * 1024]).unwrap();
+        assert_eq!(
+            transcripts::current_watermark(&journal, &execution).await.unwrap().1,
+            96 * 1024
+        );
+    }
+    #[tokio::test]
+    async fn stop_capture_marker_survives_ingestion_capacity_faults() {
+        // Sweep admission boundaries to inject failures before and after each
+        // source commit, then retry the actual ingestion after freeing space.
+        for file_ingress in [false, true] {
+            let mut failures = 0;
+            for available in (100..2500).step_by(100) {
+                let root = tempfile::tempdir().unwrap();
+                let mut execution = execution(root.path());
+                if file_ingress {
+                    execution.driver_id = "codex".into();
+                    let directory = root.path().join("sessions");
+                    std::fs::create_dir(&directory).unwrap();
+                    execution.observation.as_mut().unwrap().file = Some((
+                        boss_engine_driver::AgentJsonlFileIngress {
+                            directory: directory.clone(),
+                            filename_prefix: "rollout-".into(),
+                            filename_suffix: ".jsonl".into(),
+                            workspace_path: root.path().into(),
+                        },
+                        Vec::new(),
+                    ));
+                    let meta = serde_json::json!({"type":"session_meta","payload":{"id":"session","cwd":root.path()}});
+                    let stop = serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"done"}});
+                    std::fs::write(
+                        directory.join("rollout-example-session.jsonl"),
+                        format!("{meta}\n{stop}\n"),
+                    )
+                    .unwrap();
+                }
+                let test_limits = Limits {
+                    spool_bytes: 12_000,
+                    lifecycle_reserve: 3_000,
+                };
+                let journal = journal(root.path(), test_limits);
+                let run = run_identity(&execution);
+                let filler = vec![0; 4_000];
+                {
+                    let mut journal = journal.lock().unwrap();
+                    journal.commit_source(&run, "filler-a", None, &filler, vec![]).unwrap();
+                    let used = journal.bytes().unwrap() as usize;
+                    let tail = vec![0; test_limits.spool_bytes as usize - used - available - "filler-b".len() - 128];
+                    journal.commit_source(&run, "filler-b", None, &tail, vec![]).unwrap();
+                }
+                let result = if file_ingress {
+                    transcripts::poll(&journal, &execution, &stamp().unwrap()).await
+                } else {
+                    hooks::ingest(&journal, &execution, &hook(None), &stamp().unwrap()).await
+                };
+                if let Err(error) = result {
+                    assert!(Fault::is_full(&error), "{error:#}");
+                    failures += 1;
+                }
+                let has_stop = records(&journal).iter().any(|record| {
+                    matches!(&record.body,
+                    Some(record::Body::Event(event)) if matches!(event.event,
+                        Some(boss_protocol_spoke::v1::worker_event::Event::Stop(_))))
+                });
+                if has_stop {
+                    assert!(
+                        !boss_spoke_worker_api::captures_concluded(&journal, &execution).unwrap(),
+                        "accepted Stop must already have a durable capture marker"
+                    );
+                }
+                journal
+                    .lock()
+                    .unwrap()
+                    .delete_sources(&run, &["filler-a".into(), "filler-b".into()])
+                    .unwrap();
+                if file_ingress {
+                    transcripts::poll(&journal, &execution, &stamp().unwrap())
+                        .await
+                        .unwrap();
+                } else {
+                    hooks::ingest(&journal, &execution, &hook(None), &stamp().unwrap())
+                        .await
+                        .unwrap();
+                }
+                assert!(!boss_spoke_worker_api::captures_concluded(&journal, &execution).unwrap());
+            }
+            assert!(failures > 0);
+        }
     }
 }

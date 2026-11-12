@@ -9,9 +9,43 @@ use boss_protocol::{WorkRun, WorkerTierDenial};
 // `items_after_test_module`).
 pub(crate) use boss_protocol::{WorkItemSelector, is_typed_work_item_id, parse_work_item_selector};
 
-pub(crate) async fn connect_for_work(ctx: &RunContext) -> Result<BossClient, CliError> {
+/// Preserve ordinary CLI payloads while making spoke cache freshness visible.
+pub(crate) struct WorkerClient(BossClient);
+
+impl std::ops::Deref for WorkerClient {
+    type Target = BossClient;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for WorkerClient {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl WorkerClient {
+    pub(crate) async fn send_request(&mut self, request: &FrontendRequest) -> anyhow::Result<FrontendEvent> {
+        match self.0.send_request(request).await? {
+            FrontendEvent::WorkerGatewayResult { status, value } if matches!(status.as_str(), "cached" | "hub") => {
+                eprintln!(
+                    "Spoke {status}: revision {}, observed at {} unix milliseconds.",
+                    value["revision"], value["observed_unix_ms"]
+                );
+                Ok(serde_json::from_value(
+                    value[if status == "cached" { "event" } else { "result" }].clone(),
+                )?)
+            }
+            event => Ok(event),
+        }
+    }
+}
+
+pub(crate) async fn connect_for_work(ctx: &RunContext) -> Result<WorkerClient, CliError> {
     BossClient::connect(&ctx.discovery)
         .await
+        .map(WorkerClient)
         .map_err(|err| CliError::engine_unavailable(err.to_string()))
 }
 

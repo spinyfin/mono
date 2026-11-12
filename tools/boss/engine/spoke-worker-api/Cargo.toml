@@ -1,0 +1,25 @@
+[package]
+name = "boss-spoke-worker-api"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+anyhow.workspace = true
+boss-engine-attachments = { path = "../attachments" }
+boss-engine-proposal-validation = { path = "../proposal-validation" }
+boss-host-execution = { path = "../host-execution" }
+boss-protocol = { path = "../../protocol" }
+boss-protocol-spoke = { path = "../../protocol-spoke" }
+boss-spoke-journal = { path = "../spoke-journal" }
+libc.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "time", "rt", "macros", "sync"] }
+tracing.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+prost.workspace = true
+tempfile.workspace = true

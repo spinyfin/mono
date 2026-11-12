@@ -1,3 +1,4 @@
+use super::worker_paths::outputs_root;
 use super::*;
 use crate::cube::CubeJsonTransport;
 use async_trait::async_trait;
@@ -14,6 +15,9 @@ type StoredExecutions = HashMap<(String, String), Vec<u8>>;
 struct MemoryStore(Arc<Mutex<StoredExecutions>>, Arc<std::sync::atomic::AtomicBool>);
 
 impl ExecutionStore for MemoryStore {
+    fn worker_api_paths(&self) -> Option<(PathBuf, PathBuf)> {
+        Some(("/host/worker.sock".into(), "/host/bin/boss".into()))
+    }
     fn observations_drained(&self, _record: &ExecutionRecord) -> Result<bool> {
         Ok(self.1.load(std::sync::atomic::Ordering::SeqCst))
     }
@@ -302,21 +306,24 @@ fn spawn_command() -> Command {
 /// A private-home root under the driver's default homes root, so reclaim's
 /// containment check accepts its children without touching the process
 /// environment (which other tests in this binary share).
+fn tighten_owner_only(root: &Path) {
+    // `pin` creates a 0700 leaf only when the path is missing. The
+    // hermetic wrapper's TMPDIR is 0755, and a sibling `create_dir_all`
+    // or leftover temp-backed root can leave `process_root()` already
+    // present and too open — Linux CI then panics in `pin`.
+    if let Ok(meta) = std::fs::symlink_metadata(root)
+        && meta.is_dir()
+        && !meta.file_type().is_symlink()
+    {
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
 fn shared_homes() -> &'static Path {
     static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| {
         let root = homes::process_root();
-        // `pin` creates a 0700 leaf only when the path is missing. The
-        // hermetic wrapper's TMPDIR is 0755, and a sibling `create_dir_all`
-        // or leftover temp-backed root can leave `process_root()` already
-        // present and too open — Linux CI then panics here.
-        if let Ok(meta) = std::fs::symlink_metadata(&root)
-            && meta.is_dir()
-        {
-            let mut perms = meta.permissions();
-            perms.set_mode(0o700);
-            std::fs::set_permissions(&root, perms).unwrap();
-        }
+        tighten_owner_only(&root);
         homes::pin(&root).unwrap()
     })
 }
@@ -332,7 +339,9 @@ async fn supervisor(root: &Path, fake: Arc<FakeTmux>) -> Supervisor<ListingCube,
 }
 
 async fn supervisor_with<S: ExecutionStore>(root: &Path, fake: Arc<FakeTmux>, store: S) -> Supervisor<ListingCube, S> {
-    let homes = homes::pin(shared_homes()).unwrap();
+    let homes_root = shared_homes();
+    tighten_owner_only(homes_root);
+    let homes = homes::pin(homes_root).unwrap();
     let workspace = root.join("worker");
     std::fs::create_dir_all(&workspace).unwrap();
     Supervisor {
@@ -372,6 +381,7 @@ fn seed(store: &MemoryStore, phase: Phase) {
         reclaimed: false,
         reclaim_error: None,
         observation: None,
+        worker_outputs: BTreeMap::new(),
     };
     store
         .save(
@@ -1701,6 +1711,8 @@ async fn spawn_stamps_identity_last_and_keeps_settings_out_of_the_workspace() {
             ("BOSS_SPAWN_TOKEN", "forged"),
             ("BOSS_RUN_ID", "forged"),
             ("BOSS_SESSION_SCHEMA", "forged"),
+            ("BOSS_SOCKET_PATH", "/tmp/forged.sock"),
+            ("BOSS_BIN", "/tmp/forged-boss"),
             ("KEEP_ME", "yes"),
         ] {
             spawn.env.push(boss_protocol_spoke::v1::Env {
@@ -1719,6 +1731,9 @@ async fn spawn_stamps_identity_last_and_keeps_settings_out_of_the_workspace() {
         envs.contains(&format!("BOSS_SESSION_SCHEMA={SESSION_SCHEMA}")),
         "{envs:?}"
     );
+    for gateway in ["BOSS_SOCKET_PATH=/host/worker.sock", "BOSS_BIN=/host/bin/boss"] {
+        assert!(envs.contains(&gateway.to_owned()), "{envs:?}");
+    }
     assert!(fake.launches.lock().unwrap()[0].contains("--effort medium"));
     let output = envs
         .iter()

@@ -10,6 +10,7 @@ path = "src/lib.rs"
 
 [dependencies]
 boss-engine-stdout-progress = { path = "../stdout-progress" }
+boss-spoke-worker-api = { path = "../spoke-worker-api" }
 base64 = { workspace = true }
 boss-engine-driver = { path = "../driver" }
 boss-transcript-tail = { path = "../transcript-tail" }
@@ -34,6 +35,7 @@ tracing-subscriber = { workspace = true }
 async-trait = { workspace = true }
 boss-host-enrollment = { path = "../host-enrollment" }
 boss-host-execution = { path = "../host-execution" }
+boss-protocol = { path = "../../protocol" }
 boss-tmux = { path = "../../tmux" }
 prost = { workspace = true }
 rcgen = { workspace = true }

@@ -10,19 +10,31 @@ mod commands {
     use boss_spoke_journal::Fault;
     use boss_spoke_outbound::SharedJournal;
 
-    pub struct JournalExecutions(pub SharedJournal, pub std::path::PathBuf, pub std::path::PathBuf);
+    pub struct JournalExecutions(
+        pub SharedJournal,
+        pub std::path::PathBuf,
+        pub std::path::PathBuf,
+        pub std::path::PathBuf,
+        pub std::path::PathBuf,
+    );
     impl ExecutionStore for JournalExecutions {
+        fn worker_api_paths(&self) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+            Some((self.3.clone(), self.4.clone()))
+        }
         fn observation_paths(&self) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
             Some((self.1.clone(), self.2.clone()))
         }
         fn observations_drained(&self, record: &worker::ExecutionRecord) -> Result<bool> {
             let run = boss_spoke_ingress::run_identity(record);
-            Ok(self
+            let drained = self
                 .0
                 .lock()
                 .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
                 .source(&run, "drained")?
-                .is_some())
+                .is_some();
+            // Output files are read by the gateway, which may not have ticked
+            // since the worker exited. Reclaiming first would lose them.
+            Ok(drained && boss_spoke_worker_api::captures_concluded(&self.0, record)?)
         }
         fn prune_observation_sources(&self, record: &worker::ExecutionRecord) -> Result<()> {
             self.0
@@ -59,6 +71,7 @@ mod commands {
         supervisor: Option<Supervisor<LocalCube, JournalExecutions>>,
         captures: std::sync::Arc<boss_spoke_ingress::capture::Captures>,
         stamp: impl Fn() -> Result<Stamp>,
+        gateway: &boss_spoke_worker_api::Gateway,
     ) -> Result<()> {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -86,6 +99,9 @@ mod commands {
             };
             let observed = stamp()?;
             let result = match &command.body {
+                Some(command::Body::WorkerReply(_) | command::Body::ProposalDecision(_)) => {
+                    boss_spoke_ingress::apply_gateway_command(gateway, &command)
+                }
                 Some(command::Body::Workspace(_)) => {
                     executor.execute(&command, interrupted, observed.wall_unix_ms).await
                 }
@@ -95,7 +111,10 @@ mod commands {
                     | command::Body::Deliver(_)
                     | command::Body::Stop(_),
                 ) => match &supervisor {
-                    Some(supervisor) => supervisor.execute(&command, interrupted, observed.wall_unix_ms).await,
+                    Some(supervisor) => match boss_spoke_ingress::provision_rejection(gateway, &command, &observed) {
+                        None => supervisor.execute(&command, interrupted, observed.wall_unix_ms).await,
+                        Some(rejection) => rejection,
+                    },
                     None => CommandResult {
                         command_id: command.command_id.clone(),
                         code: ResultCode::Rejected.into(),
@@ -258,6 +277,9 @@ struct Args {
     /// Host-installed hook shim, regenerated into driver wiring.
     #[arg(long, default_value = "boss-event")]
     event_bin: PathBuf,
+    /// Host-installed worker CLI; workers never choose their gateway endpoint.
+    #[arg(long, default_value = "boss")]
+    worker_bin: PathBuf,
 }
 
 fn main() -> Result<()> {
@@ -311,7 +333,26 @@ async fn serve(args: Args, homes_root: PathBuf) -> Result<()> {
     };
     let hook_path = args.state_dir.join("events.sock");
     let hooks = boss_spoke_ingress::hooks::bind(&hook_path)?;
-    let executions = commands::JournalExecutions(Arc::clone(&journal), hook_path.clone(), args.event_bin.clone());
+    let worker_path = args.state_dir.join("worker.sock");
+    let workers = boss_spoke_ingress::hooks::bind(&worker_path)?;
+    let gateway = boss_spoke_worker_api::Gateway {
+        journal: Arc::clone(&journal),
+        state_dir: args.state_dir.clone(),
+        probe: {
+            let journal = Arc::clone(&journal);
+            Arc::new(move |execution| {
+                let journal = Arc::clone(&journal);
+                Box::pin(async move { boss_spoke_ingress::transcripts::current_watermark(&journal, &execution).await })
+            })
+        },
+    };
+    let executions = commands::JournalExecutions(
+        Arc::clone(&journal),
+        hook_path.clone(),
+        args.event_bin.clone(),
+        worker_path.clone(),
+        args.worker_bin.clone(),
+    );
     let tmux = match boss_host_execution::worker::open_tmux(args.tmux_bin.as_deref(), args.state_dir.join("tmux.sock"))
     {
         Ok(tmux) => Some(tmux),
@@ -336,7 +377,13 @@ async fn serve(args: Args, homes_root: PathBuf) -> Result<()> {
     let supervisor = tmux.map(|tmux| boss_host_execution::worker::Supervisor {
         cube: cube.clone(),
         tmux,
-        store: commands::JournalExecutions(Arc::clone(&journal), hook_path, args.event_bin),
+        store: commands::JournalExecutions(
+            Arc::clone(&journal),
+            hook_path,
+            args.event_bin,
+            worker_path,
+            args.worker_bin,
+        ),
         host_id: args.host_id.clone(),
         homes_root,
         boot_id: boot.clone(),
@@ -344,13 +391,15 @@ async fn serve(args: Args, homes_root: PathBuf) -> Result<()> {
     });
     tokio::select! {
         result = boss_spoke_outbound::run_with_observer(Arc::clone(&journal), endpoint, stamp, true, captures.as_ref()) => result,
-        result = commands::run(Arc::clone(&journal), executor, supervisor, Arc::clone(&captures), stamp) => result,
+        result = commands::run(Arc::clone(&journal), executor, supervisor, Arc::clone(&captures), stamp, &gateway) => result,
         result = capture_loop(Arc::clone(&journal), Arc::clone(&captures), panes, stamp) => result,
         result = produce(&journal, &args.state_dir, &boot, tmux_ready, preflights, first_report) => result,
         result = preflight_loop(readiness, failures, first_report_sent) => result,
         result = commands::heartbeat(cube, executions) => result,
         result = boss_spoke_ingress::hooks::serve(hooks, Arc::clone(&journal), stamp) => result,
         result = boss_spoke_ingress::observe(Arc::clone(&journal), stamp) => result,
+        result = gateway.serve(workers, stamp) => result,
+        result = gateway.observe(stamp) => result,
         result = tokio::signal::ctrl_c() => { result?; Ok(()) }
     }
 }

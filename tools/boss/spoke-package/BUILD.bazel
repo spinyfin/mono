@@ -52,9 +52,14 @@ rust_test(
 )
 
 # The installer against a staging root, with the real installed binaries.
+# size = "small" / timeout = "moderate" (300 s): each case unpacks a
+# package and execs the real installer as a subprocess. Merge-queue
+# hosts running the rest of //... in parallel miss the 60 s small
+# default; isolated runs finish in a few seconds.
 rust_test(
     name = "install_test",
     size = "small",
+    timeout = "moderate",
     srcs = ["tests/install.rs"],
     data = [
         ":boss-spoke-package",

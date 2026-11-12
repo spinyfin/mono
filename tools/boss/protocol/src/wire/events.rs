@@ -1080,6 +1080,11 @@ pub enum FrontendEvent {
         run_id: String,
         released: usize,
     },
+    /// Spoke-local receipt or revisioned cached read. Never implies hub acceptance.
+    WorkerGatewayResult {
+        status: String,
+        value: serde_json::Value,
+    },
     /// Success reply to [`FrontendRequest::SubmitProposal`]: the row is
     /// durable. `proposal` is the persisted `worker_proposals` row —
     /// engine-assigned `id` (`prp_…`), the canonicalised `payload_json`, and

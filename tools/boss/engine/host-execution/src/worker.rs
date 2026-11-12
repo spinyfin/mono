@@ -1,5 +1,9 @@
 //! Token-identified tmux worker sessions: Spawn, Adopt, Deliver, Stop.
 
+#[path = "worker_paths.rs"]
+mod worker_paths;
+use worker_paths::{OUTPUT_ENV_NAMES, hex_token, insert_output_environment};
+
 use crate::{
     cube::{self, CubeJsonTransport},
     homes, input,
@@ -43,6 +47,8 @@ pub const HOST_ENV_DENY: &[&str] = &[
     "TMUX",
     "TMUX_TMPDIR",
     "BOSS_CONTROL_SOCKET",
+    "BOSS_SOCKET_PATH",
+    "BOSS_BIN",
     "BOSS_EVENTS_SOCKET",
     EVENT_SPOOL_ENV,
 ];
@@ -115,6 +121,9 @@ pub struct ExecutionRecord {
     pub reclaim_error: Option<String>,
     #[serde(default)]
     pub observation: Option<ObservationConfig>,
+    #[serde(default)]
+    #[builder(default)]
+    pub worker_outputs: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +139,9 @@ pub trait ExecutionStore: Send + Sync {
     fn save(&self, run_id: &str, spawn_token: &str, bytes: &[u8]) -> Result<()>;
     fn assigned(&self) -> Result<Vec<Vec<u8>>>;
     fn observation_paths(&self) -> Option<(PathBuf, PathBuf)> {
+        None
+    }
+    fn worker_api_paths(&self) -> Option<(PathBuf, PathBuf)> {
         None
     }
     fn observations_drained(&self, _record: &ExecutionRecord) -> Result<bool> {
@@ -274,6 +286,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             reclaimed: false,
             reclaim_error: None,
             observation: None,
+            worker_outputs: output_environment.clone(),
         };
         self.persist(&record)?;
         if interrupted {
@@ -492,6 +505,10 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             environment.remove(*name);
         }
         environment.extend(output_environment);
+        if let Some((socket, binary)) = self.store.worker_api_paths() {
+            environment.insert("BOSS_SOCKET_PATH".into(), socket.display().to_string());
+            environment.insert("BOSS_BIN".into(), binary.display().to_string());
+        }
         insert_color_environment(&mut environment);
         environment.insert(TMUX_SPAWN_TOKEN_ENV.to_owned(), record.spawn_token.clone());
         environment.insert(SESSION_SCHEMA_ENV.to_owned(), SESSION_SCHEMA.to_owned());
@@ -1184,12 +1201,6 @@ pub async fn heartbeat_leases<T: CubeJsonTransport>(cube: &T, store: &impl Execu
     failures
 }
 
-const OUTPUT_ENV_NAMES: &[&str] = &[
-    "BOSS_STRUCTURED_OUTPUT",
-    "BOSS_STRUCTURED_OUTPUT_KIND",
-    "BOSS_PR_URL_OUTPUT",
-];
-
 /// Minimum directory age for pruning outputs of reclaimed, unassigned runs.
 const OUTPUT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
@@ -1222,61 +1233,6 @@ fn prune_stale_outputs(homes_root: &Path, retention: Duration, records: &[Execut
     }
 }
 
-fn outputs_root(homes_root: &Path, spawn_token: &str) -> PathBuf {
-    homes_root.join(format!("outputs-{}", hex_token(spawn_token)))
-}
-
-/// Output locations are allocated on the execution host beside its private homes.
-fn insert_output_environment(
-    environment: &mut BTreeMap<String, String>,
-    spawn: &Spawn,
-    homes_root: &Path,
-    spawn_token: &str,
-) -> Result<()> {
-    let root = outputs_root(homes_root, spawn_token);
-    // The supervisor alone decides the output contract; caller values for these
-    // names must never reach the worker.
-    for name in OUTPUT_ENV_NAMES {
-        environment.remove(*name);
-    }
-    if spawn.structured_output_kind.is_some() || spawn.pr_url_output {
-        std::fs::create_dir_all(&root)?;
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
-    }
-    use boss_engine_driver::{StructuredOutputRequest, default_structured_output_wiring};
-    use boss_engine_structured_output::{StructuredOutputKind, prepare};
-    let designated = spawn
-        .structured_output_kind
-        .as_deref()
-        .map(|slug| {
-            StructuredOutputKind::all()
-                .find(|kind| kind.slug() == slug && *kind != StructuredOutputKind::PrUrl)
-                .with_context(|| format!("unknown structured output kind: {slug}"))
-        })
-        .transpose()?;
-    for kind in designated
-        .into_iter()
-        .chain(spawn.pr_url_output.then_some(StructuredOutputKind::PrUrl))
-    {
-        // The identifier is the hex token, never the raw token: the raw
-        // value can hold `/` or `..` and would escape the private directory.
-        let path = prepare(&root, &hex_token(spawn_token), kind)?;
-        environment.extend(
-            default_structured_output_wiring(&StructuredOutputRequest {
-                kind,
-                result_path: &path,
-                schema: None,
-            })
-            .env,
-        );
-    }
-    if let Some(kind) = designated {
-        environment.insert("BOSS_STRUCTURED_OUTPUT_KIND".into(), kind.slug().into());
-    }
-    Ok(())
-}
-
 fn pane_command(plan: &SpawnPlan) -> String {
     let env_prefix: String = plan.env.iter().map(render_env_directive).collect();
     format!(
@@ -1287,14 +1243,6 @@ fn pane_command(plan: &SpawnPlan) -> String {
 
 fn pane_life(pane: &PaneState) -> PaneLife {
     PaneLife::try_from(pane.life).unwrap_or_default()
-}
-
-fn hex_token(spawn_token: &str) -> String {
-    spawn_token
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 fn outcome(command: &Command, code: ResultCode, reason: impl Into<String>, pane: Option<PaneState>) -> CommandResult {

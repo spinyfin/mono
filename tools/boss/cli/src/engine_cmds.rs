@@ -240,6 +240,11 @@ pub(crate) async fn run_engine_ci_command(command: EngineCiCommand, ctx: &RunCon
                 FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
                     Err(CliError::application(message))
                 }
+                // A spoke-hosted worker's outcome is queued for the hub, not applied yet.
+                FrontendEvent::WorkerGatewayResult { status, value } => {
+                    crate::propose::print_gateway_result(ctx, &status, &value)
+                }
+                FrontendEvent::ProposalRejected { error } => Err(CliError::application(error.message)),
                 other => Err(unexpected_event("ci mark-failed", &other)),
             }
         }
@@ -762,6 +767,10 @@ pub(crate) async fn run_engine_conflicts_command(
                 FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
                     Err(CliError::application(message))
                 }
+                FrontendEvent::WorkerGatewayResult { status, value } => {
+                    crate::propose::print_gateway_result(ctx, &status, &value)
+                }
+                FrontendEvent::ProposalRejected { error } => Err(CliError::application(error.message)),
                 other => Err(unexpected_event("conflicts mark-failed", &other)),
             }
         }
@@ -792,6 +801,10 @@ pub(crate) async fn run_engine_conflicts_command(
                 FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
                     Err(CliError::application(message))
                 }
+                FrontendEvent::WorkerGatewayResult { status, value } => {
+                    crate::propose::print_gateway_result(ctx, &status, &value)
+                }
+                FrontendEvent::ProposalRejected { error } => Err(CliError::application(error.message)),
                 other => Err(unexpected_event("conflicts record-producer", &other)),
             }
         }

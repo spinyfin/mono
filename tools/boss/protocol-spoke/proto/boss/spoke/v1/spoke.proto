@@ -486,6 +486,8 @@ message WorkerRequest {
   string request_id = 1;
   WorkerMethod method = 2;
   string proposal_id = 3;
+  // Optional bounded live PR refresh; absence keeps stored-state semantics.
+  bool refresh = 4;
 }
 message WorkerReply {
   string request_id = 1;
@@ -517,6 +519,8 @@ message ArtifactChunk {
   bytes sha256 = 5;
   bool eof = 6;
   uint64 total_bytes = 7;
+  // Optional worker-api/1 registration metadata (caption, media/output kind).
+  bytes metadata_json = 8;
 }
 message Gap {
   string resource = 1;

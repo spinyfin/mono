@@ -1157,6 +1157,34 @@ fn parse_wait_duration_secs(raw: &str) -> Result<u64, String> {
     Ok(secs)
 }
 
+pub(crate) fn print_gateway_result(ctx: &RunContext, status: &str, value: &serde_json::Value) -> Result<(), CliError> {
+    if status == "hub_decision" && value["receipt"]["decision"]["code"].as_i64() != Some(1) {
+        return Err(CliError::application(format!(
+            "Hub rejected proposal: {}",
+            value["receipt"]["decision"]["reason"]
+        )));
+    }
+    print_entity(ctx, &serde_json::json!({"status": status, "value": value}), || {
+        println!("Spoke worker API: {status}");
+        if status == "queued" {
+            // Only a proposal receipt lets the worker park. An attachment or a
+            // guide outcome is queued evidence for the hub, not a finish line.
+            if value.get("artifact").is_some() {
+                println!("Registered for streaming to the hub; keep working.");
+            } else if value["receipt"]["kind"] == "guide_outcome" {
+                println!("Guide outcome durably queued for the hub; keep working.");
+            } else if !matches!(value["receipt"]["kind"].as_str(), Some("run_done" | "wait")) {
+                println!("Durably queued for hub validation; keep working.");
+            } else {
+                println!(
+                    "Durably queued for hub validation. You may finish this turn and park; the run and workspace remain assigned."
+                );
+            }
+        }
+        println!("{}", serde_json::to_string_pretty(value).unwrap_or_default());
+    })
+}
+
 async fn run_propose_submit(ctx: &RunContext, command: ProposeCommand) -> Result<(), CliError> {
     let run_id = require_run_id()?;
     let (kind, payload, idempotency_key) = payload_for(command)?;
@@ -1175,6 +1203,9 @@ async fn run_propose_submit(ctx: &RunContext, command: ProposeCommand) -> Result
         })?;
 
     match response {
+        FrontendEvent::WorkerGatewayResult { status, value } => {
+            crate::propose::print_gateway_result(ctx, &status, &value)
+        }
         FrontendEvent::ProposalSubmitted { proposal, .. }
             if matches!(kind, ProposalKind::ReviewGuide | ProposalKind::RunDone)
                 && proposal.state == ProposalState::Rejected =>
@@ -1227,6 +1258,9 @@ async fn run_propose_list(
         })?;
 
     match response {
+        FrontendEvent::WorkerGatewayResult { status, value } => {
+            crate::propose::print_gateway_result(ctx, &status, &value)
+        }
         FrontendEvent::ProposalsList {
             work_item_id,
             proposals,
