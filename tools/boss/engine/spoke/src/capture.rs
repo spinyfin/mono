@@ -2,10 +2,11 @@
 //! (design §2.8). The spoke holds only what a viewer is looking at right now:
 //!
 //! * A `Capture` command opens or renews a subscription, named by its
-//!   `subscription_id`. It lives `ttl_seconds` past the last renewal (default
-//!   30, at most 120) and is cancelled at once by a TTL of one second or less.
-//!   The hub renews while a viewer is visible and stops renewing when it
-//!   leaves. Disconnect clears all subscriptions immediately.
+//!   `subscription_id` on this host. Reusing the same id for another run
+//!   replaces the existing subscription. It lives `ttl_seconds` past the last
+//!   renewal (default 30, at most 120) and is cancelled at once by a TTL of
+//!   one second or less. The hub renews while a viewer is visible and stops
+//!   renewing when it leaves. Disconnect clears all subscriptions immediately.
 //! * Each due subscription appends a `PaneCapture` record carrying a bounded
 //!   text snapshot (at most the requested bytes, never more than 64 KiB, the
 //!   newest lines first). Unchanged text is not appended again until a
@@ -111,16 +112,12 @@ impl Captures {
         self.table().is_empty()
     }
 
-    /// Open, renew or cancel `capture.subscription_id` for `run`. A new
-    /// subscription is due immediately so a viewer's first look is not a full
-    /// interval away.
+    /// Open, renew or cancel `capture.subscription_id` for `run`. The id is
+    /// host-scoped: a later open with the same id and a different run replaces
+    /// the existing subscription. A new or replaced subscription is due
+    /// immediately so a viewer's first look is not a full interval away.
     pub fn apply(&self, run: &Run, capture: &Capture, now: Instant) -> Applied {
         let mut table = self.table();
-        if let Some(existing) = table.get(&capture.subscription_id)
-            && existing.run != *run
-        {
-            return Applied::Refused("subscription belongs to another run");
-        }
         let ttl = match capture.ttl_seconds {
             0 => DEFAULT_CAPTURE_TTL_SECONDS,
             ttl => ttl.min(MAX_CAPTURE_TTL_SECONDS),
@@ -139,10 +136,16 @@ impl Captures {
         };
         let expires = now + Duration::from_secs(u64::from(ttl));
         if let Some(existing) = table.get_mut(&capture.subscription_id) {
+            let replace = existing.run != *run;
+            if replace {
+                existing.generation = self.generation.fetch_add(1, Ordering::Relaxed);
+                existing.run = run.clone();
+                existing.schedule.next_due = now;
+            }
             existing.schedule.interval = Duration::from_millis(u64::from(interval));
             existing.max_bytes = max_bytes;
             existing.schedule.expires = expires;
-            return Applied::Renewed;
+            return if replace { Applied::Opened } else { Applied::Renewed };
         }
         table.retain(|_, subscription| subscription.schedule.expires > now);
         if table.len() >= MAX_CAPTURE_SUBSCRIPTIONS {
@@ -323,10 +326,19 @@ pub async fn tick(
                 continue;
             }
         };
-        let (text, truncated) = bound_snapshot(&text, due.max_bytes);
+        let observed = stamp()?;
+        let mut table = captures.table();
+        if !Captures::current(&table, &due, now.max(Instant::now())) {
+            continue;
+        }
+        let max_bytes = table
+            .get(&due.subscription_id)
+            .map(|subscription| subscription.max_bytes)
+            .unwrap_or(due.max_bytes);
+        let (text, truncated) = bound_snapshot(&text, max_bytes);
         let digest = text_digest(&text);
         let capture = Record {
-            observed: Some(stamp()?),
+            observed: Some(observed),
             run: Some(due.run.clone()),
             body: Some(record::Body::Capture(PaneCapture {
                 subscription_id: due.subscription_id.clone(),
@@ -335,10 +347,6 @@ pub async fn tick(
             })),
             ..Default::default()
         };
-        let mut table = captures.table();
-        if !Captures::current(&table, &due, now.max(Instant::now())) {
-            continue;
-        }
         if let Some(existing) = table.get(&due.subscription_id)
             && let Some((last_digest, at)) = existing.last_snapshot
             && last_digest == digest
@@ -483,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn a_subscription_belongs_to_its_run() {
+    fn reusing_a_subscription_id_for_another_run_replaces_it() {
         let captures = Captures::default();
         let now = Instant::now();
         captures.apply(&run(), &subscribe("s", 30, 0), now);
@@ -491,13 +499,15 @@ mod tests {
             run_id: "other".into(),
             ..run()
         };
-        for ttl in [30, 1] {
-            assert_eq!(
-                captures.apply(&other, &subscribe("s", ttl, 0), now),
-                Applied::Refused("subscription belongs to another run")
-            );
-        }
+        assert_eq!(captures.apply(&other, &subscribe("s", 30, 0), now), Applied::Opened);
         assert_eq!(captures.len(), 1);
+        assert_eq!(captures.table().get("s").unwrap().run.run_id, "other");
+        let third = Run {
+            run_id: "third".into(),
+            ..run()
+        };
+        assert_eq!(captures.apply(&third, &subscribe("s", 1, 0), now), Applied::Cancelled);
+        assert!(captures.is_empty());
     }
 
     #[test]
@@ -717,6 +727,48 @@ mod tests {
         .await
         .unwrap();
         assert!(captured(&journal).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_smaller_max_bytes_renewal_rebinds_an_in_flight_snapshot() {
+        struct Blocking {
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+        impl PaneSource for Blocking {
+            async fn read(&self, _: &str, _: &str) -> PaneRead {
+                self.entered.notify_one();
+                self.release.notified().await;
+                PaneRead::Text("older line\nnewest line that is long\n".into())
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let journal = journal(root.path());
+        save(&journal, Phase::Alive);
+        let captures = Captures::default();
+        let now = Instant::now();
+        let mut request = subscribe("s", 30, 1000);
+        request.max_bytes = MAX_CAPTURE_BYTES as u32;
+        captures.apply(&run(), &request, now);
+        let source = Blocking {
+            entered: Default::default(),
+            release: Default::default(),
+        };
+        let read = tick(&journal, &captures, &source, &stamp, now);
+        let renew = async {
+            source.entered.notified().await;
+            let mut smaller = subscribe("s", 30, 1000);
+            smaller.max_bytes = 8;
+            assert_eq!(captures.apply(&run(), &smaller, now), Applied::Renewed);
+            source.release.notify_one();
+        };
+        let (result, ()) = tokio::join!(read, renew);
+        result.unwrap();
+        let found = captured(&journal);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].truncated);
+        assert!(found[0].text_utf8.len() <= 8);
+        assert_eq!(captures.len(), 1);
     }
 
     #[tokio::test]

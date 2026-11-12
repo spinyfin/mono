@@ -445,7 +445,12 @@ async fn cancelling_while_a_spawn_is_in_doubt_keeps_the_workspace_lease() {
 
 #[tokio::test]
 async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_retry_budget() {
-    let fx = Fixture::with(workspace_slack(300)).await;
+    // 300 ms is well under the 3 s observation window, so later dispatch
+    // passes re-send the stored lease and hit the command deadline again.
+    // Those re-sends must stay `LeaseOutcomeUncertain` (parked, retry
+    // budget untouched), not a pre-start failure. `workspace_slack` would
+    // raise the lease deadline to 5 s and hide that path.
+    let fx = Fixture::with(short(300)).await;
     let env = env(&fx, 2).await;
     let executions = [triage(&fx, &env, "first"), triage(&fx, &env, "second")];
     let peer = fx
@@ -1101,7 +1106,11 @@ async fn a_hung_in_doubt_adopt_does_not_stall_the_scheduler_heartbeat() {
     let other = fx.spoke_as("other", Box::new(answer), None, 0).await;
     let second = triage(&fx, &env, "stranded ready");
     let _handle = env.coordinator.spawn_scheduler_heartbeat(Duration::from_millis(80));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    // The first beat is staggered by one 80 ms interval; the second host then
+    // has to Hello, lease and spawn. 3 s covers many beats under a loaded
+    // integration binary and stays below the 5 s command deadline, so a kick
+    // that only happens when that deadline fires still fails the test.
+    tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if other
                 .commands()
@@ -1114,7 +1123,7 @@ async fn a_hung_in_doubt_adopt_does_not_stall_the_scheduler_heartbeat() {
         }
     })
     .await
-    .expect("a stranded ready row is re-kicked while Adopt is unanswered");
+    .expect("a stranded ready row is re-kicked by the heartbeat while Adopt is unanswered");
 }
 
 mod recovery;

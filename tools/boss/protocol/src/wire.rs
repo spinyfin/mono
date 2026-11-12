@@ -2932,9 +2932,9 @@ pub use snapshot_wire::{
 };
 
 // The topic-push payload enum lives in `topic_event_payload`; re-exported as
-// `boss_protocol::TopicEventPayload`.
+// `boss_protocol::TopicEventPayload` next to `PaneCaptureState`.
 mod topic_event_payload;
-pub use topic_event_payload::TopicEventPayload;
+pub use topic_event_payload::{PaneCaptureState, TopicEventPayload};
 
 #[cfg(test)]
 mod coordinator_reset_tests;
