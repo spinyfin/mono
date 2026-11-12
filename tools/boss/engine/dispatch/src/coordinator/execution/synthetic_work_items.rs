@@ -25,7 +25,7 @@ impl ExecutionCoordinator {
     }
 
     /// Build the synthetic `Chore` work item for an `answer_agent`
-    /// execution (P3b) from the bound comment and its resolved doc owner.
+    /// execution from the bound comment and its resolved doc owner.
     /// `None` when the comment is gone, or its doc owner no longer resolves
     /// (both are the same "engine state raced under us mid-flight"
     /// tolerance `synthetic_triage_work_item` already applies — the caller
@@ -35,7 +35,7 @@ impl ExecutionCoordinator {
     /// capability resolution ([`Self::select_host_for_execution`]); `name`/
     /// `description` surface the question in cube's task label / change
     /// title. Like the triage synthetic item, these fields only feed spawn
-    /// plumbing: the runner (P3b) composes the real answer-agent prompt
+    /// plumbing: the runner composes the real answer-agent prompt
     /// separately, and the completion handler branches on `kind` to
     /// finalise the run instead of doing PR detection.
     pub(super) fn synthetic_answer_agent_work_item(&self, execution: &WorkExecution) -> Option<WorkItem> {

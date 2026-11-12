@@ -856,9 +856,29 @@ async fn a_spawn_that_resolved_alive_is_not_driven_again_by_the_sweep() {
     let count = |peer: &Peer, f: fn(&Command) -> bool| peer.commands().iter().filter(|c| f(c)).count();
     let spawns = count(&peer, |c| matches!(c.body, Some(command::Body::Spawn(_))));
     let adopts = count(&peer, |c| matches!(c.body, Some(command::Body::Adopt(_))));
+    until("the launch run to finish", || {
+        fx.db.active_run_ids_for_execution(&execution.id).unwrap().is_empty()
+    })
+    .await;
+    let assignment = fx.db.spoke_assignment_for_execution(&execution.id).unwrap().unwrap();
+    let strand_flag = || {
+        fx.db
+            .set_spoke_in_doubt(&execution.id, assignment.assignment_generation, true)
+            .unwrap();
+        fx.db
+            .upsert_execution_attention(&execution.id, IN_DOUBT, "Unconfirmed assignment", "Awaiting host")
+            .unwrap();
+        assert!(attention_open(&fx, &execution.id));
+    };
+    strand_flag();
     env.coordinator.reconcile_ended_in_doubt_spokes().await;
+    assert!(!fx.db.spoke_execution_in_doubt(&execution.id).unwrap());
+    assert!(!attention_open(&fx, &execution.id));
     let restarted = restarted(&fx, &env.coordinator, 1).await;
+    strand_flag();
     restarted.reconcile_ended_in_doubt_spokes().await;
+    assert!(!fx.db.spoke_execution_in_doubt(&execution.id).unwrap());
+    assert!(!attention_open(&fx, &execution.id));
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         count(&peer, |c| matches!(c.body, Some(command::Body::Spawn(_)))),

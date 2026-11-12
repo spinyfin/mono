@@ -199,11 +199,15 @@ impl ExecutionCoordinator {
             }
             // Only a spawn still awaiting its answer is resumed: a worker whose
             // launch already completed must not have its launch path re-driven.
-            match self.work_db.active_run_ids_for_execution(execution_id) {
-                Ok(runs) if runs.is_empty() => return,
-                Ok(_) => {}
+            match self.work_db.spoke_assignment_needs_recovery(execution_id) {
+                Ok(false) => {
+                    self.clear_spoke_in_doubt(execution_id);
+                    self.resolve_spoke_in_doubt_attention(execution_id);
+                    return;
+                }
+                Ok(true) => {}
                 Err(error) => {
-                    tracing::warn!(execution_id, error = %format!("{error:#}"), "could not read the execution's runs");
+                    tracing::warn!(execution_id, error = %format!("{error:#}"), "could not read the stored spoke recovery state");
                     return;
                 }
             }
@@ -368,7 +372,10 @@ impl ExecutionCoordinator {
             }
             Ok(None) => Ok(true),
             Err(error) if waitable_spoke_lease(&error).is_some() => Ok(false),
-            Err(error) => Err(error),
+            Err(error) => {
+                self.clear_spoke_in_doubt(&execution.id);
+                Err(error)
+            }
         }
     }
 
