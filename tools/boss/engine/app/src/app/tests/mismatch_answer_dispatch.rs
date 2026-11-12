@@ -342,6 +342,28 @@ async fn wait_until_runner_saw(parked: &Parked, execution_id: &str) {
     );
 }
 
+/// Drain hands the spawn to a detached task that records the runner during
+/// `schedule_execution` and only then clears operator-forced admission.
+/// Waiting on the runner alone can observe the still-set flag.
+async fn wait_until_runner_saw_and_admission_consumed(parked: &Parked, execution_id: &str) {
+    wait_until_runner_saw(parked, execution_id).await;
+    for _ in 0..300 {
+        if !parked
+            .state
+            .work_db
+            .execution_has_operator_forced_admission(execution_id)
+            .unwrap()
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!(
+        "operator-forced admission still set after runner saw {execution_id}; status={:?}",
+        parked.state.work_db.get_execution(execution_id).unwrap().status
+    );
+}
+
 fn assert_not_dispatched(parked: &Parked, execution_id: &str) {
     assert!(
         !parked.runner.calls().iter().any(|id| id == execution_id),
@@ -488,8 +510,7 @@ async fn force_answer_dispatches_through_the_pause_and_outside_the_focus_set() {
         "{response:?}"
     );
     let exec = latest_execution(&parked.state, &parked.revision_id);
-    wait_until_runner_saw(&parked, &exec.id).await;
-    assert_forced_admission(&parked, &exec.id, false);
+    wait_until_runner_saw_and_admission_consumed(&parked, &exec.id).await;
 }
 
 #[tokio::test]
@@ -504,8 +525,7 @@ async fn rewrite_answer_dispatches_the_port_through_the_pause_and_outside_the_fo
     let port_id = port_revision_id(&parked);
     assert_ne!(port_id, parked.revision_id);
     let exec = latest_execution(&parked.state, &port_id);
-    wait_until_runner_saw(&parked, &exec.id).await;
-    assert_forced_admission(&parked, &exec.id, false);
+    wait_until_runner_saw_and_admission_consumed(&parked, &exec.id).await;
 }
 
 #[tokio::test]
@@ -523,8 +543,7 @@ async fn force_answer_keeps_admission_through_a_preflight_refusal_then_drains() 
     assert_not_dispatched(&parked, &exec.id);
     parked.state.execution_coordinator.set_dispatch_preflight_block(None);
     parked.state.execution_coordinator.drain_ready_queue_for_test().await;
-    wait_until_runner_saw(&parked, &exec.id).await;
-    assert_forced_admission(&parked, &exec.id, false);
+    wait_until_runner_saw_and_admission_consumed(&parked, &exec.id).await;
 }
 
 #[tokio::test]
@@ -542,8 +561,7 @@ async fn rewrite_answer_keeps_admission_through_a_preflight_refusal_then_drains(
     assert_not_dispatched(&parked, &exec.id);
     parked.state.execution_coordinator.set_dispatch_preflight_block(None);
     parked.state.execution_coordinator.drain_ready_queue_for_test().await;
-    wait_until_runner_saw(&parked, &exec.id).await;
-    assert_forced_admission(&parked, &exec.id, false);
+    wait_until_runner_saw_and_admission_consumed(&parked, &exec.id).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -561,8 +579,7 @@ async fn force_answer_behind_a_writer_dispatches_once_the_writer_finishes() {
     let exec = latest_execution(&parked.state, &parked.revision_id);
     assert_unblocked_for_dispatch(&exec);
     timed_drain(&parked).await;
-    wait_until_runner_saw(&parked, &exec.id).await;
-    assert_forced_admission(&parked, &exec.id, false);
+    wait_until_runner_saw_and_admission_consumed(&parked, &exec.id).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -581,6 +598,5 @@ async fn rewrite_answer_behind_a_writer_dispatches_once_the_writer_finishes() {
     let exec = latest_execution(&parked.state, &port_id);
     assert_unblocked_for_dispatch(&exec);
     timed_drain(&parked).await;
-    wait_until_runner_saw(&parked, &exec.id).await;
-    assert_forced_admission(&parked, &exec.id, false);
+    wait_until_runner_saw_and_admission_consumed(&parked, &exec.id).await;
 }
