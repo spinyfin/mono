@@ -48,8 +48,11 @@ fn occupancy_only_cleanup_error(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<boss_execution_contracts::UnownedOccupants>()
         .is_some()
+        || error
+            .downcast_ref::<boss_execution_contracts::WorkspaceOccupied>()
+            .is_some()
+        // A spoke's report crosses the wire as text.
         || boss_execution_contracts::UnownedOccupants::from_message(&format!("{error:#}")).is_some()
-        || format!("{error:#}").contains("workspace occupants")
 }
 
 /// Upper bound on one `cube workspace release` subprocess.

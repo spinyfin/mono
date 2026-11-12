@@ -147,6 +147,23 @@ pub struct UntrackedTmuxSession {
     pub spawn_token: String,
 }
 
+/// The workspace path recorded for `execution_id`, or empty when it has none or
+/// the row cannot be read. Teardown scopes process cleanup to it; an empty path
+/// scopes nothing, which signals every process carrying the session's identity.
+pub(crate) fn execution_workspace(work_db: &WorkDb, execution_id: &str) -> String {
+    match work_db.get_execution(execution_id) {
+        Ok(execution) => execution.workspace_path.unwrap_or_default(),
+        Err(err) => {
+            tracing::warn!(
+                execution_id,
+                error = %format!("{err:#}"),
+                "could not read the execution's workspace; process cleanup is not scoped to it",
+            );
+            String::new()
+        }
+    }
+}
+
 /// Read the authoritative durable identity token for a tmux session. Callers
 /// deliberately choose their mismatch policy: boot adoption leaves foreign
 /// sessions alone, while the liveness sweep treats a durable run's mismatch as
@@ -1480,7 +1497,10 @@ async fn refuse_and_reap(
     row_kind: RefusedRowKind,
 ) {
     let (session_name, spawn_token) = session;
-    let reaped = match tmux.kill_session_verified(session_name, spawn_token).await {
+    let reaped = match tmux
+        .kill_session_verified_in(session_name, spawn_token, &execution_workspace(work_db, execution_id))
+        .await
+    {
         Ok(boss_tmux::KillSessionOutcome::Killed | boss_tmux::KillSessionOutcome::Absent) => true,
         Err(err) => {
             tracing::error!(

@@ -539,27 +539,29 @@ impl SshHostAdapter {
     }
 }
 
-/// Interpret the owning host's cleanup report: only a report with no surviving
-/// owned process, no unowned occupant and no unreadable process proves the
-/// workspace empty.
-fn occupancy_from_cleanup(execution_id: &str, output: &SshOutput) -> Result<crate::workspace_lease_release::Occupancy> {
+/// Interpret the owning host's cleanup report through the same classifier the
+/// local scan uses. Only a report with no surviving owned process, no occupant
+/// and no unreadable process proves the workspace empty. A remote host's
+/// recorded shells are not visible here, so a terminal owner counts as gone.
+async fn occupancy_from_cleanup(
+    db: &WorkDb,
+    execution_id: &str,
+    output: &SshOutput,
+) -> Result<crate::workspace_lease_release::Occupancy> {
     anyhow::ensure!(output.success(), "remote process cleanup failed: {}", output.stderr);
     let result: boss_worker_processes::Cleanup = serde_json::from_str(&output.stdout)?;
     result.report(execution_id);
-    if result.stray_only() {
-        return Err(boss_execution_contracts::UnownedOccupants {
-            occupants: result.occupants,
-        }
-        .into());
-    }
-    anyhow::ensure!(
-        result.empty(),
-        "remote workspace occupants {:?}; surviving owned processes {:?}; unreadable processes {:?}",
-        result.occupants,
-        result.remaining,
-        result.unknown
-    );
-    Ok(crate::workspace_lease_release::Occupancy::Empty)
+    crate::workspace_lease_release::classify_occupants(
+        db,
+        crate::workspace_lease_release::OccupantReport {
+            occupants: &result.occupants,
+            owners: &result.owners,
+            remaining: &result.remaining,
+            unknown: &result.unknown,
+        },
+        |_owner: String| async { Ok(false) },
+    )
+    .await
 }
 
 /// Map a remote Bazel-marker `test -f A -o -f B -o -f C` result onto the
@@ -1417,7 +1419,7 @@ impl HostAdapter for SshHostAdapter {
                 workspace.to_str().context("workspace is not UTF-8")?,
             ])
             .await?;
-        occupancy_from_cleanup(execution_id, &output)
+        occupancy_from_cleanup(&self.work_db, execution_id, &output).await
     }
 
     async fn probe_remote_worker_alive(&self, remote_pid: i64) -> Result<Option<bool>> {
@@ -2061,72 +2063,109 @@ mod tests {
         }
     }
 
-    #[test]
-    fn remote_cleanup_report_with_nothing_left_proves_the_workspace_empty() {
+    fn report_with(replacements: &[(&str, &str)]) -> SshOutput {
+        let mut report = cleanup_report("");
+        for (from, to) in replacements {
+            report.stdout = report.stdout.replace(from, to);
+        }
+        report
+    }
+
+    #[tokio::test]
+    async fn remote_cleanup_report_with_nothing_left_proves_the_workspace_empty() {
+        let (_dir, db) = crate::test_support::open_db();
         assert_eq!(
-            occupancy_from_cleanup("exec", &cleanup_report("")).unwrap(),
+            occupancy_from_cleanup(&db, "exec", &cleanup_report("")).await.unwrap(),
             crate::workspace_lease_release::Occupancy::Empty
         );
     }
 
-    #[test]
-    fn remote_cleanup_report_names_occupants_survivors_and_unreadable_processes() {
+    #[tokio::test]
+    async fn remote_cleanup_report_names_survivors_and_unreadable_processes() {
+        let (_dir, db) = crate::test_support::open_db();
         for (field, label) in [
-            ("occupants", "occupants [7]"),
             ("remaining", "surviving owned processes [7]"),
             ("unknown", "unreadable processes [7]"),
         ] {
-            let mut report = cleanup_report("");
-            report.stdout = report
-                .stdout
-                .replace(&format!("\"{field}\":[]"), &format!("\"{field}\":[7]"));
-            let error = occupancy_from_cleanup("exec", &report).unwrap_err();
+            let report = report_with(&[
+                ("\"occupants\":[]", "\"occupants\":[7]"),
+                (&format!("\"{field}\":[]"), &format!("\"{field}\":[7]")),
+            ]);
+            let error = occupancy_from_cleanup(&db, "exec", &report).await.unwrap_err();
             assert!(format!("{error:#}").contains(label), "{field}: {error:#}");
+            assert!(
+                error
+                    .downcast_ref::<boss_execution_contracts::UnownedOccupants>()
+                    .is_none()
+                    && error
+                        .downcast_ref::<boss_execution_contracts::WorkspaceOccupied>()
+                        .is_none(),
+                "{field}: survivors and unreadable processes are plain errors: {error:#}"
+            );
         }
     }
 
-    #[test]
-    fn remote_cleanup_report_with_only_unowned_occupants_is_typed_and_owned_ones_are_not() {
-        let mut stray = cleanup_report("");
-        stray.stdout = stray.stdout.replace("\"occupants\":[]", "\"occupants\":[7]");
-        let error = occupancy_from_cleanup("exec", &stray).unwrap_err();
-        assert_eq!(
-            error.downcast_ref::<boss_execution_contracts::UnownedOccupants>(),
-            Some(&boss_execution_contracts::UnownedOccupants { occupants: vec![7] })
+    #[tokio::test]
+    async fn remote_cleanup_report_with_unowned_or_unknown_owner_occupants_is_typed_unowned() {
+        let (_dir, db) = crate::test_support::open_db();
+        for report in [
+            report_with(&[("\"occupants\":[]", "\"occupants\":[7]")]),
+            report_with(&[
+                ("\"occupants\":[]", "\"occupants\":[7]"),
+                ("\"owners\":{}", "\"owners\":{\"exec_from_nowhere\":[7]}"),
+            ]),
+        ] {
+            let error = occupancy_from_cleanup(&db, "exec", &report).await.unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<boss_execution_contracts::UnownedOccupants>(),
+                Some(&boss_execution_contracts::UnownedOccupants { occupants: vec![7] }),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_cleanup_report_with_a_live_runs_occupant_is_occupied_not_unowned() {
+        let (_dir, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_test_product(&db);
+        let chore = crate::test_support::create_test_chore(&db, product.id.clone(), "live-owner");
+        let live = crate::test_support::create_ready_chore_execution(&db, chore.id);
+        let report = report_with(&[
+            ("\"occupants\":[]", "\"occupants\":[7]"),
+            ("\"owners\":{}", &format!("\"owners\":{{\"{}\":[7]}}", live.id)),
+        ]);
+        let error = occupancy_from_cleanup(&db, "exec", &report).await.unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<boss_execution_contracts::WorkspaceOccupied>()
+                .is_some(),
+            "{error:#}"
         );
-        let mut owned = stray.stdout.clone();
-        owned = owned.replace("\"owners\":{}", "\"owners\":{\"exec_live\":[7]}");
-        let error = occupancy_from_cleanup(
-            "exec",
-            &SshOutput {
-                status: 0,
-                stdout: owned,
-                stderr: String::new(),
-            },
-        )
-        .unwrap_err();
         assert!(
             error
                 .downcast_ref::<boss_execution_contracts::UnownedOccupants>()
-                .is_none(),
-            "{error:#}"
+                .is_none()
         );
     }
 
-    #[test]
-    fn remote_cleanup_failure_and_garbled_report_are_errors_not_proof() {
+    #[tokio::test]
+    async fn remote_cleanup_failure_and_garbled_report_are_errors_not_proof() {
+        let (_dir, db) = crate::test_support::open_db();
         let failed = SshOutput {
             status: 255,
             stdout: String::new(),
             stderr: "connection refused".into(),
         };
-        assert!(format!("{:#}", occupancy_from_cleanup("exec", &failed).unwrap_err()).contains("connection refused"));
+        assert!(
+            format!("{:#}", occupancy_from_cleanup(&db, "exec", &failed).await.unwrap_err())
+                .contains("connection refused")
+        );
         let garbled = SshOutput {
             status: 0,
             stdout: "not json".into(),
             stderr: String::new(),
         };
-        assert!(occupancy_from_cleanup("exec", &garbled).is_err());
+        assert!(occupancy_from_cleanup(&db, "exec", &garbled).await.is_err());
     }
 
     // ── command_repr ─────────────────────────────────────────────────────────

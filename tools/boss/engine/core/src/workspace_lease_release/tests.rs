@@ -577,6 +577,49 @@ fn terminal_status_alone_never_proves_pane_death() {
     }
 }
 
+#[tokio::test]
+async fn sweep_waits_out_the_teardown_window_for_a_registered_terminal_row() {
+    let (_dir, db) = open_db();
+    let execution = seed_terminal(&db, ExecutionStatus::Completed, "lease-teardown");
+    let live = LiveWorkerStateRegistry::new();
+    live.register_spawn(1, &execution.id, "opus", 4242, None);
+    let set_finished_ago = |secs: i64| {
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET finished_at = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    execution.id,
+                    (boss_engine_utils::epoch_time::now_epoch_secs() - secs).to_string()
+                ],
+            )
+            .unwrap();
+    };
+    let unreleased = || {
+        db.list_attention_items(&execution.id)
+            .unwrap()
+            .iter()
+            .filter(|item| item.kind == LEASE_UNRELEASED_ATTENTION_KIND)
+            .count()
+    };
+
+    set_finished_ago(5);
+    let outcome = run_one_pass(&db, &SweepCube, &live).await;
+    assert_eq!(
+        (outcome.held, unreleased()),
+        (1, 0),
+        "a fresh terminal row is still tearing down"
+    );
+
+    set_finished_ago(TEARDOWN_WINDOW_SECS + 5);
+    let outcome = run_one_pass(&db, &SweepCube, &live).await;
+    assert_eq!(
+        (outcome.held, unreleased()),
+        (1, 1),
+        "a lingering registration is reported"
+    );
+}
+
 #[test]
 fn host_occupancy_sees_a_child_with_cwd_in_the_workspace() {
     let dir = tempfile::TempDir::new().unwrap();

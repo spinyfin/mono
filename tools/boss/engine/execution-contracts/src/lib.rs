@@ -1950,6 +1950,28 @@ impl std::fmt::Display for UnownedOccupants {
 
 impl std::error::Error for UnownedOccupants {}
 
+/// A workspace holds processes that belong to other live runs, with nothing of
+/// this run's own surviving and nothing unreadable. The worker being cleaned up
+/// is not to blame, so a stop may rely on its own liveness probe, but the lease
+/// must not be released while another run is using the workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceOccupied {
+    pub occupants: Vec<u32>,
+    pub owners: Vec<String>,
+}
+
+impl std::fmt::Display for WorkspaceOccupied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "workspace occupants {:?} (live owners {:?})",
+            self.occupants, self.owners
+        )
+    }
+}
+
+impl std::error::Error for WorkspaceOccupied {}
+
 /// A spawn whose outcome is unknown: the host may have started the worker.
 /// The execution keeps its assignment and workspace and a retry reuses the
 /// same command, so nothing starts twice. Coordinators treat it like an

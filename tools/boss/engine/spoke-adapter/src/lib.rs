@@ -925,7 +925,8 @@ impl HostAdapter for SpokeHostAdapter {
     async fn cleanup_execution_processes(&self, execution_id: &str, workspace: &Path) -> Result<Occupancy> {
         match self.route_execution(execution_id).await? {
             Route::Legacy(legacy) => legacy.cleanup_execution_processes(execution_id, workspace).await,
-            Route::Spoke(_) => match self.ctl_stop(execution_id, Duration::ZERO).await? {
+            Route::Spoke(_) => match self.ctl_cleanup_workspace(execution_id).await? {
+                // Delivered means the host swept the run and proved the workspace empty.
                 ControlOutcome::Delivered(_) => Ok(Occupancy::Empty),
                 outcome => {
                     let reason = format!("{outcome:?}");

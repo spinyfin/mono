@@ -730,6 +730,84 @@ pub fn settled_for(execution: &WorkExecution, secs: i64) -> bool {
     })
 }
 
+/// What an owning host's process cleanup left in a workspace, in plain data so
+/// the local scan and the remote report classify through one function.
+pub struct OccupantReport<'a> {
+    pub occupants: &'a [u32],
+    pub owners: &'a std::collections::BTreeMap<String, Vec<u32>>,
+    /// Owned processes that survived TERM/KILL.
+    pub remaining: &'a [u32],
+    /// Processes whose identity could not be read.
+    pub unknown: &'a [u32],
+}
+
+/// True when `owner` is a non-terminal execution, or a terminal one for which
+/// `terminal_owner_alive` still finds the process that carried its identity.
+/// An owner that resolves to no execution is not live.
+pub async fn owner_still_live<F, Fut>(db: &WorkDb, owner: &str, terminal_owner_alive: &F) -> Result<bool>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<bool>>,
+{
+    let Ok(old) = db.get_execution(owner) else {
+        return Ok(false);
+    };
+    if !old.status.is_terminal() {
+        return Ok(true);
+    }
+    terminal_owner_alive(owner.to_owned()).await
+}
+
+/// Classify a cleanup report into the occupancy verdict, identically for local
+/// and remote workspaces. Empty proves the workspace empty. Occupants that all
+/// belong to owners no live run claims are
+/// [`boss_execution_contracts::UnownedOccupants`] (the bounded release applies);
+/// occupants of a live run are [`boss_execution_contracts::WorkspaceOccupied`];
+/// surviving owned or unreadable processes are a plain error that keeps the
+/// lease. `terminal_owner_alive` decides whether a terminal owner's recorded
+/// shell is still running; a host that cannot see it answers `false`.
+pub async fn classify_occupants<F, Fut>(
+    db: &WorkDb,
+    report: OccupantReport<'_>,
+    terminal_owner_alive: F,
+) -> Result<Occupancy>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<bool>>,
+{
+    let mut live_owners = std::collections::BTreeMap::new();
+    let mut stale_owners = Vec::new();
+    for (owner, pids) in report.owners {
+        if owner_still_live(db, owner, &terminal_owner_alive).await? {
+            live_owners.insert(owner.clone(), pids.clone());
+        } else {
+            stale_owners.push(owner.clone());
+        }
+    }
+    anyhow::ensure!(
+        report.remaining.is_empty() && report.unknown.is_empty(),
+        "workspace occupants {:?} (owners {:?}); surviving owned processes {:?}; unreadable processes {:?}",
+        report.occupants,
+        live_owners,
+        report.remaining,
+        report.unknown
+    );
+    if !live_owners.is_empty() {
+        return Err(boss_execution_contracts::WorkspaceOccupied {
+            occupants: report.occupants.to_vec(),
+            owners: live_owners.into_keys().collect(),
+        }
+        .into());
+    }
+    if report.occupants.is_empty() {
+        return Ok(Occupancy::Empty);
+    }
+    Err(anyhow::Error::from(boss_execution_contracts::UnownedOccupants {
+        occupants: report.occupants.to_vec(),
+    })
+    .context(format!("unowned run ids {stale_owners:?}")))
+}
+
 /// Apply the bounded release for unowned occupants to an owning host's cleanup
 /// report. `result` is what the host adapter returned: when it failed only
 /// because unowned processes remain (see [`boss_execution_contracts::UnownedOccupants`])

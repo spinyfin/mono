@@ -211,7 +211,11 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             Some(command::Body::Spawn(spawn)) => self.spawn(command, run, spawn, interrupted).await?,
             Some(command::Body::Adopt(_)) => self.adopt(command, run).await?,
             Some(command::Body::Deliver(deliver)) => self.deliver(command, run, deliver, interrupted).await?,
-            Some(command::Body::Stop(stop)) => self.stop(command, run, stop, interrupted).await?,
+            Some(command::Body::Stop(stop)) => self.stop(command, run, stop, interrupted, false).await?,
+            Some(command::Body::CleanupWorkspace(_)) => {
+                self.stop(command, run, &Stop { grace_ms: 0 }, interrupted, true)
+                    .await?
+            }
             _ => outcome(command, ResultCode::Rejected, "execution command required", None),
         })
     }
@@ -754,28 +758,63 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         Ok(Gesture::Text(text.to_owned()))
     }
 
-    async fn stop(&self, command: &Command, run: &Run, stop: &Stop, interrupted: bool) -> Result<CommandResult> {
+    async fn stop(
+        &self,
+        command: &Command,
+        run: &Run,
+        stop: &Stop,
+        interrupted: bool,
+        verify_occupancy: bool,
+    ) -> Result<CommandResult> {
         let result = self.stop_inner(command, run, stop, interrupted).await?;
-        if result.code == ResultCode::Ok as i32
-            && self.tmux.runner().manages_host_processes()
-            && let Some(record) = self.loaded(run)?
-        {
-            // Stop's result is about the worker. Occupants a human or IDE left
-            // in the workspace are a lease-release concern, not a failed stop.
-            match self.workspace_path(&record.workspace_id, &record.lease_id).await {
-                Ok(workspace) => {
-                    if let Err(err) = self.tmux.cleanup_run_processes(&record.execution_id, &workspace).await {
-                        eprintln!(
-                            "boss: owned process cleanup after stop failed for {}; the worker is stopped: {err:#}",
-                            record.execution_id
-                        );
-                    }
-                }
-                Err(err) => eprintln!(
+        if result.code != ResultCode::Ok as i32 || !self.tmux.runner().manages_host_processes() {
+            return Ok(result);
+        }
+        let Some(record) = self.loaded(run)? else {
+            return Ok(result);
+        };
+        let pane = match &result.value {
+            Some(command_result::Value::Pane(pane)) => Some(pane.clone()),
+            _ => None,
+        };
+        // A plain Stop is about the worker. Occupants a human or IDE left in the
+        // workspace are a lease-release concern, answered only to a
+        // CleanupWorkspace command (`verify_occupancy`).
+        let workspace = match self.workspace_path(&record.workspace_id, &record.lease_id).await {
+            Ok(workspace) => workspace,
+            Err(err) if verify_occupancy => {
+                return Ok(outcome(
+                    command,
+                    ResultCode::OutcomeUncertain,
+                    format!("could not resolve the workspace to verify occupancy: {err:#}"),
+                    pane,
+                ));
+            }
+            Err(err) => {
+                eprintln!(
                     "boss: could not resolve workspace for post-stop process cleanup for {}; the worker is stopped: {err:#}",
                     record.execution_id
-                ),
+                );
+                return Ok(result);
             }
+        };
+        if let Err(err) = self.tmux.cleanup_run_processes(&record.execution_id, &workspace).await {
+            if verify_occupancy {
+                return Ok(outcome(
+                    command,
+                    ResultCode::OutcomeUncertain,
+                    format!("owned process cleanup failed: {err:#}"),
+                    pane,
+                ));
+            }
+            eprintln!(
+                "boss: owned process cleanup after stop failed for {}; the worker is stopped: {err:#}",
+                record.execution_id
+            );
+            return Ok(result);
+        }
+        if verify_occupancy && let Err(err) = self.tmux.verify_workspace_quiescent(&workspace).await {
+            return Ok(outcome(command, ResultCode::Rejected, format!("{err:#}"), pane));
         }
         Ok(result)
     }
@@ -879,6 +918,12 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         let workspace = self
             .workspace_path(&record.workspace_id, &record.lease_id)
             .await
+            .inspect_err(|err| {
+                eprintln!(
+                    "boss: could not resolve workspace for {}; process cleanup is not scoped to it: {err:#}",
+                    record.execution_id
+                );
+            })
             .unwrap_or_default();
         self.tmux
             .kill_session_verified_in(&record.session, &record.spawn_token, &workspace.to_string_lossy())
@@ -1088,6 +1133,12 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         let workspace = self
             .workspace_path(&record.workspace_id, &record.lease_id)
             .await
+            .inspect_err(|err| {
+                eprintln!(
+                    "boss: could not resolve workspace for {}; process cleanup is not scoped to it: {err:#}",
+                    record.execution_id
+                );
+            })
             .unwrap_or_default();
         self.tmux
             .cleanup_worker_processes_in(&record.spawn_token, &workspace.to_string_lossy())

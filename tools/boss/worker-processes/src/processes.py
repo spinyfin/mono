@@ -126,7 +126,7 @@ def install(source):
     hook_hist = shlex.quote(str(root / ".zsh_history"))
     zshenv += (
         'if [ -z "$HISTFILE" ] || [ "$HISTFILE" = "$__boss_user_zdotdir/.zsh_history" ] || '
-        f'[ "$HISTFILE" = "$HOME/.zsh_history" ] || [ "$HISTFILE" = {hook_hist} ]; then '
+        f'[ "$HISTFILE" = {hook_hist} ]; then '
         '__boss_user_histfile="$__boss_user_zdotdir/.zsh_history"; '
         'else __boss_user_histfile="$HISTFILE"; fi\n'
         'HISTFILE="$__boss_user_histfile"\n'
@@ -258,6 +258,9 @@ def snapshot(key, value, workspace):
     lineage = {}
     skipped = []
     needle = os.fsencode(key + "=" + value) if value else None
+    # No workspace to scope to (a coordinator or an unattributed session): the
+    # identity itself is the only evidence, as it was before scoping existed.
+    unscoped = not workspace
     argmax_buffer = kern_argmax_buffer() if sys.platform == "darwin" else None
     for pid in pids():
         if pid == os.getpid():
@@ -289,7 +292,7 @@ def snapshot(key, value, workspace):
             # inherit the token. A registry record means this PID ran the
             # worker hook (the pane or a nested shell). Lineage means capture
             # saw it as a descendant while the pane was alive.
-            if inside or registered_record(pid, birth) or registered_lineage(pid, birth):
+            if inside or unscoped or registered_record(pid, birth) or registered_lineage(pid, birth):
                 owned[pid] = birth
             else:
                 skipped.append(pid)

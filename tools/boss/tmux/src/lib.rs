@@ -724,6 +724,10 @@ impl Tmux {
     /// destroying it would tear down a worker this caller does not own —
     /// this is the guard against a session name recycled onto a different
     /// execution after the original session was destroyed.
+    ///
+    /// This entry point has no workspace to scope to, so every process that
+    /// carries the token is signalled wherever it runs. Callers that know the
+    /// session's workspace use [`Self::kill_session_verified_in`].
     pub async fn kill_session_verified(
         &self,
         session: &str,
@@ -734,8 +738,9 @@ impl Tmux {
 
     /// [`Self::kill_session_verified`] with the workspace the session's worker
     /// held. Capture and cleanup then signal identity matches only inside that
-    /// tree (or lineage recorded while the pane was alive), so a daemon the
-    /// worker happened to start elsewhere is left running.
+    /// tree, or those that ran the worker hook or were recorded as lineage
+    /// while the pane was alive, so a daemon the worker happened to start
+    /// elsewhere is left running. Prefer this whenever the workspace is known.
     pub async fn kill_session_verified_in(
         &self,
         session: &str,
@@ -777,13 +782,10 @@ impl Tmux {
 
     /// Detached shells retain the spawn token even after setsid and reparenting.
     /// Await their exit before callers preserve files or return the lease.
-    pub async fn cleanup_worker_processes(&self, token: &str) -> Result<()> {
-        self.cleanup_worker_processes_in(token, "").await
-    }
-
-    /// [`Self::cleanup_worker_processes`] scoped to `workspace`. An empty
-    /// workspace never matches a cwd, so only lineage-recorded descendants
-    /// are signalled.
+    /// Signals the processes that carry `token`, scoped to `workspace`: identity
+    /// matches are signalled when they are inside it, ran the worker hook (a
+    /// registry record) or were recorded as lineage while the pane was alive.
+    /// An empty workspace scopes nothing, so every identity match is signalled.
     pub async fn cleanup_worker_processes_in(&self, token: &str, workspace: &str) -> Result<()> {
         if self.runner.manages_host_processes() {
             boss_worker_processes::cleanup(BOSS_SPAWN_TOKEN_ENV, token, workspace).await?;

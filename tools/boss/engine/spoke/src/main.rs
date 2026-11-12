@@ -92,7 +92,8 @@ mod commands {
                     command::Body::Spawn(_)
                     | command::Body::Adopt(_)
                     | command::Body::Deliver(_)
-                    | command::Body::Stop(_),
+                    | command::Body::Stop(_)
+                    | command::Body::CleanupWorkspace(_),
                 ) => match &supervisor {
                     Some(supervisor) => supervisor.execute(&command, interrupted, observed.wall_unix_ms).await,
                     None => CommandResult {

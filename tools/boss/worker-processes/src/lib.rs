@@ -30,7 +30,8 @@ pub async fn install() -> Result<String> {
 
 /// Startup registration is necessary on macOS, which omits the environment
 /// of platform shells from process queries. The record pins PID and birth time.
-/// `workspace` scopes identity matches to that tree; descendants found while
+/// `workspace` scopes identity matches to that tree (an empty one scopes
+/// nothing, so the identity alone decides); descendants found while
 /// the pane is alive are recorded as lineage so a later cleanup can still
 /// signal them after they chdir out.
 pub async fn capture(key: &str, owner: &str, workspace: &str) -> Result<()> {
@@ -247,6 +248,20 @@ class OwnershipTests(unittest.TestCase):
             self.assertTrue(seen[4].endswith("/xdg/.zsh_history"), seen[4])
             self.assertTrue((registry() / f"{pid}.json").exists())
 
+    def test_zsh_launch_preserves_an_explicit_histfile_when_zdotdir_is_redirected(self):
+        if not Path("/bin/zsh").exists():
+            self.skipTest("zsh unavailable")
+        with tempfile.TemporaryDirectory() as home:
+            Path(home, ".zshenv").write_text("export ZDOTDIR=$HOME/xdg\nexport HISTFILE=$HOME/.zsh_history\n")
+            Path(home, "xdg").mkdir()
+            base = {key: value for key, value in os.environ.items() if key not in ("ZDOTDIR", "BASH_ENV", "HISTFILE")}
+            hooks = install(SOURCE)
+            result = subprocess.run(
+                ["/bin/zsh", "-l", "-i", "-c", "echo $HISTFILE"],
+                capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                env={**base, **hooks, "HOME": home, "BOSS_RUN_ID": "zsh-run"})
+            self.assertEqual(os.path.realpath(result.stdout.strip()), os.path.realpath(home + "/.zsh_history"), result.stderr)
+
     def test_nested_detached_zsh_registers_and_is_cleaned_up(self):
         if not Path("/bin/zsh").exists():
             self.skipTest("zsh unavailable")
@@ -352,6 +367,18 @@ class OwnershipTests(unittest.TestCase):
                 for child in (inside, outside):
                     child.kill()
                     child.wait()
+
+    def test_identity_is_signalled_wherever_it_runs_when_no_workspace_is_known(self):
+        owner = str(uuid.uuid4())
+        with tempfile.TemporaryDirectory() as elsewhere:
+            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                     cwd=elsewhere, env={**os.environ, "BOSS_SPAWN_TOKEN": owner})
+            try:
+                result = run("BOSS_SPAWN_TOKEN", owner, "")
+                self.assertIn(child.pid, result["terminated"] + result["killed"])
+            finally:
+                child.kill()
+                child.wait()
 
     def test_registered_shell_outside_the_workspace_is_signalled(self):
         owner = str(uuid.uuid4())

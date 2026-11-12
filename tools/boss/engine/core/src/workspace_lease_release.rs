@@ -25,6 +25,10 @@ pub use boss_engine_completion::workspace_lease_release::*;
 /// previous engine process return to the pool without waiting a day.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How long a terminal row with a live registration may sit in normal
+/// completion teardown before the sweep reports its workspace as still held.
+pub const TEARDOWN_WINDOW_SECS: i64 = 120;
+
 /// Scan local processes for a cwd inside the workspace.
 pub struct HostOccupancy;
 
@@ -45,15 +49,14 @@ impl WorkspaceOccupancy for HostOccupancy {
             // alive. Unknown owners and terminal rows with no recorded pid
             // are unowned: signal nothing, and let the 10-minute bound
             // return the lease loudly.
-            let mut stale_owners = Vec::new();
+            let alive = |owner: String| async move { local_terminal_owner_alive(db, &owner).await };
             for owner in result.owners.keys().cloned().collect::<Vec<_>>() {
                 if owner == execution.id {
                     continue;
                 }
-                if owner_still_live(db, &owner).await? {
+                if owner_still_live(db, &owner, &alive).await? {
                     continue;
                 }
-                stale_owners.push(owner.clone());
                 if let Ok(Some(pid)) = db.latest_local_shell_pid_for_execution(&owner)
                     && let Ok(pid) = u32::try_from(pid)
                     && !boss_worker_processes::shell_alive("BOSS_RUN_ID", &owner, pid).await?
@@ -64,28 +67,17 @@ impl WorkspaceOccupancy for HostOccupancy {
             if !result.owners.is_empty() {
                 result = boss_worker_processes::cleanup("BOSS_RUN_ID", "", workspace).await?;
             }
-            let mut live_owners = std::collections::BTreeMap::new();
-            for (owner, pids) in &result.owners {
-                if owner_still_live(db, owner).await? {
-                    live_owners.insert(owner.clone(), pids.clone());
-                } else if !stale_owners.contains(owner) {
-                    stale_owners.push(owner.clone());
-                }
-            }
-            anyhow::ensure!(
-                live_owners.is_empty() && result.unknown.is_empty() && result.remaining.is_empty(),
-                "workspace occupants {:?} (owners {:?}); unreadable processes {:?}",
-                result.occupants,
-                live_owners,
-                result.unknown
-            );
-            if result.occupants.is_empty() {
-                return Ok(Occupancy::Empty);
-            }
-            Err(anyhow::Error::from(boss_execution_contracts::UnownedOccupants {
-                occupants: result.occupants,
-            })
-            .context(format!("unowned run ids {stale_owners:?}")))
+            classify_occupants(
+                db,
+                OccupantReport {
+                    occupants: &result.occupants,
+                    owners: &result.owners,
+                    remaining: &result.remaining,
+                    unknown: &result.unknown,
+                },
+                alive,
+            )
+            .await
         }))
     }
 
@@ -105,15 +97,9 @@ impl WorkspaceOccupancy for HostOccupancy {
     }
 }
 
-/// True when `owner` is a non-terminal execution, or a terminal one whose
-/// recorded shell is still the process that carried that run's identity.
-async fn owner_still_live(db: &WorkDb, owner: &str) -> Result<bool> {
-    let Ok(old) = db.get_execution(owner) else {
-        return Ok(false);
-    };
-    if !old.status.is_terminal() {
-        return Ok(true);
-    }
+/// Whether a terminal owner's recorded local shell is still the process that
+/// carried that run's identity.
+async fn local_terminal_owner_alive(db: &WorkDb, owner: &str) -> Result<bool> {
     let Ok(Some(pid)) = db.latest_local_shell_pid_for_execution(owner) else {
         return Ok(false);
     };
@@ -301,6 +287,14 @@ async fn run_one_pass_with_occupancy<O: WorkspaceOccupancy, Fut: Future<Output =
         let pane = sweep_pane_status(work_db, live_states, &execution);
         if pane == PaneStatus::Present {
             let registered = live_states.snapshot().iter().any(|state| state.run_id == execution.id);
+            // A live registration on a terminal row is also the ordinary state
+            // between the terminal status write and the end of completion
+            // teardown. Give that window time to close before raising a
+            // user-visible item for what is usually a healthy completion.
+            if registered && !settled_for(&execution, TEARDOWN_WINDOW_SECS) {
+                outcome.held += 1;
+                continue;
+            }
             raise_attention(
                 work_db,
                 &execution,
