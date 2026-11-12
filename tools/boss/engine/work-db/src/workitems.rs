@@ -2045,7 +2045,8 @@ impl WorkDb {
         let removed = deps::delete_edge(&tx, dependent_id, prerequisite_id, relation)?;
         // Auto-unblock (Q4): when the only remaining gating reason is
         // gone and the engine itself put this row in `blocked` (identified
-        // by blocked_reason='dependency'), flip it back to `todo`.
+        // by blocked_reason='dependency'), restore the rest status
+        // (`in_review` when the item already belongs there, else `todo`).
         // Human-placed blocks (other blocked_reason / NULL + human actor)
         // stick — the user must clear them.
         let now = now_string();
@@ -2087,7 +2088,7 @@ impl WorkDb {
 
     /// Check whether `work_item_id` is still gated by unsatisfied
     /// prerequisites. If not — all prereqs are done and the block was
-    /// engine-owned — flip the item to `todo` and return `true`.
+    /// engine-owned — restore its rest status and return `true`.
     /// Returns `false` without modifying the DB when the item is not
     /// blocked, is human-blocked, or still has gating prereqs.
     ///

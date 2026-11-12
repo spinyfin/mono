@@ -10,7 +10,7 @@
 //! | `redispatch` | `request_execution_in_tx_with_live_check` (an explicit start), or the review restart for an `in_review` item |
 //! | `clear-signal` | the merge poller's retire writes (`clear_blocked_*_in_tx`) |
 //! | `archive-revision` | `archive_revision_task_as_actor` plus the dependent cascade |
-//! | `unblock` | the `blocked -> todo` (or `in_review`, when the item already owns a bound PR) move |
+//! | `unblock` | the `blocked -> todo` (or `in_review`, when the item already owns a bound PR or is a completed revision) move |
 //!
 //! Every write is made as `progression`, so the row's `last_status_actor` and the
 //! ledger read as the agent's decision and the dependency cascade treats a
@@ -678,11 +678,12 @@ pub(super) fn unblock(conn: &Connection, pending: &mut PendingEvents, ctx: &Verb
     }
     ctx.refuse_live_work(conn, verb)?;
     ctx.refuse_repeat(conn, verb, "")?;
-    // A primary item that already owns a bound PR cannot rest in `todo`:
-    // `insert_fresh` skips minting and an explicit start bails with "use a
-    // revision". The dependency helper already picks `in_review` vs `todo`
-    // and reconciles a waiting execution; a cleared-reason unblock does the
-    // same rest-state pick so the item is not stranded.
+    // A primary item that already owns a bound PR, or a revision whose
+    // implementation has completed, cannot rest in `todo`: `insert_fresh`
+    // skips minting and an explicit start of a primary PR bails with
+    // "use a revision". The dependency helper already picks `in_review` vs
+    // `todo` and reconciles a waiting execution; a cleared-reason unblock
+    // does the same rest-state pick so the item is not stranded.
     if item.blocked_reason.as_deref() == Some("dependency") {
         let lifted = crate::dep_helpers::maybe_engine_unblock_dependent_as_actor(
             pending,
@@ -698,7 +699,7 @@ pub(super) fn unblock(conn: &Connection, pending: &mut PendingEvents, ctx: &Verb
             )));
         }
     } else {
-        let rest = if crate::dispatch_admission::primary_pr_awaits_review(conn, &item.id)? {
+        let rest = if crate::dispatch_admission::delivered_or_completed(conn, &item.id)? {
             "in_review"
         } else {
             "todo"

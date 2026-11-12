@@ -270,6 +270,13 @@ pub(crate) fn revision_implementation_completed(conn: &Connection, work_item_id:
     Ok(status.as_deref() == Some("completed"))
 }
 
+/// True when this item already belongs in review: it owns a delivered
+/// primary PR, or it is a revision whose implementation has completed.
+/// Unblock restores `in_review` rather than `todo` for these rows.
+pub(crate) fn delivered_or_completed(conn: &Connection, work_item_id: &str) -> Result<bool> {
+    Ok(primary_pr_awaits_review(conn, work_item_id)? || revision_implementation_completed(conn, work_item_id)?)
+}
+
 /// The members of `ids` for which [`primary_pr_awaits_review`] or
 /// [`revision_implementation_completed`] is true, read with one statement.
 pub(crate) fn delivered_or_completed_among<S: AsRef<str>>(conn: &Connection, ids: &[S]) -> Result<HashSet<String>> {

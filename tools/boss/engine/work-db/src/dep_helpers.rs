@@ -665,6 +665,9 @@ pub(crate) fn add_dependency_edge_in_tx_as_actor(
 /// column, `blocked_reason IS NULL AND last_status_actor = 'engine'`
 /// — and (c) no gating prereqs remain. Items blocked for other reasons
 /// (merge_conflict, ci_failure) or manually by a human are left alone.
+/// Restores `in_review` when the item already belongs there (a delivered
+/// primary PR, or a revision whose implementation has completed); otherwise
+/// `todo`.
 ///
 /// Returns `true` when an unblock was written, `false` when the item
 /// was skipped (not blocked, not engine-owned, or still gated). This
@@ -737,7 +740,7 @@ pub(crate) fn maybe_engine_unblock_dependent_as_actor(
         write_task_status_as_actor(
             conn,
             dependent_id,
-            if crate::dispatch_admission::primary_pr_awaits_review(conn, dependent_id)? {
+            if crate::dispatch_admission::delivered_or_completed(conn, dependent_id)? {
                 TaskStatus::InReview
             } else {
                 TaskStatus::Todo
@@ -776,7 +779,7 @@ pub(crate) fn maybe_engine_unblock_dependent_as_actor(
     // during the gated window via a timing race — skip the reconcile.
     // Creating or promoting a `ready` execution on top of a live one
     // would let the dispatcher spawn a second worker for the same row.
-    if dependent_id.starts_with("task_") && !crate::dispatch_admission::primary_pr_awaits_review(conn, dependent_id)? {
+    if dependent_id.starts_with("task_") && !crate::dispatch_admission::delivered_or_completed(conn, dependent_id)? {
         let live = query_live_execution_for_work_item(conn, dependent_id)?;
         if live.is_none() {
             let kind = execution_kind_for_work_item(conn, dependent_id)?;

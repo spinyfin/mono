@@ -1,6 +1,4 @@
-use super::dispatch_admission::{
-    primary_pr_awaits_review, revision_implementation_completed, work_item_is_deliberately_parked,
-};
+use super::dispatch_admission::{delivered_or_completed, work_item_is_deliberately_parked};
 use super::*;
 
 #[work_db_boundary::instrument]
@@ -634,7 +632,7 @@ impl WorkDb {
             //   - latest execution terminal → yes,
             //   - latest execution non-terminal but `is_live`
             //     reports the slot is gone → yes (stale row).
-            if primary_pr_awaits_review(&tx, &work_item_id)? || revision_implementation_completed(&tx, &work_item_id)? {
+            if delivered_or_completed(&tx, &work_item_id)? {
                 continue;
             }
             let existing = query_latest_execution_for_work_item(&tx, &work_item_id)?;
@@ -770,7 +768,7 @@ impl WorkDb {
             if !autostart {
                 continue;
             }
-            if primary_pr_awaits_review(&tx, &work_item_id)? || revision_implementation_completed(&tx, &work_item_id)? {
+            if delivered_or_completed(&tx, &work_item_id)? {
                 continue;
             }
             let needs_dispatch = match query_latest_execution_for_work_item(&tx, &work_item_id)? {
@@ -2059,9 +2057,9 @@ pub(crate) fn review_recovery_holds_sql(item: &str) -> String {
 }
 
 /// The members of `ids` that review handling owns rather than the orphan
-/// sweep: a delivered primary PR ([`primary_pr_awaits_review`]), a completed
-/// revision ([`revision_implementation_completed`]) or a live review batch
-/// ([`live_pre_merge_batch_holds_among`]). Three statements however many ids.
+/// sweep: a delivered primary PR or completed revision
+/// ([`super::dispatch_admission::delivered_or_completed`]) or a live review
+/// batch ([`live_pre_merge_batch_holds_among`]). Three statements however many ids.
 pub(crate) fn review_handling_holds<S: AsRef<str>>(conn: &Connection, ids: &[S]) -> Result<HashSet<String>> {
     if ids.is_empty() {
         return Ok(HashSet::new());
