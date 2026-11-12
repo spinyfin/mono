@@ -1600,3 +1600,168 @@ mod tests {
         }
     }
 }
+
+pub mod update_request {
+    //! Handing an upgrade offer to the privileged update helper, and the daemon's
+    //! own release identity.
+    //!
+    //! The helper is activated by changes to the request directory and reads
+    //! `request.json` as soon as it appears, so the file must exist only once it is
+    //! complete.
+
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use anyhow::{Context, Result, bail};
+
+    pub const REQUEST_FILE: &str = "request.json";
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum Published {
+        /// This offer is now the pending request.
+        Created,
+        /// The same command was already published (a replay).
+        AlreadyPending,
+    }
+
+    /// Publishes `bytes` as `<dir>/request.json` atomically and without replacing
+    /// anything. The bytes go to a private temp file in the same directory and are
+    /// synced; a hard link then makes them visible under the final name in one
+    /// step (`link` fails if the name exists), and the directory is synced before
+    /// the caller acknowledges the command. A reader therefore sees either no
+    /// file or the whole offer, and two concurrent offers cannot both win.
+    pub fn publish(dir: &Path, command_id: &str, bytes: &[u8]) -> Result<Published> {
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join(REQUEST_FILE);
+        let temp = dir.join(format!(
+            ".{REQUEST_FILE}.{}.{}.tmp",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let write = || -> Result<()> {
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            Ok(())
+        };
+        let outcome = write().and_then(|()| match std::fs::hard_link(&temp, &path) {
+            Ok(()) => Ok(Published::Created),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).context("cannot read the pending request")?)
+                        .context("the pending request is not valid JSON")?;
+                if existing.get("command_id").and_then(|value| value.as_str()) == Some(command_id) {
+                    Ok(Published::AlreadyPending)
+                } else {
+                    bail!("upgrade_busy: another update request is already pending")
+                }
+            }
+            Err(error) => Err(error.into()),
+        });
+        let _ = std::fs::remove_file(&temp);
+        let published = outcome?;
+        std::fs::File::open(dir)
+            .and_then(|directory| directory.sync_all())
+            .context("cannot sync the request directory")?;
+        Ok(published)
+    }
+
+    /// The release this binary was unpacked from: the directory under `releases/`
+    /// that holds the running executable. It comes from where the process really
+    /// runs, not from any file the helper wrote.
+    pub fn release_of_executable(exe: &Path) -> Option<String> {
+        let exe: PathBuf = std::fs::canonicalize(exe).ok()?;
+        let mut components = exe.components().map(|c| c.as_os_str().to_str());
+        let mut release = None;
+        while let Some(component) = components.next() {
+            if component == Some("releases") {
+                release = components.next().flatten().map(str::to_owned);
+            }
+        }
+        release
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_reader_never_sees_a_partial_offer() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(REQUEST_FILE);
+            let body = vec![b'x'; 4 * 1024 * 1024];
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reader = {
+                let (path, stop, expected) = (path.clone(), stop.clone(), body.len());
+                std::thread::spawn(move || {
+                    let mut seen = 0usize;
+                    while !stop.load(Ordering::Relaxed) {
+                        if let Ok(bytes) = std::fs::read(&path) {
+                            assert_eq!(bytes.len(), expected, "a helper read a partial request");
+                            seen += 1;
+                        }
+                    }
+                    seen
+                })
+            };
+            assert_eq!(publish(dir.path(), "cmd-1", &body).unwrap(), Published::Created);
+            // Keep reading after publication so the reader certainly observed it.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            stop.store(true, Ordering::Relaxed);
+            assert!(reader.join().unwrap() > 0);
+        }
+
+        #[test]
+        fn two_racing_offers_cannot_both_win_and_a_replay_is_idempotent() {
+            let dir = tempfile::tempdir().unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let handles: Vec<_> = (0..8)
+                .map(|n| {
+                    let (path, barrier) = (dir.path().to_path_buf(), barrier.clone());
+                    std::thread::spawn(move || {
+                        let id = format!("cmd-{n}");
+                        let body = format!("{{\"command_id\":\"{id}\"}}");
+                        barrier.wait();
+                        (id, publish(&path, &format!("cmd-{n}"), body.as_bytes()))
+                    })
+                })
+                .collect();
+            let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let winners: Vec<_> = results
+                .iter()
+                .filter(|(_, result)| matches!(result, Ok(Published::Created)))
+                .collect();
+            assert_eq!(winners.len(), 1, "exactly one offer wins: {results:?}");
+            for (_, result) in results.iter().filter(|(_, r)| !matches!(r, Ok(Published::Created))) {
+                assert!(result.as_ref().unwrap_err().to_string().contains("upgrade_busy"));
+            }
+            let winner = &winners[0].0;
+            let on_disk: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.path().join(REQUEST_FILE)).unwrap()).unwrap();
+            assert_eq!(on_disk["command_id"], winner.as_str());
+            let replay = publish(dir.path(), winner, b"{}").unwrap();
+            assert_eq!(replay, Published::AlreadyPending);
+            let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .filter(|name| name != REQUEST_FILE)
+                .collect();
+            assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        }
+
+        #[test]
+        fn the_release_is_read_from_where_the_binary_lives() {
+            let dir = tempfile::tempdir().unwrap();
+            let release = dir.path().join("opt/boss-spoke/releases/2026.11.1");
+            std::fs::create_dir_all(&release).unwrap();
+            let exe = release.join("boss-spoke");
+            std::fs::write(&exe, b"x").unwrap();
+            assert_eq!(release_of_executable(&exe).as_deref(), Some("2026.11.1"));
+            let elsewhere = dir.path().join("boss-spoke");
+            std::fs::write(&elsewhere, b"x").unwrap();
+            assert_eq!(release_of_executable(&elsewhere), None);
+        }
+    }
+}

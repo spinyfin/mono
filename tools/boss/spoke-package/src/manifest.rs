@@ -299,14 +299,81 @@ pub fn parse_release_url(url: &str) -> Result<url::Url, Error> {
     Ok(parsed)
 }
 
+/// Redirect target syntax: absolute HTTPS, no userinfo, fragment or
+/// dot-segments. Unlike an offered URL it may carry a query, because release
+/// CDNs sign their download URLs with query parameters.
+fn parse_redirect_url(url: &str) -> Result<url::Url, Error> {
+    if url_has_dot_segment(url) {
+        return Err(Error::UnapprovedOrigin {
+            url: url.to_owned(),
+            origin: "dot-segment".into(),
+        });
+    }
+    let parsed = url::Url::parse(url).map_err(|error| Error::Malformed(error.to_string()))?;
+    if parsed.scheme() != "https" {
+        return Err(Error::OriginNotHttps(url.to_owned()));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(Error::UnapprovedOrigin {
+            url: url.to_owned(),
+            origin: "userinfo".into(),
+        });
+    }
+    if parsed.fragment().is_some() {
+        return Err(Error::UnapprovedOrigin {
+            url: url.to_owned(),
+            origin: "fragment".into(),
+        });
+    }
+    if parsed.host_str().is_none_or(|host| host.is_empty()) {
+        return Err(Error::OriginNotHttps(url.to_owned()));
+    }
+    if parsed
+        .path_segments()
+        .into_iter()
+        .flatten()
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return Err(Error::UnapprovedOrigin {
+            url: url.to_owned(),
+            origin: "dot-segment".into(),
+        });
+    }
+    Ok(parsed)
+}
+
 /// Resolve a redirect hop against the same origin pin as the original request.
+/// A GitHub release pin may hop onto the GitHub release-asset CDN, whose
+/// signed download URLs carry a query string; offered manifest and package
+/// URLs still may not.
 pub fn redirect_hop(current: &str, location: &str, pinned: &str) -> Result<String, Error> {
-    let current = parse_release_url(current)?;
+    let current = parse_redirect_url(current)?;
     let joined = current
         .join(location)
         .map_err(|error| Error::Malformed(error.to_string()))?;
-    require_origin(joined.as_str(), pinned)?;
-    Ok(joined.into())
+    let joined = parse_redirect_url(joined.as_str())?;
+    let pin = parse_release_url(pinned)?;
+    if origin_matches(&joined, &pin) || github_release_cdn(&current, &joined) {
+        Ok(joined.to_string())
+    } else {
+        Err(Error::UnapprovedOrigin {
+            url: joined.to_string(),
+            origin: pinned.to_owned(),
+        })
+    }
+}
+
+fn github_release_cdn(from: &url::Url, to: &url::Url) -> bool {
+    let from_host = from.host_str().unwrap_or_default();
+    let to_host = to.host_str().unwrap_or_default();
+    let github = from_host == "github.com" || from_host.ends_with(".github.com");
+    let cdn = matches!(
+        to_host,
+        "objects.githubusercontent.com"
+            | "release-assets.githubusercontent.com"
+            | "github-releases.githubusercontent.com"
+    ) || to_host.ends_with(".githubusercontent.com");
+    github && cdn
 }
 
 fn origin_matches(url: &url::Url, pinned: &url::Url) -> bool {
@@ -340,12 +407,13 @@ fn percent_decode_segment(segment: &str) -> String {
     let bytes = segment.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (from_hex(bytes[i + 1]), from_hex(bytes[i + 2])) {
-                out.push(char::from((hi << 4) | lo));
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (from_hex(bytes[i + 1]), from_hex(bytes[i + 2]))
+        {
+            out.push(char::from((hi << 4) | lo));
+            i += 3;
+            continue;
         }
         out.push(bytes[i] as char);
         i += 1;

@@ -144,6 +144,8 @@ impl Host for Recording {
         }
         output
     }
+
+    fn note_handoff(&self, _logical: &Path) {}
 }
 
 struct Release {

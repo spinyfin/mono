@@ -14,11 +14,25 @@
 	<key>WatchPaths</key>
 	<array>
 		<string>{{request}}</string>
+		<string>{{claimed}}</string>
+		<string>{{active}}</string>
 	</array>
+	<key>KeepAlive</key>
+	<dict>
+		<key>PathState</key>
+		<dict>
+			<key>{{request}}</key>
+			<true/>
+			<key>{{claimed}}</key>
+			<true/>
+			<key>{{active}}</key>
+			<true/>
+		</dict>
+	</dict>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>TimeOut</key>
-	<integer>600</integer>
+	<integer>2700</integer>
 	<key>Nice</key>
 	<integer>5</integer>
 </dict>

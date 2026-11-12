@@ -168,14 +168,18 @@ pub fn render_update_systemd(installer: &Path, config: &Path) -> String {
     )
 }
 
-pub fn render_update_path(request: &Path) -> String {
+pub fn render_update_path(request: &Path, claimed: &Path, active: &Path) -> String {
     fill(
         SYSTEMD_UPDATE_PATH_TEMPLATE,
-        &[("request", request.display().to_string())],
+        &[
+            ("request", request.display().to_string()),
+            ("claimed", claimed.display().to_string()),
+            ("active", active.display().to_string()),
+        ],
     )
 }
 
-pub fn render_update_launchd(installer: &Path, config: &Path, request: &Path) -> String {
+pub fn render_update_launchd(installer: &Path, config: &Path, request: &Path, claimed: &Path, active: &Path) -> String {
     fill(
         LAUNCHD_UPDATE_TEMPLATE,
         &[
@@ -183,6 +187,8 @@ pub fn render_update_launchd(installer: &Path, config: &Path, request: &Path) ->
             ("installer", xml(&installer.display().to_string())),
             ("config", xml(&config.display().to_string())),
             ("request", xml(&request.display().to_string())),
+            ("claimed", xml(&claimed.display().to_string())),
+            ("active", xml(&active.display().to_string())),
         ],
     )
 }

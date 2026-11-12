@@ -80,6 +80,12 @@ enum Cli {
         #[arg(long, hide = true)]
         fixture_files: Option<PathBuf>,
     },
+    /// Print a journal's SQLite `user_version`. Run by the update helper as the
+    /// service user so root never opens the service user's database.
+    JournalVersion {
+        #[arg(long)]
+        path: PathBuf,
+    },
     /// Check this host as the service user, in the installed service environment.
     Preflight {
         #[arg(long, default_value = "/etc/boss-spoke/install.json")]
@@ -208,6 +214,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
             root,
             fixture_files,
         } => return apply_update_command(&config, root, fixture_files),
+        Cli::JournalVersion { path } => {
+            println!("user_version={}", update::read_user_version(&path)?);
+            return Ok(ExitCode::SUCCESS);
+        }
         Cli::Preflight {
             config,
             storage_only,
@@ -250,7 +260,32 @@ fn load_fixture_fetcher(path: &Path) -> Result<MapFetcher> {
     Ok(MapFetcher { files })
 }
 
+extern "C" fn handle_sigterm(_: i32) {
+    update::request_terminate();
+}
+
+fn install_terminate_handler() {
+    // SAFETY: the handler only stores an atomic flag; it is installed once
+    // before the helper does any work.
+    unsafe {
+        libc::signal(libc::SIGTERM, handle_sigterm as *const () as libc::sighandler_t);
+    }
+}
+
 fn apply_update_command(config: &Path, root: Option<PathBuf>, fixture_files: Option<PathBuf>) -> Result<ExitCode> {
+    // The fixture fetcher, the stub probe and crash injection replace the
+    // network, the daemon's health and the helper's crash safety. They exist
+    // for isolated staging runs and are refused on a real host.
+    let hooks = [
+        fixture_files.is_some().then_some("--fixture-files"),
+        std::env::var_os("BOSS_SPOKE_UPDATE_PROBE").map(|_| "BOSS_SPOKE_UPDATE_PROBE"),
+        std::env::var_os("BOSS_SPOKE_UPDATE_CRASH").map(|_| "BOSS_SPOKE_UPDATE_CRASH"),
+    ];
+    if root.is_none()
+        && let Some(hook) = hooks.into_iter().flatten().next()
+    {
+        bail!("{hook} is a test hook and is only accepted with --root");
+    }
     // SAFETY: geteuid has no preconditions and cannot fail.
     if root.is_none() && unsafe { libc::geteuid() } != 0 {
         bail!("apply-update rewrites the root-owned release layout; run it as root");
@@ -260,19 +295,27 @@ fn apply_update_command(config: &Path, root: Option<PathBuf>, fixture_files: Opt
     layout.root = root;
     let platform = layout.platform;
     let staged = layout.root.is_some();
-    let host: &dyn Host = if staged { &Staged } else { &System { platform } };
+    let staged_host = Staged::default();
+    let host: &dyn Host = if staged { &staged_host } else { &System { platform } };
     let account = host
         .lookup_user(&record.user)?
         .with_context(|| format!("service user {} is missing", record.user))?;
+    let crash = std::env::var("BOSS_SPOKE_UPDATE_CRASH").ok();
     let file_probe = FileProbe {
         layout: &layout,
         account,
+        require_handshake: true,
     };
+    let only_installed = update::OnlyReady(record.release_id.clone());
     let always = AlwaysReady;
-    let probe: &dyn update::HealthProbe = if staged { &always } else { &file_probe };
-    let http = HttpFetcher {
-        origin: record.package_origin.clone(),
+    let never = update::NeverReady;
+    let probe: &dyn update::HealthProbe = match std::env::var("BOSS_SPOKE_UPDATE_PROBE").as_deref() {
+        Ok("never") => &never,
+        Ok("only_installed") => &only_installed,
+        _ if staged => &always,
+        _ => &file_probe,
     };
+    let http = HttpFetcher::new(record.package_origin.clone())?;
     let mapped = fixture_files
         .as_ref()
         .map(|path| load_fixture_fetcher(path))
@@ -281,6 +324,8 @@ fn apply_update_command(config: &Path, root: Option<PathBuf>, fixture_files: Opt
         Some(map) => map,
         None => &http,
     };
+    let inspector = std::env::current_exe().context("cannot locate the installer binary")?;
+    install_terminate_handler();
     let status = update::apply(&Apply {
         host,
         layout: &layout,
@@ -295,7 +340,10 @@ fn apply_update_command(config: &Path, root: Option<PathBuf>, fixture_files: Opt
         } else {
             install::Health::default()
         },
-        crash: None,
+        inspector: &inspector,
+        crash,
+        unwind_crash: false,
+        fail: None,
     })?;
     println!(
         "upgrade {} {} {}",
@@ -337,7 +385,8 @@ fn install_command(args: InstallArgs) -> Result<ExitCode> {
             root: args.root,
         })
         .build();
-    let host: &dyn Host = if staged { &Staged } else { &System { platform } };
+    let staged_host = Staged::default();
+    let host: &dyn Host = if staged { &staged_host } else { &System { platform } };
     let report = install::install(host, &request)?;
     println!("release {} for {}", report.release_id, platform.as_str());
     println!("release key fingerprint: {}", report.key_fingerprint);

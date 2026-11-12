@@ -177,6 +177,14 @@ mod commands {
         }
     }
 
+    fn helper_is_busy() -> bool {
+        let Some(config) = std::env::var_os("BOSS_SPOKE_INSTALL_CONFIG") else {
+            return false;
+        };
+        let etc = std::path::Path::new(&config).parent();
+        etc.is_some_and(|etc| etc.join("update-claimed.json").is_file() || etc.join("upgrade-active").is_file())
+    }
+
     fn apply_upgrade(state_dir: &Path, command_id: &str, upgrade: &boss_protocol_spoke::v1::Upgrade) -> CommandResult {
         let request = serde_json::json!({
             "schema": 1,
@@ -186,30 +194,19 @@ mod commands {
             "manifest_sha256": upgrade.manifest_sha256.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
         });
         let dir = state_dir.join("update-request");
-        let path = dir.join("request.json");
+        if helper_is_busy() {
+            return CommandResult {
+                command_id: command_id.into(),
+                code: ResultCode::Rejected.into(),
+                reason: "upgrade_busy: another update request is already pending".into(),
+                value: None,
+            };
+        }
         let written = serde_json::to_vec_pretty(&request)
             .map_err(anyhow::Error::from)
-            .and_then(|bytes| {
-                std::fs::create_dir_all(&dir)?;
-                match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-                    Ok(mut file) => {
-                        use std::io::Write;
-                        file.write_all(&bytes)?;
-                        Ok(())
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                        let existing: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
-                        if existing.get("command_id").and_then(|value| value.as_str()) == Some(command_id) {
-                            Ok(())
-                        } else {
-                            anyhow::bail!("upgrade_busy: another update request is already pending");
-                        }
-                    }
-                    Err(error) => Err(error.into()),
-                }
-            });
+            .and_then(|bytes| boss_spoke_ingress::update_request::publish(&dir, command_id, &bytes));
         match written {
-            Ok(()) => CommandResult {
+            Ok(_) => CommandResult {
                 command_id: command_id.into(),
                 code: ResultCode::Ok.into(),
                 reason: String::new(),
@@ -331,13 +328,17 @@ struct HealthFlags {
     handshake_ok: AtomicBool,
 }
 
+struct HealthAttempt {
+    release_id: String,
+    nonce: String,
+}
+
 struct HealthWatch {
     inner: Arc<boss_spoke_ingress::capture::Captures>,
     path: PathBuf,
     flags: HealthFlags,
     execution: AtomicBool,
-    release_id: String,
-    nonce: String,
+    attempt: HealthAttempt,
 }
 
 impl HealthWatch {
@@ -353,8 +354,7 @@ impl HealthWatch {
                 handshake_ok: AtomicBool::new(false),
             },
             execution: AtomicBool::new(false),
-            release_id,
-            nonce,
+            attempt: HealthAttempt { release_id, nonce },
         }
     }
 
@@ -375,9 +375,9 @@ impl HealthWatch {
             "journal_ok": self.flags.journal_ok.load(Ordering::Relaxed),
             "inventory_ok": self.flags.inventory_ok.load(Ordering::Relaxed),
             "handshake_ok": self.flags.handshake_ok.load(Ordering::Relaxed),
-            "release_id": self.release_id,
+            "release_id": self.attempt.release_id,
             "pid": std::process::id(),
-            "nonce": self.nonce,
+            "nonce": self.attempt.nonce,
         });
         let tmp = self.path.with_extension("json.tmp");
         if std::fs::write(&tmp, serde_json::to_vec(&body).unwrap_or_default()).is_ok() {
@@ -608,42 +608,41 @@ fn install_status_paths() -> (PathBuf, PathBuf) {
     (config, status)
 }
 
+/// The release this process is running, from where its executable lives; and
+/// the nonce of the helper's current restart attempt. The helper's attempt file
+/// supplies only the nonce: a binary that the service manager started from the
+/// wrong release cannot claim the release the helper expected.
 fn attempt_identity() -> (String, String) {
     let (config, _) = install_status_paths();
     let attempt = config
         .parent()
         .unwrap_or(Path::new("/etc/boss-spoke"))
         .join("update-attempt.json");
-    let parsed = std::fs::read(&attempt)
+    let nonce = std::fs::read(&attempt)
         .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-    let field = |name: &str| {
-        parsed
-            .as_ref()
-            .and_then(|value| value.get(name)?.as_str().map(str::to_owned))
-            .unwrap_or_default()
-    };
-    let release_id = std::env::var("BOSS_SPOKE_RELEASE_ID").unwrap_or_else(|_| {
-        let from_attempt = field("release_id");
-        if from_attempt.is_empty() {
-            std::fs::read(&config)
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| value.get("nonce")?.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    (running_release(&config), nonce)
+}
+
+fn running_release(config: &Path) -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| boss_spoke_ingress::update_request::release_of_executable(&exe))
+        .unwrap_or_else(|| {
+            // Not run from a release directory (a development build): fall back
+            // to what was installed.
+            std::fs::read(config)
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
                 .and_then(|value| value.get("release_id")?.as_str().map(str::to_owned))
                 .unwrap_or_default()
-        } else {
-            from_attempt
-        }
-    });
-    (release_id, field("nonce"))
+        })
 }
 
 fn reported_release(config: &Path, status: &Path) -> (String, String, String, String) {
-    let running = std::fs::read(config)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .and_then(|value| value.get("release_id")?.as_str().map(str::to_owned))
-        .unwrap_or_default();
+    let running = running_release(config);
     let parsed = std::fs::read(status)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());

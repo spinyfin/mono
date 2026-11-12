@@ -323,7 +323,10 @@ async fn actual_daemon_accepts_upgrade_when_welcome_selects_only_journal_and_upg
     let mut hub = Fixture::new().await;
     let daemon = hub.start();
     let mut connection = hub.connection().await;
-    assert_eq!(connection.hello.features, boss_spoke_outbound::executor_contracts().features);
+    assert_eq!(
+        connection.hello.features,
+        boss_spoke_outbound::executor_contracts().features
+    );
     connection.welcome_features(0, management_features()).await;
     loop {
         if let spoke_frame::Body::Record(record) = connection.next().await {
@@ -414,12 +417,12 @@ async fn actual_daemon_refuses_a_second_upgrade_offer_while_one_is_pending() {
         match connection.next().await {
             spoke_frame::Body::CommandReceipt(_) => {}
             spoke_frame::Body::Record(record) => {
-                if let Some(record::Body::Result(result)) = &record.body {
-                    if result.command_id == "upgrade-b" {
-                        assert_eq!(result.code, v1::ResultCode::Rejected as i32);
-                        assert!(result.reason.contains("upgrade_busy"), "{}", result.reason);
-                        busy = true;
-                    }
+                if let Some(record::Body::Result(result)) = &record.body
+                    && result.command_id == "upgrade-b"
+                {
+                    assert_eq!(result.code, v1::ResultCode::Rejected as i32);
+                    assert!(result.reason.contains("upgrade_busy"), "{}", result.reason);
+                    busy = true;
                 }
                 connection.receipt(record.sequence).await;
             }

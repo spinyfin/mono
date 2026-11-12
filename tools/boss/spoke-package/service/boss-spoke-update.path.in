@@ -2,7 +2,9 @@
 Description=Boss spoke update request
 
 [Path]
-PathChanged={{request}}
+PathExists={{request}}
+PathExists={{claimed}}
+PathExists={{active}}
 MakeDirectory=false
 
 [Install]

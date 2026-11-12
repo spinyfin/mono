@@ -90,6 +90,20 @@ impl Layout {
         self.request_dir().join("request.json")
     }
 
+    /// Installer-owned copy of the offer currently being applied. The helper
+    /// renames `request.json` here before it trusts the bytes, so a replacement
+    /// in the service-user directory cannot be unlinked as a side effect.
+    pub fn claimed_path(&self) -> PathBuf {
+        self.etc().join("update-claimed.json")
+    }
+
+    /// Present only while the helper has unfinished work. The path unit and
+    /// launchd KeepAlive watch it so a crashed helper is re-run without looping
+    /// on a terminal unresolved marker.
+    pub fn active_path(&self) -> PathBuf {
+        self.etc().join("upgrade-active")
+    }
+
     pub fn status_path(&self) -> PathBuf {
         self.etc().join("upgrade-status.json")
     }
@@ -271,6 +285,9 @@ pub trait Host {
     /// Runs `program` as `account` with exactly `env` and nothing inherited.
     fn run_as(&self, account: &Account, env: &[(String, String)], program: &Path, args: &[String])
     -> Result<RunOutput>;
+    /// Records that `logical` is owned by the service account. Tests use this
+    /// to prove containment; production hosts ignore it.
+    fn note_handoff(&self, _logical: &Path) {}
 }
 
 /// How long to wait for a restarted service to prove itself.
@@ -367,7 +384,7 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
         write_logical(layout, &layout.pinned_key_path(), key.to_text().as_bytes(), 0o644)?;
         report.changed.push("release key pinned");
     }
-    if ensure_state(layout, &account)? {
+    if ensure_state(host, layout, &account)? {
         report.changed.push("service state directories");
     }
     if install_release(layout, &release_id, request.package, &verified.manifest.package.sha256)? {
@@ -400,6 +417,7 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
         .context("the credentials directory was replaced after it was verified")?;
     secure_fs::verify_user_dir(&credentials_dir, &account, true, "credentials")?;
     let trust_changed = secure_fs::write_file_at(&credentials_dir, "ca.pem", request.hub_ca, 0o600, Some(&account))?;
+    host.note_handoff(&credentials.join("ca.pem"));
     if trust_changed {
         report.changed.push("hub trust installed");
     }
@@ -545,7 +563,7 @@ fn ensure_root_dir(layout: &Layout, logical: &Path) -> Result<bool> {
 /// The service user's home, then its owner-only spoke state, credential and
 /// driver-home directories. An existing directory is verified, never repaired:
 /// the service user controls these paths, so root must not chown or chmod them.
-fn ensure_state(layout: &Layout, account: &Account) -> Result<bool> {
+fn ensure_state(host: &dyn Host, layout: &Layout, account: &Account) -> Result<bool> {
     let home = layout.home();
     let parent = home.parent().context("home has no parent")?;
     let parent_dir = {
@@ -557,15 +575,18 @@ fn ensure_state(layout: &Layout, account: &Account) -> Result<bool> {
         .and_then(|name| name.to_str())
         .context("home is not a plain name")?;
     let (home_dir, mut changed) = secure_fs::ensure_user_dir_at(&parent_dir, home_name, account, false)?;
+    host.note_handoff(&home);
     let state_path = layout.state_dir();
     let state_name = state_path
         .file_name()
         .and_then(|name| name.to_str())
         .context("state directory is not a plain name")?;
     let (state_dir, state_created) = secure_fs::ensure_user_dir_at(&home_dir, state_name, account, true)?;
+    host.note_handoff(&state_path);
     changed |= state_created;
     for name in ["credentials", "homes", "update-request"] {
         let (_, created) = secure_fs::ensure_user_dir_at(&state_dir, name, account, true)?;
+        host.note_handoff(&state_path.join(name));
         changed |= created;
     }
     Ok(changed)
@@ -601,6 +622,110 @@ pub(crate) fn read_service_file(layout: &Layout, logical: &Path, account: &Accou
     }
 }
 
+/// Renames `request.json` into the installer-owned claimed location and returns
+/// its bytes. A file already sitting at the claimed path (a helper that crashed
+/// after claiming) is used as-is. A replacement that appears at the original
+/// name after the rename is left for the next helper run.
+pub(crate) fn claim_request(layout: &Layout) -> Result<Option<Vec<u8>>> {
+    let claimed = layout.claimed_path();
+    let claimed_name = claimed
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("claimed path has no name")?;
+    let claimed_parent = claimed.parent().context("claimed path has no parent")?;
+    ensure_root_dir(layout, claimed_parent)?;
+    let dest = secure_fs::open_installer_dir(layout.base(), claimed_parent)?;
+    secure_fs::verify_installer_dir(&dest, &claimed_parent.display().to_string())?;
+
+    let request = layout.request_path();
+    let request_name = request
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("request path has no name")?;
+    let request_parent = request.parent().context("request path has no parent")?;
+    if let Ok(src) = secure_fs::open_dir(layout.base(), request_parent) {
+        match secure_fs::rename_between(&src, request_name, &dest, claimed_name) {
+            Ok(()) => {}
+            Err(error) if secure_fs::is_not_found(&error) => {}
+            Err(error) if is_cross_device(&error) => {
+                copy_request_then_unlink(layout, &src, request_name, &dest, claimed_name)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    match secure_fs::read_file_at_capped(&dest, claimed_name, SERVICE_FILE_MAX) {
+        Ok((bytes, metadata)) => {
+            ensure!(
+                metadata.st_mode & libc::S_IFMT == libc::S_IFREG,
+                "claimed request must be a regular file"
+            );
+            Ok(Some(bytes))
+        }
+        Err(error) if secure_fs::is_not_found(&error) => Ok(None),
+        Err(error) => {
+            let _ = secure_fs::unlink_file_at(&dest, claimed_name);
+            Err(error)
+        }
+    }
+}
+
+fn copy_request_then_unlink(
+    layout: &Layout,
+    src: &secure_fs::DirFd,
+    request_name: &str,
+    dest: &secure_fs::DirFd,
+    claimed_name: &str,
+) -> Result<()> {
+    // Same-volume `renameat` is the atomic claim. This path is only EXDEV:
+    // copy the inode we opened, then unlink that inode only. A replacement
+    // with a different inode is left for the next helper run.
+    let _ = layout;
+    let (fd, metadata) = match secure_fs::open_regular_at(src, request_name) {
+        Ok(value) => value,
+        Err(error) if secure_fs::is_not_found(&error) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let bytes = secure_fs::read_capped(std::fs::File::from(fd), SERVICE_FILE_MAX)?;
+    secure_fs::write_file_at(dest, claimed_name, &bytes, 0o644, None)?;
+    secure_fs::unlink_if_same(src, request_name, &metadata)
+}
+
+fn is_cross_device(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<io::Error>())
+        .any(|cause| cause.raw_os_error() == Some(libc::EXDEV))
+}
+
+pub(crate) fn clear_claimed(layout: &Layout) -> Result<()> {
+    let path = layout.claimed_path();
+    let parent = path.parent().context("claimed path has no parent")?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("claimed path has no name")?;
+    let dir = match secure_fs::open_installer_dir(layout.base(), parent) {
+        Ok(dir) => dir,
+        Err(error) if secure_fs::is_not_found(&error) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    secure_fs::unlink_file_at(&dir, name)
+}
+
+pub(crate) fn write_active(layout: &Layout) -> Result<()> {
+    write_logical(layout, &layout.active_path(), b"1\n", 0o644)?;
+    Ok(())
+}
+
+pub(crate) fn clear_active(layout: &Layout) -> Result<()> {
+    let path = layout.on_disk(&layout.active_path());
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub(crate) fn unlink_service_file(layout: &Layout, logical: &Path) -> Result<()> {
     let parent = logical.parent().context("path has no parent")?;
     let name = logical
@@ -615,6 +740,9 @@ pub(crate) fn unlink_service_file(layout: &Layout, logical: &Path) -> Result<()>
     secure_fs::unlink_file_at(&dir, name)
 }
 
+/// Locates the service user's journal through the verified state directory.
+/// Root never opens the database; it only checks ownership and size so the
+/// unprivileged inspector can be pointed at a real file.
 pub(crate) fn journal_sqlite_path(layout: &Layout, account: &Account) -> Result<Option<PathBuf>> {
     let logical = layout.state_dir().join("journal.db");
     let parent = logical.parent().context("journal has no parent")?;
@@ -732,12 +860,19 @@ fn install_update_helper(layout: &Layout) -> Result<bool> {
     let installer = layout.current().join(INSTALLER_BINARY);
     let mut changed = false;
     if layout.platform.is_macos() {
-        let body = service::render_update_launchd(&installer, &layout.config_path(), &layout.request_dir());
+        let body = service::render_update_launchd(
+            &installer,
+            &layout.config_path(),
+            &layout.request_path(),
+            &layout.claimed_path(),
+            &layout.active_path(),
+        );
         changed |= write_logical(layout, &layout.helper_definition(), body.as_bytes(), 0o644)?;
     } else {
         let service_body = service::render_update_systemd(&installer, &layout.config_path());
         changed |= write_logical(layout, &layout.helper_definition(), service_body.as_bytes(), 0o644)?;
-        let path_body = service::render_update_path(&layout.request_dir());
+        let path_body =
+            service::render_update_path(&layout.request_path(), &layout.claimed_path(), &layout.active_path());
         changed |= write_logical(
             layout,
             &layout.helper_path_definition().expect("linux helper path unit"),
@@ -996,14 +1131,40 @@ mod secure_fs {
             metadata.st_size as u64 <= max_bytes,
             "{name} is larger than {max_bytes} bytes"
         );
-        let mut file = File::from(fd);
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        ensure!(
-            bytes.len() as u64 <= max_bytes,
-            "{name} is larger than {max_bytes} bytes"
-        );
+        let file = File::from(fd);
+        let bytes = read_capped(file, max_bytes).with_context(|| format!("cannot read {name}"))?;
         Ok((bytes, metadata))
+    }
+
+    /// Reads at most `max_bytes`; one byte more is an error, so a file that
+    /// grows after its `fstat` still cannot exceed the cap.
+    pub fn read_capped(reader: impl Read, max_bytes: u64) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        reader.take(max_bytes.saturating_add(1)).read_to_end(&mut bytes)?;
+        ensure!(bytes.len() as u64 <= max_bytes, "file is larger than {max_bytes} bytes");
+        Ok(bytes)
+    }
+
+    /// `fstatat(AT_SYMLINK_NOFOLLOW)` of `name` in `dir`.
+    pub fn stat_at(dir: &DirFd, name: &str) -> Result<libc::stat> {
+        let c = cstr(name)?;
+        let mut metadata = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::fstatat(dir.0.as_raw_fd(), c.as_ptr(), &mut metadata, libc::AT_SYMLINK_NOFOLLOW) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error()).with_context(|| format!("cannot stat {name}"));
+        }
+        Ok(metadata)
+    }
+
+    /// Unlinks `name` through `dir` only while it is still the object that was
+    /// examined (same device and inode). A replacement is left alone.
+    pub fn unlink_if_same(dir: &DirFd, name: &str, examined: &libc::stat) -> Result<()> {
+        match stat_at(dir, name) {
+            Ok(now) if now.st_dev == examined.st_dev && now.st_ino == examined.st_ino => unlink_at(dir, name),
+            Ok(_) => Ok(()),
+            Err(error) if is_not_found(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn unlink_file_at(dir: &DirFd, name: &str) -> Result<()> {
@@ -1108,11 +1269,23 @@ mod secure_fs {
     }
 
     fn rename_at(dir: &DirFd, from: &str, to: &str) -> Result<()> {
+        rename_between(dir, from, dir, to)
+    }
+
+    /// Atomic directory-entry move between two already-opened directories.
+    pub fn rename_between(from_dir: &DirFd, from: &str, to_dir: &DirFd, to: &str) -> Result<()> {
         let from_c = cstr(from)?;
         let to_c = cstr(to)?;
-        let rc = unsafe { libc::renameat(dir.0.as_raw_fd(), from_c.as_ptr(), dir.0.as_raw_fd(), to_c.as_ptr()) };
+        let rc = unsafe {
+            libc::renameat(
+                from_dir.0.as_raw_fd(),
+                from_c.as_ptr(),
+                to_dir.0.as_raw_fd(),
+                to_c.as_ptr(),
+            )
+        };
         if rc != 0 {
-            return Err(io::Error::last_os_error()).with_context(|| format!("cannot replace {to}"));
+            return Err(io::Error::last_os_error()).with_context(|| format!("cannot claim {from} as {to}"));
         }
         Ok(())
     }
@@ -1155,5 +1328,101 @@ mod secure_fs {
                 .chain()
                 .filter_map(|cause| cause.downcast_ref::<io::Error>())
                 .any(|cause| cause.raw_os_error() == Some(libc::ELOOP))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+
+    use super::secure_fs;
+
+    struct Endless;
+
+    impl Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            buf.fill(b'x');
+            Ok(buf.len())
+        }
+    }
+
+    #[test]
+    fn claiming_a_request_leaves_a_replacement_untouched() {
+        use super::{Layout, claim_request, clear_claimed};
+        use crate::manifest::Platform;
+        let root = tempfile::tempdir().unwrap();
+        let layout = Layout {
+            platform: Platform::LinuxAmd64,
+            user: "boss-worker".into(),
+            root: Some(root.path().to_path_buf()),
+        };
+        let request = layout.on_disk(&layout.request_path());
+        std::fs::create_dir_all(request.parent().unwrap()).unwrap();
+        std::fs::write(&request, b"{\"command_id\":\"a\"}").unwrap();
+        let claimed = claim_request(&layout).unwrap().unwrap();
+        assert_eq!(claimed, b"{\"command_id\":\"a\"}");
+        assert!(!request.exists(), "the original name is gone after the claim");
+        std::fs::write(&request, b"{\"command_id\":\"b\"}").unwrap();
+        clear_claimed(&layout).unwrap();
+        assert_eq!(
+            std::fs::read(&request).unwrap(),
+            b"{\"command_id\":\"b\"}",
+            "a replacement published after the claim must not be unlinked"
+        );
+    }
+
+    #[test]
+    fn a_claimed_unreadable_object_is_removed_without_touching_a_new_request() {
+        use super::{Layout, claim_request};
+        use crate::manifest::Platform;
+        let root = tempfile::tempdir().unwrap();
+        let layout = Layout {
+            platform: Platform::LinuxAmd64,
+            user: "boss-worker".into(),
+            root: Some(root.path().to_path_buf()),
+        };
+        let request = layout.on_disk(&layout.request_path());
+        std::fs::create_dir_all(request.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", &request).unwrap();
+        let result = claim_request(&layout);
+        assert!(
+            result.is_err(),
+            "a symlink must not be accepted as a request: {result:?}"
+        );
+        assert!(
+            !layout.on_disk(&layout.claimed_path()).exists(),
+            "the unreadable claimed object is removed"
+        );
+        std::fs::write(&request, b"{\"command_id\":\"new\"}").unwrap();
+        assert_eq!(
+            std::fs::read(&request).unwrap(),
+            b"{\"command_id\":\"new\"}",
+            "a request published after the failed claim must remain"
+        );
+    }
+
+    #[test]
+    fn unlink_if_same_leaves_a_replaced_inode() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = secure_fs::DirFd::open(root.path(), true).unwrap();
+        std::fs::write(root.path().join("request.json"), b"old").unwrap();
+        let examined = secure_fs::stat_at(&dir, "request.json").unwrap();
+        std::fs::remove_file(root.path().join("request.json")).unwrap();
+        std::fs::write(root.path().join("request.json"), b"new").unwrap();
+        secure_fs::unlink_if_same(&dir, "request.json", &examined).unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("request.json")).unwrap(),
+            b"new",
+            "a replacement published between examine and unlink must remain"
+        );
+    }
+
+    #[test]
+    fn a_file_that_keeps_growing_is_cut_off_at_the_cap() {
+        let bytes = secure_fs::read_capped(&b"0123456789"[..], 10).unwrap();
+        assert_eq!(bytes.len(), 10);
+        assert!(secure_fs::read_capped(&b"0123456789a"[..], 10).is_err());
+        // The reader is never drained past cap + 1, whatever it claims to hold.
+        assert!(secure_fs::read_capped(Endless, 64 * 1024).is_err());
     }
 }

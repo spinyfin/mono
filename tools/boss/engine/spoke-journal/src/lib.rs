@@ -3,24 +3,14 @@ mod commands;
 mod executions;
 mod records;
 mod sources;
-
-/// Current journal `user_version`. Keep in lockstep with the last
-/// `PRAGMA user_version` in [`schema::migrate`].
-pub const SCHEMA_VERSION: u32 = 6;
-/// Oldest `user_version` this reader can open. Keep in lockstep with
-/// `boss_spoke_package::manifest::OLDEST_JOURNAL_VERSION`.
-pub const OLDEST_READABLE: u32 = 1;
-
 mod schema {
     use anyhow::{Result, ensure};
     use rusqlite::Connection;
 
-    use super::SCHEMA_VERSION;
-
     pub fn migrate(db: &mut Connection) -> Result<()> {
         let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
         ensure!(
-            version <= SCHEMA_VERSION,
+            version <= 6,
             "journal schema is newer than this reader; rollback refused"
         );
         if version == 0 {

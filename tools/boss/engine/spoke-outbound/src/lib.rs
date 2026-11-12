@@ -197,10 +197,23 @@ mod session {
             contracts()
         };
         loop {
-            match connect_offered(journal, endpoint.clone(), nonce, stamp, external_executor, observer, &offered)
-                .await
+            match connect_offered(
+                journal,
+                endpoint.clone(),
+                nonce,
+                stamp,
+                external_executor,
+                observer,
+                &offered,
+            )
+            .await
             {
-                Err(error) if error.downcast_ref::<ContractFallback>().is_some() && offered.required.iter().any(|name| name == negotiate::feature::EXECUTION) =>
+                Err(error)
+                    if error.downcast_ref::<ContractFallback>().is_some()
+                        && offered
+                            .required
+                            .iter()
+                            .any(|name| name == negotiate::feature::EXECUTION) =>
                 {
                     tracing::warn!(error = %error, "execution contract refused; retrying management-only");
                     offered = contracts();
@@ -222,7 +235,12 @@ mod session {
         match offered.confirm(welcome) {
             Ok(selection) => Ok(selection),
             Err(error) => match contracts().confirm(welcome) {
-                Ok(selection) if offered.required.iter().any(|name| name == negotiate::feature::EXECUTION) => {
+                Ok(selection)
+                    if offered
+                        .required
+                        .iter()
+                        .any(|name| name == negotiate::feature::EXECUTION) =>
+                {
                     tracing::warn!(error = %error, "hub selected management contracts; execution not admitted");
                     Ok(selection)
                 }
@@ -304,7 +322,10 @@ mod session {
                     .iter()
                     .any(|name| name == negotiate::feature::EXECUTION)
                     && error.downcast_ref::<Rejection>().is_some_and(|rejection| {
-                        matches!(rejection, Rejection::NoCommonEpoch { .. } | Rejection::MissingRequired { .. })
+                        matches!(
+                            rejection,
+                            Rejection::NoCommonEpoch { .. } | Rejection::MissingRequired { .. }
+                        )
                     }) =>
             {
                 return Err(management_fallback(error));

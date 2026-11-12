@@ -46,6 +46,8 @@ rust_test(
     size = "small",
     timeout = "moderate",
     srcs = ["tests/update.rs"],
+    # Live tmux is optional: Linux bazel-any agents get host_tmux's
+    # exit-127 stub, and update_test skips session-survival asserts there.
     data = [
         ":boss-spoke-package",
         "//tools/boss/engine/spoke:boss-spoke",
@@ -61,7 +63,44 @@ rust_test(
         proc_macro = True,
         proc_macro_dev = True,
     ),
-    deps = [":spoke-package"] + all_crate_deps(
+    deps = [
+        ":spoke-package",
+        "//tools/boss/engine/spoke:test_hub",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# Live tmux pane survival against a real packaged daemon. Tagged manual: the
+# bazel-any Linux queue is not guaranteed to have a host tmux, and skipping
+# would report a pass. Hosts that run this target must have a real tmux.
+rust_test(
+    name = "update_tmux_test",
+    size = "medium",
+    timeout = "moderate",
+    srcs = ["tests/update.rs"],
+    data = [
+        ":boss-spoke-package",
+        "//tools/boss/engine/spoke:boss-spoke",
+        "@host_tmux//:tmux",
+    ],
+    edition = "2024",
+    env = {
+        "INSTALLER_BIN": "$(rootpath :boss-spoke-package)",
+        "SPOKE_BIN": "$(rootpath //tools/boss/engine/spoke:boss-spoke)",
+        "TMUX_BIN": "$(rootpath @host_tmux//:tmux)",
+        "BOSS_REQUIRE_TMUX": "1",
+    },
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    tags = ["manual"],
+    deps = [
+        ":spoke-package",
+        "//tools/boss/engine/spoke:test_hub",
+    ] + all_crate_deps(
         normal = True,
         normal_dev = True,
     ),

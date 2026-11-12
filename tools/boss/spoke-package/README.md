@@ -133,14 +133,27 @@ daemon over a live tmux session).
 
 Provisioning is one-time. The first install also writes a root-run helper
 (systemd path unit / launchd WatchPaths) that applies a request the service
-user drops into `update-request/`. The request names a release; the helper
+user drops into `update-request/`. The helper claims that file into an
+installer-owned path before it trusts the bytes, and the path unit (or launchd
+KeepAlive) watches the request, the claimed copy and an in-flight `upgrade-active`
+flag so a crashed or timed-out helper is re-run without a reboot. The request names a release; the helper
 fetches the manifest, signature and package from the origin pinned at install,
 verifies them against the root-pinned key, refuses an unreadable journal, then
 stages, switches `current` and restarts only the daemon. Tmux workers and the
 journal stay up. Health is lock, journal, inventory and a management handshake
 within two minutes; failure rolls `current` back to `previous` automatically.
-A person reinstalls a signed package by hand only when neither the current nor
-the previous binary can start. A host id never changes after the first install
+The helper stops the daemon (and, on macOS, boots the job out so `KeepAlive`
+cannot relaunch it) and waits until the service manager reports no running
+instance before it reads the journal, as the service user, through SQLite. A
+refusal or an error after that point puts the unchanged release back in
+service and requires the same full health contract before it reports: the
+restart outcome is part of the status. Rollback is held to that contract too; a
+rollback that cannot prove the restored release healthy, or one refused because
+the journal migrated past `previous`, is reported as unresolved and keeps its
+original baseline, while the request is retired so a fix-forward offer is not
+turned away as busy. The daemon's reported release is the directory its
+executable runs from. A person reinstalls a signed package by hand only when
+neither the current nor the previous binary can start. A host id never changes after the first install
 (the journal belongs to it).
 
 A hand `install` of a newer package still does not roll back automatically:
