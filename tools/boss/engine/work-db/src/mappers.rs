@@ -749,9 +749,19 @@ pub(crate) fn map_conflict_resolution(row: &Row<'_>) -> rusqlite::Result<Conflic
         mismatch_exit_barred: row.get::<_, i64>(24)? != 0,
         deferral_arm: row.get(25)?,
         deferral_end_reason: row.get(26)?,
-        ladder_outcomes: row.get(27)?,
+        ladder_outcomes: parse_ladder_outcomes(row.get(27)?)?,
         ladder_reason: row.get(28)?,
     })
+}
+
+fn parse_ladder_outcomes(raw: Option<String>) -> rusqlite::Result<Option<Vec<boss_protocol::LadderDecision>>> {
+    match raw {
+        None => Ok(None),
+        Some(s) if s.trim().is_empty() => Ok(None),
+        Some(s) => serde_json::from_str(&s)
+            .map(Some)
+            .map_err(|err| rusqlite::Error::FromSqlConversionFailure(27, rusqlite::types::Type::Text, Box::new(err))),
+    }
 }
 
 /// Canonical `conflict_resolutions` column list, in the order every

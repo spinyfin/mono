@@ -22,7 +22,9 @@
 //! Attempts deduplicate identical base/head states, and the churn guard
 //! bounds attempts across changing states.
 
-use boss_deterministic_resolvers::{ConflictedFile, RegistryResolution, ResolvedFile, ResolverRegistry};
+use boss_deterministic_resolvers::{
+    ConflictedFile, DeclinedFile, FailedFile, RegistryResolution, ResolvedFile, ResolverRegistry,
+};
 use boss_protocol::{CreateAttentionItemInput, FrontendEvent};
 
 use boss_execution_contracts::{CubeClient, ExecutionPublisher};
@@ -199,10 +201,49 @@ pub(crate) fn log_routing_verdict(
 }
 
 /// Persist decisions for CLI inspection and bounded tier/outcome counters.
+/// A blank `reason` is replaced with `{tier} {outcome}` so every ladder exit
+/// writes a non-null history entry even when per-file details were empty.
 pub(crate) fn record_tier(work_db: &WorkDb, attempt: &ConflictResolution, tier: &str, outcome: &str, reason: &str) {
+    let fallback;
+    let reason = if reason.trim().is_empty() {
+        fallback = format!("{tier} {outcome}");
+        fallback.as_str()
+    } else {
+        reason
+    };
     if let Err(err) = work_db.record_conflict_ladder_outcome(&attempt.id, tier, outcome, reason) {
         tracing::error!(attempt_id = %attempt.id, tier, outcome, ?err, "conflict_ladder: could not persist tier decision");
     }
+}
+
+/// Record a rung-0 registry decline/failure. Empty per-file lists still
+/// persist `reason` rather than leaving `ladder_reason` NULL.
+pub(crate) fn record_rung0_registry_decline(
+    work_db: &WorkDb,
+    attempt: &ConflictResolution,
+    declined: &[DeclinedFile],
+    failed: &[FailedFile],
+    reason: &str,
+) {
+    let details = declined
+        .iter()
+        .map(|d| {
+            if d.matched_resolver {
+                format!("{}: resolver ran and declined: {}", d.path, d.reason)
+            } else {
+                format!("{}: no resolver applies to this file", d.path)
+            }
+        })
+        .chain(failed.iter().map(|f| format!("{}: {}", f.path, f.reason)))
+        .collect::<Vec<_>>()
+        .join("; ");
+    record_tier(
+        work_db,
+        attempt,
+        "deterministic",
+        if failed.is_empty() { "declined" } else { "failed" },
+        if details.is_empty() { reason } else { &details },
+    );
 }
 
 /// Rung 2 eligibility: a bounded set of residual conflicted files is
@@ -283,7 +324,17 @@ pub(crate) async fn try_mechanical_rungs_with(
                 "skip",
                 "a worker is live on this PR's chain; engine rebase deferred until it finishes",
             );
-            record_tier(work_db, attempt, "engine_rebase", "deferred", &writers);
+            record_tier(
+                work_db,
+                attempt,
+                "engine_rebase",
+                "deferred",
+                if writers.trim().is_empty() {
+                    "a worker is live on this PR's chain; engine rebase deferred until it finishes"
+                } else {
+                    &writers
+                },
+            );
             return LadderOutcome::DeferredForLiveWriter;
         }
     };
@@ -971,18 +1022,7 @@ pub(crate) async fn attempt_rung0_with(
                 "rung 0 attempted but a resolver failed operationally (environment/tooling issue, \
                  not a decline)"
             };
-            let details = per_file
-                .into_iter()
-                .chain(failed.iter().map(|f| format!("{}: {}", f.path, f.reason)))
-                .collect::<Vec<_>>()
-                .join("; ");
-            record_tier(
-                work_db,
-                attempt,
-                "deterministic",
-                if failed.is_empty() { "declined" } else { "failed" },
-                &details,
-            );
+            record_rung0_registry_decline(work_db, attempt, &declined, &failed, reason);
             if files
                 .iter()
                 .all(|file| boss_deterministic_resolvers::is_generated_lockfile(&file.path))

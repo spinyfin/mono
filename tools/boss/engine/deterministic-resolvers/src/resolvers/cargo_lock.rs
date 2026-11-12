@@ -41,7 +41,6 @@ impl CargoLockResolver {
         self
     }
 
-    #[cfg(test)]
     pub(crate) fn with_runner(runner: Arc<dyn CommandRunner>) -> Self {
         Self {
             runner,

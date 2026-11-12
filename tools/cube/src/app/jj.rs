@@ -5,6 +5,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use std::{fs, io};
 
+use git_utils::pr_bookmark;
+
 use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
 use crate::{audit, paths};
 
@@ -298,6 +300,17 @@ pub(super) fn run_jj(
 /// are never the branch a PR is published from, nor stacked-PR boundaries.
 pub(super) const ENGINE_POINTER_BOOKMARK_PREFIXES: [&str; 4] =
     ["boss-recovery/", "boss-base/", "preserved/", "preserved-archive/"];
+
+/// Bookmarks that are local bookkeeping, not a published PR branch or a
+/// stacked-PR boundary: obsolete `pr/<n>` aliases and the engine pointer
+/// namespaces. Branch inference and the replay-only collapse guard must
+/// share this so a new pointer prefix cannot drift between the two.
+pub(super) fn is_bookkeeping_bookmark(name: &str) -> bool {
+    pr_bookmark::is_pr_bookmark(name)
+        || ENGINE_POINTER_BOOKMARK_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
 
 /// Rebase `branch` and its descendants onto `destination`. `-b` rewrites the
 /// whole descendant closure; branch bookmarks follow their commits, and no

@@ -11,7 +11,7 @@ use crate::store::Store;
 use crate::app::checkleft_gate::run_checkleft_gate;
 use crate::app::errors::{CubeError, Result, RunResult};
 use crate::app::gh_pr;
-use crate::app::jj::{ENGINE_POINTER_BOOKMARK_PREFIXES, rebase_branch_onto, run_jj, run_jj_network};
+use crate::app::jj::{is_bookkeeping_bookmark, rebase_branch_onto, run_jj, run_jj_network};
 use crate::app::pr::verify_push_reached_github;
 use crate::app::pr_head;
 use crate::app::provision::find_workspace_record;
@@ -501,11 +501,12 @@ fn commit_is_conflicted(ctx: &JjCtx<'_>, revision: &str) -> Result<bool> {
 /// Which bookmarks on a conflicted ancestor count as a stacked-PR boundary.
 #[derive(Clone, Copy)]
 pub(super) enum BookmarkPolicy<'a> {
-    /// Any bookmark blocks the collapse (the rebase path).
+    /// Rebase path: local bookkeeping pointers (`pr/<n>`, engine recovery /
+    /// preserved namespaces) are not stack boundaries. Any other local
+    /// bookmark still blocks.
     Strict,
-    /// The push path: the branch about to be advanced to `@` and the engine's
-    /// own pointer namespaces (including obsolete local-only `pr/<n>` aliases)
-    /// are not stack boundaries. Actual branch bookmarks still block.
+    /// Push path: same classification as [`Self::Strict`], and the branch
+    /// about to be advanced to `@` is also not a stack boundary.
     PushBranch(&'a str),
 }
 
@@ -514,26 +515,18 @@ pub(super) fn commit_has_blocking_bookmark(
     revision: &str,
     policy: BookmarkPolicy<'_>,
 ) -> Result<bool> {
-    let BookmarkPolicy::PushBranch(branch) = policy else {
-        return commit_has_bookmark(ctx, revision);
+    let skip_branch = match policy {
+        BookmarkPolicy::Strict => None,
+        BookmarkPolicy::PushBranch(branch) => Some(branch),
     };
     let out = ctx.run(&["bookmark", "list", "-r", revision, "-T", r#"if(!remote, name ++ "\n")"#])?;
     Ok(out.lines().map(str::trim).any(|name| {
         !name.is_empty()
-            && name != branch
+            && skip_branch.is_none_or(|branch| name != branch)
             // These aliases were never publishable and have not been maintained
             // since mono#3511. A leftover alias is not another PR's branch.
-            && !git_utils::pr_bookmark::is_pr_bookmark(name)
-            && !ENGINE_POINTER_BOOKMARK_PREFIXES
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
+            && !is_bookkeeping_bookmark(name)
     }))
-}
-
-/// Whether any bookmark points at `revision` — the stacked-PR guard.
-fn commit_has_bookmark(ctx: &JjCtx<'_>, revision: &str) -> Result<bool> {
-    let out = ctx.run(&["log", "-r", revision, "--no-graph", "-T", "bookmarks"])?;
-    Ok(!out.trim().is_empty())
 }
 
 /// Position the workspace working copy on the head of a PR branch.
