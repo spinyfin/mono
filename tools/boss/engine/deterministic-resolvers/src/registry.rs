@@ -1,6 +1,10 @@
 use std::path::Path;
 
-use crate::resolvers::{BazelModuleLockResolver, CargoLockResolver, RegistryAppendUnionResolver};
+use crate::recipe_config::ConflictRules;
+use crate::resolvers::{
+    BazelModuleLockResolver, CargoLockResolver, InvalidRecipe, KeepBothRuleResolver, KeepBothUnionResolver,
+    RecipeResolver,
+};
 use crate::{ConflictClass, ConflictedFile, DeterministicResolver, ResolveOutcome};
 
 /// A file some resolver successfully resolved.
@@ -63,8 +67,9 @@ pub enum RegistryResolution {
 
 /// Registry of [`DeterministicResolver`]s, dispatched by
 /// [`DeterministicResolver::applies_to`]. This is the extension seam: use
-/// [`ResolverRegistry::with_builtins`] for the shipped lockfile
-/// resolvers, or [`ResolverRegistry::empty`] plus
+/// [`ResolverRegistry::with_builtins`] for the shipped resolvers,
+/// [`ResolverRegistry::with_rules_from_base`] to add an operator's
+/// per-path rules, or [`ResolverRegistry::empty`] plus
 /// [`ResolverRegistry::register`] to build a custom set.
 pub struct ResolverRegistry {
     resolvers: Vec<Box<dyn DeterministicResolver>>,
@@ -76,17 +81,37 @@ impl ResolverRegistry {
     }
 
     pub fn with_builtins() -> Self {
-        Self::builtins(None)
+        Self::assemble(None, Vec::new())
     }
 
     /// Built-ins for a rebased PR: regenerate lockfiles from its base version.
     pub fn with_builtins_from_base(revision: &str) -> Self {
-        Self::builtins(Some(revision))
+        Self::assemble(Some(revision), Vec::new())
     }
 
-    /// The one built-in registration list. With a `base_revision`, each
-    /// lockfile resolver seeds regeneration from that revision's lockfile.
-    fn builtins(base_revision: Option<&str>) -> Self {
+    /// Built-ins for a rebased PR plus the operator's per-path `rules`.
+    ///
+    /// Fails, registering nothing, when a rule does not compile (an
+    /// invalid glob or an empty command): a broken rule file must not be
+    /// half-applied.
+    pub fn with_rules_from_base(revision: &str, rules: &ConflictRules) -> Result<Self, InvalidRecipe> {
+        let mut configured: Vec<Box<dyn DeterministicResolver>> = Vec::new();
+        for recipe in &rules.recipes {
+            configured.push(Box::new(RecipeResolver::from_recipe(recipe.clone())?));
+        }
+        for rule in &rules.keep_both {
+            configured.push(Box::new(KeepBothRuleResolver::from_rule(rule.clone())?));
+        }
+        Ok(Self::assemble(Some(revision), configured))
+    }
+
+    /// The one registration order. Lockfile resolvers come first, so no
+    /// configured rule can displace them. With a `base_revision`, each
+    /// seeds regeneration from that revision's lockfile. `configured`
+    /// rules follow, in the order given. The built-in keep-both resolver
+    /// comes last because it claims every Rust file: a rule for a Rust
+    /// path has to be asked before it.
+    fn assemble(base_revision: Option<&str>, configured: Vec<Box<dyn DeterministicResolver>>) -> Self {
         let mut registry = Self::empty();
         registry.register(Box::new(crate::resolvers::GeneratedLockResolver {
             base_revision: base_revision.map(str::to_owned),
@@ -99,7 +124,10 @@ impl ResolverRegistry {
         }
         registry.register(Box::new(cargo));
         registry.register(Box::new(bazel));
-        registry.register(Box::new(RegistryAppendUnionResolver::new()));
+        for resolver in configured {
+            registry.register(resolver);
+        }
+        registry.register(Box::new(KeepBothUnionResolver::new()));
         registry
     }
 
@@ -215,7 +243,6 @@ mod tests {
 
     use super::*;
     use crate::command::FakeCommandRunner;
-    use crate::resolvers::RecipeResolver;
     use async_trait::async_trait;
 
     struct AlwaysResolves {
@@ -575,7 +602,89 @@ mod tests {
                 .any(|r| r.applies_to(&file("MODULE.bazel.lock")))
         );
         assert!(registry.resolvers.iter().any(|r| r.applies_to(&file("mod.rs"))));
+        assert!(
+            registry
+                .resolvers
+                .iter()
+                .any(|r| r.applies_to(&file("src/work/schema_init.rs")))
+        );
         assert!(!registry.resolvers.iter().any(|r| r.applies_to(&file("random.txt"))));
+    }
+
+    fn first_match(registry: &ResolverRegistry, path: &str) -> Option<ConflictClass> {
+        registry
+            .resolvers
+            .iter()
+            .find(|resolver| resolver.applies_to(&file(path)))
+            .map(|resolver| resolver.class())
+    }
+
+    #[test]
+    fn configured_rules_sit_between_the_lockfile_resolvers_and_the_keep_both_builtin() {
+        let rules = ConflictRules {
+            recipes: vec![crate::ConflictRecipe {
+                name: "everything_locked".to_owned(),
+                glob: "**/*.lock".to_owned(),
+                resolve_command: vec!["true".to_owned()],
+                verify_command: None,
+                workdir: None,
+            }],
+            keep_both: vec![crate::KeepBothRule {
+                name: "migration_registry".to_owned(),
+                glob: "**/schema_migration_registry.rs".to_owned(),
+                format_command: None,
+            }],
+        };
+        let registry = ResolverRegistry::with_rules_from_base("main@origin", &rules).unwrap();
+
+        // A rule cannot displace a built-in lockfile resolver…
+        assert_eq!(first_match(&registry, "Cargo.lock"), Some(ConflictClass::CargoLock));
+        assert_eq!(
+            first_match(&registry, "MODULE.bazel.lock"),
+            Some(ConflictClass::BazelModuleLock)
+        );
+        // …but handles what no built-in claims…
+        assert_eq!(first_match(&registry, "vendor/other.lock"), Some(ConflictClass::Recipe));
+        // …and is asked before the keep-both built-in for a Rust path it names.
+        assert_eq!(
+            first_match(&registry, "db/src/schema_migration_registry.rs"),
+            Some(ConflictClass::Recipe)
+        );
+        assert_eq!(
+            first_match(&registry, "db/src/schema_init.rs"),
+            Some(ConflictClass::KeepBothUnion)
+        );
+        assert_eq!(first_match(&registry, "notes.txt"), None);
+    }
+
+    #[test]
+    fn a_rule_that_does_not_compile_registers_nothing() {
+        let rules = ConflictRules {
+            recipes: Vec::new(),
+            keep_both: vec![crate::KeepBothRule {
+                name: "broken".to_owned(),
+                glob: "[".to_owned(),
+                format_command: None,
+            }],
+        };
+        let err = ResolverRegistry::with_rules_from_base("main@origin", &rules)
+            .err()
+            .expect("an invalid glob must fail the whole registry");
+        assert!(err.to_string().contains("broken"), "{err}");
+    }
+
+    #[test]
+    fn empty_rules_give_the_same_resolvers_as_the_builtins() {
+        let with_rules = ResolverRegistry::with_rules_from_base("main@origin", &ConflictRules::default()).unwrap();
+        let builtins = ResolverRegistry::with_builtins_from_base("main@origin");
+        let classes = |registry: &ResolverRegistry| -> Vec<&'static str> {
+            registry.resolvers.iter().map(|r| r.class().as_str()).collect()
+        };
+        assert_eq!(classes(&with_rules), classes(&builtins));
+        assert_eq!(
+            classes(&builtins),
+            ["generated_lock", "cargo_lock", "bazel_module_lock", "keep_both_union"]
+        );
     }
 
     #[tokio::test]
