@@ -35,6 +35,22 @@
 //! probes fired at 08:59:24Z/:33Z/:41Z — 8-9s apart — against a revision
 //! that had already pushed and re-enqueued its PR for auto-merge).
 //!
+//! **A nudge counts only once the worker was given it.** The breaker judges
+//! a worker by what it did with the nudges it received, so a nudge the
+//! worker was never shown is not evidence of anything. `record` charges a
+//! nudge when it is issued; the caller must not issue the next one while
+//! that one is still on its way (queued, or written and waiting for the
+//! driver to start a turn on it), and must hand back any nudge that never
+//! arrived through [`NudgeBreaker::settle_undelivered`]. Counting queued
+//! nudges is how a parked worker was failed "after 3 nudges" having been
+//! shown none: the first sat in its composer unsubmitted, and the next two
+//! never left the queue behind it.
+//!
+//! Nudges that keep failing to arrive are bounded separately
+//! ([`NudgeBreaker::delivery_failures`]), so a pane that cannot be written
+//! to still ends the attempt, as a delivery failure rather than as an
+//! unresponsive worker.
+//!
 //! State is in-memory only, mirroring [`crate::pr_url_capture`]: the
 //! probe FIFO it guards also lives in memory, so an engine restart
 //! resets the whole nudge loop anyway. Durability across restarts is
@@ -70,6 +86,19 @@ pub const ABSOLUTE_MAX_NUDGES: u32 = 12;
 /// nudged (and eventually parked) at the same total count, just not
 /// faster than external state could plausibly have changed.
 pub const MIN_RENUDGE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long a nudge may go unshown to an idle worker before the engine gives
+/// its delivery up as failed.
+///
+/// A nudge for an idle worker is written on the boundary that issued it or
+/// by the next recurring sweep, and a written one is confirmed or settled as
+/// failed within about a minute and a half. One still not written after five
+/// re-nudge intervals is not on its way: every attempt to write it is being
+/// refused or is failing. This bound is what keeps such a nudge from holding
+/// the ladder forever, now that an undelivered nudge is no longer counted
+/// toward the cap. Giving it up counts as a delivery failure, so a pane that
+/// can never be written to still ends the attempt.
+pub const NUDGE_DELIVERY_DEADLINE: Duration = Duration::from_secs(5 * 60);
 
 /// Decision returned by [`NudgeBreaker::record`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +137,22 @@ struct NudgeRecord {
     /// against [`MIN_RENUDGE_INTERVAL`] to debounce rapid identical
     /// Stop→probe→reply→Stop cycles.
     last_nudge_at: Instant,
+    /// What became of the nudges that were issued but never arrived.
+    delivery: DeliveryLedger,
+}
+
+/// Bookkeeping for nudges that did not reach the worker.
+#[derive(Debug, Clone, Default)]
+struct DeliveryLedger {
+    /// Consecutive nudges whose delivery failed. Reset by
+    /// [`NudgeBreaker::delivery_confirmed`]; independent of the fingerprint,
+    /// because a pane that cannot be written to says nothing about the work.
+    failures: u32,
+    /// The newest nudge already handed back through
+    /// [`NudgeBreaker::settle_undelivered`]. Its fate is read off a status
+    /// that keeps reporting the same answer, so remembering it is what keeps
+    /// one undelivered nudge from being un-counted twice.
+    settled: Option<String>,
 }
 
 /// In-memory `execution_id -> (fingerprint, count)` tracker for the
@@ -159,6 +204,7 @@ impl NudgeBreaker {
             count: 0,
             total_count: 0,
             last_nudge_at: now,
+            delivery: DeliveryLedger::default(),
         });
         if entry.fingerprint != fingerprint {
             // Progress since the last nudge — reset the consecutive-run
@@ -206,28 +252,69 @@ impl NudgeBreaker {
             .remove(execution_id);
     }
 
-    /// Undo a nudge that was recorded against the breaker but never
-    /// delivered. `record` counts issued probes; a probe that failed to
-    /// reach the pane (no durable tmux identity, send failed, posture
-    /// refused) must not burn the unproductive-nudge budget — that is how
-    /// three undeliverable probes killed a worker for ignoring messages it
-    /// never received.
+    /// Hand back the nudge `nudge_id`, which was charged by [`Self::record`]
+    /// and never reached the worker. Returns the number of consecutive
+    /// delivery failures now on record.
     ///
-    /// Decrements `count` and `total_count` when either is positive, and
-    /// leaves `last_nudge_at` in place so a rapid retry is still debounced
-    /// rather than hammering a delivery path that just failed. Idempotent
-    /// against an execution with no tracked state.
-    pub fn revert_undelivered(&self, execution_id: &str) {
+    /// Always takes the nudge off `count` and `total_count`: a worker cannot
+    /// have ignored a message it was not shown. `delivery_failed` says
+    /// whether that was a failure to deliver (the write could not be made, or
+    /// was made and started no turn) or a deliberate withdrawal (the engine
+    /// discarded the nudge before writing it); only a failure is added to the
+    /// consecutive-failure run that [`Self::delivery_failures`] reports.
+    ///
+    /// Idempotent per `nudge_id`, so a caller that reads the same nudge's
+    /// fate on every evaluation settles it once. `last_nudge_at` is left in
+    /// place. A no-op, returning zero, for an execution with no tracked
+    /// state.
+    pub fn settle_undelivered(&self, execution_id: &str, nudge_id: &str, delivery_failed: bool) -> u32 {
         let mut guard = self.inner.lock().expect("NudgeBreaker mutex poisoned");
         let Some(entry) = guard.get_mut(execution_id) else {
-            return;
+            return 0;
         };
-        if entry.count > 0 {
-            entry.count -= 1;
+        if entry.delivery.settled.as_deref() == Some(nudge_id) {
+            return entry.delivery.failures;
         }
-        if entry.total_count > 0 {
-            entry.total_count -= 1;
+        entry.delivery.settled = Some(nudge_id.to_owned());
+        entry.count = entry.count.saturating_sub(1);
+        entry.total_count = entry.total_count.saturating_sub(1);
+        if delivery_failed {
+            entry.delivery.failures += 1;
         }
+        entry.delivery.failures
+    }
+
+    /// The most recent nudge reached the worker: end any run of consecutive
+    /// delivery failures. Idempotent, and a no-op for an untracked execution.
+    pub fn delivery_confirmed(&self, execution_id: &str) {
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .expect("NudgeBreaker mutex poisoned")
+            .get_mut(execution_id)
+        {
+            entry.delivery.failures = 0;
+        }
+    }
+
+    /// How long ago the nudge now charged to `execution_id` was issued, as
+    /// of `now`. `None` when nothing is tracked.
+    pub fn since_last_nudge(&self, execution_id: &str, now: Instant) -> Option<Duration> {
+        self.inner
+            .lock()
+            .expect("NudgeBreaker mutex poisoned")
+            .get(execution_id)
+            .map(|entry| now.saturating_duration_since(entry.last_nudge_at))
+    }
+
+    /// Consecutive nudges whose delivery failed for `execution_id`, zero when
+    /// nothing is tracked. Read-only; for tests and diagnostics.
+    pub fn delivery_failures(&self, execution_id: &str) -> u32 {
+        self.inner
+            .lock()
+            .expect("NudgeBreaker mutex poisoned")
+            .get(execution_id)
+            .map_or(0, |entry| entry.delivery.failures)
     }
 }
 
@@ -472,30 +559,83 @@ mod tests {
         );
     }
 
+    // ── Undelivered nudges ───────────────────────────────────────────
+
     #[test]
-    fn revert_undelivered_does_not_trip_the_breaker() {
-        // Three undeliverable probes must not park the worker: each Proceed
-        // is undone, so the cap is never exhausted.
+    fn undelivered_nudges_never_exhaust_the_cap() {
+        // A nudge the worker was not shown is handed back, so however many
+        // fail to arrive, the unproductive-nudge cap is never reached.
         let breaker = NudgeBreaker::new();
         let fp = "no_pr";
         for i in 0..5 {
             assert_eq!(
                 breaker.record("exec_undelivered", fp, 3, tick(i)),
                 NudgeDecision::Proceed { count: 1 },
-                "after revert the next issued nudge is still the first of a fresh cycle",
+                "after the hand-back the next issued nudge is still the first of a fresh cycle",
             );
-            breaker.revert_undelivered("exec_undelivered");
+            breaker.settle_undelivered("exec_undelivered", &format!("probe-{i}"), false);
         }
+        assert_eq!(breaker.counts("exec_undelivered"), Some((0, 0)));
         assert_eq!(
-            breaker.record("exec_undelivered", fp, 3, tick(5)),
-            NudgeDecision::Proceed { count: 1 },
+            breaker.delivery_failures("exec_undelivered"),
+            0,
+            "a withdrawn nudge is not a delivery failure",
         );
     }
 
     #[test]
-    fn revert_undelivered_is_a_no_op_for_unknown_executions() {
+    fn settling_the_same_nudge_twice_hands_it_back_once() {
+        // The nudge's fate is read on every evaluation and keeps reporting
+        // the same answer. Un-counting it each time would erase nudges the
+        // worker did receive.
         let breaker = NudgeBreaker::new();
-        breaker.revert_undelivered("never-tracked");
+        breaker.record("exec_s", "no_pr", 3, tick(0));
+        breaker.record("exec_s", "no_pr", 3, tick(1));
+        assert_eq!(breaker.settle_undelivered("exec_s", "probe-2", true), 1);
+        assert_eq!(breaker.settle_undelivered("exec_s", "probe-2", true), 1);
+        assert_eq!(
+            breaker.counts("exec_s"),
+            Some((1, 1)),
+            "only the undelivered nudge comes off; the delivered one stays charged",
+        );
+    }
+
+    #[test]
+    fn delivery_failures_run_until_a_nudge_arrives() {
+        let breaker = NudgeBreaker::new();
+        for i in 0..3 {
+            breaker.record("exec_f", "no_pr", 3, tick(i));
+            assert_eq!(
+                breaker.settle_undelivered("exec_f", &format!("probe-{i}"), true),
+                i + 1,
+                "each failed delivery extends the run",
+            );
+        }
+        breaker.record("exec_f", "no_pr", 3, tick(3));
+        breaker.delivery_confirmed("exec_f");
+        assert_eq!(breaker.delivery_failures("exec_f"), 0, "a delivered nudge ends the run");
+        assert_eq!(
+            breaker.counts("exec_f"),
+            Some((1, 1)),
+            "and is the only one charged to the worker",
+        );
+    }
+
+    #[test]
+    fn delivery_failures_survive_a_fingerprint_change() {
+        // Work state moving does not make the pane any more writable.
+        let breaker = NudgeBreaker::new();
+        breaker.record("exec_f", "no_pr", 3, tick(0));
+        breaker.settle_undelivered("exec_f", "probe-1", true);
+        breaker.record("exec_f", "stale:https://github.com/x/y/pull/1", 3, tick(1));
+        assert_eq!(breaker.delivery_failures("exec_f"), 1);
+    }
+
+    #[test]
+    fn settling_is_a_no_op_for_unknown_executions() {
+        let breaker = NudgeBreaker::new();
+        assert_eq!(breaker.settle_undelivered("never-tracked", "probe-1", true), 0);
+        breaker.delivery_confirmed("never-tracked");
         assert_eq!(
             breaker.record("never-tracked", "no_pr", 3, tick(0)),
             NudgeDecision::Proceed { count: 1 },

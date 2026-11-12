@@ -1023,6 +1023,44 @@ async fn interrupting_a_busy_worker_reports_delivered_without_a_prompt_submit_ho
     );
 }
 
+/// The answer above is given on the strength of the write alone, so the write
+/// is watched for the turn it should start. One that starts none is retried
+/// with Return, then taken back to `Unconfirmed` and its delivery slot freed:
+/// a probe nobody will answer must not read as delivered, nor hold up every
+/// later probe for the run.
+#[tokio::test(start_paused = true)]
+async fn a_write_after_an_interrupt_that_starts_no_turn_is_taken_back() {
+    use crate::app::parked_delivery::{RETURN_RETRIES, TURN_START_CONFIRM_TIMEOUT};
+
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 19, Some("grok"));
+    let runner = tmux_hosted(&server_state, &run_id, 19);
+    let parker = park_once_interrupted(&server_state, &runner, 19);
+    let sink = make_session_sink();
+    executions::handle_probe_run(
+        dispatch_for(&server_state, &sink),
+        probe_request(&run_id, "stop — you are building the wrong target"),
+    )
+    .await;
+    parker.await.expect("parker task");
+    let FrontendEvent::ProbeDelivered { probe_id, state, .. } = sole_response(&sink).await else {
+        panic!("expected ProbeDelivered");
+    };
+    assert_eq!(state, ProbeDeliveryState::Consumed);
+    assert_eq!(runner.return_presses(), 1);
+
+    tokio::time::sleep(TURN_START_CONFIRM_TIMEOUT * (RETURN_RETRIES + 1) + Duration::from_secs(5)).await;
+
+    assert_eq!(runner.return_presses(), 1 + RETURN_RETRIES as usize);
+    let record = server_state.probe_record(&probe_id).unwrap();
+    assert_eq!(record.state, ProbeDeliveryState::Unconfirmed);
+    assert!(
+        record.detail.unwrap().contains("the driver never started a turn"),
+        "the record must say why the delivery was taken back",
+    );
+    assert!(!server_state.has_in_flight_probe(&run_id));
+}
+
 /// Shape B: another dispatcher already claimed this probe and is mid-write.
 /// The interrupting path must wait for that path to record an outcome rather
 /// than answering `queued` (which `bossctl probe` used to print as

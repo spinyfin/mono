@@ -78,6 +78,8 @@ impl boss_engine_runtime::spawn_ack_sweep::SpawnAckReaper for ServerState {
             "execution is terminal"
         );
         let tmux = self.guard_pane_input(execution_id, tmux)?;
+        self.leave_pane_modes_before_keys(execution_id, &tmux, &identity.session_name)
+            .await?;
         let result = tmux.send_submit(&identity.session_name).await;
         self.settle_pane_input_failure(execution_id, &result).await;
         result

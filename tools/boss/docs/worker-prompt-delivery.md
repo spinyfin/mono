@@ -121,6 +121,70 @@ Spoke supervisors budget the launcher's entire delivery window plus 30 seconds. 
 
 Cancellation is checked on every prompt-confirmation poll and immediately before a Return retry, including recovery after restart.
 
+## Text typed into a running worker's pane: probes and nudges
+
+After spawn, the engine reaches a worker by typing into its pane: a coordinator probe, a description-change notice, or the engine's own "you stopped without a PR" nudge. A worker sitting at its prompt gets the text typed and submitted with Return (`tmux send-keys`, then `send-keys Enter`). This path has the same hazard as the brief: tmux reporting success for the keys says they were accepted, not that the driver took them as a prompt.
+
+### The failure this is built around
+
+On 2026-11-11 a Codex worker that had declared a wait, outlived it, and sat parked at its prompt was failed with "auto-nudge circuit breaker stopped the attempt after 3 nudges: no new commit, PR, or state change". It had been shown none of them. The first nudge was typed into its pane and recorded `consumed` because the write succeeded; the rollout shows no prompt and no turn after it. That probe then held the run's single delivery slot, which only a turn boundary releases, so the second and third nudges never left the queue. All three were counted when they were queued.
+
+Two causes make a write into a parked pane start no turn while every tmux command succeeds. Neither can be told from the other after the pane is gone, which is why the engine now records what the pane showed.
+
+- **The Return is taken as part of a paste.** Codex's TUI treats keys that arrive in a burst as a paste, and a Return landing right behind them as a newline in it. The text stays in the composer and nothing is submitted. Measured on 0.153.4 and 0.160.1 ([qualification notes](investigations/codex-0.160.1-qualification-2026-10-06.md), "Harness notes"): Return sent immediately after `send-keys -l` left the prompt unsubmitted, and a 1 s gap submitted reliably. Whether it happens depends on how long the Return's own `tmux` process takes to start, so it comes and goes with host load. That is consistent with the same code path having delivered nudges to the same worker 90 minutes earlier.
+- **The pane is in a tmux mode.** A pane someone has scrolled is in copy-mode, and `send-keys` then hands every key to the mode's key table instead of the driver. Reproduced on tmux 3.8: typed text is run as copy-mode commands, `Enter` is swallowed and leaves the pane in the mode, a bracketed paste lands in the composer with its Return swallowed, and `Escape` only leaves the mode. Codex sessions run with `mouse on` ([`codex-tmux.conf`](../engine/driver/src/codex-tmux.conf)), so one wheel tick puts a pane there.
+
+### What the engine does
+
+| Step                | Where                                                                           | Effect                                                                                                    |
+| ------------------- | ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| Leave any tmux mode | [`leave_pane_modes_before_keys`](../engine/app/src/app/pane_delivery.rs)        | `copy-mode -q` when `#{pane_in_mode}` is 1, before any key. Costs a viewer their scroll position.         |
+| Submit settle       | [`AgentDriver::pane_submit_settle`](../engine/driver/src/lib.rs)                | Wait between the text and Return. Codex declares 1 s; drivers that read input in order declare none.      |
+| Hold at `injected`  | [`deliver_probe_via_pane_write`](../engine/app/src/app/worker_events.rs)        | A parked write is not `consumed` until the driver starts a turn.                                          |
+| Confirm the turn    | [`confirm_parked_write_turn_started`](../engine/app/src/app/parked_delivery.rs) | The first main-session turn start after the write moves the probe to `consumed`.                          |
+| Press Return again  | [`parked_delivery`](../engine/app/src/app/parked_delivery.rs)                   | After `TURN_START_CONFIRM_TIMEOUT` with no turn, Return and nothing else, at most `RETURN_RETRIES` times. |
+| Settle as failed    | same                                                                            | `unconfirmed`, delivery slot released, attention item filed with the pane's last lines.                   |
+
+The first two steps prevent the two known causes. The rest is what makes delivery not depend on the list of causes being complete.
+
+Turn evidence is the same reading spawn confirmation uses, narrowed to the main session: a `UserPromptSubmit`, or the first main-session tool event after the turn boundary the worker was parked behind. A subagent's tool events do not count. A pane that reads `Working` without that evidence is left alone until it returns to its prompt: Return pressed into a busy pane can answer a dialog nobody meant to answer. The text is typed exactly once, so a retry cannot deliver a second copy.
+
+A write made after the engine interrupted a busy worker is reported `consumed` to the caller as before, and watched the same way. If no turn follows it is taken back to `unconfirmed`.
+
+| Deadline                     | Value | When it fires                                                         |
+| ---------------------------- | ----- | --------------------------------------------------------------------- |
+| `TURN_START_CONFIRM_TIMEOUT` | 30 s  | Return is pressed again                                               |
+| `RETURN_RETRIES`             | 2     | after the last window the delivery is settled `unconfirmed` (at 90 s) |
+| `NUDGE_DELIVERY_DEADLINE`    | 5 min | a nudge still unwritten, with its worker idle, is withdrawn           |
+
+The 30 s is `SUBMIT_CONFIRM_TIMEOUT`'s measurement applied to the same interval: Return to `UserPromptSubmit` peaked at 4.0 s under heavy load. A turn that starts is seen in well under a second.
+
+### What the nudge breaker counts
+
+A nudge counts against the worker only once the worker was given it ([`nudge_breaker`](../engine/completion/src/nudge_breaker.rs)). Before every nudge decision the ladder reads what became of the previous nudge:
+
+- **Not shown yet** (queued, or written and waiting for a turn): no nudge is issued and none is counted. The recurring sweep asks for delivery again, because an idle worker emits no event to carry a queued probe.
+- **Never arrived**: the nudge comes back off the count. Consecutive failed deliveries are counted separately, and at the same bound (`max_unproductive_nudges`) the attempt fails with "auto-nudge delivery failed N times in a row … This is a delivery failure, not an unresponsive worker". A nudge the engine discarded before writing it, or one meant for a busy worker that could not be interrupted, comes off the count without being a failed delivery.
+- **Not shown yet for too long**: a nudge that is still unwritten after `NUDGE_DELIVERY_DEADLINE` with the worker idle is not on its way; every attempt to write it is being refused or is failing. It is withdrawn, so it cannot arrive late on top of its replacement, and counted as a failed delivery. This is what keeps an unwritable pane from holding the ladder forever. A nudge that has been written is not withdrawn: its own delivery settles it within the 90 s above.
+- **Arrived**: the breaker judges the worker on it. A worker that receives its nudges and changes nothing is still stopped at the cap, with the reason it has always had.
+
+A turn boundary that lands while the engine is itself interrupting the worker to deliver a probe is not the worker stopping, and does not run the nudge decision.
+
+### Reading the logs
+
+| Log message                                                                             | Meaning                                                                              |
+| --------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `pane was in a tmux mode (scrolled into copy-mode); left it so the keys reach …`        | the pane had been scrolled; before this fix the write would have gone to tmux        |
+| `probe delivery confirmed: the driver started a turn after the write into its parked …` | normal delivery                                                                      |
+| `probe written into a parked pane started no turn within the confirm window; pressed …` | a retry (warning). Fields `pane` and `pane_tail` are the pane at that moment         |
+| `probe delivery failed: the text was written into a parked pane and the driver never …` | the delivery was settled `unconfirmed` (error), with the same fields                 |
+| `auto-nudge: held — the previous nudge has not reached the worker yet …`                | the ladder did not advance and did not count                                         |
+| `auto-nudge: the previous nudge was not delivered; it is not counted against …`         | a nudge was handed back; `consecutive_delivery_failures` is the run toward the bound |
+
+`pane` reads `pane_in_mode=…, foreground=…, activity=…`. `pane_tail` is the last 20 non-blank lines of the pane, where a composer is drawn: text still sitting there after a failed delivery is the swallowed-Return case.
+
 ## What this does not cover
+
+- An interrupt keystroke (`Escape`) sent to a pane that is in a tmux mode leaves the mode instead of reaching the driver. The interrupt path does not leave the mode first, so its first press is spent on tmux.
 
 - Claude Code attaches an image, and drops the line, when a pasted line names an image file that exists. A brief that quotes a real image path on its own line is therefore not delivered byte for byte. The engine does not rewrite briefs to avoid this.

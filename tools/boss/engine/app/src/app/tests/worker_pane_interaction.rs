@@ -189,8 +189,8 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
     assert_eq!(runner.escape_presses(), 0, "an idle worker must not be interrupted");
     let calls = runner.calls();
     assert!(
-        calls.len() >= 6,
-        "session, spawn-token, and pane verification plus paste delivery issue six tmux calls; extra capture-pane reads are the pane-text confirmation signal racing the UserPromptSubmit hook: {calls:?}"
+        calls.len() >= 7,
+        "session, spawn-token, pane and pane-mode verification plus paste delivery issue seven tmux calls; extra capture-pane reads are the pane-text confirmation signal racing the UserPromptSubmit hook: {calls:?}"
     );
     assert_eq!(
         calls[0],
@@ -225,6 +225,10 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
             "#{pane_dead}",
         ]
     );
+    // Leaving copy-mode and checking blocking dialogs both precede delivery.
+    assert_eq!(calls[3][2], "display-message");
+    assert_eq!(calls[3].last().unwrap(), "#{pane_in_mode}");
+    let calls = &calls[1..];
     for capture in [3, 5, 7] {
         assert_eq!(
             calls[capture],

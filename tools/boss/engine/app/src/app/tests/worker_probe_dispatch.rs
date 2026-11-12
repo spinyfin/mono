@@ -910,6 +910,20 @@ async fn probe_defers_through_fanout_then_delivers_on_stop() {
     );
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Injected),
+        "written on the boundary; delivered when the worker takes it as its prompt",
+    );
+    let submitted = boss_engine_runtime::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::UserPromptSubmit {
+            session_id: "claude-sess-1".into(),
+            prompt: String::new(),
+        },
+        Some(run_id.clone()),
+        None,
+    );
+    dispatch_live_worker_state(&server_state, &submitted).await;
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
         Some(ProbeDeliveryState::Consumed),
     );
 }
