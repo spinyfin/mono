@@ -577,7 +577,11 @@ mod flow {
                 stamp: None,
             }))
             .await;
-        tokio::time::timeout(Duration::from_secs(3), async {
+        // Merge-queue hosts run this crate's daemon cases in the same binary
+        // while the rest of //... saturates the machine. Isolated this
+        // handshake finishes in well under a second; 30s is headroom for
+        // the inbound commit, 60s for draining the 2000-record replay.
+        tokio::time::timeout(Duration::from_secs(30), async {
             while shared.lock().unwrap().received_commands().unwrap().unwrap().through == 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -585,7 +589,7 @@ mod flow {
         .await
         .expect("inbound command must commit while outbound transport is blocked");
         let (mut records, mut pulses, mut receipt) = (0, 0, false);
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             while records < 2001 || pulses < 21 || !receipt {
                 match record_or_receipt(&mut connection).await {
                     spoke_frame::Body::Record(record) => {

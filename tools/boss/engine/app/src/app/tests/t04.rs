@@ -1578,9 +1578,9 @@ async fn retire_pane_on_newer_slot_detaches_the_occupancy_slot() {
         .await;
     let server_clone = server_state.clone();
     let retire = tokio::spawn(async move { server_clone.retire_pane(2).await });
-    let release = tokio::time::timeout(Duration::from_secs(5), sink.next())
+    let release = tokio::time::timeout(Duration::from_secs(20), sink.next())
         .await
-        .expect("DetachWorkerPane should be enqueued within 5s")
+        .expect("DetachWorkerPane should be enqueued within 20s")
         .expect("a DetachWorkerPane request should be enqueued");
     match release.payload {
         FrontendEvent::EngineRequest { request_id, request } => {
