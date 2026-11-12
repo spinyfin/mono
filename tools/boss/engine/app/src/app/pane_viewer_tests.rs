@@ -41,6 +41,12 @@ impl Remote {
     fn opens(&self) -> usize {
         self.requests.lock().unwrap().iter().filter(|r| !r.cancel).count()
     }
+    /// The subscription id of the most recent open or renewal.
+    fn latest_subscription(&self) -> String {
+        let requests = self.requests.lock().unwrap();
+        let open = requests.iter().rev().find(|r| !r.cancel);
+        open.expect("an open").subscription_id.clone()
+    }
     fn cancels(&self) -> usize {
         self.requests.lock().unwrap().iter().filter(|r| r.cancel).count()
     }
@@ -213,12 +219,12 @@ async fn next_capture(sink: &SessionSink) -> (PaneCaptureState, String, String, 
     }
 }
 
-fn snapshot(text: &str) -> Arc<PaneSnapshot> {
+fn snapshot(remote: &Remote, text: &str) -> Arc<PaneSnapshot> {
     Arc::new(
         PaneSnapshot::builder()
             .run_id(RUN)
             .host_id("spoke")
-            .subscription_id(format!("viewer-{RUN}"))
+            .subscription_id(remote.latest_subscription())
             .text(text)
             .truncated(true)
             .observed_unix_ms(1_700_000_000_000)
@@ -234,16 +240,16 @@ async fn a_viewer_gets_escaped_text_and_leaving_cancels_the_capture() {
     until("the capture to open", || remote.opens() >= 1).await;
 
     let feed = state.pane_viewers.feed();
-    feed.send(snapshot("ready \x1b[31mred\x07\nnext")).unwrap();
+    feed.send(snapshot(&remote, "ready \x1b[31mred\x07\nnext")).unwrap();
     let (capture_state, text, host, truncated, _) = next_capture(&sink).await;
     assert_eq!(capture_state, PaneCaptureState::Live);
     assert_eq!(text, "ready \\x1b[31mred\\x07\nnext");
     assert_eq!((host.as_str(), truncated), ("spoke", true));
     // Another run's, or another subscription's, snapshot never reaches it.
-    let mut other = (*snapshot("elsewhere")).clone();
+    let mut other = (*snapshot(&remote, "elsewhere")).clone();
     other.subscription_id = "someone-else".into();
     feed.send(Arc::new(other)).unwrap();
-    feed.send(snapshot("again")).unwrap();
+    feed.send(snapshot(&remote, "again")).unwrap();
     assert_eq!(next_capture(&sink).await.1, "again");
 
     // The capture is renewed while the viewer stays.
@@ -281,7 +287,7 @@ async fn a_disconnected_viewer_stops_the_capture_but_a_second_viewer_keeps_it() 
     let opened = remote.opens();
     until("a renewal after one viewer left", || remote.opens() > opened).await;
     assert_eq!(remote.cancels(), 0, "the remaining viewer still needs it");
-    state.pane_viewers.feed().send(snapshot("still here")).unwrap();
+    state.pane_viewers.feed().send(snapshot(&remote, "still here")).unwrap();
     assert_eq!(next_capture(&second).await.1, "still here");
 
     state.topic_broker.remove_session("viewer-b").await;
@@ -325,7 +331,7 @@ async fn an_unreachable_host_is_reported_and_recovers_on_its_own() {
     *remote.answer.lock().unwrap() = PaneCaptureOutcome::Accepted;
     let opened = remote.opens();
     until("the next renewal", || remote.opens() > opened).await;
-    state.pane_viewers.feed().send(snapshot("back")).unwrap();
+    state.pane_viewers.feed().send(snapshot(&remote, "back")).unwrap();
     let (capture_state, text, ..) = next_capture(&sink).await;
     assert_eq!((capture_state, text.as_str()), (PaneCaptureState::Live, "back"));
 }
@@ -350,6 +356,69 @@ async fn a_local_worker_has_no_remote_view_and_never_calls_a_host() {
     let sink = viewer(&state, "viewer-a").await;
     let (capture_state, .., detail) = next_capture(&sink).await;
     assert_eq!(capture_state, PaneCaptureState::Unsupported);
-    assert!(detail.unwrap().contains("remote host"));
+    assert!(detail.unwrap().contains("spoke-connected"));
     assert!(remote.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_departure_that_leaves_viewers_asks_the_host_for_nothing() {
+    let remote = Remote::new(PaneCaptureOutcome::Accepted);
+    let (state, _dir) = state_with(&remote, true);
+    // Renewals far apart, so only a wake could cause another request.
+    state.pane_viewers.set_renew_every(Duration::from_secs(600));
+    let _sink = viewer(&state, "viewer-a").await;
+    until("the capture to open", || remote.opens() >= 1).await;
+
+    // A session that never watched a pane holds no pane topic to report.
+    let other = session_sink();
+    state.topic_broker.register_session("cli", other).await;
+    assert!(state.topic_broker.remove_session("cli").await.is_empty());
+    for _ in 0..3 {
+        state.pane_viewers.viewers_may_have_left().await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(remote.opens(), 1, "a departure is not a join");
+    assert_eq!(remote.cancels(), 0);
+    assert_eq!(
+        state.topic_broker.remove_session("viewer-a").await,
+        vec![pane_capture_topic(RUN)],
+        "a viewer's departure names the pane topic it held"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replacement_capture_is_never_cancelled_by_the_task_it_replaced() {
+    let remote = Remote::new(PaneCaptureOutcome::Accepted);
+    let (state, _dir) = state_with(&remote, true);
+    for round in 0..8 {
+        let id = format!("viewer-{round}");
+        let _sink = viewer(&state, &id).await;
+        until("an open", || remote.opens() > round).await;
+        let watched = remote.latest_subscription();
+        // Leave and come straight back, as a closed and reopened panel does.
+        unsubscribe(&state, &id).await;
+        let again = format!("viewer-{round}-again");
+        let _sink = viewer(&state, &again).await;
+        // Long enough for a departing task's cancel and the replacement's
+        // first open to both have reached the host.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let live = remote.latest_subscription();
+        let cancelled: Vec<String> = remote
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.cancel)
+            .map(|r| r.subscription_id.clone())
+            .collect();
+        assert!(
+            !cancelled.contains(&live),
+            "round {round}: the cancel of {watched} ended the live subscription {live}"
+        );
+        unsubscribe(&state, &again).await;
+        until("the task to end", || {
+            futures_executor_block(state.pane_viewers.active_runs()) == 0
+        })
+        .await;
+    }
 }

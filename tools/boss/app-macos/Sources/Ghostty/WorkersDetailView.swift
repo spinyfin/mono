@@ -23,7 +23,9 @@ import SwiftUI
 struct WorkersDetailView: View, @MainActor Equatable {
     @ObservedObject var workspace: WorkersWorkspaceModel
     @ObservedObject var liveStates: LiveWorkerStateStore
-    @ObservedObject var remotePanes: RemotePaneViewerModel
+    // Deliberately not observed: only `RemoteWorkersPanel` reads it, so a
+    // snapshot must not invalidate the rest of the Agents tab.
+    let remotePanes: RemotePaneViewerModel
     let isVisible: Bool
     let onRevealWorkItem: (String, String) -> Void
 
