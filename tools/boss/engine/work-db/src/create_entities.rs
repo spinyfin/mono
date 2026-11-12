@@ -11,18 +11,24 @@ use super::*;
 /// `design_task_description` seeds the auto-minted design task's
 /// `description` column (normally `''`; idea graduation passes the idea's
 /// markdown body there instead).
+///
+/// `actor` / `provenance` stamp the seed design task's flag ledger. Socket
+/// creates pass the resolved caller and an `rpc:` basis; engine-internal
+/// callers (including schema backfill) pass `'engine'` and `None`.
 pub(crate) fn create_project_in_tx(
     conn: &Connection,
     input: CreateProjectInput,
     design_task_description: &str,
+    actor: &str,
+    provenance: Option<&str>,
 ) -> Result<Project> {
     ensure_product_exists(conn, &input.product_id)?;
 
     let id = next_id("proj");
     let now = now_string();
     let slug = unique_project_slug(conn, &input.product_id, &slugify(&input.name))?;
-    let description = input.description.unwrap_or_default();
-    let goal = input.goal.unwrap_or_default();
+    let description = input.description.as_deref().unwrap_or("");
+    let goal = input.goal.as_deref().unwrap_or("");
     let short_id = allocate_short_id(conn, &input.product_id)?;
 
     conn.execute(
@@ -38,15 +44,7 @@ pub(crate) fn create_project_in_tx(
     // (postmortems, checklists, etc.) pass `no_design_task = true` and
     // land here with zero tasks.
     if !input.no_design_task {
-        insert_design_task_for_project_in_tx(
-            conn,
-            &input.product_id,
-            &id,
-            &input.name,
-            input.autostart,
-            input.design_reasoning_effort_xhigh,
-            design_task_description,
-        )?;
+        insert_design_task_for_project_in_tx(conn, &id, &input, design_task_description, actor, provenance)?;
     }
 
     query_project(conn, &id)?.with_context(|| format!("missing project after insert: {id}"))
@@ -262,9 +260,20 @@ impl WorkDb {
     }
 
     pub fn create_project(&self, input: CreateProjectInput) -> Result<Project> {
+        self.create_project_as_actor_with_provenance(input, boss_protocol::LAST_STATUS_ACTOR_ENGINE, None)
+    }
+
+    /// [`Self::create_project`] with the resolved caller so a
+    /// `--no-autostart` seed design task records who staged it.
+    pub fn create_project_as_actor_with_provenance(
+        &self,
+        input: CreateProjectInput,
+        actor: &str,
+        provenance: Option<&str>,
+    ) -> Result<Project> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let project = create_project_in_tx(&tx, input, "")?;
+        let project = create_project_in_tx(&tx, input, "", actor, provenance)?;
         tx.commit()?;
         Ok(project)
     }

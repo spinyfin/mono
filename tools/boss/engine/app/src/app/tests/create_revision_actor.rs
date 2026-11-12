@@ -61,6 +61,9 @@ async fn create_revision_handler_records_the_callers_actor_on_the_insert_row() {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    assert_eq!(basis, "insert_revision_in_tx");
+    assert_eq!(
+        basis,
+        "insert_revision_in_tx rpc:create_revision peer=socket_client pid=unknown session=session-test request=req-1"
+    );
     assert_eq!(actor, boss_protocol::LAST_STATUS_ACTOR_HUMAN);
 }

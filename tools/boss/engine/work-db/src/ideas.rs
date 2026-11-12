@@ -176,6 +176,31 @@ impl WorkDb {
         effort_level: Option<EffortLevel>,
         reasoning: Option<ReasoningMode>,
     ) -> Result<(Idea, Option<Task>, Option<Project>)> {
+        self.graduate_idea_as_actor_with_provenance(
+            id,
+            target,
+            name,
+            effort_level,
+            reasoning,
+            (boss_protocol::LAST_STATUS_ACTOR_ENGINE, None),
+        )
+    }
+
+    /// [`Self::graduate_idea`] with the resolved caller so the created
+    /// chore or seed design task records who graduated the idea.
+    ///
+    /// `attribution` is `(actor, provenance)`. Socket callers pass the
+    /// resolved peer and an `rpc:` basis; engine-internal callers pass
+    /// `'engine'` and `None`.
+    pub fn graduate_idea_as_actor_with_provenance(
+        &self,
+        id: &str,
+        target: IdeaGraduationKind,
+        name: Option<String>,
+        effort_level: Option<EffortLevel>,
+        reasoning: Option<ReasoningMode>,
+        (actor, provenance): (&str, Option<&str>),
+    ) -> Result<(Idea, Option<Task>, Option<Project>)> {
         if target == IdeaGraduationKind::Project && (effort_level.is_some() || reasoning.is_some()) {
             bail!("--effort / --reasoning only apply when graduating an idea to a chore, not a project");
         }
@@ -198,7 +223,7 @@ impl WorkDb {
         let (graduated_to_id, chore, project) = match target {
             IdeaGraduationKind::Chore => {
                 let created_via = format!("{CREATED_VIA_IDEA_GRADUATION_PREFIX}{id}");
-                let chore = insert_chore_in_tx(
+                let chore = insert_chore_in_tx_as_actor_with_provenance(
                     &tx,
                     CreateChoreInput::builder()
                         .product_id(idea.product_id.clone())
@@ -209,6 +234,8 @@ impl WorkDb {
                         .created_via(created_via)
                         .force_duplicate(true)
                         .build(),
+                    actor,
+                    provenance,
                 )?;
                 (chore.id.clone(), Some(chore), None)
             }
@@ -221,6 +248,8 @@ impl WorkDb {
                         .autostart(false)
                         .build(),
                     &idea.body,
+                    actor,
+                    provenance,
                 )?;
                 (project.id.clone(), None, Some(project))
             }

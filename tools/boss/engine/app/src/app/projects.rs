@@ -42,12 +42,15 @@ pub(super) async fn handle_create_project(ctx: Dispatch, req: FrontendRequest) {
         sink,
         session_id,
         request_id,
+        peer_pid,
         ..
     } = ctx;
     let FrontendRequest::CreateProject { input } = req else {
         unreachable!()
     };
-    match work_db.create_project(input) {
+    let provenance = resolve_write_basis(&server_state, peer_pid, &session_id, &request_id, "rpc:create_project").await;
+    let actor = resolve_status_actor(&server_state, peer_pid);
+    match work_db.create_project_as_actor_with_provenance(input, actor, Some(&provenance)) {
         Ok(project) => {
             let item = WorkItem::Project(project);
             let product_id = item.product_id().to_string();

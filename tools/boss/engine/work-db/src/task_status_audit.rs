@@ -22,6 +22,7 @@ pub(crate) fn compose_basis(path: &str, provenance: Option<&str>) -> String {
 }
 
 /// Actor plus optional socket caller identity for a ledger write.
+#[derive(Clone, Copy)]
 pub(crate) struct WriteAttribution<'a> {
     pub actor: &'a str,
     pub provenance: Option<&'a str>,

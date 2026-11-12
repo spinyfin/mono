@@ -584,6 +584,9 @@ impl WorkDb {
             return Ok(None);
         }
         let mut pending = PendingEvents::new();
+        if input.audit_basis.is_none() {
+            input.audit_basis = Some("dispatch_failure_recovery".to_owned());
+        }
         let execution = request_execution_in_tx_with_live_check(&mut pending, &tx, input, is_live)?;
         commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(Some(execution))
@@ -706,6 +709,7 @@ impl WorkDb {
                     .work_item_id(work_item_id.clone())
                     .maybe_preferred_workspace_id(preferred_workspace_id)
                     .allow_dirty(is_orphaned_predecessor)
+                    .audit_basis("reconcile_active_dispatch")
                     .build(),
                 |run_id| is_live(run_id),
             )?;
@@ -813,6 +817,7 @@ impl WorkDb {
                 &tx,
                 RequestExecutionInput::builder()
                     .work_item_id(work_item_id.clone())
+                    .audit_basis("rescan_active_dispatch")
                     .build(),
                 // `|_| true` keeps any non-terminal execution intact —
                 // the on-free rescan only ever fires this branch when

@@ -3,14 +3,15 @@
 //! and the calling peer, through the real request handlers.
 
 use super::*;
-use crate::app::{executions, planner_ops, work_items};
+use crate::app::{executions, ideas, planner_ops, projects, work_items};
 use boss_engine_runtime::test_support::{
     create_ready_chore_execution, create_test_chore, create_test_chore_manual, create_test_product_named,
     create_test_product_with_repo, finish_run_worker_pane_alive,
 };
 use boss_protocol::{
-    BoardColumn, BoardDropTarget, CreateChoreInput, CreateProjectInput, CreateTaskInput, FrontendRequest,
-    OperatorAnswer, OperatorAnswerType, OperatorQuestion, RequestExecutionInput, TaskFieldAuditRow, WorkItemPatch,
+    BoardColumn, BoardDropTarget, CreateChoreInput, CreateIdeaInput, CreateProjectInput, CreateTaskInput,
+    FrontendRequest, IdeaGraduationKind, OperatorAnswer, OperatorAnswerType, OperatorQuestion, RequestExecutionInput,
+    TaskFieldAuditRow, TaskKind, WorkItemPatch,
 };
 
 fn dispatch(state: &Arc<ServerState>, sink: &Arc<SessionSink>, request_id: &str) -> Dispatch {
@@ -710,5 +711,141 @@ async fn answering_yes_on_a_deferred_task_records_the_socket_caller_clearing_def
             "human".into(),
             format!("explicit_start_clears_deferred {answer_basis}")
         ))
+    );
+}
+
+fn seed_design_task_id(state: &ServerState, product_id: &str, project_id: &str) -> String {
+    state
+        .work_db
+        .list_tasks(product_id, Some(project_id), None, false)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.kind == TaskKind::Design)
+        .expect("seed design task")
+        .id
+}
+
+#[tokio::test]
+async fn creating_a_project_without_autostart_records_the_socket_caller() {
+    let (state, _dir) = test_server_state();
+    let product = create_test_product_named(&state.work_db, "Flag create project");
+    let sink = make_session_sink();
+    projects::handle_create_project(
+        dispatch(&state, &sink, "req-create-project"),
+        FrontendRequest::CreateProject {
+            input: CreateProjectInput::builder()
+                .product_id(product.id.clone())
+                .name("Staged")
+                .autostart(false)
+                .build(),
+        },
+    )
+    .await;
+    sink.close();
+    let project_id = match sink.next().await.expect("handler must reply").payload {
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Project(project),
+        } => project.id,
+        other => panic!("expected WorkItemCreated project, got {other:?}"),
+    };
+    let design_id = seed_design_task_id(&state, &product.id, &project_id);
+    let basis = socket_basis("rpc:create_project", "req-create-project");
+    assert_eq!(
+        history(&state, &design_id, "autostart"),
+        [(
+            None,
+            Some("0".into()),
+            "human".into(),
+            format!("insert_design_task_for_project_in_tx {basis}")
+        )]
+    );
+}
+
+#[tokio::test]
+async fn graduating_an_idea_to_a_chore_records_the_socket_caller() {
+    let (state, _dir) = test_server_state();
+    let product = create_test_product_named(&state.work_db, "Flag graduate chore");
+    let idea = state
+        .work_db
+        .create_idea(
+            CreateIdeaInput::builder()
+                .product_id(product.id.clone())
+                .name("Ship it")
+                .body("do the thing")
+                .build(),
+        )
+        .unwrap();
+    let sink = make_session_sink();
+    ideas::handle_graduate_idea(
+        dispatch(&state, &sink, "req-graduate-chore"),
+        FrontendRequest::GraduateIdea {
+            id: idea.id,
+            target: IdeaGraduationKind::Chore,
+            name: None,
+            effort_level: None,
+            reasoning: None,
+        },
+    )
+    .await;
+    sink.close();
+    let chore_id = match sink.next().await.expect("handler must reply").payload {
+        FrontendEvent::IdeaGraduated { chore: Some(chore), .. } => chore.id,
+        other => panic!("expected IdeaGraduated chore, got {other:?}"),
+    };
+    let basis = socket_basis("rpc:graduate_idea", "req-graduate-chore");
+    assert_eq!(
+        history(&state, &chore_id, "autostart"),
+        [(
+            None,
+            Some("1".into()),
+            "human".into(),
+            format!("insert_chore_with_project_in_tx_as_actor {basis}")
+        )]
+    );
+}
+
+#[tokio::test]
+async fn graduating_an_idea_to_a_project_records_the_socket_caller() {
+    let (state, _dir) = test_server_state();
+    let product = create_test_product_named(&state.work_db, "Flag graduate project");
+    let idea = state
+        .work_db
+        .create_idea(
+            CreateIdeaInput::builder()
+                .product_id(product.id.clone())
+                .name("Ideas layer")
+                .body("# Proposal")
+                .build(),
+        )
+        .unwrap();
+    let sink = make_session_sink();
+    ideas::handle_graduate_idea(
+        dispatch(&state, &sink, "req-graduate-project"),
+        FrontendRequest::GraduateIdea {
+            id: idea.id,
+            target: IdeaGraduationKind::Project,
+            name: None,
+            effort_level: None,
+            reasoning: None,
+        },
+    )
+    .await;
+    sink.close();
+    let project_id = match sink.next().await.expect("handler must reply").payload {
+        FrontendEvent::IdeaGraduated {
+            project: Some(project), ..
+        } => project.id,
+        other => panic!("expected IdeaGraduated project, got {other:?}"),
+    };
+    let design_id = seed_design_task_id(&state, &product.id, &project_id);
+    let basis = socket_basis("rpc:graduate_idea", "req-graduate-project");
+    assert_eq!(
+        history(&state, &design_id, "autostart"),
+        [(
+            None,
+            Some("0".into()),
+            "human".into(),
+            format!("insert_design_task_for_project_in_tx {basis}")
+        )]
     );
 }

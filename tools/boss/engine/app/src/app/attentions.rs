@@ -606,7 +606,22 @@ pub(super) async fn handle_action_attention_group(ctx: Dispatch, req: FrontendRe
         unreachable!()
     };
     let actor = super::process_signals::resolve_status_actor(&server_state, peer_pid);
-    match work_db.action_attention_group_as_actor(&id, skip_unanswered, &member_overrides, &GhPrStateChecker, actor) {
+    let provenance = super::process_signals::resolve_write_basis(
+        &server_state,
+        peer_pid,
+        &session_id,
+        &request_id,
+        "rpc:action_attention_group",
+    )
+    .await;
+    match work_db.action_attention_group_as_actor_with_provenance(
+        &id,
+        skip_unanswered,
+        &member_overrides,
+        &GhPrStateChecker,
+        actor,
+        Some(&provenance),
+    ) {
         Ok(ActionedAttentionGroup {
             group,
             produced_work_item_ids,
