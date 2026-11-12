@@ -90,6 +90,29 @@ pub(crate) fn insert_spoke_applied_write_on(conn: &Connection, write: &SpokeAppl
     Ok(())
 }
 
+/// Record a spoke submission's accepted result on `conn`, so it commits in the
+/// same transaction as the domain write it describes. A no-op for a local write.
+pub(crate) fn record_application_on(
+    conn: &Connection,
+    application: Option<crate::SpokeWriteApplication<'_>>,
+) -> Result<()> {
+    let Some(application) = application else {
+        return Ok(());
+    };
+    insert_spoke_applied_write_on(
+        conn,
+        &SpokeAppliedWrite {
+            application_key: application.key.to_owned(),
+            host_id: application.host_id.to_owned(),
+            contract: application.contract.to_owned(),
+            accepted: true,
+            reason: String::new(),
+            result_json: serde_json::json!({"state": "applied"}).to_string(),
+            created_at_ms: boss_engine_utils::epoch_time::now_epoch_ms() as i64,
+        },
+    )
+}
+
 /// Why the projection refused to move its cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SpokeProjectionFault {
@@ -191,10 +214,16 @@ pub(crate) fn migrate_applied_writes(conn: &Connection) -> Result<()> {
             created_at_ms INTEGER NOT NULL
          )",
     )?;
-    // Sequences that were receipted without a stored row (unretained captures
-    // before tombstones) would halt projection. Fill those holes as frameless
-    // skips. A later DELETE of a retained frame that is still ahead of the
-    // cursor remains a halt: it is no longer a hole at receipt time.
+    // Backfill the holes the previous schema left above `pruned_through`.
+    // Before tombstones, the only way a sequence above the prune point could be
+    // receipted without a stored row was an unretained pane capture
+    // (`retain = false` advanced `received` and stored nothing), and the only
+    // `DELETE FROM spoke_ingress` is the prune, which moves `pruned_through`
+    // past what it removes. So at upgrade time every such hole is evidence of a
+    // live-only capture and nothing else, and it is filled as a frameless skip.
+    // Sequences at or below `pruned_through` are never touched. A retained
+    // frame that disappears after this migration is a hole with no tombstone,
+    // which still halts the host.
     conn.execute_batch(
         "WITH RECURSIVE seqs(host_id, journal_id, seq, received) AS (
             SELECT host_id, journal_id, pruned_through + 1, received
@@ -1185,6 +1214,63 @@ mod tests {
             db.check_spoke_projection_advance("host-a", "journal", 1).unwrap(),
             SpokeAdvance::AlreadyApplied
         );
+    }
+
+    #[test]
+    fn upgrade_fills_only_holes_above_the_prune_point_with_frameless_tombstones() {
+        let db = db();
+        receive(&db, "host-a", 4);
+        {
+            let conn = db.connect().unwrap();
+            // An old-schema unretained capture at 3, and a pruned prefix.
+            conn.execute("DELETE FROM spoke_ingress WHERE sequence = 3", [])
+                .unwrap();
+            conn.execute("DELETE FROM spoke_ingress WHERE sequence <= 1", [])
+                .unwrap();
+            conn.execute("UPDATE spoke_journals SET pruned_through = 1", [])
+                .unwrap();
+            migrate_applied_writes(&conn).unwrap();
+        }
+        assert!(db.spoke_ingress_frame("host-a", 1).unwrap().is_none());
+        assert_eq!(
+            db.spoke_ingress_frame("host-a", 2).unwrap().as_deref(),
+            Some(&b"frame-2"[..])
+        );
+        assert_eq!(db.spoke_ingress_frame("host-a", 3).unwrap().as_deref(), Some(&b""[..]));
+        assert_eq!(
+            db.spoke_ingress_frame("host-a", 4).unwrap().as_deref(),
+            Some(&b"frame-4"[..])
+        );
+    }
+
+    fn sqlite_failure(code: i32) -> anyhow::Error {
+        anyhow::Error::new(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None))
+            .context("writing the domain row")
+    }
+
+    #[test]
+    fn transient_database_faults_are_retried_and_domain_failures_are_refused() {
+        use crate::{SpokeWriteError, retryable_work_error};
+        for code in [
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_LOCKED,
+            rusqlite::ffi::SQLITE_IOERR,
+            rusqlite::ffi::SQLITE_FULL,
+        ] {
+            let error = sqlite_failure(code);
+            assert!(retryable_work_error(&error), "code {code} is transient");
+            assert!(matches!(SpokeWriteError::from_work(error), SpokeWriteError::Retry(_)));
+        }
+        // A missing table is a defect, a constraint is a refusal, and an
+        // `ensure!` is the handler saying no: none of them heals by waiting.
+        for error in [
+            sqlite_failure(rusqlite::ffi::SQLITE_ERROR),
+            sqlite_failure(rusqlite::ffi::SQLITE_CONSTRAINT),
+            anyhow::anyhow!("comment c1 is not in_revision"),
+        ] {
+            assert!(!retryable_work_error(&error), "{error:#}");
+            assert!(matches!(SpokeWriteError::from_work(error), SpokeWriteError::Refused(_)));
+        }
     }
 
     #[test]

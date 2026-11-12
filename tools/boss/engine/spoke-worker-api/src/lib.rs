@@ -1356,10 +1356,13 @@ impl Gateway {
                 kind: RunWriteKind::GuideOutcome,
                 scope: comment_id.clone(),
                 fields,
-                canonical: json!({
-                    "run_id": execution.execution_id, "comment_id": comment_id, "disposition": disposition,
-                    "body": body, "request_regeneration": request_regeneration,
-                }),
+                canonical: boss_protocol_spoke::proposal::guide_outcome_body(
+                    &execution.execution_id,
+                    &comment_id,
+                    &disposition,
+                    &body,
+                    request_regeneration,
+                ),
             },
             stamp,
         )
@@ -1389,7 +1392,7 @@ impl Gateway {
                 kind: RunWriteKind::AnswerReply,
                 scope: String::new(),
                 fields,
-                canonical: json!({"run_id": execution.execution_id, "body": body}),
+                canonical: boss_protocol_spoke::proposal::answer_reply_body(&execution.execution_id, &body),
             },
             stamp,
         )
@@ -1426,10 +1429,12 @@ impl Gateway {
                 kind: RunWriteKind::ConflictProducer,
                 scope: String::new(),
                 fields,
-                canonical: json!({
-                    "execution_id": execution.execution_id, "head_branch": head_branch,
-                    "base_branch": base_branch, "conflicted_files": conflicted_files,
-                }),
+                canonical: boss_protocol_spoke::proposal::conflict_producer_body(
+                    &execution.execution_id,
+                    &head_branch,
+                    &base_branch,
+                    conflicted_files,
+                ),
             },
             stamp,
         )
@@ -1480,9 +1485,20 @@ impl Gateway {
                 kind,
                 scope: attempt_id.clone(),
                 fields,
-                canonical: json!({
-                    "run_id": execution.execution_id, "attempt_id": attempt_id, "reason": reason, "extra": extra,
-                }),
+                canonical: match kind {
+                    RunWriteKind::CiMarkFailed => boss_protocol_spoke::proposal::ci_mark_failed_body(
+                        &execution.execution_id,
+                        &attempt_id,
+                        &reason,
+                        extra,
+                    ),
+                    _ => boss_protocol_spoke::proposal::conflict_mark_failed_body(
+                        &execution.execution_id,
+                        &attempt_id,
+                        &reason,
+                        extra,
+                    ),
+                },
             },
             stamp,
         )

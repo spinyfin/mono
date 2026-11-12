@@ -40,6 +40,18 @@ impl WorkDb {
     /// than erroring: the caller decides how loudly to log the no-row case,
     /// and a genuine DB failure still surfaces as `Err`.
     pub fn record_semantic_progress(&self, execution_id: &str, event: &WorkerEvent) -> Result<bool> {
+        self.record_semantic_progress_observed(execution_id, event, None)
+    }
+
+    /// [`Self::record_semantic_progress`] stamped with the time the event was
+    /// observed rather than now. A replayed event from a spoke carries its
+    /// original time; the checkpoint never moves backwards.
+    pub fn record_semantic_progress_observed(
+        &self,
+        execution_id: &str,
+        event: &WorkerEvent,
+        observed_at_ms: Option<i64>,
+    ) -> Result<bool> {
         if matches!(event, WorkerEvent::Notification { .. }) {
             return Ok(false);
         }
@@ -47,7 +59,7 @@ impl WorkDb {
         let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
             return Ok(false);
         };
-        let now = boss_engine_utils::iso8601::format_epoch_iso8601(boss_engine_utils::epoch_time::now_epoch_secs());
+        let now = progress_time(observed_at_ms);
         // Bound independently: each column is carried through unchanged
         // (`COALESCE`) when its own signal is absent, so a divergence between
         // the two signal functions can never drop a transition.
@@ -55,7 +67,8 @@ impl WorkDb {
         let turn = turn_condition_signal(event).map(|c| c.as_str());
         conn.execute(
             "UPDATE work_runs
-             SET semantic_progress_at = ?2,
+             SET semantic_progress_at = CASE WHEN semantic_progress_at IS NULL OR semantic_progress_at < ?2
+                                             THEN ?2 ELSE semantic_progress_at END,
                  semantic_tool_condition = COALESCE(?3, semantic_tool_condition),
                  semantic_turn_condition = COALESCE(?4, semantic_turn_condition)
              WHERE id = ?1
@@ -93,7 +106,8 @@ impl WorkDb {
             (checkpoint.turn_condition != SemanticTurnCondition::Unknown).then(|| checkpoint.turn_condition.as_str());
         conn.execute(
             "UPDATE work_runs
-             SET semantic_progress_at = ?2,
+             SET semantic_progress_at = CASE WHEN semantic_progress_at IS NULL OR semantic_progress_at < ?2
+                                             THEN ?2 ELSE semantic_progress_at END,
                  semantic_tool_condition = COALESCE(?3, semantic_tool_condition),
                  semantic_turn_condition = COALESCE(?4, semantic_turn_condition)
              WHERE id = ?1",
@@ -106,13 +120,24 @@ impl WorkDb {
     /// For an event the reducer refused as stale: it still proves the worker
     /// is alive, but describes a state the worker has already left.
     pub fn record_semantic_progress_stamp(&self, execution_id: &str) -> Result<bool> {
+        self.record_semantic_progress_stamp_observed(execution_id, None)
+    }
+
+    /// [`Self::record_semantic_progress_stamp`] at the observed time of a
+    /// replayed event; the stamp never moves backwards.
+    pub fn record_semantic_progress_stamp_observed(
+        &self,
+        execution_id: &str,
+        observed_at_ms: Option<i64>,
+    ) -> Result<bool> {
         let conn = self.connect()?;
         let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
             return Ok(false);
         };
-        let now = boss_engine_utils::iso8601::format_epoch_iso8601(boss_engine_utils::epoch_time::now_epoch_secs());
+        let now = progress_time(observed_at_ms);
         conn.execute(
-            "UPDATE work_runs SET semantic_progress_at = ?2 WHERE id = ?1 AND semantic_progress_at IS NOT ?2",
+            "UPDATE work_runs SET semantic_progress_at = ?2
+             WHERE id = ?1 AND (semantic_progress_at IS NULL OR semantic_progress_at < ?2)",
             params![run_id, now],
         )?;
         Ok(true)
@@ -152,4 +177,13 @@ impl WorkDb {
             Some((None, _, _)) | None => None,
         })
     }
+}
+
+/// The checkpoint time for an event: when it was observed, else now.
+fn progress_time(observed_at_ms: Option<i64>) -> String {
+    let secs = observed_at_ms
+        .filter(|ms| *ms > 0)
+        .map(|ms| ms.div_euclid(1000))
+        .unwrap_or_else(boss_engine_utils::epoch_time::now_epoch_secs);
+    boss_engine_utils::iso8601::format_epoch_iso8601(secs)
 }

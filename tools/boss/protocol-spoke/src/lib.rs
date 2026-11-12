@@ -94,44 +94,48 @@ pub mod proposal {
     pub fn guide_outcome_body(
         run_id: impl Into<String>,
         comment_id: impl Into<String>,
-        disposition: impl Into<String>,
+        disposition: &boss_protocol::GuideCommentDisposition,
         body: impl Into<String>,
         request_regeneration: bool,
     ) -> serde_json::Value {
         serde_json::json!({
             "run_id": run_id.into(),
             "comment_id": comment_id.into(),
-            "disposition": disposition.into(),
+            "disposition": disposition,
             "body": body.into(),
             "request_regeneration": request_regeneration,
         })
     }
 
-    /// Canonical JSON the spoke gateway queues for `boss engine ci mark-failed`.
+    /// Canonical JSON the spoke gateway queues for `boss engine ci mark-failed`;
+    /// `extra` carries `queue_ci_evidence`.
     pub fn ci_mark_failed_body(
         run_id: impl Into<String>,
         attempt_id: impl Into<String>,
         reason: impl Into<String>,
+        extra: serde_json::Value,
     ) -> serde_json::Value {
         serde_json::json!({
             "run_id": run_id.into(),
             "attempt_id": attempt_id.into(),
             "reason": reason.into(),
-            "extra": {},
+            "extra": extra,
         })
     }
 
-    /// Canonical JSON the spoke gateway queues for `boss engine conflicts mark-failed`.
+    /// Canonical JSON the spoke gateway queues for `boss engine conflicts mark-failed`;
+    /// `extra` carries `evidence`.
     pub fn conflict_mark_failed_body(
         run_id: impl Into<String>,
         attempt_id: impl Into<String>,
         reason: impl Into<String>,
+        extra: serde_json::Value,
     ) -> serde_json::Value {
         serde_json::json!({
             "run_id": run_id.into(),
             "attempt_id": attempt_id.into(),
             "reason": reason.into(),
-            "extra": {},
+            "extra": extra,
         })
     }
 

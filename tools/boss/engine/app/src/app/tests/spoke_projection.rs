@@ -80,6 +80,18 @@ impl Fixture {
         state.feature_flags.set("worker_proposals", true).unwrap();
         state.feature_flags.set("run_done_proposals_seam", true).unwrap();
         let (execution_id, work_item_id) = new_execution(&state, "Spoke run-done target");
+        Self::on_spoke(state, dir, execution_id, work_item_id, true)
+    }
+
+    /// Assign an existing execution to the spoke host. `start` begins its run
+    /// there; an execution whose run was already started is only bound.
+    fn on_spoke(
+        state: Arc<ServerState>,
+        dir: tempfile::TempDir,
+        execution_id: String,
+        work_item_id: String,
+        start: bool,
+    ) -> Self {
         let db = &state.work_db;
         db.add_host(HOST, "worker@spoke", 1, &[]).unwrap();
         db.set_host_transport(HOST, HostTransport::SpokeReady).unwrap();
@@ -92,16 +104,18 @@ impl Fixture {
             "/remote/workspace",
         )
         .unwrap();
-        db.start_execution_run_on_host(
-            &execution_id,
-            "worker",
-            "repo",
-            "lease-run-done",
-            "workspace-run-done",
-            dir.path().to_str().unwrap(),
-            HOST,
-        )
-        .unwrap();
+        if start {
+            db.start_execution_run_on_host(
+                &execution_id,
+                "worker",
+                "repo",
+                "lease-run-done",
+                "workspace-run-done",
+                dir.path().to_str().unwrap(),
+                HOST,
+            )
+            .unwrap();
+        }
         Self::builder()
             .state(state)
             .dir(dir)
@@ -295,6 +309,8 @@ async fn a_done_queued_while_the_hub_was_away_finalizes_the_run_once_however_oft
     // The spoke cannot be reached for the decision yet.
     fx.wire.unreachable.store(true, Ordering::SeqCst);
     fx.projector().drain().await;
+    // Finalization runs off the delivery pass, so it lands just after the drain.
+    eventually("the queued done to finalize the run", || is_terminal(&fx)).await;
     let first = fx.state.work_db.get_execution(&fx.execution_id).unwrap();
     assert!(
         first.status.is_terminal(),
@@ -615,7 +631,8 @@ async fn a_run_scoped_write_for_another_runs_attempt_is_refused() {
         boss_protocol_spoke::proposal::conflict_mark_failed_body(
             &fx.execution_id,
             "crz_not_this_run",
-            "semantic_obsolescence",
+            "obsolescence_suspected",
+            json!({}),
         ),
     );
     fx.projector().drain().await;
@@ -827,7 +844,7 @@ async fn a_guide_outcome_write_uses_canonical_json_and_replays_after_a_crash() {
         boss_protocol_spoke::proposal::guide_outcome_body(
             &fx.execution_id,
             &comment.id,
-            "no_change",
+            &boss_protocol::GuideCommentDisposition::NoChange,
             "already handled",
             false,
         ),
@@ -879,7 +896,7 @@ async fn a_ci_mark_failed_write_uses_canonical_json_and_replays_after_a_crash() 
     fx.receive_run_write(
         boss_protocol_spoke::proposal::CI_MARK_FAILED,
         "ci-1",
-        boss_protocol_spoke::proposal::ci_mark_failed_body(&fx.execution_id, &attempt.id, "wont_fix"),
+        boss_protocol_spoke::proposal::ci_mark_failed_body(&fx.execution_id, &attempt.id, "wont_fix", json!({})),
     );
     fx.projector().drain().await;
     assert_eq!(
@@ -920,7 +937,8 @@ async fn a_conflict_mark_failed_write_uses_canonical_json() {
         boss_protocol_spoke::proposal::conflict_mark_failed_body(
             &fx.execution_id,
             &attempt.id,
-            "semantic_obsolescence",
+            "obsolescence_suspected",
+            json!({}),
         ),
     );
     fx.projector().drain().await;
@@ -969,7 +987,7 @@ async fn a_local_tmux_slot_does_not_record_spoke_turn_state() {
 }
 
 #[tokio::test]
-async fn a_transient_run_write_failure_retries_and_does_not_store_a_refusal() {
+async fn a_failed_result_lookup_retries_and_does_not_store_a_refusal() {
     let mut fx = delivered_with_a_resolvable_pr();
     fx.state
         .work_db
@@ -1057,6 +1075,7 @@ async fn turn_state_is_restored_on_a_fresh_server_and_a_persist_failure_holds_th
     let (fresh, _dir) = test_server_state_with_overrides(
         ServerStateOverrides::builder()
             .work_db(db)
+            .skip_hub_installation(true)
             .cube_client(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsCube))
             .execution_runner(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsRunner))
             .build(),
@@ -1115,4 +1134,792 @@ async fn turn_state_is_restored_on_a_fresh_server_and_a_persist_failure_holds_th
             .applied,
         2
     );
+}
+
+fn watcher() -> Arc<SessionSink> {
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    Arc::new(SessionSink::new(
+        shutdown_tx,
+        crate::app::frontend_metrics::test_registry(),
+    ))
+}
+
+async fn watch(state: &Arc<ServerState>, topic: String) -> Arc<SessionSink> {
+    let sink = watcher();
+    state.topic_broker.register_session("watcher", sink.clone()).await;
+    state.topic_broker.subscribe("watcher", &[topic]).await;
+    sink
+}
+
+/// Everything the sink received, waiting briefly for pushes still in flight.
+async fn received(sink: &SessionSink) -> Vec<FrontendEvent> {
+    let mut events = Vec::new();
+    while let Ok(Some(envelope)) = tokio::time::timeout(std::time::Duration::from_millis(200), sink.next()).await {
+        events.push(envelope.payload);
+    }
+    events
+}
+
+fn invalidation_reasons(events: &[FrontendEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            FrontendEvent::TopicEvent {
+                event: boss_protocol::TopicEventPayload::WorkInvalidated { reason, .. },
+                ..
+            } => Some(reason.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+    for _ in 0..150 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+fn conflict_attempt(fx: &Fixture) -> boss_protocol::ConflictResolution {
+    fx.state
+        .work_db
+        .insert_conflict_resolution(boss_work_db::ConflictResolutionInsertInput {
+            product_id: fx.product_id(),
+            work_item_id: fx.work_item_id.clone(),
+            pr_url: PR_URL.into(),
+            pr_number: 9,
+            head_branch: "feature".into(),
+            base_branch: "main".into(),
+            base_sha_at_trigger: Some("base".into()),
+            head_sha_before: Some("head".into()),
+        })
+        .unwrap()
+        .expect("pending conflict attempt")
+}
+
+fn answer_agent_comment(fx: &Fixture) -> boss_protocol::WorkComment {
+    fx.state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET kind = 'answer_agent' WHERE id = ?1",
+            [&fx.execution_id],
+        )
+        .unwrap();
+    let comment = fx
+        .state
+        .work_db
+        .create_comment(
+            boss_protocol::CreateCommentInput::builder()
+                .artifact_kind("work_item")
+                .artifact_id(&fx.work_item_id)
+                .anchor(boss_protocol::CommentAnchor {
+                    exact: "why".into(),
+                    ..Default::default()
+                })
+                .body("why?")
+                .author("operator")
+                .doc_version("v0")
+                .build(),
+        )
+        .unwrap();
+    fx.state.work_db.transition_comment_to_answering(&comment.id).unwrap();
+    let run = fx
+        .state
+        .work_db
+        .create_answer_agent_run(&comment.id, "work_item", &fx.work_item_id, "v0", 0)
+        .unwrap();
+    fx.state
+        .work_db
+        .bind_answer_agent_run_execution(&run.id, &fx.execution_id)
+        .unwrap();
+    comment
+}
+
+#[tokio::test]
+async fn a_replayed_hook_carries_its_observed_time_into_the_liveness_checkpoint() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    // The host saw this at 1s past the epoch; the hub applies it long after.
+    fx.receive_event(&boss_protocol::WorkerEvent::Stop {
+        session_id: "main".into(),
+        stop_hook_active: false,
+        stop_reason: boss_protocol::StopReason::AwaitingInput,
+    });
+    fx.projector().drain().await;
+    let observed = boss_engine_live_worker_state::iso8601_utc(1);
+    let slot = fx
+        .state
+        .live_worker_states
+        .snapshot()
+        .into_iter()
+        .find(|slot| slot.run_id == fx.execution_id)
+        .expect("the replayed hook gave the run a slot")
+        .slot_id;
+    let in_memory = fx
+        .state
+        .live_worker_states
+        .semantic_progress_for_slot(slot)
+        .expect("checkpoint");
+    assert_eq!(in_memory.progress_at, observed, "the registry checkpoint");
+    let durable = fx
+        .state
+        .work_db
+        .get_run_semantic_progress_checkpoint(&fx.execution_id)
+        .unwrap()
+        .expect("durable checkpoint");
+    assert_eq!(durable.progress_at, observed, "work_runs.semantic_progress_at");
+
+    // The stale-worker sweep reads that checkpoint, so a worker that died during
+    // the outage is still judged stale, not freshly active.
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    let verdict = boss_engine_runtime::stale_worker_sweep::classify_semantic_staleness(
+        durable.tool_condition,
+        Some(&durable.progress_at),
+        &boss_engine_live_worker_state::iso8601_utc(0),
+        boss_engine_driver::ProgressFidelity::Rich,
+        now,
+        300,
+    );
+    assert!(
+        matches!(
+            verdict,
+            boss_engine_runtime::stale_worker_sweep::SemanticStaleness::Stale { .. }
+        ),
+        "{verdict:?}"
+    );
+
+    // Draining an older backlog behind a newer record never moves it backwards.
+    fx.receive_event(&boss_protocol::WorkerEvent::UserPromptSubmit {
+        session_id: "main".into(),
+        prompt: "go".into(),
+    });
+    fx.projector().drain().await;
+    let after = fx
+        .state
+        .work_db
+        .get_run_semantic_progress_checkpoint(&fx.execution_id)
+        .unwrap()
+        .unwrap();
+    assert!(after.progress_at >= durable.progress_at);
+}
+
+fn review_member_on_a_spoke() -> (Fixture, String) {
+    let (state, dir) = test_server_state_with_fakes();
+    let (_ordinary, work_item_id) = new_execution(&state, "Review target");
+    let dispatch = state
+        .work_db
+        .create_pre_merge_review_batch(
+            boss_work_db::ReviewBatchCreateInput::builder()
+                .cycle_root_id(work_item_id.clone())
+                .base_sha("base-sha")
+                .classification(review_classification())
+                .phase(ReviewBatchPhase::PreMerge)
+                .pr_number(42)
+                .pr_url("https://github.com/example/repo/pull/42")
+                .target_sha("head-sha")
+                .build(),
+            "https://github.com/example/repo",
+        )
+        .unwrap();
+    let (batch_id, leaf_execution_id) = match dispatch {
+        boss_work_db::ReviewBatchDispatch::Created { batch, executions } => (batch.id, executions[0].id.clone()),
+        other => panic!("expected a fresh review batch, got {other:?}"),
+    };
+    (
+        Fixture::on_spoke(state, dir, leaf_execution_id, work_item_id, true),
+        batch_id,
+    )
+}
+
+fn is_terminal(fx: &Fixture) -> bool {
+    fx.state
+        .work_db
+        .get_execution(&fx.execution_id)
+        .unwrap()
+        .status
+        .is_terminal()
+}
+
+#[tokio::test]
+async fn a_reporting_member_is_finalized_after_a_delivery_that_missed_first() {
+    let (mut fx, batch) = review_member_on_a_spoke();
+    fx.receive_proposal(
+        "report-1",
+        ProposalKind::ReviewReport,
+        v1::ProposalKind::ReviewReport,
+        review_report_payload(&batch, "head-sha"),
+    );
+    let projector = fx.projector();
+    fx.wire.unreachable.store(true, Ordering::SeqCst);
+    projector.drain().await;
+    projector.drain().await;
+    assert!(fx.wire.decisions().is_empty());
+    assert!(
+        !is_terminal(&fx),
+        "a member is not torn down before the spoke has its answer"
+    );
+
+    fx.wire.unreachable.store(false, Ordering::SeqCst);
+    projector.drain().await;
+    assert_eq!(fx.wire.decisions().len(), 1);
+    eventually("the member to finalize once its decision was delivered", || {
+        is_terminal(&fx)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_reporting_member_is_finalized_when_the_hub_restarts_before_its_decision_is_delivered() {
+    let (mut fx, batch) = review_member_on_a_spoke();
+    fx.receive_proposal(
+        "report-1",
+        ProposalKind::ReviewReport,
+        v1::ProposalKind::ReviewReport,
+        review_report_payload(&batch, "head-sha"),
+    );
+    fx.wire.unreachable.store(true, Ordering::SeqCst);
+    fx.projector().drain().await;
+    assert!(!is_terminal(&fx));
+
+    // A restarted hub has a fresh applier: nothing remembers the submission.
+    fx.wire.unreachable.store(false, Ordering::SeqCst);
+    fx.projector().drain().await;
+    assert_eq!(fx.wire.decisions().len(), 1);
+    eventually("the restarted hub to finalize the member", || is_terminal(&fx)).await;
+}
+
+#[tokio::test]
+async fn an_answer_reply_refreshes_the_thread_like_the_local_handler() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    let comment = answer_agent_comment(&fx);
+    let sink = watch(
+        &fx.state,
+        boss_protocol::comment_topic(&comment.artifact_kind, &comment.artifact_id),
+    )
+    .await;
+    fx.receive_run_write(
+        boss_protocol_spoke::proposal::ANSWER_REPLY,
+        "answer-1",
+        boss_protocol_spoke::proposal::answer_reply_body(&fx.execution_id, "because"),
+    );
+    fx.projector().drain().await;
+    assert_eq!(fx.wire.decisions()[0].code, ResultCode::Ok as i32);
+    assert_eq!(
+        invalidation_reasons(&received(&sink).await),
+        ["comment_answered"],
+        "subscribers refresh the thread"
+    );
+}
+
+#[tokio::test]
+async fn a_guide_outcome_refreshes_the_comment_and_announces_a_requested_regeneration() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    fx.state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET kind = 'revision_implementation' WHERE id = ?1",
+            [&fx.execution_id],
+        )
+        .unwrap();
+    let (_root, series) = boss_work_db::test_support::seed_published_guide(fx.state.work_db.as_ref(), 9);
+    let comment = boss_work_db::test_support::add_guide_comment(fx.state.work_db.as_ref(), &series, "fix retry");
+    fx.state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_comments SET status = 'in_revision', revise_task_id = ?2 WHERE id = ?1",
+            [&comment.id, &fx.work_item_id],
+        )
+        .unwrap();
+    let sink = watch(
+        &fx.state,
+        boss_protocol::comment_topic(&comment.artifact_kind, &comment.artifact_id),
+    )
+    .await;
+    fx.receive_run_write(
+        boss_protocol_spoke::proposal::GUIDE_OUTCOME,
+        "guide-regen",
+        boss_protocol_spoke::proposal::guide_outcome_body(
+            &fx.execution_id,
+            &comment.id,
+            &boss_protocol::GuideCommentDisposition::SourceChanged,
+            "fixed",
+            true,
+        ),
+    );
+    fx.projector().drain().await;
+    assert_eq!(
+        fx.wire.decisions()[0].code,
+        ResultCode::Ok as i32,
+        "{:?}",
+        fx.wire.decisions()
+    );
+    let reasons = invalidation_reasons(&received(&sink).await);
+    assert!(
+        reasons.contains(&"guide_comment_outcome_recorded".to_owned()),
+        "{reasons:?}"
+    );
+    assert!(
+        fx.state
+            .work_db
+            .get_spoke_applied_write("guide-regen")
+            .unwrap()
+            .is_some_and(|write| write.accepted),
+        "the result row commits with the outcome"
+    );
+}
+
+#[tokio::test]
+async fn a_conflict_mark_failed_broadcasts_the_failure_and_checks_the_reason_itself() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    let attempt = conflict_attempt(&fx);
+    let sink = watch(&fx.state, boss_protocol::work_product_topic(&fx.product_id())).await;
+    // The hub does not trust the spoke's own reason check.
+    fx.receive_run_write(
+        boss_protocol_spoke::proposal::CONFLICT_MARK_FAILED,
+        "mark-bad",
+        boss_protocol_spoke::proposal::conflict_mark_failed_body(
+            &fx.execution_id,
+            &attempt.id,
+            "made_up_reason",
+            json!({}),
+        ),
+    );
+    fx.projector().drain().await;
+    assert_eq!(fx.wire.decisions()[0].code, ResultCode::Rejected as i32);
+    assert_eq!(
+        fx.state
+            .work_db
+            .get_conflict_resolution(&attempt.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        "pending"
+    );
+
+    fx.receive_run_write(
+        boss_protocol_spoke::proposal::CONFLICT_MARK_FAILED,
+        "mark-ok",
+        boss_protocol_spoke::proposal::conflict_mark_failed_body(
+            &fx.execution_id,
+            &attempt.id,
+            "obsolescence_suspected",
+            json!({}),
+        ),
+    );
+    fx.projector().drain().await;
+    assert_eq!(fx.wire.decisions()[1].code, ResultCode::Ok as i32);
+    let events = received(&sink).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, FrontendEvent::ConflictResolutionFailed { attempt_id, .. } if attempt_id == &attempt.id)),
+        "the failure appears in the activity feed: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_ci_mark_failed_broadcasts_the_failure() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    let attempt = fx
+        .state
+        .work_db
+        .insert_ci_remediation(boss_work_db::CiRemediationInsertInput {
+            product_id: fx.product_id(),
+            work_item_id: fx.work_item_id.clone(),
+            pr_url: PR_URL.into(),
+            pr_number: 9,
+            head_branch: "feature".into(),
+            head_sha_at_trigger: "a".repeat(40),
+            attempt_kind: "fix".into(),
+            consumes_budget: 1,
+            failed_checks: "[]".into(),
+            failure_kind: "pr_branch_ci".into(),
+            before_commit_sha: None,
+        })
+        .unwrap()
+        .expect("pending ci attempt");
+    let sink = watch(&fx.state, boss_protocol::work_product_topic(&fx.product_id())).await;
+    fx.receive_run_write(
+        boss_protocol_spoke::proposal::CI_MARK_FAILED,
+        "ci-broadcast",
+        boss_protocol_spoke::proposal::ci_mark_failed_body(&fx.execution_id, &attempt.id, "wont_fix", json!({})),
+    );
+    fx.projector().drain().await;
+    assert_eq!(fx.wire.decisions()[0].code, ResultCode::Ok as i32);
+    let events = received(&sink).await;
+    assert!(
+        events.iter().any(
+            |event| matches!(event, FrontendEvent::CiRemediationFailed { attempt_id, .. } if attempt_id == &attempt.id)
+        ),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_producer_conflict_is_counted_by_class() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    fx.receive_run_write(
+        boss_protocol_spoke::proposal::CONFLICT_PRODUCER,
+        "producer-metric",
+        boss_protocol_spoke::proposal::conflict_producer_body(
+            &fx.execution_id,
+            "feature",
+            "main",
+            vec!["Cargo.lock".into()],
+        ),
+    );
+    fx.projector().drain().await;
+    let recorded = fx
+        .state
+        .work_db
+        .latest_conflict_resolution_for_work_item(&fx.work_item_id)
+        .unwrap()
+        .expect("row");
+    let class = recorded.conflict_class.expect("classified");
+    let name = format!(
+        "conflict.{}.{}.classified",
+        boss_engine_merge_poller::sanitize_metric_name_component(&fx.product_id()),
+        boss_engine_merge_poller::sanitize_metric_name_component(&class),
+    );
+    assert_eq!(fx.state.metrics.counter_value(&name), Some(1), "{name}");
+}
+
+#[tokio::test]
+async fn a_busy_database_at_the_domain_write_retries_and_stores_no_refusal() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    fx.receive_run_write(
+        boss_protocol_spoke::proposal::CONFLICT_PRODUCER,
+        "producer-busy",
+        boss_protocol_spoke::proposal::conflict_producer_body(
+            &fx.execution_id,
+            "feature",
+            "main",
+            vec!["src/lib.rs".into()],
+        ),
+    );
+    // The result lookup before the write succeeds (readers are not blocked), and
+    // the write itself then meets a held writer lock.
+    let holder = fx.state.work_db.connect_new().unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    fx.state
+        .work_db
+        .connect()
+        .unwrap()
+        .busy_timeout(std::time::Duration::from_millis(30))
+        .unwrap();
+    let projector = fx.projector();
+    let mut draining = Box::pin(projector.drain());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(400), &mut draining)
+            .await
+            .is_err(),
+        "the record is held while the database is busy"
+    );
+    let effects: i64 = holder
+        .query_row("SELECT COUNT(*) FROM spoke_effects", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(effects, 0, "no decision, and so no stored refusal, while busy");
+    assert!(
+        fx.state
+            .work_db
+            .get_spoke_applied_write("producer-busy")
+            .unwrap()
+            .is_none()
+    );
+    holder.execute_batch("ROLLBACK").unwrap();
+    draining.await;
+    let decisions = fx.wire.decisions();
+    assert_eq!(decisions.len(), 1, "{decisions:?}");
+    assert_eq!(decisions[0].code, ResultCode::Ok as i32);
+    assert!(
+        fx.state
+            .work_db
+            .get_spoke_applied_write("producer-busy")
+            .unwrap()
+            .is_some_and(|write| write.accepted)
+    );
+}
+
+#[tokio::test]
+async fn a_failed_answer_transaction_leaves_nothing_behind() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    let comment = answer_agent_comment(&fx);
+    // The comment's final transition fails after the run and thread were written.
+    fx.state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_answer BEFORE UPDATE OF status ON work_comments
+             WHEN NEW.status = 'answered' BEGIN SELECT RAISE(ABORT, 'injected failure'); END",
+        )
+        .unwrap();
+    fx.receive_run_write(
+        boss_protocol_spoke::proposal::ANSWER_REPLY,
+        "answer-rollback",
+        boss_protocol_spoke::proposal::answer_reply_body(&fx.execution_id, "because"),
+    );
+    fx.projector().drain().await;
+    assert_eq!(fx.wire.decisions()[0].code, ResultCode::Rejected as i32);
+    assert!(
+        fx.state
+            .work_db
+            .list_comment_thread_entries(&comment.id)
+            .unwrap()
+            .is_empty(),
+        "the thread entry rolled back with the failed transition"
+    );
+    let run_status: String = fx
+        .state
+        .work_db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status FROM answer_agent_runs WHERE comment_id = ?1",
+            [&comment.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(run_status, "running", "the run was not left half-completed");
+    assert!(
+        fx.state
+            .work_db
+            .get_spoke_applied_write("answer-rollback")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_conflict_mark_failed_replays_after_a_crash_and_commits_with_its_result() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    let attempt = conflict_attempt(&fx);
+    fx.receive_run_write(
+        boss_protocol_spoke::proposal::CONFLICT_MARK_FAILED,
+        "mark-crash",
+        boss_protocol_spoke::proposal::conflict_mark_failed_body(
+            &fx.execution_id,
+            &attempt.id,
+            "obsolescence_suspected",
+            json!({}),
+        ),
+    );
+    fx.projector().drain().await;
+    assert!(
+        fx.state
+            .work_db
+            .get_spoke_applied_write("mark-crash")
+            .unwrap()
+            .is_some_and(|write| write.accepted),
+        "the result row commits with the failure"
+    );
+    fx.crash_before_the_cursor_moved(0);
+    fx.projector().drain().await;
+    let stored = fx.state.work_db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(stored.status, "failed");
+    let decisions = fx.wire.decisions();
+    assert!(
+        decisions.iter().all(|decision| decision.code == ResultCode::Ok as i32),
+        "a replayed write is accepted again, not refused: {decisions:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_result_insert_rolls_the_domain_write_back() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    let attempt = conflict_attempt(&fx);
+    fx.state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_result BEFORE INSERT ON spoke_applied_writes
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END",
+        )
+        .unwrap();
+    fx.receive_run_write(
+        boss_protocol_spoke::proposal::CONFLICT_MARK_FAILED,
+        "mark-atomic",
+        boss_protocol_spoke::proposal::conflict_mark_failed_body(
+            &fx.execution_id,
+            &attempt.id,
+            "obsolescence_suspected",
+            json!({}),
+        ),
+    );
+    fx.projector().drain().await;
+    assert_eq!(
+        fx.state
+            .work_db
+            .get_conflict_resolution(&attempt.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        "pending",
+        "no applied failure without its result row"
+    );
+}
+
+#[tokio::test]
+async fn a_hook_is_not_fanned_out_again_while_its_turn_state_cannot_be_saved() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    fx.receive_event(&boss_protocol::WorkerEvent::Stop {
+        session_id: "main".into(),
+        stop_hook_active: false,
+        stop_reason: boss_protocol::StopReason::AwaitingInput,
+    });
+    fx.state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch("ALTER TABLE spoke_turn_state RENAME TO spoke_turn_state_hidden")
+        .unwrap();
+    let projector = fx.projector();
+    let mut draining = Box::pin(projector.drain());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut draining)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fx.state.dispatcher_stats.snapshot().hook_events_total,
+        0,
+        "retries of a record whose turn state cannot be saved do not dispatch it"
+    );
+    fx.state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch("ALTER TABLE spoke_turn_state_hidden RENAME TO spoke_turn_state")
+        .unwrap();
+    draining.await;
+    assert_eq!(fx.state.dispatcher_stats.snapshot().hook_events_total, 1);
+}
+
+#[tokio::test]
+async fn turn_restoration_is_retried_without_another_hook() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    fx.receive_event(&boss_protocol::WorkerEvent::Stop {
+        session_id: "main".into(),
+        stop_hook_active: false,
+        stop_reason: boss_protocol::StopReason::AwaitingInput,
+    });
+    fx.projector().drain().await;
+    // A restart: the journal is fully applied, and the first restore fails.
+    let db = (*fx.state.work_db).clone();
+    let (fresh, _dir) = test_server_state_with_overrides(
+        ServerStateOverrides::builder()
+            .work_db(db.clone())
+            .skip_hub_installation(true)
+            .cube_client(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsCube))
+            .execution_runner(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsRunner))
+            .build(),
+    );
+    db.connect()
+        .unwrap()
+        .execute_batch("ALTER TABLE spoke_turn_state RENAME TO spoke_turn_state_hidden")
+        .unwrap();
+    assert!(fresh.restore_spoke_turns().is_err());
+    assert!(!crate::app::spoke_probes::spoke_parked_for_delivery(
+        &fresh,
+        &fx.execution_id
+    ));
+    db.connect()
+        .unwrap()
+        .execute_batch("ALTER TABLE spoke_turn_state_hidden RENAME TO spoke_turn_state")
+        .unwrap();
+    // No hook arrives; the projector's sweep does the retry.
+    crate::app::spoke_projection::applier(&fresh).sweep().await;
+    assert!(crate::app::spoke_probes::spoke_parked_for_delivery(
+        &fresh,
+        &fx.execution_id
+    ));
+}
+
+#[tokio::test]
+async fn a_stall_write_that_fails_is_retried_until_engine_health_shows_it() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    fx.receive_event(&boss_protocol::WorkerEvent::Stop {
+        session_id: "main".into(),
+        stop_hook_active: false,
+        stop_reason: boss_protocol::StopReason::AwaitingInput,
+    });
+    // Both the record's apply and the first stall write fail.
+    fx.state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch("ALTER TABLE spoke_turn_state RENAME TO spoke_turn_state_hidden")
+        .unwrap();
+    fx.state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_stall_update BEFORE UPDATE OF stall_reason ON spoke_projection
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END;
+             CREATE TRIGGER fail_stall_insert BEFORE INSERT ON spoke_projection
+             WHEN NEW.stall_reason IS NOT NULL
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END",
+        )
+        .unwrap();
+    let projector = fx.projector_with(
+        ProjectorConfig::builder()
+            .retry_initial(std::time::Duration::from_millis(5))
+            .retry_max(std::time::Duration::from_millis(20))
+            .retry_stall(std::time::Duration::from_millis(10))
+            .build(),
+    );
+    let draining = tokio::spawn({
+        let projector = projector.clone();
+        async move { projector.drain().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        fx.state
+            .work_db
+            .spoke_projection_status()
+            .unwrap()
+            .iter()
+            .all(|host| host.stall_reason.is_none()),
+        "the stall could not be written yet"
+    );
+    fx.state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_stall_update; DROP TRIGGER fail_stall_insert")
+        .unwrap();
+    let health = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if fx
+                .state
+                .work_db
+                .spoke_projection_status()
+                .unwrap()
+                .iter()
+                .any(|host| host.stall_reason.is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(health.is_ok(), "the stall is written by a later retry");
+    fx.state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch("ALTER TABLE spoke_turn_state_hidden RENAME TO spoke_turn_state")
+        .unwrap();
+    draining.await.unwrap();
 }

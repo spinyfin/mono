@@ -505,9 +505,9 @@ fn persist_semantic_progress(
     }
     let result = match (outcome, settled) {
         (Some(ApplyEventOutcome::ObservedDead), _) => return,
-        (Some(ApplyEventOutcome::Stale { .. }), _) | (Some(ApplyEventOutcome::Applied { .. }), None) => {
-            server_state.work_db.record_semantic_progress_stamp(run_id)
-        }
+        (Some(ApplyEventOutcome::Stale { .. }), _) | (Some(ApplyEventOutcome::Applied { .. }), None) => server_state
+            .work_db
+            .record_semantic_progress_stamp_observed(run_id, origin.observed_at_ms),
         (Some(ApplyEventOutcome::Applied { .. }), Some(checkpoint)) => {
             server_state.work_db.record_semantic_checkpoint(run_id, &checkpoint)
         }
@@ -517,9 +517,13 @@ fn persist_semantic_progress(
                 boss_protocol::WorkerEvent::PreToolUse { .. } | boss_protocol::WorkerEvent::PostToolUse { .. }
             ) =>
         {
-            server_state.work_db.record_semantic_progress_stamp(run_id)
+            server_state
+                .work_db
+                .record_semantic_progress_stamp_observed(run_id, origin.observed_at_ms)
         }
-        _ => server_state.work_db.record_semantic_progress(run_id, event),
+        _ => server_state
+            .work_db
+            .record_semantic_progress_observed(run_id, event, origin.observed_at_ms),
     };
     match result {
         Ok(true) => {}

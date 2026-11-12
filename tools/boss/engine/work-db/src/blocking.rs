@@ -1842,6 +1842,18 @@ impl WorkDb {
     /// the engine defaults to `failure_reason='no_push_no_classification'`.
     /// Idempotent — a row already terminal returns `Ok(None)`.
     pub fn mark_ci_remediation_failed(&self, attempt_id: &str, reason: &str) -> Result<Option<CiRemediation>> {
+        self.mark_ci_remediation_failed_applied(attempt_id, reason, None)
+    }
+
+    /// [`Self::mark_ci_remediation_failed`] that also records a spoke
+    /// submission's result in the same transaction, so a crash cannot leave
+    /// the attempt failed with no result row.
+    pub fn mark_ci_remediation_failed_applied(
+        &self,
+        attempt_id: &str,
+        reason: &str,
+        application: Option<crate::SpokeWriteApplication<'_>>,
+    ) -> Result<Option<CiRemediation>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
@@ -1854,6 +1866,9 @@ impl WorkDb {
                 AND status IN ('pending', 'running')",
             params![attempt_id, reason, now],
         )?;
+        if rows > 0 {
+            crate::spoke_projection::record_application_on(&tx, application)?;
+        }
         finish_attempt_update(tx, rows, attempt_id, query_ci_remediation)
     }
 

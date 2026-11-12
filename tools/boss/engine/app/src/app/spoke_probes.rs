@@ -101,9 +101,16 @@ impl SpokeTurns {
         }
     }
 
-    /// Rebuild one run after a hub restart from durable turn state.
-    pub(super) fn restore(&self, run: &str, parked: bool) {
-        self.record(run, if parked { SpokeTurn::Parked } else { SpokeTurn::Working });
+    /// Publish a complete set of durable turn states. A run already recorded
+    /// from a live event is newer than the stored row and is kept.
+    fn restore_all(&self, restored: Vec<(String, bool)>) {
+        if let Ok(mut turns) = self.0.lock() {
+            for (run, parked) in restored {
+                turns
+                    .entry(run)
+                    .or_insert(if parked { SpokeTurn::Parked } else { SpokeTurn::Working });
+            }
+        }
     }
 
     fn restored(&self) -> bool {
@@ -191,12 +198,15 @@ impl ServerState {
             return Ok(());
         }
         let stored = self.work_db.spoke_turn_states().map_err(|error| format!("{error:#}"))?;
+        // Build the whole set before publishing any of it, so a read failure
+        // part-way never leaves a partially restored map that looks usable.
+        let mut restored = Vec::with_capacity(stored.len());
         for turn in stored {
             match self.work_db.spoke_assignment_for_execution(&turn.execution_id) {
                 Ok(Some(assignment))
                     if assignment.assignment_generation == turn.assignment_generation && !assignment.resolved =>
                 {
-                    self.spoke_turns.restore(&turn.execution_id, turn.parked);
+                    restored.push((turn.execution_id, turn.parked));
                 }
                 Ok(_) => {}
                 Err(error) => {
@@ -204,6 +214,7 @@ impl ServerState {
                 }
             }
         }
+        self.spoke_turns.restore_all(restored);
         self.spoke_turns.mark_restored();
         Ok(())
     }

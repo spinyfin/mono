@@ -98,6 +98,27 @@ pub enum Applied {
     Retry(String),
 }
 
+/// How far delivery of a proposal decision has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settlement {
+    /// The spoke acknowledged the decision.
+    Delivered,
+    /// Delivery ended without an acknowledgement and is never retried.
+    GaveUp,
+    /// Delivery failed for now and will be retried.
+    Pending,
+}
+
+/// A decision effect's delivery state, with the identity needed to find the
+/// proposal it answers after a restart.
+#[derive(Debug, Clone, Copy)]
+pub struct DecisionSettled<'a> {
+    pub effect_key: &'a str,
+    pub execution_id: &'a str,
+    pub proposal_id: &'a str,
+    pub settlement: Settlement,
+}
+
 /// What the hub decided about a queued proposal.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decision {
@@ -154,15 +175,23 @@ pub trait ObservationApplier: Send + Sync {
         )))
     }
 
+    /// Called on every sweep of the projector, whether or not a record is
+    /// waiting, so state the applier could not rebuild earlier is retried
+    /// without needing another observation to arrive first.
+    async fn sweep(&self) {}
+
     /// Reflect a pane the host looked at. The projector has already recorded the
     /// observation durably; this is its effect on live state.
     async fn pane(&self, observation: &PaneObservation) -> Applied;
 
-    /// A proposal decision effect settled. `delivered` is true when the spoke
-    /// acknowledged it. Called after the cursor commit, including when delivery
-    /// is retried, so finalization can run without tearing down before an ack.
-    async fn decision_settled(&self, effect_key: &str, delivered: bool) {
-        let _ = (effect_key, delivered);
+    /// Where a proposal decision's delivery stands. Called after the cursor
+    /// commit with [`Settlement::Delivered`] or [`Settlement::GaveUp`] once the
+    /// effect is terminal, and with [`Settlement::Pending`] while delivery is
+    /// still being retried, so finalization that does not need the spoke's
+    /// acknowledgement is not held back by an unreachable host. Must return
+    /// promptly: it runs on the single delivery pass shared by every host.
+    async fn decision_settled(&self, decision: &DecisionSettled<'_>) {
+        let _ = decision;
     }
 }
 
@@ -316,7 +345,9 @@ impl Projector {
         loop {
             tokio::select! {
                 _ = inner.wake.notified() => {}
-                _ = sweep.tick() => {}
+                _ = sweep.tick() => {
+                    inner.applier.sweep().await;
+                }
                 _ = delivery.tick() => {
                     // A pass already under way makes this one return at once.
                     let inner = Arc::clone(&inner);
@@ -497,25 +528,36 @@ impl Inner {
     async fn project_record(&self, host: &str, journal: &str, row: &SpokeIngressRow) -> Result<(), String> {
         let mut attempt = 0u32;
         let started = std::time::Instant::now();
-        let mut stalled = false;
+        // True only once the stall is durably recorded, so a failed write is
+        // attempted again on the next retry rather than forgotten.
+        let mut stall_recorded = false;
         loop {
             match self.apply_record(host, journal, row).await {
                 Ok(()) => {
-                    if stalled {
+                    if stall_recorded {
                         let host_id = host.to_owned();
-                        let _ = self.blocking(move |db| db.clear_spoke_projection_stall(&host_id)).await;
+                        if let Err(Interrupted::Retry(error) | Interrupted::Halt(error)) =
+                            self.blocking(move |db| db.clear_spoke_projection_stall(&host_id)).await
+                        {
+                            tracing::warn!(host, %error, "cannot clear a spoke projection stall");
+                        }
                     }
                     return Ok(());
                 }
                 Err(Interrupted::Halt(reason)) => return Err(reason),
                 Err(Interrupted::Retry(reason)) => {
                     attempt += 1;
-                    if !stalled && started.elapsed() >= self.config.retry_stall {
-                        stalled = true;
+                    if !stall_recorded && started.elapsed() >= self.config.retry_stall {
                         let (host_id, stall_reason) = (host.to_owned(), reason.clone());
-                        let _ = self
+                        match self
                             .blocking(move |db| db.set_spoke_projection_stall(&host_id, &stall_reason))
-                            .await;
+                            .await
+                        {
+                            Ok(_) => stall_recorded = true,
+                            Err(Interrupted::Retry(error) | Interrupted::Halt(error)) => {
+                                tracing::warn!(host, %error, "cannot record a spoke projection stall; it is retried");
+                            }
+                        }
                     }
                     let wait = exponential_delay(self.config.retry_initial, self.config.retry_max, attempt.min(16));
                     tracing::warn!(
@@ -709,11 +751,9 @@ impl Inner {
                 tracing::debug!(host = %effect.host_id, kind = %effect.kind, %reason, "owed spoke effect not delivered yet");
                 unreachable.insert(effect.host_id.clone());
                 // A host that stays unreachable would otherwise be written to
-                // on every pass to say the same thing. Finalization still
-                // runs: a `run_done` declaration is already durable, and
-                // waiting for a later delivery would leave the execution live.
+                // on every pass to say the same thing.
                 if effect.last_error.as_deref() == Some(reason.as_str()) {
-                    self.applier.decision_settled(&effect.key, false).await;
+                    self.settled(&effect, Settlement::Pending).await;
                     continue;
                 }
             }
@@ -725,10 +765,8 @@ impl Inner {
             {
                 tracing::warn!(host = %effect.host_id, %reason, "cannot record a spoke effect's outcome; it will be retried");
             } else {
-                match &outcome {
-                    SpokeEffectOutcome::Done => {
-                        self.applier.decision_settled(&effect.key, true).await;
-                    }
+                let settlement = match &outcome {
+                    SpokeEffectOutcome::Done => Settlement::Delivered,
                     SpokeEffectOutcome::Failed(reason) => {
                         tracing::error!(
                             host = %effect.host_id,
@@ -737,14 +775,37 @@ impl Inner {
                             %reason,
                             "a spoke effect failed and is never retried"
                         );
-                        self.applier.decision_settled(&effect.key, false).await;
+                        Settlement::GaveUp
                     }
-                    SpokeEffectOutcome::Retry(_) | SpokeEffectOutcome::Rejected(_) => {
-                        self.applier.decision_settled(&effect.key, false).await;
-                    }
-                }
+                    SpokeEffectOutcome::Retry(_) | SpokeEffectOutcome::Rejected(_) => Settlement::Pending,
+                };
+                self.settled(&effect, settlement).await;
             }
         }
+    }
+
+    /// Tell the applier where a decision's delivery stands. An effect whose
+    /// decision cannot be read back has nothing the applier could finalize.
+    async fn settled(&self, effect: &SpokeEffect, settlement: Settlement) {
+        if effect.kind != PROPOSAL_DECISION {
+            return;
+        }
+        let Ok(command) = Command::decode(effect.payload.as_slice()) else {
+            return;
+        };
+        let (Some(run), Some(command::Body::ProposalDecision(decision))) =
+            (command.run.as_ref(), command.body.as_ref())
+        else {
+            return;
+        };
+        self.applier
+            .decision_settled(&DecisionSettled {
+                effect_key: &effect.key,
+                execution_id: &run.execution_id,
+                proposal_id: &decision.proposal_id,
+                settlement,
+            })
+            .await;
     }
 
     async fn deliver(&self, effect: &SpokeEffect) -> SpokeEffectOutcome {

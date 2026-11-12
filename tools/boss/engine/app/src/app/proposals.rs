@@ -785,20 +785,7 @@ pub(super) async fn submit_for_caller(
             // including one that lands after a crash between apply and the
             // teardown below — must still reach it rather than silently
             // skipping the only path that releases the pane.
-            let finalize_reporting_member = match kind {
-                ProposalKind::ReviewReport => proposal.state == boss_protocol::ProposalState::Applied,
-                // `ReviewVerdict` applies asynchronously (GitHub probes,
-                // possible remediation creation), so its proposal is still
-                // `Proposed` right after submission; it only reaches
-                // `Applied` once the reconciler in the `tokio::spawn` below
-                // (or a prior pass, on replay) finishes. Either state means
-                // the member itself was already accepted as `reported`.
-                ProposalKind::ReviewVerdict => matches!(
-                    proposal.state,
-                    boss_protocol::ProposalState::Proposed | boss_protocol::ProposalState::Applied
-                ),
-                _ => false,
-            };
+            let finalize_reporting_member = reporting_member_accepted(kind, proposal.state);
             // A `delivered`/`blocked` `run_done` declaration's acceptance is
             // itself the completion signal for the WHOLE execution, not just
             // a batch member the way a review report/verdict is. This
@@ -828,10 +815,7 @@ pub(super) async fn submit_for_caller(
             // inside the Stop-boundary satisfied-deliverable gate instead,
             // exactly as it did before this seam's synchronous finalize
             // existed.
-            let finalize_run_done_declaration = kind == ProposalKind::RunDone
-                && proposal.state == boss_protocol::ProposalState::Applied
-                && server_state.feature_flags.is_enabled("worker_proposals")
-                && server_state.feature_flags.is_enabled("run_done_proposals_seam");
+            let finalize_run_done_declaration = run_done_declaration_accepted(server_state, kind, proposal.state);
             // Mirror completion.rs's legacy marker-detector paths
             // (`file_worker_signal_attention` / `record_deferred_scope_item`):
             // both publish `AttentionItemCreated` on the work item's product
@@ -880,8 +864,7 @@ pub(super) async fn submit_for_caller(
                 && kind == ProposalKind::ReviewVerdict
                 && proposal.state == boss_protocol::ProposalState::Proposed;
             let apply_proposal_id = apply_after_submit.then(|| proposal.id.clone());
-            let finalize_guide =
-                kind == ProposalKind::ReviewGuide && proposal.state == boss_protocol::ProposalState::Applied;
+            let finalize_guide = guide_accepted(kind, proposal.state);
             Ok(Submission::Accepted(Accepted {
                 proposal,
                 already_submitted,
@@ -921,6 +904,77 @@ pub(super) async fn submit_for_caller(
                 format!("failed to persist the proposal: {err}"),
             ))
         }
+    }
+}
+
+fn reporting_member_accepted(kind: ProposalKind, state: boss_protocol::ProposalState) -> bool {
+    match kind {
+        ProposalKind::ReviewReport => state == boss_protocol::ProposalState::Applied,
+        // `ReviewVerdict` applies asynchronously (GitHub probes, possible
+        // remediation creation), so its proposal is still `Proposed` right
+        // after submission; it only reaches `Applied` once the reconciler
+        // finishes. Either state means the member itself was already accepted
+        // as `reported`.
+        ProposalKind::ReviewVerdict => matches!(
+            state,
+            boss_protocol::ProposalState::Proposed | boss_protocol::ProposalState::Applied
+        ),
+        _ => false,
+    }
+}
+
+fn run_done_declaration_accepted(
+    server_state: &ServerState,
+    kind: ProposalKind,
+    state: boss_protocol::ProposalState,
+) -> bool {
+    kind == ProposalKind::RunDone
+        && state == boss_protocol::ProposalState::Applied
+        && server_state.feature_flags.is_enabled("worker_proposals")
+        && server_state.feature_flags.is_enabled("run_done_proposals_seam")
+}
+
+fn guide_accepted(kind: ProposalKind, state: boss_protocol::ProposalState) -> bool {
+    kind == ProposalKind::ReviewGuide && state == boss_protocol::ProposalState::Applied
+}
+
+impl Accepted {
+    /// Whether finalization waits for the submitter's acknowledgement to be
+    /// delivered: a reporting member is torn down only after its ack, and when
+    /// the ack is never delivered a sweep raises an attention item instead.
+    /// Guide and run-done finalization are idempotent and run either way.
+    pub(super) fn needs_delivered_ack(&self) -> bool {
+        !self.after.finalize_guide && self.after.finalize_reporting_member
+    }
+
+    /// Rebuild the obligation an accepted proposal still owes from its stored
+    /// row, for a process that no longer holds the in-memory submission (a
+    /// restart between acceptance and the ack settling). `None` when the row
+    /// is not one that owes finalization.
+    pub(super) fn rederive(
+        server_state: &Arc<ServerState>,
+        work_db: &Arc<WorkDb>,
+        proposal: boss_protocol::WorkerProposal,
+    ) -> Option<Self> {
+        let finalize_guide = guide_accepted(proposal.kind, proposal.state);
+        let finalize_reporting_member = reporting_member_accepted(proposal.kind, proposal.state);
+        let finalize_run_done_declaration = run_done_declaration_accepted(server_state, proposal.kind, proposal.state);
+        if !(finalize_guide || finalize_reporting_member || finalize_run_done_declaration) {
+            return None;
+        }
+        Some(Self {
+            after: AfterAck::builder()
+                .server_state(Arc::clone(server_state))
+                .work_db(Arc::clone(work_db))
+                .execution_id(&proposal.execution_id)
+                .canonical_json(&proposal.payload_json)
+                .finalize_guide(finalize_guide)
+                .finalize_reporting_member(finalize_reporting_member)
+                .finalize_run_done_declaration(finalize_run_done_declaration)
+                .build(),
+            already_submitted: true,
+            proposal,
+        })
     }
 }
 

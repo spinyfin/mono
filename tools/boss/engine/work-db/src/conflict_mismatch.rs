@@ -112,6 +112,17 @@ impl WorkDb {
         attempt_id: &str,
         evidence: Option<&ArchitecturalMismatchEvidence>,
     ) -> Result<Option<ConflictResolution>> {
+        self.record_conflict_architectural_mismatch_applied(attempt_id, evidence, None)
+    }
+
+    /// [`Self::record_conflict_architectural_mismatch`] that also records a
+    /// spoke submission's result in the same transaction.
+    pub fn record_conflict_architectural_mismatch_applied(
+        &self,
+        attempt_id: &str,
+        evidence: Option<&ArchitecturalMismatchEvidence>,
+        application: Option<crate::SpokeWriteApplication<'_>>,
+    ) -> Result<Option<ConflictResolution>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let Some(attempt) = query_conflict_resolution(&tx, attempt_id)? else {
@@ -148,6 +159,7 @@ impl WorkDb {
             params![attempt_id, serde_json::to_string(evidence)?],
         )?;
         let updated = query_conflict_resolution(&tx, attempt_id)?;
+        crate::spoke_projection::record_application_on(&tx, application)?;
         tx.commit()?;
         Ok(updated)
     }

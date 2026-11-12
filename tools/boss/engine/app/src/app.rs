@@ -128,6 +128,7 @@ pub(crate) mod readoption;
 mod review;
 mod review_guide;
 mod review_start;
+mod run_writes;
 mod selected_product;
 mod server;
 mod sessions;
@@ -668,6 +669,10 @@ struct ServerStateOverrides {
     /// Prepared coordinator session directory. `None` uses the production
     /// directory under Application Support.
     coordinator_working_directory: Option<PathBuf>,
+    /// Skip hub binding and its startup guard, for a test that rebuilds a server
+    /// over spoke hosts without hub configuration. Injecting a database alone does not.
+    #[builder(default)]
+    skip_hub_installation: bool,
 }
 
 #[derive(bon::Builder)]
@@ -1405,8 +1410,8 @@ impl ServerState {
             coordinator_handoff_delivery: coordinator_handoff_delivery_override,
             coordinator_tmux: coordinator_tmux_override,
             coordinator_working_directory: coordinator_working_directory_override,
+            skip_hub_installation,
         } = overrides;
-        let injected_work_db = work_db_override.is_some();
         // Constructed here (rather than left to `ServerState::builder`'s
         // default) so it can be injected into `work_db` via
         // `with_event_bus` below — without that, `WorkDb`'s state-transition
@@ -1845,9 +1850,7 @@ impl ServerState {
         let provider_events_socket = boss_engine_runtime::runner::bound_events_socket_path(&cfg);
         let provider_control_dir = boss_ssh_transport::default_control_socket_dir();
         let remote_pane_releaser = pane_releaser.clone();
-        // An injected WorkDb is a restart over an existing file: the test owns
-        // hub configuration, and `prepare` would refuse spoke hosts without it.
-        let spoke_installation = if injected_work_db {
+        let spoke_installation = if skip_hub_installation {
             None
         } else {
             spoke_installation::prepare(work_db.as_ref().clone(), &cfg.work.hub)?
