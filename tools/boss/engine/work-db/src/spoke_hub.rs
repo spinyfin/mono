@@ -423,6 +423,8 @@ impl WorkDb {
     /// be gone.
     pub fn list_in_doubt_spoke_execution_ids(&self) -> Result<Vec<String>> {
         let conn = self.connect()?;
+        let lease_glob = format!("{HOST_COMMAND_LEASE_PREFIX}*");
+        let spawn_glob = format!("{HOST_COMMAND_SPAWN_PREFIX}*");
         let mut stmt = conn.prepare(
             "SELECT DISTINCT execution_id FROM spoke_assignments
               WHERE resolved_at_ms IS NULL AND (
@@ -432,11 +434,11 @@ impl WorkDb {
                      WHERE c.run_execution_id = spoke_assignments.execution_id
                        AND c.run_generation = spoke_assignments.assignment_generation
                        AND c.result IS NULL
-                       AND (c.command_id LIKE 'lease-%' OR c.command_id LIKE 'spawn-%')
+                       AND (c.command_id GLOB ?1 OR c.command_id GLOB ?2)
                 )
               )",
         )?;
-        let ids = stmt.query_map([], |row| row.get(0))?;
+        let ids = stmt.query_map(params![lease_glob, spawn_glob], |row| row.get(0))?;
         ids.collect::<rusqlite::Result<Vec<String>>>().map_err(Into::into)
     }
 

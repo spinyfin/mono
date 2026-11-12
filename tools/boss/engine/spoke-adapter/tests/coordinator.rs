@@ -790,18 +790,92 @@ async fn a_parked_running_spawn_is_reconciled_from_stored_state_after_a_restart(
         .find(|c| matches!(c.body, Some(command::Body::Spawn(_))))
         .unwrap();
     peer.answer_late(&spawn, answer(&spawn).unwrap()).await;
-    for _ in 0..50 {
+    for _ in 0..100 {
         restarted.reconcile_ended_in_doubt_spokes().await;
-        if fx.db.get_execution(&execution.id).unwrap().status != ExecutionStatus::Running
-            || peer
-                .commands()
-                .iter()
-                .any(|c| matches!(c.body, Some(command::Body::Adopt(_))))
+        if fx.db.open_spoke_assignment_for_pane_pid(HOST, 4242).unwrap().is_some()
+            && !attention_open(&fx, &execution.id)
         {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    assert!(
+        fx.db.open_spoke_assignment_for_pane_pid(HOST, 4242).unwrap().is_some(),
+        "the late spawn result is reconciled onto the pane pid"
+    );
+    assert!(
+        !attention_open(&fx, &execution.id),
+        "the in-doubt attention is resolved"
+    );
+    assert_never_failed(&fx, &execution.id);
+    assert_eq!(
+        fx.db.get_execution(&execution.id).unwrap().status,
+        ExecutionStatus::Running
+    );
+}
+
+#[tokio::test]
+async fn a_spawn_that_resolved_alive_is_not_driven_again_by_the_sweep() {
+    let fx = Fixture::with(short(300)).await;
+    let env = env(&fx, 1).await;
+    let execution = triage(&fx, &env, "resolved spawn");
+    let peer = fx
+        .spoke(
+            Box::new(|command| {
+                if matches!(command.body, Some(command::Body::Spawn(_))) {
+                    None
+                } else {
+                    answer(command)
+                }
+            }),
+            None,
+            0,
+        )
+        .await;
+    env.coordinator.kick();
+    until("the spawn to be parked", || attention_open(&fx, &execution.id)).await;
+    let spawn = peer
+        .commands()
+        .into_iter()
+        .find(|c| matches!(c.body, Some(command::Body::Spawn(_))))
+        .unwrap();
+    peer.answer_late(&spawn, answer(&spawn).unwrap()).await;
+    until("the late spawn result to be reconciled", || {
+        fx.db.open_spoke_assignment_for_pane_pid(HOST, 4242).unwrap().is_some()
+    })
+    .await;
+    until("the in-doubt attention to resolve", || {
+        !attention_open(&fx, &execution.id)
+    })
+    .await;
+    until("the in-doubt flag to clear", || {
+        !fx.db.spoke_execution_in_doubt(&execution.id).unwrap()
+    })
+    .await;
+
+    let count = |peer: &Peer, f: fn(&Command) -> bool| peer.commands().iter().filter(|c| f(c)).count();
+    let spawns = count(&peer, |c| matches!(c.body, Some(command::Body::Spawn(_))));
+    let adopts = count(&peer, |c| matches!(c.body, Some(command::Body::Adopt(_))));
+    env.coordinator.reconcile_ended_in_doubt_spokes().await;
+    let restarted = restarted(&fx, &env.coordinator, 1).await;
+    restarted.reconcile_ended_in_doubt_spokes().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        count(&peer, |c| matches!(c.body, Some(command::Body::Spawn(_)))),
+        spawns
+    );
+    assert_eq!(
+        count(&peer, |c| matches!(c.body, Some(command::Body::Adopt(_)))),
+        adopts
+    );
+    assert!(
+        !stopped(&peer.commands()),
+        "a healthy worker is not stopped by the sweep"
+    );
+    assert_eq!(
+        fx.db.get_execution(&execution.id).unwrap().status,
+        ExecutionStatus::Running
+    );
     assert_never_failed(&fx, &execution.id);
 }
 

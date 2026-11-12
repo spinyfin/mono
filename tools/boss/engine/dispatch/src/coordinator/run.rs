@@ -245,9 +245,14 @@ impl ExecutionCoordinator {
             .as_ref()
             .err()
             .is_some_and(|error| error.chain().any(|cause| cause.is::<SpawnOutcomeUncertain>()));
-        if parked && !cancelled_in_doubt {
-            // The host answered, one way or the other.
-            self.resolve_spoke_in_doubt_attention(&execution.id);
+        if !cancelled_in_doubt {
+            // The host answered, one way or the other. Clear the sticky flag
+            // so the restart sweep stops treating the spawn as unanswered; this
+            // also covers a run resumed after a restart that was parked by a
+            // previous process.
+            if self.clear_spoke_in_doubt(&execution.id) || parked {
+                self.resolve_spoke_in_doubt_attention(&execution.id);
+            }
         }
         drop(heartbeat);
 

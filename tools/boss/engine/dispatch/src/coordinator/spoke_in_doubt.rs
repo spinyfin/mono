@@ -3,7 +3,6 @@
 //! item once the wait exceeds its bound, and resolve it when the host answers.
 use super::*;
 use boss_execution_contracts::WorkerLife;
-use boss_protocol::ExecutionKind;
 
 impl ExecutionCoordinator {
     /// Park an attempt whose spoke lease the host has not answered: back to
@@ -197,6 +196,16 @@ impl ExecutionCoordinator {
         if execution.status.is_live() {
             if self.is_driving_run(execution_id) {
                 return;
+            }
+            // Only a spawn still awaiting its answer is resumed: a worker whose
+            // launch already completed must not have its launch path re-driven.
+            match self.work_db.active_run_ids_for_execution(execution_id) {
+                Ok(runs) if runs.is_empty() => return,
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(execution_id, error = %format!("{error:#}"), "could not read the execution's runs");
+                    return;
+                }
             }
             match self.resume_pane_spawn_for_running_execution(&execution).await {
                 Ok(()) => {}
@@ -412,6 +421,35 @@ impl ExecutionCoordinator {
         }
     }
 
+    /// Drop the in-doubt flag once the spawn has a definitive answer. Returns
+    /// whether the flag was set.
+    pub(super) fn clear_spoke_in_doubt(&self, execution_id: &str) -> bool {
+        let assignment = match self.work_db.spoke_assignment_for_execution(execution_id) {
+            Ok(Some(assignment)) => assignment,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(execution_id, error = %format!("{error:#}"), "could not read the spoke assignment to clear its in-doubt flag");
+                return false;
+            }
+        };
+        match self.work_db.spoke_execution_in_doubt(execution_id) {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(error) => {
+                tracing::warn!(execution_id, error = %format!("{error:#}"), "could not read the spoke in-doubt flag");
+                return false;
+            }
+        }
+        if let Err(error) = self
+            .work_db
+            .set_spoke_in_doubt(execution_id, assignment.assignment_generation, false)
+        {
+            tracing::warn!(execution_id, error = %format!("{error:#}"), "could not clear the spoke in-doubt flag");
+            return false;
+        }
+        true
+    }
+
     /// The host answered: whatever was in doubt is settled.
     pub(super) fn resolve_spoke_in_doubt_attention(&self, execution_id: &str) {
         if let Err(error) = self
@@ -420,30 +458,6 @@ impl ExecutionCoordinator {
         {
             tracing::warn!(execution_id, error = %format!("{error:#}"), "could not resolve the in-doubt spoke attention item");
         }
-    }
-
-    /// Refresh the owning review-guide card after a pre-start failure. The
-    /// attempt row is already terminal; this is the board-invalidation the
-    /// comparison-id `work_item_id` cannot provide on its own.
-    pub(super) fn notify_review_guide_pre_start_failure(&self, execution: &WorkExecution) {
-        if execution.kind != ExecutionKind::PrReviewGuide {
-            return;
-        }
-        let work_db = self.work_db.clone();
-        let publisher = self.publisher.clone();
-        let lifecycle = self.lifecycle.clone();
-        let execution_id = execution.id.clone();
-        boss_task_scope::spawn(async move {
-            let Ok(Some(attempt)) = work_db.pr_review_guide_attempt_for_execution(&execution_id) else {
-                return;
-            };
-            let Ok(Some(root_task_id)) = work_db.root_task_id_for_review_guide_series(&attempt.series_id) else {
-                return;
-            };
-            lifecycle
-                .notify_review_guide_changed(&publisher, &root_task_id, "review_guide_failed")
-                .await;
-        });
     }
 }
 
