@@ -69,7 +69,7 @@ pub(crate) struct ClassifyCost {
 
 impl ClassifyCost {
     pub(crate) fn cards(&self) -> usize {
-        self.queued.cards + self.idle_active.cards + self.review.cards
+        self.queued.cards + self.idle_active.cards + self.review.cards + self.holds.cards
     }
 
     pub(crate) fn statements(&self) -> u64 {

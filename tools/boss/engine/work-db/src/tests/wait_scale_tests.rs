@@ -666,6 +666,7 @@ fn board_and_heartbeat_statements_on_the_seeded_board() {
                 segment::DB_TASK_RUNTIMES_ANNOTATION_QUEUED,
                 segment::DB_TASK_RUNTIMES_ANNOTATION_IDLE_ACTIVE,
                 segment::DB_TASK_RUNTIMES_ANNOTATION_REVIEW,
+                segment::DB_TASK_RUNTIMES_ANNOTATION_HOLDS,
             ]
             .into_iter()
             .map(|name| counts(&trace, name))

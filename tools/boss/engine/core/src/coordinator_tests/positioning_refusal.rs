@@ -681,23 +681,28 @@ async fn recheck_sweep_converges_after_deleting_a_blocked_refused_chore() {
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     let item = refused_blocked_chore(&db);
     db.delete_work_item(&item).unwrap();
+    // Deleting resolves the attention; the tombstone keeps its reason but is no
+    // longer listed, so the sweep has nothing to do and cannot strip the reason.
+    assert!(db.list_positioning_holds().unwrap().is_empty());
+    let coordinator = recheck_coordinator(&db);
+    let pass =
+        crate::positioning_refusal_recheck_sweep::run_one_pass(&db, &coordinator, &unpositionable_checker()).await;
+    assert_eq!((pass.held, pass.cleared), (0, 0));
     assert_eq!(
         leftover_blocked_reason(&db, &item).as_deref(),
         Some("workspace_positioning_refused")
     );
+
+    // Restoring brings back a coherent hold that the sweep lists again.
+    db.restore_work_item(&item).unwrap();
     let holds = db.list_positioning_holds().unwrap();
     assert_eq!(holds.len(), 1);
-    assert!(holds[0].terminal);
-
-    let coordinator = recheck_coordinator(&db);
-    let first =
-        crate::positioning_refusal_recheck_sweep::run_one_pass(&db, &coordinator, &unpositionable_checker()).await;
-    assert_eq!((first.held, first.cleared, first.restarted), (1, 1, 0));
-    assert!(db.list_positioning_holds().unwrap().is_empty());
-    assert!(leftover_blocked_reason(&db, &item).is_none());
-    let second =
-        crate::positioning_refusal_recheck_sweep::run_one_pass(&db, &coordinator, &unpositionable_checker()).await;
-    assert_eq!((second.held, second.cleared), (0, 0));
+    assert_eq!(holds[0].work_item_id, item);
+    assert!(!holds[0].terminal);
+    assert_eq!(
+        leftover_blocked_reason(&db, &item).as_deref(),
+        Some("workspace_positioning_refused")
+    );
 }
 
 #[tokio::test]
@@ -719,23 +724,17 @@ async fn recheck_sweep_converges_after_archiving_a_blocked_refused_revision() {
         .unwrap(),
         1
     );
+    // Archiving tombstones the row and resolves the attention; the reason is
+    // kept but the row is no longer listed, so the sweep has nothing to do.
+    assert!(db.list_positioning_holds().unwrap().is_empty());
+    let coordinator = recheck_coordinator(&db);
+    let pass =
+        crate::positioning_refusal_recheck_sweep::run_one_pass(&db, &coordinator, &unpositionable_checker()).await;
+    assert_eq!((pass.held, pass.cleared), (0, 0));
     assert_eq!(
         leftover_blocked_reason(&db, &item).as_deref(),
         Some("workspace_positioning_refused")
     );
-    let holds = db.list_positioning_holds().unwrap();
-    assert_eq!(holds.len(), 1);
-    assert!(holds[0].terminal);
-
-    let coordinator = recheck_coordinator(&db);
-    let first =
-        crate::positioning_refusal_recheck_sweep::run_one_pass(&db, &coordinator, &unpositionable_checker()).await;
-    assert_eq!((first.held, first.cleared, first.restarted), (1, 1, 0));
-    assert!(db.list_positioning_holds().unwrap().is_empty());
-    assert!(leftover_blocked_reason(&db, &item).is_none());
-    let second =
-        crate::positioning_refusal_recheck_sweep::run_one_pass(&db, &coordinator, &unpositionable_checker()).await;
-    assert_eq!((second.held, second.cleared), (0, 0));
 }
 
 #[test]
