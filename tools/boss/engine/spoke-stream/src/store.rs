@@ -46,6 +46,17 @@ pub struct Admission {
 
 #[tonic::async_trait]
 pub trait SpokeObservationSink: Send + Sync {
+    /// Transport liveness is established only by an outstanding nonce response,
+    /// never by replayed journal traffic. Implementations fence by generation.
+    async fn pulse(&self, _session: &Session, _stamp: &Stamp) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Losing the stream preserves ownership and disables new admission.
+    async fn disconnected(&self, _session: &Session) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     /// Atomically validate the persisted journal identity/history, increment a
     /// durable connection generation, and return the committed record receipt.
     /// New journals require explicit authorization; never reset a known cursor.

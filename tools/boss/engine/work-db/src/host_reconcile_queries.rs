@@ -26,6 +26,11 @@ impl WorkDb {
     /// `local` is never disabled/removed anyway). "Offline" is either the
     /// host row being absent (`remove_host`) or present with
     /// `enabled = 0` (`set_host_enabled(false)` / auto-disable).
+    ///
+    /// A host on a spoke transport is offline only when removed. Disabling it
+    /// stops dispatch, and silence from it is surfaced as attention
+    /// (`reconcile_unreachable_hosts`); neither is evidence that its worker is
+    /// gone, so neither abandons the run.
     pub fn list_nonterminal_executions_on_offline_hosts(&self) -> Result<Vec<HostBoundExecution>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
@@ -44,7 +49,9 @@ impl WorkDb {
                AND r.host_id != 'local'
                AND (
                    NOT EXISTS (SELECT 1 FROM hosts h WHERE h.id = r.host_id)
-                   OR EXISTS (SELECT 1 FROM hosts h WHERE h.id = r.host_id AND h.enabled = 0)
+                   OR EXISTS (SELECT 1 FROM hosts h WHERE h.id = r.host_id AND h.enabled = 0
+                              AND NOT EXISTS (SELECT 1 FROM host_transports t
+                                              WHERE t.host_id = h.id AND t.transport != 'legacy_ssh'))
                )
              ORDER BY e.created_at ASC, e.id ASC",
         )?;
@@ -70,7 +77,9 @@ impl WorkDb {
     /// rather than emitting `outcome=error` events forever (the second
     /// half of the 2026-07-03 anaplian incident). Returns `false` when
     /// the run is `local` or its host is still enabled, and when the
-    /// execution has no run yet (nothing is bound).
+    /// execution has no run yet (nothing is bound). A host on a spoke
+    /// transport counts only when removed: disabled or silent, its worker may
+    /// still be running.
     pub fn execution_bound_host_offline(&self, execution_id: &str) -> Result<bool> {
         let conn = self.connect()?;
         let offline: Option<i64> = conn
@@ -78,7 +87,9 @@ impl WorkDb {
                 "SELECT CASE
                         WHEN r.host_id = 'local' THEN 0
                         WHEN NOT EXISTS (SELECT 1 FROM hosts h WHERE h.id = r.host_id) THEN 1
-                        WHEN EXISTS (SELECT 1 FROM hosts h WHERE h.id = r.host_id AND h.enabled = 0) THEN 1
+                        WHEN EXISTS (SELECT 1 FROM hosts h WHERE h.id = r.host_id AND h.enabled = 0
+                                     AND NOT EXISTS (SELECT 1 FROM host_transports t
+                                                     WHERE t.host_id = h.id AND t.transport != 'legacy_ssh')) THEN 1
                         ELSE 0
                     END
                  FROM work_runs r

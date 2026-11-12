@@ -989,6 +989,7 @@ pub use schema_init::table_exists;
 #[cfg(test)]
 use schema_init::table_has_column;
 mod execution_wait_history;
+mod host_capacity;
 mod progression_brief_reads;
 mod progression_calibration;
 mod progression_calibration_data;
@@ -996,6 +997,7 @@ mod prompt_confirmation;
 mod semantic_progress;
 mod spoke_custody;
 mod spoke_hub;
+pub use host_capacity::{HOST_FRESHNESS_MS, HOST_UNREACHABLE_ATTENTION_MS, HostCapacityReport};
 mod spoke_ingress;
 mod spoke_probe;
 mod spoke_projection;
