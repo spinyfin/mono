@@ -138,6 +138,7 @@ private enum MarkdownDocumentLayout {
 /// singleton vs. per-doc value payload). Only the drifted view code is
 /// unified here.
 struct MarkdownDocumentChrome: View {
+    @Environment(\.markdownRepositoryContext) private var repositoryContext
     /// Title shown in the header row.
     let title: String
     /// `<owner>/<repo>` chip rendered before the subtitle. `nil`/empty hides it.
@@ -154,6 +155,8 @@ struct MarkdownDocumentChrome: View {
     var loadError: String? = nil
     /// Base for resolving relative links/images in `source`.
     var baseURL: URL? = nil
+    var documentURL: URL? = nil
+    var initialFragment: String? = nil
     /// The comment artifact this doc corresponds to; `nil` leaves comments
     /// in-memory. Ignored when `commentsEnabled` is false.
     var artifact: CommentArtifactRef? = nil
@@ -202,7 +205,9 @@ struct MarkdownDocumentChrome: View {
             webURL: webURL,
             source: source,
             loadError: loadError,
-            baseURL: baseURL,
+            baseURL: repositoryContext?.documentURL.deletingLastPathComponent() ?? baseURL,
+            documentURL: repositoryContext?.documentURL ?? documentURL,
+            initialFragment: initialFragment,
             projectShortID: projectShortID,
             clickStartTime: clickStartTime,
             collapsedByDefaultHeadings: collapsedByDefaultHeadings
@@ -269,6 +274,10 @@ private struct MarkdownDocumentColumn: View {
     let source: String
     let loadError: String?
     let baseURL: URL?
+    let documentURL: URL?
+    let initialFragment: String?
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.markdownRepositoryContext) private var repositoryContext
     let projectShortID: String
     let clickStartTime: Date?
     let collapsedByDefaultHeadings: Set<String>
@@ -289,6 +298,7 @@ private struct MarkdownDocumentColumn: View {
     /// `collapsedByDefaultHeadings` starts collapsed — i.e. absent here;
     /// toggling a section adds/removes its heading text.
     @State private var expandedSections: Set<String> = []
+    @State private var headingTarget: Int?
 
     /// Bumped when comment or find highlights change. Threaded into each
     /// chunk's markup via `MarkdownHighlightRefreshParser` so StructuredText
@@ -357,6 +367,7 @@ private struct MarkdownDocumentColumn: View {
                     // the stack can instantiate only on-screen chunks.
                     ForEach(loadError == nil ? renderedChunks : []) { entry in
                         chunkView(entry)
+                            .id(entry.id)
                             // Applied per chunk so BossMarkdownTheme does not wrap the
                             // ForEach as a single non-lazy child of LazyVStack.
                             .bossMarkdown()
@@ -372,11 +383,38 @@ private struct MarkdownDocumentColumn: View {
                             )
                     }
                 }
+                .scrollTargetLayout()
                 .padding(.horizontal, MarkdownDocumentLayout.horizontalPadding)
                 .padding(.vertical, MarkdownDocumentLayout.verticalPadding)
                 .frame(maxWidth: cachedDocumentMeasure ?? MarkdownDocumentMeasure.forSource(source))
                 .frame(maxWidth: .infinity)
                 .background(MarkdownScrollViewCapture(controller: scrollController))
+            }
+            .scrollPosition(id: $headingTarget, anchor: .top)
+            .environment(\.openURL, OpenURLAction { url in
+                switch MarkdownLinkDestination.classify(url, documentURL: documentURL, baseURL: baseURL) {
+                case .fragment(let fragment):
+                    navigate(to: fragment)
+                case .document(let url, let fragment):
+                    if let repositoryContext {
+                        repositoryContext.open(url, fragment)
+                    } else {
+                        var content = DesignRendererContent.forLocalFile(path: url.path)
+                        content.fragment = fragment
+                        openWindow(value: content)
+                    }
+                case .external:
+                    return .systemAction
+                case .ignored:
+                    NSLog("Markdown link ignored: %@", url.absoluteString)
+                }
+                return .handled
+            })
+            .onChange(of: source) { _, _ in
+                if let initialFragment { navigate(to: initialFragment) }
+            }
+            .onAppear {
+                if let initialFragment { navigate(to: initialFragment) }
             }
             .textSelection(.enabled)
             .background(viewerBackground)
@@ -486,6 +524,19 @@ private struct MarkdownDocumentColumn: View {
                 }
             }
         }
+    }
+
+    private func navigate(to fragment: String) {
+        guard let index = MarkdownHeadingAnchors.chunkIndex(for: fragment, source: source) else {
+            NSLog("Markdown heading not found: %@", fragment)
+            return
+        }
+        if case .collapsible(let heading, _) = documentChunks[index] {
+            expandedSections.insert(heading)
+        }
+        // Re-selecting a heading must also work after scrolling within its section.
+        headingTarget = nil
+        DispatchQueue.main.async { headingTarget = index }
     }
 
     private var hasSubtitleRow: Bool {
@@ -770,7 +821,7 @@ enum MarkdownHeadingSections {
         headingLines(in: source).contains { $0.text == text }
     }
 
-    private struct HeadingLine {
+    struct HeadingLine {
         let text: String
         /// Spans the heading's own line, INCLUDING its trailing newline (or
         /// through end-of-source if the heading is the last line) — so a
@@ -792,7 +843,7 @@ enum MarkdownHeadingSections {
         return cache
     }()
 
-    private static func headingLines(in source: String) -> [HeadingLine] {
+    static func headingLines(in source: String) -> [HeadingLine] {
         let key = source as NSString
         if let cached = headingCache.object(forKey: key) { return cached.headings }
         let headings = parseHeadingLines(in: source)

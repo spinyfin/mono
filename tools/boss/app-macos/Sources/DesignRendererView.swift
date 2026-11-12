@@ -51,6 +51,7 @@ struct DesignRendererContent: Codable, Hashable {
     var repoRemoteURL: String? = nil
     var branch: String? = nil
     var path: String? = nil
+    var fragment: String? = nil
 
     /// The comment artifact this doc corresponds to (`pr_doc:*`), or `nil` when
     /// the payload lacks the repo/branch/path needed to key it.
@@ -170,6 +171,8 @@ struct DesignRendererView: View {
             source: source,
             loadError: loadError,
             baseURL: URL(fileURLWithPath: content.filePath).deletingLastPathComponent(),
+            documentURL: URL(fileURLWithPath: content.filePath),
+            initialFragment: content.fragment,
             artifact: content.commentArtifact,
             questionGroups: questionGroups
         )

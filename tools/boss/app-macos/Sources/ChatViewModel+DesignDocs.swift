@@ -77,9 +77,11 @@ extension ChatViewModel {
         ref: DesignDocRef,
         title: String,
         artifact: CommentArtifactRef?,
-        projectShortID: String
+        projectShortID: String,
+        fragment: String? = nil
     ) {
         pendingAsyncViewerRef = ref
+        asyncMarkdownViewerVM.initialFragment = fragment
         pendingAsyncViewerTitle = title
         pendingAsyncViewerArtifact = artifact
         pendingReviewGuideVersionId = nil
