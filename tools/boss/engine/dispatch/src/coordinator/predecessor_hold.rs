@@ -36,7 +36,7 @@ impl ExecutionCoordinator {
     /// fresh attention item never fails the successor. A kept-lease item or a
     /// `workspace_lease_release_failed` item that has stayed open for
     /// [`PREDECESSOR_HOLD_BOUND_SECS`] does (the sweeps have then had many
-    /// passes), or, for a remote predecessor that left no item at all, the
+    /// passes), or, for a predecessor that left no item at all, the
     /// same time since it ended. Either clock runs from the later of that
     /// start and the successor's first hold, so a successor created after the
     /// problem was already old still gets the full bound. A fresh open
@@ -98,18 +98,15 @@ impl ExecutionCoordinator {
                     });
                 }
                 let kept = open_of_kind(boss_engine_storage_values::attention_kinds::LEASE_UNRELEASED_ATTENTION_KIND);
-                // A remote predecessor can leave no item at all (its worker pid
-                // was never recorded, or the host was never probed). Nothing
-                // would ever end that wait, so it is bounded by how long ago
-                // the run ended.
-                let remote = matches!(
-                    self.work_db.latest_run_host_for_execution(&predecessor.id),
-                    Ok(Some(host)) if host != "local"
-                );
+                // A predecessor can leave no item at all (cleanup failed
+                // without raising, the worker pid was never recorded, or the
+                // host was never probed). Nothing would ever end that wait, so
+                // it is bounded by how long ago the run ended — locally and
+                // remotely.
                 let evidence = match kept {
                     Some(item) if older_than_bound(item.created_at.parse::<i64>().ok()) => item.body_markdown.clone(),
-                    None if remote && older_than_bound(predecessor.finished_epoch()) => {
-                        "No cleanup result was recorded for its remote worker".to_owned()
+                    None if older_than_bound(predecessor.finished_epoch()) => {
+                        "No cleanup result was recorded for its worker".to_owned()
                     }
                     _ => return Some(PredecessorHold::Waiting(detail)),
                 };

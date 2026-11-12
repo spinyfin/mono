@@ -41,6 +41,20 @@ use std::time::{Duration, Instant};
 use super::*;
 use crate::teardown_registry::TeardownGuard;
 
+/// Occupancy left after a successful stop is a lease-release concern, not
+/// proof the worker is still alive. Transport and signalling failures are not
+/// occupancy-only.
+fn occupancy_only_cleanup_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<boss_execution_contracts::UnownedOccupants>()
+        .is_some()
+        || error
+            .downcast_ref::<boss_execution_contracts::WorkspaceOccupied>()
+            .is_some()
+        // A spoke's report crosses the wire as text.
+        || boss_execution_contracts::UnownedOccupants::from_message(&format!("{error:#}")).is_some()
+}
+
 /// Upper bound on one `cube workspace release` subprocess.
 ///
 /// Cube being slow is an input the engine must tolerate, not a thing to
@@ -108,16 +122,7 @@ impl WorkerCompletionHandler {
     /// workspace stays protected; the item is lowered when the lease returns.
     fn keep_remote_lease(&self, execution_id: &str, host_id: Option<&str>, reason: &str) {
         if let Ok(execution) = self.work_db.get_execution(execution_id) {
-            crate::workspace_lease_release::raise_attention(
-                &self.work_db,
-                &execution,
-                crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND,
-                "Remote worker could not be confirmed gone",
-                &format!(
-                    "Host {}: {reason}. The workspace lease stays held. Restore connectivity or inspect the worker on that host, then retry recovery.",
-                    host_id.unwrap_or("(unrecorded)")
-                ),
-            );
+            crate::workspace_lease_release::keep_remote_lease(&self.work_db, &execution, host_id, reason);
         }
     }
 
@@ -166,8 +171,16 @@ impl WorkerCompletionHandler {
                 .cleanup_execution_processes(execution_id, Path::new(workspace))
                 .await
         {
-            self.keep_remote_lease(execution_id, host, &format!("process cleanup failed: {error:#}"));
-            return false;
+            if occupancy_only_cleanup_error(&error) {
+                tracing::warn!(
+                    execution_id,
+                    error = %format!("{error:#}"),
+                    "remote process cleanup left occupancy; deciding liveness by probe"
+                );
+            } else {
+                self.keep_remote_lease(execution_id, host, &format!("process cleanup failed: {error:#}"));
+                return false;
+            }
         }
         if !matches!(adapter.probe_remote_worker_alive(remote_pid).await, Ok(Some(false))) {
             self.keep_remote_lease(execution_id, host, "the worker's liveness could not be confirmed");

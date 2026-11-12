@@ -133,8 +133,12 @@ pub(super) fn current_parent_pid() -> Option<libc::pid_t> {
 
 /// Await cleanup of the execution's registered and inherited process identities.
 /// Session absence is not process absence: detached shells outlive the pane.
-pub(super) async fn reap_worker_process_tree(tmux: &boss_tmux::Tmux, token: &str) -> anyhow::Result<()> {
-    tmux.cleanup_worker_processes(token).await
+pub(super) async fn reap_worker_process_tree(
+    tmux: &boss_tmux::Tmux,
+    token: &str,
+    workspace: &str,
+) -> anyhow::Result<()> {
+    tmux.cleanup_worker_processes_in(token, workspace).await
 }
 
 pub(super) fn signal_shell_pids(pids: &[libc::pid_t], grace: Duration) {

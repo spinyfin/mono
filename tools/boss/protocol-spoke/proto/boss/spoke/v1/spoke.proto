@@ -168,6 +168,10 @@ message Command {
     ProposalDecision proposal_decision = 18;
     Upgrade upgrade = 19;
     WorkerReply worker_reply = 20;
+    // Stop the run as Stop does, then sweep its processes and prove the
+    // workspace holds no other occupant. Lease release asks for this; a plain
+    // Stop answers only for the worker.
+    Empty cleanup_workspace = 21;
   }
 }
 // Outcome of a Command. OUTCOME_UNCERTAIN means the effect may have happened;

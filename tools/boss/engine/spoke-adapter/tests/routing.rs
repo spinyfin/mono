@@ -680,7 +680,7 @@ async fn process_cleanup_on_a_spoke_succeeds_only_when_the_host_confirms_the_sto
     let _peer = fx
         .spoke(
             Box::new(move |c| match &c.body {
-                Some(command::Body::Stop(_)) => match answers.next().flatten() {
+                Some(command::Body::CleanupWorkspace(_)) => match answers.next().flatten() {
                     Some((code, reason)) => Some(refused(c, code, reason)),
                     None => Some(ok(c, Some(pane(PaneLife::Exited)))),
                 },
@@ -722,7 +722,9 @@ async fn a_spoke_reporting_only_unowned_occupants_yields_the_typed_report() {
     let _peer = fx
         .spoke(
             Box::new(move |c| match &c.body {
-                Some(command::Body::Stop(_)) => Some(refused(c, ResultCode::Rejected, answers.next().unwrap())),
+                Some(command::Body::CleanupWorkspace(_)) => {
+                    Some(refused(c, ResultCode::Rejected, answers.next().unwrap()))
+                }
                 _ => standard(c),
             }),
             None,
@@ -752,6 +754,40 @@ async fn a_spoke_reporting_only_unowned_occupants_yields_the_typed_report() {
             .is_none(),
         "an owned occupant must keep the lease: {owned:#}"
     );
+}
+
+#[tokio::test]
+async fn lease_cleanup_sends_the_verifying_command_but_a_plain_stop_does_not() {
+    let fx = Fixture::new().await;
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = seen.clone();
+    let _peer = fx
+        .spoke(
+            Box::new(move |c| match &c.body {
+                Some(command::Body::Stop(_)) => {
+                    recorder.lock().unwrap().push("stop");
+                    Some(ok(c, Some(pane(PaneLife::Exited))))
+                }
+                Some(command::Body::CleanupWorkspace(_)) => {
+                    recorder.lock().unwrap().push("cleanup");
+                    Some(ok(c, Some(pane(PaneLife::Exited))))
+                }
+                _ => standard(c),
+            }),
+            None,
+            0,
+        )
+        .await;
+    lease(&adapter).await;
+    spawn(&adapter).await.unwrap();
+    adapter
+        .cleanup_execution_processes("exec_1", Path::new(PATH))
+        .await
+        .unwrap();
+    adapter.stop_worker("exec_1", Duration::ZERO).await.unwrap();
+    assert_eq!(*seen.lock().unwrap(), vec!["cleanup", "stop"]);
 }
 
 #[tokio::test]

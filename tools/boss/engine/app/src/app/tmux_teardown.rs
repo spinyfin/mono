@@ -171,10 +171,16 @@ impl ServerState {
                         current_command: None,
                     },
                 );
-                return match reap_worker_process_tree(tmux, &identity.spawn_token).await {
+                return match reap_worker_process_tree(
+                    tmux,
+                    &identity.spawn_token,
+                    &self.execution_workspace(execution_id),
+                )
+                .await
+                {
                     Ok(_) => self.finish_tmux_reap(execution_id, identity),
                     Err(err) => {
-                        tracing::error!(execution_id, %err, "detached worker cleanup failed; retaining identity");
+                        self.retain_identity_after_cleanup_failure(execution_id, &err);
                         TmuxTeardownOutcome::Refused
                     }
                 };
@@ -232,7 +238,11 @@ impl ServerState {
         // detached children, before clearing identity or releasing the lease.
 
         match tmux
-            .kill_session_verified(&identity.session_name, &identity.spawn_token)
+            .kill_session_verified_in(
+                &identity.session_name,
+                &identity.spawn_token,
+                &self.execution_workspace(execution_id),
+            )
             .await
         {
             Ok(KillSessionOutcome::Killed | KillSessionOutcome::Absent) => {
@@ -273,8 +283,32 @@ impl ServerState {
                     error = %format!("{err:#}"),
                     "reap_tmux_worker: kill-session failed; leaving the identity columns for a retry",
                 );
+                self.retain_identity_after_cleanup_failure(execution_id, &err);
                 TmuxTeardownOutcome::Refused
             }
+        }
+    }
+
+    fn execution_workspace(&self, execution_id: &str) -> String {
+        self.work_db
+            .get_execution(execution_id)
+            .ok()
+            .and_then(|execution| execution.workspace_path)
+            .unwrap_or_default()
+    }
+
+    fn retain_identity_after_cleanup_failure(&self, execution_id: &str, err: &anyhow::Error) {
+        tracing::error!(execution_id, %err, "detached worker cleanup failed; retaining identity");
+        if let Ok(execution) = self.work_db.get_execution(execution_id) {
+            boss_engine_runtime::workspace_lease_release::raise_attention(
+                &self.work_db,
+                &execution,
+                boss_engine_runtime::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND,
+                "Workspace recovery needs process cleanup",
+                &format!(
+                    "Detached worker cleanup failed: {err:#}. Inspect the named processes on the owning host, then retry recovery. The workspace remains protected."
+                ),
+            );
         }
     }
 

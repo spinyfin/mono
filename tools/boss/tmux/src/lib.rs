@@ -724,21 +724,39 @@ impl Tmux {
     /// destroying it would tear down a worker this caller does not own —
     /// this is the guard against a session name recycled onto a different
     /// execution after the original session was destroyed.
+    ///
+    /// This entry point has no workspace to scope to, so every process that
+    /// carries the token is signalled wherever it runs. Callers that know the
+    /// session's workspace use [`Self::kill_session_verified_in`].
     pub async fn kill_session_verified(
         &self,
         session: &str,
         expected_token: &str,
     ) -> std::result::Result<KillSessionOutcome, KillSessionError> {
+        self.kill_session_verified_in(session, expected_token, "").await
+    }
+
+    /// [`Self::kill_session_verified`] with the workspace the session's worker
+    /// held. Capture and cleanup then signal identity matches only inside that
+    /// tree, or those that ran the worker hook or were recorded as lineage
+    /// while the pane was alive, so a daemon the worker happened to start
+    /// elsewhere is left running. Prefer this whenever the workspace is known.
+    pub async fn kill_session_verified_in(
+        &self,
+        session: &str,
+        expected_token: &str,
+        workspace: &str,
+    ) -> std::result::Result<KillSessionOutcome, KillSessionError> {
         validate_value("session name", session)?;
         validate_value("expected token", expected_token)?;
         match self.show_environment(session, BOSS_SPAWN_TOKEN_ENV).await? {
             None => {
-                self.cleanup_worker_processes(expected_token).await?;
+                self.cleanup_worker_processes_in(expected_token, workspace).await?;
                 Ok(KillSessionOutcome::Absent)
             }
             Some(actual) if actual == expected_token => {
                 if self.runner.manages_host_processes() {
-                    boss_worker_processes::capture(BOSS_SPAWN_TOKEN_ENV, expected_token).await?;
+                    boss_worker_processes::capture(BOSS_SPAWN_TOKEN_ENV, expected_token, workspace).await?;
                 }
                 // The session can still die on its own between the token
                 // read above and this call — the ordinary worker-completion
@@ -747,7 +765,7 @@ impl Tmux {
                 // doesn't leak the identity columns the way an unclassified
                 // Refused would.
                 let killed = self.kill_session_unchecked(session).await?;
-                self.cleanup_worker_processes(expected_token).await?;
+                self.cleanup_worker_processes_in(expected_token, workspace).await?;
                 if killed {
                     Ok(KillSessionOutcome::Killed)
                 } else {
@@ -764,9 +782,13 @@ impl Tmux {
 
     /// Detached shells retain the spawn token even after setsid and reparenting.
     /// Await their exit before callers preserve files or return the lease.
-    pub async fn cleanup_worker_processes(&self, token: &str) -> Result<()> {
+    /// Signals the processes that carry `token`, scoped to `workspace`: identity
+    /// matches are signalled when they are inside it, ran the worker hook (a
+    /// registry record) or were recorded as lineage while the pane was alive.
+    /// An empty workspace scopes nothing, so every identity match is signalled.
+    pub async fn cleanup_worker_processes_in(&self, token: &str, workspace: &str) -> Result<()> {
         if self.runner.manages_host_processes() {
-            boss_worker_processes::cleanup(BOSS_SPAWN_TOKEN_ENV, token, "").await?;
+            boss_worker_processes::cleanup(BOSS_SPAWN_TOKEN_ENV, token, workspace).await?;
         }
         Ok(())
     }

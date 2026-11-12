@@ -461,16 +461,7 @@ async fn reap_dead_remote_execution(
 /// holding forever. Lowered by the release path when the lease returns.
 fn keep_terminal_remote_lease(work_db: &WorkDb, handle: &RemoteRunHandle, reason: &str) {
     if let Ok(execution) = work_db.get_execution(&handle.execution_id) {
-        crate::workspace_lease_release::raise_attention(
-            work_db,
-            &execution,
-            crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND,
-            "Remote worker could not be confirmed gone",
-            &format!(
-                "Host {}: {reason}. The workspace lease stays held until the worker is proven gone or cube's TTL returns it. Restore connectivity or inspect the worker on that host.",
-                handle.host_id
-            ),
-        );
+        crate::workspace_lease_release::keep_remote_lease(work_db, &execution, Some(&handle.host_id), reason);
     }
 }
 

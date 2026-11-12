@@ -416,14 +416,42 @@ impl SpokeHostAdapter {
     pub(crate) async fn ctl_stop(&self, execution_id: &str, grace: Duration) -> Result<ControlOutcome> {
         let grace_ms = grace.as_millis().min(u128::from(MAX_STOP_GRACE_MS)) as u32;
         let deadline = self.hub.config.command_deadline + Duration::from_millis(u64::from(grace_ms));
+        self.stop_command(
+            execution_id,
+            deadline,
+            command::Body::Stop(Stop { grace_ms }),
+            format!("stop-{grace_ms}"),
+        )
+        .await
+    }
+
+    /// A stop that also makes the owning host sweep the run's processes and
+    /// prove the workspace holds no other occupant before answering `Delivered`.
+    pub(crate) async fn ctl_cleanup_workspace(&self, execution_id: &str) -> Result<ControlOutcome> {
+        self.stop_command(
+            execution_id,
+            self.hub.config.command_deadline,
+            command::Body::CleanupWorkspace(Empty {}),
+            "cleanup-workspace".to_owned(),
+        )
+        .await
+    }
+
+    async fn stop_command(
+        &self,
+        execution_id: &str,
+        deadline: Duration,
+        body: command::Body,
+        id_prefix: String,
+    ) -> Result<ControlOutcome> {
         Ok(
             match self
                 .control_with(
                     execution_id,
                     "stop",
                     deadline,
-                    command::Body::Stop(Stop { grace_ms }),
-                    ControlId::StableUntilOk(format!("stop-{grace_ms}")),
+                    body,
+                    ControlId::StableUntilOk(id_prefix),
                 )
                 .await?
             {

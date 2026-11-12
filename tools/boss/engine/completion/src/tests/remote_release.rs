@@ -319,6 +319,43 @@ async fn remote_worker_is_stopped_then_proven_gone() {
 }
 
 #[tokio::test]
+async fn occupancy_only_cleanup_still_probes_liveness() {
+    let (_dir, db, id) = remote_fixture();
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let adapter = Arc::new(CleaningAdapter {
+        cleanups: Default::default(),
+        cleanup_error: Some("unowned workspace occupants [7]"),
+        alive: Some(false),
+    });
+    handler.set_host_adapter_provider(Arc::new(CleaningProvider(adapter.clone())));
+    assert!(
+        handler.stop_and_confirm_remote_worker_gone(&id).await,
+        "occupancy is a lease-release concern, not proof the worker is still alive"
+    );
+    assert_eq!(*adapter.cleanups.lock().unwrap(), [id.clone()]);
+    assert!(lease_attention(&db, &id).is_empty());
+}
+
+#[tokio::test]
+async fn surviving_owned_processes_are_not_occupancy_only() {
+    let (_dir, db, id) = remote_fixture();
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let adapter = Arc::new(CleaningAdapter {
+        cleanups: Default::default(),
+        cleanup_error: Some("remote workspace occupants [7]; surviving owned processes [7]; unreadable processes []"),
+        alive: Some(false),
+    });
+    handler.set_host_adapter_provider(Arc::new(CleaningProvider(adapter)));
+    assert!(
+        !handler.stop_and_confirm_remote_worker_gone(&id).await,
+        "owned processes that survived signalling must keep the slot and lease"
+    );
+    let attention = lease_attention(&db, &id);
+    assert_eq!(attention.len(), 1);
+    assert!(attention[0].contains("surviving owned processes"), "{attention:?}");
+}
+
+#[tokio::test]
 async fn remote_cleanup_failure_keeps_the_lease_and_raises_attention() {
     let (_dir, db, id) = remote_fixture();
     let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));

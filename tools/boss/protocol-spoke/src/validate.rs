@@ -325,6 +325,7 @@ impl Validate for v1::Command {
             | command::Body::Adopt(_)
             | command::Body::Deliver(_)
             | command::Body::Stop(_)
+            | command::Body::CleanupWorkspace(_)
             | command::Body::Capture(_)
             | command::Body::ProposalDecision(_)
             | command::Body::WorkerReply(_) => (RunScope::Required, "run command"),
@@ -334,7 +335,7 @@ impl Validate for v1::Command {
         check_run(&self.run, scope, context)?;
         match body("command.body", &self.body)? {
             command::Body::Spawn(spawn) => spawn.validate(),
-            command::Body::Adopt(_) | command::Body::Inventory(_) => Ok(()),
+            command::Body::Adopt(_) | command::Body::Inventory(_) | command::Body::CleanupWorkspace(_) => Ok(()),
             command::Body::Workspace(op) => specified::<v1::WorkspaceKind>("workspace.kind", op.kind).map(|_| ()),
             command::Body::Deliver(deliver) => deliver.validate(),
             command::Body::Stop(stop) => stop.validate(),

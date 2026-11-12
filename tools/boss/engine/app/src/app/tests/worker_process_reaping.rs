@@ -7,7 +7,7 @@ async fn reap_worker_process_tree_noop_without_identity() {
     let tmux =
         boss_tmux::Tmux::from_path_with_socket(std::env::current_exe().unwrap(), dir.path().join("tmux.sock")).unwrap();
     // Missing identity must not authorize signalling any process.
-    reap_worker_process_tree(&tmux, "").await.unwrap();
+    reap_worker_process_tree(&tmux, "", "").await.unwrap();
 }
 
 /// **`bossctl` must be able to stop a worker it can see in a pane.**
@@ -261,6 +261,7 @@ async fn reap_worker_process_tree_kills_orphan_child() {
             "-c",
             "import os,time; os.setsid(); print('ready'); time.sleep(60)",
         ])
+        .current_dir(dir.path())
         .env("BOSS_SPAWN_TOKEN", &token)
         .stdout(std::process::Stdio::piped())
         .spawn()
@@ -283,7 +284,9 @@ async fn reap_worker_process_tree_kills_orphan_child() {
     // real handle exercises the shared owning-host cleanup with a detached PID.
     let tmux =
         boss_tmux::Tmux::from_path_with_socket(std::env::current_exe().unwrap(), dir.path().join("tmux.sock")).unwrap();
-    reap_worker_process_tree(&tmux, &token).await.unwrap();
+    reap_worker_process_tree(&tmux, &token, &dir.path().to_string_lossy())
+        .await
+        .unwrap();
 
     // Cleanup must finish before the caller can preserve the workspace.
     let status = tokio::task::spawn_blocking(move || child.wait())
