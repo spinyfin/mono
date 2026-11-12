@@ -113,6 +113,7 @@ mod pane_ops;
 mod pane_viewers;
 mod panes;
 mod panic_hook;
+mod parked_delivery;
 mod pid_file;
 mod planner_ops;
 mod pr_status;
@@ -485,6 +486,8 @@ impl boss_engine_runtime::spawn_ack_sweep::SpawnAckReaper for ServerState {
             !self.work_db.get_execution(execution_id)?.status.is_terminal(),
             "execution is terminal"
         );
+        self.leave_pane_modes_before_keys(execution_id, &tmux, &identity.session_name)
+            .await?;
         tmux.send_submit(&identity.session_name).await
     }
 

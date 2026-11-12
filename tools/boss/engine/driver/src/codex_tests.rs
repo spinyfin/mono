@@ -1520,6 +1520,18 @@ fn codex_buffers_mid_turn_pane_input() {
     assert!(driver.mid_turn_pane_input().buffers());
 }
 
+/// Codex takes a Return that lands right behind typed text as a newline in a
+/// paste, so the engine must leave a gap before submitting. Drivers whose
+/// composer reads input in order keep the trait default of none.
+#[test]
+fn codex_declares_a_submit_settle_and_the_default_is_none() {
+    assert_eq!(
+        CodexDriver::default().pane_submit_settle(),
+        std::time::Duration::from_secs(1)
+    );
+    assert_eq!(crate::ClaudeDriver.pane_submit_settle(), std::time::Duration::ZERO);
+}
+
 #[test]
 fn codex_control_verbs_match_existing_engine_paths() {
     let driver = CodexDriver::default();

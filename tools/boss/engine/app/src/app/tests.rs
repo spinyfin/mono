@@ -458,6 +458,7 @@ mod engine_pool_config;
 mod invalidation_routing;
 mod metadata_persistence;
 mod open_document;
+mod parked_delivery;
 mod pause_broadcast;
 mod pause_bypass_held_ready;
 mod pause_bypass_recheck;

@@ -459,9 +459,11 @@ pub enum StopOutcome {
     /// the task records the failure reason and is excluded from automatic retry.
     /// The variant name is retained for existing consumers; no park is created.
     NudgeBreakerParked { reason: String },
-    /// The nudge breaker rejected an otherwise valid probe because the same
-    /// fingerprint was queued too recently. No probe was delivered; a
-    /// recurring background-child recheck retains its intent and retries.
+    /// A nudge was due and was withheld: the same fingerprint was nudged too
+    /// recently, or the previous nudge has not reached the worker yet (still
+    /// queued, or written and awaiting a driver turn). No probe was queued
+    /// and nothing was counted; a recurring background-child recheck retains
+    /// its intent and retries.
     NudgeDebounced,
     /// The worker emitted an `[effort-escalation]` or `[blocked]` marker on
     /// a prior Stop and the filed attention item is still unresolved: the

@@ -52,6 +52,19 @@ fn post_tool_use(run_id: &str) -> boss_engine_runtime::events_socket::IncomingHo
     )
 }
 
+/// The driver taking the composer's contents as its next prompt: the
+/// evidence that a write into a parked pane was delivered.
+fn prompt_submitted(run_id: &str) -> boss_engine_runtime::events_socket::IncomingHookEvent {
+    boss_engine_runtime::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::UserPromptSubmit {
+            session_id: "claude-sess-1".into(),
+            prompt: String::new(),
+        },
+        Some(run_id.to_owned()),
+        None,
+    )
+}
+
 fn install_probe_tmux(
     server_state: &ServerState,
     run_id: &str,
@@ -336,11 +349,12 @@ async fn a_second_probe_waits_for_the_first_probes_reply_cycle() {
     assert_eq!(text, "[nudge] second");
 }
 
-/// The `[effort-escalation-ack]` protocol must keep working unchanged: a
-/// worker that emitted `[effort-escalation]` in its final response sits parked
-/// at its prompt, producing no further boundary of its own. The ack is written
-/// straight in — verbatim, with no `[nudge]` marking, since a
-/// parked write becomes the prompt itself — and recorded as `Consumed`.
+/// The `[effort-escalation-ack]` protocol must keep working: a worker that
+/// emitted `[effort-escalation]` in its final response sits parked at its
+/// prompt, producing no further boundary of its own. The ack is written
+/// straight in — verbatim, with no `[nudge]` marking, since a parked write
+/// becomes the prompt itself — and recorded as `Consumed` once the worker
+/// takes it.
 #[tokio::test]
 async fn effort_escalation_ack_reaches_a_parked_worker_immediately() {
     let (server_state, _dir) = test_server_state();
@@ -353,6 +367,12 @@ async fn effort_escalation_ack_reaches_a_parked_worker_immediately() {
 
     let text = runner.last_paste();
     assert_eq!(text, ack, "the ack must reach the worker verbatim");
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Injected),
+        "written at once, with no boundary to wait for",
+    );
+    dispatch_live_worker_state(&server_state, &prompt_submitted(&run_id)).await;
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
         Some(ProbeDeliveryState::Consumed),
@@ -905,8 +925,9 @@ async fn a_write_into_a_pane_whose_process_is_gone_is_not_recorded_as_consumed()
 
 /// The liveness check is deliberately one-sided: it downgrades only on a
 /// positive dead verdict. A live worker — and the test fixtures' unreported
-/// pid `0`, where liveness is simply unknowable — must keep the honest
-/// `Consumed`, or every probe in the fleet would be libelled as orphaned.
+/// pid `0`, where liveness is simply unknowable — must reach the honest
+/// `Consumed` once it takes the prompt, or every probe in the fleet would be
+/// libelled as orphaned.
 #[tokio::test]
 async fn a_live_worker_still_records_consumed() {
     let (server_state, _dir) = test_server_state();
@@ -930,7 +951,8 @@ async fn a_live_worker_still_records_consumed() {
     let outcome = dispatch_probe_on_stop(&server_state, &stop_event(&run_id)).await;
 
     let _ = runner.last_paste();
-    assert_eq!(outcome, ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Consumed));
+    assert_eq!(outcome, ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Injected));
+    dispatch_live_worker_state(&server_state, &prompt_submitted(&run_id)).await;
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
         Some(ProbeDeliveryState::Consumed),
@@ -1331,7 +1353,7 @@ async fn a_probe_queued_at_a_turn_boundary_is_delivered_before_teardown_can_aban
     let outcome = dispatch_probe_on_stop(&server_state, &stop).await;
     assert_eq!(
         outcome,
-        ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Consumed),
+        ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Injected),
         "the boundary the engine promised must be the boundary it delivers on",
     );
     let text = runner.last_paste();
@@ -1339,7 +1361,7 @@ async fn a_probe_queued_at_a_turn_boundary_is_delivered_before_teardown_can_aban
 
     // Now the run ends, as it would have milliseconds later. The probe is
     // past the queue, so teardown has nothing to abandon — it settles the
-    // delivered-but-unanswered probe honestly instead.
+    // written-but-unanswered probe honestly instead.
     super::tmux_stub::install_teardown(&server_state, &run_id, 4_194_303);
     server_state.release_worker_pane(&run_id).await;
     assert_eq!(
@@ -1532,11 +1554,16 @@ async fn the_turn_boundary_fanout_delivers_a_probe_queued_before_it() {
 
     let text = runner.last_paste();
     assert!(text.contains("hold the PR"));
-    assert!(
-        server_state
-            .probe_lifecycle_state(&probe_id)
-            .is_some_and(|s| s.is_delivered()),
-        "the fan-out must deliver on the boundary, not leave the probe queued",
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Injected),
+        "the fan-out must write on the boundary, not leave the probe queued",
+    );
+    dispatch_live_worker_state(&server_state, &prompt_submitted(&run_id)).await;
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Consumed),
+        "and the turn the write starts is what delivers it",
     );
     assert_eq!(
         server_state.pending_probe_count(&run_id),

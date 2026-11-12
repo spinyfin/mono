@@ -402,6 +402,12 @@ pub struct RecordingProbeQueuer {
     pub calls: std::sync::Mutex<Vec<(String, String)>>,
     pub clear_calls: std::sync::Mutex<Vec<String>>,
     pub deliver_calls: std::sync::Mutex<Vec<String>>,
+    /// What [`ProbeQueuer::nudge_delivery`] answers. `None` is the trait
+    /// default (`Settled`): every nudge arrived.
+    pub delivery: std::sync::Mutex<Option<NudgeDelivery>>,
+    /// The pending nudge has been written and is waiting for its turn, rather
+    /// than sitting in the queue, so it cannot be withdrawn.
+    pub nudge_in_flight: std::sync::atomic::AtomicBool,
 }
 
 impl ProbeQueuer for RecordingProbeQueuer {
@@ -425,9 +431,37 @@ impl ProbeQueuer for RecordingProbeQueuer {
             .expect("RecordingProbeQueuer mutex poisoned")
             .push(run_id.to_owned());
     }
+
+    fn nudge_delivery(&self, _run_id: &str) -> NudgeDelivery {
+        self.delivery
+            .lock()
+            .expect("RecordingProbeQueuer mutex poisoned")
+            .clone()
+            .unwrap_or(NudgeDelivery::Settled)
+    }
+
+    /// A scripted `Pending` nudge is modelled as still queued, so it can be
+    /// taken back, unless the test marked it in flight; anything else has
+    /// nothing left to withdraw.
+    fn withdraw_nudge(&self, _run_id: &str, _reason: &str) -> bool {
+        if self.nudge_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        let mut delivery = self.delivery.lock().expect("RecordingProbeQueuer mutex poisoned");
+        let Some(NudgeDelivery::Pending { nudge_id }) = delivery.clone() else {
+            return false;
+        };
+        *delivery = Some(NudgeDelivery::Withdrawn { nudge_id });
+        true
+    }
 }
 
 impl RecordingProbeQueuer {
+    /// Script what became of the most recent nudge.
+    pub fn set_delivery(&self, delivery: NudgeDelivery) {
+        *self.delivery.lock().expect("RecordingProbeQueuer mutex poisoned") = Some(delivery);
+    }
+
     pub fn snapshot(&self) -> Vec<(String, String)> {
         self.calls.lock().expect("RecordingProbeQueuer mutex poisoned").clone()
     }
@@ -537,16 +571,39 @@ impl TestHarness {
     /// `PaneReleaseOutcome::NoLiveWorker` pane to exercise the
     /// lease-release gate.
     pub fn with_pane(db: Arc<WorkDb>, detector: Arc<dyn PrDetector>, pane: Arc<RecordingPaneReleaser>) -> Self {
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        Self::build(db, detector, pane, probes.clone(), probes)
+    }
+
+    /// Same as [`TestHarness::new`] but nudging through a caller-supplied
+    /// queuer — for tests that drive the real probe machinery end to end.
+    /// The harness's own `probes` recorder then sees nothing.
+    pub fn with_probe_queuer(db: Arc<WorkDb>, detector: Arc<dyn PrDetector>, queuer: Arc<dyn ProbeQueuer>) -> Self {
+        Self::build(
+            db,
+            detector,
+            Arc::new(RecordingPaneReleaser::default()),
+            queuer,
+            Arc::new(RecordingProbeQueuer::default()),
+        )
+    }
+
+    fn build(
+        db: Arc<WorkDb>,
+        detector: Arc<dyn PrDetector>,
+        pane: Arc<RecordingPaneReleaser>,
+        queuer: Arc<dyn ProbeQueuer>,
+        probes: Arc<RecordingProbeQueuer>,
+    ) -> Self {
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
         let handler = WorkerCompletionHandler::new(
             db,
             detector,
             cube.clone(),
             publisher.clone(),
             pane.clone(),
-            probes.clone(),
+            queuer,
             CompletionCollaborators::noop(),
         )
         // PR-completion terminalization records a fresh head. Keep the shared
@@ -2076,6 +2133,8 @@ impl MergeProbe for FixedMergeabilityProbe {
 mod conflict_delivery;
 #[cfg(test)]
 mod local_teardown;
+#[cfg(test)]
+mod nudge_delivery;
 #[cfg(test)]
 mod revision_delivery;
 #[cfg(test)]

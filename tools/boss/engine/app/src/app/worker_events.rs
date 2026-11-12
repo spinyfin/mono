@@ -301,7 +301,16 @@ pub(super) async fn dispatch_worker_event_fanout(
     // post-completion pass did before, since a pre-existing probe already sat
     // ahead of the nudge in the queue.
     let pre_pass = dispatch_probe_on_stop(server_state, incoming).await;
-    let defer_finalization = pre_pass_delivered_a_probe(pre_pass);
+    // A boundary that lands while an interrupting delivery holds its claim
+    // and has not written yet is the engine's own interrupt taking effect,
+    // not the worker stopping, and the probe is about to be written. The
+    // worker is owed the same turn, for the same reason.
+    let defer_finalization = pre_pass_delivered_a_probe(pre_pass)
+        || (incoming.is_turn_boundary()
+            && incoming
+                .run_id
+                .as_deref()
+                .is_some_and(|run_id| server_state.probe_claimed_ahead_of_its_write(run_id)));
     if defer_finalization {
         tracing::info!(
             run_id = incoming.run_id.as_deref(),
@@ -316,13 +325,17 @@ pub(super) async fn dispatch_worker_event_fanout(
 
 /// True when the pre-completion probe pass in [`dispatch_worker_event_fanout`]
 /// actually put a probe somewhere the worker can act on it this turn —
-/// [`ProbeDeliveryState::is_delivered`] — as opposed to merely writing bytes
-/// into a pane that completion might release before anyone reads them.
+/// [`ProbeDeliveryState::is_delivered`], or written into the parked pane and
+/// awaiting the turn it starts (`Injected`) — as opposed to merely writing
+/// bytes into a pane that completion might release before anyone reads them.
 /// `Dispatched(Orphaned)` and every other non-`Dispatched` outcome return
 /// `false`: those did not hand the worker anything to act on, so completion
 /// must still run this boundary.
 fn pre_pass_delivered_a_probe(outcome: ProbeDispatchOutcome) -> bool {
-    matches!(outcome, ProbeDispatchOutcome::Dispatched(state) if state.is_delivered())
+    matches!(
+        outcome,
+        ProbeDispatchOutcome::Dispatched(state) if state.is_delivered() || state == ProbeDeliveryState::Injected
+    )
 }
 
 #[cfg(test)]
@@ -333,6 +346,10 @@ mod pre_pass_delivered_a_probe_tests {
     fn a_consumed_or_buffered_dispatch_skips_completion() {
         assert!(pre_pass_delivered_a_probe(ProbeDispatchOutcome::Dispatched(
             ProbeDeliveryState::Consumed
+        )));
+        // Written into a parked pane: the turn it starts is the worker's.
+        assert!(pre_pass_delivered_a_probe(ProbeDispatchOutcome::Dispatched(
+            ProbeDeliveryState::Injected
         )));
         assert!(pre_pass_delivered_a_probe(ProbeDispatchOutcome::Dispatched(
             ProbeDeliveryState::Buffered
@@ -786,6 +803,13 @@ pub(super) async fn dispatch_live_worker_state(
         return;
     }
     let stale_event = matches!(applied.outcome, ApplyEventOutcome::Stale { .. });
+    // The main session started a turn: a probe written into this worker's
+    // parked pane was taken. `resumed_after` is the ordering-aware reading; a
+    // prompt submission is one even for a slot with no boundary on record.
+    let prompt_submitted = matches!(incoming.event, boss_protocol::WorkerEvent::UserPromptSubmit { .. });
+    if applied.resumed_after.is_some() || (prompt_submitted && !stale_event && !incoming.connection.from_subagent) {
+        server_state.confirm_parked_write_turn_started(run_id);
+    }
     let changed = applied.repaired || matches!(applied.outcome, ApplyEventOutcome::Applied { changed: true });
     let new_state = server_state.live_worker_states.get(slot_id);
     let new_activity = new_state.as_ref().map(|s| s.activity);
@@ -1634,17 +1658,6 @@ pub(super) async fn dispatch_probe_on_stop(
     server_state: &Arc<ServerState>,
     incoming: &boss_engine_runtime::events_socket::IncomingHookEvent,
 ) -> ProbeDispatchOutcome {
-    let outcome = dispatch_probe_on_stop_inner(server_state, incoming).await;
-    if let Some(run_id) = incoming.run_id.as_deref() {
-        revert_undelivered_nudge_if_needed(server_state, run_id, outcome);
-    }
-    outcome
-}
-
-async fn dispatch_probe_on_stop_inner(
-    server_state: &Arc<ServerState>,
-    incoming: &boss_engine_runtime::events_socket::IncomingHookEvent,
-) -> ProbeDispatchOutcome {
     if !incoming.is_turn_boundary() {
         return ProbeDispatchOutcome::NotADeliveryBoundary;
     }
@@ -1709,14 +1722,17 @@ async fn dispatch_probe_on_stop_inner(
 }
 
 /// Claim the next queued probe for `run_id` and write it into the pane with
-/// tmux `send-keys`, trusting a successful write.
+/// tmux `send-keys`.
 ///
-/// The delivery mechanism for a pane the worker is *parked* at: the write
-/// becomes its next prompt, so nothing further needs to be observed to call
-/// it consumed. Shared by the `Stop` boundary ([`dispatch_probe_on_stop`])
-/// and the write issued during the `ProbeRun` call ([`dispatch_probe_now`]),
-/// which face the identical situation — a worker sitting at its prompt with
-/// no boundary of its own coming.
+/// The delivery mechanism for a pane the worker is *parked* at. A write that
+/// succeeds proves tmux accepted the keys, not that the driver took them as a
+/// prompt, so the probe stays `Injected` until the driver is seen to start a
+/// turn; [`super::parked_delivery`] confirms that, presses Return again when
+/// it does not happen, and settles the delivery as failed when it never
+/// does. Shared by the `Stop` boundary ([`dispatch_probe_on_stop`]) and the
+/// write issued during the `ProbeRun` call ([`dispatch_probe_now`]), which
+/// face the identical situation — a worker sitting at its prompt with no
+/// boundary of its own coming.
 ///
 /// `posture` may still come through as mid-turn on the `Stop` path (in
 /// production the fan-out has set `Idle` by then, so it is a narrow race);
@@ -1766,24 +1782,28 @@ async fn deliver_probe_via_pane_write(
     // is corrected to the real outcome below, and reset to `Queued` on the
     // requeue path.
     server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Injected);
+    let parked = !posture.is_mid_turn();
+    if parked {
+        // Before the write, so a turn that starts while the keys are still
+        // going out is recognised as this probe's.
+        server_state.mark_in_flight_probe_awaiting_turn_start(run_id, &probe_id);
+    }
     match server_state.send_pane_text_checked(run_id, slot_id, &probe.text).await {
         Ok(()) => {
             // The claim is conditional on somebody being home: a pane write
             // returning Ok proves tmux accepted the keys, not that a process
             // read them.
-            let state = record_pane_write_outcome(
-                server_state,
-                run_id,
-                slot_id,
-                &probe_id,
-                if posture.is_mid_turn() {
-                    ProbeDeliveryState::Buffered
-                } else {
-                    ProbeDeliveryState::Consumed
-                },
-                success_message,
-            )
-            .await;
+            let intended = if parked {
+                ProbeDeliveryState::Injected
+            } else {
+                ProbeDeliveryState::Buffered
+            };
+            let state =
+                record_pane_write_outcome(server_state, run_id, slot_id, &probe_id, intended, success_message).await;
+            if parked && !state.is_undeliverable() {
+                server_state.mark_probe_written(&probe_id);
+                super::parked_delivery::watch_parked_write(server_state, run_id, slot_id, &probe_id, probe.text);
+            }
             ProbeDispatchOutcome::Dispatched(state)
         }
         Err(PaneSendFailure::DriverExited {
@@ -1936,15 +1956,19 @@ pub(super) async fn record_pane_write_outcome(
             .await;
         return ProbeDeliveryState::Orphaned;
     }
-    tracing::info!(
-        run_id,
-        slot_id,
-        probe_id,
-        state = intended.as_str(),
-        "{success_message}",
-    );
-    server_state.set_probe_lifecycle_detail(probe_id, intended, Some(success_message.to_owned()));
-    intended
+    // Only from `Injected`, which is what every caller set before its write:
+    // the turn the write starts can begin, and even end, before this runs, and
+    // a state that path already recorded must not be overwritten.
+    let state = server_state
+        .advance_probe_lifecycle(
+            probe_id,
+            ProbeDeliveryState::Injected,
+            intended,
+            Some(success_message.to_owned()),
+        )
+        .unwrap_or(intended);
+    tracing::info!(run_id, slot_id, probe_id, state = state.as_str(), "{success_message}");
+    state
 }
 
 /// How long a mid-turn probe's pane write waits for a `UserPromptSubmit`
@@ -2362,18 +2386,6 @@ async fn inject_probe_mid_turn(
 /// `tokio::spawn` from the `ProbeRun` handler, so a caller that never sees a
 /// probe arrive has no other way to find out what it decided.
 pub(super) async fn dispatch_probe_now(server_state: &Arc<ServerState>, run_id: &str) -> ProbeDispatchOutcome {
-    let outcome = dispatch_probe_now_inner(server_state, run_id).await;
-    revert_undelivered_nudge_if_needed(server_state, run_id, outcome);
-    outcome
-}
-
-fn revert_undelivered_nudge_if_needed(server_state: &ServerState, run_id: &str, outcome: ProbeDispatchOutcome) {
-    if outcome.should_revert_undelivered_nudge() {
-        server_state.completion_handler.revert_undelivered_nudge(run_id);
-    }
-}
-
-async fn dispatch_probe_now_inner(server_state: &Arc<ServerState>, run_id: &str) -> ProbeDispatchOutcome {
     let queued = server_state.pending_probe_count(run_id);
     if queued == 0 {
         tracing::debug!(run_id, "probe-now: nothing queued for this run");
@@ -2430,9 +2442,8 @@ async fn dispatch_probe_now_inner(server_state: &Arc<ServerState>, run_id: &str)
         // idea" — the same treatment they get at a tool boundary.
         return inject_probe_mid_turn(server_state, run_id, slot_id, posture).await;
     }
-    // Parked (Idle/WaitingForInput) is a reliable arrival point just like
-    // Stop, so a successful tmux `send-keys` here is treated as consumed —
-    // provided the worker's process is actually still there to consume it.
+    // Parked (Idle/WaitingForInput): the text is typed straight in, and is
+    // delivered once the driver is seen to start a turn on it.
     deliver_probe_via_pane_write(
         server_state,
         run_id,

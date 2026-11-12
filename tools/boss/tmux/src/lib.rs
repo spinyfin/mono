@@ -612,6 +612,24 @@ impl Tmux {
     /// removed, multi-line text is bracketed-pasted, and exactly one Return
     /// follows. Single-line text keeps the bounded literal-key chunking.
     pub async fn send_keys(&self, session: &str, text: &str) -> Result<()> {
+        self.send_keys_with_submit_settle(session, text, std::time::Duration::ZERO)
+            .await
+    }
+
+    /// [`Self::send_keys`], waiting `submit_settle` between the last byte of
+    /// text and the Return that submits it.
+    ///
+    /// For an application that infers a paste from how fast keys arrive and
+    /// then reads a Return landing right behind the text as part of that
+    /// paste, a newline in the composer, rather than as the submit. The wait
+    /// is what lets such an application close its paste window first. Zero is
+    /// exactly [`Self::send_keys`].
+    pub async fn send_keys_with_submit_settle(
+        &self,
+        session: &str,
+        text: &str,
+        submit_settle: std::time::Duration,
+    ) -> Result<()> {
         validate_value("session name", session)?;
         if text.contains('\0') {
             bail!("tmux key input cannot contain NUL");
@@ -645,7 +663,34 @@ impl Tmux {
         } else {
             self.send_literal_chunks(session, text).await?;
         }
+        if !submit_settle.is_zero() {
+            sleep(submit_settle).await;
+        }
         self.send_submit(session).await
+    }
+
+    /// Takes `session`'s pane out of any tmux mode, so the keys sent next
+    /// reach the pane's application. Returns whether the pane was in one.
+    ///
+    /// While a pane is in a mode (copy-mode, entered by scrolling, which a
+    /// session with `mouse on` does on the first wheel tick), `send-keys`
+    /// hands every key to that mode's key table instead of the application:
+    /// literal text is run as copy-mode commands, `Enter` is swallowed, so a
+    /// bracketed paste lands in the composer and is never submitted, and
+    /// `Escape` only leaves the mode. Each of those returns success. Call
+    /// this before any key the application must receive.
+    ///
+    /// `copy-mode -q` leaves every mode and is a successful no-op outside
+    /// one, so a pane that leaves its mode between the read and the command
+    /// is not an error.
+    pub async fn leave_pane_modes(&self, session: &str) -> Result<bool> {
+        if self.display_message(session, DisplayField::PaneInMode).await? != "1" {
+            return Ok(false);
+        }
+        let mut args = self.server_args();
+        args.extend(["copy-mode".into(), "-q".into(), "-t".into(), session.into()]);
+        self.invoke(args).await?;
+        Ok(true)
     }
 
     async fn send_literal_chunks(&self, session: &str, text: &str) -> Result<()> {

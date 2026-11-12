@@ -130,6 +130,8 @@ enum CaptureBehavior {
 #[derive(Clone, Copy)]
 enum PaneLiveness {
     Alive,
+    /// Alive, and left in a tmux mode (someone scrolled the pane).
+    AliveInMode,
     SessionGone,
     PaneDead,
 }
@@ -166,6 +168,12 @@ impl RecordingPaneRunner {
     /// which by itself must never be treated as death evidence.
     pub(crate) fn alive(foreground_process: impl Into<String>, session_name: impl Into<String>) -> Self {
         Self::with_spawn_token(foreground_process, session_name, PaneLiveness::Alive, TEST_SPAWN_TOKEN)
+    }
+
+    /// A live pane that someone scrolled into copy-mode, where tmux consumes
+    /// the keys sent to it.
+    pub(crate) fn in_copy_mode(session_name: impl Into<String>) -> Self {
+        Self::with_spawn_token("claude", session_name, PaneLiveness::AliveInMode, TEST_SPAWN_TOKEN)
     }
 
     /// A pane whose tmux session no longer exists at all.
@@ -232,6 +240,14 @@ impl RecordingPaneRunner {
 
     pub(crate) fn stdin(&self) -> Vec<Vec<u8>> {
         self.stdin.lock().unwrap().clone()
+    }
+
+    /// How many times Return was pressed: `send-keys <session> Enter`.
+    pub(crate) fn return_presses(&self) -> usize {
+        self.calls()
+            .iter()
+            .filter(|call| call.contains(&"send-keys".to_owned()) && call.last().map(String::as_str) == Some("Enter"))
+            .count()
     }
 
     /// How many `send-keys <session> Escape` calls were issued.
@@ -308,7 +324,9 @@ impl RecordingPaneRunner {
         if args.iter().any(|arg| arg == "list-sessions") {
             return Self::success(match self.state.liveness {
                 PaneLiveness::SessionGone => String::new(),
-                PaneLiveness::Alive | PaneLiveness::PaneDead => format!("{}\t\n", self.state.session_name),
+                PaneLiveness::Alive | PaneLiveness::AliveInMode | PaneLiveness::PaneDead => {
+                    format!("{}\t\n", self.state.session_name)
+                }
             });
         }
         if args.iter().any(|arg| arg == "show-environment") {
@@ -320,13 +338,19 @@ impl RecordingPaneRunner {
         if args.iter().any(|arg| arg == "#{pane_dead}") {
             return Self::success(match self.state.liveness {
                 PaneLiveness::PaneDead => "1\n",
-                PaneLiveness::Alive | PaneLiveness::SessionGone => "0\n",
+                PaneLiveness::Alive | PaneLiveness::AliveInMode | PaneLiveness::SessionGone => "0\n",
             });
         }
         if args.iter().any(|arg| arg == "#{pane_dead_status}") {
             return Self::success(match self.state.liveness {
                 PaneLiveness::PaneDead => "1\n",
-                PaneLiveness::Alive | PaneLiveness::SessionGone => "",
+                PaneLiveness::Alive | PaneLiveness::AliveInMode | PaneLiveness::SessionGone => "",
+            });
+        }
+        if args.iter().any(|arg| arg == "#{pane_in_mode}") {
+            return Self::success(match self.state.liveness {
+                PaneLiveness::AliveInMode => "1\n",
+                PaneLiveness::Alive | PaneLiveness::PaneDead | PaneLiveness::SessionGone => "0\n",
             });
         }
         if args.iter().any(|arg| arg == "capture-pane") {

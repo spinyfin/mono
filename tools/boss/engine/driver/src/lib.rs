@@ -2290,6 +2290,23 @@ pub trait AgentDriver: Send + Sync {
         MidTurnPaneInput::Rejects
     }
 
+    /// How long the engine waits between the last byte of text it types into
+    /// this driver's composer and the Return that submits it.
+    ///
+    /// Defaults to zero: a composer that reads typed text and the Return
+    /// after it in order needs no gap. Override for a composer that decides
+    /// "this is a paste" from how fast keys arrive, and then takes a Return
+    /// landing inside that window as a newline in the pasted text. Such a
+    /// composer keeps the text and never submits it, and the pane write still
+    /// reports success.
+    ///
+    /// This shortens the common case and nothing depends on it for
+    /// correctness: the engine confirms that a parked write started a turn,
+    /// and presses Return again when it did not.
+    fn pane_submit_settle(&self) -> Duration {
+        Duration::ZERO
+    }
+
     /// Pre-interrupt snapshot for the bounded turn-end recovery the engine
     /// runs immediately after delivering an interrupt to this driver's
     /// worker — see [`InterruptRecoverySnapshot`] for why this must be
