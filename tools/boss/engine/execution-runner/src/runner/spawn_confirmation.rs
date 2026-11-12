@@ -78,11 +78,11 @@ pub(crate) const TURN_START_TIMEOUT: Duration = Duration::from_secs(45);
 /// on 12 cores (34 runs). 30 s is 7.5 times that peak. When it expires the
 /// engine presses Return again; it fails the spawn only after
 /// [`SUBMIT_RETRIES`] further waits of the same length.
-pub(crate) const SUBMIT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
+pub const SUBMIT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How many times Return is re-sent to a delivered prompt that produced no
 /// turn before the spawn fails.
-pub(crate) const SUBMIT_RETRIES: u32 = 2;
+pub const SUBMIT_RETRIES: u32 = 2;
 
 /// How long the launcher may go without reporting that it sent Return (or
 /// that it gave up) before the engine stops waiting. The launcher bounds its

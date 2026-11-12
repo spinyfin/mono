@@ -10,7 +10,7 @@ use crate::nudge_breaker::NUDGE_DELIVERY_DEADLINE;
 /// Why a nudge given up at [`NUDGE_DELIVERY_DEADLINE`] was not delivered, as
 /// recorded on the withdrawn probe and in the failure reason.
 const OVERDUE_NUDGE_DETAIL: &str = "the nudge could not be written into the worker's pane within the delivery \
-     deadline while the worker sat idle, and was withdrawn; each refused or failed attempt is in the engine log";
+     deadline after it was issued, and was withdrawn; each refused or failed attempt is in the engine log";
 
 impl WorkerCompletionHandler {
     /// Generic auto-nudge gate. Records the intent to nudge `execution`
@@ -281,55 +281,10 @@ impl WorkerCompletionHandler {
                 );
             }
         }
-        // Delivery gate. A nudge is evidence about the worker only once the
-        // worker has been shown it, so the fate of the previous nudge is
-        // settled before the breaker is consulted:
-        //
-        // - still on its way (queued, or written and waiting for the driver
-        //   to start a turn on it): nothing is issued and nothing is counted.
-        //   Issuing another would only stack it behind the first, and
-        //   counting it would charge the worker for a message it has not
-        //   seen. That is how a parked worker was failed "after 3 nudges"
-        //   having been shown none: the first sat unsubmitted in its
-        //   composer and the next two never left the queue behind it.
-        // - never arrived: it comes back off the count. A run of failed
-        //   deliveries is bounded on its own and ends the attempt as a
-        //   delivery failure, not as an unresponsive worker.
-        // - arrived: the breaker judges the worker on it, as before.
-        let outcome = 'decision: {
-            match self.probe_queuer.nudge_delivery(&execution.id) {
-                NudgeDelivery::Settled => self.nudge_breaker.delivery_confirmed(&execution.id),
-                NudgeDelivery::Pending { .. } => {
-                    tracing::info!(
-                        execution_id = %execution.id,
-                        fingerprint,
-                        "auto-nudge: held — the previous nudge has not reached the worker yet (still \
-                         queued, or written and awaiting a driver turn); not issuing another and not \
-                         counting one",
-                    );
-                    break 'decision StopOutcome::NudgeDebounced;
-                }
-                NudgeDelivery::Withdrawn { nudge_id } => {
-                    self.nudge_breaker.settle_undelivered(&execution.id, &nudge_id, false);
-                }
-                NudgeDelivery::Failed { nudge_id, detail } => {
-                    let failures = self.nudge_breaker.settle_undelivered(&execution.id, &nudge_id, true);
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        nudge_id,
-                        consecutive_delivery_failures = failures,
-                        max = self.max_unproductive_nudges,
-                        detail,
-                        "auto-nudge: the previous nudge was not delivered; it is not counted against \
-                         the worker",
-                    );
-                    if failures >= self.max_unproductive_nudges {
-                        break 'decision self
-                            .fail_for_undeliverable_nudges(execution, failures, bound_pr_url, &detail)
-                            .await;
-                    }
-                }
-            }
+        // Settle the prior delivery before charging another nudge.
+        let outcome = if let Some(outcome) = self.nudge_delivery_gate(execution, bound_pr_url).await {
+            outcome
+        } else {
             self.record_nudge(execution, probe_text, fingerprint, bound_pr_url, &proceed_outcome)
                 .await
         };
@@ -382,6 +337,49 @@ impl WorkerCompletionHandler {
             None => self.background_children_tracker.forget_intent(&execution.id),
         }
         outcome
+    }
+
+    /// Hold pending delivery and hand failed deliveries back before any
+    /// auto-nudge path consults the shared breaker.
+    pub(super) async fn nudge_delivery_gate(
+        &self,
+        execution: &crate::work::WorkExecution,
+        bound_pr_url: Option<&str>,
+    ) -> Option<StopOutcome> {
+        match self.probe_queuer.nudge_delivery(&execution.id) {
+            NudgeDelivery::Settled => self.nudge_breaker.delivery_confirmed(&execution.id),
+            NudgeDelivery::Pending { .. } => {
+                tracing::info!(
+                    execution_id = %execution.id,
+                    "auto-nudge: held — the previous nudge has not reached the worker yet (still \
+                     queued, or written and awaiting a driver turn); not issuing another and not \
+                     counting one",
+                );
+                return Some(StopOutcome::NudgeDebounced);
+            }
+            NudgeDelivery::Withdrawn { nudge_id } => {
+                self.nudge_breaker.settle_undelivered(&execution.id, &nudge_id, false);
+            }
+            NudgeDelivery::Failed { nudge_id, detail } => {
+                let failures = self.nudge_breaker.settle_undelivered(&execution.id, &nudge_id, true);
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    nudge_id,
+                    consecutive_delivery_failures = failures,
+                    max = self.max_unproductive_nudges,
+                    detail,
+                    "auto-nudge: the previous nudge was not delivered; it is not counted against \
+                     the worker",
+                );
+                if failures >= self.max_unproductive_nudges {
+                    return Some(
+                        self.fail_for_undeliverable_nudges(execution, failures, bound_pr_url, &detail)
+                            .await,
+                    );
+                }
+            }
+        }
+        None
     }
 
     /// Consult the breaker for a nudge whose predecessor has been settled,

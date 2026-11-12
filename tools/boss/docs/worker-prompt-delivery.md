@@ -141,21 +141,23 @@ Two causes make a write into a parked pane start no turn while every tmux comman
 | Leave any tmux mode | [`leave_pane_modes_before_keys`](../engine/app/src/app/pane_delivery.rs)        | `copy-mode -q` when `#{pane_in_mode}` is 1, before any key. Costs a viewer their scroll position.         |
 | Submit settle       | [`AgentDriver::pane_submit_settle`](../engine/driver/src/lib.rs)                | Wait between the text and Return. Codex declares 1 s; drivers that read input in order declare none.      |
 | Hold at `injected`  | [`deliver_probe_via_pane_write`](../engine/app/src/app/worker_events.rs)        | A parked write is not `consumed` until the driver starts a turn.                                          |
-| Confirm the turn    | [`confirm_parked_write_turn_started`](../engine/app/src/app/parked_delivery.rs) | The first main-session turn start after the write moves the probe to `consumed`.                          |
+| Confirm the turn    | [`confirm_parked_write_turn_started`](../engine/app/src/app/parked_delivery.rs) | Matching prompt or transcript text moves the probe to `consumed`.                                         |
 | Press Return again  | [`parked_delivery`](../engine/app/src/app/parked_delivery.rs)                   | After `TURN_START_CONFIRM_TIMEOUT` with no turn, Return and nothing else, at most `RETURN_RETRIES` times. |
 | Settle as failed    | same                                                                            | `unconfirmed`, delivery slot released, attention item filed with the pane's last lines.                   |
 
 The first two steps prevent the two known causes. The rest is what makes delivery not depend on the list of causes being complete.
 
-Turn evidence is the same reading spawn confirmation uses, narrowed to the main session: a `UserPromptSubmit`, or the first main-session tool event after the turn boundary the worker was parked behind. A subagent's tool events do not count. A pane that reads `Working` without that evidence is left alone until it returns to its prompt: Return pressed into a busy pane can answer a dialog nobody meant to answer. The text is typed exactly once, so a retry cannot deliver a second copy.
+A main-session `UserPromptSubmit` confirms delivery only when its whitespace-normalised prompt contains the probe text. Empty prompts and tool-only events require the probe text in the transcript after the dispatch snapshot. Unrelated turns and subagent events do not confirm delivery. A pane that reads `Working` without that evidence is left alone until it returns to its prompt: Return pressed into a busy pane can answer a dialog nobody meant to answer. The text is typed exactly once, so a retry cannot deliver a second copy.
+
+A mid-turn injection that finds the worker parked also starts this watch. An unconfirmed parked write retains its delivery claim, including against later interrupting probes. If its failure withheld a Stop completion decision, the engine re-runs that decision after releasing the claim.
 
 A write made after the engine interrupted a busy worker is reported `consumed` to the caller as before, and watched the same way. If no turn follows it is taken back to `unconfirmed`.
 
-| Deadline                     | Value | When it fires                                                         |
-| ---------------------------- | ----- | --------------------------------------------------------------------- |
-| `TURN_START_CONFIRM_TIMEOUT` | 30 s  | Return is pressed again                                               |
-| `RETURN_RETRIES`             | 2     | after the last window the delivery is settled `unconfirmed` (at 90 s) |
-| `NUDGE_DELIVERY_DEADLINE`    | 5 min | a nudge still unwritten, with its worker idle, is withdrawn           |
+| Deadline                     | Value            | When it fires                                                         |
+| ---------------------------- | ---------------- | --------------------------------------------------------------------- |
+| `TURN_START_CONFIRM_TIMEOUT` | 30 s             | Return is pressed again                                               |
+| `RETURN_RETRIES`             | 2                | after the last window the delivery is settled `unconfirmed` (at 90 s) |
+| `NUDGE_DELIVERY_DEADLINE`    | 5 min from issue | a nudge still unwritten is withdrawn when its worker is idle          |
 
 The 30 s is `SUBMIT_CONFIRM_TIMEOUT`'s measurement applied to the same interval: Return to `UserPromptSubmit` peaked at 4.0 s under heavy load. A turn that starts is seen in well under a second.
 
@@ -165,7 +167,7 @@ A nudge counts against the worker only once the worker was given it ([`nudge_bre
 
 - **Not shown yet** (queued, or written and waiting for a turn): no nudge is issued and none is counted. The recurring sweep asks for delivery again, because an idle worker emits no event to carry a queued probe.
 - **Never arrived**: the nudge comes back off the count. Consecutive failed deliveries are counted separately, and at the same bound (`max_unproductive_nudges`) the attempt fails with "auto-nudge delivery failed N times in a row … This is a delivery failure, not an unresponsive worker". A nudge the engine discarded before writing it, or one meant for a busy worker that could not be interrupted, comes off the count without being a failed delivery.
-- **Not shown yet for too long**: a nudge that is still unwritten after `NUDGE_DELIVERY_DEADLINE` with the worker idle is not on its way; every attempt to write it is being refused or is failing. It is withdrawn, so it cannot arrive late on top of its replacement, and counted as a failed delivery. This is what keeps an unwritable pane from holding the ladder forever. A nudge that has been written is not withdrawn: its own delivery settles it within the 90 s above.
+- **Not shown yet for too long**: a nudge that is still unwritten after `NUDGE_DELIVERY_DEADLINE` from issue, including time spent busy, when the worker is idle is not on its way; every attempt to write it is being refused or is failing. It is withdrawn, so it cannot arrive late on top of its replacement, and counted as a failed delivery. This is what keeps an unwritable pane from holding the ladder forever. A nudge that has been written is not withdrawn: its own delivery settles it within the 90 s above.
 - **Arrived**: the breaker judges the worker on it. A worker that receives its nudges and changes nothing is still stopped at the cap, with the reason it has always had.
 
 A turn boundary that lands while the engine is itself interrupting the worker to deliver a probe is not the worker stopping, and does not run the nudge decision.

@@ -476,3 +476,34 @@ async fn a_withdrawn_nudge_is_neither_counted_nor_a_delivery_failure() {
     assert_eq!(breaker.delivery_failures(&execution_id), 0);
     assert_eq!(probes.snapshot().len(), 2);
 }
+
+#[tokio::test]
+async fn reviewer_reprompts_wait_for_delivery_and_refund_failed_attempts() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, _, run, _) = pr_review_exec_fixture(workspace.path(), None);
+    let out_dir = tempdir().unwrap();
+    let TestHarness { handler, probes, .. } = TestHarness::new(db, StubPrDetector::ok(None));
+    let breaker = Arc::new(crate::nudge_breaker::NudgeBreaker::new());
+    let handler = handler
+        .with_nudge_breaker(breaker.clone())
+        .with_structured_output_dir(out_dir.path().to_path_buf());
+    assert!(matches!(
+        handler.on_stop(&run).await,
+        StopOutcome::ReviewPassAwaitingResult
+    ));
+    assert_eq!(breaker.counts(&run), Some((1, 1)));
+    probes.set_delivery(pending(PROBE_ONE));
+    for _ in 0..5 {
+        assert!(matches!(handler.on_stop(&run).await, StopOutcome::NudgeDebounced));
+    }
+    assert_eq!(probes.snapshot().len(), 1);
+    assert_eq!(breaker.counts(&run), Some((1, 1)));
+    probes.set_delivery(failed(PROBE_ONE));
+    assert!(matches!(
+        handler.on_stop(&run).await,
+        StopOutcome::ReviewPassAwaitingResult
+    ));
+    assert_eq!(probes.snapshot().len(), 2);
+    assert_eq!(breaker.counts(&run), Some((1, 1)), "the undelivered prompt is refunded");
+    assert_eq!(breaker.delivery_failures(&run), 1);
+}

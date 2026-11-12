@@ -41,10 +41,8 @@
 //! nudge when it is issued; the caller must not issue the next one while
 //! that one is still on its way (queued, or written and waiting for the
 //! driver to start a turn on it), and must hand back any nudge that never
-//! arrived through [`NudgeBreaker::settle_undelivered`]. Counting queued
-//! nudges is how a parked worker was failed "after 3 nudges" having been
-//! shown none: the first sat in its composer unsubmitted, and the next two
-//! never left the queue behind it.
+//! arrived through [`NudgeBreaker::settle_undelivered`]. Only confirmed
+//! deliveries contribute to the next breaker decision.
 //!
 //! Nudges that keep failing to arrive are bounded separately
 //! ([`NudgeBreaker::delivery_failures`]), so a pane that cannot be written
@@ -87,17 +85,17 @@ pub const ABSOLUTE_MAX_NUDGES: u32 = 12;
 /// faster than external state could plausibly have changed.
 pub const MIN_RENUDGE_INTERVAL: Duration = Duration::from_secs(60);
 
-/// How long a nudge may go unshown to an idle worker before the engine gives
-/// its delivery up as failed.
+/// Time since issue after which an unwritten nudge may be withdrawn when
+/// the worker is idle. Time spent busy also counts toward this deadline.
 ///
 /// A nudge for an idle worker is written on the boundary that issued it or
 /// by the next recurring sweep, and a written one is confirmed or settled as
 /// failed within about a minute and a half. One still not written after five
 /// re-nudge intervals is not on its way: every attempt to write it is being
 /// refused or is failing. This bound is what keeps such a nudge from holding
-/// the ladder forever, now that an undelivered nudge is no longer counted
-/// toward the cap. Giving it up counts as a delivery failure, so a pane that
-/// can never be written to still ends the attempt.
+/// the ladder forever while undelivered nudges do not count toward the cap.
+/// Giving it up counts as a delivery failure, so a pane that can never be
+/// written to still ends the attempt.
 pub const NUDGE_DELIVERY_DEADLINE: Duration = Duration::from_secs(5 * 60);
 
 /// Decision returned by [`NudgeBreaker::record`].

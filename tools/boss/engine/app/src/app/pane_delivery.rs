@@ -295,7 +295,7 @@ fn pane_tail(captured: &str) -> Option<String> {
 /// recorded, so exact substring matching on raw text is brittle —
 /// comparing normalized forms tolerates that without requiring an
 /// exact verbatim match.
-fn normalize_ws(s: &str) -> String {
+pub(super) fn normalize_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 

@@ -120,12 +120,13 @@ pub(crate) const TEST_SPAWN_TOKEN: &str = "tok-test";
 
 /// How `capture-pane` answers. Empty is the default so unconfirmed-delivery
 /// tests wait out the verify window instead of matching the engine's own paste.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum CaptureBehavior {
     AfterInterrupt(&'static str),
     Empty,
     Fixed(&'static str),
     EchoLastPaste,
+    Paused(Arc<ProbePause>),
 }
 
 #[derive(Clone, Copy)]
@@ -216,6 +217,11 @@ impl RecordingPaneRunner {
             on_text_write: StdMutex::new(None),
             started: tokio::sync::Notify::new(),
         }
+    }
+
+    pub(crate) fn pause_capture(mut self, pause: Arc<ProbePause>) -> Self {
+        self.state.capture = CaptureBehavior::Paused(pause);
+        self
     }
 
     pub(crate) fn capture_text(mut self, text: &'static str) -> Self {
@@ -360,12 +366,12 @@ impl RecordingPaneRunner {
             });
         }
         if args.iter().any(|arg| arg == "capture-pane") {
-            return match self.state.capture {
+            return match &self.state.capture {
                 CaptureBehavior::AfterInterrupt(text) => {
                     Self::success(if self.escape_presses() > 0 { text } else { "" })
                 }
-                CaptureBehavior::Empty => Self::success(""),
-                CaptureBehavior::Fixed(text) => Self::success(text),
+                CaptureBehavior::Empty | CaptureBehavior::Paused(_) => Self::success(""),
+                CaptureBehavior::Fixed(text) => Self::success(*text),
                 CaptureBehavior::EchoLastPaste => {
                     let last = self.stdin.lock().unwrap().last().cloned().unwrap_or_default();
                     Self::success(String::from_utf8_lossy(&last).into_owned())
@@ -384,6 +390,12 @@ impl CommandRunner for RecordingPaneRunner {
         self.calls.lock().unwrap().push(recorded.clone());
         self.maybe_fire_text_write(&recorded);
         self.started.notify_one();
+        if recorded.iter().any(|arg| arg == "capture-pane")
+            && let CaptureBehavior::Paused(pause) = &self.state.capture
+        {
+            pause.entered.notify_one();
+            pause.resume.notified().await;
+        }
         Ok(self.response(args))
     }
 
