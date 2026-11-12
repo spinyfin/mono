@@ -79,7 +79,10 @@ enum SpokeTurn {
 /// entry for it and `spoke_parked_for_delivery` stays closed: mid-turn delivery
 /// to a spoke worker is refused rather than guessed at.
 #[derive(Default)]
-pub(super) struct SpokeTurns(std::sync::Mutex<std::collections::HashMap<String, SpokeTurn>>);
+pub(super) struct SpokeTurns(
+    std::sync::Mutex<std::collections::HashMap<String, SpokeTurn>>,
+    std::sync::atomic::AtomicBool,
+);
 
 impl SpokeTurns {
     fn record(&self, run: &str, turn: SpokeTurn) {
@@ -103,11 +106,20 @@ impl SpokeTurns {
         self.record(run, if parked { SpokeTurn::Parked } else { SpokeTurn::Working });
     }
 
+    fn restored(&self) -> bool {
+        self.1.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn mark_restored(&self) {
+        self.1.store(true, std::sync::atomic::Ordering::Release);
+    }
+
     #[cfg(test)]
     pub(super) fn clear(&self) {
         if let Ok(mut turns) = self.0.lock() {
             turns.clear();
         }
+        self.1.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -120,13 +132,25 @@ pub(super) fn spoke_parked_for_delivery(state: &ServerState, run: &str) -> bool 
 }
 
 impl ServerState {
-    /// Note a turn boundary for a run no local slot tracks. Runs with a slot
-    /// are covered by the slot's own activity, so they are not recorded here.
-    /// Subagent events never move the parent session's parked/working state.
-    pub(super) fn record_spoke_turn_event(&self, run: &str, event: &boss_protocol::WorkerEvent, from_subagent: bool) {
+    /// Note a turn boundary for a spoke-supervised run. Local tmux slots keep
+    /// their own activity, so they are skipped here. Subagent events never
+    /// move the parent session's parked/working state.
+    pub(super) fn record_spoke_turn_event(
+        &self,
+        run: &str,
+        event: &boss_protocol::WorkerEvent,
+        from_subagent: bool,
+    ) -> Result<(), String> {
         use boss_protocol::WorkerEvent;
         if from_subagent {
-            return;
+            return Ok(());
+        }
+        if self
+            .worker_registry
+            .pane_for_run(run)
+            .is_some_and(|pane| pane.tmux_session_name.is_some())
+        {
+            return Ok(());
         }
         let turn = match event {
             WorkerEvent::Stop { .. } => SpokeTurn::Parked,
@@ -136,42 +160,37 @@ impl ServerState {
             | WorkerEvent::ToolPoll { .. }
             | WorkerEvent::ModelProgress { .. } => SpokeTurn::Working,
             WorkerEvent::SessionStart { .. } | WorkerEvent::Notification { .. } | WorkerEvent::SessionEnd { .. } => {
-                return;
+                return Ok(());
             }
         };
         // A remote worker gets a virtual live-status slot on its first hook.
         // That slot is display-only; mid-turn delivery still reads this map,
         // so turn state is keyed on spoke ownership rather than slot absence.
         if !self.spoke_probe_owner_remains(run) {
-            return;
+            return Ok(());
         }
-        self.spoke_turns.record(run, turn);
         let assignment_generation = match self.work_db.spoke_assignment_for_execution(run) {
             Ok(Some(assignment)) => assignment.assignment_generation,
-            Ok(None) => return,
-            Err(error) => {
-                tracing::warn!(run, error = %error, "cannot persist spoke turn state");
-                return;
-            }
+            Ok(None) => return Ok(()),
+            Err(error) => return Err(format!("{error:#}")),
         };
-        if let Err(error) = self.work_db.upsert_spoke_turn_state(&boss_work_db::SpokeTurnState {
-            execution_id: run.to_owned(),
-            assignment_generation,
-            parked: turn == SpokeTurn::Parked,
-        }) {
-            tracing::warn!(run, error = %error, "cannot persist spoke turn state");
-        }
+        self.work_db
+            .upsert_spoke_turn_state(&boss_work_db::SpokeTurnState {
+                execution_id: run.to_owned(),
+                assignment_generation,
+                parked: turn == SpokeTurn::Parked,
+            })
+            .map_err(|error| format!("{error:#}"))?;
+        self.spoke_turns.record(run, turn);
+        Ok(())
     }
 
     /// Rebuild the in-memory turn map from durable rows after a hub restart.
-    pub(super) fn restore_spoke_turns(&self) {
-        let stored = match self.work_db.spoke_turn_states() {
-            Ok(stored) => stored,
-            Err(error) => {
-                tracing::warn!(error = %error, "cannot restore spoke turn state");
-                return;
-            }
-        };
+    pub(super) fn restore_spoke_turns(&self) -> Result<(), String> {
+        if self.spoke_turns.restored() {
+            return Ok(());
+        }
+        let stored = self.work_db.spoke_turn_states().map_err(|error| format!("{error:#}"))?;
         for turn in stored {
             match self.work_db.spoke_assignment_for_execution(&turn.execution_id) {
                 Ok(Some(assignment))
@@ -181,15 +200,12 @@ impl ServerState {
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    tracing::warn!(
-                        run = %turn.execution_id,
-                        error = %error,
-                        "cannot check spoke assignment while restoring turn state; keeping the stored turn"
-                    );
-                    self.spoke_turns.restore(&turn.execution_id, turn.parked);
+                    return Err(format!("{error:#}"));
                 }
             }
         }
+        self.spoke_turns.mark_restored();
+        Ok(())
     }
 
     /// A database read failure is not evidence that a remote worker vanished.

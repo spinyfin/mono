@@ -1685,54 +1685,10 @@ pub(super) async fn handle_comments_post_answer(ctx: Dispatch, req: FrontendRequ
         );
         return;
     }
-    let comment_id = execution.work_item_id.clone();
 
-    let run = match work_db.running_answer_agent_run_for_comment(&comment_id) {
-        Ok(Some(run)) => run,
-        Ok(None) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: "no running answer-agent run found for this comment (already replied?)".to_owned(),
-                },
-            );
-            return;
-        }
-        Err(err) => {
-            send_work_error(&sink, &request_id, &err);
-            return;
-        }
-    };
-
-    if let Err(err) = work_db.complete_answer_agent_run(&run.id, ANSWER_AGENT_RUN_STATUS_REPLIED, Some(&body), None) {
-        send_work_error(&sink, &request_id, &err);
-        return;
-    }
-    boss_engine_completion::answer_agent_observability::record_replied(&server_state.metrics);
-
-    if let Err(err) = work_db.create_comment_thread_entry(
-        &comment_id,
-        THREAD_ENTRY_KIND_ANSWER,
-        "engine",
-        &body,
-        None,
-        Some(&run.id),
-    ) {
-        // The run is already `replied` — surfacing this as a hard error would
-        // tempt the agent into a (now-guarded, hence failing) retry. Log
-        // loudly and continue to the status transition; the thread entry is
-        // an audit/UI artifact, not load-bearing for `answering → answered`.
-        tracing::error!(
-            comment_id = %comment_id,
-            run_id = %run.id,
-            err = %err,
-            "CommentsPostAnswer: run completed but failed to create the thread entry",
-        );
-    }
-
-    match work_db.transition_comment_to_answered(&comment_id) {
+    match work_db.apply_answer_agent_reply(&run_id, &body, None) {
         Ok(comment) => {
+            boss_engine_completion::answer_agent_observability::record_replied(&server_state.metrics);
             let revision = publish_comment_invalidation(
                 &server_state,
                 &session_id,
@@ -1744,14 +1700,9 @@ pub(super) async fn handle_comments_post_answer(ctx: Dispatch, req: FrontendRequ
             .await;
             send_response_with_revision(&sink, &request_id, revision, FrontendEvent::CommentResult { comment });
         }
-        Err(err) => {
-            tracing::error!(
-                comment_id = %comment_id,
-                err = %err,
-                "CommentsPostAnswer: run completed and thread entry posted, but failed to \
-                 transition the comment to 'answered'",
-            );
-            send_work_error(&sink, &request_id, &err);
+        Err(boss_work_db::SpokeWriteError::Retry(err)) => send_work_error(&sink, &request_id, &err),
+        Err(boss_work_db::SpokeWriteError::Refused(message)) => {
+            send_response(&sink, &request_id, FrontendEvent::WorkError { message })
         }
     }
 }
@@ -1794,7 +1745,7 @@ pub(super) async fn handle_comments_update_anchor(ctx: Dispatch, req: FrontendRe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boss_protocol::{ANSWER_AGENT_RUN_STATUS_SUPERSEDED, COMMENT_STATUS_IN_REVISION};
+    use boss_protocol::{ANSWER_AGENT_RUN_STATUS_SUPERSEDED, COMMENT_STATUS_IN_REVISION, THREAD_ENTRY_KIND_ANSWER};
 
     fn test_server_state() -> (Arc<ServerState>, tempfile::TempDir) {
         let temp = tempfile::tempdir().unwrap();

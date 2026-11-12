@@ -26,7 +26,7 @@ The sink stores the original frame bytes and advances the receipt in one transac
 | `Proposal` (any other contract)                                                                                       | a refusal                  | a `Rejected` decision naming the contract; nothing is applied                                                                                                                           |
 | `PaneState`, inventory page                                                                                           | a pane observation per run | durable `spoke_pane_observations` row, then live state: `Exited` marks the slot terminated, `Missing` shows it exited without fencing, `Alive` revives it, `Indeterminate` does nothing |
 | `CommandResult`                                                                                                       | nothing                    | settled at ingress with its receipt                                                                                                                                                     |
-| `PaneCapture`                                                                                                         | nothing                    | live display data, already fed to viewers by the stream manager                                                                                                                         |
+| `PaneCapture`                                                                                                         | an empty tombstone         | stored without quota so the sequence stays contiguous; the projector skips it as live-only and keeps applying later records                                                             |
 | capacity, transcript, artifact, gap, worker request                                                                   | nothing yet                | owned by other consumers                                                                                                                                                                |
 
 A pane observation is evidence only. Whether absence or an exit changes a task's status is still decided by the engine's existing liveness policy.
@@ -62,12 +62,13 @@ A decision is `Ok` with a bounded summary (hub proposal id, state, applied refer
 
 - Authorizing the worker gateway's online requests (`WorkerRequest` replies) is separate follow-on work; this projection does not touch them.
 - Transcripts, artifacts and gaps are not projected here, so `spoke_ingress` is not pruned yet; whichever consumer is last to need a frame decides when it can go.
-- Wall-clock age is not yet distinguished from liveness: replaying an old event refreshes the worker's last-activity time. Staleness judgments should not be trusted for a host until its backlog has drained. A projected `Stop` carries no hub-local transcript path; Stop-time consumers that read a transcript see unavailable evidence.
+- A projected `Stop` carries no hub-local transcript path; Stop-time consumers that read a transcript see unavailable evidence. Replayed hook events stamp live-state `last_event_at` from the record's observed wall time, so a worker that died during an outage is not treated as freshly active when its backlog drains. Unretained pane-capture frames are stored as empty tombstones so they do not leave sequence holes.
 
 ## Diagnosing
 
-- Lag: `WorkDb::spoke_projection_status()`; `received` vs `applied`, `pending_effects`, `failed_effects`, `halt_reason`. The same facts appear on `GetEngineHealth` as `spoke_projection_halted` and `spoke_projection_failed_effects` issues.
-- Halted host: the log says `spoke observation projection halted` with the position, `halt_reason` is persisted, and the host is retried after a hold. Received evidence that cannot be applied is never skipped.
+- Lag: `WorkDb::spoke_projection_status()`; `received` vs `applied`, `pending_effects`, `failed_effects`, `halt_reason`, `stall_reason`. The same facts appear on `GetEngineHealth` as `spoke_projection_halted`, `spoke_projection_stalled`, and `spoke_projection_failed_effects` issues.
+- Halted host: the log says `spoke observation projection halted` with the position, `halt_reason` is persisted, and the host is retried after a hold. A missing retained frame still halts; an unretained capture is an empty tombstone and does not.
+- Stalled host: a record that keeps retrying past the stall bound persists `stall_reason` until it applies.
 - Quarantined frames and abandoned decisions are `spoke_effects` rows in state `failed` with `last_error`; they are never retried.
 - Pane evidence: `WorkDb::spoke_pane_observation(execution_id)`.
 - Parked remote workers: `spoke_turn_state` holds the latest main-session turn per assignment so a hub restart rebuilds the in-memory map.

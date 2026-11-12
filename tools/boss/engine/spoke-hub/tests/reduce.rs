@@ -258,6 +258,20 @@ fn records_owned_by_other_consumers_or_settled_at_ingress_carry_nothing() {
         reduce("h", "j", &row(2, Some(run()), capture)),
         Reduction::Skip(Skip::LiveOnly)
     );
+    assert_eq!(
+        reduce(
+            "h",
+            "j",
+            &SpokeIngressRow {
+                sequence: 9,
+                frame: Vec::new(),
+                epoch: 1,
+                features: String::new(),
+                observed_at_ms: 1,
+            }
+        ),
+        Reduction::Skip(Skip::LiveOnly)
+    );
     let result = record::Body::Result(v1::CommandResult {
         command_id: "c".into(),
         code: v1::ResultCode::Ok as i32,

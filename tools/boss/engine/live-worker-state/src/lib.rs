@@ -1778,6 +1778,7 @@ impl LiveWorkerStateRegistry {
             HookOrigin {
                 ingress_seq,
                 from_subagent: false,
+                observed_at_ms: None,
             },
             event,
         )
@@ -1868,7 +1869,13 @@ impl LiveWorkerStateRegistry {
         let resumed_after = record_turn_progress(meta, ingress_seq, event, origin);
         let before = state.clone();
 
-        state.last_event_at = Some(now.clone());
+        state.last_event_at = Some(
+            origin
+                .observed_at_ms
+                .filter(|ms| *ms > 0)
+                .map(|ms| iso8601_utc(ms.div_euclid(1000)))
+                .unwrap_or_else(|| now.clone()),
+        );
         // Driver-originated only: this method is the hook/JSONL ingress.
         // Engine-synthesized display stamps (`mark_stalled_spawns`,
         // `mark_errored`) never reach here, so they cannot advance the
@@ -2521,6 +2528,9 @@ pub struct HookOrigin {
     /// session's turn has ended, so its tool hooks are not evidence that the
     /// main session started a new turn.
     pub from_subagent: bool,
+    /// When the spoke observed this event, in unix milliseconds. `None` means
+    /// stamp activity as "now" (live local ingress).
+    pub observed_at_ms: Option<i64>,
 }
 
 /// A turn boundary (`Stop`) the main session was parked behind. `seq` is

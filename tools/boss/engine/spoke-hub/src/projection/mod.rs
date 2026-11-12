@@ -157,6 +157,13 @@ pub trait ObservationApplier: Send + Sync {
     /// Reflect a pane the host looked at. The projector has already recorded the
     /// observation durably; this is its effect on live state.
     async fn pane(&self, observation: &PaneObservation) -> Applied;
+
+    /// A proposal decision effect settled. `delivered` is true when the spoke
+    /// acknowledged it. Called after the cursor commit, including when delivery
+    /// is retried, so finalization can run without tearing down before an ack.
+    async fn decision_settled(&self, effect_key: &str, delivered: bool) {
+        let _ = (effect_key, delivered);
+    }
 }
 
 /// Delivery of a command to a spoke over its live stream.
@@ -205,6 +212,10 @@ pub struct ProjectorConfig {
     /// Definite refusals by the spoke before a decision is given up on.
     #[builder(default = 3)]
     pub max_rejections: u32,
+    /// After this long retrying one record in place, persist a stall so engine
+    /// health can report the host as blocked.
+    #[builder(default = Duration::from_secs(30))]
+    pub retry_stall: Duration,
 }
 
 impl Default for ProjectorConfig {
@@ -485,12 +496,27 @@ impl Inner {
     /// only when the record can never be applied as stored.
     async fn project_record(&self, host: &str, journal: &str, row: &SpokeIngressRow) -> Result<(), String> {
         let mut attempt = 0u32;
+        let started = std::time::Instant::now();
+        let mut stalled = false;
         loop {
             match self.apply_record(host, journal, row).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    if stalled {
+                        let host_id = host.to_owned();
+                        let _ = self.blocking(move |db| db.clear_spoke_projection_stall(&host_id)).await;
+                    }
+                    return Ok(());
+                }
                 Err(Interrupted::Halt(reason)) => return Err(reason),
                 Err(Interrupted::Retry(reason)) => {
                     attempt += 1;
+                    if !stalled && started.elapsed() >= self.config.retry_stall {
+                        stalled = true;
+                        let (host_id, stall_reason) = (host.to_owned(), reason.clone());
+                        let _ = self
+                            .blocking(move |db| db.set_spoke_projection_stall(&host_id, &stall_reason))
+                            .await;
+                    }
                     let wait = exponential_delay(self.config.retry_initial, self.config.retry_max, attempt.min(16));
                     tracing::warn!(
                         host,
@@ -683,8 +709,11 @@ impl Inner {
                 tracing::debug!(host = %effect.host_id, kind = %effect.kind, %reason, "owed spoke effect not delivered yet");
                 unreachable.insert(effect.host_id.clone());
                 // A host that stays unreachable would otherwise be written to
-                // on every pass to say the same thing.
+                // on every pass to say the same thing. Finalization still
+                // runs: a `run_done` declaration is already durable, and
+                // waiting for a later delivery would leave the execution live.
                 if effect.last_error.as_deref() == Some(reason.as_str()) {
+                    self.applier.decision_settled(&effect.key, false).await;
                     continue;
                 }
             }
@@ -695,14 +724,25 @@ impl Inner {
                 .await
             {
                 tracing::warn!(host = %effect.host_id, %reason, "cannot record a spoke effect's outcome; it will be retried");
-            } else if let SpokeEffectOutcome::Failed(reason) = outcome {
-                tracing::error!(
-                    host = %effect.host_id,
-                    kind = %effect.kind,
-                    key = %effect.key,
-                    %reason,
-                    "a spoke effect failed and is never retried"
-                );
+            } else {
+                match &outcome {
+                    SpokeEffectOutcome::Done => {
+                        self.applier.decision_settled(&effect.key, true).await;
+                    }
+                    SpokeEffectOutcome::Failed(reason) => {
+                        tracing::error!(
+                            host = %effect.host_id,
+                            kind = %effect.kind,
+                            key = %effect.key,
+                            %reason,
+                            "a spoke effect failed and is never retried"
+                        );
+                        self.applier.decision_settled(&effect.key, false).await;
+                    }
+                    SpokeEffectOutcome::Retry(_) | SpokeEffectOutcome::Rejected(_) => {
+                        self.applier.decision_settled(&effect.key, false).await;
+                    }
+                }
             }
         }
     }

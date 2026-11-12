@@ -34,6 +34,9 @@ use crate::*;
 pub(crate) const MIGRATION_ID: &str = "20261112_1400_spoke_projection";
 /// Turn state for parked remote workers, and a persisted halt reason per host.
 pub(crate) const TURN_STATE_MIGRATION_ID: &str = "20261112_1900_spoke_turn_state";
+/// Submission-keyed run-write results, projection stall columns, and
+/// tombstones for unretained sequences that were receipted without a row.
+pub(crate) const APPLIED_WRITES_MIGRATION_ID: &str = "20261112_2315_spoke_applied_writes";
 
 /// Effect rows live in `spoke_effects.state`.
 const PENDING: &str = "pending";
@@ -42,6 +45,49 @@ const FAILED: &str = "failed";
 
 fn now_ms() -> i64 {
     boss_engine_utils::epoch_time::now_epoch_ms() as i64
+}
+
+pub(crate) fn get_spoke_applied_write_on(
+    conn: &Connection,
+    application_key: &str,
+) -> Result<Option<SpokeAppliedWrite>> {
+    Ok(conn
+        .query_row(
+            "SELECT application_key, host_id, contract, accepted, reason, result_json, created_at_ms
+               FROM spoke_applied_writes WHERE application_key = ?1",
+            [application_key],
+            |row| {
+                Ok(SpokeAppliedWrite {
+                    application_key: row.get(0)?,
+                    host_id: row.get(1)?,
+                    contract: row.get(2)?,
+                    accepted: row.get::<_, i64>(3)? != 0,
+                    reason: row.get(4)?,
+                    result_json: row.get(5)?,
+                    created_at_ms: row.get(6)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+pub(crate) fn insert_spoke_applied_write_on(conn: &Connection, write: &SpokeAppliedWrite) -> Result<()> {
+    conn.execute(
+        "INSERT INTO spoke_applied_writes
+            (application_key, host_id, contract, accepted, reason, result_json, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(application_key) DO NOTHING",
+        params![
+            write.application_key,
+            write.host_id,
+            write.contract,
+            if write.accepted { 1 } else { 0 },
+            write.reason,
+            write.result_json,
+            write.created_at_ms,
+        ],
+    )?;
+    Ok(())
 }
 
 /// Why the projection refused to move its cursor.
@@ -119,6 +165,57 @@ pub(crate) fn migrate_turn_state(conn: &Connection) -> Result<()> {
     if has_halt == 0 {
         conn.execute_batch("ALTER TABLE spoke_projection ADD COLUMN halt_reason TEXT")?;
     }
+    Ok(())
+}
+
+pub(crate) fn migrate_applied_writes(conn: &Connection) -> Result<()> {
+    let has_stall: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('spoke_projection') WHERE name = 'stall_reason'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_stall == 0 {
+        conn.execute_batch(
+            "ALTER TABLE spoke_projection ADD COLUMN stall_reason TEXT;
+             ALTER TABLE spoke_projection ADD COLUMN stalled_since_ms INTEGER",
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS spoke_applied_writes (
+            application_key TEXT PRIMARY KEY,
+            host_id TEXT NOT NULL,
+            contract TEXT NOT NULL,
+            accepted INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL
+         )",
+    )?;
+    // Sequences that were receipted without a stored row (unretained captures
+    // before tombstones) would halt projection. Fill those holes as frameless
+    // skips. A later DELETE of a retained frame that is still ahead of the
+    // cursor remains a halt: it is no longer a hole at receipt time.
+    conn.execute_batch(
+        "WITH RECURSIVE seqs(host_id, journal_id, seq, received) AS (
+            SELECT host_id, journal_id, pruned_through + 1, received
+              FROM spoke_journals
+             WHERE received > pruned_through
+            UNION ALL
+            SELECT host_id, journal_id, seq + 1, received
+              FROM seqs
+             WHERE seq < received
+         )
+         INSERT OR IGNORE INTO spoke_ingress
+            (host_id, journal_id, sequence, frame, epoch, features, observed_at_ms)
+         SELECT host_id, journal_id, seq, X'', 0, '', 0
+           FROM seqs
+          WHERE NOT EXISTS (
+                SELECT 1 FROM spoke_ingress i
+                 WHERE i.host_id = seqs.host_id
+                   AND i.journal_id = seqs.journal_id
+                   AND i.sequence = seqs.seq
+          )",
+    )?;
     Ok(())
 }
 
@@ -265,7 +362,8 @@ pub enum SpokeEffectOutcome {
 }
 
 /// Per-host projection health, for logs and diagnostics.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct SpokeProjectionStatus {
     pub position: SpokeProjectionPosition,
     pub pending_effects: u64,
@@ -273,6 +371,24 @@ pub struct SpokeProjectionStatus {
     /// Why this host's projector is halted, if it is. Cleared once the host
     /// catches up.
     pub halt_reason: Option<String>,
+    /// Why the current record is being retried in place, once the retry has
+    /// lasted long enough to surface on engine health. Cleared when the record
+    /// applies or the host halts.
+    pub stall_reason: Option<String>,
+    pub stalled_since_ms: Option<i64>,
+}
+
+/// Durable result of a run-scoped write, keyed by the submission identity.
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct SpokeAppliedWrite {
+    pub application_key: String,
+    pub host_id: String,
+    pub contract: String,
+    pub accepted: bool,
+    pub reason: String,
+    pub result_json: String,
+    pub created_at_ms: i64,
 }
 
 /// Latest main-session turn for a spoke-supervised run, rebuilt into memory
@@ -546,7 +662,9 @@ impl WorkDb {
                     p.journal_id,
                     (SELECT COUNT(*) FROM spoke_effects e WHERE e.host_id = j.host_id AND e.state = 'pending'),
                     (SELECT COUNT(*) FROM spoke_effects e WHERE e.host_id = j.host_id AND e.state = 'failed'),
-                    p.halt_reason
+                    p.halt_reason,
+                    p.stall_reason,
+                    p.stalled_since_ms
                FROM spoke_journals j LEFT JOIN spoke_projection p ON p.host_id = j.host_id
               ORDER BY j.host_id",
         )?;
@@ -556,6 +674,8 @@ impl WorkDb {
                 pending_effects: row.get::<_, i64>(5)? as u64,
                 failed_effects: row.get::<_, i64>(6)? as u64,
                 halt_reason: row.get(7)?,
+                stall_reason: row.get(8)?,
+                stalled_since_ms: row.get(9)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -613,10 +733,50 @@ impl WorkDb {
     /// Clear a persisted halt once the host has no remaining lag.
     pub fn clear_spoke_projection_halt(&self, host_id: &str) -> Result<()> {
         self.connect()?.execute(
-            "UPDATE spoke_projection SET halt_reason = NULL WHERE host_id = ?1",
+            "UPDATE spoke_projection SET halt_reason = NULL, stall_reason = NULL, stalled_since_ms = NULL
+              WHERE host_id = ?1",
             [host_id],
         )?;
         Ok(())
+    }
+
+    /// Persist why this host's current record is retrying in place.
+    pub fn set_spoke_projection_stall(&self, host_id: &str, reason: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let now = now_ms();
+        let updated = conn.execute(
+            "UPDATE spoke_projection
+                SET stall_reason = ?2, stalled_since_ms = COALESCE(stalled_since_ms, ?3)
+              WHERE host_id = ?1",
+            params![host_id, reason, now],
+        )?;
+        if updated == 0 {
+            conn.execute(
+                "INSERT INTO spoke_projection(host_id, journal_id, applied, stall_reason, stalled_since_ms)
+                 SELECT host_id, journal_id, 0, ?2, ?3 FROM spoke_journals WHERE host_id = ?1",
+                params![host_id, reason, now],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Clear a stall once the record applies.
+    pub fn clear_spoke_projection_stall(&self, host_id: &str) -> Result<()> {
+        self.connect()?.execute(
+            "UPDATE spoke_projection SET stall_reason = NULL, stalled_since_ms = NULL WHERE host_id = ?1",
+            [host_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_spoke_applied_write(&self, application_key: &str) -> Result<Option<SpokeAppliedWrite>> {
+        let conn = self.connect()?;
+        get_spoke_applied_write_on(&conn, application_key)
+    }
+
+    pub fn record_spoke_applied_write(&self, write: &SpokeAppliedWrite) -> Result<()> {
+        let conn = self.connect()?;
+        insert_spoke_applied_write_on(&conn, write)
     }
 
     /// Persist the latest main-session turn for a spoke-supervised run.

@@ -78,9 +78,10 @@ async fn pane_captures_are_receipted_without_occupying_ingress() {
     frame.extend_from_slice(&[0xa0, 0x06, 0x01]);
     assert!(frame.len() > 60 * 1024);
     assert_eq!(sink.commit(&session, &frame, &capture).await.unwrap().through, 1);
-    assert!(
-        reader.spoke_ingress_frame("host-a", 1).unwrap().is_none(),
-        "a capture is live display data: receipted, not stored"
+    assert_eq!(
+        reader.spoke_ingress_frame("host-a", 1).unwrap().as_deref(),
+        Some(&b""[..]),
+        "a capture is live display data: receipted as a frameless tombstone"
     );
     assert_eq!(reader.spoke_journal("host-a").unwrap().unwrap().received, 1);
     // A retransmission, even with different bytes, is already receipted.

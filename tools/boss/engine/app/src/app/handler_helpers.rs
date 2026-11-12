@@ -370,6 +370,17 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
                         ),
                     });
                 }
+                if let Some(reason) = host.stall_reason.as_deref() {
+                    issues.push(EngineHealthIssue {
+                        kind: "spoke_projection_stalled".to_owned(),
+                        severity: "warning".to_owned(),
+                        title: format!("Spoke host {} projection is stalled", host.position.host_id),
+                        body: format!(
+                            "Host {} is retrying a record in place (applied={}, received={}). {reason}",
+                            host.position.host_id, host.position.applied, host.position.received
+                        ),
+                    });
+                }
                 if host.failed_effects > 0 {
                     issues.push(EngineHealthIssue {
                         kind: "spoke_projection_failed_effects".to_owned(),

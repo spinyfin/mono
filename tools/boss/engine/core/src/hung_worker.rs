@@ -91,6 +91,7 @@ mod tests {
             crate::live_worker_state::HookOrigin {
                 ingress_seq: None,
                 from_subagent: true,
+                observed_at_ms: None,
             },
             &WorkerEvent::PostToolUse {
                 session_id: "child".into(),

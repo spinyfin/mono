@@ -237,6 +237,17 @@ fn tool_record(sequence: u64, run: &Run) -> v1::Record {
     )
 }
 
+fn capture_record(sequence: u64, run: &Run) -> v1::Record {
+    record_of(
+        sequence,
+        run,
+        record::Body::Capture(v1::PaneCapture {
+            subscription_id: "view".into(),
+            ..Default::default()
+        }),
+    )
+}
+
 fn pane_record(sequence: u64, run: &Run, life: v1::PaneLife) -> v1::Record {
     record_of(
         sequence,
@@ -724,6 +735,67 @@ async fn missing_stored_evidence_halts_the_host_instead_of_skipping_it() {
         1,
         "the cursor stops at the gap; nothing behind it is applied"
     );
+}
+
+#[tokio::test]
+async fn an_unretained_capture_does_not_halt_later_records() {
+    let world = World::new();
+    let db = world.open();
+    let run = assign(&db, "exec_1").1;
+    let spoke = Spoke::connect(&db, None).await;
+    spoke.send(&tool_record(1, &run)).await;
+    spoke.send(&capture_record(2, &run)).await;
+    spoke.send(&proposal_record(3, &run, "done-after-capture")).await;
+    let applier = Applier::default();
+    projector(&db, &applier, &Arc::new(Sender::default()), Arc::new(Notify::new()))
+        .drain()
+        .await;
+    assert_eq!(applier.log(|l| l.events.clone()), ["1#pre_tool_use"]);
+    assert_eq!(applier.log(|l| l.proposals.clone()), ["3#done-after-capture"]);
+    assert_eq!(applied(&db), 3);
+    assert!(
+        db.spoke_projection_status().unwrap()[0].halt_reason.is_none(),
+        "a capture tombstone is skipped, not a missing retained frame"
+    );
+}
+
+#[tokio::test]
+async fn a_trailing_unretained_capture_advances_the_cursor() {
+    let world = World::new();
+    let db = world.open();
+    let run = assign(&db, "exec_1").1;
+    let spoke = Spoke::connect(&db, None).await;
+    spoke.send(&proposal_record(1, &run, "done-before-capture")).await;
+    spoke.send(&capture_record(2, &run)).await;
+    let applier = Applier::default();
+    projector(&db, &applier, &Arc::new(Sender::default()), Arc::new(Notify::new()))
+        .drain()
+        .await;
+    assert_eq!(applier.log(|l| l.proposals.clone()), ["1#done-before-capture"]);
+    assert_eq!(applied(&db), 2);
+    assert!(db.spoke_projection_status().unwrap()[0].halt_reason.is_none());
+}
+
+#[tokio::test]
+async fn an_unretained_capture_is_skippable_after_a_restart() {
+    let world = World::new();
+    let run;
+    {
+        let db = world.open();
+        run = assign(&db, "exec_1").1;
+        let spoke = Spoke::connect(&db, None).await;
+        spoke.send(&tool_record(1, &run)).await;
+        spoke.send(&capture_record(2, &run)).await;
+        spoke.send(&proposal_record(3, &run, "done-after-restart")).await;
+    }
+    let db = world.open();
+    let applier = Applier::default();
+    projector(&db, &applier, &Arc::new(Sender::default()), Arc::new(Notify::new()))
+        .drain()
+        .await;
+    assert_eq!(applier.log(|l| l.events.clone()), ["1#pre_tool_use"]);
+    assert_eq!(applier.log(|l| l.proposals.clone()), ["3#done-after-restart"]);
+    assert_eq!(applied(&db), 3);
 }
 
 #[tokio::test]

@@ -187,7 +187,7 @@ async fn a_spoke_run_with_no_local_slot_is_busy_until_its_host_reports_a_stop() 
     let probe = state.queue_probe(run_id.clone(), "continue".into(), false);
 
     // Mid-turn: the host has reported the turn starting and nothing since.
-    state.record_spoke_turn_event(&run_id, &prompt_submit(), false);
+    state.record_spoke_turn_event(&run_id, &prompt_submit(), false).unwrap();
     assert_eq!(
         dispatch_probe_now(&state, &run_id).await,
         ProbeDispatchOutcome::PostureRefused
@@ -202,7 +202,7 @@ async fn a_spoke_run_with_no_local_slot_is_busy_until_its_host_reports_a_stop() 
 
     // Parked: the host reported the turn's Stop, so the same run now accepts
     // both a probe-now and a nudge, with no local slot involved.
-    state.record_spoke_turn_event(&run_id, &stop(), false);
+    state.record_spoke_turn_event(&run_id, &stop(), false).unwrap();
     assert_eq!(
         dispatch_probe_now(&state, &run_id).await,
         ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Buffered)
@@ -240,7 +240,7 @@ async fn turn_events_for_a_run_without_a_spoke_assignment_are_not_recorded() {
         calls: Mutex::new(vec![]),
     });
     let (state, _dir) = spoke_state(remote);
-    state.record_spoke_turn_event("local-run", &stop(), false);
+    state.record_spoke_turn_event("local-run", &stop(), false).unwrap();
     assert!(!super::spoke_probes::spoke_parked_for_delivery(&state, "local-run"));
 }
 
@@ -262,8 +262,8 @@ async fn a_subagent_stop_does_not_park_a_working_parent() {
     let run_id = "spoke-run".to_owned();
     state.work_db.reserve_spoke_assignment(&run_id, "spoke").unwrap();
     state.queue_probe(run_id.clone(), "continue".into(), false);
-    state.record_spoke_turn_event(&run_id, &prompt_submit(), false);
-    state.record_spoke_turn_event(&run_id, &stop(), true);
+    state.record_spoke_turn_event(&run_id, &prompt_submit(), false).unwrap();
+    state.record_spoke_turn_event(&run_id, &stop(), true).unwrap();
     assert!(!super::spoke_probes::spoke_parked_for_delivery(&state, &run_id));
     assert_eq!(
         dispatch_probe_now(&state, &run_id).await,
@@ -281,8 +281,8 @@ async fn a_subagent_tool_event_does_not_unpark_a_parked_parent() {
     let run_id = "spoke-run".to_owned();
     state.work_db.reserve_spoke_assignment(&run_id, "spoke").unwrap();
     state.queue_probe(run_id.clone(), "continue".into(), false);
-    state.record_spoke_turn_event(&run_id, &stop(), false);
-    state.record_spoke_turn_event(&run_id, &pre_tool(), true);
+    state.record_spoke_turn_event(&run_id, &stop(), false).unwrap();
+    state.record_spoke_turn_event(&run_id, &pre_tool(), true).unwrap();
     assert!(super::spoke_probes::spoke_parked_for_delivery(&state, &run_id));
     assert_eq!(
         dispatch_probe_now(&state, &run_id).await,
@@ -300,11 +300,11 @@ async fn parked_turn_state_is_restored_from_durable_rows() {
     let (state, _dir) = spoke_state(remote);
     let run_id = "spoke-run".to_owned();
     state.work_db.reserve_spoke_assignment(&run_id, "spoke").unwrap();
-    state.record_spoke_turn_event(&run_id, &stop(), false);
+    state.record_spoke_turn_event(&run_id, &stop(), false).unwrap();
     assert!(super::spoke_probes::spoke_parked_for_delivery(&state, &run_id));
     state.spoke_turns.clear();
     assert!(!super::spoke_probes::spoke_parked_for_delivery(&state, &run_id));
-    state.restore_spoke_turns();
+    state.restore_spoke_turns().unwrap();
     assert!(super::spoke_probes::spoke_parked_for_delivery(&state, &run_id));
 }
 

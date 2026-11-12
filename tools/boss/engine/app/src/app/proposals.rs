@@ -638,7 +638,7 @@ pub(super) async fn submit_for_caller(
                     "submit_proposal: wait payload failed to deserialize after validation"
                 );
                 return Err(ProposalSubmissionError::new(
-                    ProposalErrorCode::Internal,
+                    ProposalErrorCode::ValidationFailed,
                     format!("validated wait payload could not be deserialized: {err}"),
                 ));
             }

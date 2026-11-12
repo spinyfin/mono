@@ -57,10 +57,11 @@ pub struct SpokeIngressCommit<'a> {
     pub observed_at_ms: i64,
     pub runs: &'a [SpokeRunKey],
     pub result: Option<SpokeIngressResult<'a>>,
-    /// When false, the receipt still advances but the frame is not stored and
-    /// does not count against the host's ingress quota. Pane captures are live
-    /// display data: nothing replays them, and retaining each snapshot would
-    /// fill the quota on an idle viewer.
+    /// When false, the receipt still advances and a frameless tombstone is
+    /// stored so projection can skip the sequence, but the payload is not kept
+    /// and does not count against the host's ingress quota. Pane captures are
+    /// live display data: nothing replays them, and retaining each snapshot
+    /// would fill the quota on an idle viewer.
     #[builder(default = true)]
     pub retain: bool,
 }
@@ -233,6 +234,16 @@ impl WorkDb {
             )
             .optional()?;
         if let Some(previous) = existing {
+            if previous.is_empty() {
+                // A frameless tombstone marks an intentionally unretained
+                // sequence. Retransmitting it as retained or as a result is a
+                // lie; another unretained frame is already receipted.
+                if commit.retain || commit.result.is_some() {
+                    return Err(fault(HostOutboxFault::Denied));
+                }
+                tx.commit()?;
+                return Ok(received);
+            }
             if previous != commit.frame {
                 return Err(fault(HostOutboxFault::Denied));
             }
@@ -267,11 +278,10 @@ impl WorkDb {
             return Ok(received);
         }
         if commit.sequence <= received {
-            // Already receipted and never stored (an ephemeral capture) or a
-            // hole left by not retaining a frame. Results are always stored,
-            // so a result at such a sequence is a lie. A retained-type frame
-            // at an unstored sequence is also a lie: the hub never kept that
-            // sequence, so this cannot be a legitimate replay of a kept record.
+            // Already receipted and since pruned (including an unretained
+            // tombstone). Results are always stored, so a result at such a
+            // sequence is a lie. A retained-type frame at a vanished sequence
+            // is also a lie: the hub never kept those bytes.
             if commit.result.is_some() || commit.retain {
                 return Err(fault(HostOutboxFault::Denied));
             }
@@ -319,6 +329,25 @@ impl WorkDb {
                 params![commit.host_id, commit.sequence as i64, frame_len],
             )?;
         } else {
+            // Empty blob: durable evidence of an intentionally unretained
+            // sequence so the projector can skip it instead of halting on a hole.
+            tx.execute(
+                "INSERT INTO spoke_ingress
+                    (host_id, journal_id, sequence, frame, epoch, features, observed_at_ms)
+                 VALUES (?1, ?2, ?3, X'', ?4, ?5, ?6)",
+                params![
+                    commit.host_id,
+                    commit.journal_id,
+                    commit.sequence as i64,
+                    commit.epoch as i64,
+                    commit.features,
+                    if commit.observed_at_ms == 0 {
+                        now_ms()
+                    } else {
+                        commit.observed_at_ms
+                    }
+                ],
+            )?;
             tx.execute(
                 "UPDATE spoke_journals SET received = ?2 WHERE host_id = ?1",
                 params![commit.host_id, commit.sequence as i64],
@@ -351,7 +380,7 @@ impl WorkDb {
         }
         let (count, bytes): (i64, i64) = tx.query_row(
             "SELECT COUNT(*), COALESCE(SUM(LENGTH(frame)), 0) FROM spoke_ingress
-              WHERE host_id = ?1 AND journal_id = ?2 AND sequence <= ?3",
+              WHERE host_id = ?1 AND journal_id = ?2 AND sequence <= ?3 AND LENGTH(frame) > 0",
             params![host_id, journal_id, through],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
@@ -841,7 +870,7 @@ mod tests {
             )
         };
         assert_eq!(put(1, b"capture-bytes-too-big-for-quota", false).unwrap(), 1);
-        assert!(db.spoke_ingress_frame("host-a", 1).unwrap().is_none());
+        assert_eq!(db.spoke_ingress_frame("host-a", 1).unwrap().as_deref(), Some(&b""[..]));
         assert_eq!(db.spoke_journal("host-a").unwrap().unwrap().received, 1);
         // A retransmission, even with different bytes, is already receipted.
         assert_eq!(put(1, b"changed", false).unwrap(), 1);
@@ -857,7 +886,7 @@ mod tests {
         );
         // Another capture still receipts without filling the quota.
         assert_eq!(put(3, b"another-capture", false).unwrap(), 3);
-        assert!(db.spoke_ingress_frame("host-a", 3).unwrap().is_none());
+        assert_eq!(db.spoke_ingress_frame("host-a", 3).unwrap().as_deref(), Some(&b""[..]));
         assert_eq!(db.spoke_journal("host-a").unwrap().unwrap().received, 3);
     }
 
@@ -885,7 +914,7 @@ mod tests {
             )
         };
         assert_eq!(put(1, b"capture", false).unwrap(), 1);
-        assert!(db.spoke_ingress_frame("host-a", 1).unwrap().is_none());
+        assert_eq!(db.spoke_ingress_frame("host-a", 1).unwrap().as_deref(), Some(&b""[..]));
         assert_eq!(
             fault_of(&put(1, b"lifecycle", true).unwrap_err()),
             Some(HostOutboxFault::Denied)

@@ -59,9 +59,9 @@ use boss_protocol::{
     work_product_topic,
 };
 use boss_work_db::{
-    ANSWER_AGENT_RUN_STATUS_FAILED, ANSWER_AGENT_RUN_STATUS_REPLIED, ActionedAttentionGroup, DuplicateTaskError,
-    ExecutionKind, ExecutionStatus, GhPrStateChecker, INTENT_QUESTION, ProducerConflictInsertInput, ReviseDocOutcome,
-    SetRunTranscriptPathOutcome, THREAD_ENTRY_KIND_ANSWER, Task, TaskStatus, WorkComment, WorkDb, WorkItem,
+    ANSWER_AGENT_RUN_STATUS_FAILED, ActionedAttentionGroup, DuplicateTaskError, ExecutionKind, ExecutionStatus,
+    GhPrStateChecker, INTENT_QUESTION, ProducerConflictInsertInput, ReviseDocOutcome, SetRunTranscriptPathOutcome,
+    Task, TaskStatus, WorkComment, WorkDb, WorkItem,
 };
 use tokio::time::{Duration, timeout};
 
@@ -1406,6 +1406,7 @@ impl ServerState {
             coordinator_tmux: coordinator_tmux_override,
             coordinator_working_directory: coordinator_working_directory_override,
         } = overrides;
+        let injected_work_db = work_db_override.is_some();
         // Constructed here (rather than left to `ServerState::builder`'s
         // default) so it can be injected into `work_db` via
         // `with_event_bus` below — without that, `WorkDb`'s state-transition
@@ -1844,7 +1845,13 @@ impl ServerState {
         let provider_events_socket = boss_engine_runtime::runner::bound_events_socket_path(&cfg);
         let provider_control_dir = boss_ssh_transport::default_control_socket_dir();
         let remote_pane_releaser = pane_releaser.clone();
-        let spoke_installation = spoke_installation::prepare(work_db.as_ref().clone(), &cfg.work.hub)?;
+        // An injected WorkDb is a restart over an existing file: the test owns
+        // hub configuration, and `prepare` would refuse spoke hosts without it.
+        let spoke_installation = if injected_work_db {
+            None
+        } else {
+            spoke_installation::prepare(work_db.as_ref().clone(), &cfg.work.hub)?
+        };
         let hub_stream = spoke_installation.as_ref().map(|prepared| prepared.stream());
         let server_state = Arc::new_cyclic(move |weak_self: &Weak<ServerState>| {
             let mut execution_coordinator_inner = ExecutionCoordinator::with_host_adapter_and_publisher(

@@ -1139,9 +1139,67 @@ pub use spoke_ingress::{
     MAX_HOST_INGRESS_BYTES, MAX_HOST_INGRESS_RECORDS, SpokeIngressCommit, SpokeIngressResult, SpokeJournalAdmission,
 };
 pub use spoke_projection::{
-    NewSpokeEffect, SpokeAdvance, SpokeEffect, SpokeEffectOutcome, SpokeEffectState, SpokeIngressRow,
-    SpokePaneObservation, SpokeProjectionFault, SpokeProjectionPosition, SpokeProjectionStatus, SpokeTurnState,
+    NewSpokeEffect, SpokeAdvance, SpokeAppliedWrite, SpokeEffect, SpokeEffectOutcome, SpokeEffectState,
+    SpokeIngressRow, SpokePaneObservation, SpokeProjectionFault, SpokeProjectionPosition, SpokeProjectionStatus,
+    SpokeTurnState,
 };
+
+/// True when a work-database error should be retried rather than treated as a
+/// durable refusal. Busy, locked, and I/O faults are transient; domain
+/// `bail!` strings and constraint failures are not.
+pub fn retryable_work_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        let Some(sql) = cause.downcast_ref::<rusqlite::Error>() else {
+            return false;
+        };
+        matches!(
+            sql.sqlite_error_code(),
+            Some(
+                rusqlite::ErrorCode::DatabaseBusy
+                    | rusqlite::ErrorCode::DatabaseLocked
+                    | rusqlite::ErrorCode::SystemIoFailure
+                    | rusqlite::ErrorCode::DiskFull
+                    | rusqlite::ErrorCode::DatabaseCorrupt
+                    | rusqlite::ErrorCode::CannotOpen
+                    | rusqlite::ErrorCode::OperationAborted
+            )
+        )
+    })
+}
+
+/// Outcome of a run-scoped write that must not collapse a transient database
+/// fault into a durable refusal.
+#[derive(Debug)]
+pub enum SpokeWriteError {
+    Refused(String),
+    Retry(anyhow::Error),
+}
+
+impl SpokeWriteError {
+    pub fn from_work(err: anyhow::Error) -> Self {
+        if retryable_work_error(&err) {
+            Self::Retry(err)
+        } else {
+            Self::Refused(err.to_string())
+        }
+    }
+
+    pub fn retry(reason: impl Into<String>) -> Self {
+        Self::Retry(anyhow::anyhow!(reason.into()))
+    }
+
+    pub fn refused(reason: impl Into<String>) -> Self {
+        Self::Refused(reason.into())
+    }
+}
+
+/// Optional submission identity recorded atomically with a spoke run-write.
+#[derive(Debug, Clone, Copy)]
+pub struct SpokeWriteApplication<'a> {
+    pub key: &'a str,
+    pub host_id: &'a str,
+    pub contract: &'a str,
+}
 pub use trunk_merge_intents::{ActiveTrunkMergeIntent, TrunkMergeIntent, TrunkMergeIntentInsertInput};
 
 mod legacy_store_cleanup;

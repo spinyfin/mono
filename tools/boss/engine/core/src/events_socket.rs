@@ -116,6 +116,9 @@ pub struct HookConnection {
     /// fired inside a subagent the main session launched, not in the main
     /// session. Read from the payload by [`handle_connection`]'s decode.
     pub from_subagent: bool,
+    /// The spoke's observed stamp, in unix milliseconds, when this hook was
+    /// journaled. `None` for live local ingress, which is stamped "now".
+    pub observed_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -162,6 +165,7 @@ impl IncomingHookEvent {
                 peer_pid,
                 ingress_seq: None,
                 from_subagent: false,
+                observed_at_ms: None,
             },
             run_id,
             transcript_path,
@@ -183,6 +187,13 @@ impl IncomingHookEvent {
     /// per-connection tasks happen to reach it.
     pub fn with_ingress_seq(mut self, ingress_seq: u64) -> Self {
         self.connection.ingress_seq = Some(ingress_seq);
+        self
+    }
+
+    /// Stamp the observation time the spoke recorded, so replayed events do
+    /// not refresh liveness as if they had just arrived.
+    pub fn with_observed_at_ms(mut self, observed_at_ms: i64) -> Self {
+        self.connection.observed_at_ms = Some(observed_at_ms);
         self
     }
 

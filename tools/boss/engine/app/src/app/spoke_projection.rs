@@ -19,16 +19,13 @@
 //! Nothing here is reachable until a hub listener is configured, and a spoke
 //! host is enrolled and proven ready.
 
-use std::sync::{Arc, Weak};
-use std::time::Instant;
-
 use async_trait::async_trait;
 use boss_engine_driver::DriverRegistry;
 use boss_engine_proposal_validation::{derive_idempotency_key, validate_caller_idempotency_key, validate_payload};
 use boss_engine_runtime::hub::{HubStream, projection};
 use boss_protocol::{
-    ArchitecturalMismatchEvidence, FrontendEvent, FrontendRequest, ProposalErrorCode, ProposalKind,
-    ProposalSubmissionError, QueueCiEvidence, WorkerProposal,
+    ArchitecturalMismatchEvidence, FrontendRequest, ProposalErrorCode, ProposalKind, ProposalSubmissionError,
+    QueueCiEvidence, WorkerProposal,
 };
 use boss_protocol_spoke::proposal::{
     ANSWER_REPLY, CI_MARK_FAILED, CONFLICT_MARK_FAILED, CONFLICT_PRODUCER, GUIDE_OUTCOME,
@@ -38,12 +35,13 @@ use projection::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::oneshot;
 
 use super::{
-    Dispatch, ServerState, dispatch,
+    ServerState,
     proposals::{self, AttributedCaller, Submission},
-    session_queue::SessionSink,
     worker_events::dispatch_worker_event_fanout,
 };
 
@@ -51,6 +49,8 @@ struct ServerApplier {
     /// Weak, so the projector task never keeps a shut-down engine alive.
     state: Weak<ServerState>,
     drivers: DriverRegistry,
+    /// Accepted submissions whose finish waits until the decision is delivered.
+    pending_finish: Mutex<HashMap<String, proposals::Accepted>>,
 }
 
 /// The applier that routes projected observations into `state`.
@@ -58,12 +58,15 @@ pub(super) fn applier(state: &Arc<ServerState>) -> Arc<dyn ObservationApplier> {
     Arc::new(ServerApplier {
         state: Arc::downgrade(state),
         drivers: DriverRegistry::default(),
+        pending_finish: Mutex::new(HashMap::new()),
     })
 }
 
 /// Start applying what the hub's spokes report, on the engine task scope.
 pub(super) fn start(state: &Arc<ServerState>, stream: &HubStream) {
-    state.restore_spoke_turns();
+    if let Err(reason) = state.restore_spoke_turns() {
+        tracing::warn!(%reason, "cannot restore spoke turn state at projector start; the first event retries it");
+    }
     let projector = stream.projector(
         state.work_db.as_ref().clone(),
         applier(state),
@@ -136,8 +139,16 @@ impl ObservationApplier for ServerApplier {
             None,
         )
         .with_subagent_origin(observation.from_subagent)
-        .with_ingress_seq(ingress_seq);
+        .with_ingress_seq(ingress_seq)
+        .with_observed_at_ms(observation.origin.observed.wall_unix_ms);
         dispatch_worker_event_fanout(&state, &incoming).await;
+        if let Err(reason) = state.restore_spoke_turns() {
+            return Applied::Retry(reason);
+        }
+        if let Err(reason) = state.record_spoke_turn_event(execution_id, &observation.event, observation.from_subagent)
+        {
+            return Applied::Retry(reason);
+        }
         Applied::Done
     }
 
@@ -171,14 +182,14 @@ impl ObservationApplier for ServerApplier {
             Ok(Submission::Replayed(proposal)) => Proposed::Decided(accepted(&proposal, true)),
             Ok(Submission::Accepted(accepted_submission)) => {
                 let decision = accepted(&accepted_submission.proposal, accepted_submission.already_submitted);
-                // Finalize after the decision is recorded so GitHub teardown does
-                // not hold this host's cursor. The finalize sweep covers a crash
-                // between the decision and this task.
-                boss_task_scope::spawn(async move {
-                    let (sent, delivered) = oneshot::channel();
-                    let _ = sent.send(true);
-                    accepted_submission.finish(delivered).await;
-                });
+                // Finish after the projector commits the decision effect. The
+                // oneshot stays unresolved until `decision_settled`, so a
+                // reporting member is not torn down before the spoke is answered.
+                let finish_key = format!("{}:{key}", origin.run.run_id);
+                self.pending_finish
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(finish_key, accepted_submission);
                 Proposed::Decided(decision)
             }
             Err(error) if error.code == ProposalErrorCode::Internal => Proposed::Retry(error.message),
@@ -186,7 +197,21 @@ impl ObservationApplier for ServerApplier {
         }
     }
 
-    async fn run_write(&self, origin: &Origin, contract: &str, payload: &Value, _key: &str) -> Proposed {
+    async fn decision_settled(&self, effect_key: &str, delivered: bool) {
+        let accepted = self
+            .pending_finish
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(effect_key);
+        let Some(accepted) = accepted else {
+            return;
+        };
+        let (sent, delivered_rx) = oneshot::channel();
+        let _ = sent.send(delivered);
+        accepted.finish(delivered_rx).await;
+    }
+
+    async fn run_write(&self, origin: &Origin, contract: &str, payload: &Value, key: &str) -> Proposed {
         let state = match self.state() {
             Ok(state) => state,
             Err(reason) => return Proposed::Retry(reason),
@@ -197,6 +222,17 @@ impl ObservationApplier for ServerApplier {
             Ok(None) => return Proposed::Decided(Decision::refused(format!("execution `{execution_id}` is unknown"))),
             Err(error) => return Proposed::Retry(format!("{error:#}")),
         };
+        match state.work_db.get_spoke_applied_write(key) {
+            Ok(Some(write)) => {
+                return if write.accepted {
+                    Proposed::Decided(accepted_write("already applied"))
+                } else {
+                    Proposed::Decided(Decision::refused(write.reason))
+                };
+            }
+            Ok(None) => {}
+            Err(error) => return Proposed::Retry(format!("{error:#}")),
+        }
         let request = match request_for_run_write(execution_id, contract, payload) {
             Ok(request) => request,
             Err(reason) => return Proposed::Decided(Decision::refused(reason)),
@@ -204,7 +240,7 @@ impl ObservationApplier for ServerApplier {
         if let Some(decision) = replay_or_ownership(&state, execution_id, &work_item_id, &request) {
             return decision;
         }
-        dispatch_run_write(&state, request).await
+        apply_run_write(&state, origin, contract, key, request)
     }
 
     async fn pane(&self, observation: &PaneObservation) -> Applied {
@@ -373,66 +409,212 @@ fn replay_or_ownership(
                 Ok(Some(_)) => None,
             }
         }
-        FrontendRequest::RecordProducerSideConflict {
-            head_branch,
-            base_branch,
-            ..
-        } => match state.work_db.latest_conflict_resolution_for_work_item(work_item_id) {
-            Err(error) => Some(Proposed::Retry(format!("{error:#}"))),
-            Ok(Some(existing))
-                if existing.event_source == "producer_rebase"
-                    && existing.head_branch == *head_branch
-                    && existing.base_branch == *base_branch =>
-            {
-                Some(Proposed::Decided(accepted_write("already recorded")))
-            }
-            _ => None,
-        },
         FrontendRequest::CommentsPostAnswer { .. } => match state.work_db.get_execution(execution_id) {
             Err(error) => Some(Proposed::Retry(format!("{error:#}"))),
-            Ok(execution) if execution.kind != boss_work_db::ExecutionKind::AnswerAgent => None,
-            Ok(execution) => match state
-                .work_db
-                .running_answer_agent_run_for_comment(&execution.work_item_id)
-            {
-                Err(error) => Some(Proposed::Retry(format!("{error:#}"))),
-                Ok(None) => Some(Proposed::Decided(accepted_write("already replied"))),
-                Ok(Some(_)) => None,
-            },
+            Ok(execution) if execution.kind != boss_work_db::ExecutionKind::AnswerAgent => Some(Proposed::Decided(
+                Decision::refused(format!("execution `{execution_id}` is not an answer-agent run")),
+            )),
+            Ok(_) => None,
         },
         _ => None,
     }
 }
 
-async fn dispatch_run_write(state: &Arc<ServerState>, request: FrontendRequest) -> Proposed {
-    let (shutdown_tx, _shutdown_rx) = oneshot::channel();
-    let sink = Arc::new(SessionSink::new(shutdown_tx, state.metrics.clone()));
-    let ctx = Dispatch::builder()
-        .server_state(state.clone())
-        .work_db(state.work_db.clone())
-        .sink(sink.clone())
-        .session_id("spoke-projection")
-        .request_id(format!(
-            "spoke-write-{}",
-            state.accepted_hook_seq.load(std::sync::atomic::Ordering::Relaxed)
-        ))
-        .recv_instant(Instant::now())
-        .decode_ms(0.0)
-        .build();
-    dispatch::dispatch_request(ctx, request, false).await;
-    let event = sink
-        .queue
-        .lock()
-        .expect("session queue lock poisoned")
-        .pop_front()
-        .map(|envelope| envelope.payload);
-    match event {
-        Some(FrontendEvent::WorkError { message } | FrontendEvent::Error { message }) => {
-            Proposed::Decided(Decision::refused(message))
-        }
-        Some(_) => Proposed::Decided(accepted_write("applied")),
-        None => Proposed::Retry("run-scoped write produced no reply".into()),
+fn apply_run_write(
+    state: &ServerState,
+    origin: &Origin,
+    contract: &str,
+    key: &str,
+    request: FrontendRequest,
+) -> Proposed {
+    let application = boss_work_db::SpokeWriteApplication {
+        key,
+        host_id: origin.host_id.as_str(),
+        contract,
+    };
+    let result = match request {
+        FrontendRequest::CommentsPostAnswer { run_id, body } => state
+            .work_db
+            .apply_answer_agent_reply(&run_id, &body, Some(application))
+            .map(|_| ()),
+        FrontendRequest::RecordProducerSideConflict {
+            execution_id,
+            head_branch,
+            base_branch,
+            conflicted_files,
+        } => state
+            .work_db
+            .record_producer_side_conflict(
+                boss_work_db::ProducerConflictInsertInput::builder()
+                    .execution_id(execution_id)
+                    .head_branch(head_branch)
+                    .base_branch(base_branch)
+                    .conflicted_files(conflicted_files)
+                    .application_key(key.to_owned())
+                    .spoke_host_id(origin.host_id.clone())
+                    .build(),
+            )
+            .map(|_| ())
+            .map_err(boss_work_db::SpokeWriteError::from_work),
+        FrontendRequest::CommentsRecordGuideOutcome {
+            run_id,
+            comment_id,
+            disposition,
+            body,
+            request_regeneration,
+        } => apply_guide_outcome(
+            state,
+            &run_id,
+            comment_id,
+            disposition,
+            body,
+            request_regeneration,
+            application,
+        ),
+        FrontendRequest::MarkConflictResolutionFailed {
+            attempt_id,
+            reason,
+            evidence,
+        } => apply_conflict_mark_failed(state, &attempt_id, reason, evidence, application),
+        FrontendRequest::MarkCiRemediationFailed {
+            attempt_id,
+            reason,
+            queue_ci_evidence,
+        } => apply_ci_mark_failed(state, &attempt_id, reason, queue_ci_evidence, application),
+        _ => return Proposed::Decided(Decision::refused("payload contract is not supported by this hub")),
+    };
+    match result {
+        Ok(()) => Proposed::Decided(accepted_write("applied")),
+        Err(boss_work_db::SpokeWriteError::Retry(error)) => Proposed::Retry(format!("{error:#}")),
+        Err(boss_work_db::SpokeWriteError::Refused(reason)) => Proposed::Decided(Decision::refused(reason)),
     }
+}
+
+fn apply_guide_outcome(
+    state: &ServerState,
+    run_id: &str,
+    comment_id: String,
+    disposition: boss_protocol::GuideCommentDisposition,
+    body: String,
+    request_regeneration: bool,
+    application: boss_work_db::SpokeWriteApplication<'_>,
+) -> std::result::Result<(), boss_work_db::SpokeWriteError> {
+    if body.trim().is_empty() {
+        return Err(boss_work_db::SpokeWriteError::refused(
+            "guide outcome body may not be empty",
+        ));
+    }
+    let execution = state
+        .work_db
+        .get_execution(run_id)
+        .map_err(boss_work_db::SpokeWriteError::from_work)?;
+    if execution.kind != boss_work_db::ExecutionKind::RevisionImplementation {
+        return Err(boss_work_db::SpokeWriteError::refused(format!(
+            "run '{run_id}' is not a revision execution"
+        )));
+    }
+    state
+        .work_db
+        .record_guide_comment_outcome(
+            &execution.work_item_id,
+            boss_protocol::GuideCommentOutcome::builder()
+                .comment_id(comment_id)
+                .disposition(disposition)
+                .response(body)
+                .request_regeneration(request_regeneration)
+                .build(),
+        )
+        .map(|_| ())
+        .map_err(boss_work_db::SpokeWriteError::from_work)?;
+    record_accepted_write(state, application)
+}
+
+fn apply_conflict_mark_failed(
+    state: &ServerState,
+    attempt_id: &str,
+    reason: String,
+    evidence: Option<ArchitecturalMismatchEvidence>,
+    application: boss_work_db::SpokeWriteApplication<'_>,
+) -> std::result::Result<(), boss_work_db::SpokeWriteError> {
+    if reason == boss_protocol::CONFLICT_ARCHITECTURAL_MISMATCH_REASON {
+        match state
+            .work_db
+            .record_conflict_architectural_mismatch(attempt_id, evidence.as_ref())
+            .map_err(boss_work_db::SpokeWriteError::from_work)?
+        {
+            Some(_) => return record_accepted_write(state, application),
+            None => {
+                return Err(boss_work_db::SpokeWriteError::refused(format!(
+                    "conflict resolution attempt {attempt_id:?} is unknown or already terminal"
+                )));
+            }
+        }
+    }
+    match state
+        .work_db
+        .mark_conflict_resolution_failed(attempt_id, &reason)
+        .map_err(boss_work_db::SpokeWriteError::from_work)?
+    {
+        Some(_) => record_accepted_write(state, application),
+        None => Err(boss_work_db::SpokeWriteError::refused(format!(
+            "conflict resolution attempt {attempt_id:?} is unknown or already terminal"
+        ))),
+    }
+}
+
+fn apply_ci_mark_failed(
+    state: &ServerState,
+    attempt_id: &str,
+    reason: String,
+    queue_ci_evidence: Option<QueueCiEvidence>,
+    application: boss_work_db::SpokeWriteApplication<'_>,
+) -> std::result::Result<(), boss_work_db::SpokeWriteError> {
+    state
+        .work_db
+        .validate_queue_ci_failure(attempt_id, queue_ci_evidence.as_ref(), &reason)
+        .map_err(boss_work_db::SpokeWriteError::from_work)?;
+    let reason = match queue_ci_evidence {
+        Some(evidence) => format!(
+            "{reason}\nQueue verification: main_sha={} verified_head_sha={} runs={}",
+            evidence.main_sha,
+            evidence.verified_head_sha,
+            evidence
+                .runs
+                .iter()
+                .map(|run| format!("{}: {} (exit {})", run.check_name, run.command, run.exit_code))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+        None => reason,
+    };
+    match state
+        .work_db
+        .mark_ci_remediation_failed(attempt_id, &reason)
+        .map_err(boss_work_db::SpokeWriteError::from_work)?
+    {
+        Some(_) => record_accepted_write(state, application),
+        None => Err(boss_work_db::SpokeWriteError::refused(format!(
+            "ci_remediation attempt {attempt_id:?} is unknown or already terminal"
+        ))),
+    }
+}
+
+fn record_accepted_write(
+    state: &ServerState,
+    application: boss_work_db::SpokeWriteApplication<'_>,
+) -> std::result::Result<(), boss_work_db::SpokeWriteError> {
+    state
+        .work_db
+        .record_spoke_applied_write(&boss_work_db::SpokeAppliedWrite {
+            application_key: application.key.to_owned(),
+            host_id: application.host_id.to_owned(),
+            contract: application.contract.to_owned(),
+            accepted: true,
+            reason: String::new(),
+            result_json: json!({"state": "applied"}).to_string(),
+            created_at_ms: boss_engine_utils::epoch_time::now_epoch_ms() as i64,
+        })
+        .map_err(boss_work_db::SpokeWriteError::from_work)
 }
 
 fn accepted_write(state: &str) -> Decision {

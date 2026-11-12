@@ -965,6 +965,10 @@ mod floor_tests {
                 Box::new(|c| super::super::spoke_projection::migrate_turn_state(c).unwrap()),
             ),
             (
+                super::super::spoke_projection::APPLIED_WRITES_MIGRATION_ID,
+                Box::new(|c| super::super::spoke_projection::migrate_applied_writes(c).unwrap()),
+            ),
+            (
                 super::super::parking::MIGRATION_ID,
                 Box::new(|c| super::super::parking::migrate(c).unwrap()),
             ),

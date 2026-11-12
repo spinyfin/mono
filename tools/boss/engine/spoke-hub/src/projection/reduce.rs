@@ -160,6 +160,9 @@ pub enum Reduction {
 
 /// Reduce one stored frame.
 pub fn reduce(host_id: &str, journal_id: &str, row: &SpokeIngressRow) -> Reduction {
+    if row.frame.is_empty() {
+        return Reduction::Skip(Skip::LiveOnly);
+    }
     let frame = match v1::SpokeFrame::decode(row.frame.as_slice()) {
         Ok(frame) => frame,
         Err(error) => return Reduction::Quarantine(format!("frame does not decode: {error}")),

@@ -85,6 +85,71 @@ pub mod proposal {
         )
     }
 
+    /// Canonical JSON the spoke gateway queues for `boss comment reply`.
+    pub fn answer_reply_body(run_id: impl Into<String>, body: impl Into<String>) -> serde_json::Value {
+        serde_json::json!({"run_id": run_id.into(), "body": body.into()})
+    }
+
+    /// Canonical JSON the spoke gateway queues for `boss comment guide-outcome`.
+    pub fn guide_outcome_body(
+        run_id: impl Into<String>,
+        comment_id: impl Into<String>,
+        disposition: impl Into<String>,
+        body: impl Into<String>,
+        request_regeneration: bool,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "run_id": run_id.into(),
+            "comment_id": comment_id.into(),
+            "disposition": disposition.into(),
+            "body": body.into(),
+            "request_regeneration": request_regeneration,
+        })
+    }
+
+    /// Canonical JSON the spoke gateway queues for `boss engine ci mark-failed`.
+    pub fn ci_mark_failed_body(
+        run_id: impl Into<String>,
+        attempt_id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "run_id": run_id.into(),
+            "attempt_id": attempt_id.into(),
+            "reason": reason.into(),
+            "extra": {},
+        })
+    }
+
+    /// Canonical JSON the spoke gateway queues for `boss engine conflicts mark-failed`.
+    pub fn conflict_mark_failed_body(
+        run_id: impl Into<String>,
+        attempt_id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "run_id": run_id.into(),
+            "attempt_id": attempt_id.into(),
+            "reason": reason.into(),
+            "extra": {},
+        })
+    }
+
+    /// Canonical JSON the spoke gateway queues for producer-side conflict telemetry.
+    pub fn conflict_producer_body(
+        execution_id: impl Into<String>,
+        head_branch: impl Into<String>,
+        base_branch: impl Into<String>,
+        conflicted_files: Vec<String>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "execution_id": execution_id.into(),
+            "head_branch": head_branch.into(),
+            "base_branch": base_branch.into(),
+            "conflicted_files": conflicted_files,
+        })
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;

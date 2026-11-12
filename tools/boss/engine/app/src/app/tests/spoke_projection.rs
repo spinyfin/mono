@@ -215,16 +215,29 @@ impl Fixture {
 
     /// A projector over this engine, like a fresh engine process would have.
     fn projector(&self) -> Projector {
-        Projector::new(
-            self.state.work_db.as_ref().clone(),
-            crate::app::spoke_projection::applier(&self.state),
-            self.wire.clone(),
-            Arc::new(tokio::sync::Notify::new()),
+        self.projector_with(
             ProjectorConfig::builder()
                 .retry_initial(std::time::Duration::from_millis(5))
                 .retry_max(std::time::Duration::from_millis(20))
                 .build(),
         )
+    }
+
+    fn projector_with(&self, config: ProjectorConfig) -> Projector {
+        Projector::new(
+            self.state.work_db.as_ref().clone(),
+            crate::app::spoke_projection::applier(&self.state),
+            self.wire.clone(),
+            Arc::new(tokio::sync::Notify::new()),
+            config,
+        )
+    }
+
+    fn product_id(&self) -> String {
+        match self.state.work_db.get_work_item(&self.work_item_id).unwrap() {
+            boss_protocol::WorkItem::Task(task) | boss_protocol::WorkItem::Chore(task) => task.product_id,
+            other => panic!("fixture work item is not a task or chore: {other:?}"),
+        }
     }
 
     /// The durable state a crash leaves after an application that never reached
@@ -507,7 +520,7 @@ async fn an_awaiting_input_stop_is_restored_as_parked_after_memory_is_cleared() 
         &fx.state,
         &fx.execution_id
     ));
-    fx.state.restore_spoke_turns();
+    fx.state.restore_spoke_turns().unwrap();
     assert!(crate::app::spoke_probes::spoke_parked_for_delivery(
         &fx.state,
         &fx.execution_id
@@ -561,12 +574,12 @@ async fn a_run_scoped_write_is_applied_through_the_local_handler() {
     fx.receive_run_write(
         boss_protocol_spoke::proposal::CONFLICT_PRODUCER,
         "producer-1",
-        json!({
-            "execution_id": fx.execution_id,
-            "head_branch": "feature",
-            "base_branch": "main",
-            "conflicted_files": ["src/lib.rs"],
-        }),
+        boss_protocol_spoke::proposal::conflict_producer_body(
+            &fx.execution_id,
+            "feature",
+            "main",
+            vec!["src/lib.rs".into()],
+        ),
     );
     fx.projector().drain().await;
     let decisions = fx.wire.decisions();
@@ -582,12 +595,12 @@ async fn a_run_scoped_write_is_applied_through_the_local_handler() {
     fx.receive_run_write(
         boss_protocol_spoke::proposal::CONFLICT_PRODUCER,
         "producer-1",
-        json!({
-            "execution_id": fx.execution_id,
-            "head_branch": "feature",
-            "base_branch": "main",
-            "conflicted_files": ["src/lib.rs"],
-        }),
+        boss_protocol_spoke::proposal::conflict_producer_body(
+            &fx.execution_id,
+            "feature",
+            "main",
+            vec!["src/lib.rs".into()],
+        ),
     );
     fx.projector().drain().await;
     assert_eq!(fx.wire.decisions().len(), 1, "the same write is not applied twice");
@@ -599,15 +612,507 @@ async fn a_run_scoped_write_for_another_runs_attempt_is_refused() {
     fx.receive_run_write(
         boss_protocol_spoke::proposal::CONFLICT_MARK_FAILED,
         "mark-1",
-        json!({
-            "run_id": fx.execution_id,
-            "attempt_id": "crz_not_this_run",
-            "reason": "semantic_obsolescence",
-            "extra": {},
-        }),
+        boss_protocol_spoke::proposal::conflict_mark_failed_body(
+            &fx.execution_id,
+            "crz_not_this_run",
+            "semantic_obsolescence",
+        ),
     );
     fx.projector().drain().await;
     let decisions = fx.wire.decisions();
     assert_eq!(decisions.len(), 1);
     assert_eq!(decisions[0].code, ResultCode::Rejected as i32);
+}
+
+#[tokio::test]
+async fn a_producer_write_is_keyed_on_the_submission_not_the_branch_names() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    fx.receive_run_write(
+        boss_protocol_spoke::proposal::CONFLICT_PRODUCER,
+        "producer-a",
+        boss_protocol_spoke::proposal::conflict_producer_body(
+            &fx.execution_id,
+            "feature",
+            "main",
+            vec!["src/a.rs".into()],
+        ),
+    );
+    fx.receive_run_write(
+        boss_protocol_spoke::proposal::CONFLICT_PRODUCER,
+        "producer-b",
+        boss_protocol_spoke::proposal::conflict_producer_body(
+            &fx.execution_id,
+            "feature",
+            "main",
+            vec!["src/b.rs".into()],
+        ),
+    );
+    fx.projector().drain().await;
+    let decisions = fx.wire.decisions();
+    assert_eq!(decisions.len(), 2, "{decisions:?}");
+    assert!(decisions.iter().all(|d| d.code == ResultCode::Ok as i32));
+    let latest = fx
+        .state
+        .work_db
+        .latest_conflict_resolution_for_work_item(&fx.work_item_id)
+        .unwrap()
+        .expect("second producer row");
+    assert!(
+        latest
+            .conflict_diagnosis
+            .as_deref()
+            .is_some_and(|diagnosis| diagnosis.contains("src/b.rs")),
+        "distinct keys record distinct files: {:?}",
+        latest.conflict_diagnosis
+    );
+    fx.crash_before_the_cursor_moved(1);
+    fx.projector().drain().await;
+    let rows = fx
+        .state
+        .work_db
+        .list_conflict_resolutions(None, &[], Some(&fx.work_item_id), None)
+        .unwrap();
+    assert_eq!(rows.len(), 2, "replay of the second key is not a third row");
+}
+
+#[tokio::test]
+async fn an_answer_reply_completes_the_thread_and_survives_a_crash_replay() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    fx.state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET kind = 'answer_agent' WHERE id = ?1",
+            [&fx.execution_id],
+        )
+        .unwrap();
+    let comment = fx
+        .state
+        .work_db
+        .create_comment(
+            boss_protocol::CreateCommentInput::builder()
+                .artifact_kind("work_item")
+                .artifact_id(&fx.work_item_id)
+                .anchor(boss_protocol::CommentAnchor {
+                    exact: "why".into(),
+                    ..Default::default()
+                })
+                .body("why does this retry?")
+                .author("operator")
+                .doc_version("v0")
+                .build(),
+        )
+        .unwrap();
+    fx.state.work_db.transition_comment_to_answering(&comment.id).unwrap();
+    let run = fx
+        .state
+        .work_db
+        .create_answer_agent_run(&comment.id, "work_item", &fx.work_item_id, "v0", 0)
+        .unwrap();
+    fx.state
+        .work_db
+        .bind_answer_agent_run_execution(&run.id, &fx.execution_id)
+        .unwrap();
+    fx.receive_run_write(
+        boss_protocol_spoke::proposal::ANSWER_REPLY,
+        "answer-1",
+        boss_protocol_spoke::proposal::answer_reply_body(&fx.execution_id, "because the backoff is exponential"),
+    );
+    fx.projector().drain().await;
+    assert_eq!(fx.wire.decisions()[0].code, ResultCode::Ok as i32);
+    let answered = fx.state.work_db.get_comment(&comment.id).unwrap().unwrap();
+    assert_eq!(answered.status, boss_protocol::COMMENT_STATUS_ANSWERED);
+    let thread = fx.state.work_db.list_comment_thread_entries(&comment.id).unwrap();
+    assert!(thread.iter().any(|entry| entry.body.contains("exponential")));
+    fx.crash_before_the_cursor_moved(0);
+    fx.projector().drain().await;
+    assert_eq!(
+        fx.state.work_db.list_comment_thread_entries(&comment.id).unwrap().len(),
+        thread.len(),
+        "crash replay does not add a second thread entry"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_answer_attempt_is_refused_instead_of_treated_as_already_replied() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    fx.state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET kind = 'answer_agent' WHERE id = ?1",
+            [&fx.execution_id],
+        )
+        .unwrap();
+    let comment = fx
+        .state
+        .work_db
+        .create_comment(
+            boss_protocol::CreateCommentInput::builder()
+                .artifact_kind("work_item")
+                .artifact_id(&fx.work_item_id)
+                .anchor(boss_protocol::CommentAnchor {
+                    exact: "why".into(),
+                    ..Default::default()
+                })
+                .body("why?")
+                .author("operator")
+                .doc_version("v0")
+                .build(),
+        )
+        .unwrap();
+    fx.state.work_db.transition_comment_to_answering(&comment.id).unwrap();
+    let run = fx
+        .state
+        .work_db
+        .create_answer_agent_run(&comment.id, "work_item", &fx.work_item_id, "v0", 0)
+        .unwrap();
+    fx.state
+        .work_db
+        .bind_answer_agent_run_execution(&run.id, &fx.execution_id)
+        .unwrap();
+    fx.state
+        .work_db
+        .complete_answer_agent_run(
+            &run.id,
+            boss_protocol::ANSWER_AGENT_RUN_STATUS_FAILED,
+            None,
+            Some("stopped"),
+        )
+        .unwrap();
+    fx.receive_run_write(
+        boss_protocol_spoke::proposal::ANSWER_REPLY,
+        "answer-failed",
+        boss_protocol_spoke::proposal::answer_reply_body(&fx.execution_id, "too late"),
+    );
+    fx.projector().drain().await;
+    assert_eq!(fx.wire.decisions()[0].code, ResultCode::Rejected as i32);
+    assert!(
+        fx.state
+            .work_db
+            .list_comment_thread_entries(&comment.id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_guide_outcome_write_uses_canonical_json_and_replays_after_a_crash() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    fx.state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET kind = 'revision_implementation' WHERE id = ?1",
+            [&fx.execution_id],
+        )
+        .unwrap();
+    let (_root, series) = boss_work_db::test_support::seed_published_guide(fx.state.work_db.as_ref(), 9);
+    let comment = boss_work_db::test_support::add_guide_comment(fx.state.work_db.as_ref(), &series, "fix retry");
+    fx.state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_comments SET status = 'in_revision', revise_task_id = ?2 WHERE id = ?1",
+            [&comment.id, &fx.work_item_id],
+        )
+        .unwrap();
+    fx.receive_run_write(
+        boss_protocol_spoke::proposal::GUIDE_OUTCOME,
+        "guide-1",
+        boss_protocol_spoke::proposal::guide_outcome_body(
+            &fx.execution_id,
+            &comment.id,
+            "no_change",
+            "already handled",
+            false,
+        ),
+    );
+    fx.projector().drain().await;
+    assert_eq!(
+        fx.wire.decisions()[0].code,
+        ResultCode::Ok as i32,
+        "{:?}",
+        fx.wire.decisions()
+    );
+    fx.crash_before_the_cursor_moved(0);
+    fx.projector().drain().await;
+    let outcomes: i64 = fx
+        .state
+        .work_db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM guide_comment_outcomes WHERE comment_id = ?1",
+            [&comment.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(outcomes, 1, "crash replay does not record a second guide outcome");
+}
+
+#[tokio::test]
+async fn a_ci_mark_failed_write_uses_canonical_json_and_replays_after_a_crash() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    let attempt = fx
+        .state
+        .work_db
+        .insert_ci_remediation(boss_work_db::CiRemediationInsertInput {
+            product_id: fx.product_id(),
+            work_item_id: fx.work_item_id.clone(),
+            pr_url: PR_URL.into(),
+            pr_number: 9,
+            head_branch: "feature".into(),
+            head_sha_at_trigger: "a".repeat(40),
+            attempt_kind: "fix".into(),
+            consumes_budget: 1,
+            failed_checks: "[]".into(),
+            failure_kind: "pr_branch_ci".into(),
+            before_commit_sha: None,
+        })
+        .unwrap()
+        .expect("pending ci attempt");
+    fx.receive_run_write(
+        boss_protocol_spoke::proposal::CI_MARK_FAILED,
+        "ci-1",
+        boss_protocol_spoke::proposal::ci_mark_failed_body(&fx.execution_id, &attempt.id, "wont_fix"),
+    );
+    fx.projector().drain().await;
+    assert_eq!(
+        fx.wire.decisions()[0].code,
+        ResultCode::Ok as i32,
+        "{:?}",
+        fx.wire.decisions()
+    );
+    let stored = fx.state.work_db.get_ci_remediation(&attempt.id).unwrap().unwrap();
+    assert_eq!(stored.status, "failed");
+    fx.crash_before_the_cursor_moved(0);
+    fx.projector().drain().await;
+    let stored = fx.state.work_db.get_ci_remediation(&attempt.id).unwrap().unwrap();
+    assert_eq!(stored.status, "failed");
+}
+
+#[tokio::test]
+async fn a_conflict_mark_failed_write_uses_canonical_json() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    let attempt = fx
+        .state
+        .work_db
+        .insert_conflict_resolution(boss_work_db::ConflictResolutionInsertInput {
+            product_id: fx.product_id(),
+            work_item_id: fx.work_item_id.clone(),
+            pr_url: PR_URL.into(),
+            pr_number: 9,
+            head_branch: "feature".into(),
+            base_branch: "main".into(),
+            base_sha_at_trigger: Some("base".into()),
+            head_sha_before: Some("head".into()),
+        })
+        .unwrap()
+        .expect("pending conflict attempt");
+    fx.receive_run_write(
+        boss_protocol_spoke::proposal::CONFLICT_MARK_FAILED,
+        "mark-owned",
+        boss_protocol_spoke::proposal::conflict_mark_failed_body(
+            &fx.execution_id,
+            &attempt.id,
+            "semantic_obsolescence",
+        ),
+    );
+    fx.projector().drain().await;
+    assert_eq!(
+        fx.wire.decisions()[0].code,
+        ResultCode::Ok as i32,
+        "{:?}",
+        fx.wire.decisions()
+    );
+    let stored = fx.state.work_db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(stored.status, "failed");
+}
+
+#[tokio::test]
+async fn a_replayed_hook_stamps_last_event_at_from_the_observed_wall_time() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    fx.receive_event(&boss_protocol::WorkerEvent::UserPromptSubmit {
+        session_id: "main".into(),
+        prompt: "go".into(),
+    });
+    fx.projector().drain().await;
+    let last = fx
+        .state
+        .live_worker_states
+        .last_event_at_for_run(&fx.execution_id)
+        .expect("activity time");
+    assert_eq!(last, boss_engine_live_worker_state::iso8601_utc(1));
+}
+
+#[tokio::test]
+async fn a_local_tmux_slot_does_not_record_spoke_turn_state() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    fx.state
+        .worker_registry
+        .register_tmux_run_slot(&fx.execution_id, 1, "boss-worker-1");
+    fx.receive_event(&boss_protocol::WorkerEvent::Stop {
+        session_id: "main".into(),
+        stop_hook_active: false,
+        stop_reason: boss_protocol::StopReason::AwaitingInput,
+    });
+    fx.projector().drain().await;
+    assert!(
+        fx.state.work_db.spoke_turn_states().unwrap().is_empty(),
+        "a local tmux pane is not a spoke turn"
+    );
+}
+
+#[tokio::test]
+async fn a_transient_run_write_failure_retries_and_does_not_store_a_refusal() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    fx.state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch("ALTER TABLE spoke_applied_writes RENAME TO spoke_applied_writes_hidden")
+        .unwrap();
+    fx.receive_run_write(
+        boss_protocol_spoke::proposal::CONFLICT_PRODUCER,
+        "producer-retry",
+        boss_protocol_spoke::proposal::conflict_producer_body(
+            &fx.execution_id,
+            "feature",
+            "main",
+            vec!["src/lib.rs".into()],
+        ),
+    );
+    let projector = fx.projector_with(
+        ProjectorConfig::builder()
+            .retry_initial(std::time::Duration::from_millis(5))
+            .retry_max(std::time::Duration::from_millis(20))
+            .retry_stall(std::time::Duration::from_millis(30))
+            .build(),
+    );
+    let draining = tokio::spawn({
+        let projector = projector.clone();
+        async move { projector.drain().await }
+    });
+    for _ in 0..40 {
+        let stalled = fx
+            .state
+            .work_db
+            .spoke_projection_status()
+            .unwrap()
+            .into_iter()
+            .any(|host| host.stall_reason.is_some());
+        if stalled {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        fx.state
+            .work_db
+            .spoke_projection_status()
+            .unwrap()
+            .iter()
+            .any(|host| host.stall_reason.is_some()),
+        "a host stuck retrying must surface a stall"
+    );
+    fx.state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch("ALTER TABLE spoke_applied_writes_hidden RENAME TO spoke_applied_writes")
+        .unwrap();
+    draining.await.unwrap();
+    let decisions = fx.wire.decisions();
+    assert_eq!(decisions.len(), 1, "{decisions:?}");
+    assert_eq!(decisions[0].code, ResultCode::Ok as i32);
+    assert!(
+        fx.state
+            .work_db
+            .spoke_projection_status()
+            .unwrap()
+            .iter()
+            .all(|host| host.stall_reason.is_none())
+    );
+}
+
+#[tokio::test]
+async fn turn_state_is_restored_on_a_fresh_server_and_a_persist_failure_holds_the_cursor() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    fx.receive_event(&boss_protocol::WorkerEvent::Stop {
+        session_id: "main".into(),
+        stop_hook_active: false,
+        stop_reason: boss_protocol::StopReason::AwaitingInput,
+    });
+    fx.projector().drain().await;
+    assert!(crate::app::spoke_probes::spoke_parked_for_delivery(
+        &fx.state,
+        &fx.execution_id
+    ));
+    let db = (*fx.state.work_db).clone();
+    let (fresh, _dir) = test_server_state_with_overrides(
+        ServerStateOverrides::builder()
+            .work_db(db)
+            .cube_client(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsCube))
+            .execution_runner(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsRunner))
+            .build(),
+    );
+    fresh.restore_spoke_turns().unwrap();
+    assert!(crate::app::spoke_probes::spoke_parked_for_delivery(
+        &fresh,
+        &fx.execution_id
+    ));
+
+    fx.state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch("ALTER TABLE spoke_turn_state RENAME TO spoke_turn_state_hidden")
+        .unwrap();
+    fx.receive_event(&boss_protocol::WorkerEvent::UserPromptSubmit {
+        session_id: "main".into(),
+        prompt: "go".into(),
+    });
+    let projector = fx.projector_with(
+        ProjectorConfig::builder()
+            .retry_initial(std::time::Duration::from_millis(5))
+            .retry_max(std::time::Duration::from_millis(20))
+            .retry_stall(std::time::Duration::from_millis(30))
+            .build(),
+    );
+    let draining = tokio::spawn({
+        let projector = projector.clone();
+        async move { projector.drain().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    assert_eq!(
+        fx.state
+            .work_db
+            .spoke_projection_position(HOST)
+            .unwrap()
+            .unwrap()
+            .applied,
+        1,
+        "a turn-state write failure must not advance the cursor"
+    );
+    fx.state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch("ALTER TABLE spoke_turn_state_hidden RENAME TO spoke_turn_state")
+        .unwrap();
+    draining.await.unwrap();
+    assert_eq!(
+        fx.state
+            .work_db
+            .spoke_projection_position(HOST)
+            .unwrap()
+            .unwrap()
+            .applied,
+        2
+    );
 }

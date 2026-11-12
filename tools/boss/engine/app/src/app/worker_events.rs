@@ -551,6 +551,7 @@ pub(super) fn persist_applied_semantic_progress(
     let origin = HookOrigin {
         ingress_seq: incoming.connection.ingress_seq,
         from_subagent: incoming.connection.from_subagent,
+        observed_at_ms: incoming.connection.observed_at_ms,
     };
     server_state
         .live_worker_states
@@ -568,6 +569,7 @@ pub(super) async fn dispatch_live_worker_state(
     let origin = HookOrigin {
         ingress_seq: incoming.connection.ingress_seq,
         from_subagent: incoming.connection.from_subagent,
+        observed_at_ms: incoming.connection.observed_at_ms,
     };
     tracing::info!(
         run_id = ?incoming.run_id,
@@ -586,7 +588,6 @@ pub(super) async fn dispatch_live_worker_state(
         return;
     };
     server_state.dispatcher_stats.record_last_hook(run_id, event_kind);
-    server_state.record_spoke_turn_event(run_id, &incoming.event, incoming.connection.from_subagent);
     // **Driver-start verification.** A hook is the earliest
     // driver-ORIGINATED evidence Boss ever gets that the driver binary
     // actually executed — a login shell cannot emit one. Record it here,
@@ -778,6 +779,7 @@ pub(super) async fn dispatch_live_worker_state(
         HookOrigin {
             ingress_seq: incoming.connection.ingress_seq,
             from_subagent: incoming.connection.from_subagent,
+            observed_at_ms: incoming.connection.observed_at_ms,
         },
         &incoming.event,
     );

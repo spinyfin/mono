@@ -422,6 +422,7 @@ async fn an_older_accepted_dispatch_persists_the_latest_checkpoint() {
             HookOrigin {
                 ingress_seq: Some(3),
                 from_subagent: false,
+                observed_at_ms: None,
             },
             &stop(&older_id).event,
         );
@@ -560,6 +561,7 @@ async fn a_recycled_slot_never_leaks_its_checkpoint_to_the_prior_run() {
         HookOrigin {
             ingress_seq: Some(1),
             from_subagent: false,
+            observed_at_ms: None,
         },
         &stop(&run_a).event,
     );
@@ -589,6 +591,7 @@ async fn a_recycled_slot_never_leaks_its_checkpoint_to_the_prior_run() {
         HookOrigin {
             ingress_seq: Some(1),
             from_subagent: false,
+            observed_at_ms: None,
         },
         &stop("run-b").event,
     );
