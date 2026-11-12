@@ -31,3 +31,62 @@ pub mod v1 {
 }
 
 pub use validate::{Validate, ValidationError};
+
+/// Whether a spawn reply requires a fresh observation before finalizing launch.
+pub fn spawn_result_is_uncertain(result: &v1::CommandResult) -> bool {
+    use v1::{PaneLife, ResultCode, command_result};
+    match ResultCode::try_from(result.code) {
+        Ok(ResultCode::Rejected | ResultCode::Absent) => false,
+        Ok(ResultCode::Ok) => !matches!(&result.value,
+            Some(command_result::Value::Pane(pane)) if matches!(
+                PaneLife::try_from(pane.life),
+                Ok(PaneLife::Alive | PaneLife::Exited | PaneLife::BriefNotDelivered))),
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod spawn_result_tests {
+    use super::*;
+    use v1::{CommandResult, PaneLife, PaneState, ResultCode, command_result};
+    #[test]
+    fn uncertain_spawn_classification_covers_codes_and_panes() {
+        for code in [ResultCode::Unknown as i32, ResultCode::OutcomeUncertain as i32, 999] {
+            assert!(spawn_result_is_uncertain(&CommandResult {
+                code,
+                ..Default::default()
+            }));
+        }
+        for code in [ResultCode::Rejected, ResultCode::Absent] {
+            assert!(!spawn_result_is_uncertain(&CommandResult {
+                code: code as i32,
+                ..Default::default()
+            }));
+        }
+        for life in [
+            PaneLife::Alive,
+            PaneLife::Exited,
+            PaneLife::BriefNotDelivered,
+            PaneLife::Missing,
+            PaneLife::Indeterminate,
+            PaneLife::PaneUnspecified,
+        ] {
+            let result = CommandResult {
+                code: ResultCode::Ok as i32,
+                value: Some(command_result::Value::Pane(PaneState {
+                    life: life as i32,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            assert_eq!(
+                spawn_result_is_uncertain(&result),
+                !matches!(life, PaneLife::Alive | PaneLife::Exited | PaneLife::BriefNotDelivered)
+            );
+        }
+        assert!(spawn_result_is_uncertain(&CommandResult {
+            code: ResultCode::Ok as i32,
+            ..Default::default()
+        }));
+    }
+}

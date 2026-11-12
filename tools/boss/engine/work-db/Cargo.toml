@@ -30,6 +30,8 @@ boss-host-execution = { path = "../host-execution" }
 boss-metrics = { path = "../metrics" }
 boss-pr-review = { path = "../pr-review" }
 boss-pr-review-sources = { path = "../pr-review-sources" }
+boss-protocol-spoke = { path = "../../protocol-spoke" }
+prost = { workspace = true }
 boss-protocol = { path = "../../protocol" }
 boss-review-guide = { path = "../review-guide" }
 boss-task-scope = { path = "../task-scope" }

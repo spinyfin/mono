@@ -3,6 +3,78 @@ use boss_protocol_spoke::v1::{Cursor, WorkspaceOp};
 use prost::Message;
 
 #[tokio::test]
+async fn definitive_lease_errors_clear_the_in_doubt_flag() {
+    for failure in ["unknown", "parse", "mismatch", "bind", "repo"] {
+        let fx = Fixture::new().await;
+        fx.ready(HOST);
+        let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+        if failure == "repo" {
+            let assignment = fx.db.spoke_assignment_for_execution("exec_1").unwrap().unwrap();
+            fx.db
+                .bind_spoke_repo("exec_1", assignment.assignment_generation, "other")
+                .unwrap();
+            fx.db
+                .set_spoke_in_doubt("exec_1", assignment.assignment_generation, true)
+                .unwrap();
+        }
+        if failure == "bind" {
+            let assignment = fx.db.spoke_assignment_for_execution("exec_1").unwrap().unwrap();
+            fx.db
+                .bind_spoke_lease("exec_1", assignment.assignment_generation, "old", "old-lease", PATH)
+                .unwrap();
+        }
+        let _peer = fx
+            .spoke(
+                Box::new(move |c| {
+                    if workspace_kind(c) != Some(Kind::Lease) {
+                        return standard(c);
+                    }
+                    let value = match failure {
+                        "unknown" => return Some(refused(c, ResultCode::Unknown, "unknown lease")),
+                        "parse" => workspace(c, json!({})),
+                        "mismatch" => {
+                            let command_result::Value::Workspace(mut value) = workspace(c, lease_json()) else {
+                                unreachable!()
+                            };
+                            value.lease_id = "different".into();
+                            command_result::Value::Workspace(value)
+                        }
+                        "bind" => workspace(c, lease_json()),
+                        _ => unreachable!(),
+                    };
+                    Some(ok(c, Some(value)))
+                }),
+                None,
+                0,
+            )
+            .await;
+        let error = adapter
+            .lease_workspace("repo", "task", None, false, &[])
+            .await
+            .unwrap_err();
+        let expected = match failure {
+            "unknown" => "unknown lease",
+            "parse" => "missing field",
+            "mismatch" => "disagrees with its own result",
+            "bind" => "already holds a different lease",
+            "repo" => "already leases in another repository",
+            _ => unreachable!(),
+        };
+        assert!(format!("{error:#}").contains(expected), "{failure}: {error:#}");
+        assert!(
+            error
+                .downcast_ref::<boss_execution_contracts::LeaseOutcomeUncertain>()
+                .is_none(),
+            "{failure}: {error:#}"
+        );
+        assert!(
+            !fx.db.spoke_execution_in_doubt("exec_1").unwrap(),
+            "{failure}: {error:#}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn reset_release_is_clearly_unsent_to_an_old_peer() {
     use boss_protocol_spoke::negotiate::{Contracts, feature};
     let fx = Fixture::new().await;

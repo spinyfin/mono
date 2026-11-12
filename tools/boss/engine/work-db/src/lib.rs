@@ -1131,8 +1131,8 @@ pub use spoke_hub::{
     AmbiguousSpokeAssignment, HOST_COMMAND_LEASE_PREFIX, HOST_COMMAND_SPAWN_PREFIX, HOST_COMMAND_STOP_PREFIX,
     HostOutboxFault, HostTransport, LegacyDestinationHeld, MAX_UNSETTLED_HOST_COMMAND_BYTES,
     MAX_UNSETTLED_HOST_COMMANDS, MIN_RETAINED_SETTLED_HOST_COMMANDS, RunAdmission, SETTLED_HOST_COMMAND_RETENTION_MS,
-    SpokeAssignment, SpokeHeldByOtherHost, SpokeHostInUse, SpokeRunKey, StoredHostCommand, StoredLeaseCommand,
-    host_command_lease_id, host_command_spawn_id, host_command_stop_id,
+    SpokeAssignment, SpokeHeldByOtherHost, SpokeHostInUse, SpokeRelease, SpokeRunKey, StoredHostCommand,
+    StoredLeaseCommand, host_command_lease_id, host_command_spawn_id, host_command_stop_id,
 };
 pub use spoke_ingress::{
     MAX_HOST_INGRESS_BYTES, MAX_HOST_INGRESS_RECORDS, SpokeIngressCommit, SpokeIngressResult, SpokeJournalAdmission,

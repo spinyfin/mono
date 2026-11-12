@@ -793,20 +793,7 @@ impl ServerState {
         self.drain_pending_probes(run_id, ProbeDeliveryState::Dropped, reason);
     }
 
-    /// Settle every probe still queued for `run_id` as [`ProbeDeliveryState::Abandoned`],
-    /// because the run is going away: its pane is being released, so no
-    /// delivery boundary will ever arrive.
-    ///
-    /// Called from [`ServerState::release_worker_pane`], which is the single
-    /// choke point every teardown path funnels through (completion, `bossctl
-    /// agents stop`, the stale/terminal/dead-pid sweeps, engine shutdown).
-    /// Without this a probe accepted with a `next_turn_boundary` commitment
-    /// outlives the run it was addressed to and reports `queued` forever.
-    ///
-    /// Returns the drained probe ids so a caller that just minted a probe
-    /// (`handle_probe_run`'s post-insert re-check) can tell whether its own
-    /// probe was among the ones abandoned, without hand-copying this
-    /// function's drain-and-log body.
+    /// Settle queued and in-flight probes for a run whose pane is being released, and forget its spoke turn state.
     pub(super) async fn settle_probes_for_released_run(&self, run_id: &str) {
         self.spoke_turns.forget(run_id);
         let abandoned = self.abandon_pending_probes_for_terminated_run(run_id, "worker pane released");
@@ -828,6 +815,20 @@ impl ServerState {
         }
     }
 
+    /// Settle every probe still queued for `run_id` as [`ProbeDeliveryState::Abandoned`],
+    /// because the run is going away: its pane is being released, so no
+    /// delivery boundary will ever arrive.
+    ///
+    /// Called from [`ServerState::release_worker_pane`], which is the single
+    /// choke point every teardown path funnels through (completion, `bossctl
+    /// agents stop`, the stale/terminal/dead-pid sweeps, engine shutdown).
+    /// Without this a probe accepted with a `next_turn_boundary` commitment
+    /// outlives the run it was addressed to and reports `queued` forever.
+    ///
+    /// Returns the drained probe ids so a caller that just minted a probe
+    /// (`handle_probe_run`'s post-insert re-check) can tell whether its own
+    /// probe was among the ones abandoned, without hand-copying this
+    /// function's drain-and-log body.
     pub(super) fn abandon_pending_probes_for_terminated_run(&self, run_id: &str, cause: &str) -> Vec<String> {
         let ids = self.drain_pending_probes(
             run_id,

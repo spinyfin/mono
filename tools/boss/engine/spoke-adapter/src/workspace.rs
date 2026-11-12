@@ -190,105 +190,101 @@ impl SpokeHostAdapter {
         exclude_workspace_ids: &[&str],
     ) -> Result<CubeWorkspaceLease> {
         let assignment = self.bound_open().await?;
-        let (execution, generation, repo) = (
-            assignment.execution_id.clone(),
-            assignment.assignment_generation,
-            repo_id.to_owned(),
-        );
-        self.db(move |db| db.bind_spoke_repo(&execution, generation, &repo))
-            .await?;
-        let op = WorkspaceOp {
-            kind: Kind::Lease.into(),
-            repo_id: repo_id.to_owned(),
-            workspace_id: prefer_workspace_id.unwrap_or_default().to_owned(),
-            task_label: clip(task, 1000),
-            allow_dirty,
-            exclude_workspace_ids: exclude_workspace_ids.iter().map(|id| (*id).to_owned()).collect(),
-            ..Default::default()
-        };
-        // A lease that settled as a refusal, or as uncertain with no lease to
-        // show for it, is asked again as a new recorded attempt: the host
-        // recognises its own lease by the run, so a new id cannot make a second.
-        let id = self
-            .hub
-            .current_attempt(
-                self.host_name(),
-                &host_command_lease_id(&assignment.run_id, request_digest(&op.encode_to_vec())),
-                lease_attempt_is_spent,
-            )
-            .await?;
-        self.set_doubt(&assignment, true).await?;
-        let sent = self
-            .hub
-            .send_stable(
-                self.host_name(),
-                "lease",
-                id.clone(),
-                Some(run_of(&assignment)),
-                command::Body::Workspace(op),
-                self.hub.config.command_deadline,
-            )
-            .await;
-        let uncertain = |reason: String, settled: bool| {
-            anyhow::Error::new(LeaseOutcomeUncertain {
-                host_id: self.host_name().to_owned(),
-                command_id: id.clone(),
-                reason,
-                settled,
-            })
-        };
-        let result = match sent {
-            Ok(result) => result,
-            Err(HostCallError::Uncertain { reason, .. }) => return Err(uncertain(reason, false)),
-            Err(error) => {
-                // A command that was never stored cannot have leased anything.
-                if self.hub_command_unknown(&id).await? {
-                    self.set_doubt(&assignment, false).await?;
-                }
-                return Err(error.into());
-            }
-        };
-        let code = ResultCode::try_from(result.code).unwrap_or(ResultCode::ResultUnspecified);
-        // A lease recovered after a lost reply is reported as uncertain because
-        // its setup may not have finished, but it is a real lease and the run
-        // owns it: bind it so the work continues and can release it.
-        let recovered = code == ResultCode::OutcomeUncertain
-            && matches!(&result.value, Some(command_result::Value::Workspace(w)) if !w.lease_id.is_empty());
-        if matches!(code, ResultCode::Rejected | ResultCode::Absent) {
+        let outcome = async {
+            let (execution, generation, repo) = (
+                assignment.execution_id.clone(),
+                assignment.assignment_generation,
+                repo_id.to_owned(),
+            );
+            self.db(move |db| db.bind_spoke_repo(&execution, generation, &repo))
+                .await?;
+            let op = WorkspaceOp {
+                kind: Kind::Lease.into(),
+                repo_id: repo_id.to_owned(),
+                workspace_id: prefer_workspace_id.unwrap_or_default().to_owned(),
+                task_label: clip(task, 1000),
+                allow_dirty,
+                exclude_workspace_ids: exclude_workspace_ids.iter().map(|id| (*id).to_owned()).collect(),
+                ..Default::default()
+            };
+            // A lease that settled as a refusal, or as uncertain with no lease to
+            // show for it, is asked again as a new recorded attempt: the host
+            // recognises its own lease by the run, so a new id cannot make a second.
+            let id = self
+                .hub
+                .current_attempt(
+                    self.host_name(),
+                    &host_command_lease_id(&assignment.run_id, request_digest(&op.encode_to_vec())),
+                    lease_attempt_is_spent,
+                )
+                .await?;
+            self.set_doubt(&assignment, true).await?;
+            let sent = self
+                .hub
+                .send_stable(
+                    self.host_name(),
+                    "lease",
+                    id.clone(),
+                    Some(run_of(&assignment)),
+                    command::Body::Workspace(op),
+                    self.hub.config.command_deadline,
+                )
+                .await;
+            let uncertain = |reason: String, settled: bool| {
+                anyhow::Error::new(LeaseOutcomeUncertain {
+                    host_id: self.host_name().to_owned(),
+                    command_id: id.clone(),
+                    reason,
+                    settled,
+                })
+            };
+            let result = match sent {
+                Ok(result) => result,
+                Err(HostCallError::Uncertain { reason, .. }) => return Err(uncertain(reason, false)),
+                Err(error) => return Err(error.into()),
+            };
+            let code = ResultCode::try_from(result.code).unwrap_or(ResultCode::ResultUnspecified);
+            // A lease recovered after a lost reply is reported as uncertain because
+            // its setup may not have finished, but it is a real lease and the run
+            // owns it: bind it so the work continues and can release it.
+            let recovered = code == ResultCode::OutcomeUncertain
+                && matches!(&result.value, Some(command_result::Value::Workspace(w)) if !w.lease_id.is_empty());
+            let result = if recovered {
+                tracing::warn!(host = self.host_name(), run = %assignment.run_id, "recovered an interrupted lease; setup completion is unknown");
+                result
+            } else if code == ResultCode::OutcomeUncertain {
+                return Err(uncertain(
+                    if result.reason.is_empty() {
+                        "the host reported an uncertain outcome".to_owned()
+                    } else {
+                        result.reason
+                    },
+                    true,
+                ));
+            } else {
+                expect_ok(self.host_name(), "lease", result)?
+            };
+            let granted = Self::workspace_value(self.host_name(), "lease", result)?;
+            let lease: CubeWorkspaceLease = json(&granted, "lease")?;
+            ensure!(
+                lease.workspace_id == granted.workspace_id && lease.lease_id == granted.lease_id,
+                "host {} answered a lease that disagrees with its own result",
+                self.host_name()
+            );
+            let (execution, workspace, lease_id, path) = (
+                assignment.execution_id.clone(),
+                lease.workspace_id.clone(),
+                lease.lease_id.clone(),
+                lease.workspace_path.display().to_string(),
+            );
+            self.db(move |db| db.bind_spoke_lease(&execution, generation, &workspace, &lease_id, &path))
+                .await?;
+            Ok(lease)
+        }.await;
+        if !matches!(&outcome, Err(error) if error.chain().any(|cause| cause.is::<LeaseOutcomeUncertain>())) {
             self.set_doubt(&assignment, false).await?;
         }
-        let result = if recovered {
-            tracing::warn!(host = self.host_name(), run = %assignment.run_id, "recovered an interrupted lease; setup completion is unknown");
-            result
-        } else if code == ResultCode::OutcomeUncertain {
-            return Err(uncertain(
-                if result.reason.is_empty() {
-                    "the host reported an uncertain outcome".to_owned()
-                } else {
-                    result.reason
-                },
-                true,
-            ));
-        } else {
-            expect_ok(self.host_name(), "lease", result)?
-        };
-        let granted = Self::workspace_value(self.host_name(), "lease", result)?;
-        let lease: CubeWorkspaceLease = json(&granted, "lease")?;
-        ensure!(
-            lease.workspace_id == granted.workspace_id && lease.lease_id == granted.lease_id,
-            "host {} answered a lease that disagrees with its own result",
-            self.host_name()
-        );
-        let (execution, workspace, lease_id, path) = (
-            assignment.execution_id.clone(),
-            lease.workspace_id.clone(),
-            lease.lease_id.clone(),
-            lease.workspace_path.display().to_string(),
-        );
-        self.db(move |db| db.bind_spoke_lease(&execution, generation, &workspace, &lease_id, &path))
-            .await?;
-        self.set_doubt(&assignment, false).await?;
-        Ok(lease)
+        outcome
     }
 
     /// Replay the stored lease command (the same id) and bind a late grant.
@@ -401,12 +397,6 @@ impl SpokeHostAdapter {
             .await
     }
 
-    /// Whether no command with this id was ever stored for the host.
-    async fn hub_command_unknown(&self, id: &str) -> Result<bool> {
-        let (host, id) = (self.host_name().to_owned(), id.to_owned());
-        Ok(self.db(move |db| db.host_command_wire(&host, &id)).await?.is_none())
-    }
-
     /// Whether this run has a spawn that may have started a worker. A spawn the
     /// host has not answered stays deliverable, so no present answer about the
     /// worker's session can end the doubt: the session may simply not exist yet.
@@ -438,10 +428,7 @@ impl SpokeHostAdapter {
             (Some(_), None) => StoredSpawn::Unanswered,
             (Some(_), Some(bytes)) => {
                 let result = boss_protocol_spoke::v1::CommandResult::decode(bytes.as_slice())?;
-                if matches!(
-                    ResultCode::try_from(result.code),
-                    Ok(ResultCode::Ok | ResultCode::Rejected | ResultCode::Absent)
-                ) {
+                if !boss_protocol_spoke::spawn_result_is_uncertain(&result) {
                     StoredSpawn::Settled
                 } else {
                     StoredSpawn::SettledUncertain

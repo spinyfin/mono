@@ -3,7 +3,6 @@
 //! item once the wait exceeds its bound, and resolve it when the host answers.
 use super::*;
 use boss_execution_contracts::WorkerLife;
-use boss_protocol::ExecutionKind;
 
 impl ExecutionCoordinator {
     /// Park an attempt whose spoke lease the host has not answered: back to
@@ -194,10 +193,23 @@ impl ExecutionCoordinator {
                 return;
             }
         };
-        if execution.status.is_live() {
-            if self.is_driving_run(execution_id) {
+        // The normal driver owns launch and terminal release until it exits.
+        if self.is_driving_run(execution_id) {
+            return;
+        }
+        match self.work_db.spoke_assignment_needs_recovery(execution_id) {
+            Ok(false) => {
+                self.clear_spoke_in_doubt(execution_id);
+                self.resolve_spoke_in_doubt_attention(execution_id);
                 return;
             }
+            Ok(true) => {}
+            Err(error) => {
+                tracing::warn!(execution_id, %error, "could not read stored spoke recovery state");
+                return;
+            }
+        }
+        if execution.status.is_live() {
             match self.resume_pane_spawn_for_running_execution(&execution).await {
                 Ok(()) => {}
                 Err(error) => tracing::warn!(
@@ -260,6 +272,37 @@ impl ExecutionCoordinator {
                 return;
             }
         };
+        let release_started = match self.work_db.spoke_assignment_release(execution_id) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(execution_id, %error, "could not read stored workspace release");
+                return;
+            }
+        };
+        if let Some(release) = release_started {
+            // A durable release follows the normal cleanup proof. Reuse its
+            // stable command; another Stop could race the host releasing it.
+            let Some(lease_id) = assignment.lease_id.as_deref() else {
+                return;
+            };
+            let result = match release {
+                boss_work_db::SpokeRelease::Normal => adapter.release_workspace(lease_id).await,
+                boss_work_db::SpokeRelease::Reset => adapter.release_workspace_with_reset(lease_id).await,
+                boss_work_db::SpokeRelease::Force(reason) => adapter.force_release_lease(lease_id, Some(&reason)).await,
+            };
+            match result {
+                Ok(()) => {
+                    if let Err(error) = self.work_db.clear_execution_workspace(execution_id) {
+                        tracing::warn!(execution_id, %error, "could not clear released workspace");
+                        return;
+                    }
+                    self.release_in_doubt_persona(execution_id);
+                    self.resolve_spoke_in_doubt_attention(execution_id);
+                }
+                Err(error) => tracing::warn!(execution_id, %error, "stored workspace release is still unresolved"),
+            }
+            return;
+        }
         let released = if has_spawn {
             match adapter.observe_worker(execution_id).await {
                 Ok(Some(pane)) if !matches!(pane.life, WorkerLife::Exited | WorkerLife::Missing) => {
@@ -359,7 +402,10 @@ impl ExecutionCoordinator {
             }
             Ok(None) => Ok(true),
             Err(error) if waitable_spoke_lease(&error).is_some() => Ok(false),
-            Err(error) => Err(error),
+            Err(error) => {
+                self.clear_spoke_in_doubt(&execution.id);
+                Err(error)
+            }
         }
     }
 
@@ -412,6 +458,35 @@ impl ExecutionCoordinator {
         }
     }
 
+    /// Drop the in-doubt flag once the spawn has a definitive answer. Returns
+    /// whether the flag was set.
+    pub(super) fn clear_spoke_in_doubt(&self, execution_id: &str) -> bool {
+        let assignment = match self.work_db.spoke_assignment_for_execution(execution_id) {
+            Ok(Some(assignment)) => assignment,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(execution_id, error = %format!("{error:#}"), "could not read the spoke assignment to clear its in-doubt flag");
+                return false;
+            }
+        };
+        match self.work_db.spoke_execution_in_doubt(execution_id) {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(error) => {
+                tracing::warn!(execution_id, error = %format!("{error:#}"), "could not read the spoke in-doubt flag");
+                return false;
+            }
+        }
+        if let Err(error) = self
+            .work_db
+            .set_spoke_in_doubt(execution_id, assignment.assignment_generation, false)
+        {
+            tracing::warn!(execution_id, error = %format!("{error:#}"), "could not clear the spoke in-doubt flag");
+            return false;
+        }
+        true
+    }
+
     /// The host answered: whatever was in doubt is settled.
     pub(super) fn resolve_spoke_in_doubt_attention(&self, execution_id: &str) {
         if let Err(error) = self
@@ -420,30 +495,6 @@ impl ExecutionCoordinator {
         {
             tracing::warn!(execution_id, error = %format!("{error:#}"), "could not resolve the in-doubt spoke attention item");
         }
-    }
-
-    /// Refresh the owning review-guide card after a pre-start failure. The
-    /// attempt row is already terminal; this is the board-invalidation the
-    /// comparison-id `work_item_id` cannot provide on its own.
-    pub(super) fn notify_review_guide_pre_start_failure(&self, execution: &WorkExecution) {
-        if execution.kind != ExecutionKind::PrReviewGuide {
-            return;
-        }
-        let work_db = self.work_db.clone();
-        let publisher = self.publisher.clone();
-        let lifecycle = self.lifecycle.clone();
-        let execution_id = execution.id.clone();
-        boss_task_scope::spawn(async move {
-            let Ok(Some(attempt)) = work_db.pr_review_guide_attempt_for_execution(&execution_id) else {
-                return;
-            };
-            let Ok(Some(root_task_id)) = work_db.root_task_id_for_review_guide_series(&attempt.series_id) else {
-                return;
-            };
-            lifecycle
-                .notify_review_guide_changed(&publisher, &root_task_id, "review_guide_failed")
-                .await;
-        });
     }
 }
 
