@@ -6,7 +6,9 @@
 //! Recovery pointers are saved before positioning and restored afterward;
 //! baseline maintenance cannot override the published resolution outcome.
 //!
-//! Rung 0 applies deterministic resolvers to residual conflicts. Every
+//! Rung 0 applies deterministic resolvers to residual conflicts: lockfile
+//! regeneration, the operator's per-path rules from the Boss-side
+//! `conflict-recipes.toml`, and keep-both for same-spot insertions. Every
 //! file must resolve and the result must push before the attempt retires.
 //! Otherwise a bounded residue qualifies for the small rung-2 worker;
 //! larger conflicts use the full rung-3 worker. Worker dispatch acquires
@@ -22,7 +24,9 @@
 //! Attempts deduplicate identical base/head states, and the churn guard
 //! bounds attempts across changing states.
 
-use boss_deterministic_resolvers::{ConflictedFile, RegistryResolution, ResolvedFile, ResolverRegistry};
+use boss_deterministic_resolvers::{
+    ConflictRecipesStore, ConflictRules, ConflictedFile, RegistryResolution, ResolvedFile, ResolverRegistry,
+};
 use boss_protocol::{CreateAttentionItemInput, FrontendEvent};
 
 use boss_execution_contracts::{CubeClient, ExecutionPublisher};
@@ -32,13 +36,67 @@ use crate::work::{ConflictResolution, PendingMergeCheck, WorkDb};
 use boss_host_execution::types::CubeWorkspaceLease;
 
 /// Builds the rung-0 resolver registry for a base revision (e.g.
-/// `main@origin`). Production uses [`builtin_resolvers`]; tests inject a
-/// registry whose resolvers do not need a host toolchain.
+/// `main@origin`). Production uses [`configured_resolvers`] over the
+/// operator's rules; tests inject a registry whose resolvers do not need a
+/// host toolchain.
 pub(crate) type ResolverFactory<'a> = &'a (dyn Fn(&str) -> ResolverRegistry + Send + Sync);
 
-/// The shipped lockfile/append-union resolvers, seeded from `base_revision`.
+/// The shipped lockfile and keep-both resolvers, seeded from `base_revision`.
+#[cfg(test)]
 pub(crate) fn builtin_resolvers(base_revision: &str) -> ResolverRegistry {
     ResolverRegistry::with_builtins_from_base(base_revision)
+}
+
+/// The operator's per-path conflict rules, read from
+/// `conflict-recipes.toml` beside the work database. The file is Boss-side
+/// configuration, never part of a product repository, so a PR cannot
+/// change what the engine runs on its own conflict.
+///
+/// Read once per attempt, so an edit takes effect on the next conflict
+/// without a restart. A missing file is the normal case and yields no
+/// rules. A file that does not parse yields no rules either, and says so:
+/// half of a broken rule file is not applied.
+pub(crate) fn load_conflict_rules(work_db: &WorkDb) -> ConflictRules {
+    if work_db.is_in_memory() {
+        return ConflictRules::default();
+    }
+    let Some(state_root) = work_db.path().parent() else {
+        return ConflictRules::default();
+    };
+    let store = ConflictRecipesStore::new(ConflictRecipesStore::default_path(state_root));
+    match store.load_rules() {
+        Ok(rules) => {
+            if !rules.is_empty() {
+                tracing::info!(
+                    path = %store.path().display(),
+                    recipes = rules.recipes.len(),
+                    keep_both_rules = rules.keep_both.len(),
+                    "conflict_ladder: loaded per-path conflict rules for rung 0",
+                );
+            }
+            rules
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %store.path().display(),
+                error = %format!("{err:#}"),
+                "conflict_ladder: conflict rules file is invalid; rung 0 runs with the built-in resolvers only",
+            );
+            ConflictRules::default()
+        }
+    }
+}
+
+/// The shipped resolvers plus `rules`, seeded from `base_revision`. Rules
+/// that do not compile are dropped as a set, with a warning.
+pub(crate) fn configured_resolvers(rules: &ConflictRules, base_revision: &str) -> ResolverRegistry {
+    ResolverRegistry::with_rules_from_base(base_revision, rules).unwrap_or_else(|err| {
+        tracing::warn!(
+            error = %err,
+            "conflict_ladder: a per-path conflict rule is invalid; rung 0 runs with the built-in resolvers only",
+        );
+        ResolverRegistry::with_builtins_from_base(base_revision)
+    })
 }
 
 /// A leased workspace plus the resolver registry rung 0 uses against it.
@@ -223,7 +281,9 @@ pub(crate) async fn try_mechanical_rungs(
     candidate: &PendingMergeCheck,
     attempt: &ConflictResolution,
 ) -> LadderOutcome {
-    try_mechanical_rungs_with(work_db, publisher, cube_client, candidate, attempt, &builtin_resolvers).await
+    let rules = load_conflict_rules(work_db);
+    let resolvers = |base_revision: &str| configured_resolvers(&rules, base_revision);
+    try_mechanical_rungs_with(work_db, publisher, cube_client, candidate, attempt, &resolvers).await
 }
 
 /// [`try_mechanical_rungs`] with an injectable rung-0 resolver registry.

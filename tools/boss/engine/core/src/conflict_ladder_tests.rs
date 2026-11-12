@@ -967,7 +967,7 @@ async fn rung0_declines_both_no_resolver_and_resolver_ran_files_together() {
     // Regression coverage for the decline-log mislabeling defect: a residue
     // can mix a file no resolver claims at all ("docs/readme.md") with a
     // file a resolver *does* claim (`lib.rs`, per
-    // `RegistryAppendUnionResolver::applies_to`) but that resolver itself
+    // `KeepBothUnionResolver::applies_to`) but that resolver itself
     // declines (here because the workspace path doesn't exist, so its read
     // fails) — the two are genuinely different failure classes
     // (`DeclinedFile::matched_resolver`) and the ladder must fall through
@@ -1371,4 +1371,163 @@ async fn lockfile_only_conflict_with_failing_resolver_never_falls_through_to_a_w
     let (status, reason) = chore_state(&db, &chore_id);
     assert_eq!(status, "Blocked");
     assert_eq!(reason.as_deref(), Some("merge_conflict"));
+}
+
+// ──────────────── per-path rules and keep-both at rung 0 ────────────────
+//
+// These go through `try_mechanical_rungs`, the production entry point, so
+// they cover the rules being read from the file beside the work database
+// and reaching the registry rung 0 uses. The rule under test needs no
+// formatter, which keeps the tests free of host tools; the keep-both
+// logic itself is unit-tested in the resolver crate.
+
+/// A list file in which both sides added one entry at the same spot.
+const SAME_SPOT_INSERTIONS: &str = "alpha\n<<<<<<< Conflict 1 of 1\n%%%%%%% Changes from base to side #1\n+from-main\n+++++++ Contents of side #2\nfrom-pr\n>>>>>>> Conflict 1 of 1 ends\nomega\n";
+
+const KEEP_BOTH_RULE: &str = "[[keep_both]]\nname = \"entry_list\"\nglob = \"registry.list\"\n";
+
+/// A leased workspace holding `registry.list` with [`SAME_SPOT_INSERTIONS`].
+fn conflicted_list_workspace() -> tempfile::TempDir {
+    let ws = tempdir().unwrap();
+    std::fs::write(ws.path().join("registry.list"), SAME_SPOT_INSERTIONS).unwrap();
+    ws
+}
+
+#[tokio::test]
+async fn rung0_applies_a_per_path_rule_from_the_recipes_file_beside_the_database() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    std::fs::write(dir.path().join("conflict-recipes.toml"), KEEP_BOTH_RULE).unwrap();
+    let (candidate, attempt, chore_id) = blocked_with_attempt(&db);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let ws = conflicted_list_workspace();
+    let cube = ScriptCube::with_workspace_path(
+        Script::Conflicts(vec!["registry.list".to_owned()]),
+        ws.path().to_path_buf(),
+    );
+
+    let outcome = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate, &attempt).await;
+
+    assert_eq!(outcome, LadderOutcome::Retired);
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("registry.list")).unwrap(),
+        "alpha\nfrom-main\nfrom-pr\nomega\n",
+        "both insertions must be kept, the base branch's first"
+    );
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.status, "succeeded");
+    assert_eq!(row.resolved_by_rung, Some(0));
+    assert!(
+        row.revision_task_id.is_none(),
+        "no worker revision for a keep-both rule"
+    );
+    assert_eq!(*cube.pushes.lock().await, vec![42]);
+    let (status, reason) = chore_state(&db, &chore_id);
+    assert_eq!(status, "InReview");
+    assert!(reason.is_none(), "block should be cleared, got {reason:?}");
+}
+
+#[tokio::test]
+async fn rung0_without_a_rule_leaves_the_same_conflict_to_a_worker() {
+    // No recipes file: the rule mechanism is inert until an operator
+    // writes one, and nothing built in claims this path.
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, _chore_id) = blocked_with_attempt(&db);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let ws = conflicted_list_workspace();
+    let cube = ScriptCube::with_workspace_path(
+        Script::Conflicts(vec!["registry.list".to_owned()]),
+        ws.path().to_path_buf(),
+    );
+
+    let outcome = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate, &attempt).await;
+
+    assert!(
+        matches!(
+            outcome,
+            LadderOutcome::FellThrough {
+                residual_conflict_files: Some(1),
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert!(cube.pushes.lock().await.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("registry.list")).unwrap(),
+        SAME_SPOT_INSERTIONS,
+        "an unresolved file must be left exactly as it was"
+    );
+}
+
+#[tokio::test]
+async fn rung0_keep_both_resolution_is_still_halted_by_the_deletion_tripwire() {
+    // Keeping both sides is preserving by construction, but the tripwire
+    // judges the pushed result, not the resolver's intent. A flagged
+    // deletion halts a keep-both resolution like any other.
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    std::fs::write(dir.path().join("conflict-recipes.toml"), KEEP_BOTH_RULE).unwrap();
+    let (candidate, attempt, chore_id) = blocked_with_attempt(&db);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let ws = conflicted_list_workspace();
+    let cube = ScriptCube {
+        tripwire_findings: vec!["`registry.list` — added by a merged parent, removed by this resolution".to_owned()],
+        workspace_path: ws.path().to_path_buf(),
+        ..ScriptCube::new(Script::Conflicts(vec!["registry.list".to_owned()]))
+    };
+
+    let outcome = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate, &attempt).await;
+
+    assert_eq!(outcome, LadderOutcome::HaltedForSignoff);
+    let (status, reason) = chore_state(&db, &chore_id);
+    assert_eq!(status, "Blocked");
+    assert_eq!(reason.as_deref(), Some("deletion_signoff"));
+    let typed = pub_.typed_events.lock().await;
+    assert!(
+        !typed
+            .iter()
+            .any(|(_, e)| matches!(e, FrontendEvent::ConflictResolutionSucceeded { .. })),
+        "a tripwire-halted attempt must not publish ConflictResolutionSucceeded"
+    );
+}
+
+#[tokio::test]
+async fn an_invalid_recipes_file_applies_none_of_its_rules() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    // The first rule is fine; the second has an unparsable glob.
+    std::fs::write(
+        dir.path().join("conflict-recipes.toml"),
+        format!("{KEEP_BOTH_RULE}\n[[keep_both]]\nname = \"broken\"\nglob = \"[\"\n"),
+    )
+    .unwrap();
+    assert!(load_conflict_rules(&db).is_empty());
+
+    let (candidate, attempt, _chore_id) = blocked_with_attempt(&db);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let ws = conflicted_list_workspace();
+    let cube = ScriptCube::with_workspace_path(
+        Script::Conflicts(vec!["registry.list".to_owned()]),
+        ws.path().to_path_buf(),
+    );
+
+    let outcome = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate, &attempt).await;
+
+    assert!(matches!(outcome, LadderOutcome::FellThrough { .. }), "{outcome:?}");
+    assert!(cube.pushes.lock().await.is_empty());
+}
+
+#[test]
+fn conflict_rules_are_read_from_beside_the_work_database() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    assert!(load_conflict_rules(&db).is_empty(), "no file means no rules");
+
+    std::fs::write(dir.path().join("conflict-recipes.toml"), KEEP_BOTH_RULE).unwrap();
+    let rules = load_conflict_rules(&db);
+    assert_eq!(rules.keep_both.len(), 1);
+    assert_eq!(rules.keep_both[0].name, "entry_list");
+    assert!(rules.recipes.is_empty());
 }

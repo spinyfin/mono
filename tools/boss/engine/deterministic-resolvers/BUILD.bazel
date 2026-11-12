@@ -1,5 +1,5 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 
 exports_files(["Cargo.toml"])
 
@@ -35,4 +35,14 @@ rust_test(
         normal = True,
         normal_dev = True,
     ),
+)
+
+# Offline entry point for the conflict replay under
+# //tools/boss/scripts/conflict-replay: runs the keep-both resolver on one
+# recorded conflict. Not shipped with the engine.
+rust_binary(
+    name = "keep_both_replay",
+    srcs = ["examples/keep_both_replay.rs"],
+    edition = "2024",
+    deps = [":deterministic-resolvers"],
 )

@@ -11,6 +11,23 @@
 //! every [`ConflictRecipe`]; this module owns the recipe data type and
 //! its boss-side config file.
 //!
+//! The same file carries a second kind of per-path rule, the
+//! [`KeepBothRule`]: for the paths it names, a conflict where both sides
+//! inserted at the same spot is resolved by keeping both insertions. The
+//! built-in keep-both resolver does that for whole Rust items and imports
+//! in any file; a rule extends it to statements and list entries, which
+//! is only right for a list the operator knows is append-only (a
+//! migration list, a registry array).
+//!
+//! ## Registration order
+//!
+//! The engine registers the built-in lockfile resolvers first, then every
+//! `[[recipe]]` in file order, then every `[[keep_both]]` rule in file
+//! order, then the built-in keep-both resolver. The first resolver whose
+//! pattern matches a path handles it, so a rule for a Rust path takes
+//! precedence over the built-in keep-both resolver, and no rule can
+//! displace a lockfile resolver.
+//!
 //! ## Trust boundary — boss-side config only
 //!
 //! Per the design's explicit recommendation, this module loads recipes
@@ -67,19 +84,64 @@ pub struct ConflictRecipe {
     pub workdir: Option<String>,
 }
 
-/// On-disk file shape: a flat list of recipes under a `[[recipe]]`
-/// TOML array-of-tables, e.g.:
+/// One per-path keep-both rule: for files matching `glob`, resolve a
+/// conflict in which both sides inserted lines at the same spot by
+/// keeping both insertions, side #1's (the base branch's) first.
+///
+/// The rule accepts any self-contained insertion, statements and list
+/// entries included, so it belongs only on paths where two additions are
+/// independent of each other and of their order. It still refuses a file
+/// where a conflict edits existing lines, where an insertion is not
+/// self-contained, or where both sides added the same line.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct KeepBothRule {
+    /// Stable identifier, used in summaries and decline reasons.
+    pub name: String,
+    /// `globset`-syntax pattern matched against the conflicted file's
+    /// path relative to the workspace root.
+    pub glob: String,
+    /// Optional program + args run at the workspace root after both
+    /// insertions are written, to put the file back into its formatted
+    /// shape (a sorted dependency list, say). `{file}` in an argument is
+    /// replaced by the file's path. A non-zero exit declines the
+    /// resolution and restores the conflict. Without it, Rust files are
+    /// formatted with `rustfmt` and other files are left as resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_command: Option<Vec<String>>,
+}
+
+/// Everything the recipes file configures.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConflictRules {
+    pub recipes: Vec<ConflictRecipe>,
+    pub keep_both: Vec<KeepBothRule>,
+}
+
+impl ConflictRules {
+    pub fn is_empty(&self) -> bool {
+        self.recipes.is_empty() && self.keep_both.is_empty()
+    }
+}
+
+/// On-disk file shape: recipes under a `[[recipe]]` TOML
+/// array-of-tables and keep-both rules under `[[keep_both]]`, e.g.:
 ///
 /// ```toml
 /// [[recipe]]
 /// name = "cargo_lock"
 /// glob = "**/Cargo.lock"
 /// resolve_command = ["cargo", "generate-lockfile"]
+///
+/// [[keep_both]]
+/// name = "migration_registry"
+/// glob = "**/schema_migration_registry.rs"
 /// ```
 #[derive(Debug, Deserialize)]
 struct FileShape {
     #[serde(default)]
     recipe: Vec<ConflictRecipe>,
+    #[serde(default)]
+    keep_both: Vec<KeepBothRule>,
 }
 
 /// Boss-side config store for declarative recipes. Read-only by
@@ -110,15 +172,22 @@ impl ConflictRecipesStore {
         &self.path
     }
 
-    /// Parse the config file into recipes. A missing file yields an
-    /// empty `Vec` (not configured). A malformed file, or a recipe
-    /// with an empty `name`/`glob`/`resolve_command`, returns `Err` —
-    /// callers should log and decline to register any recipes rather
-    /// than partially trusting a broken config.
+    /// Parse the config file into recipes. See [`Self::load_rules`],
+    /// which also returns the keep-both rules.
     pub fn load(&self) -> Result<Vec<ConflictRecipe>> {
+        Ok(self.load_rules()?.recipes)
+    }
+
+    /// Parse the config file. A missing file yields empty rules (not
+    /// configured). A malformed file, a recipe with an empty
+    /// `name`/`glob`/`resolve_command`, or a keep-both rule with an empty
+    /// `name`/`glob`/`format_command`, returns `Err` — callers should
+    /// log and decline to register any rule rather than partially
+    /// trusting a broken config.
+    pub fn load_rules(&self) -> Result<ConflictRules> {
         let contents = match std::fs::read_to_string(&self.path) {
             Ok(s) => s,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(ConflictRules::default()),
             Err(err) => {
                 return Err(err).with_context(|| format!("read conflict recipes file: {}", self.path.display()));
             }
@@ -129,9 +198,32 @@ impl ConflictRecipesStore {
         for recipe in &parsed.recipe {
             validate(recipe).with_context(|| format!("invalid recipe {:?} in {}", recipe.name, self.path.display()))?;
         }
+        for rule in &parsed.keep_both {
+            validate_keep_both(rule)
+                .with_context(|| format!("invalid keep_both rule {:?} in {}", rule.name, self.path.display()))?;
+        }
 
-        Ok(parsed.recipe)
+        Ok(ConflictRules {
+            recipes: parsed.recipe,
+            keep_both: parsed.keep_both,
+        })
     }
+}
+
+fn validate_keep_both(rule: &KeepBothRule) -> Result<()> {
+    if rule.name.trim().is_empty() {
+        anyhow::bail!("keep_both rule name must not be empty");
+    }
+    if rule.glob.trim().is_empty() {
+        anyhow::bail!("keep_both rule glob must not be empty");
+    }
+    if let Some(format) = &rule.format_command
+        && format.is_empty()
+    {
+        anyhow::bail!("keep_both rule format_command must not be empty when set");
+    }
+    globset::Glob::new(&rule.glob).with_context(|| format!("invalid glob pattern {:?}", rule.glob))?;
+    Ok(())
 }
 
 fn validate(recipe: &ConflictRecipe) -> Result<()> {
@@ -226,6 +318,81 @@ workdir = "."
         let recipes = store.load().unwrap();
         assert_eq!(recipes.len(), 1);
         assert_eq!(recipes[0].workdir.as_deref(), Some("."));
+    }
+
+    #[test]
+    fn parses_keep_both_rules_alongside_recipes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("conflict-recipes.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[keep_both]]
+name = "migration_registry"
+glob = "**/schema_migration_registry.rs"
+
+[[recipe]]
+name = "generated_schema"
+glob = "**/schema.generated.json"
+resolve_command = ["make", "regen-schema"]
+
+[[keep_both]]
+name = "build_deps"
+glob = "**/BUILD.bazel"
+format_command = ["buildifier", "{file}"]
+"#,
+        )
+        .unwrap();
+
+        let store = ConflictRecipesStore::new(path);
+        let rules = store.load_rules().unwrap();
+        assert!(!rules.is_empty());
+        assert_eq!(rules.recipes.len(), 1);
+        assert_eq!(
+            rules.keep_both,
+            [
+                KeepBothRule {
+                    name: "migration_registry".to_owned(),
+                    glob: "**/schema_migration_registry.rs".to_owned(),
+                    format_command: None,
+                },
+                KeepBothRule {
+                    name: "build_deps".to_owned(),
+                    glob: "**/BUILD.bazel".to_owned(),
+                    format_command: Some(vec!["buildifier".to_owned(), "{file}".to_owned()]),
+                },
+            ]
+        );
+        // The recipe-only view is unchanged by the second table.
+        assert_eq!(store.load().unwrap(), rules.recipes);
+    }
+
+    #[test]
+    fn missing_file_yields_empty_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rules = ConflictRecipesStore::new(tmp.path().join("conflict-recipes.toml"))
+            .load_rules()
+            .unwrap();
+        assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn invalid_keep_both_rules_are_rejected() {
+        for body in [
+            "name = \"\"\nglob = \"*.rs\"\n",
+            "name = \"x\"\nglob = \"\"\n",
+            "name = \"x\"\nglob = \"[\"\n",
+            "name = \"x\"\nglob = \"*.rs\"\nformat_command = []\n",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("conflict-recipes.toml");
+            std::fs::write(&path, format!("[[keep_both]]\n{body}")).unwrap();
+            let err = ConflictRecipesStore::new(path).load_rules().unwrap_err();
+            assert!(
+                format!("{err:#}").contains("invalid keep_both rule"),
+                "{body:?}: {err:#}"
+            );
+        }
     }
 
     #[test]
