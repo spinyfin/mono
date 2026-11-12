@@ -195,7 +195,7 @@ impl WorkDb {
         commit: SpokeIngressCommit<'_>,
         quota: IngressQuota,
     ) -> Result<u64> {
-        if commit.sequence == 0 || commit.frame.is_empty() {
+        if commit.sequence == 0 || commit.frame.is_empty() || (!commit.retain && commit.result.is_some()) {
             return Err(fault(HostOutboxFault::Denied));
         }
         let mut conn = self.connect()?;
@@ -268,7 +268,7 @@ impl WorkDb {
         }
         if commit.sequence <= received {
             // Already receipted and never stored (an ephemeral capture) or a
-            // hole left by not retaining a frame. Results are always retained,
+            // hole left by not retaining a frame. Results are always stored,
             // so a result at such a sequence is a lie. A retained-type frame
             // at an unstored sequence is also a lie: the hub never kept that
             // sequence, so this cannot be a legitimate replay of a kept record.
@@ -656,6 +656,39 @@ mod tests {
             db.spoke_ingress_frame("host-a", 1).unwrap().as_deref(),
             Some(&b"frame"[..])
         );
+    }
+
+    #[test]
+    fn a_new_result_cannot_be_receipted_without_storage() {
+        let db = db();
+        db.set_host_transport("host-a", HostTransport::SpokeReady).unwrap();
+        let owned = db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
+        let run = key(&owned);
+        db.append_host_command("host-a", "c1", Some(&run), RunAdmission::Start, b"req", &|seq| {
+            seq.to_be_bytes().to_vec()
+        })
+        .unwrap();
+        let admission = db.open_spoke_journal("host-a", "journal", 0, 1).unwrap();
+        let mut record = commit(
+            "host-a",
+            &admission,
+            1,
+            b"frame",
+            &[],
+            Some(SpokeIngressResult {
+                command_id: "c1",
+                run: Some(&run),
+                bytes: b"ok",
+            }),
+        );
+        record.retain = false;
+        assert_eq!(
+            fault_of(&db.commit_spoke_record(record).unwrap_err()),
+            Some(HostOutboxFault::Denied)
+        );
+        assert_eq!(db.spoke_journal("host-a").unwrap().unwrap().received, 0);
+        assert!(db.host_command_result("host-a", "c1").unwrap().is_none());
+        assert!(db.spoke_ingress_frame("host-a", 1).unwrap().is_none());
     }
 
     #[test]

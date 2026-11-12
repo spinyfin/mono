@@ -211,6 +211,11 @@ async fn the_spokes_answer_maps_to_an_outcome() {
         lease(&adapter).await;
         spawn(&adapter).await.unwrap();
         let outcome = adapter.capture_worker_pane("exec_1", &request(0, false)).await.unwrap();
+        if code == ResultCode::Absent {
+            assert!(
+                matches!(&outcome, PaneCaptureOutcome::Unreachable(reason) if reason.contains("reports the worker has finished"))
+            );
+        }
         let got = match outcome {
             PaneCaptureOutcome::Accepted => "accepted",
             PaneCaptureOutcome::Ended => "ended",
