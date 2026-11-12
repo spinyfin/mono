@@ -26,11 +26,12 @@ use super::review_badge::{ReviewKey, review_family_cte};
 use super::*;
 use boss_engine_storage_values::dispatch_wait::{
     DISPATCH_WAIT_REASON_AWAITING_MERGE, DISPATCH_WAIT_REASON_AWAITING_PARENT_PR,
-    DISPATCH_WAIT_REASON_AWAITING_REDISPATCH, DISPATCH_WAIT_REASON_AWAITING_REVIEW, DISPATCH_WAIT_REASON_DEFERRED,
-    DISPATCH_WAIT_REASON_DELIBERATE_PARK, DISPATCH_WAIT_REASON_DISPATCH_FAILED, DISPATCH_WAIT_REASON_DISPATCH_PAUSED,
-    DISPATCH_WAIT_REASON_HUMAN_DRIVEN, DISPATCH_WAIT_REASON_HUMAN_REVIEW, DISPATCH_WAIT_REASON_PARKED,
-    DISPATCH_WAIT_REASON_PR_OPEN, DISPATCH_WAIT_REASON_RECOVERY_ATTENTION, DISPATCH_WAIT_REASON_REPO_UNRESOLVED,
-    DISPATCH_WAIT_REASON_REVIEW_BATCH, DISPATCH_WAIT_REASON_REVIEW_COMPLETE, DISPATCH_WAIT_REASON_REVIEW_RESERVATION,
+    DISPATCH_WAIT_REASON_AWAITING_REDISPATCH, DISPATCH_WAIT_REASON_AWAITING_REVIEW,
+    DISPATCH_WAIT_REASON_CONFLICT_DEFERRED, DISPATCH_WAIT_REASON_DEFERRED, DISPATCH_WAIT_REASON_DELIBERATE_PARK,
+    DISPATCH_WAIT_REASON_DISPATCH_FAILED, DISPATCH_WAIT_REASON_DISPATCH_PAUSED, DISPATCH_WAIT_REASON_HUMAN_DRIVEN,
+    DISPATCH_WAIT_REASON_HUMAN_REVIEW, DISPATCH_WAIT_REASON_PARKED, DISPATCH_WAIT_REASON_PR_OPEN,
+    DISPATCH_WAIT_REASON_RECOVERY_ATTENTION, DISPATCH_WAIT_REASON_REPO_UNRESOLVED, DISPATCH_WAIT_REASON_REVIEW_BATCH,
+    DISPATCH_WAIT_REASON_REVIEW_COMPLETE, DISPATCH_WAIT_REASON_REVIEW_RESERVATION,
     DISPATCH_WAIT_REASON_REVISION_PENDING, DISPATCH_WAIT_REASON_RUN_ENDED, DISPATCH_WAIT_REASON_UNCLASSIFIED,
     DISPATCH_WAIT_REASON_WORKSPACE_POSITIONING_REFUSED,
 };
@@ -164,7 +165,49 @@ pub(super) fn classify(
         })?,
         review: measured(counter, review.len(), || classify_review(conn, &review, &mut waits))?,
     };
+    name_deferred_conflicts(conn, &mut waits)?;
     Ok((waits, cost))
+}
+
+/// The wait of one item whose latest run is parked for its PR to merge.
+pub(super) fn merge_wait(conn: &Connection, work_item_id: &str) -> Result<DispatchWait> {
+    Ok(if super::conflict_deferral::has_open_deferral(conn, work_item_id)? {
+        DispatchWait {
+            // Read from the conflict ledger, which no runtime epoch versions.
+            reads_other_items: true,
+            ..DispatchWait::named(DISPATCH_WAIT_REASON_CONFLICT_DEFERRED)
+        }
+    } else {
+        DispatchWait::named(DISPATCH_WAIT_REASON_AWAITING_MERGE)
+    })
+}
+
+/// Say so when an item that is only waiting for its merge has a conflicted
+/// PR whose resolution is being held until that merge is requested.
+///
+/// "Waiting for its pull request to merge" and "review complete" are the two
+/// answers that would otherwise hide it: the card would read as ready while
+/// nothing is going to resolve the conflict until someone asks for the
+/// merge. Every other answer names something that has to happen first, so it
+/// is left alone. Costs no statement unless a card is waiting for its merge.
+fn name_deferred_conflicts(conn: &Connection, waits: &mut HashMap<String, DispatchWait>) -> Result<()> {
+    let merge_only: Vec<&str> = waits
+        .iter()
+        .filter(|(_, wait)| {
+            matches!(
+                wait.reason.as_deref(),
+                Some(DISPATCH_WAIT_REASON_AWAITING_MERGE | DISPATCH_WAIT_REASON_REVIEW_COMPLETE)
+            )
+        })
+        .map(|(id, _)| id.as_str())
+        .collect();
+    if merge_only.is_empty() {
+        return Ok(());
+    }
+    for id in super::conflict_deferral::open_deferrals_among(conn, &merge_only)? {
+        waits.insert(id, DispatchWait::named(DISPATCH_WAIT_REASON_CONFLICT_DEFERRED));
+    }
+    Ok(())
 }
 
 /// The review branch for one item, whatever its status: the classification
@@ -172,6 +215,7 @@ pub(super) fn classify(
 pub(super) fn review_wait(conn: &Connection, task: &Task) -> Result<DispatchWait> {
     let mut waits = HashMap::new();
     classify_review(conn, &[task], &mut waits)?;
+    name_deferred_conflicts(conn, &mut waits)?;
     Ok(waits
         .remove(&task.id)
         .expect("the review branch names every item it is given"))
@@ -182,6 +226,7 @@ pub(super) fn review_waits(conn: &Connection, tasks: &[&Task]) -> Result<HashMap
     let mut waits = HashMap::new();
     if !tasks.is_empty() {
         classify_review(conn, tasks, &mut waits)?;
+        name_deferred_conflicts(conn, &mut waits)?;
     }
     Ok(waits)
 }

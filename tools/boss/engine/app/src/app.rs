@@ -1806,11 +1806,14 @@ impl ServerState {
         };
         let cube_client_for_state = cube_client.clone();
         let publisher_for_state = publisher.clone();
-        let sweep_host_for_state = Arc::new(boss_engine_runtime::merge_poller_adapters::CoreSweepHost::new(
-            work_db.clone(),
-            publisher.clone(),
-            cube_client.clone(),
-        ));
+        let sweep_host_for_state = Arc::new(
+            boss_engine_runtime::merge_poller_adapters::CoreSweepHost::new(
+                work_db.clone(),
+                publisher.clone(),
+                cube_client.clone(),
+            )
+            .with_feature_flags(feature_flags.clone()),
+        );
 
         // The evidence blob store lands under the same root, next to
         // `state.db`, so an install's data is one directory.

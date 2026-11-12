@@ -110,30 +110,57 @@ pub(super) async fn handle_retry_conflict_resolution(ctx: Dispatch, req: Fronten
     {
         match work_db.retry_conflict_resolution(&attempt_id) {
             Ok(Some(attempt)) => {
-                tracing::warn!(
-                    attempt_id = %attempt.id,
-                    work_item_id = %attempt.work_item_id,
-                    pr_url = %attempt.pr_url,
-                    "retry_conflict_resolution: attempt reset to pending",
-                );
-                // Mirror the freshly-pending start so the macOS
-                // app's activity feed shows the retry as a new
-                // attempt. The wire shape is identical to the
-                // detection-path's started event — the consumer
-                // doesn't need to distinguish.
-                server_state
-                    .publisher
-                    .publish_frontend_event_on_product(
-                        &attempt.product_id,
-                        FrontendEvent::ConflictResolutionStarted {
-                            attempt: work_db.remediation_entry(attempt.list_entry()),
-                            product_id: attempt.product_id.clone(),
-                            work_item_id: attempt.work_item_id.clone(),
-                            attempt_id: attempt.id.clone(),
-                            pr_url: attempt.pr_url.clone(),
-                        },
-                    )
-                    .await;
+                if let Some(reason) = attempt.deferral_end_reason.as_deref() {
+                    // The row recorded a deferred conflict, so there was no
+                    // attempt to reset and nothing has started yet: the
+                    // request released the conflict, and the merge poller
+                    // starts the resolution (and announces it) on its next
+                    // look at the PR. Ask for that look now, and have the
+                    // board re-read the card.
+                    tracing::info!(
+                        deferral_id = %attempt.id,
+                        work_item_id = %attempt.work_item_id,
+                        pr_url = %attempt.pr_url,
+                        reason,
+                        "retry_conflict_resolution: deferred conflict released for resolution",
+                    );
+                    server_state
+                        .publisher
+                        .publish_work_item_changed(
+                            &attempt.product_id,
+                            &attempt.work_item_id,
+                            "conflict_deferral_ended",
+                        )
+                        .await;
+                    server_state.event_bus.publish(Event::PrReconcileRequested {
+                        pr_url: attempt.pr_url.clone(),
+                    });
+                } else {
+                    tracing::warn!(
+                        attempt_id = %attempt.id,
+                        work_item_id = %attempt.work_item_id,
+                        pr_url = %attempt.pr_url,
+                        "retry_conflict_resolution: attempt reset to pending",
+                    );
+                    // Mirror the freshly-pending start so the macOS
+                    // app's activity feed shows the retry as a new
+                    // attempt. The wire shape is identical to the
+                    // detection-path's started event — the consumer
+                    // doesn't need to distinguish.
+                    server_state
+                        .publisher
+                        .publish_frontend_event_on_product(
+                            &attempt.product_id,
+                            FrontendEvent::ConflictResolutionStarted {
+                                attempt: work_db.remediation_entry(attempt.list_entry()),
+                                product_id: attempt.product_id.clone(),
+                                work_item_id: attempt.work_item_id.clone(),
+                                attempt_id: attempt.id.clone(),
+                                pr_url: attempt.pr_url.clone(),
+                            },
+                        )
+                        .await;
+                }
                 send_response(&sink, &request_id, FrontendEvent::ConflictResolutionRetried { attempt });
             }
             Ok(None) => {
@@ -142,7 +169,7 @@ pub(super) async fn handle_retry_conflict_resolution(ctx: Dispatch, req: Fronten
                     &request_id,
                     FrontendEvent::WorkError {
                         message: format!(
-                            "conflict resolution attempt {attempt_id:?} is unknown or not in a terminal-failure state (only failed/abandoned rows can be retried)",
+                            "conflict resolution attempt {attempt_id:?} is unknown or not in a terminal-failure state (only failed/abandoned rows can be retried; a deferred row can be retried to resolve it now)",
                         ),
                     },
                 );

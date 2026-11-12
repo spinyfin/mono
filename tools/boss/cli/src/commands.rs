@@ -1693,6 +1693,10 @@ pub(crate) enum EngineConflictsCommand {
     /// engine re-dispatches a worker. Rejected for non-terminal rows
     /// (`pending` / `running`). The parent work item is re-flipped to
     /// `blocked: merge_conflict` as part of the reset.
+    ///
+    /// On a `deferred` row this asks the engine to resolve the conflict
+    /// now instead of waiting for a merge request: the deferral ends and
+    /// the resolution starts on the engine's next look at the PR.
     Retry(EngineConflictsRetryArgs),
     /// Mark a non-terminal attempt `abandoned`. Distinct from
     /// `mark-failed`: the caller is explicitly stepping away (PR closed,
@@ -1729,7 +1733,8 @@ pub(crate) struct EngineConflictsListArgs {
 
     /// Filter by status. Repeatable / comma-separated. Documented
     /// values: pending, running, succeeded, failed, abandoned,
-    /// superseded.
+    /// superseded, deferred (conflict recorded, resolution waiting
+    /// for a merge request).
     #[arg(long, value_delimiter = ',')]
     pub(crate) status: Vec<String>,
 

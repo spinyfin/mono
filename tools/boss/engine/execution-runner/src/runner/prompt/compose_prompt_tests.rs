@@ -1115,6 +1115,8 @@ pub(super) fn sample_conflict_attempt() -> crate::work::ConflictResolution {
         resolved_by_rung: None,
         mechanical_rung_in_flight: None,
         mismatch_exit_barred: false,
+        deferral_arm: None,
+        deferral_end_reason: None,
     }
 }
 

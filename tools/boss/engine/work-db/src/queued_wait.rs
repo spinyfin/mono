@@ -108,7 +108,12 @@ pub(super) fn for_execution_naming(
         ExecutionStatus::Ready | ExecutionStatus::Queued => for_ready(conn, execution, now),
         ExecutionStatus::WaitingReview if review == ReviewNaming::Deferred => Ok(DispatchWait::default()),
         ExecutionStatus::WaitingReview => review_wait(conn, &execution.work_item_id),
-        ExecutionStatus::WaitingMerge => Ok(DispatchWait::named(DISPATCH_WAIT_REASON_AWAITING_MERGE)),
+        // The set-based pass that names review cards also says when a merge
+        // wait hides a deferred conflict; a single-item read asks here.
+        ExecutionStatus::WaitingMerge if review == ReviewNaming::Deferred => {
+            Ok(DispatchWait::named(DISPATCH_WAIT_REASON_AWAITING_MERGE))
+        }
+        ExecutionStatus::WaitingMerge => unscheduled_wait::merge_wait(conn, &execution.work_item_id),
         _ => Ok(DispatchWait::default()),
     }
 }
