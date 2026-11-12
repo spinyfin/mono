@@ -819,9 +819,43 @@ pub async fn on_conflict_detected_with(
                 .latest_conflict_resolution_for_work_item(&candidate.work_item_id)
                 .ok()
                 .flatten();
+            // Only the live attempt that actually holds this probe's
+            // `(base, head)` key may be reused. Any other active attempt is
+            // stale (it was created for a different head) and adopting it
+            // would aim the fix and the retire path at the wrong attempt.
             let active = work_db
                 .active_conflict_resolution_for_work_item(&candidate.work_item_id)
-                .unwrap_or(None);
+                .unwrap_or(None)
+                .filter(|a| {
+                    let holds_key =
+                        a.base_sha_at_trigger == probe.base_ref_oid && a.head_sha_before == probe.head_ref_oid;
+                    if !holds_key {
+                        tracing::warn!(
+                            work_item_id = %candidate.work_item_id,
+                            pr_url = %candidate.pr_url,
+                            attempt_id = %a.id,
+                            attempt_base_sha = ?a.base_sha_at_trigger,
+                            attempt_head_sha = ?a.head_sha_before,
+                            probe_base_sha = ?probe.base_ref_oid,
+                            probe_head_sha = ?probe.head_ref_oid,
+                            "conflict_watch: active attempt does not hold the colliding key; not adopting it",
+                        );
+                    }
+                    holds_key
+                });
+            // Reusing an attempt must leave the same trail as inserting one:
+            // the task's `blocked_attempt_id` names it, so the retire path can
+            // match the block to the attempt when the PR becomes mergeable.
+            if let Some(a) = active.as_ref()
+                && let Err(err) = work_db.record_blocked_conflict_attempt(&candidate.work_item_id, &a.id)
+            {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    attempt_id = %a.id,
+                    ?err,
+                    "conflict_watch: failed to record adopted attempt as blocked_attempt_id",
+                );
+            }
             // A `pending` attempt with no revision is the row the blocked
             // re-arm path above deliberately falls through on so the ladder
             // can be retried for it. That collision is the *expected*

@@ -31,10 +31,18 @@ async fn churn_guard_pre_abandons_fourth_attempt_in_window() {
     let a1 = db.insert_conflict_resolution(make_input("sha-1")).unwrap().unwrap();
     let a2 = db.insert_conflict_resolution(make_input("sha-2")).unwrap().unwrap();
     let a3 = db.insert_conflict_resolution(make_input("sha-3")).unwrap().unwrap();
-    for id in [&a1.id, &a2.id, &a3.id] {
+    // A newer attempt retires older pending ones, so only the latest is
+    // live; the superseded rows still count against the churn budget.
+    let a3_row = db.get_conflict_resolution(&a3.id).unwrap().unwrap();
+    assert_eq!(
+        a3_row.status, "pending",
+        "the newest of the first three attempts must be live"
+    );
+    assert!(a3_row.failure_reason.is_none());
+    for id in [&a1.id, &a2.id] {
         let row = db.get_conflict_resolution(id).unwrap().unwrap();
-        assert_eq!(row.status, "pending", "first three attempts must be live");
-        assert!(row.failure_reason.is_none());
+        assert_eq!(row.status, "abandoned", "older pending attempts are superseded");
+        assert_eq!(row.failure_reason.as_deref(), Some("superseded_by_newer_attempt"));
     }
 
     // Fourth attempt — same hour — trips the guard.

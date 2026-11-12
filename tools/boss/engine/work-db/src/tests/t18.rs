@@ -129,11 +129,14 @@ fn list_filters_by_product_and_work_item() {
 #[test]
 fn list_filters_by_status() {
     let (db, product, chore) = seed_product_and_chore("list-status");
+    // Each attempt is ended before the next is inserted: a newer attempt
+    // retires older `pending` ones, so they would otherwise all turn
+    // `abandoned`.
     let done = insert_attempt(&db, &product, &chore, "sha-done");
-    let bad = insert_attempt(&db, &product, &chore, "sha-bad");
-    let pending = insert_attempt(&db, &product, &chore, "sha-pending");
     db.mark_conflict_resolution_succeeded(&done.id, None).unwrap();
+    let bad = insert_attempt(&db, &product, &chore, "sha-bad");
     db.mark_conflict_resolution_failed(&bad.id, "gave_up").unwrap();
+    let pending = insert_attempt(&db, &product, &chore, "sha-pending");
 
     // Empty slice → all three regardless of status.
     assert_eq!(
