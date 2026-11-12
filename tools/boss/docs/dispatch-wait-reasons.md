@@ -24,33 +24,34 @@ The app formats two things itself, because they need the local clock: a retry co
 
 A pending execution:
 
-| Reason                              | Meaning                                                                                                                |
-| ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `awaiting_dispatch`                 | `ready`, and no scheduler pass has held it. The next pass claims it or records what stops it.                          |
-| `not_before`                        | `ready`, with a dispatch deadline still ahead (retry backoff, merge-order stagger).                                    |
-| `dispatch_paused`                   | The global dispatch pause holds it.                                                                                    |
-| `automation_paused`                 | The automation pause holds it.                                                                                         |
-| `focus_mode`                        | It is outside the dispatch focus set.                                                                                  |
-| `pool_exhausted`                    | Its worker pool has no free slot.                                                                                      |
-| `dispatch_preflight`                | Startup preflight (boot recovery, the capability probe, or a failed runtime check) holds dispatch.                     |
-| `progression_unavailable`           | The engine cannot start progression agents yet.                                                                        |
-| `awaiting_predecessor_preservation` | The run it recovers from has not released its workspace, so that run's work is not preserved yet.                      |
-| a sentence                          | The interactive cap, a workspace lease, or a chain hold naming the blocking task and PR.                               |
-| `waiting_dependency`                | An unmet `blocks` prerequisite gates it. The card names the prerequisite.                                              |
-| `project_order`                     | It is a later task of a project whose earlier task has not yet reached review or completion. The card names that task. |
-| `autostart_off`                     | Its task has automatic start off, so the queued execution waits for an explicit start.                                 |
+| Reason                              | Meaning                                                                                                                                                                                  |
+| ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `awaiting_dispatch`                 | `ready` with no scheduler hold, or a queued card whose latest execution was abandoned before a worker started. The next pass claims it, mints the replacement, or records what stops it. |
+| `not_before`                        | `ready`, with a dispatch deadline still ahead (retry backoff, merge-order stagger).                                                                                                      |
+| `dispatch_paused`                   | The global dispatch pause holds it.                                                                                                                                                      |
+| `automation_paused`                 | The automation pause holds it.                                                                                                                                                           |
+| `focus_mode`                        | It is outside the dispatch focus set.                                                                                                                                                    |
+| `pool_exhausted`                    | Its worker pool has no free slot.                                                                                                                                                        |
+| `dispatch_preflight`                | Startup preflight (boot recovery, the capability probe, or a failed runtime check) holds dispatch.                                                                                       |
+| `progression_unavailable`           | The engine cannot start progression agents yet.                                                                                                                                          |
+| `awaiting_predecessor_preservation` | The run it recovers from has not released its workspace, so that run's work is not preserved yet.                                                                                        |
+| a sentence                          | The interactive cap, a workspace lease, or a chain hold naming the blocking task and PR.                                                                                                 |
+| `waiting_dependency`                | An unmet `blocks` prerequisite gates it. The card names the prerequisite.                                                                                                                |
+| `project_order`                     | It is a later task of a project whose earlier task has not yet reached review or completion. The card names that task.                                                                   |
+| `autostart_off`                     | Its task has automatic start off, so the queued execution waits for an explicit start.                                                                                                   |
 
-A card queued on the board with nothing pending. These are the reconciler's own refusals to mint an execution:
+A card queued on the board with nothing pending. These are the reconciler's own refusals to mint an execution, plus the remintable case the reconciler will queue on its next pass:
 
-| Reason               | Meaning                                                                   |
-| -------------------- | ------------------------------------------------------------------------- |
-| `human_driven`       | No agent ever starts for it.                                              |
-| `deferred`           | It is future scope until someone approves it.                             |
-| `parked`             | It, its project or its parent is parked.                                  |
-| `run_ended`          | Its last run ended. The engine never starts a replacement on its own.     |
-| `awaiting_parent_pr` | It is a revision and its parent task has no pull request to push to yet.  |
-| `pr_open`            | Its pull request is open, so review and merge handling own the next step. |
-| `repo_unresolved`    | No repository resolves for it.                                            |
+| Reason               | Meaning                                                                                                                                     |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `human_driven`       | No agent ever starts for it.                                                                                                                |
+| `deferred`           | It is future scope until someone approves it.                                                                                               |
+| `parked`             | It, its project or its parent is parked.                                                                                                    |
+| `run_ended`          | Its last run ended. The engine never starts a replacement on its own.                                                                       |
+| `awaiting_dispatch`  | Its last pending execution was abandoned before a worker started. The reconciler will queue a new run. Other holds on this table still win. |
+| `awaiting_parent_pr` | It is a revision and its parent task has no pull request to push to yet.                                                                    |
+| `pr_open`            | Its pull request is open, so review and merge handling own the next step.                                                                   |
+| `repo_unresolved`    | No repository resolves for it.                                                                                                              |
 
 An `active` item with no run pending or live. The orphan sweep's own candidate predicate names the ordinary state, and the holds it leaves alone are named in turn:
 

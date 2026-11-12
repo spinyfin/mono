@@ -73,10 +73,11 @@ pub const DISPATCH_WAIT_REASON_PROJECT_ORDER: &str = "project_order";
 /// The row is `ready` but its `dispatch_not_before` deadline is still ahead.
 pub const DISPATCH_WAIT_REASON_NOT_BEFORE: &str = "not_before";
 
-/// The row is `ready` and no scheduler pass has held it: the next pass either
-/// claims a worker for it or records the hold that stops it. A row that stays
-/// here across scheduler passes is reclassified as
-/// [`DISPATCH_WAIT_REASON_UNCLASSIFIED`].
+/// The row is about to be dispatched: either it is `ready` and no scheduler
+/// pass has held it, or it is a queued card whose latest execution was
+/// abandoned before a worker started and the reconciler will mint a
+/// replacement. A `ready` row that stays here across scheduler passes is
+/// reclassified as [`DISPATCH_WAIT_REASON_UNCLASSIFIED`].
 pub const DISPATCH_WAIT_REASON_AWAITING_DISPATCH: &str = "awaiting_dispatch";
 
 /// Startup preflight (boot recovery, the local capability probe, or a failed

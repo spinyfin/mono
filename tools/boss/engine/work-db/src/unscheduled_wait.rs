@@ -25,13 +25,13 @@ use super::queued_wait::DispatchWait;
 use super::review_badge::{ReviewKey, review_family_cte};
 use super::*;
 use boss_engine_storage_values::dispatch_wait::{
-    DISPATCH_WAIT_REASON_AWAITING_MERGE, DISPATCH_WAIT_REASON_AWAITING_PARENT_PR,
-    DISPATCH_WAIT_REASON_AWAITING_REDISPATCH, DISPATCH_WAIT_REASON_AWAITING_REVIEW,
-    DISPATCH_WAIT_REASON_CONFLICT_DEFERRED, DISPATCH_WAIT_REASON_DEFERRED, DISPATCH_WAIT_REASON_DELIBERATE_PARK,
-    DISPATCH_WAIT_REASON_DISPATCH_FAILED, DISPATCH_WAIT_REASON_DISPATCH_PAUSED, DISPATCH_WAIT_REASON_HUMAN_DRIVEN,
-    DISPATCH_WAIT_REASON_HUMAN_REVIEW, DISPATCH_WAIT_REASON_PARKED, DISPATCH_WAIT_REASON_PR_OPEN,
-    DISPATCH_WAIT_REASON_RECOVERY_ATTENTION, DISPATCH_WAIT_REASON_REPO_UNRESOLVED, DISPATCH_WAIT_REASON_REVIEW_BATCH,
-    DISPATCH_WAIT_REASON_REVIEW_COMPLETE, DISPATCH_WAIT_REASON_REVIEW_RESERVATION,
+    DISPATCH_WAIT_REASON_AWAITING_DISPATCH, DISPATCH_WAIT_REASON_AWAITING_MERGE,
+    DISPATCH_WAIT_REASON_AWAITING_PARENT_PR, DISPATCH_WAIT_REASON_AWAITING_REDISPATCH,
+    DISPATCH_WAIT_REASON_AWAITING_REVIEW, DISPATCH_WAIT_REASON_CONFLICT_DEFERRED, DISPATCH_WAIT_REASON_DEFERRED,
+    DISPATCH_WAIT_REASON_DELIBERATE_PARK, DISPATCH_WAIT_REASON_DISPATCH_FAILED, DISPATCH_WAIT_REASON_DISPATCH_PAUSED,
+    DISPATCH_WAIT_REASON_HUMAN_DRIVEN, DISPATCH_WAIT_REASON_HUMAN_REVIEW, DISPATCH_WAIT_REASON_PARKED,
+    DISPATCH_WAIT_REASON_PR_OPEN, DISPATCH_WAIT_REASON_RECOVERY_ATTENTION, DISPATCH_WAIT_REASON_REPO_UNRESOLVED,
+    DISPATCH_WAIT_REASON_REVIEW_BATCH, DISPATCH_WAIT_REASON_REVIEW_COMPLETE, DISPATCH_WAIT_REASON_REVIEW_RESERVATION,
     DISPATCH_WAIT_REASON_REVISION_PENDING, DISPATCH_WAIT_REASON_RUN_ENDED, DISPATCH_WAIT_REASON_UNCLASSIFIED,
     DISPATCH_WAIT_REASON_WORKSPACE_POSITIONING_REFUSED,
 };
@@ -494,8 +494,11 @@ fn open_attention_among(conn: &Connection, ids: &[&str], kinds: &[&str]) -> Resu
 ///
 /// The named reasons are the reconciler's own refusals to mint an execution,
 /// in its order (`reconcile_work_item_execution` /
-/// `reconcile_revision_execution`). When none of them applies the reconciler
-/// would have minted one, so its absence is unclassified.
+/// `reconcile_revision_execution`). A never-started abandoned latest row is
+/// reminted on the next reconcile, so once other holds do not apply it is
+/// named [`DISPATCH_WAIT_REASON_AWAITING_DISPATCH`]. When none of the
+/// refusals applies and there is no remintable row, the reconciler would
+/// have minted one, so a genuine absence is unclassified.
 fn classify_queued(
     conn: &Connection,
     cards: &[&Candidate<'_>],
@@ -519,7 +522,9 @@ fn classify_queued(
         } else if card.latest.is_some() && !remintable.contains(&task.id) {
             // The reconciler never mints a replacement after a finished run.
             // A never-started abandoned row is reminted once the item is
-            // runnable again, so it is classified as if it had no execution.
+            // runnable again; holds above still win, and the unowned /
+            // revision fallbacks name it awaiting dispatch rather than
+            // unclassified.
             DISPATCH_WAIT_REASON_RUN_ENDED
         } else if task.kind == TaskKind::Revision {
             revisions.push(task);
@@ -550,6 +555,8 @@ fn classify_queued(
                 task,
                 if awaiting_parent {
                     DISPATCH_WAIT_REASON_AWAITING_PARENT_PR
+                } else if remintable.contains(&task.id) {
+                    DISPATCH_WAIT_REASON_AWAITING_DISPATCH
                 } else {
                     DISPATCH_WAIT_REASON_UNCLASSIFIED
                 },
@@ -565,6 +572,8 @@ fn classify_queued(
                 task,
                 if unresolved.contains(&task.id) {
                     DISPATCH_WAIT_REASON_REPO_UNRESOLVED
+                } else if remintable.contains(&task.id) {
+                    DISPATCH_WAIT_REASON_AWAITING_DISPATCH
                 } else {
                     DISPATCH_WAIT_REASON_UNCLASSIFIED
                 },

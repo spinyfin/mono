@@ -235,6 +235,13 @@ impl WorkDb {
             // render "demoted by engine: dispatch never reached a
             // worker" instead of attributing the move to the human who
             // last touched the row.
+            //
+            // The abandoned never-started rows this writes are reminted
+            // by `reconcile_work_item_execution` once the item is
+            // runnable again (autostart on). That is intended: the heal
+            // clears the ghost `active` card, and the next reconcile
+            // queues a fresh run rather than treating the withdraw as a
+            // finished attempt.
             let updated = crate::task_status_audit::execute(
                 &tx,
                 "heal_ghost_active_chores",

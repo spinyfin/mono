@@ -16,7 +16,11 @@
 //!   4. the same suppression on the `reconcile_revision_execution` branch,
 //!   5. undeferring remints a pending execution that deferral abandoned,
 //!      including a gated project task whose prerequisites then clear,
-//!   6. an execution that actually ran is not reminted automatically.
+//!   6. an execution that actually ran is not reminted automatically,
+//!   7. a live or claimed sibling blocks remint of a newer abandoned
+//!      never-started row (the `mark_execution_redundant` shape),
+//!   8. a ghost-active heal of a never-started autostart item is reminted
+//!      once the item is runnable again.
 
 use super::*;
 
@@ -621,4 +625,121 @@ fn an_abandoned_execution_with_a_run_is_not_reminted() {
         "an abandoned execution with a work_runs row must not be reminted"
     );
     assert_eq!(executions[0].id, first.id);
+}
+
+/// `mark_execution_redundant` leaves an abandoned never-started row as the
+/// newest execution while a genuinely in-flight sibling sits beneath it.
+/// Reconcile must not mint another ready row beside that worker.
+#[test]
+fn reconcile_does_not_remint_beside_a_live_or_claimed_execution() {
+    let db = WorkDb::open(temp_db_path("remint-live-guard")).unwrap();
+    let product = create_test_product_named(&db, "Boss-remint-live-guard");
+
+    for (label, status, started_at) in [
+        ("running", "running", Some("1")),
+        ("waiting_human", "waiting_human", Some("1")),
+        ("claimed", "claimed", None),
+    ] {
+        let chore = create_test_chore(&db, product.id.clone(), format!("already {label}"));
+        db.reconcile_product_executions(&product.id).unwrap();
+        let live = db
+            .list_executions(Some(&chore.id))
+            .unwrap()
+            .into_iter()
+            .find(|execution| execution.status == ExecutionStatus::Ready)
+            .unwrap_or_else(|| panic!("{label}: precondition: the item is queued"));
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_executions SET status = ?2, started_at = ?3 WHERE id = ?1",
+                params![live.id, status, started_at],
+            )
+            .unwrap();
+        }
+        let duplicate = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET created_at = '9' WHERE id = ?1",
+                params![duplicate.id],
+            )
+            .unwrap();
+        db.mark_execution_redundant(&duplicate.id).unwrap();
+
+        for _ in 0..3 {
+            db.reconcile_product_executions(&product.id).unwrap();
+        }
+
+        let executions = db.list_executions(Some(&chore.id)).unwrap();
+        assert_eq!(
+            executions.len(),
+            2,
+            "{label}: must not mint beside the in-flight execution"
+        );
+        assert!(
+            executions
+                .iter()
+                .any(|execution| execution.id == live.id && execution.status.as_str() == status),
+            "{label}: the in-flight execution must stay {status}"
+        );
+        assert!(
+            executions
+                .iter()
+                .any(|execution| execution.id == duplicate.id && execution.status == ExecutionStatus::Abandoned),
+            "{label}: the redundant row stays abandoned"
+        );
+        assert!(
+            !executions
+                .iter()
+                .any(|execution| execution.status == ExecutionStatus::Ready),
+            "{label}: no replacement ready row while the older execution is in flight"
+        );
+    }
+}
+
+/// `heal_ghost_active_chores` abandons a never-started execution and demotes
+/// the card to `todo`. Remint is keyed on that abandoned shape, so the next
+/// reconcile queues a fresh run when the item is still autostart.
+#[test]
+fn heal_ghost_active_never_started_execution_is_reminted_when_runnable() {
+    let db = WorkDb::open(temp_db_path("ghost-heal-remint")).unwrap();
+    let product = create_test_product_named(&db, "Boss-ghost-heal-remint");
+    let chore = create_test_chore(&db, product.id.clone(), "ghost then remint");
+
+    db.reconcile_product_executions(&product.id).unwrap();
+    let first = db
+        .list_executions(Some(&chore.id))
+        .unwrap()
+        .into_iter()
+        .find(|execution| execution.status == ExecutionStatus::Ready)
+        .expect("precondition: the item is queued (ready)");
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET status = 'active' WHERE id = ?1", params![chore.id])
+        .unwrap();
+
+    let healed = db.heal_ghost_active_chores().unwrap();
+    assert!(
+        healed.iter().any(|row| row.work_item_id == chore.id),
+        "precondition: heal demotes the ghost-active card"
+    );
+    assert_eq!(latest_status(&db, &chore.id), ExecutionStatus::Abandoned);
+    assert_eq!(status_of(&db, &chore.id), TaskStatus::Todo);
+
+    db.reconcile_product_executions(&product.id).unwrap();
+
+    let executions = db.list_executions(Some(&chore.id)).unwrap();
+    let ready = executions
+        .iter()
+        .find(|execution| execution.status == ExecutionStatus::Ready)
+        .expect("heal of a never-started autostart item must remint once runnable");
+    assert_ne!(ready.id, first.id, "the replacement must be a new execution");
 }

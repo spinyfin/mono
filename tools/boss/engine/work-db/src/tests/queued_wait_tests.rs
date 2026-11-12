@@ -539,7 +539,7 @@ fn every_waiting_state_yields_a_named_reason() {
 
 /// A pending execution abandoned by deferral never started, so the queued
 /// card is not "its last run ended". Until reconcile mints a replacement it
-/// is unclassified (about to be dispatched, or held for another named reason).
+/// is awaiting dispatch, unless another hold still applies.
 #[test]
 fn a_never_started_abandoned_queued_card_is_not_run_ended() {
     let db = db();
@@ -574,10 +574,30 @@ fn a_never_started_abandoned_queued_card_is_not_run_ended() {
         },
     )
     .unwrap();
+    let remintable = wait_of(&db, pid, &chore.id);
+    assert_eq!(
+        remintable.dispatch_wait_reason.as_deref(),
+        Some(DISPATCH_WAIT_REASON_AWAITING_DISPATCH),
+        "an abandoned never-started row is about to be reminted, not run_ended"
+    );
+    assert_eq!(
+        remintable.dispatch_wait_label.as_deref(),
+        Some(dispatch_wait_phrase(DISPATCH_WAIT_REASON_AWAITING_DISPATCH).as_str()),
+    );
+
+    db.park_work_item_as_actor(&chore.id, true, Some("not now"), "human")
+        .unwrap();
+    assert_eq!(
+        db.get_task_runtime(&chore.id).unwrap().dispatch_wait_reason.as_deref(),
+        Some(DISPATCH_WAIT_REASON_PARKED),
+        "a real hold still wins over awaiting dispatch"
+    );
+
+    db.park_work_item_as_actor(&chore.id, false, None, "human").unwrap();
     assert_eq!(
         wait_of(&db, pid, &chore.id).dispatch_wait_reason.as_deref(),
-        Some(DISPATCH_WAIT_REASON_UNCLASSIFIED),
-        "an abandoned never-started row must not be named run_ended"
+        Some(DISPATCH_WAIT_REASON_AWAITING_DISPATCH),
+        "clearing the hold restores awaiting dispatch until reconcile mints"
     );
 
     db.reconcile_product_executions(pid).unwrap();
