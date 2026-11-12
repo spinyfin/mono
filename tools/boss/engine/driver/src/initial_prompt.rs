@@ -154,7 +154,7 @@ pub const LAUNCHER: &str = include_str!("initial_prompt.py");
 
 /// Shared by local provisioning and SSH staging.
 pub fn launcher_command(config_dir: &str, command: &str) -> String {
-    format!("python3 {config_dir}/initial-prompt.py {}", command.trim_start())
+    format!("python3 -I {config_dir}/initial-prompt.py {}", command.trim_start())
 }
 
 pub fn launcher_config(driver: &dyn crate::AgentDriver) -> Result<String> {
@@ -718,6 +718,59 @@ assert_processes_exited(lifetime_reader)
         )
         .unwrap_or_else(|error| panic!("{error}: {}", fs::read_to_string(trace).unwrap_or_default()));
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    /// A worker can write any file next to the launcher. Files named like
+    /// stdlib modules must not be importable by it, so the real launch command
+    /// (including its interpreter flags) still reaches a ready composer.
+    #[test]
+    fn launcher_ignores_stdlib_named_files_next_to_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        fs::create_dir(&config).unwrap();
+        provision(&config, &config, "private sentinel", &crate::ClaudeDriver).unwrap();
+        for module in ["signal", "json"] {
+            fs::write(
+                config.join(format!("{module}.py")),
+                "raise FileNotFoundError('worker-written module was imported')\n",
+            )
+            .unwrap();
+        }
+        let stub = temp.path().join("stub.py");
+        fs::write(&stub, STUB_TAKES_BRIEF).unwrap();
+        let command = launcher_command(config.to_str().unwrap(), &format!("python3 -I {}", stub.display()));
+        let harness = r#"
+import os, pty, select, subprocess, sys, time
+master, slave = pty.openpty()
+proc = subprocess.Popen(["sh", "-c", sys.argv[1]], stdin=slave, stdout=slave, stderr=slave,
+                        start_new_session=True)
+os.close(slave)
+captured = b""
+deadline = time.monotonic() + 20
+while time.monotonic() < deadline and proc.poll() is None:
+    readable, _, _ = select.select([master], [], [], 0.1)
+    if readable:
+        try:
+            data = os.read(master, 65536)
+        except OSError:
+            break
+        captured += data
+        if b"\x1b[6n" in data:
+            os.write(master, b"\x1b[1;1R")
+proc.wait(timeout=10)
+assert b"Traceback" not in captured, captured
+assert proc.returncode == 0, (proc.returncode, captured)
+"#;
+        let output = boss_command_runner::output_blocking_timeout(
+            std::process::Command::new("python3")
+                .args(["-I", "-c", harness])
+                .arg(&command)
+                .stdin(std::process::Stdio::null()),
+            std::time::Duration::from_secs(45),
+        )
+        .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(delivered_marker_present(&config));
     }
 
     #[test]

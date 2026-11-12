@@ -1837,7 +1837,7 @@ pub struct SpawnPlan {
     /// `command` runs.
     pub env: Vec<EnvDirective>,
     /// The command line to run after `env` has been applied (e.g.
-    /// `python3 .claude/initial-prompt.py claude --model …\n`).
+    /// `python3 -I .claude/initial-prompt.py claude --model …\n`).
     pub command: String,
 }
 

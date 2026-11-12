@@ -770,7 +770,7 @@ async fn initial_input_types_a_short_fixed_line_sourcing_the_workspace_script() 
     // worker just sits at the bash prompt forever (as it did before
     // #174).
     assert!(
-        script.contains("python3 .claude/initial-prompt.py claude ") && !script.contains("$(cat"),
+        script.contains("python3 -I .claude/initial-prompt.py claude ") && !script.contains("$(cat"),
         "expected private terminal delivery without prompt expansion, got: {script:?}",
     );
     // The first shell line re-prepends BOSS_BIN_DIR to PATH (so the
@@ -782,7 +782,7 @@ async fn initial_input_types_a_short_fixed_line_sourcing_the_workspace_script() 
     // construction site.
     assert!(
         script.starts_with(&format!(
-            "{}{}unset ANTHROPIC_API_KEY; {}python3 .claude/initial-prompt.py claude",
+            "{}{}unset ANTHROPIC_API_KEY; {}python3 -I .claude/initial-prompt.py claude",
             path_prepend_clause("BOSS_BIN_DIR"),
             path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
             boss_engine_worker_bin::environment::shell_environment_clause(
@@ -964,7 +964,7 @@ async fn untagged_row_spawn_matches_engine_default() {
     assert_eq!(
         script,
         format!(
-            "{}{}unset ANTHROPIC_API_KEY; {}python3 .claude/initial-prompt.py claude --model {} --disallowedTools=AskUserQuestion --permission-mode auto --settings '{}'\n",
+            "{}{}unset ANTHROPIC_API_KEY; {}python3 -I .claude/initial-prompt.py claude --model {} --disallowedTools=AskUserQuestion --permission-mode auto --settings '{}'\n",
             path_prepend_clause("BOSS_BIN_DIR"),
             path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
             boss_engine_worker_bin::environment::shell_environment_clause(

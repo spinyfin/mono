@@ -295,7 +295,7 @@ pub const CODEX_FORBIDDEN_LONG_FLAGS: &[&str] = &["--color", "--skip-git-repo-ch
 pub fn codex_reference_command() -> String {
     // Required flags come from the shared constants so the double cannot
     // drift from the contract the pin tests enforce.
-    let mut cmd = String::from("python3 .codex/initial-prompt.py codex");
+    let mut cmd = String::from("python3 -I .codex/initial-prompt.py codex");
     for flag in CODEX_REQUIRED_FLAGS {
         cmd.push(' ');
         cmd.push_str(flag);
