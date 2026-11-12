@@ -74,8 +74,7 @@ async fn actual_daemon_drains_pending_hook_without_another_peer_connection() {
             .unwrap(),
         )
         .unwrap();
-    drop(journal);
-    let daemon = hub.start();
+    let daemon = hub.start_after_journal(journal);
     let mut connection = hub.connection().await;
     connection.welcome(0).await;
     loop {
@@ -202,8 +201,7 @@ async fn actual_daemon_journals_capacity_before_welcome_and_replays_offline_back
         journal.record_bounds().unwrap().1 >= 2,
         "producer continues before stream is admitted"
     );
-    drop(journal);
-    let _daemon = hub.start();
+    let _daemon = hub.start_after_journal(journal);
     let mut connection = hub.connection().await;
     connection.welcome(0).await;
     // Both backlog records are in flight under the credit window before any receipt.
@@ -255,8 +253,7 @@ async fn restored_hub_cannot_skip_compacted_history() {
         .unwrap();
     journal.compact(8 * 24 * 60 * 60 * 1000).unwrap();
     assert_eq!(journal.record_bounds().unwrap(), (2, 1));
-    drop(journal);
-    let mut daemon = hub.start();
+    let mut daemon = hub.start_after_journal(journal);
     let connection = hub.connection().await;
     assert_eq!(connection.hello.first_retained, 2);
     connection.welcome(0).await;
