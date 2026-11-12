@@ -63,21 +63,32 @@ fn find_equivalent_open_task(conn: &Connection, task: &Task, name: &str) -> Resu
     Ok(None)
 }
 
+/// The proposed prerequisite and the timestamps of the Yes that approved it.
+pub(super) struct Approval<'a> {
+    pub question: &'a OperatorQuestionView,
+    pub proposed: (&'a str, &'a str),
+    pub answered_at: DateTime<Utc>,
+    pub now: &'a str,
+}
+
 pub(super) fn approve_in_tx(
     pending: &mut PendingEvents,
     conn: &Connection,
     task: &Task,
-    question: &OperatorQuestionView,
-    proposed: (&str, &str),
-    answered_at: DateTime<Utc>,
-    now: &str,
+    approval: Approval<'_>,
+    attribution: crate::task_status_audit::WriteAttribution<'_>,
 ) -> Result<LinkedPrerequisite> {
-    let (name, brief) = proposed;
+    let Approval {
+        question,
+        proposed: (name, brief),
+        answered_at,
+        now,
+    } = approval;
     let (prerequisite, created) = match find_equivalent_open_task(conn, task, name)? {
         Some(existing) => (existing, false),
         None => {
             let prerequisite = if let Some(project_id) = &task.project_id {
-                insert_task_in_tx(
+                insert_task_in_tx_as_actor_with_provenance(
                     conn,
                     CreateTaskInput::builder()
                         .product_id(&task.product_id)
@@ -88,9 +99,11 @@ pub(super) fn approve_in_tx(
                         .created_via(CREATED_VIA_ENGINE_AUTO)
                         .force_duplicate(true)
                         .build(),
+                    attribution.actor,
+                    attribution.provenance,
                 )?
             } else {
-                insert_chore_in_tx(
+                insert_chore_in_tx_as_actor_with_provenance(
                     conn,
                     CreateChoreInput::builder()
                         .product_id(task.product_id.clone())
@@ -105,6 +118,8 @@ pub(super) fn approve_in_tx(
                         // a task that has just been completed.
                         .force_duplicate(true)
                         .build(),
+                    attribution.actor,
+                    attribution.provenance,
                 )?
             };
             (prerequisite, true)
@@ -118,11 +133,13 @@ pub(super) fn approve_in_tx(
     let schedulable = matches!(prerequisite.status, TaskStatus::Todo | TaskStatus::Blocked);
     let eligible = parking::upkeep_eligible(conn, &prerequisite.id)?;
     let enabled_dispatch = eligible && !created && schedulable && !prerequisite.autostart;
+    let actor = attribution.actor;
+    let basis = attribution.basis("approve_in_tx");
     if enabled_dispatch {
         crate::task_status_audit::execute(
             conn,
-            "approve_in_tx",
-            "engine",
+            &basis,
+            actor,
             "UPDATE tasks SET autostart = 1, updated_at = ?2 WHERE id = ?1",
             params![prerequisite.id, now],
         )?;
@@ -135,7 +152,11 @@ pub(super) fn approve_in_tx(
             request_execution_in_tx_with_live_check(
                 pending,
                 conn,
-                RequestExecutionInput::builder().work_item_id(&prerequisite.id).build(),
+                RequestExecutionInput::builder()
+                    .work_item_id(&prerequisite.id)
+                    .audit_actor(actor)
+                    .maybe_audit_basis(attribution.provenance.map(str::to_owned))
+                    .build(),
                 |_| false,
             )?;
         } else {
@@ -155,11 +176,11 @@ pub(super) fn approve_in_tx(
     // can later move it back to `todo` and dispatch it.
     crate::task_status_audit::execute(
         conn,
-        "approve_in_tx",
-        "human",
+        &basis,
+        actor,
         "UPDATE tasks SET description = ?2, status = 'todo', blocked_reason = NULL,
-         blocked_detail = NULL, autostart = 1, last_status_actor = 'human', updated_at = ?3 WHERE id = ?1",
-        params![task.id, description, now],
+         blocked_detail = NULL, autostart = 1, last_status_actor = ?4, updated_at = ?3 WHERE id = ?1",
+        params![task.id, description, now, actor],
     )?;
     add_dependency_edge_in_tx(pending, conn, &task.id, &prerequisite.id, RELATION_BLOCKS, now)?;
     queue_gated_execution(conn, task, question)?;

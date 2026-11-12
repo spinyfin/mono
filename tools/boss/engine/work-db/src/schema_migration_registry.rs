@@ -414,6 +414,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: spoke_ingress::migrate,
         },
         Migration {
+            id: task_status_audit::DEFERRED_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: task_status_audit::migrate_deferred,
+        },
+        Migration {
             id: parking::MIGRATION_ID.into(),
             legacy_version: None,
             apply: parking::migrate,

@@ -965,6 +965,10 @@ mod floor_tests {
                 Box::new(|c| task_status_audit::migrate(c).unwrap()),
             ),
             (
+                task_status_audit::DEFERRED_MIGRATION_ID,
+                Box::new(|c| task_status_audit::migrate_deferred(c).unwrap()),
+            ),
+            (
                 stuck_snapshot::MIGRATION_ID,
                 Box::new(|c| stuck_snapshot::migrate(c).unwrap()),
             ),

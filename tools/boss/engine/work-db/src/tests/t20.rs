@@ -1,5 +1,28 @@
 use super::*;
 
+/// Flag rows written when a human-filed revision is preserved as a standalone chore.
+fn assert_preserved_chore_flag_rows(db: &WorkDb, chore_id: &str, autostart: bool) {
+    let created = "insert_chore_with_project_in_tx_as_actor";
+    let autostart_value = if autostart { "1" } else { "0" };
+    let rows = db.list_task_field_audit(chore_id).unwrap();
+    let autostart_row = rows
+        .iter()
+        .find(|row| row.property == "autostart")
+        .expect("preserved chore autostart row");
+    assert_eq!(autostart_row.old_value, None);
+    assert_eq!(autostart_row.new_value.as_deref(), Some(autostart_value));
+    assert_eq!(autostart_row.actor, "engine");
+    assert_eq!(autostart_row.basis, created);
+    let deferred_row = rows
+        .iter()
+        .find(|row| row.property == "deferred")
+        .expect("preserved chore deferred row");
+    assert_eq!(deferred_row.old_value, None);
+    assert_eq!(deferred_row.new_value.as_deref(), Some("0"));
+    assert_eq!(deferred_row.actor, "engine");
+    assert_eq!(deferred_row.basis, created);
+}
+
 // ── block_pending_revisions_on_parent_close / parent-PR-merged invalidation ─
 
 /// When the parent PR merges, a human-filed `todo` revision must be converted
@@ -57,6 +80,7 @@ fn mark_chore_pr_merged_converts_todo_revision_to_chore() {
         "backlog-converted revision must yield a non-autostart chore"
     );
     assert_eq!(new_chore.status, TaskStatus::Todo, "converted chore must start as todo");
+    assert_preserved_chore_flag_rows(&db, &new_chore.id, false);
 }
 
 /// A revision archived because its parent PR merged (the non-moot,
@@ -438,6 +462,7 @@ fn mark_chore_pr_merged_converts_active_revision_to_autostart_chore() {
         "WIP-converted revision must yield an autostart chore (restart immediately)",
     );
     assert_eq!(new_chore.status, TaskStatus::Todo, "converted chore must start as todo");
+    assert_preserved_chore_flag_rows(&db, &new_chore.id, true);
 
     // The archived original revision must vanish from the board; only the
     // new standalone chore should render.

@@ -87,9 +87,13 @@ pub(super) fn measure(conn: &Connection, now: i64, create_window_secs: i64) -> R
     }
     let mut intervals = samples(
         conn,
+        // `deferred` is a classification flag, not a progression-state write.
+        // Exclude it so toggling future-scope does not shift ledger_interval_p99_secs,
+        // matching stuck-report ageing which also ignores those rows.
         "WITH writes AS (
         SELECT DISTINCT CAST(changed_at AS INTEGER) AS stamp FROM task_status_audit
-        WHERE age_is_lower_bound=0 AND CAST(changed_at AS INTEGER)>=?1 AND CAST(changed_at AS INTEGER)<?2),
+        WHERE age_is_lower_bound=0 AND property<>'deferred'
+        AND CAST(changed_at AS INTEGER)>=?1 AND CAST(changed_at AS INTEGER)<?2),
         gaps AS (SELECT stamp-LAG(stamp) OVER (ORDER BY stamp) AS gap FROM writes)
         SELECT gap FROM gaps WHERE gap IS NOT NULL",
         start,
@@ -103,7 +107,9 @@ pub(super) fn measure(conn: &Connection, now: i64, create_window_secs: i64) -> R
     }
     // Same-head red episodes only: a superseding head must be recorded at
     // abandonment and observed failing by the next branch-CI attempt.
-    // Resolution and overlapping work invalidate the gap.
+    // Resolution and overlapping work invalidate the gap. Deferring is a hold
+    // the same way clearing autostart is, so `property='deferred'` is in the
+    // hold list below.
     let mut pauses = samples(
         conn,
         &format!(
@@ -136,7 +142,7 @@ pub(super) fn measure(conn: &Connection, now: i64, create_window_secs: i64) -> R
         AND NOT EXISTS (SELECT 1 FROM task_status_audit hold
             WHERE hold.work_item_id=steps.work_item_id
             AND CAST(hold.changed_at AS INTEGER)>=prior AND CAST(hold.changed_at AS INTEGER)<=stamp
-            AND hold.property IN ('parked_at','autostart'))
+            AND hold.property IN ('parked_at','autostart','deferred'))
         AND NOT EXISTS (SELECT 1 FROM work_executions e
             WHERE e.kind<>'progression' AND {ITEM_OR_REVISION}
             AND (CAST(e.created_at AS INTEGER)<stamp OR CAST(e.started_at AS INTEGER)<stamp)

@@ -3,7 +3,7 @@
 //! execution ids, the three answers to the engine's question, and the report
 //! buckets that count it.
 use super::*;
-use crate::test_support::{create_test_chore_manual, create_test_product};
+use crate::test_support::{create_test_chore, create_test_chore_manual, create_test_product};
 use boss_protocol::{
     CreateExecutionInput, ExecutionStatus, OperatorAnswer, OperatorQuestionRecord, OperatorQuestionStatus,
     ProposalKind, ProposalSubmissionError, StuckBucket,
@@ -643,6 +643,37 @@ fn keep_trying_resets_the_attempts_and_renominates_the_item_in_the_state_it_was_
         S5,
     );
     assert_eq!(fx.pass().asked.len(), 0, "one attempt after the reset");
+}
+
+#[test]
+fn keep_trying_restores_autostart_under_the_restoration_basis() {
+    let fx = fx();
+    let id = create_test_chore(&fx.db, &fx.product, "Keep trying restores autostart").id;
+    crate::task_status_audit::execute(
+        &fx.db.connect().unwrap(),
+        "merge_conflict_observed",
+        "engine",
+        "UPDATE tasks SET status = 'blocked', blocked_reason = 'merge_conflict',
+             last_status_actor = 'engine' WHERE id = ?1",
+        [&id],
+    )
+    .unwrap();
+    fx.age(&id, 3 * HOUR);
+    let question = exhausted(&fx, &id, S5);
+    assert!(!fx.task(&id).autostart, "parking for the question clears autostart");
+    fx.answer(&question, KEEP_TRYING);
+    let mut autostart_rows: Vec<_> = fx
+        .db
+        .list_task_field_audit(&id)
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.property == "autostart")
+        .collect();
+    let restored = autostart_rows.pop().expect("autostart history");
+    assert_eq!(restored.old_value.as_deref(), Some("0"));
+    assert_eq!(restored.new_value.as_deref(), Some("1"));
+    assert_eq!(restored.actor, "human");
+    assert_eq!(restored.basis, "progression_ladder_restore_autostart");
 }
 
 #[test]

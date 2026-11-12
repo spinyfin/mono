@@ -1340,6 +1340,31 @@ pub fn parked_via_project(project_id: &str) -> String {
 /// client shows it as an unexpected state, never as an ordinary queue reason.
 pub const DISPATCH_WAIT_REASON_UNCLASSIFIED: &str = "unclassified";
 
+/// One recorded change to a task's `deferred` or `autostart` flag, from the
+/// engine's field-change ledger. `actor` is who the engine attributes the write
+/// to (`human`, `boss`, `engine`, `progression`, ...); `basis` names the code
+/// path that made it and, for a write that arrived over the socket, the
+/// calling process and request so it can be joined to the engine logs. A
+/// `basis` of `unattributed_write` marks a write that bypassed the engine's
+/// attribution helper; `unknown_legacy` marks the baseline row of an item that
+/// predates the ledger, whose `changed_at` is only a lower bound.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct TaskFieldAuditRow {
+    /// `deferred` or `autostart`.
+    pub property: String,
+    /// Value before the change; `None` for the row recorded at creation.
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+    pub actor: String,
+    pub basis: String,
+    /// Unix epoch seconds (decimal string).
+    pub changed_at: String,
+    #[serde(default)]
+    #[builder(default)]
+    pub age_is_lower_bound: bool,
+}
+
 /// Live runtime status for a single task/chore — the current execution
 /// and most recent run, summarized for the kanban view. `None` fields
 /// mean no execution (or no run) exists yet for the work item.

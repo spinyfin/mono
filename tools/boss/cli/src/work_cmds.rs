@@ -1606,6 +1606,11 @@ pub(crate) async fn run_show_leaf(
         other => return Err(unexpected_event("operator question history", &other)),
     };
     let attention_groups = list_attention_groups(client, &product.id, None, Some(item.id.clone()), None, None).await?;
+    let field_audit = field_audit_from_reply(
+        client
+            .send_request(&FrontendRequest::ListTaskFieldAudit { id: item.id.clone() })
+            .await,
+    );
     let mut task_json = task_json_with_runtime(&item, &runtime)?;
     // These keys share a namespace with `Task`'s own serialized fields, so a
     // future `Task` field named `dependencies`/`executions`/`attention_items`/
@@ -1631,6 +1636,12 @@ pub(crate) async fn run_show_leaf(
             "attention_groups".to_owned(),
             serde_json::to_value(&attention_groups).map_err(CliError::internal)?,
         );
+        // Every recorded change to `deferred` / `autostart`, oldest first,
+        // each with the actor and the code path (and calling process) behind it.
+        map.insert(
+            "field_audit".to_owned(),
+            serde_json::to_value(&field_audit).map_err(CliError::internal)?,
+        );
     } else {
         return Err(CliError::internal(anyhow::anyhow!("task JSON was not an object")));
     }
@@ -1646,7 +1657,51 @@ pub(crate) async fn run_show_leaf(
         print_runtime_section(&runtime);
         print_dependency_section(&detail);
         print_executions_section(&execution_runs);
+        print_field_audit_section(&field_audit);
     })
+}
+
+/// Flag history is additive: an older engine, or a failed history read, must
+/// not fail `boss task show`. Treat those replies as no history and warn.
+fn field_audit_from_reply(
+    reply: anyhow::Result<boss_protocol::FrontendEvent>,
+) -> Vec<boss_protocol::TaskFieldAuditRow> {
+    match reply {
+        Ok(boss_protocol::FrontendEvent::TaskFieldAuditList { rows, .. }) => rows,
+        Ok(
+            boss_protocol::FrontendEvent::WorkError { message } | boss_protocol::FrontendEvent::Error { message, .. },
+        ) => {
+            eprintln!("warning: task flag history unavailable ({message})");
+            Vec::new()
+        }
+        Ok(_) => {
+            eprintln!("warning: task flag history unavailable (unexpected engine reply)");
+            Vec::new()
+        }
+        Err(err) => {
+            eprintln!("warning: task flag history unavailable ({err})");
+            Vec::new()
+        }
+    }
+}
+
+/// The `deferred` / `autostart` history of a task, oldest first: what changed,
+/// who the engine attributes it to, and the code path that wrote it.
+fn print_field_audit_section(rows: &[boss_protocol::TaskFieldAuditRow]) {
+    if rows.is_empty() {
+        return;
+    }
+    println!();
+    println!("Flag history ({}):", rows.len());
+    for row in rows {
+        let old = row.old_value.as_deref().unwrap_or("-");
+        let new = row.new_value.as_deref().unwrap_or("-");
+        let lower_bound = if row.age_is_lower_bound { " (or earlier)" } else { "" };
+        println!(
+            "  {} {} -> {} by {} at {}{} via {}",
+            row.property, old, new, row.actor, row.changed_at, lower_bound, row.basis
+        );
+    }
 }
 
 /// Serialise `item` and splice the runtime's `current_execution_id`
@@ -2222,4 +2277,39 @@ async fn request_critical(
             println!("Pending app confirmation: {id} (expires in five minutes)");
         },
     )
+}
+
+#[cfg(test)]
+mod field_audit_show_tests {
+    use super::*;
+    use boss_protocol::FrontendEvent;
+
+    #[test]
+    fn a_history_reply_is_kept() {
+        let rows = vec![boss_protocol::TaskFieldAuditRow {
+            property: "deferred".into(),
+            old_value: None,
+            new_value: Some("0".into()),
+            actor: "human".into(),
+            basis: "insert_task_in_tx_as_actor".into(),
+            changed_at: "1".into(),
+            age_is_lower_bound: false,
+        }];
+        let got = field_audit_from_reply(Ok(FrontendEvent::TaskFieldAuditList {
+            work_item_id: "task_1".into(),
+            rows: rows.clone(),
+        }));
+        assert_eq!(got, rows);
+    }
+
+    #[test]
+    fn an_unknown_verb_or_failed_read_is_absent_history() {
+        assert!(
+            field_audit_from_reply(Ok(FrontendEvent::WorkError {
+                message: "unknown request type".into()
+            }))
+            .is_empty()
+        );
+        assert!(field_audit_from_reply(Err(anyhow::anyhow!("engine closed"))).is_empty());
+    }
 }

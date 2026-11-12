@@ -50,6 +50,7 @@ fn progression_allowed_fixtures() -> Vec<FrontendRequest> {
         req(json!({"type": "list_proposals", "run_id": "e"})),
         req(json!({"type": "list_revisions", "product_id": "p"})),
         req(json!({"type": "list_runs", "execution_id": "e"})),
+        req(json!({"type": "list_task_field_audit", "id": "t"})),
         req(json!({"type": "list_tasks", "product_id": "p", "project_id": null})),
         req(json!({"type": "resolve_project_design_doc", "project_id": "p"})),
         req(json!({"type": "submit_proposal", "run_id": "e", "kind": "wait", "payload": {}})),

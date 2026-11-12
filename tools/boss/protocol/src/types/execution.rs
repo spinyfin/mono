@@ -716,6 +716,20 @@ pub struct RequestExecutionInput {
     #[builder(default)]
     pub explicit_start: bool,
 
+    /// Ledger actor for writes this request makes (clearing `deferred` on
+    /// an explicit start). The RequestExecution handler overwrites this from
+    /// the socket peer; automatic callers leave it unset so the row records
+    /// `engine`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_actor: Option<String>,
+
+    /// Ledger caller identity for those writes (`rpc:request_execution …` or
+    /// `board_drop:request_execution …`). Combined with the helper name
+    /// (`explicit_start_clears_deferred`) at the write. Unset for automatic
+    /// callers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_basis: Option<String>,
+
     pub preferred_workspace_id: Option<String>,
     pub priority: Option<i64>,
     /// Host selected for this one dispatch request. This is intentionally

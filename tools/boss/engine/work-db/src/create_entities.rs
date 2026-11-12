@@ -280,9 +280,20 @@ impl WorkDb {
     /// Like [`Self::create_task`] with the resolved caller tier; only
     /// `'human'` may create the row at `critical`.
     pub fn create_task_as_actor(&self, input: CreateTaskInput, actor: &str) -> Result<Task> {
+        self.create_task_as_actor_with_provenance(input, actor, None)
+    }
+
+    /// [`Self::create_task_as_actor`] with the socket caller identity so a
+    /// `--deferred` / `--no-autostart` create records who filed it.
+    pub fn create_task_as_actor_with_provenance(
+        &self,
+        input: CreateTaskInput,
+        actor: &str,
+        provenance: Option<&str>,
+    ) -> Result<Task> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let task = insert_task_in_tx_as_actor(&tx, input, actor)?;
+        let task = insert_task_in_tx_as_actor_with_provenance(&tx, input, actor, provenance)?;
         tx.commit()?;
         Ok(task)
     }
@@ -295,9 +306,20 @@ impl WorkDb {
     /// Like [`Self::create_chore`] with the resolved caller tier; only
     /// `'human'` may create the row at `critical`.
     pub fn create_chore_as_actor(&self, input: CreateChoreInput, actor: &str) -> Result<Task> {
+        self.create_chore_as_actor_with_provenance(input, actor, None)
+    }
+
+    /// [`Self::create_chore_as_actor`] with the socket caller identity so a
+    /// `--deferred` / `--no-autostart` create records who filed it.
+    pub fn create_chore_as_actor_with_provenance(
+        &self,
+        input: CreateChoreInput,
+        actor: &str,
+        provenance: Option<&str>,
+    ) -> Result<Task> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let chore = insert_chore_in_tx_as_actor(&tx, input, actor)?;
+        let chore = insert_chore_in_tx_as_actor_with_provenance(&tx, input, actor, provenance)?;
         tx.commit()?;
         Ok(chore)
     }
@@ -316,9 +338,19 @@ impl WorkDb {
         input: boss_protocol::CreateInvestigationInput,
         actor: &str,
     ) -> Result<Task> {
+        self.create_investigation_as_actor_with_provenance(input, actor, None)
+    }
+
+    /// [`Self::create_investigation_as_actor`] with the socket caller identity.
+    pub fn create_investigation_as_actor_with_provenance(
+        &self,
+        input: boss_protocol::CreateInvestigationInput,
+        actor: &str,
+        provenance: Option<&str>,
+    ) -> Result<Task> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let task = insert_investigation_in_tx_as_actor(&tx, input, actor)?;
+        let task = insert_investigation_in_tx_as_actor_with_provenance(&tx, input, actor, provenance)?;
         tx.commit()?;
         Ok(task)
     }

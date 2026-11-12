@@ -60,6 +60,28 @@ pub(super) fn refuse_agent_parking(server_state: &ServerState, peer_pid: Option<
     Ok(())
 }
 
+/// Reply with the recorded `deferred` / `autostart` changes of one task.
+pub(super) async fn handle_list_task_field_audit(ctx: Dispatch, req: FrontendRequest) {
+    let FrontendRequest::ListTaskFieldAudit { id } = req else {
+        unreachable!()
+    };
+    let id = match ctx.server_state.resolve_work_item_id(&id).await {
+        Ok(id) => id,
+        Err(err) => {
+            send_work_error(&ctx.sink, &ctx.request_id, &err);
+            return;
+        }
+    };
+    match ctx.work_db.list_task_field_audit(&id) {
+        Ok(rows) => send_response(
+            &ctx.sink,
+            &ctx.request_id,
+            FrontendEvent::TaskFieldAuditList { work_item_id: id, rows },
+        ),
+        Err(err) => send_work_error(&ctx.sink, &ctx.request_id, &err),
+    }
+}
+
 pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
@@ -67,6 +89,7 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
         sink,
         session_id,
         request_id,
+        peer_pid,
         ..
     } = ctx;
     let (id, answer) = match req {
@@ -99,7 +122,15 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
         }
         return;
     };
-    match work_db.answer_operator_question_with(&id, answer, server_state.pr_state_checker.as_ref()) {
+    let actor = resolve_status_actor(&server_state, peer_pid);
+    let provenance = resolve_write_basis(&server_state, peer_pid, &session_id, &request_id, "rpc:answer").await;
+    match work_db.answer_operator_question_from(
+        &id,
+        answer,
+        server_state.pr_state_checker.as_ref(),
+        actor,
+        Some(&provenance),
+    ) {
         Ok(outcome) => {
             let mut item = outcome.item;
             // "Archive it", the owner's answer to the engine's question about an
@@ -435,8 +466,9 @@ pub(super) async fn handle_create_task(ctx: Dispatch, req: FrontendRequest) {
     // canonical origin now so the durable row is dispatchable
     // and `cube repo ensure` never sees a bare slug (#861).
     repo_slug::resolve_repo_slugs(&server_state.cube_client, &mut [&mut input.repo_remote_url]).await;
+    let provenance = resolve_write_basis(&server_state, peer_pid, &session_id, &request_id, "rpc:create_task").await;
     let created = resolve_write_actor(&server_state, peer_pid, input.priority.as_deref(), None)
-        .and_then(|actor| work_db.create_task_as_actor(input, actor))
+        .and_then(|actor| work_db.create_task_as_actor_with_provenance(input, actor, Some(&provenance)))
         .map(WorkItem::Task);
     finish_create_work_item(
         &server_state,
@@ -469,8 +501,9 @@ pub(super) async fn handle_create_chore(ctx: Dispatch, req: FrontendRequest) {
     // Resolve a `--repo <slug>` override to its canonical cube
     // origin before persisting (#861); see the CreateTask arm.
     repo_slug::resolve_repo_slugs(&server_state.cube_client, &mut [&mut input.repo_remote_url]).await;
+    let provenance = resolve_write_basis(&server_state, peer_pid, &session_id, &request_id, "rpc:create_chore").await;
     let created = resolve_write_actor(&server_state, peer_pid, input.priority.as_deref(), None)
-        .and_then(|actor| work_db.create_chore_as_actor(input, actor))
+        .and_then(|actor| work_db.create_chore_as_actor_with_provenance(input, actor, Some(&provenance)))
         .map(WorkItem::Chore);
     finish_create_work_item(
         &server_state,
@@ -705,11 +738,11 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
             let pause_bypass = bypass_dispatch_pause.then_some(BoardDragPauseBypass {
                 observed_pause_since_epoch_s,
             });
-            apply_work_item_patch(ctx, id, patch, pause_bypass).await;
+            apply_work_item_patch_from(ctx, id, patch, pause_bypass, "board_drop:set_status").await;
         }
         DropResolution::ClearAutostart => {
             let patch = WorkItemPatch::builder().autostart(false).build();
-            apply_work_item_patch(ctx, id, patch, None).await;
+            apply_work_item_patch_from(ctx, id, patch, None, "board_drop:clear_autostart").await;
         }
         DropResolution::Refused { message } => {
             let err = anyhow!(message);
@@ -753,6 +786,20 @@ pub(super) async fn apply_work_item_patch(
     id: String,
     patch: WorkItemPatch,
     pause_bypass: Option<BoardDragPauseBypass>,
+) {
+    apply_work_item_patch_from(ctx, id, patch, pause_bypass, "rpc:update_work_item").await;
+}
+
+/// [`apply_work_item_patch`] naming the handler that built the patch. `source`
+/// becomes the first word of the field-change ledger basis, so a `deferred` or
+/// `autostart` write made by a kanban gesture reads differently from one made
+/// by an explicit `UpdateWorkItem`.
+pub(super) async fn apply_work_item_patch_from(
+    ctx: Dispatch,
+    id: String,
+    patch: WorkItemPatch,
+    pause_bypass: Option<BoardDragPauseBypass>,
+    source: &str,
 ) {
     let Dispatch {
         server_state,
@@ -893,8 +940,9 @@ pub(super) async fn apply_work_item_patch(
                 .apply_parking_patch_reporting(&id, &patch, actor)
                 .map(|(item, report)| (item, Some(report)))
         } else {
+            let basis = resolve_write_basis(&server_state, peer_pid, &session_id, &request_id, source).await;
             work_db
-                .update_work_item_as_actor(&id, patch, actor)
+                .update_work_item_with_basis(&id, patch, actor, &basis)
                 .map(|item| (item, None))
         };
         match applied {
@@ -1012,6 +1060,14 @@ pub(super) async fn apply_work_item_patch(
                 if task_transitioned_to_active(&previous_task_status, &item) {
                     let work_item_id_for_event = work_item_id(&item);
                     let from_status = previous_task_status.clone();
+                    let start_basis = resolve_write_basis(
+                        &server_state,
+                        peer_pid,
+                        &session_id,
+                        &request_id,
+                        "board_drop:request_execution",
+                    )
+                    .await;
                     // Human-driven: status flip to Doing is the whole point —
                     // mark "someone is on this" without spawning a worker.
                     let item_is_human_driven = matches!(
@@ -1049,6 +1105,8 @@ pub(super) async fn apply_work_item_patch(
                             .explicit_start(true)
                             .entry_point(DispatchAdmissionEntryPoint::AppDrag)
                             .maybe_observed_pause_since_epoch_s(bypass.observed_pause_since_epoch_s)
+                            .audit_actor(actor)
+                            .audit_basis(start_basis.clone())
                             .build();
                         match coordinator
                             .dispatch_with_pause_bypass(dispatch_input, live_states)
@@ -1082,6 +1140,8 @@ pub(super) async fn apply_work_item_patch(
                         let dispatch_input = RequestExecutionInput::builder()
                             .work_item_id(work_item_id_for_event.clone())
                             .explicit_start(true)
+                            .audit_actor(actor)
+                            .audit_basis(start_basis.clone())
                             .build();
                         match work_db
                             .request_execution_with_live_check(dispatch_input, |run_id| live_states.is_run_live(run_id))
@@ -1687,8 +1747,16 @@ pub(super) async fn handle_create_investigation(ctx: Dispatch, req: FrontendRequ
     let FrontendRequest::CreateInvestigation { input } = req else {
         unreachable!()
     };
+    let provenance = resolve_write_basis(
+        &server_state,
+        peer_pid,
+        &session_id,
+        &request_id,
+        "rpc:create_investigation",
+    )
+    .await;
     let created = resolve_write_actor(&server_state, peer_pid, input.priority.as_deref(), None)
-        .and_then(|actor| work_db.create_investigation_as_actor(input, actor))
+        .and_then(|actor| work_db.create_investigation_as_actor_with_provenance(input, actor, Some(&provenance)))
         .map(WorkItem::Task);
     finish_create_work_item(
         &server_state,

@@ -142,14 +142,21 @@ fn approval_links_parked_prerequisite_without_minting() {
     park(&db, &task.id);
     let mut conn = db.connect_new().unwrap();
     let tx = conn.transaction().unwrap();
+    let question = question();
     let linked = crate::prerequisite_question::approve_in_tx(
         &mut PendingEvents::new(),
         &tx,
         &task,
-        &question(),
-        ("prerequisite", "Fix prerequisite"),
-        chrono::DateTime::from_timestamp(1, 0).unwrap(),
-        "1",
+        crate::prerequisite_question::Approval {
+            question: &question,
+            proposed: ("prerequisite", "Fix prerequisite"),
+            answered_at: chrono::DateTime::from_timestamp(1, 0).unwrap(),
+            now: "1",
+        },
+        crate::task_status_audit::WriteAttribution {
+            actor: boss_protocol::LAST_STATUS_ACTOR_HUMAN,
+            provenance: None,
+        },
     )
     .unwrap();
     assert_eq!(linked.id, prerequisite.id);

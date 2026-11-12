@@ -427,6 +427,14 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "operator_questions_list",
         },
         TagCase {
+            label: "task_field_audit",
+            event: FrontendEvent::TaskFieldAuditList {
+                work_item_id: "task_1".into(),
+                rows: vec![],
+            },
+            expected_tag: "task_field_audit_list",
+        },
+        TagCase {
             label: "operator_question_error",
             event: FrontendEvent::OperatorQuestionError {
                 error: crate::OperatorQuestionError::NotFound,
@@ -2507,6 +2515,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::AttachmentsList { .. }
         | FrontendEvent::OperatorDecisionSnapshot { .. }
         | FrontendEvent::OperatorQuestionsList { .. }
+        | FrontendEvent::TaskFieldAuditList { .. }
         | FrontendEvent::OperatorQuestionError { .. } => {}
     }
 }

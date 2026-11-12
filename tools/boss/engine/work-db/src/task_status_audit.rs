@@ -3,6 +3,35 @@
 use super::*;
 
 pub(super) const MIGRATION_ID: &str = "20261029_0314_task_status_audit";
+pub(super) const DEFERRED_MIGRATION_ID: &str = "20261112_1900_task_deferred_audit";
+
+/// The task-field changes `boss task show` reports from the ledger: the two
+/// flags that hold an item out of automatic dispatch. Each has its own
+/// trigger, so every write path leaves a row whether or not it went through
+/// [`execute`]; a bare write records `unattributed_write`.
+pub(super) const FLAG_PROPERTIES: [&str; 2] = ["deferred", "autostart"];
+
+/// Join the concrete write helper (`path`) with the socket caller identity
+/// (`provenance`, from `resolve_write_basis`). Engine-internal writers pass
+/// `None` and keep the helper name alone.
+pub(crate) fn compose_basis(path: &str, provenance: Option<&str>) -> String {
+    match provenance.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(provenance) => format!("{path} {provenance}"),
+        None => path.to_owned(),
+    }
+}
+
+/// Actor plus optional socket caller identity for a ledger write.
+pub(crate) struct WriteAttribution<'a> {
+    pub actor: &'a str,
+    pub provenance: Option<&'a str>,
+}
+
+impl WriteAttribution<'_> {
+    pub(crate) fn basis(&self, path: &str) -> String {
+        compose_basis(path, self.provenance)
+    }
+}
 
 /// A savepoint also makes callers that otherwise use autocommit atomic.
 /// The context is transaction-local in effect: SQLite serializes writers and
@@ -75,6 +104,51 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         install_property_triggers(conn, property)?;
     }
     Ok(())
+}
+
+/// Start recording `tasks.deferred`. Deferring abandons pending executions, so
+/// who deferred an item and when it was cleared must be answerable. Items that
+/// predate the trigger get one baseline row so the first recorded change has
+/// something to be compared against; its age is a lower bound.
+pub(super) fn migrate_deferred(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT INTO task_status_audit
+            (work_item_id, property, new_value, actor, changed_at, basis, age_is_lower_bound)
+         SELECT t.id, 'deferred', CAST(t.deferred AS TEXT), t.last_status_actor,
+                strftime('%s','now'), 'unknown_legacy', 1
+         FROM tasks t
+         WHERE NOT EXISTS (SELECT 1 FROM task_status_audit a
+                           WHERE a.work_item_id = t.id AND a.property = 'deferred')",
+        [],
+    )?;
+    install_property_triggers(conn, "deferred")
+}
+
+impl WorkDb {
+    /// The recorded `deferred` / `autostart` changes of one task, oldest first.
+    pub fn list_task_field_audit(&self, work_item_id: &str) -> Result<Vec<boss_protocol::TaskFieldAuditRow>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT property, old_value, new_value, actor, basis, changed_at, age_is_lower_bound
+             FROM task_status_audit
+             WHERE work_item_id = ?1 AND property IN (?2, ?3)
+             ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![work_item_id, FLAG_PROPERTIES[0], FLAG_PROPERTIES[1]], |row| {
+                Ok(boss_protocol::TaskFieldAuditRow {
+                    property: row.get(0)?,
+                    old_value: row.get(1)?,
+                    new_value: row.get(2)?,
+                    actor: row.get(3)?,
+                    basis: row.get(4)?,
+                    changed_at: row.get(5)?,
+                    age_is_lower_bound: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
 }
 
 /// Install the triggers that record every change to `tasks.<property>`.

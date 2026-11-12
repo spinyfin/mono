@@ -22,7 +22,7 @@ pub(crate) fn block_unrecoverable(db: &WorkDb, execution: &WorkExecution, err: &
                 | ExecutionKind::RevisionImplementation
         )
     {
-        db.update_work_item_as_actor(
+        db.update_work_item_with_basis(
             &execution.work_item_id,
             boss_protocol::WorkItemPatch::builder()
                 .status("blocked")
@@ -31,6 +31,7 @@ pub(crate) fn block_unrecoverable(db: &WorkDb, execution: &WorkExecution, err: &
                 .autostart(false)
                 .build(),
             "engine",
+            "execution_bookmark_recovery:block_unrecoverable",
         )?;
         report_chain_block(db, execution, &format!("{err:#}"))?;
     }
@@ -76,5 +77,35 @@ pub(crate) fn report_failure(db: &WorkDb, execution: &WorkExecution, reason: &st
         resolved_at: None,
     }) {
         tracing::error!(execution_id = %execution.id, error = %err, "could not record recovery failure on work item");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::*;
+    use crate::work::WorkDb;
+
+    #[test]
+    fn blocking_an_unrecoverable_pointer_records_the_autostart_clear_with_its_code_path() {
+        let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, product.id, "Damaged pointer");
+        let execution = create_ready_chore_execution(&db, chore.id.clone());
+        let err = boss_engine_recovery::execution_bookmark::pointer_integrity_error("ambiguous bookmark");
+
+        assert!(block_unrecoverable(&db, &execution, &err).unwrap());
+
+        let history = db.list_task_field_audit(&chore.id).unwrap();
+        let cleared = history
+            .iter()
+            .rfind(|row| row.property == "autostart")
+            .expect("autostart history");
+        assert_eq!(
+            (cleared.old_value.as_deref(), cleared.new_value.as_deref()),
+            (Some("1"), Some("0"))
+        );
+        assert_eq!(cleared.actor, "engine");
+        assert_eq!(cleared.basis, "execution_bookmark_recovery:block_unrecoverable");
     }
 }

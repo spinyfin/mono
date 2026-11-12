@@ -1610,6 +1610,14 @@ pub enum FrontendRequest {
         execution_id: String,
     },
 
+    /// Every recorded change to a task's `deferred` and `autostart` flags,
+    /// oldest first, each with its actor and basis. Backs the
+    /// `field_audit` key of `boss task show --json`. Replies with
+    /// [`FrontendEvent::TaskFieldAuditList`].
+    ListTaskFieldAudit {
+        id: String,
+    },
+
     ListTasks {
         product_id: String,
         project_id: Option<String>,
