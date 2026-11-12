@@ -891,12 +891,71 @@ pub fn reconcile_work_item_execution(
                 // doing, not a decision about the work, so the row is minted
                 // afresh exactly as one that had never had an execution.
                 insert_fresh(result, Some(&execution))?;
+            } else if execution.kind == kind
+                && abandoned_never_started(conn, &execution)?
+                && !work_item_has_in_flight_execution(conn, work_item_id)?
+            {
+                // Deferral (and other pending-withdrawals) abandon a
+                // never-started execution. Once the item is runnable again
+                // that row is as good as absent, same as a park's cancelled
+                // never-started execution. An execution that actually ran
+                // and then ended keeps the "start it again" behaviour.
+                //
+                // The in-flight check covers every row, not only this latest
+                // one: `mark_execution_redundant` leaves exactly this
+                // abandoned never-started shape on top of a genuinely live
+                // (or claimed) run, and minting beside that worker is the
+                // same churn loop the revision-to-chore arm already guards.
+                insert_fresh(result, Some(&execution))?;
             }
         }
         None => insert_fresh(result, None)?,
     }
 
     Ok(())
+}
+
+/// True when a worker is already attached or cube setup is in flight for
+/// `work_item_id`. Matches [`query_live_execution_for_work_item`] (`running`,
+/// `waiting_human`) and also treats `claimed` as in-flight, as
+/// `reconcile_revision_execution` does: there is no pane yet, but minting
+/// a duplicate ready row beside the spawn is the same abandon-churn loop.
+fn work_item_has_in_flight_execution(conn: &Connection, work_item_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM work_executions
+             WHERE work_item_id = ?1
+               AND kind != 'progression'
+               AND status IN ('running', 'waiting_human', 'claimed')
+         )",
+        [work_item_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// True when this execution was withdrawn before a worker ever started:
+/// status `abandoned`, no `started_at`, and no `work_runs` row. Deferral
+/// abandons pending executions this way; they count as absent for remint
+/// once the work item is runnable again.
+///
+/// The predicate is the abandoned-never-started *shape*, not a deferral
+/// flag: `heal_ghost_active_chores`, `mark_execution_redundant`, and the
+/// pending-withdrawal paths share it. A subsequent reconcile remints when
+/// the item is still runnable (autostart on, not parked, no in-flight
+/// sibling). That includes a ghost-active heal of an autostart item — the
+/// heal demotes the card so the next reconcile can queue it again, rather
+/// than leaving a never-started abandon as a finished run. An execution
+/// that actually started, or that sits beneath a live/claimed sibling, is
+/// still not reminted.
+pub(crate) fn abandoned_never_started(conn: &Connection, execution: &WorkExecution) -> Result<bool> {
+    if execution.status != ExecutionStatus::Abandoned || execution.started_at.is_some() {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM work_runs WHERE execution_id = ?1)",
+        params![execution.id],
+        |row| row.get(0),
+    )?)
 }
 
 /// Look up the chain root's task for a revision (the first non-revision

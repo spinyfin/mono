@@ -25,13 +25,13 @@ use super::queued_wait::DispatchWait;
 use super::review_badge::{ReviewKey, review_family_cte};
 use super::*;
 use boss_engine_storage_values::dispatch_wait::{
-    DISPATCH_WAIT_REASON_AWAITING_MERGE, DISPATCH_WAIT_REASON_AWAITING_PARENT_PR,
-    DISPATCH_WAIT_REASON_AWAITING_REDISPATCH, DISPATCH_WAIT_REASON_AWAITING_REVIEW,
-    DISPATCH_WAIT_REASON_CONFLICT_DEFERRED, DISPATCH_WAIT_REASON_DEFERRED, DISPATCH_WAIT_REASON_DELIBERATE_PARK,
-    DISPATCH_WAIT_REASON_DISPATCH_FAILED, DISPATCH_WAIT_REASON_DISPATCH_PAUSED, DISPATCH_WAIT_REASON_HUMAN_DRIVEN,
-    DISPATCH_WAIT_REASON_HUMAN_REVIEW, DISPATCH_WAIT_REASON_PARKED, DISPATCH_WAIT_REASON_PR_OPEN,
-    DISPATCH_WAIT_REASON_RECOVERY_ATTENTION, DISPATCH_WAIT_REASON_REPO_UNRESOLVED, DISPATCH_WAIT_REASON_REVIEW_BATCH,
-    DISPATCH_WAIT_REASON_REVIEW_COMPLETE, DISPATCH_WAIT_REASON_REVIEW_RESERVATION,
+    DISPATCH_WAIT_REASON_AWAITING_DISPATCH, DISPATCH_WAIT_REASON_AWAITING_MERGE,
+    DISPATCH_WAIT_REASON_AWAITING_PARENT_PR, DISPATCH_WAIT_REASON_AWAITING_REDISPATCH,
+    DISPATCH_WAIT_REASON_AWAITING_REVIEW, DISPATCH_WAIT_REASON_CONFLICT_DEFERRED, DISPATCH_WAIT_REASON_DEFERRED,
+    DISPATCH_WAIT_REASON_DELIBERATE_PARK, DISPATCH_WAIT_REASON_DISPATCH_FAILED, DISPATCH_WAIT_REASON_DISPATCH_PAUSED,
+    DISPATCH_WAIT_REASON_HUMAN_DRIVEN, DISPATCH_WAIT_REASON_HUMAN_REVIEW, DISPATCH_WAIT_REASON_PARKED,
+    DISPATCH_WAIT_REASON_PR_OPEN, DISPATCH_WAIT_REASON_RECOVERY_ATTENTION, DISPATCH_WAIT_REASON_REPO_UNRESOLVED,
+    DISPATCH_WAIT_REASON_REVIEW_BATCH, DISPATCH_WAIT_REASON_REVIEW_COMPLETE, DISPATCH_WAIT_REASON_REVIEW_RESERVATION,
     DISPATCH_WAIT_REASON_REVISION_PENDING, DISPATCH_WAIT_REASON_RUN_ENDED, DISPATCH_WAIT_REASON_UNCLASSIFIED,
     DISPATCH_WAIT_REASON_WORKSPACE_POSITIONING_REFUSED,
 };
@@ -438,6 +438,35 @@ fn open_positioning_hold_messages(conn: &Connection, ids: &[&str]) -> Result<Has
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// Members of `ids` whose latest non-progression execution was abandoned
+/// before a worker started: no `started_at` and no `work_runs` row. Those
+/// rows are reminted once the item is runnable, so they must not be named
+/// `run_ended`.
+fn abandoned_never_started_among(conn: &Connection, ids: &[&str]) -> Result<HashSet<String>> {
+    if ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT e.work_item_id
+         FROM work_executions e
+         WHERE e.work_item_id IN (SELECT value FROM json_each(?1))
+           AND e.kind <> 'progression'
+           AND e.status = 'abandoned'
+           AND e.started_at IS NULL
+           AND NOT EXISTS (SELECT 1 FROM work_runs r WHERE r.execution_id = e.id)
+           AND e.id = (
+             SELECT e2.id FROM work_executions e2
+             WHERE e2.work_item_id = e.work_item_id AND e2.kind <> 'progression'
+             ORDER BY e2.created_at DESC, e2.id DESC
+             LIMIT 1
+           )",
+    )?;
+    let found = stmt
+        .query_map([id_array(ids)], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(found)
+}
+
 /// The members of `ids` with an open attention item of one of `kinds`.
 /// `kinds` are attention-kind constants, never caller data.
 fn open_attention_among(conn: &Connection, ids: &[&str], kinds: &[&str]) -> Result<HashSet<String>> {
@@ -465,8 +494,11 @@ fn open_attention_among(conn: &Connection, ids: &[&str], kinds: &[&str]) -> Resu
 ///
 /// The named reasons are the reconciler's own refusals to mint an execution,
 /// in its order (`reconcile_work_item_execution` /
-/// `reconcile_revision_execution`). When none of them applies the reconciler
-/// would have minted one, so its absence is unclassified.
+/// `reconcile_revision_execution`). A never-started abandoned latest row is
+/// reminted on the next reconcile, so once other holds do not apply it is
+/// named [`DISPATCH_WAIT_REASON_AWAITING_DISPATCH`]. When none of the
+/// refusals applies and there is no remintable row, the reconciler would
+/// have minted one, so a genuine absence is unclassified.
 fn classify_queued(
     conn: &Connection,
     cards: &[&Candidate<'_>],
@@ -474,6 +506,12 @@ fn classify_queued(
 ) -> Result<()> {
     let ids: Vec<&str> = cards.iter().map(|card| card.task.id.as_str()).collect();
     let holds = RowHolds::load(conn, &ids)?;
+    let abandoned: Vec<&str> = cards
+        .iter()
+        .filter(|card| card.latest == Some(&ExecutionStatus::Abandoned))
+        .map(|card| card.task.id.as_str())
+        .collect();
+    let remintable = abandoned_never_started_among(conn, &abandoned)?;
     let (mut revisions, mut unowned) = (Vec::new(), Vec::new());
     for card in cards {
         let task = card.task;
@@ -481,8 +519,12 @@ fn classify_queued(
             code
         } else if task.deferred || holds.deferred.contains(&task.id) {
             DISPATCH_WAIT_REASON_DEFERRED
-        } else if card.latest.is_some() {
+        } else if card.latest.is_some() && !remintable.contains(&task.id) {
             // The reconciler never mints a replacement after a finished run.
+            // A never-started abandoned row is reminted once the item is
+            // runnable again; holds above still win, and the unowned /
+            // revision fallbacks name it awaiting dispatch rather than
+            // unclassified.
             DISPATCH_WAIT_REASON_RUN_ENDED
         } else if task.kind == TaskKind::Revision {
             revisions.push(task);
@@ -513,6 +555,8 @@ fn classify_queued(
                 task,
                 if awaiting_parent {
                     DISPATCH_WAIT_REASON_AWAITING_PARENT_PR
+                } else if remintable.contains(&task.id) {
+                    DISPATCH_WAIT_REASON_AWAITING_DISPATCH
                 } else {
                     DISPATCH_WAIT_REASON_UNCLASSIFIED
                 },
@@ -528,6 +572,8 @@ fn classify_queued(
                 task,
                 if unresolved.contains(&task.id) {
                     DISPATCH_WAIT_REASON_REPO_UNRESOLVED
+                } else if remintable.contains(&task.id) {
+                    DISPATCH_WAIT_REASON_AWAITING_DISPATCH
                 } else {
                     DISPATCH_WAIT_REASON_UNCLASSIFIED
                 },
