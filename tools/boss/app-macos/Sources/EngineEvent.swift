@@ -215,9 +215,9 @@ enum EngineEvent {
     /// silently broke summarization with no UI affordance.
     case engineHealthResult(apiKeyPresent: Bool, issues: [EngineHealthIssue])
     /// Response to `get_driver_traffic_split` / `set_driver_traffic_split`
-    /// — the current effective three-way allocation of eligible,
+    /// — the current effective four-way allocation of eligible,
     /// `standard`-reasoning implementation work between the `grok`,
-    /// `claude`, and `codex` drivers. Its shares always sum to 100.
+    /// `claude`, `codex`, and `agy` drivers. Its shares always sum to 100.
     case driverTrafficSplitResult(split: DriverTrafficSplit)
     case codexSolPercentage(percentage: Int)
     /// Response to `get_driver_quota_usage` — one entry per implemented

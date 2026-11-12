@@ -553,8 +553,8 @@ final class ChatViewModel: ObservableObject {
     @Published var engineAnthropicApiKeyPresent: Bool = true
 
     /// Current driver traffic split: how eligible, `standard`-reasoning
-    /// implementation work is allocated between the `grok`, `claude`, and
-    /// `codex` drivers. Sourced from `driver_traffic_split_result`, fetched
+    /// implementation work is allocated between the `grok`, `claude`, `codex`,
+    /// and `agy` drivers. Sourced from `driver_traffic_split_result`, fetched
     /// on Settings-pane appear and confirmed after every
     /// `setDriverTrafficShare` call.
     @Published var driverTrafficSplit: DriverTrafficSplit = .engineDefault

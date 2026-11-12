@@ -45,7 +45,7 @@ extension EngineClient {
 
     /// Ask the engine for the current driver traffic split — how eligible,
     /// `standard`-reasoning implementation work is allocated between the
-    /// `grok`, `claude`, and `codex` drivers. Replies with
+    /// `grok`, `claude`, `codex`, and `agy` drivers. Replies with
     /// `driver_traffic_split_result`.
     func sendGetDriverTrafficSplit() {
         sendLine(["type": "get_driver_traffic_split"], queueIfDisconnected: true)

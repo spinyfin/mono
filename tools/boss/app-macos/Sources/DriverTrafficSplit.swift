@@ -75,8 +75,8 @@ struct DriverTrafficSplit: Equatable, Sendable {
     /// driver — the safest place for traffic nobody has deliberately claimed,
     /// and therefore both the natural donor when a share is raised and the
     /// natural recipient when one is lowered. Lowering `claude` itself has to
-    /// go somewhere, and it goes to `codex` before `grok` or `agy`: those two
-    /// only ever receive traffic the operator explicitly gave them.
+    /// go somewhere, and it goes to `codex` before `grok` or `agy`: Grok and
+    /// Antigravity receive traffic only when their shares are explicitly increased.
     private static func donors(for driver: DriverSlug) -> [DriverSlug] {
         [.claude, .codex, .grok, .agy].filter { $0 != driver }
     }

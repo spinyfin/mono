@@ -38,7 +38,8 @@ final class DriverTrafficSplitTests: XCTestCase {
         let start = DriverTrafficSplit(grok: 40, claude: 30, codex: 30, agy: 0)
         XCTAssertEqual(start.adjusting(.grok, to: 10), DriverTrafficSplit(grok: 10, claude: 60, codex: 30, agy: 0))
         // Lowering Claude itself has to go somewhere: Codex before Grok, so
-        // Grok only ever receives traffic the operator explicitly gave it.
+        // Grok and Antigravity receive traffic only when their shares are
+        // explicitly increased.
         XCTAssertEqual(start.adjusting(.claude, to: 0), DriverTrafficSplit(grok: 40, claude: 0, codex: 60, agy: 0))
     }
 

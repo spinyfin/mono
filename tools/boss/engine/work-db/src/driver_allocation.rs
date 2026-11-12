@@ -1,4 +1,4 @@
-//! Four-way driver traffic allocation (experiment, operator-controlled).
+//! Four-way driver traffic allocation (experiment, configured through Settings).
 //!
 //! One persisted [`DriverTrafficSplit`] — four shares summing to exactly
 //! 100 — decides how work that dispatches on its own row's driver is divided
@@ -212,6 +212,23 @@ fn eligible_drivers_for(
         .collect()
 }
 
+/// True when some share is assigned to a slug the current binary has not
+/// registered, and every currently eligible driver holds 0.
+///
+/// Settings can persist that split (the stepper does not know which slugs
+/// the engine has registered). The unregistered share is dropped from the
+/// eligible set, so `agy = 100` before an Antigravity driver exists leaves
+/// every registered driver at 0. Failing the insert would strand every
+/// unpinned row; [`decide_execution_driver`] falls through to the engine
+/// default instead.
+fn unregistered_share_left_every_eligible_driver_at_zero(split: &DriverTrafficSplit, eligible: &[&str]) -> bool {
+    let registry = boss_engine_driver::DriverRegistry::default();
+    let unregistered_holds_share = DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER
+        .iter()
+        .any(|driver| split.share_for(driver).unwrap_or(0) > 0 && registry.get(driver).is_none());
+    unregistered_holds_share && eligible.iter().all(|driver| split.share_for(driver).unwrap_or(0) == 0)
+}
+
 /// Deterministic hash of `work_item_id` into `[0, 100)`. SHA-256 rather
 /// than `std::hash::Hasher` so the mapping is stable across engine
 /// versions/restarts, not just within one process — the whole point is
@@ -237,7 +254,7 @@ fn hash_bucket(work_item_id: &str) -> u8 {
 /// driver at row or product level never reach allocation at all, so an
 /// engine that has never had a split configured routes exactly where it
 /// always did. `agy` starting at 0 also means shipping this sends nothing
-/// to the Antigravity driver until an operator deliberately raises it.
+/// to the Antigravity driver until its configured share is explicitly increased.
 ///
 /// A value that is present but does not parse, or parses to a split that
 /// fails [`DriverTrafficSplit::validate`], can only come from a hand-edited
@@ -440,11 +457,14 @@ pub(crate) fn driver_has_design_investigation_model(driver_slug: &str) -> bool {
 /// 5. Not a `tasks` row at all — no override.
 ///
 /// Errors (failing the execution insert) when the row's kind is
-/// unrecognised, or when the eligible drivers hold no share between them.
-/// Both are loud on purpose: the alternative is dispatching to the engine
-/// default driver, which for an eligibility failure means handing the row to
-/// a driver whose gate refuses it, and for a zero-share failure means
-/// overruling an operator who set that driver to 0. Zero means zero.
+/// unrecognised, or when the eligible drivers hold no share between them
+/// and that is not because the funded share sits on an unregistered driver.
+/// Remaining failures are loud on purpose: falling back to the engine
+/// default would hand an eligibility failure to a driver whose gate refuses
+/// it, or revive a registered driver that was set to 0. Zero means zero.
+/// A Settings-reachable split that puts the whole share on an unregistered
+/// driver (today: `agy = 100` with no Antigravity implementation) falls
+/// through to the engine default instead of failing every unpinned insert.
 pub fn decide_execution_driver(conn: &Connection, work_item_id: &str, kind: ExecutionKind) -> Result<DriverDecision> {
     let row = conn
         .query_row(
@@ -549,6 +569,9 @@ pub fn decide_execution_driver(conn: &Connection, work_item_id: &str, kind: Exec
         Ok(driver) => driver,
         Err(_) if model_override.is_some() => return Ok(DriverDecision::default_no_override()),
         Err(_) if design_or_investigation_tier => return Ok(DriverDecision::default_no_override()),
+        Err(_) if unregistered_share_left_every_eligible_driver_at_zero(&split, &eligible) => {
+            return Ok(DriverDecision::default_no_override());
+        }
         Err(err) => return Err(err),
     };
     Ok(DriverDecision::allocated(driver, split))

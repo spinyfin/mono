@@ -43,7 +43,7 @@ pub const DRIVER_SLUG_AGY: &str = "agy";
 /// is the behaviour-preserving state: `claude` is
 /// `boss_engine_effort::ENGINE_DEFAULT_DRIVER`, so an engine that has never
 /// had a split configured allocates exactly where it always did, and the
-/// `agy` driver receives nothing until an operator deliberately raises it.
+/// `agy` driver receives no traffic until its configured share is explicitly increased.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DriverTrafficSplit {
     /// Share routed to the `claude` driver.

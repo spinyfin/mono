@@ -280,13 +280,13 @@ private struct EngineConfigPane: View {
 /// proportional bar plus one stepper per driver.
 ///
 /// Four interdependent values that must total 100 do not decompose into
-/// four independent steppers — the operator would spend their time fighting
-/// a sum constraint. They are not modelled as independent here either: each
-/// stepper moves ONE share and `DriverTrafficSplit.adjusting(_:to:)` makes
-/// the other three absorb the difference (Claude gives way first — it is the
-/// engine's default driver, so it holds the traffic nobody has deliberately
-/// claimed). The sum invariant therefore holds at every intermediate step,
-/// which means:
+/// four independent steppers: independent steppers would require manual
+/// enforcement of the sum constraint. They are not modelled as independent
+/// here either: each stepper moves ONE share and
+/// `DriverTrafficSplit.adjusting(_:to:)` makes the other three absorb the
+/// difference (Claude gives way first — it is the engine's default driver,
+/// so it holds the traffic nobody has deliberately claimed). The sum
+/// invariant therefore holds at every intermediate step, which means:
 ///
 /// - there is no "apply" button and no rejected intermediate state;
 /// - every valid split is reachable by repeated single-share edits,

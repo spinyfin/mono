@@ -694,6 +694,53 @@ fn allocation_renormalises_four_shares_and_never_revives_zero_agy() {
     assert!(err.to_string().contains("agy=0"));
 }
 
+/// Settings can persist `agy > 0` before any Antigravity driver is
+/// registered. The real registry drops the unregistered slug, so that share
+/// redistributes among registered drivers: no row is allocated to `agy`,
+/// and every row lands on a registered driver.
+#[test]
+fn unregistered_agy_share_is_redistributed_among_registered_drivers() {
+    let registry = boss_engine_driver::DriverRegistry::default();
+    assert!(
+        registry.get(DRIVER_SLUG_AGY).is_none(),
+        "this test pins the Settings-reachable state where agy has a share before any agy driver is registered",
+    );
+    let registered: Vec<_> = registry.slugs().collect();
+    assert!(!registered.is_empty());
+
+    let (_dir, db) = open_db();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(10, 20, 30, 40))
+        .unwrap();
+    let product = create_test_product(&db);
+    for driver in allocated_drivers(&db, &product.id, 200) {
+        let slug = driver.expect("an allocated row always names a driver");
+        assert_ne!(slug, DRIVER_SLUG_AGY, "unregistered agy must receive no rows");
+        assert!(registered.contains(&slug.as_str()), "{slug} is not a registered driver",);
+    }
+}
+
+/// `agy = 100` with no registered Antigravity driver leaves every eligible
+/// registered driver at 0. Inserting that unpinned row must fall through to
+/// the engine default rather than failing — Settings can persist this split.
+#[test]
+fn unregistered_agy_at_one_hundred_falls_back_instead_of_failing_insert() {
+    assert!(
+        boss_engine_driver::DriverRegistry::default()
+            .get(DRIVER_SLUG_AGY)
+            .is_none(),
+        "this test pins the Settings-reachable state where agy is 100 before any agy driver is registered",
+    );
+    let (_dir, db) = open_db();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 0, 100))
+        .unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, &product.id, "agy 100 unregistered");
+    let execution = create_ready_chore_execution(&db, &chore.id);
+    let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+    assert_eq!(decision.reason, REASON_DEFAULT);
+    assert_eq!(decision.driver, None);
+}
+
 /// Restricting to a subset keeps allocation inside that subset for every
 /// bucket, and keeps it deterministic — the same row, split and eligible
 /// set always give the same answer.
