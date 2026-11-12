@@ -1,4 +1,5 @@
 //! One `use` per name so rustfmt cannot reflow a shared brace list.
+//! This is `wire.rs`'s import list; prune a name here when `wire.rs` stops using it.
 pub(super) use crate::types::AddDependencyInput;
 pub(super) use crate::types::AnswerAgentRun;
 pub(super) use crate::types::Attention;

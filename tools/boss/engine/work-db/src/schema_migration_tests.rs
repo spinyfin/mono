@@ -224,13 +224,26 @@ fn historical_ids_preserve_integer_order() {
     assert_eq!(versions, (1..=60).collect::<Vec<_>>());
 }
 
+/// Frozen `00000000_0000_*` ids stay first in version order; named ids follow
+/// by the suffix after `YYYYMMDD_HHMM_`, then the full id for a suffix tie.
+fn registry_source_sort_key(id: &str) -> (bool, &str, &str) {
+    const TIMESTAMP_PREFIX_LEN: usize = "YYYYMMDD_HHMM_".len();
+    let is_named = !id.starts_with("00000000_0000_");
+    let name = if is_named {
+        id.get(TIMESTAMP_PREFIX_LEN..).unwrap_or(id)
+    } else {
+        id
+    };
+    (is_named, name, id)
+}
+
 #[test]
-fn registry_entries_are_sorted_by_id() {
+fn registry_entries_are_sorted_by_name() {
     let ids: Vec<_> = registry::all().into_iter().map(|m| m.id).collect();
     let mut sorted = ids.clone();
-    sorted.sort();
+    sorted.sort_by(|a, b| registry_source_sort_key(a).cmp(&registry_source_sort_key(b)));
     assert_eq!(
         ids, sorted,
-        "schema_migration_registry entries must be in id order so concurrent additions insert at different lines. Insert the new entry by id, not at the top of the list."
+        "schema_migration_registry entries must be in name order so concurrent additions insert at different lines. Keep the frozen 00000000_0000_vNNN_* block first in version order, then insert named entries by the suffix after YYYYMMDD_HHMM_, not at the end of the list."
     );
 }

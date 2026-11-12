@@ -730,8 +730,9 @@ mod floor_tests {
     #[test]
     fn supported_databases_apply_post_floor_migrations_without_losing_data() {
         // The independent expected schema is identical for every supported version.
-        // Pair each step with its migration id and sort at run time so source
-        // order is not a shared append point.
+        // Pair each step with its migration id. Write the vec in the same
+        // name order as the registry so concurrent additions insert at
+        // different lines; sort by id at run time for application order.
         let expected = Connection::open_in_memory().unwrap();
         seed_released_schema(&expected);
         expected.execute_batch("CREATE TABLE sentinel (value TEXT)").unwrap();
@@ -845,119 +846,40 @@ mod floor_tests {
                 Box::new(|c| c.execute_batch(EXECUTION_BOOKMARK_PRUNE_COLUMNS_60).unwrap()),
             ),
             (
-                "20261029_0420_sol_selection",
-                Box::new(|c| driver_allocation::sol_selection::migrate(c).unwrap()),
-            ),
-            (
-                task_status_audit::MIGRATION_ID,
-                Box::new(|c| task_status_audit::migrate(c).unwrap()),
+                super::super::conflict_mismatch::MIGRATION_ID,
+                Box::new(|c| super::super::conflict_mismatch::migrate(c).unwrap()),
             ),
             (
                 "20261029_1430_critical_requests",
                 Box::new(|c| super::super::critical_requests::migrate(c).unwrap()),
             ),
             (
-                "20261029_0735_work_executions_item_kind_status_finished_idx",
-                Box::new(|c| {
-                    c.execute_batch(WORK_EXECUTIONS_ITEM_KIND_STATUS_FINISHED_INDEX)
-                        .unwrap()
-                }),
-            ),
-            (
-                pr_flow::OPERATOR_QUESTION_STUCK_CLASSIFICATION_MIGRATION_ID,
-                Box::new(|c| pr_flow::migrate_operator_question_stuck_classification(c).unwrap()),
-            ),
-            (
-                "20261029_1900_execution_waiting_human_history",
-                Box::new(|c| stuck_report::migrate_wait_history(c).unwrap()),
-            ),
-            (
-                super::super::conflict_mismatch::MIGRATION_ID,
-                Box::new(|c| super::super::conflict_mismatch::migrate(c).unwrap()),
-            ),
-            (
-                "20261103_0501_preserved_execution_tip",
-                Box::new(|c| preserved_work::migrate(c).unwrap()),
-            ),
-            (
-                execution_wait_history::MIGRATION_ID,
-                Box::new(|c| execution_wait_history::migrate(c).unwrap()),
-            ),
-            (
-                stuck_snapshot::MIGRATION_ID,
-                Box::new(|c| stuck_snapshot::migrate(c).unwrap()),
-            ),
-            (
-                super::super::conflict_mismatch::OPERATOR_FORCED_ADMISSION_MIGRATION_ID,
-                Box::new(|c| super::super::conflict_mismatch::migrate_operator_forced_admission(c).unwrap()),
-            ),
-            (
-                "20261104_1700_workspace_lease_boundary",
-                Box::new(|c| preserved_work::migrate_lease_boundary(c).unwrap()),
-            ),
-            (
-                "20261105_1200_workspace_lease_generation",
-                Box::new(|c| preserved_work::migrate_lease_generation(c).unwrap()),
-            ),
-            (
-                super::super::parking::MIGRATION_ID,
-                Box::new(|c| super::super::parking::migrate(c).unwrap()),
-            ),
-            (
-                super::super::progression_candidates::GRACE_COLUMN_MIGRATION_ID,
-                Box::new(|c| super::super::parking_reconcile::migrate(c).unwrap()),
-            ),
-            (
-                super::super::progression_candidates::EXECUTION_PROVENANCE_MIGRATION_ID,
-                Box::new(|c| super::super::progression_candidates::migrate_execution_provenance(c).unwrap()),
-            ),
-            (
-                super::super::progression_candidates::VIEWS_MIGRATION_ID,
-                Box::new(|c| super::super::progression_candidates::migrate_views_noop(c).unwrap()),
-            ),
-            (
-                super::super::progression_ladder::MIGRATION_ID,
-                Box::new(|c| super::super::progression_ladder::migrate(c).unwrap()),
-            ),
-            (
-                super::super::spoke_hub::MIGRATION_ID,
-                Box::new(|c| super::super::spoke_hub::migrate(c).unwrap()),
-            ),
-            (
-                "20261107_0543_parking_membership",
-                Box::new(|c| super::super::parking::migrate_membership(c).unwrap()),
-            ),
-            (
                 execution_bookmarks::HAS_RECOVERY_HEAD_MIGRATION_ID,
                 Box::new(|c| execution_bookmarks::migrate_has_recovery_head(c).unwrap()),
-            ),
-            (
-                super::super::spoke_hub::RUN_INDEX_MIGRATION_ID,
-                Box::new(|c| super::super::spoke_hub::migrate_host_commands_run_idx(c).unwrap()),
-            ),
-            (
-                super::super::parking_reconcile::MIGRATION_ID,
-                Box::new(|c| super::super::parking_reconcile::migrate(c).unwrap()),
-            ),
-            (
-                "20261108_2100_parking_cancel_provenance",
-                Box::new(|c| super::super::parking_reconcile::migrate_cancel_provenance(c).unwrap()),
-            ),
-            (
-                "20261109_0451_explicit_launch_focus",
-                Box::new(|c| super::super::dispatch_focus::migrate_explicit_launch(c).unwrap()),
             ),
             (
                 execution_bookmarks::RETIRE_PRUNE_STATE_MIGRATION_ID,
                 Box::new(|c| execution_bookmarks::migrate_retire_prune_state(c).unwrap()),
             ),
             (
-                super::super::spoke_ingress::MIGRATION_ID,
-                Box::new(|c| super::super::spoke_ingress::migrate(c).unwrap()),
+                super::super::progression_candidates::EXECUTION_PROVENANCE_MIGRATION_ID,
+                Box::new(|c| super::super::progression_candidates::migrate_execution_provenance(c).unwrap()),
             ),
             (
-                "20261109_1930_preserved_archive_cleanup",
-                Box::new(|c| preserved_cleanup::migrate_archive_cleanup(c).unwrap()),
+                execution_wait_history::MIGRATION_ID,
+                Box::new(|c| execution_wait_history::migrate(c).unwrap()),
+            ),
+            (
+                "20261029_1900_execution_waiting_human_history",
+                Box::new(|c| stuck_report::migrate_wait_history(c).unwrap()),
+            ),
+            (
+                "20261109_0451_explicit_launch_focus",
+                Box::new(|c| super::super::dispatch_focus::migrate_explicit_launch(c).unwrap()),
+            ),
+            (
+                super::super::spoke_hub::RUN_INDEX_MIGRATION_ID,
+                Box::new(|c| super::super::spoke_hub::migrate_host_commands_run_idx(c).unwrap()),
             ),
             (
                 super::super::spoke_hub::LEGACY_DESTINATION_MIGRATION_ID,
@@ -968,8 +890,48 @@ mod floor_tests {
                 Box::new(|c| legacy_store_cleanup::migrate(c).unwrap()),
             ),
             (
+                super::super::conflict_mismatch::OPERATOR_FORCED_ADMISSION_MIGRATION_ID,
+                Box::new(|c| super::super::conflict_mismatch::migrate_operator_forced_admission(c).unwrap()),
+            ),
+            (
+                pr_flow::OPERATOR_QUESTION_STUCK_CLASSIFICATION_MIGRATION_ID,
+                Box::new(|c| pr_flow::migrate_operator_question_stuck_classification(c).unwrap()),
+            ),
+            (
+                "20261108_2100_parking_cancel_provenance",
+                Box::new(|c| super::super::parking_reconcile::migrate_cancel_provenance(c).unwrap()),
+            ),
+            (
+                "20261107_0543_parking_membership",
+                Box::new(|c| super::super::parking::migrate_membership(c).unwrap()),
+            ),
+            (
+                "20261109_1930_preserved_archive_cleanup",
+                Box::new(|c| preserved_cleanup::migrate_archive_cleanup(c).unwrap()),
+            ),
+            (
+                "20261103_0501_preserved_execution_tip",
+                Box::new(|c| preserved_work::migrate(c).unwrap()),
+            ),
+            (
                 super::super::progression_verbs::ACTIONS_MIGRATION_ID,
                 Box::new(|c| super::super::progression_verbs::migrate_actions(c).unwrap()),
+            ),
+            (
+                super::super::progression_candidates::VIEWS_MIGRATION_ID,
+                Box::new(|c| super::super::progression_candidates::migrate_views_noop(c).unwrap()),
+            ),
+            (
+                super::super::progression_candidates::GRACE_COLUMN_MIGRATION_ID,
+                Box::new(|c| super::super::parking_reconcile::migrate(c).unwrap()),
+            ),
+            (
+                super::super::parking_reconcile::MIGRATION_ID,
+                Box::new(|c| super::super::parking_reconcile::migrate(c).unwrap()),
+            ),
+            (
+                super::super::progression_ladder::MIGRATION_ID,
+                Box::new(|c| super::super::progression_ladder::migrate(c).unwrap()),
             ),
             (
                 "20261110_2300_prompt_confirmation",
@@ -977,6 +939,45 @@ mod floor_tests {
                     c.execute_batch("ALTER TABLE work_runs ADD COLUMN prompt_confirmed INTEGER")
                         .unwrap();
                 }),
+            ),
+            (
+                "20261029_0420_sol_selection",
+                Box::new(|c| driver_allocation::sol_selection::migrate(c).unwrap()),
+            ),
+            (
+                super::super::spoke_hub::MIGRATION_ID,
+                Box::new(|c| super::super::spoke_hub::migrate(c).unwrap()),
+            ),
+            (
+                super::super::spoke_ingress::MIGRATION_ID,
+                Box::new(|c| super::super::spoke_ingress::migrate(c).unwrap()),
+            ),
+            (
+                super::super::parking::MIGRATION_ID,
+                Box::new(|c| super::super::parking::migrate(c).unwrap()),
+            ),
+            (
+                task_status_audit::MIGRATION_ID,
+                Box::new(|c| task_status_audit::migrate(c).unwrap()),
+            ),
+            (
+                stuck_snapshot::MIGRATION_ID,
+                Box::new(|c| stuck_snapshot::migrate(c).unwrap()),
+            ),
+            (
+                "20261029_0735_work_executions_item_kind_status_finished_idx",
+                Box::new(|c| {
+                    c.execute_batch(WORK_EXECUTIONS_ITEM_KIND_STATUS_FINISHED_INDEX)
+                        .unwrap()
+                }),
+            ),
+            (
+                "20261104_1700_workspace_lease_boundary",
+                Box::new(|c| preserved_work::migrate_lease_boundary(c).unwrap()),
+            ),
+            (
+                "20261105_1200_workspace_lease_generation",
+                Box::new(|c| preserved_work::migrate_lease_generation(c).unwrap()),
             ),
         ];
         steps.sort_by_key(|(id, _)| *id);
