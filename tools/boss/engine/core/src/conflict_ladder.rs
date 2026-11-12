@@ -216,6 +216,14 @@ pub(crate) fn record_tier(work_db: &WorkDb, attempt: &ConflictResolution, tier: 
     }
 }
 
+fn format_declined_file(file: &DeclinedFile) -> String {
+    if file.matched_resolver {
+        format!("{}: resolver ran and declined: {}", file.path, file.reason)
+    } else {
+        format!("{}: no resolver applies to this file", file.path)
+    }
+}
+
 /// Record a rung-0 registry decline/failure. Empty per-file lists still
 /// persist `reason` rather than leaving `ladder_reason` NULL.
 pub(crate) fn record_rung0_registry_decline(
@@ -227,13 +235,7 @@ pub(crate) fn record_rung0_registry_decline(
 ) {
     let details = declined
         .iter()
-        .map(|d| {
-            if d.matched_resolver {
-                format!("{}: resolver ran and declined: {}", d.path, d.reason)
-            } else {
-                format!("{}: no resolver applies to this file", d.path)
-            }
-        })
+        .map(format_declined_file)
         .chain(failed.iter().map(|f| format!("{}: {}", f.path, f.reason)))
         .collect::<Vec<_>>()
         .join("; ");
@@ -979,16 +981,7 @@ pub(crate) async fn attempt_rung0_with(
             // no-resolver-applies file means the residue is simply out of
             // rung 0's coverage. Per-file reasons make either case
             // answerable straight from this trace line.
-            let per_file: Vec<String> = declined
-                .iter()
-                .map(|d| {
-                    if d.matched_resolver {
-                        format!("{}: resolver ran and declined: {}", d.path, d.reason)
-                    } else {
-                        format!("{}: no resolver applies to this file", d.path)
-                    }
-                })
-                .collect();
+            let per_file: Vec<String> = declined.iter().map(format_declined_file).collect();
             // Tell the truth in the verdict: a resolver that *matched and
             // ran* but whose command failed operationally (e.g. `bazel mod
             // deps` erroring in a cold workspace because a gitignored

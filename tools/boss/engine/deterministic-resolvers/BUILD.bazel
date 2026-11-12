@@ -3,6 +3,11 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 exports_files(["Cargo.toml"])
 
+DETERMINISTIC_RESOLVERS_DEPS = [
+    "//tools/boss/command-runner",
+    "//tools/boss/engine/conflict-diagnosis",
+]
+
 rust_library(
     name = "deterministic-resolvers",
     srcs = glob(["src/**/*.rs"]),
@@ -13,10 +18,24 @@ rust_library(
     visibility = [
         "//tools/boss/engine/core:__pkg__",
     ],
-    deps = [
-        "//tools/boss/command-runner",
-        "//tools/boss/engine/conflict-diagnosis",
-    ] + all_crate_deps(normal = True),
+    deps = DETERMINISTIC_RESOLVERS_DEPS + all_crate_deps(normal = True),
+)
+
+# Fixture variant: exposes `inject` (gated `test-support`) so engine ladder
+# tests can seed lockfile resolvers without a host toolchain.
+rust_library(
+    name = "deterministic_resolvers_test_support",
+    testonly = True,
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = ["test-support"],
+    crate_name = "boss_deterministic_resolvers",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = [
+        "//tools/boss/engine/core:__pkg__",
+    ],
+    deps = DETERMINISTIC_RESOLVERS_DEPS + all_crate_deps(normal = True),
 )
 
 rust_test(
