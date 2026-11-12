@@ -22,6 +22,7 @@ impl PrStateChecker for OpenPr {
         Ok(boss_work_db::PrInspect {
             open_state: PrOpenState::Open,
             head_sha: Some("head".to_owned()),
+            head_ref_name: Some("feature".to_owned()),
         })
     }
 }

@@ -61,6 +61,10 @@ pub(crate) struct ClassifyCost {
     pub idle_active: BranchCost,
     /// Items in review, or whose latest run is waiting for review.
     pub review: BranchCost,
+    /// Open positioning-refusal lookup over the whole candidate set, plus the
+    /// items that wait was named from. Always one statement when the set is
+    /// non-empty, counted here so production traces match the statements run.
+    pub holds: BranchCost,
 }
 
 impl ClassifyCost {
@@ -69,11 +73,11 @@ impl ClassifyCost {
     }
 
     pub(crate) fn statements(&self) -> u64 {
-        self.queued.statements + self.idle_active.statements + self.review.statements
+        self.queued.statements + self.idle_active.statements + self.review.statements + self.holds.statements
     }
 
     pub(crate) fn millis(&self) -> f64 {
-        self.queued.millis + self.idle_active.millis + self.review.millis
+        self.queued.millis + self.idle_active.millis + self.review.millis + self.holds.millis
     }
 }
 
@@ -119,17 +123,29 @@ pub(super) fn classify(
 ) -> Result<(HashMap<String, DispatchWait>, ClassifyCost)> {
     let mut waits = HashMap::new();
     let ids: Vec<&str> = candidates.iter().map(|candidate| candidate.task.id.as_str()).collect();
-    let hold_messages = open_positioning_hold_messages(conn, &ids)?;
+    let mut hold_messages = HashMap::new();
+    let mut holds = measured(counter, usize::from(!ids.is_empty()), || {
+        hold_messages = open_positioning_hold_messages(conn, &ids)?;
+        Ok(())
+    })?;
     let (mut queued, mut idle_active, mut review) = (Vec::new(), Vec::new(), Vec::new());
+    let mut held_cards = 0;
     for candidate in candidates {
+        // Deleted and terminal rows are not waiting to dispatch. Skip the hold
+        // before `branch_of`: a leftover open attention on a done card would
+        // otherwise name a `workspace_positioning_refused` wait forever.
+        let terminal = candidate.task.deleted_at.is_some()
+            || matches!(candidate.task.status, TaskStatus::Done | TaskStatus::Archived);
         // Same predicate as `positioning_hold_active`: the task-row rewrite or
         // the open attention item. Review-phase holds keep `in_review` /
         // `merge_conflict` / `ci_failure`, so the attention set is what names
         // them here — ahead of the Review branch, which would otherwise call
         // them a review-batch or human-review wait.
-        if candidate.task.blocked_reason.as_deref() == Some(DISPATCH_WAIT_REASON_WORKSPACE_POSITIONING_REFUSED)
-            || hold_messages.contains_key(&candidate.task.id)
+        if !terminal
+            && (candidate.task.blocked_reason.as_deref() == Some(DISPATCH_WAIT_REASON_WORKSPACE_POSITIONING_REFUSED)
+                || hold_messages.contains_key(&candidate.task.id))
         {
+            held_cards += 1;
             let mut wait = DispatchWait::named(DISPATCH_WAIT_REASON_WORKSPACE_POSITIONING_REFUSED);
             // `blocked_detail` belongs to the hold only when the hold rewrote
             // the row; a review-phase hold leaves the earlier conflict / CI
@@ -158,12 +174,14 @@ pub(super) fn classify(
             None => {}
         }
     }
+    holds.cards = held_cards;
     let cost = ClassifyCost {
         queued: measured(counter, queued.len(), || classify_queued(conn, &queued, &mut waits))?,
         idle_active: measured(counter, idle_active.len(), || {
             classify_idle_active(conn, &idle_active, &mut waits)
         })?,
         review: measured(counter, review.len(), || classify_review(conn, &review, &mut waits))?,
+        holds,
     };
     name_deferred_conflicts(conn, &mut waits)?;
     Ok((waits, cost))

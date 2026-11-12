@@ -206,18 +206,20 @@ impl CubeError {
     pub fn json_error(&self) -> Value {
         let mut payload = serde_json::json!({
             "error": self.to_string(),
-            "error_kind": if matches!(self, Self::PositioningRefused(_)) {
-                "workspace_positioning_refused"
-            } else { "command_failed" },
         });
+        // Only variants that have a stable kind carry `error_kind`. Labelling
+        // every other failure `command_failed` would pretend classification
+        // that is not actually known.
+        if matches!(self, Self::PositioningRefused(_)) {
+            payload["error_kind"] = Value::String("workspace_positioning_refused".into());
+        }
         // Only variants whose retryability is known carry the field; an
         // unclassified error says nothing rather than claiming it is retryable.
+        // `CommandFailed` covers deterministic jj/git state errors as well as
+        // transient ones, so it stays unclassified.
         let retryable = match self {
             Self::PositioningRefused(_) => Some(false),
-            Self::MaintenanceBusy
-            | Self::CommandFailed { .. }
-            | Self::CommandTimedOut { .. }
-            | Self::DeadlineExceeded { .. } => Some(true),
+            Self::MaintenanceBusy | Self::CommandTimedOut { .. } | Self::DeadlineExceeded { .. } => Some(true),
             _ => None,
         };
         if let Some(retryable) = retryable {

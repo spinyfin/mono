@@ -7,6 +7,10 @@ pub struct PositioningHold {
     pub work_item_id: String,
     pub pr_url: Option<String>,
     pub restarts: bool,
+    /// True when the row is `done`, `archived`, or deleted. The recheck sweep
+    /// lowers those holds without probing GitHub: a merged PR is why the item
+    /// is terminal, and probing it would keep the attention open forever.
+    pub terminal: bool,
 }
 
 /// How a pre-start failure is handled: retried with backoff, or a definitive
@@ -126,27 +130,33 @@ impl WorkDb {
     /// task row itself was moved to `blocked` by the hold, so lowering it must
     /// also start the item again; review-phase rows keep their status and only
     /// need the hold lowered.
+    ///
+    /// Includes `done` / `archived` / deleted rows that still have an open
+    /// attention item so a leftover hold can be lowered after the item becomes
+    /// terminal. `COALESCE` on `blocked_reason` keeps a NULL reason (legal on
+    /// an attention-only hold whose status is `blocked`) from aborting the
+    /// whole listing as a NULL bool.
     pub fn list_positioning_holds(&self) -> Result<Vec<PositioningHold>> {
         let conn = self.connect()?;
         let refused = WORKSPACE_POSITIONING_REFUSED;
         let sql = format!(
             "{walk}
              SELECT t.id,
-                    (t.status = 'blocked' AND t.blocked_reason = '{refused}'),
+                    (t.status = 'blocked' AND COALESCE(t.blocked_reason, '') = '{refused}'),
                     COALESCE(
                         (SELECT x.pr_url FROM work_executions x
                           WHERE x.work_item_id = t.id AND x.pr_url IS NOT NULL AND x.pr_url <> ''
                           ORDER BY x.created_at DESC, x.id DESC LIMIT 1),
                         NULLIF(t.pr_url, ''),
                         NULLIF(root.pr_url, '')
-                    )
+                    ),
+                    (t.deleted_at IS NOT NULL OR t.status IN ('done', 'archived'))
              FROM roots r
              JOIN tasks t ON t.id = r.task_id
              JOIN tasks root ON root.id = r.cycle_root_id
              ORDER BY t.id",
             walk = cycle_root_walk_cte(&format!(
-                "t.deleted_at IS NULL AND t.status NOT IN ('done', 'archived')
-                 AND (t.blocked_reason = '{refused}'
+                "(COALESCE(t.blocked_reason, '') = '{refused}'
                       OR EXISTS (SELECT 1 FROM work_attention_items a
                                  WHERE a.work_item_id = t.id AND a.kind = '{refused}' AND a.status = 'open'))"
             )),
@@ -157,22 +167,27 @@ impl WorkDb {
                 work_item_id: row.get(0)?,
                 restarts: row.get(1)?,
                 pr_url: row.get(2)?,
+                terminal: row.get(3)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Lower the positioning hold on `work_item_id` (attention and, for a row the
-    /// hold blocked, the blocked status). Returns whether a hold was present.
+    /// hold blocked, the blocked status). Returns whether attention was resolved
+    /// or a row was rewritten; a leftover reason on a tombstone counts as a
+    /// rewrite, a no-op does not.
     pub fn clear_positioning_hold(&self, work_item_id: &str) -> Result<bool> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let held = crate::dispatch_helpers::positioning_hold_active(&tx, work_item_id)?;
-        if held {
-            crate::dispatch_helpers::clear_positioning_hold_in_tx(&tx, work_item_id, "engine")?;
-        }
+        let changed = if held {
+            crate::dispatch_helpers::clear_positioning_hold_in_tx(&tx, work_item_id, "engine")?
+        } else {
+            false
+        };
         tx.commit()?;
-        Ok(held)
+        Ok(changed)
     }
 
     fn record_start_failure_with_policy(
@@ -346,4 +361,74 @@ fn resolved_positioning_pr_url(conn: &Connection, execution: &WorkExecution) -> 
     Ok(nonempty(
         get_chain_root_task(conn, &execution.work_item_id)?.and_then(|root| root.pr_url),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::test_support::*;
+    use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus};
+
+    #[test]
+    fn list_positioning_holds_survives_a_null_blocked_reason_on_a_blocked_row() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_test_chore_manual(&db, product.id, "attention-only hold");
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Claimed)
+                    .build(),
+            )
+            .unwrap();
+        db.record_workspace_positioning_refusal(
+            &execution.id,
+            "worker",
+            None,
+            "Cube command failed: refused",
+            "unpublished content",
+        )
+        .unwrap();
+        db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET blocked_reason = NULL WHERE id = ?1", [&chore.id])
+            .unwrap();
+        let holds = db
+            .list_positioning_holds()
+            .expect("a NULL blocked_reason must not abort the listing");
+        assert_eq!(holds.len(), 1);
+        assert_eq!(holds[0].work_item_id, chore.id);
+        assert!(!holds[0].restarts, "NULL blocked_reason is not a row rewrite");
+        assert!(!holds[0].terminal);
+    }
+
+    #[test]
+    fn clear_positioning_hold_clears_leftover_reason_on_a_deleted_blocked_row() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_test_chore_manual(&db, product.id, "deleted after refusal");
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Claimed)
+                    .build(),
+            )
+            .unwrap();
+        db.record_workspace_positioning_refusal(
+            &execution.id,
+            "worker",
+            None,
+            "Cube command failed: refused",
+            "unpublished content",
+        )
+        .unwrap();
+        db.delete_work_item(&chore.id).unwrap();
+        assert_eq!(db.list_positioning_holds().unwrap().len(), 1);
+        assert!(db.clear_positioning_hold(&chore.id).unwrap());
+        assert!(db.list_positioning_holds().unwrap().is_empty());
+        assert!(!db.clear_positioning_hold(&chore.id).unwrap());
+    }
 }

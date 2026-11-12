@@ -112,11 +112,7 @@ impl Board {
             Some(&counter),
         )
         .unwrap();
-        // The open positioning-refusal lookup is one statement for the whole
-        // set and is not attributed to a classification branch, so the
-        // cached path's per-branch count excludes it.
-        let hold_lookup = i64::from(!cards.is_empty());
-        counter.total() as i64 - hold_lookup
+        counter.total() as i64
     }
 
     /// Assemble through the cache and without it, assert the trees are equal,
@@ -191,7 +187,11 @@ fn an_unchanged_board_reuses_every_runtime() {
 
     let (misses, queries) = board.assert_equivalent();
     assert_eq!(misses, 0, "nothing changed");
-    assert_eq!(queries, 1, "only the epoch read remains");
+    assert_eq!(
+        queries,
+        1 + board.annotation_statements(),
+        "epoch plus the wait-annotation statements, including the bulk positioning-hold lookup"
+    );
     assert_eq!(board.cache.runtimes.stats().entries, 2);
 }
 

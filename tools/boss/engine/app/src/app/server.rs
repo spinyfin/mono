@@ -2348,7 +2348,7 @@ async fn serve_scoped(
     let _positioning_refusal_recheck_handle = boss_engine_runtime::positioning_refusal_recheck_sweep::spawn_loop(
         server_state.work_db.clone(),
         server_state.execution_coordinator.clone(),
-        boss_engine_runtime::positioning_refusal_recheck_sweep::github_positioning_probe(),
+        Arc::new(GhPrStateChecker),
         Duration::from_secs(300),
     );
 

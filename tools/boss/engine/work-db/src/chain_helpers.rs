@@ -204,6 +204,7 @@ pub fn flip_in_review_revisions_to_done(conn: &Connection, chain_root_id: &str, 
         // revision in the chain (not just ones this call just flipped) is
         // a harmless no-op for the rest.
         comments::reconcile_comments_for_task(conn, rev_id, comments::CommentReconcileOutcome::Resolved, now)?;
+        resolve_attention_kind_in_tx(conn, rev_id, WORKSPACE_POSITIONING_REFUSED)?;
     }
     Ok(())
 }
@@ -413,6 +414,9 @@ pub fn archive_revision_task_as_actor(
            AND deleted_at IS NULL",
         params![rev_id, now, provenance.mechanism, provenance.reason, actor],
     )?;
+    if rows_changed > 0 {
+        resolve_attention_kind_in_tx(conn, rev_id, WORKSPACE_POSITIONING_REFUSED)?;
+    }
     Ok(rows_changed)
 }
 

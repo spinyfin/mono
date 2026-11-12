@@ -703,17 +703,18 @@ fn board_and_heartbeat_statements_on_the_seeded_board() {
             percentile(&mut annotation_ms, 50),
         );
         if product == PRODUCT {
-            // 277 cards with nothing pending are named with 22 statements;
-            // one card at a time they took 1,717.
+            // 277 cards with nothing pending are named with 23 statements
+            // (the extra one is the positioning-hold lookup); one card at a
+            // time they took 1,717.
             assert_eq!(annotated, 277, "cards named on the seeded board");
-            assert_eq!(annotation_statements, 22, "statements to name {annotated} cards");
+            assert_eq!(annotation_statements, 23, "statements to name {annotated} cards");
             // The epoch read, three point queries for each of the 60 cards
             // waiting on a dependency (never cached), and the annotation:
-            // 203 statements, where naming one card at a time made it 1,898.
-            assert_eq!(statements, 1 + 180 + 22);
+            // 204 statements, where naming one card at a time made it 1,898.
+            assert_eq!(statements, 1 + 180 + 23);
         } else {
-            // 30 cards, 9 statements; one card at a time it was 141.
-            assert_eq!((annotated, annotation_statements, statements), (30, 8, 9));
+            // 30 cards, 10 statements; one card at a time it was 141.
+            assert_eq!((annotated, annotation_statements, statements), (30, 9, 10));
         }
     }
 
@@ -736,9 +737,10 @@ fn board_and_heartbeat_statements_on_the_seeded_board() {
     );
     assert_eq!(unexplained, 11, "the seed's unclassified queued cards");
     // 88 pending executions are projected one by one. The 239 items with
-    // nothing pending are read with one statement and named with 22, where
-    // one item at a time the whole pass ran 2,606 statements.
+    // nothing pending are read with one statement and named with 23
+    // (the extra one is the positioning-hold lookup), where one item at a
+    // time the whole pass ran 2,606 statements.
     assert_eq!((cost.pending_executions, cost.unscheduled_items), (88, 239));
-    assert_eq!(cost.classified.statements(), 22, "{:?}", cost.classified);
+    assert_eq!(cost.classified.statements(), 23, "{:?}", cost.classified);
     assert!(cost.statements <= 300, "{} statements", cost.statements);
 }
