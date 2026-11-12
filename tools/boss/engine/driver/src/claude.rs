@@ -2333,7 +2333,7 @@ mod tests {
     #[test]
     fn spawn_invocation_uses_descriptor_paths() {
         let plan = ClaudeDriver.spawn_invocation(spawn_request("sonnet"));
-        let expected_cat = format!("python3 {}/initial-prompt.py", CLAUDE_DESCRIPTOR.config_dir);
+        let expected_cat = format!("python3 -I {}/initial-prompt.py", CLAUDE_DESCRIPTOR.config_dir);
         assert!(
             plan.command.contains(&expected_cat),
             "spawn invocation must read from descriptor paths; got: {}",

@@ -196,7 +196,7 @@ pub struct GrokDriver {
 ///
 /// Execution shape (design §Execution shape + T-03 pane mode):
 /// ```text
-/// python3 .grok/initial-prompt.py grok --model … --reasoning-effort … --no-alt-screen --always-approve
+/// python3 -I .grok/initial-prompt.py grok --model … --reasoning-effort … --no-alt-screen --always-approve
 ///      --trust --session-id <uuid> --cwd <ws> --no-subagents --no-memory
 /// ```
 ///
@@ -1613,7 +1613,7 @@ mod tests {
 
         let cmd = &plan.command;
         assert!(
-            cmd.starts_with("python3 .grok/initial-prompt.py grok "),
+            cmd.starts_with("python3 -I .grok/initial-prompt.py grok "),
             "command starts with grok: {cmd}"
         );
         assert!(cmd.contains("--model "), "has --model: {cmd}");
@@ -2094,7 +2094,7 @@ mod tests {
                 spawn.command
             );
             assert!(
-                spawn.command.starts_with("python3 .grok/initial-prompt.py grok "),
+                spawn.command.starts_with("python3 -I .grok/initial-prompt.py grok "),
                 "{}",
                 spawn.command
             );

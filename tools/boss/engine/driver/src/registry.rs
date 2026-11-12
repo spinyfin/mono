@@ -670,7 +670,7 @@ mod tests {
         assert!(
             claude_plan
                 .command
-                .starts_with("python3 .claude/initial-prompt.py claude "),
+                .starts_with("python3 -I .claude/initial-prompt.py claude "),
             "claude slug must still resolve to ClaudeDriver",
         );
     }

@@ -1835,7 +1835,7 @@ pub(crate) async fn stage_remote_initial_input(
     driver: &dyn crate::driver::AgentDriver,
     command: &str,
 ) -> Result<String> {
-    let prefix = format!("python3 {}/initial-prompt.py ", driver.descriptor().config_dir);
+    let prefix = format!("python3 -I {}/initial-prompt.py ", driver.descriptor().config_dir);
     let arguments = command
         .strip_prefix(&prefix)
         .context("missing driver terminal launcher")?;

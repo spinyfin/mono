@@ -1132,7 +1132,7 @@ mod tests {
         .unwrap();
         let claude_cmd = claude_cfg.spawn_command_in(&registry, false, None).unwrap();
         assert!(
-            claude_cmd.starts_with("python3 .claude/initial-prompt.py claude "),
+            claude_cmd.starts_with("python3 -I .claude/initial-prompt.py claude "),
             "claude slug still routes to ClaudeDriver, got {claude_cmd:?}",
         );
     }
@@ -1385,7 +1385,7 @@ mod tests {
         let cfg = resolve_spawn_config(&SpawnResolutionInput::builder().build()).unwrap();
         assert_eq!(
             cfg.claude_invocation(false, None),
-            "python3 .claude/initial-prompt.py claude --model opus --disallowedTools=AskUserQuestion --permission-mode auto\n",
+            "python3 -I .claude/initial-prompt.py claude --model opus --disallowedTools=AskUserQuestion --permission-mode auto\n",
         );
     }
 
@@ -1422,7 +1422,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             cfg.claude_invocation(false, None),
-            "python3 .claude/initial-prompt.py claude --model sonnet --effort low --disallowedTools=AskUserQuestion --dangerously-skip-permissions\n",
+            "python3 -I .claude/initial-prompt.py claude --model sonnet --effort low --disallowedTools=AskUserQuestion --dangerously-skip-permissions\n",
         );
     }
 
@@ -1438,7 +1438,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             cfg.claude_invocation(false, None),
-            "python3 .claude/initial-prompt.py claude --model opus --effort high --disallowedTools=AskUserQuestion --permission-mode auto\n",
+            "python3 -I .claude/initial-prompt.py claude --model opus --effort high --disallowedTools=AskUserQuestion --permission-mode auto\n",
         );
     }
 

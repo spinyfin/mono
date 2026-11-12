@@ -708,7 +708,7 @@ mod tests {
             events_socket_path: "/tmp/boss-events-run-1.sock".into(),
             wrapper_path: "~/.boss-remote/bin/boss-remote-run".into(),
             driver_binary: "codex".into(),
-            driver_command: "python3 .codex/initial-prompt.py codex -m gpt-6-astra".into(),
+            driver_command: "python3 -I .codex/initial-prompt.py codex -m gpt-6-astra".into(),
             driver_env: "export CODEX_HOME='/tmp/codex'; ".into(),
             structured_output_kind: Some("review-result".into()),
             pr_url_output: true,
@@ -744,7 +744,7 @@ mod tests {
             events_socket_path: "/tmp/s.sock".into(),
             wrapper_path: "wrapper".into(),
             driver_binary: "claude".into(),
-            driver_command: "python3 .claude/initial-prompt.py claude --model opus".into(),
+            driver_command: "python3 -I .claude/initial-prompt.py claude --model opus".into(),
             driver_env: "unset ANTHROPIC_API_KEY; ".into(),
             structured_output_kind: None,
             pr_url_output: false,
@@ -1053,7 +1053,7 @@ mod tests {
             events_socket_path: remote_events_socket_path("run-1"),
             wrapper_path: "~/.boss-remote/bin/boss-remote-run".into(),
             driver_binary: "claude".into(),
-            driver_command: "python3 .claude/initial-prompt.py claude --model opus".into(),
+            driver_command: "python3 -I .claude/initial-prompt.py claude --model opus".into(),
             driver_env: "unset ANTHROPIC_API_KEY; ".into(),
             structured_output_kind: Some("review-result".into()),
             pr_url_output: false,
@@ -1122,7 +1122,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(command.starts_with("python3 '/remote/work space/.claude/runs/run-1'/initial-prompt.py "));
+        assert!(command.starts_with("python3 -I '/remote/work space/.claude/runs/run-1'/initial-prompt.py "));
         assert!(!command.contains("python3 .claude/initial-prompt.py"));
         let mut plan = sample_plan();
         plan.driver_command = command;
