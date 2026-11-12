@@ -352,6 +352,13 @@ pub struct Fixture {
     _dir: tempfile::TempDir,
 }
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
 impl Fixture {
     pub async fn new() -> Self {
         Self::with(
@@ -513,7 +520,53 @@ impl Fixture {
     }
 
     pub fn ready(&self, id: &str) {
+        if self.db.get_host(id).unwrap().is_none() {
+            self.db.add_host(id, "", 64, &[]).unwrap();
+        }
         self.db.set_host_transport(id, HostTransport::SpokeReady).unwrap();
+        self.db.open_spoke_journal(id, "capacity-fixture", 0, 1).unwrap();
+        let generation = self.db.spoke_journal(id).unwrap().unwrap().generation;
+        self.db.open_host_capacity(id, generation, 0, now_ms()).unwrap();
+        self.db.host_capacity_inventory(id, generation, 1, 0).unwrap();
+        self.db.connect().unwrap().execute(
+            "INSERT OR REPLACE INTO spoke_projection(host_id, journal_id, applied) VALUES (?1, 'capacity-fixture', 1)", [id]).unwrap();
+        self.refresh_budget(id);
+    }
+
+    fn refresh_budget(&self, id: &str) {
+        let Some(journal) = self.db.spoke_journal(id).unwrap() else {
+            return;
+        };
+        let generation: u64 = self
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT report_generation + 1 FROM host_capacity WHERE host_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        self.db
+            .host_capacity_pulse(id, journal.generation, "boot", 0, now_ms())
+            .unwrap();
+        let mut report = boss_work_db::HostCapacityReport::builder()
+            .generation(generation)
+            .sequence(generation + 1)
+            .boot_id("boot")
+            .awake_ns(1)
+            .total(64)
+            .occupied(0)
+            .resources(Default::default())
+            .applied_command_through(0)
+            .preflights_ok(true)
+            .build();
+        report.resources.cpu_millis = 64_000;
+        report.resources.memory_bytes = 128 * 1024 * 1024 * 1024;
+        report.resources.disk_bytes = 128 * 1024 * 1024 * 1024;
+        self.db
+            .record_host_capacity(id, journal.generation, &report, now_ms())
+            .unwrap();
     }
 
     /// The adapter for a host with no execution: operations find their own run.
@@ -523,6 +576,7 @@ impl Fixture {
 
     /// The adapter an execution is dispatched through, reserving its assignment.
     pub async fn adapter(&self, host: &str, execution_id: &str) -> anyhow::Result<Arc<dyn HostAdapter>> {
+        self.refresh_budget(host);
         self.provider
             .adapter_for_execution(&self.host(host), execution_id)
             .await

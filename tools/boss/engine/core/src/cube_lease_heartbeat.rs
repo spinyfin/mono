@@ -187,7 +187,9 @@
 //! drainer is [`crate::host_reconcile`], and this path is the
 //! belt-and-suspenders for a lease whose streak crosses threshold between
 //! that sweep's ticks. A cube outage never flips a host's `enabled` flag, so
-//! the bypass cannot fire spuriously during one.
+//! the bypass cannot fire spuriously during one. A host on a spoke transport
+//! is exempt unless it was removed: disabled or silent, its worker may still
+//! be running, so it keeps the confirm-dead gate.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

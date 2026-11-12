@@ -63,6 +63,15 @@ mod commands {
         }
     }
 
+    /// What gates a command beyond its own body: the worker gateway that applies
+    /// worker-scoped commands, whether the session admits execution, and the
+    /// host's failed preflights.
+    pub struct CommandGate<'a> {
+        pub gateway: &'a boss_spoke_worker_api::Gateway,
+        pub execution: &'a std::sync::atomic::AtomicU8,
+        pub preflights: tokio::sync::watch::Receiver<Vec<String>>,
+    }
+
     /// One serialized executor survives network reconnects. Never hold the journal
     /// lock across a subprocess, and never re-execute an effect because result
     /// admission is temporarily full.
@@ -72,9 +81,13 @@ mod commands {
         supervisor: Option<Supervisor<LocalCube, JournalExecutions>>,
         captures: std::sync::Arc<boss_spoke_ingress::capture::Captures>,
         stamp: impl Fn() -> Result<Stamp>,
-        gateway: &boss_spoke_worker_api::Gateway,
-        execution: &std::sync::atomic::AtomicU8,
+        gate: CommandGate<'_>,
     ) -> Result<()> {
+        let CommandGate {
+            gateway,
+            execution,
+            preflights,
+        } = gate;
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_sweep: Option<std::time::Instant> = None;
@@ -101,6 +114,19 @@ mod commands {
                     last_sweep = Some(std::time::Instant::now());
                     for (run, error) in supervisor.sweep().await {
                         tracing::warn!(run, error, "worker exit sweep failed");
+                    }
+                    let observations = supervisor.inventory().await?;
+                    let mut journal = journal.lock().map_err(|_| anyhow::Error::from(Fault::LockPoisoned))?;
+                    // A full spool withholds the inventory, and with it the hub's
+                    // readiness barrier; it must not take the daemon down.
+                    if let Err(error) = boss_spoke_ingress::capacity::inventory(&mut journal, stamp()?, observations) {
+                        if Fault::is_full(&error) {
+                            tracing::error!(
+                                "capacity spool full; withholding inventory and stopping capacity admission"
+                            );
+                        } else {
+                            return Err(error);
+                        }
                     }
                 }
                 continue;
@@ -132,7 +158,17 @@ mod commands {
                     | command::Body::Deliver(_)
                     | command::Body::Stop(_),
                 ) => match &supervisor {
-                    Some(supervisor) => match boss_spoke_ingress::provision_rejection(gateway, &command, &observed) {
+                    Some(supervisor) => match {
+                        let journal = journal.lock().map_err(|_| anyhow::Error::from(Fault::LockPoisoned))?;
+                        boss_spoke_ingress::capacity::admission(
+                            &journal,
+                            &executor.cube.cwd,
+                            &command,
+                            &preflights.borrow(),
+                        )?
+                    }
+                    .or_else(|| boss_spoke_ingress::provision_rejection(gateway, &command, &observed))
+                    {
                         None => supervisor.execute(&command, interrupted, observed.wall_unix_ms).await,
                         Some(rejection) => rejection,
                     },
@@ -315,8 +351,8 @@ mod host {
 }
 
 use anyhow::Result;
-use boss_protocol_spoke::v1::{Capacity, Inventory, Record, record};
-use boss_spoke_journal::{Admission, Fault, Journal, Limits};
+use boss_protocol_spoke::v1::Inventory;
+use boss_spoke_journal::{Fault, Journal, Limits};
 use boss_spoke_outbound::{SessionObserver, SharedJournal};
 use clap::Parser;
 use std::{
@@ -556,7 +592,7 @@ async fn serve(args: Args, homes_root: PathBuf) -> Result<()> {
     });
     tokio::select! {
         result = boss_spoke_outbound::run_with_observer(Arc::clone(&journal), endpoint, stamp, true, health.as_ref()) => result,
-        result = commands::run(Arc::clone(&journal), executor, supervisor, Arc::clone(&captures), stamp, &gateway, &health.execution) => result,
+        result = commands::run(Arc::clone(&journal), executor, supervisor, Arc::clone(&captures), stamp, commands::CommandGate { gateway: &gateway, execution: &health.execution, preflights: preflights.clone() }) => result,
         result = capture_loop(Arc::clone(&journal), Arc::clone(&captures), panes, stamp) => result,
         result = produce(&journal, &args.state_dir, &boot, tmux_ready, preflights, first_report, health.as_ref()) => result,
         result = preflight_loop(readiness, failures, first_report_sent) => result,
@@ -697,26 +733,12 @@ async fn produce(
         }
         let (config, status) = install_status_paths();
         let release = reported_release(&config, &status);
-        let capacity = Capacity {
-            generation: journal.record_bounds()?.1 + 1,
-            free_disk_bytes: fs4::available_space(root)?,
-            load_one_minute: host::load()?,
-            journal_bytes: journal.bytes()?,
-            applied_command_through: journal.applied_commands()?,
-            inventory: Some(Inventory {
-                os: std::env::consts::OS.into(),
-                arch: std::env::consts::ARCH.into(),
-                failed_preflights,
-                ..release
-            }),
-            ..Default::default()
+        let inventory = Inventory {
+            failed_preflights,
+            ..release
         };
-        let record = Record {
-            observed: Some(observed),
-            body: Some(record::Body::Capacity(capacity)),
-            ..Default::default()
-        };
-        if let Err(error) = journal.append(record, Admission::Capacity) {
+        if let Err(error) = boss_spoke_ingress::capacity::report(&mut journal, root, observed, inventory, host::load()?)
+        {
             if Fault::is_full(&error) {
                 tracing::error!("capacity spool full; retaining numbered evidence and stopping capacity admission");
             } else {

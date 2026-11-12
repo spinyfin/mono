@@ -76,7 +76,9 @@ struct Env {
 }
 
 async fn env(fx: &Fixture, slots: usize) -> Env {
-    fx.db.add_host(HOST, "worker@host", 1, &[]).unwrap();
+    // An unanswered lease keeps its assignment open, and an open assignment is
+    // a reservation against the host's seats, so the host needs one per slot.
+    fx.db.add_host(HOST, "worker@host", slots as i64, &[]).unwrap();
     fx.db
         .connect()
         .unwrap()

@@ -220,7 +220,8 @@ impl WorkDb {
     /// `boss_engine::host_scheduling::select_host` already excludes disabled
     /// hosts, so the very next dispatch attempt for any queued execution
     /// naturally falls back to a different (e.g. `local`) host instead of
-    /// re-selecting the broken one.
+    /// re-selecting the broken one. A host on a spoke transport is never
+    /// auto-disabled: its failures stay diagnostic.
     pub fn record_host_dispatch_failure(&self, id: &str, error_text: &str) -> Result<HostHealthOutcome> {
         let conn = self.connect()?;
         let now = now_epoch_string();
@@ -238,7 +239,16 @@ impl WorkDb {
             params![id],
             |r| r.get(0),
         )?;
-        if failures >= HOST_HEALTH_FAILURE_THRESHOLD {
+        // Only a host on the legacy transport is disabled by failures. A spoke
+        // host's enablement is operator state; its failures surface through
+        // failed preflights and missing reports, which already withhold its
+        // budget without changing what the operator configured.
+        let legacy: bool = conn.query_row(
+            "SELECT NOT EXISTS (SELECT 1 FROM host_transports WHERE host_id = ?1 AND transport != 'legacy_ssh')",
+            params![id],
+            |r| r.get(0),
+        )?;
+        if legacy && failures >= HOST_HEALTH_FAILURE_THRESHOLD {
             let reason =
                 format!("auto-disabled after {failures} consecutive dispatch failures; last error: {error_text}");
             let was_enabled: Option<bool> = conn
@@ -732,6 +742,32 @@ mod tests {
             host.last_seen_at.is_some(),
             "last_seen_at must be stamped on a failed attempt"
         );
+    }
+
+    /// A spoke host's enablement is operator state: dispatch failures are
+    /// recorded for diagnosis but never disable it or publish a disable.
+    #[tokio::test]
+    async fn spoke_host_dispatch_failures_never_change_enablement() {
+        let db = open_db();
+        db.add_host("spoke", "", 3, &[]).unwrap();
+        db.set_host_transport("spoke", crate::HostTransport::SpokeReady)
+            .unwrap();
+        let mut sub = db.event_bus().subscribe(TopicFilter::kind(EventKind::HostDisabled));
+        for n in 1..=HOST_HEALTH_FAILURE_THRESHOLD + 2 {
+            assert_eq!(
+                db.record_host_dispatch_failure("spoke", "host unreachable").unwrap(),
+                HostHealthOutcome::Degraded {
+                    consecutive_failures: n
+                }
+            );
+            assert!(db.get_host("spoke").unwrap().unwrap().enabled);
+        }
+        tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv())
+            .await
+            .expect_err("failures must not publish a disable for a spoke host");
+        db.set_host_enabled("spoke", false).unwrap();
+        db.record_host_contact_success("spoke").unwrap();
+        assert!(!db.get_host("spoke").unwrap().unwrap().enabled);
     }
 
     /// The exact regression this breaker exists for: a host that fails
