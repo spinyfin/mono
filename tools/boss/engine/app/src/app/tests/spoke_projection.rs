@@ -623,6 +623,35 @@ async fn a_run_scoped_write_is_applied_through_the_local_handler() {
 }
 
 #[tokio::test]
+async fn a_producer_write_cannot_claim_another_execution_via_run_id() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    let mut payload = boss_protocol_spoke::proposal::conflict_producer_body(
+        "exec_someone_else",
+        "feature",
+        "main",
+        vec!["src/lib.rs".into()],
+    );
+    payload["run_id"] = json!(fx.execution_id);
+    fx.receive_run_write(
+        boss_protocol_spoke::proposal::CONFLICT_PRODUCER,
+        "producer-spoof",
+        payload,
+    );
+    fx.projector().drain().await;
+    let decisions = fx.wire.decisions();
+    assert_eq!(decisions.len(), 1, "{decisions:?}");
+    assert_eq!(decisions[0].code, ResultCode::Rejected as i32);
+    assert!(
+        fx.state
+            .work_db
+            .latest_conflict_resolution_for_work_item(&fx.work_item_id)
+            .unwrap()
+            .is_none(),
+        "a spoofed run_id must not record a producer conflict"
+    );
+}
+
+#[tokio::test]
 async fn a_run_scoped_write_for_another_runs_attempt_is_refused() {
     let mut fx = delivered_with_a_resolvable_pr();
     fx.receive_run_write(

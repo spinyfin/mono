@@ -11,8 +11,9 @@
 //! distinct `answer_agent` capability profile.
 
 use super::*;
-use crate::comments::query_comment;
-use crate::spoke_projection::{get_spoke_applied_write_on, insert_spoke_applied_write_on};
+use crate::comment_thread_entries::insert_comment_thread_entry_on;
+use crate::comments::{query_comment, transition_comment_to_answered_on};
+use crate::spoke_projection::{get_spoke_applied_write_on, record_application_on};
 
 /// The apology entry standing in for the answer that never arrived. Shared by
 /// [`WorkDb::recover_unanswered_comment`]'s two callers (`finalize_answer_agent`
@@ -50,6 +51,49 @@ pub(crate) fn latest_answer_agent_run_for_comment_on(
     conn.query_row(&sql, [comment_id], map_answer_agent_run)
         .optional()
         .map_err(Into::into)
+}
+
+/// The most recent answer-agent run bound to an execution, on an already-open
+/// connection. Shared by [`WorkDb::get_answer_agent_run_by_execution`] and by
+/// [`WorkDb::apply_answer_agent_reply`], which holds the reply's Immediate
+/// transaction and cannot call back through `WorkDb::connect`.
+pub(crate) fn latest_answer_agent_run_for_execution_on(
+    conn: &Connection,
+    execution_id: &str,
+) -> Result<Option<AnswerAgentRun>> {
+    let cols = answer_agent_run_columns();
+    let sql = format!(
+        "SELECT {cols} FROM answer_agent_runs WHERE execution_id = ?1 \
+         ORDER BY created_at DESC, id DESC LIMIT 1"
+    );
+    conn.query_row(&sql, [execution_id], map_answer_agent_run)
+        .optional()
+        .map_err(Into::into)
+}
+
+/// Transition a run from `running` to a terminal status on an already-open
+/// connection. Shared by [`WorkDb::complete_answer_agent_run`] and by
+/// [`WorkDb::apply_answer_agent_reply`]'s reply transaction.
+pub(crate) fn complete_answer_agent_run_on(
+    conn: &Connection,
+    run_id: &str,
+    status: &str,
+    reply_body: Option<&str>,
+    error_kind: Option<&str>,
+) -> Result<AnswerAgentRun> {
+    let now = now_string();
+    let n = conn.execute(
+        "UPDATE answer_agent_runs \
+         SET status = ?2, reply_body = ?3, error_kind = ?4, completed_at = ?5 \
+         WHERE id = ?1 AND status = 'running'",
+        params![run_id, status, reply_body, error_kind, now],
+    )?;
+    if n == 0 {
+        bail!("answer-agent run {run_id} not found or already in a terminal state (expected running)");
+    }
+    let cols = answer_agent_run_columns();
+    let sql = format!("SELECT {cols} FROM answer_agent_runs WHERE id = ?1");
+    conn.query_row(&sql, [run_id], map_answer_agent_run).map_err(Into::into)
 }
 
 #[work_db_boundary::instrument]
@@ -187,14 +231,7 @@ impl WorkDb {
     /// reached a terminal status in a resume/redispatch.
     pub fn get_answer_agent_run_by_execution(&self, execution_id: &str) -> Result<Option<AnswerAgentRun>> {
         let conn = self.connect()?;
-        let cols = answer_agent_run_columns();
-        let sql = format!(
-            "SELECT {cols} FROM answer_agent_runs WHERE execution_id = ?1 \
-             ORDER BY created_at DESC, id DESC LIMIT 1"
-        );
-        conn.query_row(&sql, [execution_id], map_answer_agent_run)
-            .optional()
-            .map_err(Into::into)
+        latest_answer_agent_run_for_execution_on(&conn, execution_id)
     }
 
     /// Transition a run from `running` to a terminal `replied` (with the reply
@@ -210,19 +247,7 @@ impl WorkDb {
         error_kind: Option<&str>,
     ) -> Result<AnswerAgentRun> {
         let conn = self.connect()?;
-        let now = now_string();
-        let n = conn.execute(
-            "UPDATE answer_agent_runs \
-             SET status = ?2, reply_body = ?3, error_kind = ?4, completed_at = ?5 \
-             WHERE id = ?1 AND status = 'running'",
-            params![run_id, status, reply_body, error_kind, now],
-        )?;
-        if n == 0 {
-            bail!("answer-agent run {run_id} not found or already in a terminal state (expected running)");
-        }
-        let cols = answer_agent_run_columns();
-        let sql = format!("SELECT {cols} FROM answer_agent_runs WHERE id = ?1");
-        conn.query_row(&sql, [run_id], map_answer_agent_run).map_err(Into::into)
+        complete_answer_agent_run_on(&conn, run_id, status, reply_body, error_kind)
     }
 }
 
@@ -251,32 +276,18 @@ impl WorkDb {
                 tx.commit().map_err(|err| SpokeWriteError::from_work(err.into()))?;
                 return Err(SpokeWriteError::refused(existing.reason));
             }
-            let cols = answer_agent_run_columns();
-            let sql = format!(
-                "SELECT {cols} FROM answer_agent_runs WHERE execution_id = ?1 \
-                     ORDER BY created_at DESC, id DESC LIMIT 1"
-            );
-            let run: Option<AnswerAgentRun> = tx
-                .query_row(&sql, [execution_id], map_answer_agent_run)
-                .optional()
-                .map_err(|err| SpokeWriteError::from_work(err.into()))?;
-            let run = run.ok_or_else(|| SpokeWriteError::refused("no answer-agent run for this execution"))?;
+            let run = latest_answer_agent_run_for_execution_on(&tx, execution_id)
+                .map_err(SpokeWriteError::from_work)?
+                .ok_or_else(|| SpokeWriteError::refused("no answer-agent run for this execution"))?;
             let comment = query_comment(&tx, &run.comment_id)
                 .map_err(SpokeWriteError::from_work)?
                 .ok_or_else(|| SpokeWriteError::refused("comment is unknown"))?;
             tx.commit().map_err(|err| SpokeWriteError::from_work(err.into()))?;
             return Ok(comment);
         }
-        let cols = answer_agent_run_columns();
-        let sql = format!(
-            "SELECT {cols} FROM answer_agent_runs WHERE execution_id = ?1 \
-             ORDER BY created_at DESC, id DESC LIMIT 1"
-        );
-        let run: Option<AnswerAgentRun> = tx
-            .query_row(&sql, [execution_id], map_answer_agent_run)
-            .optional()
-            .map_err(|err| SpokeWriteError::from_work(err.into()))?;
-        let Some(run) = run else {
+        let Some(run) =
+            latest_answer_agent_run_for_execution_on(&tx, execution_id).map_err(SpokeWriteError::from_work)?
+        else {
             return Err(SpokeWriteError::refused("no answer-agent run for this execution"));
         };
         match run.status.as_str() {
@@ -294,20 +305,8 @@ impl WorkDb {
                 }
             }
             s if s == ANSWER_AGENT_RUN_STATUS_RUNNING => {
-                let now = now_string();
-                let n = tx
-                    .execute(
-                        "UPDATE answer_agent_runs \
-                         SET status = ?2, reply_body = ?3, error_kind = NULL, completed_at = ?4 \
-                         WHERE id = ?1 AND status = 'running'",
-                        params![run.id, ANSWER_AGENT_RUN_STATUS_REPLIED, body, now],
-                    )
-                    .map_err(|err| SpokeWriteError::from_work(err.into()))?;
-                if n == 0 {
-                    return Err(SpokeWriteError::refused(
-                        "answer-agent run is not running and cannot be replied",
-                    ));
-                }
+                complete_answer_agent_run_on(&tx, &run.id, ANSWER_AGENT_RUN_STATUS_REPLIED, Some(body), None)
+                    .map_err(SpokeWriteError::from_work)?;
             }
             other => {
                 return Err(SpokeWriteError::refused(format!(
@@ -324,55 +323,19 @@ impl WorkDb {
             )
             .map_err(|err| SpokeWriteError::from_work(err.into()))?;
         if existing_thread == 0 {
-            let id = next_id("cte");
-            tx.execute(
-                "INSERT INTO comment_thread_entries \
-                 (id, comment_id, entry_kind, author, body, revise_task_id, answer_agent_run_id, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)",
-                params![
-                    id,
-                    run.comment_id,
-                    THREAD_ENTRY_KIND_ANSWER,
-                    THREAD_ENTRY_AUTHOR_ENGINE,
-                    body,
-                    run.id,
-                    now_string()
-                ],
-            )
-            .map_err(|err| SpokeWriteError::from_work(err.into()))?;
-        }
-        let now = now_string();
-        tx.execute(
-            "UPDATE work_comments
-             SET status = CASE WHEN intent = ?5 THEN ?6 ELSE ?2 END,
-                 status_actor = 'engine', updated_at = ?3,
-                 reopened_at = CASE WHEN intent = ?5 THEN NULL ELSE reopened_at END
-             WHERE id = ?1 AND status = ?4",
-            params![
-                run.comment_id,
-                COMMENT_STATUS_ANSWERED,
-                now,
-                COMMENT_STATUS_ANSWERING,
-                INTENT_REVISION,
-                COMMENT_STATUS_ACTIVE,
-            ],
-        )
-        .map_err(|err| SpokeWriteError::from_work(err.into()))?;
-        if let Some(application) = application {
-            insert_spoke_applied_write_on(
+            insert_comment_thread_entry_on(
                 &tx,
-                &SpokeAppliedWrite {
-                    application_key: application.key.to_owned(),
-                    host_id: application.host_id.to_owned(),
-                    contract: application.contract.to_owned(),
-                    accepted: true,
-                    reason: String::new(),
-                    result_json: serde_json::json!({"state": "applied"}).to_string(),
-                    created_at_ms: boss_engine_utils::epoch_time::now_epoch_ms() as i64,
-                },
+                &run.comment_id,
+                THREAD_ENTRY_KIND_ANSWER,
+                THREAD_ENTRY_AUTHOR_ENGINE,
+                body,
+                None,
+                Some(run.id.as_str()),
             )
             .map_err(SpokeWriteError::from_work)?;
         }
+        transition_comment_to_answered_on(&tx, &run.comment_id).map_err(SpokeWriteError::from_work)?;
+        record_application_on(&tx, application).map_err(SpokeWriteError::from_work)?;
         let comment = query_comment(&tx, &run.comment_id)
             .map_err(SpokeWriteError::from_work)?
             .ok_or_else(|| SpokeWriteError::refused("comment is unknown"))?;
@@ -929,6 +892,37 @@ mod tests {
             entries.len(),
             1,
             "a losing racer must not post a duplicate apology entry"
+        );
+    }
+
+    #[test]
+    fn apply_reply_completes_the_run_posts_the_thread_and_answers_the_comment() {
+        let db = mem_db();
+        let comment = make_comment(&db, "t1");
+        db.transition_comment_to_answering(&comment).unwrap();
+        let run = db
+            .create_answer_agent_run(&comment, "work_item", "t1", "v0", 0)
+            .unwrap();
+        let execution = db
+            .create_answer_agent_execution(&comment, "https://example.test/repo.git")
+            .unwrap();
+        db.bind_answer_agent_run_execution(&run.id, &execution.id).unwrap();
+
+        let answered = db
+            .apply_answer_agent_reply(&execution.id, "because the retry is exponential", None)
+            .unwrap();
+        assert_eq!(answered.status, "answered");
+        let done = db.get_answer_agent_run(&run.id).unwrap().unwrap();
+        assert_eq!(done.status, "replied");
+        assert_eq!(done.reply_body.as_deref(), Some("because the retry is exponential"));
+        let entries = db.list_comment_thread_entries(&comment).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].body, "because the retry is exponential");
+        assert_eq!(entries[0].answer_agent_run_id.as_deref(), Some(run.id.as_str()));
+
+        assert!(
+            db.apply_answer_agent_reply(&execution.id, "a second local reply", None)
+                .is_err()
         );
     }
 }

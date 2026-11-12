@@ -72,12 +72,12 @@ enum SpokeTurn {
 /// The latest turn boundary seen for each spoke-supervised run.
 ///
 /// Turn evidence reaches this map through `record_spoke_turn_event`, which the
-/// worker-event fan-out calls for every hook event. A spoke host journals its
-/// worker's hook events and sends them to the hub as stream records; the hub's
-/// projection (`spoke_projection`) applies them in order through that same
-/// fan-out. Until a run's first turn event has been projected the map has no
-/// entry for it and `spoke_parked_for_delivery` stays closed: mid-turn delivery
-/// to a spoke worker is refused rather than guessed at.
+/// hub's projection applier (`spoke_projection`) calls for each projected
+/// main-session hook, durably and before that hook's worker-event fan-out. A
+/// spoke host journals its worker's hook events and sends them to the hub as
+/// stream records. Until a run's first turn event has been projected the map
+/// has no entry for it and `spoke_parked_for_delivery` stays closed: mid-turn
+/// delivery to a spoke worker is refused rather than guessed at.
 #[derive(Default)]
 pub(super) struct SpokeTurns(
     std::sync::Mutex<std::collections::HashMap<String, SpokeTurn>>,

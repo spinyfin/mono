@@ -28,9 +28,11 @@
 //! cursor moves is idempotent by the engine's own keys (a proposal by its
 //! idempotency key, a finalize by its status guards), so the one window a
 //! crash can open, after an application and before the cursor commit, repeats
-//! work that is already a no-op. Hook events are the exception that is
-//! at-least-once rather than idempotent: the live-state reducer and the
-//! completion paths already tolerate a repeated event, as they do a shim retry.
+//! work that is already a no-op. A transient failure of that commit retries
+//! only the commit; it does not re-run observations. Hook events are the
+//! exception that is at-least-once rather than idempotent: the live-state
+//! reducer and the completion paths already tolerate a repeated event, as
+//! they do a shim retry.
 //!
 //! # Ordering
 //!
@@ -53,7 +55,7 @@ pub mod reduce;
 use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -117,6 +119,8 @@ pub struct DecisionSettled<'a> {
     pub execution_id: &'a str,
     pub proposal_id: &'a str,
     pub settlement: Settlement,
+    /// Wire result code of the stored decision (`ResultCode::Ok` accepted it).
+    pub code: i32,
 }
 
 /// What the hub decided about a queued proposal.
@@ -263,6 +267,23 @@ enum Interrupted {
     Halt(String),
 }
 
+/// Backoff and stall reporting for a retry loop that holds one host's cursor.
+struct RetryHold {
+    attempt: u32,
+    started: std::time::Instant,
+    stall_recorded: bool,
+}
+
+impl RetryHold {
+    fn new() -> Self {
+        Self {
+            attempt: 0,
+            started: std::time::Instant::now(),
+            stall_recorded: false,
+        }
+    }
+}
+
 enum Currentness {
     Current,
     Superseded(String),
@@ -298,6 +319,10 @@ struct Inner {
     reported: Mutex<HashMap<String, u64>>,
     #[builder(skip)]
     delivering: AtomicBool,
+    /// Remaining injected `advance_spoke_projection` failures. Tests use this
+    /// to prove a transient cursor-commit error does not re-run observations.
+    #[builder(skip)]
+    fail_advances: AtomicU32,
 }
 
 /// Applies each host's stored observations, in order, and delivers the effects
@@ -405,6 +430,13 @@ impl Projector {
             Err(reason) => tracing::warn!(%reason, "cannot list spoke hosts awaiting projection"),
         }
         self.inner.deliver_pending().await;
+    }
+
+    /// Fail the next `n` cursor advances with a retryable busy error. Tests
+    /// use this to prove observations are not re-applied when only the commit
+    /// fails.
+    pub fn fail_next_advances(&self, n: u32) {
+        self.inner.fail_advances.store(n, Ordering::SeqCst);
     }
 }
 
@@ -524,50 +556,20 @@ impl Inner {
     }
 
     /// Apply one record, retrying transient failures in place. Returns an error
-    /// only when the record can never be applied as stored.
+    /// only when the record can never be applied as stored. Retry covers
+    /// failures that happen before any observation is applied; once
+    /// observations have run, only the cursor commit is retried.
     async fn project_record(&self, host: &str, journal: &str, row: &SpokeIngressRow) -> Result<(), String> {
-        let mut attempt = 0u32;
-        let started = std::time::Instant::now();
-        // True only once the stall is durably recorded, so a failed write is
-        // attempted again on the next retry rather than forgotten.
-        let mut stall_recorded = false;
+        let mut hold = RetryHold::new();
         loop {
             match self.apply_record(host, journal, row).await {
                 Ok(()) => {
-                    if stall_recorded {
-                        let host_id = host.to_owned();
-                        if let Err(Interrupted::Retry(error) | Interrupted::Halt(error)) =
-                            self.blocking(move |db| db.clear_spoke_projection_stall(&host_id)).await
-                        {
-                            tracing::warn!(host, %error, "cannot clear a spoke projection stall");
-                        }
-                    }
+                    self.clear_stall_if_recorded(host, &hold).await;
                     return Ok(());
                 }
                 Err(Interrupted::Halt(reason)) => return Err(reason),
                 Err(Interrupted::Retry(reason)) => {
-                    attempt += 1;
-                    if !stall_recorded && started.elapsed() >= self.config.retry_stall {
-                        let (host_id, stall_reason) = (host.to_owned(), reason.clone());
-                        match self
-                            .blocking(move |db| db.set_spoke_projection_stall(&host_id, &stall_reason))
-                            .await
-                        {
-                            Ok(_) => stall_recorded = true,
-                            Err(Interrupted::Retry(error) | Interrupted::Halt(error)) => {
-                                tracing::warn!(host, %error, "cannot record a spoke projection stall; it is retried");
-                            }
-                        }
-                    }
-                    let wait = exponential_delay(self.config.retry_initial, self.config.retry_max, attempt.min(16));
-                    tracing::warn!(
-                        host,
-                        sequence = row.sequence,
-                        attempt,
-                        %reason,
-                        "a spoke record could not be applied yet; holding this host's cursor"
-                    );
-                    tokio::time::sleep(wait).await;
+                    self.hold_retry(host, row.sequence, &reason, &mut hold).await;
                 }
             }
         }
@@ -608,13 +610,85 @@ impl Inner {
                 }
             }
         }
-        let (host_id, journal_id, sequence) = (host.to_owned(), journal.to_owned(), row.sequence);
-        self.blocking(move |db| {
-            let effects: Vec<_> = owed.iter().map(Owed::as_new).collect();
-            db.advance_spoke_projection(&host_id, &journal_id, sequence, &effects)
-        })
-        .await
-        .map(|_| ())
+        self.commit_cursor(host, journal, row.sequence, owed).await
+    }
+
+    /// Advance the cursor after observations have already been applied.
+    /// Transient failures retry only this commit, so a hook already fanned
+    /// out is not dispatched again.
+    async fn commit_cursor(
+        &self,
+        host: &str,
+        journal: &str,
+        sequence: u64,
+        owed: Vec<Owed>,
+    ) -> Result<(), Interrupted> {
+        let mut hold = RetryHold::new();
+        loop {
+            if self
+                .fail_advances
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                self.hold_retry(host, sequence, "database is locked (SQLITE_BUSY)", &mut hold)
+                    .await;
+                continue;
+            }
+            let (host_id, journal_id, owed) = (host.to_owned(), journal.to_owned(), owed.clone());
+            match self
+                .blocking(move |db| {
+                    let effects: Vec<_> = owed.iter().map(Owed::as_new).collect();
+                    db.advance_spoke_projection(&host_id, &journal_id, sequence, &effects)
+                })
+                .await
+            {
+                Ok(_) => {
+                    self.clear_stall_if_recorded(host, &hold).await;
+                    return Ok(());
+                }
+                Err(Interrupted::Halt(reason)) => return Err(Interrupted::Halt(reason)),
+                Err(Interrupted::Retry(reason)) => {
+                    self.hold_retry(host, sequence, &reason, &mut hold).await;
+                }
+            }
+        }
+    }
+
+    async fn hold_retry(&self, host: &str, sequence: u64, reason: &str, hold: &mut RetryHold) {
+        hold.attempt += 1;
+        if !hold.stall_recorded && hold.started.elapsed() >= self.config.retry_stall {
+            let (host_id, stall_reason) = (host.to_owned(), reason.to_owned());
+            match self
+                .blocking(move |db| db.set_spoke_projection_stall(&host_id, &stall_reason))
+                .await
+            {
+                Ok(_) => hold.stall_recorded = true,
+                Err(Interrupted::Retry(error) | Interrupted::Halt(error)) => {
+                    tracing::warn!(host, %error, "cannot record a spoke projection stall; it is retried");
+                }
+            }
+        }
+        let wait = exponential_delay(self.config.retry_initial, self.config.retry_max, hold.attempt.min(16));
+        tracing::warn!(
+            host,
+            sequence,
+            attempt = hold.attempt,
+            %reason,
+            "a spoke record could not be applied yet; holding this host's cursor"
+        );
+        tokio::time::sleep(wait).await;
+    }
+
+    async fn clear_stall_if_recorded(&self, host: &str, hold: &RetryHold) {
+        if !hold.stall_recorded {
+            return;
+        }
+        let host_id = host.to_owned();
+        if let Err(Interrupted::Retry(error) | Interrupted::Halt(error)) =
+            self.blocking(move |db| db.clear_spoke_projection_stall(&host_id)).await
+        {
+            tracing::warn!(host, %error, "cannot clear a spoke projection stall");
+        }
     }
 
     async fn apply_observation(&self, observation: Observation, owed: &mut Vec<Owed>) -> Result<(), Interrupted> {
@@ -804,6 +878,7 @@ impl Inner {
                 execution_id: &run.execution_id,
                 proposal_id: &decision.proposal_id,
                 settlement,
+                code: decision.code,
             })
             .await;
     }
@@ -865,6 +940,7 @@ impl Inner {
 }
 
 /// An effect a record owes, held until its cursor advances.
+#[derive(Clone)]
 struct Owed {
     kind: &'static str,
     key: String,

@@ -163,7 +163,7 @@ impl WorkDb {
         );
 
         let now = now_string();
-        let request_regeneration = outcome.request_regeneration;
+        let mut request_regeneration = outcome.request_regeneration;
         let comment_id = outcome.comment_id.clone();
         let series_id;
         {
@@ -172,31 +172,47 @@ impl WorkDb {
             let comment = super::comments::query_comment(&tx, &comment_id)?
                 .with_context(|| format!("unknown comment: {comment_id}"))?;
             if let Some(application) = application.as_ref()
-                && crate::spoke_projection::get_spoke_applied_write_on(&tx, application.key)?.is_some()
+                && let Some(existing) = crate::spoke_projection::get_spoke_applied_write_on(&tx, application.key)?
             {
+                if !existing.accepted {
+                    tx.commit()?;
+                    return Ok(RecordedGuideCommentOutcome {
+                        comment,
+                        regeneration: None,
+                    });
+                }
+                // Replay of a crash after the outcome row committed: if the
+                // stored row asked for regeneration, still run the token-
+                // keyed retry. AlreadyRequested is the expected answer when
+                // the first attempt already queued it.
+                let stored: Option<i64> = tx
+                    .query_row(
+                        "SELECT request_regeneration FROM guide_comment_outcomes WHERE comment_id = ?1",
+                        [&comment_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                request_regeneration = stored == Some(1);
+                series_id = comment.artifact_id.clone();
                 tx.commit()?;
-                return Ok(RecordedGuideCommentOutcome {
-                    comment,
-                    regeneration: None,
-                });
-            }
-            anyhow::ensure!(
-                comment.artifact_kind == "pr_review_guide",
-                "guide outcomes apply only to review-guide comments"
-            );
-            anyhow::ensure!(
-                comment.revise_task_id.as_deref() == Some(revise_task_id),
-                "comment {} is not claimed by revision {revise_task_id}",
-                comment.id
-            );
-            anyhow::ensure!(
-                comment.status == COMMENT_STATUS_IN_REVISION,
-                "comment {} is not in_revision",
-                comment.id
-            );
-            series_id = comment.artifact_id.clone();
-            tx.execute(
-                "INSERT INTO guide_comment_outcomes
+            } else {
+                anyhow::ensure!(
+                    comment.artifact_kind == "pr_review_guide",
+                    "guide outcomes apply only to review-guide comments"
+                );
+                anyhow::ensure!(
+                    comment.revise_task_id.as_deref() == Some(revise_task_id),
+                    "comment {} is not claimed by revision {revise_task_id}",
+                    comment.id
+                );
+                anyhow::ensure!(
+                    comment.status == COMMENT_STATUS_IN_REVISION,
+                    "comment {} is not in_revision",
+                    comment.id
+                );
+                series_id = comment.artifact_id.clone();
+                tx.execute(
+                    "INSERT INTO guide_comment_outcomes
                  (comment_id, revise_task_id, disposition, response, request_regeneration, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(comment_id) DO UPDATE SET
@@ -205,59 +221,59 @@ impl WorkDb {
                      response = excluded.response,
                      request_regeneration = excluded.request_regeneration,
                      created_at = excluded.created_at",
-                params![
-                    comment_id,
-                    revise_task_id,
-                    disposition,
-                    outcome.response,
-                    request_regeneration as i64,
-                    now
-                ],
-            )?;
-            // A re-record for the same comment (retry after a transport
-            // failure, or the worker re-running `boss comment guide-outcome`)
-            // must update the existing thread entry rather than append a
-            // duplicate — the outcome upsert above is already idempotent on
-            // `comment_id`, so the thread entry should be too.
-            let existing_entry_id: Option<String> = tx
-                .query_row(
-                    &format!(
-                        "SELECT id FROM comment_thread_entries
+                    params![
+                        comment_id,
+                        revise_task_id,
+                        disposition,
+                        outcome.response,
+                        request_regeneration as i64,
+                        now
+                    ],
+                )?;
+                // A re-record for the same comment (retry after a transport
+                // failure, or the worker re-running `boss comment guide-outcome`)
+                // must update the existing thread entry rather than append a
+                // duplicate — the outcome upsert above is already idempotent on
+                // `comment_id`, so the thread entry should be too.
+                let existing_entry_id: Option<String> = tx
+                    .query_row(
+                        &format!(
+                            "SELECT id FROM comment_thread_entries
                          WHERE comment_id = ?1 AND revise_task_id = ?2 AND entry_kind = '{THREAD_ENTRY_KIND_ANSWER}'"
-                    ),
-                    params![comment_id, revise_task_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            match existing_entry_id {
-                Some(entry_id) => {
-                    tx.execute(
-                        "UPDATE comment_thread_entries SET body = ?2, created_at = ?3 WHERE id = ?1",
-                        params![entry_id, outcome.response, now],
-                    )?;
-                }
-                None => {
-                    let entry_id = next_id("cte");
-                    tx.execute(
-                        "INSERT INTO comment_thread_entries \
+                        ),
+                        params![comment_id, revise_task_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                match existing_entry_id {
+                    Some(entry_id) => {
+                        tx.execute(
+                            "UPDATE comment_thread_entries SET body = ?2, created_at = ?3 WHERE id = ?1",
+                            params![entry_id, outcome.response, now],
+                        )?;
+                    }
+                    None => {
+                        let entry_id = next_id("cte");
+                        tx.execute(
+                            "INSERT INTO comment_thread_entries \
                          (id, comment_id, entry_kind, author, body, revise_task_id, answer_agent_run_id, created_at) \
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
-                        params![
-                            entry_id,
-                            comment_id,
-                            THREAD_ENTRY_KIND_ANSWER,
-                            THREAD_ENTRY_AUTHOR_ENGINE,
-                            outcome.response,
-                            revise_task_id,
-                            now
-                        ],
-                    )?;
+                            params![
+                                entry_id,
+                                comment_id,
+                                THREAD_ENTRY_KIND_ANSWER,
+                                THREAD_ENTRY_AUTHOR_ENGINE,
+                                outcome.response,
+                                revise_task_id,
+                                now
+                            ],
+                        )?;
+                    }
                 }
-            }
-            if self.guide_revision_was_delivered_successfully_on(&tx, revise_task_id)? {
-                tx.execute(
-                    &format!(
-                        "UPDATE work_comments
+                if self.guide_revision_was_delivered_successfully_on(&tx, revise_task_id)? {
+                    tx.execute(
+                        &format!(
+                            "UPDATE work_comments
                          SET status = '{COMMENT_STATUS_RESOLVED}',
                              status_actor = 'engine',
                              updated_at = ?2,
@@ -265,12 +281,13 @@ impl WorkDb {
                          WHERE id = ?1
                            AND status = '{COMMENT_STATUS_IN_REVISION}'
                            AND revise_task_id = ?3"
-                    ),
-                    params![comment_id, now, revise_task_id],
-                )?;
+                        ),
+                        params![comment_id, now, revise_task_id],
+                    )?;
+                }
+                crate::spoke_projection::record_application_on(&tx, application)?;
+                tx.commit()?;
             }
-            crate::spoke_projection::record_application_on(&tx, application)?;
-            tx.commit()?;
         }
 
         let regeneration = if request_regeneration {
@@ -916,6 +933,65 @@ mod tests {
             matches!(recorded.regeneration, Some(Ok(RetryReviewGuideOutcome::Created(_)))),
             "got {:?}",
             recorded.regeneration
+        );
+    }
+
+    #[test]
+    fn a_replayed_outcome_still_queues_requested_regeneration() {
+        let (_dir, db) = open_db();
+        let (_root, series, _) = seed_open_guide(&db);
+        let c1 = make_guide_comment(&db, &series, "fix retry");
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
+        let ReviseDocOutcome::Created { task_id, .. } = db
+            .revise_doc(
+                ReviseDocInput::builder()
+                    .artifact_kind("pr_review_guide")
+                    .artifact_id(series)
+                    .build(),
+                &open_checker(),
+            )
+            .unwrap()
+        else {
+            panic!("expected Created");
+        };
+        let outcome = GuideCommentOutcome::builder()
+            .comment_id(c1.id.clone())
+            .disposition(GuideCommentDisposition::SourceChanged)
+            .response("Fixed; the quoted guide is stale.")
+            .request_regeneration(true)
+            .build();
+        let application = crate::SpokeWriteApplication {
+            key: "guide-1",
+            host_id: "host-a",
+            contract: "guide-outcome/1",
+        };
+        let recorded = db
+            .record_guide_comment_outcome_applied(&task_id, outcome.clone(), Some(application))
+            .unwrap();
+        assert!(
+            matches!(recorded.regeneration, Some(Ok(RetryReviewGuideOutcome::Created(_)))),
+            "got {:?}",
+            recorded.regeneration
+        );
+        // Replay after the applied-write row exists, even with the incoming
+        // payload no longer asking for regeneration: the stored row is the
+        // source of truth.
+        let replay = GuideCommentOutcome::builder()
+            .comment_id(c1.id)
+            .disposition(GuideCommentDisposition::SourceChanged)
+            .response("Fixed; the quoted guide is stale.")
+            .request_regeneration(false)
+            .build();
+        let replayed = db
+            .record_guide_comment_outcome_applied(&task_id, replay, Some(application))
+            .unwrap();
+        assert!(
+            matches!(
+                replayed.regeneration,
+                Some(Ok(RetryReviewGuideOutcome::AlreadyRequested(_)))
+            ),
+            "got {:?}",
+            replayed.regeneration
         );
     }
 

@@ -6,9 +6,10 @@
 //! are handled by the same code that handles a local worker's:
 //!
 //! * a **hook event** takes the fan-out a hook arriving on the local events
-//!   socket takes (live state, completion on `Stop`, probes, and the rest),
-//!   which is also what feeds the spoke turn map that mid-turn probe delivery
-//!   reads;
+//!   socket takes (live state, completion on `Stop`, probes, and the rest).
+//!   Turn evidence reaches the spoke turn map through `record_spoke_turn_event`,
+//!   which this applier calls for each projected main-session hook, durably
+//!   and before that hook's worker-event fan-out;
 //! * a **queued proposal** goes through the same validators, apply pipeline and
 //!   finalization as `SubmitProposal`, and yields the decision the spoke's
 //!   worker is waiting on;
@@ -30,6 +31,7 @@ use boss_protocol::{
 use boss_protocol_spoke::proposal::{
     ANSWER_REPLY, CI_MARK_FAILED, CONFLICT_MARK_FAILED, CONFLICT_PRODUCER, GUIDE_OUTCOME,
 };
+use boss_protocol_spoke::v1::ResultCode;
 use projection::{
     Applied, Decision, DecisionSettled, EventObservation, Life, ObservationApplier, Origin, PaneObservation,
     ProjectorConfig, Proposed, Settlement,
@@ -247,6 +249,12 @@ impl ObservationApplier for ServerApplier {
                 if finished_early.remove(decision.effect_key) {
                     return;
                 }
+                if decision.code != ResultCode::Ok as i32 {
+                    // A refused or superseded decision must not rebuild and
+                    // finish another generation's accepted proposal: content-
+                    // derived keys collide by execution and canonical JSON.
+                    return;
+                }
                 drop(finished_early);
                 // This process no longer holds the submission (the hub
                 // restarted after the decision was recorded): rebuild what it
@@ -303,14 +311,14 @@ impl ObservationApplier for ServerApplier {
             Err(error) => return Proposed::Retry(format!("{error:#}")),
         };
         match state.work_db.get_spoke_applied_write(key) {
-            Ok(Some(write)) => {
+            Ok(Some(write)) if contract != GUIDE_OUTCOME => {
                 return if write.accepted {
                     Proposed::Decided(accepted_write("already applied"))
                 } else {
                     Proposed::Decided(Decision::refused(write.reason))
                 };
             }
-            Ok(None) => {}
+            Ok(Some(_)) | Ok(None) => {}
             Err(error) => return Proposed::Retry(format!("{error:#}")),
         }
         let request = match request_for_run_write(execution_id, contract, payload) {
@@ -383,14 +391,7 @@ fn rejected(error: &ProposalSubmissionError) -> Decision {
 }
 
 fn request_for_run_write(execution_id: &str, contract: &str, payload: &Value) -> Result<FrontendRequest, String> {
-    let claimed = payload
-        .get("run_id")
-        .or_else(|| payload.get("execution_id"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if claimed != execution_id {
-        return Err("run-scoped write is not bound to this execution".into());
-    }
+    bind_run_write(execution_id, contract, payload)?;
     match contract {
         GUIDE_OUTCOME => Ok(FrontendRequest::CommentsRecordGuideOutcome {
             run_id: string_field(payload, "run_id")?,
@@ -433,6 +434,29 @@ fn request_for_run_write(execution_id: &str, contract: &str, payload: &Value) ->
         }),
         other => Err(format!("payload contract `{other}` is not supported by this hub")),
     }
+}
+
+/// Check the field each contract actually writes against: `execution_id` for
+/// a producer-side conflict, `run_id` for the others. A payload that carries
+/// both fields with different values is refused rather than trusting `run_id`
+/// to stand in for another execution.
+fn bind_run_write(execution_id: &str, contract: &str, payload: &Value) -> Result<(), String> {
+    let run_id = payload.get("run_id").and_then(Value::as_str);
+    let execution_field = payload.get("execution_id").and_then(Value::as_str);
+    if let (Some(run_id), Some(execution_field)) = (run_id, execution_field)
+        && run_id != execution_field
+    {
+        return Err("run-scoped write carries both run_id and execution_id with different values".into());
+    }
+    let claimed = match contract {
+        CONFLICT_PRODUCER => execution_field,
+        _ => run_id,
+    }
+    .unwrap_or_default();
+    if claimed != execution_id {
+        return Err("run-scoped write is not bound to this execution".into());
+    }
+    Ok(())
 }
 
 fn string_field(payload: &Value, name: &str) -> Result<String, String> {

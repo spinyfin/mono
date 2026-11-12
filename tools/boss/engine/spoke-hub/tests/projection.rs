@@ -560,6 +560,25 @@ async fn a_pane_exit_is_kept_with_its_exit_code_and_the_newest_observation_wins(
 }
 
 #[tokio::test]
+async fn a_busy_cursor_commit_retries_only_the_commit_and_does_not_reapply_the_event() {
+    let world = World::new();
+    let db = world.open();
+    let run = assign(&db, "exec_1").1;
+    let spoke = Spoke::connect(&db, None).await;
+    spoke.send(&tool_record(1, &run)).await;
+    let applier = Applier::default();
+    let projector = projector(&db, &applier, &Arc::new(Sender::default()), Arc::new(Notify::new()));
+    projector.fail_next_advances(1);
+    projector.drain().await;
+    assert_eq!(
+        applier.log(|l| l.events.clone()),
+        ["1#pre_tool_use"],
+        "a transient cursor-commit failure must not re-run the event applier"
+    );
+    assert_eq!(applied(&db), 1);
+}
+
+#[tokio::test]
 async fn a_record_that_cannot_be_applied_yet_holds_the_cursor_and_the_order() {
     let world = World::new();
     let db = world.open();
