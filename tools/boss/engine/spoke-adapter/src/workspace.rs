@@ -246,10 +246,12 @@ impl SpokeHostAdapter {
                     if self.hub_command_unknown(&id).await? {
                         return Err(error.into());
                     }
-                    // The request is already on the wire. A later send that cannot
-                    // complete (busy stream, lost connection) is still in doubt:
-                    // treating it as a failed start would spend the retry budget
-                    // on a lease the host may yet grant.
+                    // Reached when the command is stored after send_stable's
+                    // NotSent re-check and before this lookup. send_stable maps a
+                    // stored-command NotSent to Uncertain (retries of an existing
+                    // id, and a store that happened during the send); this arm
+                    // covers the store that lands in that window, so the lease
+                    // stays in doubt and the retry budget is not spent.
                     return Err(uncertain(error.to_string(), false));
                 }
             };
