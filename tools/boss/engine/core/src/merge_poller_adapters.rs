@@ -17,9 +17,11 @@ use boss_engine_merge_poller::{
     ConflictCleared, ConflictHandling, ConflictResponse, LoopPasses, PopulationRequest, PopulationRequests, SweepPasses,
 };
 use boss_execution_contracts::{CubeClient, ExecutionPublisher};
+use boss_feature_flags::{ConflictDeferralArm, FeatureFlagsStore};
 use boss_observation_contracts::{DesignDetection, PrLifecycleProbe};
 
 use crate::completion_adapters::CoreDocDetection;
+use crate::conflict_deferral;
 use crate::conflict_remediation::{ConflictRemediationQueue, LadderRemediationJob};
 use crate::conflict_watch::{self, ConflictRemediationMode};
 use crate::metrics::Registry;
@@ -37,6 +39,10 @@ pub struct CoreSweepHost {
     /// ladder inline on the sweep's task when the sweep has a cube client.
     remediation: Option<ConflictRemediationQueue>,
     design: CoreDocDetection,
+    /// Where the just-in-time conflict-resolution flags are read on every
+    /// detection. `None` (tests, and any host built without flags) resolves
+    /// every conflict on detection.
+    feature_flags: Option<Arc<FeatureFlagsStore>>,
 }
 
 impl CoreSweepHost {
@@ -55,7 +61,16 @@ impl CoreSweepHost {
         Self {
             remediation,
             design: CoreDocDetection,
+            feature_flags: None,
         }
+    }
+
+    /// Read the conflict-deferral flags from `feature_flags`, so a conflict on
+    /// a PR in the deferring arm is recorded and resolved just in time instead
+    /// of on detection (see [`crate::conflict_deferral`]).
+    pub fn with_feature_flags(mut self, feature_flags: Arc<FeatureFlagsStore>) -> Self {
+        self.feature_flags = Some(feature_flags);
+        self
     }
 }
 
@@ -79,7 +94,11 @@ impl ConflictHandling for CoreSweepHost {
             (true, None, Some(cube)) => ConflictRemediationMode::Inline(cube),
             (true, None, None) => ConflictRemediationMode::Disabled,
         };
-        conflict_watch::on_conflict_detected_with(work_db, publisher, mode, pr_checker, candidate, probe).await
+        let deferral = self.feature_flags.as_deref().map_or(ConflictDeferralArm::Off, |flags| {
+            conflict_deferral::arm_for(flags, candidate)
+        });
+        conflict_watch::on_conflict_detected_with(work_db, publisher, mode, pr_checker, candidate, probe, deferral)
+            .await
     }
 
     async fn on_conflict_resolved(
@@ -108,7 +127,11 @@ impl ConflictHandling for CoreSweepHost {
         candidate: &PendingMergeCheck,
         labels: &[String],
     ) -> usize {
-        conflict_watch::retire_moot_conflict_revisions(work_db, candidate, labels)
+        // A definitive clean probe also ends a deferred conflict that went
+        // away on its own. That is a fact about the PR, not upkeep, so it is
+        // recorded whether or not the product has opted out of maintenance.
+        usize::from(conflict_deferral::on_conflict_cleared(work_db, candidate))
+            + conflict_watch::retire_moot_conflict_revisions(work_db, candidate, labels)
     }
 }
 

@@ -168,7 +168,11 @@ pub struct CiRemediation {
 /// `succeeded` (push landed, PR back to mergeable), `superseded`
 /// (a newer attempt — or a human push — replaced this one),
 /// `failed` (worker gave up / errored), `abandoned` (engine
-/// declined to spawn, e.g. churn-threshold or product opt-out).
+/// declined to spawn, e.g. churn-threshold or product opt-out),
+/// `deferred` (the conflict is recorded but its resolution waits until a
+/// merge is requested for the PR or a human asks; no attempt has been
+/// made). A `deferred` row ends as `superseded`, with
+/// `deferral_end_reason` saying what ended it.
 ///
 /// `pr_url` / `pr_number` / `head_branch` / `base_branch` are
 /// snapshots of the parent's PR state at trigger time so the row
@@ -281,6 +285,22 @@ pub struct ConflictResolution {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[builder(default)]
     pub mismatch_exit_barred: bool,
+
+    /// Which arm of the just-in-time resolution rollout this row was
+    /// assigned at detection: `"deferred"` (resolution waits for a merge
+    /// request) or `"control"` (resolved on detection). `None` for rows
+    /// written while deferral was off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferral_arm: Option<String>,
+
+    /// Set on a row that recorded a deferred conflict once the deferral is
+    /// over: `merge_requested`, `human_request`, `deferral_disabled` or
+    /// `resolution_started` when the conflict was handed to the resolver,
+    /// `conflict_cleared` when the PR stopped conflicting on its own, and
+    /// `pr_merged` / `pr_closed` when the PR ended first. `None` on every
+    /// row that is not an ended deferral.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferral_end_reason: Option<String>,
 }
 
 fn default_review_watch_event_source() -> String {
@@ -370,6 +390,12 @@ impl ConflictResolution {
         let mut extra = std::collections::BTreeMap::new();
         if let Some(id) = &self.revision_task_id {
             extra.insert("revision_task_id".into(), id.clone());
+        }
+        if let Some(arm) = &self.deferral_arm {
+            extra.insert("deferral_arm".into(), arm.clone());
+        }
+        if let Some(reason) = &self.deferral_end_reason {
+            extra.insert("deferral_end_reason".into(), reason.clone());
         }
         super::EngineAttemptListEntry {
             id: self.id.clone(),

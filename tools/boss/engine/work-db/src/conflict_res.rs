@@ -203,11 +203,15 @@ impl WorkDb {
         // into the churn budget that gates *real* conflict-resolution
         // cycles. Without this exclusion a burst of speculative predictions
         // for one work item could pre-abandon its next genuine attempt.
+        // Deferral records are excluded for the same reason: a `deferred`
+        // row, open or ended, records a conflict nobody tried to resolve.
         let recent_count: i64 = tx.query_row(
             "SELECT COUNT(*) FROM conflict_resolutions
               WHERE work_item_id = ?1
                 AND CAST(created_at AS INTEGER) >= ?2
-                AND event_source != 'speculative_predicted'",
+                AND event_source != 'speculative_predicted'
+                AND status != 'deferred'
+                AND deferral_end_reason IS NULL",
             params![input.work_item_id, cutoff_secs],
             |row| row.get(0),
         )?;
@@ -921,6 +925,28 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
+        // A deferred row is a conflict nobody has tried to resolve yet, so
+        // "retry" on it means "resolve it now": end the deferral as a human
+        // request and leave the parent in review. The conflict watcher's
+        // next pass finds the conflict released and starts the resolution
+        // through the ordinary path, ladder and push gate included.
+        let deferred_item: Option<String> = tx
+            .query_row(
+                "SELECT work_item_id FROM conflict_resolutions WHERE id = ?1 AND status = 'deferred'",
+                params![attempt_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(work_item_id) = deferred_item {
+            let released = super::conflict_deferral::end_deferral_in_tx(
+                &tx,
+                &work_item_id,
+                super::conflict_deferral::ConflictDeferralEnd::HumanRequest,
+                &now,
+            )?;
+            tx.commit()?;
+            return Ok(released);
+        }
         let rows = tx.execute(
             "UPDATE conflict_resolutions
                 SET status            = 'pending',

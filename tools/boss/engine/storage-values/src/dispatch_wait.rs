@@ -131,6 +131,10 @@ pub const DISPATCH_WAIT_REASON_REVISION_PENDING: &str = "revision_pending";
 pub const DISPATCH_WAIT_REASON_HUMAN_REVIEW: &str = "human_review";
 /// Review is complete and merge handling owns the next step.
 pub const DISPATCH_WAIT_REASON_AWAITING_MERGE: &str = "awaiting_merge";
+/// Nothing is left but the merge, and the pull request conflicts with its
+/// base. The conflict is recorded and deliberately not resolved yet; it is
+/// resolved when a merge is requested.
+pub const DISPATCH_WAIT_REASON_CONFLICT_DEFERRED: &str = "conflict_deferred";
 /// A worker deliberately stopped for a person to decide the next step.
 pub const DISPATCH_WAIT_REASON_DELIBERATE_PARK: &str = "deliberate_park";
 
@@ -174,6 +178,10 @@ pub const DISPATCH_WAIT_REASON_CODES: &[(&str, &str)] = &[
     (
         DISPATCH_WAIT_REASON_AWAITING_MERGE,
         "waiting for its pull request to merge",
+    ),
+    (
+        DISPATCH_WAIT_REASON_CONFLICT_DEFERRED,
+        "conflicted; the conflict will be resolved when a merge is requested",
     ),
     (
         DISPATCH_WAIT_REASON_DELIBERATE_PARK,

@@ -58,6 +58,7 @@ pub mod config;
 #[cfg(test)]
 mod conformance;
 pub use boss_conflict_diagnosis as conflict_diagnosis;
+pub(crate) mod conflict_deferral;
 pub mod conflict_ladder;
 pub mod conflict_remediation;
 pub mod conflict_watch;

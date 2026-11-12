@@ -675,7 +675,12 @@ pub(crate) async fn run_engine_conflicts_command(
             match response {
                 FrontendEvent::ConflictResolutionRetried { attempt } => {
                     print_entity(ctx, &serde_json::json!({ "attempt": attempt }), || {
-                        if !ctx.quiet {
+                        if !ctx.quiet && attempt.deferral_end_reason.is_some() {
+                            println!(
+                                "Deferred conflict {} released; engine will resolve it on its next look at the PR.",
+                                attempt.id,
+                            );
+                        } else if !ctx.quiet {
                             println!(
                                 "Conflict resolution {} reset to pending; engine will re-dispatch a worker.",
                                 attempt.id,

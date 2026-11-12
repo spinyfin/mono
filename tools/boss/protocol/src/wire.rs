@@ -2256,11 +2256,16 @@ pub enum FrontendRequest {
     },
 
     /// Reset a terminal-failure attempt back to `pending` so the
-    /// dispatcher re-spawns a worker. Only valid for rows whose status
+    /// dispatcher re-spawns a worker. Valid for rows whose status
     /// is `failed` or `abandoned`; calling on a non-terminal row
     /// (`pending` / `running`) is rejected. The parent work item is
     /// re-flipped to `blocked: merge_conflict` and the new
     /// `blocked_attempt_id` points at the reset row. See Phase 5 #13.
+    ///
+    /// Also valid for a `deferred` row, where it means "resolve this
+    /// conflict now": the deferral ends as `human_request`, the parent
+    /// stays in review, and the conflict watcher starts the resolution on
+    /// its next pass. The reply carries the ended deferral row.
     RetryConflictResolution {
         attempt_id: String,
     },

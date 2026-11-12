@@ -1272,6 +1272,7 @@ pub(crate) async fn sweep_one(
                     "merge poller: failed to retire GitHub merge intent after observed merge",
                 ),
             }
+            end_conflict_deferral(work_db, candidate, crate::work::ConflictDeferralEnd::PrMerged);
             if mark_merged(work_db, publisher, host, candidate, &probe_result).await {
                 outcome.merged += 1;
                 // Clean up any pending/running ci_remediations rows and emit
@@ -1471,6 +1472,7 @@ pub(crate) async fn sweep_one(
                     "merge poller: failed to retire GitHub merge intent after observed unmerged close",
                 ),
             }
+            end_conflict_deferral(work_db, candidate, crate::work::ConflictDeferralEnd::PrClosed);
             // Comment reconciliation is a narrower, comment-only signal
             // (comment-intent-classification design §"Reconciliation" /
             // §Risks — the "reopen on abandon" half of task 2c): a comment
@@ -1778,6 +1780,19 @@ pub(crate) async fn sweep_stranded_blocked_remediation(
                 .await;
             }
         }
+    }
+}
+
+/// A PR that merged or closed is no longer "conflicted, waiting for a merge
+/// request": close the ledger record of a conflict that was being held back,
+/// so a `deferred` row always describes an open PR.
+fn end_conflict_deferral(work_db: &WorkDb, candidate: &PendingMergeCheck, end: crate::work::ConflictDeferralEnd) {
+    if let Err(err) = work_db.end_conflict_deferral(&candidate.work_item_id, end) {
+        tracing::warn!(
+            work_item_id = %candidate.work_item_id,
+            ?err,
+            "merge poller: failed to end the conflict deferral of a finished PR",
+        );
     }
 }
 

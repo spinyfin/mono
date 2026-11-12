@@ -33,6 +33,7 @@ use boss_protocol::{
 };
 
 use crate::blocking_signal::{self, SignalKind};
+use crate::conflict_deferral;
 use crate::conflict_ladder;
 use crate::conflict_remediation::{ConflictRemediationQueue, EnqueueOutcome};
 use crate::merge_poller::{PrLifecycleProbe, pr_labels_opt_out, stored_pr_number};
@@ -43,6 +44,7 @@ use crate::work::{
     ConflictResolutionInsertInput, PendingMergeCheck, PrStateChecker, WorkDb,
 };
 use boss_execution_contracts::{CubeClient, ExecutionPublisher};
+use boss_feature_flags::ConflictDeferralArm;
 
 /// Decide whether the unified `auto_pr_maintenance_enabled` opt-out
 /// (per-product flag or per-PR label), or the row being parked, suppresses this
@@ -140,7 +142,16 @@ pub async fn on_conflict_detected(
         Some(cube) => ConflictRemediationMode::Inline(cube),
         None => ConflictRemediationMode::Disabled,
     };
-    on_conflict_detected_with(work_db, publisher, mode, pr_checker, candidate, probe).await
+    on_conflict_detected_with(
+        work_db,
+        publisher,
+        mode,
+        pr_checker,
+        candidate,
+        probe,
+        ConflictDeferralArm::Off,
+    )
+    .await
 }
 
 /// How a caller of [`on_conflict_detected_with`] wants the mechanical
@@ -166,7 +177,13 @@ pub enum ConflictRemediationMode<'a> {
 }
 
 /// [`on_conflict_detected`] with explicit control over how the escalation
-/// ladder is run — see [`ConflictRemediationMode`].
+/// ladder is run — see [`ConflictRemediationMode`] — and over whether this
+/// PR's conflicts are resolved on detection or just in time.
+///
+/// `deferral` is the PR's arm in the just-in-time rollout. In the deferring
+/// arm a conflict on a PR nobody has asked to merge is recorded in the
+/// ledger and this returns without resolving anything; see
+/// [`crate::conflict_deferral`] for when it is held and when it is released.
 pub async fn on_conflict_detected_with(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -174,6 +191,7 @@ pub async fn on_conflict_detected_with(
     pr_checker: &dyn PrStateChecker,
     candidate: &PendingMergeCheck,
     probe: &PrLifecycleProbe,
+    deferral: ConflictDeferralArm,
 ) -> bool {
     // Phase 6 #18 / Q7: the unified opt-out gates the entire flow.
     // Check it first so opted-out products never even probe the
@@ -204,6 +222,16 @@ pub async fn on_conflict_detected_with(
             );
             return false;
         }
+    }
+    // Just-in-time resolution: a conflict on a PR in the deferring arm that
+    // nobody has asked to merge is recorded and held here. `Proceed` covers
+    // everything else, including a held conflict being released on this
+    // pass, and falls through to the unchanged resolution path below — a
+    // released conflict is never resolved by a shortcut.
+    if let conflict_deferral::Gate::Hold { recorded } =
+        conflict_deferral::gate(work_db, publisher, candidate, probe, deferral).await
+    {
+        return recorded;
     }
     // Pre-flight: when an active revision fix vehicle already exists for this
     // work item, the detection flow is essentially a no-op for an `in_review`
@@ -506,7 +534,7 @@ pub async fn on_conflict_detected_with(
                     Ok(None) => {
                         // No active crz. Check the most recent crz to decide
                         // whether to re-arm.
-                        let latest = match work_db.latest_conflict_resolution_for_work_item(&candidate.work_item_id) {
+                        let latest = match work_db.latest_conflict_attempt_for_work_item(&candidate.work_item_id) {
                             Ok(latest) => latest,
                             Err(err) => {
                                 tracing::warn!(
@@ -581,10 +609,13 @@ pub async fn on_conflict_detected_with(
                                     }
                                 }
                             }
-                            "pending" => {
+                            "pending" | "deferred" | "superseded" => {
                                 // No previous crz (or brand-new pending one) — fall
                                 // through to the insert path; it handles idempotency
-                                // via the UNIQUE key guard.
+                                // via the UNIQUE key guard. A deferral record
+                                // (`deferred`, or `superseded` once it ended) is
+                                // not an attempt either: the conflict it recorded
+                                // has never been tried, so it gets a fresh one.
                             }
                             other => {
                                 // `churn_threshold_exceeded` is the human-attention
@@ -772,7 +803,10 @@ pub async fn on_conflict_detected_with(
         base_sha_at_trigger: probe.base_ref_oid.clone(),
         head_sha_before: probe.head_ref_oid.clone(),
     }) {
-        Ok(Some(a)) => Some(a),
+        Ok(Some(a)) => {
+            conflict_deferral::label_attempt(work_db, &a, deferral);
+            Some(a)
+        }
         Ok(None) => {
             // UNIQUE collision — a row for this (base, head) key already
             // exists. This used to be silent, which made the preceding

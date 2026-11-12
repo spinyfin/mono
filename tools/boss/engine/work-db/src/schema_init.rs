@@ -850,6 +850,10 @@ mod floor_tests {
                 Box::new(|c| super::super::conflict_mismatch::migrate(c).unwrap()),
             ),
             (
+                super::super::conflict_deferral::MIGRATION_ID,
+                Box::new(|c| super::super::conflict_deferral::migrate(c).unwrap()),
+            ),
+            (
                 "20261029_1430_critical_requests",
                 Box::new(|c| super::super::critical_requests::migrate(c).unwrap()),
             ),

@@ -432,6 +432,33 @@ fn every_waiting_state_yields_a_named_reason() {
         pending(&db, &item.id, ExecutionKind::ChoreImplementation, status);
         covered.insert(assert_named(reason, &wait_of(&db, pid, &item.id), reason));
     }
+    // Only the merge is left, but the PR conflicts and the conflict is being
+    // held until a merge is requested: the card must say so, not "waiting for
+    // its pull request to merge".
+    let conflicted = idle("merge wait, conflict deferred");
+    pending(
+        &db,
+        &conflicted.id,
+        ExecutionKind::ChoreImplementation,
+        ExecutionStatus::WaitingMerge,
+    );
+    db.record_conflict_deferral(
+        ConflictResolutionInsertInput::builder()
+            .product_id(pid)
+            .work_item_id(conflicted.id.clone())
+            .pr_url("https://github.com/test/repo/pull/9")
+            .pr_number(9)
+            .head_branch("feature")
+            .base_branch("main")
+            .head_sha_before("head-9")
+            .build(),
+    )
+    .unwrap();
+    covered.insert(assert_named(
+        "merge wait with a deferred conflict",
+        &wait_of(&db, pid, &conflicted.id),
+        DISPATCH_WAIT_REASON_CONFLICT_DEFERRED,
+    ));
     let batch = batch_held_item(&db, pid);
     set_status(&db, &batch.id, "in_review");
     covered.insert(assert_named(

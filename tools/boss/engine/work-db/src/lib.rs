@@ -835,6 +835,11 @@ mod chain_helpers;
 mod ci_failure_identity;
 mod comment_thread_entries;
 mod comments;
+mod conflict_deferral;
+pub use conflict_deferral::{
+    CONFLICT_DEFERRAL_ARM_DEFERRED, CONFLICT_STATUS_DEFERRAL_ENDED, CONFLICT_STATUS_DEFERRED, ConflictDeferralEnd,
+    ConflictDeferralRecord, ConflictDeferralState,
+};
 mod conflict_mismatch;
 mod conflict_res;
 mod coordinator_guidance_cache;

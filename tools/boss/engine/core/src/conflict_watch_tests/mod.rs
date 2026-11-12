@@ -2,6 +2,7 @@
 //! the concern each module exercises. Shared fixtures live in [`helpers`].
 
 mod churn;
+mod deferral;
 mod detection;
 mod escalation;
 mod foreign_bucket;

@@ -234,6 +234,18 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                         }
                         Err(err) => {
                             let message = format!("{err:#}");
+                            // A merge request is what a deferred conflict
+                            // waits for, and GitHub can refuse the request
+                            // *because* of that conflict. The request still
+                            // stands as a human asking: release the conflict
+                            // so it is resolved now, and say so.
+                            let conflict_released = release_deferred_conflict_for_merge(
+                                &work_db2,
+                                publisher.as_ref(),
+                                &event_bus,
+                                (&product_id2, &work_item_id2, &pr_url2),
+                            )
+                            .await;
                             if boss_engine_runtime::merge_mechanism::is_push_restriction_error(&message) {
                                 let _ = work_db2.create_attention_item(boss_work_db::CreateAttentionItemInput {
                                     work_item_id: Some(work_item_id2.clone()),
@@ -252,11 +264,17 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                                     resolved_at: None,
                                 });
                             }
+                            let hint = if conflict_released {
+                                " (the PR's merge conflict was waiting for a merge request and is now being \
+                                 resolved; request the merge again once the conflict has cleared)"
+                            } else {
+                                ""
+                            };
                             send_response(
                                 &sink2,
                                 &request_id2,
                                 FrontendEvent::WorkError {
-                                    message: format!("merge_when_ready failed: {message}"),
+                                    message: format!("merge_when_ready failed: {message}{hint}"),
                                 },
                             );
                         }
@@ -278,6 +296,42 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 )
                 .await;
             }
+        }
+    }
+}
+
+/// End the deferral of a merge conflict on `pr_url` because a merge was
+/// requested for it, and wake the merge poller so the resolution starts on
+/// its next pass rather than its next sweep. Returns `true` when a conflict
+/// was being held back. Only the request that GitHub refused needs this: an
+/// accepted one is recorded as a merge intent, which the conflict watcher
+/// already treats as the PR being ready.
+async fn release_deferred_conflict_for_merge(
+    work_db: &WorkDb,
+    publisher: &dyn boss_execution_contracts::ExecutionPublisher,
+    event_bus: &EventBus,
+    (product_id, work_item_id, pr_url): (&str, &str, &str),
+) -> bool {
+    match work_db.end_conflict_deferral(work_item_id, boss_work_db::ConflictDeferralEnd::MergeRequested) {
+        Ok(Some(deferral)) => {
+            tracing::info!(
+                %work_item_id,
+                %pr_url,
+                deferral_id = %deferral.id,
+                "merge_when_ready: merge requested for a PR with a deferred conflict; conflict released for resolution",
+            );
+            publisher
+                .publish_work_item_changed(product_id, work_item_id, "conflict_deferral_ended")
+                .await;
+            event_bus.publish(Event::PrReconcileRequested {
+                pr_url: pr_url.to_owned(),
+            });
+            true
+        }
+        Ok(None) => false,
+        Err(err) => {
+            tracing::warn!(%work_item_id, %pr_url, ?err, "merge_when_ready: failed to release a deferred conflict");
+            false
         }
     }
 }
@@ -1422,6 +1476,8 @@ mod trunk_queue_tests {
     struct FakeDirectMergeExecutor {
         calls: std::sync::Mutex<Vec<String>>,
         head_sha: String,
+        /// When set, GitHub refuses the merge request with this message.
+        refusal: Option<String>,
     }
 
     impl FakeDirectMergeExecutor {
@@ -1429,6 +1485,14 @@ mod trunk_queue_tests {
             Self {
                 calls: std::sync::Mutex::new(Vec::new()),
                 head_sha: head_sha.to_owned(),
+                refusal: None,
+            }
+        }
+
+        fn refusing(message: &str) -> Self {
+            Self {
+                refusal: Some(message.to_owned()),
+                ..Self::returning("unused-head")
             }
         }
     }
@@ -1446,6 +1510,9 @@ mod trunk_queue_tests {
             pr_url: &str,
         ) -> anyhow::Result<boss_engine_runtime::merge_when_ready::DirectMergeSuccess> {
             self.calls.lock().unwrap().push(pr_url.to_owned());
+            if let Some(message) = &self.refusal {
+                anyhow::bail!("{message}");
+            }
             Ok(boss_engine_runtime::merge_when_ready::DirectMergeSuccess {
                 head_sha: self.head_sha.clone(),
             })
@@ -1804,6 +1871,214 @@ mod trunk_queue_tests {
         );
 
         server.verify().await;
+    }
+
+    /// A merge request is what a deferred merge conflict waits for. GitHub can
+    /// refuse the request because the PR conflicts, so the refusal must still
+    /// release the conflict for resolution (and say so) instead of leaving the
+    /// PR unmergeable and unresolved. A PR with nothing deferred gets the
+    /// plain error.
+    #[tokio::test]
+    async fn refused_merge_request_releases_a_deferred_conflict() {
+        let server = MockServer::start().await;
+        let refusal = "gh pr merge failed: Pull request is not mergeable: the merge commit cannot be cleanly created";
+        let direct_executor = Arc::new(FakeDirectMergeExecutor::refusing(refusal));
+        let (state, _temp) =
+            test_server_state_with_direct_executor(trunk_client_for(server.uri()), Some(direct_executor.clone()));
+        let product = create_test_product_with_repo(
+            &state.work_db,
+            "deferred-conflict-product",
+            Some("git@github.com:brianduff/flunge.git"),
+        );
+        let in_review = |name: &str, pr: &str| {
+            let chore = create_test_chore_manual(&state.work_db, product.id.clone(), name);
+            state
+                .work_db
+                .update_work_item(
+                    &chore.id,
+                    WorkItemPatch {
+                        status: Some("in_review".into()),
+                        pr_url: Some(pr.into()),
+                        ..WorkItemPatch::default()
+                    },
+                )
+                .unwrap();
+            chore.id
+        };
+        let deferred_pr = "https://github.com/brianduff/flunge/pull/995";
+        let deferred = in_review("deferred-conflict-chore", deferred_pr);
+        let plain = in_review("plain-chore", "https://github.com/brianduff/flunge/pull/996");
+        state
+            .work_db
+            .record_conflict_deferral(
+                boss_work_db::ConflictResolutionInsertInput::builder()
+                    .product_id(product.id.clone())
+                    .work_item_id(deferred.clone())
+                    .pr_url(deferred_pr)
+                    .pr_number(995)
+                    .head_branch("feature")
+                    .base_branch("main")
+                    .base_sha_at_trigger("base-1")
+                    .head_sha_before("head-1")
+                    .build(),
+            )
+            .unwrap();
+
+        let merge_error = |work_item_id: String| {
+            let (state, sink) = (state.clone(), make_session_sink());
+            async move {
+                handle_merge_when_ready(
+                    dispatch_ctx(&state, &sink),
+                    FrontendRequest::MergeWhenReady {
+                        confirmed_revisions: vec![],
+                        work_item_id,
+                    },
+                )
+                .await;
+                let envelope = tokio::time::timeout(Duration::from_secs(2), sink.next())
+                    .await
+                    .expect("the refusal must be reported")
+                    .expect("a response should be enqueued");
+                match envelope.payload {
+                    FrontendEvent::WorkError { message } => message,
+                    other => panic!("expected WorkError, got {other:?}"),
+                }
+            }
+        };
+
+        // The bus has no replay: subscribe before the request.
+        let mut pr_reconcile_requests = state.event_bus.subscribe(boss_event_bus::TopicFilter::kind(
+            boss_event_bus::EventKind::PrReconcileRequested,
+        ));
+        let message = merge_error(deferred.clone()).await;
+        assert!(message.contains(refusal), "{message}");
+        assert!(message.contains("is now being resolved"), "{message}");
+        match pr_reconcile_requests.recv().await {
+            Some(boss_event_bus::Event::PrReconcileRequested { pr_url }) => assert_eq!(pr_url, deferred_pr),
+            other => panic!("the merge poller must be woken for the released PR, got {other:?}"),
+        }
+        assert!(
+            state.work_db.open_conflict_deferral(&deferred).unwrap().is_none(),
+            "the merge request releases the deferred conflict"
+        );
+        let rows = state
+            .work_db
+            .list_conflict_resolutions(None, &[], Some(&deferred), None)
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].status, boss_work_db::CONFLICT_STATUS_DEFERRAL_ENDED);
+        assert_eq!(rows[0].deferral_end_reason.as_deref(), Some("merge_requested"));
+        // Releasing is not resolving: the task is untouched, and the conflict
+        // watcher starts the resolution on its next pass.
+        let WorkItem::Chore(task) = state.work_db.get_work_item(&deferred).unwrap() else {
+            panic!("expected a chore");
+        };
+        assert_eq!(task.status, TaskStatus::InReview);
+        assert_eq!(task.merge_queue_state, None);
+
+        let message = merge_error(plain).await;
+        assert_eq!(message, format!("merge_when_ready failed: {refusal}"));
+    }
+
+    /// The other way a person asks for a deferred conflict: retrying its
+    /// ledger row (`boss engine conflicts retry`). That releases the conflict
+    /// and wakes the merge poller. It must not claim a resolution started,
+    /// because none has: the poller starts it, through the ordinary path.
+    #[tokio::test]
+    async fn retrying_a_deferred_conflict_releases_it_and_wakes_the_poller() {
+        let server = MockServer::start().await;
+        let (state, _temp) = test_server_state(trunk_client_for(server.uri()));
+        let product = create_test_product_with_repo(
+            &state.work_db,
+            "retry-deferred-product",
+            Some("git@github.com:brianduff/flunge.git"),
+        );
+        let pr = "https://github.com/brianduff/flunge/pull/997";
+        let chore = create_test_chore_manual(&state.work_db, product.id.clone(), "retry-deferred-chore");
+        state
+            .work_db
+            .update_work_item(
+                &chore.id,
+                WorkItemPatch {
+                    status: Some("in_review".into()),
+                    pr_url: Some(pr.into()),
+                    ..WorkItemPatch::default()
+                },
+            )
+            .unwrap();
+        let boss_work_db::ConflictDeferralRecord::Recorded(deferral) = state
+            .work_db
+            .record_conflict_deferral(
+                boss_work_db::ConflictResolutionInsertInput::builder()
+                    .product_id(product.id.clone())
+                    .work_item_id(chore.id.clone())
+                    .pr_url(pr)
+                    .pr_number(997)
+                    .head_branch("feature")
+                    .base_branch("main")
+                    .head_sha_before("head-1")
+                    .build(),
+            )
+            .unwrap()
+        else {
+            panic!("expected a new deferral record");
+        };
+
+        let sink = make_session_sink();
+        state.topic_broker.register_session("s1", sink.clone()).await;
+        state
+            .topic_broker
+            .subscribe("s1", &[boss_protocol::work_product_topic(&product.id)])
+            .await;
+        let mut pr_reconcile_requests = state.event_bus.subscribe(boss_event_bus::TopicFilter::kind(
+            boss_event_bus::EventKind::PrReconcileRequested,
+        ));
+        super::super::conflict_resolution::handle_retry_conflict_resolution(
+            dispatch_ctx(&state, &sink),
+            FrontendRequest::RetryConflictResolution {
+                attempt_id: deferral.id.clone(),
+            },
+        )
+        .await;
+
+        match pr_reconcile_requests.recv().await {
+            Some(boss_event_bus::Event::PrReconcileRequested { pr_url }) => assert_eq!(pr_url, pr),
+            other => panic!("the merge poller must be woken for the released PR, got {other:?}"),
+        }
+        let mut released = None;
+        while let Ok(Some(envelope)) = tokio::time::timeout(Duration::from_secs(2), sink.next()).await {
+            match envelope.payload {
+                FrontendEvent::ConflictResolutionRetried { attempt } => {
+                    released = Some(attempt);
+                    break;
+                }
+                FrontendEvent::ConflictResolutionStarted { .. } => {
+                    panic!("no resolution has started yet; the release must not announce one")
+                }
+                _ => {}
+            }
+        }
+        let released = released.expect("the retry is acknowledged");
+        assert_eq!(released.id, deferral.id);
+        assert_eq!(released.status, boss_work_db::CONFLICT_STATUS_DEFERRAL_ENDED);
+        assert_eq!(released.deferral_end_reason.as_deref(), Some("human_request"));
+        assert!(state.work_db.open_conflict_deferral(&chore.id).unwrap().is_none());
+        let WorkItem::Chore(task) = state.work_db.get_work_item(&chore.id).unwrap() else {
+            panic!("expected a chore");
+        };
+        assert_eq!(task.status, TaskStatus::InReview, "the parent stays in review");
+
+        // The request is spent: retrying the ended record is refused.
+        let sink = make_session_sink();
+        super::super::conflict_resolution::handle_retry_conflict_resolution(
+            dispatch_ctx(&state, &sink),
+            FrontendRequest::RetryConflictResolution {
+                attempt_id: deferral.id.clone(),
+            },
+        )
+        .await;
+        let envelope = sink.next().await.expect("a response should be enqueued");
+        assert!(matches!(envelope.payload, FrontendEvent::WorkError { .. }));
     }
 
     /// The handler must not gate durable state on a post-command probe that

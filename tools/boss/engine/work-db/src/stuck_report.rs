@@ -184,7 +184,8 @@ pub(super) fn build(
             StuckBucket::Parked
         } else if ladder_asked.contains(&id) {
             StuckBucket::ProgressionFailing
-        } else if human || matches!(classification.as_str(), "S18_pr_behind" | "awaiting_merge") {
+        } else if human || classification == "S18_pr_behind" || classification.split(':').next() == Some(AWAITING_MERGE)
+        {
             StuckBucket::WaitingOnHuman
         } else if task.blocked_reason.as_deref() == Some("dependency")
             && has_parked_prerequisite(conn, &id, &mut BTreeSet::new())?
@@ -375,6 +376,23 @@ fn has_parked_prerequisite(conn: &Connection, id: &str, seen: &mut BTreeSet<Stri
     Ok(false)
 }
 
+/// A review item with nothing left but the merge itself.
+const AWAITING_MERGE: &str = "awaiting_merge";
+
+/// `:conflict_deferred` when the item's PR has a merge conflict whose
+/// resolution is being held until a merge is requested. Appended to the two
+/// review classifications that would otherwise say nothing about it, so the
+/// report names the conflict without changing which bucket the item is in:
+/// a deferred conflict is not work in flight, and it does not make a stalled
+/// review any less stalled.
+fn conflict_deferred_suffix(conn: &Connection, task: &Task) -> Result<&'static str> {
+    Ok(if super::conflict_deferral::has_open_deferral(conn, &task.id)? {
+        ":conflict_deferred"
+    } else {
+        ""
+    })
+}
+
 /// Classify durable reasons before applying an owned host liveness observation.
 ///
 /// S19 (waiting on a human) comes first; `stuck_report` relies on this when it
@@ -476,14 +494,14 @@ pub(super) fn classification(conn: &Connection, task: &Task, wait: Option<&str>)
                 return Ok("S18_pr_behind".into());
             }
             if task.ci_required_state.as_deref() == Some("success") {
-                return Ok("awaiting_merge".into());
+                return Ok(format!("{AWAITING_MERGE}{}", conflict_deferred_suffix(conn, task)?));
             }
         }
     }
     Ok(match task.status {
         TaskStatus::Active if task.human_driven => "human_driven".into(),
         TaskStatus::Active => "orphan_active".into(),
-        TaskStatus::InReview => "review_without_live_work".into(),
+        TaskStatus::InReview => format!("review_without_live_work{}", conflict_deferred_suffix(conn, task)?),
         TaskStatus::Blocked => "S12_manual_block".into(),
         _ => "idle".into(),
     })
