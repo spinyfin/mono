@@ -733,3 +733,44 @@ async fn pane_capture_checks_real_tmux_tokens_and_exact_session_names() {
         PaneRead::Text(_)
     ));
 }
+
+#[tokio::test]
+async fn pane_capture_reads_the_visible_screen_not_scrollback() {
+    use boss_host_execution::capture::{PaneRead, PaneSource, TmuxPanes};
+    let root = tempfile::tempdir().unwrap();
+    let (tmux, _guard) = live_tmux(root.path()).await;
+    // More lines than a detached pane's height so the earliest scroll off.
+    let command = (0..80)
+        .map(|n| format!("printf 'SCROLL-LINE-{n:03}\\n'"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    tmux.new_session(&NewSession {
+        name: "capture-scroll".into(),
+        environment: [(TMUX_SPAWN_TOKEN_ENV.into(), "secret".into())].into(),
+        working_directory: root.path().to_path_buf(),
+        command: format!("{command}; exec sleep 60"),
+    })
+    .await
+    .unwrap();
+    let source = TmuxPanes(tmux.clone());
+    let visible = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match source.read("capture-scroll", "secret").await {
+                PaneRead::Text(text) if text.contains("SCROLL-LINE-079") => break text,
+                PaneRead::Text(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                other => panic!("matching pane was not readable: {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !visible.contains("SCROLL-LINE-000"),
+        "visible capture must not include scrollback: {visible:?}"
+    );
+    let history = tmux.capture_pane_with_history("=capture-scroll:").await.unwrap();
+    assert!(
+        history.contains("SCROLL-LINE-000"),
+        "history capture should still hold the scrolled-off line: {history:?}"
+    );
+}

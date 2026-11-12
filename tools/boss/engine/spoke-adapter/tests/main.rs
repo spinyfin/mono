@@ -603,10 +603,13 @@ fn host_call_errors_say_whether_anything_happened() {
 
 #[tokio::test]
 async fn session_start_without_a_turn_stops_the_spoke_worker_and_fails_spawn() {
+    // Prompt/spawn budgets stay short so a missing turn fails the spawn; the
+    // ordinary command deadline stays long enough that lease is not racing
+    // the rest of this integration binary.
     let fx = Fixture::with(
         SpokeAdapterConfig::builder()
             .command_deadline(Duration::from_secs(5))
-            .spawn_deadline(Duration::from_secs(5))
+            .spawn_deadline(Duration::from_millis(100))
             .prompt_timeout(Duration::from_millis(100))
             .build(),
     )

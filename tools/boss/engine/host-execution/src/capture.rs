@@ -120,15 +120,4 @@ mod tests {
     fn carriage_returns_do_not_survive() {
         assert_eq!(bound_snapshot("a\r\nb\r\n", 64).0, "a\nb");
     }
-
-    #[test]
-    fn the_line_bound_is_the_visible_screen() {
-        // TmuxPanes reads only the visible screen (`capture-pane -p` without -S),
-        // so pane height is the line bound before this byte cut.
-        let raw = "offscreen\nvisible-1\nvisible-2";
-        let (cut, truncated) = bound_snapshot(raw, 18);
-        assert!(cut.len() <= 18);
-        assert_eq!(truncated, raw.trim_end().len() > 18);
-        assert!(!cut.contains("offscreen"));
-    }
 }
