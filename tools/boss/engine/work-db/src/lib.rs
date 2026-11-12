@@ -955,6 +955,7 @@ mod semantic_progress;
 mod spoke_hub;
 mod spoke_ingress;
 mod spoke_probe;
+mod spoke_projection;
 mod stuck_activity;
 mod stuck_report;
 mod stuck_snapshot;
@@ -1136,6 +1137,10 @@ pub use spoke_hub::{
 };
 pub use spoke_ingress::{
     MAX_HOST_INGRESS_BYTES, MAX_HOST_INGRESS_RECORDS, SpokeIngressCommit, SpokeIngressResult, SpokeJournalAdmission,
+};
+pub use spoke_projection::{
+    NewSpokeEffect, SpokeAdvance, SpokeEffect, SpokeEffectOutcome, SpokeEffectState, SpokeIngressRow,
+    SpokePaneObservation, SpokeProjectionFault, SpokeProjectionPosition, SpokeProjectionStatus,
 };
 pub use trunk_merge_intents::{ActiveTrunkMergeIntent, TrunkMergeIntent, TrunkMergeIntentInsertInput};
 

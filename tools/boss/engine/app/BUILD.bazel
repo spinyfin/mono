@@ -114,6 +114,7 @@ rust_test(
         "//tools/boss/engine/prose-vocabulary",
         "//tools/boss/engine/spoke-adapter:spoke_adapter_test_support",
         "//tools/boss/engine/task-scope",
+        "//tools/boss/protocol-spoke",
         "//tools/boss/worker-processes",
     ] + all_crate_deps(
         normal = True,

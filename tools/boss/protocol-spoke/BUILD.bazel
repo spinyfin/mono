@@ -29,6 +29,8 @@ rust_library(
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
+        # Test-only: the app's end-to-end projection test journals real frames.
+        "//tools/boss/engine/app:__pkg__",
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/host-enrollment:__pkg__",
         "//tools/boss/engine/host-execution:__pkg__",

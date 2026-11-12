@@ -10,15 +10,25 @@ use boss_spoke_stream::store::{
 };
 use boss_work_db::{HostOutboxFault, RunAdmission, SpokeIngressCommit, SpokeIngressResult, SpokeRunKey, WorkDb};
 use prost::Message;
+use std::sync::Arc;
+use tokio::sync::Notify;
 
 /// Observation journal backed by `spoke_journals` / `spoke_ingress`.
 pub struct WorkDbSink {
     db: WorkDb,
+    /// Told after each durable commit, so the projector applies a record
+    /// promptly. Receipt never waits on it, and a missed wake costs one sweep.
+    wake: Option<Arc<Notify>>,
 }
 
 impl WorkDbSink {
     pub fn new(db: WorkDb) -> Self {
-        Self { db }
+        Self { db, wake: None }
+    }
+
+    /// A sink that wakes `wake` after every record it commits.
+    pub fn with_wake(db: WorkDb, wake: Arc<Notify>) -> Self {
+        Self { db, wake: Some(wake) }
     }
 }
 
@@ -137,6 +147,7 @@ impl SpokeObservationSink for WorkDbSink {
         let sequence = record.sequence;
         let observed_at_ms = observed_at_ms(record);
         let runs = claimed_runs(record);
+        let wake = self.wake.clone();
         let result = match &record.body {
             Some(record::Body::Result(result)) => Some((
                 result.command_id.clone(),
@@ -148,7 +159,7 @@ impl SpokeObservationSink for WorkDbSink {
         // Snapshots are live display data: receipt them so the spoke can
         // advance, but do not keep the bytes against the host's quota.
         let retain = !matches!(record.body, Some(record::Body::Capture(_)));
-        blocking(&self.db, move |db| {
+        let cursor = blocking(&self.db, move |db| {
             let result_run = result.as_ref().and_then(|(_, run, _)| run.as_ref());
             let result_ref = result.as_ref().map(|(command_id, _, bytes)| SpokeIngressResult {
                 command_id,
@@ -174,7 +185,11 @@ impl SpokeObservationSink for WorkDbSink {
                 .map_err(store_error)?;
             Ok(Cursor { journal_id, through })
         })
-        .await
+        .await?;
+        if let Some(wake) = wake {
+            wake.notify_one();
+        }
+        Ok(cursor)
     }
 }
 

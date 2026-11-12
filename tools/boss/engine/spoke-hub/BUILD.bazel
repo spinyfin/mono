@@ -3,9 +3,9 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 exports_files(["Cargo.toml"])
 
-# Production hub stream service: WorkDb-backed journals, enrollment, and the
-# authenticated listener. engine/core binds this at startup from config;
-# dispatch does not route through it.
+# Production hub stream service: WorkDb-backed journals, enrollment, the
+# authenticated listener, and the projection that applies received spoke
+# observations to work state. engine/core binds this at startup from config.
 rust_library(
     name = "spoke-hub",
     srcs = glob(["src/**/*.rs"]),
@@ -21,6 +21,7 @@ rust_library(
         "//tools/boss/engine/host-enrollment",
         "//tools/boss/engine/spoke-stream",
         "//tools/boss/engine/work-db",
+        "//tools/boss/protocol",
         "//tools/boss/protocol-spoke",
     ] + all_crate_deps(normal = True),
 )
@@ -46,6 +47,7 @@ rust_library(
         "//tools/boss/engine/host-enrollment",
         "//tools/boss/engine/spoke-stream",
         "//tools/boss/engine/work-db:work_db_test_support",
+        "//tools/boss/protocol",
         "//tools/boss/protocol-spoke",
     ] + all_crate_deps(normal = True),
 )
@@ -65,6 +67,7 @@ rust_test(
         "//tools/boss/engine/host-enrollment",
         "//tools/boss/engine/spoke-stream",
         "//tools/boss/engine/work-db",
+        "//tools/boss/protocol",
         "//tools/boss/protocol-spoke",
     ] + all_crate_deps(
         normal = True,

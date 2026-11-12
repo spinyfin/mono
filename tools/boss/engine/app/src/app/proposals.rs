@@ -463,19 +463,91 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
         }
     };
 
+    match submit_for_caller(
+        &server_state,
+        &work_db,
+        &caller,
+        kind,
+        &validated.canonical_json,
+        &idempotency_key,
+    )
+    .await
+    {
+        Err(error) => send_rejection(&sink, &request_id, error),
+        Ok(Submission::Replayed(proposal)) => send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::ProposalSubmitted {
+                proposal,
+                already_submitted: true,
+            },
+        ),
+        Ok(Submission::Accepted(accepted)) => {
+            let delivery = super::handler_helpers::send_response_awaiting_delivery(
+                &sink,
+                &request_id,
+                FrontendEvent::ProposalSubmitted {
+                    proposal: accepted.proposal.clone(),
+                    already_submitted: accepted.already_submitted,
+                },
+            );
+            accepted.finish(delivery).await;
+        }
+    }
+}
+
+/// How a transport-independent submission ended, short of a refusal.
+pub(super) enum Submission {
+    /// An ended execution's earlier acceptance, answered from storage with no
+    /// side effect.
+    Replayed(boss_protocol::WorkerProposal),
+    /// Accepted, fresh or by replay. Acknowledge the submitter, then call
+    /// [`Accepted::finish`]: teardown must not outrun the acknowledgement.
+    Accepted(Accepted),
+}
+
+/// An accepted submission whose acknowledgement has not been sent.
+pub(super) struct Accepted {
+    pub(super) proposal: boss_protocol::WorkerProposal,
+    pub(super) already_submitted: bool,
+    after: AfterAck,
+}
+
+/// What an accepted submission still owes once its acknowledgement is out.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+struct AfterAck {
+    server_state: Arc<ServerState>,
+    work_db: Arc<WorkDb>,
+    execution_id: String,
+    canonical_json: String,
+    finalize_guide: bool,
+    finalize_reporting_member: bool,
+    finalize_run_done_declaration: bool,
+    apply_proposal_id: Option<String>,
+}
+
+/// Submit a validated proposal for an attributed caller: everything a
+/// `SubmitProposal` does except attribute the caller and send the answer.
+///
+/// Shared by the socket handler below and by the hub's projection of a spoke's
+/// queued proposals, which attribute differently (the spoke attributed locally
+/// and the stream authenticated its host) but must then be validated, applied
+/// and finalized identically. Returns the typed refusal the caller reports.
+pub(super) async fn submit_for_caller(
+    server_state: &Arc<ServerState>,
+    work_db: &Arc<WorkDb>,
+    caller: &AttributedCaller,
+    kind: ProposalKind,
+    canonical_json: &str,
+    idempotency_key: &str,
+) -> std::result::Result<Submission, ProposalSubmissionError> {
     // Ended peers may recover an acknowledgement, but cannot create new work.
     match work_db.get_execution(&caller.execution_id) {
         Ok(execution) if execution.status.is_terminal() => {
-            match work_db.find_worker_proposal_by_idempotency_key(&caller.execution_id, &idempotency_key) {
+            match work_db.find_worker_proposal_by_idempotency_key(&caller.execution_id, idempotency_key) {
                 Ok(Some(proposal)) if proposal.kind == kind => {
-                    return send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::ProposalSubmitted {
-                            proposal,
-                            already_submitted: true,
-                        },
-                    );
+                    return Ok(Submission::Replayed(proposal));
                 }
                 Ok(Some(existing)) => {
                     tracing::warn!(
@@ -485,11 +557,10 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                         existing_kind = %existing.kind,
                         "submit_proposal rejected: ended execution reused an idempotency_key across kinds",
                     );
-                    return send_rejection(
-                        &sink,
-                        &request_id,
-                        ProposalSubmissionError::idempotency_key_kind_mismatch(&idempotency_key, &existing),
-                    );
+                    return Err(ProposalSubmissionError::idempotency_key_kind_mismatch(
+                        idempotency_key,
+                        &existing,
+                    ));
                 }
                 Ok(None) => {
                     tracing::warn!(
@@ -498,37 +569,25 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                         idempotency_key = %idempotency_key,
                         "submit_proposal rejected: execution has ended and only replays are accepted",
                     );
-                    return send_rejection(
-                        &sink,
-                        &request_id,
-                        ProposalSubmissionError::new(
-                            ProposalErrorCode::AttributionUnresolved,
-                            "execution has ended and can only replay existing proposals",
-                        ),
-                    );
+                    return Err(ProposalSubmissionError::new(
+                        ProposalErrorCode::AttributionUnresolved,
+                        "execution has ended and can only replay existing proposals",
+                    ));
                 }
                 Err(error) => {
-                    return send_rejection(
-                        &sink,
-                        &request_id,
-                        ProposalSubmissionError::new(
-                            ProposalErrorCode::Internal,
-                            format!("failed to look up proposal replay: {error}"),
-                        ),
-                    );
+                    return Err(ProposalSubmissionError::new(
+                        ProposalErrorCode::Internal,
+                        format!("failed to look up proposal replay: {error}"),
+                    ));
                 }
             }
         }
         Ok(_) => {}
         Err(error) => {
-            return send_rejection(
-                &sink,
-                &request_id,
-                ProposalSubmissionError::new(
-                    ProposalErrorCode::Internal,
-                    format!("failed to read execution: {error}"),
-                ),
-            );
+            return Err(ProposalSubmissionError::new(
+                ProposalErrorCode::Internal,
+                format!("failed to read execution: {error}"),
+            ));
         }
     }
 
@@ -548,10 +607,10 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
     // fresh declarations: a keyed replay of an accepted wait must resolve to
     // the original row even when the budget is now spent.
     let wait_payload = if kind == ProposalKind::Wait {
-        match serde_json::from_str::<WaitProposalPayload>(&validated.canonical_json) {
+        match serde_json::from_str::<WaitProposalPayload>(canonical_json) {
             Ok(payload) => {
                 let is_replay = matches!(
-                    work_db.find_worker_proposal_by_idempotency_key(&caller.execution_id, &idempotency_key),
+                    work_db.find_worker_proposal_by_idempotency_key(&caller.execution_id, idempotency_key),
                     Ok(Some(_))
                 );
                 if !is_replay
@@ -568,7 +627,7 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                         %err,
                         "submit_proposal rejected: worker wait cap or duration refused"
                     );
-                    return send_rejection(&sink, &request_id, error);
+                    return Err(error);
                 }
                 Some(payload)
             }
@@ -578,14 +637,10 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                     ?err,
                     "submit_proposal: wait payload failed to deserialize after validation"
                 );
-                return send_rejection(
-                    &sink,
-                    &request_id,
-                    ProposalSubmissionError::new(
-                        ProposalErrorCode::Internal,
-                        format!("validated wait payload could not be deserialized: {err}"),
-                    ),
-                );
+                return Err(ProposalSubmissionError::new(
+                    ProposalErrorCode::Internal,
+                    format!("validated wait payload could not be deserialized: {err}"),
+                ));
             }
         }
     } else {
@@ -596,8 +651,8 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
         execution_id: &caller.execution_id,
         work_item_id: &caller.work_item_id,
         kind,
-        payload_json: &validated.canonical_json,
-        idempotency_key: &idempotency_key,
+        payload_json: canonical_json,
+        idempotency_key,
     };
     // A progression verb mutates the taxonomy, so it never takes the generic
     // auto-apply route: it is scope-checked and applied in its own transaction,
@@ -606,7 +661,7 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
     let outcome = if kind.is_progression_verb() {
         work_db.submit_progression_verb(submission, server_state.pr_state_checker.as_ref())
     } else {
-        boss_engine_runtime::review_guide_validation::submit_worker_proposal(&work_db, submission)
+        boss_engine_runtime::review_guide_validation::submit_worker_proposal(work_db, submission)
     };
 
     match outcome {
@@ -629,7 +684,7 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                     pr_url: retirement.pr_url.clone(),
                 };
                 boss_engine_merge_poller::ci_watch::apply_retired_signal(
-                    &work_db,
+                    work_db,
                     server_state.publisher.as_ref(),
                     Some(server_state.cube_client.as_ref()),
                     &candidate,
@@ -674,14 +729,10 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                             %err,
                             "submit_proposal: wait row accepted but the registry refused the grant"
                         );
-                        return send_rejection(
-                            &sink,
-                            &request_id,
-                            ProposalSubmissionError::new(
-                                ProposalErrorCode::Internal,
-                                format!("wait was recorded but could not be granted: {err}"),
-                            ),
-                        );
+                        return Err(ProposalSubmissionError::new(
+                            ProposalErrorCode::Internal,
+                            format!("wait was recorded but could not be granted: {err}"),
+                        ));
                     }
                 }
             }
@@ -831,183 +882,20 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
             let apply_proposal_id = apply_after_submit.then(|| proposal.id.clone());
             let finalize_guide =
                 kind == ProposalKind::ReviewGuide && proposal.state == boss_protocol::ProposalState::Applied;
-            let response_delivery = super::handler_helpers::send_response_awaiting_delivery(
-                &sink,
-                &request_id,
-                FrontendEvent::ProposalSubmitted {
-                    proposal,
-                    already_submitted,
-                },
-            );
-            // Deliver the RPC acknowledgement before initiating teardown. The production
-            // pane releaser reaps the reporting member's whole worker process
-            // tree, which can include the very `boss propose` client still
-            // waiting on the response above — tearing down first can kill
-            // that client before it ever observes the ack it is blocked on.
-            if finalize_guide {
-                let delivery = tokio::time::timeout(std::time::Duration::from_secs(10), response_delivery).await;
-                if !matches!(delivery, Ok(Ok(true))) {
-                    tracing::warn!(execution_id = %caller.execution_id, "guide acknowledgement was not delivered; finalizing the durable submission");
-                }
-                let outcome = Box::pin(
-                    server_state
-                        .completion_handler
-                        .finalize_submitted_review_guide(&caller.execution_id),
-                )
-                .await;
-                tracing::info!(execution_id = %caller.execution_id, ?outcome, "submitted review guide finalized");
-            } else if finalize_reporting_member {
-                match tokio::time::timeout(std::time::Duration::from_secs(10), response_delivery).await {
-                    Ok(Ok(true)) => match server_state
-                        .completion_handler
-                        .finalize_accepted_review_batch_member(&caller.execution_id)
-                        .await
-                    {
-                        Some(boss_engine_completion::StopOutcome::ReviewPassCompleted { .. })
-                        | Some(boss_engine_completion::StopOutcome::AlreadyTerminal) => {}
-                        Some(outcome) => tracing::error!(
-                            execution_id = %caller.execution_id,
-                            ?outcome,
-                            "accepted review report/verdict did not cleanly finalize its batch member",
-                        ),
-                        None => tracing::error!(
-                            execution_id = %caller.execution_id,
-                            "accepted review report/verdict has no live batch member to finalize",
-                        ),
-                    },
-                    Ok(Ok(false)) | Ok(Err(_)) => tracing::error!(
-                        execution_id = %caller.execution_id,
-                        "accepted review report/verdict response was not delivered; teardown skipped, \
-                         the reported-plus-live sweep will raise an attention item",
-                    ),
-                    Err(_) => tracing::error!(
-                        execution_id = %caller.execution_id,
-                        "timed out waiting for accepted review report/verdict response delivery; teardown skipped, \
-                         the reported-plus-live sweep will raise an attention item",
-                    ),
-                }
-            } else if finalize_run_done_declaration {
-                match serde_json::from_str::<boss_protocol::RunDoneProposalPayload>(&validated.canonical_json) {
-                    Ok(run_done_payload) => {
-                        // `apply_run_done` already committed the durable
-                        // stamp before this code runs; `finalize_declared_run_done`
-                        // re-checks liveness itself and is idempotent, so it
-                        // must run regardless of whether the ack below was
-                        // delivered. A disconnected/backpressured client
-                        // after a successful commit previously left the
-                        // declaration applied but never finalized — the
-                        // exact stranded-live-execution failure mode this
-                        // seam exists to close. Submission is the primary
-                        // path; recheck can recover a delivered staged URL,
-                        // while blocked and no-PR deliveries have no poller
-                        // recovery. No-op acceptance waits for the driver's
-                        // terminal boundary and its complete command evidence.
-                        let delivery_outcome =
-                            tokio::time::timeout(std::time::Duration::from_secs(10), response_delivery).await;
-                        match &delivery_outcome {
-                            Ok(Ok(true)) => {}
-                            Ok(Ok(false)) | Ok(Err(_)) => tracing::warn!(
-                                execution_id = %caller.execution_id,
-                                "accepted run_done proposal response was not delivered; finalizing anyway — \
-                                 the declaration's write is already durable and finalize is idempotent",
-                            ),
-                            Err(_) => tracing::warn!(
-                                execution_id = %caller.execution_id,
-                                "timed out waiting for accepted run_done proposal response delivery; finalizing \
-                                 anyway — the declaration's write is already durable and finalize is idempotent",
-                            ),
-                        }
-                        // Heap-allocate this call's future rather than awaiting it
-                        // inline. `finalize_declared_run_done` fans out into a long,
-                        // multi-await chain (`completion::run_done_declaration`);
-                        // holding its generated state inline here makes it the
-                        // largest branch of this function's own state machine,
-                        // which in turn is the largest variant of the top-level
-                        // per-request dispatch match in `app.rs` — the same
-                        // class of bug that match's own `Box::pin` was added for
-                        // (see the comment there): `control_verbs_test` aborted
-                        // with a Linux-CI stack overflow once this branch grew
-                        // large enough to tip an unrelated test's thread over.
-                        let stop_outcome = Box::pin(
-                            server_state
-                                .completion_handler
-                                .finalize_declared_run_done(&caller.execution_id, run_done_payload.outcome),
-                        )
-                        .await;
-                        if boss_engine_completion::finalize_resolved(&stop_outcome)
-                            || run_done_payload.outcome == boss_protocol::RunDoneOutcome::NoChangesNeeded
-                        {
-                            tracing::info!(
-                                execution_id = %caller.execution_id,
-                                outcome = %run_done_payload.outcome,
-                                delivered = matches!(delivery_outcome, Ok(Ok(true))),
-                                ?stop_outcome,
-                                "run_done proposal accepted: delivered/blocked finalized synchronously at submit \
-                                 (no-changes-needed waits for Stop)",
-                            );
-                        } else {
-                            // The proposal is `applied` and the ack above already went out
-                            // (it must precede teardown), but the finalize did NOT commit:
-                            // the durable stamp is the pending-finalize record, the
-                            // execution is still live, and the retry below plus the
-                            // `run_done_finalize_sweep` own it until a terminal write.
-                            tracing::warn!(
-                                execution_id = %caller.execution_id,
-                                outcome = %run_done_payload.outcome,
-                                delivered = matches!(delivery_outcome, Ok(Ok(true))),
-                                ?stop_outcome,
-                                "run_done proposal accepted but its finalize is PENDING (not committed): \
-                                 background retry started; the execution stays live until it commits",
-                            );
-                            let handler = Arc::clone(&server_state.completion_handler);
-                            let execution_id = caller.execution_id.clone();
-                            let outcome = run_done_payload.outcome;
-                            boss_work_db::db_diagnostics::spawn(async move {
-                                let resolved = handler
-                                    .finalize_declared_run_done_until_resolved(&execution_id, outcome)
-                                    .await;
-                                tracing::info!(%execution_id, ?resolved, "run_done finalize resolved after retry");
-                            });
-                        }
-                    }
-                    Err(err) => tracing::error!(
-                        execution_id = %caller.execution_id,
-                        ?err,
-                        "run_done proposal applied but its own canonical payload_json did not deserialize; \
-                         finalize skipped — this should be unreachable since the payload already validated \
-                         at submission",
-                    ),
-                }
-            }
-            // Apply after the worker has the `proposed` ack so GitHub probes
-            // and remediation creation cannot stall the submission socket.
-            // The periodic sweep is the crash-recovery path for the same work.
-            if let Some(proposal_id) = apply_proposal_id {
-                let work_db = Arc::clone(&work_db);
-                let publisher = server_state.publisher.clone();
-                boss_work_db::db_diagnostics::spawn(async move {
-                    let created = boss_work_db::db_diagnostics::spawn_blocking(move || {
-                        boss_engine_runtime::review_verdict_apply_sweep::apply_review_verdict_proposal(
-                            &work_db,
-                            &proposal_id,
-                            &boss_work_db::GhPrStateChecker,
-                            &boss_engine_runtime::review_verdict_apply_sweep::observe_merge_parent_deletions,
-                        )
-                    })
-                    .await;
-                    match created {
-                        Ok(Ok(Some(_))) => publisher.kick_scheduler(),
-                        Ok(Ok(None)) => {}
-                        Ok(Err(error)) => {
-                            tracing::warn!(?error, "submit_proposal: review-verdict apply failed; sweep will retry",)
-                        }
-                        Err(error) => tracing::warn!(
-                            ?error,
-                            "submit_proposal: review-verdict apply task joined with error; sweep will retry",
-                        ),
-                    }
-                });
-            }
+            Ok(Submission::Accepted(Accepted {
+                proposal,
+                already_submitted,
+                after: AfterAck::builder()
+                    .server_state(Arc::clone(server_state))
+                    .work_db(Arc::clone(work_db))
+                    .execution_id(&caller.execution_id)
+                    .canonical_json(canonical_json)
+                    .finalize_guide(finalize_guide)
+                    .finalize_reporting_member(finalize_reporting_member)
+                    .finalize_run_done_declaration(finalize_run_done_declaration)
+                    .maybe_apply_proposal_id(apply_proposal_id)
+                    .build(),
+            }))
         }
         Ok(Err(refusal)) => {
             if refusal.code == ProposalErrorCode::RateLimited {
@@ -1019,7 +907,7 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                 "submit_proposal rejected: {}",
                 refusal.message,
             );
-            send_rejection(&sink, &request_id, refusal);
+            Err(refusal)
         }
         Err(err) => {
             tracing::error!(
@@ -1028,14 +916,199 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                 ?err,
                 "submit_proposal failed to persist",
             );
-            send_rejection(
-                &sink,
-                &request_id,
-                ProposalSubmissionError::new(
-                    ProposalErrorCode::Internal,
-                    format!("failed to persist the proposal: {err}"),
+            Err(ProposalSubmissionError::new(
+                ProposalErrorCode::Internal,
+                format!("failed to persist the proposal: {err}"),
+            ))
+        }
+    }
+}
+
+impl Accepted {
+    /// The work that must follow the acknowledgement: finalizing a completed
+    /// run, review member or guide, and applying a review verdict.
+    /// `response_delivery` resolves once the submitter has been answered; one
+    /// with no connection to wait on passes an already-resolved receiver.
+    pub(super) async fn finish(self, response_delivery: oneshot::Receiver<bool>) {
+        let AfterAck {
+            server_state,
+            work_db,
+            execution_id,
+            canonical_json,
+            finalize_guide,
+            finalize_reporting_member,
+            finalize_run_done_declaration,
+            apply_proposal_id,
+        } = self.after;
+        let canonical_json = canonical_json.as_str();
+        // Deliver the RPC acknowledgement before initiating teardown. The production
+        // pane releaser reaps the reporting member's whole worker process
+        // tree, which can include the very `boss propose` client still
+        // waiting on the response above — tearing down first can kill
+        // that client before it ever observes the ack it is blocked on.
+        if finalize_guide {
+            let delivery = tokio::time::timeout(std::time::Duration::from_secs(10), response_delivery).await;
+            if !matches!(delivery, Ok(Ok(true))) {
+                tracing::warn!(execution_id = %execution_id, "guide acknowledgement was not delivered; finalizing the durable submission");
+            }
+            let outcome = Box::pin(
+                server_state
+                    .completion_handler
+                    .finalize_submitted_review_guide(&execution_id),
+            )
+            .await;
+            tracing::info!(execution_id = %execution_id, ?outcome, "submitted review guide finalized");
+        } else if finalize_reporting_member {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), response_delivery).await {
+                Ok(Ok(true)) => match server_state
+                    .completion_handler
+                    .finalize_accepted_review_batch_member(&execution_id)
+                    .await
+                {
+                    Some(boss_engine_completion::StopOutcome::ReviewPassCompleted { .. })
+                    | Some(boss_engine_completion::StopOutcome::AlreadyTerminal) => {}
+                    Some(outcome) => tracing::error!(
+                        execution_id = %execution_id,
+                        ?outcome,
+                        "accepted review report/verdict did not cleanly finalize its batch member",
+                    ),
+                    None => tracing::error!(
+                        execution_id = %execution_id,
+                        "accepted review report/verdict has no live batch member to finalize",
+                    ),
+                },
+                Ok(Ok(false)) | Ok(Err(_)) => tracing::error!(
+                    execution_id = %execution_id,
+                    "accepted review report/verdict response was not delivered; teardown skipped, \
+                     the reported-plus-live sweep will raise an attention item",
                 ),
-            );
+                Err(_) => tracing::error!(
+                    execution_id = %execution_id,
+                    "timed out waiting for accepted review report/verdict response delivery; teardown skipped, \
+                     the reported-plus-live sweep will raise an attention item",
+                ),
+            }
+        } else if finalize_run_done_declaration {
+            match serde_json::from_str::<boss_protocol::RunDoneProposalPayload>(canonical_json) {
+                Ok(run_done_payload) => {
+                    // `apply_run_done` already committed the durable
+                    // stamp before this code runs; `finalize_declared_run_done`
+                    // re-checks liveness itself and is idempotent, so it
+                    // must run regardless of whether the ack below was
+                    // delivered. A disconnected/backpressured client
+                    // after a successful commit previously left the
+                    // declaration applied but never finalized — the
+                    // exact stranded-live-execution failure mode this
+                    // seam exists to close. Submission is the primary
+                    // path; recheck can recover a delivered staged URL,
+                    // while blocked and no-PR deliveries have no poller
+                    // recovery. No-op acceptance waits for the driver's
+                    // terminal boundary and its complete command evidence.
+                    let delivery_outcome =
+                        tokio::time::timeout(std::time::Duration::from_secs(10), response_delivery).await;
+                    match &delivery_outcome {
+                        Ok(Ok(true)) => {}
+                        Ok(Ok(false)) | Ok(Err(_)) => tracing::warn!(
+                            execution_id = %execution_id,
+                            "accepted run_done proposal response was not delivered; finalizing anyway — \
+                             the declaration's write is already durable and finalize is idempotent",
+                        ),
+                        Err(_) => tracing::warn!(
+                            execution_id = %execution_id,
+                            "timed out waiting for accepted run_done proposal response delivery; finalizing \
+                             anyway — the declaration's write is already durable and finalize is idempotent",
+                        ),
+                    }
+                    // Heap-allocate this call's future rather than awaiting it
+                    // inline. `finalize_declared_run_done` fans out into a long,
+                    // multi-await chain (`completion::run_done_declaration`);
+                    // holding its generated state inline here makes it the
+                    // largest branch of this function's own state machine,
+                    // which in turn is the largest variant of the top-level
+                    // per-request dispatch match in `app.rs` — the same
+                    // class of bug that match's own `Box::pin` was added for
+                    // (see the comment there): `control_verbs_test` aborted
+                    // with a Linux-CI stack overflow once this branch grew
+                    // large enough to tip an unrelated test's thread over.
+                    let stop_outcome = Box::pin(
+                        server_state
+                            .completion_handler
+                            .finalize_declared_run_done(&execution_id, run_done_payload.outcome),
+                    )
+                    .await;
+                    if boss_engine_completion::finalize_resolved(&stop_outcome)
+                        || run_done_payload.outcome == boss_protocol::RunDoneOutcome::NoChangesNeeded
+                    {
+                        tracing::info!(
+                            execution_id = %execution_id,
+                            outcome = %run_done_payload.outcome,
+                            delivered = matches!(delivery_outcome, Ok(Ok(true))),
+                            ?stop_outcome,
+                            "run_done proposal accepted: delivered/blocked finalized synchronously at submit \
+                             (no-changes-needed waits for Stop)",
+                        );
+                    } else {
+                        // The proposal is `applied` and the ack above already went out
+                        // (it must precede teardown), but the finalize did NOT commit:
+                        // the durable stamp is the pending-finalize record, the
+                        // execution is still live, and the retry below plus the
+                        // `run_done_finalize_sweep` own it until a terminal write.
+                        tracing::warn!(
+                            execution_id = %execution_id,
+                            outcome = %run_done_payload.outcome,
+                            delivered = matches!(delivery_outcome, Ok(Ok(true))),
+                            ?stop_outcome,
+                            "run_done proposal accepted but its finalize is PENDING (not committed): \
+                             background retry started; the execution stays live until it commits",
+                        );
+                        let handler = Arc::clone(&server_state.completion_handler);
+                        let execution_id = execution_id.clone();
+                        let outcome = run_done_payload.outcome;
+                        boss_work_db::db_diagnostics::spawn(async move {
+                            let resolved = handler
+                                .finalize_declared_run_done_until_resolved(&execution_id, outcome)
+                                .await;
+                            tracing::info!(%execution_id, ?resolved, "run_done finalize resolved after retry");
+                        });
+                    }
+                }
+                Err(err) => tracing::error!(
+                    execution_id = %execution_id,
+                    ?err,
+                    "run_done proposal applied but its own canonical payload_json did not deserialize; \
+                     finalize skipped — this should be unreachable since the payload already validated \
+                     at submission",
+                ),
+            }
+        }
+        // Apply after the worker has the `proposed` ack so GitHub probes
+        // and remediation creation cannot stall the submission socket.
+        // The periodic sweep is the crash-recovery path for the same work.
+        if let Some(proposal_id) = apply_proposal_id {
+            let work_db = Arc::clone(&work_db);
+            let publisher = server_state.publisher.clone();
+            boss_work_db::db_diagnostics::spawn(async move {
+                let created = boss_work_db::db_diagnostics::spawn_blocking(move || {
+                    boss_engine_runtime::review_verdict_apply_sweep::apply_review_verdict_proposal(
+                        &work_db,
+                        &proposal_id,
+                        &boss_work_db::GhPrStateChecker,
+                        &boss_engine_runtime::review_verdict_apply_sweep::observe_merge_parent_deletions,
+                    )
+                })
+                .await;
+                match created {
+                    Ok(Ok(Some(_))) => publisher.kick_scheduler(),
+                    Ok(Ok(None)) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(?error, "submit_proposal: review-verdict apply failed; sweep will retry",)
+                    }
+                    Err(error) => tracing::warn!(
+                        ?error,
+                        "submit_proposal: review-verdict apply task joined with error; sweep will retry",
+                    ),
+                }
+            });
         }
     }
 }

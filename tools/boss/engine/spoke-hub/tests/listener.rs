@@ -6,6 +6,10 @@ use boss_protocol_spoke::v1::enrollment_client::EnrollmentClient;
 use boss_protocol_spoke::v1::spoke_hub_client::SpokeHubClient;
 use boss_protocol_spoke::v1::{self, CommandResult, EnrollRequest, ResultCode, record, spoke_frame};
 use boss_spoke_hub::HubStream;
+use boss_spoke_hub::projection::{
+    Applied, Decision, EventObservation, ObservationApplier, Origin, PROPOSAL_DECISION, PaneObservation,
+    ProjectorConfig, Proposed,
+};
 use boss_spoke_stream::CommandOutcome;
 use boss_spoke_stream::store::CommandAdmission;
 use boss_work_db::WorkDb;
@@ -393,5 +397,162 @@ async fn a_result_at_a_pruned_sequence_does_not_resolve_the_waiter_or_fabricate_
     assert!(db.host_command_result("edge-1", "c1").unwrap().is_none());
     assert_eq!(db.spoke_journal("edge-1").unwrap().unwrap().received, 1);
 
+    hub.stop().await;
+}
+
+/// Accepts every proposal and counts how many it was asked to apply.
+#[derive(Default)]
+struct Accepting(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl ObservationApplier for Accepting {
+    async fn event(&self, _: &EventObservation) -> Applied {
+        Applied::Done
+    }
+
+    async fn proposal(&self, _: &Origin, _: boss_protocol::ProposalKind, _: &serde_json::Value, _: &str) -> Proposed {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Proposed::Decided(Decision {
+            accepted: true,
+            reason: String::new(),
+            result: serde_json::json!({"state": "applied"}),
+        })
+    }
+
+    async fn pane(&self, _: &PaneObservation) -> Applied {
+        Applied::Done
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_queued_proposal_gets_its_decision_over_the_live_stream_and_is_settled_once() {
+    let fx = Credentials::new();
+    let (_dir, db) = work_db();
+    spoke_ready(&db, "edge-1");
+    let owned = db.reserve_spoke_assignment("exec_1", "edge-1").unwrap();
+    let run = proto_run(&run_key(&owned));
+    let hub = start(db.clone(), fx.credentials.clone()).await;
+    let (spoke, cert) = enroll_edge(&hub, &fx.credentials).await;
+    let mut peer = connect(
+        dial(&hub, Some(identity_of(&spoke, &cert))).await.expect("dial"),
+        hello("edge-1"),
+    )
+    .await
+    .expect("connect");
+    let welcome = match peer.next().await {
+        Some(v1::hub_frame::Body::Welcome(welcome)) => welcome,
+        other => panic!("expected welcome, got {other:?}"),
+    };
+
+    let applier = Arc::new(Accepting::default());
+    let config = ProjectorConfig::builder()
+        .sweep_interval(std::time::Duration::from_millis(50))
+        .delivery_interval(std::time::Duration::from_millis(100))
+        .build();
+    let projecting = tokio::spawn(hub.stream.projector(db.clone(), applier.clone(), config).run());
+
+    // The worker's `done`, queued on the spoke while the hub may have been away.
+    let proposal = v1::Record {
+        sequence: 1,
+        observed: Some(stamp()),
+        run: Some(run.clone()),
+        body: Some(record::Body::Proposal(v1::Proposal {
+            proposal_id: "key-1".into(),
+            kind: v1::ProposalKind::RunDone.into(),
+            payload_contract: "proposal-json/1".into(),
+            canonical_json: serde_json::to_vec(&serde_json::json!({
+                "kind": boss_protocol::ProposalKind::RunDone,
+                "payload": {"outcome": "delivered", "summary": "queued"},
+                "idempotency_key": "key-1",
+            }))
+            .unwrap(),
+            ..Default::default()
+        })),
+    };
+    peer.tx
+        .send(v1::SpokeFrame {
+            body: Some(spoke_frame::Body::Record(proposal)),
+        })
+        .await
+        .unwrap();
+    match peer.next().await {
+        Some(v1::hub_frame::Body::RecordReceipt(cursor)) => assert_eq!(cursor.through, 1),
+        other => panic!("expected receipt, got {other:?}"),
+    }
+
+    // The hub applies it and answers over the same stream, as a command.
+    let command = match peer.next().await {
+        Some(v1::hub_frame::Body::Command(command)) => command,
+        other => panic!("expected the decision command, got {other:?}"),
+    };
+    assert_eq!(command.run.as_ref(), Some(&run));
+    let Some(v1::command::Body::ProposalDecision(decision)) = &command.body else {
+        panic!("expected a proposal decision, got {:?}", command.body)
+    };
+    assert_eq!(
+        (decision.proposal_id.as_str(), decision.code),
+        ("key-1", ResultCode::Ok as i32)
+    );
+    assert_eq!(
+        db.spoke_effect("edge-1", PROPOSAL_DECISION, &format!("{}:key-1", run.run_id))
+            .unwrap()
+            .unwrap()
+            .state,
+        boss_work_db::SpokeEffectState::Pending,
+        "owed until the spoke answers"
+    );
+
+    // The spoke acknowledges the command and reports it applied.
+    peer.tx
+        .send(v1::SpokeFrame {
+            body: Some(spoke_frame::Body::CommandReceipt(v1::Cursor {
+                journal_id: welcome.command_journal_id.clone(),
+                through: command.sequence,
+            })),
+        })
+        .await
+        .unwrap();
+    peer.tx
+        .send(v1::SpokeFrame {
+            body: Some(spoke_frame::Body::Record(v1::Record {
+                sequence: 2,
+                observed: Some(stamp()),
+                run: Some(run.clone()),
+                body: Some(record::Body::Result(CommandResult {
+                    command_id: command.command_id.clone(),
+                    code: ResultCode::Ok.into(),
+                    ..Default::default()
+                })),
+            })),
+        })
+        .await
+        .unwrap();
+    match peer.next().await {
+        Some(v1::hub_frame::Body::RecordReceipt(cursor)) => assert_eq!(cursor.through, 2),
+        other => panic!("expected the result's receipt, got {other:?}"),
+    }
+    for _ in 0..200 {
+        let effect = db
+            .spoke_effect("edge-1", PROPOSAL_DECISION, &format!("{}:key-1", run.run_id))
+            .unwrap()
+            .unwrap();
+        if effect.state == boss_work_db::SpokeEffectState::Done {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let effect = db
+        .spoke_effect("edge-1", PROPOSAL_DECISION, &format!("{}:key-1", run.run_id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(effect.state, boss_work_db::SpokeEffectState::Done);
+    // Nothing is sent or applied a second time, even after several sweeps.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert_eq!(applier.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    match tokio::time::timeout(std::time::Duration::from_millis(300), peer.next()).await {
+        Err(_) | Ok(None) => {}
+        Ok(Some(other)) => panic!("a settled decision was sent again: {other:?}"),
+    }
+    projecting.abort();
     hub.stop().await;
 }

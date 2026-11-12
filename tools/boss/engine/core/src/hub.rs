@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use boss_host_enrollment::{HostCredentials, Policy, SystemClock};
-pub use boss_spoke_hub::HubStream;
+pub use boss_spoke_hub::{HubStream, projection};
 use tokio::net::TcpListener;
 
 use crate::work::WorkDb;

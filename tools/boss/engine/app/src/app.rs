@@ -136,6 +136,7 @@ mod spoke_installation;
 #[cfg(test)]
 mod spoke_probe_tests;
 mod spoke_probes;
+mod spoke_projection;
 mod subscriptions;
 #[cfg(test)]
 mod tests;
@@ -686,8 +687,8 @@ struct ServerState {
     hub_stream: StdMutex<Option<boss_engine_runtime::hub::HubStream>>,
     /// Where each spoke-supervised worker is in its turn. A spoke run has no
     /// local slot, so the slot's live activity cannot say whether it is parked.
-    /// Nothing in production fills this yet: the hub does not project a spoke's
-    /// journaled hook events into worker-event dispatch (see `SpokeTurns`).
+    /// Filled by hook events the hub projects from a spoke's journal (see
+    /// `spoke_projection`) as they take the ordinary worker-event fan-out.
     #[builder(default)]
     spoke_turns: spoke_probes::SpokeTurns,
     /// Read-only remote pane viewers: one capture task per run being watched.
@@ -2152,6 +2153,9 @@ impl ServerState {
 
         if let Some(stream) = hub_stream {
             pane_viewers::bridge_hub_stream(&server_state, &stream);
+            // Apply what the spokes' durable journals received. Receipt does not
+            // wait for this, and a restart resumes from the application cursor.
+            spoke_projection::start(&server_state, &stream);
             server_state.set_hub_stream(Some(stream));
         }
         Ok(server_state)

@@ -642,6 +642,7 @@ dependencies = [
  "boss-metrics",
  "boss-prose-vocabulary",
  "boss-protocol",
+ "boss-protocol-spoke",
  "boss-review-guide",
  "boss-single-flight",
  "boss-spoke-adapter",
@@ -657,6 +658,7 @@ dependencies = [
  "chrono",
  "fs4",
  "libc",
+ "prost",
  "rcgen",
  "reqwest",
  "rusqlite",
@@ -1729,17 +1731,24 @@ name = "boss-spoke-hub"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "bon",
  "boss-host-enrollment",
+ "boss-protocol",
  "boss-protocol-spoke",
  "boss-spoke-stream",
  "boss-work-db",
  "prost",
  "rcgen",
  "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",
+ "tracing",
 ]
 
 [[package]]
