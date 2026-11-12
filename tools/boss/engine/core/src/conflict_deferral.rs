@@ -46,8 +46,9 @@
 //! over and over, so keying on them would resolve exactly the conflicts
 //! deferral exists to skip.
 //!
-//! See `tools/boss/docs/conflict-resolution-deferral.md` for the operator
-//! view.
+//! See `tools/boss/docs/conflict-resolution-deferral.md` for how to turn
+//! deferral on and how a deferred conflict shows on the board, in the ledger
+//! and in the stuck report.
 
 use boss_execution_contracts::ExecutionPublisher;
 use boss_feature_flags::ConflictDeferralArm;

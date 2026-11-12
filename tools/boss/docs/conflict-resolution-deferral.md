@@ -54,7 +54,7 @@ Review and CI state were the alternative and were rejected. A PR is usually revi
 
 The cost is the one the investigation names: merging a deferred PR waits for one resolution and one CI run after the merge request. On a `trunk_queue` product the standing merge intent resubmits the PR once the conflict clears. With GitHub-native merging the armed auto-merge does the same; if GitHub refused to arm it, request the merge again once the card stops showing the conflict.
 
-While a conflict is deferred, CI remediation for the PR waits too, as it does today for any conflicting PR (a conflict pre-empts CI).
+While a conflict is deferred, CI remediation for the PR waits too, as it does today for any conflicting PR (a conflict pre-empts CI). That makes a PR that is both conflicted and red wait on a merge request: nothing fixes its CI until someone asks to merge it. If you want it fixed, request the merge (the conflict is then resolved and CI remediation resumes) or run `conflicts retry` on the card; do not wait for green first.
 
 ## PRs that never become ready
 

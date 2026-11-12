@@ -116,9 +116,12 @@ pub struct ConflictDeferralState {
     /// exists for the work item, or it carries an uncleared `merge_conflict`
     /// signal (a fix vehicle is running, or the item waits on a human for one).
     pub resolution_owed: bool,
-    /// The last recorded poll already had this PR conflicting. `false` on the
-    /// first conflicting probe after a mergeable (or never-polled) one, which
-    /// is what marks a new conflict.
+    /// No poll has recorded this PR as mergeable since its conflict began.
+    /// Only a definitive clean observation ends a conflict: an `unknown`
+    /// poll (GitHub reports it routinely after a base move) leaves it in
+    /// place, so a conflict released to the resolver is not mistaken for a
+    /// new one. `false` on the first conflicting probe after a mergeable one,
+    /// which is what marks a new conflict.
     pub was_conflicting: bool,
     /// The newest watcher-written row for this PR, deferral records included.
     pub latest: Option<ConflictResolution>,
@@ -160,16 +163,26 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
             conn.execute_batch(ddl)?;
         }
     }
-    // A Review card says when its conflict is deferred, so a deferral
-    // starting or ending is a board input: journal it against the card, as
-    // `board_projection_schema` does for every other input a card reads.
+    create_board_journal_triggers(conn)?;
+    Ok(())
+}
+
+/// Journal a deferral starting or ending as a board input.
+///
+/// A Review card says when its conflict is deferred, so a deferral starting
+/// or ending is journaled against the card like every other board input. The
+/// triggers are deliberately not named `board_changes_*`:
+/// `board_projection_schema::refine_triggers` drops every trigger with that
+/// prefix and rebuilds only the ones `board_projection_schema::migrate`
+/// defines, so a later board-input migration would silently delete these.
+pub(super) fn create_board_journal_triggers(conn: &Connection) -> Result<()> {
     conn.execute_batch(&format!(
-        "CREATE TRIGGER IF NOT EXISTS board_changes_conflict_deferral_insert
+        "CREATE TRIGGER IF NOT EXISTS conflict_deferral_board_insert
             AFTER INSERT ON conflict_resolutions WHEN NEW.status = '{CONFLICT_STATUS_DEFERRED}'
          BEGIN
             INSERT INTO board_changes(item_id, source) VALUES (NEW.work_item_id, 'conflict_resolutions');
          END;
-         CREATE TRIGGER IF NOT EXISTS board_changes_conflict_deferral_update
+         CREATE TRIGGER IF NOT EXISTS conflict_deferral_board_update
             AFTER UPDATE OF status ON conflict_resolutions
             WHEN OLD.status = '{CONFLICT_STATUS_DEFERRED}' AND NEW.status IS NOT OLD.status
          BEGIN
@@ -249,6 +262,32 @@ impl WorkDb {
         query_open_deferral(&conn, work_item_id)
     }
 
+    /// Most recent resolution *attempt* for `work_item_id`: like
+    /// `latest_conflict_resolution_for_work_item`, but deferral
+    /// records (`deferred` rows, and the `superseded` rows they become when
+    /// the deferral ends) are skipped. A deferral is a ledger note, not an
+    /// attempt, and it never owns the UNIQUE (work item, base, head) key, so
+    /// it must not hide the attempt that does when the stale-success and
+    /// abandoned-row recovery decide whether that key has to be freed.
+    pub fn latest_conflict_attempt_for_work_item(&self, work_item_id: &str) -> Result<Option<ConflictResolution>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CONFLICT_RESOLUTION_COLUMNS}
+             FROM conflict_resolutions
+             WHERE work_item_id = ?1
+               AND status != '{}'
+               AND deferral_end_reason IS NULL
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+            CONFLICT_STATUS_DEFERRED,
+        ))?;
+        let mut rows = stmt.query_map([work_item_id], map_conflict_resolution)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
     /// One consistent read of everything the deferral decision depends on.
     pub fn conflict_deferral_state(&self, work_item_id: &str, pr_url: &str) -> Result<ConflictDeferralState> {
         let conn = self.connect()?;
@@ -284,7 +323,7 @@ impl WorkDb {
             in_review: status == "in_review",
             open: query_open_deferral(&conn, work_item_id)?,
             resolution_owed,
-            was_conflicting: mergeable.as_deref() == Some("conflicting"),
+            was_conflicting: mergeable.as_deref() != Some("mergeable"),
             latest,
         })
     }
@@ -417,6 +456,21 @@ mod tests {
             .unwrap()
             .query_row("SELECT updated_at FROM tasks WHERE id = ?1", [item], |row| row.get(0))
             .unwrap()
+    }
+
+    #[test]
+    fn board_trigger_rebuild_keeps_the_deferral_triggers() {
+        let (db, ..) = db_with_review_item();
+        let conn = db.connect().unwrap();
+        super::super::board_projection_schema::refine_triggers(&conn).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'conflict_deferral_board_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
     }
 
     #[test]

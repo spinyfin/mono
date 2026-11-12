@@ -384,6 +384,133 @@ async fn a_human_request_releases_a_deferred_conflict() {
     assert_eq!(ledger(&db, &chore).len(), 2);
 }
 
+/// A released conflict stays released across a poll that could not say
+/// whether the PR is mergeable: GitHub reports `unknown` routinely after a
+/// base move, and that must not make the same conflict look new.
+#[tokio::test]
+async fn an_unknown_poll_after_a_human_request_does_not_defer_the_conflict_again() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/3559";
+    let (product, chore) = make_in_review(&db, "C-unknown", pr);
+    let publisher = RecordingPublisher::default();
+
+    assert!(
+        detect(
+            &db,
+            &publisher,
+            &product,
+            &chore,
+            &conflicting(pr),
+            ConflictDeferralArm::Deferred
+        )
+        .await
+    );
+    poller_records_mergeability(&db, &chore, "conflicting");
+    let deferral = db.open_conflict_deferral(&chore).unwrap().unwrap();
+    db.retry_conflict_resolution(&deferral.id).unwrap().unwrap();
+
+    // The next poll is inconclusive, then the PR probes conflicting again.
+    poller_records_mergeability(&db, &chore, "unknown");
+    assert!(
+        detect(
+            &db,
+            &publisher,
+            &product,
+            &chore,
+            &conflicting(pr),
+            ConflictDeferralArm::Deferred
+        )
+        .await
+    );
+    let rows = ledger(&db, &chore);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[1].status, "pending", "an attempt starts, not a second deferral");
+    assert!(db.open_conflict_deferral(&chore).unwrap().is_none());
+}
+
+/// A deferral row newer than an old `succeeded` attempt must not hide that
+/// attempt from the stale-success recovery: once the deferral is released the
+/// colliding key is freed and a fresh attempt starts.
+#[tokio::test]
+async fn a_released_deferral_does_not_wedge_behind_a_stale_succeeded_attempt() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/3559";
+    let (product, chore) = make_in_review(&db, "C-stale", pr);
+    let publisher = RecordingPublisher::default();
+    let stuck = || probe_with_head(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()), "head-stuck");
+
+    // An attempt in the control arm "succeeds" without the head advancing.
+    assert!(
+        detect(
+            &db,
+            &publisher,
+            &product,
+            &chore,
+            &stuck(),
+            ConflictDeferralArm::Control
+        )
+        .await
+    );
+    let first = db.active_conflict_resolution_for_work_item(&chore).unwrap().unwrap();
+    db.mark_conflict_resolution_succeeded(&first.id, None).unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'completed' WHERE work_item_id = ?1",
+            rusqlite::params![first.revision_task_id],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+            rusqlite::params![first.revision_task_id],
+        )
+        .unwrap();
+    db.clear_merge_conflict_signal_only(&chore).unwrap();
+    poller_records_mergeability(&db, &chore, "conflicting");
+
+    // Same base and head conflict again in the treatment arm: deferred.
+    assert!(
+        detect(
+            &db,
+            &publisher,
+            &product,
+            &chore,
+            &stuck(),
+            ConflictDeferralArm::Deferred
+        )
+        .await
+    );
+    let deferral = db
+        .open_conflict_deferral(&chore)
+        .unwrap()
+        .expect("conflict is deferred");
+    db.retry_conflict_resolution(&deferral.id).unwrap().unwrap();
+
+    // Repeated detection after the release starts a fresh attempt.
+    for _ in 0..3 {
+        detect(
+            &db,
+            &publisher,
+            &product,
+            &chore,
+            &stuck(),
+            ConflictDeferralArm::Deferred,
+        )
+        .await;
+    }
+    let active = db
+        .active_conflict_resolution_for_work_item(&chore)
+        .unwrap()
+        .expect("a fresh attempt must start");
+    assert_ne!(active.id, first.id);
+    let stale = db.get_conflict_resolution(&first.id).unwrap().unwrap();
+    assert_ne!(stale.status, "succeeded", "the stale success freed its key");
+}
+
 /// Kill switch and experiment arms: with deferral off, or in the control arm,
 /// a conflict is resolved on detection, and one deferred earlier is released.
 #[tokio::test]

@@ -534,7 +534,7 @@ pub async fn on_conflict_detected_with(
                     Ok(None) => {
                         // No active crz. Check the most recent crz to decide
                         // whether to re-arm.
-                        let latest = match work_db.latest_conflict_resolution_for_work_item(&candidate.work_item_id) {
+                        let latest = match work_db.latest_conflict_attempt_for_work_item(&candidate.work_item_id) {
                             Ok(latest) => latest,
                             Err(err) => {
                                 tracing::warn!(
