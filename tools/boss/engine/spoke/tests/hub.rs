@@ -26,6 +26,15 @@ use tonic::{
 
 pub const STEP: Duration = Duration::from_secs(60);
 
+// A sibling test can fork while a journal is open. Wait for every gated spawn
+// to finish exec before closing that journal, so no child retains its flock
+// when the daemon starts. O_CLOEXEC alone does not close the FD at fork.
+static SPAWN_OR_CLOSE: Mutex<()> = Mutex::new(());
+
+fn spawn_or_close() -> std::sync::MutexGuard<'static, ()> {
+    SPAWN_OR_CLOSE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub struct Connection {
     pub hello: v1::Hello,
     pub incoming: Streaming<v1::SpokeFrame>,
@@ -225,6 +234,13 @@ impl Fixture {
             .tls_config(tls)
             .unwrap()
     }
+    pub fn start_after_journal(&self, journal: boss_spoke_journal::Journal) -> Daemon {
+        {
+            let _gate = spawn_or_close();
+            drop(journal);
+        }
+        self.start()
+    }
     pub fn start(&self) -> Daemon {
         Daemon::start(self.dir.path(), &self.endpoint, Path::new("cube"), None)
     }
@@ -278,7 +294,10 @@ impl Daemon {
         if let Some(path) = path {
             command.env("PATH", path);
         }
-        let child = command.spawn().unwrap();
+        let child = {
+            let _gate = spawn_or_close();
+            command.spawn().unwrap()
+        };
         Self { child, log }
     }
     pub fn running(&mut self) -> bool {
