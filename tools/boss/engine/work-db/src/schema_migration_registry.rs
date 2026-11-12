@@ -264,14 +264,14 @@ pub(super) fn all() -> Vec<Migration> {
             apply: conflict_mismatch::migrate,
         },
         Migration {
-            id: conflict_deferral::MIGRATION_ID.into(),
-            legacy_version: None,
-            apply: conflict_deferral::migrate,
-        },
-        Migration {
             id: "20261112_0001_conflict_ladder_outcomes".into(),
             legacy_version: None,
             apply: conflict_ladder_telemetry::migrate,
+        },
+        Migration {
+            id: conflict_deferral::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: conflict_deferral::migrate,
         },
         Migration {
             id: "20261029_1430_critical_requests".into(),
