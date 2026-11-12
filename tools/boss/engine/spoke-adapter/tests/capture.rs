@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use boss_execution_contracts::{PaneCaptureOutcome, PaneCaptureRequest};
 use boss_protocol_spoke::{
-    negotiate::{Contracts, EPOCH, OPTIONAL_FEATURES, feature},
-    v1::{Capture, Command, Feature, PaneCapture, Record, ResultCode, Stamp, command, hub_frame, record},
+    negotiate::{Contracts, feature},
+    v1::{Capture, Command, PaneCapture, Record, ResultCode, Stamp, command, hub_frame, record},
 };
 use boss_spoke_adapter::SpokeAdapterConfig;
 
@@ -41,40 +41,9 @@ fn hub_that_negotiates_with_executor() -> Contracts {
     contracts
 }
 
-/// Features the production executor Hello advertises. Keep in lockstep with
-/// `boss_spoke_outbound::executor_contracts` / `EXECUTOR_FEATURES`: journal plus
-/// workspace, execution, workspace-reset-release, spawn-launch-inputs,
-/// spawn-worker-posture, worker-event, transcript-delta, pane-capture. Optional
-/// names stay optional.
+/// The production executor Hello. Same list the live spoke sends.
 fn production_executor_hello() -> Contracts {
-    let mut contracts = Contracts {
-        min_epoch: EPOCH,
-        max_epoch: EPOCH,
-        features: vec![Feature {
-            name: feature::JOURNAL.into(),
-            revision: 1,
-        }],
-        required: vec![feature::JOURNAL.into()],
-    };
-    for name in [
-        feature::WORKSPACE,
-        feature::EXECUTION,
-        feature::WORKSPACE_RESET_RELEASE,
-        feature::SPAWN_LAUNCH_INPUTS,
-        feature::SPAWN_WORKER_POSTURE,
-        feature::WORKER_EVENT,
-        feature::TRANSCRIPT_DELTA,
-        feature::PANE_CAPTURE,
-    ] {
-        contracts.features.push(Feature {
-            name: name.into(),
-            revision: 1,
-        });
-        if !OPTIONAL_FEATURES.contains(&name) {
-            contracts.required.push(name.into());
-        }
-    }
-    contracts
+    boss_protocol_spoke::negotiate::executor_contracts()
 }
 
 async fn hub_for_executor() -> Fixture {
@@ -229,7 +198,7 @@ async fn ttls_are_translated_for_the_wire() {
 async fn the_spokes_answer_maps_to_an_outcome() {
     for (code, expect) in [
         (ResultCode::Ok, "accepted"),
-        (ResultCode::Absent, "ended"),
+        (ResultCode::Absent, "unreachable"),
         (ResultCode::Rejected, "refused"),
         (ResultCode::Unknown, "unreachable"),
     ] {
@@ -251,6 +220,22 @@ async fn the_spokes_answer_maps_to_an_outcome() {
         };
         assert_eq!(got, expect, "{code:?}");
     }
+}
+
+#[tokio::test]
+async fn an_absent_answer_while_the_assignment_is_open_is_not_ended() {
+    let fx = hub_for_executor().await;
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let _peer = fx
+        .spoke_contracts(script(ResultCode::Absent), None, 0, production_executor_hello())
+        .await;
+    lease(&adapter).await;
+    let outcome = adapter.capture_worker_pane("exec_1", &request(0, false)).await.unwrap();
+    assert!(
+        matches!(outcome, PaneCaptureOutcome::Unreachable(_)),
+        "an open assignment must keep renewing, got {outcome:?}"
+    );
 }
 
 #[tokio::test]

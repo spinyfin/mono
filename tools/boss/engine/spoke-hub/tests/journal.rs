@@ -56,7 +56,7 @@ async fn duplicate_frames_return_the_receipt_without_changing_bytes() {
 }
 
 #[tokio::test]
-async fn pane_capture_original_bytes_are_kept_and_changed_replays_are_denied() {
+async fn pane_captures_are_receipted_without_occupying_ingress() {
     let (_dir, db) = work_db();
     spoke_ready(&db, "host-a");
     let owned = db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
@@ -75,13 +75,15 @@ async fn pane_capture_original_bytes_are_kept_and_changed_replays_are_denied() {
         body: Some(v1::spoke_frame::Body::Record(capture.clone())),
     }
     .encode_to_vec();
-    // Unknown envelope fields must survive durable ingress as well.
     frame.extend_from_slice(&[0xa0, 0x06, 0x01]);
     assert!(frame.len() > 60 * 1024);
     assert_eq!(sink.commit(&session, &frame, &capture).await.unwrap().through, 1);
-    let stored = reader.spoke_ingress_frame("host-a", 1).unwrap().unwrap();
-    assert_eq!(stored, frame);
-    assert_eq!(sink.commit(&session, &frame, &capture).await.unwrap().through, 1);
+    assert!(
+        reader.spoke_ingress_frame("host-a", 1).unwrap().is_none(),
+        "a capture is live display data: receipted, not stored"
+    );
+    assert_eq!(reader.spoke_journal("host-a").unwrap().unwrap().received, 1);
+    // A retransmission, even with different bytes, is already receipted.
     let Some(record::Body::Capture(text)) = &mut capture.body else {
         unreachable!()
     };
@@ -91,10 +93,7 @@ async fn pane_capture_original_bytes_are_kept_and_changed_replays_are_denied() {
     }
     .encode_to_vec();
     changed.extend_from_slice(&[0xa0, 0x06, 0x01]);
-    assert!(matches!(
-        sink.commit(&session, &changed, &capture).await,
-        Err(StoreError::Denied)
-    ));
+    assert_eq!(sink.commit(&session, &changed, &capture).await.unwrap().through, 1);
     // Everything else is stored exactly as received.
     let verbatim = pane(2, Some(run));
     assert_eq!(sink.commit(&session, b"verbatim", &verbatim).await.unwrap().through, 2);

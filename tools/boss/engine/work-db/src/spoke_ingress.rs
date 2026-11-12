@@ -57,6 +57,12 @@ pub struct SpokeIngressCommit<'a> {
     pub observed_at_ms: i64,
     pub runs: &'a [SpokeRunKey],
     pub result: Option<SpokeIngressResult<'a>>,
+    /// When false, the receipt still advances but the frame is not stored and
+    /// does not count against the host's ingress quota. Pane captures are live
+    /// display data: nothing replays them, and retaining each snapshot would
+    /// fill the quota on an idle viewer.
+    #[builder(default = true)]
+    pub retain: bool,
 }
 
 fn fault(fault: HostOutboxFault) -> anyhow::Error {
@@ -260,6 +266,16 @@ impl WorkDb {
             tx.commit()?;
             return Ok(received);
         }
+        if commit.sequence <= received {
+            // Already receipted and never stored (an ephemeral capture) or a
+            // hole left by not retaining a frame. Results are always retained,
+            // so a result at such a sequence is a lie.
+            if commit.result.is_some() {
+                return Err(fault(HostOutboxFault::Denied));
+            }
+            tx.commit()?;
+            return Ok(received);
+        }
         if commit.sequence != received + 1 {
             return Err(fault(HostOutboxFault::ReplayGap));
         }
@@ -268,37 +284,44 @@ impl WorkDb {
                 return Err(fault(HostOutboxFault::Denied));
             }
         }
-        let frame_len = commit.frame.len() as i64;
-        if record_count >= quota.records || byte_count + frame_len > quota.bytes {
-            return Err(fault(HostOutboxFault::Full));
-        }
         if let Some(result) = commit.result {
             settle_host_command_in_tx(&tx, commit.host_id, result.command_id, result.run, result.bytes)?;
         }
-        tx.execute(
-            "INSERT INTO spoke_ingress
-                (host_id, journal_id, sequence, frame, epoch, features, observed_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                commit.host_id,
-                commit.journal_id,
-                commit.sequence as i64,
-                commit.frame,
-                commit.epoch as i64,
-                commit.features,
-                if commit.observed_at_ms == 0 {
-                    now_ms()
-                } else {
-                    commit.observed_at_ms
-                }
-            ],
-        )?;
-        tx.execute(
-            "UPDATE spoke_journals
-                SET received = ?2, record_count = record_count + 1, byte_count = byte_count + ?3
-              WHERE host_id = ?1",
-            params![commit.host_id, commit.sequence as i64, frame_len],
-        )?;
+        if commit.retain {
+            let frame_len = commit.frame.len() as i64;
+            if record_count >= quota.records || byte_count + frame_len > quota.bytes {
+                return Err(fault(HostOutboxFault::Full));
+            }
+            tx.execute(
+                "INSERT INTO spoke_ingress
+                    (host_id, journal_id, sequence, frame, epoch, features, observed_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    commit.host_id,
+                    commit.journal_id,
+                    commit.sequence as i64,
+                    commit.frame,
+                    commit.epoch as i64,
+                    commit.features,
+                    if commit.observed_at_ms == 0 {
+                        now_ms()
+                    } else {
+                        commit.observed_at_ms
+                    }
+                ],
+            )?;
+            tx.execute(
+                "UPDATE spoke_journals
+                    SET received = ?2, record_count = record_count + 1, byte_count = byte_count + ?3
+                  WHERE host_id = ?1",
+                params![commit.host_id, commit.sequence as i64, frame_len],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE spoke_journals SET received = ?2 WHERE host_id = ?1",
+                params![commit.host_id, commit.sequence as i64],
+            )?;
+        }
         tx.commit()?;
         Ok(commit.sequence)
     }
@@ -755,5 +778,51 @@ mod tests {
             db.host_command_result("host-a", "c1").unwrap().as_deref(),
             Some(&b"ok"[..])
         );
+    }
+
+    #[test]
+    fn ephemeral_frames_do_not_occupy_quota_and_replay_as_receipts() {
+        let db = db();
+        db.set_host_transport("host-a", HostTransport::SpokeReady).unwrap();
+        let owned = db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
+        let run = key(&owned);
+        let quota = IngressQuota { records: 1, bytes: 8 };
+        let admission = db.open_spoke_journal("host-a", "journal", 0, 1).unwrap();
+        let put = |sequence: u64, frame: &[u8], retain: bool| {
+            db.commit_spoke_record_within(
+                SpokeIngressCommit::builder()
+                    .host_id("host-a")
+                    .generation(admission.generation)
+                    .journal_id(&admission.journal_id)
+                    .sequence(sequence)
+                    .frame(frame)
+                    .epoch(1)
+                    .features("execution=1")
+                    .observed_at_ms(1)
+                    .runs(std::slice::from_ref(&run))
+                    .retain(retain)
+                    .build(),
+                quota,
+            )
+        };
+        assert_eq!(put(1, b"capture-bytes-too-big-for-quota", false).unwrap(), 1);
+        assert!(db.spoke_ingress_frame("host-a", 1).unwrap().is_none());
+        assert_eq!(db.spoke_journal("host-a").unwrap().unwrap().received, 1);
+        // A retransmission, even with different bytes, is already receipted.
+        assert_eq!(put(1, b"changed", false).unwrap(), 1);
+        // A retained frame still fits: the capture did not consume quota.
+        assert_eq!(put(2, b"kept", true).unwrap(), 2);
+        assert_eq!(
+            db.spoke_ingress_frame("host-a", 2).unwrap().as_deref(),
+            Some(&b"kept"[..])
+        );
+        assert_eq!(
+            fault_of(&put(3, b"full", true).unwrap_err()),
+            Some(HostOutboxFault::Full)
+        );
+        // Another capture still receipts without filling the quota.
+        assert_eq!(put(3, b"another-capture", false).unwrap(), 3);
+        assert!(db.spoke_ingress_frame("host-a", 3).unwrap().is_none());
+        assert_eq!(db.spoke_journal("host-a").unwrap().unwrap().received, 3);
     }
 }

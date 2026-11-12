@@ -408,7 +408,7 @@ mod session {
 
 use anyhow::{Result, ensure};
 use boss_protocol_spoke::{
-    negotiate::{Contracts, EPOCH, OPTIONAL_FEATURES, feature},
+    negotiate::{Contracts, EPOCH, feature},
     v1::{Feature, Hello, Stamp},
 };
 use boss_spoke_journal::Journal;
@@ -443,41 +443,10 @@ pub fn contracts() -> Contracts {
     }
 }
 
-/// Features offered when a workspace executor is attached. Keep this list in
-/// lockstep with executor support: every workspace op that needs a negotiated
-/// feature is advertised from here, so Hello and the executor cannot drift.
-/// Protocol-optional names (`workspace-reset-release`, `spawn-launch-inputs`,
-/// `pane-capture`) stay optional; the rest are required. `pane-capture` is
-/// offered because the production spoke runs the capture loop beside this
-/// session; a hub that predates it simply negotiates it away.
-const EXECUTOR_FEATURES: &[&str] = &[
-    feature::WORKSPACE,
-    feature::EXECUTION,
-    feature::WORKSPACE_RESET_RELEASE,
-    feature::SPAWN_LAUNCH_INPUTS,
-    feature::SPAWN_WORKER_POSTURE,
-    feature::WORKER_EVENT,
-    feature::TRANSCRIPT_DELTA,
-    feature::PANE_CAPTURE,
-    feature::WORKER_API,
-    feature::PROPOSAL_JSON,
-    feature::ARTIFACT,
-];
-
 /// Journal contracts plus the executor-backed workspace/execution set.
-pub fn executor_contracts() -> Contracts {
-    let mut contracts = contracts();
-    for &name in EXECUTOR_FEATURES {
-        contracts.features.push(Feature {
-            name: name.into(),
-            revision: 1,
-        });
-        if !OPTIONAL_FEATURES.contains(&name) {
-            contracts.required.push(name.into());
-        }
-    }
-    contracts
-}
+/// Defined once in `boss_protocol_spoke::negotiate` so adapter tests and the
+/// production Hello cannot drift.
+pub use boss_protocol_spoke::negotiate::executor_contracts;
 
 pub fn hello(journal: &Journal, boot_id: &str, nonce: &[u8]) -> Result<Hello> {
     let (host_id, journal_id) = journal.identity()?;
@@ -583,7 +552,7 @@ pub(crate) fn status(error: tonic::Status) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boss_protocol_spoke::negotiate::feature;
+    use boss_protocol_spoke::negotiate::{EXECUTOR_FEATURES, feature};
 
     #[test]
     fn production_executor_negotiates_only_with_a_compatible_hub() {
